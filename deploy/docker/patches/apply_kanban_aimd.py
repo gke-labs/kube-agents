@@ -70,7 +70,7 @@ def apply(root: Path) -> None:
     patch.refuse_if_patched(MARKER)
     _expect_inside(patch, RESULT_HANDLER, RESULT_ANCHOR, "result dict")
     patch.substitute(RESULT_ANCHOR, RESULT_PATCHED, label="result dict")
-    patch.commit("a worker's ssh exit 255 or credential-proxy busy line records pressure on its card")
+    patch.commit("a worker's ssh exit 255 or credential-proxy busy exit records pressure on its card")
 
 
 if __name__ == "__main__":

@@ -781,7 +781,10 @@ type TuningSpec struct {
 	// MaxInProgress caps how many kanban workers run concurrently across the whole
 	// board. It is board-wide rather than per-persona: there is one dispatcher, and
 	// every worker it spawns — platform and cluster alike — draws on the same model
-	// quota. Setting it to 1 serialises all delegated work.
+	// quota. Setting it to 1 serialises all delegated work. The kanban dispatcher
+	// treats it as a ceiling: a card's credential-proxy busy answer, a lost sandbox
+	// SSH session or sandbox-shell memory pressure steps the effective cap down to
+	// one worker for an interval, and it climbs back one slot per clean interval.
 	//
 	// One slot is guaranteed to each class of card. At 2 or more, background work (event
 	// triage and cron report relays) may hold every slot but one, so a question asked in

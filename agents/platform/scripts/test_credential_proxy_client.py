@@ -1623,11 +1623,12 @@ class TestExecutePolicyBlocked(unittest.TestCase):
 
 
 class TestExecuteBusyBroker(unittest.TestCase):
-    """A 429 or 503 the retry did not get past prints the busy line first.
+    """A 429 or 503 the retry did not get past prints the busy line first and exits EX_TEMPFAIL.
 
-    The line is the kanban worker's pressure signal to the dispatcher, read
-    back out of the command's output, so it is printed whatever the body is:
-    the broker's JSON, or Envoy's HTML from a sidecar restarting mid-request.
+    The line and the status together are the kanban worker's pressure signal
+    to the dispatcher, read back out of the command's result, so both happen
+    whatever the body is: the broker's JSON, or Envoy's HTML from a sidecar
+    restarting mid-request.
     """
 
     def setUp(self):
@@ -1659,23 +1660,25 @@ class TestExecuteBusyBroker(unittest.TestCase):
 
     def test_a_503_with_an_html_body_prints_the_busy_line_then_the_error(self):
         exit_code, err = self._execute(503, b"<html>upstream connect error</html>")
-        self.assertEqual(exit_code, 1)
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(exit_code, credential_proxy_client.EXIT_BROKER_BUSY)
         lines = err.splitlines()
         self.assertEqual(lines[0], "credential proxy busy (HTTP 503)")
         self.assertIn("credential proxy error (HTTP 503): non-JSON response", lines[1])
 
     def test_a_429_with_the_brokers_json_prints_the_busy_line_then_its_error(self):
         exit_code, err = self._execute(429, json.dumps({"error": "slot limit reached", "bound": "slot"}).encode())
-        self.assertEqual(exit_code, 1)
+        self.assertEqual(exit_code, 75)
         lines = err.splitlines()
         self.assertEqual(lines[0], "credential proxy busy (HTTP 429)")
         self.assertEqual(lines[1], "slot limit reached")
 
-    def test_other_statuses_print_no_busy_line(self):
+    def test_other_statuses_print_no_busy_line_and_exit_1(self):
         for code in (400, 403, 500, 502):
             with self.subTest(code=code):
-                _, err = self._execute(code, b"<html>no</html>")
+                exit_code, err = self._execute(code, b"<html>no</html>")
                 self.assertNotIn("credential proxy busy", err)
+                self.assertEqual(exit_code, 1)
 
 
 class TestConnectTimeout(unittest.TestCase):

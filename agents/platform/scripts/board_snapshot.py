@@ -2,7 +2,9 @@
 
 ``session_kv_server.py`` serves it as ``GET /v1/board``; the Hermes bridge relays
 it to the A2A gateway over the bus (``a2a/lib/board.go`` is the wire shape and
-holds the field names this module writes). No model is in the loop:
+holds the field names the Home tab draws; the two cap figures below are not in
+it yet, so the gateway drops them until it is taught them). No model is in the
+loop:
 
 - clusters: every Cluster Agent profile's ``cluster_identity`` (the managed
   fleet), each with the open findings the findings queue holds for it, ranked
@@ -10,10 +12,10 @@ holds the field names this module writes). No model is in the loop:
 - running: the kanban cards whose status is ``running``, the cluster their
   assignee profile is scoped to beside each;
 - prs: the newest ``pr_opened`` events (``agents/platform/plugins/pr_opened``);
-- configuredMaxInProgress and effectiveMaxInProgress: the dispatcher's cap and
-  the cap it dispatches under now, from the adaptive limiter's row in the
-  board (``deploy/docker/patches/kanban_aimd.py``); both ``None`` until the
-  dispatcher's first tick on this build writes it;
+- configured_max_in_progress and effective_max_in_progress: the kanban
+  dispatcher's cap and the cap it dispatches under now, from the adaptive
+  limiter's row in the board (``deploy/docker/patches/kanban_aimd.py``); both
+  ``None`` until the dispatcher's first tick on this build writes it;
 - audit: the most recent fleet-audit run to finish, from the report store
   (``skills/fleet-audit/scripts/report_status.py``);
 - first_report_pending: onboarding has filed its sweep, its first report is
@@ -320,14 +322,14 @@ def snapshot(
         "cluster_count": len(fleet),
         "running": [],
         "prs": [],
-        "configuredMaxInProgress": None,
-        "effectiveMaxInProgress": None,
+        "configured_max_in_progress": None,
+        "effective_max_in_progress": None,
     }
     if kanban is not None:
         try:
             board["running"] = running(kanban, identities, labels)
             board["prs"] = prs(kanban)
-            board["configuredMaxInProgress"], board["effectiveMaxInProgress"] = dispatch_cap(kanban)
+            board["configured_max_in_progress"], board["effective_max_in_progress"] = dispatch_cap(kanban)
         except sqlite3.Error as exc:
             raise BoardError(f"the kanban board could not be read: {exc}") from None
     home = (profiles_dir or PROFILES_DIR).parent

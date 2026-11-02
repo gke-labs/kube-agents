@@ -2138,7 +2138,7 @@ class WakeNudgeCompatibilityTest(unittest.TestCase):
 
     Its three ``kanban_db.py`` anchors sit in ``create_task``,
     ``complete_task`` and ``unblock_task`` — functions the one edit here in
-    that file (``block_task``) does not touch, and the other ten edits are in
+    that file (``block_task``) does not touch, and the other eleven edits are in
     ``kanban_db_dispatch.py``, which it never opens. The coupling is invisible
     from either applier alone, so it is asserted rather than left to
     inspection: a future edit that widens an anchor into one of those functions

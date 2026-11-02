@@ -703,6 +703,17 @@ class SaturationAndQueuedTest(unittest.TestCase):
         self.assertEqual(res.queued_noticed, [])
         self.assertEqual(len(b.queued("waiting")), 1, "every tick must not repeat it")
 
+    def test_a_board_full_under_a_lowered_effective_cap_still_queues_the_user_card(self):
+        """Edit 11 can leave the tick's cap below the configured one; the record
+        edit 8 wrote carries the effective limit, and fullness is judged by it,
+        not by the configured parameter edit 9 still receives."""
+        b = self._full()
+        res = b.ns["DispatchResult"]()
+        kp.record_saturation(b.conn, res, 2, 1, "default")
+        kp.note_waiting(b.conn, res, max_in_progress=6, board="default")
+        self.assertEqual(res.queued_noticed, ["waiting"])
+        self.assertEqual(b.queued("waiting")[0]["limit"], 1)
+
     def test_a_new_wait_after_a_claim_is_noticed_again(self):
         b = self._full()
         b.tick(cap=2)

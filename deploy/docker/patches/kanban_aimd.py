@@ -32,29 +32,44 @@ Three sources feed it, read once per dispatch tick by
 
 1. **Worker signals** (:func:`record_worker_pressure`), ``task_events`` rows of
    kind :data:`PRESSURE_KIND` on the worker's own card: an ssh result with exit
-   255 and no cwd marker, or the credential proxy's busy line
-   (:data:`BUSY_LINE_PREFIX`, printed by
-   ``agents/platform/scripts/credential_proxy_client.py`` on a 429 or 503) in a
-   command's output. The dispatcher already reads this table, and it survives a
-   gateway restart, which an in-memory channel would not. Only a worker
-   (:data:`WORKER_TASK_ENV` set) records; the front door's own turns do not.
-2. **The sandbox shell's memory** (:func:`probe_shell_memory`): one
-   ``cat memory.current memory.max`` over the ssh ControlMaster socket Hermes
-   already holds for the shell, at the path ``tools/environments/ssh.py``
-   derives. Skipped when no socket exists (nothing has reached the shell yet),
-   a no-op when ``memory.max`` is ``max`` or missing (no limit, or cgroup v1),
-   pressure above :data:`MEMORY_PRESSURE_RATIO` of the limit, and pressure when
-   the probe itself exits 255: the master is dead or the shell is unreachable,
-   which is the same fault a worker would report.
+   255 and no cwd marker, or a command that exited with the credential proxy
+   shim's busy status (:data:`BROKER_BUSY_EXIT`) and printed its busy line
+   (:data:`BUSY_LINE_PREFIX`; ``agents/platform/scripts/credential_proxy_client.py``
+   does both on a 429 or 503 its own retry did not get past). The status and
+   the line together are the signal: text alone would let any file or log a
+   worker reads steer the dispatcher. The dispatcher already reads this table,
+   and it survives a gateway restart, which an in-memory channel would not.
+   Only a worker (:data:`WORKER_TASK_ENV` set) records; the front door's own
+   turns do not. One card steps the cap down at most once per cooldown: its
+   further signals while the cooldown is armed are read and dropped, so a card
+   that keeps hitting a busy broker cannot hold the cap at the floor alone.
+2. **The sandbox shell's memory** (:func:`probe_shell_memory`), only while a
+   worker is running (an idle board has nothing to hold back, and the probe
+   would otherwise keep the shared ssh master alive on its own): one
+   ``cat memory.current memory.max memory.stat`` over the ssh ControlMaster
+   socket Hermes already holds for the shell, at the path
+   ``tools/environments/ssh.py`` derives. Skipped when no socket exists, a no-op
+   when ``memory.max`` is ``max`` or missing (no limit, or cgroup v1). What
+   counts is what reclaim cannot free: ``memory.current`` less the file cache
+   and reclaimable slab from ``memory.stat`` (the same accounting
+   ``apply_cgroup_memory_sample.py`` uses for the gateway container), since a
+   shell that has cloned a few repositories sits near its limit in page cache
+   while healthy. Pressure above :data:`MEMORY_PRESSURE_RATIO` of the limit,
+   and pressure when ssh itself exits 255: the sandbox did not answer. (A stale
+   socket from a master that died uncleanly is not that case: with
+   ``ControlMaster=no`` ssh falls back to a direct connection, so a dead master
+   costs the probe a handshake, not the board a step-down.)
 3. Upstream's gateway memory guard stays where it is, after this one, in
    ``_tick_spawn_budget``.
 
 State is one row of :data:`STATE_TABLE` in the board's ``kanban.db``: the
-configured and effective caps, the cooldown deadline, and the ``task_events``
-cursor the next tick reads from. It survives a restart, and the session KV
-server reads it for the board snapshot (``configuredMaxInProgress`` and
-``effectiveMaxInProgress``). The first tick on a board starts the cursor at the
-newest event, so pressure rows from before this build never pin a cap.
+configured and effective caps, the cooldown deadline, the ``task_events``
+cursor the next tick reads from, and the cards that have already stepped the
+cap down in the current cooldown. It is written when one of those changes, not
+every tick. It survives a restart, and the session KV server reads it for the
+board snapshot (``configured_max_in_progress`` and ``effective_max_in_progress``).
+The first tick on a board starts the cursor at the newest event, so pressure
+rows from before this build never pin a cap.
 
 Nothing here may break a dispatch tick or a terminal result: every entry point
 fails open, to the configured cap on the dispatcher side and to no record on the
@@ -73,7 +88,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +119,11 @@ STATE_DDL = (
     " effective INTEGER NOT NULL,"
     " cooldown_until REAL,"
     " last_event_id INTEGER NOT NULL,"
+    " signalled TEXT NOT NULL DEFAULT '[]',"
     " updated_at REAL NOT NULL)"
 )
+#: A card's status while a worker runs it; the probe runs only while one does.
+STATUS_RUNNING = "running"
 
 #: The share of the sandbox shell's memory limit above which the shell counts
 #: as under pressure.
@@ -116,8 +134,12 @@ PERCENT = 100
 #: trip; ``memory.max`` reads this when the container has no limit.
 CGROUP_MEMORY_CURRENT = "/sys/fs/cgroup/memory.current"
 CGROUP_MEMORY_MAX = "/sys/fs/cgroup/memory.max"
+CGROUP_MEMORY_STAT = "/sys/fs/cgroup/memory.stat"
 CGROUP_UNLIMITED = "max"
-PROBE_COMMAND = f"cat {CGROUP_MEMORY_CURRENT} {CGROUP_MEMORY_MAX}"
+PROBE_COMMAND = f"cat {CGROUP_MEMORY_CURRENT} {CGROUP_MEMORY_MAX} {CGROUP_MEMORY_STAT}"
+#: The ``memory.stat`` keys reclaim can free before an OOM kill: the file cache
+#: and reclaimable slab. ``apply_cgroup_memory_sample.py`` subtracts the same.
+RECLAIMABLE_KEYS = ("active_file", "inactive_file", "slab_reclaimable")
 
 #: ssh's exit status when the connection failed or the mux master went away,
 #: as opposed to the remote command's own status.
@@ -138,9 +160,11 @@ WORKER_TASK_ENV = "HERMES_KANBAN_TASK"
 WORKER_RUN_ENV = "HERMES_KANBAN_RUN_ID"
 
 #: The line the credential proxy shim prints on a 429 or 503, followed by the
-#: status and a closing parenthesis. The shim spells the same prefix;
-#: ``test_kanban_aimd`` pins the two against each other.
+#: status and a closing parenthesis, and the status it then exits with
+#: (``EX_TEMPFAIL``). The shim spells both; ``test_kanban_aimd`` pins the two
+#: files against each other.
 BUSY_LINE_PREFIX = "credential proxy busy (HTTP "
+BROKER_BUSY_EXIT = 75
 
 #: The ``reason`` a pressure event or a probe verdict carries.
 REASON_BROKER_BUSY = "broker_busy"
@@ -230,14 +254,6 @@ class AimdConcurrencyLimiter:
             self.cooldown_until = now + self.cooldown
         return self.effective
 
-    def set_ceiling(self, c_max: int) -> int:
-        """A new configured ceiling; the effective cap is clamped under it."""
-        self.c_max = max(FLOOR, int(c_max))
-        self.effective = min(self.effective, self.c_max)
-        if self.effective >= self.c_max:
-            self.cooldown_until = None
-        return self.effective
-
 
 # ---------------------------------------------------------------------------
 # Persistence in kanban.db
@@ -268,7 +284,7 @@ def load_state(conn: sqlite3.Connection) -> Optional[dict]:
     """The persisted row, or None before the first tick (or on an older board)."""
     try:
         row = conn.execute(
-            f"SELECT configured, effective, cooldown_until, last_event_id, updated_at "
+            f"SELECT configured, effective, cooldown_until, last_event_id, signalled, updated_at "
             f"FROM {STATE_TABLE} WHERE id = ?",
             (STATE_ROW_ID,),
         ).fetchone()
@@ -276,12 +292,17 @@ def load_state(conn: sqlite3.Connection) -> Optional[dict]:
         return None
     if row is None:
         return None
+    try:
+        signalled = [str(card) for card in json.loads(row[4] or "[]")]
+    except (TypeError, ValueError):
+        signalled = []
     return {
         "configured": int(row[0]),
         "effective": int(row[1]),
         "cooldown_until": None if row[2] is None else float(row[2]),
         "last_event_id": int(row[3]),
-        "updated_at": float(row[4]),
+        "signalled": signalled,
+        "updated_at": float(row[5]),
     }
 
 
@@ -293,16 +314,22 @@ def save_state(
     cooldown_until: Optional[float],
     last_event_id: int,
     now: float,
+    signalled: Sequence[str] = (),
 ) -> None:
+    """Write the row; ``updated_at`` is when it last changed, not the last tick."""
     with _write(conn):
         conn.execute(STATE_DDL)
         conn.execute(
-            f"INSERT INTO {STATE_TABLE} (id, configured, effective, cooldown_until, last_event_id, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            f"INSERT INTO {STATE_TABLE} "
+            "(id, configured, effective, cooldown_until, last_event_id, signalled, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
             "configured = excluded.configured, effective = excluded.effective, "
             "cooldown_until = excluded.cooldown_until, last_event_id = excluded.last_event_id, "
-            "updated_at = excluded.updated_at",
-            (STATE_ROW_ID, int(configured), int(effective), cooldown_until, int(last_event_id), float(now)),
+            "signalled = excluded.signalled, updated_at = excluded.updated_at",
+            (
+                STATE_ROW_ID, int(configured), int(effective), cooldown_until, int(last_event_id),
+                json.dumps(sorted(signalled)), float(now),
+            ),
         )
 
 
@@ -310,13 +337,24 @@ def latest_event_id(conn: sqlite3.Connection) -> int:
     return int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0])
 
 
-def pending_pressure(conn: sqlite3.Connection, after_id: int) -> int:
-    """How many pressure events workers wrote after the cursor."""
+def pending_pressure(conn: sqlite3.Connection, after_id: int, up_to_id: int) -> list[str]:
+    """The cards with a pressure event in ``(after_id, up_to_id]``, each once.
+
+    The upper bound is the newest id the tick read first, so a row a worker
+    writes between the two reads waits for the next tick rather than being
+    counted by both.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT task_id FROM task_events WHERE kind = ? AND id > ? AND id <= ? ORDER BY task_id",
+        (PRESSURE_KIND, int(after_id), int(up_to_id)),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def running_workers(conn: sqlite3.Connection) -> int:
+    """How many cards a worker is running now; the probe runs only while one is."""
     return int(
-        conn.execute(
-            "SELECT COUNT(*) FROM task_events WHERE kind = ? AND id > ?",
-            (PRESSURE_KIND, int(after_id)),
-        ).fetchone()[0]
+        conn.execute("SELECT COUNT(*) FROM tasks WHERE status = ?", (STATUS_RUNNING,)).fetchone()[0]
     )
 
 
@@ -352,22 +390,34 @@ def control_socket(user: str, host: str, port: int) -> Path:
 
 
 def classify_memory(text: str) -> Optional[str]:
-    """The probe's verdict from ``memory.current`` and ``memory.max``: a reason, or None.
+    """The probe's verdict from ``memory.current``, ``memory.max`` and ``memory.stat``: a reason, or None.
 
-    None when the limit is ``max`` or absent, when either value is not a
-    number, or when usage is at or under :data:`MEMORY_PRESSURE_RATIO`.
+    What is measured is ``memory.current`` less the :data:`RECLAIMABLE_KEYS` of
+    ``memory.stat``: page cache and reclaimable slab are freed before an OOM
+    kill, and a shell that has read a few repositories carries most of its
+    limit as cache while healthy. None when the limit is ``max`` or absent,
+    when either figure is not a number, or when what remains is at or under
+    :data:`MEMORY_PRESSURE_RATIO` of the limit. Missing ``memory.stat`` lines
+    count as nothing reclaimable, the conservative reading.
     """
-    fields = (text or "").split()
-    if len(fields) < 2 or fields[1] == CGROUP_UNLIMITED:
+    lines = (text or "").split("\n")
+    head = " ".join(lines[:2]).split()
+    if len(head) < 2 or head[1] == CGROUP_UNLIMITED:
         return None
     try:
-        current, limit = int(fields[0]), int(fields[1])
+        current, limit = int(head[0]), int(head[1])
     except ValueError:
         return None
     if limit <= 0:
         return None
-    if current > limit * MEMORY_PRESSURE_RATIO:
-        return f"{REASON_SHELL_MEMORY} {current * PERCENT // limit}%"
+    reclaimable = 0
+    for line in lines[2:]:
+        fields = line.split()
+        if len(fields) == 2 and fields[0] in RECLAIMABLE_KEYS and fields[1].isdigit():
+            reclaimable += int(fields[1])
+    used = max(0, current - reclaimable)
+    if used > limit * MEMORY_PRESSURE_RATIO:
+        return f"{REASON_SHELL_MEMORY} {used * PERCENT // limit}%"
     return None
 
 
@@ -379,9 +429,12 @@ def probe_shell_memory(
 
     None, with no connection made, when the terminal is not ssh or no master
     socket exists yet. ``ControlMaster=no`` keeps the probe from opening a
-    master of its own. The remote ``cat`` failing (no cgroup v2 files) is a
-    no-op; ssh itself failing (255) is pressure. A probe that outruns its
-    timeout is logged and counts for nothing: the next tick asks again.
+    master of its own; it also means a stale socket (a master that died
+    uncleanly) is bypassed with a direct connection rather than failed, so
+    only a sandbox that does not answer gives ssh's own 255, and that is
+    pressure. The remote ``cat`` failing (no cgroup v2 files) is a no-op. A
+    probe that outruns its timeout is logged and counts for nothing: the next
+    tick asks again.
     """
     target = ssh_target() if target is None else target
     if target is None:
@@ -436,11 +489,13 @@ def effective_max_in_progress(
 ) -> Optional[int]:
     """The cap this tick dispatches under, given the configured one.
 
-    Reads the worker signals since the last tick and the shell probe, steps
-    the persisted limiter, writes the state back, and logs each step. ``None``
-    stays ``None`` (an uncapped dispatcher has no ceiling to lower). ``board``
-    is the dispatcher's own parameter and is only named in the log. Never
-    raises: on any error the configured cap is returned unchanged.
+    Reads the worker signals since the last tick and, while a worker is
+    running, the shell probe; steps the persisted limiter; writes the state
+    back when it changed; and logs each step. A card counts once per armed
+    cooldown: its later signals are read and dropped. ``None`` stays ``None``
+    (an uncapped dispatcher has no ceiling to lower). ``board`` is the
+    dispatcher's own parameter and is only named in the log. Never raises: on
+    any error the configured cap is returned unchanged.
     """
     if configured is None:
         return None
@@ -455,6 +510,7 @@ def effective_max_in_progress(
         latest = latest_event_id(conn)
         state = load_state(conn)
         reasons: list[str] = []
+        signalled: list[str] = []
         if state is None:
             limiter = AimdConcurrencyLimiter(c_max)
         else:
@@ -468,18 +524,36 @@ def effective_max_in_progress(
                 # all: one spurious step-down is the conservative error.
                 logger.info("kanban aimd: the event cursor (%d) is past the newest event (%d); rereading", cursor, latest)
                 cursor = 0
-            signals = pending_pressure(conn, cursor)
-            if signals:
-                reasons.append(f"{signals} worker signal(s)")
-        verdict = (probe_shell_memory if probe is None else probe)()
+            armed = limiter.cooldown_until is not None and now < limiter.cooldown_until
+            signalled = list(state["signalled"]) if armed else []
+            cards = pending_pressure(conn, cursor, latest)
+            fresh = [card for card in cards if card not in signalled]
+            if len(fresh) < len(cards):
+                logger.debug(
+                    "kanban aimd: %d card(s) signalled again inside the cooldown; not counted",
+                    len(cards) - len(fresh),
+                )
+            if fresh:
+                reasons.append(f"{len(fresh)} worker signal(s)")
+                signalled.extend(fresh)
+        verdict = None
+        if running_workers(conn):
+            verdict = (probe_shell_memory if probe is None else probe)()
         if verdict:
             reasons.append(str(verdict))
         before = limiter.effective
         effective = limiter.tick(pressure=bool(reasons), now=now)
-        save_state(
-            conn, configured=c_max, effective=effective, cooldown_until=limiter.cooldown_until,
-            last_event_id=latest, now=now,
-        )
+        if limiter.cooldown_until is None:
+            signalled = []  # back at the ceiling: every card may signal again
+        changed = state is None or (
+            state["configured"], state["effective"], state["cooldown_until"],
+            state["last_event_id"], sorted(state["signalled"]),
+        ) != (c_max, effective, limiter.cooldown_until, latest, sorted(signalled))
+        if changed:
+            save_state(
+                conn, configured=c_max, effective=effective, cooldown_until=limiter.cooldown_until,
+                last_event_id=latest, now=now, signalled=signalled,
+            )
         if reasons:
             logger.warning(
                 "kanban aimd: pressure (%s); effective max_in_progress %d -> %d of %d for %ss%s",
@@ -507,12 +581,16 @@ def worker_pressure_reason(env_type: str, returncode: int, output: str, cwd_obse
 
     An ssh result with exit 255 and no cwd marker is the mux client whose
     master went away, or a connection that never opened (the shape
-    ``ssh_shared_master`` hints on). The credential proxy's busy line in the
-    output is a 429 or 503 the shim could not retry past.
+    ``ssh_shared_master`` hints on). A command that exited with the shim's
+    busy status and whose output has the busy line at the start of a line is
+    a 429 or 503 the shim could not retry past. The line alone is not enough:
+    a log, a file or a README the worker reads could carry it.
     """
     if env_type == SSH_BACKEND and returncode == SSH_MUX_EXIT and not cwd_observed:
         return REASON_SSH_EXIT
-    if BUSY_LINE_PREFIX in (output or ""):
+    if returncode == BROKER_BUSY_EXIT and any(
+        line.startswith(BUSY_LINE_PREFIX) for line in (output or "").splitlines()
+    ):
         return REASON_BROKER_BUSY
     return None
 

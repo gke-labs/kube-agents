@@ -118,10 +118,10 @@ class BoardSnapshotTest(unittest.TestCase):
 
     def test_the_dispatch_cap_is_unknown_until_the_limiter_has_written_it(self):
         board = self.snap()
-        self.assertIsNone(board["configuredMaxInProgress"])
-        self.assertIsNone(board["effectiveMaxInProgress"])
+        self.assertIsNone(board["configured_max_in_progress"])
+        self.assertIsNone(board["effective_max_in_progress"])
         with_board = self.snap(kanban_db())
-        self.assertEqual((with_board["configuredMaxInProgress"], with_board["effectiveMaxInProgress"]), (None, None))
+        self.assertEqual((with_board["configured_max_in_progress"], with_board["effective_max_in_progress"]), (None, None))
 
     def test_the_dispatch_cap_is_the_limiters_row(self):
         kanban = kanban_db()
@@ -135,15 +135,15 @@ class BoardSnapshotTest(unittest.TestCase):
             (board_snapshot.AIMD_STATE_ROW_ID,),
         )
         board = self.snap(kanban)
-        self.assertEqual(board["configuredMaxInProgress"], 6)
-        self.assertEqual(board["effectiveMaxInProgress"], 2)
+        self.assertEqual(board["configured_max_in_progress"], 6)
+        self.assertEqual(board["effective_max_in_progress"], 2)
 
     def test_a_malformed_cap_row_costs_the_figures_not_the_board(self):
         kanban = kanban_db()
         kanban.execute(f"CREATE TABLE {board_snapshot.AIMD_STATE_TABLE} (id INTEGER PRIMARY KEY, configured, effective)")
         kanban.execute(f"INSERT INTO {board_snapshot.AIMD_STATE_TABLE} VALUES (1, 'six', 2)")
         board = self.snap(kanban)
-        self.assertEqual((board["configuredMaxInProgress"], board["effectiveMaxInProgress"]), (None, None))
+        self.assertEqual((board["configured_max_in_progress"], board["effective_max_in_progress"]), (None, None))
         self.assertEqual(board["running"], [])
 
     def test_a_closed_finding_is_not_open(self):

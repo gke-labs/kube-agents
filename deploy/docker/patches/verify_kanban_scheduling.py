@@ -2,7 +2,7 @@
 """Build gate for the kanban scheduling patches.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_kanban_scheduling.py``. The applier only proves eleven anchors matched
+``apply_kanban_scheduling.py``. The applier only proves twelve anchors matched
 exactly once. That says nothing about whether the engine those edits
 produce actually schedules correctly, and every fault they fix was emergent
 scheduling behaviour rather than a bad string — so every case below is driven

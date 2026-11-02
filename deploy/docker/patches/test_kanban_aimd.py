@@ -136,8 +136,6 @@ class LimiterTest(unittest.TestCase):
         self.assertEqual(limiter.tick(), 1)
 
     def test_a_lowered_ceiling_clamps_the_effective_cap(self):
-        limiter = ka.AimdConcurrencyLimiter(6, clock=Clock(0), cooldown=60)
-        self.assertEqual(limiter.set_ceiling(2), 2)
         restored = ka.AimdConcurrencyLimiter(2, clock=Clock(0), cooldown=60, effective=6, cooldown_until=None)
         self.assertEqual(restored.effective, 2)
 
@@ -200,6 +198,18 @@ class ClassifyMemoryTest(unittest.TestCase):
     def test_above_the_ratio_is_pressure_with_the_percentage(self):
         self.assertEqual(ka.classify_memory("751\n1000\n"), f"{ka.REASON_SHELL_MEMORY} 75%")
         self.assertEqual(ka.classify_memory("990\n1000\n"), f"{ka.REASON_SHELL_MEMORY} 99%")
+
+    def test_page_cache_and_reclaimable_slab_are_not_pressure(self):
+        """A shell that has cloned a few repositories sits near its limit in cache while healthy."""
+        stat = "anon 200\nfile 700\nactive_file 300\ninactive_file 400\nslab_reclaimable 50\nslab_unreclaimable 20\n"
+        self.assertIsNone(ka.classify_memory(f"990\n1000\n{stat}"))
+
+    def test_anonymous_memory_above_the_ratio_is_pressure_after_the_cache_is_taken_off(self):
+        stat = "anon 800\nactive_file 100\ninactive_file 50\nslab_reclaimable 0\n"
+        self.assertEqual(ka.classify_memory(f"960\n1000\n{stat}"), f"{ka.REASON_SHELL_MEMORY} 81%")
+
+    def test_a_malformed_stat_line_counts_as_nothing_reclaimable(self):
+        self.assertEqual(ka.classify_memory("800\n1000\nactive_file lots\nfile\n"), f"{ka.REASON_SHELL_MEMORY} 80%")
 
 
 class ProbeTest(unittest.TestCase):
@@ -318,6 +328,9 @@ class EffectiveCapTest(unittest.TestCase):
     def state(self):
         return ka.load_state(self.conn)
 
+    def running(self, task_id="r1"):
+        self.conn.execute("INSERT INTO tasks (id, status) VALUES (?, 'running')", (task_id,))
+
     def test_an_uncapped_dispatcher_stays_uncapped(self):
         self.assertIsNone(self.cap(None))
         self.assertIsNone(self.state())
@@ -364,6 +377,7 @@ class EffectiveCapTest(unittest.TestCase):
 
     def test_the_probe_verdict_is_a_signal_too(self):
         self.cap(4)
+        self.running()
         self.verdict = ka.REASON_PROBE_EXIT
         with self.assertLogs(ka.logger, level=logging.WARNING) as logs:
             self.assertEqual(self.cap(4), 1)
@@ -396,8 +410,64 @@ class EffectiveCapTest(unittest.TestCase):
         def boom():
             raise RuntimeError("no ssh")
 
+        self.running()
         with self.assertLogs(ka.logger, level=logging.WARNING):
             self.assertEqual(ka.effective_max_in_progress(self.conn, 4, now=1.0, probe=boom), 4)
+
+    def test_the_probe_is_not_asked_on_an_idle_board(self):
+        """No worker is running: nothing to hold back, and the probe would keep the ssh master alive alone."""
+        asked = []
+        ka.effective_max_in_progress(self.conn, 4, now=1.0, probe=lambda: asked.append(1) or ka.REASON_PROBE_EXIT)
+        self.assertEqual(asked, [])
+        self.assertEqual(self.state()["effective"], 4)
+        self.running()
+        ka.effective_max_in_progress(self.conn, 4, now=2.0, probe=lambda: asked.append(1) or None)
+        self.assertEqual(asked, [1])
+
+    def test_one_card_steps_the_cap_down_once_per_cooldown(self):
+        """A card that keeps hitting a busy broker cannot hold the cap at the floor on its own."""
+        self.cap(4)
+        pressure(self.conn, task_id="loud", when=5)
+        self.assertEqual(self.cap(4), 1)
+        for seconds in (10, 10, 10):
+            self.clock.advance(seconds)
+            pressure(self.conn, task_id="loud", when=6)
+            self.assertEqual(self.cap(4), 1)
+        self.assertEqual(self.state()["cooldown_until"], 1_060.0, "its later signals did not re-arm")
+        self.assertEqual(self.state()["signalled"], ["loud"])
+        self.clock.advance(30)
+        self.assertEqual(self.cap(4), 2)
+        self.assertEqual(self.state()["signalled"], [], "a clean step forgets the card")
+        pressure(self.conn, task_id="loud", when=7)
+        self.assertEqual(self.cap(4), 1, "a new cooldown: the same card counts again")
+
+    def test_a_second_card_does_re_arm_the_cooldown(self):
+        self.cap(4)
+        pressure(self.conn, task_id="one", when=5)
+        self.cap(4)
+        self.clock.advance(30)
+        pressure(self.conn, task_id="two", when=6)
+        self.assertEqual(self.cap(4), 1)
+        self.assertEqual(self.state()["cooldown_until"], 1_090.0)
+        self.assertEqual(self.state()["signalled"], ["one", "two"])
+
+    def test_the_row_is_written_only_when_something_changed(self):
+        self.cap(4)
+        written = self.state()["updated_at"]
+        self.clock.advance(5)
+        self.cap(4)
+        self.assertEqual(self.state()["updated_at"], written, "an idle tick writes nothing")
+        self.conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES ('t', 'comment', 1)")
+        self.clock.advance(5)
+        self.cap(4)
+        self.assertEqual(self.state()["updated_at"], 1_010.0, "a moved cursor is a change")
+
+    def test_an_event_written_between_the_two_reads_is_counted_once(self):
+        """``pending_pressure`` is bounded by the newest id the tick read first."""
+        self.cap(4)
+        pressure(self.conn, when=5)
+        self.assertEqual(ka.pending_pressure(self.conn, 0, 0), [])
+        self.assertEqual(ka.pending_pressure(self.conn, 0, 1), ["t1"])
 
     def test_a_nonsense_cap_is_returned_as_given(self):
         self.assertEqual(ka.effective_max_in_progress(self.conn, "six", now=1.0, probe=lambda: None), "six")
@@ -511,10 +581,23 @@ class WorkerSignalTest(unittest.TestCase):
     def test_a_local_255_is_not(self):
         self.assertIsNone(ka.worker_pressure_reason("local", 255, "", False))
 
-    def test_the_brokers_busy_line_is_a_signal_whatever_the_exit(self):
+    def test_the_brokers_busy_exit_with_its_line_is_a_signal(self):
         output = f"some output\n{ka.BUSY_LINE_PREFIX}503)\nsome more"
-        self.assertEqual(ka.worker_pressure_reason("ssh", 1, output, True), ka.REASON_BROKER_BUSY)
-        self.assertEqual(ka.worker_pressure_reason("local", 0, output, False), ka.REASON_BROKER_BUSY)
+        self.assertEqual(ka.worker_pressure_reason("ssh", 75, output, True), ka.REASON_BROKER_BUSY)
+        self.assertEqual(ka.worker_pressure_reason("local", 75, output, False), ka.REASON_BROKER_BUSY)
+
+    def test_the_busy_line_in_a_commands_output_is_not_a_signal_without_the_exit(self):
+        """A log, a file or a README a worker reads can carry the line; only the shim exits 75 with it."""
+        output = f"{ka.BUSY_LINE_PREFIX}503)\n"
+        for code in (0, 1, 2):
+            with self.subTest(exit=code):
+                self.assertIsNone(ka.worker_pressure_reason("ssh", code, output, True))
+
+    def test_the_busy_exit_without_the_line_is_not_a_signal(self):
+        self.assertIsNone(ka.worker_pressure_reason("ssh", 75, "temporary failure of my own", True))
+
+    def test_the_busy_line_mid_line_is_not_a_signal(self):
+        self.assertIsNone(ka.worker_pressure_reason("ssh", 75, f"saw: {ka.BUSY_LINE_PREFIX}503)", True))
 
     def test_a_clean_result_is_not(self):
         self.assertIsNone(ka.worker_pressure_reason("ssh", 0, "fine", True))
@@ -535,7 +618,7 @@ class WorkerSignalTest(unittest.TestCase):
     def test_a_worker_without_a_run_id_records_a_task_scoped_event(self):
         with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_abc"}, clear=True):
             self.assertEqual(
-                ka.record_worker_pressure("local", 1, f"{ka.BUSY_LINE_PREFIX}429)", connect=lambda: self.conn),
+                ka.record_worker_pressure("local", 75, f"{ka.BUSY_LINE_PREFIX}429)", connect=lambda: self.conn),
                 ka.REASON_BROKER_BUSY,
             )
         (task, run, payload), = self.events()
@@ -579,6 +662,8 @@ class SharedNamesTest(unittest.TestCase):
         constants = _module_constants(CREDENTIAL_PROXY_CLIENT)
         self.assertEqual(constants["BROKER_BUSY_LINE"].format(code=503), f"{ka.BUSY_LINE_PREFIX}503)")
         self.assertEqual(tuple(constants["BROKER_BUSY_STATUSES"]), (429, 503))
+        self.assertEqual(constants["BROKER_BUSY_EXIT_FALLBACK"], ka.BROKER_BUSY_EXIT)
+        self.assertEqual(getattr(os, "EX_TEMPFAIL", ka.BROKER_BUSY_EXIT), ka.BROKER_BUSY_EXIT)
 
     def test_the_state_table_is_the_one_the_board_snapshot_reads(self):
         if not BOARD_SNAPSHOT.exists():

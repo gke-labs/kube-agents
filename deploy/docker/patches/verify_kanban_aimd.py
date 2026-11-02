@@ -14,8 +14,13 @@ way the install reaches it: a real board, a planted ``pressure`` event, the real
      saturation record against the effective cap on the next tick.
   C. The clock moved past the cooldown: the next tick dispatches one more.
   D. As a worker, an ssh exit 255 without the cwd marker and the credential
-     proxy's busy line each write a pressure event on the worker's card, a
-     clean result writes none, and the dispatcher reads what was written.
+     proxy's busy exit with its busy line each write a pressure event on the
+     worker's card, a clean result writes none, the busy line without the
+     exit writes none, and the dispatcher reads what was written.
+  E. The ControlMaster socket path the probe derives is the one the installed
+     ``tools/environments/ssh.py`` derives: the four source lines the
+     derivation copies are present verbatim, so a Hermes bump that moves the
+     socket fails the build instead of silently disabling the probe.
 
 Usage::
 
@@ -72,6 +77,15 @@ KA.CLOCK = lambda: _now[0]
 os.environ[KA.COOLDOWN_ENV] = str(COOLDOWN)
 # The sandbox probe would need an ssh master; none exists in the build.
 check("the shell probe is a no-op without a master socket", KA.probe_shell_memory() is None)
+
+# E. The lines of SSHEnvironment.__init__ the probe's socket derivation copies.
+SSH_SOURCE = HERMES / "tools" / "environments" / "ssh.py"
+SSH_DERIVATION_LINES = (
+    f'Path(tempfile.gettempdir()) / "{KA.SSH_CONTROL_DIR_NAME}"',
+    'socket_key = f"{user}@{host}:{port}"',
+    f".hexdigest()[:{KA.SSH_SOCKET_ID_CHARS}]",
+    'f"{_socket_id}' + KA.SSH_SOCKET_SUFFIX + '"',
+)
 
 
 def fresh():
@@ -192,9 +206,12 @@ out = json.loads(run_terminal(255, "", cwd_observed=False))
 events = pressure_events(conn, worker)
 check("D2. an ssh exit 255 without the marker writes a pressure event", len(events) == 1 and events[0]["reason"] == KA.REASON_SSH_EXIT, str(events))
 check("D2. the tool result still carries the exit code", out["exit_code"] == 255, str(out))
-out = json.loads(run_terminal(1, f"{KA.BUSY_LINE_PREFIX}503)\ncredential proxy error (HTTP 503): non-JSON response", cwd_observed=True))
+BUSY_OUTPUT = f"{KA.BUSY_LINE_PREFIX}503)\ncredential proxy error (HTTP 503): non-JSON response"
+out = json.loads(run_terminal(KA.BROKER_BUSY_EXIT, BUSY_OUTPUT, cwd_observed=True))
 events = pressure_events(conn, worker)
-check("D3. the broker's busy line writes a pressure event", len(events) == 2 and events[1]["reason"] == KA.REASON_BROKER_BUSY, str(events))
+check("D3. the broker's busy exit with its line writes a pressure event", len(events) == 2 and events[1]["reason"] == KA.REASON_BROKER_BUSY, str(events))
+out = json.loads(run_terminal(0, f"some log line\n{BUSY_OUTPUT}", cwd_observed=True))
+check("D3. the busy line in a command's output without the exit writes nothing", len(pressure_events(conn, worker)) == 2)
 out = json.loads(run_terminal(255, "", cwd_observed=True))
 check("D4. a command's own 255 with the marker writes nothing", len(pressure_events(conn, worker)) == 2)
 os.environ.pop("HERMES_KANBAN_TASK")
@@ -202,6 +219,11 @@ out = json.loads(run_terminal(255, "", cwd_observed=False))
 check("D5. outside a worker nothing is written", len(pressure_events(conn, worker)) == 2)
 KA.effective_max_in_progress(conn, CAP, probe=lambda: None)
 check("D6. the dispatcher reads the worker's events", state(conn)["effective"] == KA.FLOOR, str(state(conn)))
+
+print("E. the socket derivation:")
+ssh_source = SSH_SOURCE.read_text() if SSH_SOURCE.exists() else ""
+for line in SSH_DERIVATION_LINES:
+    check(f"E1. ssh.py still derives the socket with {line!r}", line in ssh_source)
 
 print()
 if FAILURES:

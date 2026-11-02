@@ -596,7 +596,10 @@ def note_waiting(
         result.saturation["reserved_background"] = reserved - len(held_user)
         if dry_run:
             return
-        full = int(result.saturation["running"]) >= int(max_in_progress)
+        # The record's own limit, not the parameter: under the adaptive cap
+        # (kanban_aimd, edit 11) the tick recorded the effective one, and the
+        # configured value here would read a full board as having room.
+        full = int(result.saturation["running"]) >= int(result.saturation["limit"])
         candidates = user_waiting if full else held_user
         owed = [
             tid for tid in candidates

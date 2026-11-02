@@ -388,12 +388,17 @@ below. Set it on the CR to raise or lower that. Either way the value is pinned i
 at `/etc/hermes`, so it applies over whatever the agent's own `config.yaml` says, and removing the
 field puts the default back.
 
-The value is a ceiling. Three signals drop the dispatcher's effective cap to one worker. A card
-reports that the credential proxy answered `429` or `503`. A card's sandbox command loses its SSH
-session (exit `255` with no exit marker). The sandbox shell uses more than 75% of its memory
-limit. The cap holds there for a minute. It then rises by one slot for every clean minute until it
-is back at `maxInProgress`. The board endpoint reports both numbers, as `configuredMaxInProgress`
-and `effectiveMaxInProgress`, and the gateway log names each step.
+The value is a ceiling for the kanban dispatcher; under `mode: next`, `profiles.ceiling` does not
+move with it. Three signals drop the kanban dispatcher's effective cap to one worker. A card
+reports that the credential proxy answered `429` or `503` and its command's own retry did not get
+past it. A card's sandbox command, or the dispatcher's own check of the sandbox shell, loses its
+SSH session (exit `255` with no exit marker). The sandbox shell, while a card is running, holds
+more than 75% of its memory limit in memory that reclaim cannot free.
+
+The cap holds at one worker for one interval. It then rises by one slot for every clean interval
+until it is back at `maxInProgress`. A card that keeps signalling does not restart the interval on
+its own. The interval is 60 seconds; `KANBAN_AIMD_COOLDOWN_SECONDS` under `spec.deployment.env`
+sets another. The gateway log names each step in lines that start with `kanban aimd:`.
 
 ```yaml
 spec:
