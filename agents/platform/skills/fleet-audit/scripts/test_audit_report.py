@@ -23551,9 +23551,10 @@ metadata:
         return make_finding(fid="f1", cluster="p/us-central1/c1", obj="NodePool/pinned-inference-pool",
                             remediation={"kind": "manual", "note": note})
 
-    def test_the_paragraph_never_cuts_the_kustomize_note_or_its_copied_file(self):
-        """The Kustomize note's block is the only published copy of a degraded
-        fix: it stays whole, and the paragraph's first sentence still shows."""
+    def test_a_full_kustomize_block_is_shortened_by_lines_for_the_paragraph(self):
+        """The Kustomize note's copied file fills the cap. The block is made
+        shorter by whole lines, with its fences closed, so the paragraph's
+        core fits under the cap; the Kustomize note's own text stays whole."""
         reason = ("did not open a pull request for this fix. `clusters/a/provisioning/pool.yaml` is a new file in the "
                   "Kustomize root `clusters/a`, and `clusters/a/kustomization.yaml` does not list it. "
                   f"{audit_report.KUSTOMIZE_NOTE_MARK} To apply the fix, add the file and add the line `- provisioning/pool.yaml` "
@@ -23566,11 +23567,18 @@ metadata:
             lines, True, lambda b: len(audit_report.publishable_text(prefix + b)) <= audit_report.MAX_NOTE_CHARS
         )
         finding = self.harness_finding(prefix + block + " Raise the cap.")
-        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(self.POOL_STALL), self.root, declarations={}, complete=True)
         note = finding["remediation"]["note"]
-        self.assertTrue(note.startswith(prefix + block), note[:200])
-        self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, note.split(block, 1)[1])
-        self.assertEqual(note.count("```"), block.count("```"))
+        self.assertTrue(note.startswith(prefix), note[:200])
+        self.assertIn("- provisioning/pool.yaml", note)
+        self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED, note)
+        self.assertEqual(note.count("```") % 2, 0)
+        paragraph = note.split("\n\n")[-1]
+        self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_OBJECT_MARK), paragraph[:120])
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+        self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
+        self.assertIn("the fix says so", err.getvalue())
 
     def test_the_paragraph_never_cuts_the_degraded_fix_text(self):
         worker = ("Raise the pool's max node count and add a second zone. " * 24).strip()

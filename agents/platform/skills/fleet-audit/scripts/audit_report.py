@@ -2271,6 +2271,10 @@ KCC_STALLED_NAMED = 2
 # The paragraph's steps from whole to core, as (objects named, follow the
 # dependency chain, keep the tail): `_fit_kcc_paragraph` takes the first
 # that fits.
+# How the paragraph went on a note (`_fit_kcc_paragraph`), for the log.
+KCC_FIT_WHOLE = "whole"
+KCC_FIT_SHORTER = "shorter"
+KCC_FIT_PAST_CAP = "past-cap"
 KCC_PARAGRAPH_STEPS = ((KCC_STALLED_NAMED, True, True), (1, True, True), (1, False, True), (1, False, False))
 # How the list names one object, joins two, names what one waits on, and
 # counts the ones it leaves out.
@@ -19325,7 +19329,7 @@ def _strip_kcc_stalled_note(remediation: object) -> None:
         remediation["note"] = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
 
 
-def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> None:
+def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     """Put the first of `paragraphs` that fits on `remediation`'s note.
 
     `paragraphs` go from the whole paragraph to its core with one object.
@@ -19336,11 +19340,17 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> None:
     and never inside a code block. The route notes already on the note stay,
     and a paragraph that would push out the reconciler note does not fit, so
     the reconciler note is always shown. When even the core does not fit
-    beside the text `finish` wrote, that text stays whole and the core goes
-    after it, past `MAX_NOTE_CHARS`: the renderer then cuts the core's end,
-    and its first sentence still shows. The worker's note before a cut goes
+    beside the text `finish` wrote and the note carries the Kustomize note's
+    copied file, that block is made shorter by whole lines, with its fences
+    closed, to make room for the core and the reconciler note, as
+    `_fit_route_notes` does for the reconciler note (`_sized_manifest_block`).
+    Only when that does not fit either does the core go after the text
+    `finish` wrote, past `MAX_NOTE_CHARS`. The worker's note before a cut goes
     in `ROUTE_UNCUT_NOTE_FIELD`, as the route-note pass keeps it, so the carry
     puts the whole note back once the stall is gone.
+
+    Returns how the paragraph went on: `KCC_FIT_WHOLE`, `KCC_FIT_SHORTER`
+    (a shorter step, or a shorter copied block) or `KCC_FIT_PAST_CAP`.
     """
     note = str(remediation.get("note") or "").strip()
     uncut = remediation.get(ROUTE_UNCUT_NOTE_FIELD)
@@ -19348,23 +19358,50 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> None:
     worker = uncut if isinstance(uncut, str) else ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
     reconciler = [text for text in route if text.startswith(RECONCILED_NOTE_LEDE)]
     fitted, added = _fit_route_notes(worker, route)
-    for paragraph in paragraphs:
+    outcome = KCC_FIT_PAST_CAP
+    for step, paragraph in enumerate(paragraphs):
         # On a paragraph of its own after the route notes, so that a later
         # strip of it (`KCC_STALLED_NOTE_PATTERN`) leaves them whole.
         shown = ROUTE_PARAGRAPH_BREAK + paragraph if route else paragraph
         candidate, candidate_added = _fit_route_notes(worker, [*route, shown])
         if shown in candidate_added and all(text in candidate_added for text in reconciler):
             fitted, added = candidate, candidate_added.replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
+            outcome = KCC_FIT_WHOLE if step == 0 else KCC_FIT_SHORTER
             break
     else:
-        # No room even for the core: the text `finish` wrote stays whole, and
-        # so do the route notes, and the core goes after them.
-        added = ROUTE_PARAGRAPH_BREAK.join(part for part in (added, paragraphs[-1]) if part)
+        shortened = _kcc_core_with_shorter_block(worker, reconciler, paragraphs[-1])
+        if shortened is not None:
+            fitted, added = shortened
+            outcome = KCC_FIT_SHORTER
+        else:
+            # No room even for the core: the text `finish` wrote stays whole,
+            # and so do the route notes, and the core goes after them.
+            added = ROUTE_PARAGRAPH_BREAK.join(part for part in (added, paragraphs[-1]) if part)
     if fitted != worker:
         remediation[ROUTE_UNCUT_NOTE_FIELD] = worker
     else:
         remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
     remediation["note"] = ROUTE_PARAGRAPH_BREAK.join(part for part in (fitted, added) if part)
+    return outcome
+
+
+def _kcc_core_with_shorter_block(worker: str, reconciler: list[str], core: str) -> "tuple[str, str] | None":
+    """The worker's note with its Kustomize copied file made shorter by whole
+    lines (`_sized_manifest_block`, fences closed) so that the reconciler
+    note and the paragraph's `core` fit `MAX_NOTE_CHARS`, as `(note, added)`;
+    None when the note has no copied file or even an empty block leaves no
+    room. Only the block is shortened; the Kustomize note's own text stays
+    whole, and the worker's text after it is cut as needed."""
+    head = _split_kustomize_head(worker)
+    if head.lines is None:
+        return None
+    shown = ROUTE_PARAGRAPH_BREAK + core if reconciler else core
+    added = NOTE_SEPARATOR.join([*reconciler, shown]).replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
+    block = _sized_manifest_block(
+        head.lines, head.whole, lambda shorter: _cut_worker_note(head.rest, "", added, head.prefix + shorter) is not None
+    )
+    fitted = _cut_worker_note(head.rest, "", added, head.prefix + block)
+    return (fitted, added) if fitted is not None else None
 
 
 def disclose_stalled_kcc_remediations(
@@ -19373,6 +19410,7 @@ def disclose_stalled_kcc_remediations(
     root: Path,
     declarations: "dict[KccKey, KccDeclaration] | None" = None,
     complete: bool | None = None,
+    outcomes: "dict[str, str] | None" = None,
 ) -> list[str]:
     """Say so on any fix whose finding's own object Config Connector does not
     apply. Returns the ids whose note or paragraph changed.
@@ -19464,7 +19502,9 @@ def disclose_stalled_kcc_remediations(
             if isinstance(remediation, dict) and remediation.get("kind") == "gcloud":
                 finding[KCC_STALLED_PARAGRAPH_FIELD] = paragraphs[0]
             elif isinstance(remediation, dict):
-                _fit_kcc_paragraph(remediation, paragraphs)
+                outcome = _fit_kcc_paragraph(remediation, paragraphs)
+                if outcomes is not None:
+                    outcomes[fid] = outcome
         moved = isinstance(remediation, dict) and remediation.get("note") != before
         if moved or finding.get(KCC_STALLED_PARAGRAPH_FIELD) != before_paragraph:
             changed.append(fid)
@@ -19489,9 +19529,15 @@ def disclose_stalled_kcc_and_log(
             "publishes with no note about whether Config Connector applies it."
         )
     by_id = {str(finding.get("id", "")): finding for finding in findings}
-    for fid in disclose_stalled_kcc_remediations(findings, manifest, root, declarations, complete):
+    outcomes: dict[str, str] = {}
+    for fid in disclose_stalled_kcc_remediations(findings, manifest, root, declarations, complete, outcomes):
         note = str((by_id[fid].get("remediation") or {}).get("note") or "")
-        if any(mark in note for mark in KCC_STALLED_NOTE_MARKS) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
+        if outcomes.get(fid) == KCC_FIT_PAST_CAP:
+            log(
+                f"{prefix}WARNING: {fid}: Config Connector is not applying the finding's own object, and the "
+                "paragraph that says so does not fit beside the text the audit wrote; the renderer cuts its end."
+            )
+        elif any(mark in note for mark in KCC_STALLED_NOTE_MARKS) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
             log(f"{prefix}{fid}: Config Connector is not applying the finding's own object; the fix says so.")
         else:
             log(f"{prefix}{fid}: removed a Config Connector note that its remediation copied from an earlier ledger.")
