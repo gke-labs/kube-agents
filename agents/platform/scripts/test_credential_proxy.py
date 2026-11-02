@@ -2736,6 +2736,26 @@ class ResourcePressureRouteTest(unittest.TestCase):
         handler._watcher_cluster_endpoint = lambda target, request_id: handler.endpoints_asked.append(target) or None
         return handler
 
+    def test_a_workspace_open_at_the_hard_watermark_is_refused_and_a_read_passes(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        routed = []
+        store = types.SimpleNamespace()
+        with (
+            mock.patch.object(CredentialProxyHandler, "workspaces", store),
+            mock.patch.object(CredentialProxyHandler, "_workspace_route", lambda self, route, payload: routed.append(route) or {"ok": True}),
+        ):
+            status, headers, body = self.post({"repo": "acme/fleet"}, path="/v1/workspace/open")
+            self.assertEqual(429, status)
+            self.assertEqual("11", headers["Retry-After"])
+            self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
+            self.assertEqual([], routed)
+            status, _, _ = self.post({"handle": "h", "path": "README.md"}, path="/v1/workspace/read")
+            self.assertEqual(200, status)
+            self.assertEqual(["read"], routed)
+            self.set_memory_percent(50)
+            status, _, _ = self.post({"repo": "acme/fleet"}, path="/v1/workspace/open")
+            self.assertEqual(200, status)
+
     def test_a_watcher_list_at_the_hard_watermark_is_refused_and_a_watch_passes(self):
         listing = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?limit=500")
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):

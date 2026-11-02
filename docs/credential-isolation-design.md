@@ -684,8 +684,8 @@ The cap counts a list the runtime keeps in memory, so a worker that dies without
 closing its workspace would otherwise hold a slot until the pod restarts. Two
 things bound that. A workspace no verb has named for
 `CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS` (30 minutes by default) is reclaimed by
-the next `open`, and every tree a previous process left under the root is removed
-when the runtime starts. A refusal at the cap logs each holder's handle prefix,
+the next `open` or by the broker's resource watermark relief step (below), and every
+tree a previous process left under the root is removed when the runtime starts. A refusal at the cap logs each holder's handle prefix,
 repository, caller label (the card or session id the client sends), age and idle
 time, so a full store is diagnosable from the runtime's log.
 
@@ -911,7 +911,8 @@ Consequences:
   The queue is in arrival order, except that a forge refresh that fits the budget passes
   requests the slot cap alone holds, since it takes no slot.
   Beside the static budget sits the resource watermark gate, which reads what the container
-  holds now: `memory.current` against `memory.max` on every admission, and the state and
+  holds now: the working set (`memory.current` less `memory.stat`'s `inactive_file`, the
+  kubelet's eviction signal) against `memory.max` on every admission, and the state and
   `/tmp` emptyDirs against the sizeLimits the operator passes
   (`CREDENTIAL_PROXY_STATE_LIMIT_BYTES`, `CREDENTIAL_PROXY_TMP_LIMIT_BYTES`; statvfs when
   unset) on the memory sampler's 30 s tick. From the soft watermark
@@ -921,11 +922,14 @@ Consequences:
   (`CREDENTIAL_PROXY_MEM_HARD_PCT` 85, `CREDENTIAL_PROXY_DISK_HARD_PCT` 80) a background
   caller is answered at once, before it queues, with
   `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE`, `Retry-After: N` (5 to 30, drawn at random) and
-  the same envelope plus `retry_after`; one slot stays open to the session role, which is
-  the one interactive class, up to a ceiling of 92% memory or 90% disk, past which it is
-  refused too. The class is the authenticated role, never a header. The gate covers
+  the same envelope plus `retry_after`, with `retry in N s` in the text the shim prints; one
+  slot stays open to the session role, which is the one interactive class, up to a ceiling
+  of 92% memory or 90% disk, past which it is refused too. Under the clamp that reserve is a
+  slot in the executor as well: a session's command runs beside the one command the clamp
+  lets background work keep, and passes background requests the clamp holds. The class is the authenticated role, never a header. The gate covers
   `/v1/exec`, `/v1/vcs/*` and the feedback route; a `/v1/k8s` list without `watch=true`
-  takes the hard check alone, and a watch passes. A missing or `max` `memory.max` turns the
+  and the content workspace's `open` and `push` take the hard check alone, and a watch and
+  the workspace reads pass. A missing or `max` `memory.max` turns the
   memory half off. The refusal counts under `bound="pressure"`, and
   `kubeagents_credential_proxy_resource_watermark_ratio` carries each resource's fill.
   A long-running command holds its slot and reservation for as long as it runs,

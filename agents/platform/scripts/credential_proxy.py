@@ -426,6 +426,12 @@ ENV_TMP_LIMIT_BYTES = "CREDENTIAL_PROXY_TMP_LIMIT_BYTES"
 TMP_DIR = "/tmp"
 # os.stat's st_blocks unit; the allocated size is what the kubelet charges.
 STAT_BLOCK_BYTES = 512
+# The memory the gate measures is the working set the kubelet evicts on:
+# memory.current less the inactive file pages the kernel drops first. Plain
+# memory.current counts every clean page a clone or a streamed listing left in
+# the cache, which nothing reclaims while nothing allocates, so a broker at rest
+# after file work would read "hard" and stay there.
+CGROUP_INACTIVE_FILE_KEY = "inactive_file"
 WATERMARK_RESOURCE_MEMORY = "memory"
 WATERMARK_RESOURCE_STATE = "state"
 WATERMARK_RESOURCE_TMP = "tmp"
@@ -445,9 +451,6 @@ RESOURCE_PRESSURE_CODE = "CREDENTIAL_PROXY_RESOURCE_PRESSURE"
 # What the tick's relief step calls: the C allocator's trim, where libc has it.
 LIBC_SONAME = "libc.so.6"
 MALLOC_TRIM_SYMBOL = "malloc_trim"
-# A vcs scratch directory's name: `<kind>-<pid>-<sequence>` (vcs_broker._scratch).
-# One whose pid is not this process's was left by a process that is gone.
-VCS_SCRATCH_NAME_RE = re.compile(r"^[a-z]+-(?P<pid>\d+)-\d+$")
 # The session role's own share of that pool. Session pods are opened by chat
 # conversations, and under the cluster-view flag all of them draw on the one
 # pool the platform agent's shell uses, so without a bound of their own a
@@ -1349,6 +1352,9 @@ ROLE_SLOT_ATTRIBUTES: dict[str, str] = {
 # is refused first under the hard watermark and told when to come back. Read
 # from the authenticated principal, never from a header the caller sets.
 INTERACTIVE_ROLES = frozenset({CALLER_ROLE_SESSION})
+# The content workspace routes that write the state volume (a clone, a push's
+# fetch) and so take the resource watermark gate's hard check.
+WORKSPACE_WRITING_ROUTES = frozenset({"open", "push"})
 
 
 def executable_permitted(role: str, executable: str) -> bool:
@@ -2843,29 +2849,6 @@ def release_process_memory() -> bool:
     return True
 
 
-def reclaim_orphaned_vcs_scratch(root: Path) -> int:
-    """Remove the vcs scratch directories under `root` that a previous
-    process left: the emptyDir outlives a container restart, and a scratch
-    tree whose request died with its process is reachable by nothing. Only
-    names of the shape `vcs_broker._scratch` mints, and only those naming
-    another pid; this process's own trees may be mid-request. Returns how
-    many were removed."""
-    try:
-        entries = list(root.iterdir())
-    except OSError:
-        return 0
-    own = str(os.getpid())
-    removed = 0
-    for entry in entries:
-        match = VCS_SCRATCH_NAME_RE.match(entry.name)
-        if match is None or match.group("pid") == own or entry.is_symlink() or not entry.is_dir():
-            continue
-        shutil.rmtree(entry, ignore_errors=True)
-        if not entry.exists():
-            removed += 1
-    return removed
-
-
 class ResourceWatermarkGate:
     """Admission by what the container holds now (#4333; the constants above
     say why and name the steps). One instance per broker, shared by the
@@ -2944,14 +2927,18 @@ class ResourceWatermarkGate:
         return _positive_int(raw)
 
     def read_memory_ratio(self) -> float | None:
-        """memory.current over memory.max, or None with the memory half off
-        or the file unreadable."""
+        """The working set over memory.max: memory.current less memory.stat's
+        inactive_file (CGROUP_INACTIVE_FILE_KEY), the figure the kubelet
+        evicts on. None with the memory half off or memory.current
+        unreadable; an unreadable memory.stat leaves the cache counted."""
         if self.memory_limit_bytes is None:
             return None
         current = _read_int_file(self._cgroup_dir / Path(CGROUP_MEMORY_CURRENT_PATH).name)
         if current is None:
             return None
-        return current / self.memory_limit_bytes
+        inactive = _read_keyed_file(self._cgroup_dir / Path(CGROUP_MEMORY_STAT_PATH).name, (CGROUP_INACTIVE_FILE_KEY,))
+        working_set = max(0, current - inactive.get(CGROUP_INACTIVE_FILE_KEY, 0))
+        return working_set / self.memory_limit_bytes
 
     def read_volume_ratio(self, volume: WatchedVolume) -> float | None:
         """The volume's fill: its tree against its cap, or the filesystem
@@ -3079,39 +3066,42 @@ class ResourceWatermarkGate:
     def is_interactive(role: str | None) -> bool:
         return role in INTERACTIVE_ROLES
 
-    def _refusal_locked(self, role: str | None) -> str | None:
-        """Why a caller of `role` is refused at the current level, or None to
-        admit it. Called under the lock after the memory read."""
+    def _refusal_locked(self, role: str | None) -> ResourcePressure | None:
+        """The refusal a caller of `role` gets at the current level, or None
+        to admit it. The interval is drawn here and written into the text,
+        because the exec shim prints the body's `error` alone: a caller that
+        reads neither the header nor `retry_after` still learns how long to
+        wait. Called under the lock after the memory read."""
         if self._level in (WATERMARK_LEVEL_NORMAL, WATERMARK_LEVEL_SOFT):
             return None
         pressure = self._describe_locked()
         if not self.is_interactive(role):
-            return (
+            reason = (
                 f"the credential proxy is at its hard resource watermark ({pressure}) and is "
-                f"admitting interactive sessions only; retry after the Retry-After interval"
+                f"admitting interactive sessions only"
             )
-        if self._level == WATERMARK_LEVEL_CEILING:
-            return (
-                f"the credential proxy is at its interactive resource ceiling ({pressure}); "
-                f"retry after the Retry-After interval"
-            )
-        if self._interactive_in_flight >= self._interactive_reserved:
-            return (
+        elif self._level == WATERMARK_LEVEL_CEILING:
+            reason = f"the credential proxy is at its interactive resource ceiling ({pressure})"
+        elif self._interactive_in_flight >= self._interactive_reserved:
+            reason = (
                 f"the credential proxy is at its hard resource watermark ({pressure}) and its "
-                f"{self._interactive_reserved} interactive slot(s) are in use; retry after the "
-                f"Retry-After interval"
+                f"{self._interactive_reserved} interactive slot(s) are in use"
             )
-        return None
+        else:
+            return None
+        retry_after = self._retry_after(RETRY_AFTER_MIN_SECONDS, RETRY_AFTER_MAX_SECONDS)
+        return ResourcePressure(f"{reason}; retry in {retry_after} s", retry_after)
 
     def check(self, role: str | None) -> None:
-        """The hard check alone, for a read that takes no slot: raise
-        ResourcePressure when a caller of `role` would be refused now."""
+        """The hard check alone, for a route that takes no slot (a k8s list, a
+        content workspace write): raise ResourcePressure when a caller of
+        `role` would be refused now."""
         memory = self.read_memory_ratio()
         with self._lock:
             self._update({WATERMARK_RESOURCE_MEMORY: memory})
-            reason = self._refusal_locked(role)
-        if reason is not None:
-            raise ResourcePressure(reason, self._retry_after(RETRY_AFTER_MIN_SECONDS, RETRY_AFTER_MAX_SECONDS))
+            refusal = self._refusal_locked(role)
+        if refusal is not None:
+            raise refusal
 
     @contextlib.contextmanager
     def admit(self, role: str | None) -> Iterator[None]:
@@ -3123,11 +3113,11 @@ class ResourceWatermarkGate:
         interactive = self.is_interactive(role)
         with self._lock:
             self._update({WATERMARK_RESOURCE_MEMORY: memory})
-            reason = self._refusal_locked(role)
-            if reason is None and interactive:
+            refusal = self._refusal_locked(role)
+            if refusal is None and interactive:
                 self._interactive_in_flight += 1
-        if reason is not None:
-            raise ResourcePressure(reason, self._retry_after(RETRY_AFTER_MIN_SECONDS, RETRY_AFTER_MAX_SECONDS))
+        if refusal is not None:
+            raise refusal
         try:
             yield
         finally:
@@ -7636,9 +7626,12 @@ def _capture_output(
 class _AdmissionTicket:
     """A request's place in the admission queue. Compared by identity; the
     kind is kept so a slot-less reserver can tell whether only the slot cap
-    holds the tickets ahead of it (`CommandExecutor._admit`)."""
+    holds the tickets ahead of it, and `interactive` so an interactive
+    slot-taker can tell whether only the pressure clamp holds them
+    (`CommandExecutor._admit`)."""
 
     takes_slot: bool
+    interactive: bool = False
 
 
 class CommandExecutor:
@@ -8061,14 +8054,19 @@ class CommandExecutor:
                 budget_bytes=self.children_budget_bytes,
             )
 
-    def _effective_cap(self) -> int:
-        """The slot cap in force now: PRESSURE_CLAMPED_CONCURRENCY while the
-        resource watermark gate is at or past its soft watermark, else the
-        configured cap. The gauges keep reporting the configured cap; the
-        clamp is a state of the gate, read off its ratio gauge."""
+    def _effective_cap(self, interactive: bool = False) -> int:
+        """The slot cap in force now for a request of this class: while the
+        resource watermark gate is at or past its soft watermark,
+        PRESSURE_CLAMPED_CONCURRENCY, plus INTERACTIVE_RESERVED_SLOTS for an
+        interactive request, so the reserve is a slot in this executor and
+        not only an admission at the gate: a session's read runs beside the
+        one long command the clamp lets a sweep keep; else the configured
+        cap. The gauges keep reporting the configured cap; the clamp is a
+        state of the gate, read off its ratio gauge."""
         gate = self.watermark_gate
         if gate is not None and gate.clamps_concurrency:
-            return min(self.max_concurrent_commands, PRESSURE_CLAMPED_CONCURRENCY)
+            clamped = PRESSURE_CLAMPED_CONCURRENCY + (INTERACTIVE_RESERVED_SLOTS if interactive else 0)
+            return min(self.max_concurrent_commands, clamped)
         return self.max_concurrent_commands
 
     def _held_bound(self, takes_slot: bool, saw_slots_full: bool) -> str:
@@ -8087,7 +8085,7 @@ class CommandExecutor:
         return ADMISSION_BOUND_BUDGET
 
     @contextlib.contextmanager
-    def request_slot(self, caller: socket.socket | None = None) -> Iterator[None]:
+    def request_slot(self, caller: socket.socket | None = None, interactive: bool = False) -> Iterator[None]:
         """Hold one concurrency slot for the whole of a request.
 
         Taken by the routes that run agent-selected commands -- `/v1/exec` and
@@ -8126,7 +8124,7 @@ class CommandExecutor:
         end to end -- longer than the idle time Envoy allows the stream in
         front of the broker, which is sized against this one.
         """
-        with self._admit(takes_slot=True, caller=caller):
+        with self._admit(takes_slot=True, caller=caller, interactive=interactive):
             yield
 
     @contextlib.contextmanager
@@ -8190,7 +8188,7 @@ class CommandExecutor:
             return True
         return False
 
-    def _refusal_text(self, takes_slot: bool, bound: str) -> str:
+    def _refusal_text(self, takes_slot: bool, bound: str, interactive: bool = False) -> str:
         """Why a request still queued at the bound is refused, worded for the
         bound `_held_bound` named, so the text and the refusals counter agree
         by construction. Called under `_slot_condition`.
@@ -8202,7 +8200,7 @@ class CommandExecutor:
         past tickets the slot cap alone holds, `_admit`). The text never says
         a request waited without fitting when it fits."""
         if bound == ADMISSION_BOUND_SLOT:
-            cap = self._effective_cap()
+            cap = self._effective_cap(interactive)
             clamped = " (clamped under resource pressure)" if cap < self.max_concurrent_commands else ""
             if self._slots_in_use >= cap:
                 # Worded for the queue: slots may well have freed in the
@@ -8263,6 +8261,23 @@ class CommandExecutor:
                 return False
         return False
 
+    def _only_the_clamp_holds_ahead_of(self, ticket: _AdmissionTicket) -> bool:
+        """Whether every ticket ahead of `ticket` is a background slot-taker
+        held by the pressure clamp: the slots in use are at the clamped cap,
+        which is under the configured one. Those wait on the clamp, which an
+        interactive ticket's own cap sits above, so it is admitted past them
+        into the reserved slot and takes nothing they can have. Called under
+        `_slot_condition`."""
+        cap = self._effective_cap()
+        if cap >= self.max_concurrent_commands or self._slots_in_use < cap:
+            return False
+        for ahead in self._slot_queue:
+            if ahead is ticket:
+                return True
+            if not ahead.takes_slot or ahead.interactive:
+                return False
+        return False
+
     @contextlib.contextmanager
     def _admit(
         self,
@@ -8271,6 +8286,7 @@ class CommandExecutor:
         yield_when: Callable[[], bool] | None = None,
         deadline: float | None = None,
         queued_at: float | None = None,
+        interactive: bool = False,
     ) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
         reservation whenever the budget is on. One arrival-order queue for
@@ -8309,7 +8325,7 @@ class CommandExecutor:
             queued_at = time.monotonic()
         if deadline is None:
             deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
-        ticket = _AdmissionTicket(takes_slot)
+        ticket = _AdmissionTicket(takes_slot, interactive)
         # Set if this slot-taking request ever found the slot cap full while it
         # waited. The wait log names the slot cap only then; otherwise, with the
         # budget on, what held it was the budget, directly or through the
@@ -8321,9 +8337,11 @@ class CommandExecutor:
                 while True:
                     # Read each time round: the gate's clamp can arrive or
                     # lift while a request waits.
-                    cap = self._effective_cap()
-                    eligible = self._slot_queue[0] is ticket or (
-                        not takes_slot and self._only_the_slot_cap_holds_ahead_of(ticket)
+                    cap = self._effective_cap(interactive)
+                    eligible = (
+                        self._slot_queue[0] is ticket
+                        or (not takes_slot and self._only_the_slot_cap_holds_ahead_of(ticket))
+                        or (interactive and self._only_the_clamp_holds_ahead_of(ticket))
                     )
                     slot_free = (not takes_slot) or self._slots_in_use < cap
                     if eligible and slot_free and self._fits_budget(takes_slot):
@@ -8333,7 +8351,7 @@ class CommandExecutor:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         bound = self._held_bound(takes_slot, saw_slots_full)
-                        raise CommandSlotUnavailable(self._refusal_text(takes_slot, bound), bound=bound)
+                        raise CommandSlotUnavailable(self._refusal_text(takes_slot, bound, interactive), bound=bound)
                     waited = True
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
@@ -8376,7 +8394,7 @@ class CommandExecutor:
                     LOGGER.info(
                         "request waited %dms for a slot (all %d slots were busy)",
                         waited_ms,
-                        self._effective_cap(),
+                        self._effective_cap(interactive),
                     )
             yield
         finally:
@@ -13326,6 +13344,17 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         route = self.path[len("/v1/workspace/") :]
+        # The verbs that write the state volume take the gate's hard check,
+        # as the k8s list does: `open` clones into it, which is the fill the
+        # disk half exists to stop. Reads take nothing, as before.
+        gate = getattr(self, "watermark_gate", None)
+        if route in WORKSPACE_WRITING_ROUTES and gate is not None:
+            try:
+                gate.check(self._caller_role())
+            except ResourcePressure as exc:
+                LOGGER.warning("workspace %s refused under resource pressure: %s", route, exc)
+                self._busy(exc)
+                return
         try:
             payload = self._read_json_body(
                 max_bytes=max(
@@ -14199,7 +14228,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         executor = getattr(self, "executor", None)
         slot: contextlib.AbstractContextManager = contextlib.nullcontext()
         if hasattr(executor, "request_slot"):
-            slot = executor.request_slot(caller=getattr(self, "connection", None))
+            # The keyword only for an interactive caller: the route tests'
+            # stand-ins for `request_slot` predate it.
+            interactive = {"interactive": True} if ResourceWatermarkGate.is_interactive(self._caller_role()) else {}
+            slot = executor.request_slot(caller=getattr(self, "connection", None), **interactive)
         with self._pressure_admission(), slot:
             yield
 
@@ -14610,8 +14642,9 @@ def serve(args: argparse.Namespace) -> None:
     )
     # What the gate's soft watermark reclaims: idle content workspaces (the
     # store's own idle rule, run now rather than on the next verb) and vcs
-    # scratch a dead process left. The store is None with content passing off.
-    reclaimers: list[Callable[[], int]] = [functools.partial(reclaim_orphaned_vcs_scratch, executor.vcs_root)]
+    # scratch no request of this process holds (the vcs broker swept a dead
+    # process's at start). The store is None with content passing off.
+    reclaimers: list[Callable[[], int]] = [CredentialProxyHandler.vcs.reclaim_orphan_scratch]
     if CredentialProxyHandler.workspaces is not None:
         reclaimers.insert(0, CredentialProxyHandler.workspaces.reclaim_idle)
     gate.set_reclaimers(reclaimers)

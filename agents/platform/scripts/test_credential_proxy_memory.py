@@ -419,9 +419,6 @@ class MemorySeriesTest(unittest.TestCase):
                 self.assertIn(kind, {"current", "peak", "limit", "anon", "file"})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # -- the resource watermark gate (#4333) ------------------------------------
 
@@ -430,9 +427,10 @@ _STATE_LIMIT = 5 * _GIB
 _TMP_LIMIT = 2 * _GIB
 
 
-def _fake_memory(root: Path, *, current: int, limit: str | None = str(_LIMIT)) -> Path:
+def _fake_memory(root: Path, *, current: int, limit: str | None = str(_LIMIT), inactive_file: int = 0) -> Path:
     cgroup = root / "cgroup"
     _write(cgroup / "memory.current", f"{current}\n")
+    _write(cgroup / "memory.stat", f"anon {current - inactive_file}\nfile {inactive_file}\ninactive_file {inactive_file}\n")
     if limit is not None:
         _write(cgroup / "memory.max", f"{limit}\n")
     return cgroup
@@ -553,7 +551,7 @@ class ResourceWatermarkGateTest(unittest.TestCase):
             self.assertEqual(17, raised.exception.retry_after)
             self.assertEqual("pressure", raised.exception.bound)
             self.assertIn("hard resource watermark (memory=86%", str(raised.exception))
-            self.assertIn("interactive sessions only", str(raised.exception))
+            self.assertIn("interactive sessions only; retry in 17 s", str(raised.exception))
         self.assertEqual([(5, 30)] * 5, self.retry.ranges)
         # The one reserved slot: a session is admitted, a second refused while
         # the first holds it, and admitted once it is released.
@@ -565,6 +563,20 @@ class ResourceWatermarkGateTest(unittest.TestCase):
         with gate.admit("session"):
             pass
         self.assertTrue(gate.clamps_concurrency)
+
+    def test_the_memory_ratio_is_the_working_set_not_the_page_cache(self):
+        # 90% of the limit in memory.current, 60% of it inactive file pages the
+        # kernel drops first: the gate reads 30%, as the kubelet would, and a
+        # broker at rest after a clone is not "hard". Without memory.stat the
+        # cache is counted.
+        cgroup = _fake_memory(self.root, current=_percent(_LIMIT, 90), inactive_file=_percent(_LIMIT, 60))
+        gate = self.gate(memory_percent=90)
+        (cgroup / "memory.stat").write_text(f"anon 1\nfile 1\ninactive_file {_percent(_LIMIT, 60)}\n")
+        self.assertAlmostEqual(0.3, gate.read_memory_ratio(), places=3)
+        with gate.admit("shell"):
+            pass
+        (cgroup / "memory.stat").unlink()
+        self.assertAlmostEqual(0.9, gate.read_memory_ratio(), places=3)
 
     def test_the_memory_read_is_per_admission_not_per_tick(self):
         gate = self.gate(memory_percent=50)
@@ -659,6 +671,19 @@ class ResourceWatermarkGateTest(unittest.TestCase):
                     self.fail("a second command ran under the clamp")
         self.assertIn("limit of 1 concurrent commands (clamped under resource pressure)", str(raised.exception))
         self.assertEqual("slot", raised.exception.bound)
+        # The reserve is a slot here too: an interactive request is admitted
+        # past the clamp while the holder runs, and a second interactive one
+        # waits behind it; the background caller stays held.
+        with executor.request_slot(interactive=True):
+            self.assertEqual(2, executor.slots_in_use)
+            with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable) as second:
+                    with executor.request_slot(interactive=True):
+                        self.fail("a third command ran under the clamp")
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable):
+                    with executor.request_slot():
+                        self.fail("a background command ran in the reserved slot")
+        self.assertIn("limit of 2 concurrent commands (clamped under resource pressure)", str(second.exception))
         # The clamp lifts with the level, and a waiter sees it on its next poll.
         self.set_memory(gate, 50)
         gate.tick()
@@ -763,16 +788,37 @@ class ReliefStepTest(unittest.TestCase):
         self.assertLess(counted, _MIB)
         self.assertEqual(0, credential_proxy.tree_allocated_bytes(self.root / "absent"))
 
-    def test_orphaned_vcs_scratch_of_another_process_is_removed_and_nothing_else(self):
-        own = f"clone-{os.getpid()}-1"
-        for name in ("clone-1-3", own, "notes", "publish-2-9"):
-            (self.root / name).mkdir()
-            (self.root / name / "object").write_text("x")
-        (self.root / "branch-4-4").symlink_to(self.root / "notes")
-        self.assertEqual(2, credential_proxy.reclaim_orphaned_vcs_scratch(self.root))
-        self.assertEqual({own, "notes", "branch-4-4"}, {entry.name for entry in self.root.iterdir()})
-        self.assertTrue((self.root / "notes" / "object").exists())
-        self.assertEqual(0, credential_proxy.reclaim_orphaned_vcs_scratch(self.root / "absent"))
+    def test_vcs_scratch_a_dead_process_left_is_swept_at_start_and_a_live_tree_is_kept_at_relief(self):
+        import vcs_broker
+
+        root = self.root / "vcs"
+        root.mkdir()
+        # A restarted container's broker gets the dead one's pid, so an
+        # orphan can carry this very pid; the start sweep takes it anyway.
+        for name in ("clone-1-3", f"clone-{os.getpid()}-7", "publish-2-9"):
+            (root / name).mkdir()
+            (root / name / "object").write_text("x")
+        (root / "notes").mkdir()
+        (root / "branch-4-4").symlink_to(root / "notes")
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            broker = vcs_broker.VcsBroker(root, git_runner=lambda *args, **kwargs: None)
+        self.assertIn("removed 3 orphaned scratch tree(s)", "\n".join(logs.output))
+        self.assertEqual({"notes", "branch-4-4"}, {entry.name for entry in root.iterdir()})
+        live = broker._scratch("clone")
+        self.assertTrue(vcs_broker.SCRATCH_NAME_RE.match(live.name))
+        # A tree this process minted and no request holds any more.
+        stale = root / vcs_broker.SCRATCH_NAME_FORMAT.format(kind="snapshot", pid=os.getpid(), sequence=0)
+        stale.mkdir()
+        self.assertEqual(1, broker.reclaim_orphan_scratch())
+        self.assertTrue(live.exists())
+        self.assertFalse(stale.exists())
+        broker._discard_scratch(live)
+        self.assertFalse(live.exists())
+        self.assertEqual(0, broker.reclaim_orphan_scratch())
 
     def test_release_process_memory_collects_and_trims_where_libc_has_it(self):
         self.assertIsInstance(credential_proxy.release_process_memory(), bool)
+
+
+if __name__ == "__main__":
+    unittest.main()

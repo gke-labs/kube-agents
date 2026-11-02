@@ -115,7 +115,8 @@ and each caller routes to the right one.**
     the hourly reconcile run through `sandbox_exec` and then the shim. `sandbox_exec` also runs
     the platform MCP server's interactive tools (`platform_mcp_server.py:590`).
 
-  **The broker cannot tell interactive work from background work today.**
+  **The broker cannot tell the shell role's interactive work from its background work today;**
+  only the session role is classed (§4.1).
 
 ### 2.2 What blocks more replicas [doc, `credential-proxy-single-pod.md` §2 and §3]
 
@@ -518,9 +519,11 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
 
 - The shim opens one connection per call, and kube-proxy balances per connection [measured, spike:
   69/51 over two pods]. So each replica gets about 1/N of each class.
-- New: the shim retries a `503 CREDENTIAL_PROXY_BUSY` once (and, #4448, backs off a
-  `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` for its `Retry-After`). The retry is a new connection,
-  so it reaches another replica with probability (N−1)/N: half the time at 2 replicas. It does not
+- New: the shim retries a `503 CREDENTIAL_PROXY_BUSY` once, and would wait out a
+  `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` for its `Retry-After` before that retry, since the
+  broker drew the interval to spread a sweep's workers and a retry at once undoes it; today the
+  shim prints the refusal, whose text names the interval, and retries nothing. The retry is a new
+  connection, so it reaches another replica with probability (N−1)/N: half the time at 2 replicas. It does not
   retry a dropped connection (`BrokerDisconnected`), because the command may have run.
   `CREDENTIAL_PROXY_BUSY` is raised only at admission, before the command starts, so a retry
   never runs a command twice.
