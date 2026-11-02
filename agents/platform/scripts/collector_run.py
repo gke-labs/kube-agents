@@ -351,7 +351,8 @@ def paged_dump(
             return None, result._replace(duration_s=elapsed)
         first = first or result
         merged.extend(items)
-    assert first is not None, "paged_dump needs at least one resource"
+    if first is None:
+        raise ValueError("paged_dump needs at least one resource")
     summary = PAGED_SUMMARY_FORMAT.format(items=len(merged), pages=pages, digest=digest.hexdigest())
     return (
         {API_VERSION_KEY: LIST_API_VERSION, KIND_KEY: LIST_KIND, ITEMS_KEY: merged},
