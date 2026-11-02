@@ -43,7 +43,10 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      required_phrases: ["clusters upgrade", "--node-pool"]
+      # The flag alone: phrases are tested on the flattened report, where a
+      # line continuation reads as a backslash and would break `clusters
+      # upgrade` written across lines. The pattern below enforces the head.
+      required_phrases: ["--node-pool"]
       # `--node-pool` after a `gcloud ... container clusters upgrade` head
       # (gcloud takes flags on either side of the cluster name), walking only
       # argument-shaped tokens with no `--master` and no next `gcloud` between
@@ -52,12 +55,14 @@ verification_spec:
       # (the shell glues `prod-1\` and the next line into one word): the
       # verifier searches the report with its line breaks kept, so a space in
       # the pattern does not cross one, and a runbook writes one flag per line.
-      # Prose that names `clusters upgrade` without the `gcloud`
+      # No token may be a backslash and the release-track word is letters
+      # only, so a doubled backslash, which the shell reads as an escaped
+      # character that ends the command, is not a continuation. Prose that names `clusters upgrade` without the `gcloud`
       # head, a sentence whose words carry `:`, `;` or `,`, or a flag on the
       # next line with no backslash does not open or extend the match;
       # bench/tests/test_upgrades_freeze_runbook_pattern.py pins all three.
       any_of_patterns:
-        - 'gcloud(?: | \\\n ?|\\\n )(?:\S+(?: | \\\n ?|\\\n ))?container(?: | \\\n ?|\\\n )clusters(?: | \\\n ?|\\\n )upgrade(?: | \\\n ?|\\\n )(?:(?!--master|gcloud )[-\w./=$<>{}"''\\]+(?: | \\\n ?|\\\n ))*?--node-pool(?=[ =])'
+        - 'gcloud(?: | \\\n ?|\\\n )(?:[a-z]+(?: | \\\n ?|\\\n ))?container(?: | \\\n ?|\\\n )clusters(?: | \\\n ?|\\\n )upgrade(?: | \\\n ?|\\\n )(?:(?!--master|gcloud )[-\w./=$<>{}"'']+(?: | \\\n ?|\\\n ))*?--node-pool(?=[ =])'
   - name: the-answer-states-the-92-day-window
     role: objective
     mode: assert
