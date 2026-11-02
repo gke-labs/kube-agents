@@ -529,15 +529,16 @@ API_RELAY_DEADLINE_S = 120
 # smaller `pageSize`, which every listed endpoint supports. Read in chunks up
 # to the cap rather than with `.read()`, so the cap bounds memory too.
 API_RELAY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-# Pub/Sub's largest message (10 MB of data), and the answer cap the platform
-# Pub/Sub relay carries instead of API_RELAY_MAX_RESPONSE_BYTES: a pull is a
-# lease, Pub/Sub has started the ack deadline and the ack ids are in the body
-# by the time the broker reads it, so an answer refused for size strands the
-# message until the deadline, forever for one that is always over. The adapter
-# pulls one message at a time; 16 MiB holds the largest one base64-encoded
-# (13.4 MiB) with its envelope.
+# Pub/Sub's largest message (10 MB of data), and the answer cap every Pub/Sub
+# call relayed by the watcher and platform families carries instead of
+# API_RELAY_MAX_RESPONSE_BYTES: a pull is a lease, Pub/Sub has started the ack
+# deadline and the ack ids are in the body by the time the broker reads it, so
+# an answer refused for size strands the batch until the deadline, forever for
+# one that is always over. 16 MiB holds the largest message base64-encoded
+# (13.4 MiB) with its envelope, so a pull of one message always fits; the
+# drift-detector's pull asks for a batch and halves it on a 502 until it does.
 PUBSUB_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
-PLATFORM_PUBSUB_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+PUBSUB_RELAY_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 API_RELAY_READ_CHUNK_BYTES = 64 * 1024
 # Query keys removed before forwarding. Each is a way to substitute a
 # credential for the broker's or to change the response class: an API key
@@ -3949,8 +3950,8 @@ class GoogleApiRelay:
     ) -> ApiRelayResponse:
         """One `GET https://{host}{target}` on the broker's credential, or a POST with `body`.
 
-        `max_bytes` is the answer cap, API_RELAY_MAX_RESPONSE_BYTES unless a
-        family carries its own (the platform Pub/Sub relay does).
+        `max_bytes` is the answer cap, API_RELAY_MAX_RESPONSE_BYTES unless the
+        call carries its own (a Pub/Sub call on the watcher and platform relays).
 
         `target` is the path and query as the handler assembled them, already
         checked against the policy and stripped of the credential keys. Raises
@@ -12368,7 +12369,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 self.command, host, path, body, self.platform_pubsub_subscriptions
             ),
             family="platform Pub/Sub relay",
-            max_bytes=PLATFORM_PUBSUB_MAX_RESPONSE_BYTES,
         )
 
     def _relay_google_call(
@@ -12377,14 +12377,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         prefix: str,
         decide: Callable[[str, str, bytes], command_policy.Decision],
         family: str = "watcher relay",
-        max_bytes: int | None = None,
     ) -> None:
         """Forward one `<prefix><host>/<path>` Google call that `decide` allows.
 
         `label` is the first word of every audit line, naming the family; the
         caller's role was already checked against ROUTE_ROLES by the time this
-        runs, so `decide` is the second gate, on the target. `max_bytes` is the
-        family's answer cap, the relay's own when None.
+        runs, so `decide` is the second gate, on the target. The answer cap is
+        the host's: PUBSUB_RELAY_MAX_RESPONSE_BYTES for a Pub/Sub call, whichever
+        family relays it, and the relay's own for anything else.
         """
         request_id = str(uuid.uuid4())
         parts = urllib.parse.urlsplit(self.path)
@@ -12442,8 +12442,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         extra: dict[str, Any] = {}
         if self.command == watcher_policy.METHOD_POST:
             extra = {"body": body, "headers": (("Content-Type", WATCHER_GCP_CONTENT_TYPE),)}
-        if max_bytes is not None:
-            extra["max_bytes"] = max_bytes
+        if host == watcher_policy.PUBSUB_HOST:
+            extra["max_bytes"] = PUBSUB_RELAY_MAX_RESPONSE_BYTES
         upstream = self._relay_fetch(label, request_id, host, target, authorization, **extra)
         if upstream is None:
             return
