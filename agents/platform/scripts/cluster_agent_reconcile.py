@@ -77,6 +77,7 @@ from cluster_agent_profile import (
     list_profiles,
     profile_home,
     read_cluster_identity,
+    sweep_sandbox_orphans,
 )
 
 DESCRIBE_TIMEOUT_SECONDS = 30
@@ -1684,6 +1685,7 @@ def reconcile(dry_run: bool = False) -> dict:
         "create_failed": [],     # cluster that should have a profile and could not get one
         "unmanaged": [],  # kept and listed: project never produced by the scope, retiring, or carried forward
         "retiring": [],          # project the scope dropped whose profiles are being removed
+        "swept": [],             # sandbox home removed whose profile was already gone (#4468)
     }
     # Per-project outcome (design §4), keyed by project ID. Not a bucket of names: the
     # same outcomes go into the snapshot, which the bootstrap gate reads to name the
@@ -2342,6 +2344,17 @@ def reconcile(dry_run: bool = False) -> dict:
             NUMBERS_KEY: _numbers_memo(previous, selector_reports, numbers_named,
                                        scope_readable and scope_present and selectors_known, exclude_patterns),
         })
+
+
+    # Sandbox homes whose profile is already gone: left by deletes from before
+    # delete_profile removed them (#4389), or by one that missed the sandbox. Here
+    # rather than in the entrypoint because this runs hourly with the sandbox up
+    # and the start-time push runs before it may be; independent of the scope
+    # above, and never allowed to fail the run (#4468).
+    try:
+        report["swept"] = sweep_sandbox_orphans(dry_run=dry_run)
+    except Exception as e:  # noqa: BLE001 - housekeeping must not cost the roster its run
+        log(f"the sandbox orphan sweep failed ({e}); the next run retries it")
 
     return report
 

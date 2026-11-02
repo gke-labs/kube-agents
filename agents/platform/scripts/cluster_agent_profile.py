@@ -19,6 +19,7 @@
 import argparse
 import fcntl
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -403,7 +404,7 @@ def _push_sandbox_layout(name: str) -> None:
             "the next container start retries it")
 
 
-def _remove_sandbox_layout(name: str) -> None:
+def _remove_sandbox_layout(name: str) -> bool:
     """Remove a deleted profile's home from the shell sandbox (#4389).
 
     The inverse of _push_sandbox_layout, through the same script over the same
@@ -413,10 +414,11 @@ def _remove_sandbox_layout(name: str) -> None:
     name can be between those two steps.
 
     Never fatal, for the reason the push is not: a sandbox that is down leaves a
-    stale skeleton, which costs disk and nothing else.
+    stale skeleton, which costs disk and nothing else. Returns whether it removed
+    the home, for the orphan sweep's report.
     """
     if not SANDBOX_MIRROR.is_file():
-        return
+        return False
     try:
         subprocess.run(
             [sys.executable, str(SANDBOX_MIRROR),
@@ -428,9 +430,84 @@ def _remove_sandbox_layout(name: str) -> None:
             timeout=SANDBOX_MIRROR_TIMEOUT_SECONDS,
         )
         log(f"{name}: removed the profile layout from the shell sandbox")
+        return True
     except Exception as e:  # noqa: BLE001 - no sandbox, or a sandbox that is down
         log(f"{name}: could not remove the profile layout from the shell sandbox ({e}); "
             "its directory stays there until somebody removes it")
+        return False
+
+
+# The orphan sweep (#4468): how many sandbox homes one reconcile run removes at
+# most. Each removal is one SSH round trip under its own lock, so this bounds the
+# time a run spends here; a backlog clears over successive hourly runs.
+SWEEP_MAX_PER_RUN = 25
+# The names the sweep may remove: the shape profile_name() makes. Anything else
+# under the sandbox's profiles/ was put there by something other than a scaffold,
+# the model included, and is not this code's to judge.
+CLUSTER_PROFILE_NAME_RE = re.compile(r"^cluster-[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _list_sandbox_profiles() -> list[str] | None:
+    """The names under the sandbox's profiles/, or None when they could not be read."""
+    if not SANDBOX_MIRROR.is_file():
+        return None
+    try:
+        done = subprocess.run(
+            [sys.executable, str(SANDBOX_MIRROR),
+             "--agent-home", str(HERMES_HOME), "--skeleton-only", "--list-profiles",
+             "--wait", "30"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=SANDBOX_MIRROR_TIMEOUT_SECONDS,
+        )
+        names = json.loads(done.stdout)["profiles"]
+        if not isinstance(names, list):
+            raise ValueError("profiles is not a list")
+        return [str(n) for n in names]
+    except Exception as e:  # noqa: BLE001 - no sandbox, a sandbox that is down, or a bad answer
+        log(f"could not list the shell sandbox's profiles ({e}); no orphan sweep this run")
+        return None
+
+
+def sweep_sandbox_orphans(limit: int = SWEEP_MAX_PER_RUN, dry_run: bool = False) -> list[str]:
+    """Remove sandbox homes whose profile is gone here; return the names removed (#4468).
+
+    For deletes from before #4389 was fixed, and any delete whose sandbox removal
+    missed the sandbox. Each name goes through delete_profile's own guards: its
+    profile lock, a check under that lock that nothing of it exists here, and the
+    mirror's --remove-profile, which refuses the same. A scaffold of the same name
+    therefore runs wholly before or after, as for a delete. Only Cluster Agent
+    names (CLUSTER_PROFILE_NAME_RE), never a reserved one, at most `limit` a run.
+    """
+    names = _list_sandbox_profiles()
+    if not names:
+        return []
+    orphans = sorted(
+        n for n in set(names)
+        if CLUSTER_PROFILE_NAME_RE.match(n) and len(n) <= MAX_NAME_LEN
+        and n not in RESERVED_PROFILES and not os.path.lexists(profile_home(n))
+    )
+    if not orphans:
+        return []
+    if len(orphans) > limit:
+        log(f"{len(orphans)} sandbox profile homes have no profile here; removing {limit} this run, "
+            "the rest on the next")
+    removed: list[str] = []
+    for name in orphans[:limit]:
+        if dry_run:
+            log(f"{name}: sandbox home with no profile here — WOULD remove (dry-run).")
+            continue
+        with _profile_lock(name) as locked:
+            if not locked:
+                log(f"{name}: sandbox home left in place; its profile lock could not be taken")
+                continue
+            if os.path.lexists(profile_home(name)):
+                log(f"{name}: the profile exists again; its sandbox home stays")
+                continue
+            if _remove_sandbox_layout(name):
+                removed.append(name)
+    return removed
 
 
 @contextmanager

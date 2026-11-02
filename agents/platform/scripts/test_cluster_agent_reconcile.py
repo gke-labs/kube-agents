@@ -7,6 +7,8 @@ GKE NotFound. Missing identity, transient errors, and reserved profiles are neve
 deleted.
 """
 
+import contextlib
+import io
 import json
 import time
 from datetime import datetime, timezone
@@ -216,6 +218,35 @@ def _name_for(identity_kwargs, identities):
             return name
     raise KeyError(identity_kwargs)
 
+
+class SweepHookTest(HomesMixin):
+    """The reconcile runs the sandbox orphan sweep, and a sweep failure costs it nothing (#4468)."""
+
+    def _sweep_run(self, sweep, dry_run=False):
+        profiles = ["cluster-a"]
+        identities = {"cluster-a": _identity(cluster="a")}
+        with mock.patch.object(rec, "sweep_sandbox_orphans", side_effect=sweep) as called:
+            report, _ = ReconcileTest._run(self, profiles, identities, {"cluster-a": True}, dry_run=dry_run)
+        return report, called
+
+    def test_the_swept_names_are_reported(self):
+        report, called = self._sweep_run(lambda dry_run: ["cluster-gone-one"])
+        self.assertEqual(report["swept"], ["cluster-gone-one"])
+        self.assertEqual(report["kept"], ["cluster-a"])
+        called.assert_called_once_with(dry_run=False)
+
+    def test_a_dry_run_sweeps_dry(self):
+        _, called = self._sweep_run(lambda dry_run: [], dry_run=True)
+        called.assert_called_once_with(dry_run=True)
+
+    def test_a_sweep_that_raises_does_not_fail_the_run(self):
+        def boom(dry_run):
+            raise RuntimeError("sandbox went away")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            report, _ = self._sweep_run(boom)
+        self.assertEqual(report["swept"], [])
+        self.assertEqual(report["kept"], ["cluster-a"])
+        self.assertIn("orphan sweep failed", err.getvalue())
 
 class CreateDirectionTest(HomesMixin):
     def test_creates_missing_including_the_management_cluster(self):

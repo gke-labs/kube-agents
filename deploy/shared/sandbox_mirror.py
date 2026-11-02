@@ -661,6 +661,19 @@ def removable_profile_homes(agent_home: Path, names: list[str]) -> tuple[list[st
     return homes, rejected
 
 
+def list_remote_profiles(ssh: list[str], remote_root: str) -> list[str]:
+    """The names under the sandbox's profiles/, for the reconcile's orphan sweep (#4468).
+
+    A read, over the same hop as everything else here. A sandbox with no profiles/
+    yet lists nothing. The names are whatever the model left there, so this only
+    reports them: what counts as a deleted profile, and whether to remove it, is
+    the caller's to decide under the profile's lock.
+    """
+    root = shlex.quote(f"{remote_root}/{PROFILES_DIR}")
+    result = remote(ssh, f"if [ -d {root} ]; then ls -1A -- {root}; fi")
+    return [name for name in result.stdout.splitlines() if name]
+
+
 def remove_profile_homes(ssh: list[str], remote_root: str, homes: list[str]) -> None:
     """Remove each deleted profile's home from the sandbox, in one remote call.
 
@@ -1065,6 +1078,12 @@ def main(argv: list[str] | None = None) -> int:
         "a profile that still exists on the agent's volume. Pushes and migrates nothing",
     )
     parser.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="print the names under the sandbox's profiles/ as JSON and change nothing; "
+        "for the reconcile's sweep of homes whose profile is gone",
+    )
+    parser.add_argument(
         "--force-migrate",
         action="store_true",
         help="migrate even if the sandbox already carries the marker",
@@ -1091,6 +1110,9 @@ def main(argv: list[str] | None = None) -> int:
 
     ssh = ssh_base_command(terminal)
     removing: list[str] = []
+    if args.list_profiles and (args.remove_profile or args.profile or not args.skeleton_only):
+        log("--list-profiles needs --skeleton-only and no --profile or --remove-profile; refusing")
+        return EXIT_RETRY
     if args.remove_profile:
         # Its own mode: a removal that also pushed or migrated would be two
         # decisions in one call. EXIT_RETRY on every refusal, as for --profile:
@@ -1133,7 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"would_remove": removing}, indent=2, sort_keys=True))
         return EXIT_OK
 
-    if args.dry_run:
+    if args.dry_run and not args.list_profiles:  # a list changes nothing to begin with
         include, skipped = migration_candidates(agent_home, homes)
         sizes = measure(agent_home, include)
         # No ssh yet on this path, so no free-space reading: the dry run reports
@@ -1153,7 +1175,7 @@ def main(argv: list[str] | None = None) -> int:
         # A start that misses the sandbox is redone by the next start's full push. A
         # removal is not: that push only creates homes the agent side still has, so
         # the caller has to hear that nothing was removed.
-        return EXIT_RETRY if removing else EXIT_OK
+        return EXIT_RETRY if (removing or args.list_profiles) else EXIT_OK
 
     # The sandbox writes this at the root of its own volume on every start. Its
     # absence means --remote-root does not name that volume, and every write
@@ -1177,6 +1199,15 @@ def main(argv: list[str] | None = None) -> int:
             "removed from it. Refusing to write, and leaving it for the next start."
         )
         return EXIT_RETRY
+
+    if args.list_profiles:
+        try:
+            names = list_remote_profiles(ssh, args.remote_root)
+        except RuntimeError as exc:
+            log(f"could not list the sandbox's profiles: {exc}")
+            return EXIT_RETRY
+        print(json.dumps({"profiles": names}))
+        return EXIT_OK
 
     if removing:
         try:

@@ -18,6 +18,7 @@ hop replaced by `sh -c`.
 """
 
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -306,7 +307,7 @@ class OneProfile(unittest.TestCase):
 class RemoveProfile(unittest.TestCase):
     """--remove-profile: a deleted profile's home leaves the sandbox too (#4389)."""
 
-    def drive(self, *extra, profiles=("platform", "cluster-a"), prepare=lambda root: None, answers=True):
+    def drive(self, *extra, profiles=("platform", "cluster-a"), prepare=lambda root: None, answers=True, listing=""):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = pathlib.Path(tmp.name)
@@ -320,10 +321,12 @@ class RemoveProfile(unittest.TestCase):
 
         def remote(ssh, command, check=True):
             self.commands.append(command)
-            return subprocess.CompletedProcess([], 0, "", "")
+            return subprocess.CompletedProcess([], 0, listing if "ls -1A" in command else "", "")
 
+        self.stdout = io.StringIO()
         patches = [
             unittest.mock.patch.object(sm, "remote", remote),
+            unittest.mock.patch("sys.stdout", self.stdout),
             unittest.mock.patch.object(sm, "wait_for_sandbox", lambda *a, **k: answers),
             unittest.mock.patch.object(sm, "push_skeleton", lambda ssh, rr, homes: self.pushed.append(homes)),
             unittest.mock.patch.object(sm, "push_cluster_identities", lambda *a, **k: self.pushed.append("identities")),
@@ -383,6 +386,30 @@ class RemoveProfile(unittest.TestCase):
         self.assertEqual(code, sm.EXIT_RETRY)
         self.assertEqual(self.removals(), [])
 
+    def test_the_listing_prints_the_sandbox_s_names_and_changes_nothing(self):
+        # #4468's sweep reads this. Every name, whatever it is: judging them is the caller's.
+        code = self.drive("--skeleton-only", "--list-profiles", listing="cluster-gone\nplatform\nnotes\n.hidden\n")
+        self.assertEqual(code, sm.EXIT_OK)
+        self.assertEqual(json.loads(self.stdout.getvalue()), {"profiles": ["cluster-gone", "platform", "notes", ".hidden"]})
+        self.assertEqual(self.removals(), [])
+        self.assertEqual(self.pushed, [])
+
+    def test_a_listing_with_no_sandbox_answer_is_not_an_empty_list(self):
+        # An empty list would read as "nothing to sweep"; this is "could not look".
+        code = self.drive("--skeleton-only", "--list-profiles", answers=False)
+        self.assertEqual(code, sm.EXIT_RETRY)
+        self.assertEqual(self.stdout.getvalue(), "")
+
+    def test_listing_is_its_own_mode(self):
+        for extra in (("--list-profiles",),
+                      ("--skeleton-only", "--list-profiles", "--remove-profile", "cluster-gone"),
+                      ("--skeleton-only", "--list-profiles", "--profile", "cluster-a")):
+            with self.subTest(extra=extra):
+                self.assertEqual(self.drive(*extra), sm.EXIT_RETRY)
+                self.assertEqual(self.removals(), [])
+                self.assertEqual(self.pushed, [])
+                self.assertEqual(self.stdout.getvalue(), "")
+
     def test_removal_is_its_own_mode(self):
         for extra in (("--remove-profile", "cluster-gone"),
                       ("--skeleton-only", "--remove-profile", "cluster-gone", "--profile", "cluster-a")):
@@ -435,6 +462,12 @@ class RemoveProfileOnDisk(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.sandbox / "profiles" / "cluster-b"))
         self.assertTrue((self.sandbox / "profiles" / "cluster-a" / "workspace").is_dir())
         self.assertTrue((self.sandbox / "profiles" / "platform" / "workspace").is_dir())
+
+    def test_the_listing_reads_the_sandbox_s_profiles_directory(self):
+        self.assertEqual(sm.list_remote_profiles(["sh", "-c"], str(self.sandbox)), [])
+        self.assertEqual(self.mirror(), sm.EXIT_OK)
+        self.assertEqual(sorted(sm.list_remote_profiles(["sh", "-c"], str(self.sandbox))),
+                         ["cluster-a", "cluster-b", "platform"])
 
     def test_a_home_the_model_swapped_for_a_symlink_is_unlinked_not_followed(self):
         precious = self.sandbox / "profiles" / "cluster-a"

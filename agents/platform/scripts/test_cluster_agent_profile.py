@@ -314,6 +314,149 @@ class DeleteProfileTest(unittest.TestCase):
             self.assertFalse(worker.is_alive())
         self.assertEqual(self.removed, [self.NAME])
 
+
+class SweepSandboxOrphansTest(unittest.TestCase):
+    """The reconcile's sweep of sandbox homes whose profile is gone (#4468)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home_root = self.tmp / "data"
+        (self.home_root / "profiles").mkdir(parents=True)
+        for attr, value in (("HERMES_HOME", self.home_root), ("PROFILES_BASE", self.home_root / "profiles")):
+            original = getattr(cap, attr)
+            setattr(cap, attr, value)
+            self.addCleanup(setattr, cap, attr, original)
+        self.listing = []
+        self.removed = []
+        for target, replacement in (
+            ("_list_sandbox_profiles", lambda: self.listing),
+            ("_remove_sandbox_layout", lambda name: self.removed.append(name) or True),
+        ):
+            patcher = mock.patch.object(cap, target, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def profile_here(self, name):
+        (self.home_root / "profiles" / name).mkdir()
+
+    def sweep(self, **kw):
+        with redirect_stderr(io.StringIO()) as err:
+            swept = cap.sweep_sandbox_orphans(**kw)
+        self.log = err.getvalue()
+        return swept
+
+    def test_only_cluster_profile_homes_with_no_profile_here_go(self):
+        self.profile_here("cluster-live-one")
+        self.listing = [
+            "cluster-gone-one", "cluster-live-one",  # one orphan, one live profile
+            "platform", "default", "tse",            # the fixed and reserved homes
+            "notes", "Cluster-UPPER", "cluster-", ".cluster-hidden", "cluster-a_b",  # not ours
+            "cluster-" + "x" * 60,                   # longer than profile_name makes
+            "cluster-gone-one",                      # listed twice
+        ]
+        self.assertEqual(self.sweep(), ["cluster-gone-one"])
+        self.assertEqual(self.removed, ["cluster-gone-one"])
+
+    def test_anything_left_here_under_the_name_keeps_the_sandbox_home(self):
+        (self.home_root / "profiles" / "cluster-file").write_text("x")
+        (self.home_root / "profiles" / "cluster-link").symlink_to(self.tmp / "nowhere")
+        self.listing = ["cluster-file", "cluster-link"]
+        self.assertEqual(self.sweep(), [])
+        self.assertEqual(self.removed, [])
+
+    def test_a_run_removes_at_most_its_cap_and_says_the_rest_wait(self):
+        self.listing = [f"cluster-gone-{i:02d}" for i in range(30)]
+        self.assertEqual(self.sweep(limit=25), [f"cluster-gone-{i:02d}" for i in range(25)])
+        self.assertIn("30 sandbox profile homes have no profile here; removing 25", self.log)
+
+    def test_live_profiles_do_not_use_up_the_cap(self):
+        # Filtered before the cap, not only under each lock: otherwise an install with
+        # more live profiles than the cap never reaches an orphan that sorts after them.
+        live = [f"cluster-a-live-{i:02d}" for i in range(30)]
+        for name in live:
+            self.profile_here(name)
+        self.listing = live + ["cluster-z-gone"]
+        self.assertEqual(self.sweep(limit=25), ["cluster-z-gone"])
+
+    def test_a_dry_run_removes_nothing(self):
+        self.listing = ["cluster-gone-one"]
+        self.assertEqual(self.sweep(dry_run=True), [])
+        self.assertEqual(self.removed, [])
+        self.assertIn("WOULD remove", self.log)
+
+    def test_an_unreadable_listing_sweeps_nothing(self):
+        self.listing = None
+        self.assertEqual(self.sweep(), [])
+        self.assertEqual(self.removed, [])
+
+    def test_without_the_lock_the_home_stays(self):
+        (self.home_root / cap.PROFILE_LOCKS_DIRNAME).write_text("a file where the lock dir goes")
+        self.listing = ["cluster-gone-one"]
+        self.assertEqual(self.sweep(), [])
+        self.assertEqual(self.removed, [])
+
+    def test_a_create_during_the_sweep_keeps_its_sandbox_home(self):
+        # The race: the sweep has listed the name as an orphan, and a scaffold of the
+        # same name holds the lock and makes the home before the sweep gets the lock.
+        self.listing = ["cluster-racing"]
+        result = []
+        worker = threading.Thread(target=lambda: result.append(self.sweep()))
+        with cap._profile_lock("cluster-racing") as locked:
+            self.assertTrue(locked)
+            worker.start()
+            worker.join(0.5)
+            self.assertTrue(worker.is_alive(), "the sweep went ahead while a scaffold held the lock")
+            self.profile_here("cluster-racing")
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [[]])
+        self.assertEqual(self.removed, [])
+
+    def test_a_removal_that_misses_the_sandbox_is_not_reported_as_swept(self):
+        self.listing = ["cluster-gone-one"]
+        with mock.patch.object(cap, "_remove_sandbox_layout", lambda name: False):
+            self.assertEqual(self.sweep(), [])
+
+
+class ListSandboxProfilesTest(PushSandboxLayoutTest):
+    """The sweep's listing: the same script, the same bounds, a JSON answer."""
+
+    def push(self):
+        with redirect_stderr(io.StringIO()) as err:
+            self.listed = cap._list_sandbox_profiles()
+        return err.getvalue()
+
+    def test_the_mirror_call_is_bounded(self):
+        with mock.patch.object(subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, '{"profiles": ["cluster-a"]}', "")
+            self.push()
+        self.assertEqual(self.listed, ["cluster-a"])
+        self.assertEqual(run.call_args.kwargs["timeout"], cap.SANDBOX_MIRROR_TIMEOUT_SECONDS)
+        argv = run.call_args.args[0]
+        self.assertIn("--list-profiles", argv)
+        self.assertIn("--skeleton-only", argv)
+        self.assertNotIn("--remove-profile", argv)
+
+    def test_a_mirror_that_hangs_does_not_fail_the_scaffold(self):
+        timed_out = subprocess.TimeoutExpired(cmd=[str(self.mirror)], timeout=cap.SANDBOX_MIRROR_TIMEOUT_SECONDS)
+        with mock.patch.object(subprocess, "run", side_effect=timed_out):
+            self.assertIn("could not list", self.push())
+        self.assertIsNone(self.listed)
+
+    def test_a_mirror_that_exits_non_zero_does_not_fail_the_scaffold(self):
+        failed = subprocess.CalledProcessError(2, [str(self.mirror)], "", "no answer")
+        with mock.patch.object(subprocess, "run", side_effect=failed):
+            self.assertIn("could not list", self.push())
+        self.assertIsNone(self.listed)
+
+    def test_an_answer_that_is_not_the_listing_is_unreadable(self):
+        for out in ("", "not json", '{"profiles": "cluster-a"}', '{"other": []}'):
+            with self.subTest(out=out), mock.patch.object(subprocess, "run") as run:
+                run.return_value = subprocess.CompletedProcess([], 0, out, "")
+                self.push()
+                self.assertIsNone(self.listed)
+
 # --- The runtime scaffold path --------------------------------------------------
 #
 # A cluster profile is created when its cluster is onboarded, which is not a pod start:
