@@ -18,9 +18,9 @@ package fakeapiserver
 
 // The fleet-scale cluster: the thousand-node shape whose startup burst the
 // event watcher is sized for, served per fake cluster when the race detector
-// is off. sizes_race.go holds the smaller dataset the same tests use under
-// -race, whose instrumented decode of this many objects would run past the
-// presubmit's budget.
+// is off, which is how CI runs the operator's tests. sizes_race.go holds the
+// smaller dataset the same tests use under a hand-run `go test -race`, where
+// the instrumented decode of this many objects would take minutes.
 const (
 	FleetNodes  = 1_500
 	FleetPods   = 20_000

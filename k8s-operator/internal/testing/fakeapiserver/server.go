@@ -21,8 +21,12 @@
 // is 410 Gone, and injects the faults a reflector has to live through: 429s
 // with Retry-After on the first requests, and the expiry of every open watch.
 //
+// The event watcher reads Events only; Nodes and Pods are served, at the
+// sizes the issue of fleet scale names, for the collectors that page through
+// them, which have no Go consumer here yet.
+//
 // What it does not do: selectors (every request sees every object), namespaced
-// paths (the three resources are resource at the cluster scope only), writes
+// paths (the three resources are served at the cluster scope only), writes
 // (AddEvent is the one way an object appears after start), and any resource
 // beyond the three and the SelfSubjectAccessReview the event watcher's
 // preflight asks for, which is always allowed. Unlike the API server, `limit`
@@ -116,16 +120,16 @@ type Options struct {
 type Counts struct {
 	// Requests is every request received, the throttled ones included.
 	Requests int64
-	// Lists is every list request resource, a page each.
+	// Lists is every list request served, a page each.
 	Lists int64
-	// Watches is every watch request resource, watch-lists included.
+	// Watches is every watch request served, watch-lists included.
 	Watches int64
 	// WatchLists is every watch-list stream that reached the bookmark ending
 	// its initial events.
 	WatchLists int64
 	// Throttled is every request answered 429.
 	Throttled int64
-	// Expired is every 410 resource: a list below the floor, a watch opened
+	// Expired is every 410 served: a list below the floor, a watch opened
 	// below it, or an open watch ended by Expire.
 	Expired int64
 }
@@ -183,7 +187,7 @@ type stream struct {
 }
 
 // continueToken is what the fake puts in a list's continue field: the
-// snapshot the page was resource at and the index the next page starts from.
+// snapshot the page was served at and the index the next page starts from.
 type continueToken struct {
 	Version         int   `json:"v"`
 	ResourceVersion int64 `json:"rv"`
@@ -434,7 +438,7 @@ func (s *Server) expiredStatus(requested, floor int64) *metav1.Status {
 
 // snapshot is the server's state as of one resource version: how many
 // generated objects of the resource it holds and which added Events, so a
-// page or a stream resource from it is consistent whatever is added meanwhile.
+// page or a stream served from it is consistent whatever is added meanwhile.
 type snapshot struct {
 	version   int64
 	generated int64

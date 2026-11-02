@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // The fleet soak CI runs: ten fake API servers at the thousand-node shape
-// (fakeapiserver.Fleet; a tenth of it under -race), watched from one process
+// (fakeapiserver.Fleet; smaller under a hand-run -race), watched from one process
 // through the gate and the wire format the binary ships, through two 429s per
 // cluster at the start and the expiry of every watch once all ten have
 // synced. It asserts the fleet-scale invariants the three-node fixtures in
@@ -53,10 +53,11 @@ const (
 	// in the reflector's temporary store with managedFields stripped, so the
 	// bound is on the watcher's design and not on the dataset's garbage.
 	fleetSoakLiveHeapCeiling = 512 << 20
-	// fleetSoakPhaseTimeout bounds each wait: all ten synced, all ten
-	// streamed again after the expiry, the post-expiry Event on all ten. A
-	// run that passes takes seconds per phase; the timeout is for a hang.
-	fleetSoakPhaseTimeout = 4 * time.Minute
+	// fleetSoakTimeout bounds the whole run, every phase and the watchers'
+	// return together, so a hang in any phase is reported by its name well
+	// inside go test's own ten-minute timeout. A run that passes takes
+	// seconds per phase.
+	fleetSoakTimeout = 4 * time.Minute
 	// fleetSoakSampleInterval is how often the heap is read; the live metric
 	// moves once per GC, which under this allocation rate is far oftener.
 	fleetSoakSampleInterval = 25 * time.Millisecond
@@ -166,6 +167,12 @@ func TestFleetSoak_TenClustersThroughThrottleAndExpiry(t *testing.T) {
 	var synced, reportedDown atomic.Int64
 	runErrs := make(chan error, fleetSoakClusters)
 	start := time.Now()
+	deadline := start.Add(fleetSoakTimeout)
+	// phase waits for cond with what is left of the run's one deadline.
+	phase := func(cond func() bool, what string) {
+		t.Helper()
+		eventually(t, time.Until(deadline), cond, what)
+	}
 	for i, srv := range servers {
 		client, err := newClusterClient(srv.Config())
 		if err != nil {
@@ -184,13 +191,13 @@ func TestFleetSoak_TenClustersThroughThrottleAndExpiry(t *testing.T) {
 		}()
 	}
 
-	eventually(t, fleetSoakPhaseTimeout, func() bool { return synced.Load() == fleetSoakClusters }, "all ten clusters to sync")
+	phase(func() bool { return synced.Load() == fleetSoakClusters }, "all ten clusters to sync")
 	syncedIn := time.Since(start)
 	// The sync is reported as the last initial Event is handed over, which
 	// can be an instant before its dispatch returns (see Run), so the count
 	// is given that instant; a count past the backlog would mean a relist
 	// that nothing asked for.
-	eventually(t, fleetSoakPhaseTimeout, func() bool {
+	phase(func() bool {
 		for _, name := range names {
 			if counter.delivered[name].Load() < int64(sizes.Events) {
 				return false
@@ -207,7 +214,7 @@ func TestFleetSoak_TenClustersThroughThrottleAndExpiry(t *testing.T) {
 	for _, srv := range servers {
 		srv.Expire()
 	}
-	eventually(t, fleetSoakPhaseTimeout, func() bool {
+	phase(func() bool {
 		for _, srv := range servers {
 			if srv.Counts().WatchLists < 2 {
 				return false
@@ -227,7 +234,7 @@ func TestFleetSoak_TenClustersThroughThrottleAndExpiry(t *testing.T) {
 			Count:          1,
 		})
 	}
-	eventually(t, fleetSoakPhaseTimeout, func() bool {
+	phase(func() bool {
 		for _, name := range names {
 			if counter.afterExpiry[name].Load() == 0 {
 				return false
@@ -244,7 +251,7 @@ func TestFleetSoak_TenClustersThroughThrottleAndExpiry(t *testing.T) {
 			if err != nil {
 				t.Errorf("Run returned %v", err)
 			}
-		case <-time.After(fleetSoakPhaseTimeout):
+		case <-time.After(time.Until(deadline)):
 			t.Fatal("a watcher did not return after the context was cancelled")
 		}
 	}
@@ -267,8 +274,11 @@ func TestFleetSoak_TenClustersThroughThrottleAndExpiry(t *testing.T) {
 	}
 	for i, srv := range servers {
 		c := srv.Counts()
-		if c.Throttled != fleetSoakThrottles || c.WatchLists != 2 || c.Expired != 2 || c.Lists != 0 {
-			t.Errorf("%s: %+v; want %d throttled, 2 watch-lists (start, after the expiry), 2 expired (the open stream, the stale resume), no list", names[i], c, fleetSoakThrottles)
+		// Expired is at least the 410 that ended the open stream; how many
+		// stale resumes follow it is client-go's recovery sequence, not the
+		// watcher's, so it is not pinned.
+		if c.Throttled != fleetSoakThrottles || c.WatchLists != 2 || c.Expired < 1 || c.Lists != 0 {
+			t.Errorf("%s: %+v; want %d throttled, 2 watch-lists (start, after the expiry), at least 1 expired (the open stream), no list", names[i], c, fleetSoakThrottles)
 		}
 	}
 	if sampler.peakLive >= fleetSoakLiveHeapCeiling {

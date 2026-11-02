@@ -16,10 +16,11 @@
 
 package fakeapiserver
 
-// The fleet-scale cluster under the race detector: a tenth of the Events,
-// so the soak's instrumented decode of ten clusters stays inside two
-// minutes. The same tests run against both datasets; sizes.go holds the
-// full one.
+// The fleet-scale cluster under the race detector, which a hand-run
+// `go test -race` builds: a tenth of the Pods and Events and a third of the
+// Nodes, so the soak's instrumented decode of ten clusters takes seconds.
+// The same tests run against both datasets; sizes.go holds the full one CI
+// runs.
 const (
 	FleetNodes  = 500
 	FleetPods   = 2_000

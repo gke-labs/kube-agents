@@ -17,9 +17,11 @@ package fakeapiserver
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -469,8 +471,10 @@ func TestReflector_SyncsAndRecoversFromExpiry(t *testing.T) {
 		_, ok, _ := store.GetByKey("team-1/after-expiry")
 		return ok
 	}, "the post-expiry Event to reach the store")
-	if c := s.Counts(); c.Expired != 2 || c.Lists != 0 {
-		t.Errorf("after the recovery: %+v; want two 410s (the stream, the stale resume) and no list", c)
+	// How many stale resumes follow the stream's 410 is client-go's recovery
+	// sequence, so only its floor is asserted.
+	if c := s.Counts(); c.Expired < 1 || c.Lists != 0 {
+		t.Errorf("after the recovery: %+v; want at least the stream's 410 and no list", c)
 	}
 	if peak.Load() != 1 {
 		t.Errorf("peak backlogs in flight = %d, want 1 for one reflector", peak.Load())
@@ -559,4 +563,75 @@ func TestUnknownPathIs404(t *testing.T) {
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("namespaced path: %v, want 404", err)
 	}
+}
+
+// The refusals are Status bodies a client decodes, not broken responses: a
+// bad limit, continue token or timeout and an unsupported method on a
+// resource or on the review route.
+func TestRefusalsAreStatuses(t *testing.T) {
+	s := startSmall(t, 1)
+	client := clientFor(t, s, k8sruntime.ContentTypeProtobuf)
+	ctx := context.Background()
+	events := client.CoreV1().Events(metav1.NamespaceAll)
+	for name, err := range map[string]error{
+		"negative limit": func() error {
+			_, err := events.List(ctx, metav1.ListOptions{Limit: -1})
+			return err
+		}(),
+		"undecodable continue": func() error {
+			_, err := events.List(ctx, metav1.ListOptions{Continue: "not-a-token"})
+			return err
+		}(),
+		"bad resourceVersion": func() error {
+			_, err := events.List(ctx, metav1.ListOptions{ResourceVersion: "latest"})
+			return err
+		}(),
+		"negative timeout": func() error {
+			_, err := events.Watch(ctx, metav1.ListOptions{TimeoutSeconds: ptr.To[int64](-1)})
+			return err
+		}(),
+	} {
+		if !apierrors.IsBadRequest(err) {
+			t.Errorf("%s: %v, want 400", name, err)
+		}
+	}
+	_, err := client.CoreV1().Events("team-0").Create(ctx, &corev1.Event{ObjectMeta: metav1.ObjectMeta{Name: "x"}}, metav1.CreateOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("create on a namespaced path: %v, want 404", err)
+	}
+	for name, req := range map[string]*http.Request{
+		"POST on a resource":          mustRequest(t, http.MethodPost, s.URL+eventsPath, "{}"),
+		"GET on the review route":     mustRequest(t, http.MethodGet, s.URL+selfSubjectAccessReviewPath, ""),
+		"undecodable review body":     mustRequest(t, http.MethodPost, s.URL+selfSubjectAccessReviewPath, "not a review"),
+		"review body of another kind": mustRequest(t, http.MethodPost, s.URL+selfSubjectAccessReviewPath, `{"apiVersion":"v1","kind":"Pod"}`),
+	} {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var status metav1.Status
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err := json.Unmarshal(body, &status); err != nil || status.Kind != "Status" || int(status.Code) != resp.StatusCode {
+			t.Errorf("%s: status %d, body %q", name, resp.StatusCode, body)
+			continue
+		}
+		wantCode := http.StatusMethodNotAllowed
+		if name == "undecodable review body" || name == "review body of another kind" {
+			wantCode = http.StatusBadRequest
+		}
+		if resp.StatusCode != wantCode {
+			t.Errorf("%s: status %d, want %d", name, resp.StatusCode, wantCode)
+		}
+	}
+}
+
+func mustRequest(t *testing.T, method, url, body string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(contentTypeHeader, k8sruntime.ContentTypeJSON)
+	return req
 }

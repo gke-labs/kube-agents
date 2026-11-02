@@ -132,6 +132,14 @@ const (
 	uidClockMask          = 0xfff
 	uidNodeMask           = 0xffffffffffff
 	imageTagMask          = 0xfffffff
+	// hashBase renders a hash as the lower-case alphanumerics Kubernetes
+	// uses for generated name suffixes; decimalBase renders one as a number.
+	hashBase          = 36
+	decimalBase       = 10
+	imageDigestPrefix = "@sha256:"
+	containerIDPrefix = "containerd://"
+	// digestFormat renders four hashes as a 64-hex-digit SHA-256 digest.
+	digestFormat = "%016x%016x%016x%016x"
 
 	// The managedFields payloads, as the API server records them for a
 	// Deployment-owned Pod (its controller, the scheduler's binding, the
@@ -147,6 +155,23 @@ const (
 	eventKubeletFields   = `{"f:count":{},"f:firstTimestamp":{},"f:involvedObject":{},"f:lastTimestamp":{},"f:message":{},"f:reason":{},"f:reportingComponent":{},"f:reportingInstance":{},"f:source":{"f:component":{},"f:host":{}},"f:type":{}}`
 )
 
+// messageArgs says what a shape's message format takes, so each shape is one
+// row: the arguments are built by Event from the kind named here, and a
+// message with no verbs takes argsNone.
+type messageArgs int
+
+const (
+	argsNone messageArgs = iota
+	// argsImage: the Pod's image.
+	argsImage
+	// argsPodAndNode: the namespaced Pod name and the node it went to.
+	argsPodAndNode
+	// argsPod: the Pod's name.
+	argsPod
+	// argsNodeCounts: the cluster's node count, four times.
+	argsNodeCounts
+)
+
 // eventShape is one kind of Event a cluster records, with the component that
 // records it and the message it carries; generated Events cycle through them
 // by hash so a backlog mixes the routine (Pulled, Started) with the ones the
@@ -159,22 +184,25 @@ type eventShape struct {
 	nodeHost bool
 	// repeats says whether the Event is one the recorder counts up.
 	repeats bool
-	message string
+	// involvesOwner says the Event is about the Pod's ReplicaSet, not the Pod.
+	involvesOwner bool
+	message       string
+	args          messageArgs
 }
 
 // eventShapes is the table generated Events cycle through; the index is
 // hash(seed, event, i) modulo its length.
 var eventShapes = []eventShape{
-	{reason: "Pulled", eventType: corev1.EventTypeNormal, component: managerKubelet, nodeHost: true, message: "Successfully pulled image %q in 1.284s (1.284s including waiting). Image size: 184729384 bytes."},
+	{reason: "Pulled", eventType: corev1.EventTypeNormal, component: managerKubelet, nodeHost: true, message: "Successfully pulled image %q in 1.284s (1.284s including waiting). Image size: 184729384 bytes.", args: argsImage},
 	{reason: "Created", eventType: corev1.EventTypeNormal, component: managerKubelet, nodeHost: true, message: "Created container: " + containerName},
 	{reason: "Started", eventType: corev1.EventTypeNormal, component: managerKubelet, nodeHost: true, message: "Started container " + containerName},
-	{reason: "Scheduled", eventType: corev1.EventTypeNormal, component: schedulerName, message: "Successfully assigned %s to %s"},
-	{reason: "Pulling", eventType: corev1.EventTypeNormal, component: managerKubelet, nodeHost: true, message: "Pulling image %q"},
+	{reason: "Scheduled", eventType: corev1.EventTypeNormal, component: schedulerName, message: "Successfully assigned %s to %s", args: argsPodAndNode},
+	{reason: "Pulling", eventType: corev1.EventTypeNormal, component: managerKubelet, nodeHost: true, message: "Pulling image %q", args: argsImage},
 	{reason: "Killing", eventType: corev1.EventTypeNormal, component: managerKubelet, nodeHost: true, message: "Stopping container " + containerName},
-	{reason: "BackOff", eventType: corev1.EventTypeWarning, component: managerKubelet, nodeHost: true, repeats: true, message: "Back-off restarting failed container " + containerName + " in pod %s"},
+	{reason: "BackOff", eventType: corev1.EventTypeWarning, component: managerKubelet, nodeHost: true, repeats: true, message: "Back-off restarting failed container " + containerName + " in pod %s", args: argsPod},
 	{reason: "Unhealthy", eventType: corev1.EventTypeWarning, component: managerKubelet, nodeHost: true, repeats: true, message: "Readiness probe failed: HTTP probe failed with statuscode: 503"},
-	{reason: "FailedScheduling", eventType: corev1.EventTypeWarning, component: schedulerName, repeats: true, message: "0/%d nodes are available: %d Insufficient cpu. preemption: 0/%d nodes are available: %d No preemption victims found for incoming pod."},
-	{reason: "SuccessfulCreate", eventType: corev1.EventTypeNormal, component: "replicaset-controller", message: "Created pod: %s"},
+	{reason: "FailedScheduling", eventType: corev1.EventTypeWarning, component: schedulerName, repeats: true, message: "0/%d nodes are available: %d Insufficient cpu. preemption: 0/%d nodes are available: %d No preemption victims found for incoming pod.", args: argsNodeCounts},
+	{reason: "SuccessfulCreate", eventType: corev1.EventTypeNormal, component: "replicaset-controller", involvesOwner: true, message: "Created pod: %s", args: argsPod},
 }
 
 // Sizes is how many of each kind a fake cluster holds.
@@ -260,7 +288,7 @@ func (g *Generator) workload(i int) string {
 
 func (g *Generator) replicaSet(i int) (name string, uid types.UID) {
 	index := i % (namespaceCount * workloadsPerNamespace)
-	hash := strconv.FormatUint(g.hash(hashKindReplicaSet, index, hashFieldTemplate), 36)
+	hash := strconv.FormatUint(g.hash(hashKindReplicaSet, index, hashFieldTemplate), hashBase)
 	if len(hash) > podTemplateHashLength {
 		hash = hash[:podTemplateHashLength]
 	}
@@ -270,7 +298,7 @@ func (g *Generator) replicaSet(i int) (name string, uid types.UID) {
 // PodName is the name of the i-th Pod, and its namespace.
 func (g *Generator) PodName(i int) (name, namespace string) {
 	rs, _ := g.replicaSet(i)
-	suffix := strconv.FormatUint(g.hash(hashKindPod, i, hashFieldName), 36)
+	suffix := strconv.FormatUint(g.hash(hashKindPod, i, hashFieldName), hashBase)
 	if len(suffix) > podSuffixLength {
 		suffix = suffix[:podSuffixLength]
 	}
@@ -340,7 +368,7 @@ func (g *Generator) Node(i int) *corev1.Node {
 				"topology.kubernetes.io/zone":              zone,
 			},
 			Annotations: map[string]string{
-				"container.googleapis.com/instance_id":                   strconv.FormatUint(g.hash(hashKindNode, i, hashFieldUID)>>1, 10),
+				"container.googleapis.com/instance_id":                   strconv.FormatUint(g.hash(hashKindNode, i, hashFieldUID)>>1, decimalBase),
 				"csi.volume.kubernetes.io/nodeid":                        fmt.Sprintf(`{"pd.csi.storage.gke.io":"projects/example-project/zones/%s/instances/%s"}`, zone, name),
 				"node.alpha.kubernetes.io/ttl":                           "0",
 				"node.gke.io/last-applied-node-labels":                   "cloud.google.com/gke-boot-disk=" + bootDiskType + ",cloud.google.com/gke-nodepool=" + g.nodePool(i),
@@ -498,8 +526,8 @@ func (g *Generator) Pod(i int) *corev1.Pod {
 			ContainerStatuses: []corev1.ContainerStatus{{
 				Name:         containerName,
 				Image:        g.image(i),
-				ImageID:      g.image(i) + "@sha256:" + fmt.Sprintf("%016x%016x%016x%016x", g.hash(hashKindPod, i, hashFieldTemplate), g.hash(hashKindPod, i, hashFieldUID), g.hash(hashKindPod, i, hashFieldName), g.hash(hashKindPod, i, hashFieldShape)),
-				ContainerID:  "containerd://" + fmt.Sprintf("%016x%016x%016x%016x", g.hash(hashKindPod, i, hashFieldShape), g.hash(hashKindPod, i, hashFieldName), g.hash(hashKindPod, i, hashFieldUID), g.hash(hashKindPod, i, hashFieldTemplate)),
+				ImageID:      g.image(i) + imageDigestPrefix + fmt.Sprintf(digestFormat, g.hash(hashKindPod, i, hashFieldTemplate), g.hash(hashKindPod, i, hashFieldUID), g.hash(hashKindPod, i, hashFieldName), g.hash(hashKindPod, i, hashFieldShape)),
+				ContainerID:  containerIDPrefix + fmt.Sprintf(digestFormat, g.hash(hashKindPod, i, hashFieldShape), g.hash(hashKindPod, i, hashFieldName), g.hash(hashKindPod, i, hashFieldUID), g.hash(hashKindPod, i, hashFieldTemplate)),
 				Ready:        true,
 				Started:      &controller,
 				RestartCount: int32(g.hash(hashKindPod, i, hashFieldCount) % restartCountSpan),
@@ -541,14 +569,14 @@ func (g *Generator) Event(i int) *corev1.Event {
 		last = metav1.NewTime(first.Add(eventAgeStep * time.Duration(count)))
 	}
 	var message string
-	switch shape.reason {
-	case "Pulled", "Pulling":
+	switch shape.args {
+	case argsImage:
 		message = fmt.Sprintf(shape.message, g.image(podIndex))
-	case "Scheduled":
+	case argsPodAndNode:
 		message = fmt.Sprintf(shape.message, namespace+"/"+podName, nodeName)
-	case "BackOff", "SuccessfulCreate":
+	case argsPod:
 		message = fmt.Sprintf(shape.message, podName)
-	case "FailedScheduling":
+	case argsNodeCounts:
 		message = fmt.Sprintf(shape.message, g.sizes.Nodes, g.sizes.Nodes, g.sizes.Nodes, g.sizes.Nodes)
 	default:
 		message = shape.message
@@ -561,7 +589,7 @@ func (g *Generator) Event(i int) *corev1.Event {
 		Kind: eventKindPod, Namespace: namespace, Name: podName, UID: g.uid(hashKindPod, podIndex),
 		APIVersion: apiVersionV1, FieldPath: fmt.Sprintf(eventFieldPathFormat, containerName),
 	}
-	if shape.reason == "SuccessfulCreate" {
+	if shape.involvesOwner {
 		rsName, rsUID := g.replicaSet(podIndex)
 		involved = corev1.ObjectReference{Kind: ownerKindReplicaSet, Namespace: namespace, Name: rsName, UID: rsUID, APIVersion: ownerAPIVersion}
 	}
