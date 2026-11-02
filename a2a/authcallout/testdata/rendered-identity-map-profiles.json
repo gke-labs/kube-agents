@@ -1,5 +1,5 @@
 {
-  "version": "06fa98178d9e8737",
+  "version": "2f554691847a4d72",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -8,6 +8,7 @@
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.agent.platform.topology-skew",
           "a2a.topics.shared.blueprint",
           "a2a.topics.shared.annotations",
           "$JS.API.INFO",
@@ -20,6 +21,9 @@
           "$JS.API.STREAM.CREATE.KV_runtime-state",
           "$JS.API.STREAM.CREATE.KV_session-state",
           "$JS.API.STREAM.CREATE.KV_cap",
+          "$JS.API.STREAM.CREATE.KV_feedback",
+          "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
           "$JS.API.STREAM.INFO.TASKS",
           "$JS.API.STREAM.INFO.DIRECTORY",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -27,6 +31,9 @@
           "$JS.API.STREAM.INFO.KV_runtime-state",
           "$JS.API.STREAM.INFO.KV_session-state",
           "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.STREAM.INFO.KV_feedback",
+          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
           "_INBOX.provision.>"
         ],
         "subscribe": [
@@ -52,6 +59,7 @@
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.agent.platform.topology-skew",
           "a2a.topics.shared.blueprint",
           "a2a.topics.shared.annotations",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -60,6 +68,7 @@
           "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
           "chat.notify.gchat",
           "chat.notify.slack",
+          "chat.notify.console",
           "_INBOX.agent.>"
         ],
         "subscribe": [
@@ -102,8 +111,8 @@
       }
     },
     {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agentprofile-auditor",
-      "user": "profile-auditor",
+      "serviceAccount": "system:serviceaccount:kubeagents-system-profiles:agentprofile-auditor-read",
+      "user": "profile-auditor-read",
       "account": "APP",
       "grants": {
         "publish": null,
@@ -118,18 +127,20 @@
         "subscribe": [
           "shared.blueprint"
         ]
-      }
+      },
+      "tier": "read"
     },
     {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agentprofile-cluster-a",
-      "user": "profile-cluster-a",
+      "serviceAccount": "system:serviceaccount:kubeagents-system-profiles:agentprofile-cluster-a-read",
+      "user": "profile-cluster-a-read",
       "account": "APP",
       "grants": {
         "publish": null,
         "subscribe": null
       },
       "narrowing": "profile",
-      "profile": "cluster-a"
+      "profile": "cluster-a",
+      "tier": "read"
     }
   ]
 }

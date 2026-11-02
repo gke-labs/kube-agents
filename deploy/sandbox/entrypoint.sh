@@ -695,14 +695,14 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
       continue
     fi
     if grep -q "gke-gcloud-auth-plugin" "$kc" 2>/dev/null; then
-      kc_ctx="$(sed -n 's/^current-context:[[:space:]]*//p' "$kc" | head -n 1 | tr -d "'\"[:space:]")"
+      kc_ctx="$(awk '/^current-context:/{sub(/^current-context:[[:space:]]*/,""); print; exit}' "$kc" 2>/dev/null | tr -d "'\"[:space:]" || true)"
       if [ -z "$kc_ctx" ]; then
         kc_ctx="$default_ctx"
       fi
       case "$kc_ctx" in
       *[!A-Za-z0-9._:-]* | "") continue ;;
       esac
-      write_kube_proxy_kubeconfig "$kc" "$kc_ctx"
+      write_kube_proxy_kubeconfig "$kc" "$kc_ctx" || log "WARNING: could not rewrite legacy kubeconfig $kc"
     fi
   done
   if id -u hermes >/dev/null 2>&1; then

@@ -129,6 +129,13 @@ func kubeProxyOTelEnvVars(agent *agentv1alpha1.PlatformAgent, endpoint string, d
 	return envs
 }
 
+func hostClusterContextName(agent *agentv1alpha1.PlatformAgent) string {
+	if h := agent.Spec.Harness; h != nil && h.ProjectID != "" && h.Location != "" && h.ClusterName != "" && !harnessOnKind(h) {
+		return fmt.Sprintf("gke_%s_%s_%s", h.ProjectID, h.Location, h.ClusterName)
+	}
+	return inClusterContextName
+}
+
 func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool, tlsCertHash string) *appsv1.Deployment {
 	saName := agentServiceAccountName(agent)
 	podLabels := commonLabels(agent)
@@ -157,10 +164,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 	}
 
-	defaultCluster := inClusterContextName
-	if h := agent.Spec.Harness; h != nil && h.ProjectID != "" && h.Location != "" && h.ClusterName != "" && h.Location != kindLocation {
-		defaultCluster = fmt.Sprintf("gke_%s_%s_%s", h.ProjectID, h.Location, h.ClusterName)
-	}
+	defaultCluster := hostClusterContextName(agent)
 
 	envVars := []corev1.EnvVar{
 		{Name: "KUBE_PROXY_LISTEN_ADDR", Value: fmt.Sprintf(":%d", kubeProxyPort)},
@@ -171,7 +175,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: "KUBE_PROXY_REDACT_SECRETS", Value: "true"},
 		{Name: "KUBE_PROXY_DEFAULT_CLUSTER", Value: defaultCluster},
 		{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
-		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
+		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent, false)},
 		{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 	}

@@ -82,12 +82,14 @@ const (
 	a2aConsoleLocalHost    = "localhost"
 	a2aConsoleLoopbackHost = "127.0.0.1"
 	a2aConsoleHostSep      = ","
-	// The scheme for both the console server's own origin (as the browser
-	// asserts it) and the bus URL the proxy dials. Both are plain http: the
-	// browser origin because the port-forward is unencrypted, and the bus
-	// dial because the proxy upgrades the connection itself.
+	// The console server's own origin as the browser asserts it: plain http,
+	// because the browser's end of the port-forward is.
 	a2aConsoleOriginScheme = "http://"
-	a2aConsoleOriginSep    = ", "
+	// The bus URL the proxy dials: https, because the websocket listener
+	// serves TLS (renderA2ANATSConf), and not wss, because the proxy is an
+	// HTTP reverse proxy that upgrades the connection itself.
+	a2aConsoleBusScheme = "https://"
+	a2aConsoleOriginSep = ", "
 
 	// The binary's environment (a2a/cmd/console).
 	a2aConsoleEnvBusURL       = "CONSOLE_BUS_URL"
@@ -142,10 +144,10 @@ func a2aConsoleOriginList() string {
 }
 
 // a2aNATSWebSocketURL is the bus's websocket listener as the proxy dials it.
-// http, not ws: the proxy is an HTTP reverse proxy and upgrades on the way
-// through.
+// The host is one of the serving certificate's SANs (a2aNATSDNSNames), which
+// the proxy verifies against the CA bundle.
 func a2aNATSWebSocketURL(agent *agentv1alpha1.PlatformAgent) string {
-	return fmt.Sprintf("%s%s.%s.svc:%d", a2aConsoleOriginScheme, a2aNATSName(agent), agent.Namespace, a2aNATSWebSocketPort)
+	return fmt.Sprintf("%s%s.%s.svc:%d", a2aConsoleBusScheme, a2aNATSName(agent), agent.Namespace, a2aNATSWebSocketPort)
 }
 
 // buildA2AConsoleDeployment renders the console server.
@@ -198,7 +200,13 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							}},
 							Optional: ptr.To(true),
 						}},
-					}},
+					},
+						// The bus CA the proxy verifies the websocket
+						// listener against. Not optional: without it the
+						// server refuses to start rather than dial the bus
+						// unverified.
+						a2aNATSCABundleVolume(agent),
+					},
 					Containers: []corev1.Container{{
 						Name:  a2aConsoleContainer,
 						Image: a2aConsoleImage(),
@@ -213,13 +221,14 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: a2aConsoleEnvUser, Value: a2aConsoleConfUser},
 							{Name: a2aConsoleEnvPasswordFile, Value: path.Join(a2aConsoleMountDir, a2aConsolePasswordKey)},
 							{Name: a2aConsoleEnvAllowedHosts, Value: strings.Join(a2aConsoleHosts(), a2aConsoleHostSep)},
+							a2aNATSCAFileEnvVar(),
 						},
 						Ports: []corev1.ContainerPort{{Name: a2aConsolePortName, ContainerPort: a2aConsolePort}},
 						VolumeMounts: []corev1.VolumeMount{{
 							Name:      a2aConsoleKeyVolume,
 							MountPath: a2aConsoleMountDir,
 							ReadOnly:  true,
-						}},
+						}, a2aNATSCABundleMount()},
 						// /healthz is the one path the server answers for any
 						// Host. The kubelet sends the pod IP, which the Host
 						// check would refuse everywhere else.

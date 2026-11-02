@@ -55,16 +55,16 @@ every other closing line is kept as written, counts and all, since they are
 how a text reader asks for the rest. When the roll-up was the last of them,
 "Ask me to see all <n>." takes its place.
 
-``blocks`` is the same card as Block Kit, which ``bootstrap_delivery``
-posts itself when it can: the headline, lead and the first :data:`CARD_ROWS`
-findings as rows with no count above them, the lead counting only those, a
+``blocks`` is the same card as Block Kit: the headline, lead and the first
+:data:`CARD_ROWS` findings as rows with no count above them, the lead counting only those, a
 kept roll-up and then the posture line, a sentence a line, under them, the other listed findings folded under
 "<n> more worth a look", then a primary "Fix the first one" button and, when the total is
 more than the findings the report lists, a "See all N" button, both answered as the
 clicker's turn: a click posts the button's label in the card's thread.
 The closing lines are left out too: "See all N" asks for the rest. ``chat``
-is the same card as a ``kube-agents.chat/v1`` message, which
-``bootstrap_delivery`` sends through the A2A gateway under ``spec.mode: next``.
+is the same card as a ``kube-agents.chat/v1`` message. Neither is the first
+report any more: ``bootstrap_delivery`` posts the card ``inventory_card`` builds
+from the stored findings, and takes ``present`` here when that card cannot be built.
 
 The report is model-written to the format in
 ``agents/platform/governance/inventory_prioritize_sop.md`` (Step 6). A report

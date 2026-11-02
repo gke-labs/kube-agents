@@ -68,12 +68,15 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Siblings in `$HERMES_HOME/scripts`, which is this script's own directory and
 # therefore already `sys.path[0]` when the scheduler runs it.
 import forge
 import gitops_workspace
 import pr_triggers
+import repo_ref
+import script_log
 
 # Which sweeps run, and in what order, is `SWEEP_ORDER` — derived from the
 # `SWEEPS` registry near the bottom of this file rather than written out twice.
@@ -118,6 +121,75 @@ PR_MAX_PER_TICK_DEFAULT = 3
 PR_MAX_REFUSALS_ENV = pr_triggers.MAX_REFUSALS_ENV
 PR_MAX_REFUSALS_DEFAULT = pr_triggers.MAX_REFUSALS_DEFAULT
 
+# A pull request whose conversation could not be read is one plain line, posted
+# the tick it first fails and once more the tick it reads again; the reason
+# code goes to `WATCHER_LOG_FILE` under the agent home (`script_log`), since
+# the scheduler keeps a zero-exit script's stderr nowhere. This job runs every
+# ten minutes, so without the record below a failure that persists was the
+# same line 144 times a day.
+UNREADABLE_LINE = "**Comments on {pr} aren't being answered.** {why}"
+READABLE_AGAIN_LINE = "**Comments on {pr} are being answered again.**"
+# Each sentence names the forge by the pull request's host (`_forge_name`), and
+# ends on whether the next tick may clear it or a person has to act first. The
+# default covers every transient code -- the sandbox hop, the broker, and the
+# forge's own 502 and 503 -- with one sentence that does not say which side
+# failed: a hop that times out may already have asked the forge, and a slow
+# forge alternating between them must not post a new line at each switch.
+UNREADABLE_WHY_DEFAULT = "Kage couldn't reach {forge} to read its comments just now. It keeps trying every 10 minutes."
+# The sentences this job posted before each named its forge, by the reason
+# that replaced them. A record holding one is read as its replacement, so an
+# outage that spans the upgrade is not posted twice.
+UNREADABLE_WHY_LEGACY = {
+    "GitHub didn't respond when Kage tried to read the pull request. It keeps trying every 10 minutes.": "",
+    "GitHub's rate limit was reached when Kage tried to read the pull request. It keeps trying every 10 minutes.": (
+        "FORGE_RATE_LIMITED"
+    ),
+    "GitHub refused Kage's credentials when it tried to read the pull request. It keeps trying every 10 minutes.": (
+        "FORGE_UNAUTHENTICATED"
+    ),
+}
+LEGACY_FORGE = "GitHub"
+# A conversation too long for one page never clears on its own; the label is
+# the way out. The forge's 403 and 404 do not clear either: the credential or
+# the repository has to change.
+UNREADABLE_WHY = {
+    forge.REASON_CONVERSATION_TRUNCATED: (
+        f"The conversation is too long for Kage to read. Add the `{forge.IGNORE_LABEL}` label to stop watching it."
+    ),
+    "FORGE_RATE_LIMITED": (
+        "{forge}'s rate limit was reached when Kage tried to read its comments. It keeps trying every 10 minutes."
+    ),
+    "FORGE_UNAUTHENTICATED": (
+        "{forge} refused Kage's credentials when it tried to read its comments. It keeps trying every 10 minutes."
+    ),
+    "FORGE_FORBIDDEN": (
+        "{forge} accepted Kage's credentials but refused to show it the comments. Retrying won't help; an admin "
+        "needs to give the credential read access to this repository."
+    ),
+    "FORGE_NOT_FOUND": (
+        "{forge} couldn't find the repository with Kage's credentials: it is gone, renamed, or hidden from "
+        "them. Retrying won't help; an admin needs to fix the repository's name or its access."
+    ),
+}
+# What a host is called in those sentences. A host no forge serves by default (a
+# self-managed instance) is named as itself; a repository with neither a URL nor
+# a host is the bare `owner/name` GitHub shorthand.
+FORGE_NAMES = {**dict.fromkeys(repo_ref.GITHUB_HOSTS, "GitHub"), repo_ref.GITLAB_CANONICAL_HOST: "GitLab"}
+FORGE_NAME_HOSTLESS = "GitHub"
+# A registered `host/path` on a self-managed instance parses hostless, since
+# `repo_ref` lifts only the hosts it knows. A GitHub owner cannot contain a dot,
+# so a dotted first segment is that host.
+HOST_LABEL_SEPARATOR = "."
+PR_LINK = "[{name}#{number}]({url})"
+PR_REF = "{repo}#{number}"
+PR_REF_SEPARATOR = "#"
+REPO_NAME_SEPARATOR = "/"
+# The pull requests last posted as unreadable, under the profile home, each
+# with the sentence it was posted with, so two codes that read the same do not
+# post twice: `{"owner/name#12": "GitHub didn't respond ..."}`.
+UNREADABLE_RECORD = Path("github-repo-watcher") / "unreadable-prs.json"
+WATCHER_LOG_FILE = "github_repo_watcher.log"
+
 
 @dataclass
 class Card:
@@ -143,6 +215,57 @@ class SweepResult:
 
 def hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME", "/opt/data"))
+
+
+def _pr_ref(repo: str, number: int, url: str = "") -> str:
+    """A pull request as the channel reads it: its repository's name and number, linked when the URL is known."""
+    if url:
+        return PR_LINK.format(name=repo.rsplit(REPO_NAME_SEPARATOR, 1)[-1], number=number, url=url)
+    return PR_REF.format(repo=repo, number=number)
+
+
+def _forge_name(repo: str, url: str = "") -> str:
+    """The forge `repo` is on, as the channel reads it: by the pull request URL's host, else the repository's."""
+    try:
+        host = (urlsplit(url).hostname or "") if url else ""
+    except ValueError:
+        host = ""
+    if not host:
+        parsed = repo_ref.try_parse(repo)
+        host = parsed.host if parsed else ""
+        if parsed and not host:
+            first = parsed.segments[0]
+            host = first if HOST_LABEL_SEPARATOR in first and len(parsed.segments) > 1 else ""
+    return FORGE_NAMES.get(host.lower(), host or FORGE_NAME_HOSTLESS)
+
+
+def _load_unreadable() -> dict[str, str]:
+    """The pull requests last posted as unreadable; empty when there is no record or it cannot be read."""
+    try:
+        record = json.loads((hermes_home() / UNREADABLE_RECORD).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(record, dict):
+        return {}
+    return {str(key): _current_why(str(why)) for key, why in record.items()}
+
+
+def _current_why(why: str) -> str:
+    """`why` as this version words it: a sentence from before the forge was named maps to its replacement."""
+    reason = UNREADABLE_WHY_LEGACY.get(why)
+    if reason is None:
+        return why
+    return UNREADABLE_WHY.get(reason, UNREADABLE_WHY_DEFAULT).format(forge=LEGACY_FORGE)
+
+
+def _save_unreadable(record: dict[str, str]) -> None:
+    """Keep the record; one that cannot be written leaves every tick posting, as before it existed."""
+    path = hermes_home() / UNREADABLE_RECORD
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+    except OSError as error:
+        sys.stderr.write(f"github_scan_gate: unreadable-PR record not written: {error}\n")
 
 
 def _slug(text: str) -> str:
@@ -640,8 +763,8 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             comments = provider.list_comments(repo, pr)
         except forge.ForgeError as refusal:
             # One pull request that will not load must not blind the sweep for
-            # the others. Collected into a single warning below rather than one
-            # line each, so a repo-wide outage is one message.
+            # the others. Collected, and posted below one line per pull request
+            # the tick it first fails, so a standing outage is posted once.
             #
             # The reason travels with it because the two that land here send an
             # operator to different places: a transport or credential fault
@@ -685,21 +808,38 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             f"github_scan_gate: {indeterminate} PR trigger(s) held — write access "
             "could not be determined this tick\n"
         )
-    if unreadable:
-        warnings.append(
-            "⚠️ **GitHub PR watcher could not read** "
-            + ", ".join(f"{repo}#{n} ({reason})" for repo, n, reason in sorted(unreadable))
-            + " — those conversations were skipped this tick."
-        )
-        # A conversation too long for one page never clears on its own, and the
-        # watcher runs every ten minutes with `deliver: "chat"`: without a way
-        # out named here, that is 144 identical warnings a day in the room.
-        if any(reason == forge.REASON_CONVERSATION_TRUNCATED for _, _, reason in unreadable):
-            warnings[-1] += (
-                f" For {forge.REASON_CONVERSATION_TRUNCATED}, this repeats every"
-                f" tick until the pull request closes: label it `{forge.IGNORE_LABEL}`"
-                " to stop this warning, or split the thread."
-            )
+    # One line per pull request whose conversation could not be read, the tick
+    # it first fails or fails with a sentence it was not posted with, and one
+    # more the tick it reads again. A dry run changes no record or log and
+    # posts every one: the operator running it is looking at the failures.
+    previous = _load_unreadable()
+    urls = {(repo, pr.number): pr.url for repo, pr in prs}
+    current: dict[str, str] = {}
+    details = []
+    for repo, n, reason in sorted(unreadable):
+        key = PR_REF.format(repo=repo, number=n)
+        why = UNREADABLE_WHY.get(reason, UNREADABLE_WHY_DEFAULT).format(forge=_forge_name(repo, urls.get((repo, n), "")))
+        current[key] = why
+        details.append(f"github_scan_gate: could not read {key} ({reason}); its conversation was skipped this tick")
+        if dry_run or previous.get(key) != why:
+            warnings.append(UNREADABLE_LINE.format(pr=_pr_ref(repo, n, urls.get((repo, n), "")), why=why))
+    if dry_run:
+        sys.stderr.writelines(f"{line}\n" for line in details)
+    else:
+        script_log.append(WATCHER_LOG_FILE, details)
+    # Read this tick: the pull requests the sweep listed. One that closed, or that
+    # a refusal kept the sweep out of its repository, is not "being answered
+    # again"; the record keeps the second until its repository is read.
+    listed = {PR_REF.format(repo=repo, number=pr.number): (repo, pr) for repo, pr in prs}
+    unswept = set(nameless) | {name for name, _ in refused}
+    for key in sorted(set(previous) - set(current)):
+        if key in listed:
+            repo, pr = listed[key]
+            warnings.append(READABLE_AGAIN_LINE.format(pr=_pr_ref(repo, pr.number, pr.url)))
+        elif key.rsplit(PR_REF_SEPARATOR, 1)[0] in unswept:
+            current[key] = previous[key]
+    if not dry_run and current != previous:
+        _save_unreadable(current)
     # Drained here rather than warned about where it happens, because the same
     # listing fills its page on every tick and on more than one repository. A
     # listing read short is not an error the sweep can recover from — it simply

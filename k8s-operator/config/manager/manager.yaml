@@ -75,6 +75,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.serviceAccountName
+            # This container's memory limit in bytes, which the manager turns
+            # into the Go runtime's soft memory limit (nine tenths of it; an
+            # explicit GOMEMLIMIT wins). Read from the container itself so it
+            # follows the limit below, and on Autopilot the limit the cluster
+            # admitted rather than the one written here.
+            - name: OPERATOR_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
             # Private-registry installs: uncomment (or patch via kustomize) to
             # point the images the operator deploys at your own registry.
             # OPERATOR_IMAGE is this container's own image; the A2A next-stack
@@ -159,12 +168,21 @@ spec:
           # replaces: on a 3-node install the store holds 675 objects in
           # 3.7 MiB of live heap, in a process of 22 MiB RSS. Keep in step
           # with charts/kube-agents/values.yaml's operator.resources.
+          #
+          # requests.cpu is 50m rather than the 10m the manager needs: GKE
+          # Autopilot admits a pod unchanged only at 50m or more and between
+          # 1 and 6.5 GiB of memory per vCPU on the requests pair, and raises
+          # the smaller request into that band, so 10m beside 128Mi was
+          # admitted at 50m whatever this line said. Autopilot without
+          # bursting also raises the pod to 250m CPU and 512 MiB and sets the
+          # limits equal to the requests; the manager reads the admitted
+          # limit through OPERATOR_MEMORY_LIMIT_BYTES.
           resources:
             limits:
               cpu: 500m
               memory: 512Mi
             requests:
-              cpu: 10m
+              cpu: 50m
               memory: 128Mi
           volumeMounts:
             - mountPath: /tmp/k8s-webhook-server/serving-certs

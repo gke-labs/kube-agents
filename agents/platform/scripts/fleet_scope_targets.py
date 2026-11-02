@@ -33,7 +33,9 @@ script on the same pod that hands the readiness report script
 `sa-role-watch` job (sa_role_watch.py), which reads the IAM policy of each
 project in the resolved scope, and by the onboarding inventory scan
 (agents/chat/scripts/bootstrap_scan_gate.py), which leaves the declaration's
-excluded clusters out of the sweep it files. The collectors
+excluded clusters out of the sweep it files, and by the front door's roster
+(agents/chat/scripts/agent_roster.py), which lists the projects in scope in
+the block injected into every chat turn and in `list_agents`. The collectors
 themselves cannot read the file: they run in the shell sandbox, whose
 /opt/data is a separate volume at the same path (deploy/sandbox/entrypoint.sh
 says nothing is copied across), so the agent carries the scope from the tool
@@ -278,6 +280,37 @@ def snapshot_path(agent_home: str | os.PathLike | None = None) -> Path:
     PLATFORM_AGENT_HOME names it, or the root given."""
     root = agent_home if agent_home is not None else (os.environ.get(AGENT_HOME_ENV) or DEFAULT_AGENT_HOME)
     return Path(root) / SNAPSHOT_FILE
+
+
+def management_project_id(agent_home: str | os.PathLike | None = None) -> str | None:
+    """The install's own project ID from the reconcile snapshot's management row, or None.
+
+    When spec.harness.projectId is a project number, the reconcile resolves it to
+    its project ID before writing the snapshot (cluster_agent_reconcile.py),
+    whether or not spec.scope is declared. A digit-only value is refused so a
+    corrupt file never hands on a project number as an ID.
+    """
+    path = snapshot_path(agent_home)
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("projects"), list):
+        return None
+    for row in parsed["projects"]:
+        if not isinstance(row, dict) or row.get("state", STATE_IN_SCOPE) != STATE_IN_SCOPE:
+            continue
+        via = row.get("via")
+        project = row.get("id")
+        if (
+            isinstance(via, list)
+            and VIA_MANAGEMENT in via
+            and isinstance(project, str)
+            and project
+            and not project.isdigit()
+        ):
+            return project
+    return None
 
 
 def _read_render() -> dict | None:

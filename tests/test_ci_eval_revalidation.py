@@ -14,7 +14,7 @@ override plugin's, one pull of a batch without a verdict, the escape hatch
 -- must fall through to a full run.
 
 The script is copied into a fixture checkout (with the mint module beside
-it) and sourced, then executed with `gsutil` stubbed, GitHub faked by a
+it) and sourced, then executed with `gcloud` stubbed, GitHub faked by a
 `sitecustomize` that replaces urlopen for every python the script runs, and
 the fixture git repository standing in for the decorated checkout, so these
 assertions are against the code that ships.
@@ -59,30 +59,31 @@ _JOB_NAME_PROBE = 'if [ -n "${JOB_NAME+x}" ]; then echo "JOB_NAME: set"; else ec
 _JOB_NAME_SET = "JOB_NAME: set"
 _JOB_NAME_ABSENT = "JOB_NAME: absent"
 
-_GSUTIL_STUB = """#!/usr/bin/env bash
-# gsutil stub: `ls` prints the fixture listing for the PR named in the glob
-# (GSUTIL_LS_DIR/<pr>.txt, else it fails like a no-match glob), `cat` serves
-# "<build>.<file>" out of GSUTIL_OBJECT_DIR.
-# Every call is appended to GSUTIL_CALL_LOG so a test can pin WHICH history
+_GCLOUD_STUB = """#!/usr/bin/env bash
+# gcloud stub, its `storage` group only: `ls` prints the fixture listing for
+# the PR named in the glob (GCLOUD_LS_DIR/<pr>.txt, else it fails like a
+# no-match glob), `cat` serves "<build>.<file>" out of GCLOUD_OBJECT_DIR.
+# Every call is appended to GCLOUD_CALL_LOG so a test can pin WHICH history
 # the script read -- reading another PR's (or another job's) records would
 # reuse a foreign verdict while every content assertion still passed.
-cmd="$1"; shift
-if [ -n "${GSUTIL_CALL_LOG:-}" ]; then
-  echo "${cmd} $*" >> "${GSUTIL_CALL_LOG}"
+[ "$1" = "storage" ] || exit 1
+cmd="$2"; shift 2
+if [ -n "${GCLOUD_CALL_LOG:-}" ]; then
+  echo "${cmd} $*" >> "${GCLOUD_CALL_LOG}"
 fi
 case "${cmd}" in
   ls)
     pr="$(printf '%s' "$1" | sed -n 's|.*/gke-labs_kube-agents/\\([0-9]*\\)/.*|\\1|p')"
-    if [ -n "${GSUTIL_LS_DIR:-}" ] && [ -f "${GSUTIL_LS_DIR}/${pr}.txt" ]; then
-      cat "${GSUTIL_LS_DIR}/${pr}.txt"
+    if [ -n "${GCLOUD_LS_DIR:-}" ] && [ -f "${GCLOUD_LS_DIR}/${pr}.txt" ]; then
+      cat "${GCLOUD_LS_DIR}/${pr}.txt"
     else
-      echo "CommandException: One or more URLs matched no objects." >&2
+      echo "ERROR: (gcloud.storage.ls) One or more URLs matched no objects." >&2
       exit 1
     fi
     ;;
   cat)
     build="$(basename "$(dirname "$1")")"
-    object="${GSUTIL_OBJECT_DIR}/${build}.$(basename "$1")"
+    object="${GCLOUD_OBJECT_DIR}/${build}.$(basename "$1")"
     [ -f "${object}" ] || exit 1
     cat "${object}"
     ;;
@@ -197,11 +198,11 @@ class RevalidationTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = pathlib.Path(tmp.name)
 
-        # The stub gsutil, first on PATH; the fake GitHub, first on PYTHONPATH.
+        # The stub gcloud, first on PATH; the fake GitHub, first on PYTHONPATH.
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        stub = self.bin / "gsutil"
-        stub.write_text(_GSUTIL_STUB)
+        stub = self.bin / "gcloud"
+        stub.write_text(_GCLOUD_STUB)
         stub.chmod(0o755)
         self.pysite = self.tmp / "pysite"
         self.pysite.mkdir()
@@ -398,7 +399,7 @@ class RevalidationTest(unittest.TestCase):
         return key
 
     def _base_env(self, cur_head, cur_base):
-        self.call_log = self.tmp / "gsutil.calls"
+        self.call_log = self.tmp / "gcloud.calls"
         env = {
             "PULL_NUMBER": _PR,
             "PULL_PULL_SHA": cur_head,
@@ -407,9 +408,9 @@ class RevalidationTest(unittest.TestCase):
             # Unset in the pod that is not this job; a developer's shell may
             # carry one, and the default is what these fixtures name.
             "JOB_NAME": "",
-            "GSUTIL_OBJECT_DIR": str(self.objects),
-            "GSUTIL_LS_DIR": str(self.listings),
-            "GSUTIL_CALL_LOG": str(self.call_log),
+            "GCLOUD_OBJECT_DIR": str(self.objects),
+            "GCLOUD_LS_DIR": str(self.listings),
+            "GCLOUD_CALL_LOG": str(self.call_log),
             "GITHUB_STATUS_DIR": str(self.statuses),
             "GITHUB_REQUEST_LOG": str(self.requests_log),
             "PYTHONPATH": str(self.pysite),
@@ -492,7 +493,7 @@ class RevalidationTest(unittest.TestCase):
     def test_the_history_read_is_scoped_to_this_prs_own_job(self):
         """A wrong PR number, job name or bucket in the history path would
         reuse a FOREIGN verdict while every content assertion still passed;
-        the URLs the script hands gsutil are the load-bearing part."""
+        the URLs the script hands gcloud storage are the load-bearing part."""
         self._plant_history([("200", True, self.c1, self.c3)])
         self._run(cur_head=self.c4, cur_base=self.c2)
         calls = self.call_log.read_text().splitlines()
@@ -1196,7 +1197,7 @@ class RevalidationTest(unittest.TestCase):
 
     def test_a_malformed_pull_refs_is_a_full_run(self):
         """A PULL_REFS whose entries are not <number>:<40-hex> is a full run
-        before any SHA reaches gsutil or git -- a short SHA, a base alone, a
+        before any SHA reaches gcloud storage or git -- a short SHA, a base alone, a
         non-numeric number."""
         self._plant_history([("200", True, self.c1, self.c3)])
         for refs in (
@@ -1224,9 +1225,9 @@ class RevalidationTest(unittest.TestCase):
                 self.assertIn("VERDICT: FULL-RUN", proc.stdout)
                 self.assertIn("PULL_REFS is not <base_ref>:<PULL_BASE_SHA>", proc.stdout)
                 self.assertNotIn("holds a reusable verdict", proc.stdout)
-                # Refused before any SHA reached gsutil (the stub logs every
+                # Refused before any SHA reached gcloud storage (the stub logs every
                 # call) or git (the fixture repo's only reader is the script).
-                self.assertFalse(self.call_log.exists(), "gsutil was called on a refused PULL_REFS")
+                self.assertFalse(self.call_log.exists(), "gcloud storage was called on a refused PULL_REFS")
 
     def test_a_malformed_base_or_head_sha_is_a_full_run(self):
         """PULL_BASE_SHA and PULL_PULL_SHA are held to 40-hex before they can
@@ -1250,7 +1251,7 @@ class RevalidationTest(unittest.TestCase):
                 proc = self._run(cur_head=self.c4, cur_base=self.c2, env_overrides=overrides)
                 self.assertIn("VERDICT: FULL-RUN", proc.stdout)
                 self.assertIn(reason, proc.stdout)
-                self.assertFalse(self.call_log.exists(), "gsutil was called on a malformed SHA")
+                self.assertFalse(self.call_log.exists(), "gcloud storage was called on a malformed SHA")
 
     def test_a_started_json_entry_with_a_ref_suffix_is_read_the_same_way(self):
         """started.json's repos value is the same Refs.String() shape as

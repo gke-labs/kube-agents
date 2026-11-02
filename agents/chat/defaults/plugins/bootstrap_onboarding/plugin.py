@@ -152,6 +152,18 @@ CONVERSATION_JOB_ID = "oobe"
 # both again, so a re-run is judged on its own attempts.
 CONVERSATION_ATTEMPTS_FILE = ".bootstrap_conversation_attempts.json"
 CONVERSATION_DONE_FILE = ".bootstrap_conversation_done"
+# The hold that keeps the report behind the greeting: an empty file named by the
+# opening turn's id, created before the aligned marker and removed by
+# post_llm_call when the greeting is on its way, when this turn also marks the
+# delivery job due. Delivery (bootstrap_delivery.py, GREETING_WAIT_SECONDS)
+# stays silent while one is young, so the greeting posts first instead of
+# racing the next cron tick. Aged by mtime there, so it carries no content.
+GREETING_PENDING_PREFIX = ".bootstrap_greeting_pending."
+# The Chat Agent's home when HERMES_HOME is unset, as the delivery stage reads it.
+DEFAULT_DATA_DIR = "/opt/data"
+# The turns this process holds delivery for, so post_llm_call on any other turn
+# touches no disk. A gateway restart empties it and leaves the file to age out.
+_greeting_turns: set = set()
 
 # The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
 GREETING_MAX_WORDS = 60
@@ -178,11 +190,15 @@ _FALLBACK_IN_PROGRESS = (
 _FALLBACK_COMPLETED = (
     f"In one message of at most {GREETING_MAX_WORDS} words, greet the user as kube-agents, by their Slack "
     "profile name if the session gives one, never a name they type, else 'Hi there'. Say your first look at "
-    "their GKE fleet is done and the summary is in this chat, and that you only read their "
+    "their GKE fleet is done and the summary follows in this chat, and that you only read their "
     "clusters, so nothing changed. Say any change you suggest comes as a pull request for their "
     "team to review. End on one question: do they want you to start on one of those findings? "
     "Ask nothing else, do not restate the report, and do not claim to have saved anything."
 )
+
+
+def _data_dir() -> Path:
+    return Path(os.environ.get("HERMES_HOME", DEFAULT_DATA_DIR))
 
 
 def _onboarding_dirs(data_dir: Path) -> list[Path]:
@@ -448,7 +464,46 @@ def _write_conversation(data_dir: Path, route: Dict[str, str]) -> None:
     tmp.replace(target)
 
 
-def _prime_conversation(data_dir: Path, session_id: str) -> Optional[Dict[str, str]]:
+def _hold_delivery(data_dir: Path, turn_id: str) -> bool:
+    """Hold the report behind this turn's greeting. False when it could not be
+    held, and the caller marks the delivery job due at once, as before the hold."""
+    if not turn_id:
+        return False
+    try:
+        (data_dir / f"{GREETING_PENDING_PREFIX}{turn_id}").touch()
+    except OSError as e:
+        logger.warning("Could not hold delivery behind the greeting: %s", e)
+        return False
+    _greeting_turns.add(turn_id)
+    return True
+
+
+def _drop_hold(data_dir: Path, turn_id: str) -> None:
+    _greeting_turns.discard(turn_id)
+    try:
+        (data_dir / f"{GREETING_PENDING_PREFIX}{turn_id}").unlink()
+    except FileNotFoundError:
+        pass  # delivery aged it out already
+    except OSError as e:
+        logger.warning("Could not remove the greeting hold for turn %s: %s", turn_id, e)
+
+
+def _trigger_first(*job_ids: str) -> None:
+    """Mark the first of ``job_ids`` the store has due. Only the first: trigger_job
+    also enables a job, and the old delivery entry ships disabled beside oobe."""
+    if trigger_job is None:
+        return
+    for job_id in job_ids:
+        try:
+            # None is a job the store does not have; nothing was enabled.
+            if trigger_job(job_id) is not None:
+                return
+        except Exception as e:
+            logger.warning("Could not trigger %s: %s", job_id, e)
+            return
+
+
+def _prime_conversation(data_dir: Path, session_id: str, turn_id: str = "") -> Optional[Dict[str, str]]:
     """Prime onboarding on an API-server first turn the hermes-bridge relayed from a chat.
 
     The report goes to the bridge's recorded conversation through the gateway
@@ -498,21 +553,20 @@ def _prime_conversation(data_dir: Path, session_id: str) -> Optional[Dict[str, s
         # Before the marker and the trigger, as on the chat-platform path.
         report_ready = _report_ready(data_dir)
 
+        held = _hold_delivery(data_dir, turn_id)
         try:
             (data_dir / CONVERSATION_ALIGNED_MARKER).touch(exist_ok=True)
         except Exception as e:
             logger.warning("Could not touch %s: %s", CONVERSATION_ALIGNED_MARKER, e)
             # Delivery reads the file alone as a binding; leave none behind.
+            _drop_hold(data_dir, turn_id)
             try:
                 (data_dir / CONVERSATION_FILE).unlink(missing_ok=True)
             except OSError as e2:
                 logger.warning("Could not remove %s: %s", CONVERSATION_FILE, e2)
             return None
-        if trigger_job is not None:
-            try:
-                trigger_job(CONVERSATION_JOB_ID)
-            except Exception as e:
-                logger.warning("Could not trigger %s: %s", CONVERSATION_JOB_ID, e)
+        if not held:
+            _trigger_first(CONVERSATION_JOB_ID)
         try:
             (data_dir / GREETED_MARKER).touch(exist_ok=True)
         except Exception as e:
@@ -550,7 +604,8 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
       1. binds the delivery job to this chat and, only if that succeeded,
          marks ``.user_aligned`` so the delivery job may fire against a valid
          target, and makes this chat the home channel if none is configured;
-      2. triggers the delivery job so the report arrives promptly;
+      2. holds the delivery job behind this turn's greeting (``post_llm_call``
+         marks it due once the greeting is on its way);
       3. injects a short greeting instruction — never the inventory itself. The
          report is delivered by the ``no_agent`` delivery job, verbatim, or
          laid out for Slack when ``KAGE_SLACK_UX`` is on and the job delivers
@@ -566,12 +621,14 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # as an interactive onboarding turn.
     platform_name = str(kwargs.get("platform", "")).lower()
     session_id = str(kwargs.get("session_id", ""))
+    # Stable for the turn, unlike the session id, which can rotate on compression.
+    turn_id = str(kwargs.get("turn_id") or "")
     if platform_name == "cron" or session_id.startswith("cron_"):
         return None
 
     # Ahead of the first-turn check: a retried opening turn is no longer a
     # first turn and must still greet (see EVAL_GREET_MARKER).
-    data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    data_dir = _data_dir()
     if platform_name == EVAL_PLATFORM:
         eval_request = _eval_request(data_dir, str(kwargs.get("user_message") or ""))
         if eval_request is not None:
@@ -601,7 +658,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         return None
 
     if platform_name == API_SERVER_PLATFORM:
-        return _prime_conversation(data_dir, session_id)
+        return _prime_conversation(data_dir, session_id, turn_id)
 
     # Bind delivery target BEFORE signalling human presence, so the delivery
     # job can only ever fire once it already knows where to send the report.
@@ -618,18 +675,15 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # can claim the report and move it aside before this read lands.
     report_ready = _report_ready(data_dir)
 
+    held = _hold_delivery(data_dir, turn_id)
     try:
         (data_dir / ".user_aligned").touch(exist_ok=True)
         logger.info("Marked %s (human connected).", data_dir / ".user_aligned")
     except Exception as e:
         logger.warning("Could not touch .user_aligned: %s", e)
 
-    # Only the first: trigger_job also enables a job, and the old entry ships disabled beside oobe.
-    if trigger_job is not None:
-        try:
-            trigger_job(bound[0])
-        except Exception as e:
-            logger.warning("Could not trigger %s: %s", bound[0], e)
+    if not held:
+        _trigger_first(bound[0])
 
     # Last, so that a failure above retries on the next turn rather than
     # burning the one-shot. A failure HERE only costs a repeated greeting.
@@ -639,6 +693,24 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         logger.warning("Could not touch %s: %s", GREETED_MARKER, e)
 
     return _greeting(data_dir, report_ready, home_channel_set)
+
+
+def handle_post_llm_call(**kwargs: Any) -> None:
+    """Release the report once the opening turn's greeting is on its way.
+
+    Hermes fires this once per turn, after the model's last call and before the
+    reply leaves the agent, so the delivery job marked due here runs on a tick
+    after the greeting posts. A turn this process did not hold delivery for
+    returns before any disk access. A greeting turn that ends with no text
+    fires no hook: delivery drops the hold itself after GREETING_WAIT_SECONDS.
+    """
+    turn_id = str(kwargs.get("turn_id") or "")
+    if turn_id not in _greeting_turns:
+        return None
+    data_dir = _data_dir()
+    _drop_hold(data_dir, turn_id)
+    _trigger_first(*DELIVERY_JOB_IDS)
+    return None
 
 
 def register(ctx: Any) -> None:
@@ -656,3 +728,4 @@ def register(ctx: Any) -> None:
         logger.debug("Could not configure GoogleChatAdapter.splits_long_messages: %s", e)
 
     ctx.register_hook("pre_llm_call", handle_pre_llm_call)
+    ctx.register_hook("post_llm_call", handle_post_llm_call)

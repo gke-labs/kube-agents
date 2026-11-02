@@ -41,6 +41,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 )
 
 func TestToTriageEvent(t *testing.T) {
@@ -835,6 +836,55 @@ func TestHandleWatchError_ForbiddenAfterSyncIsHeld(t *testing.T) {
 	w.watchEstablished()
 	if got, want := rec.snapshot(), []bool{true, false, true}; !equalBools(got, want) {
 		t.Errorf("transitions after the watch succeeded again = %v; want %v", got, want)
+	}
+}
+
+// A list or watch that fails for any other reason is client-go's to retry,
+// and nothing is held; but the caller is told the cluster is not delivering,
+// as it is for a hold, until a watch succeeds again.
+func TestHandleWatchError_OtherErrorAfterSyncReportsDownUntilTheWatchReturns(t *testing.T) {
+	logs := captureLog(t)
+	w := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "flaky"})
+	w.forbiddenHold = time.Hour
+	rec := &transitionRecorder{}
+	w.onWatching = func(watching bool) { rec.record(watching) }
+	w.markSynced()
+	// A real reflector, because the non-403 path hands the error to client-go's
+	// default handler, which reads it.
+	r := cache.NewReflector(w.newListWatch(), &corev1.Event{}, cache.NewStore(cache.MetaNamespaceKeyFunc), 0)
+
+	start := time.Now()
+	w.handleWatchError(context.Background(), r, apierrors.NewInternalError(errors.New("etcd unavailable")))
+	if time.Since(start) >= time.Second {
+		t.Errorf("a non-403 error held the handler; it must return to client-go's backoff at once")
+	}
+	if got, want := rec.snapshot(), []bool{true, false}; !equalBools(got, want) {
+		t.Fatalf("transitions after the error = %v; want %v", got, want)
+	}
+	if strings.Contains(logs.String(), "forbidden, holding") {
+		t.Errorf("a non-403 error must not be logged as a hold:\n%s", logs.String())
+	}
+	w.handleWatchError(context.Background(), r, apierrors.NewInternalError(errors.New("still")))
+	if got, want := rec.snapshot(), []bool{true, false}; !equalBools(got, want) {
+		t.Errorf("a second error reported again = %v; want %v", got, want)
+	}
+	w.watchEstablished()
+	if got, want := rec.snapshot(), []bool{true, false, true}; !equalBools(got, want) {
+		t.Errorf("transitions after the watch returned = %v; want %v", got, want)
+	}
+	// A failure before the sync is reported at the sync, as a hold is.
+	w2 := newWatcher(fake.NewClientset(), nopDispatcher{}, targetCluster{Name: "early"})
+	rec2 := &transitionRecorder{}
+	w2.onWatching = func(watching bool) { rec2.record(watching) }
+	w2.handleWatchError(context.Background(), cache.NewReflector(w2.newListWatch(), &corev1.Event{}, cache.NewStore(cache.MetaNamespaceKeyFunc), 0), apierrors.NewInternalError(errors.New("early")))
+	w2.markSynced()
+	if got, want := rec2.snapshot(), []bool{true, false}; !equalBools(got, want) {
+		t.Errorf("transitions for an error before the sync = %v; want %v", got, want)
+	}
+	w2.listCompleted()
+	w2.watchEstablished()
+	if got, want := rec2.snapshot(), []bool{true, false, true}; !equalBools(got, want) {
+		t.Errorf("transitions after the list and watch succeeded = %v; want %v", got, want)
 	}
 }
 

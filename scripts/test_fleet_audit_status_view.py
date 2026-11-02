@@ -717,6 +717,11 @@ class TestRender(unittest.TestCase):
         text, style = view.status_cell(doc, {"status": audit_report.NO_FORGE_STATUS})
         self.assertEqual((text, style), (audit_report.NO_FORGE_STATUS, "yellow"))
 
+    def test_a_store_ledger_run_is_a_known_outcome(self):
+        doc = stream(liveness="completed")
+        text, style = view.status_cell(doc, {"status": audit_report.STORE_LEDGER_STATUS})
+        self.assertEqual((text, style), (audit_report.STORE_LEDGER_STATUS, "cyan"))
+
     def test_a_stream_error_reaches_the_status_cell(self):
         doc = stream(liveness="error", error="latest.json: not a JSON object")
         out = self.render({"compliance-audit": doc})

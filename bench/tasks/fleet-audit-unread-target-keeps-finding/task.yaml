@@ -1,0 +1,138 @@
+# NIGHTLY-TIER, registered on landing in hack/eval/nightly-cases.txt: the
+# default home for a new case. A full drift audit, tofu-provisioned, the same
+# cost band as consistency-no-environment-label.
+#
+# WHAT THIS GRADES. A findings run over a coverage gap writes the ledger body
+# again from its own document. A previous finding on a target that the run
+# did not check must stay on the ledger, with its id in the hidden block, as a
+# held row under "Not re-checked this run" (`unread_held_entries` in
+# audit_report.py). Without that, the finding goes off the ledger: the next
+# complete run calls it new if it is still there, and never calls it resolved
+# if somebody fixed it during the gap.
+#
+# THE PLANT (prebuilt/unread-target-ledger). The stack opens one
+# fleet-consistency-drift ledger with one `label-keys` finding on the
+# install's host cluster, on an invented object (`Cluster/eval-unread-held`),
+# and writes the stored record of that ledger, both from the shell sandbox
+# with audit_report's own functions. The host cluster carries no environment
+# label (see consistency-no-environment-label), so the drift collector puts it
+# in no cohort and compares it on no facet: only `no-environment-label` runs
+# there, and its `limitations` sentence is a coverage gap. A run that files
+# a finding takes the findings branch and writes the body again. On a
+# project with the seeded fleet the planted drift outlier is such a finding
+# (the fixture below). `no-environment-label` files the host itself only when
+# two or more labelled peers share the host's mode (`joinable_for_cluster`
+# in fleet_drift.py), so the grade does not ask for that finding.
+# `label-keys` is a cluster-level facet, so the collector does not declare
+# it not applicable on the host in either mode.
+# No collector emits the invented object, so only a held row can keep its id.
+#
+# THE GRADE. `ledger_issue_contains` on `finding_ids` reads the hidden id
+# block of the ledger that the report cites. The body is the one this run's
+# `finish` wrote, so the default clock-skew window holds. The held-row
+# objective shows that this run wrote it: only the held-row renderer writes
+# its line, and the stack's body has no held row.
+#
+# Eval-driven development (.agents/rules/eval_driven_development.md): red on
+# main, where the body is written from the run's document alone and the
+# seeded id goes out of the block ("required phrases absent" on
+# the-seeded-finding-stays-in-the-ledger-id-block); green once the run keeps
+# it as a held row.
+#
+# Ways the case breaks without the change being wrong, each reported as a
+# failure of the fleet or the run rather than as a red:
+#   -- the host is compared on its facets. Three or more unlabelled Standard
+#      clusters older than 24h in the project put the host in a cohort that
+#      reaches the floor (consistency-no-environment-label's header has the
+#      arithmetic); `label-keys` then runs on the host, the finding is gone,
+#      and the change correctly does not keep it.
+#   -- the run files no finding at all. The clean branch then keeps the
+#      stack's body as it is, and the held-row objective fails.
+#   -- the run writes the seeded finding into its own document. That is a
+#      false green on main, not a red.
+#   -- the drift collector spells the host target other than
+#      `<project>/<location>/<name>`, or the harness passes a location that
+#      differs from the cluster list's. The seeded row then names a target
+#      the run does not know, and nothing keeps it.
+#
+# Isolation class: read-only cluster sweep, GitOps-repo write (the ledger, the
+# same throwaway-repo terms as every audit case).
+id: fleet-audit-unread-target-keeps-finding
+name: A drift run over a gap keeps the previous finding on the cluster it did not compare
+prompt: >-
+  Run the fleet consistency drift audit, following the fleet-consistency-drift
+  SOP.
+expected_output: >-
+  The audit files its findings on the drift ledger. The run cannot compare the
+  host cluster, which has no environment label, so the run is partial. The
+  previous label-keys finding on the host cluster stays on the ledger under
+  "Not re-checked this run", with its id in the hidden block, and is not
+  reported as resolved. The closing response is the SOP's one line, carrying
+  the ledger URL in full.
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/unread-target-ledger"
+  teardown: true
+  # host_cluster_* arrive from the environment (TF_VAR_host_cluster_name /
+  # TF_VAR_host_cluster_location, exported by hack/ci-eval-pr.sh).
+
+validated: false
+
+# Slug per docs/designs/domains.yaml: the SOP-machinery domain. The stack
+# plants the ledger; no seeded-fleet defect domain claims it.
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: dshnayder
+
+# The stack plants everything this case asserts on, and the gap is the host
+# cluster's, which is the install and not a fixture. The run needs one
+# finding to write the body again, and on the seeded fleet the drift outlier
+# gives it; no check reads the fixture itself.
+fixtures: [drift-outlier]
+
+verification_spec:
+  # The id is "label-keys.<host target>._.cluster-eval-unread-held". The
+  # object segment is the last one, and `_shorten_id` keeps its start when a
+  # long project id clips the cluster segment, so the invented name is in the
+  # id whatever the project. No collector emits that object, so the id is in
+  # the block only when the run kept the seeded finding.
+  - name: the-seeded-finding-stays-in-the-ledger-id-block
+    role: objective
+    # assert: the ledger is written once, at `finish`.
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: finding_ids
+      required_phrases: ["eval-unread-held"]
+  # The row says why it is held. Only the held-row renderer writes this line,
+  # with the facet and the host target in it. The stack's body has no held
+  # row, so this check also refuses a clean run that left that body as it is,
+  # even when its footer stamp falls inside the default clock-skew window.
+  - name: the-held-row-says-the-facet-did-not-run
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: fleet-consistency-drift
+      scope: body
+      required_phrases: ["- **Not re-checked:** `label-keys` did not run on"]
+  # The audit reads the fleet and changes nothing. Labelling the host would
+  # also put it in a cohort, so a run that "fixes" the gap destroys what the
+  # case grades on later repetitions. The check reads each command as an argv,
+  # so it matches a real `gcloud … container clusters update`, also behind
+  # `cd x &&`, an exec wrapper, `bash -c` or `$(…)`. It does not match the same
+  # words in a quoted string: hermes writes a multi-line command on one log
+  # line, so a recommendation in a `python3 -c` body or a heredoc is text on
+  # the line of its first command.
+  - name: the-audit-changed-no-cluster
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_runs:
+        - script: gcloud
+          word_patterns: ["^container$", "^clusters$", "^update$"]

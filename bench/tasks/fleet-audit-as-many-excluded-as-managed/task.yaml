@@ -1,0 +1,75 @@
+# Domain: fleet audits. Journey: ask for a fleet audit on an install whose
+# spec.scope.exclude.clusters names as many clusters as it manages; the audit
+# must run on the managed clusters, not cancel (#3933).
+#
+# The runner excludes slots b and d for this case's repetitions alone, plus one
+# cluster that does not exist, named like the seeded ones (scope_exclude,
+# absent: 1). On a pool install that manages the host cluster and four seeded
+# clusters, that leaves three managed (the host, seeded-a, seeded-c) against
+# three excluded, with names alike, the shape the harness saw.
+#
+# Not reproduced on demand: on the #3753 harness install (8 excluded, 8
+# managed) two of three fleet audits answered that "all 8 managed clusters are
+# explicitly excluded" and cancelled; three runs on main on a dev install with
+# 8 excluded and 8 managed did not cancel (#3933). The nightly keeps measuring
+# it; a fix waits for a red here.
+#
+# THE PROMPT names one stream and its SOP, so the skill routes it to form 1
+# (fleet-audit references/on-demand.md): the session runs the audit itself, and
+# its outcome is in the report store before grading. The harness's prompt asked
+# for every audit, which form 2 answers by triggering cron runs that finish
+# after the objectives are read, so a cancel inside one could not be seen. The
+# misread is in the same step either way: every audit SOP starts from the
+# fleet_scope read ("the fleet is its projects, less every cluster it lists in
+# excluded_clusters").
+#
+# THE OBJECTIVES: a compliance-audit report that finished after the run
+# started is in the report store and carries the debug-binding finding, which
+# the rbac-overgrant fixture plants on slot a, a managed cluster here; and the
+# worker ran `audit_report.py start` for the stream. A cancel, before or after
+# `start`, leaves no fresh report; an audit that read every managed cluster as
+# excluded and swept nothing stores one without that finding. No check reads
+# the answer's wording: a negated sentence ("none of the managed clusters are
+# excluded") would match any such pattern on a correct answer.
+#
+# READ A RED before counting it as #3933 evidence. #3933 is an answer that
+# cancels because it reads the managed clusters as excluded. A red with no
+# such claim is another failure: for example a worker that answers "queued for
+# the next cron tick" without running anything (#4258).
+id: fleet-audit-as-many-excluded-as-managed
+name: A fleet audit runs when as many clusters are excluded as are managed
+prompt: >-
+  Run the security and RBAC posture audit across every cluster you manage,
+  following the compliance-audit SOP, and report the result.
+expected_output: >-
+  The compliance audit runs on the clusters the install manages: the worker
+  starts and finishes the stream and reports its ledger. It does not cancel, and
+  it does not say the managed clusters are excluded; where it names the excluded
+  clusters, it says they were not checked.
+infrastructure:
+  deployer: noop
+scope_exclude: { slots: [b, d], absent: 1 }
+audit_streams: [compliance-audit]
+fixtures: [rbac-overgrant]
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: fleet-audits
+
+verification_spec:
+  - name: the-report-store-holds-this-run
+    role: objective
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: compliance-audit
+      required_finding_phrases: ["debug-binding"]
+  - name: the-audit-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: audit_report.py
+          flags: [start]
+          word_patterns: ["(?:^|=)compliance-audit$"]

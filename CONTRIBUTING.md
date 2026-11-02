@@ -19,8 +19,8 @@ This project follows
 ## Code review
 
 All submissions, including from project members, require review through GitHub pull requests.
-Nobody merges by hand: Prow squash-merges a pull request once a reviewer's `lgtm` and an `OWNERS`
-approver's `approved` are both on it and the required checks are green.
+Nobody merges by hand: the GitHub merge queue squash-merges a pull request once a reviewer's `lgtm`
+and an `OWNERS` approver's `approved` are both on it and the required checks are green.
 [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges) has the
 mechanics, including what a pull request is waiting for when it sits unmerged.
 

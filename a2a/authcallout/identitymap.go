@@ -101,6 +101,13 @@ type Identity struct {
 	// profile's own spelling; the callout composes the subjects (see
 	// profile_narrowing.go). Set only with that narrowing.
 	Topics *TopicGrants `json:"topics,omitempty"`
+
+	// Tier is the tier a NarrowingProfile entry's pods run at (#3655): the
+	// operator renders one ServiceAccount and one entry per (profile, tier),
+	// so a pod's tier is its identity's. Set only with that narrowing.
+	// Optional while an operator from before per-tier identities can still
+	// render the map; when set it must be a known tier.
+	Tier string `json:"tier,omitempty"`
 }
 
 // IdentityMap is what the operator renders and the callout serves. Version is
@@ -210,7 +217,7 @@ func (id Identity) validate() error {
 	// The profile fields mean something only under NarrowingProfile. On any
 	// other entry they would be read by nothing, and a field the callout
 	// silently ignores is a grant someone believes exists.
-	if id.Narrowing != NarrowingProfile && (id.Profile != "" || id.Topics != nil) {
+	if id.Narrowing != NarrowingProfile && (id.Profile != "" || id.Topics != nil || id.Tier != "") {
 		return fmt.Errorf("user %q carries profile or topics but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingProfile)
 	}
 	switch id.Narrowing {

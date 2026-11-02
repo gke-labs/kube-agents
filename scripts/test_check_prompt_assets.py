@@ -524,6 +524,48 @@ class SyntheticProfileTests(unittest.TestCase):
                     findings = cpa.check_cron_risk()
                 self.assertEqual([], findings)
 
+
+    def test_model_run_cron_job_without_max_turns_is_reported(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": "run it", "risk": "low"}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            findings = cpa.check_cron_max_turns()
+        self.assertEqual(["cron-max-turns"], [f.rule for f in findings])
+        self.assertIn("has max_turns=None", findings[0].message)
+
+    def test_cron_job_max_turns_hermes_would_read_as_unlimited_is_reported(self):
+        for value in ("0", "-1", "true", '"250"', "null"):
+            with self.subTest(value=value):
+                self.fixture.write(
+                    "agents/platform/cron/jobs.json",
+                    '{"jobs": [{"id": "audit", "prompt": "run it", "risk": "low", '
+                    f'"max_turns": {value}}}]}}',
+                )
+                with mock.patch.object(cpa, "REPO", self.fixture.root):
+                    findings = cpa.check_cron_max_turns()
+                self.assertEqual(["cron-max-turns"], [f.rule for f in findings])
+
+    def test_no_agent_cron_job_with_max_turns_is_reported(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "sweep", "prompt": "", "risk": "low", "no_agent": true, '
+            '"script": "sweep.py", "max_turns": 90}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            findings = cpa.check_cron_max_turns()
+        self.assertEqual(["cron-max-turns"], [f.rule for f in findings])
+        self.assertIn("is no_agent", findings[0].message)
+
+    def test_cron_jobs_with_a_declared_budget_pass(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": "run it", "risk": "low", "max_turns": 250}, '
+            '{"id": "sweep", "prompt": "", "risk": "low", "no_agent": true, "script": "s.py"}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            self.assertEqual([], cpa.check_cron_max_turns())
     def test_cron_job_with_medium_risk_is_reported(self):
         self.fixture.write(
             "agents/platform/cron/jobs.json",
@@ -857,6 +899,18 @@ class ResolutionModelTests(unittest.TestCase):
             set(re.findall(r'"([^"]+)"', declared.group(1))),
             set(cpa.PROFILE_HOME_ITEMS["cluster"]),
             "cluster home model has drifted from cluster_agent_profile.py",
+        )
+
+        optional_items = re.search(r'OPTIONAL_SYNC_ITEMS="([^"]+)"', entrypoint)
+        self.assertIsNotNone(optional_items, "OPTIONAL_SYNC_ITEMS moved or changed shape")
+        self.assertEqual(
+            set(optional_items.group(1).split()) | {"skills", "scripts"},
+            set(cpa.PROFILE_HOME_ITEMS["tse"]),
+            "tse home model has drifted from docker-entrypoint.sh OPTIONAL_SYNC_ITEMS",
+        )
+        self.assertIn(
+            'ln -sfn "$TARGET_DIR/scripts" "$_opt_home/scripts"',
+            entrypoint,
         )
 
 

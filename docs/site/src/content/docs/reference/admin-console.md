@@ -2,7 +2,7 @@
 title: Admin console
 description: The Kube Agents Console, a local Streamlit prototype started from a repository checkout that chats with the agent, browses its activity, and shows the inference gateway's status. The install does not deploy it.
 sidebar:
-  order: 9
+  order: 10
 ---
 
 The Kube Agents Console is a web interface for one operator's machine. `./scripts/admin_portal.sh` starts it from a repository checkout; it listens on loopback only, and the gcloud login the launcher verifies is its authentication boundary. It is a prototype: the install does not deploy it, and nothing reaches it from another machine. [`admin_console/README.md`](https://github.com/gke-labs/kube-agents/blob/main/admin_console/README.md) is the operating guide and [`docs/designs/admin-console.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/admin-console.md) the design of record; this page is the summary, and the README is canonical where the two differ.

@@ -4,347 +4,294 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
-	"os"
-	"strings"
+	"net/url"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
-type contextKey int
-
 const (
-	clusterIDContextKey contextKey = iota
-	requestInfoContextKey
-	callerWantsPartialContextKey
+	authFailedMessage      = messagePrefix + "caller authentication failed"
+	authUnavailableMessage = messagePrefix + "caller authentication is unavailable; retry"
+	unclassifiedMessage    = messagePrefix + "the request path could not be classified"
+	upstreamFailed         = "kube-proxy could not reach cluster %q"
+
+	// flushImmediately streams each upstream write to the caller, which watch and log
+	// follow need.
+	flushImmediately = -1
+
+	// HealthzPath is the unauthenticated health probe path for the proxy itself.
+	HealthzPath = "/_kube_proxy/healthz"
 )
 
-// NewHandler constructs the Kubernetes API proxy HTTP handler.
+// Config configures NewHandler.
+type Config struct {
+	// Authenticator verifies the caller of each request. Required.
+	Authenticator CallerAuthenticator
+	// Upstream forwards an approved request to its target cluster. Required.
+	Upstream UpstreamTransport
+	// DefaultClusterID is the cluster used when the request path does not start with
+	// /clusters/{id}; InClusterID when empty.
+	DefaultClusterID string
+	// Policy decides which requests are forwarded. Its Mode must be set.
+	Policy Policy
+	// Audit receives an AuditEvent for every request; NewSlogAuditSink(Logger) when nil.
+	Audit AuditSink
+	// Logger receives the reverse proxy's own errors, such as a response body that failed to
+	// copy; slog.Default() when nil.
+	Logger *slog.Logger
+	// Metrics records Prometheus metrics for requests, rejections, and Secret redactions; optional.
+	Metrics *Metrics
+	// TracerProvider emits OpenTelemetry server and upstream client spans; optional.
+	TracerProvider trace.TracerProvider
+}
+
+// auditEventKey carries the request's *AuditEvent to the transport and the error handler.
+type auditEventKey struct{}
+
+type handler struct {
+	authenticator    CallerAuthenticator
+	defaultClusterID string
+	policy           Policy
+	audit            AuditSink
+	metrics          *Metrics
+	tracerProvider   trace.TracerProvider
+	factory          *request.RequestInfoFactory
+	proxy            *httputil.ReverseProxy
+}
+
+// NewHandler returns an http.Handler that authenticates the caller, resolves the target
+// cluster from the path, evaluates cfg.Policy against the API server's classification of the
+// request, strips caller credentials and identity headers, and forwards the request through
+// cfg.Upstream.
 func NewHandler(cfg Config) (http.Handler, error) {
-	if cfg.Upstream == nil {
-		return nil, errors.New("k8sapiproxy: Config.Upstream is required")
-	}
 	if cfg.Authenticator == nil {
 		return nil, errors.New("k8sapiproxy: Config.Authenticator is required")
 	}
-	mode, err := ParseMode(string(cfg.Mode))
-	if err != nil {
-		return nil, err
+	if cfg.Upstream == nil {
+		return nil, errors.New("k8sapiproxy: Config.Upstream is required")
 	}
-	defaultCluster := cfg.DefaultClusterID
-	if defaultCluster == "" {
-		defaultCluster = "in-cluster"
+	if !cfg.Policy.Mode.valid() {
+		return nil, fmt.Errorf("k8sapiproxy: invalid Config.Policy.Mode %q", cfg.Policy.Mode)
+	}
+	if cfg.DefaultClusterID != "" && !validClusterID.MatchString(cfg.DefaultClusterID) {
+		return nil, fmt.Errorf("k8sapiproxy: invalid Config.DefaultClusterID %q", cfg.DefaultClusterID)
 	}
 
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	audit := cfg.Audit
+	if audit == nil {
+		audit = NewSlogAuditSink(logger)
+	}
+
+	upstream := cfg.Upstream
 	metrics := cfg.Metrics
-	if metrics == nil {
-		metrics = NewMetrics()
-	}
-
-	auditSink := cfg.AuditSink
-	if auditSink == nil {
-		auditSink = NewJSONAuditSink(os.Stdout)
-	}
-
-	factory := NewRequestInfoFactory()
-
-	h := &proxyHandler{
-		authenticator:            cfg.Authenticator,
-		upstream:                 cfg.Upstream,
-		defaultClusterID:         defaultCluster,
-		mode:                     mode,
-		redactSecrets:            cfg.RedactSecrets,
-		allowUpgradeSubresources: cfg.AllowUpgradeSubresources,
-		metrics:                  metrics,
-		tracerProvider:           cfg.TracerProvider,
-		auditSink:                auditSink,
-		factory:                  factory,
-	}
-
-	h.reverseProxy = &httputil.ReverseProxy{
-		FlushInterval: -1,
-		Director: func(req *http.Request) {
-			if req.URL.Scheme == "" {
-				req.URL.Scheme = "https"
-			}
-			if req.URL.Host == "" {
-				req.URL.Host = "kubernetes.default.svc"
-			}
+	tp := cfg.TracerProvider
+	return &handler{
+		authenticator:    cfg.Authenticator,
+		defaultClusterID: cfg.DefaultClusterID,
+		policy:           cfg.Policy,
+		audit:            audit,
+		metrics:          metrics,
+		tracerProvider:   tp,
+		factory:          NewRequestInfoFactory(),
+		proxy: &httputil.ReverseProxy{
+			// Rewrite rather than Director: the reverse proxy then also drops the caller's
+			// Forwarded, X-Forwarded-For, X-Forwarded-Host and X-Forwarded-Proto headers. The
+			// outbound URL keeps only the path and query, so a scheme, host or userinfo from an
+			// absolute-form request URI never reaches the transport.
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				pr.Out.Host = ""
+				pr.Out.URL = &url.URL{Path: pr.In.URL.Path, RawQuery: pr.In.URL.RawQuery}
+			},
+			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				ev := eventFrom(req)
+				upCtx, upSpan := startUpstreamSpan(req.Context(), tp, ev.ClusterID, req.Method)
+				defer upSpan.End()
+				resp, err := upstream.RoundTripCluster(upCtx, ev.ClusterID, req.WithContext(upCtx))
+				// Redacting here rather than in ModifyResponse keeps the plan off resp.Request,
+				// which a transport may replace with a request of its own.
+				if plan, ok := req.Context().Value(secretRedactionKey{}).(*secretRedaction); ok && resp != nil {
+					redactSecretResponse(resp, plan)
+					metrics.recordSecretRedaction(SecretActionPayloadScrubbed)
+				}
+				return resp, err
+			}),
+			FlushInterval: flushImmediately,
+			// The transport's error goes to the audit event, not to the caller: it can name
+			// the upstream endpoint.
+			ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+				ev := eventFrom(req)
+				ev.Err = err
+				switch {
+				case req.Context().Err() != nil:
+					ev.Outcome = OutcomeCanceled
+				case isHijacked(w):
+					// The upgrade failed after the connection was handed over, so there is no
+					// response left to write.
+					ev.Outcome = OutcomeAborted
+					return
+				default:
+					ev.Outcome = OutcomeUpstreamError
+				}
+				writeStatus(w, http.StatusBadGateway, metav1.StatusReasonInternalError,
+					fmt.Sprintf(upstreamFailed, ev.ClusterID))
+			},
+			ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
 		},
-		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			clusterID, _ := req.Context().Value(clusterIDContextKey).(string)
-			upCtx, upSpan := startUpstreamSpan(req.Context(), h.tracerProvider, clusterID, req.Method)
-			defer upSpan.End()
-
-			resp, err := h.upstream.RoundTripCluster(upCtx, clusterID, req.WithContext(upCtx))
-			if err != nil {
-				upSpan.RecordError(err)
-				upSpan.SetStatus(codes.Error, err.Error())
-				return nil, err
-			}
-			upSpan.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
-			if resp.StatusCode >= http.StatusInternalServerError {
-				upSpan.SetStatus(codes.Error, http.StatusText(resp.StatusCode))
-			} else {
-				upSpan.SetStatus(codes.Ok, "")
-			}
-			return resp, nil
-		}),
-		ModifyResponse: func(resp *http.Response) error {
-			if !h.redactSecrets {
-				return nil
-			}
-			info, _ := resp.Request.Context().Value(requestInfoContextKey).(*request.RequestInfo)
-			if IsCoreV1Secret(info) {
-				callerWantsPartial, _ := resp.Request.Context().Value(callerWantsPartialContextKey).(bool)
-				ScrubSecretResponse(resp, info, callerWantsPartial)
-				h.metrics.recordSecretRedaction(SecretActionPayloadScrubbed)
-			}
-			return nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-			WriteStatusError(
-				w,
-				http.StatusBadGateway,
-				metav1.StatusReasonInternalError,
-				fmt.Sprintf("kube-proxy upstream transport error: %v", err),
-			)
-		},
-	}
-
-	return h, nil
+	}, nil
 }
 
-type proxyHandler struct {
-	authenticator            CallerAuthenticator
-	upstream                 UpstreamTransport
-	defaultClusterID         string
-	mode                     Mode
-	redactSecrets            bool
-	allowUpgradeSubresources bool
-	metrics                  *Metrics
-	tracerProvider           trace.TracerProvider
-	auditSink                AuditSink
-	factory                  *request.RequestInfoFactory
-	reverseProxy             *httputil.ReverseProxy
-}
-
-func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	if r.URL.Path == "/_kube_proxy/healthz" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == HealthzPath {
+		h.metrics.recordRequest("healthz", "healthz", "none", h.policy.Mode, false, OutcomeAllowed, http.StatusOK, 0)
+		w.Header().Set(headerContentType, contentTypeJSON)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-		h.metrics.recordRequest("healthz", "healthz", metricsLabelNone, h.mode, false, OutcomeAllowed, http.StatusOK, time.Since(start))
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 		return
 	}
 
+	start := time.Now()
 	h.metrics.incInFlight()
-	defer h.metrics.decInFlight()
+	rCtx, span := startRequestSpan(h.tracerProvider, r, h.policy.Mode)
+	r = r.WithContext(rCtx)
+	rec := &statusRecorder{ResponseWriter: w}
+	ev := &AuditEvent{HTTPMethod: r.Method, Path: r.URL.Path, UserAgent: r.UserAgent()}
+	var info *request.RequestInfo
+	defer func() {
+		h.metrics.decInFlight()
+		// The reverse proxy panics with http.ErrAbortHandler when a response fails mid-copy;
+		// the event is recorded before the panic carries on to the server.
+		p := recover()
+		switch {
+		case p == nil:
+		case p == http.ErrAbortHandler && r.Context().Err() != nil:
+			ev.Outcome = OutcomeCanceled
+		case p == http.ErrAbortHandler:
+			ev.Outcome = OutcomeAborted
+		default:
+			ev.Err = fmt.Errorf("panic: %v", p)
+		}
+		ev.StatusCode, ev.Duration = rec.code, time.Since(start)
+		h.recordObservability(r, info, ev, span)
+		h.audit.Record(r.Context(), *ev)
+		if p != nil {
+			panic(p)
+		}
+	}()
+	h.serve(rec, r, ev, &info)
+}
 
-	dryRun := HasStrictDryRunAll(r)
-	userAgent := r.UserAgent()
-	spanCtx, span := startRequestSpan(h.tracerProvider, r, h.mode)
-	r = r.WithContext(spanCtx)
+func (h *handler) recordObservability(r *http.Request, info *request.RequestInfo, ev *AuditEvent, span trace.Span) {
+	verbLabel, resLabel, subLabel := ClassifyRequestLabels(r, info)
+	var metricOutcome string
+	var spanReason RejectionReason
+	switch {
+	case ev.Outcome == OutcomeUnauthenticated:
+		metricOutcome = OutcomeRejectedAuth
+		spanReason = ReasonUnauthenticated
+		h.metrics.recordRejection(ReasonUnauthenticated, verbLabel, resLabel, subLabel, h.policy.Mode)
+	case ev.Outcome == OutcomeRefused:
+		if ev.Reason == ReasonInvalidRoute {
+			metricOutcome = OutcomeRejectedRoute
+		} else {
+			metricOutcome = OutcomeRejectedPolicy
+		}
+		spanReason = ev.Reason
+		h.metrics.recordRejection(ev.Reason, verbLabel, resLabel, subLabel, h.policy.Mode)
+	case ev.Outcome == OutcomeUpstreamError || ev.Outcome == OutcomeAborted || ev.StatusCode >= http.StatusInternalServerError:
+		metricOutcome = string(OutcomeUpstreamError)
+	default:
+		metricOutcome = OutcomeAllowed
+	}
+	h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.policy.Mode, ev.DryRun, metricOutcome, ev.StatusCode, ev.Duration)
+	finishRequestSpan(span, metricOutcome, spanReason, ev.StatusCode)
+}
 
+func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, infoOut **request.RequestInfo) {
+	// The authenticator's error goes to the audit event, not to the caller, as the transport's
+	// does: it can describe the proxy's own authentication setup.
 	caller, err := h.authenticator.AuthenticateRequest(r)
+	if errors.Is(err, errAuthenticationUnavailable) {
+		ev.Outcome, ev.Err = OutcomeUnauthenticated, err
+		writeStatus(w, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable, authUnavailableMessage)
+		return
+	}
+	if err != nil || caller == nil {
+		ev.Outcome, ev.Err = OutcomeUnauthenticated, err
+		writeStatus(w, http.StatusUnauthorized, metav1.StatusReasonUnauthorized, authFailedMessage)
+		return
+	}
+	ev.Caller = caller
+
+	clusterID, apiPath, perr := SplitClusterPath(r.URL, h.defaultClusterID)
+	if perr != nil {
+		refuse(w, ev, perr)
+		return
+	}
+	ev.ClusterID, ev.Path = clusterID, apiPath
+
+	out := r.Clone(r.Context())
+	out.URL.Path = apiPath
+	out.URL.RawPath = ""
+
+	info, err := h.factory.NewRequestInfo(out)
 	if err != nil {
-		verbLabel, resLabel, subLabel := ClassifyRequestLabels(r, nil)
-		WriteStatusError(
-			w,
-			http.StatusUnauthorized,
-			metav1.StatusReasonUnauthorized,
-			fmt.Sprintf("kube-proxy caller authentication failed: %v", err),
-		)
-		duration := time.Since(start)
-		h.metrics.recordRejection(ReasonUnauthenticated, verbLabel, resLabel, subLabel, h.mode)
-		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedAuth, http.StatusUnauthorized, duration)
-		finishRequestSpan(span, OutcomeRejectedAuth, ReasonUnauthenticated, http.StatusUnauthorized)
-		logAuditEvent(r.Context(), h.auditSink, auditEntry{
-			httpMethod: r.Method,
-			path:       auditPathForRequest(r, ""),
-			userAgent:  userAgent,
-			mode:       h.mode,
-			dryRun:     dryRun,
-			outcome:    OutcomeRejectedAuth,
-			reason:     ReasonUnauthenticated,
-			statusCode: http.StatusUnauthorized,
-			duration:   duration,
-			span:       span,
-		})
+		ev.Outcome, ev.Reason = OutcomeRefused, ReasonInvalidRoute
+		writeStatus(w, http.StatusBadRequest, metav1.StatusReasonBadRequest, unclassifiedMessage)
+		return
+	}
+	*infoOut = info
+	ev.Verb, ev.APIGroup, ev.APIVersion = info.Verb, info.APIGroup, info.APIVersion
+	ev.Resource, ev.Subresource, ev.Namespace, ev.Name = info.Resource, info.Subresource, info.Namespace, info.Name
+	ev.DryRun = HasStrictDryRunAll(out)
+	secretRedacted := h.policy.RedactSecrets && isCoreV1Secret(info)
+	annotateRequestSpanInfo(trace.SpanFromContext(out.Context()), clusterID, info, ev.DryRun, secretRedacted)
+	if perr := h.policy.Evaluate(out, info); perr != nil {
+		refuse(w, ev, perr)
 		return
 	}
 
-	clusterID, cleanPath, policyErr := NormalizeAndExtractCluster(r.URL.RawPath, r.URL.Path, h.defaultClusterID)
-	if policyErr != nil {
-		verbLabel, resLabel, subLabel := ClassifyRequestLabels(r, nil)
-		WriteStatusError(w, policyErr.Code, policyErr.Reason, policyErr.Message)
-		duration := time.Since(start)
-		h.metrics.recordRejection(policyErr.RejectionReason, verbLabel, resLabel, subLabel, h.mode)
-		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedRoute, policyErr.Code, duration)
-		finishRequestSpan(span, OutcomeRejectedRoute, policyErr.RejectionReason, policyErr.Code)
-		logAuditEvent(r.Context(), h.auditSink, auditEntry{
-			caller:     caller,
-			httpMethod: r.Method,
-			path:       auditPathForRequest(r, ""),
-			userAgent:  userAgent,
-			mode:       h.mode,
-			dryRun:     dryRun,
-			outcome:    OutcomeRejectedRoute,
-			reason:     policyErr.RejectionReason,
-			statusCode: policyErr.Code,
-			duration:   duration,
-			span:       span,
-		})
-		return
-	}
-
-	outReq := r.Clone(r.Context())
-	outReq.URL.Path = cleanPath
-	outReq.URL.RawPath = ""
-
-	info, err := h.factory.NewRequestInfo(outReq)
-	if err != nil {
-		verbLabel, resLabel, subLabel := ClassifyRequestLabels(outReq, nil)
-		WriteStatusError(
-			w,
-			http.StatusBadRequest,
-			metav1.StatusReasonBadRequest,
-			fmt.Sprintf("kube-proxy failed to parse Kubernetes API request path %q: %v", cleanPath, err),
-		)
-		duration := time.Since(start)
-		h.metrics.recordRejection(ReasonInvalidRoute, verbLabel, resLabel, subLabel, h.mode)
-		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedRoute, http.StatusBadRequest, duration)
-		finishRequestSpan(span, OutcomeRejectedRoute, ReasonInvalidRoute, http.StatusBadRequest)
-		logAuditEvent(r.Context(), h.auditSink, auditEntry{
-			caller:     caller,
-			clusterID:  clusterID,
-			httpMethod: r.Method,
-			path:       cleanPath,
-			userAgent:  userAgent,
-			mode:       h.mode,
-			dryRun:     dryRun,
-			outcome:    OutcomeRejectedRoute,
-			reason:     ReasonInvalidRoute,
-			statusCode: http.StatusBadRequest,
-			duration:   duration,
-			span:       span,
-		})
-		return
-	}
-
-	verbLabel, resLabel, subLabel := ClassifyRequestLabels(outReq, info)
-	secretRedacted := h.redactSecrets && IsCoreV1Secret(info)
-	annotateRequestSpanInfo(span, clusterID, info, dryRun, secretRedacted)
-
-	if policyErr := EvaluatePolicyWithOptions(h.mode, h.redactSecrets, h.allowUpgradeSubresources, outReq, info); policyErr != nil {
-		WriteStatusError(w, policyErr.Code, policyErr.Reason, policyErr.Message)
-		duration := time.Since(start)
-		h.metrics.recordRejection(policyErr.RejectionReason, verbLabel, resLabel, subLabel, h.mode)
-		h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, OutcomeRejectedPolicy, policyErr.Code, duration)
-		finishRequestSpan(span, OutcomeRejectedPolicy, policyErr.RejectionReason, policyErr.Code)
-		logAuditEvent(r.Context(), h.auditSink, auditEntry{
-			caller:         caller,
-			clusterID:      clusterID,
-			httpMethod:     r.Method,
-			path:           cleanPath,
-			userAgent:      userAgent,
-			info:           info,
-			mode:           h.mode,
-			dryRun:         dryRun,
-			secretRedacted: secretRedacted,
-			outcome:        OutcomeRejectedPolicy,
-			reason:         policyErr.RejectionReason,
-			statusCode:     policyErr.Code,
-			duration:       duration,
-			span:           span,
-		})
-		return
-	}
-
-	_, isUpgradeSub := upgradeSubresources[strings.ToLower(info.Subresource)]
-	preserveUpgrade := h.mode == ModeReadWrite && h.allowUpgradeSubresources && info.IsResourceRequest && isUpgradeSub
-	SanitizeRequestHeadersWithOptions(outReq.Header, preserveUpgrade)
-	AppendCallerUserAgent(outReq.Header, caller)
-
-	var callerWantsPartial bool
+	sanitizeRequestHeaders(out.Header, h.policy.permitsUpgrade(info))
+	ev.Outcome = OutcomeForwarded
+	ctx := context.WithValue(out.Context(), auditEventKey{}, ev)
 	if secretRedacted {
-		var acceptRewritten bool
-		callerWantsPartial, acceptRewritten = RewriteSecretRequestHeadersWithStatus(outReq, info)
-		if acceptRewritten {
+		plan := rewriteSecretRequest(out.Header, info)
+		if plan.view != viewTable {
 			h.metrics.recordSecretRedaction(SecretActionAcceptHeaderRewritten)
 		}
+		ctx = context.WithValue(ctx, secretRedactionKey{}, plan)
 	}
-
-	ctx := context.WithValue(outReq.Context(), clusterIDContextKey, clusterID)
-	ctx = context.WithValue(ctx, requestInfoContextKey, info)
-	ctx = context.WithValue(ctx, callerWantsPartialContextKey, callerWantsPartial)
-	outReq = outReq.WithContext(ctx)
-
-	rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
-	h.reverseProxy.ServeHTTP(rec, outReq)
-
-	outcome := OutcomeAllowed
-	if rec.statusCode >= http.StatusInternalServerError {
-		outcome = OutcomeUpstreamError
-	}
-	duration := time.Since(start)
-	h.metrics.recordRequest(verbLabel, resLabel, subLabel, h.mode, dryRun, outcome, rec.statusCode, duration)
-	finishRequestSpan(span, outcome, ReasonNone, rec.statusCode)
-	logAuditEvent(r.Context(), h.auditSink, auditEntry{
-		caller:         caller,
-		clusterID:      clusterID,
-		httpMethod:     r.Method,
-		path:           cleanPath,
-		userAgent:      userAgent,
-		info:           info,
-		mode:           h.mode,
-		dryRun:         dryRun,
-		secretRedacted: secretRedacted,
-		outcome:        outcome,
-		reason:         ReasonNone,
-		statusCode:     rec.statusCode,
-		duration:       duration,
-		span:           span,
-	})
+	out = out.WithContext(ctx)
+	h.proxy.ServeHTTP(w, out)
 }
 
-type statusRecorder struct {
-	http.ResponseWriter
-	statusCode  int
-	wroteHeader bool
+func refuse(w http.ResponseWriter, ev *AuditEvent, perr *PolicyError) {
+	ev.Outcome, ev.Reason = OutcomeRefused, perr.RejectionReason
+	writePolicyError(w, perr)
 }
 
-func (r *statusRecorder) WriteHeader(code int) {
-	if !r.wroteHeader {
-		r.statusCode = code
-		r.wroteHeader = true
+func isHijacked(w http.ResponseWriter) bool {
+	rec, ok := w.(*statusRecorder)
+	return ok && rec.hijacked
+}
+
+// eventFrom returns the request's audit event, which ServeHTTP always sets before it
+// forwards.
+func eventFrom(req *http.Request) *AuditEvent {
+	ev, _ := req.Context().Value(auditEventKey{}).(*AuditEvent)
+	if ev == nil {
+		ev = &AuditEvent{}
 	}
-	r.ResponseWriter.WriteHeader(code)
-}
-
-func (r *statusRecorder) Write(b []byte) (int, error) {
-	if !r.wroteHeader {
-		r.statusCode = http.StatusOK
-		r.wroteHeader = true
-	}
-	return r.ResponseWriter.Write(b)
-}
-
-func (r *statusRecorder) Flush() {
-	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
-}
-
-func (r *statusRecorder) Unwrap() http.ResponseWriter {
-	return r.ResponseWriter
+	return ev
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)

@@ -208,6 +208,43 @@ class TestUnattendedSharedWrites(unittest.TestCase):
 
         self.assertIn("captured automatically", _retain_description(provider(user_tag="user:alice")[0]))
 
+    def test_an_unqualified_write_in_an_unattributable_interactive_dm_is_refused_not_published(self):
+        """When an A2A or interactive DM session loses its route or user_id, a human
+        is still speaking (`_unattended = False`, `_personal_disabled_reason = NO_IDENTITY_NOTICE`).
+        An unqualified write must default to `personal` and be refused rather than
+        silently publishing the human's personal fact to `scope:shared`.
+        """
+        from unittest.mock import patch
+        from kube_agents_memory import client as kam_client
+
+        p = KubeAgentsMemoryProvider()
+        retained = {}
+
+        class StubClient:
+            def aretain_batch(self, **kw):
+                retained.update(kw)
+                return SimpleNamespace(id="doc-1")
+
+        stub_hs = SimpleNamespace(
+            _bank_id="kube-agents-memory",
+            _budget="low",
+            _recall_max_tokens=4096,
+            _recall_types=["observation"],
+            _run_hindsight_operation=lambda op: op(StubClient()),
+        )
+        with patch.object(kam_client, "load_hindsight", return_value=stub_hs), \
+             patch.object(kam_client, "apply_scoping"), \
+             patch.object(kam_client, "ensure_bank"):
+            p.initialize("a2a-ctx-unrouted")
+        self.assertFalse(p._unattended)
+        self.assertEqual(p._personal_disabled_reason, NO_IDENTITY_NOTICE)
+        r = json.loads(p.handle_tool_call("memory_retain", {
+            "content": "My personal GKE cluster is dev-1.",
+        }))
+        self.assertIn("error", r, r)
+        self.assertEqual(r["error"], NO_IDENTITY_NOTICE, r)
+        self.assertFalse(retained, retained)
+
     def test_a_read_only_profile_is_unaffected_in_every_state(self):
         """Specialists stay barred; none of this reaches them."""
         for has_identity, unattended in ((True, False), (False, True), (False, False)):

@@ -49,7 +49,7 @@ func TestAOneSidedStaticUserRendersADenyOnTheEmptySide(t *testing.T) {
 				comment:   "a one-sided principal",
 				publish:   tc.publish,
 				subscribe: tc.subscribe,
-			}, "pw")
+			}, func(string) string { return "pw" })
 
 			if !strings.Contains(got, tc.wantDenied+` { deny = [">"] }`) {
 				t.Errorf("%s side is empty but renders no deny, so the server reads it as unrestricted:\n%s", tc.wantDenied, got)
@@ -73,7 +73,7 @@ func TestAStaticUserWithNoSubjectsRendersNoPermissionsBlock(t *testing.T) {
 		account: a2aAccountSys,
 		auth:    a2aAuthStatic,
 		comment: "the system account's own user",
-	}, "pw")
+	}, func(string) string { return "pw" })
 
 	if strings.Contains(got, "permissions") {
 		t.Errorf("a user with no subject lists gained a permissions block; it would not be denied anything by it, so the block is noise:\n%s", got)

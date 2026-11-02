@@ -15,8 +15,9 @@ import subprocess
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 #: Environment variables an enclosing make leaves behind that would change how
-#: a nested one behaves.
-INHERITED_MAKE_VARS = ("MAKEFLAGS", "MAKELEVEL")
+#: a nested one behaves. PYTHON_TEST_SHARD is CI's: a test that runs inside one
+#: shard of the sweep must see the whole sweep when it drives make itself.
+INHERITED_MAKE_VARS = ("MAKEFLAGS", "MAKELEVEL", "PYTHON_TEST_SHARD")
 
 
 def run_make(args, timeout, cwd=None, extra_env=None, drop_env=()):

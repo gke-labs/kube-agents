@@ -3,9 +3,9 @@ package k8sapiproxy
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -82,7 +82,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 	upstream := &fakeUpstream{
 		handler: func(_ string, req *http.Request) (*http.Response, error) {
 			if strings.Contains(req.URL.Path, "/secrets/") {
-				body := `{"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadata","metadata":{"name":"my-secret","namespace":"default"},"data":{"token":"c2VjcmV0"}}`
+				body := `{"apiVersion":"meta.k8s.io/v1","kind":"PartialObjectMetadata","metadata":{"name":"my-secret","namespace":"default"}}`
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -105,8 +105,8 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 		Authenticator:    tokenAuthenticator{expected: "valid-token"},
 		Upstream:         upstream,
 		DefaultClusterID: "in-cluster",
-		Mode:             ModeReadOnlyWithDryRun,
-		RedactSecrets:    true,
+		Policy:           Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Logger:           slog.New(slog.DiscardHandler),
 		Metrics:          metrics,
 	})
 	if err != nil {
@@ -260,8 +260,8 @@ func TestOpenTelemetryTracing(t *testing.T) {
 		Authenticator:    tokenAuthenticator{expected: "valid-token"},
 		Upstream:         upstream,
 		DefaultClusterID: "in-cluster",
-		Mode:             ModeReadOnlyWithDryRun,
-		RedactSecrets:    true,
+		Policy:           Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Logger:           slog.New(slog.DiscardHandler),
 		TracerProvider:   tp,
 	})
 	if err != nil {
@@ -396,191 +396,4 @@ func TestSetupOTelDisabledOrUnset(t *testing.T) {
 		t.Fatal("expected non-nil TracerProvider")
 	}
 	_ = shutdown2(context.Background())
-}
-
-func TestAuditLogging(t *testing.T) {
-	var auditBuf bytes.Buffer
-	jsonSink := NewJSONAuditSink(&auditBuf)
-
-	var recordedEvents []AuditEvent
-	customSink := AuditSinkFunc(func(_ context.Context, event AuditEvent) {
-		recordedEvents = append(recordedEvents, event)
-		if len(recordedEvents) == 1 && event.Caller != nil {
-			event.Caller.Username = "mutated-by-sink"
-		}
-	})
-
-	exporter := &recordingSpanExporter{}
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
-	defer func() { _ = tp.Shutdown(context.Background()) }()
-
-	upstream := &fakeUpstream{
-		handler: func(_ string, req *http.Request) (*http.Response, error) {
-			if strings.Contains(req.URL.Path, "/secrets/") {
-				body := `{"apiVersion":"v1","kind":"Secret","metadata":{"name":"my-secret","namespace":"default"},"data":{"token":"c2VjcmV0"}}`
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(bytes.NewBufferString(body)),
-				}, nil
-			}
-			status := http.StatusOK
-			if req.Method == http.MethodPost {
-				status = http.StatusCreated
-			}
-			return &http.Response{
-				StatusCode: status,
-				Header:     http.Header{"Content-Type": []string{"application/json"}},
-				Body:       io.NopCloser(bytes.NewBufferString(`{"kind":"Pod","metadata":{"name":"coredns-123"}}`)),
-			}, nil
-		},
-	}
-
-	h, err := NewHandler(Config{
-		Authenticator:    tokenAuthenticator{expected: "super-secret-caller-token"},
-		Upstream:         upstream,
-		DefaultClusterID: "in-cluster",
-		Mode:             ModeReadOnlyWithDryRun,
-		RedactSecrets:    true,
-		TracerProvider:   tp,
-		AuditSink:        NewMultiAuditSink(customSink, jsonSink),
-	})
-	if err != nil {
-		t.Fatalf("NewHandler failed: %v", err)
-	}
-
-	// 1. Healthz probe must not produce an audit entry.
-	{
-		req := httptest.NewRequest(http.MethodGet, "/_kube_proxy/healthz", nil)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("healthz status = %d, want 200", rec.Code)
-		}
-	}
-
-	// 2. Allowed GET pod with explicit cluster prefix and User-Agent.
-	{
-		req := httptest.NewRequest(http.MethodGet, "/clusters/gke_my-proj_us-central1_my-cluster/api/v1/namespaces/kube-system/pods/coredns-123", nil)
-		req.Header.Set("Authorization", "Bearer super-secret-caller-token")
-		req.Header.Set("User-Agent", "kubectl/v1.32.0 (linux/amd64)")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("GET pod status = %d, want 200", rec.Code)
-		}
-	}
-
-	// 3. Allowed GET secret (secret_redacted=true).
-	{
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/my-secret", nil)
-		req.Header.Set("Authorization", "Bearer super-secret-caller-token")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("GET secret status = %d, want 200", rec.Code)
-		}
-	}
-
-	// 4. Allowed dry-run POST configmap.
-	{
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/configmaps?dryRun=All", strings.NewReader(`{"kind":"ConfigMap"}`))
-		req.Header.Set("Authorization", "Bearer super-secret-caller-token")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusCreated {
-			t.Fatalf("POST configmaps dryRun=All status = %d, want 201", rec.Code)
-		}
-	}
-
-	// 5. Rejected DELETE pod (verb_blocked).
-	{
-		req := httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/default/pods/victim", nil)
-		req.Header.Set("Authorization", "Bearer super-secret-caller-token")
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusForbidden {
-			t.Fatalf("DELETE pod status = %d, want 403", rec.Code)
-		}
-	}
-
-	// 6. Rejected unauthenticated request.
-	{
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized {
-			t.Fatalf("unauthenticated status = %d, want 401", rec.Code)
-		}
-	}
-
-	rawLogs := auditBuf.String()
-	if strings.Contains(rawLogs, "super-secret-caller-token") || strings.Contains(rawLogs, "c2VjcmV0") {
-		t.Fatalf("audit log leaked credential or Secret payload:\n%s", rawLogs)
-	}
-
-	lines := strings.Split(strings.TrimSpace(rawLogs), "\n")
-	if len(lines) != 5 {
-		t.Fatalf("got %d audit log lines, want 5 (healthz excluded):\n%s", len(lines), rawLogs)
-	}
-
-	var entries []map[string]any
-	for i, line := range lines {
-		var m map[string]any
-		if err := json.Unmarshal([]byte(line), &m); err != nil {
-			t.Fatalf("line %d is not valid JSON: %v\nline: %s", i, err, line)
-		}
-		if got := m["event_type"]; got != AuditEventType {
-			t.Errorf("line %d event_type = %v, want %q", i, got, AuditEventType)
-		}
-		if got, _ := m["trace_id"].(string); len(got) != 32 {
-			t.Errorf("line %d trace_id = %q, want 32-char hex trace ID", i, got)
-		}
-		entries = append(entries, m)
-	}
-
-	// Verify entry 0: allowed GET pod.
-	e0 := entries[0]
-	if e0["outcome"] != OutcomeAllowed || e0["cluster"] != "gke_my-proj_us-central1_my-cluster" ||
-		e0["verb"] != "get" || e0["resource"] != "pods" || e0["namespace"] != "kube-system" ||
-		e0["name"] != "coredns-123" || e0["caller_username"] != "system:serviceaccount:default:shell" ||
-		e0["user_agent"] != "kubectl/v1.32.0 (linux/amd64)" {
-		t.Errorf("unexpected audit entry[0]: %#v", e0)
-	}
-
-	// Verify entry 1: allowed GET secret with secret_redacted=true.
-	e1 := entries[1]
-	if e1["resource"] != "secrets" || e1["name"] != "my-secret" || e1["secret_redacted"] != true {
-		t.Errorf("unexpected audit entry[1]: %#v", e1)
-	}
-
-	// Verify entry 2: allowed dry-run POST configmap.
-	e2 := entries[2]
-	if e2["verb"] != "create" || e2["resource"] != "configmaps" || e2["dry_run"] != true || e2["status_code"] != float64(http.StatusCreated) {
-		t.Errorf("unexpected audit entry[2]: %#v", e2)
-	}
-
-	// Verify entry 3: rejected DELETE pod.
-	e3 := entries[3]
-	if e3["level"] != "WARN" || e3["outcome"] != OutcomeRejectedPolicy || e3["rejection_reason"] != string(ReasonVerbBlocked) ||
-		e3["verb"] != "delete" || e3["resource"] != "pods" || e3["name"] != "victim" || e3["status_code"] != float64(http.StatusForbidden) {
-		t.Errorf("unexpected audit entry[3]: %#v", e3)
-	}
-
-	// Verify entry 4: rejected unauthenticated request.
-	e4 := entries[4]
-	if e4["level"] != "WARN" || e4["outcome"] != OutcomeRejectedAuth || e4["rejection_reason"] != string(ReasonUnauthenticated) ||
-		e4["status_code"] != float64(http.StatusUnauthorized) {
-		t.Errorf("unexpected audit entry[4]: %#v", e4)
-	}
-
-	if len(recordedEvents) != 5 {
-		t.Fatalf("custom AuditSink recorded %d events, want 5", len(recordedEvents))
-	}
-	if recordedEvents[0].Verb != "get" || recordedEvents[0].Resource != "pods" || recordedEvents[0].ClusterID != "gke_my-proj_us-central1_my-cluster" {
-		t.Errorf("unexpected typed AuditEvent[0]: %+v", recordedEvents[0])
-	}
-	if recordedEvents[1].Caller == nil || recordedEvents[1].Caller.Username != "system:serviceaccount:default:shell" {
-		t.Errorf("custom sink mutation leaked into subsequent AuditEvent.Caller: %+v", recordedEvents[1].Caller)
-	}
 }

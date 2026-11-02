@@ -32,9 +32,12 @@ BASE = "https://forge.example.test/api/v4"
 
 
 class _Response(io.BytesIO):
-    def __init__(self, body: bytes, status: int = 200) -> None:
+    def __init__(self, body: bytes, status: int = 200, headers: dict | None = None) -> None:
         super().__init__(body)
         self.status = status
+        self.headers = http.client.HTTPMessage()
+        for name, value in (headers or {}).items():
+            self.headers[name] = value
 
     def __enter__(self):
         return self
@@ -121,6 +124,24 @@ class RequestTest(unittest.TestCase):
         text = transport(opener).api("GET", "projects/1/merge_requests/2/raw_diffs", raw="text/plain")
         self.assertEqual("diff --git a/x b/x\n", text)
         self.assertEqual("text/plain", opener.requests[0].get_header("Accept"))
+
+    def test_headers_come_back_beside_the_answer_only_when_asked(self):
+        # A forge that counts in a header (GitLab's `X-Total`, Gitea's
+        # `X-Total-Count`) reads it here, by its lower-case name.
+        answer = _Response(b'[{"iid": 1}]', headers={"X-Total": "41", "Content-Type": "application/json"})
+        payload, headers = transport(Opener(answer)).api("GET", "projects/1/merge_requests", with_headers=True)
+        self.assertEqual([{"iid": 1}], payload)
+        self.assertEqual("41", headers["x-total"])
+        self.assertEqual("application/json", headers["content-type"])
+        plain = _Response(b"[]", headers={"X-Total": "0"})
+        self.assertEqual([], transport(Opener(plain)).api("GET", "projects/1/merge_requests"))
+
+    def test_the_cli_transport_refuses_to_answer_headers(self):
+        runner = mock.Mock()
+        with self.assertRaises(providers.ForgeUnsupported) as caught:
+            providers.CliTransport(runner, "gh").api("GET", "search/issues", with_headers=True)
+        self.assertIn("with-headers", str(caught.exception))
+        runner.assert_not_called()
 
     def test_a_path_that_names_a_host_or_climbs_out_is_not_sent(self):
         # The credential header goes wherever the URL does.
@@ -481,6 +502,32 @@ class BrokerBuildsItTest(unittest.TestCase):
         with mock.patch("providers.transport.time.monotonic", lambda: 100.0):
             built.api("GET", "user")
         self.assertEqual([3.0, 1.0], opener.timeouts)
+
+    def test_a_scheme_http_forge_passes_allow_http_to_transport_and_git_runner(self):
+        opener = Opener({})
+        recorded = []
+
+        def recording_git_runner(argv, cwd, check=True, config=(), **kwargs):
+            recorded.append((argv, cwd, check, config, kwargs))
+            return None
+
+        broker = vcs_broker.VcsBroker(
+            self.root, git_runner=recording_git_runner, http_opener=opener
+        )
+        http_forge = _HttpForge(api_url="http://gitea.gitea.svc.cluster.local:3000/api/v1")
+        http_forge.scheme = "http"
+        built = broker._transport(http_forge, "acme/infra")
+        self.assertIsInstance(built, HttpTransport)
+        built.api("GET", "user")
+
+        https_forge = _HttpForge(api_url="http://gitea.gitea.svc.cluster.local:3000/api/v1")
+        with self.assertRaisesRegex(ValueError, "https"):
+            broker._transport(https_forge, "acme/infra")
+
+        broker._git_for(http_forge, "acme/infra")(self.root, "status")
+        broker._git_for( _HttpForge(), "acme/infra")(self.root, "status")
+        self.assertEqual({"allow_http": True}, recorded[0][4])
+        self.assertEqual({}, recorded[1][4])
 
     def test_the_reach_question_goes_through_the_forges_own_transport(self):
         # Review round 3: the one line joining the startup diagnostic to the

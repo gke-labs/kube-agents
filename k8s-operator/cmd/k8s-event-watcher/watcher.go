@@ -188,6 +188,13 @@ type watcher struct {
 	synced   bool
 	held     bool
 	watching bool
+	// broken is set while the reflector's last list or watch failed for a
+	// reason other than a 403 (an unreachable API server, a bad credential,
+	// a partition: client-go retries those on its own backoff and tells
+	// nobody) and cleared by the next list or watch that succeeds. It is
+	// reported through onWatching like held is, so a caller that reads
+	// "watching" as "events are being delivered" is told when they are not.
+	broken bool
 }
 
 // newWatcher constructs a watcher. There is no resync period: a resync
@@ -539,7 +546,7 @@ func (w *watcher) markSynced() {
 	defer w.stateMu.Unlock()
 	w.synced = true
 	w.reportLocked(true)
-	if w.held {
+	if w.held || w.broken {
 		w.reportLocked(false)
 	}
 }
@@ -554,6 +561,19 @@ func (w *watcher) listCompleted() {
 	w.stateMu.Lock()
 	defer w.stateMu.Unlock()
 	w.held = false
+	w.broken = false
+}
+
+// markBroken records a list or watch failure that is not a 403. Reported as
+// not watching once synced, as a hold is; nothing is held, since client-go's
+// own backoff is retrying, and the next successful list or watch clears it.
+func (w *watcher) markBroken() {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	w.broken = true
+	if w.synced {
+		w.reportLocked(false)
+	}
 }
 
 // markHeld records a 403 from the list or the watch. Before the initial list
@@ -578,6 +598,7 @@ func (w *watcher) watchEstablished() {
 	w.stateMu.Lock()
 	defer w.stateMu.Unlock()
 	w.held = false
+	w.broken = false
 	if w.synced {
 		w.reportLocked(true)
 	}
@@ -626,6 +647,7 @@ func (w *watcher) reportLocked(watching bool) {
 // stay quiet too.
 func (w *watcher) handleWatchError(ctx context.Context, r *cache.Reflector, err error) {
 	if !apierrors.IsForbidden(err) {
+		w.markBroken()
 		cache.DefaultWatchErrorHandler(ctx, r, err)
 		return
 	}

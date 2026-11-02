@@ -242,6 +242,14 @@ def test_an_artifact_is_not_read_as_a_result():
     assert _verifier().verify(timeout_sec=1.0).success
 
 
+def test_a_paused_cards_question_is_not_read_as_a_result():
+    message = "\n\n".join(
+        [ACK, f"Result of delegated task t_1:\n{GOOD}", f"Question from delegated task t_2:\n{REPORT}"]
+    )
+    transcript.set(ACK, [], final_message=message)
+    assert _verifier().verify(timeout_sec=1.0).success
+
+
 def test_no_delivered_result_fails():
     transcript.set(ACK, [])
     outcome = _verifier().verify(timeout_sec=1.0)

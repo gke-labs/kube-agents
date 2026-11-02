@@ -1,13 +1,18 @@
-# NIGHTLY-TIER ACTIVE — recast out of the presubmit on 2026-08-26, an
-# entry in hack/eval/nightly-cases.txt since 2026-09-02: the nightly
-# runs it (EVAL_TIER=nightly), the presubmit never does. Its one run failed
-# on
+# PRESUBMIT-ACTIVE, ON THE BLOCKING ROSTER since 2026-10-26, the consistency
+# domain's seat, moved from hack/eval/nightly-cases.txt on its nightly record:
+# 33/34 graded repetitions on the twelve main nightlies that graded it
+# 2026-10-13 to 10-26, 14/14 since the claude-opus-5-5 agent model of
+# 2026-10-19, 5/5 under spec.mode next, about 200s a repetition
+# (docs/eval-gate-roster.md, "Admitted on the record since the split", has
+# the entry). Before that it was nightly-only: recast out of the presubmit
+# on 2026-08-26, an entry in hack/eval/nightly-cases.txt from 2026-09-02.
+# Its one run then failed on
 # agent-endpoint HTTP 502s — transport, not a scenario bug — and the audit
-# shape budgets at 600-1300s (bench/tasks/DRAFTS.md, the 2026-08-26 smoke
+# shape budgeted at 600-1300s (bench/tasks/DRAFTS.md, the 2026-08-26 smoke
 # run), which six domains cannot spend in one presubmit. The consistency
 # domain was covered there by consistency-authorized-networks-probe
-# (nightly since 2026-10-21, #3598); this
-# full sweep is the SOP-fidelity version and runs nightly. It was held by A1 and A4 (bench/tasks/DRAFTS.md) and by nothing else
+# until its demotion to the nightly on 2026-10-21 (#3598); this
+# full sweep is the SOP-fidelity version. It was held by A1 and A4 (bench/tasks/DRAFTS.md) and by nothing else
 # -- it compares GKE-level facets through the ledger, so A5's
 # ambient-kubeconfig problem never touched it.
 #
@@ -45,21 +50,25 @@
 # reason the seeded fleet needs THREE clusters, not two; two clusters have
 # no majority and no outlier.
 #
-# NOT date-gated, unlike fleet-cost-idle-pool. The consistency SOP has no age
-# threshold to wait out and drift-outlier is `available_from_day: 1` in
-# docs/designs/fleet-fixtures.yaml, so a replant of the fixtures does not move
-# this case's activation. Recorded here because the absence of a gate reads the
-# same as a forgotten one.
+# NOT date-gated, unlike fleet-cost-idle-pool: the only wait is the SOP's
+# 24-hour cluster age gate, which is why drift-outlier is
+# `available_from_day: 1` in docs/designs/fleet-fixtures.yaml. Replacing
+# seeded-c restarts that day, and the hourly scan reports it
+# (`createTime age_hours_ge 24` on drift-outlier).
 # Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
 # the earlier claim that it was is the correction this line carries: step 0 of
 # every fleet-audit stream (`audit_report.py start`) mints a repo-scoped
 # GitHub token and clones the GitOps workspace named by the `Git Repo:` line
 # of /opt/data/SETTINGS.md, and `finish` rewrites the ledger issue, opens
-# remediation pull requests and closes findings that stopped reproducing.
+# remediation pull requests and closes findings that stopped reproducing
+# (the remediation sweep is off on the inject lane's install,
+# KUBEAGENTS_AUDIT_AUTO_PROMOTE=false, #3439, so there the case requests no
+# pull request and runs in the fan-out's first phase).
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
-# blocker A1, now closed. Eligible tier: presubmit, and active there
-# since 2026-08-25.
+# blocker A1, now closed. Eligible tier: presubmit; active there
+# 2026-08-25 to 2026-08-26, nightly from then, and on the roster since
+# 2026-10-26.
 id: consistency-drift-outlier
 name: Drift audit names the cluster that does not match its peers
 # The prompt no longer asks for a summary in the final answer: the SOP's
@@ -85,7 +94,15 @@ domain: consistency
 # by cluster: each eval project carries its own trio and this case has to run
 # unchanged against all of them. Roles are defined in
 # bench/tf/fleet/fixtures.json; the rule is
-# docs/designs/bench-fleet-catalog.md.
+# docs/designs/bench-fleet-catalog.md. The grade also depends on the
+# drift-peer-a, drift-peer-b and drift-peer-d roles, the majority seeded-c is
+# outvoted by (the SOP files the finding only when 2/3 of the cohort agree),
+# and the hourly scan asserts each still carries its authorized-networks
+# block. They are named here and not listed below on purpose: a `fixtures:`
+# list of more than one role, with no check reading one through
+# `fixture_role:`, excuses the case from nothing when a role drifts
+# (case_roles in bench/kube_agents_bench/fixture_drift.py), and the single
+# role keeps the excuse for a drifted or under-a-day-old seeded-c.
 fixtures:
   - drift-outlier
 

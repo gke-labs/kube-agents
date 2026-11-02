@@ -15,8 +15,10 @@ import (
 	"syscall"
 	"time"
 
+	"k8s.io/client-go/rest"
+
 	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/k8sapiproxy"
-	gkehttpstransport "github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/transport/gkehttps"
+	"github.com/gke-labs/kube-agents/k8s-api-proxy/pkg/upstream"
 )
 
 const (
@@ -72,23 +74,32 @@ func startMetricsListener(ctx context.Context, port int, metrics *k8sapiproxy.Me
 	}()
 }
 
+func inClusterConfig(apiServer, caFile, tokenFile string) *rest.Config {
+	return &rest.Config{
+		Host:            apiServer,
+		BearerTokenFile: tokenFile,
+		TLSClientConfig: rest.TLSClientConfig{CAFile: caFile},
+	}
+}
+
 func main() {
-	defaultCluster := envOrDefault("KUBE_PROXY_DEFAULT_CLUSTER", envOrDefault("KUBE_CONTEXT_NAME", "in-cluster"))
+	defaultCluster := envOrDefault("KUBE_PROXY_DEFAULT_CLUSTER", envOrDefault("KUBE_CONTEXT_NAME", k8sapiproxy.InClusterID))
 
 	var (
-		listenAddr      = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
-		metricsPort     = flag.Int("metrics-port", envIntOrDefault("KUBE_PROXY_METRICS_PORT", 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
-		tlsCertFile     = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
-		tlsKeyFile      = flag.String("tls-key-file", envOrDefault("KUBE_PROXY_TLS_KEY_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"), "TLS server private key PEM file")
-		modeRaw         = flag.String("mode", envOrDefault("KUBE_PROXY_MODE", string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
+		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
+		metricsPort              = flag.Int("metrics-port", envIntOrDefault("KUBE_PROXY_METRICS_PORT", 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
+		tlsCertFile              = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
+		tlsKeyFile               = flag.String("tls-key-file", envOrDefault("KUBE_PROXY_TLS_KEY_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"), "TLS server private key PEM file")
+		modeRaw                  = flag.String("mode", envOrDefault("KUBE_PROXY_MODE", string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
 		defaultClusterF          = flag.String("default-cluster", defaultCluster, "Default cluster ID when /clusters/{id} prefix is omitted")
+		hostClusterIDF           = flag.String("host-cluster-id", envOrDefault("KUBE_PROXY_HOST_CLUSTER_ID", ""), "Optional gke_ cluster ID to route through the in-cluster ServiceAccount instead of Google credentials")
 		redactSecrets            = flag.Bool("redact-secrets", envBoolOrDefault("KUBE_PROXY_REDACT_SECRETS", true), "Redact core/v1 Secret payloads and rewrite Accept headers to PartialObjectMetadata")
 		allowUpgradeSubresources = flag.Bool("allow-upgrade-subresources", envBoolOrDefault("KUBE_PROXY_ALLOW_UPGRADE_SUBRESOURCES", false), "Allow exec, attach, portforward, and proxy subresources when mode is read-write")
 		kubeAPIServer            = flag.String("kube-api-server", envOrDefault("CREDENTIAL_PROXY_KUBE_API_SERVER", "https://kubernetes.default.svc"), "Host cluster Kubernetes API server URL")
-		kubeCAFile      = flag.String("kube-ca-file", envOrDefault("CREDENTIAL_PROXY_KUBE_CA_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"), "Host cluster CA bundle PEM file")
-		kubeTokenFile   = flag.String("kube-token-file", envOrDefault("CREDENTIAL_PROXY_KUBE_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"), "Host cluster ServiceAccount token file")
-		audience        = flag.String("audience", envOrDefault("CREDENTIAL_PROXY_AUDIENCE", "kubeagents-credential-proxy"), "Required TokenReview JWT audience")
-		allowedCallers  = flag.String("allowed-callers", envOrDefault("CREDENTIAL_PROXY_ALLOWED_CALLERS", ""), "Comma-separated allowlist of caller ServiceAccount usernames")
+		kubeCAFile               = flag.String("kube-ca-file", envOrDefault("CREDENTIAL_PROXY_KUBE_CA_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"), "Host cluster CA bundle PEM file")
+		kubeTokenFile            = flag.String("kube-token-file", envOrDefault("CREDENTIAL_PROXY_KUBE_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"), "Host cluster ServiceAccount token file")
+		audience                 = flag.String("audience", envOrDefault("CREDENTIAL_PROXY_AUDIENCE", "kubeagents-credential-proxy"), "Required TokenReview JWT audience")
+		allowedCallers           = flag.String("allowed-callers", envOrDefault("CREDENTIAL_PROXY_ALLOWED_CALLERS", ""), "Comma-separated allowlist of caller ServiceAccount usernames")
 	)
 	flag.Parse()
 
@@ -121,10 +132,10 @@ func main() {
 		log.Fatalf("--allowed-callers (or CREDENTIAL_PROXY_ALLOWED_CALLERS) is required and must name at least one caller ServiceAccount")
 	}
 
+	inCluster := inClusterConfig(*kubeAPIServer, *kubeCAFile, *kubeTokenFile)
+
 	authn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{
-		APIServerURL:   *kubeAPIServer,
-		CAFile:         *kubeCAFile,
-		TokenFile:      *kubeTokenFile,
+		Kubernetes:     inCluster,
 		Audience:       *audience,
 		AllowedCallers: callers,
 	})
@@ -132,37 +143,37 @@ func main() {
 		log.Fatalf("failed to initialize TokenReview authenticator: %v", err)
 	}
 
-	gcpTokens := gkehttpstransport.NewGCPTokenSource(gkehttpstransport.GCPTokenConfig{
+	gcpTokens := newGCPTokenSource(gcpTokenConfig{
 		WIFAudience:       os.Getenv("CREDENTIAL_PROXY_WIF_AUDIENCE"),
 		WIFServiceAccount: os.Getenv("CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT"),
 		WIFTokenFile:      os.Getenv("CREDENTIAL_PROXY_WIF_TOKEN_FILE"),
 	})
 
-	upstream, err := gkehttpstransport.NewTransport(gkehttpstransport.Config{
-		HostClusterID:      *defaultClusterF,
-		InClusterServerURL: *kubeAPIServer,
-		InClusterCAFile:    *kubeCAFile,
-		InClusterTokenFile: *kubeTokenFile,
-		TokenProvider:      gcpTokens,
+	upstreamTransport, err := upstream.New(ctx, upstream.Config{
+		InCluster:     inCluster,
+		HostClusterID: *hostClusterIDF,
+		TokenSource:   gcpTokens,
 	})
 	if err != nil {
-		log.Fatalf("failed to initialize upstream gke-https transport: %v", err)
+		log.Fatalf("failed to initialize upstream transport: %v", err)
 	}
 
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	metrics := k8sapiproxy.NewMetrics()
-	startMetricsListener(ctx, *metricsPort, metrics, slog.Default())
-	auditSink := k8sapiproxy.NewJSONAuditSink(os.Stdout)
+	startMetricsListener(ctx, *metricsPort, metrics, logger)
 
 	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
-		Authenticator:            authn,
-		Upstream:                 upstream,
-		DefaultClusterID:         *defaultClusterF,
-		Mode:                     mode,
-		RedactSecrets:            *redactSecrets,
-		AllowUpgradeSubresources: *allowUpgradeSubresources,
-		Metrics:                  metrics,
-		TracerProvider:           tp,
-		AuditSink:                auditSink,
+		Authenticator:    authn,
+		Upstream:         upstreamTransport,
+		DefaultClusterID: *defaultClusterF,
+		Policy: k8sapiproxy.Policy{
+			Mode:                     mode,
+			RedactSecrets:            *redactSecrets,
+			AllowUpgradeSubresources: *allowUpgradeSubresources,
+		},
+		Logger:         logger,
+		Metrics:        metrics,
+		TracerProvider: tp,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize k8s-api-proxy handler: %v", err)

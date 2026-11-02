@@ -25,11 +25,12 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "provision_ci_pool_project.sh"
 _SECTION_START = "# ─── GitOps Repo & App Installation Check"
 _SECTION_END_RE = re.compile(r"^# ─── (?!GitOps Repo)", re.MULTILINE)
-_CONSTANT_RE = re.compile(r"^readonly GITOPS_(?:SEED|INTENT_NOTE|NOTE_ABSENT)_\w+=.*$", re.MULTILINE)
-# The note constant spans lines (a single-quoted heredoc-style value), so the
-# constants are lifted as the span from the first to the closing quote line.
+_CONSTANT_RE = re.compile(r"^readonly GITOPS_(?:SEED|INTENT_NOTE|NOTE_ABSENT|WORKLOAD_MANIFEST)_\w+=.*$", re.MULTILINE)
+# The note and manifest constants span lines (single-quoted heredoc-style
+# values), so the constants are lifted as the span from the first to the
+# manifest's closing quote line.
 _CONSTANTS_SPAN_RE = re.compile(
-    r"^readonly GITOPS_SEED_FILE=.*?^readonly GITOPS_INTENT_NOTE_CONTENT='.*?^---\n.*?'$",
+    r"^readonly GITOPS_SEED_FILE=.*?^readonly GITOPS_WORKLOAD_MANIFEST_CONTENT='[^']*'$",
     re.MULTILINE | re.DOTALL,
 )
 
@@ -40,6 +41,7 @@ _SEED_MESSAGE = "Initial commit"
 _SEED_CONTENT = "# GitOps Infrastructure Repo\n"
 _NOTE_PATH = "knowledge/notification-relay-no-pdb.md"
 _NOTE_DECLARES = "    object: Deployment/notification-relay\n"
+_MANIFEST_PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
 
 _FAKE_GH = r"""#!/usr/bin/env bash
 # Records every call, one JSON array per line, and answers what the case set.
@@ -68,6 +70,11 @@ case "$1 $2" in
     [ "${FAKE_NOTE_PRESENT:-0}" = "1" ] && { echo '{"sha":"abc"}'; exit 0; }
     [ "${FAKE_NOTE_READ_FAILS:-0}" = "1" ] && { echo "gh: HTTP 502" >&2; exit 1; }
     echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  "api repos/gke-agentic/kube-agents-evals-99-infra/contents/clusters/seeded-a/seeded-reliability/checkout-gateway.yaml")
+    # The same read for checkout-gateway's declaration.
+    [ "${FAKE_MANIFEST_PRESENT:-0}" = "1" ] && { echo '{"sha":"def"}'; exit 0; }
+    [ "${FAKE_MANIFEST_READ_FAILS:-0}" = "1" ] && { echo "gh: HTTP 502" >&2; exit 1; }
+    echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
   "api /orgs/gke-agentic/installations") exit 0 ;;
   "api -X") echo '{}'; exit 0 ;;
 esac
@@ -82,7 +89,7 @@ def _section() -> str:
     assert start != -1, f"{_SECTION_START!r} not found in {_SCRIPT}"
     end = _SECTION_END_RE.search(text, start + len(_SECTION_START))
     assert end, "no section marker follows the GitOps repository block"
-    assert len(_CONSTANT_RE.findall(text)) == 7, "expected the seven GITOPS_SEED_* / GITOPS_NOTE_ABSENT_* / GITOPS_INTENT_NOTE_* constants"
+    assert len(_CONSTANT_RE.findall(text)) == 10, "expected the ten GITOPS_SEED_* / GITOPS_NOTE_ABSENT_* / GITOPS_INTENT_NOTE_* / GITOPS_WORKLOAD_MANIFEST_* constants"
     span = _CONSTANTS_SPAN_RE.search(text)
     assert span, "the GITOPS_* constants are not one contiguous block"
     return span.group(0) + "\n" + text[start : end.start()]
@@ -100,7 +107,8 @@ class ProvisionGitopsRepoSeedTest(unittest.TestCase):
         self.bindir = bindir
         self.log = pathlib.Path(self.tmp.name) / "gh.log"
 
-    def _run(self, default_branch: str, view_fails: bool = False, note_present: bool = False, note_read_fails: bool = False):
+    def _run(self, default_branch: str, view_fails: bool = False, note_present: bool = False, note_read_fails: bool = False,
+             manifest_present: bool = False, manifest_read_fails: bool = False):
         env = get_isolated_test_env(
             overrides={
                 "PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -109,6 +117,8 @@ class ProvisionGitopsRepoSeedTest(unittest.TestCase):
                 "FAKE_VIEW_FAILS": "1" if view_fails else "0",
                 "FAKE_NOTE_PRESENT": "1" if note_present else "0",
                 "FAKE_NOTE_READ_FAILS": "1" if note_read_fails else "0",
+                "FAKE_MANIFEST_PRESENT": "1" if manifest_present else "0",
+                "FAKE_MANIFEST_READ_FAILS": "1" if manifest_read_fails else "0",
                 "PROJECT_ID": "kube-agents-evals-99",
                 "GITOPS_REPO": "gke-agentic/kube-agents-evals-99-infra",
                 "APP_ID": "4675512",
@@ -126,11 +136,12 @@ class ProvisionGitopsRepoSeedTest(unittest.TestCase):
         puts = [c for c in calls if c[:2] == ["api", "-X"]]
         return proc, puts
 
-    def test_an_empty_repository_gets_the_seed_commit_then_the_note(self):
+    def test_an_empty_repository_gets_the_seed_commit_then_the_note_then_the_manifest(self):
         proc, puts = self._run(default_branch="")
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("Seeding gke-agentic/kube-agents-evals-99-infra", proc.stdout)
-        self.assertEqual(2, len(puts), puts)
+        self.assertEqual(3, len(puts), puts)
+        self.assertEqual([_SEED_FILE, _NOTE_PATH, _MANIFEST_PATH], [argv[3].rsplit("/contents/", 1)[1] for argv in puts])
         argv = puts[0]
         self.assertEqual(
             ["api", "-X", "PUT", f"repos/gke-agentic/kube-agents-evals-99-infra/contents/{_SEED_FILE}"],
@@ -140,11 +151,11 @@ class ProvisionGitopsRepoSeedTest(unittest.TestCase):
         self.assertEqual(_SEED_MESSAGE, fields["message"])
         self.assertEqual(_SEED_CONTENT, base64.b64decode(fields["content"]).decode())
 
-    def test_a_repository_with_a_branch_gets_only_the_note(self):
+    def test_a_repository_with_a_branch_gets_the_note_and_the_manifest(self):
         proc, puts = self._run(default_branch="main")
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertNotIn("with its first commit", proc.stdout)
-        self.assertEqual(1, len(puts), puts)
+        self.assertEqual(2, len(puts), puts)
         argv = puts[0]
         self.assertEqual(
             ["api", "-X", "PUT", f"repos/gke-agentic/kube-agents-evals-99-infra/contents/{_NOTE_PATH}"],
@@ -156,12 +167,34 @@ class ProvisionGitopsRepoSeedTest(unittest.TestCase):
         self.assertIn("check: no-pdb\n", body)
         self.assertIn("namespace: seeded-intent\n", body)
         self.assertIn(_NOTE_DECLARES, body)
+        argv = puts[1]
+        self.assertEqual(
+            ["api", "-X", "PUT", f"repos/gke-agentic/kube-agents-evals-99-infra/contents/{_MANIFEST_PATH}"],
+            argv[:4],
+        )
+        fields = dict(argv[i + 1].split("=", 1) for i in range(len(argv)) if argv[i] == "-f")
+        manifest = base64.b64decode(fields["content"]).decode()
+        # What the audit's index keys on, and nothing about the budget: a word
+        # about it reads as declared intent and silences the finding.
+        self.assertIn("kind: Deployment\n", manifest)
+        self.assertIn("  name: checkout-gateway\n", manifest)
+        self.assertIn("  namespace: seeded-reliability\n", manifest)
+        self.assertIn("  replicas: 2\n", manifest)
+        self.assertNotIn("PodDisruptionBudget", manifest)
+        self.assertNotIn("#", manifest)
 
-    def test_a_repository_that_already_has_the_note_is_left_alone(self):
-        proc, puts = self._run(default_branch="main", note_present=True)
+    def test_a_repository_that_already_has_both_files_is_left_alone(self):
+        proc, puts = self._run(default_branch="main", note_present=True, manifest_present=True)
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertNotIn("Seeding", proc.stdout)
         self.assertEqual([], puts)
+
+    def test_a_repository_with_the_note_alone_gets_only_the_manifest(self):
+        # Every pool repository on 2026-10-15: seeded before the manifest existed.
+        proc, puts = self._run(default_branch="main", note_present=True)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual(1, len(puts), puts)
+        self.assertTrue(puts[0][3].endswith(f"/contents/{_MANIFEST_PATH}"), puts[0])
 
     def test_a_failed_read_stops_the_step_rather_than_seeding_blind(self):
         proc, puts = self._run(default_branch="", view_fails=True)
@@ -172,6 +205,13 @@ class ProvisionGitopsRepoSeedTest(unittest.TestCase):
     def test_a_failed_note_read_stops_the_step_rather_than_seeding_blind(self):
         proc, puts = self._run(default_branch="main", note_read_fails=True)
         self.assertNotEqual(0, proc.returncode)
+        self.assertIn("not seeding it blind", proc.stderr)
+        self.assertEqual([], puts)
+
+    def test_a_failed_manifest_read_stops_the_step_after_the_note(self):
+        proc, puts = self._run(default_branch="main", note_present=True, manifest_read_fails=True)
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn(f"could not read {_MANIFEST_PATH}", proc.stderr)
         self.assertIn("not seeding it blind", proc.stderr)
         self.assertEqual([], puts)
 

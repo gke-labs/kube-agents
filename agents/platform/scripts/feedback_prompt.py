@@ -54,9 +54,10 @@ take their per-install settings (the operator copies them from the CR's
   nothing at all: it neither arms nor claims, so an install that turns the
   prompt on later still gets exactly one request, a delay after it did so.
 - ``FEEDBACK_PROMPT_DELAY`` (default ``7d``; ``<n>d``, ``<n>h`` or ``<n>m``). A
-  value that does not parse is a failed run, exit 1 with the reason on stderr,
-  which the scheduler reports in chat like any other script failure until the
-  value is fixed. Falling back silently was the alternative, and it is not
+  value that does not parse is a failed run, exit 1 with the reason on stderr.
+  The scheduler turns that into its failure line, which the chat relay posts
+  once in plain words, and the run's output, which the scheduler saves under
+  the profile's ``cron/output/``, keeps the reason. Falling back silently was the alternative, and it is not
   observable: the scheduler keeps a zero-exit script's stderr nowhere, so the
   only trace of a rejected value would be the message arriving a week early.
 

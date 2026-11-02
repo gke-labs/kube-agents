@@ -5,7 +5,8 @@ Verifies that:
    ("kube-agents-bench plant") with age gating rooted on the parent VPC network
    (and standalone/orphan resources).
 2. Deletion order is strictly dependency-ordered:
-   Addresses -> Subnets -> Networks.
+   Addresses -> Subnets -> Networks, then alert policies labelled
+   managed-by=kube-agents-bench (#3797), gated on their own creation time.
 3. Regional vs global addresses are correctly scoped.
 4. Dry-run runs list commands and invokes no delete commands.
 5. Failures (list error, delete failure) are handled and reported without unhandled crashes.
@@ -877,6 +878,141 @@ class SweepProjectTest(unittest.TestCase):
         self.assertIn("net-1 (networkInUse)", str(ctx.exception))
         self.assertEqual(ctx.exception.deleted["addresses"], ["addr-1"])
         self.assertEqual(ctx.exception.deleted["networks"], [])
+
+
+class AlertPolicySweepTest(unittest.TestCase):
+    """The alert-policy step (#3797): labelled, aged policies go; nothing else does."""
+
+    def setUp(self):
+        self.now = datetime(2026, 10, 22, 12, 0, 0, tzinfo=timezone.utc)
+        self.old_ts = (self.now - timedelta(hours=6)).isoformat()
+        self.recent_ts = (self.now - timedelta(hours=1)).isoformat()
+        self.policies = [
+            {
+                "name": "projects/p/alertPolicies/111",
+                "displayName": "ka-bench orbital-checkout restart storm",
+                "userLabels": {"managed-by": "kube-agents-bench", "build-id": "1"},
+                "creationRecord": {"mutateTime": self.old_ts},
+            },
+            {
+                "name": "projects/p/alertPolicies/222",
+                "displayName": "ka-bench orbital-checkout restart storm",
+                "userLabels": {"managed-by": "kube-agents-bench", "build-id": "2"},
+                "creationRecord": {"mutateTime": self.recent_ts},
+            },
+            {
+                "name": "projects/p/alertPolicies/333",
+                "displayName": "someone's real policy",
+                "userLabels": {"team": "checkout"},
+                "creationRecord": {"mutateTime": self.old_ts},
+            },
+            {
+                "name": "projects/p/alertPolicies/444",
+                "displayName": "no labels at all",
+                "creationRecord": {"mutateTime": self.old_ts},
+            },
+        ]
+
+    def runner_for(self, policies, commands_run, list_rc=0, delete_rc=0):
+        def mock_runner(cmd, capture_output=True, text=True, check=False):
+            commands_run.append(cmd)
+            if cmd[:3] == ["gcloud", "monitoring", "policies"] and "list" in cmd:
+                return mock.Mock(returncode=list_rc, stdout=json.dumps(policies), stderr="denied" if list_rc else "")
+            if "list" in cmd:
+                return mock.Mock(returncode=0, stdout="[]", stderr="")
+            if cmd[:3] == ["gcloud", "monitoring", "policies"]:
+                return mock.Mock(returncode=delete_rc, stdout="", stderr="boom" if delete_rc else "")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        return mock_runner
+
+    def test_fixture_stack_carries_the_label_the_sweep_matches(self):
+        stack = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "monitoring-alert-policy" / "main.tf"
+        content = stack.read_text(encoding="utf-8")
+        match = re.search(r'(?m)^\s*managed-by\s*=\s*"([^"]+)"', content)
+        self.assertIsNotNone(match, "user_labels.managed-by must be set in the fixture stack")
+        assert match is not None
+        self.assertTrue(sweep.matches_plant_labels({sweep.PLANT_LABEL_KEY: match.group(1)}))
+
+    def test_labelled_aged_policy_is_deleted_by_full_name_and_others_survive(self):
+        commands_run = []
+        res = sweep.sweep_project(
+            "p", max_age_hours=4.0, runner=self.runner_for(self.policies, commands_run), now=self.now)
+        self.assertEqual(res["alert_policies"], ["111"])
+        self.assertEqual(res["addresses"], [])
+        deletes = [cmd for cmd in commands_run if "delete" in cmd]
+        self.assertEqual(deletes, [[
+            "gcloud", "monitoring", "policies", "delete", "projects/p/alertPolicies/111",
+            "--project=p", "--quiet",
+        ]])
+
+    def test_policy_list_runs_after_the_compute_deletes(self):
+        commands_run = []
+        sweep.sweep_project("p", runner=self.runner_for([], commands_run), now=self.now)
+        kinds = [cmd[1] for cmd in commands_run if "list" in cmd]
+        self.assertEqual(kinds, ["compute", "compute", "compute", "monitoring"])
+        self.assertEqual(
+            commands_run[-1], ["gcloud", "monitoring", "policies", "list", "--project=p", "--format=json"])
+
+    def test_missing_creation_record_is_treated_as_old(self):
+        commands_run = []
+        policies = [{"name": "projects/p/alertPolicies/555", "userLabels": {"managed-by": "kube-agents-bench"}}]
+        res = sweep.sweep_project("p", runner=self.runner_for(policies, commands_run), now=self.now)
+        self.assertEqual(res["alert_policies"], ["555"])
+
+    def test_dry_run_lists_and_deletes_nothing(self):
+        commands_run = []
+        res = sweep.sweep_project(
+            "p", dry_run=True, runner=self.runner_for(self.policies, commands_run), now=self.now)
+        self.assertEqual(res["alert_policies"], ["111"])
+        self.assertEqual([cmd for cmd in commands_run if "delete" in cmd], [])
+
+    def test_refused_policy_list_fails_the_project_after_the_compute_sweep(self):
+        """A role without the Monitoring permissions: the Compute sweep still runs,
+        its deletes stay in the error's `deleted`, and the refusal is the failure."""
+        commands_run = []
+        old_net = {"name": "bench-vpc-1", "description": "kube-agents-bench plant", "creationTimestamp": self.old_ts}
+
+        def runner(cmd, capture_output=True, text=True, check=False):
+            if cmd[1] == "compute" and "networks" in cmd and "subnets" not in cmd and "list" in cmd:
+                commands_run.append(cmd)
+                return mock.Mock(returncode=0, stdout=json.dumps([old_net]), stderr="")
+            return self.runner_for([], commands_run, list_rc=1)(cmd, capture_output, text, check)
+
+        with self.assertRaises(sweep.SweepError) as ctx:
+            sweep.sweep_project("p", runner=runner, now=self.now)
+        self.assertIn("alert_policies: list (could not list alert policies in p: denied)", str(ctx.exception))
+        self.assertEqual(ctx.exception.deleted["networks"], ["bench-vpc-1"])
+        self.assertEqual(sweep._counts(ctx.exception.deleted), {"addresses": 0, "subnets": 0, "networks": 1, "alert_policies": 0})
+        self.assertEqual([cmd[1] for cmd in commands_run if "list" in cmd], ["compute"] * 3 + ["monitoring"])
+
+    def test_nine_fractional_digit_creation_time_is_gated_by_age(self):
+        # A protobuf Timestamp as the Monitoring API writes it; fromisoformat
+        # before Python 3.11 rejects more than six fractional digits.
+        recent = "2026-10-22T11:30:00.123456789Z"
+        self.assertFalse(sweep.is_older_than(recent, 4.0, now=self.now))
+        self.assertTrue(sweep.is_older_than("2026-10-22T01:00:00.123456789Z", 4.0, now=self.now))
+        commands_run = []
+        policies = [{"name": "projects/p/alertPolicies/666", "userLabels": {"managed-by": "kube-agents-bench"},
+                     "creationRecord": {"mutateTime": recent}}]
+        res = sweep.sweep_project("p", runner=self.runner_for(policies, commands_run), now=self.now)
+        self.assertEqual(res["alert_policies"], [])
+
+    def test_delete_failure_is_reported_and_keeps_the_rest(self):
+        commands_run = []
+        with self.assertRaises(sweep.SweepError) as ctx:
+            sweep.sweep_project(
+                "p", runner=self.runner_for(self.policies, commands_run, delete_rc=1), now=self.now)
+        self.assertIn("alert_policies: 111 (boom)", str(ctx.exception))
+        self.assertEqual(ctx.exception.deleted["alert_policies"], [])
+
+    def test_counts_include_policies_and_tolerate_the_old_shape(self):
+        self.assertEqual(
+            sweep._counts({"addresses": [], "subnets": [], "networks": [], "alert_policies": ["111"]}),
+            {"addresses": 0, "subnets": 0, "networks": 0, "alert_policies": 1})
+        self.assertEqual(
+            sweep._counts({"addresses": ["a"], "subnets": [], "networks": []}),
+            {"addresses": 1, "subnets": 0, "networks": 0, "alert_policies": 0})
+        self.assertIsNone(sweep._counts({"addresses": [], "subnets": [], "networks": []}))
 
 
 class SweepPoolTest(unittest.TestCase):

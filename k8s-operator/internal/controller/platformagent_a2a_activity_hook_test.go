@@ -123,7 +123,7 @@ func TestActivityHookRendersOnlyWithABridgeOnNext(t *testing.T) {
 			wantEntry := map[string]any{
 				"name":       "a2a-bridge-activity",
 				"url":        "http://127.0.0.1:8651/hermes/tool-events",
-				"events":     []any{"pre_tool_call", "post_tool_call"},
+				"events":     []any{"pre_tool_call", "post_tool_call", "post_api_request"},
 				"secret_env": "A2A_ACTIVITY_SECRET",
 				"timeout":    float64(10),
 			}

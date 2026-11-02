@@ -91,3 +91,9 @@ verification_spec:
       path: spec.taints[?(@.key=='seeded-role')].value
       op: eq
       value: idle-batch
+      # The pool can have more than one node, and without this a second node
+      # failed the check even when nothing changed (#4037). The taint must
+      # survive on every node: fleet_resource_property fails a matched node
+      # with no seeded-role taint left (#4038), where upstream's `every` would
+      # let it drop out.
+      across_matches: every

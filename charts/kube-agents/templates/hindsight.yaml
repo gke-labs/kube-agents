@@ -329,10 +329,16 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
+        # The socket and pid file (64Mi, the floor for a process's own small
+        # state) and the entrypoint's /tmp (1Gi, the floor for a directory a
+        # process writes into). PGDATA, where postgres keeps its temp files, is
+        # on the PVC.
         - name: run
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 64Mi
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 1Gi
   volumeClaimTemplates:
     - metadata:
         name: data

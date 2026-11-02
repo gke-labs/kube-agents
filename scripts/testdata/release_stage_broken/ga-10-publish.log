@@ -1,0 +1,10 @@
+2026-10-02T05:29:52.1710966Z shell: /usr/bin/bash -e {0}
+2026-10-02T05:29:52.1711390Z env:
+2026-10-02T05:29:52.1711720Z   EXPLICIT_RELEASE_VERSION: 
+2026-10-02T05:29:52.1712490Z   TARGET_COMMIT: d817b3b2c4e5f92e84d2a62636d6279b571a82d7
+2026-10-02T05:29:52.1713025Z   SKIP_STAGING_VALIDATION: false
+2026-10-02T05:29:54.4411532Z 🔎 Verifying required container images exist in registry for commit d817b3b...
+2026-10-02T05:29:54.4500543Z ⚠️ Required release images: scripts/release/common.sh at d817b3b has no readable REQUIRED_RELEASE_IMAGES; using the 11 this checkout's scripts/release/common.sh lists.
+2026-10-02T05:30:08.5778308Z ❌ ERROR: Required container images for commit d817b3b2c4e5f92e84d2a62636d6279b571a82d7 do not exist in registry!
+2026-10-02T05:30:08.5787550Z ##[error]Process completed with exit code 1.
+2026-10-02T05:30:08.6003959Z Post job cleanup.

@@ -240,6 +240,9 @@ ENTRY_RISK_RUBRIC = {
     18: (5, 4, 2, 2, 60),
     19: (5, 4, 2, 3, 90),
     20: (5, 6, 2, 2, 90),
+    23: (3, 4, 3, 3, 90),  # 65, major: a capacity failure is noticed when the operation errors and waits for the region
+    25: (3, 4, 2, 1, 100),  # 36, minor: the channel's list says so before the window, and the fix is the next active patch
+    26: (3, 4, 2, 2, 90),  # 43, major: the issue decides; the match is exact on the add-on and the patch
 }
 DEFAULT_RISK_RUBRIC = (3, 4, 2, 2, 90)
 RUBRIC_KEYS = ("B", "L", "detect", "recover")
@@ -268,6 +271,12 @@ ENTRY_TITLES = {
     18: "GPU driver mismatch",
     19: "In-tree volumes lose their CSI path",
     20: "Images on a retired registry",
+    21: "The load balancer's connection drain outlasts the node's deregistration wait",
+    22: "A Node object outlives its virtual machine",
+    23: "A control-plane upgrade or resize fails on regional compute capacity",
+    24: "A cluster held in a long reconcile",
+    25: "The target patch is withdrawn before the window",
+    26: "A known issue in an add-on at the target version",
 }
 ENTRY_MITIGATIONS = {
     1: "Give the budget room: maxUnavailable at least 1 or minAvailable below the replica count, and a "
@@ -310,6 +319,18 @@ ENTRY_MITIGATIONS = {
     "per GKE version and NVIDIA's minimum-driver matrix the floor the images accept; canary a GPU pool.",
     19: "Enable the PD CSI driver add-on and move StorageClasses to pd.csi.storage.gke.io.",
     20: "Mirror every image into a registry you own and keep egress allowlists in step.",
+    21: "Set the backend service's connection draining timeout at or under the wait: gcloud compute "
+    "backend-services update <name> --global|--region <region> --connection-draining-timeout=600.",
+    22: "Delete the orphan Node object (kubectl delete node <name>); nothing runs on it.",
+    23: "Set a maintenance window in an off-peak hour for the region and retry the upgrade in it; keep "
+    "upgrade notifications consumed so a failed attempt is a message the same day.",
+    24: "Do not start the upgrade: freeze changes and, past a few hours, open a support case quoting the "
+    "operation id, or the status and its message when no operation holds the cluster; re-check after "
+    "the status settles.",
+    25: "Target the newest active patch of the minor on the channel at or above the version, or the next "
+    "active version the channel lists; hold when none is active.",
+    26: "Upgrade the matched add-on to the fixed-in version before the window (for a managed add-on, the "
+    "GKE patch the issue names as fixed), or hold the cluster at a version the issue does not cover.",
 }
 # Entries the built-in reads stand for.
 ENTRY_BUDGET = 1
@@ -323,6 +344,24 @@ DEFAULT_MITIGATION = "Read the finding's text and the catalogue entry it names, 
 # clause, not the entry's one-size mitigation, which for entry 2 names the surge settings a
 # pool on GKE's defaults already has.
 RULE_REMEDY_ENTRIES = frozenset({2})
+# A plan-level rule, one with no catalogue entry (readiness_rules' `ENTRY` is None): its row
+# takes the rule's own title, keyed by rule id, where an entry's row takes the catalogue
+# heading; its action and its remediation note are the remedy clause of its text; and its
+# risk is graded by the rule-keyed rubric. The rollout-sequence precheck is one: the host
+# project already holds the one RolloutSequence the platform allows, a posture the plan
+# adapts to, so its risk is minor. One row per host project per week falls out of the
+# identity: the check, the host's first member (where the report files the read) and the
+# sequence's name.
+RULE_TITLES = {"rollout-sequence-precheck": "A second RolloutSequence in the host project is refused"}
+RULE_REMEDY_RULES = frozenset({"rollout-sequence-precheck"})
+RULE_RISK_RUBRIC = {
+    "rollout-sequence-precheck": (2, 4, 2, 1, 100),  # 8: nothing breaks at the upgrade; the plan takes the existing sequence
+}
+ENTRY_TITLE_FORMAT = "{entry}. {title}: {subject} {lead}"
+PLAN_LEVEL_TITLE_FORMAT = "{title}: {subject} {lead}"
+PLAN_LEVEL_RISK_LEAD = "shapes the upgrade plan"
+ENTRY_LABEL_FORMAT = "catalogue entry {entry}"
+PLAN_LEVEL_ENTRY_LABEL = "a plan-level rule, no catalogue entry"
 REMEDY_SEPARATOR = "; "
 PAREN_OPEN = "("
 PAREN_CLOSE = ")"
@@ -490,14 +529,31 @@ def rule_remedy(text: str) -> str:
     return clause[:1].upper() + clause[1:] if clause else ""
 
 
-def rule_action(entry: int | None, text: str) -> str:
-    """A rule row's action: the rule's own remedy for the entries that carry one, else
-    the entry's mitigation."""
-    if entry in RULE_REMEDY_ENTRIES:
+def rule_action(entry: int | None, text: str, rule: str | None = None) -> str:
+    """A rule row's action: the rule's own remedy for the entries and the plan-level rules
+    that carry one, else the entry's mitigation."""
+    if entry in RULE_REMEDY_ENTRIES or rule in RULE_REMEDY_RULES:
         remedy = rule_remedy(text)
         if remedy:
             return remedy
     return entry_mitigation(entry)
+
+
+def rule_title(rule: str, entry: int | None, subject: str, lead: str) -> str:
+    """The row's title: the catalogue heading for an entry, the rule's own for a plan-level
+    rule (`DEFAULT_ENTRY_TITLE` for one RULE_TITLES does not name)."""
+    if entry is None:
+        return PLAN_LEVEL_TITLE_FORMAT.format(title=RULE_TITLES.get(rule, DEFAULT_ENTRY_TITLE), subject=subject, lead=lead)
+    return ENTRY_TITLE_FORMAT.format(entry=entry, title=entry_title(entry), subject=subject, lead=lead)
+
+
+def entry_label(entry: int | None) -> str:
+    return ENTRY_LABEL_FORMAT.format(entry=entry) if entry is not None else PLAN_LEVEL_ENTRY_LABEL
+
+
+def risk_rubric(rule: str, entry: int | None) -> tuple[int, int, int, int, int]:
+    """A rule's risk rubric: by rule id for the rules RULE_RISK_RUBRIC names, else by entry."""
+    return RULE_RISK_RUBRIC.get(rule) or ENTRY_RISK_RUBRIC.get(entry or 0, DEFAULT_RISK_RUBRIC)
 
 
 def cluster_fields(member: dict) -> tuple[str, str, str]:
@@ -519,6 +575,7 @@ def finding(
     rationale: str,
     verify: str,
     still_failing_when: str,
+    mitigation: str | None = None,
 ) -> dict:
     project, location, cluster = cluster_fields(member)
     where = watch.MEMBER_KEY_SEPARATOR.join((project, location, cluster))
@@ -537,7 +594,7 @@ def finding(
             "rationale": clip(rationale),
             "risk": clip(f"Read-only first, on {where}: {verify}"),
         },
-        "remediation": {"kind": REMEDIATION_KIND, "note": clip(entry_mitigation(entry))},
+        "remediation": {"kind": REMEDIATION_KIND, "note": clip(entry_mitigation(entry) if mitigation is None else mitigation)},
         "verification": {
             "kind": VERIFICATION_KIND,
             "command": clip(f"On {where}: {verify}"),
@@ -726,8 +783,9 @@ def rule_findings(member: dict) -> list[dict]:
                 continue
             namespace, object_name = rule_object(item)
             text = str(item.get(TEXT_KEY) or item.get(SUMMARY_KEY) or item.get(DETAIL_KEY) or "")
-            values = RUBRIC["rule-blocking"] if blocking else ENTRY_RISK_RUBRIC.get(entry or 0, DEFAULT_RISK_RUBRIC)
-            lead = "blocks the upgrade" if blocking else "is at risk in the upgrade"
+            values = RUBRIC["rule-blocking"] if blocking else risk_rubric(rule, entry)
+            lead = "blocks the upgrade" if blocking else ("is at risk in the upgrade" if entry is not None else PLAN_LEVEL_RISK_LEAD)
+            action = rule_action(entry, text, rule)
             out.append(
                 finding(
                     member=member,
@@ -735,13 +793,14 @@ def rule_findings(member: dict) -> list[dict]:
                     entry=entry,
                     namespace=namespace,
                     object_name=object_name,
-                    title=f"{entry or '-'}. {entry_title(entry)}: {object_name if object_name != CLUSTER_OBJECT else 'this cluster'} {lead}",
+                    title=rule_title(rule, entry, object_name if object_name != CLUSTER_OBJECT else "this cluster", lead),
                     detail=text,
                     rubric_values=values,
-                    action=rule_action(entry, text),
-                    rationale=f"The readiness rule {rule} (catalogue entry {entry or 'unnumbered'}) read: {text}",
+                    action=action,
+                    rationale=f"The readiness rule {rule} ({entry_label(entry)}) read: {text}",
                     verify=f"re-run the readiness report ({rule}) for this cluster",
                     still_failing_when=f"the readiness rule {rule} still names {object_name}.",
+                    mitigation=action if entry is None else None,
                 )
             )
     return out

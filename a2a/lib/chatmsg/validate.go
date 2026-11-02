@@ -57,6 +57,22 @@ const (
 // tokenRE is a severity or a mark's ask: 1-16 characters of [a-z0-9-].
 var tokenRE = regexp.MustCompile(`^[a-z0-9-]{1,16}$`)
 
+// rowTasksMax is session-kv's cap on the cards one Retry or Drop acts on
+// (BOARD_ACTION_MAX_TASKS), and rowTasksJoinedMax Slack's on a button's
+// value, which carries the ids joined by rowTaskSeparator.
+const (
+	rowTasksMax       = 50
+	rowTasksJoinedMax = 2000
+	rowTaskSeparator  = ","
+)
+
+// taskIDRE is a board card id a row may carry: 1-64 characters of
+// [A-Za-z0-9_-], so the ids join into a button's value unambiguously.
+var taskIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// rowActions are the buttons a row may ask for.
+var rowActions = map[string]bool{RowActionRetry: true, RowActionDrop: true}
+
 // ipvFutureRE is the IPvFuture form urlsplit admits in brackets
 // (RFC 3986: "v", a hex version, a dot, then the address).
 var ipvFutureRE = regexp.MustCompile(`^v[a-fA-F0-9]+\..+$`)
@@ -166,6 +182,45 @@ func validateRows(rows []Row) error {
 		if err := oneLine(field+".detail", row.Detail, rowTextMax); err != nil {
 			return err
 		}
+		if err := validateRowActions(field, row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateRowActions checks a row's cards and the buttons that act on them:
+// both or neither, known actions once each, ids that join into one button
+// value.
+func validateRowActions(field string, row Row) error {
+	switch {
+	case len(row.Tasks) == 0 && len(row.Actions) == 0:
+		return nil
+	case len(row.Tasks) == 0:
+		return broke(field+".tasks", "empty, but the row has actions")
+	case len(row.Actions) == 0:
+		return broke(field+".actions", "empty, but the row has tasks")
+	case len(row.Tasks) > rowTasksMax:
+		return broke(field+".tasks", "%d cards, at most %d", len(row.Tasks), rowTasksMax)
+	}
+	for j, id := range row.Tasks {
+		if !taskIDRE.MatchString(id) {
+			return broke(fmt.Sprintf("%s.tasks[%d]", field, j), "%q is not 1-64 characters of [A-Za-z0-9_-]", id)
+		}
+	}
+	if n := utf8.RuneCountInString(strings.Join(row.Tasks, rowTaskSeparator)); n > rowTasksJoinedMax {
+		return broke(field+".tasks", "%d characters joined, at most %d", n, rowTasksJoinedMax)
+	}
+	seen := map[string]bool{}
+	for j, action := range row.Actions {
+		sub := fmt.Sprintf("%s.actions[%d]", field, j)
+		if !rowActions[action] {
+			return broke(sub, "%q is not %q or %q", action, RowActionRetry, RowActionDrop)
+		}
+		if seen[action] {
+			return broke(sub, "%q twice", action)
+		}
+		seen[action] = true
 	}
 	return nil
 }

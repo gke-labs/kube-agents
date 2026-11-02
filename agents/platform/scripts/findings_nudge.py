@@ -22,8 +22,10 @@ formatting and bookkeeping. Each run:
 3. Once a UTC day, on the first run at or after 12:00 UTC, also reminds the
    top pending criticals and names every pending non-critical holding
    additions back, with how to release it. A decision on any id of an item
-   covers every undecided row of the item (`findings_queue.patch_finding`),
-   and the count printed beside the id is that number of objects. Shown rows
+   covers the rows of the item a message has named
+   (`findings_queue.patch_finding`); every row of a line it names is marked
+   below, so the count printed beside the id is that number of objects. A
+   row a sweep adds to the line later stays open until a message names it. Shown rows
    a complete sweep stopped reporting are in that count but not listed, and
    the line says how many of them there are.
 4. Prints, records the day's state (the daily part sent, the items announced
@@ -160,6 +162,20 @@ def _filed_at(marker: Path) -> tuple[datetime, str] | None:
     return datetime.fromtimestamp(mtime, timezone.utc), "its mtime"
 
 
+def first_report_markers(gateway_home: Path) -> tuple[Path, Path]:
+    """The sweep marker, and the marker that says the first report is out.
+
+    Out is the delivery claim, or on the conversation path (``spec.mode: next``)
+    the recorded outcome, because a claim there can be released and taken
+    again. The board snapshot reads the same pair for the Home tab, and ends
+    its state early once delivery has registered the sweep's findings.
+    """
+    filed, delivered = gateway_home / SCAN_FILED_MARKER, gateway_home / DELIVERED_MARKER
+    if any((gateway_home / name).exists() for name in CONVERSATION_MARKERS):
+        delivered = gateway_home / CONVERSATION_DONE_MARKER
+    return filed, delivered
+
+
 def first_report_hold(gateway_home: Path, now: datetime) -> tuple[bool, str]:
     """Whether to add nothing yet, and the line to log about it ("" for none).
 
@@ -168,9 +184,7 @@ def first_report_hold(gateway_home: Path, now: datetime) -> tuple[bool, str]:
     onboarding never started (the experimental front door does not run it)
     has neither marker and is not held.
     """
-    filed, delivered = gateway_home / SCAN_FILED_MARKER, gateway_home / DELIVERED_MARKER
-    if any((gateway_home / name).exists() for name in CONVERSATION_MARKERS):
-        delivered = gateway_home / CONVERSATION_DONE_MARKER
+    filed, delivered = first_report_markers(gateway_home)
     if not filed.exists() or delivered.exists():
         return False, ""
     found = _filed_at(filed)
@@ -306,7 +320,8 @@ def compose(plan: fq.PacingPlan, open_count: int, daily: bool) -> str:
                 + [
                     "Reply with the id and the decision: dismiss (won't fix), snooze until a "
                     "date, or accept (being worked on). "
-                    "A decision on an id covers every undecided object in its item."
+                    "A decision on an id covers the objects counted beside it; "
+                    "a finding added to the line later stays open until a message names it."
                 ]
             )
         )

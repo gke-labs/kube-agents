@@ -35,7 +35,8 @@ from typing import Any
 import pytest
 
 #: The variables that select and configure a forge: GitLab, a GitHub
-#: Enterprise Server host, another GitHub API root, a private CA. Every check
+#: Enterprise Server host, another GitHub API root, a private CA, the renewed
+#: GitHub grading-token file (which outranks a fixture's token). Every check
 #: reads them from the process environment, so a developer's shell that
 #: exports them (as a GitLab dev install is told to) would turn the GitHub
 #: tests' answers into another forge's. Cleared before every test; a forge
@@ -48,6 +49,7 @@ FORGE_ENV_VARS = (
     "BENCH_GITHUB_HOST",
     "BENCH_GITHUB_API_ROOT",
     "BENCH_FORGE_CA_FILE",
+    "BENCH_GITHUB_TOKEN_FILE",
 )
 
 
@@ -55,6 +57,14 @@ FORGE_ENV_VARS = (
 def _no_forge_from_the_shell(monkeypatch):
     for name in FORGE_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_grader_sha_from_the_shell(monkeypatch):
+    """`bench-gate suite` reads EVAL_GRADER_SHA, which hack/ci-eval-pr.sh
+    exports; a shell that has it would add a key and a line to every suite
+    output the tests compare, the store-unset golden's included."""
+    monkeypatch.delenv("EVAL_GRADER_SHA", raising=False)
 
 
 FIXTURE_RUNS = Path(__file__).parent / "fixtures" / "runs"
@@ -120,6 +130,40 @@ def make_run(tmp_path: Path):
 def kanban_task() -> Path:
     """The real `agent-kanban-smoke` task file: noop deployer, declares checks."""
     return TASKS / "agent-kanban-smoke" / "task.yaml"
+
+
+@pytest.fixture
+def measured_kanban_task(write_task) -> Path:
+    """`agent-kanban-smoke` as the inject measurement run (#2039) declared it.
+
+    The answer check, and the router-scope `kanban_create` check #4004 dropped
+    from the real task file. The captured inject record (``INJECT_RUN``)
+    carries both entries, so the tests of how the lane grades a check its
+    transport blinds read the case this way.
+    """
+    return write_task(
+        "agent-kanban-smoke",
+        {
+            "id": "agent-kanban-smoke",
+            "name": "Agent kanban smoke test",
+            "prompt": "Which GKE clusters are we running in this project right now? Give me the list.",
+            "infrastructure": {"deployer": "noop"},
+            "verification_spec": [
+                {
+                    "name": "the-answer-names-the-planted-fleet",
+                    "role": "objective",
+                    "mode": "assert",
+                    "check": {"type": "report_contains", "required_phrases": ["seeded-a", "seeded-b", "seeded-c"]},
+                },
+                {
+                    "name": "the-kanban-card-was-actually-filed",
+                    "role": "objective",
+                    "mode": "assert",
+                    "check": {"type": "tool_called", "tool_names": ["kanban_create"], "require_success": True},
+                },
+            ],
+        },
+    )
 
 
 @pytest.fixture

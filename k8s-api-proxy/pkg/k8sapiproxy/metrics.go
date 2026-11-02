@@ -30,15 +30,15 @@ const (
 	inFlightRequestsName        = "in_flight_requests"
 	processStartTimeSecondsName = "process_start_time_seconds"
 
-	labelVerb       = "verb"
-	labelResource   = "resource"
+	labelVerb        = "verb"
+	labelResource    = "resource"
 	labelSubresource = "subresource"
-	labelMode       = "mode"
-	labelDryRun     = "dry_run"
-	labelOutcome    = "outcome"
-	labelStatusCode = "status_code"
-	labelReason     = "reason"
-	labelAction     = "action"
+	labelMode        = "mode"
+	labelDryRun      = "dry_run"
+	labelOutcome     = "outcome"
+	labelStatusCode  = "status_code"
+	labelReason      = "reason"
+	labelAction      = "action"
 
 	// OutcomeAllowed indicates that the request passed policy checks and received a non-5xx upstream response.
 	OutcomeAllowed = "allowed"
@@ -48,8 +48,11 @@ const (
 	OutcomeRejectedPolicy = "rejected_policy"
 	// OutcomeRejectedRoute indicates that URL normalization or RequestInfo parsing rejected the request.
 	OutcomeRejectedRoute = "rejected_route"
-	// OutcomeUpstreamError indicates that upstream transport failed or returned a 5xx response.
-	OutcomeUpstreamError = "upstream_error"
+
+	// ReasonNone indicates no rejection occurred.
+	ReasonNone RejectionReason = ""
+	// ReasonUnauthenticated indicates that caller authentication rejected the request.
+	ReasonUnauthenticated RejectionReason = "unauthenticated"
 
 	// SecretActionAcceptHeaderRewritten counts requests where Accept was rewritten to PartialObjectMetadata.
 	SecretActionAcceptHeaderRewritten = "accept_header_rewritten"
@@ -59,14 +62,14 @@ const (
 	metricsLabelOther = "other"
 	metricsLabelNone  = "none"
 
-	metricsPortMin              = 1
-	metricsPortMax              = 65535
-	metricsMaxConnections       = 16
-	metricsMaxRequestsInFlight  = metricsMaxConnections
-	metricsConnectionDeadline   = 10 * time.Second
-	metricsScrapeTimeout        = 5 * time.Second
-	metricsIdleTimeout          = 10 * time.Second
-	metricsShutdownGrace        = 5 * time.Second
+	metricsPortMin             = 1
+	metricsPortMax             = 65535
+	metricsMaxConnections      = 16
+	metricsMaxRequestsInFlight = metricsMaxConnections
+	metricsConnectionDeadline  = 10 * time.Second
+	metricsScrapeTimeout       = 5 * time.Second
+	metricsIdleTimeout         = 10 * time.Second
+	metricsShutdownGrace       = 5 * time.Second
 )
 
 var (
@@ -146,17 +149,18 @@ var (
 		ReasonDiscoveryPathBlocked:     {},
 		ReasonAuthResourceBlocked:      {},
 		ReasonSecretSubresourceBlocked: {},
+		ReasonSecretWriteBlocked:       {},
 		ReasonSubresourceBlocked:       {},
 		ReasonDryRunRequired:           {},
 		ReasonVerbBlocked:              {},
 	}
 
 	knownOutcomes = map[string]struct{}{
-		OutcomeAllowed:        {},
-		OutcomeRejectedAuth:   {},
-		OutcomeRejectedPolicy: {},
-		OutcomeRejectedRoute:  {},
-		OutcomeUpstreamError:  {},
+		OutcomeAllowed:               {},
+		OutcomeRejectedAuth:          {},
+		OutcomeRejectedPolicy:        {},
+		OutcomeRejectedRoute:         {},
+		string(OutcomeUpstreamError): {},
 	}
 
 	durationBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}

@@ -263,10 +263,10 @@ class ComposeTest(unittest.TestCase):
         text = h.compose(self._state([("t_str", "done", meta, "")]), timed_out=False, now=NOW)
         self.assertIn("seeded-a (t_str): could not list Jobs", text)
 
-    def test_a_cluster_the_sweep_audited_is_named_as_having_no_agent(self):
+    def test_a_cluster_the_sweep_audited_is_named_as_having_no_agent_card(self):
         own = dict(_metadata()["t_ccbfda55"], cluster="no-agent-cluster")
         text = h.compose(self._state([], {"clusters": [own], "fleet": []}), timed_out=False, now=NOW)
-        self.assertIn("no-agent-cluster (example-project): no Cluster Agent, so the sweep audited it itself", text)
+        self.assertIn("no-agent-cluster (example-project): no Cluster Agent card, so the sweep audited it itself", text)
 
     def test_a_sweep_that_never_finished_says_so(self):
         text = h.compose(self._state(_all_done(), sweep_status="running"), timed_out=True, now=NOW)
@@ -598,6 +598,173 @@ class HandOffTest(unittest.TestCase):
         self.assertFalse((self.d / "INVENTORY.raw.md").exists())
         self.assertEqual(self.filed, [])
 
+    def test_the_first_run_cap_bounds_the_cards_one_sweep_files(self):
+        # #3702: a roster past the cap files the cap's worth, and the rest are
+        # left to the sweep rather than counted as unfiled.
+        _board(self.board, clusters=[])
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("3\n")
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(10)]))
+        self.assertEqual(len(sent), 3)
+
+    def test_the_cap_counts_cards_already_filed_for_the_sweep(self):
+        # A roster that changes between ticks cannot file past the cap: two
+        # cards are on the board, so a cap of three files one more.
+        _board(self.board, clusters=_all_done()[:2])
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("3")
+        sent = []
+        roster = [self._agent(f"t_new{i}") for i in range(5)]
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster(roster))
+        self.assertEqual(len(sent), 1)
+
+    def test_an_agent_past_the_cap_is_not_a_card_the_gate_could_not_file(self):
+        # #3702: the cap's worth of cards are on the board and done and the sweep
+        # finished, so the hand-off goes ahead; the agents past the cap were left
+        # to the sweep, so the raw report has no unfiled-card gap for them.
+        _board(self.board, clusters=_all_done())
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text(str(len(_all_done())))
+        roster = [self._agent(tid) for tid, _, _, _ in _all_done()] + [self._agent(f"t_past{i}") for i in range(3)]
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertEqual(self._run_roster(roster), "t_rank1")
+        self.assertEqual(sent, [])
+        self.assertNotIn("could not file this Cluster Agent's card", (self.d / "INVENTORY.raw.md").read_text())
+
+    def test_the_deadline_budgets_for_the_agents_the_marker_left_uncarded(self):
+        # #3702: the gate's marker records the agents past the cap, and the
+        # hand-off waits five more minutes for each before it stops waiting.
+        uncarded = 4
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\nuncarded={uncarded}\n")
+        _board(self.board, clusters=_all_done() + [("t_stuck", "running", None, "")])
+        unbudgeted = h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * (len(_all_done()) + 1)
+        budgeted = unbudgeted + h.DEADLINE_PER_CARD_SECONDS * uncarded
+        self.assertIsNone(self._run(now=NOW - 60 + unbudgeted))
+        self.assertIsNone(self._run(now=NOW - 60 + budgeted - 1))
+        self.assertFalse((self.d / "INVENTORY.raw.md").exists())
+        self.assertEqual(self._run(now=NOW - 60 + budgeted), "t_rank1")
+        self.assertIn("stopped waiting", (self.d / "INVENTORY.raw.md").read_text())
+
+    def _mid_sweep(self, marker_cap):
+        # Six of the sweep's cluster cards are on the board, four more agents
+        # are ready, and the operator has since raised the file to 20.
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\nuncarded=4\n{marker_cap}")
+        _board(self.board, clusters=[(f"t_{i}", "running", None, "") for i in range(6)])
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("20\n")
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(10)]))
+        return sent
+
+    def test_a_cap_raised_mid_sweep_files_no_more_cards(self):
+        # #3702: the sweep card told its worker to audit the four past cap 6;
+        # carding them now would audit them twice.
+        self.assertEqual(self._mid_sweep("cap=6\n"), [])
+
+    def test_a_sweep_marker_without_a_cap_falls_back_to_the_file(self):
+        # A sweep filed by an older build records no cap= and keeps the file's.
+        self.assertEqual(len(self._mid_sweep("")), 4)
+
+    def _carded_run(self, carded, clusters, roster, cap=3):
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncap={cap}\ncarded={carded}\n")
+        self.board.unlink(missing_ok=True)
+        _board(self.board, clusters=clusters)
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(t) for t in roster]))
+        return [shlex.split(cmd)[shlex.split(cmd).index("--idempotency-key") + 1] for cmd in sent]
+
+    def test_a_failed_carded_create_is_retried_and_a_newly_ready_profile_gets_none(self):
+        # #3702: t_3's create failed on the filing tick, and t_0, which sorts
+        # first, has become ready since. The sweep card gave t_0 to its worker,
+        # so the free slot goes to t_3 alone.
+        carded = ",".join(f"{h.CLUSTER_KEY_PREFIX}t_{i}" for i in (1, 2, 3))
+        running = [(f"t_{i}", "running", None, "") for i in (1, 2)]
+        self.assertEqual(self._carded_run(carded, running, ["t_0", "t_1", "t_2", "t_3"]),
+                         [f"{h.CLUSTER_KEY_PREFIX}t_3"])
+
+    def test_a_stray_cluster_card_takes_no_carded_agents_slot(self):
+        # #3702: cap 3 over a, b, c; a's create failed, b and c are on the board,
+        # and so is a card for x, which the sweep card never listed. Counting x
+        # against the cap would leave a without a card for the whole sweep.
+        carded = ",".join(f"{h.CLUSTER_KEY_PREFIX}t_{n}" for n in "abc")
+        clusters = [(f"t_{n}", "running", None, "") for n in "bcx"]
+        self.assertEqual(self._carded_run(carded, clusters, ["t_a", "t_b", "t_c"], cap=3),
+                         [f"{h.CLUSTER_KEY_PREFIX}t_a"])
+
+    def test_an_archived_carded_card_frees_no_slot_for_an_unlisted_profile(self):
+        carded = f"{h.CLUSTER_KEY_PREFIX}t_1,{h.CLUSTER_KEY_PREFIX}t_2"
+        clusters = [("t_1", "running", None, ""), ("t_2", "archived", None, "")]
+        self.assertEqual(self._carded_run(carded, clusters, ["t_0", "t_1", "t_2"], cap=2), [])
+
+    def test_a_malformed_carded_list_narrows_and_never_widens(self):
+        # Entries that are not cluster card keys are dropped; a list with none
+        # left files nothing rather than falling back to the cap alone.
+        roster = ["t_0", "t_1", "t_2"]
+        self.assertEqual(self._carded_run(f"garbage,,bootstrap-inventory-other-t_0,{h.CLUSTER_KEY_PREFIX}t_1", [], roster),
+                         [f"{h.CLUSTER_KEY_PREFIX}t_1"])
+        for carded in ("!!", "-", f"{h.CLUSTER_KEY_PREFIX}t_0;rm"):
+            with self.subTest(carded=carded):
+                self.assertEqual(self._carded_run(carded, [], roster), [])
+
+    def test_a_marker_without_carded_keeps_the_cap_as_the_only_bound(self):
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncap=2\n")
+        _board(self.board, clusters=[])
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(4)]))
+        self.assertEqual(len(sent), 2)
+
+    def _unpinned_at(self, now, full_roster):
+        # #3702: a marker that pinned nothing (an empty or failed listing at
+        # filing), cap 6, six cluster cards, and 200 ready agents now.
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncap=6\n")
+        self.board.unlink(missing_ok=True)
+        # Four done with findings and two still running: six cards, so the
+        # timed-out hand-off has audits to rank.
+        _board(self.board, clusters=_all_done() + [(f"t_run{i}", "running", None, "") for i in range(2)])
+        with self._stub_kanban([]):
+            return h.hand_off(self.d, self.scan_marker, None, roster=[], now=now, full_roster=full_roster)
+
+    def test_an_unpinned_sweep_budgets_the_live_roster_past_the_cap(self):
+        roster = [self._agent(f"t_{i:03d}") for i in range(200)]
+        filed_at = NOW - 60
+        self.assertEqual(h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * (6 + 194), 63600)
+        self.assertIsNone(self._unpinned_at(filed_at + h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 6 + 1, lambda: roster))
+        self.assertIsNone(self._unpinned_at(filed_at + 63600 - 1, lambda: roster))
+        self.assertFalse((self.d / "INVENTORY.raw.md").exists())
+        self.assertEqual(self._unpinned_at(filed_at + 63600, lambda: roster), "t_rank1")
+        self.assertIn("stopped waiting", (self.d / "INVENTORY.raw.md").read_text())
+
+    def test_a_full_roster_that_raises_reads_as_no_live_budget(self):
+        def broken():
+            raise OSError("profiles unreadable")
+
+        with mock.patch.object(h, "_log"):
+            self.assertEqual(
+                self._unpinned_at(NOW - 60 + h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 6, broken), "t_rank1"
+            )
+
+    def test_a_pinned_marker_ignores_the_live_roster(self):
+        marker = self.d / "pinned"
+        roster = [self._agent(f"t_{i}") for i in range(200)]
+        marker.write_text("task_id=t\ncap=6\nuncarded=4\n")
+        self.assertEqual(h.uncarded_budget(marker, 6, roster), 4)
+        marker.write_text(f"task_id=t\ncap=6\ncarded={h.CLUSTER_KEY_PREFIX}t_0\n")
+        self.assertEqual(h.uncarded_budget(marker, 6, roster), 0)
+        marker.write_text("task_id=t\ncap=6\n")
+        self.assertEqual(h.uncarded_budget(marker, 6, roster), 194)
+        self.assertEqual(h.uncarded_budget(marker, 6, None), 0)
+        self.assertEqual(h.uncarded_budget(marker, 6, [self._agent("t")] * 5000), h.FIRST_RUN_UNCARDED_MAX)
+
+    def test_a_roster_under_the_cap_files_every_card(self):
+        _board(self.board, clusters=[])
+        sent = []
+        with self._stub_kanban(sent):
+            self.assertIsNone(self._run_roster([self._agent(f"t_{i}") for i in range(h.FIRST_RUN_CLUSTER_CARDS - 1)]))
+        self.assertEqual(len(sent), h.FIRST_RUN_CLUSTER_CARDS - 1)
+
     def test_an_archived_cluster_card_is_not_filed_again(self):
         _board(self.board, clusters=_all_done() + [("t_gone", "archived", None, "")])
         sent = []
@@ -797,6 +964,105 @@ class HandOffTest(unittest.TestCase):
         self.assertEqual(kw["principal"], "agent")
         self.assertIn("first_report_criticals", json.loads(kw["stdin"]))
         self.assertFalse((self.d / "INVENTORY.raw.md").exists())
+
+
+class FirstRunClusterCardsTest(unittest.TestCase):
+    """The cap file's clamp (#3702): it can lower or raise the cap within
+    bounds, and nothing in it uncaps the scan."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.d = Path(self.tmp.name)
+
+    def _cap(self, content=None):
+        if content is not None:
+            (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text(content)
+        with mock.patch.object(h, "_log"):
+            return h.first_run_cluster_cards(self.d)
+
+    def test_absent_is_the_default(self):
+        self.assertEqual(self._cap(), h.FIRST_RUN_CLUSTER_CARDS)
+
+    def test_a_value_in_range_is_used(self):
+        self.assertEqual(self._cap("2\n"), 2)
+        self.assertEqual(self._cap(str(h.FIRST_RUN_CLUSTER_CARDS_MAX)), h.FIRST_RUN_CLUSTER_CARDS_MAX)
+
+    def test_malformed_zero_or_negative_is_the_default(self):
+        for content in ("", "six", "2.5", "0", "-3", "1e9"):
+            with self.subTest(content=content):
+                self.assertEqual(self._cap(content), h.FIRST_RUN_CLUSTER_CARDS)
+
+    def test_a_value_past_the_maximum_is_clamped(self):
+        self.assertEqual(self._cap("100000"), h.FIRST_RUN_CLUSTER_CARDS_MAX)
+
+    def test_an_unreadable_file_is_the_default(self):
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).mkdir()
+        self.assertEqual(self._cap(), h.FIRST_RUN_CLUSTER_CARDS)
+
+    def test_a_file_that_is_not_utf8_is_the_default(self):
+        # UnicodeDecodeError is a ValueError, not an OSError.
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_bytes(b"\xff\xfe6\x00")
+        self.assertEqual(self._cap(), h.FIRST_RUN_CLUSTER_CARDS)
+
+    def test_the_marker_count_of_uncarded_agents_is_clamped(self):
+        marker = self.d / "scan_filed"
+        for content, want in (("task_id=t\nfiled_at=1\n", 0), ("task_id=t\nuncarded=194\n", 194),
+                              ("task_id=t\nuncarded=-4\n", 0), ("task_id=t\nuncarded=lots\n", 0),
+                              (f"task_id=t\nuncarded={h.FIRST_RUN_UNCARDED_MAX + 1}\n", h.FIRST_RUN_UNCARDED_MAX)):
+            with self.subTest(content=content):
+                marker.write_text(content)
+                self.assertEqual(h.uncarded_agents(marker), want)
+
+    def test_the_marker_cap_is_read_like_the_file(self):
+        marker = self.d / "scan_filed"
+        for content, want in (("task_id=t\nfiled_at=1\n", None), ("task_id=t\ncap=3\n", 3),
+                              ("task_id=t\ncap=0\n", h.FIRST_RUN_CLUSTER_CARDS),
+                              ("task_id=t\ncap=-2\n", h.FIRST_RUN_CLUSTER_CARDS),
+                              ("task_id=t\ncap=lots\n", h.FIRST_RUN_CLUSTER_CARDS),
+                              (f"task_id=t\ncap={h.FIRST_RUN_CLUSTER_CARDS_MAX + 1}\n", h.FIRST_RUN_CLUSTER_CARDS_MAX)):
+            with self.subTest(content=content), mock.patch.object(h, "_log"):
+                marker.write_text(content)
+                self.assertEqual(h.marker_cap(marker), want)
+
+    def test_a_sweep_uses_its_marker_cap_and_else_the_file(self):
+        marker = self.d / "scan_filed"
+        (self.d / h.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("20")
+        marker.write_text("task_id=t\ncap=99\n")
+        with mock.patch.object(h, "_log"):
+            self.assertEqual(h.sweep_cluster_cards(self.d, marker), h.FIRST_RUN_CLUSTER_CARDS_MAX)
+            marker.write_text("task_id=t\n")
+            self.assertEqual(h.sweep_cluster_cards(self.d, marker), 20)
+            marker.write_bytes(b"\xff\xfecap=2\n")
+            self.assertEqual(h.sweep_cluster_cards(self.d, marker), 20)
+
+    def test_the_carded_keys_are_read_from_the_marker(self):
+        marker = self.d / "scan_filed"
+        key = h.CLUSTER_KEY_PREFIX
+        for content, want in (("task_id=t\n", None),
+                              (f"task_id=t\ncarded={key}a,{key}b.c\n", {f"{key}a", f"{key}b.c"}),
+                              (f"task_id=t\ncarded={key}a,x,{key}\n", {f"{key}a"}),
+                              ("task_id=t\ncarded=-\n", set())):
+            with self.subTest(content=content):
+                marker.write_text(content)
+                got = h.carded_keys(marker)
+                self.assertEqual(got if got is None else set(got), want)
+        many = ",".join(f"{key}p{i:03d}" for i in range(h.FIRST_RUN_CLUSTER_CARDS_MAX + 5))
+        marker.write_text(f"task_id=t\ncarded={many}\n")
+        self.assertEqual(len(h.carded_keys(marker)), h.FIRST_RUN_CLUSTER_CARDS_MAX)
+        marker.write_bytes(b"\xff\xfecarded=x\n")
+        self.assertIsNone(h.carded_keys(marker))
+
+    def test_a_marker_that_is_not_utf8_records_no_uncarded_agents(self):
+        # _read_marker raises UnicodeDecodeError, a ValueError, which this read catches.
+        marker = self.d / "scan_filed"
+        marker.write_bytes(b"\xff\xfe6\x00")
+        self.assertEqual(h.uncarded_agents(marker), 0)
+
+    def test_the_deadline_budgets_for_clusters_left_to_the_sweep(self):
+        state = {"clusters": [{}] * 6, "uncarded": 194}
+        self.assertEqual(h.deadline(state), h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 200)
+        self.assertEqual(h.deadline({"clusters": [{}] * 6}), h.DEADLINE_SECONDS + h.DEADLINE_PER_CARD_SECONDS * 6)
 
 
 if __name__ == "__main__":

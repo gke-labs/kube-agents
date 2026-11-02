@@ -12,8 +12,9 @@
 > is not a scheduling slip: `inspect_repository.py` stays on the broker's
 > content-workspace route rather than moving to the verbs, because it reads
 > repositories this install does not manage and does it with a shallow clone —
-> neither of which the verbs offer, the second on purpose
-> ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
+> neither of which `clone` offers, the second on purpose
+> ([The seam](#3-the-seam)). The `snapshot` verb now offers both; the move is
+> not made yet. The CRD declares forges and repositories in `spec.integration.forges`
 > and `spec.integration.repositories`; each provider states its own hosts, grammar and credential.
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
@@ -647,7 +648,8 @@ them a route. A protocol that answers from the credential side has to grow a
 verb for each such narrowing and a cap on each verb's response, and a caller
 that hits the cap gets a truncated list rather than a smaller question. This
 design has no cap on a history question, because a history question never
-crosses the seam. The one transfer it does make is bounded, once, at `clone`.
+crosses the seam. The transfers it does make are bounded once each, at `clone`
+and at `snapshot`.
 
 ### The broker is already in its own pod
 
@@ -669,6 +671,12 @@ and nothing that needs to be co-resident.
 the same sandbox, and a route that demanded nothing would be the one gap in a
 table whose point is that every route names what it requires.
 
+It admits one other caller: the A2A MCP server's pod, under the `mcp` role,
+which `ROLE_VCS_VERBS` holds to `proposal-view`, a read, with that verb's
+managed-repository check still applying. `CREDENTIAL_PROXY_MCP_CALLERS` binds
+the role to the MCP pod's own ServiceAccount.
+[`agent-shell-sandboxing.md`](agent-shell-sandboxing.md) owns that caller.
+
 ### No shallow clones
 
 There is no `depth`. This is a property of the transport rather than an
@@ -679,6 +687,23 @@ clone from it fails with `remote did not send all necessary objects`. Naming a
 single-branch. The two ceilings — `CREDENTIAL_PROXY_MAX_CLONE_BYTES` (256 MiB
 of working tree) and `CREDENTIAL_PROXY_MAX_BUNDLE_BYTES` (64 MiB of bundle, both
 directions) — say so in their refusals.
+
+`snapshot` clones with `--depth 1` and has no boundary problem, because no
+history leaves the broker. It runs `git archive` on the one revision of a bare,
+single-branch clone and sends the tree as a tar. A tar has no commits, so it
+has no parent for the receiver to miss, and the answer says `history: "none"`.
+The clone stays under `CREDENTIAL_PROXY_MAX_CLONE_BYTES`: it is measured while
+git writes, about every half second, and killed past the ceiling, because the
+repository can be anyone's and a clone left to finish could fill the scratch
+volume first. The tar stays under
+`CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES` (32 MiB, refused as `SNAPSHOT_TOO_LARGE`).
+The tar is smaller than the bundle ceiling because the answer is base64 inside
+one JSON body, and the broker holds several copies of it. The tar is sized from
+`git ls-tree` before `git archive` writes it, because the clone ceiling measures
+a compressed pack: a few MB of repeated bytes can be GB as a tar, on the volume
+the broker shares with its own state. The clone's `info/attributes` unsets
+`export-subst`, `export-ignore`, `ident`, `text` and `working-tree-encoding`, so the tar holds every file of the tree as it was
+committed, and the measured size holds.
 
 ### One git in the sandbox
 
@@ -727,9 +752,10 @@ directory's own profile.d entry always has. A missed prepend is a
 other thing deleting the shim buys.
 
 The wrapper gives the agent's own `git` `core.hooksPath` pointed at an empty,
-root-owned directory, `core.fsmonitor` off, `protocol.ext.allow=never`, and no
-system config — the hooks, `ext` and system-config settings `vcs.py` gives its
-own calls, plus `fsmonitor`. `-c` outranks every
+root-owned directory, `core.fsmonitor` off, `protocol.ext.allow=never`,
+`safe.bareRepository=explicit`, and no system config — the hooks, `ext`,
+bare-repository and system-config settings `vcs.py` gives its own calls, plus
+`fsmonitor`. `-c` outranks every
 config file, so a working copy that sets its own `core.hooksPath` — the step an
 injected `CONTRIBUTING.md` asked for — still gets the empty one. It is not a
 boundary, and does not claim to be. A repository-local `filter.<name>.clean`
@@ -803,7 +829,7 @@ about git.
 
 `vcs.py` runs that binary with `GIT_CONFIG_NOSYSTEM=1`,
 `GIT_CONFIG_GLOBAL=/dev/null`, `core.hooksPath` pointed at an empty directory,
-`protocol.ext.allow=never`, and no `origin`. The clone's only config is the one
+`protocol.ext.allow=never`, `safe.bareRepository=explicit`, and no `origin`. The clone's only config is the one
 git just wrote, so a `.gitattributes` naming `filter.foo.clean` finds no `foo`
 defined and is inert.
 
@@ -850,8 +876,8 @@ names a repository, does one thing, and keeps nothing. There is no session, no
 handle, and no state on the broker that a later call depends on — a caller that
 crashes between two verbs leaves nothing behind to reconcile, and two agents
 calling the same verb on the same repository do not have to be ordered against
-each other. `clone` is the only route that hands back something durable, and it
-hands it to the sandbox as a bundle rather than keeping a tree.
+each other. `clone` and `snapshot` are the only routes that hand back something
+durable: a bundle and a tar, never a tree the broker keeps.
 
 That is a constraint on what the verbs may be, not just a description of them.
 It is why `publish` carries `baseRevision` instead of remembering what `clone`
@@ -868,6 +894,7 @@ another for no property gained.
 | ------------------------------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, labels, missing, baseBranch, fileUrl?}` |
 | `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`                        |
+| `snapshot`                           | `{repository, ref?, paths?}`                                         | `{forge, repo, role, ref, revision, size, archiveBase64, history: "none"}`               |
 | `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                        |
 | `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal}`                                                                             |
 | `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                          |
@@ -911,7 +938,8 @@ labels serves `label-ensure`, and a forge without them does not: the two say one
 thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
-The rows down to `issue-create`, and the two branch rows, are the version-control skill's. The rest are the union of
+The rows down to `issue-create` except `snapshot`, and the two branch rows, are the version-control skill's;
+`snapshot` is served to library callers (`vcs_client.snapshot`). The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
@@ -998,8 +1026,9 @@ instruction, not the broker's refusal.
 tip is not in the fresh copy, so no caller has to know which setting the
 repository has.
 
-Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
-`BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
+Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE`,
+`BUNDLE_TOO_LARGE` and `SNAPSHOT_TOO_LARGE`, 400 `PATH_NOT_FOUND` (a `snapshot`
+path that names nothing at the ref; the refusal carries the `revision` it read), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
 `BASE_BRANCH_MISSING`, `BRANCH_NOT_OURS`, `OPEN_PROPOSAL`, `BRANCH_MOVED`,
 `NOT_SPENT` and `DELETE_REFUSED`, 501 `LABELS_UNSUPPORTED`, 502 `GIT_FAILED`,
@@ -2101,6 +2130,15 @@ shared table, living in the forge package. GitLab is the first to populate it,
 for its own readings of 401 and 400, so by the time Bitbucket arrives the
 mechanism has a user and a test rather than being a speculative hook.
 
+Self-managed Gitea checks a second axis of the same contract: a forge with no
+canonical SaaS host, an optional non-default `port`, and an optional
+`scheme: http` restricted to in-cluster `.svc` / `.svc.cluster.local` Services.
+Its differences — `WIP:` draft title prefixes, label name-to-numeric-ID
+resolution, issue endpoints that return pull requests alongside issues, and
+`Authorization: token <t>` on `StaticFileCredential` — stay inside its own
+package, while `Forge.scheme` and `BrokerForge.{Scheme,Port}` carry the origin
+metadata across `VCS_FORGES_CONFIG`.
+
 ### Not every provider is a forge
 
 The Bitbucket row above says "no issue tracker" is absorbed by `verbs`
@@ -2163,10 +2201,12 @@ the first three forges and not a property of the domain.**
 ## 6. The declarative surface
 
 `IntegrationSpec` declares two lists. `forges` names each forge the install talks to: a `name`
-the rest of the spec refers to it by, a `provider`, an optional `host`, an optional default
-`namespace`, and an optional `credentialsRef`. `repositories` names each repository the operator
-registers: the `forge` it lives on, the `repository` itself, an optional `namespace` of its own
-for a repository given as a bare name, a `role`, and an optional `baseBranch`.
+the rest of the spec refers to it by, a `provider`, an optional `host`, an optional `port`
+(`1`–`65535`) and `scheme` (`https` default, or `http` for an in-cluster self-managed service),
+an optional default `namespace`, and an optional `credentialsRef`. `repositories` names each
+repository the operator registers: the `forge` it lives on, the `repository` itself, an optional
+`namespace` of its own for a repository given as a bare name, a `role`, and an optional
+`baseBranch`.
 (`PlatformAgentIntegrationSpec` embeds it alongside `GoogleChat` and `Slack`, so version control
 is one integration among several.)
 
@@ -2931,6 +2971,10 @@ summary to chat. A repository on a forge with no issue verbs uses the same
 path. The signal is `capabilities`: when its `verbs` do not include the issue
 verbs, the ledger goes to the store. An answer that cannot be read keeps the
 forge path, so a transient fault on GitHub or GitLab does not move a ledger.
+The read that then checks that the repository can be reached is the listing
+that the chosen path needs: one open issue for a ledger on the forge, and one
+open proposal for a ledger in the store. An issue listing proves nothing on a
+forge that has no issues.
 
 One difference makes the decision carry two facts, not one. The path with no
 GitOps repository opens no remediation proposal, because there is no forge to
@@ -2952,15 +2996,29 @@ class LedgerDecision(NamedTuple):
     ledger: Literal["forge", "store"]
     remediation: bool
     reason: str | None
+    probe: str = "issue-list"
 ```
 
 `start` makes the decision and writes it into the run record, `ledger` and
 `remediation` included, and `finish` follows the record. If `finish` decided
 again, a forge that changed between the two steps would split one run across
-two ledgers. The "store, remediation on" row is new behaviour for the store
-path: it opens, finds and closes remediation proposals as the forge path does
+two ledgers. `probe` is the listing that found a repository unreachable: the
+note gives its advice from the record, with no broker call, so a broker that
+is lost at `finish` cannot stop the run after its store write. In the "store,
+remediation on" row the store path opens, finds and closes remediation
+proposals as the forge path does
 (`open_remediation_pr`, `list_remediation_prs`, `close_stale_remediation_prs`),
-and it puts their links in the chat summary and in the stored report. An
+and it puts their links in the chat summary and in the stored report. The
+stored report is the ledger: it holds the body that the forge path would post,
+with the status `STORE_LEDGER`, and nothing posts it. The next run of the
+repository reads it as its memory, so the delta, the findings that `start`
+names, and the guard that stops a clean run from closing a fix over a finding
+that it did not account for read it as the forge path reads the stored body of
+the issue. One input differs: the forge path seeds a lost memory from the
+issue, and this ledger has no other copy, so a store with no ledger in it is a
+lost memory while a remediation proposal of the stream is open. The
+envelope is not marked as a diverted run's is, and the no-forge path and the
+forge path do not read it. An
 install can use a forge with no issues only where `start` makes this decision:
 on a path that does not, the ledger lookup refuses, and the run stops at
 `start`.
@@ -2972,7 +3030,10 @@ ledger in the store. Its ledger lookup refuses, not answers "none", because
 
 What a store ledger does not give: a ledger that a person can open, link and
 comment on. A `/remediate` request then comes through chat, not a ledger
-comment, and the history is on the volume of the report store.
+comment, and the history is on the volume of the report store. A request in
+chat is not tied to a forge identity, so it cannot overrule a person's close of
+a remediation proposal, as a write-gated ledger comment can. Only the person at
+the terminal can, with `--override-human-close`.
 
 The chat-delivery watch keeps its own ledger issue beside a log channel that
 does not depend on chat. On a forge with no issue tracker, or no labels, the
@@ -3289,9 +3350,16 @@ claim about what else the sandbox can reach —
 [`../credential-isolation-design.md`](../credential-isolation-design.md) owns
 that question.
 
+The MCP pod is the second caller, and its requests come from outside the
+cluster, through the pod. What bounds it is narrower than the `shell` role:
+`ROLE_VCS_VERBS` holds the `mcp` role to `proposal-view`, which writes nothing,
+and only on a repository the install manages.
+
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it
-cheaper.
+cheaper. `snapshot` is the one-off read: one revision's tree, with no history
+(see the end of this section). A tree larger than its ceiling is refused, and
+`paths` is the size control that works.
 
 Throttling is legible to the agent and only partly to an operator.
 [Where the error contract splits](#where-the-error-contract-splits) puts the
@@ -3304,7 +3372,7 @@ been added to it, so until they are, an install approaching its token quota is
 visible in the broker's logs and, by status code alone, as `429`s under
 `endpoint="/v1/vcs"` in `kubeagents_credential_proxy_requests_total`, the route
 family every forge verb travels (`/v1/forge` reaches only the credential
-refresh, which spends no quota). The per-verb `kubeagents_vcs_requests_total{verb,status}` names the failing verb, not the cause: a `429` lands as `status="error"` under its verb. The refusal is also thinner than it could
+refresh, which spends no quota). The per-verb `kubeagents_vcs_requests_total{verb,status,provider}` names the failing verb and forge, not the cause: a `429` lands as `status="error"` under its verb. The refusal is also thinner than it could
 be: `FORGE_UNAVAILABLE` tells a caller the same call may work later without
 telling it when, and the `Retry-After` and `RateLimit-*` values both forges
 return are read to classify the failure and then dropped rather than carried
@@ -3348,21 +3416,48 @@ case that will arrive first — are named in
 ---
 
 **Reads of repositories the install does not manage.** The broker refuses every
-verb but `capabilities` at the route for a repository the install does not
-manage, reads included, so the managed list is a visibility control as well as
-a write one on every forge, whatever its credential strategy. A token an
+verb but `capabilities` and `snapshot` at the route for a repository the install
+does not manage, reads included, so the managed list is a visibility control as
+well as a write one on every forge, whatever its credential strategy. A token an
 administrator stored is one token for every repository it can see, so nothing
-downstream of the route would refuse on its behalf. The intent that reading a
-repository this install does not write to should work — a public upstream, read
-with no credential — is real and not served. Opening those reads needs a
-credential-less path — a clone with no token, a read API call with
-none — that the provider can take when the repository is public, which is a
-change to the credential strategy and not to the verbs, and is not designed
-here.
+downstream of the route would refuse on its behalf.
+
+`snapshot` is the read that does not take that gate. The route still resolves
+the repository, so the host allowlist holds, and the verb chooses the
+credential by the repository's role in the broker's ConfigMap:
+
+| Role                                      | Credential on the clone                                                           |
+| ----------------------------------------- | --------------------------------------------------------------------------------- |
+| managed                                   | The forge's managed credential, made current as `clone` makes it current.         |
+| context                                   | `read_credential(repo)`, never the write token, with `credential.helper` cleared. |
+| unregistered, or the lists cannot be read | None, with `credential.helper` cleared.                                           |
+
+The clear goes into the same per-invocation config layer as the credential. An
+empty `credential.helper` there resets every helper git read before it,
+including a URL-scoped one in the global file, so a clone that must not ride
+the ambient write credential cannot fall back to it. A private repository that
+nobody registered therefore fails as `GIT_FAILED` instead of being read on a
+token that reaches more than the install lists. The clone is bare and one
+revision deep, and nothing is checked out. `git archive` does not write a
+`.git` path, and `vcs_client.snapshot` refuses one again on unpack (in any
+case), together with absolute paths, `..`, a path through a symbolic link, hard
+links out of the tree and device files. Two things are not written, and the
+answer names them under `skipped`: a symbolic link that points out of the tree,
+and every member of a directory laid out as a bare repository (`HEAD` with
+`objects/` and `refs/`, or with `commondir`), which git would open and whose
+`config` it would read. Git tooling commits such directories as test fixtures,
+so one of them does not cost the rest of the tree. Both of the
+sandbox's gits also run with `safe.bareRepository=explicit`, so git opens a bare
+repository only when it is named. A bare `owner/name` is GitHub's, as it is to
+the content workspace. On an install with a GitHub forge it is read on that
+forge. On an install with none it is read from github.com with no credential,
+because github.com is not in that install's host table and a URL cannot name
+it, unless the install's own forge lists the name as managed or context; then
+it is read there, as `clone` reads it. The MCP role cannot call `snapshot`. The verb is reachable to the `shell` role;
+`capabilities` does not list it (`LIBRARY_VERBS`), because no `vcs.py` command runs it, and no skill calls it yet.
 
 **Registered context repositories** are the one unmanaged read the install does
-grant a credential for, and the shape is the credential-strategy change above
-for one case. A repository under `context_repos` is read for declared intent and
+grant a credential for. A repository under `context_repos` is read for declared intent and
 never written, and it is usually private. The broker's content-mode `open`
 resolves the repository's registered role from the ConfigMap — `managed`,
 `context`, or neither, decided by the broker and never by a forge — and for a
@@ -3379,9 +3474,9 @@ sets its reach, a project or a group. The broker still presents it only for a
 registered context repository inside the forge's `allowedPaths`. A forge without a read-only
 credential answers `NoCredential` and the clone proceeds as before.
 The write gate does not consult the role, so a context repository stays refused
-by every `/v1/vcs` verb but `capabilities`, by `commit` and `push`, and by the
-refresh route; the verbs' credential-less read path for public repositories
-remains open as above.
+by every `/v1/vcs` verb but `capabilities` and `snapshot`, by `commit` and
+`push`, and by the refresh route. `snapshot` presents the same read-only
+credential, minted under the request's own memory reservation.
 
 ## 12. Open questions
 

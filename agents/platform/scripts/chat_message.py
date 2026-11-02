@@ -467,6 +467,7 @@ def report_message(
     after_rows: str = "",
     fold_title: str = "",
     fold_rows: Sequence[Any] = (),
+    replies: Mapping[str, str] | None = None,
 ) -> dict:
     """:func:`slack_presenter.blocks_report`'s report: the first choice primary, links after.
 
@@ -475,7 +476,11 @@ def report_message(
     ``detail``, as a needs-you question keeps an option it cannot offer.
     ``fold_rows`` go under ``fold_title`` as the fold's text, a row each
     (its severity as inline code, its detail on the line under it).
+    ``replies`` gives a choice, by its label, the longer turn its click posts;
+    a reply :func:`_choice` refuses leaves the choice's label as its turn.
     """
+    # Keyed as `kept` spells the labels, by the same function, so a lookup by a kept label finds its reply.
+    replies = {spelled: reply for label, reply in (replies or {}).items() for spelled in _presenter._choice_labels([label])}
     shown = _presenter._shown(rows)[:ROWS_MAX]
     kept, left = _usable(choices)
     detail_line = _presenter._clip(_line(_presenter._plain(detail or "")), _presenter.ROW_TEXT_MAX)
@@ -496,7 +501,10 @@ def report_message(
         rows=[_row(row) for row in shown],
         after=after[:AFTER_MAX],
         fold=fold,
-        choices=[_choice(label, primary=not i) for i, label in enumerate(kept[:CHOICES_MAX])],
+        choices=[
+            _choice(label, reply=replies.get(label, ""), primary=not i) or _choice(label, primary=not i)
+            for i, label in enumerate(kept[:CHOICES_MAX])
+        ],
         links=_links(links),
     )
 

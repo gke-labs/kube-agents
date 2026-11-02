@@ -5,14 +5,36 @@ import (
 	"strings"
 )
 
-// HasUpgradeHeader returns true when r requests a protocol upgrade (such as SPDY or WebSocket).
+const (
+	headerUpgrade     = "Upgrade"
+	headerConnection  = "Connection"
+	upgradeToken      = "upgrade"
+	connectionUpgrade = "Upgrade"
+
+	headerWebSocketProtocol = "Sec-WebSocket-Protocol"
+	// subprotocolAuthPrefix starts a WebSocket subprotocol the API server reads as a bearer
+	// token, for clients that cannot set Authorization.
+	subprotocolAuthPrefix = "base64url.bearer.authorization.k8s.io."
+)
+
+// callerHeaders never reach the API server: the caller's own credentials, Audit-ID, which the
+// API server would record as the request's audit ID, and X-Real-Ip, which it would record as a
+// source IP. The reverse proxy's Rewrite drops Forwarded and X-Forwarded-*.
+var callerHeaders = []string{"Authorization", "Proxy-Authorization", "Cookie", "Audit-ID", "X-Real-Ip"}
+
+// identityHeaderPrefixes start the headers an API server reads as the requesting identity:
+// impersonation, and the X-Remote-* headers of an authenticating front proxy.
+var identityHeaderPrefixes = []string{"impersonate-", "x-remote-"}
+
+// HasUpgradeHeader reports whether r asks for a protocol upgrade (SPDY or WebSocket), through
+// either an Upgrade header or an `upgrade` token in Connection.
 func HasUpgradeHeader(r *http.Request) bool {
-	if strings.TrimSpace(r.Header.Get("Upgrade")) != "" {
+	if strings.TrimSpace(r.Header.Get(headerUpgrade)) != "" {
 		return true
 	}
-	for _, connVal := range r.Header.Values("Connection") {
-		for _, token := range strings.Split(connVal, ",") {
-			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+	for _, v := range r.Header.Values(headerConnection) {
+		for _, token := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), upgradeToken) {
 				return true
 			}
 		}
@@ -20,47 +42,63 @@ func HasUpgradeHeader(r *http.Request) bool {
 	return false
 }
 
-// SanitizeRequestHeaders removes caller credentials, protocol upgrades, and Kubernetes impersonation headers from h.
-func SanitizeRequestHeaders(h http.Header) {
-	SanitizeRequestHeadersWithOptions(h, false)
-}
-
-// SanitizeRequestHeadersWithOptions removes caller credentials, hop-by-hop Connection tokens, and Kubernetes impersonation headers from h,
-// and removes Upgrade unless preserveUpgrade is true.
-func SanitizeRequestHeadersWithOptions(h http.Header, preserveUpgrade bool) {
-	h.Del("Authorization")
-	h.Del("Proxy-Authorization")
-	h.Del("Cookie")
-	h.Del("Connection")
-	if !preserveUpgrade {
-		h.Del("Upgrade")
-	} else if strings.TrimSpace(h.Get("Upgrade")) != "" {
-		h.Set("Connection", "Upgrade")
-	}
-	for key := range h {
-		lower := strings.ToLower(key)
-		if strings.HasPrefix(lower, "impersonate-") || strings.HasPrefix(lower, "x-remote-") {
-			h.Del(key)
+// sanitizeRequestHeaders removes from h what must not reach the API server: the caller's
+// credentials, a bearer token in Sec-WebSocket-Protocol, Audit-ID, identity headers, the headers the caller named in Connection, Connection
+// itself, and Upgrade unless preserveUpgrade. It runs before the handler sets any header of
+// its own: the reverse proxy drops every header Connection names, so a caller listing one
+// the handler sets could otherwise make it disappear.
+func sanitizeRequestHeaders(h http.Header, preserveUpgrade bool) {
+	for _, v := range h.Values(headerConnection) {
+		for _, token := range strings.Split(v, ",") {
+			name := strings.TrimSpace(token)
+			if name == "" || (preserveUpgrade && strings.EqualFold(name, upgradeToken)) {
+				continue
+			}
+			h.Del(name)
 		}
 	}
+	h.Del(headerConnection)
+	for _, name := range callerHeaders {
+		h.Del(name)
+	}
+	stripBearerProtocols(h)
+	for key := range h {
+		lower := strings.ToLower(key)
+		for _, prefix := range identityHeaderPrefixes {
+			if strings.HasPrefix(lower, prefix) {
+				delete(h, key)
+				break
+			}
+		}
+	}
+	if preserveUpgrade && strings.TrimSpace(h.Get(headerUpgrade)) != "" {
+		h.Set(headerConnection, connectionUpgrade)
+	} else {
+		h.Del(headerUpgrade)
+	}
 }
 
-// AppendCallerUserAgent appends the kproxy/<caller> provenance token to the outbound User-Agent header.
-func AppendCallerUserAgent(h http.Header, caller *CallerIdentity) {
-	if h == nil || caller == nil {
-		return
+// stripBearerProtocols drops the Sec-WebSocket-Protocol entries that carry a bearer token and
+// keeps the rest, which name the stream protocol.
+// It matches the key in any case, so a map built without canonical keys cannot slip one past.
+func stripBearerProtocols(h http.Header) {
+	var kept []string
+	for key, values := range h {
+		if !strings.EqualFold(key, headerWebSocketProtocol) {
+			continue
+		}
+		for _, v := range values {
+			for _, entry := range strings.Split(v, ",") {
+				entry = strings.TrimSpace(entry)
+				if entry == "" || strings.HasPrefix(strings.ToLower(entry), subprotocolAuthPrefix) {
+					continue
+				}
+				kept = append(kept, entry)
+			}
+		}
+		delete(h, key)
 	}
-	username := strings.TrimSpace(caller.Username)
-	if username == "" {
-		return
-	}
-	suffix := "kproxy/" + username
-	current := strings.TrimSpace(h.Get("User-Agent"))
-	if current == "" {
-		h.Set("User-Agent", suffix)
-		return
-	}
-	if !strings.Contains(current, suffix) {
-		h.Set("User-Agent", current+" "+suffix)
+	if len(kept) > 0 {
+		h.Set(headerWebSocketProtocol, strings.Join(kept, ", "))
 	}
 }

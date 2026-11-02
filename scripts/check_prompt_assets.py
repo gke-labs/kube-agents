@@ -16,7 +16,7 @@ it was told to open and carries on without it. The failure is a *worse* answer,
 not an error, so it does not page anyone -- it just makes the fleet report
 slightly less true, indefinitely.
 
-Six checks, all offline and standard library only:
+Seven checks, all offline and standard library only:
 
 ``asset-path``
     Every path reference in an instruction file resolves to a real file.
@@ -34,6 +34,9 @@ Six checks, all offline and standard library only:
 ``cron-risk``
     Every cron job declares a risk tier (``low`` or ``high``) the runtime
     approval gate can key its command policy off.
+``cron-max-turns``
+    Every model-run cron job declares a positive integer ``max_turns``, and
+    no ``no_agent`` job carries one.
 
 Scope is deliberately narrow, because a lint the team switches off protects
 nothing:
@@ -92,8 +95,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 # The profile source trees. `chat` is the Chat Agent (the `default` profile),
-# `cluster` is the per-cluster template the Platform Agent scaffolds at runtime.
-PROFILES = ("platform", "chat", "cluster")
+# `cluster` is the per-cluster template the Platform Agent scaffolds at runtime,
+# and `tse` is the GKE Support Agent (Customer-Side Technical Solutions Engineer).
+PROFILES = ("platform", "chat", "cluster", "tse")
 
 # Extensions an asset reference can end in. Anything else -- `.admin`,
 # `.global-static-ip-name`, `.conf` -- is a GCP role, an annotation key or an
@@ -137,19 +141,20 @@ OPT_DEFAULTS: tuple[tuple[str, str], ...] = (
 # What a specialist profile home actually contains, which is not the whole of
 # its source tree and is not /opt/defaults either. Each is built from its
 # template by an explicit item list: `profile_scaffold.py --items` in
-# docker-entrypoint.sh for platform, OVERLAY_ITEMS in cluster_agent_profile.py
-# for a cluster. A path whose first segment is outside that list is absent at
-# runtime however plainly it exists in the checkout.
+# docker-entrypoint.sh for platform and tse, OVERLAY_ITEMS in
+# cluster_agent_profile.py for a cluster. A path whose first segment is outside
+# that list is absent at runtime however plainly it exists in the checkout.
 #
 # agents/platform/docs is the live case: the Dockerfile copies it to
 # /opt/defaults/docs and nowhere else, so it reaches the default profile and no
-# specialist. `scripts` is here because the entrypoint makes it the one
-# exception, symlinking $TARGET_DIR/scripts into profiles/platform (line 538)
-# -- a link it would not need if that layer reached the profile on its own.
+# specialist. `scripts` is here because the entrypoint makes it the exception
+# for platform and tse, symlinking $TARGET_DIR/scripts into profiles/platform
+# and profiles/tse -- links they would not need if that layer reached those
+# profiles on its own.
 #
 # `chat` is deliberately absent: it *is* the default profile, so its home is
 # $TARGET_DIR and the /opt/defaults layer resolves there in full.
-# `test_profile_home_items_match_the_entrypoint` re-derives both lists.
+# `test_profile_home_items_match_the_entrypoint` re-derives all three lists.
 PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
     "platform": frozenset(
         {
@@ -167,6 +172,9 @@ PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
     "cluster": frozenset(
         {"SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills"}
     ),
+    "tse": frozenset(
+        {"SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills", "scripts"}
+    ),
 }
 
 # The platform profile's home in a running pod, and a file in the platform
@@ -181,6 +189,7 @@ OPT_TEMPLATES: tuple[tuple[str, str], ...] = (
     ("/opt/platform-template/", "agents/platform"),
     ("/opt/cluster-template/", "agents/cluster"),
     ("/opt/chat-template/", "agents/chat"),
+    ("/opt/tse-template/", "agents/tse"),
 )
 
 # Top-level repository directories. These make a token count as a *path* --
@@ -313,6 +322,13 @@ FRONTMATTER_DESCRIPTION = re.compile(
 
 # The valid risk tiers a cron job can declare (SKILL-002).
 ALLOWED_CRON_RISK = frozenset({"low", "high"})
+# The smallest iteration budget a model-run cron job may declare. Hermes'
+# `resolve_turn_limit` reads 0, a negative number, a bool and a non-numeric
+# string as unlimited; the image's scheduler patch ignores such a roster value
+# and runs the job at the profile's budget instead, so a roster that carried
+# one would say one thing and run another. A numeric string would parse, and
+# is refused here only to keep the roster one type.
+CRON_MAX_TURNS_MIN = 1
 
 
 @dataclass(frozen=True)
@@ -953,6 +969,56 @@ def check_cron_risk() -> list[Finding]:
     return findings
 
 
+def check_cron_max_turns() -> list[Finding]:
+    """Every model-run cron job declares its own iteration budget (#1947).
+
+    The image's scheduler reads a roster entry's ``max_turns`` ahead of the
+    profile's ``agent.max_turns`` (deploy/docker/patches/apply_cron_job_max_turns.py),
+    so the fleet audits can carry the budget they need while the profile default
+    bounds the kanban workers. An entry without one silently runs under the
+    worker budget; one with 0, a negative number, a bool or a non-numeric string
+    is a value Hermes would read as unlimited and the image's patch therefore
+    ignores, so the entry would run at the profile's budget while saying
+    otherwise; a numeric string is refused only to keep the roster one type. A ``no_agent`` job runs no model turn and must not carry one,
+    or the roster reads as if the key bounded the script.
+    """
+    findings = []
+    for path, jobs in cron_rosters():
+        rel = path.relative_to(REPO)
+        for job in jobs:
+            declared = "max_turns" in job
+            value = job.get("max_turns")
+            if job.get("no_agent"):
+                if declared:
+                    findings.append(
+                        Finding(
+                            "cron-max-turns",
+                            str(rel),
+                            f"job {job['id']!r} is no_agent and carries max_turns={value!r}; "
+                            "a script job runs no model turn, so the key bounds nothing",
+                        )
+                    )
+                continue
+            valid = (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= CRON_MAX_TURNS_MIN
+            )
+            if not valid:
+                findings.append(
+                    Finding(
+                        "cron-max-turns",
+                        str(rel),
+                        f"job {job['id']!r} has max_turns={value!r}; a model-run job must "
+                        f"declare an integer of at least {CRON_MAX_TURNS_MIN} — an absent key "
+                        "runs the job under the profile's worker budget, and 0, a negative "
+                        "number, a bool or a non-numeric string is ignored by the scheduler "
+                        "patch and runs it there too, while reading as something else",
+                    )
+                )
+    return findings
+
+
 def _nearest(name: str, owned: dict[str, Path]) -> str | None:
     """The closest real skill name, for the common single-character slips."""
     matches = difflib.get_close_matches(name, sorted(owned), n=1, cutoff=0.85)
@@ -1009,6 +1075,7 @@ def main(argv: list[str] | None = None) -> int:
         + check_cron_assets()
         + check_cron_delivery()
         + check_cron_risk()
+        + check_cron_max_turns()
     )
     if findings:
         print(

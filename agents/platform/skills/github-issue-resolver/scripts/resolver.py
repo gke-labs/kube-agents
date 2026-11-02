@@ -36,6 +36,7 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 # it needs to read the managed config is imported inside the function that reads
 # it, and a missing config just means "no sandbox".
 import sandbox_exec  # noqa: E402 — needs the sys.path lines above
+import untrusted_text  # noqa: E402 — needs the sys.path lines above
 import vcs_client  # noqa: E402 — needs the sys.path lines above
 from gitops_workspace import (  # noqa: E402 — needs the sys.path lines above
     GITOPS_STATE_READ_TIMEOUT_SECONDS,
@@ -446,44 +447,6 @@ def sweep_stale_issues(repo: str):
             )
 
 
-def _is_safe_char(ch: str) -> bool:
-    """Check whether a character is safe from control/zero-width/bidi smuggling."""
-    # Logically identical to `_is_safe_char` in
-    # agents/platform/scripts/platform_mcp_server.py, which is the canonical
-    # copy: both classify untrusted external text bound for the same model, and
-    # a class stripped in one place but not the other is a hole in whichever
-    # side forgot. Importing it is not an option — that module builds an MCP
-    # server at import time and pulls in `mcp`, `agent_common_server` and
-    # `gke_endpoint`, none of which this script has or needs. The mirror is held
-    # honest by test_resolver.py's drift test, which compares the two as parsed
-    # syntax — so this comment and the docstring may differ from the canonical
-    # copy's, and the logic may not.
-    code = ord(ch)
-    # Preserve newline (\n, 10) and tab (\t, 9)
-    if code in (9, 10):
-        return True
-    # Strip C0 control characters (< 32), DEL (127), and C1 control characters (128-159)
-    if code < 32 or 127 <= code <= 159:
-        return False
-    # Strip zero-width, bidi, and format control characters
-    # U+200B-U+200F (Zero-width space, non-joiner, joiner, LRM, RLM)
-    # U+202A-U+202E (Bidi embedding/override controls: LRE, RLE, PDF, LRO, RLO)
-    # U+2060-U+206F (Word joiner, invisible operators, bidi isolates)
-    # U+FEFF (Zero-width no-break space / BOM)
-    # U+00AD (Soft hyphen), U+034F (Combining grapheme joiner), U+061C (Arabic letter mark), U+180E (Mongolian vowel separator)
-    if (
-        0x200B <= code <= 0x200F
-        or 0x202A <= code <= 0x202E
-        or 0x2060 <= code <= 0x206F
-        or code in (0xFEFF, 0x00AD, 0x034F, 0x061C, 0x180E)
-    ):
-        return False
-    # Strip Unicode tag block and non-printable supplementary blocks (U+E0000 and above)
-    if code >= 0xE0000:
-        return False
-    return True
-
-
 def sanitize_untrusted_text(text: str, max_length: int = 8192) -> str:
     """Sanitizes untrusted external input to neutralize prompt injection attacks."""
     if not text or not isinstance(text, str):
@@ -493,16 +456,9 @@ def sanitize_untrusted_text(text: str, max_length: int = 8192) -> str:
     if is_truncated:
         text = text[:max_length]
 
-    # 1. Strip ANSI escape sequences (7-bit and 8-bit CSI) and carriage returns
-    cleaned = re.sub(r"\r", "", text)
-    cleaned = re.sub(
-        r"(?:\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\x9B[0-?]*[ -/]*[@-~])",
-        "",
-        cleaned,
-    )
-
-    # 2. Strip C0/C1 control characters, DEL, zero-width/bidi characters, and Unicode tag blocks
-    cleaned = "".join(ch for ch in cleaned if _is_safe_char(ch))
+    # 1 and 2. Carriage returns, ANSI escape sequences, control, zero-width and bidi
+    #    characters out, with the one filter every path to the model shares.
+    cleaned = untrusted_text.strip_unsafe(text)
 
     # 3. Neutralize prompt injection delimiter tags, instruction markers, and fake system headers.
     #    `[/\s]*` on both sides of the name, not just the front: `</untrusted_title>`,

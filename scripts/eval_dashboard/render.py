@@ -26,6 +26,15 @@ writes six pages and two data files into ``out/``:
 * ``cases.html`` -- **the Cases page**: one row per case with its last
   ``STRIP_RUNS`` presubmit outcomes, its 7- and 30-day pass rates per tier,
   its roster status and its last failure; ``#<case>`` lands on the row.
+  ``cases.html#view=scenarios[&domain=<slug>]`` is its second view, **the
+  scenarios view**: what kube-agents can do, scenario by scenario, from the
+  customer's side: one card per case from the three fields its task.yaml
+  carries (the title, the situation, what a good answer does;
+  ``--repo-root``), grouped by domain under the domain's ``meaning``
+  sentence, with a confidence level read from the store's last week at the
+  current version key (Proven, Proving, In development), the first-reply
+  and task-finished medians over that window's nightly reps, the roster
+  status and the newest passing transcript.
 * ``nightly.html[#build=<prow build id>&cases=a,b]`` (either key may be left out) -- **the Nightly
   report**: last night's run of the nightly tier (or the night ``build``
   names), its cases by domain with pass / partial / fail and the grader's
@@ -269,6 +278,48 @@ RELEASES_MAX_ROWS = 10
 # value is read out of a build log, and a log line is the wrong place to be
 # minting `javascript:`; anything else is dropped before it reaches the page.
 RELEASE_URL_SCHEME = "https://"
+
+# --- the Cases page's scenarios view (docs/designs/eval-dashboard-scenarios.md) ---
+# A card per case from three fields of its task.yaml (the case format reads
+# them; a missing one is null on the card): the title, the situation and
+# what a good answer does, each cut to SUMMARY_MAX_CHARS at a word with
+# trailing punctuation dropped. A checklist in expected_output ("critical
+# requirements:" over list items) renders its first item: the lead-in line
+# says nothing about the scenario.
+TASKS_DIR = pathlib.Path("bench") / "tasks"
+TASK_FILE = "task.yaml"
+DOMAINS_YAML = pathlib.Path("docs") / "designs" / "domains.yaml"
+SUMMARY_MAX_CHARS = 220
+ELLIPSIS = "\u2026"
+TRIM_TRAILING_CHARS = " ,;:"
+CHECKLIST_ITEM_RE = re.compile(r"^\s*(?:[-*\u2022]|\d+[.)])\s+")
+# A strict case-id grammar (no leading dot, no separator), checked before a
+# name is joined to bench/tasks/, so a historical name is never a path.
+CASE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# Confidence levels, from the case's nightly record at its current version
+# key (the newest record's key, as admission pools: a baseline measured on
+# other software is not evidence about this one) over the last
+# CONFIDENCE_WINDOW_DAYS, with CONFIDENCE_MIN_RUNS repetitions before a
+# reading counts; the design note says why a week and not admission's 20
+# repetitions. Proven is the admission rate (trend.ADMISSION_RATE) over at
+# least CONFIDENCE_MIN_RUNS; Proving is fewer repetitions than that, or a
+# rate from PROVING_MIN_RATE up to the bar; In development is a rate below
+# PROVING_MIN_RATE, or a case the roster has not admitted (held out,
+# demoted, in no matrix) or whose task.yaml carries expected_fail, whatever
+# its record says.
+CONFIDENCE_PROVEN = "proven"
+CONFIDENCE_PROVING = "proving"
+CONFIDENCE_IN_DEVELOPMENT = "in_development"
+CONFIDENCE_WINDOW_DAYS = 7
+CONFIDENCE_MIN_RUNS = 6
+PROVING_MIN_RATE = 0.70
+UNADMITTED_STATUSES = (STATUS_HELD_OUT, STATUS_DEMOTED, STATUS_RETIRED)
+# Where a card's two times were read: the window's own nightly repetitions,
+# or, while the collector has not recorded the window's night yet (the
+# store writes a record as the case is graded; data.json lists a build once
+# it finished), the newest recorded night that timed the case.
+TIMES_FROM_WINDOW = "window"
+TIMES_FROM_LAST_NIGHT = "last_night"
 
 
 def is_count(value) -> bool:
@@ -840,6 +891,181 @@ def case_status(case: dict, admitted: frozenset | None, demoted: dict[str, str])
 
 
 # --------------------------------------------------------------------------
+# the scenarios view: domain rows, task summaries, confidence
+
+
+def domain_rows(repo_root: pathlib.Path) -> list[dict]:
+    """``brief.json``'s ``domains[]``: the rows of docs/designs/domains.yaml
+    in file order as ``{slug, meaning}`` (``meaning`` is the sentence the
+    file keeps for a reader who does not know the code; the view heads a
+    section with the slug's words, as the reliability view does). An unreadable
+    file is no rows, and the page orders the slugs it has alphabetically."""
+    try:
+        doc = yaml.safe_load((repo_root / DOMAINS_YAML).read_text())
+    except (OSError, yaml.YAMLError):
+        return []
+    rows = doc.get("domains") if isinstance(doc, dict) else None
+    out = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or not isinstance(row.get("slug"), str):
+            continue
+        out.append({"slug": row["slug"], "meaning": row["meaning"] if isinstance(row.get("meaning"), str) else None})
+    return out
+
+
+def trim_text(text, limit: int = SUMMARY_MAX_CHARS) -> str | None:
+    """``text`` as a card shows it: a checklist's first item (a list that
+    starts on the first or second line, lead-in allowed), else the whole
+    text; whitespace collapsed, cut at the last word inside ``limit`` with
+    an ellipsis. None for anything but a string with text in it."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    items = [i for i, line in enumerate(lines) if CHECKLIST_ITEM_RE.match(line)]
+    if items and items[0] <= 1:
+        start, end = items[0], items[1] if len(items) > 1 else len(lines)
+        lines = [CHECKLIST_ITEM_RE.sub("", lines[start], count=1)] + lines[start + 1:end]
+    flat = " ".join(" ".join(lines).split())
+    if len(flat) <= limit:
+        return flat
+    # The last whole word inside the limit; one that ends exactly at it stays.
+    head = flat[:limit]
+    if flat[limit] != " " and " " in head:
+        head = head.rsplit(" ", 1)[0]
+    return head.rstrip(TRIM_TRAILING_CHARS) + ELLIPSIS
+
+
+def task_summary(name: str, repo_root: pathlib.Path) -> dict | None:
+    """``cases{}.summary``: ``{name, prompt, expected_output, expected_fail}``
+    from bench/tasks/<name>/task.yaml on ``repo_root``, the three texts
+    trimmed by ``trim_text`` (a missing one, which the case format does not
+    forbid, is null and the card says so).
+    None when the checkout has no task.yaml for the name or it does not
+    parse: a historical case gets no card."""
+    if not CASE_ID_RE.fullmatch(name):
+        return None
+    try:
+        doc = yaml.safe_load((repo_root / TASKS_DIR / name / TASK_FILE).read_text())
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    return {
+        "name": trim_text(doc.get("name")) or name,
+        "prompt": trim_text(doc.get("prompt")),
+        "expected_output": trim_text(doc.get("expected_output")),
+        "expected_fail": doc.get("expected_fail") is True,
+    }
+
+
+def store_records_by_case(store: dict | None) -> dict[str, list[dict]]:
+    """The store's usable records per case, oldest first (trend.usable_records)."""
+    out: dict[str, list[dict]] = {}
+    for record in trend.usable_records(store):
+        out.setdefault(record["case"], []).append(record)
+    return out
+
+
+def confidence_window(records: list[dict], now_ms: float | None) -> tuple[dict | None, list[str]]:
+    """The case's record at its newest record's version key over the last
+    CONFIDENCE_WINDOW_DAYS before ``now_ms``: ``{key, runs, passes, rate,
+    full, since, as_of}`` (``full`` once CONFIDENCE_MIN_RUNS repetitions are
+    in it; ``since`` and ``as_of`` the oldest and newest pooled records'
+    stamps) and the nightly builds the pooled records came from, oldest
+    first. ``(None, [])`` for a case the store has not recorded, or with no
+    record in the window; without a clock every record is in it."""
+    points = trend.case_points(records)
+    if not points:
+        return None, []
+    key = points[-1]["key"]
+    floor = now_ms - CONFIDENCE_WINDOW_DAYS * DAY_MS if now_ms is not None else None
+    pooled = [p for p in points if p["key"] == key and (floor is None or (trend.at_ms(p) or 0) >= floor)]
+    if not pooled:
+        return None, []
+    runs = sum(p["runs"] for p in pooled)
+    passes = sum(p["passes"] for p in pooled)
+    state = {
+        "key": key,
+        "runs": runs,
+        "passes": passes,
+        "rate": passes / runs if runs else None,
+        "full": runs >= CONFIDENCE_MIN_RUNS,
+        "since": pooled[0]["at"],
+        "as_of": pooled[-1]["at"],
+    }
+    return state, [p["build"] for p in pooled if p["build"]]
+
+
+def case_confidence(state: dict | None, status: str, expected_fail: bool) -> dict:
+    """``cases{}.confidence``: the level (CONFIDENCE_*) and the window it was
+    read from (``confidence_window``'s state). A case the roster has not
+    admitted, or whose task carries ``expected_fail``, is In development
+    whatever the window says."""
+    rate = state["rate"] if state else None
+    full = bool(state) and state["full"] and rate is not None
+    if status in UNADMITTED_STATUSES or expected_fail:
+        level = CONFIDENCE_IN_DEVELOPMENT
+    elif full and rate >= trend.ADMISSION_RATE:
+        level = CONFIDENCE_PROVEN
+    elif not full or rate >= PROVING_MIN_RATE:
+        level = CONFIDENCE_PROVING
+    else:
+        level = CONFIDENCE_IN_DEVELOPMENT
+    return {
+        "level": level,
+        "runs": state["runs"] if state else 0,
+        "passes": state["passes"] if state else 0,
+        "rate": rate,
+        "full": full,
+        "min_runs": CONFIDENCE_MIN_RUNS,
+        "window_days": CONFIDENCE_WINDOW_DAYS,
+        "since": state["since"] if state else None,
+        "as_of": state["as_of"] if state else None,
+    }
+
+
+def window_times(name: str, builds: list[str], runs_by_build: dict[str, dict]) -> dict | None:
+    """The card's two times: ``nightly.latency_rollup`` over the case's reps
+    in the window's nightly runs (``builds`` from ``confidence_window``, the
+    runs data.json holds for them), so the medians and the level read one
+    record; ``source`` says so. None when no rep in the window carried
+    timing."""
+    reps = []
+    for build in builds:
+        for task in run_tasks(runs_by_build.get(build)):
+            if task.get("name") == name and isinstance(task.get("reps"), list):
+                reps.extend(task["reps"])
+    rollup = nightly.latency_rollup(reps)
+    return {**rollup, "source": TIMES_FROM_WINDOW} if rollup else None
+
+
+def last_night_times(name: str, runs: list[dict]) -> dict | None:
+    """The fallback when no repetition in the window carries timing (its
+    night not collected yet, or every rep of it lost to infra): the same
+    rollup over the newest nightly run that timed the case, with ``at`` the
+    run's stamp so the card can say which night. None when no run on record
+    did."""
+    for run in reversed(runs):
+        for task in run_tasks(run):
+            if task.get("name") == name and isinstance(task.get("reps"), list):
+                rollup = nightly.latency_rollup(task["reps"])
+                if rollup:
+                    return {**rollup, "source": TIMES_FROM_LAST_NIGHT, "at": run_when(run)}
+    return None
+
+
+def newest_pass_transcript(name: str, runs: list[dict]) -> str | None:
+    """The transcript of the newest nightly run in which the case passed
+    every graded rep, as the Nightly report links it (rep 1's log). None
+    when no run on record did."""
+    for run in reversed(runs):
+        for task in run_tasks(run):
+            if task.get("name") == name and cell_state(task) == STRIP_PASS:
+                return nightly.transcript_url(run, name)
+    return None
+
+
+# --------------------------------------------------------------------------
 # brief.json: what the pages render from
 
 
@@ -964,13 +1190,23 @@ def case_latency(case: dict) -> dict | None:
     return out or None
 
 
-def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted: dict[str, str], classified: dict[str, dict]) -> dict[str, dict]:
+def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted: dict[str, str], classified: dict[str, dict],
+                   store: dict | None = None, repo_root: pathlib.Path | None = None) -> dict[str, dict]:
     """``brief.json``'s ``cases{}``: per case, what the Cases page and the
     Grid need beyond the runs -- roster status, domain, notes, the per-tier
-    7- and 30-day rates, the strip, the last failure and the reps' timing."""
+    7- and 30-day rates, the strip, the last failure and the reps' timing --
+    and what the scenarios view adds: the task's summary from ``repo_root``,
+    the confidence read from ``store`` with the times over its window (or
+    the last recorded night's), and the newest passing transcript."""
     gate = appearances_by_case(gate_runs(data))
     nights = nightly.joined_night_runs(nightly_runs(data))
     nightly_rows = appearances_by_case(nightly_runs(data))
+    records = store_records_by_case(store)
+    runs_by_build = trend.nightly_runs_by_build(data)
+    nights_on_record = nightly_runs(data)
+    # The window's clock: the store's read (its records can be hours newer
+    # than data.json), else the collector's.
+    now_ms = (iso_ms(store.get("read_at")) if isinstance(store, dict) else None) or reference_ms(data)
     rates = {
         (tier, days): tier_pass_rates(data, tier, days)
         for tier in tiers.CASE_TIERS
@@ -983,6 +1219,8 @@ def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted:
         name = str(case["name"])
         status, demoted_on = case_status(case, admitted, demoted)
         note = notes.get(name) or {}
+        summary = task_summary(name, repo_root) if repo_root is not None else None
+        state, builds = confidence_window(records.get(name, []), now_ms)
         cases[name] = {
             "active": case.get("active") is True,
             "nightly_active": case.get("nightly_active") is True,
@@ -999,6 +1237,10 @@ def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted:
             "strip": case_strip(gate.get(name, [])),
             "last_failure": last_failure(name, gate.get(name, []), nightly_rows.get(name, []), classified, nights),
             "latency": case_latency(case),
+            "summary": summary,
+            "confidence": case_confidence(state, status, bool(summary and summary["expected_fail"])),
+            "times": window_times(name, builds, runs_by_build) or last_night_times(name, nights_on_record),
+            "transcript_url": newest_pass_transcript(name, nights_on_record),
         }
     return cases
 
@@ -1083,7 +1325,7 @@ def pending_builds(data: dict) -> list[dict]:
 def brief_document(data: dict, health: dict | None, history: list[dict] | None, merges: list[dict] | None,
                    notes: dict | None = None, events: dict | None = None,
                    admitted: frozenset | None = None, demoted: dict[str, str] | None = None,
-                   store: dict | None = None) -> dict:
+                   store: dict | None = None, repo_root: pathlib.Path | None = None) -> dict:
     """The document every page reads. Runs are the presubmit's last
     RUN_VIEW_DAYS of data.json, oldest first, each classified against every
     run on record with the verdict in force when it finished. The nightly's
@@ -1093,7 +1335,12 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
     (its nightly rates, and its last failure when the presubmit has none).
     ``admitted`` and ``demoted`` default to the checkout's roster and roster
     page; tests pass their own. ``store`` is the evidence-store read for the
-    Trend page (``load_store``), None when there was none."""
+    Trend page (``load_store``), None when there was none; the scenarios
+    view reads its confidence from it too. ``repo_root`` is the checkout
+    whose bench/tasks and domains.yaml the scenarios view summarises (the
+    one the roster is read from when None)."""
+    if repo_root is None:
+        repo_root = classify.REPO_ROOT
     anchor = reference_ms(data)
     runs = [r for r in data.get("runs") or [] if isinstance(r, dict)]
     now = ms_to_utc(anchor) if anchor is not None else None
@@ -1135,7 +1382,9 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
         ], "incidents": incidents} if history is not None else None,
         "merges": merges,
         "catches": (events or {}).get("catches"),
-        "cases": case_documents(data, notes or {}, admitted, demoted, classified),
+        "domains": domain_rows(repo_root),
+        "confidence_bar": {"rate": trend.ADMISSION_RATE, "min_runs": CONFIDENCE_MIN_RUNS, "window_days": CONFIDENCE_WINDOW_DAYS, "proving_min_rate": PROVING_MIN_RATE},
+        "cases": case_documents(data, notes or {}, admitted, demoted, classified, store, repo_root),
         "runs": out_runs,
         "pending": pending_builds(data),
         "releases": [compact_release(r) for r in sorted_releases(data)],
@@ -1282,7 +1531,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--repo-root",
         default=str(classify.REPO_ROOT),
-        help="checkout whose git log lists the merges to main (a shallow checkout omits the block)",
+        help="checkout whose git log lists the merges to main (a shallow checkout omits the block) and whose bench/tasks and docs/designs/domains.yaml the Cases page's scenarios view summarises",
     )
     parser.add_argument(
         "--public-url",
@@ -1301,7 +1550,7 @@ def main(argv: list[str] | None = None) -> int:
     history = load_health_history(pathlib.Path(args.health_history)) if args.health_history else None
     merges = recent_merges(pathlib.Path(args.repo_root), reference_ms(data))
     store = load_store(pathlib.Path(args.store)) if args.store else None
-    brief = brief_document(data, health, history, merges, notes=notes, events=events, store=store)
+    brief = brief_document(data, health, history, merges, notes=notes, events=events, store=store, repo_root=pathlib.Path(args.repo_root))
 
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

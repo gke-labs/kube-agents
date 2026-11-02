@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import pytest
 
-from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpecError, load_case
+import yaml
+from devops_bench.tasks.schema import Task
+
+from kube_agents_bench.cases import CASE_KEYS, DEVOPS_BENCH_CASE_KEYS, NOOP_DEPLOYER, CaseSpecError, load_case
 
 from conftest import TASKS
 
@@ -51,6 +54,22 @@ def test_every_shipped_task_parses(path):
     assert spec.case_id == path.parent.name
     assert spec.name
     assert spec.deployer
+
+
+@pytest.mark.parametrize("path", _task_files(), ids=lambda p: p.parent.name)
+def test_every_shipped_task_keeps_to_the_case_keys(path):
+    """hack/ci-eval-pr.sh reds a pull request's case with a top-level key
+    outside main's CASE_KEYS; no case in the tree may carry one."""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    assert set(raw) <= CASE_KEYS, sorted(set(raw) - CASE_KEYS)
+
+
+def test_the_case_keys_are_devops_benchs_fields_and_aliases_plus_ours():
+    """devops-bench's half is read off its model, so a field it adds is a key a
+    case may use; its loader-set ``folder`` is not one."""
+    assert DEVOPS_BENCH_CASE_KEYS == (set(Task.model_fields) - {"folder"}) | {"task_id", "goal", "input"}
+    assert "folder" not in CASE_KEYS
+    assert {"domain", "fixtures", "expected_fail"} <= CASE_KEYS
 
 
 def test_kanban_smoke_reads_as_the_shell_read_it(kanban_task):
@@ -187,11 +206,12 @@ def test_yaml_is_loaded_safely(write_task):
 # --------------------------------------------------------------------------
 
 
-def test_the_kanban_smoke_names_its_tool_called_objective(kanban_task):
+def test_the_kanban_smoke_declares_no_check_its_transport_can_blind(kanban_task):
+    """#4004: the case grades the answer the user receives and nothing about
+    how the front door delegated, so the inject lane sets nothing aside."""
     spec = load_case(kanban_task)
-    assert spec.transport_blind_checks == {"the-kanban-card-was-actually-filed"}
-    # A router-scope tool_called: gradable once the door shows the trace.
-    assert spec.trace_blind_checks == {"the-kanban-card-was-actually-filed"}
+    assert spec.transport_blind_checks == frozenset()
+    assert spec.trace_blind_checks == frozenset()
     assert spec.worker_blind_checks == frozenset()
 
 
@@ -344,6 +364,31 @@ def test_a_router_scope_result_pattern_is_worker_blind(write_task):
     assert spec.negated_trace_blind_checks == frozenset()
 
 
+def test_a_tool_called_over_harness_entries_is_never_transport_blind(write_task):
+    """The harness writes these entries itself; a lossy door trace says
+    nothing about them, so a stopped ask's objectives always grade."""
+    path = write_task(
+        "harness-entries",
+        {
+            "verification_spec": [
+                {
+                    "name": "stop-sent",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["harness_stop_sent"], "require_success": True},
+                },
+                {
+                    "name": "mixed",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["harness_stop_sent", "kanban_create"]},
+                },
+            ],
+        },
+    )
+    spec = load_case(path)
+    assert spec.trace_blind_checks == {"mixed"}
+    assert spec.worker_blind_checks == frozenset()
+
+
 def test_a_task_with_no_such_check_has_an_empty_set(write_task):
     path = write_task(
         "phrases",
@@ -433,7 +478,7 @@ def test_every_shipped_blind_check_is_named(path):
     import re
 
     import yaml
-    from kube_agents_bench.cases import TRANSPORT_BLIND_CHECK_TYPES
+    from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, TRANSPORT_BLIND_CHECK_TYPES
 
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
 
@@ -454,7 +499,28 @@ def test_every_shipped_blind_check_is_named(path):
     assert unnamed == [], f"{path}: transport-blind entries without a name"
     # Compound node types are not leaves; only leaf types decide.
     compounds = {"sequence", "parallel", "all", "any", "none"}
+    # Leaf by leaf, as the loader decides: an entry is all-blind when every
+    # leaf is of a blind type and none is a check naming only entries the
+    # harness writes, which is graded on every record.
+    def leaves(node):
+        if isinstance(node, list):
+            return [leaf for item in node for leaf in leaves(item)]
+        if not isinstance(node, dict):
+            return []
+        if node.get("type") in compounds:
+            return [leaf for value in node.values() for leaf in leaves(value)]
+        return [node] if "type" in node else []
+
+    def harness_only(leaf):
+        named = leaf.get("tool_names") or []
+        return bool(named) and set(named) <= HARNESS_WRITTEN_ENTRIES
+
     all_blind = {
-        str(e["name"]) for e in declared if (types_of(e) - compounds) <= TRANSPORT_BLIND_CHECK_TYPES
+        str(e["name"])
+        for e in declared
+        if all(
+            leaf.get("type") in TRANSPORT_BLIND_CHECK_TYPES and not harness_only(leaf)
+            for leaf in leaves(e.get("check"))
+        )
     }
     assert load_case(path).transport_blind_checks == all_blind

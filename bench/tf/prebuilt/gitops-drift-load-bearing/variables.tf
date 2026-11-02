@@ -132,7 +132,7 @@ variable "drift_field_manager" {
 # describe a record that cannot exist.
 variable "drift_principal" {
   type        = string
-  description = "Authenticated identity the audit entry recorded as making the change"
+  description = "Principal the planted record names as making the change; the real audit entry carries the identity that runs the stack"
   default     = "eval-operator@example.com"
   validation {
     condition     = !can(regex("[\"$\\\\`[:cntrl:]]", var.drift_principal))

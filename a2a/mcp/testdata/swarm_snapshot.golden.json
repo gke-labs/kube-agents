@@ -1,0 +1,295 @@
+{
+  "title": "kube-agents · demo",
+  "members": {
+    "coordinator": {
+      "name": "coordinator",
+      "role": "coordinator",
+      "model": "kube-agents · kube-agents · demo",
+      "conversation_id": "",
+      "wake_mode": "mentions",
+      "wait_since": 12,
+      "last_read_seq": 12,
+      "last_nudged_seq": 12,
+      "last_park_blocked_seq": 12,
+      "joined_at": "2026-10-22T12:00:00Z",
+      "killed": false,
+      "managed_by": "kube-agents"
+    },
+    "narrator": {
+      "name": "narrator",
+      "role": "narrator",
+      "model": "a2a-jetstream/0.4 · tasks",
+      "conversation_id": "",
+      "wake_mode": "mentions",
+      "wait_since": 12,
+      "last_read_seq": 12,
+      "last_nudged_seq": 12,
+      "last_park_blocked_seq": 12,
+      "joined_at": "2026-10-22T12:00:00Z",
+      "killed": false,
+      "managed_by": "kube-agents"
+    },
+    "platform": {
+      "name": "platform",
+      "role": "worker",
+      "model": "hermes · Platform Agent · ⚡ Approve the restart?",
+      "conversation_id": "",
+      "wake_mode": "working",
+      "wait_since": 12,
+      "last_read_seq": 12,
+      "last_nudged_seq": 12,
+      "last_park_blocked_seq": 12,
+      "joined_at": "2026-10-22T12:00:00Z",
+      "killed": false,
+      "managed_by": "kube-agents"
+    },
+    "session-triage": {
+      "name": "session-triage",
+      "role": "worker",
+      "model": "console:tok-triage-00… · ⚡ Approve the restart?",
+      "conversation_id": "",
+      "wake_mode": "working",
+      "wait_since": 12,
+      "last_read_seq": 12,
+      "last_nudged_seq": 12,
+      "last_park_blocked_seq": 12,
+      "joined_at": "2026-10-22T11:30:00Z",
+      "killed": false,
+      "managed_by": "kube-agents"
+    },
+    "session-triage-db": {
+      "name": "session-triage-db",
+      "role": "worker",
+      "model": "console:tok-db-0002 · ⚡ psql_query",
+      "conversation_id": "",
+      "wake_mode": "working",
+      "wait_since": 12,
+      "last_read_seq": 12,
+      "last_nudged_seq": 12,
+      "last_park_blocked_seq": 12,
+      "joined_at": "2026-10-22T11:50:00Z",
+      "killed": false,
+      "managed_by": "kube-agents"
+    }
+  },
+  "newMessages": [
+    {
+      "seq": 1,
+      "agent": "coordinator",
+      "text": "Connected @platform to kube-agents swarm `kube-agents · demo`.",
+      "time": "2026-10-22T12:00:00Z"
+    },
+    {
+      "seq": 2,
+      "agent": "coordinator",
+      "text": "@session-triage joined from console conversation `triage` — `Cluster triage`.",
+      "time": "2026-10-22T11:30:00Z"
+    },
+    {
+      "seq": 3,
+      "agent": "coordinator",
+      "text": "@platform [task `t-100`] `Why are the checkout pods restarting?`",
+      "time": "2026-10-22T11:30:00Z"
+    },
+    {
+      "seq": 4,
+      "agent": "platform",
+      "text": "@platform delegated task `t-101` (#3) to `db-specialist` (`DB Specialist`): `Check replica lag on orders-db`",
+      "time": "2026-10-22T11:31:00Z"
+    },
+    {
+      "seq": 5,
+      "agent": "coordinator",
+      "text": "@session-triage-db joined from console conversation `triage-db` — `Database deep dive`.",
+      "time": "2026-10-22T11:50:00Z"
+    },
+    {
+      "seq": 6,
+      "agent": "coordinator",
+      "text": "@session-triage-db [task `t-102`] submitted to `session-db-pod`.",
+      "time": "2026-10-22T11:50:00Z"
+    },
+    {
+      "seq": 7,
+      "agent": "coordinator",
+      "text": "@platform [task `t-103`] submitted to `platform` (`Platform Agent`).",
+      "time": "2026-10-22T11:52:00Z"
+    },
+    {
+      "seq": 8,
+      "agent": "coordinator",
+      "text": "@platform [task `t-104`] submitted to `platform` (`Platform Agent`).",
+      "time": "2026-10-22T11:54:00Z"
+    },
+    {
+      "seq": 9,
+      "agent": "platform",
+      "text": "@coordinator `completed` on #3 (`t-100`): `Summary`",
+      "time": "2026-10-22T12:00:00Z"
+    },
+    {
+      "seq": 10,
+      "agent": "platform",
+      "text": "@platform `completed` on #4 (`t-101`): `Replica lag 2s.`",
+      "time": "2026-10-22T12:00:00Z"
+    },
+    {
+      "seq": 11,
+      "agent": "platform",
+      "text": "@coordinator input required on #7 (`t-103`): `Approve the restart?`",
+      "time": "2026-10-22T12:00:00Z"
+    },
+    {
+      "seq": 12,
+      "agent": "platform",
+      "text": "@coordinator `failed` on #8 (`t-104`): `reason: quota - out of tokens`",
+      "time": "2026-10-22T12:00:00Z"
+    }
+  ],
+  "view": {
+    "version": 1,
+    "as_of_seq": 12,
+    "updated_at": "2026-10-22T12:00:00Z",
+    "headline": "Connected to kube-agents · demo · 2 conversation(s) · 5 task(s) on TASKS",
+    "phase": {
+      "label": "Executing 2 Task(s)",
+      "index": 2,
+      "total": 2
+    },
+    "attention": [
+      {
+        "id": "fail-t-104",
+        "kind": "failure",
+        "severity": "med",
+        "title": "Task t-104 (platform) failed",
+        "why": "reason: quota - out of tokens",
+        "refs": [
+          {
+            "seq": 12
+          }
+        ],
+        "actions": [
+          {
+            "type": "board_post",
+            "target": 12,
+            "label": "Jump to #12"
+          }
+        ]
+      },
+      {
+        "id": "input-t-103",
+        "kind": "decision",
+        "severity": "high",
+        "title": "Input required on task t-103 (platform)",
+        "why": "Approve the restart?",
+        "refs": [
+          {
+            "seq": 11
+          }
+        ],
+        "actions": [
+          {
+            "type": "board_post",
+            "target": 11,
+            "label": "Jump to #11"
+          }
+        ]
+      }
+    ],
+    "workstreams": [
+      {
+        "id": "ws-conv-session-triage",
+        "title": "Conversation: triage",
+        "owners": [
+          "session-triage",
+          "session-triage-db"
+        ],
+        "state": "active",
+        "note": "⚡ Approve the restart? — Cluster triage · 1 sub-conversation(s)",
+        "refs": [
+          {
+            "member": "session-triage"
+          },
+          {
+            "member": "session-triage-db"
+          }
+        ]
+      },
+      {
+        "id": "ws-platform-fleet",
+        "title": "Platform Agent (kube-agents · demo)",
+        "owners": [
+          "platform"
+        ],
+        "state": "active",
+        "note": "Latest task t-104 (failed): reason: quota - out of tokens",
+        "refs": [
+          {
+            "member": "platform"
+          },
+          {
+            "seq": 12
+          }
+        ],
+        "actions": [
+          {
+            "type": "board_post",
+            "target": 12,
+            "label": "Latest Post #12"
+          }
+        ]
+      }
+    ],
+    "milestones": [
+      {
+        "id": "task-t-104",
+        "text": "Task t-104 (platform -› failed): reason: quota - out of tokens",
+        "refs": [
+          {
+            "seq": 12
+          }
+        ],
+        "actions": [
+          {
+            "type": "board_post",
+            "target": 12,
+            "label": "Post #12"
+          }
+        ]
+      },
+      {
+        "id": "task-t-101",
+        "text": "Task t-101 (db-specialist -› completed): Replica lag 2s.",
+        "refs": [
+          {
+            "seq": 10
+          }
+        ],
+        "actions": [
+          {
+            "type": "board_post",
+            "target": 10,
+            "label": "Post #10"
+          }
+        ]
+      },
+      {
+        "id": "task-t-100",
+        "text": "Task t-100 (platform -› completed): Summary",
+        "refs": [
+          {
+            "seq": 9
+          }
+        ],
+        "actions": [
+          {
+            "type": "board_post",
+            "target": 9,
+            "label": "Post #9"
+          }
+        ]
+      }
+    ],
+    "risks": []
+  }
+}

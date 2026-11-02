@@ -337,21 +337,26 @@ def main(argv: list[str] | None = None) -> int:
         "--forge", choices=(ledgers.FORGE_GITHUB, ledgers.FORGE_GITLAB), default=ledgers.FORGE_GITHUB,
         help="github: --repo is owner/name on github.com; gitlab: --repo is the project path under the pool's group, and merge requests are what close (hack/ci_gitlab_forge.py)",
     )
+    parser.add_argument("--host", default=None, help="gitlab only: the instance's hostname (default gitlab.com); a self-managed GitLab (kube-agents#3682)")
+    parser.add_argument("--ca-file", default=None, help="gitlab only: a PEM CA to trust for --host, the instance's private CA")
     args = parser.parse_args(argv)
+    if args.forge != ledgers.FORGE_GITLAB and (args.host or args.ca_file):
+        parser.error("--host and --ca-file apply to --forge gitlab only")
     token = os.environ.get(TOKEN_ENV, "")
     if not token:
         print(f"ERROR: {TOKEN_ENV} is not set; nothing to authenticate with", file=sys.stderr)
         return 2
     record = new_record(args.repo, args.project, args.build, args.scope, args.dry_run)
     forge = "GitLab" if args.forge == ledgers.FORGE_GITLAB else "GitHub"
-    host = ledgers.FORGE_HOSTS[args.forge]
+    host = args.host or ledgers.FORGE_HOSTS[args.forge]
     limited: tuple = ()
     try:
         if args.forge == ledgers.FORGE_GITLAB:
             import ci_gitlab_forge as gitlab
 
             limited = (gitlab.RateLimited,)
-            gitlab.reset_merge_requests(args.repo, args.project, args.build, args.scope, token, args.dry_run, record)
+            gitlab.configure_ca(args.ca_file)
+            gitlab.reset_merge_requests(args.repo, args.project, args.build, args.scope, token, args.dry_run, record, host=host)
         else:
             reset(args.repo, args.project, args.build, args.scope, token, args.dry_run, record)
     except ResetError as exc:

@@ -58,7 +58,7 @@ func renderedNATSConfAuthUsers(t *testing.T, conf string) []string {
 
 func calloutContainer(t *testing.T, agent *agentv1alpha1.PlatformAgent) corev1.Container {
 	t.Helper()
-	for _, c := range buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers {
+	for _, c := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers {
 		if c.Name == "callout" {
 			return c
 		}

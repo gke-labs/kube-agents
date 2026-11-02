@@ -117,7 +117,7 @@ func TestParseIdentityMapRejectsMapsItCannotServe(t *testing.T) {
 		},
 		{
 			name: "a field the renderer does not know about",
-			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"a","account":"APP","grants":{"publish":["x.>"],"subscribe":["s.>"]},"tier":"admin"}]}`,
+			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"a","account":"APP","grants":{"publish":["x.>"],"subscribe":["s.>"]},"clearance":"admin"}]}`,
 			want: "decoding identity map",
 		},
 		{
