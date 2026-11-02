@@ -223,15 +223,28 @@ const (
 	// longer pending, so the entry that outlives it has nothing to suppress.
 	failedSchedulingLogEvery = failedSchedulingStaleAfter
 	// maxFailedSchedulingLogEntries caps the memo behind that: one entry per
-	// Pending pod across the fleet. Grouped by cluster, so a cluster with
-	// thousands of Pending pods displaces its own entries before another
-	// cluster's, as the scale-up memo does by namespace; a displaced pod is
-	// logged once more on its next sighting, which is the memo's failure
-	// mode and costs one line.
+	// Pending pod across the fleet, about 200 bytes each. A full memo keeps
+	// what it holds and remembers nothing new: a pod it has no room for is
+	// logged on every sighting, as every pod was before the memo existed,
+	// until a sweep (below) has made room. It never evicts a live entry,
+	// because under a working set larger than the cap that would re-log
+	// every pod on every sighting and scan the whole memo under the
+	// fleet-wide lock each time, which is the flood this memo exists to
+	// stop, with a scan added. The cost of a fleet over the cap is therefore
+	// one line per sighting for the pods over it, and nothing else.
 	maxFailedSchedulingLogEntries = 10_000
-	// failedSchedulingLogKeySep joins the cluster, namespace and UID of a
-	// memo key; the cluster is read back off it for grouping. A byte no name
-	// can carry, so a namespace cannot forge another cluster's prefix.
+	// failedSchedulingLogSweepEvery is the least time between two sweeps of
+	// expired entries out of a full memo. lookup reclaims an expired entry
+	// only when its pod is sighted again, and a pod that scheduled or was
+	// deleted never is, so a full memo sweeps the map once; the interval
+	// bounds that scan to one a minute however many sightings arrive over
+	// the cap. See logFailedSchedulingDecision.
+	failedSchedulingLogSweepEvery = time.Minute
+	// failedSchedulingLogKeySep joins the project, location, cluster,
+	// namespace and UID of a memo key: the cluster's identity rather than
+	// its name, because a GKE name is unique only within its project and
+	// location and a fleet can watch two clusters named alike. A byte no
+	// name can carry, so no field can forge another's boundary.
 	failedSchedulingLogKeySep = "\x00"
 	// noNodesAvailableMessage is kube-scheduler's ErrNoNodesAvailable text,
 	// which it emits only when the cluster has no nodes at all. Every other
@@ -373,17 +386,17 @@ type filter struct {
 	// against. nil means time.Now; tests set it.
 	now func() time.Time
 	// fsLogged is the last FailedScheduling decision logged per pod, keyed
-	// by cluster, namespace and UID and dated by the watcher's clock when it
-	// was logged; see logFailedSchedulingDecision. Written from every
-	// cluster's delivery goroutine, hence the lock.
-	fsLogMu  sync.Mutex
-	fsLogged boundedEntries[filterGate]
+	// by the cluster's identity, namespace and UID and dated by the
+	// watcher's clock when it was logged; fsLastSweep is when a full memo
+	// last swept its expired entries. See logFailedSchedulingDecision.
+	// Written from every cluster's delivery goroutine, hence the lock.
+	fsLogMu     sync.Mutex
+	fsLogged    boundedEntries[filterGate]
+	fsLastSweep time.Time
 }
 
 func newFilter(cfg filterConfig) *filter {
-	logged := newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)
-	logged.groupOf = failedSchedulingLogCluster
-	return &filter{cfg: cfg, fsLogged: logged}
+	return &filter{cfg: cfg, fsLogged: newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)}
 }
 
 func (f *filter) clock() time.Time {
@@ -670,14 +683,41 @@ func (f *filter) failedSchedulingGate(ev TriageEvent) (gate filterGate) {
 // is not logged. The memo is dated by the watcher's clock at the line, not by
 // the sighting: the question is how long the log has been quiet about this
 // pod, which a replayed event's own stamps do not answer.
+//
+// An event with no involvedObject UID or namespace names no one pod and is
+// not memoised, so every such sighting is logged; filing two hand-made
+// events under one key would lose the second's line, and the scale-up memo
+// refuses the same key for the same reason (scaleUpMemoKey). A full memo
+// remembers no new pod (see maxFailedSchedulingLogEntries): it sweeps its
+// expired entries at most once per failedSchedulingLogSweepEvery and, if that
+// made no room, writes the lines and keeps nothing.
 func (f *filter) logFailedSchedulingDecision(ev TriageEvent, gate filterGate, now time.Time, lines []notedLine) {
-	key := strings.Join([]string{ev.Cluster, ev.Namespace, ev.Key.UID}, failedSchedulingLogKeySep)
-	f.fsLogMu.Lock()
-	defer f.fsLogMu.Unlock()
-	if last, _, ok := f.fsLogged.lookup(key, now); ok && last == gate {
+	if ev.Key.UID == "" || ev.Namespace == "" {
+		writeNotedLines(lines)
 		return
 	}
+	key := strings.Join([]string{ev.Project, ev.Location, ev.Cluster, ev.Namespace, ev.Key.UID}, failedSchedulingLogKeySep)
+	f.fsLogMu.Lock()
+	defer f.fsLogMu.Unlock()
+	last, _, known := f.fsLogged.lookup(key, now)
+	if known && last == gate {
+		return
+	}
+	if !known && f.fsLogged.full() {
+		if now.Sub(f.fsLastSweep) >= failedSchedulingLogSweepEvery {
+			f.fsLogged.expire(now)
+			f.fsLastSweep = now
+		}
+		if f.fsLogged.full() {
+			writeNotedLines(lines)
+			return
+		}
+	}
 	f.fsLogged.store(key, gate, now, now)
+	writeNotedLines(lines)
+}
+
+func writeNotedLines(lines []notedLine) {
 	for _, line := range lines {
 		log.Printf(line.format, line.args...)
 	}
@@ -688,13 +728,6 @@ func (f *filter) logFailedSchedulingDecision(ev TriageEvent, gate filterGate, no
 type notedLine struct {
 	format string
 	args   []any
-}
-
-// failedSchedulingLogCluster is the memo's group: the cluster off a key
-// logFailedSchedulingDecision built.
-func failedSchedulingLogCluster(key string) string {
-	cluster, _, _ := strings.Cut(key, failedSchedulingLogKeySep)
-	return cluster
 }
 
 // autopilotScaleToZero reports whether a FailedScheduling is the one an

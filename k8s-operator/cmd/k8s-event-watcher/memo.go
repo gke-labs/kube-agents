@@ -75,15 +75,28 @@ func (b *boundedEntries[V]) evictIfFull(now time.Time) {
 	if len(b.entries) < b.max {
 		return
 	}
+	b.expire(now)
+	if len(b.entries) < b.max {
+		return
+	}
+	delete(b.entries, b.evictee())
+}
+
+// expire drops every entry that has aged past ttl as of now: the first step
+// of evictIfFull, on its own for a memo that never evicts a live entry and
+// sweeps on a clock of its own instead (the filter's FailedScheduling log
+// memo). One pass over the map.
+func (b *boundedEntries[V]) expire(now time.Time) {
 	for uid, e := range b.entries {
 		if now.Sub(e.at) > b.ttl {
 			delete(b.entries, uid)
 		}
 	}
-	if len(b.entries) < b.max {
-		return
-	}
-	delete(b.entries, b.evictee())
+}
+
+// full reports whether the memo holds max entries.
+func (b *boundedEntries[V]) full() bool {
+	return len(b.entries) >= b.max
 }
 
 // evictee picks the live entry a full map gives up: the oldest in the map

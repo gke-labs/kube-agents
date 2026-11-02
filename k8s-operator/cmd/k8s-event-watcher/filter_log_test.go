@@ -153,19 +153,115 @@ func TestFailedSchedulingGateIsSafeForConcurrentDispatchers(t *testing.T) {
 	}
 }
 
-// The memo is capped: a fleet with more Pending pods than entries logs the
-// displaced pod once more on its next sighting and holds no more than the
-// cap. Pinned here because the cap is the only thing between the log
-// suppression and an unbounded map keyed by pod UIDs the watched clusters
-// choose; the eviction order itself is memo.go's and tested there.
-func TestFailedSchedulingGateLogMemoIsCapped(t *testing.T) {
+// A full memo keeps what it holds. A pod it has no room for is logged on
+// every sighting, as every pod was before this memo existed, and nothing it
+// already remembers is displaced to make room: evicting live entries under a
+// working set larger than the cap would re-log every pod on every sighting
+// and scan the whole memo under the fleet-wide lock each time.
+func TestFailedSchedulingGateLogMemoKeepsWhatItHoldsWhenFull(t *testing.T) {
+	buf := captureLog(t)
+	now := time.Unix(1_700_000_000, 0)
+	f := fsLogFilter(100, &now)
+	f.Decide(fsSighting(now, "c1", "first", 1))
+	for i := 1; i < maxFailedSchedulingLogEntries; i++ {
+		f.Decide(fsSighting(now, "c1", fmt.Sprintf("pod-%d", i), 1))
+	}
+	if got := f.fsLogged.len(); got != maxFailedSchedulingLogEntries {
+		t.Fatalf("memo holds %d entries after filling it; want %d", got, maxFailedSchedulingLogEntries)
+	}
+	// Over the cap: the new pod's first decision is still logged, on every
+	// sighting, and the memo neither grows nor gives anything up for it.
+	for count := 1; count <= 3; count++ {
+		f.Decide(fsSighting(now, "c1", "overflow", count))
+	}
+	if got := countLines(buf, "pod=default/overflow"); got != 3 {
+		t.Errorf("a pod over the cap logged %d lines in 3 sightings; want 3 (logged, not remembered)", got)
+	}
+	if got := f.fsLogged.len(); got != maxFailedSchedulingLogEntries {
+		t.Errorf("memo holds %d entries after an over-cap pod; want %d", got, maxFailedSchedulingLogEntries)
+	}
+	f.Decide(fsSighting(now, "c1", "first", 2))
+	if got := countLines(buf, "pod=default/first"); got != 1 {
+		t.Errorf("the first pod logged %d lines; want 1 (its entry was not displaced by the overflow)", got)
+	}
+}
+
+// Expired entries are swept out of a full memo at most once per
+// failedSchedulingLogSweepEvery, so an over-cap fleet costs one scan a minute
+// rather than one per sighting, and room comes back once the entries age out.
+func TestFailedSchedulingGateLogMemoSweepsExpiredEntriesWhenFull(t *testing.T) {
 	captureLog(t)
 	now := time.Unix(1_700_000_000, 0)
 	f := fsLogFilter(100, &now)
-	for i := 0; i < maxFailedSchedulingLogEntries+500; i++ {
+	for i := 0; i < maxFailedSchedulingLogEntries; i++ {
 		f.Decide(fsSighting(now, "c1", fmt.Sprintf("pod-%d", i), 1))
 	}
-	if got := f.fsLogged.len(); got > maxFailedSchedulingLogEntries {
-		t.Errorf("memo holds %d entries after %d pods; want at most %d", got, maxFailedSchedulingLogEntries+500, maxFailedSchedulingLogEntries)
+	// Just inside the entries' life: the sweep runs, frees nothing, and the
+	// pod is logged without being remembered.
+	now = now.Add(failedSchedulingLogEvery - time.Second)
+	f.Decide(fsSighting(now, "c1", "early", 1))
+	if got := f.fsLogged.len(); got != maxFailedSchedulingLogEntries {
+		t.Fatalf("memo holds %d entries after a sweep that should free nothing; want %d", got, maxFailedSchedulingLogEntries)
+	}
+	// Two seconds later every entry has expired, but the last sweep was
+	// under a minute ago: no second scan, still no room.
+	now = now.Add(2 * time.Second)
+	f.Decide(fsSighting(now, "c1", "soon", 1))
+	if got := f.fsLogged.len(); got != maxFailedSchedulingLogEntries {
+		t.Errorf("memo holds %d entries inside the sweep interval; want %d (no sweep yet)", got, maxFailedSchedulingLogEntries)
+	}
+	// Once the interval has passed the sweep reclaims every expired entry
+	// and the next pod is remembered again.
+	now = now.Add(failedSchedulingLogSweepEvery)
+	f.Decide(fsSighting(now, "c1", "later", 1))
+	if got := f.fsLogged.len(); got != 1 {
+		t.Errorf("memo holds %d entries after the sweep; want 1 (only the pod just logged)", got)
+	}
+}
+
+// A GKE cluster name is unique only within its project and location, and a
+// fleet can watch two clusters named alike, so the memo keys on the triple.
+func TestFailedSchedulingGateLogsSameNamedClustersApart(t *testing.T) {
+	buf := captureLog(t)
+	now := time.Unix(1_700_000_000, 0)
+	f := fsLogFilter(100, &now)
+	a := fsSighting(now, "prod", "pod-a", 1)
+	a.Project, a.Location = "team-one", "us-central1"
+	b := fsSighting(now, "prod", "pod-a", 1)
+	b.Project, b.Location = "team-two", "europe-west1"
+	for i := 0; i < 5; i++ {
+		f.Decide(a)
+		f.Decide(b)
+	}
+	if got := countLines(buf, "held FailedScheduling pod=default/pod-a"); got != 2 {
+		t.Errorf("one pod UID on two same-named clusters logged %d lines; want 2", got)
+	}
+}
+
+// An Event with no involvedObject UID or namespace names no one pod, so it is
+// not memoised: every such sighting is logged, as the scale-up memo refuses
+// the same key rather than file two pods under it.
+func TestFailedSchedulingGateDoesNotMemoiseAnEventWithoutAPodKey(t *testing.T) {
+	buf := captureLog(t)
+	now := time.Unix(1_700_000_000, 0)
+	f := fsLogFilter(100, &now)
+	noUID := fsSighting(now, "c1", "", 1)
+	noUID.Name = "handmade"
+	for i := 0; i < 3; i++ {
+		f.Decide(noUID)
+	}
+	noNS := fsSighting(now, "c1", "pod-x", 1)
+	noNS.Namespace = ""
+	for i := 0; i < 3; i++ {
+		f.Decide(noNS)
+	}
+	if got := countLines(buf, "pod=default/handmade"); got != 3 {
+		t.Errorf("3 sightings of an event with no UID logged %d lines; want 3", got)
+	}
+	if got := countLines(buf, "pod=/pod-x"); got != 3 {
+		t.Errorf("3 sightings of an event with no namespace logged %d lines; want 3", got)
+	}
+	if got := f.fsLogged.len(); got != 0 {
+		t.Errorf("memo holds %d entries for events with no pod key; want 0", got)
 	}
 }
