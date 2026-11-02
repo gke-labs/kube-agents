@@ -4605,7 +4605,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The repository this unit's agent writes to, emptied of every agent pull
   # request and every branch but the default and read back, so repetitions
   # 2 and 3 start as 1 did and a leftover from an earlier lease is never what
-  # the agent builds on (#2260). Only for a case that requests a pull request, or a stopped ask:
+  # the agent builds on (#2260). Only for a case that requests a pull request, a stopped ask, or a writes_alone case:
   # those run one at a time after every other unit (unit_phase), so nothing a
   # sibling is working on is open here. Not clean: the unit does not run, the
   # locks go back, and the repetition grades MISSING -- unless what stopped it
@@ -4766,15 +4766,15 @@ scheduled_audits pause "fan-out"
 # are not waited for, and a write from one of those can land in the next
 # unit's window (docs/designs/eval-next-transport.md, "What the lane
 # grades"): unattributed there in the first phase, and charged to the unit
-# in the second, whose window is exclusive (a requesting case's and a stopped
-# ask's alike).
+# in the second, whose window is exclusive (a requesting case's, a stopped
+# ask's and a writes_alone case's alike).
 #
 # A case that excludes seeded slots from the install's scope (SCOPE_EXCLUDE_NAMES)
 # is phase 2, run after both and alone, each case between its own scope edit and
 # restore (scope_exclude_apply); it takes 2 even when it also writes, and then
 # keeps the writer pause but not run_one_unit's per-repetition repository reset,
 # which no scope-excluding case needs today: each of them is read-only.
-unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that requests a pull request or a stopped ask, 0 otherwise
+unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that requests a pull request, a stopped ask or a writes_alone case, 0 otherwise
   case ",${SCOPE_EXCLUDE_NAMES:-}," in
     *",$1,"*) echo 2; return ;;
   esac
@@ -4919,7 +4919,7 @@ profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units,
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) and the stopped asks (${STOPPED_ASK_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) and the stopped asks and writes_alone cases (${STOPPED_ASK_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
   launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi

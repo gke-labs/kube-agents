@@ -583,7 +583,7 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
-written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
+written as a mention or not a login, an `expected_fail:`, `tool_calls_optional:` or `writes_alone:`
 that is not a bare YAML boolean, a `resource_property` or `fleet_resource_property` check that
 compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
 `op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts

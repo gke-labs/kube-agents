@@ -526,7 +526,7 @@ with "Not a roster admission."
   presubmit wall time, priced from `unit_cost_hint` in `hack/ci-eval-pr.sh`. Phase one runs the
   cases that request nothing, four lanes at a time (`EVAL_TASK_PARALLELISM`), and one case's
   repetitions run one after another on its task lock. Phase two runs the cases that request a
-  pull request, and the stopped asks, one unit at a time, after phase one is done, each after
+  pull request, the stopped asks and the cases that declare `writes_alone`, one unit at a time, after phase one is done, each after
   the 120 s write settle, so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
   Held-out seats count, because they run. Locks shared between cases are not counted, so a
   seat with its own Terraform stack would cost more than the estimate says. The test fails
@@ -731,7 +731,8 @@ after the opening turn, then the reply sent as a second message on it,
 [`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)).
 `hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
 needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
-the cases that request a pull request, with its window marked exclusive like theirs, so a stop
+the cases that request a pull request, as does a case that declares `writes_alone: true` on
+either lane, with its window marked exclusive like theirs, so a stop
 that fails and lets its card write reds that case whether or not it names the write, and only
 that case.
 
@@ -755,8 +756,8 @@ included, and on GitHub without `EVAL_LEDGER_APP_KEY_FILE` it refuses unless
 learned on the first repetition, whose check errors naming the repository and the missing permission.
 The task files under `bench/tasks/` are untouched. A case that
 requests a pull request (a `pull_request_opened` or `pull_request_diff_contains` check of its
-own) is allowed the ones its reply names, and the script runs those cases in a second phase
-after every other unit has finished, one at a time and each after a settle as long as the
+own) is allowed the ones its reply names, and the script runs those cases, the stopped asks and
+the cases that declare `writes_alone: true` in a second phase after every other unit has finished, one at a time and each after a settle as long as the
 check's clock-skew tolerance, so a repetition that requests nothing never shares the repository
 with one that writes by design and no window reaches back into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
