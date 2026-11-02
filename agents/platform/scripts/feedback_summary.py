@@ -184,6 +184,15 @@ LITELLM_DEFAULT_NAME_LINE = re.compile(
 #: The same line followed, within its entry (indented lines that open no new
 #: list item), by ``litellm_params:`` and that block's ``model:``, quoted or
 #: bare, captured possibly empty.
+#:
+#: Two valid YAML shapes are not read: an entry with ``litellm_params:`` before
+#: ``model_name:``, and an entry with a nested ``- `` list line between the name
+#: line and ``litellm_params:``. Each prints ``unavailable`` with no fallback. No
+#: config the repository renders uses either: the chart's
+#: ``kube-agents.litellmConfig``, the kustomize ``litellm/base`` and
+#: ``overlays/anthropic`` configs, and the ``examples/litellm-*`` configs all put
+#: the name line first. This path runs only for an operator older than
+#: ``status.inference``.
 LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
     LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
     r"(?:(?:[ \t]+(?![ \t-])[^\n]*)?\n)*?"
@@ -410,6 +419,12 @@ def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
     if LITELLM_DEFAULT_NAME_LINE.search(config_yaml):
         entry = LITELLM_DEFAULT_ENTRY_MODEL.search(config_yaml)
         return split_model(entry.group("model")) if entry else None
+    # The scan reads every ``model:`` line, while the operator's parser reads only
+    # ``model_list[].litellm_params.model``: a ``model:`` key elsewhere in the
+    # config can answer here and not in the operator. CRLF line endings defeat
+    # LITELLM_DEFAULT_NAME_LINE (``$`` does not match before ``\r``), so a
+    # malformed ``model-default`` entry then falls to this scan instead of a
+    # negative.
     for match in LITELLM_MODEL_LINE.finditer(config_yaml):
         model = split_model(match.group("model"))
         if model:
