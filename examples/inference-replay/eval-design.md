@@ -87,18 +87,23 @@ values, so a replayed `kanban_show` names this run's card, not the recording's. 
 names a placeholder the current request does not bind is not served.
 
 ```mermaid
-sequenceDiagram
-    participant A as Recording run
-    participant P as Proxy
-    participant C as Cache
-    participant B as Later run
-    A->>P: work kanban task t_3c176184
-    P->>P: t_3c176184 becomes ⟦TASK_1⟧, then hash
-    P->>C: store answer kanban_show(⟦TASK_1⟧)
-    B->>P: work kanban task t_9a02e1f7
-    P->>P: t_9a02e1f7 becomes ⟦TASK_1⟧, same hash
-    C-->>P: hit: kanban_show(⟦TASK_1⟧)
-    P-->>B: kanban_show(t_9a02e1f7)
+flowchart LR
+    subgraph rec["Run 1: recording"]
+        direction TB
+        a1["Agent asks:<br/>work kanban task t_3c176184"]
+        a2["Proxy swaps the ID:<br/>work kanban task ⟦TASK_1⟧<br/>(not in cache: ask the model)"]
+        a3["Model answers:<br/>kanban_show(t_3c176184)"]
+        a4["Proxy saves the answer as:<br/>kanban_show(⟦TASK_1⟧)"]
+        a1 --> a2 --> a3 --> a4
+    end
+    subgraph rep["Run 2: later run"]
+        direction TB
+        b1["Agent asks:<br/>work kanban task t_9a02e1f7"]
+        b2["Proxy swaps the ID:<br/>work kanban task ⟦TASK_1⟧<br/>(same as run 1: a hit)"]
+        b3["Proxy fills in this run's ID:<br/>kanban_show(t_9a02e1f7)<br/>(no model call)"]
+        b1 --> b2 --> b3
+    end
+    a4 -. "saved answer reused" .-> b3
 ```
 
 The rules that keep this safe:
@@ -232,9 +237,14 @@ resolves the real model, `reasoning_effort` and thinking on its side, and rewrit
 callback modules mounted beside it (the thinking-replay hook, redaction), so a pull request that
 changes any of those sends byte-identical requests. The chart already hashes all of it into the
 LiteLLM Deployment's `checksum/config` annotation; the key includes that checksum and the LiteLLM
-image. Fallbacks cannot be keyed: the chart's fallback alias is the same upstream model at a lower
-`reasoning_effort`, and the response's `model` field does not tell them apart. Eval installs run
-without `litellm.fallback` until a response field names the alias that answered.
+image. A fallback answer is never recorded. The chart's fallback alias is the same upstream model at a
+lower `reasoning_effort`, so the response body's `model` field is the same for both, but LiteLLM's
+response headers say which alias answered: `x-litellm-model-group` names it and
+`x-litellm-attempted-fallbacks` counts the fallbacks tried (per
+[the gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)). The proxy
+stores an answer only when the model group is the primary alias and no fallback was attempted;
+otherwise it passes the answer through unrecorded. The prototype did not read these headers, so
+this is unmeasured.
 
 ### Which recordings may be served
 
