@@ -47,6 +47,10 @@ const (
 	usageExportRemediationsClosedUnmerged = "remediationsClosedUnmergedTotal"
 	usageExportProposalHumanTouches       = "proposalHumanTouches"
 	usageExportProposalsMergedUntouched   = "proposalsMergedUntouched"
+	// The two people readings' field names, which share one pruning record
+	// (usageNewerFieldPeople).
+	usageExportPeopleSeen7d  = "peopleSeen7d"
+	usageExportPeopleSeen30d = "peopleSeen30d"
 	// usageCreatedTimeField is the one time sample that is not status.usage's:
 	// the CR's creation timestamp, so a rule can read an install's age before
 	// anyone has spoken to it. Published beside the phase, outside every hold.
@@ -69,8 +73,8 @@ var usagePhases = []string{pendingPhase, provisioningPhase, readyPhase, degraded
 type usageExportField struct {
 	name string
 	read func(*agentv1alpha1.AgentUsageStatus) (int64, bool)
-	// pointer marks a cluster gauge or a proposal reading, whose presence at
-	// 0 is a reading.
+	// pointer marks a cluster gauge, a proposal reading or a people reading,
+	// whose presence at 0 is a reading.
 	pointer bool
 }
 
@@ -114,6 +118,8 @@ var usageExportFields = []usageExportField{
 	usageGaugeField(usageExportRemediationsClosedUnmerged, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.RemediationsClosedUnmergedTotal }),
 	usageGaugeField(usageExportProposalHumanTouches, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalHumanTouches }),
 	usageGaugeField(usageExportProposalsMergedUntouched, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsMergedUntouched }),
+	usageGaugeField(usageExportPeopleSeen7d, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.PeopleSeen7d }),
+	usageGaugeField(usageExportPeopleSeen30d, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.PeopleSeen30d }),
 }
 
 type usageExportTimeField struct {
@@ -237,18 +243,19 @@ func usageExportFieldSet(extra []string) map[string]bool {
 
 // usageExportFieldsOfRecord maps one of the poller's per-field pruning records
 // to the exported fields it covers: the cluster gauges share one record, the
-// six proposal readings another, and every other record is named for its
-// field.
+// six proposal readings another, the two people readings a third, and every
+// other record is named for its field.
 func usageExportFieldsOfRecord(record string) []string {
 	switch record {
 	case usageNewerFieldGauges:
 		return []string{usageExportClustersRegistered, usageExportClustersMonitored}
 	case usageNewerFieldReadings:
-		fields := make([]string, 0, len(usageReadingSpecs))
-		for _, spec := range usageReadingSpecs {
-			fields = append(fields, spec.field)
+		return []string{
+			usageExportRemediationsMerged, usageExportRemediationsOpen, usageExportProposalsAuthored,
+			usageExportRemediationsClosedUnmerged, usageExportProposalHumanTouches, usageExportProposalsMergedUntouched,
 		}
-		return fields
+	case usageNewerFieldPeople:
+		return []string{usageExportPeopleSeen7d, usageExportPeopleSeen30d}
 	}
 	return []string{record}
 }

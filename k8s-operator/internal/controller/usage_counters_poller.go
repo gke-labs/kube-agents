@@ -49,6 +49,9 @@ const (
 	// record: they arrived in one release, the two kept fields changing from
 	// counters to readings, and a CRD serves all six or none of the four new.
 	usageNewerFieldReadings = "the six proposal readings"
+	// usageNewerFieldPeople names the two people readings' shared pruning
+	// record: they arrived in one release and a CRD serves both or neither.
+	usageNewerFieldPeople = "the two people readings"
 	// usageNewerFieldLastHumanActive is lastHumanActiveTime's pruning record
 	// key, the status field's name.
 	usageNewerFieldLastHumanActive = "lastHumanActiveTime"
