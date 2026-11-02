@@ -128,6 +128,31 @@ func TestHandlerAuditEvents(t *testing.T) {
 				Outcome: OutcomeRefused, Reason: ReasonSecretWriteBlocked, StatusCode: http.StatusForbidden},
 		},
 		{
+			name: "secret read", method: http.MethodGet, target: "/api/v1/namespaces/default/secrets/db",
+			cfg: Config{Upstream: &recordingTransport{response: func(*http.Request) *http.Response {
+				return jsonResponse([]byte(secretJSON), nil)
+			}}},
+			want: AuditEvent{ClusterID: InClusterID, Path: "/api/v1/namespaces/default/secrets/db", Verb: "get",
+				APIVersion: "v1", Resource: "secrets", Namespace: "default", Name: "db",
+				Outcome: OutcomeForwarded, StatusCode: http.StatusOK},
+		},
+		{
+			// The default test upstream answers with a PodList, which the redactor refuses.
+			name: "unredactable secret", method: http.MethodGet, target: "/api/v1/namespaces/default/secrets/db",
+			want: AuditEvent{ClusterID: InClusterID, Path: "/api/v1/namespaces/default/secrets/db", Verb: "get",
+				APIVersion: "v1", Resource: "secrets", Namespace: "default", Name: "db",
+				Outcome: OutcomeForwarded, StatusCode: http.StatusBadGateway},
+			wantErr: `unexpected kind "PodList" in "v1"`,
+		},
+		{
+			name: "unredactable secret watch", method: http.MethodGet, target: "/api/v1/namespaces/default/secrets?watch=true",
+			cfg: Config{Upstream: respondWith(http.StatusOK, strings.NewReader("c2VjcmV0\n"))},
+			want: AuditEvent{ClusterID: InClusterID, Path: "/api/v1/namespaces/default/secrets", Verb: "watch",
+				APIVersion: "v1", Resource: "secrets", Namespace: "default",
+				Outcome: OutcomeForwarded, StatusCode: http.StatusOK},
+			wantErr: "a watch event is not one JSON object",
+		},
+		{
 			name: "upstream error", method: http.MethodGet, target: "/api/v1/pods",
 			cfg: Config{Upstream: &recordingTransport{err: errors.New(transportErr)}, DefaultClusterID: gkeHost},
 			want: AuditEvent{ClusterID: gkeHost, Path: "/api/v1/pods", Verb: "list", APIVersion: "v1", Resource: "pods",

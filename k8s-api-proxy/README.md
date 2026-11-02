@@ -18,7 +18,9 @@ up, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 ca
 the status and the duration. An upgraded session that breaks off after its 101 is recorded as
 `forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
 puts no body, query or credential in it, but an authentication or transport error is recorded as
-returned. The caller never sees that error, because it can name the upstream. The default sink
+returned. The caller never sees that error, because it can name the upstream. A Secret response
+the handler refuses to pass on because it cannot redact it stays `forwarded`, with the cause as
+the error and the handler's 502 as the status (on a watch, the stream's 200). The default sink
 writes each event as one `slog` record, and the reverse proxy's own errors go to the same logger.
 
 The policy has three modes. `read-only` permits `get`, `list` and `watch` and the discovery

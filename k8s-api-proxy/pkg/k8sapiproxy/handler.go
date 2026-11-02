@@ -104,7 +104,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 				// Redacting here rather than in ModifyResponse keeps the plan off resp.Request,
 				// which a transport may replace with a request of its own.
 				if plan, ok := req.Context().Value(secretRedactionKey{}).(*secretRedaction); ok && resp != nil {
-					redactSecretResponse(resp, plan)
+					redactSecretResponse(resp, plan, func(cause error) { eventFrom(req).Err = cause })
 				}
 				return resp, err
 			}),

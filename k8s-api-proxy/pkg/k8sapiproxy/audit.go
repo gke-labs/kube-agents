@@ -13,7 +13,9 @@ import (
 type Outcome string
 
 const (
-	// OutcomeForwarded is a request the upstream answered; StatusCode is its status.
+	// OutcomeForwarded is a request the upstream answered; StatusCode is its status. A Secret
+	// response the handler cannot redact is refused, and Err says why: StatusCode is then the
+	// handler's 502, or on a watch the 200 the stream began with.
 	OutcomeForwarded Outcome = "forwarded"
 	// OutcomeUnauthenticated is a request whose caller was not authenticated.
 	OutcomeUnauthenticated Outcome = "unauthenticated"
