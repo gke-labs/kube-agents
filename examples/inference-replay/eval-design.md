@@ -11,7 +11,9 @@ served, and the rollout stages. The gate's ladder and roster stay in
 [`testing-strategy.md`](../../docs/designs/testing-strategy.md) §4.2; the eval transport stays in
 [`eval-next-transport.md`](../../docs/designs/eval-next-transport.md). The example proxy in this
 directory ([`README.md`](README.md)) is the starting point and is superseded by the design here
-for eval use.
+for eval use. The kustomize integration under `k8s-operator/config/integrations/inference-replay/`
+labels its proxy `app: standalone-replay`, which the agents' egress policies do not admit under
+`spec.mode: next` (see "Where the proxy runs"), so it is not a base for this either.
 
 ## The problem
 
@@ -49,8 +51,8 @@ Three properties make this sound for grading:
 
 Raw requests never repeat. Kanban task IDs, pod name suffixes, UIDs, timestamps, ages, process and
 row IDs, and scratch file names differ every run, and one difference poisons every later request
-in the conversation, because each request embeds the ones before it. Hashing raw bodies, as the example proxy
-does, gave 5–7% token-weighted hits in a two-run measurement on a dev install on 2026-09-04.
+in the conversation, because each request embeds the ones before it. Hashing near-raw bodies (only a
+per-message `timestamp` stripped), as the example proxy does, gave 5–7% token-weighted hits in a two-run measurement on a dev install on 2026-09-04.
 
 The normalizer replaces each identifier with a placeholder numbered by first appearance in the
 request (`⟦TASK_1⟧`, `⟦POD_2⟧`, `⟦AGEm_1⟧`), and the mapping works both ways. A stored answer
@@ -124,18 +126,20 @@ replace it.
 
 ### Where the proxy runs
 
-Eval installs only. `hack/ci-deploy.sh` renders the proxy beside LiteLLM after the Helm release
-is applied and points `inference-gateway` at it, since a later Helm upgrade reverts the Service;
-customer installs never carry it. The proxy pod has to carry `app: litellm`, because that is the only
-label the agents' egress policies admit for the model gateway. A second label (`replay: proxy`)
+Eval installs only. `hack/ci-deploy.sh` renders the proxy beside LiteLLM after its last Helm
+upgrade (the next-mode flip) and points `inference-gateway` at it, since a Helm upgrade can revert
+the Service; customer installs never carry it. The proxy pod has to carry `app: litellm`, because
+that is the label the agents' and Cluster Agents' egress policies admit for the model gateway. A second label (`replay: proxy`)
 selects it for `inference-gateway`, an `inference-gateway-upstream` Service selects the real LiteLLM
 pods, and one extra NetworkPolicy lets the proxy reach them. The upstream selector is the hard part:
 the chart's LiteLLM pods carry only `app: litellm`, so a Service selecting that also selects the
 proxy and loops. The prototype selected on the LiteLLM ReplicaSet's `pod-template-hash`, which breaks
 on the next LiteLLM roll; CI needs a stable label on the LiteLLM pods (a chart value) that the proxy
-does not carry. The shared label also enrols the proxy in LiteLLM's PodDisruptionBudget, its
-`PodMonitoring` scrape and the console's metrics Service; the proxy passes unknown paths through
-to LiteLLM, so `/metrics` still answers.
+does not carry. The shared label also enrols the proxy in LiteLLM's PodDisruptionBudget, its topology spread, its
+`PodMonitoring` scrape and the console's metrics Service. The scrape and the console sum
+`/metrics` across every `app: litellm` address, so the proxy must answer `/metrics` itself (its own
+counters, or empty) rather than pass it through to a LiteLLM replica, which would count that
+replica twice.
 
 ### One shared cache for the evaluation pool
 
@@ -146,20 +150,25 @@ multiplies the live runs needed to warm the cache after each prompt change by th
 cache lives in an eval-owned bucket and is never shared with dev or customer installs, because
 recorded answers carry cluster details.
 
-**Only base-branch code writes to it.** A presubmit runs the pull request's tree, so a proxy built
-from that tree could write any answer under `main`'s keys and every later pull request would be
-graded from it, which breaks the rule [`testing-strategy.md`](../../docs/designs/testing-strategy.md)
-§4.2 states for the evidence store: a pull request cannot move the baseline it is judged against.
-The proxy image, its normalizer and its commit-on-pass step are therefore built from
-`PULL_BASE_SHA`, the way the scorer is pinned. What the pull request's code can still change is the
-requests, and a changed request lands under its own key, where only a run of that same input can
-read it.
+**Presubmits read it; only jobs running `main`'s tree write it.** A presubmit runs the pull
+request's tree, including `hack/ci-deploy.sh` and whatever pins the proxy, so code pinning cannot
+stop a presubmit holding write access from putting any answer under `main`'s keys, and every later
+pull request would be graded from it. That breaks the rule
+[`testing-strategy.md`](../../docs/designs/testing-strategy.md) §4.2 states for the evidence store
+(a pull request cannot move the baseline it is judged against), and the evidence store holds that
+rule structurally: the presubmit's identity has read access only. The cache does the same. The
+presubmit identity gets object read on the bucket and nothing else; the nightly and a post-merge
+job, which run `main`'s tree, are the only writers. The cost is freshness: after a prompt change
+merges, presubmits miss until the post-merge job has run the affected cases.
 
 **The key includes what the request does not show.** Agents send the alias `model-default`; LiteLLM
-resolves the real model, `reasoning_effort`, thinking and fallbacks on its side, so a pull request
-that changes those sends byte-identical requests. The proxy reads the install's LiteLLM model
-configuration at start and puts its hash in the key, and it does not record an answer whose
-reported `model` is not the configured primary (a fallback's answer).
+resolves the real model, `reasoning_effort` and thinking on its side, and rewrites requests through
+callback modules mounted beside it (the thinking-replay hook, redaction), so a pull request that
+changes any of those sends byte-identical requests. The chart already hashes all of it into the
+LiteLLM Deployment's `checksum/config` annotation; the key includes that checksum and the LiteLLM
+image. Fallbacks cannot be keyed: the chart's fallback alias is the same upstream model at a lower
+`reasoning_effort`, and the response's `model` field does not tell them apart. Eval installs run
+without `litellm.fallback` until a response field names the alias that answered.
 
 ### Which recordings may be served
 
@@ -172,16 +181,18 @@ verdict is in.
 Ideally each repetition replays its own recording, with the repetition index in the key, so the
 three repetitions keep three samples rather than one served three times. That needs a run's
 requests to carry its identity, which they do not today (open questions). Without it, all three
-repetitions of a case replay the same recording. The measurements below were taken that way: one
+repetitions of a case replay the same recording. The measurements above were taken that way: one
 recording, served to three replays.
 
 ### Prompt churn
 
 On weekdays 1–9 commits a day change system-prompt content (`SOUL.md`, profile `AGENTS.md`,
 profile config, skill descriptions), and each one misses every request of every profile it
-touches. A recording made only by the nightly would be stale for most presubmits. Presubmits must
-record their own misses, so the first pull request after a prompt change warms the cache for the
-next; there were 150–290 presubmit builds a weekday in late October, cancelled ones included.
+touches. A recording made only by the nightly would be stale for most presubmits, which is why a
+post-merge job writes too: the first merge after a prompt change pays for the live runs, and the
+presubmits after it hit. Whether that job runs every case or only those whose requests the merge
+changed is a cost question for shadow mode to answer; there were 150–290 presubmit builds a weekday
+in late October, cancelled ones included, so even a full post-merge run is amortised quickly.
 
 ### What stays live
 
@@ -205,15 +216,18 @@ the eval crew's decision before stage 2 of the rollout below:
 - A case that is flaky on `main` stops showing its flakiness on unrelated pull requests. The nightly
   still reports it.
 - Token accounting. A hit returns the recorded answer's `usage`, so the record's token counts, and
-  rung 3's check that a run billed a model call, behave as if the model ran. The proxy marks each
-  response as hit or miss, and the record splits replayed tokens from billed ones; without the split
-  the saving cannot be read from the eval records.
+  rung 3's check that a run billed a model call, behave as if the model ran. Splitting replayed
+  tokens from billed ones in the record needs the proxy's hit or miss to reach it, which goes
+  through the same run identity as attribution (open questions); until then the saving is read
+  from the proxy's own log, not the eval records.
 
 ## Rollout
 
-1. **Shadow mode.** The proxy records every presubmit's answers to the shared cache, checks
-   whether each request would have hit, logs it with the recording's project and repetition, and
-   always calls the model. No verdict changes. A week of it gives the real hit rate under prompt
+1. **Shadow mode.** The proxy records every presubmit's answers to a shadow bucket that nothing is
+   served from, checks whether each request would have hit, logs it with the recording's project and
+   whether a presubmit or a `main` job wrote it, and always calls the model. Only hits on
+   `main`-written entries count towards the design's hit rate; the rest show what the freshness
+   cost of read-only presubmits is. No verdict changes. A week of it gives the real hit rate under prompt
    churn and project rotation, the token and cost saving per build, and the misses worth
    normalizing. Cheap and reversible.
 2. **Replay on the presubmit**, after the eval crew settles the gate questions above and #1730
