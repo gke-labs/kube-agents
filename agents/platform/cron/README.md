@@ -586,8 +586,9 @@ warning line, as their likely cause: every board write fails on a full volume.
 Alone the line is not printed, because the server's warning posts once per
 crossing and a daily repeat would be noise, and because it would turn a
 stuck-cards report into text without its buttons. A board that cannot be read
-for "disk I/O error" or "database or disk is full" while the volume is past
-the line is said as a full disk, with the line, not as a bare read error.
+for "database or disk is full" while the volume is past the line, or for "disk
+I/O error" with no space left at all, is said as a full disk, with the line,
+not as a bare read error.
 
 It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
