@@ -1341,8 +1341,9 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # made the card, so a card a worker's ``kanban_create`` handed back by its
 # ``idempotency_key`` (which ``kanban_worker_children`` attributes when it is
 # under a minute old) is printed ``foreign <id>`` and left alone, files
-# included. A taken card is kept, printed ``kept <id>``, while it runs (its
-# worker would write to a deleted row) and while a fan-out card of its creator
+# included. A taken card is kept, printed ``kept <id>``, files included, while
+# it or the card that filed it runs (a worker would write to, or read, a
+# deleted row) and while a fan-out card of its creator
 # or of its own can still run (``LIVE``) and is not a ``task_links`` follow-up:
 # ``kanban_fanout_reaper`` finds an overdue running fan-out card only through
 # its creator's row and a sibling's attribution row, and skips follow-ups.
@@ -1373,7 +1374,7 @@ try:
             "WHERE l.parent_id = c.creator_id AND l.child_id = c.child_id)" % ",".join("?" * len(LIVE)),
             LIVE,
         )}
-    taken = set(roots)
+    taken, gone = set(roots), []
     for tid in roots + fanned:
         row = kb.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
         if row is None:
@@ -1391,18 +1392,18 @@ try:
                 print("%s %s" % (FOREIGN, tid))
                 continue
             taken.add(tid)
-            shutil.rmtree(os.path.join(ATTACHMENTS, tid), ignore_errors=True)
-            try:
-                os.remove(os.path.join(LOGS, tid + ".log"))
-            except OSError:
-                pass
-        creator = None
+        creator, creator_status = None, None
         if children:
-            r = kb.execute("SELECT creator_id FROM kanban_worker_children WHERE child_id = ?", (tid,)).fetchone()
-            creator = r[0] if r else None
-        if row[0] == "running" or tid in held or creator in held:
+            r = kb.execute(
+                "SELECT c.creator_id, t.status FROM kanban_worker_children c "
+                "LEFT JOIN tasks t ON t.id = c.creator_id WHERE c.child_id = ?", (tid,)
+            ).fetchone()
+            creator, creator_status = (r[0], r[1]) if r else (None, None)
+        if row[0] == "running" or creator_status == "running" or tid in held or creator in held:
             print("%s %s" % (KEPT, tid))
             continue
+        if tid not in roots:
+            gone.append(tid)
         kb.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (tid, tid))
         for table in BY_TASK:
             if table in tables:
@@ -1413,6 +1414,12 @@ try:
             )
         kb.execute("DELETE FROM tasks WHERE id = ?", (tid,))
     kb.execute("COMMIT")
+    for tid in gone:
+        shutil.rmtree(os.path.join(ATTACHMENTS, tid), ignore_errors=True)
+        try:
+            os.remove(os.path.join(LOGS, tid + ".log"))
+        except OSError:
+            pass
     print(DONE)
 except sqlite3.Error as exc:
     print("rows kept: %s" % exc)

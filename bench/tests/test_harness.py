@@ -3935,11 +3935,18 @@ def test_the_purge_keeps_a_fan_out_while_one_of_its_cards_runs(tmp_path: Path) -
     _purge_card(kb, "t_c2", "running", creator="t_parent", attributed_to="t_parent")
     kb.commit()
 
-    out = _run_purge(tmp_path, ["t_parent"], ["t_c1", "t_c2"])
+    _purge_card(kb, "t_gc", "done", creator="t_c2", attributed_to="t_c2")
+    kb.commit()
+    for tid in ("t_c1", "t_c2", "t_gc"):
+        (tmp_path / "attachments" / tid).mkdir(parents=True)
 
-    assert out == ["kept t_parent", "kept t_c1", "kept t_c2", "purged"]
+    out = _run_purge(tmp_path, ["t_parent"], ["t_c1", "t_c2", "t_gc"])
+
+    # t_gc is settled, but t_c2's worker is still reading it.
+    assert out == ["kept t_parent", "kept t_c1", "kept t_c2", "kept t_gc", "purged"]
     rows = kb.execute("SELECT child_id FROM kanban_worker_children WHERE creator_id = 't_parent' ORDER BY 1")
     assert [r[0] for r in rows] == ["t_c1", "t_c2"]
+    assert all((tmp_path / "attachments" / tid).is_dir() for tid in ("t_c1", "t_c2", "t_gc"))
 
 
 def test_the_purge_holds_no_fan_out_for_a_card_that_cannot_run(tmp_path: Path) -> None:
