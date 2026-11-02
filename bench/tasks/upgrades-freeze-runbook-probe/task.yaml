@@ -62,7 +62,7 @@ verification_spec:
       # next line with no backslash does not open or extend the match;
       # bench/tests/test_upgrades_freeze_runbook_pattern.py pins all three.
       any_of_patterns:
-        - 'gcloud(?: | \\\n ?|\\\n )(?:[a-z]+(?: | \\\n ?|\\\n ))?container(?: | \\\n ?|\\\n )clusters(?: | \\\n ?|\\\n )upgrade(?: | \\\n ?|\\\n )(?:(?!--master|gcloud )[-\w./=$<>{}"'']+(?: | \\\n ?|\\\n ))*?--node-pool(?=[ =])'
+        - 'gcloud(?: | \\\n ?|\\\n )(?:(?!--master|gcloud )[-\w./=$<>{}"'']+(?: | \\\n ?|\\\n ))?container(?: | \\\n ?|\\\n )clusters(?: | \\\n ?|\\\n )upgrade(?: | \\\n ?|\\\n )(?:(?!--master|gcloud )[-\w./=$<>{}"'']+(?: | \\\n ?|\\\n ))*?--node-pool(?=[ =])'
   - name: the-answer-states-the-92-day-window
     role: objective
     mode: assert

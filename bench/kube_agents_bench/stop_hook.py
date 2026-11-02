@@ -110,11 +110,16 @@ def parse(prompt: str) -> Stop | None:
 
 def main(argv: list[str] | None = None) -> int:
     """Print the case id (its directory) of every task file given whose
-    prompt is a stopped ask, one per line: the list hack/ci-eval-pr.sh runs
-    in its second phase. An unreadable task file is an error."""
+    prompt is a stopped ask or that declares ``writes_alone: true``, one per
+    line: the list hack/ci-eval-pr.sh runs in its second phase, where the
+    lane marks the write safeguard's window exclusive
+    (:func:`kube_agents_bench.lane.runs_alone`). An unreadable task file is
+    an error."""
+    from kube_agents_bench import lane  # local: lane imports this module
+
     for task in sys.argv[1:] if argv is None else argv:
         doc = yaml.safe_load(Path(task).read_text(encoding="utf-8")) or {}
-        if is_stopped_ask(str(doc.get("prompt") or "")):
+        if lane.runs_alone(doc):
             print(Path(task).parent.name)
     return 0
 

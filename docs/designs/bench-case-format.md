@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -134,6 +134,12 @@ declared outcome, and passing every repetition reds the job until the marker is 
 defaults to `false`, a case for your own change never carries it, and it must be a bare YAML
 boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
+
+`writes_alone` is for a case that requests no pull request but whose wrong answer may open one
+the reply never names: the lane runs it alone in its second phase and marks the write
+safeguard's window exclusive, so any write in the window is charged to it
+(`bench/kube_agents_bench/lane.py`). A bare YAML boolean, `false` by default; devops-bench
+ignores the key.
 
 `tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
 first-turn greeting, a reply that names a command. `bench-gate`'s rung 3 otherwise reads an empty

@@ -253,3 +253,24 @@ def test_the_case_carries_the_directive_on_its_own_line():
     case = harness.Path(__file__).resolve().parents[1] / "tasks" / "chat-stop-halts-delegated-remediation" / "task.yaml"
     stop = stop_hook.parse(yaml.safe_load(case.read_text(encoding="utf-8"))["prompt"])
     assert stop is not None and "checkout-gateway" in stop.prompt
+
+
+def test_the_listing_names_stopped_asks_and_writes_alone_cases(tmp_path, capsys):
+    # The list hack/ci-eval-pr.sh runs in its second phase: a stopped ask, a
+    # case that declares `writes_alone: true`, and nothing else.
+    import yaml
+
+    def task(name, doc):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "task.yaml").write_text(yaml.safe_dump(doc))
+        return str(d / "task.yaml")
+
+    paths = [
+        task("stopped", {"prompt": f"{stop_hook.STOP_DIRECTIVE}\nstop this"}),
+        task("alone", {"prompt": "an ordinary ask", "writes_alone": True}),
+        task("quoted", {"prompt": "an ordinary ask", "writes_alone": "true"}),
+        task("ordinary", {"prompt": "an ordinary ask"}),
+    ]
+    assert stop_hook.main(paths) == 0
+    assert capsys.readouterr().out.split() == ["stopped", "alone"]
