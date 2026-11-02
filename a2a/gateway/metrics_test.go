@@ -789,7 +789,7 @@ func TestMetricsListenerCapsItsConnections(t *testing.T) {
 
 func TestTheGaugeServesNoSampleUntilTheMapLoads(t *testing.T) {
 	var none *Metrics
-	none.setPeopleSource(func(time.Time) (int, int, bool) { return 1, 2, true })
+	none.setPeopleSource(func() (int, int, bool) { return 1, 2, true })
 
 	m := NewMetrics()
 	url := startMetricsServer(t, m)
@@ -798,7 +798,7 @@ func TestTheGaugeServesNoSampleUntilTheMapLoads(t *testing.T) {
 		t.Fatalf("a sample with no source:\n%s", body)
 	}
 	var loaded atomic.Bool
-	m.setPeopleSource(func(time.Time) (int, int, bool) { return 1, 2, loaded.Load() })
+	m.setPeopleSource(func() (int, int, bool) { return 1, 2, loaded.Load() })
 	_, body = scrape(t, http.MethodGet, url+MetricsPath)
 	if strings.Contains(body, "people_seen") {
 		t.Fatalf("a sample while the map is not loaded:\n%s", body)

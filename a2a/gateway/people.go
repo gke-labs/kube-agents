@@ -25,7 +25,7 @@ const peopleKeyPrefix = "people."
 const peopleKeyInfo = "people"
 
 // peopleKeyLen is how many bytes the derived HMAC key gets: one SHA-256
-// block of output.
+// digest.
 const peopleKeyLen = 32
 
 // peopleKeyHexLen is how many hex characters of the HMAC a people key keeps
@@ -72,6 +72,16 @@ const (
 	peopleDeleteFailedLog  = "people: purge could not delete a key"
 )
 
+// The people desk's log attribute keys. No log line carries a people key: a
+// key is a person's pseudonym.
+const (
+	peopleLogBucket     = "bucket"
+	peopleLogKeptFor    = "keptFor"
+	peopleLogKeys       = "keys"
+	peopleLogErr        = "err"
+	peopleLogUnparsable = "unparsable"
+)
+
 // peopleBackends are the chat backends whose verified senders are people.
 // Named here, not derived from a metrics label set: the doors and the
 // console are programs or operators, not people.
@@ -82,8 +92,12 @@ var peopleBackends = []string{gchatBackend, slackBackend, discordBackend}
 type peopleDesk struct {
 	g     *Gateway
 	keyer *peopleKeyer
-	ttl   time.Duration
 	now   func() time.Time
+	// openWatch starts one watch over the whole bucket (watchBucket), and
+	// watchRetry is how long watch waits to start another after one ends;
+	// tests replace both.
+	openWatch  func(ctx context.Context) (jetstream.KeyWatcher, error)
+	watchRetry time.Duration
 
 	mu sync.Mutex
 	// loaded reports that seen holds the bucket: the watch has delivered
@@ -149,7 +163,7 @@ func (g *Gateway) startPeople(ctx context.Context) {
 				}
 			}
 		}
-		g.log.Info(peopleOffGaveUpLog, "bucket", lib.PeopleBucket)
+		g.log.Info(peopleOffGaveUpLog, peopleLogBucket, lib.PeopleBucket)
 	}()
 }
 
@@ -159,7 +173,7 @@ func (g *Gateway) startPeople(ctx context.Context) {
 // (quiet) logs why only at debug.
 func (g *Gateway) tryPeople(ctx context.Context, quiet bool) bool {
 	off := func(why string, args ...any) bool {
-		args = append([]any{"bucket", lib.PeopleBucket}, args...)
+		args = append([]any{peopleLogBucket, lib.PeopleBucket}, args...)
 		if quiet {
 			g.log.Debug(why, args...)
 		} else {
@@ -169,11 +183,11 @@ func (g *Gateway) tryPeople(ctx context.Context, quiet bool) bool {
 	}
 	kv, err := g.client.KV(ctx, lib.PeopleBucket)
 	if err != nil {
-		return off(peopleOffNoBucketLog, "err", err)
+		return off(peopleOffNoBucketLog, peopleLogErr, err)
 	}
 	status, err := kv.Status(ctx)
 	if err != nil {
-		return off(peopleOffNoStatusLog, "err", err)
+		return off(peopleOffNoStatusLog, peopleLogErr, err)
 	}
 	if status.TTL() <= 0 {
 		return off(peopleOffNoMaxAgeLog)
@@ -181,28 +195,29 @@ func (g *Gateway) tryPeople(ctx context.Context, quiet bool) bool {
 	desk := &peopleDesk{
 		g:          g,
 		keyer:      g.peopleKeyer,
-		ttl:        status.TTL(),
 		now:        time.Now,
+		watchRetry: peopleWatchRetryInterval,
 		seen:       map[string]time.Time{},
 		unparsable: map[string]bool{},
 	}
+	desk.openWatch = desk.watchBucket
 	g.people.Store(desk)
 	g.metrics.setPeopleSource(desk.count)
 	go desk.watch(ctx)
-	g.log.Info(peopleOnLog, "bucket", lib.PeopleBucket, "keptFor", status.TTL().String())
+	g.log.Info(peopleOnLog, peopleLogBucket, lib.PeopleBucket, peopleLogKeptFor, status.TTL().String())
 	return true
 }
 
 // watch follows the bucket into seen until ctx ends: each time a watch ends,
 // the map is unloaded and emptied, and a new watch starts after
-// peopleWatchRetryInterval.
+// watchRetry.
 func (d *peopleDesk) watch(ctx context.Context) {
-	timer := time.NewTimer(peopleWatchRetryInterval)
+	timer := time.NewTimer(d.watchRetry)
 	defer timer.Stop()
 	for {
 		d.follow(ctx)
 		d.reset()
-		timer.Reset(peopleWatchRetryInterval)
+		timer.Reset(d.watchRetry)
 		select {
 		case <-ctx.Done():
 			return
@@ -214,17 +229,10 @@ func (d *peopleDesk) watch(ctx context.Context) {
 // follow runs one watch over the whole bucket, deletes and purges included,
 // applying each entry to seen, and returns when the watch ends or ctx does.
 func (d *peopleDesk) follow(ctx context.Context) {
-	kv, err := d.g.client.KV(ctx, lib.PeopleBucket)
+	watcher, err := d.openWatch(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
-			d.g.log.Warn(peopleWatchFailedLog, "bucket", lib.PeopleBucket, "err", err)
-		}
-		return
-	}
-	watcher, err := kv.WatchAll(ctx)
-	if err != nil {
-		if ctx.Err() == nil {
-			d.g.log.Warn(peopleWatchFailedLog, "bucket", lib.PeopleBucket, "err", err)
+			d.g.log.Warn(peopleWatchFailedLog, peopleLogBucket, lib.PeopleBucket, peopleLogErr, err)
 		}
 		return
 	}
@@ -235,12 +243,21 @@ func (d *peopleDesk) follow(ctx context.Context) {
 			return
 		case entry, ok := <-watcher.Updates():
 			if !ok {
-				d.g.log.Warn(peopleWatchClosedLog, "bucket", lib.PeopleBucket)
+				d.g.log.Warn(peopleWatchClosedLog, peopleLogBucket, lib.PeopleBucket)
 				return
 			}
 			d.apply(entry)
 		}
 	}
+}
+
+// watchBucket binds the people bucket and watches all of it.
+func (d *peopleDesk) watchBucket(ctx context.Context) (jetstream.KeyWatcher, error) {
+	kv, err := d.g.client.KV(ctx, lib.PeopleBucket)
+	if err != nil {
+		return nil, err
+	}
+	return kv.WatchAll(ctx)
 }
 
 // apply folds one watch entry into seen; nil marks the end of the values
@@ -263,7 +280,7 @@ func (d *peopleDesk) apply(entry jetstream.KeyValueEntry) {
 	if err != nil {
 		if !d.unparsable[key] {
 			d.unparsable[key] = true
-			d.g.log.Debug(peopleBadValueLog, "key", key, "err", err)
+			d.g.log.Debug(peopleBadValueLog, peopleLogErr, err, peopleLogUnparsable, len(d.unparsable))
 		}
 		return
 	}
@@ -290,19 +307,22 @@ func (d *peopleDesk) note(principal string) {
 	}
 	d.mu.Lock()
 	now := d.now()
-	if now.Sub(d.seen[key]) < peoplePutInterval {
+	prior := d.seen[key]
+	if now.Sub(prior) < peoplePutInterval {
 		d.mu.Unlock()
 		return
 	}
 	// Set before the put, so a second turn in the same moment skips.
 	d.seen[key] = now
 	d.mu.Unlock()
-	go d.put(key, now)
+	go d.put(key, now, prior)
 }
 
-// put writes at as key's value, and on failure takes back note's entry if
-// no later note has replaced it, so the next turn tries again.
-func (d *peopleDesk) put(key string, at time.Time) {
+// put writes at as key's value. On failure, unless a later note or the
+// watch has replaced note's entry, it puts back prior, the time the map held
+// before (the zero time: none, and the entry is deleted), so a person
+// already counted stays counted and the next turn tries again.
+func (d *peopleDesk) put(key string, at, prior time.Time) {
 	ctx, cancel := context.WithTimeout(d.g.runCtx, peoplePutDeadline)
 	defer cancel()
 	err := func() error {
@@ -316,20 +336,26 @@ func (d *peopleDesk) put(key string, at time.Time) {
 	if err == nil {
 		return
 	}
-	d.g.log.Warn(peoplePutFailedLog, "err", err)
+	d.g.log.Warn(peoplePutFailedLog, peopleLogErr, err)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if held, ok := d.seen[key]; ok && held.Equal(at) {
-		delete(d.seen, key)
+	if held, ok := d.seen[key]; !ok || !held.Equal(at) {
+		return
 	}
+	if prior.IsZero() {
+		delete(d.seen, key)
+		return
+	}
+	d.seen[key] = prior
 }
 
 // count reports the distinct people seen within peopleWindowShort and
-// peopleWindowLong of now, and whether the map holds the bucket (ok). An
-// entry older than peopleWindowLong is dropped.
-func (d *peopleDesk) count(now time.Time) (short, long int, ok bool) {
+// peopleWindowLong of the desk's clock, and whether the map holds the bucket
+// (ok). An entry older than peopleWindowLong is dropped.
+func (d *peopleDesk) count() (short, long int, ok bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	now := d.now()
 	for key, at := range d.seen {
 		age := now.Sub(at)
 		if age > peopleWindowLong {
@@ -349,27 +375,27 @@ func (d *peopleDesk) count(now time.Time) (short, long int, ok bool) {
 func (g *Gateway) purgePeople(ctx context.Context) {
 	kv, err := g.client.KV(ctx, lib.PeopleBucket)
 	if errors.Is(err, jetstream.ErrBucketNotFound) {
-		g.log.Info(peoplePurgeNoBucketLog, "bucket", lib.PeopleBucket)
+		g.log.Info(peoplePurgeNoBucketLog, peopleLogBucket, lib.PeopleBucket)
 		return
 	}
 	if err != nil {
-		g.log.Warn(peoplePurgeFailedLog, "bucket", lib.PeopleBucket, "err", err)
+		g.log.Warn(peoplePurgeFailedLog, peopleLogBucket, lib.PeopleBucket, peopleLogErr, err)
 		return
 	}
 	lister, err := kv.ListKeys(ctx)
 	if err != nil {
-		g.log.Warn(peoplePurgeFailedLog, "bucket", lib.PeopleBucket, "err", err)
+		g.log.Warn(peoplePurgeFailedLog, peopleLogBucket, lib.PeopleBucket, peopleLogErr, err)
 		return
 	}
 	n := 0
 	for key := range lister.Keys() {
 		if err := kv.Delete(ctx, key); err != nil {
-			g.log.Warn(peopleDeleteFailedLog, "bucket", lib.PeopleBucket, "err", err)
+			g.log.Warn(peopleDeleteFailedLog, peopleLogBucket, lib.PeopleBucket, peopleLogErr, err)
 			continue
 		}
 		n++
 	}
-	g.log.Info(peoplePurgedLog, "bucket", lib.PeopleBucket, "keys", n)
+	g.log.Info(peoplePurgedLog, peopleLogBucket, lib.PeopleBucket, peopleLogKeys, n)
 }
 
 // peopleNote notes a verified turn's person when it came from a chat backend

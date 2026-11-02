@@ -196,9 +196,9 @@ type Metrics struct {
 	peopleSource atomic.Pointer[peopleCount]
 }
 
-// peopleCount reports the distinct people seen in the short and long windows
-// at now, and whether the count holds the bucket (ok).
-type peopleCount func(now time.Time) (short, long int, ok bool)
+// peopleCount reports the distinct people seen in the short and long windows,
+// on the source's own clock, and whether the count holds the bucket (ok).
+type peopleCount func() (short, long int, ok bool)
 
 // peopleCollector serves peopleSeenName from the Metrics' people source: two
 // samples, one per window, while the source reports ok, and none otherwise.
@@ -218,7 +218,7 @@ func (c *peopleCollector) Collect(ch chan<- prometheus.Metric) {
 	if fn == nil {
 		return
 	}
-	short, long, ok := (*fn)(time.Now())
+	short, long, ok := (*fn)()
 	if !ok {
 		return
 	}

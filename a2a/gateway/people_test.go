@@ -132,7 +132,7 @@ func waitPeopleLoaded(t *testing.T, r *rig) *peopleDesk {
 		if d == nil {
 			return false
 		}
-		_, _, ok := d.count(time.Now())
+		_, _, ok := d.count()
 		return ok
 	})
 	return r.g.people.Load()
@@ -348,6 +348,37 @@ func TestAFailedPutLeavesTheTurnAlone(t *testing.T) {
 	waitFor(t, "the rollback", func() bool { return desk.seenLen() == 0 })
 }
 
+func TestAFailedPutKeepsAPriorEntry(t *testing.T) {
+	key := testPeopleKey(t, peopleTestPrincipal)
+	prior := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second)
+	r := startPeopleRig(t, func(c *Config) {
+		kv := createPeopleBucket(t, c.NATSURL, jetstream.KeyValueConfig{History: 1, TTL: peopleTestTTL})
+		if _, err := kv.PutString(context.Background(), key, prior.Format(time.RFC3339)); err != nil {
+			t.Fatalf("seed put: %v", err)
+		}
+		// A value cap below any time: the seeded entry stays, and every put fails.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := peopleBucketJS(t, c.NATSURL).UpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.PeopleBucket, History: 1, TTL: peopleTestTTL, MaxValueSize: 1}); err != nil {
+			t.Fatalf("cap people: %v", err)
+		}
+	})
+	desk := waitPeopleLoaded(t, r)
+	if at, ok := desk.seenAt(key); !ok || !at.Equal(prior) {
+		t.Fatalf("seen[key] = %v, %v; want the seeded %v", at, ok, prior)
+	}
+	peopleTurn(r, "discord:g1/pk1", "d-1")
+	r.awaitTask(t, "platform")
+	waitFor(t, "the put failure log", func() bool { return strings.Contains(r.logs.String(), "people: put failed") })
+	waitFor(t, "the prior entry restored", func() bool {
+		at, ok := desk.seenAt(key)
+		return ok && at.Equal(prior)
+	})
+	if short, long, ok := desk.count(); !ok || short != 1 || long != 1 {
+		t.Fatalf("count = %d, %d, %v; want 1, 1, true", short, long, ok)
+	}
+}
+
 func TestPeopleSeenOffWritesNothingAndPurges(t *testing.T) {
 	var kv jetstream.KeyValue
 	r := startPeopleRig(t, func(c *Config) {
@@ -377,30 +408,93 @@ func TestPeopleSeenOffWritesNothingAndPurges(t *testing.T) {
 	}
 }
 
+// fakePeopleWatcher is a jetstream.KeyWatcher whose updates the test sends.
+type fakePeopleWatcher struct {
+	updates chan jetstream.KeyValueEntry
+}
+
+func (w *fakePeopleWatcher) Updates() <-chan jetstream.KeyValueEntry { return w.updates }
+func (w *fakePeopleWatcher) Stop() error                             { return nil }
+
+// fakePeopleEntry is a put of value under key.
+type fakePeopleEntry struct {
+	jetstream.KeyValueEntry
+	key, value string
+}
+
+func (e fakePeopleEntry) Key() string                     { return e.key }
+func (e fakePeopleEntry) Value() []byte                   { return []byte(e.value) }
+func (e fakePeopleEntry) Operation() jetstream.KeyValueOp { return jetstream.KeyValuePut }
+
 func TestAClosedWatchUnloadsTheMapUntilItIsRebuilt(t *testing.T) {
-	now := time.Now()
-	d := &peopleDesk{now: time.Now, loaded: true, seen: map[string]time.Time{"people.x": now}}
-	if short, long, ok := d.count(now); !ok || short != 1 || long != 1 {
-		t.Fatalf("before reset: count = %d, %d, %v; want 1, 1, true", short, long, ok)
+	logs := &lockedBuffer{}
+	first := &fakePeopleWatcher{updates: make(chan jetstream.KeyValueEntry, 2)}
+	second := &fakePeopleWatcher{updates: make(chan jetstream.KeyValueEntry, 1)}
+	rebuild := make(chan struct{})
+	var opened int
+	var openedMu sync.Mutex
+	d := &peopleDesk{
+		g:          &Gateway{log: slog.New(slog.NewTextHandler(logs, nil))},
+		now:        time.Now,
+		watchRetry: time.Millisecond,
+		seen:       map[string]time.Time{},
+		unparsable: map[string]bool{},
 	}
-	d.reset()
-	if _, _, ok := d.count(now); ok {
-		t.Fatal("count is ok after the watch closed")
+	d.openWatch = func(ctx context.Context) (jetstream.KeyWatcher, error) {
+		openedMu.Lock()
+		opened++
+		n := opened
+		openedMu.Unlock()
+		if n == 1 {
+			return first, nil
+		}
+		select {
+		case <-rebuild:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return second, nil
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.watch(ctx)
+
+	first.updates <- fakePeopleEntry{key: "people.x", value: time.Now().UTC().Format(time.RFC3339)}
+	first.updates <- nil
+	waitFor(t, "the first watch to load", func() bool {
+		short, long, ok := d.count()
+		return ok && short == 1 && long == 1
+	})
+
+	close(first.updates)
+	waitFor(t, "the closed watch to unload the map", func() bool {
+		_, _, ok := d.count()
+		return !ok
+	})
 	if d.seenLen() != 0 {
-		t.Fatalf("seen holds %d entries after reset, want none", d.seenLen())
+		t.Fatalf("seen holds %d entries after the watch closed, want none", d.seenLen())
 	}
+	if !strings.Contains(logs.String(), peopleWatchClosedLog) {
+		t.Errorf("log lacks the closed line:\n%s", logs.String())
+	}
+
+	second.updates <- nil
+	close(rebuild)
+	waitFor(t, "the rebuilt watch to load", func() bool {
+		short, long, ok := d.count()
+		return ok && short == 0 && long == 0
+	})
 }
 
 func TestPeopleCountWindows(t *testing.T) {
 	now := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
-	d := &peopleDesk{now: time.Now, loaded: true, seen: map[string]time.Time{
+	d := &peopleDesk{now: func() time.Time { return now }, loaded: true, seen: map[string]time.Time{
 		"people.today":   now.Add(-time.Hour),
 		"people.week":    now.Add(-peopleWindowShort),
 		"people.month":   now.Add(-20 * 24 * time.Hour),
 		"people.expired": now.Add(-peopleWindowLong - time.Second),
 	}}
-	short, long, ok := d.count(now)
+	short, long, ok := d.count()
 	if !ok || short != 2 || long != 3 {
 		t.Fatalf("count = %d, %d, %v; want 2, 3, true", short, long, ok)
 	}
@@ -481,11 +575,14 @@ func TestTheWindowsCountTheRecordedTimes(t *testing.T) {
 		}
 	}, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	desk := waitPeopleLoaded(t, r)
-	if short, long, ok := desk.count(now); !ok || short != 1 || long != 2 {
+	if short, long, ok := desk.count(); !ok || short != 1 || long != 2 {
 		t.Fatalf("count = %d, %d, %v; want 1, 2, true", short, long, ok)
 	}
 	if n := strings.Count(logs.String(), peopleBadValueLog); n != 1 {
 		t.Errorf("the skipped value was logged %d times, want once:\n%s", n, logs.String())
+	}
+	if strings.Contains(logs.String(), peopleKeyPrefix) {
+		t.Errorf("a log line carries a people key:\n%s", logs.String())
 	}
 	_, body := scrape(t, http.MethodGet, startMetricsServer(t, r.g.Metrics())+MetricsPath)
 	for _, want := range []string{
@@ -506,11 +603,11 @@ func TestAnEntryLeavesTheCountWhenItsTimeAgesOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "the entry in the map", func() bool { return desk.seenLen() == 1 })
-	if short, long, ok := desk.count(clock.now()); !ok || short != 0 || long != 1 {
+	if short, long, ok := desk.count(); !ok || short != 0 || long != 1 {
 		t.Fatalf("count = %d, %d, %v; want 0, 1, true", short, long, ok)
 	}
 	clock.advance(2 * 24 * time.Hour)
-	if short, long, ok := desk.count(clock.now()); !ok || short != 0 || long != 0 {
+	if short, long, ok := desk.count(); !ok || short != 0 || long != 0 {
 		t.Fatalf("after two days: count = %d, %d, %v; want 0, 0, true", short, long, ok)
 	}
 }
@@ -525,14 +622,14 @@ func TestADeletedKeyLeavesTheCountAtOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "the entry counted", func() bool {
-		short, long, ok := desk.count(time.Now())
+		short, long, ok := desk.count()
 		return ok && short == 1 && long == 1
 	})
 	if err := kv.Delete(ctx, key); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "the entry gone from the count", func() bool {
-		short, long, ok := desk.count(time.Now())
+		short, long, ok := desk.count()
 		return ok && short == 0 && long == 0
 	})
 }
