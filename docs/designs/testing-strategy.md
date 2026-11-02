@@ -178,6 +178,8 @@ Rung 2 is not hypothetical, and it is what kept the audit scenarios commented ou
 
 Every number here is a starting point. Three runs, all-three-fail for collapse, 90% over 20 for admission, and the non-inferiority margin are set to be tuned, not defended. The way to tune them is to run the suite twice against `main`, see how much it moves when nothing has changed, and set the bars above that. Admission was tuned that way once: it started at 19 of 20 (0.95), a number nobody had chosen from data, and on 2026-09-29 (#1493) moved to 0.90 to match the roster page's bar after the store's four clean nights since oss-test-infra#2707 were read for movement. Under `EVAL_ADMISSION_MODE=roster`, the default, that bar is advisory: the roster decides who blocks, and the record's would-admit / would-demote beside it is the sentence a roster edit cites. If a real regression is getting through, add repetitions before loosening a threshold. A looser threshold buys detection with false reds, and a gate that reds pull requests it should not is a gate people learn to ignore.
 
+Repetitions cost inference whether or not a pull request touches the case. Serving recorded model answers to runs whose input has not changed is proposed, with its measurements and what it would change for the rules above, in [`examples/inference-replay/eval-design.md`](../../examples/inference-replay/eval-design.md).
+
 #### Pinning and baselines
 
 Two things run pinned from the merge target rather than from the pull request:
