@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -89,7 +90,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	// The plugin-aware render the reconciler calls; the wrapper above is
 	// the same Deployment with no plugins. Both are pod-bearing builders,
 	// so both pods reach the assertion.
-	credentialProxyWithPlugins := buildCredentialProxyDeploymentForPlugins(agent, "p", nil, true, credentialProxyProfileConfig{})
+	credentialProxyWithPlugins := buildCredentialProxyDeploymentForPlugins(agent, "p", nil, allBrokerCallersOwned, credentialProxyProfileConfig{})
 	a2aGateway := buildA2AGatewayDeployment(agent)
 	a2aCallout := buildA2ACalloutDeployment(agent, "")
 	a2aVerifier := buildA2AVerifierDeployment(agent)
@@ -100,6 +101,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	sandbox := buildShellSandboxStatefulSet(agent, agent.Name+"-sandbox-keys", "http://credential-proxy:8080", "s")
 	nats := buildA2ANATSStatefulSet(agent, "c")
 	provision := buildA2AProvisionJob(agent)
+	scopePublisher := buildScopePublisherJob(agent, time.Time{}, scopeMemberHash(agent))
 
 	pods := []renderedPodTemplate{
 		{"buildDeployment", gatewayDeployment.Name, gatewayDeployment.Spec.Template.Spec},
@@ -112,6 +114,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 		{"buildA2AConsoleDeployment", a2aConsole.Name, a2aConsole.Spec.Template.Spec},
 		{"buildA2AMCPDeployment", a2aMCP.Name, a2aMCP.Spec.Template.Spec},
 		{"buildA2AProvisionJob", provision.Name, provision.Spec.Template.Spec},
+		{"buildScopePublisherJob", scopePublisher.Name, scopePublisher.Spec.Template.Spec},
 	}
 	for builder, statefulSet := range map[string]*appsv1.StatefulSet{
 		"buildStatefulSet":             gatewayStatefulSet,
