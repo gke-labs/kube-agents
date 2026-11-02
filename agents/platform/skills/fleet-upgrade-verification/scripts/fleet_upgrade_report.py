@@ -115,6 +115,7 @@ import collector_run  # noqa: E402
 # (collector_run.paged_dump), so a list the credential proxy would cut at its
 # output cap in one `-A -o json` read comes back whole in pages; the node read
 # keeps its jsonpath projection.
+Run = collector_run.Run
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
 
@@ -947,10 +948,10 @@ def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
     ]
 
 
-def _paged_run(argv: list[str], *, env: dict | None = None) -> collector_run.Run:
+def _paged_run(argv: list[str], *, env: dict | None = None) -> Run:
     """`run_cmd` in the shape the paged reader drives: one page's argv in, its `Run` out."""
     rc, stdout, stderr = run_cmd(argv, KUBECTL_TIMEOUT_SECONDS, env)
-    return collector_run.Run(argv, rc, stdout, stderr, 0.0)
+    return Run(argv, rc, stdout, stderr, 0.0)
 
 
 def _kubectl_get(resources: str, env: dict) -> tuple[list | None, str | None]:
