@@ -3829,23 +3829,54 @@ def _purge_board(root: Path) -> sqlite3.Connection:
         "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, profile TEXT,"
         " outcome TEXT, summary TEXT, ended_at INTEGER);"
         "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
-        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT);"
+        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
         "CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, body TEXT);"
         "CREATE TABLE kanban_notify_subs (task_id TEXT, chat_id TEXT);"
         "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER);"
     )
     for tid, status, ended in [("t_done", "done", 3), ("t_run", "running", 2), ("t_other", "done", 1)]:
-        kb.execute("INSERT INTO tasks VALUES (?, ?, ?, 'platform')", (tid, tid, status))
-        kb.execute(
-            "INSERT INTO task_runs (task_id, profile, outcome, summary, ended_at) "
-            "VALUES (?, 'platform', 'completed', ?, ?)", (tid, f"fixed it in {tid}", ended),
-        )
-        kb.execute("INSERT INTO task_events (task_id, kind) VALUES (?, 'completed')", (tid,))
+        _purge_card(kb, tid, status, ended=ended)
     kb.execute("INSERT INTO task_links VALUES ('t_done', 't_other')")
     kb.execute("INSERT INTO kanban_worker_children VALUES ('t_kid', 't_done', 0)")
     kb.execute("INSERT INTO tasks VALUES ('t_next', 'next run', 'ready', 'platform')")
     kb.commit()
     return kb
+
+
+def _purge_card(
+    kb: sqlite3.Connection, tid: str, status: str, *, ended: int = 1, creator: str | None = None,
+    attributed_to: str | None = None,
+) -> None:
+    """One card with a completed run, and its ``created`` event as hermes writes it.
+
+    ``creator`` is the event's ``creator_task_id`` (``None`` for a cron, a person,
+    or a card someone else's worker filed); ``attributed_to`` is the
+    ``kanban_worker_children`` creator, which the adoption window can set to a
+    run's card when ``creator`` is not.
+    """
+    kb.execute("INSERT INTO tasks VALUES (?, ?, ?, 'platform')", (tid, tid, status))
+    kb.execute(
+        "INSERT INTO task_runs (task_id, profile, outcome, summary, ended_at) "
+        "VALUES (?, 'platform', 'completed', ?, ?)", (tid, f"fixed it in {tid}", ended),
+    )
+    kb.execute(
+        "INSERT INTO task_events (task_id, kind, payload) VALUES (?, 'created', ?)",
+        (tid, json.dumps({"creator_task_id": creator})),
+    )
+    if attributed_to:
+        kb.execute("INSERT INTO kanban_worker_children VALUES (?, ?, 0)", (tid, attributed_to))
+
+
+def _run_purge(root: Path, roots: list[str], fanned_out: list[str] = ()) -> list[str]:
+    """The in-pod script on the harness's own argv, pointed at a temporary tree."""
+    argv = harness._purge_argv(roots, fanned_out)
+    paths = [worker_trajectory.DATA_ROOT, harness._ATTACHMENTS_DIR, harness._LOGS_DIR]
+    local = [str(root), str(root / "attachments"), str(root / "logs")]
+    argv = [local[paths.index(a)] if a in paths else a for a in argv]
+    proc = subprocess.run(
+        [sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, *argv], capture_output=True, text=True, check=True,
+    )
+    return proc.stdout.splitlines()
 
 
 def test_the_purge_script_drops_a_settled_card_from_the_role_history(tmp_path: Path) -> None:
@@ -3854,15 +3885,8 @@ def test_the_purge_script_drops_a_settled_card_from_the_role_history(tmp_path: P
     before = [r[0] for r in kb.execute(_ROLE_HISTORY_SQL, ("platform", "t_next"))]
     assert before == ["t_done", "t_run", "t_other"]
 
-    # The harness's own argv, with the board root pointed at the temporary one.
-    argv = harness._purge_argv(["t_done", "t_run", "t_gone"])
-    assert argv[0] == worker_trajectory.DATA_ROOT
-    proc = subprocess.run(
-        [sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, str(tmp_path), *argv[1:]],
-        capture_output=True, text=True, check=True,
-    )
+    assert _run_purge(tmp_path, ["t_done", "t_run", "t_gone"]) == ["kept t_run", "purged"]
 
-    assert proc.stdout.splitlines() == ["kept t_run", "purged"]
     after = [r[0] for r in kb.execute(_ROLE_HISTORY_SQL, ("platform", "t_next"))]
     assert after == ["t_run", "t_other"]
     for table, column in [
@@ -3870,6 +3894,44 @@ def test_the_purge_script_drops_a_settled_card_from_the_role_history(tmp_path: P
         ("task_links", "parent_id"), ("kanban_worker_children", "creator_id"),
     ]:
         assert kb.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} = 't_done'").fetchone() == (0,)
+
+
+def test_the_purge_leaves_a_card_the_run_adopted_but_did_not_create(tmp_path: Path) -> None:
+    """A worker's ``kanban_create`` can hand back a card a cron filed seconds earlier by its key.
+
+    ``kanban_worker_children`` attributes it to the worker's card anyway, so the
+    capture lists it as fan-out; hermes' ``created`` event says who made it.
+    """
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_mine", "done", creator="t_done", attributed_to="t_done")
+    _purge_card(kb, "t_cron", "done", creator=None, attributed_to="t_done")
+    _purge_card(kb, "t_cron_kid", "done", creator="t_cron", attributed_to="t_cron")
+    kb.commit()
+    (tmp_path / "attachments" / "t_cron").mkdir(parents=True)
+    (tmp_path / "attachments" / "t_mine").mkdir()
+
+    out = _run_purge(tmp_path, ["t_done"], ["t_mine", "t_cron", "t_cron_kid"])
+
+    assert out == ["foreign t_cron", "foreign t_cron_kid", "purged"]
+    on_board = {r[0] for r in kb.execute("SELECT id FROM tasks")}
+    assert {"t_cron", "t_cron_kid"} <= on_board and not {"t_done", "t_mine"} & on_board
+    assert (tmp_path / "attachments" / "t_cron").is_dir()
+    assert not (tmp_path / "attachments" / "t_mine").exists()
+
+
+def test_the_purge_keeps_a_fan_out_while_one_of_its_cards_runs(tmp_path: Path) -> None:
+    """``kanban_fanout_reaper`` reaches an overdue card only through its creator's and siblings' rows."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_parent", "done", creator=None)
+    _purge_card(kb, "t_c1", "done", creator="t_parent", attributed_to="t_parent")
+    _purge_card(kb, "t_c2", "running", creator="t_parent", attributed_to="t_parent")
+    kb.commit()
+
+    out = _run_purge(tmp_path, ["t_parent"], ["t_c1", "t_c2"])
+
+    assert out == ["kept t_parent", "kept t_c1", "kept t_c2", "purged"]
+    rows = kb.execute("SELECT child_id FROM kanban_worker_children WHERE creator_id = 't_parent' ORDER BY 1")
+    assert [r[0] for r in rows] == ["t_c1", "t_c2"]
 
 
 def test_a_purge_that_cannot_reach_the_board_is_a_warning(
@@ -3902,7 +3964,9 @@ def test_settle_purges_the_cards_the_workers_fanned_out(
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
     purged: list[str] = []
-    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, to: purged.extend(ids))
+    monkeypatch.setattr(
+        harness, "_purge_card_state", lambda ids, to, fanned_out=(): purged.extend([*ids, *fanned_out])
+    )
 
     res = harness.AgentResult(output="ok", trajectory=[{"name": "kanban_create"}])
     harness.KubeAgentsHarness._settle(res, [], ["t_1"])
