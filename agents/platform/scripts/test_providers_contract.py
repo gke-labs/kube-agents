@@ -44,6 +44,7 @@ from providers.credentials import (
     NoCredential,
     StaticFileCredential,
 )
+from providers.validate import MAX_PAGE_SIZE
 from workspace_paths import WorkspaceError
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -103,12 +104,38 @@ SHAPES: dict[str, frozenset[str]] = {
     "comment": frozenset(
         {"id", "ref", "kind", "author", "bot", "created", "body", "url", "path", "line"}
     ),
-    "commit": frozenset({"sha", "author", "committed", "message", "url"}),
+    # `email` is the git author email and `bot` whether the linked account is
+    # an automation: the install's own commits carry an address no forge links
+    # to an account, so a login alone cannot tell them from a person's.
+    "commit": frozenset({"sha", "author", "email", "bot", "committed", "message", "url"}),
     "label": frozenset({"name", "color", "description"}),
 }
 COMMENT_KINDS = frozenset({"issue", "review_comment", "review"})
 
 PROPOSAL_STATES = frozenset({"open", "closed", "merged"})
+
+# The readings a sweep takes of a forge. Not agent verbs, so no forge lists
+# them in `verbs`, and every forge here ships a recording for each.
+READING_VERBS = (
+    "proposal-list-by-author",
+    "proposal-tally",
+    "proposal-reviews",
+    "proposal-closer",
+)
+AUTHORED_SHAPE = frozenset(
+    {"number", "state", "author", "authorBot", "created", "updated", "closed"}
+)
+REVIEW_SHAPE = frozenset({"id", "state", "author", "bot", "created"})
+REVIEW_STATES = frozenset({"approved", "changes_requested", "commented", "dismissed"})
+# What every recording of `proposal-list-by-author` and `proposal-tally` says
+# the forge counted, and who closed the proposal in `proposal-closer`.
+RECORDED_TOTAL = 8
+RECORDED_TALLY = {"open": 2, "merged": 5, "closed": 1}
+RECORDED_CLOSER = {"actor": "example-maintainer", "bot": False}
+# The address the broker stamps the install's proxied commits with. No forge
+# links it to an account, so each recording carries one such commit.
+INSTALL_COMMIT_EMAIL = "platform-agent@kube-agents.invalid"
+INSTALL_COMMIT_NAME = "platform-agent"
 
 # Payload fields that hold text a caller wrote, as opposed to an identifier or
 # an enumerated value the protocol fixed. These are what must never reach a
@@ -140,15 +167,25 @@ class Recorded:
     `repeat`, when given, answers every call past the recorded ones: the
     probe below uses it to say "the forge holds more of the same" to a forge
     that reads on past a full page.
+
+
+    A response recorded as `{"__headers__": {...}, "__body__": ...}` is one
+    whose headers the forge reads: a call that asks `with_headers` gets
+    `(body, headers)` back, as the HTTP transport answers it, and a call
+    asking for headers the recording does not hold fails.
     """
 
     def __init__(self, responses: list, repeat: Any = None) -> None:
         self.responses = list(responses)
         self.repeat = repeat
         self.calls: list[tuple] = []
+        self.with_headers: list[bool] = []
 
-    def __call__(self, method, path, *, params=None, body=None, raw=None) -> Any:
+    def __call__(
+        self, method, path, *, params=None, body=None, raw=None, with_headers=False
+    ) -> Any:
         self.calls.append((method, path, params, body, raw))
+        self.with_headers.append(with_headers)
         if raw:
             # A raw request asks for a media type rather than JSON; no fixture
             # models a diff, and none needs to -- it is returned unparsed.
@@ -167,6 +204,12 @@ class Recorded:
                 status=int(answer["__status__"]),
                 code="FORGE_CALL_FAILED",
             )
+        if isinstance(answer, dict) and "__headers__" in answer:
+            if with_headers:
+                return answer["__body__"], dict(answer["__headers__"])
+            return answer["__body__"]
+        if with_headers:
+            raise AssertionError(f"the forge asked for headers the recording lacks: {method} {path}")
         return answer
 
 
@@ -555,6 +598,245 @@ class ContractTest(unittest.TestCase):
                         with self.assertRaises(WorkspaceError):
                             method(api, "acme/infra", payload)
                         self.assertEqual(api.calls, [])
+
+    # -- the sweep's readings -----------------------------------------------
+
+    def test_no_forge_lists_a_reading_as_a_verb(self):
+        # The sweep reads these through the forge directly; an agent never
+        # asks for one, so none is routed or advertised.
+        for name, forge, _ in self.instances():
+            with self.subTest(forge=name):
+                self.assertFalse(set(READING_VERBS) & set(forge.verbs))
+                self.assertFalse(set(READING_VERBS) & set(COLLABORATION_VERBS))
+
+    def test_a_forge_that_serves_no_reading_refuses_it_by_name(self):
+        for verb in READING_VERBS:
+            with self.subTest(verb=verb):
+                with self.assertRaises(ForgeUnsupported) as caught:
+                    getattr(Forge(), verb.replace("-", "_"))(Recorded([]), "acme/infra", {})
+                self.assertEqual(caught.exception.status, 501)
+                self.assertIn(verb, str(caught.exception))
+
+    def test_proposal_list_by_author_returns_state_author_and_total(self):
+        for name, forge, directory in self.instances():
+            fixture = self.load(directory, "proposal-list-by-author")
+            with self.subTest(forge=name):
+                answer, api = self.invoke(forge, "proposal-list-by-author", fixture)
+                self.assertEqual(set(answer), {"proposals", "count", "truncated", "total"})
+                self.assertEqual(answer["count"], len(answer["proposals"]))
+                self.assertIsInstance(answer["truncated"], bool)
+                self.assertEqual(RECORDED_TOTAL, answer["total"])
+                self.assertTrue(answer["proposals"])
+                for item in answer["proposals"]:
+                    self.assertEqual(set(item), AUTHORED_SHAPE)
+                    self.assertIn(item["state"], PROPOSAL_STATES)
+                    self.assertIsInstance(item["authorBot"], bool)
+                    self.assertTrue(item["author"])
+                # Each recording holds one proposal in each state, so a forge
+                # that told merged from closed wrongly fails here.
+                self.assertEqual(PROPOSAL_STATES, {item["state"] for item in answer["proposals"]})
+                # Filtered at the forge, on the author the payload names.
+                self.assertEqual(1, len(api.calls))
+                method, _path, params, _body, _raw = api.calls[0]
+                self.assertEqual("GET", method)
+                wanted = {str(fixture["payload"]["author"]), str(fixture["payload"].get("authorId"))}
+                self.assertTrue(
+                    any(token in str(value) for value in params.values() for token in wanted),
+                    f"{params} does not filter on the author",
+                )
+
+    def test_an_author_that_could_widen_the_query_is_refused(self):
+        # GitHub's search reads `author:` from inside a query string, where a
+        # space or a second qualifier would ask about another repository.
+        for name, forge, _ in self.instances():
+            for verb in ("proposal-list-by-author", "proposal-tally"):
+                for author in ("a repo:other/x", "a:b", "", None, 7):
+                    with self.subTest(forge=name, verb=verb, author=author):
+                        api = Recorded([])
+                        with self.assertRaises(WorkspaceError):
+                            getattr(forge, verb.replace("-", "_"))(
+                                api, "acme/infra", {"author": author, "authorId": 7}
+                            )
+                        self.assertEqual(api.calls, [])
+
+    def test_an_incomplete_github_search_is_never_a_whole_listing_or_a_count(self):
+        # GitHub sets `incomplete_results` when the search timed out, and then
+        # its items and its count may both be short.
+        for name, forge, directory in self.instances():
+            if name != "github":
+                continue
+            listing = self.load(directory, "proposal-list-by-author")
+            listing["responses"][0]["incomplete_results"] = True
+            with self.subTest(forge=name, verb="proposal-list-by-author"):
+                answer, _ = self.invoke(forge, "proposal-list-by-author", listing)
+                self.assertTrue(answer["truncated"])
+                self.assertIs(True, answer["incomplete"])
+            tally = self.load(directory, "proposal-tally")
+            for response in tally["responses"]:
+                response["incomplete_results"] = True
+            with self.subTest(forge=name, verb="proposal-tally"):
+                with self.assertRaises(WorkspaceError) as caught:
+                    self.invoke(forge, "proposal-tally", tally)
+                self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields.get("code"))
+
+    def test_proposal_tally_counts_by_state(self):
+        for name, forge, directory in self.instances():
+            fixture = self.load(directory, "proposal-tally")
+            with self.subTest(forge=name):
+                answer, _ = self.invoke(forge, "proposal-tally", fixture)
+                if name == "gitea":
+                    # Gitea's `state` is open or closed and merged is a flag on
+                    # the item, so no header total splits the closed ones.
+                    self.assertEqual(
+                        {"open": RECORDED_TALLY["open"], "merged": None, "closed": None}, answer
+                    )
+                elif name in ("github", "gitlab"):
+                    # The states are separate requests; these two also answer
+                    # the one count of every state, which the sweep sums the
+                    # states to, and derive `open` from it.
+                    self.assertEqual({**RECORDED_TALLY, "total": RECORDED_TOTAL}, answer)
+                else:
+                    self.assertEqual(RECORDED_TALLY, answer)
+
+    def test_proposal_reviews_keep_bodiless_approvals(self):
+        for name, forge, directory in self.instances():
+            fixture = self.load(directory, "proposal-reviews")
+            with self.subTest(forge=name):
+                answer, _ = self.invoke(forge, "proposal-reviews", fixture)
+                self.assertEqual(set(answer), {"reviews", "count", "truncated"})
+                self.assertEqual(answer["count"], len(answer["reviews"]))
+                self.assertIsInstance(answer["truncated"], bool)
+                for review in answer["reviews"]:
+                    self.assertEqual(set(review), REVIEW_SHAPE)
+                    self.assertIn(review["state"], REVIEW_STATES)
+                    self.assertIsInstance(review["bot"], bool)
+                approved = {r["id"] for r in answer["reviews"] if r["state"] == "approved"}
+                self.assertTrue(approved, "no approval survived")
+                rows = fixture["responses"][0]
+                if isinstance(rows, list):
+                    bodiless = {
+                        row["id"]
+                        for row in rows
+                        if row.get("state") == "APPROVED"
+                        and not row.get("dismissed")
+                        and not (row.get("body") or "").strip()
+                    }
+                    self.assertTrue(bodiless, "the recording holds no bodiless approval")
+                    self.assertLessEqual(bodiless, approved)
+
+    def test_proposal_closer_names_the_closer(self):
+        for name, forge, directory in self.instances():
+            fixture = self.load(directory, "proposal-closer")
+            with self.subTest(forge=name):
+                answer, _ = self.invoke(forge, "proposal-closer", fixture)
+                self.assertEqual(RECORDED_CLOSER, answer)
+
+    def test_commit_translation_carries_email_and_bot(self):
+        for name, forge, directory in self.instances():
+            fixture = self.load(directory, "proposal-commits")
+            with self.subTest(forge=name):
+                answer, _ = self.invoke(forge, "proposal-commits", fixture)
+                for item in answer["commits"]:
+                    self.assertEqual(set(item), SHAPES["commit"])
+                    self.assertIsInstance(item["email"], str)
+                    self.assertIsInstance(item["bot"], bool)
+                # The install's own commit is linked to no account: its author
+                # is the git name, and only the email says whose it is.
+                own = [c for c in answer["commits"] if c["email"] == INSTALL_COMMIT_EMAIL]
+                self.assertEqual(1, len(own), "the recording holds no unlinked install commit")
+                self.assertEqual(INSTALL_COMMIT_NAME, own[0]["author"])
+                self.assertFalse(own[0]["bot"])
+                if name == "github":
+                    linked = [c for c in answer["commits"] if c["email"] != INSTALL_COMMIT_EMAIL]
+                    self.assertTrue(linked and all(c["bot"] for c in linked))
+
+    def test_github_proposal_commits_makes_one_call_at_the_callers_page_size(self):
+        # Every caller page is one call at the caller's own size, the default
+        # size included: no full-page read behind it, no re-read of page 1.
+        for name, forge, directory in self.instances():
+            if name != "github":
+                continue
+            row = self.load(directory, "proposal-commits")["responses"][0][0]
+            cap = forge.COMMIT_CAP
+            rows = [dict(row, sha=f"{index:040x}") for index in range(cap)]
+
+            class Pager:
+                def __init__(self):
+                    self.calls = []
+
+                def __call__(self, method, path, params=None, **kwargs):
+                    self.calls.append(dict(params or {}))
+                    size, number = params["per_page"], int(params.get("page", 1))
+                    return rows[(number - 1) * size : number * size]
+
+            for limit, page in ((MAX_PAGE_SIZE, 1), (MAX_PAGE_SIZE, 3), (30, 1), (30, 4), (30, 9), (60, 4)):
+                with self.subTest(limit=limit, page=page):
+                    api = Pager()
+                    answer = forge.proposal_commits(api, "acme/infra", {"number": 4321, "limit": limit, "page": page})
+                    expected = {"per_page": limit} if page == 1 else {"per_page": limit, "page": page}
+                    self.assertEqual([expected], api.calls)
+                    self.assertEqual(rows[(page - 1) * limit]["sha"], answer["commits"][0]["sha"])
+                    # The page that straddles the cap holds what GitHub serves up to it,
+                    # and says `truncated` though it is short: (100, 3) and (30, 9).
+                    self.assertEqual(min(limit, cap - (page - 1) * limit), answer["count"])
+                    self.assertTrue(answer["truncated"], "a full page, or the page that reaches the cap")
+
+    def test_github_proposal_commits_pages_to_the_cap_and_reports_truncated(self):
+        for name, forge, directory in self.instances():
+            if name != "github":
+                continue
+            row = self.load(directory, "proposal-commits")["responses"][0][0]
+            cap = forge.COMMIT_CAP
+            rows = [dict(row, sha=f"{index:040x}") for index in range(cap)]
+            pages = [rows[start : start + MAX_PAGE_SIZE] for start in range(0, cap, MAX_PAGE_SIZE)]
+            limit = 50
+            with self.subTest(case="the page that reaches the cap"):
+                # GitHub serves exactly up to the cap: a page whose window
+                # straddles it comes back that long and says `truncated`.
+                answer, api = self.invoke(
+                    forge,
+                    "proposal-commits",
+                    {"payload": {"number": 4321, "limit": limit, "page": cap // limit}, "responses": [rows[cap - limit :]]},
+                )
+                self.assertEqual(limit, answer["count"])
+                self.assertEqual(rows[-1]["sha"], answer["commits"][-1]["sha"])
+                self.assertTrue(answer["truncated"])
+                self.assertEqual(1, len(api.calls))
+                self.assertEqual([(limit, cap // limit)], [(params["per_page"], params["page"]) for _, _, params, _, _ in api.calls])
+            with self.subTest(case="a short page under the cap is the end of the branch"):
+                answer, _ = self.invoke(
+                    forge,
+                    "proposal-commits",
+                    {"payload": {"number": 4321, "limit": limit, "page": 2}, "responses": [rows[limit : limit + 7]]},
+                )
+                self.assertEqual(7, answer["count"])
+                self.assertFalse(answer["truncated"])
+            with self.subTest(case="a page past the cap ends a walk"):
+                answer, _ = self.invoke(
+                    forge,
+                    "proposal-commits",
+                    {"payload": {"number": 4321, "limit": limit, "page": cap // limit + 1}, "responses": pages},
+                )
+                self.assertEqual([], answer["commits"])
+                self.assertFalse(answer["truncated"])
+            with self.subTest(case="a short last page under the cap"):
+                answer, _ = self.invoke(
+                    forge,
+                    "proposal-commits",
+                    {"payload": {"number": 4321, "limit": limit, "page": 2}, "responses": [rows[limit:70]]},
+                )
+                self.assertEqual(
+                    [r["sha"] for r in rows[limit:70]], [c["sha"] for c in answer["commits"]]
+                )
+                self.assertFalse(answer["truncated"])
+            with self.subTest(case="a full page with more behind it"):
+                answer, _ = self.invoke(
+                    forge,
+                    "proposal-commits",
+                    {"payload": {"number": 4321, "limit": limit}, "responses": [rows[:limit]]},
+                )
+                self.assertEqual(limit, answer["count"])
+                self.assertTrue(answer["truncated"])
 
     # -- the prohibition ----------------------------------------------------
 

@@ -26,11 +26,25 @@ or `timed_out` run has no failed job for that endpoint to find). A red check
 run from another app (the review bot's `AI Review`) is not a workflow run and
 is named in the log and left alone.
 
+A required check name is the exception. GitHub's merge requirement counts
+every red check run of a name the base branch's rules require, so a run an
+`edited` event superseded -- cancelled by its concurrency group, with a newer
+run of the same name green beside it -- still keeps the pull request out of
+the merge queue (#4355). For a required name the script keeps every red check
+run, not the newest of an all-red name, and re-runs each one's workflow run --
+unless a check run of the name is still going, when the name is pending.
+A re-run joins its workflow's concurrency group, which cancels in progress, so
+a red run is named as waiting, not re-run, while another run of its workflow
+on the pull request is still going -- whether or not that run has made check
+runs yet -- and one command re-runs at most one run of each workflow. The next
+`/retest`, once that run finishes, takes the next.
+The required names come from the base branch's rules; when GitHub refuses
+that read, every name is read the Tide way and the log says so.
+
 Reading check runs rather than workflow runs is what keeps the command from
 spending runners on nothing. A workflow run cancelled while still queued -- its
-concurrency group displaced it -- never created a check run, and a run an
-`edited` event superseded left a check run whose name a newer success covers;
-both read `cancelled` on the runs list and neither blocks anything.
+concurrency group displaced it -- never created a check run, so it blocks
+nothing and is never re-run, required or not.
 
 A re-run executes the original run again, with the privileges of the actor
 who first triggered it, so the person typing the command gains no ability to
@@ -77,6 +91,10 @@ STATE_SUCCESS, STATE_PENDING, STATE_FAILURE = "success", "pending", "failure"
 # Which check runs the commit endpoint lists: the latest attempt per check
 # suite, as the commit rollup does (`list_check_runs` says why not `all`).
 CHECK_RUNS_FILTER = "latest"
+
+# The rule type, in `GET /repos/{repo}/rules/branches/{branch}`, that lists the
+# check names a merge into the branch requires, each under `context`.
+RULE_REQUIRED_STATUS_CHECKS = "required_status_checks"
 
 # Check runs GitHub Actions itself posts carry this app slug. Any other app's
 # red check run is not a workflow run and this command cannot re-run it.
@@ -133,7 +151,7 @@ class Rerun:
     check_names: list
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class Skipped:
     name: str
     reason: str
@@ -141,9 +159,9 @@ class Skipped:
 
 @dataclasses.dataclass
 class Plan:
-    rerun: list  # Rerun, one per workflow run behind a red check name
-    skipped: list  # Skipped, one per red check name left alone, with why
-    pending: int  # check names whose best state is pending
+    rerun: list  # Rerun, one per workflow run behind a red check run, at most one per workflow
+    skipped: list  # Skipped, one per red check run left alone and why, each name and reason once
+    pending: int  # check names still going (`red_check_runs`)
 
 
 def list_runs(api, repo: str, head_sha: str) -> list:
@@ -159,6 +177,31 @@ def list_check_runs(api, repo: str, head_sha: str) -> list:
     re-run would read green here and red on the pull request. A run a newer
     event superseded is a check suite of its own and is listed either way."""
     return api.get_object_pages(f"/repos/{repo}/commits/{head_sha}/check-runs", "check_runs", {"filter": CHECK_RUNS_FILTER})
+
+
+def required_check_names(api, repo: str, branch: str) -> frozenset:
+    """The check names the rules on `branch` require for a merge.
+
+    A refusal reads as none required, which is the Tide reading the script
+    had before it knew about required names: the command still re-runs every
+    all-red name, and the log says the required read was refused.
+    """
+    try:
+        rules = api.get_all(f"/repos/{repo}/rules/branches/{branch}")
+    except urllib.error.HTTPError as error:
+        if not is_refusal(error):
+            raise
+        log(f"Could not read the rules on {branch} ({error.code}: {refusal_message(error)}); reading every check name the Tide way")
+        return frozenset()
+    names = frozenset(
+        check["context"]
+        for rule in rules
+        if rule.get("type") == RULE_REQUIRED_STATUS_CHECKS
+        for check in (rule.get("parameters") or {}).get("required_status_checks", [])
+    )
+    if not names:
+        log(f"The rules on {branch} require no check; reading every check name the Tide way")
+    return names
 
 
 def check_state(check_run: dict) -> str:
@@ -178,20 +221,34 @@ def best_state(states) -> str:
     return STATE_FAILURE
 
 
-def red_check_runs(check_runs) -> tuple:
-    """The newest check run of each name whose best state is failure, by name,
-    and how many names are pending."""
+def red_check_runs(check_runs, required=frozenset()) -> tuple:
+    """The red check runs to re-run, as a list per name, and how many names are pending.
+
+    A name in `required` keeps every red check run it has, beside a green one
+    too, unless one of its check runs is still going: that name is pending,
+    because re-running a red run of it now would join the running one's
+    concurrency group and could cancel it. Any other name keeps its newest
+    check run, and only when its best state is failure.
+    """
     by_name = {}
     for check_run in check_runs:
         by_name.setdefault(check_run["name"], []).append(check_run)
     red = {}
     pending = 0
     for name, entries in by_name.items():
-        state = best_state(check_state(entry) for entry in entries)
+        states = [check_state(entry) for entry in entries]
+        failed = [entry for entry, state in zip(entries, states) if state == STATE_FAILURE]
+        if name in required and failed:
+            if STATE_PENDING in states:
+                pending += 1
+            else:
+                red[name] = sorted(failed, key=lambda entry: entry["id"])
+            continue
+        state = best_state(states)
         if state == STATE_PENDING:
             pending += 1
         elif state == STATE_FAILURE:
-            red[name] = max(entries, key=lambda entry: entry["id"])
+            red[name] = [max(entries, key=lambda entry: entry["id"])]
     return red, pending
 
 
@@ -215,18 +272,22 @@ def waiting_reason(run: dict) -> str:
     return f"its workflow run {run['id']} is still running"
 
 
-def plan_reruns(check_runs, runs, head: dict) -> Plan:
+def plan_reruns(check_runs, runs, head: dict, required=frozenset()) -> Plan:
     """Which workflow runs to re-run and how, and which red names to leave alone and why.
 
     `head` is the pull request's `head` object (`ref`, `repo.full_name`); a
     run at the commit that is not the pull request's is never re-run.
+    `required` is the check names the base branch requires (`red_check_runs`).
     """
-    red, pending = red_check_runs(check_runs)
+    red, pending = red_check_runs(check_runs, required)
     by_suite = {run.get("check_suite_id"): run for run in runs}
     plan = Plan(rerun=[], skipped=[], pending=pending)
     by_run = {}
-    for name in sorted(red):
-        check_run = red[name]
+    by_workflow = {}  # workflow id -> the one run of it this command re-runs
+    # Workflow id -> a run of it on this pull request that is still going, check runs or not:
+    # a re-run of the same workflow would join its concurrency group and could cancel it.
+    running = {run.get("workflow_id", run["id"]): run["id"] for run in runs if belongs_to(run, head) and run.get("status") != COMPLETED_STATUS}
+    for name, check_run in ((name, check_run) for name in sorted(red) for check_run in red[name]):
         app = (check_run.get("app") or {}).get("slug")
         if app != ACTIONS_APP_SLUG:
             plan.skipped.append(Skipped(name, f"posted by {app or 'an unknown app'}, not a workflow run"))
@@ -247,11 +308,26 @@ def plan_reruns(check_runs, runs, head: dict) -> Plan:
         if attempt >= RERUN_ATTEMPT_CEILING:
             plan.skipped.append(Skipped(name, f"run {run['id']} is already on attempt {attempt}; a person with Write access decides"))
             continue
+        workflow = run.get("workflow_id", run["id"])
+        if workflow in running:
+            plan.skipped.append(
+                Skipped(name, f"its workflow run {run['id']} waits: run {running[workflow]} of the same workflow is still going, and a re-run now would join its concurrency group and could cancel it; /retest again once it finishes")
+            )
+            continue
+        if run["id"] not in by_run and workflow in by_workflow:
+            plan.skipped.append(
+                Skipped(name, f"its workflow run {run['id']} waits: re-running {by_workflow[workflow]} of the same workflow now would put both in one concurrency group, where one cancels the other; /retest again once that finishes")
+            )
+            continue
         if run["id"] not in by_run:
+            by_workflow[workflow] = run["id"]
             action = RERUN_FAILED_JOBS if run.get("conclusion") == FAILED_CONCLUSION else RERUN_WHOLE
             by_run[run["id"]] = Rerun(run, action, [])
             plan.rerun.append(by_run[run["id"]])
-        by_run[run["id"]].check_names.append(name)
+        if name not in by_run[run["id"]].check_names:
+            by_run[run["id"]].check_names.append(name)
+    # A required name's red check runs can be left alone for one reason, said once.
+    plan.skipped = list(dict.fromkeys(plan.skipped))
     return plan
 
 
@@ -355,7 +431,8 @@ def main(argv=None):
         decline(api, args, f"#{args.pr} is {pull_request.get('state')}")
         return 0
 
-    plan = plan_reruns(list_check_runs(api, args.repo, head_sha), list_runs(api, args.repo, head_sha), pull_request["head"])
+    required = required_check_names(api, args.repo, pull_request["base"]["ref"])
+    plan = plan_reruns(list_check_runs(api, args.repo, head_sha), list_runs(api, args.repo, head_sha), pull_request["head"], required)
     skipped_lines = [f"Left alone: {entry.name}: {entry.reason}" for entry in plan.skipped]
     if not plan.rerun:
         reason = "no red GitHub Actions check at the head commit"

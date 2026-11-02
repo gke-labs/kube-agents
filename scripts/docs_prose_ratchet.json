@@ -4,7 +4,7 @@
   },
   "concepts/chatops.md": {
     "long-paragraph": 33,
-    "long-sentence": 84
+    "long-sentence": 83
   },
   "concepts/cluster-agents.md": {
     "long-paragraph": 4,
@@ -28,14 +28,6 @@
     "long-paragraph": 2,
     "long-sentence": 3
   },
-  "deploy/docker-images.md": {
-    "banned-word": 1,
-    "long-paragraph": 5,
-    "long-sentence": 19
-  },
-  "deploy/gitops-argocd.md": {
-    "long-sentence": 2
-  },
   "deploy/kustomize.md": {
     "long-paragraph": 2,
     "long-sentence": 5
@@ -46,10 +38,6 @@
   },
   "deploy/release-versioning.md": {
     "long-sentence": 3
-  },
-  "deploy/rollback.md": {
-    "long-paragraph": 9,
-    "long-sentence": 20
   },
   "deploy/telemetry.md": {
     "long-paragraph": 4,
@@ -78,10 +66,6 @@
     "long-table-cell": 1,
     "long-sentence": 15
   },
-  "install/quickstart-gke.mdx": {
-    "long-paragraph": 5,
-    "long-sentence": 9
-  },
   "install/slack-app.md": {
     "long-paragraph": 3,
     "long-sentence": 3
@@ -89,14 +73,6 @@
   "install/uninstall.md": {
     "long-paragraph": 3,
     "long-sentence": 9
-  },
-  "install/upgrade.md": {
-    "long-paragraph": 5,
-    "long-sentence": 13
-  },
-  "operator/agentplugin-crd.md": {
-    "long-paragraph": 1,
-    "long-sentence": 4
   },
   "operator/agentprofile-crd.md": {
     "long-sentence": 2
@@ -106,9 +82,7 @@
     "long-sentence": 9
   },
   "operator/platformagent-crd.md": {
-    "long-paragraph": 54,
-    "long-table-cell": 4,
-    "long-sentence": 176
+    "long-sentence": 119
   },
   "overview/architecture.mdx": {
     "long-paragraph": 2,
@@ -117,11 +91,6 @@
   "overview/day-in-the-life.md": {
     "long-paragraph": 2,
     "long-sentence": 2
-  },
-  "overview/proactive-autonomy.md": {
-    "banned-word": 1,
-    "long-paragraph": 2,
-    "long-sentence": 6
   },
   "overview/what-is-kube-agents.md": {
     "long-sentence": 1

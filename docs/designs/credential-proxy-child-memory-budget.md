@@ -82,12 +82,12 @@ route reach `refresh_forge_credential`, whose helper (`github_token_refresh.py`)
 federation is tried first and spawns nothing, so on a federated broker, where the operator sets
 the credential-file variables to the federation file it lays down, no `gcloud` runs; on an
 unfederated one it runs when a credential file is set or the metadata server yields no token.
-The content-workspace `open` and `commit` reach the same helper through `mint_read_credential`
-with its read-only flag, which prints a minted token and returns before any `gh`: at most that
+The content-workspace `open` and `commit`, and a vcs `snapshot` of a context repository, reach
+the same helper through `mint_read_credential` with its read-only flag, which prints a minted token and returns before any `gh`: at most that
 one `gcloud`, under the same conditions, and nothing else. Either way the vcs route can run a
 Python helper, a `gcloud` and a `gh` behind one `git`, which is what the single reserve has to
-hold; the mint path is lighter, and §2.1 below takes it out of the per-request budget on other
-grounds. The reserve is sized for the
+hold; the mint path is lighter, and §2.1 below takes the workspace's call out of the
+per-request budget on other grounds; a `snapshot`'s call runs under that request's reservation. The reserve is sized for the
 tree a request spawns, not for one process: `gcloud` starts short-lived `gcloud` children of its
 own, which is why the sampler saw twelve processes for eight requests, and the figure that
 matters is the 102 MiB per request the eight listings summed to. The margin to 128 MiB covers
@@ -140,6 +140,7 @@ Where each route reserves, and why there:
   request, the function runs under that request's reservation and takes none; it reads the
   coalesce cache without the lock, and otherwise waits for the lock as long as it takes; from the
   content-workspace `open` and `commit`, through `mint_read_credential`, it runs under the store's fixed term.
+  `mint_read_credential` called from a vcs `snapshot` runs under that request's reservation.
 - The content-workspace verbs take no reservation at all. The store serves one verb at a time
   under its single lock, across every open workspace, so at most one of its process trees exists
   at any moment, whatever the load; that is a fixed quantity, and the budget carries it as a

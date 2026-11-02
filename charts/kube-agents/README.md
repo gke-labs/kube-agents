@@ -449,6 +449,14 @@ helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
   --set litellm.modelProvider=sap --set litellm.envFromSecret=sap-aicore
 ```
 
+#### Upgrade notes: proposal counters become readings
+
+The operator now exports the proposal fields of `kubeagents_platformagent_usage` as readings of the forge: `remediationsMergedTotal`, `remediationsClosedUnmergedTotal`, `proposalsAuthored`, `remediationsOpen`, `proposalHumanTouches` and `proposalsMergedUntouched`. The first reading after the upgrade replaces a count of what the old process saw with the forge's all-time count. The health rules take a fourteen-day window over these readings, so they read that step as fourteen days of outcomes. For two weeks after the upgrade, `proposals_rejected_ratio_14d` and `proposals_merge_rate_14d` are distorted, and the merge rate can read above one. The same step occurs for two weeks after a repository with proposal history enters the managed list.
+
+A reading can also fall: a repository leaves the managed list, or a proposal is deleted. When `proposalsAuthored` falls inside the window, the rules drop both proposal ratios, and `KubeAgentsProposalsRejected` and `KubeAgentsProposalsUnmerged` cannot fire for the fourteen days the fall stays in the window. A proposal that a person closes and reopens does not cause this. The thresholds keep their names and values; `proposalsProposedMin14d` now counts proposals authored in the window.
+
+`status.usage.remediationsAppliedTotal`, which nothing ever wrote, leaves the CRD schema and the operator's export in this release. `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` keep their names but are absent, not 0, until the first reading lands and whenever two polls in a row read none, so a dashboard that read them as counters sees a gap rather than a zero.
+
 #### Upgrade notes: inference-gateway Service rename
 
 The agent-facing K8s Service was renamed from `litellm` to `inference-gateway` (and `litellm-gateway` to `inference-gateway-upstream` for the upstream gateway). The operator now renders `base_url: http://inference-gateway.<namespace>.svc.cluster.local/v1` into the managed agent config on every reconcile; the managed scope is overlaid on load, so agents cannot retain the old name via a local override.
@@ -648,7 +656,9 @@ the key keeps the rules off; turning them on from such a release needs `--reset-
 defaults and keeps the release's values, or every threshold set; the schema requires the whole
 block and the template says so when it is missing. The rules read the operator's scrape, so
 enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
-render with a message.
+render with a message. The two proposal alerts read the forge's proposal readings, and a fall in
+`proposalsAuthored` (a repository leaving the managed list, or a deleted proposal) silences them for two weeks; see
+[Upgrade notes: proposal counters become readings](#upgrade-notes-proposal-counters-become-readings).
 
 ### Turning telemetry off
 
@@ -860,6 +870,19 @@ does): against a CRD that predates `spec.deployment.credentialProxy`, the API
 server would prune the value silently while the release record kept it, so the
 chart looks up the installed CRD and fails the upgrade instead.
 
+`platformAgent.harness.experimental.shellSandbox.resources` sizes the shell
+container the same way: forwarded to the CR's
+`spec.harness.experimental.shellSandbox.resources` when any key is set and merged
+over the operator's defaults per key, with the
+[`shellSandbox` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#shellsandbox)
+canonical for the defaults and the refusals. The chart fails the render on the
+same shape faults (a key other than `requests`, `limits` and `claims`, a name
+the container does not declare, a quantity it cannot read) and leaves the
+crossed-pair and zero-limit refusals to the operator; the quota preflight counts
+the override, at the defaults when the operator would refuse it (it then renders
+the shell at them), and the same CRD guard fails the upgrade when the installed CRD
+predates the field.
+
 `platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
 `critical`, `warning`, `info` and `drift`, and each key that is set becomes an
 `ALERT_DAILY_LIMIT_<KEY>` entry in the CR's `spec.deployment.env`. A key that is not set keeps the
@@ -937,6 +960,8 @@ These knobs need context beyond the chart:
   other lands on. It has no default: unset leaves the sandbox on the node's
   standard runtime, and `gvisor` needs the same GKE Sandbox node pool the agent's
   key does.
+- `harness.experimental.shellSandbox.resources` sizes the shell container; see
+  the sizing-override paragraph above.
 - `security.workloadIdentityFederation` needs a Workload Identity pool and
   provider trusting the cluster's OIDC issuer, and one
   `roles/iam.workloadIdentityUser` grant on the agent's GSA. Nothing creates
@@ -1090,8 +1115,12 @@ it. The credential proxy is counted with `platformAgent.deployment.credentialPro
 merged over its footprint entry per key, as the operator renders it, so a raised limit is
 summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
 as a request of that size too, because the operator renders no ephemeral-storage request and
-the API server defaults it to the limit; a `PlatformAgent` edited by hand after the install is
-outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
+the API server defaults it to the limit. The shell sandbox is counted the same way with
+`platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
+ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own; an
+override the operator refuses (a zero limit, a request above its limit) is counted at the defaults
+the operator renders in its place, because the chart does not fail the render on those. A
+`PlatformAgent` edited by hand after the install is outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
@@ -1169,6 +1198,24 @@ returns nothing for a NotFound and raises a template error for everything else, 
 identity without that permission gets `error calling lookup: resourcequotas is
 forbidden` and no install rather than a quiet pass. Grant the permission, or install with
 `--set quotaPreflight.enabled=false`.
+
+#### Upgrade notes: operator memory floor
+
+`operator.resources.limits.memory` has a floor at its default, 512Mi, and the chart fails the
+render on a smaller limit, naming the key; the preflight, which sums that block, runs the same
+check first, and both skip it when `operator.enabled` is false. Releases up to 0.16.0 shipped
+the Kubebuilder scaffold's 128Mi, and `helm upgrade --reuse-values` renders a new chart against
+the old release's values, defaults included, so an install upgraded that way kept 128Mi and the
+operator was OOM-killed as its cache filled. A hand-run upgrade from such a release uses
+`--reset-then-reuse-values` (Helm 3.14+), which takes the new defaults and keeps the release's
+own overrides; `upgrade.sh` resets the values the same way, so it never meets the floor on the
+old defaults. An explicit limit under 512Mi, in a values file or `extra_helm_values`, fails on
+every path: raise it to 512Mi or more, or drop the key. The operator reads whatever limit is
+rendered through the Downward API and sets its Go soft memory limit to nine tenths of it, so a
+larger cluster raises this one value. On GKE Autopilot the floor still applies. A cluster without
+bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets the limits equal to
+the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
+rendered manifest. A cluster with bursting admits the manifest as rendered.
 
 ### Optional AgentProfiles (`profiles.tse`)
 

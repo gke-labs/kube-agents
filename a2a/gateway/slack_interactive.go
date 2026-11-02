@@ -39,11 +39,11 @@ const (
 	// but the ack, since Slack has opened the url.
 	slackChoiceActionPrefix = slackChatActionPrefix + "." + slackChatChoiceAction + "."
 
-	// slackAnsweredLine is the line an answer leaves on its question.
-	slackAnsweredLine = "✓ %s: %s"
-	// slackNamelessClicker stands in for a clicker Slack names nowhere:
+	// answeredLine is the line an answer leaves on its question.
+	answeredLine = "✓ %s: %s"
+	// namelessClicker stands in for a clicker the backend names nowhere:
 	// never their raw id.
-	slackNamelessClicker = "Someone"
+	namelessClicker = "Someone"
 	// slackTypedAnswerMax clips a typed answer's words on its line (today's
 	// TYPED_ANSWER_MAX).
 	slackTypedAnswerMax = 80
@@ -56,8 +56,8 @@ const (
 	slackPlainText     = "plain_text"
 	slackMrkdwnText    = "mrkdwn"
 
-	// slackUXCap bounds each of the click and question maps, oldest first.
-	slackUXCap = 512
+	// uxCap bounds each of the click and question maps, oldest first.
+	uxCap = 512
 
 	// slackDMChannelPrefix is a DM channel id's first letter.
 	slackDMChannelPrefix = "D"
@@ -175,12 +175,12 @@ func (s *SlackAdapter) uxLocked() *slackUX {
 // A key keeps one slot: one already in the ring moves to the newest end
 // rather than gaining a second slot, whose older twin's eviction would
 // otherwise drop the live entry (a map entry deleted without retiring its
-// slot, then added again). The rings hold at most slackUXCap keys, so the
+// slot, then added again). The rings hold at most uxCap keys, so the
 // scan is bounded.
 func remember(order *[]string, key string, drop func(string)) {
 	forget(order, key)
 	*order = append(*order, key)
-	if len(*order) > slackUXCap {
+	if len(*order) > uxCap {
 		drop((*order)[0])
 		*order = (*order)[1:]
 	}
@@ -680,21 +680,21 @@ func (s *SlackAdapter) slackNameOf(userID string, u *slack.User, err error) stri
 		if err != nil {
 			s.log.Debug("slack: users.info failed; naming the answer generically", "user", userID, "err", err)
 		}
-		return slackNamelessClicker
+		return namelessClicker
 	}
 	for _, name := range []string{u.Profile.DisplayName, u.RealName, u.Profile.RealName, u.Name} {
 		if name = strings.TrimSpace(name); name != "" {
 			return name
 		}
 	}
-	return slackNamelessClicker
+	return namelessClicker
 }
 
 // rewriteAnswered rewrites a question as answered by userID with label. If
 // Slack refuses the rewrite, the line is posted in the question's thread
 // instead, so an answer always shows once.
 func (s *SlackAdapter) rewriteAnswered(q slackQuestion, userID, label string) {
-	line := fmt.Sprintf(slackAnsweredLine, s.slackUserName(userID), label)
+	line := fmt.Sprintf(answeredLine, s.slackUserName(userID), label)
 	blocks, attachments, err := slackAnsweredLayout(q.blocks, q.attachments, line)
 	if err == nil {
 		opts := []slack.MsgOption{slack.MsgOptionText(q.text, false), slack.MsgOptionBlocks(blocks.BlockSet...)}

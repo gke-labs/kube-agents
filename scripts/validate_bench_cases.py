@@ -208,13 +208,14 @@ KNOWN_UNREGISTERED = {
     "notification-dead-thread-falls-back": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
-    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
-    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
-    # it. No eval lane deploys either, so it runs by hand with the recipe in
-    # its header. The entry goes when a lane deploys both.
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host.
+    # The GHES lane (hack/eval/ghes-cases.txt) runs pdb-remediation-pr itself
+    # against the proxy, which proves the same path; registering this copy in
+    # the nightly would run it on the github.com nightly too. The entry goes
+    # when the registration rules grow a lane-only seat.
     "ghes-pdb-remediation-pr": (
-        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
-        "run by hand with the recipe in the case header"
+        "the GHES lane runs pdb-remediation-pr against the proxy; a nightly registration "
+        "would run this copy on github.com too; run by hand with the recipe in the case header"
     ),
     # The upgrade-failure catalogue's scenario cases enter
     # hack/eval/nightly-cases.txt in batches of five (decided 2026-10-15 on
@@ -284,11 +285,6 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
-    "cluster-agent-scaled-zero-gateway-silence": (
-        "#4098: needs bench/tf/fleet's scaled-zero-gateway role on every pool project "
-        "(the postsubmit reconcile) and stall_report.py's scale-to-zero rule for Gateways "
-        "and HTTPRoutes; without the rule the case is red every run"
-    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
@@ -508,15 +504,15 @@ KNOWN_JUDGE_ONLY: dict[str, str] = {}
 # the run did.
 #
 # devops-bench's registry is authoritative and rejects an unknown type at
-# spec-load time; this table is the pre-cluster copy. The first three come
-# from the pinned devops-bench SHA in bench/pyproject.toml, the last three
-# from bench/kube_agents_bench/verifiers.py -- a test re-derives those from
-# the entry-point group so a new local verifier fails here rather than
-# drifting silently.
+# spec-load time; this table is the pre-cluster copy. The upstream entries
+# come from the pinned devops-bench SHA in bench/pyproject.toml, the local
+# ones from the `devops_bench.verifiers` entry-point group in the same file
+# -- a test re-derives the local ones from that group so a new local
+# verifier fails here rather than drifting silently.
 #
-# For the first three the named field is also required by the verifier's own
+# For the upstream entries the named field is also required by the verifier's own
 # pydantic model, so this rule only moves the rejection earlier -- from after a
-# cluster lease to now. The rule earns its keep on the last three, where the
+# cluster lease to now. The rule earns its keep on the local ones, where the
 # field is optional and an empty or blank-stringed list is the shape that
 # actually ships: a check that reads as an assertion and can only pass.
 CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
@@ -548,6 +544,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "every_finding_named",
     ),
+    # No field: the verifier's own model refuses a spec that binds nothing
+    # (`state: closed` or `min_comments` >= 1 is required), and
+    # bench/tests/test_lane.py parses every shipped case through devops-bench
+    # on every pull request, so an unbound spec never reaches a lease.
+    "forge_issue_state": (),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
     "answer_first": (),
@@ -1297,7 +1298,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         try:
             slots = reader.declared_slots(path)
         except reader.ScopeExcludeError as exc:
-            problems.append(f"'scope_exclude:' must be {{slots: [<slot>, ...]}}: {exc}")
+            problems.append(f"'scope_exclude:' must be {{slots: [<slot>, ...], absent: <n>}}: {exc}")
         else:
             catalog = _catalog_slots()
             unknown = sorted(set(slots) - catalog)

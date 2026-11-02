@@ -2037,6 +2037,36 @@ class ScopeTest(HomesMixin):
             with mock.patch.object(rec.sandbox_exec, "run", side_effect=err):
                 self.assertEqual(rec._search_container(self.FOLDER), (None, want), stderr)
 
+    def test_the_scope_lookups_go_through_the_command_runner_when_one_is_set(self):
+        # The scope publisher runs these four lookups with its broker runner; unset, they keep
+        # the sandbox route, so the reconcile's own path does not change.
+        lookups = (
+            (lambda: rec._list_project("team-a"),
+             ["gcloud", "container", "clusters", "list", "--project", "team-a", "--format=value(name,location)"]),
+            (lambda: rec._search_container(self.FOLDER),
+             ["gcloud", "asset", "search-all-resources", f"--scope={self.FOLDER}",
+              "--asset-types=container.googleapis.com/Cluster", "--format=json(name,location)"]),
+            (lambda: rec._resolve_selector("sharedVpcHosts/host-project"),
+             ["gcloud", "compute", "shared-vpc", "list-associated-resources", "host-project", "--format=json(id,type)"]),
+            (lambda: rec._resolve_selector("metricsScopes/scope-project"),
+             ["gcloud", "beta", "monitoring", "metrics-scopes", "describe",
+              "locations/global/metricsScopes/scope-project", "--format=json(name,monitoredProjects)"]),
+            (lambda: rec._project_id_of("123456789012"),
+             ["gcloud", "projects", "describe", "123456789012", "--format=value(projectId)"]),
+        )
+        for lookup, argv in lookups:
+            runner = mock.Mock(return_value=mock.Mock(stdout="", stderr=""))
+            with mock.patch.object(rec, "COMMAND_RUNNER", runner), \
+                    mock.patch.object(rec.sandbox_exec, "run") as sandboxed, mock.patch.object(rec, "log"):
+                lookup()
+            self.assertEqual(runner.call_args[0][0], argv)
+            self.assertTrue(runner.call_args[1]["check"])
+            sandboxed.assert_not_called()
+            with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="", stderr="")) as sandboxed, \
+                    mock.patch.object(rec, "log"):
+                lookup()
+            self.assertEqual(sandboxed.call_args[0][0], argv)
+
     def test_the_notification_counts_unlisted_projects_past_a_limit_and_names_containers(self):
         report = {"created": ["cluster-x"], "pruned": [], "create_failed": [], "skipped_error": [],
                   "projects": {f"proj-{i:04d}": rec.OUTCOME_OVER_CAP for i in range(30)} | {self.MGMT: rec.OUTCOME_OK},

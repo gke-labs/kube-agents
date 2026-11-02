@@ -3,8 +3,8 @@ day, renders the six approved message shapes, and never lets the token, the
 space or the webhook URL reach a log.
 
 Times in messages are Toronto time ("7:30 AM ET"); T0 is 12:00Z, which is
-8:00 AM EDT on 2026-09-04, and the digest hour is 9 AM Toronto (13:00Z that
-day), so the window is 12:40Z-13:20Z.
+8:00 AM EDT on 2026-09-04, and these tests pin the digest hour at 9 AM Toronto
+(13:00Z that day; the product's default is 11), so the window is 12:40Z-13:20Z.
 
 The HTTP layer is a recording fake handed in as `opener`; nothing here opens
 a socket or touches a bucket (the gs:// state path is exercised through a
@@ -32,7 +32,7 @@ URL = post_health.DASHBOARD_URL
 GH_ENV = {post_health.ghcli.TOKEN_ENV: "ghs_workflow_token"}
 
 T0 = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
-DIGEST_HOUR = 9  # Toronto; 13:00Z in September
+DIGEST_HOUR = 9  # Toronto; 13:00Z in September. The tests pin this hour; the product's default is 11 (post_health.DEFAULT_DIGEST_HOUR)
 DIGEST_UTC = 13
 
 TRIO = ["cluster-agent-crashloop-debug", "cluster-agent-crashloop-evidence-chain", "cluster-agent-crashloop-misleading-symptom"]
@@ -599,6 +599,18 @@ class Digest(RunHarness):
         self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
         self.assertEqual(len(self.opener.requests), 2, "the next day gets its own")
 
+    def test_without_the_flag_the_digest_goes_out_at_the_default_hour(self):
+        # The workflow passes no --digest-hour, so DEFAULT_DIGEST_HOUR (11 AM
+        # Toronto) is the product's hour; the rest of this file pins 9.
+        path = self.dir / "health.json"
+        path.write_text(json.dumps(health()))
+        for hour_utc, sent in ((13, 0), (15, 1)):  # 9:05 AM EDT: not yet; 11:05 AM EDT: once
+            argv = ["--health", str(path), "--state", str(self.state), "--now", datetime(2026, 9, 4, hour_utc, 5, tzinfo=timezone.utc).isoformat()]
+            with contextlib.redirect_stderr(io.StringIO()):
+                post_health.main(argv, environ={post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN}, opener=self.opener, gh_runner=self.gh)
+            self.assertEqual(len(self.opener.requests), sent, f"{hour_utc}:05Z")
+        self.assertEqual(post_health.DEFAULT_DIGEST_HOUR, 11)
+
     def test_digest_hour_is_a_toronto_hour_and_the_zone_is_configurable(self):
         # 9 AM Toronto is 13:00Z in September and 14:00Z in January (DST).
         self.tick(health(), datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc))
@@ -684,7 +696,7 @@ class Digest(RunHarness):
         store.write_text("{}")
         path = self.dir / "health.json"
         path.write_text(json.dumps(health()))
-        argv = ["--health", str(path), "--state", str(self.state), "--now", self.at(DIGEST_UTC, 5).isoformat(), "--store", str(store)]
+        argv = ["--health", str(path), "--state", str(self.state), "--now", self.at(DIGEST_UTC, 5).isoformat(), "--digest-hour", str(DIGEST_HOUR), "--store", str(store)]
         with contextlib.redirect_stderr(io.StringIO()):
             post_health.main(argv, environ={post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN}, opener=self.opener, gh_runner=self.gh)
         [(args, _)] = self.coverage.call_args_list

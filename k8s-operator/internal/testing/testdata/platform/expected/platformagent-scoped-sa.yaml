@@ -1154,7 +1154,7 @@ spec:
           resources:
             limits:
               cpu: "1"
-              ephemeral-storage: 2Gi
+              ephemeral-storage: 8Gi
               memory: 2Gi
             requests:
               cpu: 500m
@@ -1247,6 +1247,36 @@ spec:
             name: platformagent-gitops-state
           name: gitops-state-volume
 status: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: platformagent-credential-proxy
+      kubeagents.x-k8s.io/component: credential-proxy
+  unhealthyPodEvictionPolicy: AlwaysAllow
+status:
+  currentHealthy: 0
+  desiredHealthy: 0
+  disruptionsAllowed: 0
+  expectedPods: 0
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1451,14 +1481,14 @@ spec:
               command:
                 - sh
                 - -c
-                - 'curl --fail --silent --show-error -o /dev/null -H "Authorization: Bearer
-                  $API_SERVER_KEY" http://127.0.0.1:8642/api/sessions?limit=1; rc=$?;
-                  [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION"
+                - 'curl --fail --silent --show-error --max-time 8 -o /dev/null -H "Authorization:
+                  Bearer $API_SERVER_KEY" http://127.0.0.1:8642/api/sessions?limit=1;
+                  rc=$?; [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION"
                   = "true" ] && exit 0; exit "$rc"'
             failureThreshold: 3
             initialDelaySeconds: 5
             periodSeconds: 15
-            timeoutSeconds: 5
+            timeoutSeconds: 10
           resources:
             limits:
               cpu: "3"
@@ -1477,9 +1507,9 @@ spec:
               command:
                 - sh
                 - -c
-                - 'curl --fail --silent --show-error -o /dev/null -H "Authorization: Bearer
-                  $API_SERVER_KEY" http://127.0.0.1:8642/api/sessions?limit=1; rc=$?;
-                  [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION"
+                - 'curl --fail --silent --show-error --max-time 3 -o /dev/null -H "Authorization:
+                  Bearer $API_SERVER_KEY" http://127.0.0.1:8642/api/sessions?limit=1;
+                  rc=$?; [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION"
                   = "true" ] && exit 0; exit "$rc"'
             failureThreshold: 90
             initialDelaySeconds: 5

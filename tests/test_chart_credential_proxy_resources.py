@@ -313,8 +313,8 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         self.assertEqual(_cr_resources(cr), {"requests": {"memory": "1Gi"}})
 
     def test_an_ephemeral_storage_request_above_the_default_limit_fails(self):
-        err = self._render_error([f"{_VALUE_PATH}.requests.ephemeral-storage=3Gi"])
-        self.assertIn("limits.ephemeral-storage (2Gi)", err)
+        err = self._render_error([f"{_VALUE_PATH}.requests.ephemeral-storage=9Gi"])
+        self.assertIn("limits.ephemeral-storage (8Gi)", err)
 
     def test_a_negative_quantity_fails(self):
         err = self._render_error(values=_proxy_values({"requests": {"cpu": "-1"}}))
@@ -434,36 +434,45 @@ class CrdGuardTest(unittest.TestCase):
     the field would be pruned silently. `lookup` is empty under `helm template`, so
     the guard can only be pinned as text here; the render tests above show the block
     still renders when the lookup returns nothing. The failing branch is exercised
-    only against a live install."""
+    only against a live install. The guard is kube-agents.crdFieldGuard, shared by
+    the three sizing overrides; this pins the CR template's call and the helper's body."""
 
     _LOOKUP = 'lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io"'
 
     def setUp(self):
         template = (_CHART / _CR_TEMPLATE).read_text()
-        block = re.search(r"\n(\s*\{\{- if or \$proxyQuantities \(gt \$execReplicas 0\) \}\}\n\s*\{\{- \$crd := .*?)\n\s*credentialProxy:\n", template, re.DOTALL)
-        self.assertIsNotNone(block, "the credentialProxy block is missing from the CR template")
-        self.guard = block.group(1)
+        call = re.search(r"\{\{- if \$proxyQuantities \}\}\n\s*(\{\{- include \"kube-agents.crdFieldGuard\" \(dict [^\n]*\) \}\})\n", template)
+        self.assertIsNotNone(call, "the credentialProxy block does not call the CRD guard on a set override")
+        self.call = call.group(1)
+        exec_call = re.search(r"\{\{- if gt \$execReplicas 0 \}\}\n\s*(\{\{- include \"kube-agents.crdFieldGuard\" \(dict [^\n]*\) \}\})\n", template)
+        self.assertIsNotNone(exec_call, "the credentialProxy block does not call the CRD guard on an exec count")
+        self.exec_call = exec_call.group(1)
+        helpers = (_CHART / "templates" / "_helpers.tpl").read_text()
+        body = re.search(r'\{\{- define "kube-agents.crdFieldGuard" -\}\}\n(.*?)\n\{\{- end \}\}', helpers, re.DOTALL)
+        self.assertIsNotNone(body, "kube-agents.crdFieldGuard is missing from _helpers.tpl")
+        self.guard = body.group(1)
 
-    def test_a_set_override_looks_up_the_installed_crd(self):
-        gate = re.search(r"\{\{- if or \$proxyQuantities \(gt \$execReplicas 0\) \}\}\n\s*\{\{- \$crd := " + re.escape(self._LOOKUP), self.guard)
-        self.assertIsNotNone(gate, "the CRD lookup is not gated on a set override or exec count")
+    def test_a_set_override_names_the_value_and_the_field(self):
+        self.assertIn('"value" "platformAgent.deployment.credentialProxy.resources"', self.call)
+        self.assertIn('"path" (list "deployment" "credentialProxy") "field" "resources"', self.call)
 
-    def test_the_guard_reads_the_storage_versions_deployment_properties(self):
-        self.assertIn("{{- if .storage }}", self.guard)
-        self.assertIn('dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) .', self.guard)
+    def test_an_exec_count_names_the_value_and_the_field(self):
+        self.assertIn('"value" "platformAgent.deployment.credentialProxy.exec.replicas"', self.exec_call)
+        self.assertIn('"path" (list "deployment" "credentialProxy") "field" "exec"', self.exec_call)
+
+    def test_the_guard_looks_up_the_installed_crd(self):
+        self.assertIn(self._LOOKUP, self.guard)
+
+    def test_the_guard_reads_the_storage_versions_properties(self):
+        self.assertIn("{{- if .storage -}}", self.guard)
+        self.assertIn('dig "schema" "openAPIV3Schema" "properties" "spec" "properties" (dict) .', self.guard)
+        self.assertIn('dig $segment "properties" (dict) $node', self.guard)
 
     def test_the_guard_fails_naming_the_field_and_the_remedy(self):
-        fail = re.search(r'\{\{- if and \$proxyQuantities \(not \(hasKey \$deploymentProps "credentialProxy"\)\) \}\}\n\s*\{\{- fail "([^"]*)" \}\}', self.guard)
-        self.assertIsNotNone(fail, "the CRD guard does not fail on a missing key")
-        for want in ("predates spec.deployment.credentialProxy", "helm upgrade does not update CRDs",
+        fail = re.search(r'\{\{- if not \(hasKey \$props \.field\) -\}\}.*?\{\{- fail \(printf "([^"]*)" \.value \$crdPath\) -\}\}', self.guard, re.DOTALL)
+        self.assertIsNotNone(fail, "the CRD guard does not fail on a missing field")
+        for want in ("is set, but the installed PlatformAgent CRD predates %s", "helm upgrade does not update CRDs",
                      "charts/kube-agents/crds/", "upgrade.sh", "prunes the value silently", "release record keeps it"):
-            self.assertIn(want, fail.group(1))
-
-    def test_the_guard_fails_on_an_exec_count_against_a_crd_without_exec(self):
-        fail = re.search(r'\{\{- if and \(gt \$execReplicas 0\) \(not \(hasKey \(dig "credentialProxy" "properties" \(dict\) \$deploymentProps\) "exec"\)\) \}\}\n\s*\{\{- fail "([^"]*)" \}\}', self.guard)
-        self.assertIsNotNone(fail, "the CRD guard does not fail on a missing exec key")
-        for want in ("predates spec.deployment.credentialProxy.exec", "helm upgrade does not update CRDs",
-                     "charts/kube-agents/crds/", "upgrade.sh", "prunes the value silently"):
             self.assertIn(want, fail.group(1))
 
 

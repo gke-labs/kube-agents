@@ -30,6 +30,14 @@ export KUBE_AGENTS_MCP_TOKEN="$(kubectl -n kubeagents-system get secret platform
 
 Reading the Secret needs `get` on it, and the port-forward needs `pods/portforward`; together they are the access gate.
 
+The workstation bridge (`kube-agents-mcp`, gke-labs/kube-agents#3689) reads `KUBE_AGENTS_MCP_TOKEN` too. Set `KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT` to the saved name of the deployment the token belongs to. The bridge matches it exactly, never by a base name or kube context. When it is set, the token goes only to the deployment saved under exactly that name, even with one deployment saved. If it names none of them, the bridge sends the token nowhere and logs a warning. When it is unset, the token goes to the only saved deployment, or nowhere, with a warning, when several are saved.
+
+The match fails closed. The bridge renames a deployment to `<kube-context>/<name>` when another context holds one called `<name>`. After that rename, or after the deployment is removed, the old value names nothing. The token is not sent until you set the variable to the new saved name. If a different deployment is later saved under the same name, the variable names that one, so update or unset it when you remove an install.
+
+The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning. Such an override applies to that connection only: the bridge doesn't save it or make it the active deployment, and reconnects to it until the next `connect_deployment`.
+
+The bridge relays `notifications/progress` frames from an NDJSON reply as live progress, but this server sends none yet: each call gets one JSON answer, so the bridge shows a turn's result when it ends, with no progress before it.
+
 Point an MCP client at `http://localhost:8089/mcp` with the header `Authorization: Bearer <token>`. The endpoint takes JSON-RPC 2.0 over `POST`, one JSON answer per request. It refuses any request that carries an `Origin` header, so a browser page cannot use it. `GET /healthz` answers without a token.
 
 A request that names an MCP revision this server doesn't speak (the `MCP-Protocol-Version` header) is refused with 400; a request without the header is served.
