@@ -1,0 +1,52 @@
+# tse - the GKE Support Agent (Technical Solutions Engineer) persona, as an AgentProfile.
+#
+# Models a customer-side Google Cloud Technical Solutions Engineer (TSE) for L1
+# GKE support case deflection and structured incident triage (docs/designs/spec-subagent-profiles.md).
+#
+# Applied to a `mode: next` install, the operator renders this profile's
+# ServiceAccount, its bus identity, its agent card, and `KUBE_AGENTS_ENABLED_PROFILES=tse`
+# on the gateway Deployment so the entrypoint scaffolds `$HERMES_HOME/profiles/tse`
+# from `/opt/tse-template` and the kanban dispatcher can run `tse` tasks inside the
+# gateway pod until the per-profile Job dispatcher lands.
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentProfile
+metadata:
+  name: tse
+spec:
+  description: >-
+    Customer-side GKE Technical Solutions Engineer (TSE) for L1 support case
+    deflection and cross-layer incident triage. Performs read-only diagnostics
+    across Kubernetes (kubectl) and GCP control-plane telemetry (Cloud Logging,
+    Cloud Monitoring, GKE operations) using sanitized Google Cloud support
+    skills, returning either a grounded Root Cause Analysis with a proposed
+    GitOps fix or a redacted Google Cloud Support Escalation Bundle.
+
+  persona:
+    # SOUL.md, AGENTS.md, CAPABILITIES.md, TSE support skills, persona config.
+    image: <registry>/kube-agents/persona-tse:2026.08
+
+  harness:
+    image: <registry>/kube-agents/agent-worker:2026.08
+    model: model-default
+    maxTurns: 90
+
+  bus:
+    # Read-only on the blackboard: reads standing cluster/upgrade state and
+    # returns its Root Cause Analysis or Escalation Bundle in the task result.
+    subscribeTopics:
+      - shared.blueprint
+      - agent.platform.upgrade-readiness
+
+  identity: {}
+    # Operator-created KSA with zero RoleBindings; read-only GKE/developer_knowledge
+    # MCP access is mediated via the credential broker and persona config.yaml.
+
+  lifecycle:
+    activeDeadlineSeconds: 1800
+    ttlSecondsAfterFinished: 600
+
+  concurrency: 2
+
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 2Gi }

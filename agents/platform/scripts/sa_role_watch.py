@@ -33,8 +33,8 @@ no model. Each tick:
    bound to one of those accounts that is not in ``READ_ONLY_ROLES``;
 4. diffs that against the ledger the previous tick left. Chat hears a role on
    the tick it first appears and again when it goes, and a role still held is
-   said again once a day, on the first tick from ``REMIND_HOUR_UTC``, the way
-   ``kanban-board-health`` names a card still blocked: a grant said once can be
+   said again once a day, on the first tick from ``REMIND_HOUR_UTC``, as
+   ``kanban-board-health`` repeats a card still blocked: a grant said once can be
    missed, and one line in chat should not be the only word on it. Any other
    tick on which nothing changed prints nothing. A project whose policy could not be read keeps its
    last answer, since absence of evidence is not removal, and its failure is
@@ -91,6 +91,7 @@ READ_ONLY_ROLES = (
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",

@@ -16,7 +16,11 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
   …", "`dependabot[bot]` opened …") is not announced as ours.
 * A question the work is waiting on (:func:`needs_you`): the worker's question
   in bold (plain, when bold would cost it a ``*`` or a ``__name__``), the rest
-  of its reason below it, a choice button for each option
+  of its reason below it (of a first line too long for the headline, its first
+  sentence is the headline, cut at a word with an ellipsis when a question is
+  too long as well, and the rest opens the detail; a headline's links open it
+  too, on a line of their own, so nothing shows twice and no url is lost), a choice button for
+  each option
   the reason ends with, and a "waiting on you" line. A click is the clicker's
   answer in the thread (``gateway/slack_ux_clicks.py``), the same path as
   typing it. The options are buttons only when there are two to five, each
@@ -259,6 +263,10 @@ OPTIONS_MIN = 2
 OPTIONS_MAX = _presenter.BUTTONS_PER_ROW
 #: The reason below the question, clipped; ``kanban_block`` puts no bound on it.
 DETAIL_MAX = 2000
+#: The shortest headline a cut at a word may leave (:func:`_word_cut`): a code span, link
+#: or bold run across the limit would otherwise leave "Should I scale…", so the cut is
+#: made at a character instead.
+WORD_CUT_MIN = _presenter.HEADLINE_MAX // 2
 #: Bold in a context line: ``**text**`` between word boundaries with no ``*`` inside,
 #: which mrkdwn would read as a marker. ``__x__`` stays text, so a ``__init__.py`` in a
 #: path or url keeps its characters.
@@ -597,13 +605,112 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
     )
     if not usable:
         start, options = len(lines), []
-    first = lines[0].strip()
-    # A clipped headline keeps its whole line below it too, measured as shown, and so
-    # does one with a link: the headline shows only the label, the line below the url.
-    below = 0 if len(_headline_text(first)) > _presenter.HEADLINE_MAX or _presenter.MD_LINK.search(first) else 1
-    # Linked options likewise stay in the detail: their buttons show only the label.
+    head, overflow = _headline_cut(lines[0].strip())
+    # Linked options stay in the detail: their buttons show only the label. The overflow
+    # continues the headline, so it comes right under it, ahead of any fenced block.
     end = len(lines) if any(_presenter.MD_LINK.search(line) for line in lines[start:]) else start
-    return first, [*before, *lines[below:end]], options
+    return head, [*([overflow] if overflow else []), *before, *lines[1:end]], options
+
+
+def _headline_cut(line: str) -> tuple[str, str]:
+    """``(headline, overflow)`` for a question's first line, so no word of it shows twice.
+
+    A line that fits the headline, measured as shown, is the headline; otherwise
+    its first sentence is, when that fits, and the rest of the line is the
+    overflow, which opens the detail. A first sentence too long as well is cut:
+    a statement at a clause, as an answer's is (``slack_presenter.clause_cut``),
+    and a question, or a statement with no clause to cut at, by :func:`_word_cut`,
+    the headline ending in an ellipsis the overflow resumes after, so a cut
+    question never reads as a statement. The headline shows a link's label only,
+    so each link in it also opens the overflow, on a line of its own and once, to
+    keep its url.
+    """
+    sentence, after = line, ""
+    if len(_headline_text(line)) > _presenter.HEADLINE_MAX:
+        lead, body = _presenter.split_lead(line, cut=False)
+        links = len(_presenter.MD_LINK.findall(line))
+        # A sentence end inside a link's label ("[Fix A. Part 2](…)") would split the link.
+        if lead and len(_presenter.MD_LINK.findall(lead)) + sum(len(_presenter.MD_LINK.findall(b)) for b in body) == links:
+            sentence, after = lead, "\n".join(body)
+    head, rest = sentence, ""
+    if len(_headline_text(sentence)) > _presenter.HEADLINE_MAX:
+        cut = None if _headline_text(sentence).endswith(QUESTION_END) else _presenter.clause_cut(sentence)
+        head, rest = cut or _word_cut(sentence)
+    shown: list[str] = []
+    for link in _presenter.MD_LINK.finditer(head):
+        if link.group(0) not in shown and link.group(0) not in rest and link.group(0) not in after:
+            shown.append(link.group(0))
+    text = " ".join(part for part in (rest, after) if part)
+    return head, "\n".join(part for part in (" ".join(shown), text) if part)
+
+
+def _word_cut(sentence: str) -> tuple[str, str]:
+    """``(headline, rest)``: ``sentence`` cut where the headline is longest, at most
+    ``HEADLINE_MAX`` characters as shown with its ellipsis, each half carrying the ellipsis.
+
+    The cut is at the last space that fits, or, when that would leave a headline shorter
+    than :data:`WORD_CUT_MIN` (a long code span, link or bold run across the limit), at
+    the last character that fits. It is never inside a link, a marker or an italic run; a
+    code span or bold run it falls inside is closed at the end of the headline and
+    reopened at the start of the rest, so each half keeps its markup. A link that crosses
+    the limit with no cut long enough before it is kept whole, the cut made after it."""
+    spans = _presenter._code_spans(sentence)
+    links = [link.span() for link in _presenter.MD_LINK.finditer(sentence)]
+    masked = list(sentence)
+    for start, end, _opener in spans:
+        masked[start:end] = _presenter.CODE_FILLER * (end - start)
+    plain = "".join(masked)
+    space = char = None
+    i, linked = 1, 0
+    while i < len(sentence):
+        link = next((span for span in links if span[0] < i < span[1]), None)
+        if link:
+            i = linked = link[1]
+            continue
+        cut = _cut_at(sentence, i, spans, plain)
+        # Every later cut leaves a longer headline, so the first past the limit ends the scan.
+        if len(_headline_text(cut[0] if cut else sentence[:i])) + len(_presenter.ELLIPSIS) > _presenter.HEADLINE_MAX:
+            break
+        if cut and cut[0].strip():
+            char = cut
+            if sentence[i].isspace() and not sentence[i - 1].isspace():
+                space = cut
+        i += 1
+    if space and len(_headline_text(space[0])) >= WORD_CUT_MIN:
+        char = space
+    if char is None or (i == linked and len(_headline_text(char[0])) < WORD_CUT_MIN):
+        # A link no cut may enter crosses the limit: the headline runs to its end, and the
+        # renderer clips its label, which the link below shows whole.
+        end = linked or len(sentence)
+        char = sentence[:end], sentence[end:]
+    head, rest = char
+    return head + _presenter.ELLIPSIS, _presenter.ELLIPSIS + rest.lstrip()
+
+
+def _cut_at(sentence: str, i: int, spans: Sequence[tuple[int, int, int]], plain: str) -> tuple[str, str] | None:
+    """``sentence`` split before index ``i``, a code span, italic or bold run open there
+    closed on the left and reopened on the right; None inside a marker, or right after
+    the opener of a run, which would leave it empty. ``plain`` is ``sentence`` with its code
+    spans masked."""
+    closers, openers = "", ""
+    for start, end, opener in spans:
+        if start < i < end:
+            if not start + opener < i < end - opener:
+                return None
+            closers, openers = _presenter.BACKTICK * opener, _presenter.BACKTICK * opener
+    head = plain[:i]
+    if any(plain[i - 1 : i + 1] == marker for marker in _presenter.BOLD_MARKERS):
+        return None
+    # A run is open when this head opens it at a word's edge and the rest closes it, as
+    # _first_sentence counts them; an in-word "2**30" or a marker nothing closes is text.
+    runs = [(marker, edges, head.replace(marker * 2, "").count(marker)) for marker, edges in _presenter.ITALIC_EDGES.items()]
+    runs += [(marker, edges, head.count(marker)) for marker, edges in _presenter.BOLD_EDGES.items()]
+    for marker, (opener, closer), count in runs:
+        if count % 2 and opener.search(plain[: i + 1]) and closer.search(plain, i):
+            if head.rstrip().endswith(marker):
+                return None
+            closers, openers = closers + marker, marker + openers
+    return sentence[:i].rstrip() + closers, openers + sentence[i:].lstrip()
 
 
 def _detail(lines: Sequence[str]) -> str:

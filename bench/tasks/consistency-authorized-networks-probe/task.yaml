@@ -3,21 +3,27 @@
 # about 30% of repetitions on unrelated pull requests and on main: Vertex
 # 429s, #3399, and real misses where the agent read seeded-c's leftover
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} as
-# configured or open); `consistency` is on the coverage allowlist in
-# docs/designs/domains.yaml until it returns, after #3448 merges, the
-# agent-side fix (#3605) lands and the case passes the roster's bar on the
-# Gemini nightly.
+# configured or open); `consistency` was on the coverage allowlist in
+# docs/designs/domains.yaml from then until consistency-drift-outlier took
+# the domain's roster seat on 2026-10-26. The agent-side fix landed in #3609
+# (2026-10-23); the case stays nightly by the decision on #3975: with that
+# route reverted it still passed 10/10 on the inject lane (#4116), where the
+# route check is set aside, so a presubmit seat could not fail when the fix
+# is undone. No CI lane grades the route today (the route comment below).
 #
 # A PROBE, not the audit. The full fleet-consistency-drift sweep exists and
 # is spec-ready (consistency-drift-outlier); on 2026-08-26 its run failed on
 # transport (agent-endpoint HTTP 502s), and its shape — cohort math over the
 # whole fleet plus a ledger write — budgets like the other audits at
-# 600-1300s. Presubmit coverage of this domain is therefore a targeted
-# question about the planted defect, answered from observed evidence and
-# graded on the reply. Full audit SOP fidelity lives in
+# 600-1300s. This probe is the targeted question about the planted defect,
+# answered through the drift collector's run (SOUL.md's audit-stream row,
+# #3609) and graded on the reply and, where a lane can see it, on that run;
+# the domain's presubmit seat is the full audit since 2026-10-26. Full audit
+# SOP fidelity lives in
 # the fleet-audits canary (compliance-rbac-overgrant, 606s measured
 # 2026-08-26; nightly 2026-09-22 to 2026-09-29, presubmit held out since
-# (#2013)) and, in the nightly tier, consistency-drift-outlier.
+# (#2013)) and consistency-drift-outlier (nightly from 2026-08-26, on the
+# blocking roster since 2026-10-26).
 # Expected cost bracket: ~150-350s.
 #
 # Planted defect required: the seeded fleet's slot-c cluster carries no
@@ -30,7 +36,7 @@
 # "Master authorized networks" is the planted facet name, so an exact match
 # on it is fair.
 #
-# Isolation class: read-only (chat probe; no audit helper, no GitOps-repo
+# Isolation class: read-only (chat probe; no ledger helper, no GitOps-repo
 # write). Eligible tier: presubmit; a blocking-roster case until its
 # demotion to the nightly on 2026-10-21 (#3598).
 #
@@ -95,4 +101,23 @@ verification_spec:
       # configuration") and "authorizednetworks" covers the API field forms
       # (masterAuthorizedNetworksConfig, authorizedNetworksConfig), which
       # lowercase without the space.
-      any_of_phrases: ["authorized network", "authorizednetworks"]
+      # "authorized-networks" is the drift collector's facet id, which the
+      # agent may quote once the question routes there (#3609).
+      any_of_phrases:
+        ["authorized network", "authorizednetworks", "authorized-networks"]
+  # The route (#3605, #3609): the comparison is the drift collector's run.
+  # Graded on api-lane runs only; an inject-lane run (the blocking presubmit
+  # since #3156, the nightly halves since #3783) sets worker_commands checks
+  # aside as not applicable (#2039), so there the reply check alone grades.
+  # Since #3969 retired the today-mode nightly, no CI job runs this file over
+  # the agent API, so the route is graded only when an api-lane run carries
+  # the case (as #3975's measuring run on pull-kube-agents-smoke-test-today
+  # did). Same shape as
+  # drift-chat-request-runs-collector's the-drift-collector-ran.
+  - name: the-comparison-ran-the-drift-collector
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: fleet_drift.py

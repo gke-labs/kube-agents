@@ -158,6 +158,13 @@ class GateTest(unittest.TestCase):
         self.assertEqual(gate.profile_for_home(pathlib.Path("/opt/data")), "default")
         self.assertEqual(gate.profile_for_home(pathlib.Path("/home/agent/.hermes")), "default")
 
+    def test_tse_skill_roots_and_non_optional_templates_rejected(self):
+        self.assertEqual(gate.image_skill_roots("tse"), ("/opt/tse-template/skills",))
+        self.assertEqual(gate.image_skill_roots("chat"), ())
+        self.assertEqual(gate.image_skill_roots("a2a"), ())
+        self.assertEqual(gate.image_skill_roots("auditor"), ())
+        self.assertFalse(hasattr(gate, "OPTIONAL_PROFILE_MOUNT_BASE"))
+
     def test_shipped_is_answered_per_profile_from_the_template_tree(self):
         self.assertEqual(gate.image_shipped_skill("submit-suggestion", "platform"), str(self.platform_root))
         self.assertIsNone(gate.image_shipped_skill("submit-suggestion", "cluster-a"))
@@ -276,19 +283,39 @@ class CheckRootsTest(unittest.TestCase):
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(self.tmp)], check=False))
         self.p = self.tmp / "platform-template" / "skills"
         self.c = self.tmp / "cluster-template" / "skills"
-        for root, name in ((self.p, "submit-suggestion"), (self.c, "gke-stall-detection")):
+        self.t = self.tmp / "tse-template" / "skills"
+        for root, name in (
+            (self.p, "submit-suggestion"),
+            (self.c, "gke-stall-detection"),
+            (self.t, "support-escalation-bundle"),
+        ):
             (root / name).mkdir(parents=True)
             (root / name / "SKILL.md").write_text("---\nname: x\ndescription: y\n---\n")
 
     def test_passes_when_every_root_holds_a_shipped_skill(self):
-        with mock.patch.multiple(gate, PLATFORM_ROOTS=(str(self.p),), CLUSTER_ROOTS=(str(self.c),)):
+        with mock.patch.multiple(
+            gate,
+            PLATFORM_ROOTS=(str(self.p),),
+            CLUSTER_ROOTS=(str(self.c),),
+            TSE_ROOTS=(str(self.t),),
+        ):
             self.assertEqual(gate.check_roots(["--check-roots"]), 0)
 
     def test_fails_when_a_root_is_missing_or_empty(self):
-        with mock.patch.multiple(gate, PLATFORM_ROOTS=(str(self.tmp / "nowhere"),), CLUSTER_ROOTS=(str(self.c),)):
+        with mock.patch.multiple(
+            gate,
+            PLATFORM_ROOTS=(str(self.tmp / "nowhere"),),
+            CLUSTER_ROOTS=(str(self.c),),
+            TSE_ROOTS=(str(self.t),),
+        ):
             self.assertEqual(gate.check_roots(["--check-roots"]), 1)
         (self.c / "gke-stall-detection" / "SKILL.md").unlink()
-        with mock.patch.multiple(gate, PLATFORM_ROOTS=(str(self.p),), CLUSTER_ROOTS=(str(self.c),)):
+        with mock.patch.multiple(
+            gate,
+            PLATFORM_ROOTS=(str(self.p),),
+            CLUSTER_ROOTS=(str(self.c),),
+            TSE_ROOTS=(str(self.t),),
+        ):
             self.assertEqual(gate.check_roots(["--check-roots"]), 1)
 
     def test_needs_the_flag(self):

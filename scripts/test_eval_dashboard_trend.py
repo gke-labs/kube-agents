@@ -154,6 +154,43 @@ PAGE_ONLY_RUNS = [
 ]
 
 
+class ModeSeriesTest(unittest.TestCase):
+    """The today-mode and next-mode nightlies both record every night. The
+    top level is today's series alone, exactly as before next records
+    existed; next's records are their own series under ``next``."""
+
+    @classmethod
+    def setUpClass(cls):
+        today = night_one_records()
+        cls.today_only = trend.trend_document(store_doc(today), data_with_nightly(DOMAINS, [NIGHT_1_RUN]))
+        nxt = later_night(today, 17, "9001", judged={"OutcomeValidity": 0.5}, key={"mode": "next"})
+        cls.both = trend.trend_document(store_doc(today + nxt), data_with_nightly(DOMAINS, [NIGHT_1_RUN]))
+
+    def test_the_today_series_is_unchanged_by_next_records(self):
+        for field in ("records", "metrics", "keys", "nights", "cases", "domains"):
+            self.assertEqual(self.both[field], self.today_only[field], field)
+        self.assertIsNone(self.today_only["next"], "no next records, no next series")
+        for doc in self.both["cases"].values():
+            self.assertEqual(doc["key_changes"], [], "a next night is not a key change on today's line")
+
+    def test_next_records_are_their_own_series(self):
+        nxt = self.both["next"]
+        self.assertEqual(nxt["records"], 4)
+        self.assertEqual(list(nxt["keys"]), [KEY_1 + "-next"])
+        self.assertEqual(nxt["keys"][KEY_1 + "-next"]["mode"], "next")
+        self.assertEqual(sorted(nxt["cases"]), [n for n, _ in DOMAINS])
+        point = nxt["cases"]["agent-kanban-smoke"]["points"][0]
+        self.assertEqual(point["judged"]["OutcomeValidity"]["mean"], 0.5)
+        self.assertEqual([n["build"] for n in nxt["nights"]], ["9001"])
+
+    def test_the_key_path_carries_the_mode_as_the_writer_files_it(self):
+        key = {"setup_id": "s", "scoring_version": "v1", "judge_model": "j", "fleet": 1, "verifiers": 1}
+        self.assertEqual(trend.key_path(key), "s/j/v1-f1-v1")
+        self.assertEqual(trend.key_path(dict(key, mode="today")), "s/j/v1-f1-v1")
+        self.assertEqual(trend.key_path(dict(key, mode="next")), "s/j/v1-f1-v1-next")
+        self.assertNotIn("mode", trend.key_document(key))
+
+
 class NightOneTest(unittest.TestCase):
     """The real first night, alone: one point per case, no line, no band."""
 
@@ -419,8 +456,8 @@ class StoreStatesTest(unittest.TestCase):
     def test_no_store_an_error_and_odd_records_all_yield_a_document(self):
         empty = trend.trend_document(None, data_with_nightly(DOMAINS))
         self.assertEqual((empty["source"], empty["read_at"], empty["records"], empty["cases"], empty["domains"], empty["metrics"], empty["default_metric"]), (None, None, 0, {}, {}, [], None))
-        failed = trend.trend_document(store_doc(night_one_records(), error="2026-09-17T14:30:00Z: gsutil ls: 403", truncated={"rca-remediation-pr": 2}, warnings=["x:1: not valid JSON"], partial={"fetched": 3, "remaining": 1}), data_with_nightly(DOMAINS))
-        self.assertEqual((failed["error"], failed["truncated"], failed["warnings"], failed["records"], failed["partial"]), ("2026-09-17T14:30:00Z: gsutil ls: 403", {"rca-remediation-pr": 2}, ["x:1: not valid JSON"], 4, {"fetched": 3, "remaining": 1}))
+        failed = trend.trend_document(store_doc(night_one_records(), error="2026-09-17T14:30:00Z: gcloud storage ls: 403", truncated={"rca-remediation-pr": 2}, warnings=["x:1: not valid JSON"], partial={"fetched": 3, "remaining": 1}), data_with_nightly(DOMAINS))
+        self.assertEqual((failed["error"], failed["truncated"], failed["warnings"], failed["records"], failed["partial"]), ("2026-09-17T14:30:00Z: gcloud storage ls: 403", {"rca-remediation-pr": 2}, ["x:1: not valid JSON"], 4, {"fetched": 3, "remaining": 1}))
         self.assertIsNone(empty["partial"])
         self.assertIsNone(trend.trend_document(store_doc(night_one_records(), partial={"fetched": 4, "remaining": 0}), data_with_nightly(DOMAINS))["partial"], "nothing left is not partial")
         # A non-finite mean is what json.loads makes of a `NaN` or `Infinity`
@@ -491,7 +528,7 @@ class TrendPageTest(unittest.TestCase):
             cls.bare = render_to(root / "bare", data, health=health_doc("GREEN"))
             # A read that failed this tick: the prior document with error set,
             # a cap that trimmed one case and a line that would not parse.
-            stale = store_doc(records, error="2026-09-17T14:30:00Z: gsutil ls gs://kube-agents-evals-bench/evidence: AccessDeniedException: 403",
+            stale = store_doc(records, error="2026-09-17T14:30:00Z: gcloud storage ls gs://kube-agents-evals-bench/evidence: HTTPError 403",
                               truncated={"rca-remediation-pr": 2}, warnings=["gs://kube-agents-evals-bench/evidence/x/1.jsonl: not valid JSON: Expecting value"],
                               partial={"fetched": 800, "remaining": 2600})
             (root / "stale.json").write_text(json.dumps(stale))
@@ -741,7 +778,7 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn("this page shows the last good read, Thu 10:09 AM ET", stale)
         self.assertEqual(stale.count('class="tcard"'), 4, "the last good read is still drawn")
         empty = dom_text(self.empty / "trend.html")
-        self.assertIn("holds no record inside its 90-day window yet", empty)
+        self.assertIn("holds no today-mode record inside its 90-day window yet", empty)
         self.assertNotIn('class="tcard"', empty)
 
     def test_the_page_carries_its_data_inline_and_the_nav_tab(self):

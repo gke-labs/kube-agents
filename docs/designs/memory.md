@@ -758,17 +758,25 @@ row is outside the noise the random load-balancing introduces.
 | Personal | `user:<id>`    | automatic capture, and `memory_retain` | that user only |
 | Shared   | `scope:shared` | `memory_retain(scope="shared")` only   | everyone       |
 
-`<id>` is the gateway identity (`agent._user_id`) run through
-`sanitize_user_id`, which produces `<readable>_<digest>`. The readable half
+`<id>` is the user identity run through `sanitize_user_id`, which produces
+`<readable>_<digest>`. Under `spec.mode: today`, the Hermes gateway supplies
+`agent._user_id` directly to `initialize()`. Under `spec.mode: next`, the Hermes
+API server runs `a2a-*` sessions without `user_id` or `chat_type` headers, so
+`hermes-bridge` records `authority.requester.principal` (`hmac:<32-hex>`) and
+`authority.audience.kind` (`dm` or `group`) from the gateway's `.in` task
+submission envelope in `session_kv.db` via `PUT /v1/sessions/a2a-<contextId>/route`,
+and both `kube_agents_memory` and `multiuser_memory` resolve them from
+`session_kv.db` (walking `state.db` `parent_session_id` across compressed
+session continuations). The readable half
 mirrors Hindsight's own `_sanitize_bank_segment`: non-alphanumerics collapse to
 `-`, runs of `-` collapse to one, and leading or trailing `-`/`_` are stripped.
 The digest is `sha256(raw)[:12]`, and it is there because the readable half alone
 is lossy while the tag is the entire isolation boundary — identities are
-email-shaped, punctuation is what distinguishes many of them, and
+email-shaped (or `hmac:<32-hex>` pseudonyms under `spec.mode: next`), punctuation is what distinguishes many of them, and
 `alice.smith@corp.example` and `alice+dev@corp.example`-style pairs otherwise
 land on one tag and read each other's private facts. `multiuser_memory` guarded
-the same thing the same way in its filenames. An empty identity produces an
-empty string rather than a hash of nothing, which is what lets the provider fail
+the same thing the same way in its filenames. An empty or `"default"` identity produces an
+empty string rather than a hash of nothing or a shared `"default"` file, which is what lets both providers fail
 closed on personal memory; see
 [`tests/memory/test_user_tag_isolation.py`](../../tests/memory/test_user_tag_isolation.py).
 Recall asks for `[user:<id>, scope:shared]` with match mode `any_strict`, and
@@ -925,7 +933,7 @@ What the write is _spelled_ varies, because the safe reading of an unqualified
 retain is not the same everywhere. Wherever a person is in the conversation it
 stays `scope="shared"`, explicitly; in an unattended session — cron, the k8s event
 watcher — there is no personal scope to write to and an unqualified retain resolves
-to shared instead of failing. The three cases are in
+to shared instead of failing. The cases are in
 [The tools](#the-tools).
 
 #### What goes in which scope
@@ -1060,20 +1068,22 @@ A write that names no scope is the model declining to state intent, so the defau
 is the safe reading of that silence — which depends on who is in the room, not on
 whether the session happens to hold a user tag:
 
-| Session                                | Write default | An unqualified retain                            |
-| -------------------------------------- | ------------- | ------------------------------------------------ |
-| DM from a known user                   | `personal`    | filed under that user                            |
-| Group thread (`SHARED_SESSION_NOTICE`) | `personal`    | refused, with the reason, and nothing is written |
-| Unattended (`NO_IDENTITY_NOTICE`)      | `shared`      | filed under `scope:shared`                       |
+| Session                                              | Write default | An unqualified retain                            |
+| ---------------------------------------------------- | ------------- | ------------------------------------------------ |
+| DM from a known user                                 | `personal`    | filed under that user                            |
+| Group thread (`SHARED_SESSION_NOTICE`)               | `personal`    | refused, with the reason, and nothing is written |
+| Unattributable interactive DM (`NO_IDENTITY_NOTICE`) | `personal`    | refused, with the reason, and nothing is written |
+| Unattended background run (`NO_IDENTITY_NOTICE`)     | `shared`      | filed under `scope:shared`                       |
 
-The middle row is why the provider carries `_unattended` rather than keying on
-`self._user_tag` being empty: both of the last two states have no tag, and only one
-of them is an empty room. A space is full of named people whose personal memory
-exists and is merely unreachable from a session that cannot attribute the speaker,
+The middle two rows are why the provider carries `_unattended` rather than keying on
+`self._user_tag` being empty: three states have no tag, and only the last one
+(cron and the k8s event watcher) is an empty room. Both a group space and an
+interactive DM or `a2a-*` session whose route or identity is missing have a
+human speaker whose personal facts must not be published org-wide,
 so an unqualified write there must keep failing closed — publishing one
 participant's stated fact org-wide is the outcome the whole scope design exists to
 prevent. `get_tool_schemas` splits the same way: only the unattended variant drops
-`personal` from the write enum, because in a space that value is the model's only
+`personal` from the write enum, because whenever a human is present that value is the model's only
 way to say "this belongs to one person" and earn the refusal.
 
 Neither read delegates to the stock tool. `memory_reflect` cannot, because
@@ -1370,8 +1380,10 @@ DM-only by design.
 
 #### Why a space stays on one session
 
-`thread_sessions_per_user` would restore attribution, and with it personal memory,
-by giving each participant their own session. It is deliberately left off: a space's
+In `spec.mode: today`, `thread_sessions_per_user` would restore attribution, and
+with it personal memory, by giving each participant their own session. It is
+deliberately left off (and in `spec.mode: next`, the A2A gateway always assigns one
+`context_id` per group thread regardless of `thread_sessions_per_user`): a space's
 value is the shared thread, and with per-user sessions Bob's follow-up lands in a
 session that never saw Alice ask the question.
 

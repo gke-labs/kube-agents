@@ -25,10 +25,17 @@ from workspace_paths import WorkspaceError
 from .base import Forge, ForgeUnsupported, StubForge
 from .bitbucket import BitbucketCloudForge
 from .bitbucket_datacenter import BitbucketDataCenterForge
+from .gitea import GiteaForge
 from .github import GitHubForge
 from .gitlab import GitLabForge
 
-AVAILABLE: tuple[type[Forge], ...] = (GitHubForge, GitLabForge, BitbucketCloudForge, BitbucketDataCenterForge)
+AVAILABLE: tuple[type[Forge], ...] = (
+    GitHubForge,
+    GitLabForge,
+    GiteaForge,
+    BitbucketCloudForge,
+    BitbucketDataCenterForge,
+)
 
 
 # Hosts this design has a name and a shape for but no implementation of yet.
@@ -38,15 +45,15 @@ AVAILABLE: tuple[type[Forge], ...] = (GitHubForge, GitLabForge, BitbucketCloudFo
 _UNIMPLEMENTED: tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...] = ()
 
 
-# Where the operator mounts the forges this install was configured with. Unset
-# means the install predates per-forge configuration, and each forge class
-# decides what that means for it (see `Forge.for_config`). Set, the file is the
-# whole answer: a forge it does not list is not built.
+# Where the operator mounts or passes the forges this install was configured
+# with. Unset means the install predates per-forge configuration, and each
+# forge class decides what that means for it (see `Forge.for_config`). Set, the
+# list is the whole answer: a forge it does not list is not built.
 FORGES_CONFIG_ENV = "VCS_FORGES_CONFIG"
-# A hostname and nothing else. A port is refused rather than accepted: the
-# repository parser reads a URL's host without its port, so a forge declared at
-# `host:8443` would load and then match no request; until ports are carried
-# through resolution end to end, the misconfiguration stops the build.
+# A hostname and nothing else. A port is refused in `host` rather than
+# accepted: the repository parser reads a URL's host without its port, so a
+# forge declared at `host:8443` would load and then match no request; use the
+# explicit `port` field instead.
 _HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
 # One login, as a forge names an account: an account id may keep its braces
 # (`{...}`), and a username may hold `@`. The operator's schema holds the same
@@ -57,16 +64,16 @@ _IDENTITY_RE = re.compile(r"[A-Za-z0-9._@+{}-]{1,255}")
 def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
     """The configured forges, normalised, or None when nothing configures them.
 
-    The file is `{"forges": [{"provider", "host", "tokenPath"?, "readTokenPath"?,
-    "allowedPaths"?, "caFile"?, "caSecret"?, "caKey"?, "identity"?}]}`.
-    `identity` is the login the forge's credential acts as, for a token that
-    cannot name its own account; a forge that reads it says so, and every
-    other forge ignores it. `readTokenPath` is
-    where a read-only token may be: the file is there only when the Secret
-    carries the key, so the forge checks for it on each call. `caFile` is an
-    absolute path to PEM CA certificates that this forge's host, and no
-    other, is trusted under; `caSecret` and `caKey` name where the file comes
-    from, for the answer when it is missing.
+    The file is `{"forges": [{"provider", "host", "name"?, "scheme"?, "port"?,
+    "tokenPath"?, "readTokenPath"?, "allowedPaths"?, "caFile"?, "caSecret"?,
+    "caKey"?, "identity"?}]}`. `identity` is the login the forge's credential
+    acts as, for a token that cannot name its own account; a forge that reads
+    it says so, and every other forge ignores it. `readTokenPath` is where a
+    read-only token may be: the file is there only when the Secret carries the
+    key, so the forge checks for it on each call. `caFile` is an absolute path
+    to PEM CA certificates that this forge's host, and no other, is trusted
+    under; `caSecret` and `caKey` name where the file comes from, for the
+    answer when it is missing.
     Read at registry construction, never cached across it, so a test or a
     remount sees the file it names. A file that is named and cannot be read
     raises: a broker that does not know which forges it serves must not start
@@ -83,6 +90,7 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
     raw = document.get("forges") if isinstance(document, dict) else None
     if not isinstance(raw, list):
         raise ValueError(f"the forge configuration {path} has no `forges` list")
+    by_provider = {cls.name: cls for cls in AVAILABLE}
     entries = []
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
@@ -94,6 +102,7 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
                 f"forges[{index}] in {path} needs a provider and a hostname "
                 "(no scheme, path or port)"
             )
+        cls = by_provider.get(provider)
         # Absent is kept apart from empty: a forge whose credential reaches a
         # whole host may require the administrator to say so (`[]`) rather
         # than get it by leaving the field out.
@@ -113,20 +122,39 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
                 f"forges[{index}].identity in {path} must be one login: letters, digits "
                 "and . _ @ + - { }, with no space"
             )
-        entries.append(
-            {
-                "provider": provider,
-                "host": host,
-                "token_path": str(item.get("tokenPath") or "").strip(),
-                "read_token_path": str(item.get("readTokenPath") or "").strip(),
-                "ca_file": (ca_file or "").strip(),
-                "ca_source": _ca_source(item),
-                "identity": (identity or "").strip(),
-                # Passed through unfiltered: an entry that trims to nothing is
-                # the forge's to refuse, not the loader's to drop.
-                "allowed_paths": None if allowed is None else tuple(allowed),
-            }
-        )
+        entry: dict[str, Any] = {
+            "provider": provider,
+            "host": host,
+            "token_path": str(item.get("tokenPath") or "").strip(),
+            "read_token_path": str(item.get("readTokenPath") or "").strip(),
+            "ca_file": (ca_file or "").strip(),
+            "ca_source": _ca_source(item),
+            "identity": (identity or "").strip(),
+            # Passed through unfiltered: an entry that trims to nothing is
+            # the forge's to refuse, not the loader's to drop.
+            "allowed_paths": None if allowed is None else tuple(allowed),
+        }
+        if item.get("name") is not None:
+            entry["name"] = str(item["name"]).strip().lower()
+        if item.get("scheme") is not None:
+            scheme = str(item["scheme"]).strip().lower()
+            if scheme not in ("https", "http"):
+                raise ValueError(f"forges[{index}].scheme in {path} must be https or http")
+            if cls is not None and scheme not in cls.schemes:
+                raise ValueError(
+                    f"forges[{index}].scheme in {path}: scheme {scheme!r} is not supported for {provider}"
+                )
+            entry["scheme"] = scheme
+        if item.get("port") not in (None, "", 0):
+            port = item["port"]
+            if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+                raise ValueError(f"forges[{index}].port in {path} must be an integer in 1..65535")
+            if cls is not None and not cls.accepts_port:
+                raise ValueError(
+                    f"forges[{index}].port in {path}: port is not supported for {provider}"
+                )
+            entry["port"] = port
+        entries.append(entry)
     return entries
 
 

@@ -1,0 +1,69 @@
+# Domain: cluster-debugging. Journey: delegate a GKE node NotReady (PLEG is not
+# healthy) escalation request to the optional GKE Support Agent (tse) specialist
+# and verify it produces the 5-section Google Cloud Support Escalation Bundle.
+#
+# Precondition: a spec.mode: next install with the optional AgentProfile/tse
+# bound (profiles.tse.enabled=true, set on EVAL_MODE_NEXT=1 installs by
+# MODE_NEXT_ENV_ARGS in hack/ci-deploy.sh, so the operator projects
+# KUBE_AGENTS_ENABLED_PROFILES=tse and the entrypoint scaffolds
+# /opt/data/profiles/tse). Registered in hack/eval/nightly-cases.txt (#3492).
+id: tse-node-notready-pleg-probe
+name: GKE Support Agent (tse) node NotReady PLEG triage and escalation bundle
+
+domain: cluster-debugging
+owner: adrianchung
+
+prompt: >-
+  Ask the GKE Support Agent (tse) to prepare a read-only Google Cloud Support
+  Escalation Bundle for node gke-prod-1-default-pool-8a9b1c2d-x7z9 in GKE
+  cluster prod-1 (us-central1), which flipped to NotReady at
+  2026-10-20T14:22:00Z with "PLEG is not healthy: pleg was last seen active
+  3m12s ago; threshold is 3m0s" while ContainerGCE remained True. Do not run
+  live cluster or gcloud commands — produce the 5-section escalation bundle and
+  the exact read-only Cloud Logging and Compute Engine serial port commands to
+  distinguish kubelet/containerd saturation from a host freeze.
+expected_output: >-
+  The Planning Agent delegates the task to the tse specialist via
+  kanban_create(assignee="tse"), and the tse specialist produces a redacted
+  5-section Google Cloud Support Escalation Bundle (Environment & Cluster
+  Identity, Problem Statement & Business Impact, Observed Evidence,
+  Customer-Side Checks Already Verified, and Specific Request for Google Cloud
+  Support) including read-only gcloud logging read and gcloud compute instances
+  get-serial-port-output triage commands.
+infrastructure:
+  deployer: noop
+fixtures: []
+validated: true
+
+verification_spec:
+  - name: delegated-to-tse-specialist
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      arguments:
+        assignee: "^tse$"
+      require_success: true
+  - name: report-carries-five-section-escalation-bundle
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases:
+        [
+          "Environment & Cluster Identity",
+          "Problem Statement & Business Impact",
+          "Observed Evidence",
+          "Customer-Side Checks Already Verified",
+          "Specific Request for Google Cloud Support",
+          "get-serial-port-output",
+        ]
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

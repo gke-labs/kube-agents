@@ -46,6 +46,10 @@ set -euo pipefail
 # else mounts, so the wider mode does not widen who can read a credential.
 umask 0002
 
+# An exit status over this is a signal: status - SIGNAL_EXIT_BASE.
+# report_credential_path_exit reads it. Below the umask, like everything.
+readonly SIGNAL_EXIT_BASE=128
+
 # Below the umask, and nothing goes above it: `tests/test_startup_umask.py`
 # asserts the umask is the first line here that could create a file, because one
 # sitting under a `mkdir` reads as the control while doing none of its job.
@@ -98,8 +102,8 @@ readonly KV_DAEMON_URL="http://${KV_DAEMON_HOST}:${KV_DAEMON_PORT}"
 # The agent gateway the daemon starts each triage turn on, on the same loopback
 # (session_kv_server.py's PLATFORM_API_URL default). The watcher waits for it to
 # answer before it watches events: the daemon accepts an inject before it starts
-# the turn, so an event offered while the gateway boots would be recorded as
-# delivered with no triage behind it.
+# the turn, so an event offered while the gateway boots would rest on the
+# daemon's retries, which give up after a bounded wait.
 readonly AGENT_GATEWAY_URL="http://127.0.0.1:8642"
 
 # How long to wait for that daemon to start listening before launching the
@@ -154,6 +158,45 @@ DRIFT_DAEMON_POLL_SECONDS="${DRIFT_DAEMON_POLL_SECONDS:-2}"
 # the same request.
 # shellcheck disable=SC2034  # read indirectly, as clamp_at_least's default floor name
 readonly MIN_SETTING_VALUE=1
+
+# The shapes the watcher's duration and count flags are allowed to take: a
+# subset of what Go's flag package accepts, so that every value inside a
+# pattern (and, for a duration, inside duration_nanoseconds' range check) is
+# one the binary parses, and a value outside it only ever reaches the
+# fallback. A duration is time.ParseDuration's grammar narrowed five ways: no
+# sign (validate() rejects a negative settle, span or quiet period, and the
+# filter replaces a negative hold with its default anyway); no `µs`, `.5h` or
+# `1.h`; at most eighteen integer and three fraction digits per component,
+# which keeps the arithmetic below inside bash's int64; at most sixteen
+# components, which bounds duration_nanoseconds' loop (it rescans what is left
+# on every pass, so a value of thousands of components would hold PID 1 for
+# minutes before anything listens); and no more than
+# WATCHER_DURATION_MAX_HOURS in all. A count is plain decimal,
+# at most eighteen digits: the flag package reads ints with a base prefix, so
+# `08` is a bad octal literal there and `0x10` is sixteen, and nineteen digits
+# can overflow an int64, which it rejects as out of range.
+readonly WATCHER_DURATION_PATTERN='^(0|([0-9]{1,18}(\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$'
+readonly WATCHER_COUNT_PATTERN='^[0-9]{1,18}$'
+
+# Nanoseconds in one of each unit WATCHER_DURATION_PATTERN admits, and the
+# largest duration Go represents, for the size checks: whether a duration fits
+# Go's int64 of nanoseconds (`3000000h` does not), and whether it is above
+# zero once Go has truncated it to whole nanoseconds (`0.5ns` is not).
+readonly NS_PER_US=1000
+readonly NS_PER_MS=1000000
+readonly NS_PER_S=1000000000
+readonly NS_PER_M=60000000000
+readonly NS_PER_H=3600000000000
+readonly NS_MAX=9223372036854775807
+readonly DECIMAL_BASE=10
+
+# The longest duration a tunable may be, far below Go's limit of about
+# 2562047h. The watcher adds its own constants to two of them (the settle
+# period plus its quiet slack, the scale-up hold plus the staleness window),
+# and either sum wraps negative within minutes of Go's limit. A million hours
+# is over a century, so no tunable meant as one is refused, and the headroom
+# does not depend on what those constants are.
+readonly WATCHER_DURATION_MAX_HOURS=1000000
 
 # Rewrite the *named* variable, in place, to a decimal integer of at least the
 # value held by $2 (default MIN_SETTING_VALUE). By name on both sides because the
@@ -221,6 +264,94 @@ normalize_boolean() {
   esac
 }
 
+# Set the *named* variable to the whole nanoseconds Go's time.ParseDuration
+# reads $2 as, $2 being a duration WATCHER_DURATION_PATTERN already admitted,
+# and fail without setting it if Go would reject the value as out of range.
+# Each component's fraction is truncated as Go truncates it, and every
+# addition is checked against NS_MAX before it is made, as Go checks it. By
+# name, like the normalisers, so a caller reads the answer without a subshell.
+duration_nanoseconds() {
+  local out="$1"
+  local rest="$2"
+  local total=0 whole fraction unit per part
+  while [[ "${rest}" =~ ^([0-9]+)(\.([0-9]+))?(ns|us|ms|s|m|h)([0-9].*)?$ ]]; do
+    whole="${BASH_REMATCH[1]}"
+    fraction="${BASH_REMATCH[3]}"
+    unit="${BASH_REMATCH[4]}"
+    rest="${BASH_REMATCH[5]}"
+    case "${unit}" in
+      ns) per=1 ;;
+      us) per="${NS_PER_US}" ;;
+      ms) per="${NS_PER_MS}" ;;
+      s) per="${NS_PER_S}" ;;
+      m) per="${NS_PER_M}" ;;
+      h) per="${NS_PER_H}" ;;
+    esac
+    # Divided before multiplied, so the test itself cannot overflow.
+    if ((10#${whole} > (NS_MAX - total) / per)); then
+      return 1
+    fi
+    total=$((total + 10#${whole} * per))
+    if [[ -n "${fraction}" ]]; then
+      part=$((10#${fraction} * per / DECIMAL_BASE ** ${#fraction}))
+      if ((part > NS_MAX - total)); then
+        return 1
+      fi
+      total=$((total + part))
+    fi
+  done
+  printf -v "${out}" '%s' "${total}"
+}
+
+# Rewrite the *named* variable, in place, to a duration the watcher's flag
+# parser and validate() both accept, or to $2 if it is not one. The same
+# contract as normalize_boolean above, for the same reason: the value is pasted
+# into `--flag=${value}`, and one the watcher rejects is an exit on every start
+# -- the supervisor's backoff, `NO cluster events are being watched`, and a
+# container that stays Ready -- for a missing unit. $3, when set, also refuses
+# zero, for the flag whose validate() requires a value above it.
+normalize_duration() {
+  local name="$1"
+  local fallback="$2"
+  local positive="${3:-}"
+  local value="${!name}"
+  local nanoseconds=0
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+
+  # Zero is measured in nanoseconds rather than read off the digits: `0.5ns`
+  # has a non-zero digit and is still zero to the watcher.
+  if [[ "${value}" =~ ${WATCHER_DURATION_PATTERN} ]] && duration_nanoseconds nanoseconds "${value}" &&
+    ((nanoseconds <= WATCHER_DURATION_MAX_HOURS * NS_PER_H)) &&
+    { [[ -z "${positive}" ]] || ((nanoseconds > 0)); }; then
+    printf -v "${name}" '%s' "${value}"
+    return 0
+  fi
+
+  printf -v "${name}" '%s' "${fallback}"
+  echo "start-services: ${name}=${value} is not a usable duration (a Go duration such as 2m or 90s, up to eighteen digits and three decimals per number and sixteen numbers, at most ${WATCHER_DURATION_MAX_HOURS}h${positive:+, above zero}); using ${fallback}" >&2
+}
+
+# Rewrite the *named* variable, in place, to a decimal count the watcher's flag
+# parser accepts, or to $2 if it is not one. Leading zeros are dropped rather
+# than reported, as clamp_at_least drops them: `08` and `8` are the same
+# request, and only the binary would have read them differently.
+normalize_count() {
+  local name="$1"
+  local fallback="$2"
+  local value="${!name}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+
+  if [[ "${value}" =~ ${WATCHER_COUNT_PATTERN} ]]; then
+    printf -v "${name}" '%s' "$((10#${value}))"
+    return 0
+  fi
+
+  printf -v "${name}" '%s' "${fallback}"
+  echo "start-services: ${name}=${value} is not a usable count (decimal digits); using ${fallback}" >&2
+}
+
 clamp_at_least WATCHER_RETRY_MIN_SECONDS
 clamp_at_least DRIFT_RETRY_MIN_SECONDS
 # The ceilings are floored at their own minimum, not at MIN_SETTING_VALUE: a
@@ -248,12 +379,39 @@ clamp_at_least DRIFT_SHORT_EXIT_ALERT_COUNT
 # delivers the signal and not the shutdown.
 #
 # Fifteen seconds because the detector budgets ten to settle its in-flight
-# records (settleGracePeriod, k8s-operator/cmd/drift-detector/subscriber.go) and
-# the pod takes Kubernetes' default thirty-second grace period, so this leaves
-# half of it unspent for the credential runtime and Envoy. The poll is whole
-# seconds: the drain is bounded by the settle, not by how often it is checked.
+# records (settleGracePeriod, k8s-operator/cmd/drift-detector/subscriber.go).
+# A cut drain loses those settles: unsettled records go to the next instance,
+# which can post one duplicate drift record to Session KV per non-graceful
+# restart. The credential runtime is drained after them, on its own budget
+# (RUNTIME_DRAIN_SECONDS): it leaves on SIGTERM too.
+#
+# With the current operator, the only pod that runs this drain is the gateway
+# pod, where this script runs in the agent-api-auth native sidecar. That pod's
+# grace period is gatewayTerminationGracePeriodSeconds (60s,
+# k8s-operator/internal/controller/platformagent_manifests.go), not the 30s
+# default. Native sidecars are signalled after the app containers exit and share
+# that budget. Today the operator runs the gateway at one replica
+# (supportedGatewayReplicas), where Hermes' stop path may spend 40s, so this
+# drain gets about 20s. If multi-replica gateways return (#3016), leader_elect.py
+# may spend up to 56s (50s drain plus lease release calls), leaving this drain
+# about 4s; resizing it is tracked in #3407. An older operator's `combined`
+# sidecar keeps the 30s default, which 15s fits. The standalone broker pod
+# (CREDENTIAL_PROXY_ROLE=broker) starts no watcher or detector, so only the
+# runtime drain below runs there. The poll is whole seconds: the drain is
+# bounded by the settle, not by how often it is checked.
 readonly SHUTDOWN_DRAIN_SECONDS=15
 readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
+# The credential runtime's own drain budget. In the broker role the runtime
+# leaves on SIGTERM (install_shutdown_handler in
+# agents/platform/scripts/credential_proxy.py): it refuses new Chat event pulls,
+# keeps the settle routes open for its 3s window so the gateway's acks land,
+# hands any unsettled Chat receipt back to Pub/Sub, and exits. Killing it and
+# returning, as terminate() once did, delivered the signal and not that
+# shutdown, because terminate() returning is PID 1 exiting. Ten seconds is the
+# window plus margin, inside the broker pod's 30s default grace with the Envoy
+# kill after it. In the api-proxy role the runtime installs no handler and
+# exits on the signal, so the wait there is one poll.
+readonly RUNTIME_DRAIN_SECONDS=10
 
 # Where the watcher keeps its dedup snapshots. Without them the cache starts
 # empty on every restart, and an empty cache is not a neutral state: the
@@ -292,7 +450,15 @@ WATCHER_DEDUP_DIR="${WATCHER_DEDUP_DIR:-${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/
 #
 # Overridable because the right value depends on the fleet's failure mix, and
 # an operator should not have to rebuild the image to find out.
-WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-24h}"
+#
+# This and the seven tunables below reach the watcher as flags, so each is
+# normalised where it is declared (normalize_duration, normalize_count) against
+# a default named once, as WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD is: an unset
+# value and an unusable one resolve the same way. The window is the one that
+# also refuses zero, which the watcher's validate() rejects.
+readonly WATCHER_DEDUP_WINDOW_DEFAULT=24h
+WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-${WATCHER_DEDUP_WINDOW_DEFAULT}}"
+normalize_duration WATCHER_DEDUP_WINDOW "${WATCHER_DEDUP_WINDOW_DEFAULT}" positive
 
 # Leading-edge debounce for the crash-loop family: how many times kubelet must
 # report the same BackOff before it is treated as an incident rather than a
@@ -301,7 +467,9 @@ WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-24h}"
 # operator tunes per install — a cluster with slow-starting workloads wants it
 # higher — and threading it through an env var means doing so does not require
 # rebuilding the image. Set to 1 to restore firing on the first event.
-WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
+readonly WATCHER_BACKOFF_MIN_COUNT_DEFAULT=3
+WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}}"
+normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}"
 
 # The same debounce for the half of the image-pull family that self-clears —
 # registry rate limits, 5xx, connection timeouts. Only failures the watcher
@@ -310,18 +478,36 @@ WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
 # separately from the crash-loop value: an install pulling from a rate-limited
 # public registry wants it higher, and one where every pull is from a private
 # mirror will rarely see it apply at all. Set to 1 to disable.
-WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-3}"
+readonly WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT=3
+WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT}}"
+normalize_count WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT "${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT}"
 
 # The backstop for FailedScheduling when cluster-autoscaler has recorded no
-# verdict on the pod: five failed scheduling attempts, a count rather than a
-# time, since the scheduler retries on every cluster change and at least
-# every five minutes. The autoscaler's own events take precedence over it: a
+# verdict on the pod: five failed scheduling attempts, with
+# WATCHER_FAILEDSCHEDULING_MIN_SPAN below on top, because the scheduler
+# retries on every cluster change and the count alone climbs in seconds.
+# The autoscaler's own events take precedence over it: a
 # NotTriggerScaleUp on the pod fires at any count, a TriggeredScaleUp holds at
 # any count for WATCHER_SCALEUP_HOLD, and on a cluster with an autoscaler one
 # or the other arrives seconds after the pod's first attempt. Both are in the
 # --reason list below so the watcher reads them; neither is forwarded. Set to
-# 1 to fire on the first event when no verdict is on record.
-WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
+# 1, with WATCHER_FAILEDSCHEDULING_MIN_SPAN=0, to fire on the first event when
+# no verdict is on record.
+readonly WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT=5
+WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-${WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT}}"
+normalize_count WATCHER_FAILEDSCHEDULING_MIN_COUNT "${WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT}"
+
+# How long such a FailedScheduling has to have lasted, by the event's own first
+# and last sighting, before the count backstop passes it. The count alone
+# climbs in seconds while a node scale-down drains a node: no verdict is
+# recorded, the scheduler retries the evicted pod's replacement on every
+# change, and it is placed seconds later. A pod still stuck is sighted again
+# within the scheduler's five-minute flush and fires then. A Go duration
+# (2m, 90s); anything else falls back to the default. Set to 0 to switch it
+# off.
+readonly WATCHER_FAILEDSCHEDULING_MIN_SPAN_DEFAULT=2m
+WATCHER_FAILEDSCHEDULING_MIN_SPAN="${WATCHER_FAILEDSCHEDULING_MIN_SPAN:-${WATCHER_FAILEDSCHEDULING_MIN_SPAN_DEFAULT}}"
+normalize_duration WATCHER_FAILEDSCHEDULING_MIN_SPAN "${WATCHER_FAILEDSCHEDULING_MIN_SPAN_DEFAULT}"
 
 # How long a TriggeredScaleUp on a pod holds its FailedScheduling events,
 # measured from the autoscaler's event to the FailedScheduling's own last
@@ -329,7 +515,35 @@ WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
 # the alert: 15m is cluster-autoscaler's default node-provision timeout, and
 # a pod still pending past it is reported on the count whatever the autoscaler
 # last said. Raise it on a cluster whose node pools take longer to provision.
-WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-15m}"
+readonly WATCHER_SCALEUP_HOLD_DEFAULT=15m
+WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-${WATCHER_SCALEUP_HOLD_DEFAULT}}"
+normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}"
+
+# The settle period: how long a failure in the settle family (the crash-loop
+# family, FailedMount, Unhealthy; the reasons kubelet re-emits while they
+# last) has to have lasted, by the
+# event's own first and last sighting, before the watcher forwards it. It
+# runs after the count debounces above: a failure has to have repeated AND
+# lasted. A BackOff that clears inside it, kubelet warming its object cache on
+# a fresh Autopilot node, is not forwarded; a real crash loop crosses it on
+# its fourth or fifth back-off and is forwarded with its first sighting kept.
+# Never applied to OOMKilled, the image-pull family or FailedScheduling, which
+# have gates of their own. Set to 0 to switch it off.
+readonly WATCHER_SETTLE_DEFAULT=2m
+WATCHER_SETTLE="${WATCHER_SETTLE:-${WATCHER_SETTLE_DEFAULT}}"
+normalize_duration WATCHER_SETTLE "${WATCHER_SETTLE_DEFAULT}"
+
+# How long after its last sighting an incident whose alert went out is reported
+# quiet: the watcher sends the Session KV server one k8s-event-followup inject
+# for it, which lands in the alert's thread saying the object has emitted
+# nothing since, so a card read hours later says what was true when. Silence,
+# not recovery: the watcher reads events only and reads no object back, and a
+# deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
+# ceiling with margin, so a crash loop still going is never reported quiet
+# between two of its back-offs. Set to 0 to send none.
+readonly WATCHER_QUIET_AFTER_DEFAULT=15m
+WATCHER_QUIET_AFTER="${WATCHER_QUIET_AFTER:-${WATCHER_QUIET_AFTER_DEFAULT}}"
+normalize_duration WATCHER_QUIET_AFTER "${WATCHER_QUIET_AFTER_DEFAULT}"
 
 # Whether to hold the FailedScheduling an Autopilot cluster emits for GKE's own
 # system pods once it has scaled itself to zero nodes — kube-dns, metrics-server,
@@ -397,16 +611,31 @@ drift_pid=""
 # could not end a supervisor whose process is ignoring the signal -- which is the
 # only state a supervisor can still be in by the time the loop above gives up.
 drain_supervised() {
+  # The budget is the first argument, never read from the environment:
+  # spec.deployment.env reaches this container unfiltered, and a variable
+  # would have made the supervisors' drain a knob nothing documents.
+  local budget="$1"
+  shift
   local pid
-  local waited=0
-  local running
 
   for pid in "$@"; do
     pkill -TERM -P "${pid}" 2>/dev/null || true
     kill -TERM "${pid}" 2>/dev/null || true
   done
 
-  while [[ "${waited}" -lt "${SHUTDOWN_DRAIN_SECONDS}" ]]; do
+  wait_for_exit "${budget}" "$@"
+}
+
+# Wait until every pid is gone or the budget runs out, then SIGKILL whatever
+# is left: the second half of drain_supervised and of drain_runtime.
+wait_for_exit() {
+  local budget="$1"
+  shift
+  local pid
+  local waited=0
+  local running
+
+  while [[ "${waited}" -lt "${budget}" ]]; do
     running=""
     for pid in "$@"; do
       if kill -0 "${pid}" 2>/dev/null; then
@@ -424,6 +653,21 @@ drain_supervised() {
   done
 }
 
+# SIGTERM the credential runtime alone and wait for it. Not drain_supervised:
+# that sweeps the pid's children first, and the runtime's children are the
+# brokered commands in flight (kubectl, git, gh, gcloud, each in its own
+# session), which the runtime keeps its exec route open for during its settle
+# window so they can finish. A sweep would end them at the first instant of
+# the stop. One still running when the runtime exits dies with the pod, as it
+# did before.
+drain_runtime() {
+  local budget="$1"
+  local pid="$2"
+
+  kill -TERM "${pid}" 2>/dev/null || true
+  wait_for_exit "${budget}" "${pid}"
+}
+
 terminate() {
   trap - EXIT INT TERM
 
@@ -432,12 +676,49 @@ terminate() {
   [[ -z "${drift_pid}" ]] || supervisors+=("${drift_pid}")
   # One shared drain budget, not one each: the two run concurrently and the pod's
   # grace period does not grow with the number of processes in the container.
-  [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${supervisors[@]}"
+  [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${SHUTDOWN_DRAIN_SECONDS}" "${supervisors[@]}"
 
-  [[ -z "${runtime_pid}" ]] || kill "${runtime_pid}" 2>/dev/null || true
+  # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS and drain_runtime.
+  [[ -z "${runtime_pid}" ]] || drain_runtime "${RUNTIME_DRAIN_SECONDS}" "${runtime_pid}"
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
 }
 trap terminate EXIT INT TERM
+
+# What ended the container, said before it ends. Only the credential path's
+# two processes are waited on at the foot of this script, and when one of them
+# exits nothing else says which or how: the broker's own log stops mid-request
+# and Envoy's says nothing. A status over SIGNAL_EXIT_BASE is a signal; 137 is
+# SIGKILL, which is the kernel's OOM killer or the kubelet, and the container's
+# lastState (`OOMKilled`) says which. Under cgroup v2 the kubelet sets
+# memory.oom.group, so an OOM kill takes this script down with the process it
+# was for, and then no line is written at all: a restart with OOMKilled in
+# lastState and no line here is that case, and the broker's own memory
+# high-water lines before it are the record of what it held (#4315).
+report_credential_path_exit() {
+  local ended_pid="$1"
+  local status="$2"
+  local name="a credential-path process"
+  if [[ -z "${ended_pid}" && "${status}" -gt "${SIGNAL_EXIT_BASE}" ]]; then
+    # Nothing was waited for: the signal was this script's, the kubelet's
+    # stop, and `terminate` has already ended the credential-path processes
+    # for it (both in the broker role; the runtime alone in api-proxy).
+    echo "start-services: stopped by signal $((status - SIGNAL_EXIT_BASE)) (exit status ${status}) before a credential-path process exited; the container ends" >&2
+    return "${status}"
+  fi
+  if [[ -n "${ended_pid}" && "${ended_pid}" == "${runtime_pid}" ]]; then
+    name="the credential runtime"
+  elif [[ -n "${ended_pid}" && -n "${envoy_pid}" && "${ended_pid}" == "${envoy_pid}" ]]; then
+    name="envoy"
+  fi
+  if [[ "${status}" -gt "${SIGNAL_EXIT_BASE}" ]]; then
+    echo "start-services: ${name} (pid ${ended_pid}) was killed by signal $((status - SIGNAL_EXIT_BASE)) (exit status ${status}); the container ends" >&2
+  else
+    echo "start-services: ${name} (pid ${ended_pid}) exited with status ${status}; the container ends" >&2
+  fi
+  # Handed back so that, as the script's last command, the status it reports
+  # is the status the container exits with.
+  return "${status}"
+}
 
 # Workload Identity Federation, when the proxy shares a pod with the shell
 # sandbox. It has to run before anything that authenticates to GCP: the
@@ -608,6 +889,7 @@ start_event_watcher() {
       /usr/local/bin/k8s-event-watcher \
         --cluster-name="${EVENT_WATCHER_CLUSTER_NAME:-}" \
         --profiles-dir="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/profiles" \
+        --data-volume="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}" \
         --dedup-persist="${dedup_persist}" \
         --dedup-window="${WATCHER_DEDUP_WINDOW}" \
         --metrics-addr="${metrics_addr}" \
@@ -620,7 +902,10 @@ start_event_watcher() {
         --backoff-min-count="${WATCHER_BACKOFF_MIN_COUNT}" \
         --imagepull-transient-min-count="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT}" \
         --failedscheduling-min-count="${WATCHER_FAILEDSCHEDULING_MIN_COUNT}" \
+        --failedscheduling-min-span="${WATCHER_FAILEDSCHEDULING_MIN_SPAN}" \
         --scaleup-hold="${WATCHER_SCALEUP_HOLD}" \
+        --settle="${WATCHER_SETTLE}" \
+        --quiet-after="${WATCHER_QUIET_AFTER}" \
         --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" || true
       ran=$(( SECONDS - started ))
 
@@ -884,6 +1169,13 @@ fi
 # Only the credential-path services are waited on. The watcher and the drift
 # detector are absent from this list deliberately — see the header. envoy_pid is
 # empty in the api-proxy role, and `wait -n` rejects an empty argument, so it is
-# expanded unquoted.
+# expanded unquoted. `-p` names the one that exited; its status is the
+# container's, once report_credential_path_exit has said whose it was: the
+# report is the last command, and it returns the status it was given.
+# `-p` unsets its variable when no process was waited for, which a trapped
+# SIGTERM is, so the expansion carries a default or `set -u` ends the script
+# on this line instead of the report.
+exit_status=0
 # shellcheck disable=SC2086
-wait -n "${runtime_pid}" ${envoy_pid}
+wait -n -p ended_pid "${runtime_pid}" ${envoy_pid} || exit_status=$?
+report_credential_path_exit "${ended_pid-}" "${exit_status}"

@@ -29,3 +29,12 @@ oss\.gprow\.dev
 
 # Internal repositories.
 gke-internal/
+
+# Maintainer release-pipeline markers: the eval-candidate tag prefix, a
+# concrete release-candidate tag (`rc_` followed by a digit; the word boundary
+# keeps `src_1` and the like clear, and the `rc_YYMMDDHHMM_<SHA>` template is
+# not a tag), and the `release-*.yml` workflow files. A page that needs them is
+# a release runbook, and its home is scripts/release/README.md.
+evalcand_
+\brc_[0-9]
+\.github/workflows/release-

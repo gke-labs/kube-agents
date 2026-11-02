@@ -46,6 +46,22 @@ const (
 	stagePrefix       = "stage-"
 )
 
+// The staged emptyDirs' sizeLimits. A staging container writes its volume once,
+// before the harness starts, and the mount is read-only after, so an image whose
+// payload is over the limit fails at the pod's first start, never mid-task. A
+// persona's payload is skills and a persona file: sixteen times the largest such
+// tree in the repository (agents/platform, 20 MiB), rounded up. No tools image
+// ships yet to measure, so each takes the 1Gi floor for a workspace a process
+// writes into; each tools image has its own volume. stagingLogsAllowance is what
+// a staging container requests as ephemeral storage on top of its volume, for
+// its own logs (its root filesystem is read-only), with the limit equal: a
+// LimitRange defaulting a smaller limit would refuse a request with none.
+const (
+	personaStagingSizeLimit = "512Mi"
+	toolStagingSizeLimit    = "1Gi"
+	stagingLogsAllowance    = "64Mi"
+)
+
 // stagingResources are the staging init containers' fixed requests and limits.
 // A staging run is one streaming cp, so it needs little. Setting them matters
 // anyway: a namespace quota on requests.cpu or requests.memory rejects a pod
@@ -91,19 +107,19 @@ func ToolMountPath(name string) string {
 // staged; such an image must then ship /bin/sh.
 func RenderPersonaAndTools(profile *agentv1alpha1.AgentProfile, imageVolumesSupported bool) Rendered {
 	var r Rendered
-	r.add(personaVolumeName, profile.Spec.Persona.Image, nil, PersonaMountPath, imageVolumesSupported)
+	r.add(personaVolumeName, profile.Spec.Persona.Image, nil, PersonaMountPath, personaStagingSizeLimit, imageVolumesSupported)
 
 	bins := make([]string, 0, len(profile.Spec.Tools))
 	for _, tool := range profile.Spec.Tools {
 		mountPath := ToolMountPath(tool.Name)
-		r.add(toolVolumePrefix+tool.Name, tool.Image, tool.ImagePullPolicy, mountPath, imageVolumesSupported)
+		r.add(toolVolumePrefix+tool.Name, tool.Image, tool.ImagePullPolicy, mountPath, toolStagingSizeLimit, imageVolumesSupported)
 		bins = append(bins, path.Join(mountPath, "bin"))
 	}
 	r.PathPrefix = strings.Join(bins, ":")
 	return r
 }
 
-func (r *Rendered) add(volume, image string, policy *corev1.PullPolicy, mountPath string, imageVolumesSupported bool) {
+func (r *Rendered) add(volume, image string, policy *corev1.PullPolicy, mountPath, sizeLimit string, imageVolumesSupported bool) {
 	pullPolicy := corev1.PullIfNotPresent
 	if policy != nil {
 		pullPolicy = *policy
@@ -118,9 +134,9 @@ func (r *Rendered) add(volume, image string, policy *corev1.PullPolicy, mountPat
 	} else {
 		r.Volumes = append(r.Volumes, corev1.Volume{
 			Name:         volume,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(sizeLimit))}},
 		})
-		r.InitContainers = append(r.InitContainers, stagingContainer(volume, image, pullPolicy, mountPath))
+		r.InitContainers = append(r.InitContainers, stagingContainer(volume, image, pullPolicy, mountPath, sizeLimit))
 	}
 	mount := corev1.VolumeMount{Name: volume, MountPath: mountPath, ReadOnly: true}
 	if imageVolumesSupported {
@@ -138,7 +154,12 @@ func (r *Rendered) add(volume, image string, policy *corev1.PullPolicy, mountPat
 // nothing else from the image: unlike AgentPlugin's staging there is no
 // top-level fallback, which would also have copied the mount into itself for
 // /persona.
-func stagingContainer(volume, image string, pullPolicy corev1.PullPolicy, mountPath string) corev1.Container {
+func stagingContainer(volume, image string, pullPolicy corev1.PullPolicy, mountPath, sizeLimit string) corev1.Container {
+	resources := *stagingResources.DeepCopy()
+	ephemeral := resource.MustParse(sizeLimit)
+	ephemeral.Add(resource.MustParse(stagingLogsAllowance))
+	resources.Requests[corev1.ResourceEphemeralStorage] = ephemeral
+	resources.Limits[corev1.ResourceEphemeralStorage] = ephemeral.DeepCopy()
 	script := fmt.Sprintf(`set -e
 src=/%s
 dst=%q
@@ -153,7 +174,7 @@ done
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
 		Command:         []string{"/bin/sh", "-c", script},
-		Resources:       *stagingResources.DeepCopy(),
+		Resources:       resources,
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: ptr.To(false),
 			ReadOnlyRootFilesystem:   ptr.To(true),

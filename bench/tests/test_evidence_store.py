@@ -298,6 +298,23 @@ def test_the_path_spells_out_the_version_key(gcloud, monkeypatch):
     assert gcloud.objects[url].endswith("\n")
 
 
+def test_a_next_key_files_under_its_own_directory(gcloud):
+    """The mode suffixes the last segment for next only, so every today
+    directory is the one it always was and a next window is its own prefix."""
+    backend = GcsBackend("gs://b/e")
+    today = backend.append("case-a", line("case-a", key=KEY))
+    nxt = backend.append("case-a", line("case-a", key={**KEY, "mode": "next"}))
+    assert f"/{KEY_DIR}/" in today
+    assert f"/{KEY_DIR}-next/" in nxt
+    assert backend.append("case-a", line("case-a", at="2026-08-02T00:00:00Z", key={**KEY, "mode": "today"})).rsplit("/", 1)[0] == today.rsplit("/", 1)[0]
+
+
+def test_the_default_mode_is_the_baselines_today():
+    from kube_agents_bench import baselines, evidence_store
+
+    assert evidence_store.DEFAULT_KEY_MODE == baselines.MODE_TODAY
+
+
 def test_the_judge_model_keeps_its_dots(gcloud):
     """The whole point of this layout over a hash is that a human reads it."""
     url = GcsBackend("gs://b/e").append("case-a", line("case-a", key=KEY))

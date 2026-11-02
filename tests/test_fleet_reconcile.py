@@ -345,6 +345,21 @@ class TargetsTest(unittest.TestCase):
         }
         self.assertEqual(reconcile.drifted_projects(document), [P8, "kube-agents-evals-9"])
 
+    def test_a_project_whose_only_drift_no_re_apply_clears_is_skipped(self):
+        # #4005: the age gate and a master ahead of its channel; one ordinary line beside them keeps the project.
+        age = 'cluster createTime age_hours_ge 24: observed "2026-09-14T12:00:00+00:00", 1.0 hours old'
+        ahead = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000", newer than every 1.34 patch REGULAR offers (newest 1.34.11-gke.1209000)'
+        document = {
+            "projects": {
+                P7: {"roles": {"drift-outlier": {"state": "drifted", "detail": [age]}, "version-laggard": {"state": "drifted", "detail": [ahead]}}},
+                P8: {"roles": {"drift-outlier": {"state": "drifted", "detail": [age, "cluster masterAuthorizedNetworksConfig.enabled none_eq true: observed true"]}}},
+            }
+        }
+        # An unset channel on the same op is the stack's to restore, so that project is applied.
+        unset = 'cluster currentMasterVersion not_ahead_of_channel: observed "1.34.12-gke.1011000"; release channel unset'
+        document["projects"]["kube-agents-evals-9"] = {"roles": {"version-laggard": {"state": "drifted", "detail": [unset]}}}
+        self.assertEqual(reconcile.drifted_projects(document), [P8, "kube-agents-evals-9"])
+
     def test_a_scan_with_no_drift_targets_nothing(self):
         self.assertEqual(reconcile.drifted_projects({"projects": {P7: {"roles": {}}}}), [])
         self.assertEqual(reconcile.drifted_projects({}), [])
@@ -601,6 +616,17 @@ class MainTest(unittest.TestCase):
         self.assertIn("-var=project_id=%s" % P8, tofu.calls[1])
         self.assertEqual(boskos.resets[0]["state"], reconcile.HOLD_STATE)
         self.assertEqual(boskos.resets[0]["expire"], reconcile.STRANDED_AFTER)
+
+    def test_drifted_skips_and_names_a_project_no_re_apply_clears(self):
+        scan = {"projects": {P8: {"roles": {"drift-outlier": {"state": "drifted", "detail": ['cluster createTime age_hours_ge 24: observed "2026-09-14T12:00:00+00:00", 1.0 hours old']}}}}}
+        tofu = _Tofu({})
+        with mock.patch("builtins.print") as printed:
+            rc, _ = self._main(["--drifted"], _Boskos(free=[P8]), tofu, scan=scan)
+        self.assertEqual(rc, reconcile.EXIT_OK)
+        self.assertEqual(tofu.verbs(), [], "an apply there changes nothing")
+        lines = [c.args[0] for c in printed.call_args_list if c.args]
+        self.assertIn("skipped, no re-apply clears their drift: %s" % P8, lines)
+        self.assertIn("1 project(s) drifted in %s, 0 to re-apply" % reconcile.DEFAULT_FIXTURE_STATE, lines)
 
     def test_all_asks_for_every_mapped_project_after_resetting_strands_and_applies_each(self):
         # The full-pass arm: every mapped project is asked for by name, held
@@ -1747,10 +1773,12 @@ class ConvergedTest(unittest.TestCase):
 class AllowlistTest(unittest.TestCase):
     """What a re-apply may delete or replace is declared in the fleet directory, not in this script."""
 
-    def test_the_committed_allowlist_carries_the_no_surge_pool_as_a_standing_entry(self):
+    def test_the_committed_allowlist_carries_its_two_standing_entries(self):
+        # The no-surge pool's replace on a minor roll, and the scaled-zero
+        # gateway fixture's status writer, replaced when its Gateway or route is.
         entries = reconcile.load_allowlist(reconcile.ALLOWLIST_FILE)
         standing = [e for e in entries if e.standing]
-        self.assertEqual([e.address for e in standing], ["google_container_node_pool.no_surge_pool"])
+        self.assertEqual([e.address for e in standing], ["google_container_node_pool.no_surge_pool", "terraform_data.scaled_zero_status"])
         self.assertTrue(all(e.why for e in entries), "every entry says why")
         self.assertFalse(hasattr(reconcile, "REPLACE_ALLOWED_ADDRESSES"), "one list, in the file")
 

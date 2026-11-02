@@ -1,6 +1,6 @@
 name: Merge Gate
 
-# The merge queue's two gate checks: `Smoke gate` and `Merge labels` (#1363). Each stands in for something Tide decides today that no required
+# The merge queue's two gate checks: `Smoke gate` and `Merge labels` (#1363). Each stands in for something Tide decided that no required
 # GitHub check covers; `scripts/merge_gate.py`'s docstring says what each one
 # reads and is the reference.
 #
@@ -16,11 +16,10 @@ name: Merge Gate
 # there under the check names themselves. The queue must group with
 # `ALLGREEN`; the script says why.
 #
-# Until a merge queue is enabled on `main` nothing requires these and
-# `merge_group` never fires. Tide does read them, as it reads every posted
+# This was written while Tide still merged `main`. Tide read every posted
 # context, so the head statuses are posted green only; `post_verdicts` in the
-# script says why. Tide also reads this job's own check run on the pull
-# request head, where a cancelled or failed run holds the merge, so the job
+# script says why. Tide also read this job's own check run on the pull
+# request head, where a cancelled or failed run held the merge, so the job
 # has no concurrency group (a superseded pending run is cancelled) and on
 # that trigger no step can fail it.
 on:
@@ -77,8 +76,8 @@ jobs:
       # Event fields go in through the environment, never into the script
       # text. On `pull_request_target` a failure here or in the checkout is
       # logged and left to the next event: that run's check run sits on the
-      # pull request head, and a red one would hold the Tide merge of a pull
-      # request the gate exists only to describe. A `status` run attaches to
+      # pull request head, and under Tide a red one held the merge of a pull
+      # request the gate existed only to describe. A `status` run attaches to
       # the default branch and holds nothing, so it goes red and a failure
       # that repeats stays visible.
       - name: Post the statuses

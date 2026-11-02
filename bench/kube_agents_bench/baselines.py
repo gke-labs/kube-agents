@@ -67,7 +67,7 @@ is that knowledge (decided 2026-09-14, gke-labs/kube-agents#1493). In
 case only while the store cannot judge it, and once a full window exists the
 record decides either way. See :meth:`BaselineStore.admission`.
 
-THE VERSION KEY, AND WHY IT IS MOSTLY NOT OURS. Three of its five components
+THE VERSION KEY, AND WHY IT IS MOSTLY NOT OURS. Three of its six components
 are produced by devops-bench and read off the run: ``setupId`` from
 ``manifest.json`` folds together the agent model, the harness and the
 augmentation, and ``scoringVersion`` from ``rows.json`` names the roll-up
@@ -87,6 +87,15 @@ THE JUDGE MODEL IS PINNED INDEPENDENTLY of the agent model, which is why it is
 a separate component rather than being folded into ``setupId``. A drifting
 judge moves every baseline at once, and a judge that tracks whatever the agent
 is running cannot be told apart from an agent that got better.
+
+THE MODE IS THE SIXTH COMPONENT: the ``spec.mode`` of the install the matrix
+graded, ``today`` or ``next``. ``setupId`` names the same agent model and
+harness under either, so without it a next-mode run and a today-mode run file
+under one key, and rung 6 compared a next run's judged mean with today's
+history. The gate reads it off the run's transport (``gate.graded_mode``).
+``today`` is the default and is never written: a record with no ``mode`` reads
+as today, so every line recorded before the field existed keeps matching
+today's key, and a today key serialises byte-for-byte as it did.
 """
 
 from __future__ import annotations
@@ -115,6 +124,9 @@ __all__ = [
     "ADMITTED_BY_BOOTSTRAP",
     "ADMITTED_BY_NEITHER",
     "ADMITTED_BY_RECORD",
+    "MODES",
+    "MODE_NEXT",
+    "MODE_TODAY",
     "RECORD_COLLECTING",
     "RECORD_NONE",
     "RECORD_STALE",
@@ -172,6 +184,13 @@ RECORD_WOULD_DEMOTE = "would-demote"
 RECORD_COLLECTING = "collecting"
 RECORD_STALE = "stale"
 RECORD_NONE = "none"
+
+#: The ``spec.mode`` a run graded, the version key's sixth component.
+#: ``today`` is the default and is left out of the serialised key, so the
+#: records written before the component existed read as today.
+MODE_TODAY = "today"
+MODE_NEXT = "next"
+MODES = (MODE_TODAY, MODE_NEXT)
 
 #: Which authority admits a case. ``roster``: ``BOOTSTRAP_ADMITTED`` decides,
 #: the record informs. ``record``: the record decides once it holds a full
@@ -316,11 +335,11 @@ def load_versions(path: str | Path) -> Versions:
 
 @dataclass(frozen=True)
 class VersionKey:
-    """The five components a baseline record is filed under.
+    """The six components a baseline record is filed under.
 
-    Equality is exact on all five. There is no notion of a compatible-enough
+    Equality is exact on all six. There is no notion of a compatible-enough
     key: the point of the key is that a baseline measured on other software is
-    not evidence about this one.
+    not evidence about this one, and a next-mode install is other software.
     """
 
     setup_id: str
@@ -328,24 +347,34 @@ class VersionKey:
     judge_model: str
     fleet: int
     verifiers: int
+    mode: str = MODE_TODAY
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        """The key as written. ``mode`` only when it is not today, so a today
+        key is the same five-field object every existing line carries."""
+        doc: dict[str, Any] = {
             "setup_id": self.setup_id,
             "scoring_version": self.scoring_version,
             "judge_model": self.judge_model,
             "fleet": self.fleet,
             "verifiers": self.verifiers,
         }
+        if self.mode != MODE_TODAY:
+            doc["mode"] = self.mode
+        return doc
 
     @classmethod
     def from_dict(cls, doc: dict[str, Any]) -> VersionKey:
+        """An absent or empty ``mode`` is today. Any other value is kept as
+        written, so a mode this reader does not know matches neither today's
+        key nor next's rather than being pooled into one of them."""
         return cls(
             setup_id=str(doc.get("setup_id") or ""),
             scoring_version=str(doc.get("scoring_version") or ""),
             judge_model=str(doc.get("judge_model") or ""),
             fleet=int(doc.get("fleet") or 0),
             verifiers=int(doc.get("verifiers") or 0),
+            mode=str(doc.get("mode") or MODE_TODAY),
         )
 
     @classmethod
@@ -356,6 +385,7 @@ class VersionKey:
         scoring_version: str | None,
         judge_model: str | None,
         versions: Versions,
+        mode: str = MODE_TODAY,
     ) -> VersionKey | None:
         """Build the key for a run, or None when the run does not carry one.
 
@@ -372,6 +402,7 @@ class VersionKey:
             judge_model=judge_model,
             fleet=versions.fleet,
             verifiers=versions.verifiers,
+            mode=mode,
         )
 
 
@@ -745,7 +776,8 @@ class BaselineStore:
                     f"stale: {known} baseline record(s) exist for this case but "
                     f"none at the current key ({key.setup_id}, judge "
                     f"{key.judge_model}, fleet {key.fleet}, verifiers "
-                    f"{key.verifiers}) -- re-screen before this case can collapse"
+                    f"{key.verifiers}, mode {key.mode}) -- re-screen before "
+                    "this case can collapse"
                 )
             return "no screening evidence for this case yet"
         span = f"{evidence.lines} recorded run(s)"

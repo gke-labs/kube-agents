@@ -69,6 +69,7 @@ const (
 	slackHomeCritical = "🔴"
 	slackHomeWarning  = "🟠"
 	slackHomeHealthy  = "🟢"
+	slackHomeNeutral  = "⚪"
 
 	// slackDateToken is Slack's date formatting: rendered in the viewer's
 	// own time zone, with the fallback shown by a client that cannot.
@@ -86,6 +87,8 @@ const (
 	slackHomeBoardUnread  = "Could not read the board at %s."
 	slackHomeMoreFindings = " · %d more finding%s"
 	slackHomeNoFindings   = "no open findings"
+	slackHomeNotYet       = "no findings registered yet"
+	slackHomeFirstReport  = "Send me a message to get your first report and findings."
 	slackHomeAuditCounts  = "*%s:* %d finding%s, %d critical"
 	slackHomeAuditClean   = "*%s:* clean"
 	slackHomeUpdated      = "updated "
@@ -94,6 +97,16 @@ const (
 	slackHomeOpened       = "opened "
 	// slackHomePRLink is a pull request as mrkdwn: its URL, number and title.
 	slackHomePRLink = "<%s|#%d %s>"
+
+	// slackHomeFeedbackWeek is the answer ratings line, over the last
+	// slackHomeFeedbackWindow, drawn when answer feedback is on.
+	slackHomeFeedbackWeek   = "This week: %d 👍, %d 👎"
+	slackHomeFeedbackWindow = 7 * 24 * time.Hour
+	// slackHomeTallyFresh and slackHomeTallyErrorFresh are how long a tally,
+	// and a failed one, is reused: a week's count moves slowly, and the
+	// tally reads the whole bucket.
+	slackHomeTallyFresh      = 5 * time.Minute
+	slackHomeTallyErrorFresh = time.Minute
 	// slackHomeHTTPS is the scheme prRepo reads a forge URL under.
 	slackHomeHTTPS = "https://"
 
@@ -144,6 +157,10 @@ type slackHome struct {
 	// running: the running pass rearms the timer when it ends, so passes
 	// never overlap and no change is lost.
 	dirty bool
+	// The answer ratings tally, cached like the board (homeTally).
+	tallyUp, tallyDown int
+	tallyErr           error
+	tallyAt            time.Time
 }
 
 var _ HomeSink = (*SlackAdapter)(nil)
@@ -198,7 +215,8 @@ func (s *SlackAdapter) publishHome(member string, republish bool) {
 			s.log.Warn("slack: home tab board read failed", "err", err)
 			board = &lib.Board{Error: err.Error()}
 		}
-		view.Blocks = slack.Blocks{BlockSet: s.homeBlocks(board, s.waitingOn(member), time.Now())}
+		blocks := s.homeBlocks(board, s.waitingOn(member), time.Now())
+		view.Blocks = slack.Blocks{BlockSet: append(blocks, s.homeFeedback()...)}
 	}
 	if _, err := s.api.PublishView(member, view, ""); err != nil {
 		s.log.Warn("slack: views.publish failed", "member", member, "err", err)
@@ -207,8 +225,12 @@ func (s *SlackAdapter) publishHome(member string, republish bool) {
 
 // homeAdmitted is the allowlist, and under allow-all the member's workspace
 // being the bot's: allow-all admits anyone who can open the app, and a Slack
-// Connect member of another organisation is not anyone. A listed member is
-// the install's own word and needs no users.info (nor users:read). decided is
+// Connect member of another organisation is not anyone. With no guest entries
+// on the list, a listed member is the install's own word and needs no
+// users.info (nor users:read). With guest entries, every member is looked up,
+// because the event carries only the bare member id: a member of another
+// workspace is admitted only by the "T…:U…" entry naming them (admitGuest), as
+// on the message path, and never by a plain entry or allow-all. decided is
 // false when that lookup failed, which says nothing either way.
 func (s *SlackAdapter) homeAdmitted(member string) (admitted, decided bool) {
 	s.home.mu.Lock()
@@ -218,18 +240,26 @@ func (s *SlackAdapter) homeAdmitted(member string) (admitted, decided bool) {
 		return false, true
 	}
 	ok, byAllowAll := admits(member)
-	if !ok {
-		return false, true
-	}
-	if !byAllowAll {
-		return true, true
+	if len(s.guests) == 0 && (!ok || !byAllowAll) {
+		return ok, true
 	}
 	user, err := s.api.GetUserInfo(member)
 	if err != nil {
 		s.log.Warn("slack: home tab member lookup failed; publishing nothing", "member", member, "err", err)
 		return false, false
 	}
-	return s.teamID != "" && user.TeamID == s.teamID, true
+	if s.otherWorkspace(user.TeamID) {
+		guest, listed := s.admitGuest(user.TeamID, "", member)
+		if !listed {
+			return false, true
+		}
+		ok, _ = admits(guest)
+		return ok, true
+	}
+	if byAllowAll {
+		return ok && s.teamID != "" && user.TeamID == s.teamID, true
+	}
+	return ok, true
 }
 
 // homeBoard is the cached snapshot, read again once it is older than
@@ -257,6 +287,50 @@ func (s *SlackAdapter) homeBoard() (*lib.Board, error) {
 	s.home.cached, s.home.readErr, s.home.readAt = b, err, time.Now()
 	s.home.mu.Unlock()
 	return b, err
+}
+
+// homeFeedback is the answer ratings line under a divider, or nothing when
+// answer feedback is off or the tally could not be read.
+func (s *SlackAdapter) homeFeedback() []slack.Block {
+	recorder := s.feedbackRecorder()
+	if recorder == nil {
+		return nil
+	}
+	up, down, err := s.homeTally(recorder)
+	if err != nil {
+		s.log.Warn("slack: home tab feedback tally failed", "err", err)
+		return nil
+	}
+	return []slack.Block{
+		slack.NewDividerBlock(),
+		slack.NewContextBlock("", slack.NewTextBlockObject(slack.MarkdownType, fmt.Sprintf(slackHomeFeedbackWeek, up, down), false, false)),
+	}
+}
+
+// homeTally is the cached tally of the last slackHomeFeedbackWindow's
+// ratings, read again once it is older than slackHomeTallyFresh.
+func (s *SlackAdapter) homeTally(recorder FeedbackRecorder) (up, down int, err error) {
+	s.home.mu.Lock()
+	age := time.Since(s.home.tallyAt)
+	switch {
+	case s.home.tallyErr == nil && !s.home.tallyAt.IsZero() && age < slackHomeTallyFresh:
+		up, down = s.home.tallyUp, s.home.tallyDown
+		s.home.mu.Unlock()
+		return up, down, nil
+	case s.home.tallyErr != nil && age < slackHomeTallyErrorFresh:
+		err = s.home.tallyErr
+		s.home.mu.Unlock()
+		return 0, 0, err
+	}
+	s.home.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), slackHomeBoardTimeout)
+	defer cancel()
+	now := time.Now()
+	up, down, err = recorder.Tally(ctx, now.Add(-slackHomeFeedbackWindow))
+	s.home.mu.Lock()
+	s.home.tallyUp, s.home.tallyDown, s.home.tallyErr, s.home.tallyAt = up, down, err, now
+	s.home.mu.Unlock()
+	return up, down, err
 }
 
 func (s *SlackAdapter) noteViewer(member string) {
@@ -407,11 +481,14 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 		total := max(b.ClusterCount, len(b.Clusters))
 		note(fmt.Sprintf(slackHomeClusterCount, total, plural(total)),
 			slackHomeUpdated+slackDate(b.GeneratedAt, slackDateTime))
+		if b.FirstReportPending && b.FirstMessagePending {
+			note(slackHomeFirstReport)
+		}
 		for i, c := range b.Clusters {
 			if i == slackHomeClustersMax {
 				break
 			}
-			section(clusterLine(c), nil)
+			section(clusterLine(c, b.FirstReportPending), nil)
 		}
 		if shown := min(len(b.Clusters), slackHomeClustersMax); total > shown {
 			note(fmt.Sprintf(slackHomeMoreClusters, total-shown, plural(total-shown)))
@@ -473,9 +550,13 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 }
 
 // clusterLine is one cluster: a dot for its worst open finding, its name,
-// that finding's title and how many more there are.
-func clusterLine(c lib.BoardCluster) string {
+// that finding's title and how many more there are. Before the first report,
+// no finding means not checked yet, so it is not drawn green.
+func clusterLine(c lib.BoardCluster, firstReportPending bool) string {
 	name := "*" + slackEscaper.Replace(c.Name) + "*"
+	if c.Findings == 0 && firstReportPending {
+		return slackHomeNeutral + " " + name + "  " + slackHomeNotYet
+	}
 	if c.Findings == 0 {
 		return slackHomeHealthy + " " + name + "  " + slackHomeNoFindings
 	}

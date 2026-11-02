@@ -1,0 +1,87 @@
+# Skill-guidance probe for gke-cluster-autoscaler: the scope of the ~5-minute
+# stockout cooldown on a cluster at or past GKE 1.36.3-gke.1244000. Upstream's
+# gke-cluster-autoscaler says a hard stockout puts the whole priority tier on
+# a GLOBAL cooldown across all zones; upstream's own gke-compute-classes says
+# that holds only before 1.36.3-gke.1244000 and that from it the cooldown is
+# zonal, so the healthy zones keep provisioning the preferred tier. The
+# overlay patch on gke-cluster-autoscaler carries that version split; main's
+# skill gives the pre-1.36.3 answer for every cluster.
+#
+# The objective is a verdict line the prompt asks for, so the deterministic
+# check reads a decision rather than prose: a regex over the flat report
+# cannot tell "zonal" said of this cluster from the same word said of the
+# legacy behaviour or negated. The verdict must be a line of its own, and an
+# answer that also states the other verdict on a line of its own fails. The
+# verifier lowercases the report and drops emphasis and backticks, so the
+# patterns are lowercase; fold_decoration lets a numbered, bolded or quoted
+# verdict line count;
+# bench/tests/test_autoscaler_cooldown_verdict.py pins both sides. Why the verdict
+# holds is left to the judge, which reads expected_output.
+#
+# Planted defect required: none. deployer: noop, no fixture, no cluster read.
+#
+# Isolation class: read-only (no cluster touched at all).
+# Tier: nightly (hack/eval/nightly-cases.txt).
+id: autoscaler-zonal-stockout-cooldown-scope-probe
+name: On GKE 1.36.3-gke.1244000 or later a zonal stockout cools down only its own zone, not the whole priority tier
+
+owner: GinnyJI
+domain: capacity
+
+prompt: >-
+  Our regional GKE cluster in us-central1 (zones a, b, c) runs
+  1.36.4-gke.1100000. Its ComputeClass batch has two priorities: n2 Spot
+  first, then e2 on-demand. A StatefulSet pod with a zonal persistent volume
+  in us-central1-a just forced a scale-up of n2 Spot there, which failed with
+  ZONE_RESOURCE_POOL_EXHAUSTED. Within the next five minutes an unconstrained
+  Deployment pod on the same ComputeClass needs a new node. Will the
+  autoscaler still try n2 Spot in us-central1-b and us-central1-c, or skip
+  the n2 Spot tier in every zone and fall back to e2 on-demand? Load the
+  installed gke-cluster-autoscaler skill and answer from it before searching
+  documentation. Start your answer with exactly one of these lines, on its
+  own: "VERDICT: STILL-TRIES-N2-SPOT" or "VERDICT: FALLS-BACK-TO-E2". Do not
+  apply anything.
+expected_output: >-
+  VERDICT: STILL-TRIES-N2-SPOT. From GKE 1.36.3-gke.1244000 the ~5-minute
+  stockout cooldown is zonal: only us-central1-a's n2 Spot tier is backed
+  off, and the healthy zones b and c keep provisioning n2 Spot for the
+  unconstrained pod. Before that version the whole tier would have cooled
+  down across all zones and the pod would have fallen back to e2 on-demand.
+  Quota errors (QUOTA_EXCEEDED) still back off regionally.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  - name: the-verdict-is-the-zonal-one
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns: ["(?m)^\\W*verdict:\\s*still-tries-n2-spot\\b"]
+      forbidden_patterns: ["(?m)^\\W*verdict:\\s*falls-back-to-e2\\b"]
+      fold_decoration: true
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # Same delegation-boundary safeguard as knowledge-grounding-sources-probe.
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
+  - name: no-worker-spends-an-answer-query-call
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        # The quota-limited Developer Knowledge tool the personas forbid; see
+        # knowledge-grounding-sources-probe for why both spellings.
+        - type: tool_called
+          scope: workers
+          tool_names:
+            [
+              "mcp__developer_knowledge__answer_query",
+              "mcp_developer_knowledge_answer_query",
+            ]

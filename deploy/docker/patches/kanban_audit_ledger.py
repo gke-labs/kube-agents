@@ -40,7 +40,7 @@ and content unchanged, after the rows it archives.
 * Every ``start`` has a ``finish`` result line after it: accepted. Each ledger
   URL a ``finish`` printed that ``result`` does not contain is appended (a
   stream run once per repository prints one per repository). A null
-  ``issue_url`` (``NO_FORGE``, or a ``CLEAN`` run with no earlier ledger) has
+  ``issue_url`` (``NO_FORGE``, ``STORE_LEDGER``, or a ``CLEAN`` run with no earlier ledger) has
   no URL to give.
 * The last ``start`` has no ``finish`` result line after it: refused once,
   with the next step. The submitted ``result`` is saved on the card first,

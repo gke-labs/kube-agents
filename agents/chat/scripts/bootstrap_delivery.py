@@ -13,6 +13,9 @@ human has connected:
 
 - ``.user_aligned`` present -> a human has opened the chat (set by the plugin;
   never by a background task — see the plugin README).
+- no young ``.bootstrap_greeting_pending.*`` -> the greeting of that opening turn
+  is on its way (the plugin removes the hold), or never came within
+  ``GREETING_WAIT_SECONDS``; the report follows the greeting instead of racing it.
 - ``.bootstrap_completed`` absent -> the report has not been delivered yet.
 - ``INVENTORY.md`` present  -> the background scan has produced the report.
 
@@ -33,10 +36,20 @@ sandbox stays silent and is retried on the next tick. The first run
 ``RETIRE_AFTER_SECONDS`` or more after a delivery removes the two onboarding
 cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
-With the flag on, a Slack origin and the credential proxy's Slack relay in the
-environment, the report goes out as Block Kit instead (a headline with the
-total, the top two rows, the rest folded, and "Fix the first one" and "See all N"
-buttons), posted here through ``slack_blocks_post`` because the scheduler's delivery
+With the flag on and a Slack destination, the report goes out as a card instead,
+built by ``inventory_card`` from the files the prioritization worker left beside
+the report (the items, scores, limits and shown files, read once before the claim
+by ``_read_sweep_files``) and never from the report's text: a headline counting
+the things to fix first, one row per listed item with its scored risk and action,
+the queue line, the scan's checks folded, and the "Fix the first one" and "See all
+N" buttons. The card needs the hand-off to have filed a prioritization card and
+the files to be there, readable and in step (the recomputed selection equals the
+shown file); otherwise the text goes, and one line in the oobe stage log says why
+(``_first_report_card``), as it does on the origin path for a card its door could
+not post (in a recorded conversation, a card that did not post is posted again on a
+later tick, below). On a Slack
+origin with the credential proxy's Slack relay in the environment it is posted
+here as Block Kit through ``slack_blocks_post``, because the scheduler's delivery
 takes text only. Under ``spec.mode: next``, on an install whose job was linked to a Slack chat before
 the switch and that has a Slack home channel, the same card goes through the A2A gateway as a chat message instead
 (``_posted_through_gateway``).
@@ -60,10 +73,11 @@ Every delivery closes with a short note on the first-run audits, read off the ``
 marker by ``_audits_note``: the report's scan leaves security and RBAC, reliability, capacity and
 cost to those audits (``inventory_findings.AUDIT_FAMILIES``; an install whose kept marker records
 an older stage's no-repository skip ran the workload checks in the scan), and a short report would
-otherwise read as a healthy fleet. An audit the stage started or
-adopted whose summary failed to deliver, as every one that finished before anyone opened the chat
-does for want of a home channel, is named (``_undelivered_audits``). The text path appends it to
-the report; the
+otherwise read as a healthy fleet. It also names every shipped fleet audit that ran since the sweep
+was filed and whose summary was not posted, however its run started, with a request for those
+reports (``_lost_audits``): an audit that finished before anyone opened the chat had no home channel
+to post to, and nothing posts it later. The note is built before the claim. The text path appends it
+to the report; the
 card paths print it on their own, since the card leaves closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
@@ -71,7 +85,8 @@ findings queue from this pod, from the items and scores the prioritization
 worker left beside the report (``_register_findings`` says why the worker's
 own registration is not enough). Between the claim and the first byte of
 stdout, it marks the report's findings shown in the findings queue, as the paced publisher ``first_report``,
-from ``INVENTORY.shown.json`` (what ``inventory_findings.py select`` chose).
+from ``INVENTORY.shown.json`` (what ``inventory_findings.py select`` chose), read with
+the other files before the claim.
 That counts them against the day's limit and keeps the hourly findings nudge,
 whose hold ends at the claim, from announcing them again as new. The marks are
 best-effort: a missing file or an unreachable queue is logged to stderr and the
@@ -88,8 +103,9 @@ sent the entire onboarding report twice.
 
 Because the prioritization stage writes a finished, presentation-ready
 ``INVENTORY.md``, no LLM is involved in delivery: what that stage produced is
-what the user sees, as written or, on Slack with the flag on, laid out again by
-``inventory_presenter`` without a model call, followed by the audits note. The
+what the user sees: as written; on Slack with the flag on, as the card built from
+that stage's files without a model call; or, when the card cannot be built, laid
+out again by ``inventory_presenter`` without one; followed by the audits note. The
 sweep's complete findings are a different file (``INVENTORY.raw.md``) and are
 never delivered from here.
 """
@@ -107,12 +123,16 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import bootstrap_handoff  # beside this script in the pod
 import chat_notify  # beside this script in the pod
+import findings_queue as fq  # beside this script in the pod
+import inventory_card  # beside this script in the pod
 import inventory_findings  # beside this script in the pod
 import oobe  # beside this script in the pod
 import sandbox_exec
+import slack_presenter  # beside this script in the pod
 
 # The two jobs oobe took over, removed once onboarding is done.
 SCAN_JOB_ID = "bootstrap-inventory-scan"
@@ -125,6 +145,11 @@ OOBE_JOB_ID = "oobe"
 # is easy to lose; keeping it means a re-send is a `cat`, not a re-scan.
 DELIVERED_REPORT_NAME = "INVENTORY.delivered.md"
 REPORT_NAME = "INVENTORY.md"
+# Touched once the sweep's findings are in the findings queue (or the sweep found
+# none), before the claim: the record that the fleet was checked, which the
+# Slack Home tab's board reads (agents/platform/scripts/board_snapshot.py) so a
+# clean cluster is not drawn as unchecked after a delivery that never posts.
+FINDINGS_REGISTERED_MARKER = ".bootstrap_findings_registered"
 
 # The items the report lists, written by ``inventory_findings.py select``
 # (its DEFAULT_SHOWN_PATH and the keys below; test_bootstrap_onboarding_scripts.py
@@ -143,6 +168,9 @@ ITEMS_NAME = "INVENTORY.items.json"
 SCORES_NAME = "INVENTORY.scores.json"
 ITEMS_KEY = "items"
 SCORES_KEY = "scores"
+# The pacing limits the hand-off wrote beside the raw file (bootstrap_handoff.LIMITS_PATH) and
+# `select` read; the card recomputes `select`'s choice under the same ones.
+LIMITS_NAME = "INVENTORY.limits.json"
 # A few KB per finding; far above any fleet's sweep.
 BATCH_MAX_BYTES = 4 * 1024 * 1024
 # The outcome the queue gives a row the user dismissed (findings_queue._register_one).
@@ -206,9 +234,32 @@ REMOTE_MV = "/bin/mv"
 
 # The only surface the reshaped report is written for; every other one gets it as written.
 PRESENTED_PLATFORM = "slack"
+# Why the first report went as text and not as the card, one line in the oobe stage log
+# (_stage_note), which an operator reads; the scheduler keeps a zero-exit run's stderr nowhere.
+# No name here reads CARD_NO or CARD_NUM: CodeQL's private-data heuristic takes that for a card
+# number and flags every stage-log line it reaches.
+TEXT_REPORT_NOTE = "the first report went as text: {reason}"
+CARD_FLAG_OFF = "KAGE_SLACK_UX is off"
+CARD_PLATFORM_TAKES_TEXT = "the report goes to {platform}, which takes text"
+CARD_PLATFORM_UNRECORDED = "a chat whose platform is not recorded"
+CARD_MARKER_UNREAD = "the hand-off marker could not be read, so the files beside the report may be an earlier sweep's"
+CARD_RANKING_MISSING = "the hand-off filed no prioritization card, so the files beside the report are an earlier sweep's"
+CARD_FILE_UNUSABLE = "{name} could not be read: {problem}"
+CARD_FILE_MISSING = "no {name}"
+CARD_BUILD_FAILED = "the card could not be built: {error!r}"
+# A card that was built and not posted: the Slack doors' reasons.
+CARD_UNPOSTED = "the report card was not posted, so the text goes: {reason}"
+CARD_CHAT_ID_MISSING = "the origin is not a Slack chat with a chat id"
+CARD_THREAD_MISSING = "the origin has no thread for the gateway to post into"
+CARD_RELAY_MISSING = "no Slack relay is configured"
+CARD_REFUSED = "Slack refused the blocks: {error}"
+CARD_GATEWAY_REFUSED = "the gateway did not post it: {error}"
+CARD_POST_FAILED = "{error!r}"
 
-# The note on the first-run audits (_audits_note). The scan leaves their workload checks to them.
-AUDITS_SKIPPED_NOTE = "The first-run audits did not run: {reason}."
+# The note on the fleet audits (_audits_note). The scan leaves their workload checks to the first-run
+# audits. Its stage sentences say only what oobe's marker records the stage did; whether an audit ran is
+# said by AUDITS_LOST_NOTE alone, from the cron store, so no sentence about the stage can contradict it.
+AUDITS_SKIPPED_NOTE = "The audits did not run as part of onboarding: {reason}."
 AUDITS_NO_REASON = "no reason was recorded"
 # The reason an older oobe stage recorded when it skipped for no repository. A marker an install
 # kept through the upgrade still carries it, and on such an install the scan ran those checks,
@@ -225,42 +276,61 @@ AUDITS_NOT_COVERED_NOTE = (
 )
 # A skip with the hand-off's no-coverage report (bootstrap_handoff.NO_RANKING).
 AUDITS_UNCHECKED_SCHEDULED_NOTE = (
-    "No cluster was audited either, so this report covers no cluster; those audits check "
+    "No cluster was audited, so this report covers no cluster; those audits check "
     f"{inventory_findings.AUDIT_FAMILY_WORDS} on their schedules."
 )
-# The audits by what each reports on, in the posture line's order. The job ids stay out of
+# The first-run audits by what each reports on, in the posture line's order. The job ids stay out of
 # these sentences; the list of unposted summaries keeps them, since a request for one names it.
 AUDITS_AREAS = "The {areas} {audits}"
 AUDITS_WORD = ("audit", "audits")
 # Also the note before the marker exists: the stage writes it on its first tick after the ranking
 # card finishes, which a user already in the chat can beat to this run.
 AUDITS_RUNNING_NOTE = (
-    f"{AUDITS_AREAS.format(areas=inventory_findings.AUDIT_FAMILY_WORDS, audits=AUDITS_WORD[1])} run one after another once this "
-    "scan is done. Each posts a summary to the home channel when it finds something new."
+    f"{AUDITS_AREAS.format(areas=inventory_findings.AUDIT_FAMILY_WORDS, audits=AUDITS_WORD[1])} run one after another "
+    "once this scan is done."
 )
-AUDITS_RAN_NOTE = (
-    "{audits} {have} started. Each posts a summary to the home channel when it finds something new."
+AUDITS_STARTED_NOTE = "{audits} started as part of onboarding."
+AUDITS_NONE_STARTED_NOTE = (
+    "None of the first-run audits ran as part of onboarding. This report does not cover "
+    f"{inventory_findings.AUDIT_FAMILY_WORDS}."
 )
-AUDITS_NONE_RAN_NOTE = (
-    f"None of the first-run audits ran. This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}."
-)
-AUDITS_NOT_RUN_NOTE = "Not run: {audits}."
-AUDITS_NOT_RUN_ITEM = "the {area} audit ({reason})"
+AUDITS_NOT_STARTED_NOTE = "Did not run as part of onboarding: {audits}."
+AUDITS_NOT_STARTED_ITEM = "the {area} audit ({reason})"
 # oobe gives up on an audit it could not start; the audit still runs on its own schedule.
 AUDITS_GAVE_UP_REASON = "it did not start, and runs on its own schedule"
-# Every audit the chain started has completed its run, so "have started" would be stale.
-AUDITS_FINISHED_NOTE = "{audits} {have} run."
-AUDITS_HAVE = ("has", "have")
+
+# The shipped fleet audits beyond the first-run ones (agents/platform/cron/jobs.json, each `deliver: chat`),
+# in roster order. One that ends before anyone opens the chat loses its summary the same way.
+OTHER_FLEET_AUDITS = (
+    "security-patch-orchestrator",
+    "fleet-consistency-drift",
+    "ai-security-audit",
+    "gcp-networking-fabric-audit",
+    "gce-compute-fleet-audit",
+)
+# A request that needs no chat history, so it works in any conversation; the nightly request-path case
+# sends it verbatim. A test holds every audit the note checks to the store's audits (audit_report.AUDITS).
+AUDITS_REQUEST_FORMAT = "Show me the latest report of each of these fleet audits from the report store: {ids}."
+# The first-run chain's fifth job is not a posture family: named in the note by what it is.
+AUDIT_AREA_EXTRA = {"upgrade-retrospective": "upgrade retrospective"}
 # Said of every failed delivery, whatever refused it: usually no home channel yet, which an audit
 # that ends before anyone opens the chat always meets, and the scheduler does not post it again
-# (_undelivered_audits).
-AUDITS_UNDELIVERED_NOTE = (
-    "These finished, but their summaries were not posted to the chat: {audits}. "
-    "Ask me for any of these reports."
+# (_lost_audits).
+AUDITS_LOST_NOTE = (
+    "These ran, but their summaries were not posted to the chat: {labels}. To see them, send me: `{request}`"
+)
+# An audit whose run failed wrote no report, so the request above cannot fetch what was lost: the
+# scheduler's failure notice. Said, like AUDITS_LOST_NOTE, of every failed delivery, whatever refused it.
+AUDITS_FAILED_RUNS_NOTE = "These failed, and their failure notices were not posted to the chat: {labels}."
+AUDITS_UNREAD_NOTE = (
+    "I could not read the audit run records, so this note cannot say which summaries reached the chat. "
+    "To see any of them, send me: `{request}`"
 )
 
-# The scheduler's record of where a run's final message went (Hermes cron/executions.db).
+# The scheduler's record of where a run's final message went (Hermes cron/executions.db), and the run
+# statuses that can carry one: a completed run's summary, or a failed run's failure notice.
 DELIVERY_OUTCOME_COLUMN = "delivery_outcome"
+RUN_FAILED_STATUS = "failed"
 OUTCOME_LOST = "lost"
 OUTCOME_SILENT = "silent"
 OUTCOME_TRIED = "tried"
@@ -279,8 +349,20 @@ DELIVERY_OUTCOME_CLASS: dict[str | None, str] = {
     "not_configured": OUTCOME_TRIED,
 }
 
-# The sentence of the two notes above that names the home channel, and what replaces it where the
-# gateway has none to post to (no A2A_NOTIFY_PLATFORM on the conversation path).
+# What the chat relay posted, per audit job: session_kv_server.py's audit_report_runs, written when it posts
+# a fleet-audit job's report. `delivered` alone is not proof, because the relay plugin answers success for a
+# run whose last message is a silence marker the scheduler let through, and `failed` alone is not either,
+# because the plugin answers an error for a post that reached one platform and missed another.
+SESSION_KV_DB_ENV = "SESSION_KV_DB_PATH"
+DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+# SQLite's CURRENT_TIMESTAMP, which is UTC.
+RELAY_POSTED_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# One ended run: (claimed_at, finished_at, delivery_outcome, status).
+AuditRun = tuple[float, float | None, str | None, str]
+
+# The sentence that names the home channel, and what replaces it where the gateway has none to post
+# to (no A2A_NOTIFY_PLATFORM on the conversation path).
 AUDITS_HOME_SENTENCE = "Each posts a summary to the home channel when it finds something new."
 AUDITS_NO_HOME_SENTENCE = (
     "Each one's summary goes to the home channel, and this install has none yet, so those summaries "
@@ -333,18 +415,65 @@ PLATFORM_KEY = "platform"
 CHAT_ID_KEY = "chat_id"
 THREAD_ID_KEY = "thread_id"
 
+# The plugin's hold on the report while the opening turn's greeting is on its way: one
+# empty file per opening turn (bootstrap_onboarding, GREETING_PENDING_PREFIX), which the
+# plugin removes when the greeting leaves the agent. Aged by mtime here, never read. The
+# wait is the ceiling for a greeting turn that never reports back (a gateway restart
+# inside the turn, a turn that ends with no text): past it the report goes out without
+# the greeting. The longest first turn measured, a real ask that delegated work, took
+# 218 s (#1971, #2009); 300 s covers it with a margin for a loaded model and its provider
+# retries. A greeting that runs longer still arrives, after the report.
+GREETING_PENDING_GLOB = ".bootstrap_greeting_pending.*"
+GREETING_WAIT_SECONDS = 300
+
 
 def _data_dir() -> Path:
     return Path(os.environ.get("HERMES_HOME", "/opt/data"))
 
 
 def _awaiting_delivery(data_dir: Path) -> bool:
-    """True when a human is present; main() has already returned on a delivered report.
+    """True when a human is present and the greeting is not still on its way;
+    main() has already returned on a delivered report.
 
     The markers live on this pod, so this costs a stat or two; it runs before the
     report read, which may cross into the sandbox.
     """
-    return (data_dir / ".user_aligned").exists() or (data_dir / CONVERSATION_ALIGNED_MARKER).exists()
+    if not ((data_dir / ".user_aligned").exists() or (data_dir / CONVERSATION_ALIGNED_MARKER).exists()):
+        return False
+    return not _greeting_pending(data_dir)
+
+
+def _greeting_pending(data_dir: Path) -> bool:
+    """Whether the plugin still holds the report behind the opening turn's greeting.
+
+    The newest hold decides. One older than GREETING_WAIT_SECONDS belongs to a
+    greeting turn that never reported back: every hold is removed, the stage log
+    says so once, and the report goes out. Never raises: a raise here would exit
+    the run non-zero on every tick, which posts to the chat on the origin path
+    and blocks the report for good on the conversation path.
+    """
+    try:
+        holds = list(data_dir.glob(GREETING_PENDING_GLOB))
+    except OSError:
+        return False
+    newest = None
+    for hold in holds:
+        try:
+            at = hold.stat().st_mtime
+        except OSError:
+            continue
+        newest = at if newest is None else max(newest, at)
+    if newest is None:
+        return False
+    if abs(time.time() - newest) < GREETING_WAIT_SECONDS:
+        return True
+    for hold in holds:
+        try:
+            hold.unlink()
+        except OSError:
+            pass
+    _stage_note(data_dir, f"the greeting did not finish within {GREETING_WAIT_SECONDS} s; delivering the report")
+    return False
 
 
 def _bound_conversation(data_dir: Path) -> dict | None:
@@ -585,6 +714,65 @@ def _read_json_beside(data_dir: Path, in_sandbox: bool, name: str) -> dict | Non
     return parsed
 
 
+def _parse_shown(raw: bytes):
+    """``SHOWN_NAME``'s record from its bytes; ``ValueError`` past ``SHOWN_MAX_BYTES`` or when it is not JSON."""
+    if len(raw) > SHOWN_MAX_BYTES:
+        raise ValueError(f"larger than {SHOWN_MAX_BYTES} bytes")
+    return json.loads(raw.decode("utf-8"))
+
+
+class SweepFiles(NamedTuple):
+    """What the prioritization worker left beside the report, read once before the claim.
+
+    ``items`` and ``scores`` are the parsed files, None when absent; ``limits`` the pacing
+    limits the hand-off wrote, the defaults when the file is absent or unusable, as ``select``
+    read them; ``shown`` the shown file's bytes, None when absent, which ``_mark_shown`` and the
+    card each parse for what they need. ``problems`` names each file that was there and could not
+    be read or parsed, with why; its readers say what they did without it.
+    """
+
+    items: dict | None
+    scores: dict | None
+    limits: fq.PacingLimits
+    shown: bytes | None
+    problems: dict[str, str]
+
+
+def _read_sweep_files(data_dir: Path, in_sandbox: bool) -> SweepFiles:
+    """The files beside the report, each read once, where the report was read.
+
+    Raises ``sandbox_exec.SandboxUnavailable`` or ``subprocess.TimeoutExpired`` when the sandbox
+    did not answer, for ``main`` to treat as it does the report's read: silent, retried next tick.
+    Every other failure to read or parse a file goes in ``problems`` under its name; a file that
+    is not there is None and no problem.
+    """
+    parsed: dict[str, dict | None] = {}
+    problems: dict[str, str] = {}
+    for name in (ITEMS_NAME, SCORES_NAME, LIMITS_NAME):
+        try:
+            parsed[name] = _read_json_beside(data_dir, in_sandbox, name)
+        except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired):
+            raise
+        except Exception as e:  # noqa: BLE001 - the file's readers say what they did without it
+            parsed[name] = None
+            problems[name] = str(e)
+    try:
+        shown = _read_shown(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired):
+        raise
+    except Exception as e:  # noqa: BLE001 - as above
+        shown = None
+        problems[SHOWN_NAME] = str(e)
+    if LIMITS_NAME in problems:
+        sys.stderr.write(
+            f"bootstrap_delivery: cannot read {LIMITS_NAME} ({problems[LIMITS_NAME]}); using the default limits\n"
+        )
+    elif parsed[LIMITS_NAME] is None:
+        sys.stderr.write(f"bootstrap_delivery: no {LIMITS_NAME}; using the default limits\n")
+    limits = inventory_findings.limits_from(parsed[LIMITS_NAME] or {})
+    return SweepFiles(parsed[ITEMS_NAME], parsed[SCORES_NAME], limits, shown, problems)
+
+
 def _findings_endpoint() -> str:
     return (os.environ.get(FINDINGS_ENDPOINT_ENV) or DEFAULT_FINDINGS_ENDPOINT).rstrip("/")
 
@@ -606,9 +794,10 @@ def _no_ranking(data_dir: Path) -> bool | None:
         return None
 
 
-def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None) -> set[str]:
+def _register_findings(data_dir: Path, no_ranking: bool | None, files: SweepFiles) -> set[str]:
     """Register every finding the sweep extracted in the findings queue, as
-    ``inventory_findings.py register`` does, from this pod.
+    ``inventory_findings.py register`` does, from this pod, from the items and
+    scores read before the claim (``files``).
 
     The worker runs ``register`` through its terminal. With the shell sandbox
     on, that terminal cannot reach the queue on this pod's loopback, so
@@ -642,14 +831,18 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
                 f"{ITEMS_NAME} is an earlier sweep's; registering nothing\n"
             )
             return suppressed
-        extracted = _read_json_beside(data_dir, in_sandbox, ITEMS_NAME)
-        if extracted is None:
+        if ITEMS_NAME in files.problems:
+            raise ValueError(files.problems[ITEMS_NAME])
+        if files.items is None:
             sys.stderr.write(f"bootstrap_delivery: no {ITEMS_NAME}; registering nothing\n")
             return suppressed
-        items = extracted[ITEMS_KEY]
+        items = files.items[ITEMS_KEY]
         if not items:
+            _mark_registered(data_dir)
             return suppressed  # a clean fleet: nothing to register, and no scores file
-        raw_scores = _read_json_beside(data_dir, in_sandbox, SCORES_NAME)
+        if SCORES_NAME in files.problems:
+            raise ValueError(files.problems[SCORES_NAME])
+        raw_scores = files.scores
         if raw_scores is None:
             sys.stderr.write(f"bootstrap_delivery: no {SCORES_NAME}; registering nothing\n")
             return suppressed
@@ -660,12 +853,14 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
         sys.stderr.write(f"bootstrap_delivery: could not read the sweep's findings; registering nothing: {detail}\n")
         return suppressed
     endpoint = _findings_endpoint()
+    refused = 0
     for where, batch, scope in batches:
         try:
             result = inventory_findings.post_batch(endpoint, batch, scope)
         except urllib.error.HTTPError as e:
             # This cluster only.
             sys.stderr.write(f"bootstrap_delivery: the findings queue refused {where}'s findings: {e.code}\n")
+            refused += 1
             continue
         except Exception as e:
             sys.stderr.write(
@@ -677,7 +872,18 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
         for entry in outcomes if isinstance(outcomes, list) else []:
             if isinstance(entry, dict) and entry.get("outcome") == SUPPRESSED:
                 suppressed.add(str(entry.get("id")))
+    # A refused batch is a cluster the queue does not hold, so the fleet is not checked yet.
+    if not refused:
+        _mark_registered(data_dir)
     return suppressed
+
+
+def _mark_registered(data_dir: Path) -> None:
+    """Record that the sweep's findings reached the queue; best effort, never raises."""
+    try:
+        (data_dir / FINDINGS_REGISTERED_MARKER).touch(exist_ok=True)
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not touch {FINDINGS_REGISTERED_MARKER}: {e}\n")
 
 
 def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
@@ -693,29 +899,28 @@ def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
         response.read()
 
 
-def _mark_shown(data_dir: Path, in_sandbox: bool, suppressed: set[str] = frozenset()) -> bool:
+def _mark_shown(files: SweepFiles, suppressed: set[str] = frozenset()) -> bool:
     """Mark every row of every item the report lists shown, as ``PUBLISHER``,
-    except the ``suppressed`` ids registration reported: the user dismissed
-    them, so they are never pending and spend no slot of the day's limit.
-    The queue refuses such a mark anyway; skipping it saves the request.
+    from the shown file read before the claim (``files``), except the
+    ``suppressed`` ids registration reported: the user dismissed them, so they
+    are never pending and spend no slot of the day's limit. The queue refuses
+    such a mark anyway; skipping it saves the request.
 
     Returns whether to set the shown file aside: True unless there is none,
     so a file this run could not read is not marked by a later report.
     Never raises: the claim is taken, so nothing here may stop the report
     going out.
     """
-    try:
-        raw = _read_shown(data_dir, in_sandbox)
-    except Exception as e:
-        sys.stderr.write(f"bootstrap_delivery: could not read {SHOWN_NAME}; marking nothing: {e}\n")
+    problem = files.problems.get(SHOWN_NAME)
+    if problem:
+        sys.stderr.write(f"bootstrap_delivery: could not read {SHOWN_NAME}; marking nothing: {problem}\n")
         return True
+    raw = files.shown
     if raw is None:
         sys.stderr.write(f"bootstrap_delivery: no {SHOWN_NAME}; marking nothing\n")
         return False
     try:
-        if len(raw) > SHOWN_MAX_BYTES:
-            raise ValueError(f"larger than {SHOWN_MAX_BYTES} bytes")
-        items = json.loads(raw.decode("utf-8"))[SHOWN_ITEMS]
+        items = _parse_shown(raw)[SHOWN_ITEMS]
         marks = [(str(item[SHOWN_CLASS]), [str(fid) for fid in item[SHOWN_IDS]]) for item in items]
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: {SHOWN_NAME} is not readable; marking nothing: {e}\n")
@@ -841,30 +1046,103 @@ def _skip_follows_this_sweep(data_dir: Path, state: dict) -> bool:
     A sweep filed after the skip (onboarding repeated with the stage's marker kept) ran on a later
     build, whose scan leaves the workload checks to the audits whatever the old skip said.
     """
-    filed = bootstrap_handoff.read_scan_marker(data_dir / oobe.SCAN_FILED_MARKER)
     try:
+        filed = oobe.scan_filed(data_dir)
         skipped_at = float(state.get(oobe.STATE_AT))
-    except (TypeError, ValueError):
+    except (OSError, TypeError, ValueError):
+        # Also a marker whose bytes do not decode: the not-covered caveat is the safe one.
         return False
     return filed is not None and skipped_at >= filed[1]
 
 
 def _audits_note(data_dir: Path, no_coverage: bool, home: bool = True) -> str:
-    """The note on the first-run audits, saying where their summaries go only when ``home``.
+    """The note on the fleet audits the delivery closes with.
 
-    With no home channel and a list of unposted summaries already in the note,
-    the home sentence is dropped rather than replaced, so "not posted" is said once.
+    In order: what the stage did (``_stage_sentences``); the audits whose summaries ran but were not
+    posted, each fleet audit whatever path its run took, or why that cannot be told; then where later
+    summaries go. ``home`` false is a gateway with no home channel to post to, which every path says.
+    With one, the home sentence is left out beside a list of unposted summaries, which it would contradict.
+    ``no_coverage`` is a report no cluster's audit reached (``_no_ranking``), which covers nothing.
     """
-    note = _audits_state_note(data_dir, no_coverage)
-    if home:
-        return note
-    replacement = "" if AUDITS_UNDELIVERED_NOTE.split("{audits}")[0] in note else " " + AUDITS_NO_HOME_SENTENCE
-    return note.replace(" " + AUDITS_HOME_SENTENCE, replacement)
+    state = oobe.read_state(data_dir)
+    stage, later_posts = _stage_sentences(data_dir, state, no_coverage)
+    sentences = [stage]
+    try:
+        lost = _lost_sentences(data_dir, state)
+    except Exception as e:  # noqa: BLE001 - the stage sentence, and its coverage caveat, still go out
+        _stage_note(data_dir, f"the audits note could not tell which summaries were posted: {e!r}")
+        lost = [AUDITS_UNREAD_NOTE.format(request=_request(_checked_audits()))]
+    sentences += lost
+    later_posts = later_posts and not lost
+    if not home:
+        sentences.append(AUDITS_NO_HOME_SENTENCE)
+    elif later_posts:
+        sentences.append(AUDITS_HOME_SENTENCE)
+    return " ".join(sentences)
+
+
+def _lost_sentences(data_dir: Path, state: dict) -> list[str]:
+    """The sentences on runs whose summaries or failure notices were not posted, or that this cannot be told."""
+    audits = _checked_audits()
+    runs = _audit_runs(data_dir, audits)
+    if runs is None:
+        return [AUDITS_UNREAD_NOTE.format(request=_request(audits))]
+    lost = _lost_audits(audits, runs, _windows(data_dir, state, audits), _relay_posts(data_dir))
+    summaries = [a for a, crashed in lost if not crashed]
+    failed = [a for a, crashed in lost if crashed]
+    sentences = []
+    if summaries:
+        labels = ", ".join(_audit_label(a) for a in summaries)
+        sentences.append(AUDITS_LOST_NOTE.format(labels=labels, request=_request(summaries)))
+    if failed:
+        sentences.append(AUDITS_FAILED_RUNS_NOTE.format(labels=", ".join(_audit_label(a) for a in failed)))
+    return sentences
+
+
+def _safe_audits_note(data_dir: Path, no_coverage: bool, home: bool) -> str:
+    """``_audits_note``, or on any error the unreadable-records note: delivery calls no stage under oobe's guard."""
+    try:
+        return _audits_note(data_dir, no_coverage, home)
+    except Exception as e:  # noqa: BLE001 - a raise here would hold the report back on every tick
+        _stage_note(data_dir, f"the audits note failed, so it says the run records could not be read: {e!r}")
+        note = AUDITS_UNREAD_NOTE.format(request=_request(_checked_audits()))
+        return note if home else f"{note} {AUDITS_NO_HOME_SENTENCE}"
+
+
+def _stage_sentences(data_dir: Path, state: dict, no_coverage: bool) -> tuple[str, bool]:
+    """What oobe's marker says the stage did, and whether audits it started or will start are still to report.
+
+    Before the marker exists the stage has not decided, and the sentence is the chain's.
+    """
+    if state.get(oobe.STATE_SKIPPED):
+        reason = str(state.get(oobe.STATE_REASON) or AUDITS_NO_REASON)
+        if no_coverage:
+            coverage = AUDITS_UNCHECKED_SCHEDULED_NOTE
+        elif reason == LEGACY_NO_REPOSITORY_REASON and _skip_follows_this_sweep(data_dir, state):
+            coverage = AUDITS_COVERED_NOTE
+        else:
+            coverage = AUDITS_NOT_COVERED_NOTE
+        return f"{AUDITS_SKIPPED_NOTE.format(reason=reason)} {coverage}", False
+    fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
+    held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
+    gave_up = _list(state.get(oobe.STATE_GAVE_UP))
+    reasons = {a: held[a] for a in oobe.FIRST_RUN_AUDITS if a in held}
+    reasons.update({a: AUDITS_GAVE_UP_REASON for a in oobe.FIRST_RUN_AUDITS if a in gave_up and a not in reasons})
+    not_started = [AUDITS_NOT_STARTED_ITEM.format(area=_area(a), reason=reasons[a]) for a in _in_area_order(list(reasons))]
+    if not state.get(oobe.STATE_DONE):
+        note, later_posts = AUDITS_RUNNING_NOTE, True
+    elif fired:
+        note, later_posts = AUDITS_STARTED_NOTE.format(audits=_areas(fired)), True
+    else:
+        note, later_posts = AUDITS_NONE_STARTED_NOTE, False
+    if not_started:
+        note = f"{note} {AUDITS_NOT_STARTED_NOTE.format(audits=', '.join(not_started))}"
+    return note, later_posts
 
 
 def _area(audit: str) -> str:
     """What ``audit`` reports on, or its job id for an audit with no area."""
-    return inventory_findings.AUDIT_FAMILIES.get(audit) or f"`{audit}`"
+    return inventory_findings.AUDIT_FAMILIES.get(audit) or AUDIT_AREA_EXTRA.get(audit) or _audit_label(audit)
 
 
 def _in_area_order(audits: list[str]) -> list[str]:
@@ -880,66 +1158,58 @@ def _areas(audits: list[str]) -> str:
     return AUDITS_AREAS.format(areas=joined, audits=AUDITS_WORD[len(words) != 1])
 
 
-def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
-    """The note on the first-run audits the delivery closes with, from oobe's marker.
+def _checked_audits() -> tuple[str, ...]:
+    """Every fleet audit whose lost summary the note names: the first-run audits in chain order, then the rest.
 
-    Before the marker exists the stage has not decided, and the note is the chain's. ``no_coverage``
-    is a report no cluster's audit reached (``_no_ranking``), which covers nothing.
+    Built when called, not at import: ``oobe`` imports this module, so its tuples are not defined yet
+    when ``oobe`` is imported first.
     """
-    state = oobe.read_state(data_dir)
-    if state.get(oobe.STATE_SKIPPED):
-        reason = str(state.get(oobe.STATE_REASON) or AUDITS_NO_REASON)
-        if no_coverage:
-            coverage = AUDITS_UNCHECKED_SCHEDULED_NOTE
-        elif reason == LEGACY_NO_REPOSITORY_REASON and _skip_follows_this_sweep(data_dir, state):
-            coverage = AUDITS_COVERED_NOTE
-        else:
-            coverage = AUDITS_NOT_COVERED_NOTE
-        return f"{AUDITS_SKIPPED_NOTE.format(reason=reason)} {coverage}"
-    fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
-    held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
-    gave_up = _list(state.get(oobe.STATE_GAVE_UP))
-    reasons = {a: held[a] for a in oobe.FIRST_RUN_AUDITS if a in held}
-    reasons.update({a: AUDITS_GAVE_UP_REASON for a in oobe.FIRST_RUN_AUDITS if a in gave_up and a not in reasons})
-    not_run = [AUDITS_NOT_RUN_ITEM.format(area=_area(a), reason=reasons[a]) for a in _in_area_order(list(reasons))]
-    runs = _completed_runs(data_dir, fired)
+    first = tuple(oobe.FIRST_RUN_AUDITS)
+    return first + tuple(a for a in OTHER_FLEET_AUDITS if a not in first)
+
+
+def _audit_label(audit: str) -> str:
+    return f"`{audit}`"
+
+
+def _request(audits: list[str] | tuple[str, ...]) -> str:
+    """The message that fetches ``audits``' latest reports, in their order."""
+    return AUDITS_REQUEST_FORMAT.format(ids=", ".join(audits))
+
+
+def _windows(data_dir: Path, state: dict, audits: tuple[str, ...]) -> dict[str, float]:
+    """``audit -> time``: a run that ended before it is not one this onboarding owes the user.
+
+    The sweep's filing, or for an audit the stage marked its mark, whichever is later. A mark that is
+    not a number reads as no mark, and a sweep marker that cannot be read as none: this runs before
+    the claim, and a raise here would hold the report back on every tick.
+    """
+    try:
+        filed = oobe.scan_filed(data_dir)
+    except (OSError, ValueError) as e:
+        _stage_note(data_dir, f"cannot read the sweep marker, so the audits note reads every run: {e}")
+        filed = None
+    since = filed[1] if filed is not None else 0
     marks = state.get(oobe.STATE_MARKS) if isinstance(state.get(oobe.STATE_MARKS), dict) else {}
-    # A mark that is not a number reads as no mark: this runs after the claim, and a raise here
-    # would lose the report.
-    since = {a: m if isinstance(m, (int, float)) else 0 for a, m in marks.items()}
-    # Judged by when the run ended: a scheduled run already going when the stage marked the audit
-    # is the stage's answer, though it was claimed before the mark.
-    finished = [
-        a for a in fired if any((ended or claimed) >= since.get(a, 0) for claimed, ended, _ in runs.get(a, ()))
-    ]
-    if not state.get(oobe.STATE_DONE):
-        note = AUDITS_RUNNING_NOTE
-    elif fired and finished == fired:
-        note = AUDITS_FINISHED_NOTE.format(audits=_areas(fired), have=AUDITS_HAVE[len(fired) != 1])
-    elif fired:
-        note = AUDITS_RAN_NOTE.format(audits=_areas(fired), have=AUDITS_HAVE[len(fired) != 1])
-    else:
-        note = AUDITS_NONE_RAN_NOTE
-    if not_run:
-        note = f"{note} {AUDITS_NOT_RUN_NOTE.format(audits=', '.join(not_run))}"
-    undelivered = _undelivered_audits(finished, runs)
-    return f"{note} {AUDITS_UNDELIVERED_NOTE.format(audits=', '.join(undelivered))}" if undelivered else note
+    fired = _list(state.get(oobe.STATE_FIRED))
+    windows = {}
+    for audit in audits:
+        mark = marks.get(audit) if audit in fired else None
+        windows[audit] = max(since, mark) if isinstance(mark, (int, float)) else since
+    return windows
 
 
-def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[float, float | None, str | None]]]:
-    """``job -> [(claimed_at, finished_at, delivery_outcome), ...]`` for the completed runs of ``jobs``, oldest first.
+def _audit_runs(data_dir: Path, jobs: tuple[str, ...]) -> dict[str, list[AuditRun]] | None:
+    """``job -> [(claimed_at, finished_at, delivery_outcome, status), ...]``: the ended runs of ``jobs``, oldest first.
 
-    Empty when the Platform Agent's cron store cannot be read: the note then says what it said
-    before, rather than holding the report back, and the stage log says why (Hermes drops this
-    run's stderr when it exits 0).
+    Completed runs carry a summary, failed ones the scheduler's failure notice. Empty before the
+    Platform Agent's cron store exists; None when it cannot be read, and the stage log says why
+    (Hermes drops this run's stderr when it exits 0).
     """
     ledger = data_dir / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR / oobe.EXECUTIONS_DB
-    if not jobs:
-        return {}
     if not ledger.is_file():
-        _stage_note(data_dir, f"no {ledger}, so the audits note names no unposted summary")
         return {}
-    placeholders = ",".join("?" * len(jobs))
+    statuses = (oobe.COMPLETED_STATUS, RUN_FAILED_STATUS)
     try:
         conn = sqlite3.connect(
             f"file:{ledger}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS
@@ -954,17 +1224,18 @@ def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[flo
             outcome = DELIVERY_OUTCOME_COLUMN if DELIVERY_OUTCOME_COLUMN in columns else "NULL"
             finished = oobe.FINISHED_AT_COLUMN if oobe.FINISHED_AT_COLUMN in columns else "NULL"
             rows = conn.execute(
-                f"SELECT job_id, claimed_at, {finished}, {outcome} FROM executions "
-                f"WHERE job_id IN ({placeholders}) AND status = ? ORDER BY claimed_at",
-                (*jobs, oobe.COMPLETED_STATUS),
+                f"SELECT job_id, claimed_at, {finished}, {outcome}, status FROM executions "
+                f"WHERE job_id IN ({','.join('?' * len(jobs))}) AND status IN ({','.join('?' * len(statuses))}) "
+                "ORDER BY claimed_at",
+                (*jobs, *statuses),
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as e:
-        _stage_note(data_dir, f"cannot read {ledger}, so the audits note names no unposted summary: {e}")
-        return {}
-    runs: dict[str, list[tuple[float, float | None, str | None]]] = {}
-    for job_id, claimed, finished_at, delivery in rows:
+        _stage_note(data_dir, f"cannot read {ledger}, so the audits note cannot say which summaries were posted: {e}")
+        return None
+    runs: dict[str, list[AuditRun]] = {}
+    for job_id, claimed, finished_at, delivery, status in rows:
         try:
             claimed_at = datetime.fromisoformat(claimed).timestamp()
         except (TypeError, ValueError):
@@ -973,26 +1244,86 @@ def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[flo
             ended = datetime.fromisoformat(finished_at).timestamp()
         except (TypeError, ValueError):
             ended = None
-        runs.setdefault(job_id, []).append((claimed_at, ended, delivery))
+        runs.setdefault(job_id, []).append((claimed_at, ended, delivery, status))
     return runs
 
 
-def _undelivered_audits(audits: list[str], runs: dict[str, list[tuple[float, float | None, str | None]]]) -> list[str]:
-    """The audits whose latest run that tried to post its summary failed, or recorded an unknown outcome.
+def _relay_posts(data_dir: Path) -> dict[str, float] | None:
+    """``job -> when the chat relay last posted for it``.
+
+    From session-kv's database; None when unreadable, which leaves each run's delivery outcome to
+    decide alone, and the stage log says why.
+    """
+    db = Path(os.environ.get(SESSION_KV_DB_ENV) or DEFAULT_SESSION_KV_DB_PATH)
+    if not db.is_file():
+        _stage_note(data_dir, f"no {db}, so the audits note takes each run's delivery outcome as it is")
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS)
+        try:
+            rows = conn.execute(
+                "SELECT job_id, posted_at FROM audit_report_runs WHERE profile = ?", (oobe.PLATFORM_PROFILE,)
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        _stage_note(data_dir, f"cannot read {db}, so the audits note takes each run's delivery outcome as it is: {e}")
+        return None
+    posts = {}
+    for job_id, posted_at in rows:
+        try:
+            posted = datetime.strptime(posted_at, RELAY_POSTED_AT_FORMAT).replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        posts[job_id] = posted.timestamp()
+    return posts
+
+
+def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windows: dict[str, float],
+                 posts: dict[str, float] | None) -> list[tuple[str, bool]]:
+    """``(audit, its run failed)`` for each audit whose newest run in its window with something to post did not post it.
 
     A run that ends before anyone has opened the chat finds no home channel, the relay refuses
-    it, and nothing posts it later; this delivery is the first message that user reads. Any other
-    failed delivery is listed too, since its summary is just as missing. A later run that posted
-    nothing on purpose (a silent run: suppressed, or no outcome recorded) does not stand in for
-    the lost one.
+    it, and nothing posts it later; this delivery is the first message that user reads. Runs are
+    judged newest first. A silent one is passed over, so it does not stand in for a lost one. A relay
+    post at or after a run's claim settles it as posted, whatever its outcome says. Lost otherwise
+    means a ``failed`` outcome or one the table does not know. A run the scheduler counts as delivered
+    that the relay has no post for posted nothing, and is passed over too; with no relay record to ask,
+    its outcome stands. A run that crashed wrote no report, so it does not stand in for an earlier run
+    whose report is in the store: the audit is named for both. Its posted failure notice replaces the
+    relay's one row per job, so the post is read as the crashed run's, and nothing left in the row says
+    whether an earlier run posted: the walk goes on, and each earlier run is judged by its outcome.
+    Where that names a summary that did post, the user asks one question instead of missing a report.
     """
-    out = []
+    lost = []
     for audit in audits:
-        classes = [DELIVERY_OUTCOME_CLASS.get(run[2], OUTCOME_LOST) for run in runs.get(audit, ())]
-        tried = [c for c in classes if c != OUTCOME_SILENT]
-        if tried and tried[-1] == OUTCOME_LOST:
-            out.append(f"`{audit}`")
-    return out
+        since = windows.get(audit, 0)
+        posted = posts.get(audit) if posts is not None else None
+        crashed = False
+        for claimed, ended, outcome, status in reversed(runs.get(audit, ())):
+            if (ended if ended is not None else claimed) < since:
+                break
+            kind = DELIVERY_OUTCOME_CLASS.get(outcome, OUTCOME_LOST)
+            if kind == OUTCOME_SILENT:
+                continue
+            if posted is not None and posted >= claimed:
+                # The relay keeps one row per job, so the post is this run's; a posted failure notice is
+                # not an earlier run's report.
+                if status != RUN_FAILED_STATUS:
+                    break
+                posted = None
+                continue
+            if kind == OUTCOME_LOST and status == RUN_FAILED_STATUS:
+                if not crashed:
+                    lost.append((audit, True))
+                crashed = True
+                continue
+            if kind == OUTCOME_LOST:
+                lost.append((audit, False))
+                break
+            if posts is None and status != RUN_FAILED_STATUS:
+                break
+    return lost
 
 
 def _stage_note(data_dir: Path, message: str) -> None:
@@ -1012,66 +1343,103 @@ def _with_note(report: str, note: str) -> str:
     return report.rstrip("\n") + "\n\n" + note + "\n"
 
 
-def _posted_as_blocks(content: str) -> bool:
-    """Whether the report was posted to Slack as Block Kit; False posts nothing.
+def _first_report_card(
+    platform: str | None, no_ranking: bool | None, files: SweepFiles, suppressed: set[str]
+) -> tuple[inventory_card.Card | None, str]:
+    """The first report as the card ``inventory_card`` builds from the stage's files, or None and
+    why the text goes instead.
 
-    False, and the caller prints the text, unless the flag is on, the origin is
-    Slack with a chat id, the relay is configured and the report parses. Any
+    The card needs all of: ``KAGE_SLACK_UX`` on; a Slack destination (``platform``); a hand-off
+    that filed a prioritization card (``no_ranking`` False: otherwise the files beside the report
+    are an earlier sweep's, or that cannot be told); the items and shown files there and readable,
+    and the scores file readable when an item is listed; and a card the builder accepts, which recomputes
+    ``select``'s choice and checks it against the shown file. Built once per run, before the
+    claim, for whichever door posts it. Never raises: a report the card cannot carry goes as text.
+    """
+    if not slack_presenter.enabled():
+        return None, CARD_FLAG_OFF
+    if platform != PRESENTED_PLATFORM:
+        return None, CARD_PLATFORM_TAKES_TEXT.format(platform=platform or CARD_PLATFORM_UNRECORDED)
+    if no_ranking is None:
+        return None, CARD_MARKER_UNREAD
+    if no_ranking:
+        return None, CARD_RANKING_MISSING
+    for name in (ITEMS_NAME, SHOWN_NAME):
+        if name in files.problems:
+            return None, CARD_FILE_UNUSABLE.format(name=name, problem=files.problems[name])
+    for name, present in ((ITEMS_NAME, files.items), (SHOWN_NAME, files.shown)):
+        if present is None:
+            return None, CARD_FILE_MISSING.format(name=name)
+    # The builder reads the scores file only for a listed item, as ``_register_findings`` does, so
+    # one that cannot be read beside an empty item list (a clean fleet writes none) is no reason to
+    # hold the done card back.
+    item_list = files.items.get(ITEMS_KEY)
+    if SCORES_NAME in files.problems and isinstance(item_list, list) and item_list:
+        return None, CARD_FILE_UNUSABLE.format(name=SCORES_NAME, problem=files.problems[SCORES_NAME])
+    try:
+        shown = _parse_shown(files.shown)
+    except ValueError as e:
+        return None, CARD_FILE_UNUSABLE.format(name=SHOWN_NAME, problem=e)
+    try:
+        return inventory_card.build(files.items, files.scores, files.limits, shown, frozenset(suppressed)), ""
+    except inventory_card.CardUnavailable as e:
+        return None, str(e)
+    except Exception as e:  # noqa: BLE001 - the text must still go
+        return None, CARD_BUILD_FAILED.format(error=e)
+
+
+def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
+    """Whether the report was posted to Slack as the card; False posts nothing.
+
+    False, and the caller prints the text, with no card (``_first_report_card``
+    said why), an origin that is not Slack with a chat id, or no relay. Any
     failure is False too, including one that may have posted (a timeout once
     the request was sent): this report is sent once per install, and a second
-    copy of it is a smaller loss than none.
+    copy of it is a smaller loss than none. Each goes to the stage log.
     """
+    if card is None:
+        return False
     try:
-        import slack_presenter
-
-        if not slack_presenter.enabled():
-            return False
         origin = _origin()
         channel = str(origin.get(CHAT_ID_KEY) or "")
+        thread = str(origin.get(THREAD_ID_KEY) or "")
         if origin.get(PLATFORM_KEY) != PRESENTED_PLATFORM or not channel:
+            _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_CHAT_ID_MISSING))
             return False
-        import chat_notify
-
         if chat_notify.routes(PRESENTED_PLATFORM):
-            return _posted_through_gateway(content, channel, str(origin.get(THREAD_ID_KEY) or ""))
-        import inventory_presenter
+            return _posted_through_gateway(data_dir, card, channel, thread)
         import slack_blocks_post
 
         if not slack_blocks_post.configured():
+            _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_RELAY_MISSING))
             return False
-        built = inventory_presenter.blocks(content)
-        if built is None:
-            return False
-        blocks, text = built
+        blocks, text = inventory_card.blocks(card)
         try:
-            slack_blocks_post.post(channel, text, blocks, str(origin.get(THREAD_ID_KEY) or ""))
+            slack_blocks_post.post(channel, text, blocks, thread)
         except slack_blocks_post.Refused as e:
-            sys.stderr.write(f"bootstrap_delivery: Slack refused the report blocks ({e})\n")
+            _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_REFUSED.format(error=e)))
             return False
         return True
-    except Exception as e:
-        sys.stderr.write(f"bootstrap_delivery: posting the report as text: {e}\n")
+    except Exception as e:  # noqa: BLE001 - the text must still go
+        _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_POST_FAILED.format(error=e)))
     return False
 
 
-def _posted_through_gateway(content: str, channel: str, thread: str) -> bool:
+def _posted_through_gateway(data_dir: Path, card: inventory_card.Card, channel: str, thread: str) -> bool:
     """Under ``spec.mode: next``, whether the card posted as a chat message through the gateway.
 
     The gateway holds Slack there and the broker's relay is gone, so the card
-    goes as ``a2a notify --chat-file`` (``inventory_presenter.chat``) into the
+    goes as ``a2a notify --chat-file`` (``inventory_card.chat``) into the
     origin's thread, which the gateway posts only when it is a thread of its
     home channel. False, and the caller prints the text, with no thread to
     reply on (a bare post would land in the home channel, wherever the origin
-    is), a report that does not parse, or any failure, including one that may
-    have posted, for the reason ``_posted_as_blocks`` gives.
+    is) or any failure, including one that may have posted, for the reason
+    ``_posted_as_blocks`` gives.
     """
-    import chat_notify
-    import inventory_presenter
-
-    built = inventory_presenter.chat(content) if thread else None
-    if built is None:
+    if not thread:
+        _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_THREAD_MISSING))
         return False
-    chat, text = built
+    chat, text = inventory_card.chat(card)
     path = ""
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
@@ -1092,7 +1460,7 @@ def _posted_through_gateway(content: str, channel: str, thread: str) -> bool:
             with contextlib.suppress(OSError):
                 os.unlink(path)
     if res.returncode != 0:
-        sys.stderr.write(f"bootstrap_delivery: the gateway did not post the report card: {res.stderr.strip()}\n")
+        _stage_note(data_dir, CARD_UNPOSTED.format(reason=CARD_GATEWAY_REFUSED.format(error=res.stderr.strip())))
         return False
     return True
 
@@ -1160,35 +1528,24 @@ def _notify_conversation(conversation: dict, text: str, chat: dict | None = None
 
 
 def _post_to_conversation(data_dir: Path, conversation: dict, content: str, note: str,
-                          mark_shown) -> tuple[str, str, bool]:
+                          mark_shown, card: inventory_card.Card | None) -> tuple[str, str, bool]:
     """Post the report and the audits note: the card then the note, or one text message.
 
-    The card goes only when ``KAGE_SLACK_UX`` is on, the conversation is Slack's
-    and the report parses. On the card path anything short of posted is
-    returned as ``NOT_POSTED``, since the next attempt's key edits a card that
-    landed. Once the claim is kept, the outcome is recorded, then the
-    findings are marked shown (``mark_shown``, whose result is returned), both
-    before the card path's note goes, since the outcome ends the findings
-    nudge's hold. A note that fails is logged: the report is out.
+    ``card`` is ``_first_report_card``'s for this conversation, None for the
+    text. On the card path anything short of posted is returned as
+    ``NOT_POSTED``, since the next attempt's key edits a card that landed. Once
+    the claim is kept, the outcome is recorded, then the findings are marked
+    shown (``mark_shown``, whose result is returned), both before the card
+    path's note goes, since the outcome ends the findings nudge's hold. A note
+    that fails is logged: the report is out.
     """
-    platform = conversation["platform"]
-    card = None
-    try:
-        import slack_presenter
-
-        if platform == PRESENTED_PLATFORM and slack_presenter.enabled():
-            import inventory_presenter
-
-            card = inventory_presenter.chat(content)
-    except Exception as e:
-        sys.stderr.write(f"bootstrap_delivery: posting the report as text: {e}\n")
     if card is None:
-        outcome, reason = _notify_conversation(conversation, _with_note(_presented(content, platform), note))
+        outcome, reason = _notify_conversation(conversation, _with_note(_presented(content, conversation["platform"]), note))
         if outcome == NOT_POSTED:
             return outcome, reason, False
         _record_outcome(data_dir, outcome)
         return outcome, reason, mark_shown()
-    chat, text = card
+    chat, text = inventory_card.chat(card)
     outcome, reason = _notify_conversation(conversation, text, chat, CONVERSATION_REPORT_UPDATE)
     if outcome != POSTED:
         return NOT_POSTED, reason, False
@@ -1208,25 +1565,26 @@ def _record_outcome(data_dir: Path, outcome: str) -> None:
 
 
 def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dict, content: str,
-                             no_ranking: bool | None, suppressed: set[str]) -> None:
+                             note: str, suppressed: set[str], files: SweepFiles,
+                             card: inventory_card.Card | None) -> bool:
     """After the claim: post into the conversation, and release the claim unless the report is out.
 
-    The findings are marked shown only once the claim is kept (posted, or on
-    the text path most likely posted), so a released claim leaves none counted
-    against the day's limit.
+    True when the claim is kept. The findings are marked shown only once it is
+    (posted, or on the text path most likely posted), so a released claim
+    leaves none counted against the day's limit.
     """
-    note = _audits_note(data_dir, no_ranking is True, home=bool(chat_notify.routed_platform()))
     outcome, reason, shown = _post_to_conversation(
-        data_dir, conversation, content, note, lambda: _mark_shown(data_dir, in_sandbox, suppressed)
+        data_dir, conversation, content, note, lambda: _mark_shown(files, suppressed), card
     )
     if outcome == NOT_POSTED:
         # Recorded first, so the released claim is retried only after the wait.
         _record_attempt(data_dir, reason, counted=True)
         _release_claim(data_dir)
-        return
+        return False
     if outcome != POSTED:
         _record_attempt(data_dir, reason, counted=False)
     _cleanup(data_dir, in_sandbox, shown)
+    return True
 
 
 def main(data_dir: Path | None = None) -> int:
@@ -1285,10 +1643,24 @@ def main(data_dir: Path | None = None) -> int:
         )
         return 1
 
+    # The files beside the report, read before the claim like the report, so a
+    # sandbox that stopped answering leaves no claim behind to undo.
+    try:
+        files = _read_sweep_files(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
+        return 0
     # Before the claim, which ends the nudge's hold, so the rows exist when
     # the marks below are sent.
     no_ranking = _no_ranking(data_dir)
-    suppressed = _register_findings(data_dir, in_sandbox, no_ranking)
+    suppressed = _register_findings(data_dir, no_ranking, files)
+    # One card for whichever door posts it, from the files read above; built
+    # here, before the claim, since it reads nothing more.
+    platform = conversation["platform"] if conversation is not None else _origin_platform()
+    card, text_reason = _first_report_card(platform, no_ranking, files, suppressed)
+    # Also before the claim, so its reads cannot cost the report once the claim is taken.
+    home = bool(chat_notify.routed_platform()) if conversation is not None else True
+    note = _safe_audits_note(data_dir, no_ranking is True, home)
 
     # The cheap check above is advisory; this is the decision. Nothing may be
     # written to stdout before it succeeds.
@@ -1296,23 +1668,28 @@ def main(data_dir: Path | None = None) -> int:
         return 0  # another run is delivering this report — stay silent
 
     if conversation is not None:
-        _deliver_to_conversation(data_dir, in_sandbox, conversation, content, no_ranking, suppressed)
-        return 0
-
-    # Right after the claim, which ends the nudge's hold, so a nudge run has
-    # the shortest window in which to announce these findings as new.
-    shown = _mark_shown(data_dir, in_sandbox, suppressed)
-
-    note = _audits_note(data_dir, no_ranking is True)
-    if _posted_as_blocks(content):
-        sys.stdout.write(note + "\n")
+        kept = _deliver_to_conversation(data_dir, in_sandbox, conversation, content, note, suppressed, files, card)
     else:
-        sys.stdout.write(_with_note(_presented(content), note))
-    sys.stdout.flush()
+        # The origin path keeps every claim: stdout is the scheduler's.
+        kept = True
+        # Right after the claim, which ends the nudge's hold, so a nudge run has
+        # the shortest window in which to announce these findings as new.
+        shown = _mark_shown(files, suppressed)
 
-    # Cleanup runs only after the report is posted or safely on stdout (already
-    # captured by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
-    _cleanup(data_dir, in_sandbox, shown)
+        if _posted_as_blocks(data_dir, card):
+            sys.stdout.write(note + "\n")
+        else:
+            sys.stdout.write(_with_note(_presented(content, platform), note))
+        sys.stdout.flush()
+
+        # Cleanup runs only after the report is posted or safely on stdout (already
+        # captured by the scheduler), so removing INVENTORY.md here cannot truncate delivery.
+        _cleanup(data_dir, in_sandbox, shown)
+
+    # Logged by the run that keeps the claim, so a text post that failed and
+    # released it leaves no line; the attempt that posts writes the one.
+    if kept and card is None:
+        _stage_note(data_dir, TEXT_REPORT_NOTE.format(reason=text_reason))
     return 0
 
 

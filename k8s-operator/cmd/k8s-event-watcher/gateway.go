@@ -39,8 +39,9 @@ const (
 //
 // The daemon accepts an inject before it can start the triage turn, because
 // the turn runs in a background task after the 200. An event offered while
-// the gateway is still booting is therefore marked delivered in the dedup
-// cache and never offered again, although no triage ran. Holding the
+// the gateway is still booting is marked delivered in the dedup cache and
+// never offered again, so its triage rests on the daemon's retries, which give
+// up after a bounded wait. Holding the
 // informers until the gateway answers loses nothing: their initial list
 // replays every event still inside the API server's Event TTL.
 //

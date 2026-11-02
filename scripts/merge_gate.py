@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The merge queue's two gate checks, and the sweep that enqueues pull requests.
 
-Part of the Tide-to-merge-queue migration (#1363). Tide decides two things
-that `main`'s required GitHub checks do not: the smoke test passed, and the
+Part of the Tide-to-merge-queue migration (#1363). Tide decided two things
+that `main`'s required GitHub checks did not: the smoke test passed, and the
 pull request carries `lgtm` and `approved` with no `do-not-merge` label. A
 merge queue only reads required checks, so each of the two becomes one, under
 these names:
@@ -10,8 +10,9 @@ these names:
   - `Smoke gate`: the latest `pull-kube-agents-smoke-test` status on the pull
     request head is green (an `/override` included), or there is none and the
     pull request only changes paths the presubmit skips, which is when Tide
-    does not wait for it.
-  - `Merge labels`: Tide's query for this repository, read from the labels.
+    did not wait for it either.
+  - `Merge labels`: the label test of Tide's query for this repository, read
+    from the labels.
 
 A smoke green from before the blocking job changed what it grades does not
 pass. While the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time, the
@@ -36,12 +37,12 @@ the queue removed, stays out until its head moves: the one retry after a
 `failed_checks` removal fails the same way. So the pending text asks for a push,
 not a `/test`.
 
-Tide also holds a merge on any other posted context that is not green, required
-or not, because no `context_options` entry for this repository says otherwise.
+Tide also held a merge on any other posted context that was not green, required
+or not, because no `context_options` entry for this repository said otherwise.
 These two checks do not restate that rule. The CLA needs no gate:
 `cla/google` stays a required check, because the CLA app also posts it on a
-queue commit (it subscribes to `merge_group`). A check that is not required stops
-blocking a merge at cut-over unless the ruleset adds it.
+queue commit (it subscribes to `merge_group`). A check that is not required no
+longer blocks a merge unless the ruleset adds it.
 
 Each check reports in two places, because the queue asks twice. A pull request
 must already pass every required check to enter the queue, so `pull` and
@@ -105,12 +106,12 @@ NOT_BEFORE_ENV = "SMOKE_PIN_NOT_BEFORE"
 #: What `Smoke gate` says while it waits on a green from before the cutoff.
 SMOKE_PREDATES = f"smoke predates {NOT_BEFORE_ENV}; push a new commit to rerun {SMOKE_CONTEXT}"
 #: The note `pin_smoke_status.py` (EXPIRED_NOTE) adds to a pre-cutoff green that Tide still
-#: credited. It holds that green with or without the variable, as it does for Tide.
+#: credited. It holds that green with or without the variable, as it did for Tide.
 SMOKE_EXPIRED_NOTE = f"(predates {NOT_BEFORE_ENV}: retest)"
-#: Tide's query for this repository (`prow/oss/config.yaml` in oss-test-infra) wants both.
+#: Tide's query for this repository (`prow/oss/config.yaml` in oss-test-infra) wanted both.
 REQUIRED_LABELS = ("approved", "lgtm")
-#: The four labels Tide's query for this repository excludes. Any other `do-not-merge/` label
-#: does not hold a Tide merge, so it does not hold here either.
+#: The four labels Tide's query for this repository excluded. Any other `do-not-merge/` label
+#: did not hold a Tide merge, so it does not hold here either.
 HOLD_LABELS = (
     "do-not-merge",
     "do-not-merge/hold",
@@ -122,8 +123,10 @@ HOLD_LABELS = (
 STICKY_LGTM_TEAM = "gke-labs/Googlers"
 #: `skip_if_only_changed` of `pull-kube-agents-smoke-test` in oss-test-infra
 #: `prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml`. Keep the two identical.
+#: k8s-api-proxy/ is there by choice, and only until the sandbox routes kubectl through the
+#: proxy (issue #4087); test_merge_gate fails once it does.
 SMOKE_SKIP_RE = re.compile(
-    r"^(docs/|\.github/|examples/|tests/|scripts/release/|scripts/eval_dashboard/)"
+    r"^(docs/|\.github/|examples/|tests/|scripts/release/|scripts/eval_dashboard/|k8s-api-proxy/)"
     r"|^scripts/test_[^/]+\.py$|^[^/]+\.md$"
     r"|^(LICENSE|OWNERS|OWNERS_ALIASES|\.gitignore|install\.sh|upgrade\.sh|uninstall\.sh)$"
 )
@@ -314,7 +317,7 @@ def verdicts(pull, files, not_before=None, first_reported=None):
     """
     smoke = pull["statuses"].get(SMOKE_CONTEXT)
     # A posted smoke status decides, even on skipped paths: a hand-run `/test`
-    # that went red holds a Tide merge too. The paths decide only when Prow
+    # that went red held a Tide merge too. The paths decide only when Prow
     # posted nothing.
     if smoke is None and not smoke_required(files()):
         smoke_gate = SUCCESS, "smoke not required: only paths it skips changed"
@@ -400,10 +403,11 @@ def rest_pull(api, raw):
 def post_verdicts(api, pull, results, dry_run=False):
     """Post each gate status that differs from the one on the head. Returns log lines.
 
-    Green only. Tide holds a merge on any posted context that is not green,
-    required or not, and nothing re-posts a status when the hold sweep's own
-    label change starts no run, so a non-green posted while Tide still merges
-    could hold a pull request after its inputs turned green again. A green that
+    Green only. This was written while Tide still merged: Tide held a merge on
+    any posted context that was not green, required or not, and nothing
+    re-posts a status when the hold sweep's own label change starts no run, so
+    a non-green posted then could hold a pull request after its inputs turned
+    green again. A green that
     went stale is safe: the queue judges both again on its own commit.
     """
     lines = []

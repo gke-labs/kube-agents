@@ -101,7 +101,7 @@ class Store:
             )
 
     def chain(self, start: datetime, last_status: str = "running") -> None:
-        """The four runs one after another, each just after its mark, the last still going unless told otherwise."""
+        """The audits run one after another, each just after its mark, the last still going unless told otherwise."""
         at = start
         for i, audit in enumerate(oobe.FIRST_RUN_AUDITS):
             last = i == len(oobe.FIRST_RUN_AUDITS) - 1

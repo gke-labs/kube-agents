@@ -1469,6 +1469,15 @@ func TestSafeSandboxEnvOverridesPassesFindingsPacingLimits(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
+	// session_kv_server.py reads the window from its own environment; off the
+	// allowlist, the documented spec.deployment.env entry never reaches it.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "900"}})
+	if len(got) != 1 || got[0].Name != "INCIDENT_WORKLOAD_DEDUP_SECONDS" || got[0].Value != "900" {
+		t.Errorf("expected INCIDENT_WORKLOAD_DEDUP_SECONDS=900 to pass, got %#v", got)
+	}
+}
+
 func TestBuildCredentialProxyContainer(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -4219,6 +4228,11 @@ func TestBuildDeployment_AgentPlugins_ImageVolumeUnsupported(t *testing.T) {
 	}
 	if pluginVol.EmptyDir == nil {
 		t.Errorf("expected plugin-myplugin volume source to be EmptyDir, got %+v", pluginVol)
+	} else if sl := pluginVol.EmptyDir.SizeLimit; sl == nil || sl.Cmp(resource.MustParse(pluginStagingSizeLimit)) != 0 {
+		// The staging emptyDir is bounded at the figure emptydir_limits.go
+		// gives; this is the only render of it, since no golden fixture
+		// carries an AgentPlugin.
+		t.Errorf("plugin-myplugin staging emptyDir sizeLimit = %v, want %s", sl, pluginStagingSizeLimit)
 	}
 
 	// 2. InitContainer must stage the plugin
@@ -5437,6 +5451,50 @@ func TestMaxInProgressIsPinnedInTheManagedScope(t *testing.T) {
 		agent := agentWithTuning(&agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(want)})
 		if got := managedCap(t, agent); fmt.Sprint(got) != fmt.Sprint(want) {
 			t.Errorf("max_in_progress = %v, want the CR's %d", got, want)
+		}
+	}
+}
+
+// Session retention rides the managed scope, so it applies to every profile in the pod (the
+// front door, the Platform Agent and each Cluster Agent) and a profile cannot lengthen its own
+// (#3704). auto_prune is pinned true; retention_days is the CR's value or the operator default.
+// The tests read defaultSessionRetentionDays rather than a literal, so flipping the default is a
+// one-line change.
+func TestSessionRetentionIsPinnedInTheManagedScope(t *testing.T) {
+	managedSessions := func(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]any {
+		t.Helper()
+		var managed map[string]any
+		if err := yaml.Unmarshal([]byte(buildConfigMapData(agent, nil)[managedConfigKey]), &managed); err != nil {
+			t.Fatalf("unmarshal managed scope: %v", err)
+		}
+		sessions, ok := managed["sessions"].(map[string]any)
+		if !ok {
+			t.Fatalf("the managed scope carries no sessions block, got:\n%v", managed)
+		}
+		if got := sessions["auto_prune"]; got != true {
+			t.Errorf("sessions.auto_prune = %v, want true", got)
+		}
+		return sessions
+	}
+
+	if got := managedSessions(t, newTestPlatformAgent())["retention_days"]; fmt.Sprint(got) != fmt.Sprint(defaultSessionRetentionDays) {
+		t.Errorf("unset retention_days = %v, want the operator default %d", got, defaultSessionRetentionDays)
+	}
+	for _, want := range []int{defaultSessionRetentionDays + 1, 365} {
+		if want == defaultSessionRetentionDays {
+			t.Fatalf("test value %d must differ from the default to prove the override", want)
+		}
+		agent := newTestPlatformAgent()
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Retention: &agentv1alpha1.RetentionSpec{SessionDays: ptr.To(want)}}
+		if got := managedSessions(t, agent)["retention_days"]; fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("retention_days = %v, want the CR's %d", got, want)
+		}
+	}
+	// One route only: an overlay copy would be merged into a profile's config.yaml and then
+	// overruled by the pin, and would outlive the CR field.
+	for key, overlay := range buildConfigMapData(newTestPlatformAgent(), nil) {
+		if key != managedConfigKey && strings.Contains(overlay, "retention_days") {
+			t.Errorf("%s must not carry retention_days; it belongs to the managed scope alone", key)
 		}
 	}
 }
@@ -7685,5 +7743,61 @@ func TestLeaderRolePodsRuleVerbsAboveOneReplica(t *testing.T) {
 		if slices.Contains(r.Resources, "pods") {
 			t.Errorf("a pods rule at one replica: %v", r)
 		}
+	}
+}
+
+// The gateway's startup and readiness probes run the same curl against the
+// Hermes API on loopback. curl carries its own --max-time under kubelet's
+// TimeoutSeconds, so a hung listener is reported as curl's exit 28 rather
+// than cut off by kubelet's exec kill; each timeout stays within its probe's
+// period so a slow check never delays the next tick; and the startup probe's
+// budget is the 905s cold boot gatewayProgressDeadlineSeconds is sized over.
+// The golden manifests pin the exact numbers; this test holds the relations
+// between them.
+func TestAgentAPIProbesTimeOutUnderKubeletAndKeepTheStartupBudget(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true})
+	c, ok := findContainer(dep.Spec.Template.Spec, "platform-agent")
+	if !ok {
+		t.Fatal("the platform-agent container is missing")
+	}
+	maxTime := regexp.MustCompile(`--max-time (\d+)`)
+	probes := map[string]*corev1.Probe{"startup": c.StartupProbe, "readiness": c.ReadinessProbe}
+	for name, probe := range probes {
+		if probe == nil || probe.Exec == nil || len(probe.Exec.Command) == 0 {
+			t.Fatalf("%s probe = %+v, want an exec probe", name, probe)
+		}
+		cmd := strings.Join(probe.Exec.Command, " ")
+		for _, want := range []string{
+			`http://127.0.0.1:8642/api/sessions?limit=1`,
+			`-H "Authorization: Bearer $API_SERVER_KEY"`,
+			`[ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION" = "true" ] && exit 0`,
+		} {
+			if !strings.Contains(cmd, want) {
+				t.Errorf("%s probe command %q lacks %q", name, cmd, want)
+			}
+		}
+		m := maxTime.FindStringSubmatch(cmd)
+		if m == nil {
+			t.Errorf("%s probe command %q has no curl --max-time: a hung listener would run to kubelet's kill", name, cmd)
+		} else if secs, _ := strconv.Atoi(m[1]); secs <= 0 || int32(secs) >= probe.TimeoutSeconds {
+			t.Errorf("%s probe --max-time %d must sit under TimeoutSeconds %d", name, secs, probe.TimeoutSeconds)
+		}
+		if probe.TimeoutSeconds > probe.PeriodSeconds {
+			t.Errorf("%s probe TimeoutSeconds %d exceeds PeriodSeconds %d: a slow check would skip the next tick", name, probe.TimeoutSeconds, probe.PeriodSeconds)
+		}
+	}
+	startup, readiness := probes["startup"], probes["readiness"]
+	budget := startup.InitialDelaySeconds + startup.PeriodSeconds*startup.FailureThreshold
+	if budget != 905 {
+		t.Errorf("startup probe budget = %ds, want the 905s cold boot gatewayProgressDeadlineSeconds is sized over", budget)
+	}
+	if budget >= gatewayProgressDeadlineSeconds {
+		t.Errorf("startup probe budget %ds must stay under gatewayProgressDeadlineSeconds %d", budget, gatewayProgressDeadlineSeconds)
+	}
+	if window := readiness.PeriodSeconds * readiness.FailureThreshold; window >= budget {
+		t.Errorf("readiness withdraws after %ds, which is not quicker than the %ds startup budget", window, budget)
 	}
 }

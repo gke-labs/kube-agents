@@ -1,0 +1,51 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. The front door's roster block carries a "GCP
+# Projects in Scope" section (agents/chat/scripts/agent_roster.py, read through
+# the platform agent's own scope reader), and agents/chat/SOUL.md §1.4 tells it
+# to answer this question from that block in the same turn (#3143). Before the
+# section existed the front door filed a diagnostic card for a static fact.
+#
+# What it grades: no kanban_create in the delegating turn, and an answer that
+# talks about projects rather than a "checking ..." stub. The project ids differ
+# per install and report_contains cannot substitute them, so the case does not
+# pin the list itself; agent_roster's unit tests pin what the block says.
+#
+# Planted defect required: none. Isolation class: read-only. deployer: noop,
+# one front-door turn with no card.
+id: chat-scope-projects-answered-from-roster
+name: The front door answers "what projects are in scope?" from its roster block
+prompt: >-
+  What GCP projects are currently in your scope?
+expected_output: >-
+  The front door answers in the same turn, without filing a card, naming the
+  GCP project ids its roster block lists as in scope (and, only if the block
+  marks the scope partial or names an unread project, includes that note).
+infrastructure:
+  deployer: noop
+validated: false
+tool_calls_optional: true
+
+# Slug per docs/designs/domains.yaml: the front door's routing journey.
+domain: chat-and-routing
+
+verification_spec:
+  # assert, not the converge default: the transcript is immutable once the
+  # run ends, so polling a failed check would only wait out the timeout.
+  - name: answered-without-a-card
+    role: objective
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]
+  - name: the-answer-is-about-projects-not-a-stub
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["project"]
+      forbidden_patterns:
+        - '(?i)^\s*checking\b'

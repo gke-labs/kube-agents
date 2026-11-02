@@ -1574,7 +1574,7 @@ func TestInjectReadRouteReportsATerminalOnTheStreamBeforeTheRelay(t *testing.T) 
 	door.SetProbe(func(context.Context, string, string) (ConversationState, error) {
 		return ConversationState{Active: true, TaskID: "task-1", ExecutorState: lib.StateFailed, Final: true, Grace: injectTestGrace}, nil
 	})
-	report := door.runProbe(context.Background(), injectKeyPrefix+"any", "")
+	report := door.runProbe(context.Background(), injectKeyPrefix+"any", "", false)
 	if !report.Active || !report.Final || report.ExecutorState != string(lib.StateFailed) {
 		t.Fatalf("report = %+v, want an active task whose stream is final", report)
 	}
@@ -1616,7 +1616,7 @@ func TestInjectReadRouteSaysWhenItCannotLook(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	report := door.runProbe(context.Background(), injectKeyPrefix+"orphan", "")
+	report := door.runProbe(context.Background(), injectKeyPrefix+"orphan", "", false)
 	if report.Error == "" || report.Active {
 		t.Fatalf("probe with no gateway = %+v, want an error and nothing asserted", report)
 	}
@@ -1624,7 +1624,7 @@ func TestInjectReadRouteSaysWhenItCannotLook(t *testing.T) {
 		return ConversationState{Active: true, TaskID: "task-1"}, fmt.Errorf("the stream is unreachable")
 	}
 	door.SetProbe(failing)
-	report = door.runProbe(context.Background(), injectKeyPrefix+"orphan", "")
+	report = door.runProbe(context.Background(), injectKeyPrefix+"orphan", "", false)
 	if !strings.Contains(report.Error, "unreachable") || !report.Active || report.TaskID != "task-1" {
 		t.Fatalf("probe that failed to look = %+v, want the error beside what was learned", report)
 	}
@@ -1994,12 +1994,16 @@ func TestInjectReadRouteCarriesTheFoldOfAFinishedTask(t *testing.T) {
 
 // probeRaw is probe as the wire carries it: the probe object's keys and
 // their raw JSON, for a test whose claim is about presence -- a decoded
-// struct cannot tell an absent key from its zero value.
-func (r *injectRig) probeRaw(t *testing.T, key, taskID string) map[string]json.RawMessage {
+// struct cannot tell an absent key from its zero value. Each of query is
+// one more key=value on the read.
+func (r *injectRig) probeRaw(t *testing.T, key, taskID string, query ...string) map[string]json.RawMessage {
 	t.Helper()
 	target := fmt.Sprintf("%s%s%s?after=0&wait=0&%s=1", r.base, conversationsPath, key, probeParam)
 	if taskID != "" {
 		target += "&task=" + taskID
+	}
+	for _, q := range query {
+		target += "&" + q
 	}
 	resp, err := r.do(t, http.MethodGet, target, nil, injectTestToken)
 	if err != nil {
@@ -2132,6 +2136,65 @@ func TestInjectReadRouteShowsAnEmptyTraceForATaskThatCalledNothing(t *testing.T)
 	}
 }
 
+// TestInjectReadRouteCarriesTheTasksUsage: the relay never posts the usage
+// artifact, so the read route is how a harness learns what the front door's
+// turn cost. A read that asks (usage=chain) carries the total over every
+// turn's part; the key is absent while the executor has published none, and
+// on every read that did not ask.
+func TestInjectReadRouteCarriesTheTasksUsage(t *testing.T) {
+	r := startInjectRig(t)
+	reply := r.inject(t, "case-usage", injectTestAuthor, "list the clusters")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	asked := usageParam + "=" + usageChain
+	if usage, ok := r.probeRaw(t, reply.Conversation, reply.TaskID, asked)["usage"]; ok {
+		t.Fatalf("usage = %s before the executor published any; want the key absent", usage)
+	}
+
+	first, err := lib.UsagePart(lib.Usage{Model: "m1", InputTokens: 1200, OutputTokens: 300, DurationMs: 2000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := lib.UsagePart(lib.Usage{Model: "m2", InputTokens: 800, OutputTokens: 100, DurationMs: 500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: lib.ArtifactUsage, Name: lib.ArtifactUsage,
+		Parts: []lib.Part{first}}); err != nil {
+		t.Fatal(err)
+	}
+	r.appendArtifact(t, origin, "platform", lib.Artifact{ArtifactID: lib.ArtifactUsage, Name: lib.ArtifactUsage,
+		Parts: []lib.Part{second}})
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+
+	plain := r.probeRaw(t, reply.Conversation, reply.TaskID)
+	if string(plain["final"]) != "true" {
+		t.Fatalf("probe = %s, want the finished task read by id", plain)
+	}
+	if usage, ok := plain["usage"]; ok {
+		t.Fatalf("usage = %s on a read that did not ask; want the key absent", usage)
+	}
+	raw, ok := r.probeRaw(t, reply.Conversation, reply.TaskID, asked)["usage"]
+	if !ok {
+		t.Fatalf("no usage on a read that asked for it")
+	}
+	var got lib.Usage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("usage %s does not decode: %v", raw, err)
+	}
+	want := lib.Usage{Model: "m2", InputTokens: 2000, OutputTokens: 400, DurationMs: 2500}
+	if got != want {
+		t.Fatalf("usage = %+v, want %+v: the sum over the task's turns", got, want)
+	}
+}
+
 // TestInjectReadRouteOmitsTheTraceWhenNoStreamWasRead: with no active task
 // there is no stream to read, and a read that failed learned nothing about
 // one, so the activity key is absent in both -- the same shape a door older
@@ -2151,7 +2214,7 @@ func TestInjectReadRouteOmitsTheTraceWhenNoStreamWasRead(t *testing.T) {
 	door.SetProbe(func(context.Context, string, string) (ConversationState, error) {
 		return ConversationState{Active: true, TaskID: "task-1"}, fmt.Errorf("the stream is unreachable")
 	})
-	body, err := json.Marshal(door.runProbe(context.Background(), injectKeyPrefix+"orphan", ""))
+	body, err := json.Marshal(door.runProbe(context.Background(), injectKeyPrefix+"orphan", "", false))
 	if err != nil {
 		t.Fatal(err)
 	}

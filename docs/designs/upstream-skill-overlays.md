@@ -150,14 +150,14 @@ Why order rarely matters:
 
 When parallel PRs on one skill conflict:
 
-| The two PRs change               | What happens                                                              | Fix                                                   |
-| -------------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------- |
-| Separate parts of the skill      | Both merge; they share no file                                            | None                                                  |
-| The same or adjacent lines       | GitHub reports a conflict on the second PR                                | Rebase, settle the wording, run `make skills-refresh` |
-| Lines within three of each other | Both can merge green; `validate` on `main` then fails and names the patch | A follow-up PR runs `make skills-refresh`             |
+| The two PRs change               | What happens                                                                                     | Fix                                                   |
+| -------------------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------- |
+| Separate parts of the skill      | Both merge; they share no file                                                                   | None                                                  |
+| The same or adjacent lines       | GitHub reports a conflict on the second PR                                                       | Rebase, settle the wording, run `make skills-refresh` |
+| Lines within three of each other | `validate` fails on the second PR's merge queue commit and names the patch; the queue removes it | Rebase, run `make skills-refresh`, push               |
 
 - Each fix is one command once the wording is settled.
-- The third case is caught after merge because `validate` does not rerun on an open PR when `main` moves; a merge queue would catch it before merge (`validate` already runs on `merge_group`).
+- The third case is caught before merge: `validate` does not rerun on an open PR when `main` moves, but it runs again on the merge queue commit (`merge_group`).
 
 ### Syncing a skill
 
@@ -456,7 +456,7 @@ What happens after a sync conflict:
 | 1    | Weekly job          | Files one issue per conflicted skill, or updates the open one: label `skill-sync-conflict`, unassigned, with the patch and its `Why:`, the upstream diff and the conflicting lines. |
 | 2    | `kube-agents-robot` | Claims it by assigning itself, as `agents/contributor/AGENTS.md` requires; the contract only claims unassigned issues, which is why the job does not assign it.                     |
 | 3    | `kube-agents-robot` | Runs `make skills-sync SKILL=<skill>` in its fork, resolves the conflicting lines, runs `make skills-continue`, and opens a PR that closes the issue.                               |
-| 4    | Reviewers           | `kube-agents-bot` reviews; a root approver approves; Tide merges.                                                                                                                   |
+| 4    | Reviewers           | `kube-agents-bot` reviews; a root approver approves; the merge queue merges.                                                                                                        |
 | —    | Fallback            | If the robot is stuck it adds `needs-human` and stops, per its contract; a person resolves from the same issue.                                                                     |
 
 ```mermaid

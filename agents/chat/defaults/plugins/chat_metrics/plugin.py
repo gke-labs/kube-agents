@@ -49,6 +49,7 @@ def _platform_of(event: Any) -> str:
 
 def count_inbound(event: Any = None, gateway: Any = None, session_store: Any = None, **kwargs: Any) -> Optional[Dict[str, str]]:
     """Count the event under its platform; rewrite nothing."""
+    metrics.note_gateway(gateway)
     try:
         REGISTRY.record_inbound(_platform_of(event))
     except Exception as exc:  # noqa: BLE001 -- the count never costs a turn

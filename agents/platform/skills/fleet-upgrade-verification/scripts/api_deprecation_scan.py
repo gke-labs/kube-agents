@@ -670,8 +670,9 @@ def render_report(report: dict) -> str:
             f"Scope: apiVersions declared in Git, matched against {TABLE_NAME} "
             f"(as of Kubernetes {table['as_of']}, source {table['source_url']}). "
             "Files that did not parse are listed as skipped above and were not scanned. "
-            "Live client usage of deprecated APIs is GKE Deprecation Insights' job, not this "
-            f"script's: {DEPRECATION_INSIGHTS_URL} in the console, or "
+            "Live client usage of deprecated APIs is read from the audit log, not from Git: "
+            "`fleet_upgrade_report.py --readiness` reads seven days of it per member, and GKE "
+            f"Deprecation Insights read thirty: {DEPRECATION_INSIGHTS_URL} in the console, or "
             f"`{DEPRECATION_INSIGHTS_COMMAND}` run by a human; this script does not run it.",
         ]
     )

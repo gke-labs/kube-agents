@@ -1,0 +1,18 @@
+2026-10-21T02:37:11.1014054Z ##[group]Run ./scripts/release/resolve_promotion_candidate.sh
+2026-10-21T02:37:11.1014977Z [36;1m./scripts/release/resolve_promotion_candidate.sh[0m
+2026-10-21T02:37:11.1202049Z shell: /usr/bin/bash -e {0}
+2026-10-21T02:37:11.1202454Z env:
+2026-10-21T02:37:11.1203281Z   PROW_ARCHIVE_WIF_PROVIDER: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+2026-10-21T02:37:11.1204432Z   PROW_ARCHIVE_READER_SA: github-actions@kube-agents-prow.iam.gserviceaccount.com
+2026-10-21T02:37:11.1205297Z   RC_TAG: rc_2610210024_8dc552a_validated
+2026-10-21T02:37:11.1205713Z   GH_ORG: gke-labs
+2026-10-21T02:37:11.1206046Z   GH_REPO: kube-agents
+2026-10-21T02:37:11.1206391Z ##[endgroup]
+2026-10-21T02:37:11.3221395Z ======================================================================
+2026-10-21T02:37:11.3222088Z 🌙 RESOLVED NIGHTLY PROMOTION CANDIDATE
+2026-10-21T02:37:11.3222431Z Candidate RC Tag:   rc_2610210024_8dc552a_validated
+2026-10-21T02:37:11.3223355Z Commit SHA:         8dc552a35eb4fa831ea12058868063e530d1e957
+2026-10-21T02:37:11.3224036Z Eval-Candidate Tag: evalcand_2610210024_8dc552a
+2026-10-21T02:37:11.3224911Z Staging Tag:        staging_2610210024_8dc552a
+2026-10-21T02:37:11.3225627Z Skip Pipeline:      false
+2026-10-21T02:37:11.3226225Z Skip Promotion:     false

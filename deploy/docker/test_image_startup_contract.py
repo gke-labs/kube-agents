@@ -35,6 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ENTRYPOINT = REPO_ROOT / "deploy" / "shared" / "docker-entrypoint.sh"
 START_SERVICES = REPO_ROOT / "deploy" / "shared" / "start-services.sh"
 DOCKERFILE = REPO_ROOT / "deploy" / "docker" / "Dockerfile"
+SANDBOX_DOCKERFILE = REPO_ROOT / "deploy" / "sandbox" / "Dockerfile"
 MANIFESTS_GO = (
     REPO_ROOT
     / "k8s-operator"
@@ -47,6 +48,13 @@ MANIFESTS_GO = (
 # CREDENTIAL_PROXY_WORKSPACE_ROOT, so if the entrypoint's default home and the
 # operator's diverge, the agent starts in a directory its own shims reject.
 DEFAULT_AGENT_HOME = "/opt/data"
+
+# Flags to python -m compileall that request optimized bytecode (.opt-1.pyc or
+# .opt-2.pyc). Neither runtime image sets PYTHONOPTIMIZE or -O, so producing
+# optimized bytecode leaves the interpreter with no valid cache and forces it
+# back to compiling from source on every import. Matches both separated (-o 1,
+# --optimize 1, --optimize=1) and attached (-o1, -qo1) flag forms.
+OPTIMIZE_FLAG_RE = r"\s-[a-z]*o\d*|\s--optimize\b"
 
 
 def stage_body(dockerfile_text: str, target: str) -> str:
@@ -597,15 +605,65 @@ class BytecodeIsBakedAtBuildTimeTest(unittest.TestCase):
         # The runtime sets neither PYTHONOPTIMIZE nor -O, so it looks for the
         # plain .cpython-NNN.pyc. An `-o` here would write .opt-N files that
         # nothing loads.
-        self.assertNotRegex(
-            self.compileall_command(), r"\s-o\b|\s--optimize\b"
-        )
+        self.assertNotRegex(self.compileall_command(), OPTIMIZE_FLAG_RE)
 
     def test_a_module_that_will_not_compile_does_not_break_the_build(self):
         # Large vendored trees carry the odd file that cannot be compiled. The
         # cache is an optimisation; losing part of it is today's behaviour, and
         # not a reason to fail the image.
         self.assertIn("||", self.compileall_command())
+
+
+class SandboxBytecodeIsBakedAtBuildTimeTest(unittest.TestCase):
+    """The sandbox image must precompile Python standard library bytecode (#4027).
+
+    The sandbox image sets PYTHONDONTWRITEBYTECODE=1 (so root-run scripts do not
+    leave caches in /opt/defaults) and the non-root agent shell cannot write to
+    the root-owned standard library under /usr/local/lib/python3.14. Without a
+    build-time compileall pass, every python3 and credential-proxy-exec invocation
+    recompiles standard library modules from source, wasting ~0.85s of shell CPU
+    per command.
+    """
+
+    def setUp(self):
+        self.text = SANDBOX_DOCKERFILE.read_text()
+
+    def compileall_command(self):
+        """The whole RUN instruction that precompiles the stdlib."""
+        for instruction in joined_instructions(self.text):
+            if "compileall" in instruction:
+                return instruction
+        self.fail("deploy/sandbox/Dockerfile does not precompile the standard library")
+
+    def test_the_sandbox_image_precompiles_the_standard_library(self):
+        cmd = self.compileall_command()
+        self.assertIn("stdlib", cmd)
+
+    def test_a_module_that_will_not_compile_does_not_break_the_build(self):
+        self.assertIn("||", self.compileall_command())
+
+    def test_it_compiles_with_python3(self):
+        # In the sandbox image python3 is the container's interpreter on PATH
+        self.assertIn("python3 -m compileall", self.compileall_command())
+
+    def test_it_does_not_ask_for_optimized_bytecode(self):
+        self.assertNotRegex(self.compileall_command(), OPTIMIZE_FLAG_RE)
+
+    def test_optimize_flag_regex_rejects_attached_and_separated_forms(self):
+        for flag in ("-o 1", "-o1", "-o2", "-qo1", "--optimize=1", "--optimize 1", "--optimize"):
+            with self.subTest(flag=flag):
+                self.assertRegex(f"python3 -m compileall {flag} /path", OPTIMIZE_FLAG_RE)
+        for valid in ("-q -j 0", "-j0", "--invalidation-mode=timestamp"):
+            with self.subTest(valid=valid):
+                self.assertNotRegex(f"python3 -m compileall {valid} /path", OPTIMIZE_FLAG_RE)
+
+    def test_it_verifies_minimum_pyc_count(self):
+        cmd = self.compileall_command()
+        self.assertRegex(cmd, r"find\s+.*\.pyc.*-ge\s+\d+")
+        # The count must not be satisfiable by .opt-N files, which the runtime
+        # never loads. This exclusion is the one guard that covers every route
+        # to them (-o, -oN, -O, PYTHONOPTIMIZE), not only the flag the regex sees.
+        self.assertIn("! -name '*.opt-*.pyc'", cmd)
 
 
 class BytecodePremiseTest(unittest.TestCase):
@@ -717,6 +775,7 @@ class SkillProvenanceContractTest(unittest.TestCase):
         "/opt/hermes/skills",
         "/opt/platform-template/skills",
         "/opt/cluster-template/skills",
+        "/opt/tse-template/skills",
     )
 
     def setUp(self):
@@ -826,6 +885,7 @@ class SkillProvenanceContractTest(unittest.TestCase):
             "/opt/hermes/plugins",
             "/opt/platform-template",
             "/opt/cluster-template",
+            "/opt/tse-template",
             "/opt/chat-template",
             "/opt/defaults/scripts",
         ):

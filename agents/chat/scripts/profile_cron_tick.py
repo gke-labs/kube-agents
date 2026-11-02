@@ -40,7 +40,8 @@ at import (``cron/executions.py`` binds ``EXECUTIONS_FILE`` when it loads). A
 fresh process is the only way to get all of them pointing at one profile, and
 it is the same path ``hermes cron tick`` takes for a manual tick — so a job
 fires through the identical execute → save → deliver → mark body the gateway
-ticker uses, with the profile's own persona, toolsets and ``max_turns``.
+ticker uses, with the profile's own persona and toolsets and the entry's own
+``skills``, ``model`` and ``max_turns``.
 
 Correctness comes from ``tick()`` itself, not from bookkeeping here:
 

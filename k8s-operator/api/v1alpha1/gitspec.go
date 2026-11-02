@@ -28,10 +28,13 @@ package v1alpha1
 import (
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
 
@@ -73,6 +76,10 @@ type ResolvedForge struct {
 	// anything. The key is "ca.crt" when the Secret is named without one.
 	CABundleSecret string
 	CABundleKey    string
+	// Scheme is the declared scheme, lowercased, empty for DefaultForgeScheme.
+	Scheme string
+	// Port is the declared port, zero when none was declared.
+	Port int32
 	// Identity is the declared login the forge's credential acts as, or
 	// empty.
 	Identity string
@@ -166,6 +173,8 @@ func resolveLists(forges []ForgeSpec, repositories []RepositorySpec) *ResolvedIn
 			Provider:         provider,
 			Host:             strings.TrimSpace(f.Host),
 			Namespace:        strings.TrimSpace(f.Namespace),
+			Scheme:           strings.ToLower(strings.TrimSpace(f.Scheme)),
+			Port:             f.Port,
 			Identity:         strings.TrimSpace(f.Identity),
 		}
 		if f.CredentialsRef != nil {
@@ -211,18 +220,53 @@ func (f *ResolvedForge) GitProvider() (*GitProvider, error) {
 // valid reports whether the forge's own fields pass its provider's rules, which
 // is what a repository on it, and its egress, depend on.
 func (f *ResolvedForge) valid() bool {
+	return len(f.problems()) == 0
+}
+
+// forgeProblem is one field of a forge declaration its provider refuses.
+type forgeProblem struct {
+	field string
+	value string
+	err   error
+}
+
+// problems applies the forge's provider rules to its own fields: the
+// provider's name, then its host, namespace, scheme, port and credentials.
+func (f *ResolvedForge) problems() []forgeProblem {
 	provider, err := f.GitProvider()
 	if err != nil {
-		return false
+		return []forgeProblem{{gitProviderField, f.Provider, err}}
 	}
-	return f.providerProblem() == nil &&
-		validateDeclaredValue(gitHostField, f.Host, MaxGitHostLength) == nil &&
-		provider.ValidateHost(f.Host) == nil &&
-		validateDeclaredValue(gitNamespaceField, f.Namespace, MaxGitNamespaceLength) == nil &&
-		provider.ValidateNamespaceOn(f.Host, f.Namespace) == nil &&
-		f.credentialsProblem(provider) == nil &&
-		f.caBundleProblem(provider) == nil &&
-		f.identityProblem(provider) == nil
+	var out []forgeProblem
+	if err := f.providerProblem(); err != nil {
+		out = append(out, forgeProblem{gitProviderField, f.Provider, err})
+	}
+	if err := validateDeclaredValue(gitHostField, f.Host, MaxGitHostLength); err != nil {
+		out = append(out, forgeProblem{gitHostField, f.Host, err})
+	} else if err := provider.ValidateHost(f.Host); err != nil {
+		out = append(out, forgeProblem{gitHostField, f.Host, err})
+	}
+	if err := validateDeclaredValue(gitNamespaceField, f.Namespace, MaxGitNamespaceLength); err != nil {
+		out = append(out, forgeProblem{gitNamespaceField, f.Namespace, err})
+	} else if err := provider.ValidateNamespaceOn(f.Host, f.Namespace); err != nil {
+		out = append(out, forgeProblem{gitNamespaceField, f.Namespace, err})
+	}
+	if err := provider.ValidateSchemeOn(f.Host, f.Scheme); err != nil {
+		out = append(out, forgeProblem{gitSchemeField, f.Scheme, err})
+	}
+	if err := provider.ValidatePort(f.Port); err != nil {
+		out = append(out, forgeProblem{gitPortField, strconv.Itoa(int(f.Port)), err})
+	}
+	if err := f.credentialsProblem(provider); err != nil {
+		out = append(out, forgeProblem{gitCredentialsField, f.CredentialsSecret, err})
+	}
+	if err := f.caBundleProblem(provider); err != nil {
+		out = append(out, forgeProblem{gitCABundleField, f.CABundleSecret, err})
+	}
+	if err := f.identityProblem(provider); err != nil {
+		out = append(out, forgeProblem{gitIdentityField, f.Identity, err})
+	}
+	return out
 }
 
 // providerProblem is why a forge must name its provider, or nil. A forge at
@@ -427,10 +471,13 @@ func (f *ResolvedForge) caBundleProblem(provider *GitProvider) error {
 	if !provider.AcceptsCABundle {
 		return fmt.Errorf("provider %s does not read a CA bundle; caBundleRef is for a forge at a self-managed host", provider.Name)
 	}
+	if f.EffectiveScheme() == ForgeSchemeHTTP {
+		return fmt.Errorf("caBundleRef cannot be set when scheme is %s", ForgeSchemeHTTP)
+	}
 	// The provider's own public host presents a certificate the public CAs
 	// sign. A private CA there would vouch for that host, and the broker would
 	// relax its strict X.509 checks for it.
-	if f.Host == "" || provider.Hosts[lowerASCII(f.Host)] {
+	if (provider.DefaultHost != "" && f.Host == "") || provider.Hosts[lowerASCII(f.Host)] {
 		return fmt.Errorf("caBundleRef is for a self-managed host; %s uses the public CAs", provider.canonicalHost(f.Host))
 	}
 	if errs := validation.IsDNS1123Subdomain(f.CABundleSecret); len(errs) > 0 {
@@ -441,6 +488,25 @@ func (f *ResolvedForge) caBundleProblem(provider *GitProvider) error {
 		return fmt.Errorf("caBundleRef.key %q is not a Secret key: %s", f.CABundleKey, strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// EffectiveScheme is the scheme the forge is reached over.
+func (f *ResolvedForge) EffectiveScheme() string {
+	if f.Scheme == "" {
+		return DefaultForgeScheme
+	}
+	return f.Scheme
+}
+
+// RepoURL is the URL a resolved repository on this forge is seeded as: the
+// forge's scheme, the ref's host, the declared port if any, and the path.
+// For a GitHub forge it is ref.URL(), so existing entries are unchanged.
+func (f *ResolvedForge) RepoURL(ref RepoRef) string {
+	authority := ref.Host
+	if f.Port != 0 {
+		authority = net.JoinHostPort(ref.Host, strconv.Itoa(int(f.Port)))
+	}
+	return f.EffectiveScheme() + schemeSeparator + authority + pathSeparator + ref.Path
 }
 
 // identityProblem is why a forge's identity cannot be used, or nil.
@@ -485,14 +551,15 @@ var forgeIdentityRegex = regexp.MustCompile(`^[A-Za-z0-9._@+{}-]{1,255}$`)
 // status that would say why is written. The CRD refuses it as well; this is
 // the same rule for a spec that reached the operator another way.
 func (f *ResolvedForge) credentialsProblem(provider *GitProvider) error {
-	if provider.NeedsCredentials && f.CredentialsSecret == "" {
+	if !provider.NeedsCredentials {
+		return nil
+	}
+	if f.CredentialsSecret == "" {
 		return fmt.Errorf("provider %s needs credentialsRef: a Secret holding the forge's access token under the key %q",
 			provider.Name, ForgeCredentialsTokenKey)
 	}
-	if provider.NeedsCredentials {
-		if errs := validation.IsDNS1123Subdomain(f.CredentialsSecret); len(errs) > 0 {
-			return fmt.Errorf("credentialsRef.name %q is not a Secret name: %s", f.CredentialsSecret, strings.Join(errs, "; "))
-		}
+	if errs := validation.IsDNS1123Subdomain(f.CredentialsSecret); len(errs) > 0 {
+		return fmt.Errorf("credentialsRef.name %q is not a Secret name: %s", f.CredentialsSecret, strings.Join(errs, "; "))
 	}
 	return nil
 }
@@ -532,7 +599,7 @@ func (r *ResolvedRepository) Resolve() (RepoRef, error) {
 	if err != nil {
 		return RepoRef{}, err
 	}
-	return provider.Resolve(r.Forge.Host, r.Repository, r.EffectiveNamespace())
+	return provider.ResolveOn(r.Forge.Host, r.Forge.EffectiveScheme(), r.Forge.Port, r.Repository, r.EffectiveNamespace())
 }
 
 // ManagedRepoEntry is the gitops-state ConfigMap entry the repository seeds.
@@ -541,7 +608,7 @@ func (r *ResolvedRepository) ManagedRepoEntry() (ManagedRepoEntry, error) {
 	if err != nil {
 		return ManagedRepoEntry{}, err
 	}
-	return ManagedRepoEntry{Type: r.Forge.Provider, URL: ref.URL()}, nil
+	return ManagedRepoEntry{Type: r.Forge.Provider, URL: r.Forge.RepoURL(ref)}, nil
 }
 
 // GitOps returns the repository with role gitops, or nil.
@@ -722,7 +789,7 @@ func (r *ResolvedRepository) restatesAccepted(accepted map[string]bool) bool {
 		return false
 	}
 	for _, namespace := range []string{"", r.EffectiveNamespace()} {
-		if ref, err := provider.Resolve(r.Forge.Host, r.Repository, namespace); err == nil && accepted[strings.ToLower(ref.URL())] {
+		if ref, err := provider.ResolveOn(r.Forge.Host, r.Forge.EffectiveScheme(), r.Forge.Port, r.Repository, namespace); err == nil && accepted[strings.ToLower(ref.URL())] {
 			return true
 		}
 	}
@@ -766,6 +833,8 @@ const (
 	gitNamespaceField     = "namespace"
 	gitCredentialsField   = "credentialsRef"
 	gitCABundleField      = "caBundleRef"
+	gitSchemeField        = "scheme"
+	gitPortField          = "port"
 	gitIdentityField      = "identity"
 	gitRepositoryField    = "repository"
 	gitRepoForgeField     = "forge"
@@ -869,40 +938,22 @@ func (ri *ResolvedIntegration) check() ([]IntegrationProblem, map[*ResolvedRepos
 	_, shadowedBy := ri.credentialClaims()
 	conflicts := ri.hostConflicts()
 	for _, f := range ri.Forges {
-		provider, err := f.GitProvider()
-		if err != nil {
-			add(ri.forgePath(f, gitProviderField), f.Provider, err)
-			continue
+		forgeProblems := f.problems()
+		for _, p := range forgeProblems {
+			add(ri.forgePath(f, p.field), p.value, p.err)
 		}
-		if err := f.providerProblem(); err != nil {
-			add(ri.forgePath(f, gitProviderField), f.Provider, err)
+		if len(forgeProblems) > 0 {
+			continue
 		}
 		if why, conflicted := conflicts[f]; conflicted {
 			add(ri.forgePath(f, gitHostField), f.Host, errors.New(why))
+			continue
 		}
+		provider, _ := f.GitProvider()
 		if first, shadowed := shadowedBy[f]; shadowed {
 			add(ri.forgePath(f, gitHostField), f.Host, fmt.Errorf(
 				"%s is already served by %s; the broker holds one credential per host, so declare one forge there and give its token the groups both need",
 				provider.canonicalHost(f.Host), ri.forgePath(first, "").String()))
-		}
-		if err := validateDeclaredValue(gitHostField, f.Host, MaxGitHostLength); err != nil {
-			add(ri.forgePath(f, gitHostField), f.Host, err)
-		} else if err := provider.ValidateHost(f.Host); err != nil {
-			add(ri.forgePath(f, gitHostField), f.Host, err)
-		}
-		if err := validateDeclaredValue(gitNamespaceField, f.Namespace, MaxGitNamespaceLength); err != nil {
-			add(ri.forgePath(f, gitNamespaceField), f.Namespace, err)
-		} else if err := provider.ValidateNamespaceOn(f.Host, f.Namespace); err != nil {
-			add(ri.forgePath(f, gitNamespaceField), f.Namespace, err)
-		}
-		if err := f.credentialsProblem(provider); err != nil {
-			add(ri.forgePath(f, gitCredentialsField), f.CredentialsSecret, err)
-		}
-		if err := f.caBundleProblem(provider); err != nil {
-			add(ri.forgePath(f, gitCABundleField), f.CABundleSecret, err)
-		}
-		if err := f.identityProblem(provider); err != nil {
-			add(ri.forgePath(f, gitIdentityField), f.Identity, err)
 		}
 	}
 
@@ -1041,8 +1092,82 @@ func (ri *ResolvedIntegration) Warnings() []string {
 				"spec.integration.%s is ignored for provider %s: GitHub credentials come from the install's GitHub App through the token minter",
 				ri.forgePath(f, gitCredentialsField), GitProviderGitHub))
 		}
+		if f.Scheme == ForgeSchemeHTTP && f.valid() {
+			warnings = append(warnings, fmt.Sprintf(
+				"spec.integration.%s is http: the forge token and repository contents cross the network unencrypted; use it only for a forge inside the cluster",
+				ri.forgePath(f, gitSchemeField)))
+		}
 	}
 	return warnings
+}
+
+// ForgeCredentialVolumePrefix and ForgeCAVolumePrefix start the names of the
+// volumes the operator mounts a forge's credentialsRef and caBundleRef Secrets
+// on.
+const (
+	ForgeCredentialVolumePrefix = "vcs-forge-credentials-" // #nosec G101 -- Volume name prefix, not a credential
+	ForgeCAVolumePrefix         = "vcs-forge-ca-"
+)
+
+// IsForgeCredentialVolumeName reports whether name uses a prefix reserved
+// for forge credential or CA volumes.
+func IsForgeCredentialVolumeName(name string) bool {
+	if strings.HasPrefix(name, ForgeCredentialVolumePrefix) || strings.HasPrefix(name, ForgeCAVolumePrefix) {
+		return true
+	}
+	for _, prefix := range ReservedVolumePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// ForgeCredentialSecretNames returns the Secret names referenced by
+// credentialed forges' credentialsRef in the integration spec, in declaration
+// order without duplicates. CA bundle Secrets (caBundleRef) hold public root
+// certificates and are intentionally excluded so user-authored containers or
+// volumes that also trust the internal CA are not refused.
+func (in *IntegrationSpec) ForgeCredentialSecretNames() []string {
+	resolved, err := in.ResolveGit()
+	if err != nil || resolved == nil {
+		return nil
+	}
+	var out []string
+	for _, f := range resolved.Forges {
+		provider, err := f.GitProvider()
+		if err != nil {
+			continue
+		}
+		if f.CredentialsSecret != "" && provider.NeedsCredentials {
+			if !slices.Contains(out, f.CredentialsSecret) {
+				out = append(out, f.CredentialsSecret)
+			}
+		}
+	}
+	return out
+}
+
+// ForgeCredentialRoutes lists the ways a user-authored volume would mount a
+// Secret named by a self-managed forge's credentialsRef, either as a `secret`
+// volume or as a projected `secret` source.
+func (in *IntegrationSpec) ForgeCredentialRoutes(v corev1.Volume) []BusCredentialRoute {
+	forgeSecrets := in.ForgeCredentialSecretNames()
+	if len(forgeSecrets) == 0 {
+		return nil
+	}
+	var routes []BusCredentialRoute
+	if v.Secret != nil && slices.Contains(forgeSecrets, v.Secret.SecretName) {
+		routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: BusCredentialRouteVolumeSource, Secret: v.Secret.SecretName})
+	}
+	if v.Projected != nil {
+		for i, src := range v.Projected.Sources {
+			if src.Secret != nil && slices.Contains(forgeSecrets, src.Secret.Name) {
+				routes = append(routes, BusCredentialRoute{Kind: BusCredentialRouteSecret, Source: i, Secret: src.Secret.Name})
+			}
+		}
+	}
+	return routes
 }
 
 // ValidateGit is ResolveGit followed by Problems, joined into one error — the
@@ -1118,6 +1243,8 @@ type BrokerForge struct {
 	Name     string `json:"-"`
 	Provider string `json:"provider"`
 	Host     string `json:"host"`
+	Scheme   string `json:"scheme,omitempty"`
+	Port     int32  `json:"port,omitempty"`
 	// CredentialsSecret is the Secret the token is projected from. Not read by
 	// the broker, which is handed the file instead.
 	CredentialsSecret string `json:"-"`
@@ -1191,11 +1318,15 @@ func (ri *ResolvedIntegration) BrokerForges(tokenDir, caDir string) []BrokerForg
 			Name:              f.Name,
 			Provider:          provider.Name,
 			Host:              provider.canonicalHost(f.Host),
+			Port:              f.Port,
 			CredentialsSecret: f.CredentialsSecret,
 			TokenPath:         tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsTokenKey,
 			ReadTokenPath:     tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsReadTokenKey,
 			AllowedPaths:      allowed,
 			Identity:          f.Identity,
+		}
+		if f.Scheme != "" && f.Scheme != DefaultForgeScheme {
+			entry.Scheme = f.Scheme
 		}
 		if f.CABundleSecret != "" {
 			entry.CABundleSecret = f.CABundleSecret

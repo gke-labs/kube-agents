@@ -54,6 +54,7 @@ READ_ONLY_ROLES = [
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
@@ -84,6 +85,9 @@ ROLE_APIS = {
     "roles/cloudtrace.user": "cloudtrace.googleapis.com",
     "roles/monitoring.viewer": "monitoring.googleapis.com",
     "roles/logging.viewer": "logging.googleapis.com",
+    # The readiness report's rollout-sequence precheck lists RolloutSequences
+    # through the GKE Hub API.
+    "roles/gkehub.viewer": "gkehub.googleapis.com",
 }
 
 # Values a human or a stale vars.sh might plausibly carry. Everything here that

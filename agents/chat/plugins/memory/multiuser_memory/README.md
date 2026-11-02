@@ -1,7 +1,8 @@
 # `multiuser_memory` — the file-backed memory provider
 
-Keeps `MEMORY.md` global and gives every user their own `USER.md`, keyed by the gateway
-identity (`agent._user_id`). Entries are `§`-delimited and written with an atomic replace,
+Keeps `MEMORY.md` global and gives every user their own `USER.md`, keyed by the user
+identity (`agent._user_id` under `spec.mode: today`, or `conversation_route.user_id`
+in `session_kv.db` for `a2a-*` sessions under `spec.mode: next`). Entries are `§`-delimited and written with an atomic replace,
 so a `SIGKILL` mid-write cannot leave a half-file behind.
 
 It needs nothing outside the pod: no API server, no database, no embedding model, no LLM
@@ -33,11 +34,13 @@ spec:
 sitting alongside it; leaving the built-in store on would put a second, unscoped
 `MEMORY.md`/`USER.md` pair in front of the same agent.
 
-## Shared threads
+## Shared threads and unattributed sessions
 
 A group space is not a private channel, and the harness cannot attribute a message in one
-to its sender. There the provider refuses personal reads and writes outright and says so,
-rather than guessing an identity — see `SHARED_SESSION_NOTICE` in
+to its sender. Likewise, a session that carries no user identity (empty or `"default"`)
+cannot safely isolate personal entries. In both cases the provider refuses personal reads
+and writes outright and says so, rather than guessing an identity or falling back to a
+shared `"default"` file — see `SHARED_SESSION_NOTICE` and `NO_IDENTITY_NOTICE` in
 [`__init__.py`](__init__.py). `target='memory'` still works, because a shared fact is
 shared either way.
 

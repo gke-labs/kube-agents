@@ -17,6 +17,7 @@ import (
 // retention class.
 const (
 	subjUpgradeReadiness = "a2a.topics.agent.platform.upgrade-readiness"
+	subjTopologySkew     = "a2a.topics.agent.platform.topology-skew"
 	subjBlueprint        = "a2a.topics.shared.blueprint"
 	subjAnnotations      = "a2a.topics.shared.annotations"
 )
@@ -39,7 +40,7 @@ func provisionTopicStreams(t *testing.T, url string) {
 	defer cancel()
 	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:              StreamTopicsState,
-		Subjects:          []string{subjUpgradeReadiness, subjBlueprint},
+		Subjects:          []string{subjUpgradeReadiness, subjTopologySkew, subjBlueprint},
 		Retention:         jetstream.LimitsPolicy,
 		MaxMsgsPerSubject: 8,
 	}); err != nil {
@@ -242,8 +243,8 @@ func TestTopicRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("registry: %v", err)
 	}
-	if len(registry) != 3 {
-		t.Fatalf("registry holds %d topics, want the 3 provisioned: %+v", len(registry), registry)
+	if len(registry) != 4 {
+		t.Fatalf("registry holds %d topics, want the 4 provisioned: %+v", len(registry), registry)
 	}
 
 	got := map[string]TopicEntry{}
@@ -252,6 +253,9 @@ func TestTopicRegistry(t *testing.T) {
 	}
 	if e := got["upgrade-readiness"]; e.Class != "state" || e.Scope != TopicScopeAgent || e.Agent != "platform" {
 		t.Errorf("upgrade-readiness resolved to %+v", e)
+	}
+	if e := got["topology-skew"]; e.Class != "state" || e.Scope != TopicScopeAgent || e.Agent != "platform" {
+		t.Errorf("topology-skew resolved to %+v", e)
 	}
 	if e := got["annotations"]; e.Class != "journal" || e.Scope != TopicScopeShared {
 		t.Errorf("annotations resolved to %+v", e)
@@ -268,6 +272,20 @@ func TestTopicRegistry(t *testing.T) {
 			continue
 		}
 		if e.Subject != subjUpgradeReadiness {
+			t.Errorf("resolve %q gave %s", name, e.Subject)
+		}
+	}
+	for _, name := range []string{
+		"topology-skew",
+		"agent.platform.topology-skew",
+		subjTopologySkew,
+	} {
+		e, err := ResolveTopic(registry, name)
+		if err != nil {
+			t.Errorf("resolve %q: %v", name, err)
+			continue
+		}
+		if e.Subject != subjTopologySkew {
 			t.Errorf("resolve %q gave %s", name, e.Subject)
 		}
 	}

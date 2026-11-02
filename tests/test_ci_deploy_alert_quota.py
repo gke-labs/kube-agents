@@ -84,6 +84,35 @@ class CiDeployAlertQuotaTest(unittest.TestCase):
                 "and a correctly filtered record look identical from the board.",
             )
 
+    def test_helm_release_folds_a_workloads_repeat_events_briefly(self) -> None:
+        # incident-triage-workload-fold goes green only with the window on, and
+        # the autoops cases re-plant one workload per repetition, so a window
+        # as long as a repetition folds the next repetition's incident away.
+        text = _CI_DEPLOY.read_text()
+        self.assertIn(
+            '--set-string "platformAgent.deployment.env[2].name=INCIDENT_WORKLOAD_DEDUP_SECONDS"', text
+        )
+        self.assertIn(
+            '--set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}"', text
+        )
+        window = re.search(r'readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="(\d+)"', text)
+        self.assertIsNotNone(window, "hack/ci-deploy.sh no longer sets EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS")
+        assert window is not None
+        self.assertGreaterEqual(
+            int(window.group(1)),
+            60,
+            "the window must outlast the spread of incident-triage-workload-fold's three "
+            "replicas (measured up to 32 s); read the comment above "
+            "EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS before lowering it",
+        )
+        self.assertLess(
+            int(window.group(1)),
+            270,
+            "a repetition of an autoops case lasts at least 4.5 minutes, so a window that "
+            "long can fold one repetition into the last when a matrix runs them back to "
+            "back; read the comment above EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS before raising it",
+        )
+
     def test_no_two_env_overrides_share_an_index(self) -> None:
         # helm's --set array indices are positional and silent about a
         # collision: an override added at an index another already uses
@@ -124,7 +153,7 @@ class CiDeployAlertQuotaTest(unittest.TestCase):
         # would leave the --set in ci-deploy.sh rendering onto the CR and
         # reaching nothing.
         text = _OPERATOR_MANIFESTS.read_text()
-        for name in ("ALERT_DAILY_LIMIT_WARNING", "ALERT_DAILY_LIMIT_DRIFT"):
+        for name in ("ALERT_DAILY_LIMIT_WARNING", "ALERT_DAILY_LIMIT_DRIFT", "INCIDENT_WORKLOAD_DEDUP_SECONDS"):
             self.assertIn(
                 f'"{name}":',
                 text,

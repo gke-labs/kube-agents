@@ -1,0 +1,43 @@
+# This template renders the built-in optional `tse` (GKE Support Agent)
+# AgentProfile custom resource for `spec.mode: next` installations when both
+# `.Values.platformAgent.enabled` and `.Values.profiles.tse.enabled` are true.
+{{- if and .Values.platformAgent.enabled .Values.profiles .Values.profiles.tse .Values.profiles.tse.enabled }}
+{{- $tse := .Values.profiles.tse -}}
+{{- $defaultTag := (.Values.platformAgent.deployment.image.tag | default .Chart.AppVersion) | toString -}}
+{{- $personaRepo := include "kube-agents.imageRepository" (dict "repository" $tse.persona.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
+{{- $personaTag := ($tse.persona.image.tag | default $defaultTag) | toString -}}
+{{- $harnessRepo := include "kube-agents.imageRepository" (dict "repository" $tse.harness.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
+{{- $harnessTag := ($tse.harness.image.tag | default $defaultTag) | toString -}}
+---
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentProfile
+metadata:
+  name: {{ "tse" | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  description: {{ $tse.description | quote }}
+  persona:
+    image: {{ printf "%s:%s" $personaRepo $personaTag | quote }}
+  harness:
+    image: {{ printf "%s:%s" $harnessRepo $harnessTag | quote }}
+    model: {{ $tse.harness.model | quote }}
+    maxTurns: {{ $tse.harness.maxTurns }}
+  bus:
+    {{- with $tse.bus.publishTopics }}
+    publishTopics:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with $tse.bus.subscribeTopics }}
+    subscribeTopics:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  identity: {}
+  lifecycle:
+    activeDeadlineSeconds: {{ $tse.lifecycle.activeDeadlineSeconds }}
+    ttlSecondsAfterFinished: {{ $tse.lifecycle.ttlSecondsAfterFinished }}
+  concurrency: {{ $tse.concurrency }}
+  resources:
+    {{- toYaml $tse.resources | nindent 4 }}
+{{- end }}

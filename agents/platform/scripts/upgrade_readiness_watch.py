@@ -103,9 +103,12 @@ report graded blocked, ready and not graded and which are blocked, where the
 report is on the gateway pod, and when the next refresh is due; one line per
 version retired; one line when the version table was partial, with the
 reason per project; and one line when a tick fails. A quiet tick prints nothing, and
-nothing reaches chat. Exit code is 0 on every path except a ledger or report
-that cannot be written, because a tick whose ledger did not save would report
-the same version as new again tomorrow.
+nothing reaches chat. A failed tick's line says what happens next and the
+detail goes to ``logs/upgrade_readiness_watch.log`` under the agent home. Exit
+code is 0 on every path, a ledger or report that cannot be written included: a
+non-zero exit made the scheduler post its own failure line in place of the
+tick's, and that line promises a retry, where a tick whose ledger did not save
+needs a person (it would report the same version as new again tomorrow).
 
 ``UPGRADE_READINESS_REFRESH_DAYS`` overrides the refresh interval,
 ``UPGRADE_READINESS_WATCH_HOME`` the directory the ledger and reports live in,
@@ -131,10 +134,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cron_schedule  # noqa: E402
 import fleet_scope_args  # noqa: E402
 import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
+import script_log  # noqa: E402
 
 # Where the job keeps its ledger and reports, under the agent home.
 HOME_ENV = "HERMES_HOME"
@@ -396,6 +401,22 @@ REFUSAL_RETIRING = "retiring from the declaration"
 REFUSAL_UNREAD = "listed but unread ({outcome})"
 REFUSAL_NUMBER = "project number unresolved"
 REFUSAL_SANDBOX = "sandbox marker stale"
+# The refusal causes whose remedy is to wait, not to act (`refusal_remedy`): a
+# sandbox that restarts under the new declaration, a project the reconcile
+# prunes, a scope not yet resolved, and a declared project the next reconcile
+# tick lists. Every other cause (outside or excluded from the resolved scope, a
+# number the reporter cannot resolve, read access denied, the project cap)
+# needs a person.
+REFUSAL_CAUSES_THAT_CLEAR = frozenset(
+    {
+        REFUSAL_SANDBOX,
+        REFUSAL_RETIRING,
+        REFUSAL_OUTSIDE_UNRESOLVED,
+        REFUSAL_UNREAD.format(outcome=fleet_scope_targets.OUTCOME_UNRESOLVED),
+        REFUSAL_UNREAD.format(outcome=fleet_scope_targets.OUTCOME_UNREACHABLE),
+        REFUSAL_UNREAD.format(outcome=fleet_scope_targets.OUTCOME_UNKNOWN),
+    }
+)
 # The refusals the report script can answer this job with, each a
 # fleet_scope_args message that ends in a remedy for an agent (the tool's
 # collector_args, an id the tool lists), with the same reason in the
@@ -525,7 +546,7 @@ ANNOUNCED_UNGRADED_KEY = "ungraded"
 # in this file beside it, so the same failure is posted once and its recovery
 # once.
 FAILURE_MARKER_FILE_NAME = "last-failure.txt"
-RECOVERED_LINE = "{prefix} watch: the tick runs again"
+RECOVERED_LINE = "**The upgrade readiness check is running again.**"
 DETAIL_KEY = "detail"
 ATTEMPTS_KEY = "attempts"
 # What an ungraded version's announcement is keyed on: each of its projects
@@ -547,6 +568,44 @@ REPORT_LINE = (
     "{ready} ready{ungraded}; report on the gateway pod at {path}; next refresh after {next_date}"
 )
 BLOCKED_NAMES = " ({names})"
+# A failed tick posts one plain line: what did not happen, why, and what
+# happens next. The exception and its text go to `WATCH_LOG_FILE` under the
+# agent home (`script_log`), and to stderr for a person running it by hand;
+# the scheduler keeps a zero-exit script's stderr nowhere.
+FAILED_TICK_LINE = "**The upgrade readiness check didn't run today.** {reason}. {next}"
+FAILED_WRITE_LINE = "**The upgrade readiness check didn't finish today.** {reason}. {next}"
+# What happens next, with no clock time (`cron_schedule`): "tomorrow" only
+# while its roster entry fires once a day, every day, and for a failure no
+# retry clears, that a person has to act.
+FAILED_NEXT_DAILY = "It will try again tomorrow."
+FAILED_NEXT_UNKNOWN = "It will try again at its next scheduled run."
+FAILED_NEEDS_ADMIN = "An admin needs to fix this before it can run; the details are in the agent's log."
+WATCH_JOB_ID = "upgrade-readiness-watch"
+WATCH_LOG_FILE = "upgrade_readiness_watch.log"
+FAILED_REASON_REFUSED = "It couldn't read the clusters in the install's scope"
+FAILED_REASON_SCOPE_UNREADABLE = "It couldn't read the install's scope"
+FAILED_REASON_UNRESOLVED = "It couldn't look up the fleet's projects"
+FAILED_REASON_WRITE = "It couldn't save its report"
+FAILED_REASON_SCRIPT_MISSING = "The agent image is missing its report script"
+FAILED_REASON_TIMED_OUT = "Reading the fleet took too long"
+FAILED_REASON_ROSTER = "Its list of projects names something that isn't a project"
+FAILED_REASON_NO_PROJECT = "It has no GCP project to read"
+FAILED_REASON_LEDGER = "Its record of earlier runs can't be read"
+FAILED_REASON_ERROR = "It hit an error"
+# The reasons a retry does not clear: the install's scope, the roster, the
+# ledger, the disk or the image has to change first. A refusal is decided by
+# its causes instead (`REFUSAL_CAUSES_THAT_CLEAR`).
+FAILED_REASONS_NEED_ADMIN = frozenset(
+    {
+        FAILED_REASON_SCOPE_UNREADABLE,
+        FAILED_REASON_UNRESOLVED,
+        FAILED_REASON_WRITE,
+        FAILED_REASON_ROSTER,
+        FAILED_REASON_NO_PROJECT,
+        FAILED_REASON_LEDGER,
+        FAILED_REASON_SCRIPT_MISSING,
+    }
+)
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
@@ -618,7 +677,6 @@ DRY_RUN_NOTHING_DUE = "dry run: nothing due; pending versions: {versions}"
 NONE_WORD = "none"
 MAX_NAMES_IN_LINE = 6
 NAMES_OVERFLOW = ", +{more} more"
-WRITE_FAILED_EXIT = 2
 DATE_FORMAT = "%Y-%m-%d"
 
 
@@ -643,6 +701,9 @@ class ReportRefused(RuntimeError):
         super().__init__(detail)
         self.cause = cause
         self.signature: str | None = None
+        # Every refusal the tick's failure stands for, where one stands for a
+        # whole tick (``versions_by_project``); otherwise this one's cause.
+        self.causes: list[str] = [cause]
         # The project the refusal names, as the reporter resolved it (``refused_project``).
         self.project: str | None = None
 
@@ -657,8 +718,33 @@ class SandboxTimedOut(RuntimeError):
     """The sandbox run hit the client-side timeout."""
 
 
+class ScopeUnreadable(RuntimeError):
+    """The operator's scope render could not be read, so whether the install declares a scope is unknown."""
+
+
 class ProjectUnresolved(RuntimeError):
     """Every project the table ran is a number the report could not resolve: nothing was read under a key."""
+
+
+# The fail-closed configuration faults. RuntimeErrors still, so a caller that
+# catches the plain failure (the standing-outside write) keeps catching them;
+# their own class is what gives the tick's line its reason and the admin ending.
+class RosterMisspelled(RuntimeError):
+    """A roster spelling is not a project id or number (``ROSTER_SPELLING_DETAIL``)."""
+
+
+class NoProject(RuntimeError):
+    """No source names a GCP project, and the report would otherwise enumerate every one (``NO_PROJECT_DETAIL``)."""
+
+
+class LedgerUnusable(RuntimeError):
+    """The ledger is not valid JSON, not this job's, or malformed; it is refused rather than overwritten."""
+
+
+class ReportScriptMissing(RuntimeError):
+    """The skill's report script is not where the image puts it: no run clears it, the
+    image does. A RuntimeError still, so a project's run that hits it is that project's
+    table failure, and a tick where every run did is the tick's failure line."""
 
 
 class WriteFailed(Exception):
@@ -721,7 +807,7 @@ def roster_projects() -> set[str]:
         return set()
     projects: set[str] = set()
     for home in base.iterdir():
-        if home.name in RESERVED_PROFILES or not home.is_dir():
+        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not home.is_dir():
             continue
         try:
             identity = read_cluster_identity(home)
@@ -741,7 +827,7 @@ def projects() -> list[str]:
     names = roster_names()
     refused = [p for p in names if ROSTER_SPELLING_REFUSED.search(p)]
     if refused:
-        raise RuntimeError(ROSTER_SPELLING_DETAIL.format(spellings=shown_names([repr(p) for p in refused])))
+        raise RosterMisspelled(ROSTER_SPELLING_DETAIL.format(spellings=shown_names([repr(p) for p in refused])))
     return names
 
 
@@ -761,7 +847,7 @@ def roster_names() -> list[str]:
         raise RuntimeError(TIMED_OUT_DETAIL.format(seconds=PROJECT_LOOKUP_TIMEOUT_SECONDS)) from None
     configured = (completed.stdout or "").strip()
     if not configured:
-        raise RuntimeError(NO_PROJECT_DETAIL)
+        raise NoProject(NO_PROJECT_DETAIL)
     return [configured]
 
 
@@ -781,7 +867,7 @@ def skill_scripts_dir() -> Path:
     for candidate in candidates:
         if (candidate / (REPORT_MODULE + PYTHON_SOURCE_SUFFIX)).is_file():
             return candidate
-    raise RuntimeError(f"{REPORT_MODULE}.py not found under {', '.join(str(c) for c in candidates)}")
+    raise ReportScriptMissing(f"{REPORT_MODULE}.py not found under {', '.join(str(c) for c in candidates)}")
 
 
 def scope_args_path() -> Path:
@@ -925,7 +1011,7 @@ def declared_scope() -> fleet_scope_targets.ScopeTargets | None:
     try:
         return fleet_scope_targets.declared_scope_targets()
     except fleet_scope_targets.ScopeRenderUnreadable as exc:
-        raise RuntimeError(SCOPE_UNREADABLE_DETAIL.format(error=exc)) from None
+        raise ScopeUnreadable(SCOPE_UNREADABLE_DETAIL.format(error=exc)) from None
 
 
 def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
@@ -1328,9 +1414,9 @@ def load_ledger(path: Path) -> dict:
     except FileNotFoundError:
         return empty_ledger()
     except ValueError as exc:
-        raise RuntimeError(f"ledger at {path} is not valid JSON ({exc}); refusing to overwrite it") from None
+        raise LedgerUnusable(f"ledger at {path} is not valid JSON ({exc}); refusing to overwrite it") from None
     if not isinstance(data, dict) or not isinstance(data.get(TARGETS_KEY), dict):
-        raise RuntimeError(f"ledger at {path} is not this job's ledger; refusing to overwrite it")
+        raise LedgerUnusable(f"ledger at {path} is not this job's ledger; refusing to overwrite it")
     for version, entry in data[TARGETS_KEY].items():
         shape_ok = (
             isinstance(version, str)
@@ -1341,12 +1427,12 @@ def load_ledger(path: Path) -> dict:
             and (entry.get(LAST_REPORT_KEY) is None or parse_iso(entry.get(LAST_REPORT_KEY)) is not None)
         )
         if not shape_ok:
-            raise RuntimeError(f"ledger at {path} has a malformed entry for {version}; refusing to overwrite it")
+            raise LedgerUnusable(f"ledger at {path} has a malformed entry for {version}; refusing to overwrite it")
     block = data.get(ANNOUNCED_KEY)
     if block is None:
         data[ANNOUNCED_KEY] = {}
     elif not announced_shape_ok(block):
-        raise RuntimeError(f"ledger at {path} has a malformed {ANNOUNCED_KEY} block; refusing to overwrite it")
+        raise LedgerUnusable(f"ledger at {path} has a malformed {ANNOUNCED_KEY} block; refusing to overwrite it")
     # A null map is the absent one: ``setdefault`` and ``get`` would otherwise
     # hand the None back on the next due or retired version.
     if data[ANNOUNCED_KEY].get(ANNOUNCED_UNGRADED_KEY) is None:
@@ -1687,6 +1773,7 @@ def versions_by_project(
                 if len(refusals) > 1:
                     chosen = ReportRefused(shown_names([PARTIAL_REASON.format(project=project, message=exc) for project, exc in refusals.items()], REASONS_SEPARATOR), chosen.cause)
                 chosen.signature = refused_tick_signature(refusals)
+                chosen.causes = [exc.cause for exc in refusals.values() if isinstance(exc, ReportRefused)]
             raise chosen
         if unresolved:
             raise ProjectUnresolved(
@@ -1998,6 +2085,22 @@ def remove_reports(home: Path, version: str) -> None:
     shutil.rmtree(home / REPORTS_DIR_NAME / version, ignore_errors=True)
 
 
+def read_failure_marker(home: Path) -> str | None:
+    """The last announced failure's key, or None when there is none or it cannot be read."""
+    try:
+        return (home / FAILURE_MARKER_FILE_NAME).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def restore_failure_marker(home: Path, key: str) -> None:
+    """Put back a marker a failed tick cleared; one that cannot be written leaves the next failure posted."""
+    try:
+        (home / FAILURE_MARKER_FILE_NAME).write_text(key, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def clear_failure_marker(home: Path) -> bool:
     """Remove the last failure's marker if there is one; True when one was
     removed, so the caller announces the recovery. A marker that cannot be
@@ -2170,22 +2273,67 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
         announced(ledger).get(ANNOUNCED_UNGRADED_KEY, {}).pop(version, None)
     ledger[LAST_TICK_KEY] = iso(now)
     # The marker goes before the ledger is saved: a marker that cannot be
-    # removed must not cost the lines a saved ledger has already recorded.
+    # removed must not cost the lines a saved ledger has already recorded. A
+    # save that fails puts it back, so a save that keeps failing is announced
+    # once, as any other standing failure is.
+    standing = read_failure_marker(home)
     recovered = clear_failure_marker(home)
     try:
         save_ledger(ledger_path, ledger)
     except OSError as exc:
+        if recovered and standing is not None:
+            restore_failure_marker(home, standing)
         raise WriteFailed(str(exc)) from exc
     if recovered:
-        lines.insert(0, RECOVERED_LINE.format(prefix=LINE_PREFIX))
+        lines.insert(0, RECOVERED_LINE)
     return lines
+
+
+def needs_admin(exc: Exception) -> bool:
+    """Whether a person has to act before the tick can succeed: a refusal any of
+    whose causes does not clear on its own, or a failure in `FAILED_REASONS_NEED_ADMIN`."""
+    if isinstance(exc, ReportRefused):
+        return any(cause not in REFUSAL_CAUSES_THAT_CLEAR for cause in exc.causes)
+    return failure_reason(exc) in FAILED_REASONS_NEED_ADMIN
+
+
+def next_attempt(admin: bool) -> str:
+    """What happens after a failure, in the channel's words: a person acts, or
+    the watch tries again tomorrow for a daily roster entry, else at its next run."""
+    if admin:
+        return FAILED_NEEDS_ADMIN
+    return FAILED_NEXT_DAILY if cron_schedule.job_runs_daily(profile_home(), WATCH_JOB_ID) else FAILED_NEXT_UNKNOWN
+
+
+def failure_reason(exc: Exception) -> str:
+    """Why a tick failed, in the channel's words: the kind of failure, never its text."""
+    if isinstance(exc, WriteFailed):
+        return FAILED_REASON_WRITE
+    if isinstance(exc, ReportScriptMissing):
+        return FAILED_REASON_SCRIPT_MISSING
+    if isinstance(exc, ReportRefused):
+        return FAILED_REASON_REFUSED
+    if isinstance(exc, ScopeUnreadable):
+        return FAILED_REASON_SCOPE_UNREADABLE
+    if isinstance(exc, ProjectUnresolved):
+        return FAILED_REASON_UNRESOLVED
+    if isinstance(exc, SandboxTimedOut):
+        return FAILED_REASON_TIMED_OUT
+    if isinstance(exc, RosterMisspelled):
+        return FAILED_REASON_ROSTER
+    if isinstance(exc, NoProject):
+        return FAILED_REASON_NO_PROJECT
+    if isinstance(exc, LedgerUnusable):
+        return FAILED_REASON_LEDGER
+    return FAILED_REASON_ERROR
 
 
 def announce_failure_once(detail: str, key: str | None = None) -> bool:
     """A failure that persists is posted once per distinct key, the detail
-    itself unless the caller hands one (a refused tick's, so the resolved set
-    the detail names can change membership without re-posting a standing
-    refusal), and the next clean tick posts a recovery line. The marker lives
+    itself unless the caller hands one (the plain reason, or a refused tick's
+    signature, so neither a sandbox's changing stderr nor a resolved set that
+    changes membership re-posts a standing failure), and the next clean tick
+    posts a recovery line. The marker lives
     beside the ledger, to which a failed tick writes nothing but the
     standing-outside record and the learned ids; a marker that cannot be read or written leaves
     the line posted every time, since nothing can remember it."""
@@ -2206,16 +2354,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         lines = tick(dry_run=args.dry_run)
-    except WriteFailed as exc:
-        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=exc))
-        return WRITE_FAILED_EXIT
     except Exception as exc:  # noqa: BLE001 - one line to chat, never a traceback
-        detail = f"{type(exc).__name__}: {exc}"
-        # A dry run changes nothing, the marker included, and is never silenced
-        # by it: the operator running one is looking at the failure.
-        key = exc.signature if isinstance(exc, ReportRefused) else None
+        # Exit 0 for a write failure too: a non-zero exit makes the scheduler
+        # post its own failure line in place of this one, and that line can
+        # only promise a retry the disk will not grant.
+        write = isinstance(exc, WriteFailed)
+        detail = str(exc) if write else f"{type(exc).__name__}: {exc}"
+        failed_line = FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE if write else FAILED_WHAT_TICK, detail=detail)
+        reason = failure_reason(exc)
+        # Keyed on the kind of failure, never its text: a sandbox's stderr
+        # carries paths that change every run, and keyed on it the same
+        # failure was posted every day. A refused tick keeps its signature,
+        # so a refusal whose cause changes is posted again.
+        key = exc.signature if isinstance(exc, ReportRefused) and exc.signature else reason
+        # A dry run changes nothing, the marker and the log included, and is
+        # never silenced by it: the operator running one is looking at the failure.
+        if not args.dry_run:
+            script_log.append(WATCH_LOG_FILE, [failed_line])
         if args.dry_run or announce_failure_once(detail, key):
-            print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail))
+            print((FAILED_WRITE_LINE if write else FAILED_TICK_LINE).format(reason=reason, next=next_attempt(needs_admin(exc))))
+            print(failed_line, file=sys.stderr)
         return 0
     for line in lines:
         print(line)

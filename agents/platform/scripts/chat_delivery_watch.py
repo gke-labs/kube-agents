@@ -222,7 +222,7 @@ def roster_paths(agent_home: Path) -> list[tuple[str, Path]]:
     profiles_dir = agent_home / PROFILES_DIR
     if profiles_dir.is_dir():
         for entry in sorted(profiles_dir.iterdir()):
-            if entry.is_dir() and entry.name not in RESERVED_PROFILES:
+            if entry.is_dir() and not entry.name.startswith(".") and entry.name not in RESERVED_PROFILES:
                 paths.append((entry.name, entry / CRON_DIR / JOBS_FILE))
     return paths
 

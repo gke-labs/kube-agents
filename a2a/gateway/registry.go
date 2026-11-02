@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +17,11 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
+
+// relayedSeqCap bounds TaskRef.RelayedSeqs. Only an event rendered and not
+// yet acked can come again, and those are a task's most recent batch's, which
+// a burst of progress events can make long.
+const relayedSeqCap = 256
 
 // ActiveTask is the task currently serializing a session's conversation.
 type ActiveTask struct {
@@ -248,6 +254,11 @@ type TaskRequester struct {
 type TaskRef struct {
 	ID        string `json:"id"`
 	Addressee string `json:"addressee"`
+	// RelayedSeqs are the stream sequences of this task's most recent
+	// events the relay rendered (at most relayedSeqCap), written with the
+	// render. A redelivered event found here was rendered by a gateway that
+	// died before acking it, and is not rendered again.
+	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.
@@ -265,6 +276,10 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
+	// QuietCancel marks a cancel the Slack Stop button sent
+	// (cancelTaskVoiced): the stop answers with one reply of its own, so the
+	// relay posts no "canceled" line for the task's terminal.
+	QuietCancel bool `json:"quietCancel,omitempty"`
 	// TerminalObserved marks that observeTaskTerminal has already been called
 	// for this task (e.g. by healActiveTask when recovering a stale terminal
 	// from the stream), so a queued or redelivered relayTerminal does not
@@ -343,6 +358,11 @@ type TaskRef struct {
 	// observer the turn ends failed with this reason and delivers nothing
 	// (handOffEnd), and the read route reports the same. Empty otherwise.
 	DelegationEnd string `json:"delegationEnd,omitempty"`
+	// CardsAnswer, on a chain's root entry, records that a task of the chain
+	// handed the ask to kanban cards (cardsPending or handedOff at its
+	// terminal): a card's report answers the ask, so no relay answer in the
+	// chain, the wake's included, carries rating controls (answer feedback).
+	CardsAnswer bool `json:"cardsAnswer,omitempty"`
 	// AskMessageID is the backend id of the human message that started the
 	// chain, on its root entry only: the message the chain's mark is drawn
 	// on (spec-a2a-payloads.md, "mark"). Mark is the reaction state last
@@ -459,6 +479,17 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
 			rec.Tasks[i].Canceled = true
+			return
+		}
+	}
+}
+
+// markQuietCancel records that taskID's cancel came from the Slack Stop
+// button (TaskRef.QuietCancel).
+func (rec *SessionRecord) markQuietCancel(taskID string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].QuietCancel = true
 			return
 		}
 	}
@@ -828,4 +859,35 @@ func (r *Registry) Sessions(ctx context.Context) ([]*SessionRecord, error) {
 		return nil, err
 	}
 	return recs, nil
+}
+
+// relayed reports whether taskID's event at stream sequence seq was already
+// rendered. A sequence of 0 (no metadata) is never taken as rendered.
+func (rec *SessionRecord) relayed(taskID string, seq uint64) bool {
+	if seq == 0 {
+		return false
+	}
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			return slices.Contains(rec.Tasks[i].RelayedSeqs, seq)
+		}
+	}
+	return false
+}
+
+// markRelayed records that taskID's event at seq was rendered.
+func (rec *SessionRecord) markRelayed(taskID string, seq uint64) {
+	if seq == 0 {
+		return
+	}
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			seqs := append(rec.Tasks[i].RelayedSeqs, seq)
+			if len(seqs) > relayedSeqCap {
+				seqs = seqs[len(seqs)-relayedSeqCap:]
+			}
+			rec.Tasks[i].RelayedSeqs = seqs
+			return
+		}
+	}
 }

@@ -5,8 +5,9 @@ on green and red exits alike, beside `collect_gateway_log`. The thinking-replay
 hook's per-request "thinking replay: dropped N" line lives only in this log, so
 a green run that kept no litellm.log could not say whether the hook touched its
 traffic. These tests run the real function, lifted from the real file with the
-constants it reads, under bash with a `kubectl` stub on PATH, so the bounds it
-applies and the exit status it leaves behind are the ones the script has.
+byte-cap helper and constants it reads, under bash with a `kubectl` stub on
+PATH, so the bounds it applies and the exit status it leaves behind are the
+ones the script has.
 """
 
 import os
@@ -21,6 +22,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENV_SCRIPT = REPO_ROOT / "hack" / "ci-env.sh"
 EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 FUNCTION = "collect_litellm_log"
+# The byte cap the function bounds the log with (hack/ci-env.sh, "Byte caps").
+HELPER = "last_bytes"
 ARTIFACT = "litellm.log"
 # The chart's pod label and container name (charts/kube-agents/templates/litellm.yaml).
 POD_SELECTOR = "app=litellm"
@@ -64,15 +67,19 @@ done
 
 
 def lifted() -> str:
-    """The function and the constants it reads, as written in ci-env.sh."""
+    """The function, the byte-cap helper it bounds the log with, and the
+    constants it reads, as written in ci-env.sh."""
     src = ENV_SCRIPT.read_text(encoding="utf-8")
     constants = re.findall(r"^readonly LITELLM_[A-Z_]+=.*$", src, re.MULTILINE)
     if not constants:  # pragma: no cover - a rename should say so loudly
         raise AssertionError(f"no LITELLM_ constants in {ENV_SCRIPT}")
-    match = re.search(rf"^{FUNCTION}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
-    if match is None:  # pragma: no cover
-        raise AssertionError(f"{FUNCTION}() not found in {ENV_SCRIPT}")
-    return "\n".join([*constants, match.group(0)])
+    functions = []
+    for name in (HELPER, FUNCTION):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", src, re.DOTALL | re.MULTILINE)
+        if match is None:  # pragma: no cover
+            raise AssertionError(f"{name}() not found in {ENV_SCRIPT}")
+        functions.append(match.group(0))
+    return "\n".join([*constants, *functions])
 
 
 def constant(name: str) -> int:
@@ -100,6 +107,12 @@ def run_collect(*then: str, **stub_env: str) -> tuple[subprocess.CompletedProces
     kubectl = stubs / "kubectl"
     kubectl.write_text(KUBECTL_STUB, encoding="utf-8")
     kubectl.chmod(kubectl.stat().st_mode | stat.S_IXUSR)
+    tail = stubs / "tail"
+    tail.write_text(
+        '#!/usr/bin/env bash\nif [ "${1:-}" = "-c" ] && [ "$#" -eq 2 ]; then /usr/bin/tail "$@"; printf "uutils-pipe-overrun"; exit 0; fi\nexec /usr/bin/tail "$@"\n',
+        encoding="utf-8",
+    )
+    tail.chmod(tail.stat().st_mode | stat.S_IXUSR)
     artifacts = tmp / "artifacts"
     script = "\n".join(
         [

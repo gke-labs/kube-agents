@@ -43,6 +43,8 @@ SLACK_ROUTE = {
     "context_id": "ctx-21f41a7dc20859301d2307b8",
     "ask": "question",
 }
+# The opening turn's id, which both hooks receive.
+TURN = "turn-7f3a"
 
 
 # Hermes' Platform also has non-durable members, so a turn past a regressed
@@ -58,6 +60,18 @@ def _fake_session_env(**values):
     def _get(name, default=""):
         return values.get(name, default)
     return _get
+
+
+def _touch_failing(prefix):
+    """A Path.touch that fails for names starting with ``prefix`` and works for the rest."""
+    real_touch = Path.touch
+
+    def touch(path, *args, **kwargs):
+        if path.name.startswith(prefix):
+            raise OSError("disk full")
+        return real_touch(path, *args, **kwargs)
+
+    return touch
 
 
 class PreLlmCallTest(unittest.TestCase):
@@ -86,7 +100,8 @@ class PreLlmCallTest(unittest.TestCase):
         # job it does not have, as Hermes' does.
         self.store_ids = {"oobe"}
         self.update_job = mock.MagicMock(side_effect=lambda job_id, updates: {} if job_id in self.store_ids else None)
-        self.trigger_job = mock.MagicMock()
+        # trigger_job answers None for a job the store does not have, as Hermes' does.
+        self.trigger_job = mock.MagicMock(side_effect=lambda job_id, *a, **k: {} if job_id in self.store_ids else None)
         self._patches = [
             mock.patch.object(plugin, "SANDBOX_EXEC_PATH", REPO_SANDBOX_EXEC),
             mock.patch.object(plugin, "update_job", self.update_job),
@@ -109,11 +124,23 @@ class PreLlmCallTest(unittest.TestCase):
             p.stop()
         self._env.stop()
         self._tmp.cleanup()
+        plugin._greeting_turns.clear()
 
     def _call(self, **overrides):
-        kwargs = {"is_first_turn": True, "platform": "google_chat", "session_id": "20260720_120000_abcd1234"}
+        kwargs = {"is_first_turn": True, "platform": "google_chat", "session_id": "20260720_120000_abcd1234",
+                  "turn_id": TURN}
         kwargs.update(overrides)
         return plugin.handle_pre_llm_call(**kwargs)
+
+    def _end_turn(self, **overrides):
+        """The same turn's post_llm_call, as Hermes fires it once the reply is final."""
+        kwargs = {"platform": "google_chat", "session_id": "20260720_120000_abcd1234", "turn_id": TURN,
+                  "assistant_response": "Hi there, I'm kube-agents"}
+        kwargs.update(overrides)
+        return plugin.handle_post_llm_call(**kwargs)
+
+    def _holds(self):
+        return sorted(p.name for p in self.data_dir.glob(f"{plugin.GREETING_PENDING_PREFIX}*"))
 
     # --- turns that must be ignored -------------------------------------
 
@@ -157,7 +184,7 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIn("IN-PROGRESS-INSTRUCTIONS", result["context"])
         # Never leak inventory content into the turn.
         self.assertNotIn("COMPLETED-INSTRUCTIONS", result["context"])
-        # Presence marker set, delivery bound to origin and triggered.
+        # Presence marker set, delivery bound to origin and held behind the greeting.
         self.assertTrue((self.data_dir / ".user_aligned").exists())
         self.update_job.assert_any_call(
             "oobe",
@@ -170,6 +197,11 @@ class PreLlmCallTest(unittest.TestCase):
                 },
             },
         )
+        self.assertEqual(self._holds(), [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])
+        self.trigger_job.assert_not_called()
+        # The greeting is on its way: the hold goes and the job is marked due.
+        self._end_turn()
+        self.assertEqual(self._holds(), [])
         self.trigger_job.assert_called_once_with("oobe")
 
     def test_both_delivery_jobs_present_are_bound_and_only_oobe_triggered(self):
@@ -178,6 +210,7 @@ class PreLlmCallTest(unittest.TestCase):
         self.store_ids = {"oobe", "bootstrap-inventory-delivery"}
         self._call()
         self.assertEqual([c.args[0] for c in self.update_job.call_args_list], ["oobe", "bootstrap-inventory-delivery"])
+        self._end_turn()
         # Triggering also enables a job; the old entry stays disabled.
         self.trigger_job.assert_called_once_with("oobe")
 
@@ -186,7 +219,80 @@ class PreLlmCallTest(unittest.TestCase):
         self.store_ids = {"bootstrap-inventory-delivery"}
         self._call()
         self.assertTrue((self.data_dir / ".user_aligned").exists())
+        self._end_turn()
+        # The oobe call answered None (no such job, nothing enabled); the next present job is due.
+        self.assertEqual([c.args[0] for c in self.trigger_job.call_args_list], ["oobe", "bootstrap-inventory-delivery"])
+
+    def test_an_install_without_oobe_triggers_the_old_job_at_once_when_the_hold_fails(self):
+        self.store_ids = {"bootstrap-inventory-delivery"}
+        with mock.patch.object(Path, "touch", _touch_failing(plugin.GREETING_PENDING_PREFIX)):
+            self._call()
         self.trigger_job.assert_called_once_with("bootstrap-inventory-delivery")
+
+    # --- the greeting hold ------------------------------------------------
+
+    def test_the_hold_is_written_before_the_aligned_marker(self):
+        # Once .user_aligned exists a tick may deliver; the hold must already be there.
+        seen = []
+        real_touch = Path.touch
+
+        def touch(path, *args, **kwargs):
+            if path.name == ".user_aligned":
+                seen.append(self._holds())
+            return real_touch(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "touch", touch):
+            self._call()
+        self.assertEqual(seen, [[f"{plugin.GREETING_PENDING_PREFIX}{TURN}"]])
+
+    def test_a_failed_hold_triggers_at_once(self):
+        with mock.patch.object(Path, "touch", _touch_failing(plugin.GREETING_PENDING_PREFIX)):
+            self.assertIsNotNone(self._call())
+        self.assertEqual(self._holds(), [])
+        self.trigger_job.assert_called_once_with("oobe")
+        self.assertTrue((self.data_dir / ".user_aligned").exists())
+
+    def test_a_turn_without_an_id_triggers_at_once(self):
+        self.assertIsNotNone(self._call(turn_id=""))
+        self.assertEqual(self._holds(), [])
+        self.trigger_job.assert_called_once_with("oobe")
+
+    def test_another_turn_ending_touches_neither_the_hold_nor_the_job(self):
+        self._call()
+        with mock.patch.object(plugin, "_drop_hold") as drop:
+            self._end_turn(turn_id="turn-other")
+        drop.assert_not_called()
+        self.trigger_job.assert_not_called()
+        self.assertEqual(self._holds(), [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])
+
+    def test_a_session_id_change_between_the_hooks_still_releases_the_hold(self):
+        # Hermes rotates the session id on compression; the turn id stays.
+        self._call(session_id="20260720_120000_abcd1234")
+        self._end_turn(session_id="20260720_120500_ffff0000")
+        self.assertEqual(self._holds(), [])
+        self.trigger_job.assert_called_once_with("oobe")
+
+    def test_a_hold_delivery_aged_out_is_released_without_error(self):
+        self._call()
+        (self.data_dir / f"{plugin.GREETING_PENDING_PREFIX}{TURN}").unlink()
+        self._end_turn()
+        self.trigger_job.assert_called_once_with("oobe")
+
+    def test_a_turn_from_before_a_restart_is_not_held_in_this_process(self):
+        # The hold file is on the volume; the set is not. The file ages out in delivery.
+        self._call()
+        plugin._greeting_turns.clear()
+        self._end_turn()
+        self.trigger_job.assert_not_called()
+        self.assertEqual(self._holds(), [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])
+
+    def test_register_installs_both_hooks(self):
+        ctx = mock.MagicMock()
+        plugin.register(ctx)
+        self.assertEqual(
+            [c.args for c in ctx.register_hook.call_args_list],
+            [("pre_llm_call", plugin.handle_pre_llm_call), ("post_llm_call", plugin.handle_post_llm_call)],
+        )
 
     def test_no_delivery_job_at_all_primes_nothing(self):
         self.store_ids = set()
@@ -203,6 +309,8 @@ class PreLlmCallTest(unittest.TestCase):
         # The plugin must NOT inject the inventory itself (delivery is verbatim).
         self.assertNotIn("SECRET-FLEET-DATA", result["context"])
         self.assertTrue((self.data_dir / ".user_aligned").exists())
+        self.assertEqual(self._holds(), [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])
+        self._end_turn()
         self.trigger_job.assert_called_once_with("oobe")
 
     # --- the report on the shell sandbox's volume ------------------------
@@ -251,7 +359,7 @@ class PreLlmCallTest(unittest.TestCase):
                 self.assertIn("SCAN IN PROGRESS", result["context"])
                 self.assertTrue((self.data_dir / ".user_aligned").exists())
                 self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
-                self.trigger_job.assert_called_once_with("oobe")
+                self.assertEqual(self._holds(), [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])
 
     def test_unknown_sandbox_state_falls_back_to_the_local_report(self):
         (self.data_dir / "INVENTORY.md").write_text("REPORT", encoding="utf-8")
@@ -323,7 +431,8 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIsNone(second)
         # Delivery still bound to the first chat: no bind and no trigger for the second session.
         self.assertEqual(self.update_job.call_count, len(plugin.DELIVERY_JOB_IDS))
-        self.trigger_job.assert_called_once()
+        self.assertEqual(self._holds(), [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])
+        self.trigger_job.assert_not_called()
 
     def test_greeted_marker_is_written(self):
         self._call()
@@ -491,7 +600,7 @@ class PreLlmCallTest(unittest.TestCase):
     def test_failed_home_channel_write_still_primes_onboarding(self):
         _, save_env_value = self._arm_home_channel(persist_error=OSError("read-only"))
         self.assertIn("SCAN IN PROGRESS", self._call()["context"])
-        self.trigger_job.assert_called_once()
+        self.assertEqual(self._holds(), [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])
         self.assertTrue((self.data_dir / ".user_aligned").exists())
         save_env_value.assert_not_called()
 
@@ -706,6 +815,8 @@ class ConversationPrimingTest(unittest.TestCase):
     # The same workspace and framework doubles, without running PreLlmCallTest's tests again.
     tearDown = PreLlmCallTest.tearDown
     _call = PreLlmCallTest._call
+    _end_turn = PreLlmCallTest._end_turn
+    _holds = PreLlmCallTest._holds
     _arm_home_channel = PreLlmCallTest._arm_home_channel
 
     def setUp(self):
@@ -758,6 +869,11 @@ class ConversationPrimingTest(unittest.TestCase):
         self.assertTrue((self.data_dir / plugin.CONVERSATION_ALIGNED_MARKER).exists())
         self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
         self.assertFalse((self.data_dir / plugin.PRIMING_MARKER).exists())
+        # Held behind the greeting; the turn's end marks oobe due.
+        self.assertEqual(self._holds(), [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])
+        self.trigger_job.assert_not_called()
+        self._end_turn(platform="api_server", session_id=BRIDGE_SESSION)
+        self.assertEqual(self._holds(), [])
         self.trigger_job.assert_called_once_with("oobe")
         # The scheduler cannot post to a gateway conversation: no job is pointed anywhere, the
         # origin path's marker stays absent, and no Hermes home channel is written.
@@ -829,7 +945,8 @@ class ConversationPrimingTest(unittest.TestCase):
         self.assertEqual(record["conversation"], "slack:C0HOME/2.2")
         # Once greeted, no later turn primes again.
         self.assertIsNone(self._bridge_call(is_first_turn=False))
-        self.trigger_job.assert_called_once()
+        self.assertEqual(self._holds(), [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])
+        self.trigger_job.assert_not_called()
 
     def test_a_later_turn_on_a_chat_platform_is_still_ignored(self):
         self.assertIsNone(self._call(is_first_turn=False))
@@ -847,12 +964,37 @@ class ConversationPrimingTest(unittest.TestCase):
             self.assertIsNone(self._bridge_call())
         self.assertFalse((self.data_dir / plugin.CONVERSATION_FILE).exists())
         self.assertFalse((self.data_dir / plugin.PRIMING_MARKER).exists())
+        # Nor a hold: delivery would wait on it for a binding that is not there.
+        self.assertEqual(self._holds(), [])
+        self._end_turn(platform="api_server", session_id=BRIDGE_SESSION)
+        self.trigger_job.assert_not_called()
 
     def test_a_live_priming_holds_off_a_second_first_turn(self):
         (self.data_dir / plugin.PRIMING_MARKER).touch()
         self.assertIsNone(self._bridge_call())
         self.assertFalse((self.data_dir / plugin.CONVERSATION_FILE).exists())
         self.assertTrue((self.data_dir / plugin.PRIMING_MARKER).exists())
+        # A losing priming writes no hold either.
+        self.assertEqual(self._holds(), [])
+
+    def test_the_hold_comes_after_the_binding_and_before_the_aligned_marker(self):
+        seen = []
+        real_touch = Path.touch
+
+        def touch(path, *args, **kwargs):
+            if path.name == plugin.CONVERSATION_ALIGNED_MARKER:
+                seen.append(((self.data_dir / plugin.CONVERSATION_FILE).exists(), self._holds()))
+            return real_touch(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "touch", touch):
+            self._bridge_call()
+        self.assertEqual(seen, [(True, [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])])
+
+    def test_a_failed_hold_on_the_conversation_path_triggers_at_once(self):
+        with mock.patch.object(Path, "touch", _touch_failing(plugin.GREETING_PENDING_PREFIX)):
+            self.assertIsNotNone(self._bridge_call())
+        self.assertTrue((self.data_dir / plugin.CONVERSATION_ALIGNED_MARKER).exists())
+        self.trigger_job.assert_called_once_with("oobe")
 
     def test_a_stale_priming_is_taken_over(self):
         marker = self.data_dir / plugin.PRIMING_MARKER
@@ -869,7 +1011,8 @@ class ConversationPrimingTest(unittest.TestCase):
         self.assertIsNone(self._bridge_call(session_id="a2a-ctx-second"))
         record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
         self.assertEqual(record["conversation"], SLACK_ROUTE["conversation"])
-        self.trigger_job.assert_called_once()
+        self.assertEqual(self._holds(), [f"{plugin.GREETING_PENDING_PREFIX}{TURN}"])
+        self.trigger_job.assert_not_called()
 
     def test_a_sweep_from_before_this_path_is_not_primed(self):
         marker = self.data_dir / plugin.SCAN_FILED_MARKER

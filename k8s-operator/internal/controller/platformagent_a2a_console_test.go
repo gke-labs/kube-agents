@@ -83,10 +83,11 @@ func TestBuildA2AConsoleDeployment(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"CONSOLE_BUS_URL":       "http://test-agent-a2a-nats.test-ns.svc:9222",
+		"CONSOLE_BUS_URL":       "https://test-agent-a2a-nats.test-ns.svc:9222",
 		"CONSOLE_USER":          "console",
 		"CONSOLE_PASSWORD_FILE": "/var/run/secrets/a2a-console/console-password",
 		"CONSOLE_ALLOWED_HOSTS": "localhost:8080,127.0.0.1:8080",
+		"NATS_CA_FILE":          "/etc/a2a-nats-ca/ca.crt",
 	}
 	if got := consoleEnv(t, c); !reflect.DeepEqual(got, want) {
 		t.Errorf("env = %v\nwant  %v", got, want)
@@ -118,15 +119,23 @@ func TestTheConsoleImageCanBeOverridden(t *testing.T) {
 // The creds Secret holds every static user's password, sys included. The
 // console pod gets exactly one of them, and the only way it gets it is this
 // volume, so the volume is what has to be pinned. The sys-password check in
-// the manifests tests reads env references, which this pod has none of.
+// the manifests tests reads env references, which this pod has none of. The
+// pod's other volume is the CA bundle, a ConfigMap of public material, so
+// "one Secret volume" is the property, not "one volume".
 func TestTheConsoleCredentialVolumeProjectsOneKey(t *testing.T) {
 	agent := a2aTestAgent()
 	pod := buildA2AConsoleDeployment(agent).Spec.Template.Spec
 
-	if len(pod.Volumes) != 1 || pod.Volumes[0].Secret == nil {
-		t.Fatalf("volumes = %+v, want one Secret volume", pod.Volumes)
+	var secrets []corev1.Volume
+	for _, v := range pod.Volumes {
+		if v.Secret != nil || v.Projected != nil {
+			secrets = append(secrets, v)
+		}
 	}
-	src := pod.Volumes[0].Secret
+	if len(secrets) != 1 || secrets[0].Secret == nil {
+		t.Fatalf("secret-bearing volumes = %+v, want one Secret volume", secrets)
+	}
+	src := secrets[0].Secret
 	if src.SecretName != a2aCredsSecretName(agent) {
 		t.Errorf("secret = %q, want %q", src.SecretName, a2aCredsSecretName(agent))
 	}
@@ -142,12 +151,17 @@ func TestTheConsoleCredentialVolumeProjectsOneKey(t *testing.T) {
 		t.Errorf("optional = %v, want true", src.Optional)
 	}
 
-	mounts := pod.Containers[0].VolumeMounts
+	var mounts []corev1.VolumeMount
+	for _, m := range pod.Containers[0].VolumeMounts {
+		if m.Name == secrets[0].Name {
+			mounts = append(mounts, m)
+		}
+	}
 	if len(mounts) != 1 {
-		t.Fatalf("mounts = %+v, want one", mounts)
+		t.Fatalf("credential mounts = %+v, want one", mounts)
 	}
 	m := mounts[0]
-	if m.Name != pod.Volumes[0].Name || m.MountPath != "/var/run/secrets/a2a-console" || !m.ReadOnly {
+	if m.MountPath != "/var/run/secrets/a2a-console" || !m.ReadOnly {
 		t.Errorf("mount = %+v, want the credential volume read-only at /var/run/secrets/a2a-console", m)
 	}
 	// A subPath mount never sees a rotated Secret. The server reads the file
@@ -309,5 +323,48 @@ func TestTheConsoleFenceIsDeletedAfterTheConsoleAndBeforeTheBus(t *testing.T) {
 	// into the walk, the order still has to hold.
 	if sts, ok := pos["*v1.StatefulSet/"+a2aNATSName(agent)]; ok && fence > sts {
 		t.Errorf("console fence at %d, after the StatefulSet sentinel at %d", fence, sts)
+	}
+}
+
+// The proxy verifies the bus's websocket listener against the bus CA, so the
+// pod mounts the CA bundle ConfigMap, and NATS_CA_FILE names the file in that
+// mount. Not optional: a pod without the CA must not start and dial the bus
+// unverified, and the server refuses an https bus URL with no CA file.
+func TestTheConsoleTrustsTheBusCA(t *testing.T) {
+	agent := a2aTestAgent()
+	pod := buildA2AConsoleDeployment(agent).Spec.Template.Spec
+
+	var vol *corev1.Volume
+	for i := range pod.Volumes {
+		if pod.Volumes[i].ConfigMap != nil {
+			vol = &pod.Volumes[i]
+		}
+	}
+	if vol == nil {
+		t.Fatalf("volumes = %+v, want the CA bundle ConfigMap", pod.Volumes)
+	}
+	if got, want := vol.ConfigMap.Name, a2aNATSCABundleName(agent); got != want {
+		t.Errorf("CA bundle ConfigMap = %q, want %q", got, want)
+	}
+	if vol.ConfigMap.Optional != nil && *vol.ConfigMap.Optional {
+		t.Error("the CA bundle volume is optional; a console without the CA must not start")
+	}
+
+	c := pod.Containers[0]
+	var mount *corev1.VolumeMount
+	for i := range c.VolumeMounts {
+		if c.VolumeMounts[i].Name == vol.Name {
+			mount = &c.VolumeMounts[i]
+		}
+	}
+	if mount == nil || !mount.ReadOnly || mount.SubPath != "" {
+		t.Fatalf("CA bundle mount = %+v, want a read-only directory mount", mount)
+	}
+	caFile := consoleEnv(t, c)[a2aNATSCAFileEnv]
+	if !strings.HasPrefix(caFile, mount.MountPath+"/") {
+		t.Errorf("%s = %q, not under the CA bundle mount %q", a2aNATSCAFileEnv, caFile, mount.MountPath)
+	}
+	if !strings.HasPrefix(consoleEnv(t, c)[a2aConsoleEnvBusURL], "https://") {
+		t.Errorf("%s = %q, want https: the websocket listener serves TLS", a2aConsoleEnvBusURL, consoleEnv(t, c)[a2aConsoleEnvBusURL])
 	}
 }
