@@ -20,10 +20,12 @@ otherwise. The fleet column is modeled and is not held here.
 Run: python3 -m unittest discover -s tests -p 'test_chart_values_fleet_example.py' -v
 """
 
+import importlib.util
 import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import unittest
 
 import yaml
@@ -65,7 +67,7 @@ _SANDBOX_FORWARD_RE = re.compile(r'envAuditAutoPromote\s*=\s*"(?P<name>[A-Z0-9_]
 # container's allowlist above drops them; the credential-proxy and agent-api-auth
 # containers take spec.deployment.env through mergeCredentialProxyEnv, a denylist
 # of the names the operator itself sets or lists as sensitive, so a name the
-# operator source never spells reaches those two containers.
+# operator source never spells as a string reaches those two containers.
 _LEFT_OUT_ENV_NAMES = ("CLOUDSDK_CORE_DISABLE_FILE_LOGGING", "MALLOC_ARENA_MAX")
 
 # The page's declared column, derived from the two files the page cites.
@@ -89,23 +91,25 @@ _AUTOPILOT_MIN_MIB_PER_VCPU = 1024
 _AUTOPILOT_MAX_MIB_PER_VCPU = 6.5 * 1024
 _AUTOPILOT_EPHEMERAL_CEILING_MI = 10 * 1024
 
-_QUANTITY_RE = re.compile(r"^(?P<number>\d+(?:\.\d+)?)(?P<suffix>m|Mi|Gi|Ti|)$")
-_MIB_PER_SUFFIX = {"Mi": 1, "Gi": 1024, "Ti": 1024 * 1024}
+# The quantity parsers are the generator's, which wrote footprint.yaml from the
+# operator golden and reads every form the chart's own kube-agents.parseBytes and
+# parseCpuMillis read (Ki..Ei, k..E, exponents, bare byte counts). Imported by path,
+# as tests/test_generate_chart_footprint.py does, so the two sides of the declared
+# column share one grammar.
+_GENERATOR_PATH = _REPO_ROOT / "scripts" / "generate_chart_footprint.py"
+_generator_spec = importlib.util.spec_from_file_location("generate_chart_footprint", _GENERATOR_PATH)
+_generator = importlib.util.module_from_spec(_generator_spec)
+sys.modules.setdefault("generate_chart_footprint", _generator)
+_generator_spec.loader.exec_module(_generator)
+_MIB = 1024 ** 2
 
 
 def _millicores(quantity) -> float:
-    match = _QUANTITY_RE.match(str(quantity))
-    if match is None or match.group("suffix") not in ("m", ""):
-        raise AssertionError(f"not a CPU quantity: {quantity!r}")
-    number = float(match.group("number"))
-    return number if match.group("suffix") == "m" else number * 1000
+    return float(_generator.parse_cpu_millis(quantity))
 
 
 def _mebibytes(quantity) -> float:
-    match = _QUANTITY_RE.match(str(quantity))
-    if match is None or match.group("suffix") not in _MIB_PER_SUFFIX:
-        raise AssertionError(f"not a memory quantity: {quantity!r}")
-    return float(match.group("number")) * _MIB_PER_SUFFIX[match.group("suffix")]
+    return _generator.parse_bytes(quantity) / _MIB
 
 
 def _example() -> dict:
@@ -174,9 +178,19 @@ def _footprint() -> dict:
 
 
 def _operator_source() -> str:
-    """Every Go file the operator's controller and API types are built from, tests excepted."""
+    """Every Go file the operator's controller and API types are built from, tests excepted.
+
+    Comment lines are dropped, as tests/test_ci_deploy_drift_detector.py drops them for the
+    sibling DRIFT_DETECTOR_LOG_DROPPED: the operator's comments name a variable to say why it
+    is absent, and a comment reserves nothing.
+    """
     files = [f for f in _CONTROLLER_DIR.glob("*.go") if not f.name.endswith("_test.go")] + [_API_TYPES]
-    return "\n".join(f.read_text() for f in files)
+    return "\n".join(
+        line
+        for f in files
+        for line in f.read_text().splitlines()
+        if not line.lstrip().startswith("//")
+    )
 
 
 def _forwarded_env_names() -> set:
@@ -231,7 +245,7 @@ class ExampleShapeTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertNotIn(name, names)
                 self.assertNotIn(name, forwarded, f"{name} reaches the agent container now; re-read the page's sentence on it")
-                self.assertNotIn(name, source, f"the operator names {name} now; re-read which container it reaches")
+                self.assertNotIn(f'"{name}"', source, f"the operator names {name} now; re-read which container it reaches")
 
     def test_the_operator_memory_request_matches_its_limit(self):
         # Autopilot without bursting sets limits equal to requests; the file
