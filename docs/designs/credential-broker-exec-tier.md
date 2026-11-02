@@ -878,8 +878,9 @@ on: the sandbox restarts with the variable before an exec replica is ready.
 ## 12. Implementation contract
 
 The names and shapes that the implementation shares. The operator, the broker, the shim and the
-chart will use these exact values; on `main` today, none of them does yet. A Python block in `credential_proxy_client.py` holds the broker's
-and the shim's copies, and `test_exec_tier_contract.py` checks that they match this section.
+chart will use these exact values; on `main` today, only the shim does. A Python block in
+`credential_proxy_client.py` holds the broker's and the shim's copies, and
+`test_exec_tier_contract.py` checks that they match this section.
 
 | Item                  | Value                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
