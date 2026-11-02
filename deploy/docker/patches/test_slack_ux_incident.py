@@ -463,10 +463,9 @@ class RuntimeTest(unittest.TestCase):
         self.deliver(refused)
         self.assertEqual([e[0] for e in refused.log], ["send_chat", "send"])
 
-    def test_under_next_a_google_chat_alert_gets_its_triage_laid_out_too(self):
-        # The gateway lays the triage out on Google Chat under next, so the stand-in sends
-        # it under the alert's key as for Slack (the gateway posts a home-channel chat
-        # message under the alert rather than editing it); Hermes's own Chat adapter
+    def test_under_next_a_google_chat_alert_is_edited_too(self):
+        # The gateway lays the triage out on Google Chat under next, so the alert in a
+        # Chat space is edited by its key as a Slack one is; Hermes's own Chat adapter
         # (today, no send_chat) is left alone.
         class StandIn(_Adapter):
             async def send_chat(self, chat_id, content, chat, update="", metadata=None):

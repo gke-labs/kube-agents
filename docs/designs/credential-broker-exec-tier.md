@@ -1,7 +1,6 @@
 # The Credential Broker Scales Out: an Exec Tier Beside One Stateful Broker
 
-> **STATUS — proposal; not implemented.** The first measurement run is in §8.3. 16 and 32 clusters and the exec tier are not measured yet.
-> Nothing is built. This document proposes how the credential broker grows past one pod. It is
+> **STATUS — proposal; partly implemented.** Priority admission by class (§4.2) runs on the broker; the exec tier is not built. The first measurement run is in §8.3. 16 and 32 clusters and the exec tier are not measured yet. This document proposes how the credential broker grows past one pod. It is
 > meant to replace [`credential-proxy-single-pod.md`](credential-proxy-single-pod.md) once the
 > measurements in §8 exist and the design is reviewed. Issue: #4082. Partner: the sizing tiger
 > team (#3753).
@@ -96,9 +95,10 @@ and each caller routes to the right one.**
   and 4 on Autopilot without bursting (limit clamped to the 1 GiB request). The smaller of the
   two numbers binds.
 - Session role: its own cap of 2, refused at once and not queued (`credential_proxy.py:322`).
-- Admission is one arrival-order queue with a 60 s timeout, then `503 CREDENTIAL_PROXY_BUSY`
-  (`_admit`, `credential_proxy.py:6354`).
-- **No priority.** A caller authenticates with a projected ServiceAccount token. The broker
+- Admission is one queue with a 60 s timeout, then `503 CREDENTIAL_PROXY_BUSY` (`_admit`).
+  Inside it the classes of §4.2 apply: the profile and `scope` roles are background, and every
+  other role is interactive.
+- **No priority inside the shell role.** A caller authenticates with a projected ServiceAccount token. The broker
   learns the workload and a role (shell, chat, a2a-chat, session, watcher, mcp) from it. The
   `caller` field of `Principal` is always `None` (`credential_proxy.py:2182`). Background work
   reaches the broker as the shell role, the same as an interactive command:
@@ -109,7 +109,7 @@ and each caller routes to the right one.**
     the hourly reconcile run through `sandbox_exec` and then the shim. `sandbox_exec` also runs
     the platform MCP server's interactive tools (`platform_mcp_server.py:590`).
 
-  **The broker cannot tell interactive work from background work today.**
+  **The broker cannot tell the shell's interactive work from its background work today.**
 
 ### 2.2 What blocks more replicas [doc, `credential-proxy-single-pod.md` §2 and §3]
 
@@ -878,7 +878,9 @@ on: the sandbox restarts with the variable before an exec replica is ready.
 ## 12. Implementation contract
 
 The names and shapes that the implementation shares. The operator, the broker, the shim and the
-chart will use these exact values; on `main` today, only the shim does. A Python block in
+chart use these exact values. The broker's priority admission (§4.2) uses the classes, the
+`background` bound and the nice value. The shim uses the caller URL, the busy reply's `bound` and
+the retried bounds. The other items arrive with the changes that need them. A Python block in
 `credential_proxy_client.py` holds the broker's and the shim's copies, and
 `test_exec_tier_contract.py` checks that they match this section.
 
