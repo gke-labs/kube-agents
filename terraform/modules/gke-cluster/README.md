@@ -3,7 +3,7 @@
 Reusable Terraform module for provisioning the GKE cluster that hosts Kube-Agents workloads. It manages one of three cluster shapes, selected by `cluster_mode` and `create_cluster`:
 
 - **`cluster_mode = "autopilot"`** (default) — a GKE Autopilot cluster. Autopilot clusters are regional: `location` must be a region (a zone is rejected at plan time).
-- **`cluster_mode = "standard"`** — a GKE Standard cluster: a default node pool of `e2-standard-4` machines (one per zone), Dataplane V2 with FQDN NetworkPolicy, the Filestore CSI and BackupRestore addons, Workload Identity, and CMEK database encryption. `enable_gvisor_node_pool` adds a dedicated GKE Sandbox pool (Standard only — Autopilot ships the `gvisor` RuntimeClass natively).
+- **`cluster_mode = "standard"`** — a GKE Standard cluster: a default node pool of `e2-standard-4` machines (one per zone), Dataplane V2 with FQDN NetworkPolicy, the Filestore CSI and BackupRestore addons, Workload Identity, and CMEK database encryption. `enable_gvisor_node_pool` adds a dedicated GKE Sandbox pool (Standard only — Autopilot ships the `gvisor` RuntimeClass natively). [Sizing the node pools](#sizing-the-node-pools) covers both pools' machine types, boot disks and the gVisor pool's autoscaling bounds.
 - **`create_cluster = false`** — install onto a cluster somebody else made. The module reads the named cluster through a data source and creates no cluster or KMS resources. Two postconditions gate the plan: the cluster must already have Workload Identity enabled, and it must enforce NetworkPolicy — either Dataplane V2 or the legacy Calico addon, which takes two `gcloud container clusters update` calls in order, `--update-addons=NetworkPolicy=ENABLED` and then `--enable-network-policy`. `install.sh` does both for you when authorized; a bare Terraform run refuses instead. `accept_no_network_policy = true` waives the second postcondition and installs onto a cluster that enforces none, without changing it; the `network_policy_enforced` output is then `false`, and every NetworkPolicy kube-agents installs is inert.
 
 The full-install composition passes `kube-agents-host=true` through `resource_labels` so the admin portal can discover the deployed host; standalone callers can use the same input when they install kube-agents on the cluster.
@@ -33,6 +33,24 @@ The `cluster_endpoint` output is whichever endpoint GKE publishes for the cluste
 > `kms_keyring_name`/`kms_key_name` values. The full-install composition's `lifecycle.sh`
 > does both for you; its README's [Teardown and re-apply](../../examples/full-install/README.md#teardown-and-re-apply) section says how, including how to restore
 > versions a raw destroy scheduled.
+
+## Sizing the node pools
+
+Standard mode only. `sizing_profile` picks the shape of both node pools in one setting, and each shape can be set on its own:
+
+| Input                                    | `small` (default) and `medium` | `fleet`         |
+| ---------------------------------------- | ------------------------------ | --------------- |
+| `standard_machine_type`                  | `e2-standard-4`                | `n2-standard-8` |
+| `standard_disk_size_gb`                  | 100                            | 200             |
+| `gvisor_machine_type`                    | `e2-standard-4`                | `n2-standard-4` |
+| `gvisor_disk_size_gb`                    | 100                            | 150             |
+| `standard_disk_type`, `gvisor_disk_type` | `pd-balanced`                  | `pd-balanced`   |
+
+`small` is the shape the module produced before profiles existed, so the default changes nothing on an existing cluster. `medium` resolves like `small` until a later change gives it a shape of its own. The four machine-type and disk-size inputs and the two disk-type inputs default to `null`, which means "the profile's value": an explicit value always wins, even one equal to the `small` shape, so a tfvars file that writes `standard_machine_type = "e2-standard-4"` beside `sizing_profile = "fleet"` gets `e2-standard-4`. The resolved values are the `standard_*` and `gvisor_*` outputs. Disk types accepted: `pd-standard`, `pd-balanced`, `pd-ssd` and `hyperdisk-balanced` (the last only on machine series that support it, which GKE checks at apply).
+
+The gVisor pool autoscales between `gvisor_min_node_count` (default 1) and `gvisor_max_node_count` (default 2) nodes per zone and is created at the minimum; equal bounds keep it at a fixed size. The default pool stays at `standard_node_count` per zone.
+
+Changing a machine type or a boot disk on a live cluster replaces the node pool, and on the default pool that means the cluster itself: read the plan before applying. At the defaults the module renders GKE's own disk values, so upgrading to this version of the module plans no replacement; an existing gVisor pool gains the autoscaling bounds in place.
 
 ## Usage
 

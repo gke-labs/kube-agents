@@ -97,8 +97,9 @@ Four behaviours worth knowing before the first run:
   unsandboxed pod shares the node kernel with everything else on the node. Autopilot, the shape a
   fresh install creates, ships the RuntimeClass and needs no node pool, from GKE `1.27.4-gke.800`
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
-  node pool of one `e2-standard-4` per zone. Pass `--enable-gvisor=false` to run on the standard
-  container runtime.
+  node pool of one `e2-standard-4` per zone, autoscaling to two; the module's `sizing_profile`
+  and `gvisor_*` inputs resize it. Pass `--enable-gvisor=false` to run on the standard container
+  runtime.
 - **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
   one where a change made outside that repository is worth reporting, and nothing else here
   reports it. It costs three GCP resources in the install's project — a Log Router sink, a Pub/Sub

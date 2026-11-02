@@ -48,6 +48,66 @@ variable "gvisor_pool_name" {
   default     = "gvisor-pool"
 }
 
+variable "sizing_profile" {
+  description = "Shape of the Standard cluster's node pools when no explicit machine type or disk size is given: \"small\" (the default: e2-standard-4, 100 GB pd-balanced on both pools), \"medium\" (the same, until it has a shape of its own) or \"fleet\" (n2-standard-8 with 200 GB for the default pool, n2-standard-4 with 150 GB for the gVisor pool). An explicit standard_* or gvisor_* value wins over the profile. Passed through to the gke-cluster module; Standard mode only."
+  type        = string
+  default     = "small"
+}
+
+variable "standard_machine_type" {
+  description = "Machine type for the Standard cluster's default node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "standard_node_count" {
+  description = "Node count per zone for the Standard cluster's default node pool. Passed through to the gke-cluster module."
+  type        = number
+  default     = 1
+}
+
+variable "standard_disk_size_gb" {
+  description = "Boot disk size in GB for the Standard cluster's default node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = number
+  default     = null
+}
+
+variable "standard_disk_type" {
+  description = "Boot disk type for the Standard cluster's default node pool (pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced); null is pd-balanced. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "gvisor_machine_type" {
+  description = "Machine type for the gVisor node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "gvisor_min_node_count" {
+  description = "Lower autoscaling bound of the gVisor node pool, per zone, and the size it is created at. Passed through to the gke-cluster module."
+  type        = number
+  default     = 1
+}
+
+variable "gvisor_max_node_count" {
+  description = "Upper autoscaling bound of the gVisor node pool, per zone; equal to gvisor_min_node_count keeps the pool at a fixed size. Passed through to the gke-cluster module."
+  type        = number
+  default     = 2
+}
+
+variable "gvisor_disk_size_gb" {
+  description = "Boot disk size in GB for the gVisor node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = number
+  default     = null
+}
+
+variable "gvisor_disk_type" {
+  description = "Boot disk type for the gVisor node pool (pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced); null is pd-balanced. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
 variable "agent_runtime_class" {
   description = "RuntimeClass for the agent pod, overriding what enable_gvisor_node_pool implies. Autopilot ships the gvisor RuntimeClass with no node pool to manage — and enable_gvisor_node_pool fails the plan there — so \"gvisor\" here is how an Autopilot install asks for the sandbox without reaching for extra_helm_values. Empty derives the value from enable_gvisor_node_pool."
   type        = string
