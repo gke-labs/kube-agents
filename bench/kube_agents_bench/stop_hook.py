@@ -29,6 +29,16 @@ nothing, fails its objectives rather than passing the safeguard vacuously.
 The directive line may carry ``observe=<seconds>`` after it; the default is
 :data:`DEFAULT_OBSERVE_SECONDS`. A case writes its prompt as a YAML literal
 block (``|-``), since a folded one joins the directive to the ask.
+
+``cards=done`` moves the stop later: the harness waits off the board until
+every card the turn filed is terminal, for at most ``wait=<seconds>``
+(:data:`DEFAULT_WAIT_SECONDS`), then until the conversation has gone quiet
+(the harness's `_await_quiet`), and stops then, so a case can grade what a
+stop says about work that already landed. Whichever way the stop goes, the
+harness reads the gateway's answer to it off the conversation and records it
+as :data:`STOP_REPLY_ENTRY`: ``completed`` with the answer as its result, or
+``error`` when no answer came within the harness's bound. A case asserts on
+the answer with ``tool_called`` and ``result``.
 """
 
 from __future__ import annotations
@@ -57,6 +67,16 @@ STOP_ENTRY = "harness_stop_sent"
 CARDS_STOPPED_ENTRY = "harness_cards_stopped"
 #: The board status a stopped card ends in.
 STOPPED_STATUS = "archived"
+#: The trajectory entry for the gateway's answer to the stop.
+STOP_REPLY_ENTRY = "harness_stop_reply"
+#: The optional field that moves the stop to after the filed cards ended, and
+#: its one value.
+CARDS_FIELD = "cards="
+CARDS_DONE = "done"
+#: The optional field bounding that wait, in seconds, and its default and cap.
+WAIT_FIELD = "wait="
+DEFAULT_WAIT_SECONDS = 1800.0
+MAX_WAIT_SECONDS = 3600.0
 
 
 @dataclass(frozen=True)
@@ -65,6 +85,10 @@ class Stop:
 
     prompt: str
     observe_seconds: float
+    #: Stop once every filed card is terminal rather than at once.
+    cards_done: bool = False
+    #: The longest wait for that, in seconds.
+    wait_seconds: float = DEFAULT_WAIT_SECONDS
 
 
 def is_stopped_ask(prompt: str) -> bool:
@@ -80,8 +104,10 @@ def parse(prompt: str) -> Stop | None:
     """The stopped ask ``prompt`` holds, or ``None`` for an ordinary ask.
 
     Raises:
-        ValueError: The directive carries something other than one
-            ``observe=<seconds>`` within bounds, or no ask follows it.
+        ValueError: The directive carries something other than at most one
+            each of ``observe=<seconds>``, ``cards=done`` and ``wait=<seconds>``,
+            within bounds, or ``wait=`` without ``cards=done``, or no ask
+            follows it.
     """
     if not is_stopped_ask(prompt):
         return None
@@ -89,23 +115,39 @@ def parse(prompt: str) -> Stop | None:
     words = first.split()
     if words[0] != STOP_DIRECTIVE:
         raise ValueError(f"{STOP_DIRECTIVE} must stand alone, then a space before {OBSERVE_FIELD}<seconds>; got {words[0]}")
-    observe = DEFAULT_OBSERVE_SECONDS
-    extra = words[1:]
-    if len(extra) > 1 or (extra and not extra[0].startswith(OBSERVE_FIELD)):
-        raise ValueError(f"{STOP_DIRECTIVE} takes at most one {OBSERVE_FIELD}<seconds>, got {extra}")
-    if extra:
-        try:
-            observe = float(extra[0][len(OBSERVE_FIELD) :])
-        except ValueError as exc:
-            raise ValueError(f"{STOP_DIRECTIVE}: {extra[0]} is not a number of seconds") from exc
-        if not 0 < observe <= MAX_OBSERVE_SECONDS:
+    fields: dict[str, str] = {}
+    for word in words[1:]:
+        name = next((f for f in (OBSERVE_FIELD, CARDS_FIELD, WAIT_FIELD) if word.startswith(f)), None)
+        if name is None or name in fields:
             raise ValueError(
-                f"{STOP_DIRECTIVE}: {OBSERVE_FIELD} must be above 0 and at most {MAX_OBSERVE_SECONDS:.0f}"
+                f"{STOP_DIRECTIVE} takes at most one each of {OBSERVE_FIELD}<seconds>, "
+                f"{CARDS_FIELD}{CARDS_DONE} and {WAIT_FIELD}<seconds>, got {words[1:]}"
             )
+        fields[name] = word[len(name) :]
+    observe = _directive_seconds(fields, OBSERVE_FIELD, DEFAULT_OBSERVE_SECONDS, MAX_OBSERVE_SECONDS)
+    after = fields.get(CARDS_FIELD)
+    if after is not None and after != CARDS_DONE:
+        raise ValueError(f"{STOP_DIRECTIVE}: {CARDS_FIELD} takes only {CARDS_DONE}, got {after}")
+    if WAIT_FIELD in fields and after is None:
+        raise ValueError(f"{STOP_DIRECTIVE}: {WAIT_FIELD} bounds {CARDS_FIELD}{CARDS_DONE}, which is missing")
+    wait = _directive_seconds(fields, WAIT_FIELD, DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS)
     ask = rest.strip()
     if not ask:
         raise ValueError(f"{STOP_DIRECTIVE} needs the ask on the lines after it")
-    return Stop(prompt=ask, observe_seconds=observe)
+    return Stop(prompt=ask, observe_seconds=observe, cards_done=after is not None, wait_seconds=wait)
+
+
+def _directive_seconds(fields: dict[str, str], name: str, default: float, cap: float) -> float:
+    """The directive field ``name`` as seconds above 0 and at most ``cap``, or ``default``."""
+    if name not in fields:
+        return default
+    try:
+        value = float(fields[name])
+    except ValueError as exc:
+        raise ValueError(f"{STOP_DIRECTIVE}: {name}{fields[name]} is not a number of seconds") from exc
+    if not 0 < value <= cap:
+        raise ValueError(f"{STOP_DIRECTIVE}: {name} must be above 0 and at most {cap:.0f}")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -68,10 +68,14 @@ is sent, and the wake's reply is the run's one turn. A
 first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
 prompt an ask the harness stops once it has filed a card
-([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
-only over the inject transport, so the case needs an entry in
-`hack/eval/api-lane-exclusions.txt`. The harness writes two entries for such a case,
-`harness_stop_sent` and `harness_cards_stopped`, and the case's `tool_called` objectives name them.
+([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py));
+`cards=done`, bounded by `wait=<seconds>`, stops it once every filed card has ended and the conversation has gone quiet instead. It
+runs only over the inject transport, so the case needs an entry in
+`hack/eval/api-lane-exclusions.txt`. The harness writes three entries for such a case,
+`harness_stop_sent`, `harness_cards_stopped` and `harness_stop_reply` (the gateway's answer to
+the stop, as its result), and the case's `tool_called` objectives name them, with a `result`
+pattern for the answer. Under `cards=done` the cards have ended before the stop, so
+`harness_cards_stopped` reads `error` and such a case does not assert it.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted

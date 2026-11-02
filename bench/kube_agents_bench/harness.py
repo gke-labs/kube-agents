@@ -292,6 +292,22 @@ _QUESTION_SECTION = "Question from delegated task {tid}:\n{text}"
 # Appended to the opening turn's message id for the stop a stopped ask sends
 # (stop_hook), so the door's dedupe never answers it with the opening task.
 _INJECT_STOP_SUFFIX = "/stop"
+# How long the harness reads the conversation for the gateway's answer to a
+# stop: the card stop answers within its 24 s bound, plus the bridge and the
+# relay.
+_STOP_REPLY_WAIT_SECONDS = 90.0
+_STOP_REPLY_POLL_SECONDS = 1.0
+# With cards=done, how long the conversation must post nothing before the stop
+# goes, and the longest the harness waits for that: a finished card's report
+# and the turn it wakes land within seconds to a couple of minutes.
+_QUIET_SECONDS = 30.0
+_QUIET_MAX_SECONDS = 300.0
+# The lines the gateway posts while a card stop runs (a2a/gateway/cardstop.go,
+# cardStopPlaceholder and cardStopDoorNotice), which are not its answer.
+_STOP_PLACEHOLDERS = frozenset({
+    "🛑 stopping this conversation's cards…",
+    "🛑 sent a stop to this conversation's cards; this door doesn't report how it went",
+})
 # A pushed-report reply the door absorbed as a steer (the relay's record
 # still held the opening task) is sent again, under a fresh message id, this
 # many times in all, this long apart.
@@ -1871,6 +1887,72 @@ class _DelegationTransportExhausted(Exception):
     """
 
 
+def _stop_reply_cursor(exchange: Any) -> int:
+    """The highest transcript sequence the opening exchange read, so the stop's
+    answer is read from past it."""
+    seqs = [e["seq"] for e in exchange.fold.entries if isinstance(e.get("seq"), int)]
+    return max(seqs, default=0)
+
+
+def _await_quiet(stopper: inject.InjectTask, after: int) -> int:
+    """Read the conversation past ``after`` until :data:`_QUIET_SECONDS` go by
+    with nothing new on it, for at most :data:`_QUIET_MAX_SECONDS`; the
+    sequence read past.
+
+    Raises:
+        InjectUnavailable: The gateway could not be reached.
+    """
+    deadline = time.monotonic() + _QUIET_MAX_SECONDS
+    quiet_since = time.monotonic()
+    while time.monotonic() < deadline:
+        if time.monotonic() - quiet_since >= _QUIET_SECONDS:
+            return after
+        posts, after = stopper.read_posts(after, min(_QUIET_SECONDS, max(0.0, deadline - time.monotonic())))
+        if posts:
+            quiet_since = time.monotonic()
+        else:
+            time.sleep(min(max(0.0, deadline - time.monotonic()), _STOP_REPLY_POLL_SECONDS))
+    _log.warning("stop: the conversation was still posting after %.0fs; stopping anyway", _QUIET_MAX_SECONDS)
+    return after
+
+
+def _read_stop_reply(stopper: inject.InjectTask, after: int) -> dict[str, Any]:
+    """The gateway's answer to a stop it took, read past ``after`` for up to
+    :data:`_STOP_REPLY_WAIT_SECONDS`: the edit that replaces the stop's
+    placeholder, which is where the gateway puts it. Any other post (a card's
+    late report, say) is the answer only when no placeholder came and nothing
+    better did by the deadline, since the gateway posts the answer itself
+    when it has no placeholder to edit. A read that fails ends the wait with
+    what it has."""
+    deadline = time.monotonic() + _STOP_REPLY_WAIT_SECONDS
+    placeholders: set[str] = set()
+    reply, fallback = "", ""
+    try:
+        while not reply:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            posts, after = stopper.read_posts(after, left)
+            for post in posts:
+                text = post["text"].strip()
+                if text in _STOP_PLACEHOLDERS:
+                    placeholders.add(post["messageId"])
+                    fallback = ""
+                elif post["kind"] == inject.ENTRY_EDIT and post["messageId"] in placeholders:
+                    reply = post["text"]
+                elif text and not placeholders:
+                    fallback = post["text"]
+            if not posts:
+                # A door that answers an empty read at once is not spun on.
+                time.sleep(min(max(0.0, deadline - time.monotonic()), _STOP_REPLY_POLL_SECONDS))
+    except inject.InjectUnavailable as exc:
+        _log.warning("inject: reading the stop's answer failed: %s", exc)
+    reply = reply or fallback
+    if not reply:
+        return {"status": "error", "result": f"no answer to the stop within {_STOP_REPLY_WAIT_SECONDS:.0f}s"}
+    return {"status": "completed", "result": reply}
+
+
 class KubeAgentsHarness(AgentHarness):
     """Drives the in-cluster platform agent over its HTTP endpoint.
 
@@ -2882,6 +2964,18 @@ class KubeAgentsHarness(AgentHarness):
                     author=author,
                     message_id=f"{message_id}{_INJECT_STOP_SUFFIX}",
                 )
+                # Past whatever the conversation gained since the opening
+                # exchange (a card's report), so only the stop's answer is read.
+                cursor = _stop_reply_cursor(exchange)
+                try:
+                    if stop.cards_done:
+                        # The cards have ended; their reports and any turn they
+                        # woke still post. The stop waits for the thread to go
+                        # quiet, as a person reading it would.
+                        cursor = _await_quiet(stopper, cursor)
+                    _, cursor = stopper.read_posts(cursor, 0)
+                except inject.InjectUnavailable as exc:
+                    _log.warning("inject: reading past the conversation before the stop failed: %s", exc)
                 failures = 0
                 while True:
                     try:
@@ -2915,8 +3009,12 @@ class KubeAgentsHarness(AgentHarness):
                     return False, f"the gateway started task {started} for the stop instead of stopping"
                 if stopper.refusal != inject.REFUSAL_NO_TASK:
                     return False, f"{inject.refusal_detail(stopper.refusal)}: {stopper.note}"
+                stop_reply.update(_read_stop_reply(stopper, cursor))
                 return True, stopper.note
 
+            # The gateway's answer to the stop, read off the conversation once
+            # the stop went (stop_hook.STOP_REPLY_ENTRY).
+            stop_reply: dict[str, Any] = {"status": "error", "result": "the stop did not go"}
             context_id = exchange.probe.context_id if exchange.probe else ""
             try:
                 self._stop_after_first_card(
@@ -2928,6 +3026,7 @@ class KubeAgentsHarness(AgentHarness):
                 )
             except _TransportError as exc:
                 return _infra_failure(str(exc))
+            result.trajectory.append({"name": stop_hook.STOP_REPLY_ENTRY, "args": {}, **stop_reply})
             return result
 
         if follow_up is not None:
@@ -3058,6 +3157,27 @@ class KubeAgentsHarness(AgentHarness):
         """
         entry: dict[str, Any] = {"name": stop_hook.STOP_ENTRY, "args": {"session": session_id}}
         result.trajectory.append(entry)
+
+        # 0. With cards=done, the stop waits until every card the turn filed
+        # has ended, or the wait's bound: what it says about work already
+        # landed is what such a case grades. A read that fails is waited
+        # through; the reads after the stop decide.
+        if stop.cards_done and session_id:
+            wait_until = time.monotonic() + stop.wait_seconds
+            while True:
+                got = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+                if (
+                    got is not None
+                    and got.session_found
+                    and got.card_ids
+                    and all(str(got.cards.get(t, {}).get("status")) in _TERMINAL_STATUSES for t in got.card_ids)
+                ):
+                    break
+                left = wait_until - time.monotonic()
+                if left <= 0:
+                    _log.warning("stop: the filed cards had not all ended after %.0fs; stopping anyway", stop.wait_seconds)
+                    break
+                time.sleep(min(left, max(poll_interval, 1.0)))
 
         # 1. The stop.
         unreachable: _TransportError | None = None

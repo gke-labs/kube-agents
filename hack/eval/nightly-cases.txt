@@ -962,6 +962,13 @@
 # record files under the version key's `next` mode, the inject lane's.
 ./tasks/chat-stop-halts-delegated-remediation/task.yaml
 
+# gke-labs#4061, the Stop write record: a `stop` typed after the card opened
+# its pull request names that pull request in the stop's answer. Next lane
+# only (api-lane-exclusions.txt), as above; requests one pull request
+# (pull_request_opened). deployer: noop, the no-pdb-workload fixture, one
+# card, the stop after it ends.
+./tasks/chat-stop-names-pull-request-already-opened/task.yaml
+
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.

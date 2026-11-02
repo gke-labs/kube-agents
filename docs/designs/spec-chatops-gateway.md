@@ -186,7 +186,10 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   edits it into the answer: "🛑 stopped N cards: <title>, …" naming at most five, then
   "and K more", and clauses for what the stop could not promise (cards already finished,
   ones that could not be stopped, ones still being stopped, a worker that may still start,
-  more cards than one stop takes, a stop that ran out of time). Titles are model text, so
+  more cards than one stop takes, a stop that ran out of time), then the pull requests the
+  result's `writes` names (`already opened a pull request: [#412](<url>)`, `!7` for a GitLab
+  merge request), each checked again as a pull request or merge request URL whose number is
+  the one it names before it is linked. Titles are model text, so
   each is cut to one line of at most 80 runes, with angle brackets and `@` replaced by
   look-alikes so a title can't mention anyone, `[`, `]`, backticks, `~`, `|`, `*` and `_`
   neutralised so it can't make a masked link or bleed formatting, and every dot and colon,

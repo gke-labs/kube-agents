@@ -38,3 +38,10 @@ chat-question-asked-to-choose-pauses
 # to. Leaves this list when the api lane can send a second message on the
 # same conversation.
 chat-reply-under-pushed-report
+
+# #4061: the harness types `stop` through the door once the card has ended
+# (stop_hook.py, cards=done) and reads the gateway's answer off the inject
+# conversation.
+# Leaves this list when the api lane can send a second message on the same
+# conversation.
+chat-stop-names-pull-request-already-opened

@@ -127,6 +127,10 @@ type cardStopResponse struct {
 	Errors     []string          `json:"errors"`
 	Truncated  bool              `json:"truncated"`
 	Deadline   bool              `json:"deadline"`
+	// Writes is the pull requests the conversation's cards opened
+	// (session-kv's `_card_writes`); a session-kv older than the field
+	// sends none.
+	Writes []lib.CardStopWrite `json:"writes"`
 }
 
 // cardStopCardRef is a card session-kv names by id and title alone.
@@ -319,6 +323,14 @@ func cardStopResult(r *cardStopResponse) *lib.CardStopResult {
 			break
 		}
 		out.NotStopped = append(out.NotStopped, lib.CardStopCard{ID: c.ID, Title: cardStopTitle(c.Title)})
+	}
+	// Passed on as session-kv checked them; the gateway checks each again
+	// before it names one (cardStopWrites).
+	for _, w := range r.Writes {
+		if len(out.Writes) == lib.CardStopWritesMax {
+			break
+		}
+		out.Writes = append(out.Writes, w)
 	}
 	return out
 }

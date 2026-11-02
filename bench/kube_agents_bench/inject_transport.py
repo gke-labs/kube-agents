@@ -1869,6 +1869,28 @@ class InjectTask:
         )
         return Exchange(fold, OUTCOME_STREAM_TERMINAL, self.conversation, task_id, probe)
 
+    def read_posts(self, after: int, budget: float) -> tuple[list[dict[str, str]], int]:
+        """The posts and edits on the conversation past sequence ``after``, in
+        order, each as its ``kind``, ``messageId`` and ``text``, and the
+        sequence to read past next: one blocking ``GET`` that names no task,
+        for an answer that belongs to none (the gateway's reply to a stop).
+
+        Raises:
+            InjectUnavailable: The gateway could not be reached.
+        """
+        body = self._poll("", after, budget, probe=False)
+        posts: list[dict[str, str]] = []
+        entries = body.get("entries")
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, dict) and entry.get("kind") in (ENTRY_POST, ENTRY_EDIT):
+                posts.append({
+                    "kind": str(entry["kind"]),
+                    "messageId": str(entry.get("messageId") or ""),
+                    "text": str(entry.get("text") or ""),
+                })
+        last_seq = body.get("lastSeq")
+        return posts, last_seq if isinstance(last_seq, int) and last_seq > after else after
+
     def _poll(self, task_id: str, after: int, budget: float, *, probe: bool = True) -> dict[str, Any]:
         """One blocking GET for whatever is new on the conversation."""
         wait = max(0, min(POLL_WAIT_SECONDS, int(budget)))
