@@ -155,7 +155,10 @@ mkdir -p "${ARTIFACT_DIR}"
 # markers and the final verdict word; scripts/eval_dashboard/collect.py reads
 # the blocks from this file.
 readonly EVAL_GRADING_LOG_FILE="eval-grading.log"
-readonly EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EVAL_GRADING_LOG_FILE}"
+# Assigned, then made readonly, like EVAL_LOG_DIR above: the tests lift every
+# `readonly NAME=value` line as one block, which must stand on its own.
+EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EVAL_GRADING_LOG_FILE}"
+readonly EVAL_GRADING_LOG
 # The suite's markdown verdict table, written beside the grading log.
 readonly EVAL_VERDICT_MARKDOWN_FILE="eval-verdict.md"
 
@@ -4328,11 +4331,13 @@ record_case() { # <task-name>
 # Grade one finished case and, on a main run, record it. One case at a time:
 # `bench-gate case` reads the whole store (up to sixteen gcloud processes for a
 # GCS store), and six lanes finishing together would run six of those at once;
-# serialized, the load is the old loop's, just earlier. The block goes to
-# EVAL_GRADING_LOG in one `cat` under the same lock, so two cases' blocks never
-# interleave there (scripts/eval_dashboard/collect.py attaches `rep N:` lines
-# to the `Task <name> Result:` line above them); the job log gets one pointer
-# line. A lock whose holder died is a throttle failure, not a reason to skip
+# serialized, the load is the old loop's, just earlier. The block (bench-gate's
+# stdout) goes to EVAL_GRADING_LOG in one `cat` under the same lock, so two
+# cases' blocks never interleave there (scripts/eval_dashboard/collect.py
+# attaches `rep N:` lines to the `Task <name> Result:` line above them); the
+# job log gets one pointer line, and bench-gate's stderr (its WARNING lines, a
+# grading that could not run) stays on it. A lock whose holder died is a
+# throttle failure, not a reason to skip
 # the grading. The sentinel is written only on a grading that produced its
 # JSON; anything else is left for the loop after the fan-out, and says so.
 finish_case() { # <task-path> <task-name>
@@ -4341,9 +4346,9 @@ finish_case() { # <task-path> <task-name>
   # them is assigned, so `${name}` on the same line as `name="$2"` is unbound.
   local block="${STATE_DIR}/${name}.grading"
   lock_acquire "${STATE_DIR}/lock-grade" 1800 || true
-  if grade_case "${task}" "${name}" > "${block}" 2>&1; then
+  if grade_case "${task}" "${name}" > "${block}"; then
     : > "${STATE_DIR}/${name}.graded"
-    record_case "${name}" >> "${block}" 2>&1 || true
+    record_case "${name}" >> "${block}" || true
   else
     status=$?
   fi
@@ -5027,7 +5032,7 @@ for TASK in "${TASKS[@]}"; do
   else
     # A grading that could not run (bench-gate's exit 2) stops the job as it
     # always did; the reason now sits in the artifact, so the job log says so.
-    grade_case "${TASK}" "${TASK_NAME}" >> "${EVAL_GRADING_LOG}" 2>&1 || {
+    grade_case "${TASK}" "${TASK_NAME}" >> "${EVAL_GRADING_LOG}" || {
       rc=$?
       echo "ERROR: grading ${TASK_NAME} failed (status ${rc}); its output is in ${EVAL_GRADING_LOG_FILE}" >&2
       exit "${rc}"
@@ -5326,7 +5331,7 @@ SUITE_STATUS=0
 EVAL_SUITE_REACHED=1
 (cd "${BENCH_DIR}" && uv run bench-gate suite \
   "${CASE_RESULTS[@]}" \
-  --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
+  --markdown-out "${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE}" \
   --json-out "${ARTIFACT_DIR}/eval-verdict.json") >> "${EVAL_GRADING_LOG}" || SUITE_STATUS=$?
 if [ -f "${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verdict table written to ${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE} ==="

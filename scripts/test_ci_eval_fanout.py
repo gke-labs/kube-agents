@@ -534,7 +534,7 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
     FINISH_STUBS = """
 lock_acquire() { echo "lock $(basename "$1")"; }
 lock_release() { echo "unlock $(basename "$1")"; }
-grade_case() { echo "Task $2 Result: [PASSED] passed all 3 repetitions"; echo "  rep 1: pass -- ok"; : > "${ARTIFACT_DIR}/case-$2.json"; return "${GRADE_STATUS:-0}"; }
+grade_case() { echo "Task $2 Result: [PASSED] passed all 3 repetitions"; echo "  rep 1: pass -- ok"; echo "WARNING: $2: a bench-gate note" >&2; : > "${ARTIFACT_DIR}/case-$2.json"; return "${GRADE_STATUS:-0}"; }
 record_case() { echo "  recorded $1: 3/3 -> store"; }
 STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"
 EVAL_GRADING_LOG_FILE="eval-grading.log"; EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EVAL_GRADING_LOG_FILE}"
@@ -568,6 +568,9 @@ EVAL_GRADING_LOG_FILE="eval-grading.log"; EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EV
         self.assertLess(out.index(pointer), out.index("unlock lock-grade"))
         self.assertNotIn("Task case-x Result:", out, "grading detail never reaches the public job log")
         self.assertNotIn("recorded case-x", out)
+        # bench-gate's stderr is not grading detail: it stays on the job log.
+        self.assertIn("WARNING: case-x: a bench-gate note", self.run_finish(0).stderr)
+        self.assertNotIn("a bench-gate note", block)
 
     def test_a_grading_that_failed_is_left_for_the_loop_after_the_fan_out(self):
         out = self.run_finish(2).stdout
@@ -582,7 +585,8 @@ EVAL_GRADING_LOG_FILE="eval-grading.log"; EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EV
         src = SCRIPT.read_text(encoding="utf-8")
         loop = src[src.index("# ─── Per-case verdicts, in the order TASKS declares"):src.index('profile_begin "record + final gate"')]
         self.assertIn('if [ -f "${STATE_DIR}/${TASK_NAME}.graded" ] && [ -f "${CASE_JSON}" ]; then', loop)
-        self.assertIn('grade_case "${TASK}" "${TASK_NAME}" >> "${EVAL_GRADING_LOG}" 2>&1', loop)
+        self.assertIn('grade_case "${TASK}" "${TASK_NAME}" >> "${EVAL_GRADING_LOG}" || {', loop)
+        self.assertNotIn('"${EVAL_GRADING_LOG}" 2>&1', loop, "stderr stays on the job log")
         self.assertIn('CASE_RESULTS+=(--case-result "${CASE_JSON}")', loop)
 
     def test_grading_detail_reaches_the_job_log_nowhere(self):

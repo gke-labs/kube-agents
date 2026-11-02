@@ -214,7 +214,8 @@ env:
   # ~2 missed ticks).
   PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
   # The archive the lane wrote before it moved buckets (2026-11), read
-  # alongside until its runs leave the SINCE_DAYS window; delete it then.
+  # alongside until its runs leave the SINCE_DAYS window; empty or delete it
+  # then (the collect step passes it only when it is set).
   PR_GLOB_PREVIOUS: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
   # The GitLab lane (kube-agents#2394): the forge-grading cases of the
   # catalogue against a pool project's GitLab repository, collected
@@ -367,11 +368,16 @@ jobs:
             echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-evals-presubmit-logs, gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
             exit 1
           fi
+          # The old archives ride only while their knobs are set, as in
+          # hack/ci-dashboard-refresh.sh: an empty glob would be a listing
+          # that fails, and the refusal below.
+          previous=()
+          [ -n "$PR_GLOB_PREVIOUS" ] && previous+=(--pr-glob "$PR_GLOB_PREVIOUS")
+          [ -n "$GITLAB_PR_GLOB_PREVIOUS" ] && previous+=(--gitlab-pr-glob "$GITLAB_PR_GLOB_PREVIOUS")
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
             --pr-glob "$PR_GLOB" \
-            --pr-glob "$PR_GLOB_PREVIOUS" \
             --gitlab-pr-glob "$GITLAB_PR_GLOB" \
-            --gitlab-pr-glob "$GITLAB_PR_GLOB_PREVIOUS" \
+            "${previous[@]}" \
             --nightly-prefix "$NIGHTLY_PREFIX" \
             --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
             --nightly-main-b-prefix "$NIGHTLY_MAIN_B_PREFIX" \
