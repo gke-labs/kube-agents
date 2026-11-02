@@ -8307,9 +8307,11 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 	}
 }
 
-// The people reading is read only while no chat platform the install enables
-// is served through Hermes: Chat or Slack on its legacy consumer, or Teams,
-// which only Hermes serves.
+// The people reading is read only while the install renders the A2A stack
+// and no chat platform it enables is served through Hermes: Chat or Slack on
+// its legacy consumer, or Teams, which only Hermes serves. The today rows are
+// false through the render gate alone, since a today install has no gateway
+// to read; the Slack and Teams rows test the Hermes reason by itself.
 func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
 	on := ptr.To(true)
 	agent := func(mode string, chat, slack, teams bool) *agentv1alpha1.PlatformAgent {

@@ -1436,7 +1436,9 @@ func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 // while no chat platform it enables is served through Hermes, since the
 // gateway counts only the people who write through it, and a count beside a
 // Hermes-served platform would say nobody wrote while that platform's users
-// were writing.
+// were writing. The legacy Chat term is already implied by the render gate
+// today (a next install arms Chat on the A2A door, never on its legacy
+// consumer); it stays so the function states the design's rule in full.
 func peopleReadingEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return a2aStackRendering(agent) && !legacyChatConsumer(agent) && !legacySlackConsumer(agent) && !teamsEnabled(agent)
 }
