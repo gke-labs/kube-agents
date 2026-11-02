@@ -1,0 +1,101 @@
+# The resource-parity violations the rendered manifests carried when
+# tests/test_manifest_resource_parity.py landed (2026-11-02), each with the
+# issue that removes it. The file may only shrink: the test fails on a
+# violation not listed here, on a listed one no longer observed (remove the
+# line), on a figure larger than `measure` (a regression), and on a smaller one
+# (lower `measure` to it, so the gain holds). Never add a line for a new
+# violation; fix the manifest. `python3 tests/test_manifest_resource_parity.py`
+# prints the entries as observed, in this form.
+#
+# `workload` is `<source> <Kind>/<name>`: `chart` for the rendered chart,
+# `golden` for the operator goldens (one key for every golden fixture that
+# renders the workload), or the kustomize manifest's path. `container` is
+# omitted for a pod-level rule. `measure` is the rule's figure: the number of
+# missing declarations for resources-declared, bytes over the limit for the
+# emptyDir rules, MiB per vCPU outside the band for pod-memory-per-vcpu.
+entries:
+  # The chart's Hindsight API and operator render no ephemeral-storage figures.
+  - workload: "chart Deployment/hindsight-api"
+    container: api
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  - workload: "chart Deployment/t-controller-manager"
+    container: manager
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  # LiteLLM requests 2Gi of memory against 100m of CPU, 20 GiB per vCPU;
+  # Autopilot raises the CPU request into the band.
+  - workload: "chart Deployment/litellm"
+    rule: pod-memory-per-vcpu
+    measure: 13824
+    detail: "2Gi memory per 100m CPU requested = 20480Mi per vCPU; Autopilot admits 1Gi to 6656Mi"
+    issue: 4341
+  - workload: "k8s-operator/config/integrations/litellm/base/deployment.yaml Deployment/litellm"
+    rule: pod-memory-per-vcpu
+    measure: 13824
+    detail: "2Gi memory per 100m CPU requested = 20480Mi per vCPU; Autopilot admits 1Gi to 6656Mi"
+    issue: 4341
+  # The gateway pod: agent-api-auth mounts the proxy's 2Gi /tmp writable under
+  # a 2Gi limit, so the allowance does not fit; the agent, its dashboard and the
+  # sandbox credential cleanup declare no ephemeral-storage figures.
+  - workload: "golden Deployment/platformagent-gateway"
+    container: agent-api-auth
+    rule: container-emptydir-fit
+    measure: 67108864
+    detail: "writable emptyDirs credential-proxy-tmp sum 2Gi + allowance 64Mi = 2112Mi, over limits.ephemeral-storage 2Gi by 64Mi"
+    issue: 4341
+  - workload: "golden Deployment/platformagent-gateway"
+    container: platform-agent
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  - workload: "golden Deployment/platformagent-gateway"
+    container: platform-agent-dashboard
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  - workload: "golden Deployment/platformagent-gateway"
+    container: sandbox-credential-cleanup
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  # The shell sandbox and its image-tree init container.
+  - workload: "golden StatefulSet/platformagent-shell"
+    container: prepare-image-trees
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4337
+  - workload: "golden StatefulSet/platformagent-shell"
+    container: shell
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4337
+  # The kustomize copies of the Hindsight API and the operator, and the
+  # inference-replay proxy.
+  - workload: "k8s-operator/config/integrations/hindsight/api.yaml Deployment/hindsight-api"
+    container: api
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  - workload: "k8s-operator/config/manager/manager.yaml Deployment/controller-manager"
+    container: manager
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  - workload: "k8s-operator/config/integrations/inference-replay/base/deployment.yaml Deployment/standalone-replay"
+    container: replay-proxy-container
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
