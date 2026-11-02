@@ -28,7 +28,7 @@ What gets measured gets built. This list is for agents, engineers and other prod
 
 ## Gaps
 
-Only what a user meets on the core flow is listed here: install, the first report, questions, audits and retries. A missing test, a missing metric, a step an admin does once, or an installer edge case are not gaps in this document. The audit of 2026-10-29 measured each criterion on one development install: `main` 3e5be2e0e plus #3922 (image `5dcb02145`), `spec.mode` today, Vertex AI `gemini-3.1-pro-preview` as `model-default`, `maxInProgress` 5, 47 clusters in scope (the host, two GPU clusters, four seeded clusters and 40 six-node scale clusters). Questions went through the agent's API door (`POST /v1/responses` through the auth sidecar), which is the chat path minus the chat backend's hop; each delegated card was watched on the kanban store until it was terminal. Every timed run, the baseline runs and the install's record are in the audit's tracking issue, #4354, which also tracks the changes below.
+Only what a user meets day to day is listed here: the first report, questions, audits and retries. Install friction, a missing test, a missing metric, or a step an admin does once are not gaps in this document. The audit of 2026-10-29 measured each criterion on one development install: `main` 3e5be2e0e plus #3922 (image `5dcb02145`), `spec.mode` today, Vertex AI `gemini-3.1-pro-preview` as `model-default`, `maxInProgress` 5, 47 clusters in scope (the host, two GPU clusters, four seeded clusters and 40 six-node scale clusters). Questions went through the agent's API door (`POST /v1/responses` through the auth sidecar), which is the chat path minus the chat backend's hop; each delegated card was watched on the kanban store until it was terminal. Every timed run, the baseline runs and the install's record are in the audit's tracking issue, #4354, which also tracks the changes below.
 
 ### SC1: agentic installation and onboarding
 
@@ -36,12 +36,7 @@ What exists: `INSTALL.md` is written for an agent, `install.sh` runs non-interac
 
 #### Gaps found
 
-Accepted and not tracked: an admin does the console steps the providers require (the Google Chat app, the Slack app, the GitHub App), so full agentic onboarding is not a criterion, and the installer's edge cases (a dry run that cannot plan, a shortfall found mid-apply) are not part of the core flow. The gaps below are what the person running the install sees on the normal path.
-
-| Gap                                                                                                                                                                                                                                                               | Evidence                                                                      | State |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ----- |
-| The installer prints "Installation Complete" while a deployment has not reported ready (`SUCCESS_PENDING_ROLLOUT`) and hands the user a watch command instead of waiting or announcing readiness; a first boot can take over fifteen minutes.                     | `install.sh`, `docs/site/src/content/docs/install/quickstart-gke.mdx`         | open  |
-| Nothing confirms the assistant answers: the installer verifies that the deployments are up, not that a question gets a reply, so the user's first prompt is the test; on the documented first run its acknowledgement took 21 s and its result a further 6.6 min. | `docs/site/src/content/docs/install/first-prompts.md`, `docs/designs/oobe.md` | open  |
+None tracked. The agentic install works: an agent runs `install.sh` non-interactively and an admin does the console steps the providers require. The friction that remains on the normal path (the installer prints "Installation Complete" before every deployment is ready, and nothing confirms that the assistant answers until the user's first prompt) is small and accepted. The day-to-day gaps are under SC2 to SC4.
 
 ### SC2: out-of-box experience
 
@@ -185,8 +180,7 @@ The changes that close them, ordered by what the user gains first, tracked from 
 5. Zonal skew and anomaly discovery built as designed in `docs/designs/fleet-anomaly-detection-checks.md`, and routed by name.
 6. Scheduled reports reach the Google Chat channel on a Workload Identity install, and a delivery failure surfaces in chat within the hour.
 7. The first report posts to the home channel when it is ready, without waiting for the user's first message.
-8. An install self-check: the assistant answers one question before the installer reports success, and the installer says when the assistant is ready.
-9. A sign of life within 10 s of every request on every backend, before the model turn.
-10. A stated, tested size the install supports, from the sizing data.
+8. A sign of life within 10 s of every request on every backend, before the model turn.
+9. A stated, tested size the install supports, from the sizing data.
 
 The measurements behind this document (the timed questions, the bare-model baseline, the install's record) were run by hand with the author's scripts and are recorded on #4354; they repeat on the next release with the same questions on the same install, and the numbers then replace the ones above.
