@@ -48,7 +48,8 @@ still running or cut short, the night counts as cut short when its main or
 main-b part is, and a night without its main or main-b part gives no verdict on
 what is newly failing. `scripts/eval_dashboard/nightly.py` derives that line
 and the report from the same nightly runs. After it, the digest carries one
-line per domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)).
+line while nightly bug filing has been held for about two hours ([Nightly bugs](#nightly-bugs)),
+then one line per domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)).
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
 the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
 and incremental) and renders the dashboard's Trend page (`trend.html`,
@@ -860,7 +861,8 @@ the armed step has held 8 ticks in a row (about two hours), the 11 AM digest
 carries one line, "Nightly bug filing held since <time>", with the last
 reason; the first trusted tick clears it. The count lives in
 `nightly-bugs-state.json` beside `health.json`; a dry run records no hold, and
-a count the step has not rewritten in the last hour is not reported. When a comment read
+a count the step has not rewritten in the last hour is not reported and
+starts over at the next held tick. When a comment read
 returns fewer comments than the issue listing counts, the step skips that
 issue for the tick, so a recovery or night comment is not posted twice. When a case with an open issue passes every graded
 repetition on a graded night after its last failing one, and that night

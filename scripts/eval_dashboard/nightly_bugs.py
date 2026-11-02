@@ -660,8 +660,12 @@ def held_state(prev: dict | None, doubt: str | None, live: bool, now: datetime.d
     """The ``--state`` document after a pass whose listings were read:
     ``held_ticks`` live passes in a row with no trusted listing, since
     ``held_since``, last for ``doubt``. A trusted pass, or a dry run, holds
-    nothing."""
+    nothing. A count older than HELD_STATE_FRESH starts over: the ticks
+    between went unrecorded, so they were not held in a row."""
     prev = prev or {}
+    updated = post_health.parse_iso(prev.get("updated_at"))
+    if not updated or now - updated > HELD_STATE_FRESH:
+        prev = {}
     stamp = now.isoformat(timespec="seconds")
     if not (doubt and live):
         return {"held_ticks": 0, "held_since": None, "doubt": None, "updated_at": stamp}
@@ -1015,11 +1019,11 @@ def main(argv=None, gh_runner=None) -> int:
     # A pass that could not read the listings at all leaves the count as it
     # was: it neither trusted nor doubted them.
     if args.state and filer.doubt is not None:
-        state = held_state(post_health.read_state(args.state), filer.doubt, not args.dry_run, datetime.datetime.now(datetime.timezone.utc))
         try:
+            state = held_state(post_health.read_state(args.state), filer.doubt, not args.dry_run, datetime.datetime.now(datetime.timezone.utc))
             post_health.write_state(args.state, state)
         except (OSError, subprocess.CalledProcessError) as exc:
-            log(f"warning: could not write {args.state}: {exc}; the held-tick count is retried next tick")
+            log(f"warning: could not update {args.state}: {exc}; the held-tick count is retried next tick")
     return 0
 
 

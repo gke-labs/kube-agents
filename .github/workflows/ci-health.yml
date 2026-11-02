@@ -122,9 +122,10 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # digest's nightly section (scripts/eval_dashboard/nightly_digest.py) reads
 # the issues it filed that tick. Armed, it counts the ticks it held for an
 # untrusted issue listing in nightly-bugs-state.json beside health.json, and
-# the digest says so once the hold has lasted about two hours. The section turns owners' GitHub logins
-# into Chat mentions through the CI_HEALTH_CHAT_MENTIONS secret (a JSON
-# object, login -> Chat user id); without it the logins print as text.
+# the digest says so once the hold has lasted about two hours. The section
+# turns owners' GitHub logins into Chat mentions through the
+# CI_HEALTH_CHAT_MENTIONS secret (a JSON object, login -> Chat user id);
+# without it the logins print as text.
 # A fourth, scripts/eval_dashboard/coverage_gaps.py, keeps one
 # `presubmit-gate` issue open per domain with no blocking roster seat,
 # assigned to the domain owner, and closes it when the domain is covered

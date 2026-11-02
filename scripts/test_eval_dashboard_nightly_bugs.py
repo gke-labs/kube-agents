@@ -693,6 +693,20 @@ class HeldStateTest(Harness):
         self.state.unlink()
         self.assertIsNone(self.held_tick(fail_list=True), "nothing to record")
 
+    def test_a_count_older_than_an_hour_starts_over(self):
+        # The ticks between went unrecorded, so they were not held in a row.
+        old = nightly_bugs.datetime.datetime.now(nightly_bugs.datetime.timezone.utc) - nightly_bugs.datetime.timedelta(hours=2)
+        self.state.write_text(json.dumps({"held_ticks": 7, "held_since": "2026-10-19T12:00:00+00:00", "doubt": "x", "updated_at": old.isoformat()}))
+        after = self.held_tick(empty_open=True)
+        self.assertEqual(after["held_ticks"], 1)
+        self.assertNotEqual(after["held_since"], "2026-10-19T12:00:00+00:00")
+
+    def test_a_state_that_cannot_be_read_costs_the_count_not_the_run(self):
+        # run_once asserts rc 0.
+        with unittest.mock.patch.object(nightly_bugs.post_health, "read_state", side_effect=FileNotFoundError("gcloud")):
+            _, _, err = self.run_once(self.THREE_RED(), FakeGh(empty_open=True), extra=["--state", str(self.state)])
+        self.assertIn("could not update", err)
+
     def test_without_state_nothing_is_written(self):
         self.run_once(self.THREE_RED(), FakeGh(empty_open=True))
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["data.json", "repo"])
