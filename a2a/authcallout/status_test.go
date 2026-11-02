@@ -180,3 +180,20 @@ func TestLivenessDoesNotDependOnTheBusEither(t *testing.T) {
 		t.Errorf("liveness = %d while detached from the bus, want 200", code)
 	}
 }
+
+// The readiness body on a callout waiting for a shard names the shard, so a
+// probe failure during a startup where one shard's watch is forbidden or slow
+// points at that shard rather than at the network.
+func TestReadinessNamesTheShardsStillPending(t *testing.T) {
+	s := shardedStore(t, 2)
+	if err := s.UpdateShard(0, []byte(shardDoc("v1", 0, 2, "gateway"))); err != nil {
+		t.Fatalf("UpdateShard: %v", err)
+	}
+	code, body := get(t, StatusHandler(s, nil), ReadyPath)
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("readiness = %d with one shard of two, want 503", code)
+	}
+	if !strings.Contains(body, "shard(s) 1 of 2 not yet seen") {
+		t.Errorf("readiness body = %q, want it to name the shard still pending", body)
+	}
+}

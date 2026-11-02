@@ -85,8 +85,8 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 // What rolling buys is not that the new pods can read the map -- with a
 // mutable tag they pull a binary that can, but that is the registry's doing,
 // not ours. It is that a pod which refuses its FIRST map has no previous one to
-// fall back on, so Store.Ready is false, /readyz answers 503 `no identity map:
-// ...`, the Deployment never goes Available and the rollout stops with the
+// fall back on, so Store.Ready is false, /readyz answers 503 `no identity map;
+// the last one was refused: ...`, the Deployment never goes Available and the rollout stops with the
 // reason on the pod. The silent case only exists because the refusing replica
 // was already serving something. Rolling removes the fallback, and with it the
 // silence.

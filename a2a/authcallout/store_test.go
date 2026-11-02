@@ -361,7 +361,7 @@ func TestWatchingShardsAssemblesTheMapFromEveryConfigMap(t *testing.T) {
 	go func() { _ = s.WatchConfigMapShards(ctx, client, ns, stem, key) }()
 
 	if err := s.WaitForMap(ctx, 5*time.Second); err != nil {
-		t.Fatalf("the watches never delivered both shards: %v (pending: %s)", err, s.Pending())
+		t.Fatalf("the watches never delivered both shards: %v", err)
 	}
 	if got := s.Current().Users(); !slices.Equal(got, []string{"gateway", "session"}) {
 		t.Fatalf("Users = %v, want both shards' identities", got)
@@ -390,5 +390,97 @@ func TestWatchingShardsAssemblesTheMapFromEveryConfigMap(t *testing.T) {
 	}
 	if got := s.Current().Users(); !slices.Equal(got, []string{"gateway", "worker"}) {
 		t.Errorf("Users = %v after the re-render, want the v2 set", got)
+	}
+}
+
+// A shard refused and then replaced by one that is taken leaves no refusal on
+// record; what stands is the shard still missing, and WaitForMap names it
+// rather than the refusal the next document resolved, or nothing at all. The
+// shard whose watch delivers nothing is the diagnostic the startup failure
+// has to carry.
+func TestATakenShardSupersedesItsRefusalAndWaitForMapNamesWhatIsPending(t *testing.T) {
+	s := shardedStore(t, 2)
+	if err := s.UpdateShard(0, []byte(`not a document`)); err == nil {
+		t.Fatal("a document that does not parse was taken")
+	}
+	if s.LastError() == "" {
+		t.Fatal("a refused shard left no error")
+	}
+	if err := s.UpdateShard(0, []byte(shardDoc("v1", 0, 2, "gateway"))); err != nil {
+		t.Fatalf("shard 0: %v", err)
+	}
+	if s.LastError() != "" {
+		t.Errorf("LastError = %q after a document under the refused index was taken; want it cleared", s.LastError())
+	}
+	err := s.WaitForMap(context.Background(), 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("WaitForMap returned success with one shard of two")
+	}
+	if !strings.Contains(err.Error(), "shard(s) 1 of 2 not yet seen") {
+		t.Errorf("error = %v, want it to name the shard still pending", err)
+	}
+	if strings.Contains(err.Error(), "refused") {
+		t.Errorf("error = %v, carries a refusal a later document superseded", err)
+	}
+}
+
+// A complete set refused at assembly is not pending: every shard of the
+// version arrived. The status says the set was refused and why, not that a
+// shard is still missing.
+func TestASetRefusedAtAssemblyLeavesNothingPending(t *testing.T) {
+	s := shardedStore(t, 2)
+	if err := s.UpdateShard(0, []byte(shardDoc("v1", 0, 2, "gateway"))); err != nil {
+		t.Fatalf("shard 0: %v", err)
+	}
+	if s.Pending() == "" {
+		t.Fatal("one shard of two is not reported as pending")
+	}
+	if err := s.UpdateShard(1, []byte(shardDoc("v1", 1, 2, "gateway"))); err == nil {
+		t.Fatal("a duplicate across shards was assembled")
+	}
+	if s.Pending() != "" {
+		t.Errorf("Pending = %q after the complete set was refused; want nothing pending", s.Pending())
+	}
+	if !strings.Contains(s.LastError(), "duplicate") {
+		t.Errorf("LastError = %q, want the assembly refusal", s.LastError())
+	}
+	if !strings.Contains(s.Unserved(), "duplicate") || strings.Contains(s.Unserved(), "pending") {
+		t.Errorf("Unserved = %q, want the refusal and no pending note", s.Unserved())
+	}
+}
+
+// A shard whose latest document was refused stays on record while the
+// previous map serves, however often a sibling is redelivered unchanged: the
+// redelivery re-assembles the set still in hand, which is the same map, and
+// must not read as the broken shard having been fixed. A document taken under
+// the refused index is what clears it.
+func TestASiblingRedeliveredUnchangedDoesNotClearARefusedShard(t *testing.T) {
+	s := shardedStore(t, 2)
+	for i, user := range []string{"gateway", "session"} {
+		if err := s.UpdateShard(i, []byte(shardDoc("v1", i, 2, user))); err != nil {
+			t.Fatalf("v1 shard %d: %v", i, err)
+		}
+	}
+	if err := s.UpdateShard(0, []byte(shardDoc("v2", 0, 3, "gateway"))); err == nil {
+		t.Fatal("a shard stamped for another count was taken")
+	}
+	if !strings.Contains(s.LastError(), "shard 0") {
+		t.Fatalf("LastError = %q, want shard 0's refusal", s.LastError())
+	}
+	// Shard 1 again, unchanged: a relist or a metadata-only update.
+	if err := s.UpdateShard(1, []byte(shardDoc("v1", 1, 2, "session"))); err != nil {
+		t.Fatalf("v1 shard 1 redelivered: %v", err)
+	}
+	if s.Version() != "v1" {
+		t.Errorf("serving %q, want v1 kept", s.Version())
+	}
+	if !strings.Contains(s.LastError(), "shard 0") || !strings.Contains(s.LastError(), "expects 2 shards") {
+		t.Errorf("LastError = %q after a sibling's redelivery; want shard 0's refusal kept", s.LastError())
+	}
+	if err := s.UpdateShard(0, []byte(shardDoc("v1", 0, 2, "gateway"))); err != nil {
+		t.Fatalf("v1 shard 0 again: %v", err)
+	}
+	if s.LastError() != "" {
+		t.Errorf("LastError = %q after shard 0 was taken again; want it cleared", s.LastError())
 	}
 }

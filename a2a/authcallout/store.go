@@ -40,6 +40,10 @@ const (
 	// unshardedCount is the shard count a store that was told nothing
 	// expects: one, the whole map in one document.
 	unshardedCount = 1
+
+	// detailSeparator joins the refusals that stand into LastError, and the
+	// refusal and the pending note into the reason a store serves nothing.
+	detailSeparator = "; "
 )
 
 // Store holds the identity map the callout is currently serving, kept current
@@ -61,25 +65,34 @@ const (
 type Store struct {
 	current atomic.Pointer[IdentityMap]
 
-	// lastErr holds the reason the most recent update was refused, if it
-	// was. A refused update leaves the previous map serving, which is the
-	// right behaviour — the alternative is to drop every identity because
-	// one entry was malformed — but it must not be silent, or the callout
-	// reports healthy while serving a version nobody rendered.
+	// lastErr holds the refusals that stand: why the latest document under
+	// each refused index was not taken, and why the complete set was not
+	// assembled, if it was not. A refused update leaves the previous map
+	// serving, which is the right behaviour — the alternative is to drop
+	// every identity because one entry was malformed — but it must not be
+	// silent, or the callout reports healthy while serving a version nobody
+	// rendered. It is recomputed from refused and setErr by settle.
 	lastErr atomic.Pointer[string]
 
 	// The shards. The operator cuts the map into `shards` ConfigMaps, and
 	// a document that arrives is one of them; pending holds the latest
-	// document seen for each index, and the map is re-assembled and
+	// document taken for each index, and the map is re-assembled and
 	// installed whenever every index holds a document of one version. Until
 	// then the previous map keeps serving and pendingNote says what is
 	// missing, so a re-render half-landed, or stuck half-landed, is visible
 	// in the status rather than indistinguishable from nothing rendered.
-	// mu covers pending alone: it is taken on the informer's path, never on
-	// the authorization path, which reads current.
+	// refused holds, per index, why the latest document under it was not
+	// taken, until one is; setErr why the complete set in pending was not
+	// assembled, until the set changes. Kept apart from pending so that a
+	// sibling shard redelivered unchanged, which re-assembles the set
+	// pending still holds, cannot clear what a broken shard left on record.
+	// mu covers pending, refused and setErr: it is taken on the informer's
+	// path, never on the authorization path, which reads current.
 	shards      int
 	mu          sync.Mutex
 	pending     []*IdentityMap
+	refused     map[int]string
+	setErr      string
 	pendingNote atomic.Pointer[string]
 
 	log *slog.Logger
@@ -105,7 +118,7 @@ func NewShardedStore(log *slog.Logger, shards int) (*Store, error) {
 	if shards < 1 {
 		return nil, fmt.Errorf("the identity map is cut into %d shards; it takes at least one", shards)
 	}
-	return &Store{log: log, shards: shards, pending: make([]*IdentityMap, shards)}, nil
+	return &Store{log: log, shards: shards, pending: make([]*IdentityMap, shards), refused: map[int]string{}}, nil
 }
 
 // Shards is how many documents the store expects the map in.
@@ -143,7 +156,10 @@ func (s *Store) Ready() bool {
 	return s.current.Load() != nil
 }
 
-// LastError returns the reason the most recent update was refused, if it was.
+// LastError returns the refusals that stand, if any: per refused shard, why
+// its latest document was not taken, then why the complete set was not
+// assembled. Empty once every refused index has had a document taken and the
+// set in hand assembled, or was never refused.
 func (s *Store) LastError() string {
 	if e := s.lastErr.Load(); e != nil {
 		return *e
@@ -177,13 +193,26 @@ func (s *Store) Update(raw []byte) error {
 // that is merely incomplete — a shard not yet seen, or two versions among them
 // while a re-render lands — is not refused: the previous map keeps serving and
 // Pending says what is missing.
+//
+// A refusal stays on record (LastError) until it is superseded: a document
+// refused under an index, until a document under that index is taken; a
+// complete set refused at assembly, until the set changes. A document taken
+// under one index therefore clears nothing another index left, and a sibling
+// shard redelivered unchanged — a relist, a metadata-only update — re-assembles
+// the set but does not clear the refusal of the shard whose live document is
+// still broken. A complete set, taken or refused, leaves nothing pending.
 func (s *Store) UpdateShard(index int, raw []byte) error {
 	m, err := ParseIdentityMap(raw)
 	if err == nil {
 		err = s.checkStamps(index, m)
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err != nil {
-		s.refuse(fmt.Sprintf("shard %d: %v", index, err), err)
+		s.refused[index] = fmt.Sprintf("shard %d: %v", index, err)
+		s.settle()
+		s.logRefusal(err)
 		return err
 	}
 	if m.Shards == 0 {
@@ -191,22 +220,26 @@ func (s *Store) UpdateShard(index int, raw []byte) error {
 		// one-shard store. Stamp it so assembly sees one shape.
 		m.Shard, m.Shards = 0, unshardedCount
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	delete(s.refused, index)
+	s.setErr = ""
 	s.pending[index] = m
 	if note := s.incomplete(); note != "" {
 		n := note
 		s.pendingNote.Store(&n)
+		s.settle()
 		s.log.Info("identity map shard arrived; waiting for the rest", "shard", index, "of", s.shards, "version", m.Version, "pending", note)
 		return nil
 	}
+	s.pendingNote.Store(nil)
 	assembled, err := AssembleIdentityMap(s.pending)
 	if err != nil {
-		s.refuse(err.Error(), err)
+		s.setErr = err.Error()
+		s.settle()
+		s.logRefusal(err)
 		return err
 	}
 	s.install(assembled)
+	s.settle()
 	return nil
 }
 
@@ -258,9 +291,34 @@ func (s *Store) incomplete() string {
 	return ""
 }
 
-// refuse records a refused update and keeps the previous map serving.
-func (s *Store) refuse(msg string, err error) {
+// settle recomputes LastError from what stands: the refused indices in
+// order, then the set refused at assembly. Called under mu after every change
+// to refused or setErr, so LastError is never a refusal a later document
+// resolved and never empty while one stands.
+func (s *Store) settle() {
+	indices := make([]int, 0, len(s.refused))
+	for i := range s.refused {
+		indices = append(indices, i)
+	}
+	sort.Ints(indices)
+	parts := make([]string, 0, len(indices)+1)
+	for _, i := range indices {
+		parts = append(parts, s.refused[i])
+	}
+	if s.setErr != "" {
+		parts = append(parts, s.setErr)
+	}
+	if len(parts) == 0 {
+		s.lastErr.Store(nil)
+		return
+	}
+	msg := strings.Join(parts, detailSeparator)
 	s.lastErr.Store(&msg)
+}
+
+// logRefusal says that an update was refused and the previous map keeps
+// serving; the caller has put the refusal on record.
+func (s *Store) logRefusal(err error) {
 	serving := s.Version()
 	if serving == "" {
 		s.log.Error("identity map refused and none is being served; every connection will be refused", "error", err)
@@ -269,12 +327,30 @@ func (s *Store) refuse(msg string, err error) {
 	}
 }
 
+// Unserved says why no map is being served: the refusals that stand, the
+// shards still pending, both, or nothing when no document has arrived at all.
+// Empty while a map is being served. It is what WaitForMap and the readiness
+// probe report, so a callout that starts and serves nothing names the shard
+// whose watch delivered nothing, or the render it refused, rather than only
+// the time it waited.
+func (s *Store) Unserved() string {
+	if s.Ready() {
+		return ""
+	}
+	var parts []string
+	if e := s.LastError(); e != "" {
+		parts = append(parts, "the last one was refused: "+e)
+	}
+	if p := s.Pending(); p != "" {
+		parts = append(parts, "pending: "+p)
+	}
+	return strings.Join(parts, detailSeparator)
+}
+
 // install swaps in an assembled map.
 func (s *Store) install(m *IdentityMap) {
 	previous := s.Version()
 	s.current.Store(m)
-	s.lastErr.Store(nil)
-	s.pendingNote.Store(nil)
 
 	// Logged at every change, because "the map says X" has to be checkable
 	// against the running system rather than against the rendered object.
@@ -390,8 +466,8 @@ func (s *Store) WaitForMap(ctx context.Context, timeout time.Duration) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline.C:
-			if e := s.LastError(); e != "" {
-				return fmt.Errorf("no identity map after %s; the last one was refused: %s", timeout, e)
+			if why := s.Unserved(); why != "" {
+				return fmt.Errorf("no identity map after %s; %s", timeout, why)
 			}
 			return fmt.Errorf("no identity map after %s", timeout)
 		case <-tick.C:
