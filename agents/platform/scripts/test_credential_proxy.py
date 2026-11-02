@@ -4720,8 +4720,10 @@ class CommandExecutorTest(unittest.TestCase):
         # lock, and a cold read of fast-cluster completes while it is held.
         # Under one lock for every cluster the fast read could not return
         # before the stall ended (here, after ten seconds), which is what
-        # `slow_stall_over` records; the 100 ms bound is the issue's figure and
-        # a sanity cap on top of that ordering, not the verdict on its own.
+        # `slow_stall_over` records, and that ordering is the whole verdict.
+        # No wall-clock bound: the fast read forks a bash stub, which took
+        # half a second on a loaded CI runner, so the issue's 100 ms figure
+        # is a number for the live proxy and not for this test.
         executor = self.fake_gcloud(self.executor())
         slow = "gke_demo-project_us-central1_slow-cluster"
         fast = "gke_demo-project_us-central1_fast-cluster"
@@ -4746,16 +4748,13 @@ class CommandExecutorTest(unittest.TestCase):
                 target=lambda: slow_result.append(executor._resolve_kubeconfig(slow)), daemon=True)
             slow_thread.start()
             self.assertTrue(slow_started.wait(timeout=10), "the slow fetch never started")
-            started = time.monotonic()
             served = executor._resolve_kubeconfig(fast)
-            elapsed = time.monotonic() - started
             self.assertFalse(slow_stall_over.is_set(), "the fast read waited for the slow fetch's stall to end")
             release_slow.set()
             slow_thread.join(timeout=10)
         self.assertFalse(slow_thread.is_alive())
         self.assertEqual(executor.kubeconfig_dir / f"{fast}.yaml", served)
         self.assertTrue(served.is_file(), "the fast cluster's kubeconfig was filed")
-        self.assertLess(elapsed, 0.1, f"the fast cluster's cold read took {elapsed:.3f}s")
         self.assertEqual([executor.kubeconfig_dir / f"{slow}.yaml"], slow_result)
         self.assertTrue(slow_result[0].is_file(), "the slow cluster's kubeconfig was filed once released")
 
