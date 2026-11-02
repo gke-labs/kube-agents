@@ -23089,7 +23089,7 @@ metadata:
         for hub2 in ({"kcc_unready": []}, {"kcc_unread": "`kubectl get gcp -A` did not finish in 240s"}):
             with self.subTest(hub2=list(hub2)):
                 finding = kcc_finding(path="topics/events.yaml")
-                finding["object"] = "PubSubTopic/events"
+                finding.update(object="PubSubTopic/events", check="kcc-object-wedged", cluster="acme/us-central1/hub-1")
                 manifest = self.two_hosts(("acme/us-central1/hub-1", [topic]), ("acme/us-east1/hub-2", []))
                 del manifest["clusters"][1]["kcc_unready"]
                 manifest["clusters"][1].update(hub2)
@@ -23113,7 +23113,7 @@ metadata:
         ):
             with self.subTest(hub2=hub2):
                 finding = kcc_finding(path="topics/events.yaml")
-                finding["object"] = "PubSubTopic/events"
+                finding.update(object="PubSubTopic/events", check="kcc-object-wedged", cluster="acme/us-central1/hub-1")
                 manifest = self.two_hosts(("acme/us-central1/hub-1", [topic]), ("acme/us-east1/hub-2", []))
                 del manifest["clusters"][1]["kcc_unready"]
                 manifest["clusters"][1].update(hub2)
@@ -23150,7 +23150,7 @@ metadata:
             "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
         )
         finding = kcc_finding(path="topics/events.yaml")
-        finding["object"] = "PubSubTopic/events"
+        finding.update(object="PubSubTopic/events", check="kcc-object-wedged", cluster="acme/us-central1/hub-1")
         manifest = self.two_hosts(("acme/us-central1/hub-1", [dict(KCC_TOPIC, name="events", project="acme")]), ("acme/us-east1/hub-2", []))
         del manifest["clusters"][1]["kcc_unready"]
         manifest["clusters"][1]["outcome"] = "unreachable"
@@ -23237,7 +23237,7 @@ metadata:
             "iam/web-sa.yaml",
             "apiVersion: iam.cnrm.cloud.google.com/v1beta1\nkind: IAMServiceAccount\nmetadata:\n  name: web-sa\n  namespace: shop\n",
         )
-        finding = make_finding(fid="a", cluster="acme/us-central1/prod-usc1", obj="IAMServiceAccount/web-sa",
+        finding = make_finding(fid="a", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="IAMServiceAccount/web-sa",
                                remediation={"kind": "manifest", "path": "iam/web-sa.yaml", "note": "Grant the role."})
         account = {"kind": "IAMServiceAccount", "namespace": "shop", "name": "web-sa", "why": "UpdateFailed: Error 403"}
         self.assertEqual(self.disclose([finding], kcc_manifest(account)), ["a"])
@@ -23305,7 +23305,7 @@ metadata:
 
     def firewall_fix(self, text):
         self.write("network/allow-ssh.yaml", text)
-        return make_finding(fid="fw", cluster="hub-proj/us-central1/hub", obj="ComputeFirewall/allow-ssh",
+        return make_finding(fid="fw", check="kcc-object-wedged", cluster="hub-proj/us-central1/hub", obj="ComputeFirewall/allow-ssh",
                             remediation={"kind": "manifest", "path": "network/allow-ssh.yaml", "note": "Close port 22."})
 
     def test_a_config_connector_kind_finding_takes_its_project_from_the_declaration_not_the_host(self):
@@ -23314,7 +23314,7 @@ metadata:
         the project the object manages."""
         stall = {"kind": "ComputeFirewall", "namespace": "app", "name": "allow-ssh", "why": "UpdateFailed", "project": "app-proj"}
         finding = self.firewall_fix(self.FIREWALL)
-        self.assertEqual(self.disclose([finding], kcc_manifest(stall)), ["fw"])
+        self.assertEqual(self.disclose([finding], self.two_hosts(("hub-proj/us-central1/hub", [stall]))), ["fw"])
         # With two hosts the project must be known: the file's Namespace gives it.
         two = self.two_hosts(("hub-proj/us-central1/hub", [stall]), ("hub-proj/us-east1/hub-2", []))
         finding = self.firewall_fix(self.FIREWALL)
@@ -23323,7 +23323,7 @@ metadata:
         finding = self.firewall_fix(namespace + self.FIREWALL)
         self.assertEqual(self.disclose([finding], two), ["fw"])
         finding = self.firewall_fix(namespace.replace("app-proj", "other-proj") + self.FIREWALL)
-        self.assertEqual(self.disclose([finding], kcc_manifest(stall)), [])
+        self.assertEqual(self.disclose([finding], self.two_hosts(("hub-proj/us-central1/hub", [stall]))), [])
 
     def test_a_kcc_object_wedged_finding_on_a_container_cluster_takes_nothing_from_the_host(self):
         """Compliance's finding on `ContainerCluster/prod` sits on the hub in
@@ -23682,6 +23682,27 @@ metadata:
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
         self.assertIn("The declaration is `b/prod.yaml`.", finding["remediation"]["note"])
 
+    def test_a_kubernetes_kind_never_takes_a_config_connector_object_of_the_same_kind_name(self):
+        """A compliance `lb-world-open` finding on the Kubernetes Service
+        `billing` in the app cluster is not the Config Connector `Service`
+        (serviceusage) `payments/billing` stalled on the hub."""
+        service = {"kind": "Service", "namespace": "payments", "name": "billing", "why": "UpdateFailed: 403", "project": "p1"}
+        manifest = self.two_hosts(("p1/us-central1/hub", [service]), ("p1/us-central1/app", []))
+        # The app cluster runs no Config Connector: neither key.
+        del manifest["clusters"][1]["kcc_unready"]
+        lb = make_finding(fid="lb", check="lb-world-open", cluster="p1/us-central1/app", namespace="payments",
+                          obj="Service/billing", remediation={"kind": "manual", "note": "Restrict the source ranges."})
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([lb], manifest, self.root, {}), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, lb)
+        # The Config Connector object's own finding is raised on the hub that
+        # holds it, and gets the paragraph; the same check on another cluster
+        # does not.
+        for cluster, expected in (("p1/us-central1/hub", ["w"]), ("p1/us-central1/app", [])):
+            with self.subTest(cluster=cluster):
+                wedged = make_finding(fid="w", check="kcc-object-wedged", cluster=cluster, namespace="payments",
+                                      obj="Service/billing", remediation={"kind": "manual", "note": "Grant the role."})
+                self.assertEqual(audit_report.disclose_stalled_kcc_remediations([wedged], manifest, self.root, {}), expected)
+
     def test_the_cycle_guard_ends_a_chain_that_waits_on_itself(self):
         """A waits on B and B waits on A: the chain ends."""
         a = audit_report.KccStall("PubSubTopic", "infra", "a", "DependencyNotReady: reference PubSubTopic infra/b is not ready", "", "", "h")
@@ -23764,7 +23785,7 @@ metadata:
         )
         self.write(KCC_CLUSTER_FILE, "\n---\n".join(declaration.format(region=region) for region in regions))
         finding = kcc_finding()
-        finding["object"] = "ComputeAddress/events"
+        finding.update(object="ComputeAddress/events", check="kcc-object-wedged", cluster="acme/us-central1/hub")
         self.disclose([finding], kcc_manifest(*(
             {"kind": "ComputeAddress", "namespace": "infra", "name": "events", "why": "UpdateFailed", "location": region}
             for region in regions

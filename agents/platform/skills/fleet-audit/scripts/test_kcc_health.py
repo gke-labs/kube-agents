@@ -670,7 +670,7 @@ class AnnotateManifestTest(unittest.TestCase):
         )
 
         def finding():
-            return {"id": "f", "cluster": "acme/us-central1/hub", "object": "PubSubTopic/events",
+            return {"id": "f", "check": "kcc-object-wedged", "cluster": "acme/us-central1/hub", "object": "PubSubTopic/events",
                     "remediation": {"kind": "manifest", "path": "topics/events.yaml", "note": "x"}}
 
         for namespaces, expected in ((None, []), (listing(self.namespace("infra", "acme")), ["f"])):

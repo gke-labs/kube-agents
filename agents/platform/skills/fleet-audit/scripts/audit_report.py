@@ -2171,6 +2171,11 @@ KCC_PROJECT_ANNOTATION = "cnrm.cloud.google.com/project-id"
 # The kind of a Namespace, whose project annotation a Config Connector
 # object in it takes when it names none.
 KCC_NAMESPACE_KIND = "Namespace"
+# The one check whose findings are about a Config Connector object: only its
+# `<Kind>/<n>` findings take a Config Connector object of another kind than a
+# cluster or a node pool as their own. A Kubernetes `Service/billing` is not
+# the Config Connector `Service` (serviceusage) of the same name.
+KCC_OBJECT_CHECK = "kcc-object-wedged"
 # How many segments a `project/location/name` cluster target has.
 CLUSTER_TARGET_SEGMENTS = 3
 # What an entry of a collector that reads Config Connector needs to be a
@@ -19025,8 +19030,11 @@ def _fix_declarations(finding: dict, index: dict[KccKey, KccDeclaration]) -> dic
             for key, declaration in index.items()
             if key[0] in kinds and key[1] == name and (key[0] not in pool_kinds or key[2] == cluster)
         }
-    # The index holds Config Connector kinds only, so a match on the kind is
-    # also the test that the finding's kind is a Config Connector kind.
+    # Only a finding about a Config Connector object has one of another kind
+    # (`KCC_OBJECT_CHECK`): a kind name alone can be a core Kubernetes kind
+    # that a Config Connector kind shares (`Service`).
+    if str(finding.get("check") or "") != KCC_OBJECT_CHECK:
+        return {}
     return {key: declaration for key, declaration in index.items() if key[0] == prefix and declaration.name == name}
 
 
@@ -19181,16 +19189,23 @@ def _generic_object_stalls(
 ) -> list[KccStall]:
     """The unready objects that are the own object of a `<Kind>/<n>` finding.
 
-    Such a finding is on the cluster that runs Config Connector, so the
-    finding gives no project or location: they come from the one declaration
-    of the object in `declarations`, when there is exactly one. A finding
-    that names a namespace matches only that namespace.
+    Only a finding about a Config Connector object (`KCC_OBJECT_CHECK`) has
+    one, and it is raised on the cluster that holds the object, so the stall
+    must be on that host: a kind name alone can be a core Kubernetes kind
+    (`Service`) that a Config Connector kind shares. The finding gives no
+    project or location: they come from the one declaration of the object in
+    `declarations`, when there is exactly one. A finding that names a
+    namespace matches only that namespace.
     """
+    if str(finding.get("check") or "") != KCC_OBJECT_CHECK:
+        return []
+    cluster = str(finding.get("cluster") or "")
     namespace = str(finding.get("namespace") or "")
     fits = [
         stall
         for stall in stalled
-        if stall.kind == kind
+        if _on_finding_cluster(stall, cluster)
+        and stall.kind == kind
         and stall.name == name
         and (not namespace or stall.namespace == namespace)
         and (not namespaces or stall.namespace in namespaces)
@@ -19203,6 +19218,15 @@ def _generic_object_stalls(
         if _project_certain(stall, project, kcc_hosts) and _location_agrees(stall, location):
             certain.append(stall)
     return certain if _one_object(certain) else []
+
+
+def _on_finding_cluster(stall: KccStall, cluster: str) -> bool:
+    """Whether `stall` was read on the finding's cluster: the same
+    `project/location/name` target, or the same bare name when the finding
+    names its cluster bare."""
+    if "/" in cluster:
+        return stall.host == cluster
+    return stall.host.rpartition("/")[2] == cluster
 
 
 def _one_object(fits: list[KccStall]) -> bool:
