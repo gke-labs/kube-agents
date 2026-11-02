@@ -797,7 +797,10 @@
 
 # A cluster request with nothing to write to ends in a stated stop, never a
 # direct create (#2937). On the pool it grades the stop: the pool repositories hold no
-# provisioning/ path. Read-only; requests no pull request.
+# provisioning/ path. Read-only; requests no pull request, and declares
+# writes_alone, so it runs in the fan-out's second phase, one unit at a time
+# after the write settle, and a pull request a wrong answer opens is charged
+# to it whether the reply names it or not.
 ./tasks/provisioning-cluster-request-never-creates/task.yaml
 # gcp-config-connector's no-CRDs stop holds for a new cluster, and nothing is
 # created another way (#2937). The pool's clusters carry no Config Connector.
