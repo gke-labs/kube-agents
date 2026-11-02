@@ -3808,7 +3808,7 @@ def test_a_cards_board_rows_are_deleted_with_its_state(
     (purge,) = [s for s in no_cluster_exec if "rm -rf" in s]
     assert harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in purge
     q = harness._shell_quote
-    assert purge.endswith(f"{q(worker_trajectory.DATA_ROOT)} {q(_TASK_ID)}")
+    assert purge.endswith(f"{q(harness._PURGE_DONE_MARKER)} {q(_TASK_ID)}")
 
 
 # hermes v2026.9.14's ``_ctx_role_history`` query, verbatim: what the next
@@ -3856,7 +3856,11 @@ def test_the_purge_script_drops_a_settled_card_from_the_role_history(tmp_path: P
     assert before == ["t_done", "t_run", "t_other"]
 
     proc = subprocess.run(
-        [sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, str(tmp_path), "t_done", "t_run", "t_gone"],
+        [
+            sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, str(tmp_path),
+            str(harness._PURGE_BUSY_TIMEOUT_SECONDS), harness._PURGE_KEPT_MARKER,
+            harness._PURGE_DONE_MARKER, "t_done", "t_run", "t_gone",
+        ],
         capture_output=True, text=True, check=True,
     )
 
@@ -3883,12 +3887,19 @@ def test_a_purge_that_cannot_reach_the_board_is_a_warning(
 def test_settle_purges_the_cards_the_workers_fanned_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Cluster Agent profile outlives the run, so its cards' digest leaks too."""
+    """A Cluster Agent profile outlives the run, so its cards' digest leaks too.
+
+    Only cards the run's workers filed: a card linked under one is left alone.
+    """
     monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
     monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
         summary={"cards": [
-            {"task": "t_1", "fanned_out": ["t_child"]},
-            {"task": "t_child", "fanned_out": []},
+            {"task": "t_1", "fanned_out": ["t_child"], "children": ["t_child", "t_linked"]},
+            {"task": "t_child", "fanned_out": ["t_grandchild"], "children": ["t_grandchild"]},
+            {"task": "t_grandchild", "fanned_out": [], "children": []},
+            # Reached through a predecessor link only: someone else's card.
+            {"task": "t_linked", "fanned_out": ["t_linked_kid"], "children": ["t_linked_kid"]},
+            {"task": "t_linked_kid", "fanned_out": [], "children": []},
         ]},
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
@@ -3898,7 +3909,7 @@ def test_settle_purges_the_cards_the_workers_fanned_out(
     res = harness.AgentResult(output="ok", trajectory=[{"name": "kanban_create"}])
     harness.KubeAgentsHarness._settle(res, [], ["t_1"])
 
-    assert purged == ["t_1", "t_child"]
+    assert purged == ["t_1", "t_child", "t_grandchild"]
 
 
 def test_artifacts_are_read_before_the_card_state_is_purged(

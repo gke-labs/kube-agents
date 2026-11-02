@@ -1338,13 +1338,15 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # Raw ``sqlite3`` rather than ``hermes kanban archive --rm``: that is two cold
 # hermes starts, over a minute in the sandboxed container, and its ``archived``
 # event is one the gateway's notifier delivers to the card's subscribers.
+# The busy timeout and both output markers are passed in, so no literal is
+# spelled twice.
 _PURGE_ROWS_SCRIPT = r"""
 import sqlite3, sys
-ROOT = sys.argv[1]
-ids = [a for a in sys.argv[2:] if a]
+ROOT, BUSY, KEPT, DONE = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+ids = [a for a in sys.argv[5:] if a]
 BY_TASK = ("task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")
 try:
-    kb = sqlite3.connect("%s/kanban.db" % ROOT, timeout=10, isolation_level=None)
+    kb = sqlite3.connect("%s/kanban.db" % ROOT, timeout=BUSY, isolation_level=None)
     kb.execute("BEGIN IMMEDIATE")
     tables = {r[0] for r in kb.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for tid in ids:
@@ -1352,7 +1354,7 @@ try:
         if row is None:
             continue
         if row[0] == "running":
-            print("kept %s" % tid)
+            print("%s %s" % (KEPT, tid))
             continue
         kb.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (tid, tid))
         for table in BY_TASK:
@@ -1364,10 +1366,16 @@ try:
             )
         kb.execute("DELETE FROM tasks WHERE id = ?", (tid,))
     kb.execute("COMMIT")
-    print("purged")
+    print(DONE)
 except sqlite3.Error as exc:
     print("rows kept: %s" % exc)
 """
+# How long the purge waits on hermes' write lock, as the capture's read does
+# (``worker_trajectory`` ``SQLITE_BUSY_TIMEOUT``).
+_PURGE_BUSY_TIMEOUT_SECONDS = 10
+# What the purge prints before each running card it kept, and once it committed.
+_PURGE_KEPT_MARKER = "kept"
+_PURGE_DONE_MARKER = "purged"
 
 
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
@@ -1388,7 +1396,16 @@ def _purge_card_state(task_ids: list[str], timeout: float) -> None:
     if not task_ids:
         return
     listing = " ".join(_shell_quote(t) for t in task_ids)
-    args = " ".join(_shell_quote(a) for a in [worker_trajectory.DATA_ROOT, *task_ids])
+    args = " ".join(
+        _shell_quote(a)
+        for a in [
+            worker_trajectory.DATA_ROOT,
+            str(_PURGE_BUSY_TIMEOUT_SECONDS),
+            _PURGE_KEPT_MARKER,
+            _PURGE_DONE_MARKER,
+            *task_ids,
+        ]
+    )
     script = (
         f"for t in {listing}; do "
         f'  rm -rf {_ATTACHMENTS_DIR}/"$t" {_LOGS_DIR}/"$t".log; '
@@ -1399,17 +1416,36 @@ def _purge_card_state(task_ids: list[str], timeout: float) -> None:
     )
     out = _agent_shell(script, timeout)
     lines = out.splitlines()
-    kept = [line.split()[1] for line in lines if line.startswith("kept ")]
+    kept = [line.split()[1] for line in lines if line.startswith(_PURGE_KEPT_MARKER + " ")]
     if kept:
         _log.warning(
             "cards %s were still running and stay on the board; the next run's role-history "
             "digest can show their summaries", ", ".join(kept),
         )
-    if "purged" not in lines:
+    if _PURGE_DONE_MARKER not in lines:
         _log.warning(
             "could not delete the board rows of cards %s; the next run's role-history digest can "
             "show their summaries (%s)", ", ".join(task_ids), out[:_LOG_EXCERPT_CHARS] or "no output",
         )
+
+
+def _fanned_out_closure(
+    awaited: list[str], captured: worker_trajectory.WorkerCapture | None
+) -> list[str]:
+    """``awaited`` and every card their workers filed, recursively, from the capture's walk.
+
+    Only ``fanned_out`` edges (``kanban_worker_children``, who filed whom): the
+    walk also follows ``task_links``, which can reach a card someone else filed,
+    and the purge deletes what it is given.
+    """
+    edges: dict[str, list[str]] = {}
+    for card in ((captured.summary.get("cards") if captured else None) or []):
+        if isinstance(card, dict):
+            edges[str(card.get("task") or "")] = [str(c) for c in card.get("fanned_out") or []]
+    out = list(dict.fromkeys(awaited))
+    for tid in out:
+        out.extend(c for c in edges.get(tid, []) if c not in out)
+    return out
 
 
 def _worker_token_buckets(
@@ -3915,14 +3951,9 @@ class KubeAgentsHarness(AgentHarness):
                 if infra_reason:
                     break
 
-        # Every card the capture walked, the workers' fan-out included: a
-        # Cluster Agent profile outlives the run, and its digest would carry
-        # their summaries forward.
-        walked = [
-            str(c.get("task")) if isinstance(c, dict) else str(c)
-            for c in ((captured.summary.get("cards") if captured else None) or [])
-        ]
-        _purge_card_state(list(dict.fromkeys([*awaited, *(t for t in walked if t)])), _EXEC_TIMEOUT)
+        # The cards the workers fanned out too: a Cluster Agent profile
+        # outlives the run, and its digest would carry their summaries forward.
+        _purge_card_state(_fanned_out_closure(awaited, captured), _EXEC_TIMEOUT)
 
         if infra_reason and trajectory_clean and logs_clean and not agent_acted:
             _mark_result_infra_failure(

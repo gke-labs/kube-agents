@@ -59,7 +59,9 @@ every card has settled or
 six full-audit units). The delivered card results are appended to the answer, and the worker's
 report and terminal commands are read back with `kubectl exec` from
 `/opt/data/kanban/attachments/<id>/` and `/opt/data/kanban/logs/<id>.log` in the agent pod, then
-deleted; a card still running when the wait ran out is archived first, which stops its worker, and so are the cards its worker fanned out (#3019). A
+deleted, along with the board rows of the card and the cards its worker filed (Hermes shows the
+assignee's recent completed runs on every card, which would hand the next repetition this one's
+summary); a card still running when the wait ran out is archived first, which stops its worker, and so are the cards its worker fanned out (#3019). A
 customer sees the card result relayed to their thread; they never see the files, the
 store reads, or the collecting turn, which is a model call the customer never made.
 
