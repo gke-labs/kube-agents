@@ -298,6 +298,15 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		warnings = append(warnings, apiAuthWarnings...)
 	}
 
+	// 2h. The shell container's requests and limits, checked the same way as
+	// the two above: merged over the defaults per key, so the reconciler refuses
+	// at reconcile what this refuses at apply. Outside the deployment block
+	// because the field sits under spec.harness.experimental.shellSandbox.
+	sandboxErrs, sandboxWarnings := controller.ValidateShellSandboxResources(platformAgent,
+		field.NewPath("spec", "harness", "experimental", "shellSandbox", "resources"))
+	allErrs = append(allErrs, sandboxErrs...)
+	warnings = append(warnings, sandboxWarnings...)
+
 	// 3. Validate Security ServiceAccountName
 	// Note: This check serves as a name-based tripwire against obvious misconfigurations
 	// (e.g., binding to literal names like "cluster-admin" or "system:admin"). It is NOT
