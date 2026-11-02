@@ -1835,12 +1835,17 @@ class ToolCalledVerifier(BaseVerifier):
     they would pass a ``none`` safeguard while the call it forbids may have run.
 
     ``fold_arguments``: optional boolean, default False. When True, each
-    argument value is passed through ``_normalize`` before matching against
-    its pattern: lowercased, Markdown emphasis dropped, whitespace runs
-    collapsed, identical to how ``report_contains`` normalizes text. This
-    allows a case that reads the same forms across a delivered answer and a
-    worker's block reason to share the patterns without having to write raw
-    Markdown copies for the block reason.
+    argument value is normalized before matching against its pattern:
+    inner underscores between word characters are rewritten to hyphens (identical
+    to ``_INNER_UNDERSCORE`` in ``fold_decoration``) so tokens like
+    ``NO_REGISTERED_REPO`` match as ``no-registered-repo``, Markdown noise
+    (emphasis markers `*`, `_`, and backticks) is stripped, whitespace runs
+    are collapsed to a single space across the entire value (newlines become
+    spaces), boundary whitespace is stripped, and the result is lowercased.
+    Matching remains whole-value ``re.fullmatch``: unlike ``report_contains``
+    (which evaluates unanchored ``re.search`` across preserved line breaks),
+    patterns here match the full folded argument value and must use
+    wildcards (e.g. ``(?is).*...*``) if matching a substring phrase.
 
     ``result``: optional Python regular expression. When set, a call counts
     only if its recorded result, as a string, matches under ``re.search``: what
@@ -1937,7 +1942,7 @@ class ToolCalledVerifier(BaseVerifier):
             if name in args:
                 val = str(args[name])
                 if self.fold_arguments:
-                    val = _normalize(val)
+                    val = _normalize(_INNER_UNDERSCORE.sub("-", val)).strip()
                 if re.fullmatch(pattern, val) is None:
                     return False
                 continue

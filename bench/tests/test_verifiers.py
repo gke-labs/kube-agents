@@ -3051,6 +3051,59 @@ def test_tool_called_fold_arguments_works_with_clipped_worker_call():
     assert folded_check.verify(5.0).status == "pass"
 
 
+def test_tool_called_fold_arguments_rewrites_inner_underscores_to_hyphens():
+    raw_reason = "NO_REGISTERED_REPO: acme/other is not registered on this install (preflight stop)."
+    transcript.set(
+        "done",
+        [
+            {
+                "name": "kanban_block",
+                "args": {"reason": raw_reason},
+                "status": "completed",
+                "agent": "platform",
+            }
+        ],
+    )
+    # A pattern matching the token with hyphens (as folded) or with [-_]
+    pattern = r"(?is).*(?:no[-_]?registered[-_]?repo|\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)\b).*"
+    check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+        fold_arguments=True,
+    )
+    assert check.verify(5.0).status == "pass"
+
+
+def test_tool_called_fold_arguments_strips_boundary_whitespace():
+    # Value ends in newline or whitespace
+    raw_reason = "No registered repository declares `seeded-a`.\n"
+    transcript.set(
+        "done",
+        [
+            {
+                "name": "kanban_block",
+                "args": {"reason": raw_reason},
+                "status": "completed",
+                "agent": "platform",
+            }
+        ],
+    )
+    # Pattern without trailing .* or \s*
+    pattern = r"no registered repository declares seeded-a\."
+    check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+        fold_arguments=True,
+    )
+    assert check.verify(5.0).status == "pass"
+
+
 def test_tool_called_result_counts_only_the_calls_that_answered_so():
     spilled = "<persisted-output>\nThis tool result was too large (109,963 characters, 107.4 KB)."
     transcript.set(
