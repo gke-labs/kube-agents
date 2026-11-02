@@ -221,9 +221,22 @@ Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `CHAT_TOPIC_NAME`, `CHAT_SUB_NAME`, `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`,
 `SLACK_HOME_CHANNEL_NAME`, `SLACK_HOME_CHANNEL_POLICY`, `PLATFORM_AGENT_CUSTOM_ROLES`,
 `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
-`KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`, `PLATFORM_AGENT_MODE`. Secrets: `GH_APP_ID`,
+`KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`, `PLATFORM_AGENT_MODE`,
+`HELM_UPGRADE_INSTALL`. Secrets: `GH_APP_ID`,
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`,
 `SLACK_APP_TOKEN`.
+
+`HELM_UPGRADE_INSTALL=true` makes the composition create the `kube-agents` Helm
+release with `helm upgrade --install` (the release's `upgrade_install`). The Helm
+provider can drop a live release from state when a refresh lookup fails
+([hashicorp/terraform-provider-helm#1669](https://github.com/hashicorp/terraform-provider-helm/issues/1669)),
+and the next apply then plans a create that stops with "cannot re-use a name that
+is still in use". With the variable on, that create
+adopts the running release. Absent means `false`, today's behaviour, and destroys
+nothing, so it is not among the required settings. Set it only on a long-lived
+environment whose own state owns the release: it also takes over, silently, a
+release another Terraform state or a manual `helm install` owns in that namespace,
+where `false` fails loudly instead.
 
 `PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`; the
 renderer refuses anything else and writes `today` as no key, because an absent
