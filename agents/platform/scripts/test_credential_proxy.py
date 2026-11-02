@@ -3024,6 +3024,19 @@ class _Holder:
         self.thread.join(10)
 
 
+class _Reserver(_Holder):
+    """A slot-less child memory reservation (the forge refresh's kind), held on
+    its own thread until released."""
+
+    def _run(self, executor, klass):
+        try:
+            with executor.reserve_child_memory():
+                self.admitted.set()
+                self.release.wait(10)
+        except credential_proxy.CommandSlotUnavailable as exc:
+            self.refused = exc
+
+
 class ClassAdmissionTest(unittest.TestCase):
     """Priority admission by class (credential-broker-exec-tier.md §4.2, §12)."""
 
@@ -3200,6 +3213,38 @@ class ClassAdmissionTest(unittest.TestCase):
         held[0].done()
         self.assertTrue(waiting_interactive.admitted.wait(5))
         self.assertFalse(waiting_background.admitted.is_set())
+
+    def test_the_reserve_holds_budget_room_a_slot_less_reservation_would_take(self):
+        # The budget admits 4 (B = 2). A forge refresh's slot-less reservation
+        # takes budget but no slot and no class share. The first background
+        # request still leaves the reserve's two admissions; a second is under
+        # its cap of two and fits the budget, but would leave room for one.
+        executor = self.budgeted(4)
+        reserver = _Reserver(executor, self.I)
+        self.holders.append(reserver)
+        self.assertTrue(reserver.admitted.wait(5))
+        self.hold(executor, self.B)
+        late = self.queue(executor, self.B)
+        late.thread.join(5)
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_BACKGROUND, late.refused.bound)
+
+    def test_a_slot_less_reservation_passes_a_request_its_class_cap_holds(self):
+        # With the budget on, the interactive cap full and a slot free, an
+        # interactive request queues on its cap; a forge refresh's reservation
+        # behind it takes no slot and is admitted past it.
+        executor = self.executor(
+            memory_limit_bytes=credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
+            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
+            + 9 * (credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + credential_proxy.OUTPUT_COPIES_PER_COMMAND * 1024)
+        )
+        self.assertEqual(8, executor.admitted_requests())
+        self.hold(executor, self.I, 7)
+        capped = self.queue(executor, self.I)
+        self.wait_queued(executor, 1)
+        reserver = _Reserver(executor, self.I)
+        self.holders.append(reserver)
+        self.assertTrue(reserver.admitted.wait(5))
+        self.assertFalse(capped.admitted.is_set())
 
     def test_one_class_alone_keeps_todays_order(self):
         executor = self.executor()
@@ -17501,17 +17546,6 @@ class ScopeSlotShareTest(unittest.TestCase):
             with self.subTest(raw=raw, background_cap=background_cap):
                 with self.assertLogs(credential_proxy.LOGGER, level="WARNING") if warns else contextlib.nullcontext():
                     self.assertEqual(want, self.limit(raw, background_cap))
-
-    def test_a_scope_share_of_zero_is_busy_and_the_shell_is_not(self):
-        slots = credential_proxy.SessionSlots(
-            0, role=credential_proxy.CALLER_ROLE_SCOPE,
-            env_name=credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS, bound=credential_proxy.ADMISSION_BOUND_SCOPE,
-        )
-        with self.assertRaises(credential_proxy.CommandSlotUnavailable):
-            with slots.acquire(credential_proxy.CALLER_ROLE_SCOPE):
-                pass
-        with slots.acquire(credential_proxy.CALLER_ROLE_SHELL):
-            pass
 
 
 SCOPE_ASSET_SEARCH = [

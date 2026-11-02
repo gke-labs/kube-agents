@@ -7757,17 +7757,22 @@ class CommandExecutor:
         finally:
             self._request_budget.exempt = previous
 
-    def _only_the_slot_cap_holds_ahead_of(self, ticket: _AdmissionTicket) -> bool:
-        """Whether every ticket ahead of `ticket` takes a slot while the slots
-        are full. Those wait on the slot cap, not the budget, so a slot-less
-        reserver admitted past them takes nothing they are waiting for (§2.3).
-        Called under `_slot_condition`."""
-        if self._slots_in_use < self.max_concurrent_commands:
-            return False
+    def _only_slot_caps_hold_ahead_of(self, ticket: _AdmissionTicket) -> bool:
+        """Whether every ticket ahead of `ticket` takes a slot and is held by a
+        slot cap: the full slot cap, or its own class's full cap while it would
+        otherwise fit the budget (§4.2). Those wait for a slot, not for the
+        budget, so a slot-less reserver admitted past them takes nothing they
+        are waiting for (§2.3). A class cap that is full because the budget is
+        (a small pod's caps follow its budget) is the budget holding, and order
+        is kept. Called under `_slot_condition`."""
+        slots_full = self._slots_in_use >= self.max_concurrent_commands
         for ahead in self._slot_queue:
             if ahead is ticket:
                 return True
             if not ahead.takes_slot:
+                return False
+            class_full = self._slots_by_class[ahead.klass] >= self.class_cap(ahead.klass)
+            if not (slots_full or (class_full and self._fits_budget(takes_slot=True))):
                 return False
         return False
 
@@ -7903,7 +7908,7 @@ class CommandExecutor:
             try:
                 while True:
                     eligible = self._ahead_may_be_passed(ticket) or (
-                        not takes_slot and self._only_the_slot_cap_holds_ahead_of(ticket)
+                        not takes_slot and self._only_slot_caps_hold_ahead_of(ticket)
                     )
                     slot_free = (not takes_slot) or self._slots_in_use < self.max_concurrent_commands
                     class_free = (not takes_slot) or self._slots_by_class[klass] < self.class_cap(klass)

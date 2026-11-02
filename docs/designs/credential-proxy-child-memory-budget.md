@@ -239,7 +239,7 @@ is interactive work, so it goes ahead of queued background tickets too. Among th
 exception. A slot-less reserver that fits the budget is
 admitted past the tickets ahead of it when every one of them takes a slot and the slots are full:
 those wait on the slot cap, not the budget, and the reserver competes with them for nothing, so
-eight `kubectl logs -f` holding every slot and a ninth exec queued behind them do not keep a forge
+`kubectl logs -f` commands holding every slot their caps allow and an exec queued behind them do not keep a forge
 refresh waiting out the bound. Behind a ticket the budget holds, order is kept, because a reserver
 admitted ahead of it would take the budget that ticket is waiting for and could starve it. A
 request that fits but is still queued at the bound is refused naming the queue rather than the
