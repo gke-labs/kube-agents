@@ -2323,6 +2323,25 @@ type TelemetryStatus struct {
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }
 
+// InferenceStatus reports the Platform Agent's default model as the install's LiteLLM
+// config states it.
+//
+// A resource reference, a Vertex AI endpoint path or a Bedrock ARN, keeps its resource id
+// only, so a project id, a region or an account id never appears here. Both fields are
+// absent until the operator reads the config; a read that fails keeps the last pair; both
+// are absent while the served CRD predates them.
+type InferenceStatus struct {
+	// Provider is the LiteLLM provider slug, the text before the first "/" of the
+	// default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
+	// +optional
+	Provider string `json:"provider,omitempty"`
+
+	// Model is the model name after the provider, as typed, or the resource id alone
+	// for a resource reference.
+	// +optional
+	Model string `json:"model,omitempty"`
+}
+
 // NetworkPolicyStatus reports the network wiring the operator resolved, and its source —
 // the same diagnostic split as TelemetryStatus: the value alone cannot say whether a DNS
 // IP was discovered or pinned.
@@ -2435,6 +2454,19 @@ type AgentStatus struct {
 	// aggregate counters of what it has done.
 	// +optional
 	Usage AgentUsageStatus `json:"usage,omitempty"`
+
+	// Note, deliberately not a doc comment — the blank line below keeps it out of the
+	// CRD description that `kubectl explain` prints. As on the structs above, omitempty
+	// does nothing on a struct field, so this key is always serialised, as `{}` before
+	// the first reconcile; its own fields carry omitempty, so a pair nothing has read
+	// is absent rather than empty strings.
+
+	// Inference reports the Platform Agent's default model, as the install's LiteLLM
+	// config states it. Both fields are absent until the operator reads the config; a
+	// read that fails keeps the last pair; both are absent while the served CRD
+	// predates them.
+	// +optional
+	Inference InferenceStatus `json:"inference,omitempty"`
 }
 
 // AgentUsageStatus is the non-sensitive activity summary of an agent. Static
