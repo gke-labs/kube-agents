@@ -2471,12 +2471,13 @@ type AgentUsageStatus struct {
 	// conversations the gateway opened a session for (the session_store
 	// plugin's kubeagents_chat_sessions_total on a today install, that plus
 	// the A2A gateway's kubeagents_a2a_gateway_sessions_total on a next
-	// install), without the event watcher's triage sessions. On an install
-	// whose usage document was re-seeded before this release, its first
-	// value carries that re-seed's triage sessions once. Read every five
-	// minutes and kept monotonic the same way as ToolExecutionsTotal. Moves
-	// LastActiveTime, as SessionsTotal does; does not move
-	// LastHumanActiveTime. Absent while the served CRD predates it.
+	// install), without the event watcher's triage sessions. A re-seed from
+	// a status that carries no chatSessionsTotal (an install with triage
+	// sessions and no chat yet, or a served CRD that holds the field back)
+	// seeds those triage sessions into the chat half, and the counter keeps
+	// them. Read every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal. Moves LastActiveTime, as SessionsTotal does; does
+	// not move LastHumanActiveTime. Absent while the served CRD predates it.
 	// +optional
 	ChatSessionsTotal int64 `json:"chatSessionsTotal,omitempty"`
 

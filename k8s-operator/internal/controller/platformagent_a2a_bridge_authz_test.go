@@ -230,7 +230,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 }
 
 // a2aProvisionLikeTheScript seeds a test bus with what the provision Job
-// creates: the streams above and five KV buckets.
+// creates: the streams above and six KV buckets.
 func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 	t.Helper()
 	_, js := a2aConnectAs(t, url, "seed", seedPassword)

@@ -115,14 +115,15 @@ const (
 
 // UsageCounterPoller produces status.usage's toolExecutionsTotal,
 // eventsIngestedTotal, remediationsProposedTotal, chatMessagesInboundTotal,
-// sessionsTotal, toolExecutionsBlockedTotal, brokerFailuresTotal,
-// chatTurnsErroredTotal, backgroundTasksGaveUpTotal, negativeFeedbackTotal,
-// lastActiveTime and lastHumanActiveTime on every PlatformAgent, the two
-// cluster gauges and the six proposal readings, from the broker's, the
-// watcher's, the chat plugin's and the A2A gateway's metrics listeners, as a
-// manager Runnable on the leader, off the reconcile path. docs/designs/usage-counters-producer.md is
-// the design; the rules the counters follow are in usage_counters_fold.go, the
-// scrape in usage_counters_scrape.go. This file is the loop and the two
+// sessionsTotal, chatSessionsTotal, toolExecutionsBlockedTotal,
+// brokerFailuresTotal, chatTurnsErroredTotal, backgroundTasksGaveUpTotal,
+// negativeFeedbackTotal, lastActiveTime and lastHumanActiveTime on every
+// PlatformAgent, the two cluster gauges and the six proposal readings, from
+// the broker's, the watcher's, the chat plugin's and the A2A gateway's
+// metrics listeners, as a manager Runnable on the leader, off the reconcile
+// path. docs/designs/usage-counters-producer.md is the design; the rules the
+// counters follow are in usage_counters_fold.go, the scrape in
+// usage_counters_scrape.go. This file is the loop and the two
 // objects it writes: the ConfigMap that holds the document, first, and the
 // status, after it and only when it is behind.
 type UsageCounterPoller struct {
