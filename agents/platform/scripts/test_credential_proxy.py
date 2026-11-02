@@ -12748,9 +12748,14 @@ class RequiredRoleTest(unittest.TestCase):
                     credential_proxy.required_roles(path),
                 )
 
-    def test_the_exec_route_admits_the_shell_the_session_and_the_profile(self):
+    def test_the_exec_route_admits_the_shell_the_session_the_profile_and_the_scope_publisher(self):
         self.assertEqual(
-            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_PROFILE),
+            (
+                credential_proxy.CALLER_ROLE_SHELL,
+                credential_proxy.CALLER_ROLE_SESSION,
+                credential_proxy.CALLER_ROLE_PROFILE,
+                credential_proxy.CALLER_ROLE_SCOPE,
+            ),
             credential_proxy.required_roles("/v1/exec"),
         )
 
@@ -16969,6 +16974,446 @@ class GitAllowProtocolForHttpForgeTest(unittest.TestCase):
             for verb, allow_http in asked:
                 if verb in remote_verbs:
                     self.assertTrue(allow_http, f"git {verb} did not ask for allow_http")
+
+
+class ScopeCallerBindingTest(unittest.TestCase):
+    """The scope role is bound to the publisher's ServiceAccount in both directions.
+
+    The mcp binding's shape (MCPCallerBindingTest): no scope callers named
+    means the scope audience confers nothing.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    MCP = "kubeagents-credential-proxy-mcp"
+    SCOPE = "kubeagents-credential-proxy-scope"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    MCP_SA = "system:serviceaccount:kubeagents-system:agent-a2a-mcp"
+    SCOPE_SA = "system:serviceaccount:kubeagents-system:agent-scope-publisher"
+
+    def _authenticator(self, scope_callers=frozenset({SCOPE_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.MCP: credential_proxy.CALLER_ROLE_MCP,
+                self.SCOPE: credential_proxy.CALLER_ROLE_SCOPE,
+            },
+            allowed_callers=frozenset({self.AGENT, self.MCP_SA, self.SCOPE_SA}),
+            mcp_callers=frozenset({self.MCP_SA}),
+            scope_callers=scope_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_a_scope_caller_presenting_any_other_audience_is_refused(self):
+        for audience in (self.SHELL, self.CHAT, self.MCP):
+            with self.subTest(audience=audience):
+                with self.assertRaises(credential_proxy.AuthenticationError):
+                    self._authenticator()._principal_from(self._review(self.SCOPE_SA, audience))
+
+    def test_a_scope_caller_presenting_the_scope_audience_is_the_scope_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.SCOPE_SA, self.SCOPE))
+        self.assertEqual(credential_proxy.CALLER_ROLE_SCOPE, principal.role)
+
+    def test_another_caller_presenting_the_scope_audience_is_refused(self):
+        for caller in (self.AGENT, self.MCP_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaises(credential_proxy.AuthenticationError):
+                    self._authenticator()._principal_from(self._review(caller, self.SCOPE))
+
+    def test_with_no_scope_callers_named_the_scope_audience_confers_nothing(self):
+        for caller in (self.AGENT, self.SCOPE_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only for scope callers"
+                ):
+                    self._authenticator(frozenset())._principal_from(self._review(caller, self.SCOPE))
+
+    def test_the_scope_callers_are_read_from_the_environment(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{self.AGENT},{self.SCOPE_SA}",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_SCOPE_AUDIENCE": "aud-scope",
+            "CREDENTIAL_PROXY_SCOPE_CALLERS": f" {self.SCOPE_SA} , ",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset({self.SCOPE_SA}), authenticator.scope_callers)
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_SCOPE,
+            authenticator._principal_from(self._review(self.SCOPE_SA, "aud-scope")).role,
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(
+                self._review(self.SCOPE_SA, credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE)
+            )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self._review(self.AGENT, "aud-scope"))
+
+    def test_a_scope_audience_without_scope_callers_warns(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": self.AGENT,
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_SCOPE_AUDIENCE": "aud-scope",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.scope_callers)
+        self.assertTrue(any("CREDENTIAL_PROXY_SCOPE_CALLERS" in line for line in logs.output))
+
+
+class ScopeAudienceTest(unittest.TestCase):
+    """The scope publisher's audience: read raw, only inside the chat split, refused on a collision."""
+
+    BASE = {
+        "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+        "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+        "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+    }
+
+    def _build(self, **env):
+        with mock.patch.dict(os.environ, {**self.BASE, **env}, clear=True):
+            return credential_proxy.build_authenticator()
+
+    def test_the_scope_audience_confers_its_own_role(self):
+        authenticator = self._build(
+            CREDENTIAL_PROXY_CHAT_AUDIENCE="aud-chat",
+            CREDENTIAL_PROXY_SCOPE_AUDIENCE=credential_proxy.DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE,
+            CREDENTIAL_PROXY_SCOPE_CALLERS="system:serviceaccount:ns:agent-scope-publisher",
+        )
+        self.assertEqual(
+            {
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: credential_proxy.CALLER_ROLE_SHELL,
+                "aud-chat": credential_proxy.CALLER_ROLE_CHAT,
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE: credential_proxy.CALLER_ROLE_SCOPE,
+            },
+            authenticator.audience_roles,
+        )
+
+    def test_unset_means_the_role_is_never_conferred(self):
+        authenticator = self._build(CREDENTIAL_PROXY_CHAT_AUDIENCE="aud-chat")
+        self.assertNotIn(credential_proxy.CALLER_ROLE_SCOPE, authenticator.audience_roles.values())
+
+    def test_the_scope_audience_means_nothing_without_the_chat_split(self):
+        # Without the split every caller is role "", which reaches every
+        # route; the scope audience must never land there.
+        with mock.patch.dict(
+            os.environ, {**self.BASE, "CREDENTIAL_PROXY_SCOPE_AUDIENCE": "aud-scope"}, clear=True
+        ):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            {credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: ""}, authenticator.audience_roles
+        )
+        self.assertTrue(any("CREDENTIAL_PROXY_SCOPE_AUDIENCE" in line for line in logs.output))
+
+    def test_a_scope_audience_equal_to_another_roles_is_refused_with_a_warning(self):
+        others = {
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-a2a",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+            "CREDENTIAL_PROXY_SESSION_CALLERS": "system:serviceaccount:ns:session",
+            "CREDENTIAL_PROXY_WATCHER_AUDIENCE": "aud-watcher",
+            "CREDENTIAL_PROXY_MCP_AUDIENCE": "aud-mcp",
+            "CREDENTIAL_PROXY_MCP_CALLERS": "system:serviceaccount:ns:mcp",
+        }
+        for clash, role in (
+            (credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE, credential_proxy.CALLER_ROLE_SHELL),
+            ("aud-chat", credential_proxy.CALLER_ROLE_CHAT),
+            ("aud-a2a", credential_proxy.CALLER_ROLE_A2A_CHAT),
+            ("aud-session", credential_proxy.CALLER_ROLE_SESSION),
+            ("aud-watcher", credential_proxy.CALLER_ROLE_WATCHER),
+            ("aud-mcp", credential_proxy.CALLER_ROLE_MCP),
+        ):
+            with self.subTest(clash=clash):
+                with mock.patch.dict(
+                    os.environ,
+                    {**self.BASE, **others, "CREDENTIAL_PROXY_SCOPE_AUDIENCE": clash},
+                    clear=True,
+                ):
+                    with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                        authenticator = credential_proxy.build_authenticator()
+                self.assertNotIn(credential_proxy.CALLER_ROLE_SCOPE, authenticator.audience_roles.values())
+                self.assertEqual(role, authenticator.audience_roles[clash])
+                self.assertTrue(any("CREDENTIAL_PROXY_SCOPE_AUDIENCE" in line for line in logs.output))
+
+    def test_the_default_scope_audience_is_no_other_roles_default(self):
+        self.assertNotIn(
+            credential_proxy.DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE,
+            {
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE,
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE,
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE,
+                "kubeagents-credential-proxy-a2a-chat",
+                "kubeagents-credential-proxy-watcher",
+                "kubeagents-credential-proxy-session",
+            },
+        )
+        self.assertIn(credential_proxy.CALLER_ROLE_SCOPE, credential_proxy.CALLER_ROLES)
+
+
+class ScopeRouteAdmissionTest(unittest.TestCase):
+    """The scope role reaches /v1/exec and no other route family."""
+
+    def _permits(self, path):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = path
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent-scope-publisher", uid="u", groups=(),
+            role=credential_proxy.CALLER_ROLE_SCOPE,
+        )
+        return handler._role_permits(principal), handler.replies
+
+    def test_the_exec_route_admits_the_scope_role(self):
+        permitted, replies = self._permits("/v1/exec")
+        self.assertTrue(permitted)
+        self.assertEqual([], replies)
+
+    def test_every_other_route_family_refuses_the_scope_role(self):
+        for path in (
+            credential_proxy.ADMISSION_PATH,
+            "/v1/vcs/proposal-view",
+            "/v1/github/refresh",
+            "/v1/forge/refresh",
+            "/v1/workspace/open",
+            credential_proxy.API_RELAY_PREFIX + "cloudasset.googleapis.com/v1/x",
+            credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "server/x",
+            credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + "x",
+            credential_proxy.watcher_policy.WATCHER_K8S_PREFIX + "api/v1/pods",
+            credential_proxy.watcher_policy.PLATFORM_PUBSUB_PREFIX + "x",
+            feedback_broker.ROUTE,
+            "/v1/chat/api",
+            "/v1/chat/a2a/events",
+            "/v1/chat/events",
+        ):
+            with self.subTest(path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                    permitted, replies = self._permits(path)
+                self.assertFalse(permitted)
+                self.assertEqual("CALLER_ROLE_FORBIDDEN", replies[0][1]["code"])
+
+    def test_the_scope_role_runs_gcloud_only(self):
+        self.assertEqual(frozenset({"gcloud"}), credential_proxy.ROLE_EXECUTABLES[credential_proxy.CALLER_ROLE_SCOPE])
+        self.assertFalse(credential_proxy.executable_permitted(credential_proxy.CALLER_ROLE_SCOPE, "kubectl"))
+
+
+class ScopeSlotShareTest(unittest.TestCase):
+    """The scope share takes only what session and profile work leave, and the shell keeps a slot."""
+
+    def limit(self, raw, pool, session, profile):
+        with mock.patch.dict(os.environ, {credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS: raw}):
+            return credential_proxy.scope_slot_limit_from_env(pool, session, profile)
+
+    def test_the_defaults_leave_the_shell_a_slot_with_every_bounded_role_busy(self):
+        pool = credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS
+        with mock.patch.dict(os.environ, {}, clear=True):
+            session = credential_proxy.session_slot_limit_from_env()
+            profile = credential_proxy.profile_slot_limit_from_env(pool, session)
+            scope = credential_proxy.scope_slot_limit_from_env(pool, session, profile)
+        self.assertEqual(1, credential_proxy.DEFAULT_SCOPE_MAX_CONCURRENT_COMMANDS)
+        self.assertEqual(1, scope)
+        self.assertLessEqual(session + profile + scope, pool - 1)
+
+    def test_an_oversubscribed_config_clamps_scope_first(self):
+        for raw, pool, session, profile, want, warns in (
+            ("1", 8, 2, 4, 1, False),
+            ("4", 8, 2, 4, 1, True),   # 8 - 2 - 4 - 1: the profile share is kept, scope gives way
+            ("4", 16, 2, 4, 4, False),
+            ("2", 8, 2, 5, 0, True),   # profile left nothing: scope is answered busy, the shell keeps its slot
+            ("x", 8, 2, 4, 1, True),   # an unreadable value is the default
+        ):
+            with self.subTest(raw=raw, pool=pool, profile=profile):
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING") if warns else contextlib.nullcontext():
+                    got = self.limit(raw, pool, session, profile)
+                self.assertEqual(want, got)
+                self.assertLessEqual(session + profile + got, pool - 1)
+
+    def test_a_scope_share_of_zero_is_busy_and_the_shell_is_not(self):
+        slots = credential_proxy.SessionSlots(
+            0, role=credential_proxy.CALLER_ROLE_SCOPE,
+            env_name=credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS, bound=credential_proxy.ADMISSION_BOUND_SCOPE,
+        )
+        with self.assertRaises(credential_proxy.CommandSlotUnavailable):
+            with slots.acquire(credential_proxy.CALLER_ROLE_SCOPE):
+                pass
+        with slots.acquire(credential_proxy.CALLER_ROLE_SHELL):
+            pass
+
+
+SCOPE_ASSET_SEARCH = [
+    "gcloud", "asset", "search-all-resources", "--scope=folders/111",
+    "--asset-types=container.googleapis.com/Cluster", "--format=json(name,location)",
+]
+SCOPE_PROBE = ["gcloud", "container", "clusters", "list", "--project", "p-one", "--format=value(name,location)"]
+
+
+class ScopeExecRouteTest(unittest.TestCase):
+    """The scope role through the real exec route, with a gcloud stub."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        root = Path(self.temp_dir.name)
+        policy_path = root / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        self.scope_file = root / "scope.json"
+        self.scope_file.write_text(json.dumps({
+            "present": True, "projects": [], "folders": ["111"], "organizations": [],
+            "sharedVpcHosts": [], "metricsScopes": [], "maxProjects": 10,
+            "exclude": {"projects": [], "clusters": []},
+        }), encoding="utf-8")
+        env = mock.patch.dict(os.environ, {credential_proxy.scope_policy.SCOPE_FILE_ENV: str(self.scope_file)})
+        env.start()
+        self.addCleanup(env.stop)
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5, max_output_bytes=65536, state_dir=str(root / "state"), scoped_pool=None
+        )
+        stub_dir = root / "bin"
+        stub_dir.mkdir()
+        self.exit_file = root / "exit"
+        self.exit_file.write_text("0", encoding="utf-8")
+        gcloud = stub_dir / "gcloud"
+        gcloud.write_text(textwrap.dedent(f"""\
+            #!/bin/bash
+            echo "$@" >> {root / "calls"}
+            case "$1" in
+              asset) echo '[{{"name":"//container.googleapis.com/projects/p-one/locations/us-central1/clusters/c1","location":"us-central1"}}]' ;;
+              container) echo "c1 us-central1" ;;
+            esac
+            exit "$(cat {self.exit_file})"
+            """), encoding="utf-8")
+        gcloud.chmod(0o755)
+        CredentialProxyHandler.executor.executables["gcloud"] = str(gcloud)
+        self.calls = root / "calls"
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.scope_window = credential_proxy.scope_policy.MemberWindow()
+        self.addCleanup(setattr, CredentialProxyHandler, "scope_window", credential_proxy.scope_policy.MemberWindow())
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post_as(self, role, payload):
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent-scope-publisher", uid="u", groups=(), role=role
+        )
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with mock.patch.object(CredentialProxyHandler, "_authenticated", return_value=principal):
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read())
+
+    def scope(self, payload):
+        return self.post_as(credential_proxy.CALLER_ROLE_SCOPE, payload)
+
+    def refused(self, payload, rule):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.scope(payload)
+        self.assertEqual(403, status, body)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual(rule, body["rule"])
+        return body
+
+    def test_a_lookup_opens_the_probe_for_the_members_it_returned(self):
+        self.refused({"argv": SCOPE_PROBE}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})
+        self.assertEqual(200, status, body)
+        self.assertEqual(0, body["exitCode"])
+        status, body = self.scope({"argv": SCOPE_PROBE})
+        self.assertEqual(200, status, body)
+        self.assertEqual("c1 us-central1\n", body["stdout"])
+        self.assertEqual(2, len(self.calls.read_text(encoding="utf-8").splitlines()))
+
+    def test_a_failed_lookup_records_nothing(self):
+        self.exit_file.write_text("1", encoding="utf-8")
+        status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})
+        self.assertEqual(200, status, body)
+        self.assertEqual(1, body["exitCode"])
+        self.refused({"argv": SCOPE_PROBE}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+
+    def test_refusals_never_run_gcloud(self):
+        for payload, rule in (
+            ({"argv": [*SCOPE_ASSET_SEARCH, "--impersonate-service-account=x@y"]}, credential_proxy.scope_policy.RULE_SCOPE_ARGV),
+            ({"argv": [*SCOPE_ASSET_SEARCH, "--verbosity=debug"]}, credential_proxy.scope_policy.RULE_SCOPE_ARGV),
+            ({"argv": ["gcloud", "auth", "print-access-token"]}, credential_proxy.scope_policy.RULE_SCOPE_ARGV),
+            ({"argv": [*SCOPE_ASSET_SEARCH[:3], "--scope=folders/999", *SCOPE_ASSET_SEARCH[4:]]}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT),
+            ({"argv": SCOPE_ASSET_SEARCH, "stdin": "x"}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
+            ({"argv": SCOPE_ASSET_SEARCH, "cwd": "/tmp"}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
+            ({"argv": SCOPE_ASSET_SEARCH, "kubeconfigContext": "gke_p_l_c"}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
+            ({"argv": SCOPE_ASSET_SEARCH, "wantsKubeconfig": True}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
+            ({"argv": ["kubectl", "get", "pods"]}, credential_proxy.RULE_CALLER_EXECUTABLE),
+        ):
+            with self.subTest(payload=payload):
+                self.refused(payload, rule)
+        self.assertFalse(self.calls.exists())
+
+    def test_without_a_scope_file_nothing_is_admitted(self):
+        self.scope_file.unlink()
+        self.refused({"argv": SCOPE_ASSET_SEARCH}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        self.assertFalse(self.calls.exists())
+
+    def test_the_shell_is_not_held_to_the_scope_shapes(self):
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["gcloud", "container", "clusters", "list"]})
+        self.assertEqual(200, status, body)
+
+    def test_the_scope_role_has_its_own_slot_bound(self):
+        slots = credential_proxy.SessionSlots(
+            1, role=credential_proxy.CALLER_ROLE_SCOPE,
+            env_name=credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS, bound=credential_proxy.ADMISSION_BOUND_SCOPE,
+        )
+        with slots.acquire(credential_proxy.CALLER_ROLE_SCOPE):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as refused:
+                with slots.acquire(credential_proxy.CALLER_ROLE_SCOPE):
+                    pass
+            self.assertIn("scope", str(refused.exception))
+            self.assertIn(credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS, str(refused.exception))
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_SCOPE, refused.exception.bound)
+            # The session and the shell are not counted against it.
+            with slots.acquire(credential_proxy.CALLER_ROLE_SESSION), slots.acquire(credential_proxy.CALLER_ROLE_SHELL):
+                pass
+        self.assertIn(credential_proxy.ADMISSION_BOUND_SCOPE, credential_proxy.ADMISSION_BOUNDS)
+
+    def test_a_scope_command_at_its_bound_is_answered_busy(self):
+        CredentialProxyHandler.scope_slots = credential_proxy.SessionSlots(
+            0, role=credential_proxy.CALLER_ROLE_SCOPE,
+            env_name=credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS, bound=credential_proxy.ADMISSION_BOUND_SCOPE,
+        )
+        self.addCleanup(setattr, CredentialProxyHandler, "scope_slots", None)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})
+        self.assertEqual(503, status, body)
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
+        self.assertFalse(self.calls.exists())
 
 
 class TeamsRelayTest(unittest.TestCase):

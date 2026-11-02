@@ -93,6 +93,15 @@ type metrics struct {
 	followups      *prometheus.CounterVec
 	injectErrors   *prometheus.CounterVec
 	sessionCreates *prometheus.CounterVec
+	// sessionCreatesSuppressed counts the per-incident creates the
+	// dispatcher did not attempt because the session breaker was open
+	// (sessionBreaker in injector.go). Not a sessionCreates outcome: that
+	// series counts POSTs that were made, by what they got back
+	// (docs/designs/usage-counters-producer.md), and nothing was POSTed.
+	// Each one is an incident whose alert waits for its next sighting after
+	// the cooldown, so the labels name the workload it held, where the
+	// breaker itself, one per process, cannot.
+	sessionCreatesSuppressed *prometheus.CounterVec
 	// triageSessions counts the sessions this process opened whose event the
 	// daemon then delivered: one per injected event in per-incident mode,
 	// incremented after the inject returns delivered and never on the
@@ -185,6 +194,23 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
 		}, []string{"cluster", "project", "location", "outcome"}),
+		// namespace, kind and workload line up with the daemon's own
+		// incident key (workloadOf: a Deployment's pod on its Deployment as
+		// the daemon's _fold_key does, a Deployment, StatefulSet, DaemonSet
+		// or CronJob on its name, everything else empty), so a hold's rows
+		// line up with the incidents it delayed. The only watcher series with
+		// an object name in its labels: a child is minted the first time a
+		// workload is held and, like any counter child, lives until the
+		// process restarts, so the distinct values are the named workloads
+		// that failed during a hold over the process's life, not a snapshot
+		// of the current hold. A name minted per instance is never a value:
+		// a CronJob or Job pod is a new name per run, a Node a new name per
+		// node, and naming either would grow the vector by one child per run
+		// or per node for as long as the process lives.
+		sessionCreatesSuppressed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_session_creates_suppressed_total",
+			Help: "Total per-incident session creates the watcher did not attempt because the daemon had answered POST /sessions with 429 or 5xx three times running and the cooldown breaker was open. No HTTP call was made; the dedup entry is rolled back so the next sighting after the cooldown opens the incident. workload is the Deployment's name for a Deployment's pod, the object's own name for a Deployment, StatefulSet, DaemonSet or CronJob, and empty for everything else (a StatefulSet ordinal, a Job's, CronJob run's, DaemonSet's or bare pod, a Node, a ReplicaSet, a Job), which share one child per namespace and kind.",
+		}, []string{"cluster", "project", "location", "namespace", "kind", "workload"}),
 		triageSessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_triage_sessions_total",
 			Help: "Total triage sessions opened: sessions this watcher created whose event the daemon then delivered (per-incident mode, one per injected event). A session whose inject was filtered, suppressed or failed is not counted.",
@@ -234,6 +260,7 @@ func newMetrics() *metrics {
 		m.followups,
 		m.injectErrors,
 		m.sessionCreates,
+		m.sessionCreatesSuppressed,
 		m.triageSessions,
 		m.activeIncidents,
 		m.clusterDiscoveryErrors,

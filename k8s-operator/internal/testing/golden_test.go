@@ -167,6 +167,19 @@ func TestAgentsGolden(t *testing.T) {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
 			},
 		},
+		{
+			// A shellSandbox.resources override that raises the memory pair.
+			// Diff this against platformagent-tagged.yaml and the whole of what
+			// the field renders is the shell container's requests.memory and
+			// limits.memory on the sandbox StatefulSet, the CPU defaults kept.
+			name:         "PlatformAgentShellSandboxResources",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-sandbox-resources.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-sandbox-resources.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
 	}
 
 	for _, tt := range tests {

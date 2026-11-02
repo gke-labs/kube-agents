@@ -870,6 +870,19 @@ does): against a CRD that predates `spec.deployment.credentialProxy`, the API
 server would prune the value silently while the release record kept it, so the
 chart looks up the installed CRD and fails the upgrade instead.
 
+`platformAgent.harness.experimental.shellSandbox.resources` sizes the shell
+container the same way: forwarded to the CR's
+`spec.harness.experimental.shellSandbox.resources` when any key is set and merged
+over the operator's defaults per key, with the
+[`shellSandbox` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#shellsandbox)
+canonical for the defaults and the refusals. The chart fails the render on the
+same shape faults (a key other than `requests`, `limits` and `claims`, a name
+the container does not declare, a quantity it cannot read) and leaves the
+crossed-pair and zero-limit refusals to the operator; the quota preflight counts
+the override, at the defaults when the operator would refuse it (it then renders
+the shell at them), and the same CRD guard fails the upgrade when the installed CRD
+predates the field.
+
 `platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
 `critical`, `warning`, `info` and `drift`, and each key that is set becomes an
 `ALERT_DAILY_LIMIT_<KEY>` entry in the CR's `spec.deployment.env`. A key that is not set keeps the
@@ -947,6 +960,8 @@ These knobs need context beyond the chart:
   other lands on. It has no default: unset leaves the sandbox on the node's
   standard runtime, and `gvisor` needs the same GKE Sandbox node pool the agent's
   key does.
+- `harness.experimental.shellSandbox.resources` sizes the shell container; see
+  the sizing-override paragraph above.
 - `security.workloadIdentityFederation` needs a Workload Identity pool and
   provider trusting the cluster's OIDC issuer, and one
   `roles/iam.workloadIdentityUser` grant on the agent's GSA. Nothing creates
@@ -1100,8 +1115,12 @@ it. The credential proxy is counted with `platformAgent.deployment.credentialPro
 merged over its footprint entry per key, as the operator renders it, so a raised limit is
 summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
 as a request of that size too, because the operator renders no ephemeral-storage request and
-the API server defaults it to the limit; a `PlatformAgent` edited by hand after the install is
-outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
+the API server defaults it to the limit. The shell sandbox is counted the same way with
+`platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
+ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own; an
+override the operator refuses (a zero limit, a request above its limit) is counted at the defaults
+the operator renders in its place, because the chart does not fail the render on those. A
+`PlatformAgent` edited by hand after the install is outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to

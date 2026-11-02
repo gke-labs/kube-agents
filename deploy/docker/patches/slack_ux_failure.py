@@ -146,11 +146,11 @@ LOWERABLE = re.compile(r"^(?!I(?:'|$))[A-Z](?:[a-z]|$)")
 #: Slack's cap on a message's blocks; a reply already at it keeps its question as text.
 MESSAGE_BLOCKS_MAX = 50
 
-#: Marked threads, ``(chat_id, thread_id) -> (monotonic time, wall time, card id)``.
-_marks: "OrderedDict[tuple[str, str], tuple[float, datetime, str]]" = OrderedDict()
-#: Marks a queued wake carried to its follow-up's reply, ``(chat_id, thread_id) ->
-#: (mark time, when carried)``: taken under any event that arrived before the carry.
-_carried: "OrderedDict[tuple[str, str], tuple[float, datetime]]" = OrderedDict()
+#: Marked threads, ``(platform, chat_id, thread_id) -> (monotonic time, wall time, card id)``.
+_marks: "OrderedDict[tuple[str, str, str], tuple[float, datetime, str]]" = OrderedDict()
+#: Marks a queued wake carried to its follow-up's reply, ``(platform, chat_id, thread_id)
+#: -> (mark time, when carried)``: taken under any event that arrived before the carry.
+_carried: "OrderedDict[tuple[str, str, str], tuple[float, datetime]]" = OrderedDict()
 
 #: The step the final being sent declared, held while its line is kept off the posted text.
 _held: contextvars.ContextVar[str] = contextvars.ContextVar("kage_declared_step", default="")
@@ -167,8 +167,10 @@ def enabled() -> bool:
     return _presenter is not None and _presenter.enabled()
 
 
-def _key(chat_id: Any, thread_id: Any) -> tuple[str, str]:
-    return str(chat_id or ""), str(thread_id or "")
+def _key(platform: Any, chat_id: Any, thread_id: Any) -> tuple[str, str, str]:
+    """A thread's mark key: its platform too, since a Slack channel and a Chat space
+    could share an id, and a mark on one must not draw the other's reply."""
+    return str(platform or "").strip().lower(), str(chat_id or ""), str(thread_id or "")
 
 
 def _wake_note() -> str:
@@ -181,13 +183,15 @@ def _wake_note() -> str:
 
 
 def note_wake(sub: dict, wake_kinds: Iterable[str], text: str) -> None:
-    """Mark ``sub``'s thread when this wake announces a failure on Slack."""
+    """Mark ``sub``'s thread when this wake announces a failure on a platform whose
+    replies are laid out: Slack, or Google Chat under ``spec.mode: next``
+    (``kanban_notifier.chat_ux_on``)."""
     try:
-        if str(sub.get("platform") or "").strip().lower() != SLACK_PLATFORM:
+        if not _chat_ux_on(sub.get("platform")):
             return
-        if not FAILURE_KINDS & set(wake_kinds or ()) or not enabled():
+        if not FAILURE_KINDS & set(wake_kinds or ()):
             return
-        key = _key(sub.get("chat_id"), sub.get("thread_id"))
+        key = _key(sub.get("platform"), sub.get("chat_id"), sub.get("thread_id"))
         card = str(sub.get("task_id") or "")
         if _wake_note() in (text or ""):
             # Only this card's own mark: a sibling's failure wake may still be queued.
@@ -223,7 +227,7 @@ def begin(event: Any) -> Optional[contextvars.Token]:
             return None
         if time.monotonic() - carried[0] > MARK_TTL_SECONDS:
             return None
-        return _marked.set(key[1])
+        return _marked.set(key[2])
     except Exception:
         logger.warning("slack_ux_failure: reading the final's thread failed", exc_info=True)
         return None
@@ -278,11 +282,49 @@ def drop(source: Any, pending_event: Any) -> None:
         logger.warning("slack_ux_failure: dropping the turn's claim failed", exc_info=True)
 
 
-def _slack_key(source: Any) -> Optional[tuple[str, str]]:
+def _slack_key(source: Any) -> Optional[tuple[str, str, str]]:
     platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
-    if str(platform or "").lower() != SLACK_PLATFORM:
+    if str(platform or "").lower() not in _chat_ux_platforms():
         return None
-    return _key(source.chat_id, getattr(source, "thread_id", None))
+    return _key(platform, source.chat_id, getattr(source, "thread_id", None))
+
+
+def _chat_ux_on(platform: Any) -> bool:
+    """Whether ``platform``'s failure replies are laid out: Slack with the flag on, or Google
+    Chat with the flag on where the gateway serves it (``spec.mode: next``, where the A2A
+    gateway lays the reply out; under ``today`` Google Chat takes text). Anything wrong
+    reads as off."""
+    name = str(platform or "").strip().lower()
+    if not enabled():
+        return False
+    if name == SLACK_PLATFORM:
+        return True
+    notifier = _notifier()
+    if notifier is None or name not in notifier.CHAT_UX_PLATFORMS:
+        return False
+    try:
+        return bool(notifier.gateway_serves(name))
+    except Exception:  # noqa: BLE001 - presentation must not fail a delivery
+        logger.debug("slack_ux_failure: reading the gateway's served platforms failed", exc_info=True)
+        return False
+
+
+def _notifier() -> Any:
+    """``gateway.kanban_notifier``, read when a send runs; None on an image without it."""
+    try:
+        try:
+            from gateway import kanban_notifier
+        except ImportError:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+        return kanban_notifier
+    except Exception:  # noqa: BLE001 - presentation must not fail a delivery
+        return None
+
+
+def _chat_ux_platforms() -> tuple:
+    """The platforms whose failure replies are laid out (kanban_notifier.CHAT_UX_PLATFORMS); Slack alone without the module."""
+    notifier = _notifier()
+    return tuple(notifier.CHAT_UX_PLATFORMS) if notifier is not None else (SLACK_PLATFORM,)
 
 
 def _queued_reply(event: Any) -> bool:

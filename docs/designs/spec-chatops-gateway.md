@@ -720,8 +720,8 @@ come out of the grace) is closed by the gateway as its supervisor
 (`failed`, on the `…supervisor` subject, unless a final is already on the stream) and the pod is
 deleted. A pod without room left in its lifetime for a whole task is not handed one, so the
 lifetime and that check never fire together. The pod's bus credential still lapses with its
-connection's grant TTL (an hour less jitter) and is renewed by the client's reconnect, which
-re-reads the pod-bound token. Two ends still have
+connection's grant TTL (an hour less jitter) and is renewed by the reconnect of each of the
+pod's two connections, which re-reads the pod-bound token. Two ends still have
 no terminal to wait for, and the record carries an independent bound for each rather
 than a justification that assumes a terminal that may not come. The `ask` copy is
 cleared by the reap scan once it is `A2A_ASK_TTL` old (24 hours by default,
@@ -1546,7 +1546,8 @@ works and until the parent's own answer has been delivered on that thread, then 
 cursor moved past it, and posted after all if the parent ends blocked, its subscription is gone,
 or the hold passes two hours (then led "Interim result from <card title> …"). One that arrives after
 the parent's answer has posted opens with "Late result from <card title>:". On Slack with
-`KAGE_SLACK_UX` on, a child whose parent still works is not held: its `completed` delivers, and
+`KAGE_SLACK_UX` on, and on Google Chat under `next`, where the gateway lays the plan out, a
+child whose parent still works is not held: its `completed` delivers, and
 `kanban_progress_lines` settles its plan row and posts nothing, as under `today`. Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
 notifier when the route is unavailable (the gateway restarting), and it holds deliveries
 unclaimed then; only a send that meets the outage before the next probe spends one unit of
@@ -1600,8 +1601,8 @@ kubelet refreshes the file in place within about a minute, so a learned channel 
 no pod replaced and no copy to drift, and the `HomeChannelUnset` condition comes from the same read.
 The agent's env carries the CR field only, as any CR edit does. The operator admits a recorded channel
 only under policy `auto`, when the value is a channel id of at most 32 runes and no `slack.refused`
-stands beside it; a hand edit of the record carries the trust of the CR field, and the gateway checks
-neither before a post. The projection joins the stack's teardown list, and a hand edit of it is
+stands beside it; a hand edit of the record carries the trust of the CR field, and the gateway checks a
+file-sourced home before each post (below), never the CR field. The projection joins the stack's teardown list, and a hand edit of it is
 rewritten on the next pass. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
 switch, `A2A_HOME_CHANNEL_LEARN=true`. The gateway keeps no copy of the home
 channel. It reads one file, `/etc/a2a/chat-home/slack_home`: the projection of the home channel the
@@ -1649,8 +1650,8 @@ card filed under `today` in a DM or another channel and delivered after the swit
 refused rather than reported into home; a Slack subscription with no channel is not sent. Slack
 lays out a home-channel request's `chat` message as it lays out a conversation's (the fleet
 audit's report card, `a2a notify --chat-file`): one that breaks a rule, or that Slack refuses,
-is dropped and its `text` posted, and the request's `update` and `mark` are not read. Chat posts
-the `text`. Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
+is dropped and its `text` posted, and the request's `update` and `mark` are not read. Google Chat
+under `next` lays a home-channel `chat` message out the same way ("Chat messages on Google Chat"). Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
 `text` as its notification and fallback (`a2a notify --blocks-file`). A backend without blocks, Chat today, refuses such a request
 rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back as the
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
