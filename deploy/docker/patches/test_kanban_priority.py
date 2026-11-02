@@ -26,6 +26,7 @@ from unittest import mock
 import apply_kanban_priority as applier
 import apply_kanban_scheduling as scheduling
 import apply_kanban_wake_nudge as wake_nudge
+import kanban_aimd
 import kanban_children_settled
 import kanban_priority as kp
 import kanban_progress_lines
@@ -642,6 +643,48 @@ class ReservedSlotTest(unittest.TestCase):
         _, res = b.tick(cap=2)
         self.assertEqual(res.skipped_unassigned, ["orphan"])
         self.assertEqual(res.skipped_reserved, [])
+
+    def test_a_lowered_effective_cap_sizes_the_class_shares(self):
+        """Configured 6, stepped down to 2 by the limiter: background holds one
+        slot, not five, so a user card filed afterwards still starts at once."""
+        b = Board(self)
+        kanban_aimd.save_state(
+            b.conn, configured=6, effective=2, cooldown_until=b.clock + 60, last_event_id=0, now=b.clock,
+        )
+        b.card("bg-run", status="running", session_id=EVENT_SESSION)
+        b.card("bg2", session_id=EVENT_SESSION)
+        spawned, res = b.tick(cap=6)
+        self.assertEqual(spawned, [])
+        self.assertEqual(res.skipped_reserved, ["bg2"])
+        self.assertEqual(res.saturation["limit"], 2)
+        b.card("user", U)
+        spawned, _res = b.tick(cap=6)
+        self.assertEqual(spawned, ["user"])
+
+    def test_the_configured_cap_rules_when_the_limiter_has_no_row(self):
+        b = Board(self)
+        self.assertEqual(kp.effective_cap(b.conn, 6), 6)
+        self.assertIsNone(kp.effective_cap(b.conn, None))
+        kanban_aimd.save_state(b.conn, configured=6, effective=6, cooldown_until=None, last_event_id=0, now=b.clock)
+        self.assertEqual(kp.effective_cap(b.conn, 6), 6)
+        self.assertEqual(kp.effective_cap(b.conn, 4), 4, "a lowered configured cap wins over a stale row")
+
+    def test_a_board_full_under_the_effective_cap_is_full_after_the_loop_too(self):
+        """Running 2 of a configured 6 with the limiter at 2: the ready loop's
+        own pass holds the user card and tells it it is queued, at the
+        effective limit, where the configured value would have read room."""
+        b = Board(self)
+        kanban_aimd.save_state(
+            b.conn, configured=6, effective=2, cooldown_until=b.clock + 60, last_event_id=0, now=b.clock,
+        )
+        b.card("bg-run", status="running", session_id=EVENT_SESSION)
+        b.card("u-run", U, status="running", session_id=GATEWAY_SESSION)
+        b.card("waiting", U)
+        spawned, res = b.tick(cap=6)
+        self.assertEqual(spawned, [])
+        self.assertEqual((res.saturation["running"], res.saturation["limit"]), (2, 2))
+        self.assertEqual(res.queued_noticed, ["waiting"])
+        self.assertEqual(b.queued("waiting")[0]["limit"], 2)
 
     def test_a_broken_share_read_turns_the_reservation_off_not_dispatch(self):
         b = Board(self)

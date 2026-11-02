@@ -50,7 +50,11 @@ What
    background).
 2. **One slot guaranteed to each class** (:class:`ReservedSlot`). At a cap of
    2 or more, each class may hold at most ``max_in_progress - 1`` slots
-   host-wide: background cannot take the user's last slot, and user cards
+   host-wide, where the cap is the one the tick dispatches under: the
+   configured value, or the limiter's effective cap when ``kanban_aimd`` has
+   stepped it down (:func:`effective_cap` reads it back from the limiter's
+   row, which edit 11 writes earlier in the same tick), so the guarantee holds
+   under pressure too. Background cannot take the user's last slot, and user cards
    (including a door's fan-out) cannot take triage's last slot, so alerts are
    never silenced. The slots between go to whoever is first, and user cards
    sort first. The ready loop skips a held row into
@@ -346,6 +350,42 @@ def class_cap(max_in_progress: Optional[int]) -> Optional[int]:
 background_cap = class_cap
 
 
+def _limiter_effective(conn) -> Optional[int]:
+    """The effective cap in the limiter's row, or None before its first tick (or on an older board)."""
+    try:
+        from hermes_cli.kanban_aimd import load_state
+    except ImportError:  # unit tests import the patch modules flat
+        from kanban_aimd import load_state
+    state = load_state(conn)
+    return None if state is None else int(state["effective"])
+
+
+def effective_cap(conn, max_in_progress: Optional[int]) -> Optional[int]:
+    """The cap this tick dispatches under: the configured one, lowered to the limiter's effective cap.
+
+    Edit 11 rebinds ``max_in_progress`` inside ``_tick_spawn_budget`` and
+    writes the effective cap to the limiter's row; edits 9 and 10 run later
+    in the same tick, in ``_dispatch_once_locked``, with the configured
+    value, so this is where they read the effective one back. Without it a
+    cap stepped down to 2 of a configured 6 would size the class shares at 5
+    and let background cards fill both slots, and ``note_waiting`` would read
+    a board full under the lowered cap as having room. No row (no tick yet,
+    an older board) or a failed read is the configured value, as every
+    fallback here is.
+    """
+    if max_in_progress is None:
+        return None
+    try:
+        configured = int(max_in_progress)
+        effective = _limiter_effective(conn)
+    except Exception as exc:  # noqa: BLE001 — never break the dispatch tick
+        logger.warning("kanban priority: reading the effective cap failed; using the configured one: %r", exc)
+        return max_in_progress
+    if effective is None:
+        return configured
+    return min(configured, effective)
+
+
 def _ready_rows(conn) -> list:
     return conn.execute(
         "SELECT id, priority, created_at FROM tasks "
@@ -373,8 +413,8 @@ class ReservedSlot:
     def __init__(self, conn, max_in_progress: Optional[int], board: Optional[str]) -> None:
         self.conn = conn
         self.board = board
-        self.max_in_progress = max_in_progress
-        self.cap = class_cap(max_in_progress)
+        self.max_in_progress = effective_cap(conn, max_in_progress)
+        self.cap = class_cap(self.max_in_progress)
         self.background_running = 0
         self.user_running = 0
         self.priorities: dict = {}
@@ -568,6 +608,7 @@ def note_waiting(
     having nothing left, not as stuck.
     """
     try:
+        max_in_progress = effective_cap(conn, max_in_progress)
         rows = _ready_rows(conn)
         skipped = _skipped_ids(result)
         waiting = [
@@ -596,9 +637,8 @@ def note_waiting(
         result.saturation["reserved_background"] = reserved - len(held_user)
         if dry_run:
             return
-        # The record's own limit, not the parameter: under the adaptive cap
-        # (kanban_aimd, edit 11) the tick recorded the effective one, and the
-        # configured value here would read a full board as having room.
+        # The record's own limit: edit 8 recorded the effective cap, and
+        # judging by it keeps the notice and the record in step.
         full = int(result.saturation["running"]) >= int(result.saturation["limit"])
         candidates = user_waiting if full else held_user
         owed = [
