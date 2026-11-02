@@ -567,3 +567,92 @@ class BitbucketDataCenterForge(Forge):
             for node in reversed(nodes)
         ]
         return listing(commits[(page - 1) * limit : page * limit], limit, "commits")
+
+    # -- the readings sweep's calls -------------------------------------------
+
+    @staticmethod
+    def _authored_params(author: str, state: str) -> dict[str, Any]:
+        """The query for the proposals `author` opened, in `state`.
+
+        Filtered by the instance on the participant role. `order=NEWEST`
+        is newest activity first (verify live).
+        """
+        return {"state": state, "order": "NEWEST", "role.1": "AUTHOR", "username.1": author}
+
+    def proposal_list_by_author(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        author = _reading_author(payload.get("author"))
+        limit = validate_limit(payload.get("limit"))
+        page = validate_page(payload.get("page"))
+        nodes, more = self._pages(
+            api,
+            f"{self._repo(repo)}/pull-requests",
+            self._authored_params(author, "ALL"),
+            limit,
+            start=(page - 1) * limit,
+        )
+        proposals = [translate.authored(node) for node in nodes]
+        # The instance pages by position and gives no count of the query.
+        return {"proposals": proposals, "count": len(proposals), "truncated": more, "total": None}
+
+    def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # The instance gives no count of a query, so each state is counted by
+        # reading it, up to `MAX_CONVERSATION_SIZE` rows. A state past that is
+        # refused rather than counted short.
+        author = _reading_author(payload.get("author"))
+        tally: dict[str, Any] = {}
+        for neutral, state in TALLY_STATES.items():
+            rows, more = self._pages(
+                api,
+                f"{self._repo(repo)}/pull-requests",
+                self._authored_params(author, state),
+                MAX_CONVERSATION_SIZE,
+            )
+            if more:
+                raise WorkspaceError(
+                    f"Bitbucket Data Center holds more than {MAX_CONVERSATION_SIZE} {neutral} pull "
+                    "requests by this author, and gives no count of them",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
+                )
+            tally[neutral] = len(rows)
+        return tally
+
+    def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # An approval and a "needs work" are rows of the activity stream,
+        # beside the comments, which the conversation reader has.
+        number = validate_number(payload.get("number"))
+        limit = validate_comment_limit(payload.get("limit"))
+        rows, more = self._pages(
+            api, f"{self._repo(repo)}/pull-requests/{number}/activities", {}, MAX_CONVERSATION_SIZE
+        )
+        found = [review for review in (translate.review(row) for row in rows) if review]
+        return {
+            "reviews": found[:limit],
+            "count": len(found[:limit]),
+            "truncated": more or len(found) > limit,
+        }
+
+    def proposal_closer(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # The activity stream is newest first, so its first decline is the
+        # last one.
+        number = validate_number(payload.get("number"))
+        rows, _ = self._pages(
+            api, f"{self._repo(repo)}/pull-requests/{number}/activities", {}, MAX_CONVERSATION_SIZE
+        )
+        declines = [row for row in rows if str(row.get("action") or "") == translate.DECLINED]
+        return translate.closer(declines[0] if declines else None)
+
+
+#: The Bitbucket state each neutral count of `proposal_tally` reads.
+TALLY_STATES = {"open": "OPEN", "merged": "MERGED", "closed": "DECLINED"}
+
+#: A username a reading may ask about. It is a query parameter, not part of a
+#: query language, but it is held to one name with no space, colon or
+#: separator, as every forge holds its author.
+_READING_AUTHOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}")
+
+
+def _reading_author(value: Any) -> str:
+    if not isinstance(value, str) or not _READING_AUTHOR_RE.fullmatch(value.strip()):
+        raise WorkspaceError("author is not an acceptable account name")
+    return value.strip()

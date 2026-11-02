@@ -156,12 +156,74 @@ def _author_name(node: dict[str, Any]) -> str:
     return raw.split("<", 1)[0].strip() or raw
 
 
+def _author_email(node: dict[str, Any]) -> str:
+    """The git author email, from the `Name <email>` line."""
+    author = node.get("author") if isinstance(node.get("author"), dict) else {}
+    raw = str(author.get("raw") or "")
+    if "<" not in raw or not raw.rstrip().endswith(">"):
+        return ""
+    return raw.rsplit("<", 1)[1].rstrip().rstrip(">").strip()
+
+
 def commit(node: dict[str, Any]) -> dict[str, Any]:
-    """One commit. Bitbucket Cloud gives one date, the author's."""
+    """One commit. Bitbucket Cloud gives one date, the author's.
+
+    `email` is the git author email and `bot` whether the linked account is an
+    access token's bot user; False when no account is linked, as for the
+    install's own commits, whose address Bitbucket links to nobody.
+    """
+    author = node.get("author") if isinstance(node.get("author"), dict) else {}
     return {
         "sha": node.get("hash") or "",
         "author": _author_name(node),
+        "email": _author_email(node),
+        "bot": is_automation(author.get("user") if isinstance(author.get("user"), dict) else None),
         "committed": node.get("date") or "",
         "message": node.get("message") or "",
         "url": _href(node),
     }
+
+
+def authored(node: dict[str, Any]) -> dict[str, Any]:
+    """A pull request as one of an author's proposals."""
+    item = proposal(node)
+    return {
+        "number": item["number"],
+        "state": item["state"],
+        "author": item["author"],
+        "authorBot": is_automation(node.get("author")),
+        "created": item["created"],
+        "updated": item["updated"],
+        "closed": item["closed"],
+    }
+
+
+#: The activity rows that are reviews, as the neutral review state.
+REVIEW_ROWS = {"approval": "approved", "changes_requested": "changes_requested"}
+
+
+def review(row: dict[str, Any]) -> dict[str, Any] | None:
+    """An approval or a request for changes in the activity stream; None otherwise.
+
+    An activity row has no id of its own, so the review's id is the kind, the
+    account and the time, which is unique for one pull request.
+    """
+    for key, state in REVIEW_ROWS.items():
+        node = row.get(key)
+        if isinstance(node, dict):
+            who = node.get("user") if isinstance(node.get("user"), dict) else None
+            when = str(node.get("date") or "")
+            return {
+                "id": f"{key}:{actor(who)}:{when}",
+                "state": state,
+                "author": actor(who),
+                "bot": is_automation(who),
+                "created": when,
+            }
+    return None
+
+
+def closer(node: dict[str, Any]) -> dict[str, Any]:
+    """Who closed a pull request: its `closed_by`; "" when Bitbucket does not say."""
+    who = node.get("closed_by") if isinstance(node.get("closed_by"), dict) else None
+    return {"actor": actor(who), "bot": is_automation(who)}

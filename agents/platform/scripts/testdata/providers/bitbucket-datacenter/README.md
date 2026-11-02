@@ -15,4 +15,5 @@ Fields not yet checked against a live response:
 - where an activity carries the anchor of a comment on a line (`comment.anchor` or `commentAnchor`);
 - `closedDate` on a merged or declined pull request;
 - the `SERVICE` user type of the account a project or repository token acts as;
-- the `draft` field (Data Center 8.18 and later).
+- the `draft` field (Data Center 8.18 and later);
+- the readings: `role.1=AUTHOR` with `username.1`, the order `NEWEST`, the `APPROVED` and `REVIEWED` actions of `activities`, and the `DECLINED` action that names who declined.

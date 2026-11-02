@@ -1,0 +1,156 @@
+{
+  "payload": {
+    "author": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}"
+  },
+  "responses": [
+    {
+      "size": 2,
+      "page": 1,
+      "pagelen": 1,
+      "values": [
+        {
+          "type": "pullrequest",
+          "id": 8,
+          "title": "ingest: change 8",
+          "state": "OPEN",
+          "author": {
+            "type": "user",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "display_name": "kube-agents install"
+          },
+          "created_on": "2026-10-02T09:00:00.000000+00:00",
+          "updated_on": "2026-10-08T12:00:00.000000+00:00",
+          "source": {
+            "branch": {
+              "name": "platform-agent/change-8"
+            },
+            "commit": {
+              "hash": "4e7a1c9b2d30"
+            },
+            "repository": {
+              "full_name": "acme/infra"
+            }
+          },
+          "destination": {
+            "branch": {
+              "name": "main"
+            },
+            "commit": {
+              "hash": "9a8b7c6d5e4f"
+            },
+            "repository": {
+              "full_name": "acme/infra"
+            }
+          },
+          "links": {
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/pull-requests/8"
+            }
+          },
+          "description": "body text"
+        }
+      ]
+    },
+    {
+      "size": 5,
+      "page": 1,
+      "pagelen": 1,
+      "values": [
+        {
+          "type": "pullrequest",
+          "id": 6,
+          "title": "ingest: change 6",
+          "state": "MERGED",
+          "author": {
+            "type": "user",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "display_name": "kube-agents install"
+          },
+          "created_on": "2026-10-02T09:00:00.000000+00:00",
+          "updated_on": "2026-10-06T12:00:00.000000+00:00",
+          "source": {
+            "branch": {
+              "name": "platform-agent/change-6"
+            },
+            "commit": {
+              "hash": "4e7a1c9b2d30"
+            },
+            "repository": {
+              "full_name": "acme/infra"
+            }
+          },
+          "destination": {
+            "branch": {
+              "name": "main"
+            },
+            "commit": {
+              "hash": "9a8b7c6d5e4f"
+            },
+            "repository": {
+              "full_name": "acme/infra"
+            }
+          },
+          "links": {
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/pull-requests/6"
+            }
+          },
+          "description": "body text"
+        }
+      ]
+    },
+    {
+      "size": 1,
+      "page": 1,
+      "pagelen": 1,
+      "values": [
+        {
+          "type": "pullrequest",
+          "id": 3,
+          "title": "ingest: change 3",
+          "state": "DECLINED",
+          "author": {
+            "type": "user",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "display_name": "kube-agents install"
+          },
+          "created_on": "2026-10-02T09:00:00.000000+00:00",
+          "updated_on": "2026-10-03T12:00:00.000000+00:00",
+          "source": {
+            "branch": {
+              "name": "platform-agent/change-3"
+            },
+            "commit": {
+              "hash": "4e7a1c9b2d30"
+            },
+            "repository": {
+              "full_name": "acme/infra"
+            }
+          },
+          "destination": {
+            "branch": {
+              "name": "main"
+            },
+            "commit": {
+              "hash": "9a8b7c6d5e4f"
+            },
+            "repository": {
+              "full_name": "acme/infra"
+            }
+          },
+          "links": {
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/pull-requests/3"
+            }
+          },
+          "description": "body text",
+          "closed_by": {
+            "type": "user",
+            "uuid": "example-maintainer",
+            "display_name": "Example Maintainer"
+          }
+        }
+      ]
+    }
+  ]
+}

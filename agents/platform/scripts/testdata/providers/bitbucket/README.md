@@ -17,3 +17,4 @@ Fields not yet checked against a live response:
 - the order of `pullrequests/{id}/commits` (newest first is assumed);
 - the 12-character `source.commit.hash` of a pull request;
 - the page size of 50 for pull requests.
+- the readings: `size` on an author-filtered page of pull requests, the `approval` and `changes_requested` rows of `pullrequests/{id}/activity`, and `closed_by` on a declined pull request.

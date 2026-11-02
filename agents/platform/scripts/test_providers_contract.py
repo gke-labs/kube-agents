@@ -130,6 +130,8 @@ REVIEW_STATES = frozenset({"approved", "changes_requested", "commented", "dismis
 # What every recording of `proposal-list-by-author` and `proposal-tally` says
 # the forge counted, and who closed the proposal in `proposal-closer`.
 RECORDED_TOTAL = 8
+# Forges whose listing gives no count of the query, so `total` is None.
+FORGES_WITHOUT_A_COUNT = frozenset({"bitbucket-datacenter"})
 RECORDED_TALLY = {"open": 2, "merged": 5, "closed": 1}
 RECORDED_CLOSER = {"actor": "example-maintainer", "bot": False}
 # The address the broker stamps the install's proxied commits with. No forge
@@ -643,7 +645,11 @@ class ContractTest(unittest.TestCase):
                 self.assertEqual(set(answer), {"proposals", "count", "truncated", "total"})
                 self.assertEqual(answer["count"], len(answer["proposals"]))
                 self.assertIsInstance(answer["truncated"], bool)
-                self.assertEqual(RECORDED_TOTAL, answer["total"])
+                if name in FORGES_WITHOUT_A_COUNT:
+                    # The forge pages by position and counts no query.
+                    self.assertIsNone(answer["total"])
+                else:
+                    self.assertEqual(RECORDED_TOTAL, answer["total"])
                 self.assertTrue(answer["proposals"])
                 for item in answer["proposals"]:
                     self.assertEqual(set(item), AUTHORED_SHAPE)

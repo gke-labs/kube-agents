@@ -93,6 +93,22 @@
               }
             }
           }
+        },
+        {
+          "type": "commit",
+          "hash": "5b6c7d8e9f00112233445566778899aabbccddee",
+          "date": "2026-10-20T13:00:00+00:00",
+          "message": "ingest: read the floor from values\n",
+          "author": {
+            "type": "author",
+            "raw": "platform-agent <platform-agent@kube-agents.invalid>"
+          },
+          "parents": [],
+          "links": {
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/commits/5b6c7d8e9f00112233445566778899aabbccddee"
+            }
+          }
         }
       ]
     }

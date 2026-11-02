@@ -1,0 +1,51 @@
+{
+  "payload": {
+    "number": 3
+  },
+  "responses": [
+    {
+      "size": 3,
+      "limit": 100,
+      "isLastPage": true,
+      "start": 0,
+      "values": [
+        {
+          "id": 6002,
+          "createdDate": 1791300000000,
+          "user": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "displayName": "Example Maintainer",
+            "type": "NORMAL",
+            "slug": "example-maintainer"
+          },
+          "action": "DECLINED"
+        },
+        {
+          "id": 6001,
+          "createdDate": 1791100000000,
+          "user": {
+            "name": "svc-kube-agents",
+            "emailAddress": "kube-agents@acme.example",
+            "displayName": "kube-agents",
+            "type": "SERVICE",
+            "slug": "svc-kube-agents"
+          },
+          "action": "RESCOPED"
+        },
+        {
+          "id": 6000,
+          "createdDate": 1791000000000,
+          "user": {
+            "name": "svc-kube-agents",
+            "emailAddress": "kube-agents@acme.example",
+            "displayName": "kube-agents",
+            "type": "SERVICE",
+            "slug": "svc-kube-agents"
+          },
+          "action": "OPENED"
+        }
+      ]
+    }
+  ]
+}

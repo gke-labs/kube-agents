@@ -79,6 +79,16 @@ PROPOSAL_PAGE = 50
 #: The most rows one page of comments or commits holds.
 PAGE = 100
 
+#: The most rows asked for in one page of a pull request's activity.
+ACTIVITY_PAGE = 50
+
+#: The Bitbucket states each neutral count of `proposal_tally` asks for.
+TALLY_STATES = {
+    "open": ("OPEN",),
+    "merged": ("MERGED",),
+    "closed": ("DECLINED", "SUPERSEDED"),
+}
+
 #: A commit hash as Bitbucket writes one: 7 to 40 hexadecimal characters.
 _HASH_RE = re.compile(r"[0-9a-f]{7,40}")
 
@@ -591,6 +601,93 @@ class BitbucketCloudForge(Forge):
         commits = [translate.commit(node) for node in reversed(nodes)]
         return listing(commits[(page - 1) * limit : page * limit], limit, "commits")
 
+    # -- the readings sweep's calls -------------------------------------------
+
+    def _authored_page(
+        self, api: Callable, repo: str, author: str, states: tuple[str, ...], pagelen: int, page: int
+    ) -> dict[str, Any]:
+        """One of Bitbucket's own pages of the proposals `author` opened.
+
+        Filtered by the forge with BBQL on the author's `uuid`, newest
+        activity first. `size` is Bitbucket's count of every row the query
+        matches.
+        """
+        params: dict[str, Any] = {
+            "q": f'author.uuid="{author}"',
+            "state": list(states),
+            "sort": "-updated_on",
+            "pagelen": pagelen,
+        }
+        if page > 1:
+            params["page"] = page
+        return api("GET", f"{self._repo(repo)}/pullrequests", params=params) or {}
+
+    def proposal_list_by_author(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        author = _reading_author(payload.get("author"))
+        limit = validate_limit(payload.get("limit"))
+        page = validate_page(payload.get("page"))
+        # A window of `limit` rows from Bitbucket's pages of at most
+        # `PROPOSAL_PAGE`, as `_window` reads one, with the count of the
+        # first page kept.
+        start = (page - 1) * limit
+        first = start // PROPOSAL_PAGE + 1
+        offset = start % PROPOSAL_PAGE
+        answer = self._authored_page(
+            api, repo, author, translate.NEUTRAL_STATES["all"], PROPOSAL_PAGE, first
+        )
+        size = answer.get("size")
+        total = size if isinstance(size, int) and not isinstance(size, bool) else None
+        rows: list[dict] = []
+        while True:
+            rows += [row for row in (answer.get("values") or []) if isinstance(row, dict)]
+            following = str(answer.get("next") or "")
+            if len(rows) >= offset + limit or not following:
+                break
+            answer = api("GET", self._relative(following)) or {}
+        window = rows[offset : offset + limit]
+        proposals = [translate.authored(node) for node in window]
+        more = len(rows) > offset + limit or bool(following)
+        return {"proposals": proposals, "count": len(proposals), "truncated": more, "total": total}
+
+    def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # One row a state is enough: the count is the page's `size`.
+        author = _reading_author(payload.get("author"))
+        tally: dict[str, Any] = {}
+        for neutral, states in TALLY_STATES.items():
+            size = self._authored_page(api, repo, author, states, 1, 1).get("size")
+            if isinstance(size, bool) or not isinstance(size, int):
+                raise WorkspaceError(
+                    f"Bitbucket Cloud answered the {neutral} pull requests with no `size` count",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
+                )
+            tally[neutral] = size
+        return tally
+
+    def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # Bitbucket Cloud has no reviews: an approval and a request for
+        # changes are rows of the activity stream, beside the comments, which
+        # the conversation reader has.
+        number = validate_number(payload.get("number"))
+        limit = validate_comment_limit(payload.get("limit"))
+        rows, more = self._pages(
+            api,
+            f"{self._repo(repo)}/pullrequests/{number}/activity",
+            {"pagelen": ACTIVITY_PAGE},
+            MAX_CONVERSATION_SIZE,
+        )
+        found = [review for review in (translate.review(row) for row in rows) if review]
+        return {
+            "reviews": found[:limit],
+            "count": len(found[:limit]),
+            "truncated": more or len(found) > limit,
+        }
+
+    def proposal_closer(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        node = api("GET", f"{self._repo(repo)}/pullrequests/{number}") or {}
+        return translate.closer(node)
+
 
 #: An account UUID, with or without the braces Bitbucket Cloud writes it in.
 _UUID_RE = re.compile(r"\{?([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})\}?")
@@ -614,6 +711,21 @@ def _account_uuid(identity: str) -> str:
             f"the bitbucket forge's identity {trimmed!r} is not an account UUID; write the "
             "UUID of the account that the token acts as, such as {0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}"
         )
+    return "{" + match.group(1).lower() + "}"
+
+
+def _reading_author(value: Any) -> str:
+    """The author a reading asks about, as Bitbucket writes it: `{uuid}`.
+
+    The value goes inside a BBQL string, so it is held to an account UUID,
+    which carries no quote and no operator.
+    """
+    if not isinstance(value, str):
+        raise WorkspaceError("author is not an account UUID")
+    trimmed = value.strip()
+    match = _UUID_RE.fullmatch(trimmed)
+    if not match or (trimmed.startswith("{") != trimmed.endswith("}")):
+        raise WorkspaceError("author is not an account UUID")
     return "{" + match.group(1).lower() + "}"
 
 

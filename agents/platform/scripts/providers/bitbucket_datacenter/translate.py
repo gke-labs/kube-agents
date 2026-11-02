@@ -174,12 +174,62 @@ def activity_comments(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def commit(node: dict[str, Any], url: str = "") -> dict[str, Any]:
-    """One commit. The committer time, for the reason GitHub's translation gives."""
+    """One commit. The committer time, for the reason GitHub's translation gives.
+
+    `email` is the git author email and `bot` whether the linked account is a
+    service account; False when no account is linked, as for the install's own
+    commits.
+    """
     author = node.get("author") if isinstance(node.get("author"), dict) else {}
     return {
         "sha": node.get("id") or "",
         "author": str(author.get("displayName") or author.get("name") or ""),
+        "email": str(author.get("emailAddress") or ""),
+        "bot": is_automation(author),
         "committed": instant(node.get("committerTimestamp") or node.get("authorTimestamp")),
         "message": node.get("message") or "",
         "url": url,
     }
+
+
+#: The activity action of a decline.
+DECLINED = "DECLINED"
+
+#: The activity actions that are reviews, as the neutral review state.
+#: `REVIEWED` is a reviewer setting "needs work".
+REVIEW_ACTIONS = {"APPROVED": "approved", "REVIEWED": "changes_requested"}
+
+
+def authored(node: dict[str, Any]) -> dict[str, Any]:
+    """A pull request as one of an author's proposals."""
+    item = proposal(node)
+    return {
+        "number": item["number"],
+        "state": item["state"],
+        "author": item["author"],
+        "authorBot": is_automation(node.get("author") if isinstance(node.get("author"), dict) else None),
+        "created": item["created"],
+        "updated": item["updated"],
+        "closed": item["closed"],
+    }
+
+
+def review(row: dict[str, Any]) -> dict[str, Any] | None:
+    """An approval or a "needs work" in the activity stream; None otherwise."""
+    state = REVIEW_ACTIONS.get(str(row.get("action") or ""))
+    if state is None:
+        return None
+    who = row.get("user") if isinstance(row.get("user"), dict) else None
+    return {
+        "id": row.get("id"),
+        "state": state,
+        "author": actor(who),
+        "bot": is_automation(who),
+        "created": instant(row.get("createdDate")),
+    }
+
+
+def closer(row: dict[str, Any] | None) -> dict[str, Any]:
+    """Who made an activity; "" when nobody."""
+    who = (row or {}).get("user") if isinstance((row or {}).get("user"), dict) else None
+    return {"actor": actor(who), "bot": is_automation(who)}

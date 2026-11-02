@@ -4,7 +4,7 @@
   },
   "responses": [
     {
-      "size": 2,
+      "size": 3,
       "limit": 100,
       "isLastPage": true,
       "start": 0,
@@ -52,6 +52,22 @@
               "displayId": "9a8b7c6d5e4"
             }
           ]
+        },
+        {
+          "id": "5b6c7d8e9f00112233445566778899aabbccddee",
+          "displayId": "5b6c7d8e9f0",
+          "author": {
+            "name": "platform-agent",
+            "emailAddress": "platform-agent@kube-agents.invalid"
+          },
+          "authorTimestamp": 1792500000000,
+          "committer": {
+            "name": "platform-agent",
+            "emailAddress": "platform-agent@kube-agents.invalid"
+          },
+          "committerTimestamp": 1792500000000,
+          "message": "ingest: read the floor from values",
+          "parents": []
         }
       ]
     }

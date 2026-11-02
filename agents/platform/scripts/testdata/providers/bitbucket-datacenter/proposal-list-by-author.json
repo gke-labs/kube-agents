@@ -1,0 +1,174 @@
+{
+  "payload": {
+    "author": "svc-kube-agents",
+    "limit": 10
+  },
+  "responses": [
+    {
+      "size": 3,
+      "limit": 100,
+      "isLastPage": true,
+      "start": 0,
+      "values": [
+        {
+          "id": 8,
+          "version": 1,
+          "title": "ingest: change 8",
+          "description": "body text",
+          "state": "OPEN",
+          "open": true,
+          "closed": false,
+          "createdDate": 1791000000000,
+          "updatedDate": 1791800000000,
+          "fromRef": {
+            "id": "refs/heads/platform-agent/change-8",
+            "displayId": "platform-agent/change-8",
+            "latestCommit": "4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f",
+            "repository": {
+              "slug": "infra",
+              "project": {
+                "key": "ACME"
+              }
+            }
+          },
+          "toRef": {
+            "id": "refs/heads/main",
+            "displayId": "main",
+            "latestCommit": "9a8b7c6d5e4f00112233445566778899aabbccdd",
+            "repository": {
+              "slug": "infra",
+              "project": {
+                "key": "ACME"
+              }
+            }
+          },
+          "author": {
+            "user": {
+              "name": "svc-kube-agents",
+              "emailAddress": "kube-agents@acme.example",
+              "displayName": "kube-agents",
+              "type": "SERVICE",
+              "slug": "svc-kube-agents"
+            },
+            "role": "AUTHOR",
+            "approved": false,
+            "status": "UNAPPROVED"
+          },
+          "links": {
+            "self": [
+              {
+                "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/pull-requests/8"
+              }
+            ]
+          }
+        },
+        {
+          "id": 6,
+          "version": 1,
+          "title": "ingest: change 6",
+          "description": "body text",
+          "state": "MERGED",
+          "open": false,
+          "closed": true,
+          "createdDate": 1791000000000,
+          "updatedDate": 1791600000000,
+          "fromRef": {
+            "id": "refs/heads/platform-agent/change-6",
+            "displayId": "platform-agent/change-6",
+            "latestCommit": "4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f",
+            "repository": {
+              "slug": "infra",
+              "project": {
+                "key": "ACME"
+              }
+            }
+          },
+          "toRef": {
+            "id": "refs/heads/main",
+            "displayId": "main",
+            "latestCommit": "9a8b7c6d5e4f00112233445566778899aabbccdd",
+            "repository": {
+              "slug": "infra",
+              "project": {
+                "key": "ACME"
+              }
+            }
+          },
+          "author": {
+            "user": {
+              "name": "svc-kube-agents",
+              "emailAddress": "kube-agents@acme.example",
+              "displayName": "kube-agents",
+              "type": "SERVICE",
+              "slug": "svc-kube-agents"
+            },
+            "role": "AUTHOR",
+            "approved": false,
+            "status": "UNAPPROVED"
+          },
+          "links": {
+            "self": [
+              {
+                "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/pull-requests/6"
+              }
+            ]
+          },
+          "closedDate": 1791600000000
+        },
+        {
+          "id": 3,
+          "version": 1,
+          "title": "ingest: change 3",
+          "description": "body text",
+          "state": "DECLINED",
+          "open": false,
+          "closed": true,
+          "createdDate": 1791000000000,
+          "updatedDate": 1791300000000,
+          "fromRef": {
+            "id": "refs/heads/platform-agent/change-3",
+            "displayId": "platform-agent/change-3",
+            "latestCommit": "4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f",
+            "repository": {
+              "slug": "infra",
+              "project": {
+                "key": "ACME"
+              }
+            }
+          },
+          "toRef": {
+            "id": "refs/heads/main",
+            "displayId": "main",
+            "latestCommit": "9a8b7c6d5e4f00112233445566778899aabbccdd",
+            "repository": {
+              "slug": "infra",
+              "project": {
+                "key": "ACME"
+              }
+            }
+          },
+          "author": {
+            "user": {
+              "name": "svc-kube-agents",
+              "emailAddress": "kube-agents@acme.example",
+              "displayName": "kube-agents",
+              "type": "SERVICE",
+              "slug": "svc-kube-agents"
+            },
+            "role": "AUTHOR",
+            "approved": false,
+            "status": "UNAPPROVED"
+          },
+          "links": {
+            "self": [
+              {
+                "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/pull-requests/3"
+              }
+            ]
+          },
+          "closedDate": 1791300000000
+        }
+      ]
+    }
+  ]
+}

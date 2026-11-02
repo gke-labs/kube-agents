@@ -1,0 +1,77 @@
+{
+  "payload": {
+    "number": 6
+  },
+  "responses": [
+    {
+      "size": 4,
+      "limit": 100,
+      "isLastPage": true,
+      "start": 0,
+      "values": [
+        {
+          "id": 7003,
+          "createdDate": 1791590000000,
+          "user": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "displayName": "Example Maintainer",
+            "type": "NORMAL",
+            "slug": "example-maintainer"
+          },
+          "action": "APPROVED"
+        },
+        {
+          "id": 7002,
+          "createdDate": 1791580000000,
+          "user": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "displayName": "Example Maintainer",
+            "type": "NORMAL",
+            "slug": "example-maintainer"
+          },
+          "action": "COMMENTED",
+          "commentAction": "ADDED",
+          "comment": {
+            "id": 901,
+            "text": "Looks right.",
+            "author": {
+              "name": "example-maintainer",
+              "emailAddress": "maintainer@acme.example",
+              "displayName": "Example Maintainer",
+              "type": "NORMAL",
+              "slug": "example-maintainer"
+            },
+            "createdDate": 1791580000000,
+            "comments": []
+          }
+        },
+        {
+          "id": 7001,
+          "createdDate": 1791500000000,
+          "user": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "displayName": "Example Maintainer",
+            "type": "NORMAL",
+            "slug": "example-maintainer"
+          },
+          "action": "REVIEWED"
+        },
+        {
+          "id": 7000,
+          "createdDate": 1791000000000,
+          "user": {
+            "name": "svc-kube-agents",
+            "emailAddress": "kube-agents@acme.example",
+            "displayName": "kube-agents",
+            "type": "SERVICE",
+            "slug": "svc-kube-agents"
+          },
+          "action": "OPENED"
+        }
+      ]
+    }
+  ]
+}

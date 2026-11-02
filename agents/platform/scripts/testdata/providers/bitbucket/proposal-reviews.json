@@ -1,0 +1,73 @@
+{
+  "payload": {
+    "number": 6
+  },
+  "responses": [
+    {
+      "pagelen": 50,
+      "values": [
+        {
+          "approval": {
+            "date": "2026-10-06T11:00:00.000000+00:00",
+            "user": {
+              "type": "user",
+              "uuid": "example-maintainer",
+              "display_name": "Example Maintainer"
+            }
+          },
+          "pull_request": {
+            "type": "pullrequest",
+            "id": 6
+          }
+        },
+        {
+          "comment": {
+            "id": 901,
+            "content": {
+              "raw": "Looks right."
+            },
+            "user": {
+              "type": "user",
+              "uuid": "example-maintainer",
+              "display_name": "Example Maintainer"
+            },
+            "created_on": "2026-10-06T10:30:00.000000+00:00"
+          },
+          "pull_request": {
+            "type": "pullrequest",
+            "id": 6
+          }
+        },
+        {
+          "changes_requested": {
+            "date": "2026-10-05T09:00:00.000000+00:00",
+            "user": {
+              "type": "user",
+              "uuid": "example-maintainer",
+              "display_name": "Example Maintainer"
+            }
+          },
+          "pull_request": {
+            "type": "pullrequest",
+            "id": 6
+          }
+        },
+        {
+          "update": {
+            "state": "OPEN",
+            "date": "2026-10-02T09:00:00.000000+00:00",
+            "author": {
+              "type": "user",
+              "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+              "display_name": "kube-agents install"
+            }
+          },
+          "pull_request": {
+            "type": "pullrequest",
+            "id": 6
+          }
+        }
+      ]
+    }
+  ]
+}
