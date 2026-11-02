@@ -358,13 +358,33 @@ class PrincipalTest(unittest.TestCase):
 
 
 def _find_output(*rows):
-    """`FIND_FORMAT` output for (name, mtime, size, type) rows."""
+    """`FIND_FORMAT` or `TREE_FIND_FORMAT` output for (name-or-path, mtime, size, type) rows."""
     return "".join(f"{n}\t{m}\t{sz}\t{k}\0" for n, m, sz, k in rows)
+
+
+def _find_supports_printf():
+    """Whether the local find is GNU-compatible enough to run the shipped argv (CI's is)."""
+    binary = shutil.which("find")
+    if not binary:
+        return False
+    try:
+        probe = subprocess.run([binary, "/", "-maxdepth", "0", "-printf", "%P%y"], capture_output=True, text=True)
+    except OSError:
+        return False
+    return probe.returncode == 0
+
+
+def _local_sandbox(argv, **kwargs):
+    """`sandbox_exec.run` that runs the shipped find and rm argv on this machine's tree."""
+    binary = shutil.which("find") if argv[0] == gc.REMOTE_FIND else shutil.which("rm")
+    return subprocess.run([binary, *argv[1:]], capture_output=True, text=True, errors=kwargs.get("errors"))
 
 
 class FakeSandbox:
     """`sandbox_exec.run` over a dict of directory -> listing rows.
 
+    A tree listing (`-maxdepth 2`) is composed from the dict: the root's rows,
+    then `<home>/<entry>` for every directory row the dict has a listing for.
     Answers the `-P` type check with ``d`` per path unless *linked* names one,
     and records an ``rm`` without removing anything from the tree.
     """
@@ -388,7 +408,15 @@ class FakeSandbox:
             raise self.fail[path]
         if path not in self.tree:
             return subprocess.CompletedProcess(argv, 1, "", f"find: '{path}': No such file or directory")
-        return subprocess.CompletedProcess(argv, 0, _find_output(*self.tree[path]), "")
+        mindepth = int(argv[argv.index("-mindepth") + 1])
+        maxdepth = int(argv[argv.index("-maxdepth") + 1])
+        rows = []
+        for name, mtime, size, kind in self.tree[path]:
+            if mindepth <= 1:
+                rows.append((name, mtime, size, kind))
+            if maxdepth >= 2 and kind == "d":
+                rows.extend((f"{name}/{sub[0]}", *sub[1:]) for sub in self.tree.get(f"{path}/{name}", []))
+        return subprocess.CompletedProcess(argv, 0, _find_output(*rows), "")
 
 
 class _HomeFixture(unittest.TestCase):
@@ -438,11 +466,13 @@ class HomeInventoryTest(_HomeFixture):
         self.assertEqual(inv.problems, [])
 
     def test_lists_in_the_sandbox_root_read_only_as_the_default_principal(self):
+        # One find for the root and every home's entries, not one per home.
         fake = FakeSandbox(self.tree)
         self.run_inventory(fake)
         listed = [argv[1] for argv, _ in fake.calls]
         rp = self.remote / "profiles"
-        self.assertEqual(listed, [str(rp), str(rp / "cluster-a"), str(rp / "platform")])
+        self.assertEqual(listed, [str(rp)])
+        self.assertEqual(fake.calls[0][0][2:6], ["-mindepth", "1", "-maxdepth", str(gc.HOME_ENTRIES_DEPTH)])
         for argv, kwargs in fake.calls:
             self.assertEqual(argv[0], gc.REMOTE_FIND)
             self.assertNotIn("principal", kwargs)
@@ -532,14 +562,29 @@ class HomeInventoryTest(_HomeFixture):
         roots = re.search(r'SANDBOX_HOME_ROOTS="\$\{SANDBOX_HOME_ROOTS:-([^}]*)\}"', entrypoint)
         self.assertIn(f"profiles/{gc.PLATFORM_PROFILE}", roots.group(1).split())
 
-    def test_a_home_find_cannot_list_is_logged(self):
-        # A profile on the agent pod whose sandbox home is missing: find exits
-        # non-zero, and that is a logged problem, not a clean home.
+    def test_a_home_missing_in_the_sandbox_is_logged(self):
+        # A profile on the agent pod whose sandbox home is missing: the one listing
+        # has no row for it, and that is a logged problem, not a clean home.
         (self.profiles / "cluster-b").mkdir()
         inv = self.run_inventory(FakeSandbox(self.tree))
         self.assertEqual(len(inv.problems), 1)
-        self.assertIn("cluster-b in the sandbox exited 1", inv.problems[0])
+        self.assertIn("cluster-b is missing in the sandbox", inv.problems[0])
         self.assertIn(str(self.remote / "profiles" / "platform"), inv.unexpected)
+
+    def test_fifty_homes_cost_one_find(self):
+        # The issue's acceptance: the inventory's sandbox cost does not grow with the fleet.
+        rp = self.remote / "profiles"
+        for i in range(50):
+            name = f"cluster-{i:03d}"
+            (self.profiles / name).mkdir()
+            self.tree[str(rp)].append((name, "1.0", "1", "d"))
+            self.tree[str(rp / name)] = [(n, "1.0", "4096", k) for n, k in gc.CLUSTER_HOME_ENTRIES.items()] + [
+                ("probe.py", "1.0", "10", "f")]
+        fake = FakeSandbox(self.tree)
+        inv = self.run_inventory(fake)
+        self.assertEqual(len([argv for argv, _ in fake.calls if argv[0] == gc.REMOTE_FIND]), 1)
+        self.assertEqual(len(inv.unexpected), 51)
+        self.assertEqual(inv.problems, [])
 
     def test_a_live_home_that_is_not_a_directory_is_flagged(self):
         rp = str(self.remote / "profiles")
@@ -548,11 +593,29 @@ class HomeInventoryTest(_HomeFixture):
         self.assertEqual(len(inv.problems), 1)
         self.assertIn("cluster-a is type 'l'", inv.problems[0])
 
-    def test_an_unreadable_home_is_a_problem_not_a_stop(self):
+    def test_a_listing_that_exits_non_zero_is_used_and_reported(self):
+        # find keeps going past a home it cannot read and exits non-zero at the end:
+        # the rows it printed are still the inventory, and the exit is a problem.
         rp = self.remote / "profiles"
-        fake = FakeSandbox(self.tree, fail={str(rp / "cluster-a"): UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")})
+        inner = FakeSandbox(self.tree)
+
+        def fake(argv, **kwargs):
+            result = inner(argv, **kwargs)
+            return subprocess.CompletedProcess(argv, 1, result.stdout, f"find: '{rp / 'cluster-a' / 'x'}': Permission denied")
+
         inv = self.run_inventory(fake)
         self.assertIn(str(rp / "platform"), inv.unexpected)
+        self.assertEqual([r[0] for r in inv.stale_homes], ["cluster-gone"])
+        self.assertEqual(len(inv.problems), 1)
+        self.assertIn("exited 1", inv.problems[0])
+        self.assertIn("Permission denied", inv.problems[0])
+
+    def test_a_listing_that_raises_is_a_problem_not_a_stop(self):
+        rp = self.remote / "profiles"
+        fake = FakeSandbox(self.tree, fail={str(rp): UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")})
+        inv = self.run_inventory(fake)
+        self.assertEqual(inv.unexpected, {})
+        self.assertEqual(inv.agent_profiles, ["cluster-a", "platform"])
         self.assertEqual(len(inv.problems), 1)
 
     def test_an_unreachable_or_hung_sandbox_stops_after_one_try(self):
@@ -629,10 +692,20 @@ class HomeInventoryTest(_HomeFixture):
         self.assertEqual(rms, [[gc.REMOTE_RM, "-rf", "--", str(self.remote / "profiles" / "cluster-gone")]])
 
     def test_main_failure_paths_stay_out_of_chat(self):
-        rp = str(self.remote / "profiles")
+        # The inventory's own failures are logged, never delivered. Only its listing
+        # fails here: the cron and override sweeps list the same root, and a sandbox
+        # that is down for them is a warning for chat by design.
+        inventory_depth = ["-mindepth", "1", "-maxdepth", str(gc.HOME_ENTRIES_DEPTH)]
         for exc in (sandbox_exec.SandboxUnavailable("down"), subprocess.TimeoutExpired("ssh", 60),
                     UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")):
-            out, log = self.run_main(FakeSandbox(self.tree, fail={rp: exc}))
+            inner = FakeSandbox(self.tree)
+
+            def fake(argv, **kwargs):
+                if argv[0] == gc.REMOTE_FIND and argv[2:6] == inventory_depth:
+                    raise exc
+                return inner(argv, **kwargs)
+
+            out, log = self.run_main(fake)
             self.assertEqual(out, "", exc)
             self.assertIn(gc.LOG_PREFIX, log)
 
@@ -945,34 +1018,90 @@ class CronRunsTest(unittest.TestCase):
         self.assertEqual(gc.expected_entries("platform").get("cron"), "d")
         self.assertEqual(gc.expected_entries("cluster-a").get("cron"), "d")
 
-    def test_the_sandbox_half_removes_old_names_only_under_a_real_root(self):
+    def test_the_sandbox_half_removes_the_old_runs_the_one_listing_names(self):
+        # One find over the profiles root; only rows shaped <home>/cron/runs/<run>
+        # for a home the pod has count, and only the old ones go.
         remote = Path("/sandbox-root")
         rruns = remote.joinpath("profiles", "platform", *gc.CRON_RUNS_PARTS)
         calls = []
-        kinds = {"real": "d\nd\nd\n", "linked": "d\nl\nd\n"}
-        state = {"kinds": "real"}
 
         def fake(argv, **kwargs):
             calls.append(argv)
-            if argv[1] == "-P":
-                return subprocess.CompletedProcess(argv, 0, kinds[state["kinds"]], "")
             if argv[0] == gc.REMOTE_FIND:
                 return subprocess.CompletedProcess(argv, 0, _find_output(
-                    ("cron-a_ex1", str(self.OLD), "4096", "d"),
-                    ("cron-a_ex2", str(self.NEW), "4096", "d"),
-                    ("..", str(self.OLD), "4096", "d")), "")
+                    ("platform/cron/runs/cron-a_ex1", str(self.OLD), "4096", "d"),
+                    ("platform/cron/runs/cron-a_ex2", str(self.NEW), "4096", "d"),
+                    ("platform/cron/runs/..", str(self.OLD), "4096", "d"),
+                    ("platform/cron/cron-a_ex3", str(self.OLD), "4096", "d"),
+                    ("platform/scratch/runs/cron-a_ex4", str(self.OLD), "4096", "d"),
+                    ("ghost/cron/runs/cron-a_ex5", str(self.OLD), "4096", "d")), "")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         sweep = self.sweep(remote, fake)
+        finds = [a for a in calls if a[0] == gc.REMOTE_FIND]
+        self.assertEqual(len(finds), 1)
+        self.assertEqual(finds[0][1], str(remote / "profiles"))
+        self.assertEqual(finds[0][-1], gc.TREE_FIND_FORMAT)
         rms = [a for a in calls if a[0] == gc.REMOTE_RM]
         self.assertEqual(rms, [[gc.REMOTE_RM, "-rf", "--", str(rruns / "cron-a_ex1")]])
         self.assertEqual(sweep.cron_runs_removed, ["sandbox platform/cron-a_ex1"])
+        self.assertEqual(sweep.warnings, [])
 
-        calls.clear()
-        state["kinds"] = "linked"
-        sweep = self.sweep(remote, fake)
-        self.assertEqual([a for a in calls if a[0] == gc.REMOTE_RM], [])
-        self.assertTrue(any("symlink" in w for w in sweep.warnings), sweep.warnings)
+    def test_fifty_homes_with_expired_runs_cost_one_find(self):
+        # The issue's acceptance: the listing is O(1) in the fleet; the rm stays per home.
+        names = [f"cluster-{i:03d}" for i in range(50)]
+        for name in names:
+            (self.profiles / name).mkdir()
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 0, _find_output(
+                    *[(f"{n}/cron/runs/audit_ex1", str(self.OLD), "4096", "d") for n in names]), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(len([a for a in calls if a[0] == gc.REMOTE_FIND]), 1)
+        self.assertEqual(len([a for a in calls if a[0] == gc.REMOTE_RM]), 50)
+        self.assertEqual(len(sweep.cron_runs_removed), 50)
+
+    @unittest.skipUnless(_find_supports_printf(), "needs a find with -printf")
+    def test_the_shipped_find_lists_runs_through_real_directories_only(self):
+        """The argv the sandbox gets, run against a real tree.
+
+        The symlink check for this sweep is find's own -P: a runs root, a cron
+        directory or a home swapped for a link is not descended into, so the
+        listing cannot name anything behind one, and the prune keeps the walk out
+        of every other tree in a home.
+        """
+        remote = Path(self.tmp.name) / "sandbox"
+        rp = remote / "profiles"
+        old_run = rp.joinpath("platform", *gc.CRON_RUNS_PARTS, "audit_ex1")
+        old_run.mkdir(parents=True)
+        new_run = rp.joinpath("platform", *gc.CRON_RUNS_PARTS, "audit_ex2")
+        new_run.mkdir()
+        decoy = rp / "platform" / "skills" / "cron" / "runs" / "audit_ex3"
+        decoy.mkdir(parents=True)
+        precious = Path(self.tmp.name) / "precious"
+        for sub in ("home/cron/runs/keep1", "cron/runs/keep2", "runs/keep3"):
+            (precious / sub).mkdir(parents=True)
+        (rp / "cluster-a").symlink_to(precious / "home")
+        (rp / "cluster-b").mkdir()
+        (rp / "cluster-b" / "cron").symlink_to(precious / "cron")
+        (rp / "cluster-c" / "cron").mkdir(parents=True)
+        (rp / "cluster-c" / "cron" / "runs").symlink_to(precious / "runs")
+        for path in (old_run, new_run, decoy, *(precious.rglob("keep*"))):
+            os.utime(path, (self.OLD if path.name != "audit_ex2" else self.NEW,) * 2)
+        for name in ("cluster-a", "cluster-b", "cluster-c"):
+            (self.profiles / name).mkdir()
+        sweep = self.sweep(remote, _local_sandbox)
+        self.assertEqual(sweep.cron_runs_removed, ["sandbox platform/audit_ex1"])
+        self.assertFalse(old_run.exists())
+        self.assertTrue(new_run.is_dir())
+        self.assertTrue(decoy.is_dir(), "the walk went into a home's skills tree")
+        self.assertEqual(sorted(p.name for p in precious.rglob("keep*")), ["keep1", "keep2", "keep3"])
+        self.assertEqual(sweep.warnings, [])
 
 
 class OverridesTest(unittest.TestCase):
@@ -1059,9 +1188,9 @@ class OverridesTest(unittest.TestCase):
         sweep = self.sweep(Path("/sandbox-root"), fake)
         self.assertTrue(any("exited 1" in w and "Permission denied" in w for w in sweep.warnings), sweep.warnings)
 
-    def test_a_home_the_sandbox_has_not_received_says_nothing(self):
+    def test_a_profiles_root_the_sandbox_has_not_received_says_nothing(self):
         def fake(argv, **kwargs):
-            return subprocess.CompletedProcess(argv, 1, "", "/usr/bin/find: '/sandbox-root/profiles/platform': No such file or directory")
+            return subprocess.CompletedProcess(argv, 1, "", "/usr/bin/find: '/sandbox-root/profiles': No such file or directory")
 
         sweep = self.sweep(Path("/sandbox-root"), fake)
         self.assertEqual(sweep.warnings, [])
@@ -1072,10 +1201,8 @@ class OverridesTest(unittest.TestCase):
 
         def fake(argv, **kwargs):
             calls.append(argv)
-            if argv[1] == "-P":
-                return subprocess.CompletedProcess(argv, 0, "d\nd\n", "")
             if argv[0] == gc.REMOTE_FIND:
-                return subprocess.CompletedProcess(argv, 1, _find_output(("skills_override", "1", "4096", "d")),
+                return subprocess.CompletedProcess(argv, 1, _find_output(("platform/skills_override", "1", "4096", "d")),
                                                    f"find: '{rhome}/tmp': No such file or directory")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -1089,10 +1216,8 @@ class OverridesTest(unittest.TestCase):
 
         def fake(argv, **kwargs):
             calls.append(argv)
-            if argv[1] == "-P":
-                return subprocess.CompletedProcess(argv, 0, "d\nd\n", "")
             if argv[0] == gc.REMOTE_FIND:
-                return subprocess.CompletedProcess(argv, 0, _find_output(*[(n, "1", "4096", "d") for n in names]), "")
+                return subprocess.CompletedProcess(argv, 0, _find_output(*[(f"platform/{n}", "1", "4096", "d") for n in names]), "")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         sweep = self.sweep(Path("/sandbox-root"), fake)
@@ -1103,11 +1228,9 @@ class OverridesTest(unittest.TestCase):
         rhome = Path("/sandbox-root") / "profiles" / "platform"
 
         def fake(argv, **kwargs):
-            if argv[1] == "-P":
-                return subprocess.CompletedProcess(argv, 0, "d\nd\n", "")
             if argv[0] == gc.REMOTE_FIND:
                 return subprocess.CompletedProcess(argv, 0, _find_output(
-                    ("scripts_override", "1", "4096", "d"), ("skills_override", "1", "4096", "d")), "")
+                    ("platform/scripts_override", "1", "4096", "d"), ("platform/skills_override", "1", "4096", "d")), "")
             if str(rhome / "skills_override") in argv:
                 return subprocess.CompletedProcess(argv, 1, "", "rm: cannot remove: Permission denied")
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -1133,37 +1256,73 @@ class OverridesTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(len([w for w in sweep.warnings if "did not answer" in w]), 1, sweep.warnings)
 
-    def test_the_sandbox_half_removes_overrides_only_under_a_real_home(self):
+    def test_the_sandbox_half_removes_the_overrides_the_one_listing_names(self):
+        # One find over the profiles root at depth two; a tree or link with the
+        # suffix at the top of a home the pod has goes, nothing else does.
         remote = Path("/sandbox-root")
         rhome = remote / "profiles" / "platform"
         calls = []
-        kinds = {"real": "d\nd\n", "linked": "d\nl\n"}
-        state = {"kinds": "real"}
 
         def fake(argv, **kwargs):
             calls.append(argv)
-            if argv[1] == "-P":
-                return subprocess.CompletedProcess(argv, 0, kinds[state["kinds"]], "")
             if argv[0] == gc.REMOTE_FIND:
                 return subprocess.CompletedProcess(argv, 0, _find_output(
-                    ("skills_override", "1", "4096", "d"),
-                    ("scripts_override", "1", "4096", "l"),
-                    ("notes_override", "1", "10", "f"),
-                    ("skills", "1", "4096", "d"),
-                    ("..", "1", "4096", "d")), "")
+                    ("platform/skills_override", "1", "4096", "d"),
+                    ("platform/scripts_override", "1", "4096", "l"),
+                    ("platform/notes_override", "1", "10", "f"),
+                    ("platform/skills", "1", "4096", "d"),
+                    ("platform/..", "1", "4096", "d"),
+                    ("ghost/skills_override", "1", "4096", "d")), "")
             return subprocess.CompletedProcess(argv, 0, "", "")
 
         sweep = self.sweep(remote, fake)
+        finds = [a for a in calls if a[0] == gc.REMOTE_FIND]
+        self.assertEqual(len(finds), 1)
+        self.assertEqual(finds[0][1:6], [str(remote / "profiles"), "-mindepth", "2", "-maxdepth", "2"])
         rms = [a for a in calls if a[0] == gc.REMOTE_RM]
         self.assertEqual(rms, [[gc.REMOTE_RM, "-rf", "--", str(rhome / "scripts_override")],
                                [gc.REMOTE_RM, "-rf", "--", str(rhome / "skills_override")]])
         self.assertEqual(sweep.overrides_removed, ["sandbox platform/scripts_override", "sandbox platform/skills_override"])
+        self.assertEqual(sweep.warnings, [])
 
-        calls.clear()
-        state["kinds"] = "linked"
-        sweep = self.sweep(remote, fake)
-        self.assertEqual([a for a in calls if a[0] == gc.REMOTE_RM], [])
-        self.assertTrue(any("symlink" in w for w in sweep.warnings), sweep.warnings)
+    def test_fifty_homes_with_override_trees_cost_one_find(self):
+        names = [f"cluster-{i:03d}" for i in range(50)]
+        for name in names:
+            (self.profiles / name).mkdir()
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 0, _find_output(
+                    *[(f"{n}/skills_override", "1", "4096", "d") for n in names]), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(len([a for a in calls if a[0] == gc.REMOTE_FIND]), 1)
+        self.assertEqual(len([a for a in calls if a[0] == gc.REMOTE_RM]), 50)
+        self.assertEqual(len(sweep.overrides_removed), 50)
+
+    @unittest.skipUnless(_find_supports_printf(), "needs a find with -printf")
+    def test_the_shipped_find_lists_overrides_through_real_directories_only(self):
+        # As for the cron runs: a symlinked home is not descended into, and a tree
+        # with the suffix below the top of a home is not at depth two.
+        remote = Path(self.tmp.name) / "sandbox"
+        rp = remote / "profiles"
+        top = rp / "platform" / "skills_override"
+        (top / "fleet-audit").mkdir(parents=True)
+        nested = rp / "platform" / "scratch" / "skills_override"
+        nested.mkdir(parents=True)
+        precious = Path(self.tmp.name) / "precious"
+        (precious / "skills_override").mkdir(parents=True)
+        (rp / "cluster-a").symlink_to(precious)
+        (self.profiles / "cluster-a").mkdir()
+        sweep = self.sweep(remote, _local_sandbox)
+        self.assertEqual(sweep.overrides_removed, ["sandbox platform/skills_override"])
+        self.assertFalse(top.exists())
+        self.assertTrue(nested.is_dir())
+        self.assertTrue((precious / "skills_override").is_dir(), "the walk followed a symlinked home")
+        self.assertEqual(sweep.warnings, [])
 
     def test_an_unreachable_sandbox_is_tried_once(self):
         (self.profiles / "cluster-a").mkdir()
