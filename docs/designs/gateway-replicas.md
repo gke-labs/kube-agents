@@ -65,8 +65,7 @@ On losing the lease, or on SIGTERM, it stops in this order:
    depth at that moment (see "What a failover loses").
 3. **The relay:** the batches rendering finish, and the relay gives back every event it holds
    unrendered, in stream order. This needs the relay's deferred-ack mode, where an event is acked
-   only after it renders. That's the relay ack-after-render change (#4183), which lands before the
-   election; on `main` today the relay acks each event on receipt.
+   only after it renders, which the relay ack-after-render change (#4183) put on `main`.
 4. **The loops:** reap and sweep stop.
 
 Then it releases the lease.
@@ -95,6 +94,18 @@ Then it releases the lease.
   leader reads the same guard the old one wrote. A bus server draining in lame-duck mode spreads its clients' reconnects over
   about 30s: a burst of reconnects for the active gateway, not a gap.
 
+### What it costs
+
+The crash that's most common, a container restarting in its own pod after a panic or an OOM kill,
+recovers more slowly than it does with one replica. With one replica the restarted container is
+back in seconds. With two, the restarted container is a new holder (the per-process id), so it
+waits out the lease like the standby does, and the standby takes over after the lease expires: 20s
+or more, and up to 30s more before the relay binds. What the second replica buys is everything
+else, where one replica has no gateway at all until a new pod schedules and starts: a rollout or a
+node drain (a graceful handover in a few seconds), and a node or zone loss. On a cluster that
+rolls and drains often, that's the larger share of gateway downtime, but it's a trade, and one
+replica with a fast restart stays a supported setting.
+
 ### Fencing
 
 A replica that can't renew the lease steps down, and the stop has to fit before a standby can
@@ -102,8 +113,10 @@ take the lease. In client-go the renew loop starts its `renewDeadline` (10s) win
 `retryPeriod` (2s) after the last good renewal, so a leader that stops renewing gives up about 12s
 after it, and a standby that saw that renewal can take the lease after `leaseDuration`. With
 client-go's 15s default that leaves about 3s, so the gateway sets `leaseDuration` to 20s, leaving
-about 8s. Ingress and the inbound queue stop at once; the relay's render drain is bounded at 5s
-inside that, and a batch still rendering when it runs out is abandoned and given back. That makes two replicas acting at once unlikely, not
+about 8s. Ingress and the inbound queue stop at once. The relay's render drain is bounded at 5s
+inside that, and a batch still rendering when it runs out is abandoned and given back. The relay's
+own stop drain (`relayStopDrainTimeout`) is 15s today, sized to the pod's grace period on SIGTERM.
+So step 2 gives the lost-lease path its own 5s bound, and SIGTERM keeps the 15s. That makes two replicas acting at once unlikely, not
 impossible: a paused process, or a clock that jumps, can still overlap the next leader.
 
 So writes are fenced by a term number. The term isn't the Lease's `leaseTransitions`: the Lease
@@ -226,7 +239,10 @@ ingress gap above.
   standby.
 - **`RollingUpdate` with `maxSurge: 1`, `maxUnavailable: 0`,** replacing `Recreate`, so the new
   pod comes up as a standby before an old one stops. The operator renders it, and a second
-  replica, only once the Lease has had a holder: a gateway from before the election holds no
+  replica, only once the Lease has had a holder. The operator records that as a condition on the
+  PlatformAgent (`GatewayElected`), set the first time it sees a holder and never cleared, so a
+  deleted Lease, its held-back recreate or a restore doesn't flip the Deployment back to one
+  replica. A gateway from before the election holds no
   Lease and would act beside an elected one, and term 0 fences nothing. So an install upgrading
   across the election in one roll keeps one replica and `Recreate` for that roll, and moves to two
   once the elected gateway has taken the Lease. A surge pod needs room under the agent
@@ -265,7 +281,8 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    exists, every write carries term 0, and term 0 fences nothing.
 2. **Leader election in the gateway.** It lands after the relay's ack-after-render change.
    Acquire (identity: pod name and per-process id), start a term, renew and step down; all of `Run`'s and
-   `realMain`'s work gated on the lease; the step-down order and budget above; the relay's delayed
+   `realMain`'s work gated on the lease; the step-down order and budget above, with the relay's
+   drain bounded at 5s on the lost-lease path; the relay's delayed
    bind after a takeover from an expired lease; release on SIGTERM. Tests on an embedded server
    with two gateways: one acts, the other doesn't; the lease moves and the work follows; a crash
    takeover renders the dead leader's held events before newer ones.
@@ -276,7 +293,7 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    helper, and the eval harness, the CI scripts and the docs resolving the holder. It lands before
    step 4, so nothing meets a standby it can't route around.
 4. **Operator:** replicas, the readiness probe, the strategy (held at one replica and `Recreate`
-   until the Lease has had a holder), the PDB, the spread, the Lease (with its owner reference and
+   until the `GatewayElected` condition is set), the PDB, the spread, the Lease (with its owner reference and
    an `Owns` watch, recreated one `leaseDuration` after a deletion) and its Role. Its tests pin
    each, including the held-back recreate and the first roll across the election.
 5. **The cards-pending mark on the record** (planned separately).
