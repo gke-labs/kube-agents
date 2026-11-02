@@ -1714,7 +1714,7 @@ class CiEvalWiringTest(unittest.TestCase):
                 self.assertEqual(list(artifacts.iterdir()), [])
 
     def test_skipped_on_a_pull_requests_run(self) -> None:
-        # The merge-blocking presubmit grades next, and a Tide batch runs it
+        # The merge-blocking presubmit grades next, and Tide ran it in batches
         # too; neither reads a report-only round trip, and the today lane
         # proves the path on main.
         for job_type in ("presubmit", "batch"):
