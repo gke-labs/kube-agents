@@ -51,6 +51,10 @@ EXTRA_BODY_KEY = "extra_body"
 SESSION_ID_KEY = "session_id"
 SYSTEM_ROLES = frozenset({"system", "developer"})
 USER_ROLE = "user"
+ASSISTANT_ROLE = "assistant"
+# OpenAI-format tool entries name the tool under function.name.
+TOOL_FUNCTION_KEY = "function"
+TOOL_NAME_KEY = "name"
 # A deployment's parameters, and the provider-qualified model string in them.
 DEPLOYMENT_PARAMS_KEY = "litellm_params"
 DEPLOYMENT_MODEL_KEY = "model"
@@ -68,6 +72,9 @@ PREFIX_HEAD_CHARS = 8192
 # Vertex reads session_id as a signed 64-bit integer, sent as a string.
 SESSION_ID_BYTES = 8
 FIELD_SEPARATOR = "\0"
+# Hex characters of each digest in the per-conversation diagnostic line: enough
+# to tell two inputs apart in a log, too few to stand for the text.
+DIAGNOSTIC_DIGEST_CHARS = 12
 LOG_LEVEL = logging.INFO
 LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
 
@@ -131,13 +138,55 @@ def _digest(*fields: str) -> bytes:
     return hashlib.sha256(FIELD_SEPARATOR.join(fields).encode("utf-8")).digest()
 
 
+def _key(data: dict, slots: int) -> tuple[str, str, int, str]:
+    """The id's inputs, computed once: the system prompt, the tool list's text, the slot, and the id."""
+    system = system_prompt(data)
+    tools = _text(data.get(TOOLS_KEY))
+    slot = int.from_bytes(_digest(system, first_user_message(data)), "big") % slots
+    prefix = _digest(str(data.get(MODEL_KEY, "")), system[:PREFIX_HEAD_CHARS], tools, str(slot))
+    return system, tools, slot, str(int.from_bytes(prefix[:SESSION_ID_BYTES], "big", signed=True))
+
+
 def session_id_for(data: dict, slots: int) -> str:
     """The id for this request's conversation: the same for every turn, shared by ``slots`` conversations' worth of prompt."""
-    system = system_prompt(data)
-    conversation = _digest(system, first_user_message(data))
-    slot = int.from_bytes(conversation, "big") % slots
-    prefix = _digest(str(data.get(MODEL_KEY, "")), system[:PREFIX_HEAD_CHARS], _text(data.get(TOOLS_KEY)), str(slot))
-    return str(int.from_bytes(prefix[:SESSION_ID_BYTES], "big", signed=True))
+    return _key(data, slots)[3]
+
+
+def _short(*fields: str) -> str:
+    return _digest(*fields).hex()[:DIAGNOSTIC_DIGEST_CHARS]
+
+
+def _tool_name(tool: Any) -> str:
+    """The tool's name: OpenAI format nests it under ``function``, Anthropic format has it at the top."""
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get(TOOL_FUNCTION_KEY)
+    return str(function.get(TOOL_NAME_KEY, "") if isinstance(function, dict) else tool.get(TOOL_NAME_KEY, ""))
+
+
+def is_first_turn(data: dict) -> bool:
+    """Whether the request opens a conversation: no assistant message in its history."""
+    return not any(isinstance(m, dict) and m.get(ROLE_KEY) == ASSISTANT_ROLE for m in data.get(MESSAGES_KEY) or [])
+
+
+def key_diagnostics(data: dict, slots: int) -> dict:
+    """Short digests, never content, of each input to the id, so conversations whose ids differ show which input did."""
+    system, tools_text, slot, session_id = _key(data, slots)
+    tools = data.get(TOOLS_KEY) if isinstance(data.get(TOOLS_KEY), list) else []
+    names = [_tool_name(t) for t in tools]
+    by_name = [t for _, t in sorted(zip(names, tools), key=lambda pair: pair[0])]
+    return {
+        "model": str(data.get(MODEL_KEY, "")),
+        "head": _short(system[:PREFIX_HEAD_CHARS]),
+        "system": _short(system),
+        "system_chars": len(system),
+        "tools": _short(tools_text),
+        "tools_sorted": _short(_text(by_name)),
+        "tool_order": _short(*names),
+        "tool_count": len(tools),
+        "slot": slot,
+        "session_id": session_id,
+    }
 
 
 def slot_count() -> int:
@@ -190,7 +239,14 @@ class SessionAffinity(CustomLogger):
             extra = {}
         if SESSION_ID_KEY in extra:
             return data
-        extra[SESSION_ID_KEY] = session_id_for(data, self.slots)
+        if is_first_turn(data):
+            # One line per new conversation: conversations of one profile that
+            # should share an id but do not show which input differs.
+            diagnostics = key_diagnostics(data, self.slots)
+            extra[SESSION_ID_KEY] = diagnostics["session_id"]
+            logger.info("session affinity: new conversation %s", " ".join(f"{k}={v}" for k, v in diagnostics.items()))
+        else:
+            extra[SESSION_ID_KEY] = session_id_for(data, self.slots)
         data[EXTRA_BODY_KEY] = extra
         if not _announced:
             _announced = True

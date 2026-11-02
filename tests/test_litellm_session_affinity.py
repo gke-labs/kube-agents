@@ -169,6 +169,56 @@ class TestHook(unittest.TestCase):
         with mock.patch.object(self.hook, "_router", return_value=None):
             self.assertNotIn("extra_body", self._run(_request("t_1")))
 
+    def test_a_new_conversation_logs_one_diagnostic_line_and_later_turns_none(self):
+        with self.assertLogs(self.hook.logger, level="INFO") as logs:
+            self._run(_request("t_1"))
+            self._run(_request("t_1", turns=3))
+        lines = [line for line in logs.output if "new conversation" in line]
+        self.assertEqual(len(lines), 1)
+        for field in ("head=", "system=", "tools=", "tools_sorted=", "tool_order=", "tool_count=1", "slot=", "session_id="):
+            self.assertIn(field, lines[0])
+        self.assertNotIn("Platform Agent", lines[0])
+
+    def test_the_logged_slot_and_id_are_the_ones_sent(self):
+        data = _request("t_7")
+        with self.assertLogs(self.hook.logger, level="INFO") as logs:
+            sent = self._run(data)["extra_body"]["session_id"]
+        line = next(line for line in logs.output if "new conversation" in line)
+        self.assertIn(f"session_id={sent}", line)
+        self.assertEqual(self.hook.key_diagnostics(_request("t_7"), 2)["session_id"], sent)
+        self.assertEqual(self.hook.key_diagnostics(_request("t_7"), 2)["session_id"], self.hook.session_id_for(_request("t_7"), 2))
+
+    def test_malformed_tools_and_messages_still_get_an_id(self):
+        for tools in (None, {"a": 1}, "x", [1, "x", None], [{"function": "x"}], [{"function": None}],
+                      [{"function": {"name": 5}}], [{"function": {"name": None}}], [{"name": "a", "input_schema": {}}]):
+            with self.subTest(tools=tools):
+                data = _request("t_1")
+                data["tools"] = tools
+                self.assertIsNotNone(self._id(data))
+        for messages in ([], [None, 3, "x"], [{"role": "user"}], [{"role": "system", "content": None}]):
+            with self.subTest(messages=messages):
+                self.assertIsNotNone(self._id({"model": "model-default", "messages": messages}))
+
+    def test_the_diagnostics_read_anthropic_format_tool_names(self):
+        tools = [{"name": n, "input_schema": {}} for n in ("a", "b")]
+        first, reordered = _request("t_1"), _request("t_1")
+        first["tools"], reordered["tools"] = tools, list(reversed(tools))
+        d1, d2 = (self.hook.key_diagnostics(d, 2) for d in (first, reordered))
+        self.assertEqual(d1["tools_sorted"], d2["tools_sorted"])
+        self.assertNotEqual(d1["tool_order"], d2["tool_order"])
+
+    def test_the_diagnostics_tell_a_reordered_tool_list_from_a_changed_one(self):
+        tools = [{"type": "function", "function": {"name": n}} for n in ("a", "b")]
+        first, reordered, changed = _request("t_1"), _request("t_1"), _request("t_1")
+        first["tools"], reordered["tools"] = tools, list(reversed(tools))
+        changed["tools"] = [tools[0], {"type": "function", "function": {"name": "b", "description": "x"}}]
+        d1, d2, d3 = (self.hook.key_diagnostics(d, 2) for d in (first, reordered, changed))
+        self.assertNotEqual(d1["tools"], d2["tools"])
+        self.assertEqual(d1["tools_sorted"], d2["tools_sorted"])
+        self.assertNotEqual(d1["tool_order"], d2["tool_order"])
+        self.assertNotEqual(d1["tools_sorted"], d3["tools_sorted"])
+        self.assertEqual(d1["tool_order"], d3["tool_order"])
+
     def test_the_slot_count_comes_from_the_env_and_a_bad_value_falls_back(self):
         for raw, want in (("", 2), ("3", 3), ("0", 2), ("-1", 2), ("two", 2)):
             with self.subTest(raw=raw), mock.patch.dict(os.environ, {_SLOTS_ENV: raw}):
