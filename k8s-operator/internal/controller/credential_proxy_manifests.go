@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -231,6 +232,20 @@ const (
 	// start. In the base env list and so reserved in mergeCredentialProxyEnv,
 	// because a CR that could set it would detach the budget from the limit.
 	credentialProxyMemoryLimitEnv = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES" // #nosec G101 -- Env var name, not a credential
+	// credentialProxyStateLimitEnv and credentialProxyTmpLimitEnv carry each
+	// scratch emptyDir's rendered sizeLimit, in bytes, to the broker's resource
+	// watermark gate (credential_proxy.py, ENV_STATE_LIMIT_BYTES and
+	// ENV_TMP_LIMIT_BYTES; tests/test_credential_proxy_sizing_parity.py holds
+	// the names equal). statvfs on an emptyDir reports the node's filesystem,
+	// not the cap the kubelet evicts the pod on, so the gate sums each volume's
+	// tree against the figure given here. Plain values rather than a Downward
+	// API field, which has no selector for a volume's sizeLimit; the state
+	// figure follows a raised ephemeral-storage override the way the volume
+	// does (credentialProxyEmptyDirSizeLimit), and /tmp keeps its cap. In the
+	// base env list and so reserved in mergeCredentialProxyEnv, because a CR
+	// that could set either would detach the gate from the eviction threshold.
+	credentialProxyStateLimitEnv = "CREDENTIAL_PROXY_STATE_LIMIT_BYTES" // #nosec G101 -- Env var name, not a credential
+	credentialProxyTmpLimitEnv   = "CREDENTIAL_PROXY_TMP_LIMIT_BYTES"   // #nosec G101 -- Env var name, not a credential
 	// The child memory budget's terms, in bytes, as the broker declares them
 	// (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
 	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
@@ -866,6 +881,21 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 	volumes = append(volumes, buildGitopsStateVolume(agent))
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
+}
+
+// credentialProxyVolumeLimitEnv renders the two variables that tell the broker
+// the sizeLimit of each scratch emptyDir it writes, in bytes, from the same
+// arithmetic buildCredentialProxyRuntimeVolumes sizes the volumes with, so the
+// figure the gate measures against is the figure the kubelet evicts on at any
+// override.
+func credentialProxyVolumeLimitEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
+	state := credentialProxyEmptyDirSizeLimit(credentialProxyStateSizeLimit, credentialProxyEphemeralStorageLimit, ephemeralLimit)
+	tmp := resource.MustParse(credentialProxyTmpSizeLimit)
+	return []corev1.EnvVar{
+		{Name: credentialProxyStateLimitEnv, Value: strconv.FormatInt(state.Value(), 10)},
+		{Name: credentialProxyTmpLimitEnv, Value: strconv.FormatInt(tmp.Value(), 10)},
+	}
 }
 
 // credentialProxyEmptyDirSizeLimit is a volume's default sizeLimit plus

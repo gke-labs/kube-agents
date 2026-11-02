@@ -192,6 +192,42 @@ func TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit(t *testing.T
 	}
 }
 
+// TestCredentialProxyVolumeLimitEnvFollowsTheRenderedSizeLimits: the broker's
+// resource watermark gate measures each scratch volume against the byte figure
+// these two variables carry, so each has to equal the sizeLimit the kubelet
+// evicts on, at the default and at a raised ephemeral-storage override; both
+// names are in the managed set a CR cannot override.
+func TestCredentialProxyVolumeLimitEnvFollowsTheRenderedSizeLimits(t *testing.T) {
+	for _, limit := range []string{"", "8Gi", "10Gi", "16Gi"} {
+		var override *corev1.ResourceRequirements
+		if limit != "" {
+			override = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse(limit)},
+			}
+		}
+		agent := proxyAgentWithResources(override)
+		agent.Spec.Deployment.Env = []corev1.EnvVar{
+			{Name: credentialProxyStateLimitEnv, Value: "1"},
+			{Name: credentialProxyTmpLimitEnv, Value: "1"},
+		}
+		sizes := map[string]string{}
+		for _, vol := range buildCredentialProxyRuntimeVolumes(agent) {
+			if vol.EmptyDir != nil && vol.EmptyDir.SizeLimit != nil {
+				sizes[vol.Name] = strconv.FormatInt(vol.EmptyDir.SizeLimit.Value(), 10)
+			}
+		}
+		env := map[string][]string{}
+		for _, e := range buildCredentialProxyContainer(agent).Env {
+			env[e.Name] = append(env[e.Name], e.Value)
+		}
+		for name, volume := range map[string]string{credentialProxyStateLimitEnv: credentialProxyStateVolumeName, credentialProxyTmpLimitEnv: credentialProxyTmpVolumeName} {
+			if got := env[name]; len(got) != 1 || got[0] != sizes[volume] {
+				t.Errorf("limit %q: %s = %v, want exactly the %s sizeLimit %s", limit, name, got, volume, sizes[volume])
+			}
+		}
+	}
+}
+
 // TestAgentAPIAuthEmptyDirFollowsARaisedEphemeralStorageLimit: the sidecar's /tmp
 // is the credential-proxy-tmp emptyDir, and the kubelet evicts the gateway pod
 // when it passes its sizeLimit. So a raised agentAPIAuth ephemeral limit must
