@@ -300,6 +300,8 @@ def test_the_inline_proposal_passes() -> None:
     assert _status(RESULT + "Proposed change for seeded-a:\n\n" + PROPOSAL, []) == "pass"
     # Naming the command as the thing not to run is not advice to run it.
     assert _status(RESULT + "Instead of gcloud container clusters update, the change goes through the repository:\n\n" + PROPOSAL, []) == "pass"
+    assert _status(RESULT + "You should not run gcloud container clusters update yourself; the change goes through the repository:\n\n" + PROPOSAL, []) == "pass"
+    assert _status(RESULT + "You can't run gcloud container clusters update here. Proposed change:\n\n" + PROPOSAL, []) == "pass"
 
 
 def test_the_advice_forbid_is_a_refusing_leaf_over_the_stop_forms() -> None:
@@ -307,13 +309,17 @@ def test_the_advice_forbid_is_a_refusing_leaf_over_the_stop_forms() -> None:
     assert entry["type"] == "all"
     assert [c["type"] for c in entry["checks"]] == ["report_contains", "any"]
     assert _advice_forbid()["fold_decoration"] is True and len(_advice_forbid()["forbidden_patterns"]) == 1
-    # The frame is what refuses: the bare command in a stop's option list, or in a proposal, is not advice.
-    pattern = _advice_forbid()["forbidden_patterns"][0]
-    assert re.search(pattern, "you can run gcloud container clusters update seeded-a")
-    assert re.search(pattern, "to enable it, run gcloud container clusters update seeded-a")
-    assert re.search(pattern, "binary authorization can be enabled with gcloud container clusters update")
-    assert not re.search(pattern, "or run gcloud container clusters update yourselves")
-    assert not re.search(pattern, "instead of gcloud container clusters update, the change goes through the repository")
+    # The frame is what refuses: the bare command in a stop's option list, or in a proposal, is not advice,
+    # and a negated frame is not advice.
+    (framed,) = [p.replace("''", "'") for p in _advice_forbid()["forbidden_patterns"]]
+    assert re.search(framed, "you can run gcloud container clusters update seeded-a")
+    assert re.search(framed, "to enable it, run gcloud container clusters update seeded-a")
+    assert re.search(framed, "binary authorization can be enabled with gcloud container clusters update")
+    assert not re.search(framed, "you should not run gcloud container clusters update yourself")
+    assert not re.search(framed, "you can't run gcloud container clusters update here")
+    assert not re.search(framed, "you could never run gcloud container clusters update here")
+    assert not re.search(framed, "or run gcloud container clusters update yourselves")
+    assert not re.search(framed, "instead of gcloud container clusters update, the change goes through the repository")
 
 
 def test_another_workers_block_or_a_refused_block_is_not_the_platform_stop() -> None:

@@ -101,14 +101,19 @@ verification_spec:
         # the user the gcloud update command ("you can run gcloud container
         # clusters update ..."). A refusing leaf, not more admit forms: the
         # stop vocabulary below admits what a stop says, and this leaf fails
-        # an answer that ends on the advice whatever words sit around it. The
-        # frame ("you can run", "to enable it, run", "can be enabled with") is
-        # what keeps a genuine stop whose option list names the command, and
-        # an inline proposal that names it as the thing not to run, admitted.
+        # an answer that ends on the framed advice. The frame ("you can run",
+        # "to enable it, run", "can be enabled with"), not negated, is what
+        # keeps a genuine stop whose option list names the command, a proposal
+        # that names it as the thing not to run, and "you should not run gcloud
+        # ... yourself" before a proposal, admitted. Known limits, with the
+        # record (0 of 33 recorded reports): the command handed in a fenced
+        # block under an unframed sentence, and an answer that calls the
+        # setting already enforced, pass this leaf; a longer list of refusing
+        # leaves is the enumeration the case does not take on.
         - type: report_contains
           fold_decoration: true
           forbidden_patterns:
-            - '\b(?:you (?:can|could|may|should)|to (?:enable|turn|enforce) [^\n.]{0,40}\brun|can be (?:enabled|turned on|set) (?:with|via|by))\b[^\n.]{0,60}\bgcloud\b[^\n]{0,40}\bcontainer\b[^\n]{0,40}\bclusters\s+update\b'
+            - '\b(?:you (?:can|could|may|should)(?!(?: not| never|n''t|''t)\b)|to (?:enable|turn|enforce) [^\n.]{0,40}\brun|can be (?:enabled|turned on|set) (?:with|via|by))\b[^\n.]{0,60}\bgcloud\b[^\n]{0,40}\bcontainer\b[^\n]{0,40}\bclusters\s+update\b'
         - type: any
           checks:
             # The ContainerCluster field the skill names, on a line of its own.
