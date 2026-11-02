@@ -77,6 +77,12 @@ def test_prose_that_names_no_absence_does_not_match():
         "Nothing is missing: Config Connector is installed on every cluster.",
         # Presence stated outright.
         "Config Connector is present on every cluster in the project.",
+        # Config Connector stated present, then an absence word in the next
+        # clause of the same line: the clause bounds keep these out.
+        "None of the clusters have workloads yet, but all have Config Connector",
+        "Config Connector is installed and syncing; the eval-kcc-probe cluster was not found in the project, so the manifest creates it.",
+        "Config Connector is installed on the host cluster; the eval-kcc-probe cluster does not exist yet",
+        "No cluster is missing anything: each one has Config Connector",
     ):
         assert not _matches(report), report
 
