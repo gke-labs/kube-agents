@@ -815,7 +815,8 @@ Only the finding's own object in the file counts, also when the file declares on
 object: for `NodePool/<n>`, the `ContainerNodePool` `<n>` on the finding's cluster; for
 `Cluster/<n>`, the `ContainerCluster` `<n>`; for `<Kind>/<n>` of a Config Connector kind, the object
 of that kind and that name. This last rule applies only to a `kcc-object-wedged` finding, which is
-about a Config Connector object, and only to an object on the finding's cluster. A finding of another kind (a `Deployment`, a `HorizontalPodAutoscaler`)
+about a Config Connector object, and only to an object on the finding's cluster, in the fix's file
+and outside it. A finding of another kind (a `Deployment`, a `HorizontalPodAutoscaler`)
 has no Config Connector object of its own, even when the file declares one of the same name: a
 `Deployment` fix in a file that also declares an `IAMServiceAccount` did not change that account, so
 a stall of the account gives it no note. A file with no object of the finding gives no in-file
@@ -839,7 +840,10 @@ another Config Connector kind is on the cluster that runs Config Connector, so i
 unknown.
 
 A ready object is not in the list, so with more than one possible host the same name can be ready
-on one host and not ready on another. Then the `project` must also be known. A possible host is an
+on one host and not ready on another. Then the `project` must also be known, for a `Cluster/` or
+`NodePool/` finding. A `kcc-object-wedged` finding's object is on the finding's own cluster, so the
+number of hosts does not apply to it. In the fix's file, a known `project` that differs from the
+file's still blocks the match; outside it, a declaration for another project is not named. A possible host is an
 entry that carries `kcc_unready` (also empty) or `kcc_unread`, or, when any entry carries either key,
 a cluster entry the collector never read (`unreachable` or `gate-failed`), or a project whose
 cluster list failed (a `gate-failed` `project/<id>` entry). An entry
@@ -890,17 +894,20 @@ when Config Connector applies the object again.
 
 The note fits the note cap through `_fit_route_notes`, the route-note pass's fit: only the worker's
 own text is cut, never inside a code block, and the text `finish` wrote stays whole (the Kustomize
-note and its copied file, the closing text of `degrade_missing_remediations`, the note of
+note's own text, the closing text of `degrade_missing_remediations`, the note of
 `degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`, and the route notes). The paragraph
-goes after the route notes, and one that would push out the reconciler note does not fit. When the
+goes after the route notes, and one that would push out the reconciler note does not fit. The
+Kustomize note's copied file can only become shorter by whole lines, as below. When the
 whole paragraph does not fit, it names one object, then no object it waits on, then drops its tail;
 when even that core does not fit beside the text `finish` wrote and the note carries a Kustomize
 copied file, that block is made shorter by whole lines, with its fences closed, as
 `_fit_route_notes` does for the reconciler note. Only when that does not fit either does the core go
 past the cap, and the log warns that the renderer cuts its end. A cut keeps the whole worker note in
 `uncut_note`, as the route-note pass does, so the carry puts it back once the stall is gone. The
-pass first removes an earlier copy of the note from every remediation, and the carry removes it too,
-so a note never shows a stall that this run's manifest does not. A cluster whose read failed
+route-note pass removes a copy of either paragraph from the worker's note before it keeps that note
+as `uncut_note`, so no later pass brings back a paragraph from an earlier ledger. The paragraph pass
+also removes an earlier copy from every remediation, and the carry removes it too, so a note never
+shows a stall that this run's manifest does not. A cluster whose read failed
 (`kcc_unread`) records no objects, so no note names an object there, and the log has a warning. The
 absence of the note never says that Config Connector applies a file.
 
