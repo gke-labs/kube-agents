@@ -569,9 +569,9 @@ the last of them moved. After its own
 patch the poller reads the echo the same way `noteUsageStatusEcho` does: counters it wrote that
 come back absent mean the pruning, recorded in the shared map; counters that come back clear it.
 The fields added after `status.usage`'s first schema, the two cluster gauges (one record between them),
-the six proposal readings (one record among them), `chatMessagesInboundTotal`, `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`, `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal` and `lastHumanActiveTime`, have a record each, in the poller, because a CRD at a previous
+the six proposal readings (one record among them), `chatMessagesInboundTotal`, `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`, `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`, have a record each, in the poller, because a CRD at a previous
 schema prunes some or all of those and serves the first-schema counters (every CRD with
-`status.usage` has carried `remediationsProposedTotal` and `sessionsTotal`, so `sessionsTotal` shares the first three counters' treatment and has no record of its own), the shared record would hold those back
+`status.usage` has carried `remediationsProposedTotal` and `sessionsTotal`, so `sessionsTotal` shares the first three counters' treatment and has no record of its own; `chatSessionsTotal`, the chat half alone, arrived later and has its record, named for the field), the shared record would hold those back
 for the interval too, and one record for all the newer fields would hold the gauges back on the CRD
 from the release between them, which serves the gauges and prunes the counter; each field is
 probed again after the same interval, and a difference in it alone waits on its record rather
@@ -619,7 +619,10 @@ field for it comes back with a series: a Hermes-side one from the same plugin, s
 distinguishable from reads. It lands on the poller's existing path: a new row in the source
 table and a new series summed. It needs no second mechanism. `sessionsTotal` landed the same way,
 as two document counters under one status field, because its halves aggregate differently and
-the fold aggregates per counter; the source table has the row.
+the fold aggregates per counter; the source table has the row. `chatSessionsTotal` is the chat
+half projected alone, and the status seed splits `sessionsTotal` between the halves by it: a
+status that carries it seeds the chat half with it, clamped to the total, and the triage half
+with the rest; a status without it seeds the whole total into the chat half, as before.
 
 ## Security and privacy
 

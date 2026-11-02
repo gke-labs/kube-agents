@@ -86,7 +86,12 @@ const (
 	// counters project to, and the name the Warning for a failed listener
 	// carries. The field is in status.usage's first schema, so it has no
 	// pruning record of its own.
-	usageStatusFieldSessions          = "sessionsTotal"
+	usageStatusFieldSessions = "sessionsTotal"
+	// usageStatusFieldChatSessions is the status field the chat half alone
+	// projects to, and its pruning record's key: it arrived after the first
+	// schema, and usageExportFieldsOfRecord maps a record named for its
+	// field to that field.
+	usageStatusFieldChatSessions      = "chatSessionsTotal"
 	usageCounterToolExecutionsBlocked = "toolExecutionsBlockedTotal"
 	// usagePodEntryKeySeparator joins a pod UID and a counter into an entry
 	// key; a UID carries no slash.
@@ -147,14 +152,15 @@ func usageSessionsTotal(totals map[string]int64) int64 {
 }
 
 // usageFieldFloor is the status floor of the field a counter projects to: the
-// counter's own for every counter but the sessions halves, whose one status
-// value the seed puts in the chat half. The unfolded rule reads this rather
-// than the half's own floor, because a zero floor means none of any sample is
-// in the total, and after a rollback and return the triage half's share of a
-// non-zero status is in the chat half's floor.
+// counter's own for every counter but the sessions halves, whose floor is the
+// two halves' summed floors, sessionsTotal as the seed split it
+// (usageStatusSeed). The unfolded rule reads this rather than the half's own
+// floor, because a zero floor means none of any sample is in the total, and
+// after a rollback and return the triage half's share of a non-zero status
+// may be in the chat half's floor.
 func usageFieldFloor(floors map[string]int64, counter string) int64 {
 	if slices.Contains(usageSessionsCounters, counter) {
-		return floors[usageCounterSessionsChat]
+		return floors[usageCounterSessionsChat] + floors[usageCounterSessionsTriage]
 	}
 	return floors[counter]
 }

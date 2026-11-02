@@ -2444,9 +2444,9 @@ type AgentStatus struct {
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
 // update, and ToolExecutionsTotal, ToolExecutionsBlockedTotal, EventsIngestedTotal,
-// SessionsTotal, RemediationsProposedTotal, ChatMessagesInboundTotal,
-// LastActiveTime, LastHumanActiveTime, ClustersRegistered and
-// ClustersMonitored from the broker's, the event watcher's, the chat
+// SessionsTotal, ChatSessionsTotal, RemediationsProposedTotal,
+// ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime,
+// ClustersRegistered and ClustersMonitored from the broker's, the event watcher's, the chat
 // plugin's and, on a next install, the A2A gateway's metrics
 // listeners, and the six proposal readings (RemediationsMergedTotal,
 // RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
@@ -2466,6 +2466,19 @@ type AgentUsageStatus struct {
 	// and kept monotonic across restarts, like toolExecutionsTotal.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
+
+	// ChatSessionsTotal is the chat half of SessionsTotal: the chat
+	// conversations the gateway opened a session for (the session_store
+	// plugin's kubeagents_chat_sessions_total on a today install, that plus
+	// the A2A gateway's kubeagents_a2a_gateway_sessions_total on a next
+	// install), without the event watcher's triage sessions. On an install
+	// whose usage document was re-seeded before this release, its first
+	// value carries that re-seed's triage sessions once. Read every five
+	// minutes and kept monotonic the same way as ToolExecutionsTotal. Does
+	// not move LastHumanActiveTime or LastActiveTime. Absent while the served
+	// CRD predates it.
+	// +optional
+	ChatSessionsTotal int64 `json:"chatSessionsTotal,omitempty"`
 
 	// EventsIngestedTotal is the cumulative count of cluster events the event
 	// watcher accepted for triage: past its reason filter and its dedup

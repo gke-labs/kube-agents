@@ -975,7 +975,12 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 			return "a total is below the status it projects to"
 		}
 	}
-	if usageSessionsTotal(doc.Totals) < floors[usageCounterSessionsChat] {
+	if usageSessionsTotal(doc.Totals) < usageFieldFloor(floors, usageCounterSessionsChat) {
+		return "a total is below the status it projects to"
+	}
+	// Under a split seed the chat half has a status of its own,
+	// chatSessionsTotal, and is held to it as well.
+	if usageStatusFloor(agent.Status.Usage.ChatSessionsTotal) > 0 && doc.Totals[usageCounterSessionsChat] < floors[usageCounterSessionsChat] {
 		return "a total is below the status it projects to"
 	}
 	for _, counter := range doc.Unfolded {
@@ -1008,6 +1013,7 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 // invalid, and taken as a seed it would be written into one that the next
 // poll refuses, re-seeding the CR, and adding nothing, on every poll.
 func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSeed {
+	chatSessions, triageSessions := usageStatusSessionsSeed(&agent.Status.Usage)
 	seed := usageSeed{Totals: map[string]int64{
 		usageCounterToolExecutions:        usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
 		usageCounterEventsIngested:        usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
@@ -1017,10 +1023,10 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		usageCounterChatTurnsErrored:      usageStatusFloor(agent.Status.Usage.ChatTurnsErroredTotal),
 		usageCounterBackgroundTasksGaveUp: usageStatusFloor(agent.Status.Usage.BackgroundTasksGaveUpTotal),
 		usageCounterNegativeFeedback:      usageStatusFloor(agent.Status.Usage.NegativeFeedbackTotal),
-		// One status value for two halves: it seeds the chat half, and the
-		// read-back bound holds the pair's sum to it (usageDocumentInvalid).
-		usageCounterSessionsTriage:        0,
-		usageCounterSessionsChat:          usageStatusFloor(agent.Status.Usage.SessionsTotal),
+		// sessionsTotal split between the halves (usageStatusSessionsSeed);
+		// the read-back bound holds the pair's sum to it (usageDocumentInvalid).
+		usageCounterSessionsTriage:        triageSessions,
+		usageCounterSessionsChat:          chatSessions,
 		usageCounterToolExecutionsBlocked: usageStatusFloor(agent.Status.Usage.ToolExecutionsBlockedTotal),
 	}}
 	if last := agent.Status.Usage.LastActiveTime; last != nil && !last.Time.After(now) {
@@ -1031,6 +1037,22 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		seed.LastHumanMoved = last.DeepCopy()
 	}
 	return seed
+}
+
+// usageStatusSessionsSeed splits sessionsTotal between the two halves. A
+// status carrying chatSessionsTotal seeds the chat half with it, clamped to
+// the total, and the triage half with the rest. A status without it, or with
+// it at zero, which the omitempty field cannot tell apart, seeds the whole
+// total into the chat half, so a re-seed never hides past chat sessions in
+// the triage half.
+func usageStatusSessionsSeed(usage *agentv1alpha1.AgentUsageStatus) (chat, triage int64) {
+	total := usageStatusFloor(usage.SessionsTotal)
+	chat = usageStatusFloor(usage.ChatSessionsTotal)
+	if chat == 0 {
+		return total, 0
+	}
+	chat = min(chat, total)
+	return chat, total - chat
 }
 
 func usageStatusFloor(value int64) int64 {
@@ -1180,16 +1202,18 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	background := doc.Totals[usageCounterBackgroundTasksGaveUp]
 	negative := doc.Totals[usageCounterNegativeFeedback]
 	sessions := usageSessionsTotal(doc.Totals)
+	chatSessions := doc.Totals[usageCounterSessionsChat]
 	blocked := doc.Totals[usageCounterToolExecutionsBlocked]
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first-schema counters are in every served CRD that has status.usage;
 	// the gauges, the chat counter, the blocked counter, the failures
 	// counter, the errored counter, the background-tasks counter, the
-	// feedback counter and the proposal readings arrived later, each at its
-	// own release, and a CRD at a previous schema prunes some or all of them,
-	// so a difference in one of them alone waits while that field's record is
-	// fresh rather than re-patching every poll, and the others keep landing.
+	// feedback counter, the chat sessions and the proposal readings arrived
+	// later, each at its own release, and a CRD at a previous schema prunes
+	// some or all of them, so a difference in one of them alone waits while
+	// that field's record is fresh rather than re-patching every poll, and
+	// the others keep landing.
 	gaugesPruned := p.newerFieldPruned(agent, usageNewerFieldGauges)
 	readingsPruned := p.newerFieldPruned(agent, usageNewerFieldReadings)
 	chatPruned := p.newerFieldPruned(agent, usageCounterChatMessagesInbound)
@@ -1198,6 +1222,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	erroredPruned := p.newerFieldPruned(agent, usageCounterChatTurnsErrored)
 	backgroundPruned := p.newerFieldPruned(agent, usageCounterBackgroundTasksGaveUp)
 	feedbackPruned := p.newerFieldPruned(agent, usageCounterNegativeFeedback)
+	chatSessionsPruned := p.newerFieldPruned(agent, usageStatusFieldChatSessions)
 	humanPruned := p.newerFieldPruned(agent, usageNewerFieldLastHumanActive)
 	humanBehind := !humanPruned && doc.LastHumanMoved != nil && (usage.LastHumanActiveTime == nil || !usage.LastHumanActiveTime.Equal(doc.LastHumanMoved))
 	gaugesMoved := gaugesKnown && !gaugesPruned &&
@@ -1211,7 +1236,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	newerBehind := (!chatPruned && usage.ChatMessagesInboundTotal < chat) ||
 		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked) || (!failuresPruned && usage.BrokerFailuresTotal < failures) ||
 		(!erroredPruned && usage.ChatTurnsErroredTotal < errored) || (!backgroundPruned && usage.BackgroundTasksGaveUpTotal < background) ||
-		(!feedbackPruned && usage.NegativeFeedbackTotal < negative) || readingsMoved
+		(!feedbackPruned && usage.NegativeFeedbackTotal < negative) ||
+		(!chatSessionsPruned && usage.ChatSessionsTotal < chatSessions) || readingsMoved
 	// sessionsTotal is in the first schema beside the first three counters
 	// (every CRD with status.usage has carried it), so it has no record of
 	// its own: a served CRD prunes it only with status.usage whole.
@@ -1230,6 +1256,9 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.BackgroundTasksGaveUpTotal = background
 	usage.NegativeFeedbackTotal = negative
 	usage.SessionsTotal = sessions
+	if !chatSessionsPruned {
+		usage.ChatSessionsTotal = chatSessions
+	}
 	usage.ToolExecutionsBlockedTotal = blocked
 	if doc.LastMoved != nil {
 		usage.LastActiveTime = doc.LastMoved.DeepCopy()
@@ -1300,6 +1329,9 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	}
 	if negative > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterNegativeFeedback, agent.Status.Usage.NegativeFeedbackTotal == negative)
+	}
+	if !chatSessionsPruned && chatSessions > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageStatusFieldChatSessions, agent.Status.Usage.ChatSessionsTotal == chatSessions)
 	}
 	return nil
 }
