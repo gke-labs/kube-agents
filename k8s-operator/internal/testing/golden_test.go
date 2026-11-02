@@ -176,6 +176,20 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
+			// spec.deployment.credentialProxy.resources.limits.ephemeral-storage
+			// raised above the 8Gi default. The proxy's state emptyDir grows by
+			// the headroom (5Gi + 4Gi) and its /tmp keeps 2Gi, which
+			// tests/test_manifest_resource_parity.py reads to check the grown
+			// volumes still fit under the raised limit.
+			name:         "PlatformAgentCredentialProxyResources",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-credential-proxy-resources.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-credential-proxy-resources.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
 			// The egress policy on. Diff this against
 			// platformagent-tagged.yaml and the whole of what
 			// spec.security.egressPolicy renders is one NetworkPolicy —
