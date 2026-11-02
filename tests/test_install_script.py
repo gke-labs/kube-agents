@@ -1320,6 +1320,39 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertIn("Create the GitHub App on ghe.example.com, not on github.com", proc.stdout)
         self.assertIn("DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=1 READS=2", proc.stdout)
 
+    def test_an_exported_ca_file_is_offered_as_option_2_default(self):
+        """On a first install with GITOPS_HOST and GITOPS_CA_FILE exported,
+        option 2 offers both as their prompt defaults and keeps the derived
+        CA Secret name. Before, option 2 cleared the CA file and skipped the
+        CA prompt because it read the derived name as a recorded Secret name,
+        leaving a host, no CA file, and an unfulfilled Secret name (#4018)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = pathlib.Path(tmp) / "ca.pem"
+            ca.write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+            preset = (
+                f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+                'PARAM_GITOPS_CA_SECRET="github-forge-ca"\n'
+            )
+            proc = self._ask_gitops_forge(["2"], ["ghe.example.com", str(ca)], preset=preset)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                f"PROMPT: PEM CA file that signed the instance's certificate (empty if a public CA signed it) default=[{ca}]",
+                proc.stdout,
+            )
+            self.assertIn(
+                f"DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[{ca}] MENUS=1 READS=2 SECRET=[github-forge-ca]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
+            # An empty answer at the CA prompt clears the CA file and the derived Secret name.
+            proc = self._ask_gitops_forge(["2"], ["ghe.example.com", ""], preset=preset)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                "DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=1 READS=2 SECRET=[]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
+
     def test_a_declined_forge_menu_skips_the_repository_menu_in_main(self):
         """main's step 8 does not ask the repository menu over an answer the
         forge menu already took: the declined flag picks "Skip for now", and
