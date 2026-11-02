@@ -689,6 +689,38 @@ class AnnotateManifestTest(unittest.TestCase):
         self.assertEqual([r["name"] for r in entry["kcc_unready"]], ["prod"])
         self.assertEqual(entry["kcc_kinds_read"], ["ContainerCluster", "ContainerNodePool"])
 
+    def test_credential_fetches_take_a_proxy_slot_too(self):
+        """`get-credentials` goes through the broker as the reads do, so the
+        peak of commands in flight, fetches included, stays inside the slots."""
+        lock = threading.Lock()
+        running = [0, 0]
+        kinds = [f"Kind{n}" for n in range(6)]
+
+        def run(argv, *, env=None, timeout=None):
+            with lock:
+                running[0] += 1
+                running[1] = max(running[1], running[0])
+            time.sleep(0.01)
+            with lock:
+                running[0] -= 1
+            if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
+                Path(env["KUBECONFIG"]).write_text("apiVersion: v1\n")
+                return kcc_health.Result(0, "", "")
+            if is_discovery(argv):
+                return kcc_health.Result(0, "".join(crd_line(kind) + "\n" for kind in kinds), "")
+            return listing()
+
+        width = kcc_health.proxy_slots()
+        manifest = {"clusters": [
+            {"name": f"acme/us-central1/c{n}", "project": "acme", "location": "us-central1", "outcome": "collected"}
+            for n in range(2 * width)
+        ]}
+        with ThreadPoolExecutor(max_workers=width) as pool:
+            kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, mapper=pool.map, clock=self.clock)
+        self.assertTrue(all(entry.get("kcc_unready") == [] for entry in manifest["clusters"]))
+        self.assertGreater(running[1], 1)
+        self.assertLessEqual(running[1], width)
+
     def test_clusters_with_the_add_on_are_read_first(self):
         run = FakeRun({"hub": listing(), "edge": listing(), "slow": listing()})
         mapped = []

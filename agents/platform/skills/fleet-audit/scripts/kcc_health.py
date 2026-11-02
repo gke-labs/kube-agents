@@ -139,7 +139,8 @@ KIND_READ_TIMEOUT_S = 60
 # several clusters at once, each with its own kind pool, so without this bound
 # width x width requests would queue in the broker, which refuses a request
 # that waits past its slot wait and so makes a host's read unknown. Every
-# `kubectl` call of the read takes a slot first (`_with_proxy_slot`), and one
+# command of the read takes a slot first (`_with_proxy_slot`): the
+# `get-credentials`, the discovery, each kind's list and the namespaces read. One
 # cluster's kind pool is as wide as the slots. Other reads of the compliance
 # sweep threads at the same time are not counted here, so the broker's queue
 # can still hold up to one sweep width less one more requests than this bound.
@@ -613,7 +614,10 @@ def _annotate_entry(
         if note:
             return {UNREAD_FIELD: f"{note}, so whether Config Connector applies its objects here is not known."}
         argv = ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project]
-        fetched = run(argv, env={**os.environ, "KUBECONFIG": str(kubeconfig)}, timeout=min(CREDENTIALS_TIMEOUT_S, left))
+        # Through the broker too, so it takes a slot like the reads.
+        fetched = _with_proxy_slot(run, argv, kubeconfig, CREDENTIALS_TIMEOUT_S, deadline, clock)
+        if fetched is None:
+            return _budget_spent()
         if fetched.rc != 0:
             excerpt = " ".join(fetched.stderr.split())[:MAX_ERROR_CHARS] or "no stderr"
             return {
