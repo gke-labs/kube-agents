@@ -223,13 +223,23 @@ def test_the_note_finish_writes_for_the_plant_carries_the_cases_phrases(tmp_path
         "object": "NodePool/pinned-inference-pool",
         "remediation": {"kind": "manifest", "path": path, "note": "Spread the pool over three zones."},
     }
-    assert audit_report.disclose_stalled_kcc_remediations([finding], collected, tmp_path) == ["pool-single-zone"]
-    note = finding["remediation"]["note"]
     task = yaml.safe_load(TASK.read_text(encoding="utf-8"))
     [deciding] = [e for e in task["verification_spec"] if e["name"] == "the-fix-says-config-connector-is-not-applying-its-file"]
-    for phrase in deciding["check"]["required_phrases"]:
-        assert phrase in note
-    # Red on main: the worker's note alone carries neither phrase.
+    declarations = audit_report.kcc_declarations(tmp_path)
+    # A manifest fix of the planted file, and the live run's case: the worker
+    # named a file it never wrote, so the fix degraded to manual. The ledger
+    # row carries every phrase either way.
+    for remediation in (
+        {"kind": "manifest", "path": path, "note": "Spread the pool over three zones."},
+        {"kind": "manifest", "path": "clusters/acme-seeded-a/pinned-inference-pool.tf", "note": "Spread the pool over three zones."},
+    ):
+        case = {**finding, "remediation": dict(remediation)}
+        audit_report.degrade_missing_remediations([case], tmp_path)
+        assert audit_report.disclose_stalled_kcc_remediations([case], collected, tmp_path, declarations) == ["pool-single-zone"]
+        row = "\n".join(audit_report.render_finding({**case, "severity": "major", "title": "Single-zone pool", "evidence": {}}))
+        for phrase in deciding["check"]["required_phrases"]:
+            assert phrase in row, (case["remediation"]["kind"], phrase)
+    # Red on main: the worker's note alone carries no phrase.
     for phrase in deciding["check"]["required_phrases"]:
         assert phrase not in "Spread the pool over three zones."
 

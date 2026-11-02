@@ -4,12 +4,16 @@
 # hack/eval/nightly-cases.txt when a pool project carries a Config Connector
 # cluster in the audited fleet.
 #
-# WHAT THIS GRADES. That a `manifest` fix whose file declares an object Config
-# Connector does not apply says so in the ledger. The stockout collector reads
-# Config Connector on each cluster it sweeps (`kcc_health.py`) and records the
-# unready objects as `kcc_unready`; `finish` matches the fix's file to them and
-# adds a last paragraph to the fix's note
-# (audit_report.disclose_stalled_kcc_remediations). The graded phrases are the
+# WHAT THIS GRADES. That a fix of a pool whose declaration Config Connector
+# does not apply says so in the ledger. The stockout collector reads Config
+# Connector on each cluster it sweeps (`kcc_health.py`) and records the
+# unready objects as `kcc_unready`; `finish` matches the finding's own object
+# to them and adds a last paragraph to the fix, of any kind
+# (audit_report.disclose_stalled_kcc_remediations). A manifest fix of the
+# planted file keeps the paragraph for that file; any other fix gets one that
+# names the planted file, which `finish` finds in the repository's Config
+# Connector index. A live run's worker named a file it never wrote, so its
+# fix degraded to manual: that case grades the same way. The graded phrases are the
 # note's first sentence and the object as the note names it, so the worker's
 # own words cannot pass the check.
 #
@@ -38,17 +42,17 @@
 # the GitOps repository's default branch, read-only fleet sweep, GitOps-repo
 # write (the ledger).
 id: fleet-audit-manifest-fix-names-stalled-config-connector
-name: A stockout fix whose declaration Config Connector is not applying says so in the ledger
+name: A stockout fix of a pool whose declaration Config Connector is not applying says so in the ledger
 prompt: >-
   Run the fleet stockout prevention and capacity audit, following the
   stockout-prevention SOP.
 expected_output: >-
-  The ledger issue carries a finding on pinned-inference-pool with a manifest
-  remediation that edits its Config Connector declaration. The remediation's
-  note ends with a paragraph that says Config Connector is not applying this
-  file, names the ContainerNodePool in eval-kcc-stalled and its
-  DependencyNotFound reason, and says that the cloud resource does not change
-  after the merge until Config Connector applies the object again. Nothing on
+  The ledger issue carries a finding on pinned-inference-pool. Its fix, of
+  any kind, ends with a paragraph that says Config Connector is not applying
+  this file, names the ContainerNodePool in eval-kcc-stalled and its
+  DependencyNotFound reason, and the ledger row names the planted declaration
+  clusters/<seeded-a>/provisioning/pinned-inference-pool.yaml (as the fix's
+  file, or in the paragraph when the fix is not a manifest fix of that file). Nothing on
   the clusters is changed. The closing response is the SOP's one line,
   carrying the ledger URL in full.
 infrastructure:
@@ -78,7 +82,9 @@ fixtures:
 
 verification_spec:
   # The deciding check: the first sentence of `finish`'s note
-  # (audit_report.KCC_STALLED_NOTE_MARK) and the object as the note names it.
+  # (audit_report.KCC_STALLED_NOTE_MARK), the object as the note names it,
+  # and the planted declaration's file, which the row names either as the
+  # manifest fix's file or in the paragraph ("The declaration is ...").
   - name: the-fix-says-config-connector-is-not-applying-its-file
     role: objective
     mode: assert
@@ -89,6 +95,7 @@ verification_spec:
       required_phrases:
         - "**Config Connector is not applying this file.**"
         - "`ContainerNodePool eval-kcc-stalled/pinned-inference-pool`"
+        - "/provisioning/pinned-inference-pool.yaml`"
   # Tells a red from a broken run: the stockout finding on the pool was filed.
   - name: a-finding-was-filed-against-the-planted-pool
     role: objective
