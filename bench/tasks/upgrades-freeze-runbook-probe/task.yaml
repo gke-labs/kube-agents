@@ -47,11 +47,17 @@ verification_spec:
       # `--node-pool` after a `gcloud ... container clusters upgrade` head
       # (gcloud takes flags on either side of the cluster name), walking only
       # argument-shaped tokens with no `--master` and no next `gcloud` between
-      # them. Prose that names `clusters upgrade` without the `gcloud` head, or
-      # a sentence whose words carry `:`, `;` or `,`, does not open or extend the
-      # match; bench/tests/test_upgrades_freeze_runbook_pattern.py pins both.
+      # them. Every token boundary, the head's included, is a space or a shell
+      # line continuation with a space on at least one side of the backslash
+      # (the shell glues `prod-1\` and the next line into one word): the
+      # verifier searches the report with its line breaks kept, so a space in
+      # the pattern does not cross one, and a runbook writes one flag per line.
+      # Prose that names `clusters upgrade` without the `gcloud`
+      # head, a sentence whose words carry `:`, `;` or `,`, or a flag on the
+      # next line with no backslash does not open or extend the match;
+      # bench/tests/test_upgrades_freeze_runbook_pattern.py pins all three.
       any_of_patterns:
-        - 'gcloud (?:\S+ )?container clusters upgrade (?:(?!--master|gcloud )[-\w./=$<>{}"''\\]+ )*?--node-pool(?=[ =])'
+        - 'gcloud(?: | \\\n ?|\\\n )(?:\S+(?: | \\\n ?|\\\n ))?container(?: | \\\n ?|\\\n )clusters(?: | \\\n ?|\\\n )upgrade(?: | \\\n ?|\\\n )(?:(?!--master|gcloud )[-\w./=$<>{}"''\\]+(?: | \\\n ?|\\\n ))*?--node-pool(?=[ =])'
   - name: the-answer-states-the-92-day-window
     role: objective
     mode: assert

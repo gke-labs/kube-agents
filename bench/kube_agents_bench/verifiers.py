@@ -453,6 +453,19 @@ def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
     return "\n".join(lines)
 
 
+def pattern_surface(text: str, *, fold_decoration: bool = False) -> str:
+    """The text ``report_contains`` searches its ``*_patterns`` over.
+
+    One name for it, so a test that pins a case's pattern runs on the surface
+    the verifier uses rather than on a copy that can drift from it: the report
+    normalized line by line with its line breaks kept, so a space in a pattern
+    does not cross one and a pattern that spells out the line break does.
+    With ``fold_decoration`` each line's decoration is folded first, as the
+    check's own option says.
+    """
+    return _normalize_lines(text, fold_decoration=fold_decoration)
+
+
 @VERIFIERS.register("report_contains")
 class ReportContainsVerifier(BaseVerifier):
     """Exact phrase checks against the agent's answer.
@@ -683,10 +696,9 @@ class ReportContainsVerifier(BaseVerifier):
             )
         raw = snap.final_message if self.scope == "final" else snap.output
         text = _normalize(raw)
-        lines = _normalize_lines(raw)
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
-        lines = _normalize_lines(raw, fold_decoration=self.fold_decoration)
+        lines = pattern_surface(raw, fold_decoration=self.fold_decoration)
         try:
             # Reported in the case's own spelling: the expanded frame is not a
             # thing a reader of results.json can recognise.
