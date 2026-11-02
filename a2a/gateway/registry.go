@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -693,6 +694,9 @@ func (r *Registry) BeginTerm(ctx context.Context) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
+		if current == math.MaxUint64 {
+			return 0, fmt.Errorf("term counter %s is at its maximum; incrementing it would wrap to term 0, which fences nothing", termKey)
+		}
 		next := current + 1
 		value := []byte(strconv.FormatUint(next, 10))
 		if rev == 0 {
@@ -715,6 +719,14 @@ func (r *Registry) BeginTerm(ctx context.Context) (uint64, error) {
 func readTerm(ctx context.Context, kv jetstream.KeyValue) (uint64, uint64, error) {
 	entry, err := kv.Get(ctx, termKey)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		// Get reports a deleted key as missing too. A counter that was
+		// deleted would restart terms at 1, beneath every record a later
+		// term stamped, so it's refused rather than read as never raised.
+		if history, herr := kv.History(ctx, termKey); herr == nil && len(history) > 0 {
+			if op := history[len(history)-1].Operation(); op == jetstream.KeyValueDelete || op == jetstream.KeyValuePurge {
+				return 0, 0, fmt.Errorf("term counter %s was deleted: restore it to at least the highest term a record carries", termKey)
+			}
+		}
 		return 0, 0, nil
 	}
 	if err != nil {
@@ -759,6 +771,12 @@ func fencedRecord(ctx context.Context, kv jetstream.KeyValue, sessionKey string,
 		return entry.Revision(), nil
 	}
 	if stored.Epoch > mine {
+		if stored.Epoch > term {
+			// A record above the counter means the counter went backwards,
+			// by hand: no term hands out a number below one already used.
+			return 0, fmt.Errorf("session %s carries term %d, above the term counter %s at %d (the counter was reset): %w",
+				sessionKey, stored.Epoch, termKey, term, ErrFenced)
+		}
 		return 0, fmt.Errorf("session %s: %w", sessionKey, ErrFenced)
 	}
 	return entry.Revision(), nil

@@ -437,3 +437,72 @@ func TestACreateOverADeletedKeyLosingARaceIsARevisionConflict(t *testing.T) {
 		}
 	}
 }
+
+// TestBeginTermRefusesToWrapPastTheMaximum: a counter at MaxUint64 would wrap
+// to term 0, the unfenced path; BeginTerm refuses and names the key instead.
+func TestBeginTermRefusesToWrapPastTheMaximum(t *testing.T) {
+	ctx := context.Background()
+	r := startRig(t)
+	kv, err := r.client.KV(ctx, lib.SessionStateBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, termKey, []byte("18446744073709551615")); err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry(r.client)
+	if got, err := reg.BeginTerm(ctx); err == nil || !strings.Contains(err.Error(), termKey) || got != 0 || reg.Epoch() != 0 {
+		t.Fatalf("BeginTerm at the maximum = %d, %v (epoch %d), want a refusal naming %s", got, err, reg.Epoch(), termKey)
+	}
+	if term, _, _ := readTerm(ctx, kv); term == 0 {
+		t.Fatal("the counter wrapped to 0")
+	}
+}
+
+// TestADeletedCounterIsRefusedNotRestartedAtOne: a deleted counter isn't read
+// as never raised, which would restart terms beneath the records.
+func TestADeletedCounterIsRefusedNotRestartedAtOne(t *testing.T) {
+	ctx := context.Background()
+	r := startRig(t)
+	reg := NewRegistry(r.client)
+	if _, err := reg.BeginTerm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	kv, err := r.client.KV(ctx, lib.SessionStateBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := kv.Delete(ctx, termKey); err != nil {
+		t.Fatal(err)
+	}
+	next := NewRegistry(r.client)
+	if got, err := next.BeginTerm(ctx); err == nil || !strings.Contains(err.Error(), "was deleted") {
+		t.Fatalf("BeginTerm over a deleted counter = %d, %v, want a refusal", got, err)
+	}
+}
+
+// TestARecordAboveTheCounterSaysTheCounterWasReset: a write refused because a
+// record's term is above the counter names the counter, not just the session.
+func TestARecordAboveTheCounterSaysTheCounterWasReset(t *testing.T) {
+	ctx := context.Background()
+	r := startRig(t)
+	high := NewRegistry(r.client)
+	high.setEpoch(3)
+	key := "slack:T1/C1/reset"
+	if err := high.Put(ctx, &SessionRecord{Key: key, Addressee: "platform"}); err != nil {
+		t.Fatal(err)
+	}
+	kv, err := r.client.KV(ctx, lib.SessionStateBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, termKey, []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	low := NewRegistry(r.client)
+	low.setEpoch(1)
+	err = low.Put(ctx, &SessionRecord{Key: key, Addressee: "after-reset"})
+	if !errors.Is(err, ErrFenced) || !strings.Contains(err.Error(), termKey) || !strings.Contains(err.Error(), "reset") {
+		t.Fatalf("Put under a reset counter = %v, want ErrFenced naming %s and the reset", err, termKey)
+	}
+}
