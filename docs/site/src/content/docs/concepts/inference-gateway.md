@@ -284,7 +284,7 @@ To bound disk consumption on the gateway pod's `/tmp` `emptyDir`, the logger rot
 
 ### Vertex AI and Model Garden
 
-`MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and by default (when using Workload Identity rather than `litellm.vertex.credentialsSecretRef`) no model API key or static GCP key exists in the cluster. The project boundary governs billing and credentials. The default location is the global endpoint, which makes no promise about the region a request is processed in; see the location bullet below.
+`MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and by default (when using Workload Identity rather than `litellm.vertex.credentialsSecretRef`) no model API key or static GCP key exists in the cluster. That boundary is the project, which governs billing, credentials and data, and it says nothing about geography. The default location is the global endpoint, which makes no promise about the region a request is processed in; see the location bullet below.
 
 Two things differ from the API-key providers:
 

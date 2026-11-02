@@ -219,7 +219,7 @@ An answer that posts whole, as below, still gets the button under it. The except
 - it runs past 12,000 characters;
 - the Slack adapter is set to send Slack's own markdown blocks or no rich blocks.
 
-A card that blocks, crashes, times out or gives up posts no line of its own (except a question, below) once the wake asking the agent that created the card to explain it has been queued. For work you asked for, that agent is the Planning Agent, and the failure is told by it. If that wake fails, the card's own failure line posts instead, and a wake that then succeeds on a retry tells the failure a second time. A failure line still waiting on its wake when the same card recovers (it completes, hands off for review or is moved to done) is dropped, so it never lands beneath the recovery.
+A card that blocks, crashes, times out or gives up posts no line of its own (except a question, below) once the wake asking its creator to explain it has been queued. The agent that created the card then tells the failure; for work you asked for, that is the Planning Agent. If that wake fails, the card's own failure line posts instead, and a wake that then succeeds on a retry tells the failure a second time. A failure line still waiting on its wake when the same card recovers (it completes, hands off for review or is moved to done) is dropped, so it never lands beneath the recovery.
 
 The agent's reply to that wake opens with its first sentence in bold. When it ends on one short yes/no question, such as "Check it there?", a **Try again** button follows it (an open or either/or question stays text). Clicking it sends "Try again" as your reply in the thread, and the message is rewritten to name who clicked. When the reply marks its next step, that step is the button instead, such as **check seeded-a**, whatever the question. The reply posts as written if the agent restarts between the wake and its reply; outside a thread the question stays text, and a step the reply marks is not shown.
 
@@ -286,7 +286,7 @@ The daily stuck-task report shows a **Retry** and a **Drop** button under each t
 
 With `KAGE_SLACK_UX` on, the harness's own messages stay out of the way on Slack. Scheduled reports arrive without the `Cronjob Response` header, job ID and footer. The long-turn heartbeat, if it is enabled for Slack, says the agent is still working without naming the tool running. The agent does not announce that it is back after a restart, post the session-database warnings (the error stays in the log), or append Hermes' tip about its queueing setting.
 
-Its replies about restarting, shutting down, stopping, being busy with an earlier message, a command sent while it is working, or a `/steer` it could not take are written plainly in its own voice. They carry no console commands or error text. So are its replies about the model provider failing or turning a request down. That covers the English replies; an install set to another display language gets Hermes' translation of the restart and stop replies. Other chat platforms are unchanged, and with the flag off nothing changes.
+Its replies about restarting, shutting down, stopping, being busy with an earlier message, a command sent while it is working, or a `/steer` it could not take are written plainly in its own voice. They carry no console commands or error text, and its replies about the model provider failing or turning a request down read the same way. That covers the English replies; an install set to another display language gets Hermes' translation of the restart and stop replies. Other chat platforms are unchanged, and with the flag off nothing changes.
 
 ## Sending another message while it works
 
@@ -355,7 +355,7 @@ A reply you type in the conversation answers the question the same way, with you
 
 A conversation runs one task at a time. A message sent while its task runs, other than the commands below, goes to that task as a follow-up, and the gateway answers `✏️ got it, I'll take that next`. The agent finishes the turn it is on, then takes each follow-up in the order it arrived as a further turn in the same session, so it answers with the earlier turns in context. Each turn's answer posts as soon as the next turn starts, and the last one closes the task. A task takes at most 16 follow-ups.
 
-One the agent cannot take is answered `⚠️ not taken: <why>. Send it again after the answer.`, for one of five reasons:
+One the agent cannot take is answered `⚠️ not taken: <why>. Send it again after the answer.`, for one of these reasons:
 
 - the task has already taken as many follow-ups as it runs;
 - it was already finishing;
