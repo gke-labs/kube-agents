@@ -436,7 +436,8 @@ func (c *dedupCache) ReopenIfPolicyFiltered(key EventKey, message string, eventL
 // This exists for one caller: the dispatch path, when the daemon did
 // not accept the alert the entry was created for — a failed
 // CreateSession, a non-2xx inject, or a 2xx inject the daemon reports
-// as suppressed against its daily ceiling. It is not a claim that the
+// as suppressed against its daily ceiling — or was not offered it,
+// because the session breaker was holding creates. It is not a claim that the
 // alert reached a human; the daemon answers the inject before it posts
 // to chat, so a failure after that point is beyond what any caller here
 // can observe. Observe writes the entry before CreateSession or Inject

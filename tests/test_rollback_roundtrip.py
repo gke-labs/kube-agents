@@ -89,6 +89,30 @@ _FAST_ENV = {
     "ROLLBACK_BUS_TASK_TIMEOUT": "10",
 }
 
+# The signal case sends SIGTERM only while the script is blocked in a poll
+# sleep. bash 5.2 runs a pending trap at the start of the next command, unless
+# a `$(...)` expansion comes first: xparse_dolparen() sets the parser's eof
+# token to `)` and calls parse_command(), whose first act is
+# run_pending_traps(), so the trap string is parsed where only a `)` may end
+# the input and dies with "trap: line 2: unexpected EOF while looking for
+# matching `)'", exit status 2, before on_signal runs. With POLL_SECONDS at 0
+# the script expands one every few milliseconds. A signal that lands while
+# the script's foreground child is `sleep` stays pending until that sleep
+# ends, and the loop's next command is a clean checkpoint.
+_SIGNAL_POLL_SECONDS = "3"
+_SIGNAL_WAIT_SECONDS = 60
+_SIGNAL_CHECK_INTERVAL_SECONDS = 0.05
+_PGREP_CHILDREN = ["pgrep", "-P"]
+_PS_COMMAND_NAMES = ["ps", "-o", "comm=", "-p"]
+
+
+def child_commands(pid: int) -> list[str]:
+    """The command name of each direct child of pid; a child that exits between the two reads is dropped."""
+    children = subprocess.run([*_PGREP_CHILDREN, str(pid)], capture_output=True, text=True, check=False).stdout.split()
+    if not children:
+        return []
+    return subprocess.run([*_PS_COMMAND_NAMES, ",".join(children)], capture_output=True, text=True, check=False).stdout.split()
+
 # Every assertion a passing run prints, in order, for a CR that declares the
 # bridge sidecar by hand (the case the unset and restore exist for; the
 # operator's rendered bridge needs neither, test_no_sidecars_... below).
@@ -1306,14 +1330,36 @@ class FailureTest(RoundTripTest):
         sim = Sim(healthy_next_state(never_ready_on="today"))
         self.addCleanup(sim.close)
         proc = subprocess.Popen(
-            ["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=sim.env(ROLLBACK_READY_TIMEOUT="600")
+            ["bash", str(_SCRIPT), _NS, _CR],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=sim.env(ROLLBACK_READY_TIMEOUT="600", ROLLBACK_POLL_SECONDS=_SIGNAL_POLL_SECONDS),
         )
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and not any(p.get("spec", {}).get("mode") == "today" for p in sim.state()["patches"]):
-            time.sleep(0.2)
-        time.sleep(1)
+        # Past the flip to today and inside a poll sleep (_SIGNAL_POLL_SECONDS
+        # above): leg1.mode-today's rollout wait, which sleeps until the fake's
+        # reconcile lands, is the first one. The signal goes the moment the
+        # sleep is seen, not an interval later.
+        deadline = time.monotonic() + _SIGNAL_WAIT_SECONDS
+        flipped = sleeping = False
+        while time.monotonic() < deadline and proc.poll() is None:
+            flipped = flipped or any(p.get("spec", {}).get("mode") == "today" for p in sim.state()["patches"])
+            sleeping = flipped and child_commands(proc.pid) == ["sleep"]
+            if sleeping:
+                break
+            time.sleep(_SIGNAL_CHECK_INTERVAL_SECONDS)
+        if proc.poll() is not None:
+            out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
+            self.fail(f"the script exited with status {proc.returncode} before the signal:\n{out}{err}")
+        if not sleeping:
+            # The script is still running somewhere this test did not expect:
+            # reap it and carry its transcript, so the failure says what it was doing.
+            proc.kill()
+            out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
+            what = "reach a poll sleep after the flip" if flipped else "flip to today"
+            self.fail(f"the script did not {what} within {_SIGNAL_WAIT_SECONDS}s:\n{out}{err}")
         proc.send_signal(signal.SIGTERM)
-        out, err = proc.communicate(timeout=60)
+        out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
         self.assertEqual(proc.returncode, 1, out + err)
         self.assertIn("FAIL leg1.interrupted:", out, err)
         self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted", out + err)

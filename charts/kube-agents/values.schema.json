@@ -861,6 +861,9 @@
                     },
                     "runtimeClassName": {
                       "type": "string"
+                    },
+                    "resources": {
+                      "type": "object"
                     }
                   }
                 }
