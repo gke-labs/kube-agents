@@ -21,10 +21,36 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+)
+
+// The session-create cooldown breaker (sessionBreaker). session_kv_server is
+// one loopback process shared by every cluster's dispatcher, so a 429 or a
+// 5xx from POST /sessions says the daemon is busy or broken, not that one
+// workload's request was. Before the breaker, every sighting of every
+// workload on every cluster re-POSTed into that failure, because the failed
+// dispatch forgets its dedup entry and the next sighting retries.
+const (
+	// sessionBreakerThreshold is how many consecutive 429 or 5xx answers to
+	// POST /sessions open the breaker. A 201 resets the count; any other
+	// status (a 401, a 404) leaves it alone, since it says nothing about load.
+	sessionBreakerThreshold = 3
+	// sessionBreakerCooldown is how long an open breaker holds session
+	// creates when the opening response carries no Retry-After, or one
+	// shorter than this.
+	sessionBreakerCooldown = 60 * time.Second
+	// sessionBreakerMaxCooldown caps a Retry-After the daemon sends, so a
+	// misconfigured or hostile header cannot silence triage for hours.
+	sessionBreakerMaxCooldown = 300 * time.Second
+	// retryAfterHeader is the header the opening failure's cooldown is read
+	// from, either delta-seconds or an HTTP-date (RFC 9110 §10.2.3).
+	retryAfterHeader = "Retry-After"
 )
 
 // injectorConfig holds the REST endpoint configuration for the agent gateway.
@@ -46,6 +72,125 @@ type injectorConfig struct {
 type injector struct {
 	cfg    injectorConfig
 	client *http.Client
+	// breaker is one per injector, and the injector is one per process
+	// (main builds it once and every cluster's dispatcher shares it), so an
+	// open breaker holds every cluster's session creates at once.
+	breaker *sessionBreaker
+}
+
+// sessionBreaker counts consecutive 429 and 5xx answers to POST /sessions
+// and, past sessionBreakerThreshold, holds session creates for a cooldown.
+// Only POST /sessions feeds it: the inject and follow-up POSTs have a session
+// already and are not what piles up on a struggling daemon.
+//
+// Mutex-guarded because every cluster's dispatcher reaches it from its own
+// goroutine. The clock is a field so tests drive the cooldown without
+// sleeping.
+type sessionBreaker struct {
+	mu sync.Mutex
+	// failures is the consecutive 429 or 5xx count since the last 201.
+	failures int
+	// openUntil is when the hold ends; zero while the breaker is closed.
+	openUntil time.Time
+	// openedBy is the status that tripped the breaker, for the log line.
+	openedBy int
+	// held counts the creates SuppressedUntil turned away during the
+	// current hold, for the line logged when it closes.
+	held int
+	now  func() time.Time
+}
+
+func newSessionBreaker() *sessionBreaker {
+	return &sessionBreaker{now: time.Now}
+}
+
+// record takes one POST /sessions outcome. A 201 closes the count; a 429 or
+// a 5xx increments it and, at the threshold, opens the breaker for
+// sessionBreakerCooldown or the response's Retry-After when that is longer,
+// capped at sessionBreakerMaxCooldown. Any other status is left alone. An
+// answer that lands while the breaker is open (a POST that was in flight
+// when it opened) changes nothing: the deadline the open line logged stands.
+func (b *sessionBreaker) record(status int, retryAfter string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.openUntil.IsZero() && b.now().Before(b.openUntil) {
+		return
+	}
+	if status == http.StatusCreated {
+		b.failures = 0
+		return
+	}
+	if status != http.StatusTooManyRequests && status < http.StatusInternalServerError {
+		return
+	}
+	b.failures++
+	if b.failures < sessionBreakerThreshold {
+		return
+	}
+	now := b.now()
+	cooldown := sessionBreakerCooldown
+	if asked, ok := parseRetryAfter(retryAfter, now); ok && asked > cooldown {
+		cooldown = asked
+	}
+	if cooldown > sessionBreakerMaxCooldown {
+		cooldown = sessionBreakerMaxCooldown
+	}
+	b.openUntil = now.Add(cooldown)
+	b.openedBy = status
+	log.Printf("injector: session creates held until %s: %d consecutive POST /sessions failures, last status %d",
+		b.openUntil.UTC().Format(time.RFC3339), b.failures, status)
+}
+
+// SuppressedUntil reports whether session creates are held, and until when.
+// A call that is told "held" is a create turned away, and is counted for
+// the close line. The first call past the deadline closes the breaker,
+// resets the count and logs once, with how many creates the hold turned
+// away; the caller then proceeds to POST. There is no timer: on a quiet
+// fleet the line waits for the next event.
+func (b *sessionBreaker) SuppressedUntil() (time.Time, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.openUntil.IsZero() {
+		return time.Time{}, false
+	}
+	if b.now().Before(b.openUntil) {
+		b.held++
+		return b.openUntil, true
+	}
+	log.Printf("injector: session creates resume: cooldown opened by status %d ended at %s; %d creates held",
+		b.openedBy, b.openUntil.UTC().Format(time.RFC3339), b.held)
+	b.openUntil = time.Time{}
+	b.openedBy = 0
+	b.failures = 0
+	b.held = 0
+	return time.Time{}, false
+}
+
+// parseRetryAfter reads a Retry-After value as a duration from now: either
+// delta-seconds or an HTTP-date. A missing, malformed or past value is not
+// a duration, and the caller falls back to the fixed cooldown.
+func parseRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(value); err == nil {
+		if secs <= 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	at, err := http.ParseTime(value)
+	if err != nil || !at.After(now) {
+		return 0, false
+	}
+	return at.Sub(now), true
+}
+
+// SessionCreatesSuppressedUntil is the dispatcher's question before a
+// per-incident POST /sessions: held, and until when. See sessionBreaker.
+func (i *injector) SessionCreatesSuppressedUntil() (time.Time, bool) {
+	return i.breaker.SuppressedUntil()
 }
 
 // newInjector creates a new injector and validates target endpoint configurations.
@@ -66,7 +211,7 @@ func newInjector(cfg injectorConfig) (*injector, error) {
 			Timeout: 10 * time.Second,
 		}
 	}
-	return &injector{cfg: cfg, client: client}, nil
+	return &injector{cfg: cfg, client: client, breaker: newSessionBreaker()}, nil
 }
 
 // createSessionResponse maps the JSON response from session creation.
@@ -89,9 +234,13 @@ func (i *injector) CreateSession(ctx context.Context) (string, error) {
 	}
 	resp, err := i.client.Do(req)
 	if err != nil {
+		// A transport error is not the daemon answering, so it does not
+		// feed the breaker: a daemon that is not listening yet costs one
+		// refused connection per sighting, not a queue on its socket.
 		return "", fmt.Errorf("injector: POST /sessions: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	i.breaker.record(resp.StatusCode, resp.Header.Get(retryAfterHeader))
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return "", fmt.Errorf("injector: POST /sessions: status %d: %s", resp.StatusCode, string(body))
