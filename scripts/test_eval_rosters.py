@@ -291,10 +291,11 @@ HELD_OUT_IN_PRESUBMIT: list[tuple[str, str]] = []
 # but it is pinned here rather than in PROMOTED_AFTER_THE_SPLIT because its
 # split-time presubmit line is also in HELD_OUT_TO_NIGHTLY, so the
 # presubmit expectation drops that line and re-inserts this one, and the
-# nightly expectation leaves it out. pdb-remediation-pr took the other
-# route: withdrawn to the nightly first, then promoted from there. A later
-# demotion of a case here deletes its entry and records it in
-# DEMOTED_AFTER_THE_SPLIT with None, like any demotion since #3495.
+# nightly expectation leaves it out. pdb-remediation-pr's seat could take
+# the PROMOTED_AFTER_THE_SPLIT route on 2026-10-14 because its split-time
+# line was not in HELD_OUT_TO_NIGHTLY. A later demotion of a case here is
+# the ordinary one: the entry stays, DEMOTED_AFTER_THE_SPLIT records it
+# with None, and the DEMOTED filter removes it from every expectation.
 RESEATED_FROM_HELD_OUT = [
     ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),  # #2013 step 2 seated it 2026-09-29; step 4, the roster line, 2026-11-02 (#4094)
 ]
@@ -484,11 +485,13 @@ class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
         expected = [
             c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT)
-            if c not in HELD_OUT_TO_NIGHTLY and c not in DEMOTED
+            if c not in HELD_OUT_TO_NIGHTLY
         ]
+        # The DEMOTED filter runs last, after the reseated and held-out
+        # insertions, so a demotion of any of them is the ordinary edit.
         self.assertEqual(
             eval_rosters.presubmit_cases(),
-            with_insertions(expected, RESEATED_FROM_HELD_OUT + HELD_OUT_IN_PRESUBMIT))
+            [c for c in with_insertions(expected, RESEATED_FROM_HELD_OUT + HELD_OUT_IN_PRESUBMIT) if c not in DEMOTED])
 
     def test_the_presubmit_runs_the_blocking_roster_plus_the_held_out_seats_and_nothing_else(self):
         # Decided 2026-09-22 (#1023): a case that cannot red a pull request
@@ -519,15 +522,16 @@ class SplitLostNothingTest(unittest.TestCase):
                 self.assertNotIn(case, eval_rosters.blocking_roster())
                 self.assertIn(case, eval_rosters.nightly_cases())
 
-    def test_a_reseated_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
-        # A seat that took its roster line in place (RESEATED_FROM_HELD_OUT)
-        # reads like a promoted case from here on, and no file lists it twice.
+    def test_a_reseated_case_sits_after_its_line_and_is_pinned_once(self):
+        # A seat that took its roster line in place (RESEATED_FROM_HELD_OUT):
+        # its membership is held with the promoted cases below; what is new
+        # here is its place in the presubmit file and the cross-list pins.
         for case, follows in RESEATED_FROM_HELD_OUT:
+            if case in DEMOTED:
+                continue  # demoted since; test_a_demoted_case_is_in_the_nightly_only holds it
             with self.subTest(case=case):
                 presubmit = eval_rosters.presubmit_cases()
                 self.assertEqual(presubmit.index(case), presubmit.index(follows) + 1)
-                self.assertIn(case, eval_rosters.blocking_roster())
-                self.assertNotIn(case, eval_rosters.nightly_cases())
                 self.assertIn(case, HELD_OUT_TO_NIGHTLY, "a reseated case is one that left for the nightly on 2026-09-22 and came back held out")
                 self.assertNotIn(case, {c for c, _ in HELD_OUT_IN_PRESUBMIT})
                 self.assertIn(case, {c for c, _ in ADMITTED_AFTER_THE_SPLIT})
@@ -583,7 +587,7 @@ class SplitLostNothingTest(unittest.TestCase):
                 self.assertNotIn(case, eval_rosters.blocking_roster())
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
-        for case, _ in PROMOTED_AFTER_THE_SPLIT:
+        for case, _ in PROMOTED_AFTER_THE_SPLIT + RESEATED_FROM_HELD_OUT:
             if case in DEMOTED:
                 continue  # demoted since its promotion; test_a_demoted_case_is_in_the_nightly_only holds it
             with self.subTest(case=case):

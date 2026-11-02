@@ -82,9 +82,10 @@
 # The full audit kept here as the machinery canary
 # (compliance-rbac-overgrant, under the fleet-audits domain) ran on every
 # pull request from 2026-08-25 until 2026-09-22 without ever being admitted,
-# was a nightly case 2026-09-22 to 2026-09-29 and is seated held out below
-# since (#2013); fleet-audits stays on the docs/designs/domains.yaml
-# allowlist until its roster line lands. The comment above EVAL_REPETITIONS
+# was a nightly case 2026-09-22 to 2026-09-29, sat held out below from
+# 2026-09-29 (#2013) and took its roster line on 2026-11-02 (#2013 step 4),
+# which took fleet-audits off the docs/designs/domains.yaml allowlist. The
+# comment above EVAL_REPETITIONS
 # in the script carries the measured history of that budget.
 
 # ── The domain probes ────────────────────────────────────────────────────────
