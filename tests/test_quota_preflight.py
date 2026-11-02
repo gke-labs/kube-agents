@@ -759,9 +759,11 @@ class PreflightDecisionTest(unittest.TestCase):
         surging = [w for w in following.values() if isinstance(w, dict) and w.get("surges")]
         self.assertGreaterEqual(len(surging), 2, "the callouts and verifiers should surge")
         widest = max(w["cpuMillisRequest"] // w["pods"] for w in surging)
-        today = self._requirements(["litellm.enabled=false"])
-        self.assertLess(today["surgeRequestsCpu"], widest, "the test needs LiteLLM's surge out of the way")
-        req = self._requirements(["litellm.enabled=false", "platformAgent.mode=next"])
+        # LiteLLM and the operator also roll surge-first; shrink both below the widest.
+        quiet = ["litellm.enabled=false", "operator.resources.requests.cpu=10m"]
+        today = self._requirements(quiet)
+        self.assertLess(today["surgeRequestsCpu"], widest, "the test needs the chart's own surges out of the way")
+        req = self._requirements([*quiet, "platformAgent.mode=next"])
         self.assertGreaterEqual(req["surgeRequestsCpu"], widest)
 
     def _bridge_delta(self, extra_env: list[dict]) -> int:
