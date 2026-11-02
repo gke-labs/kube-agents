@@ -615,29 +615,29 @@ class BitbucketDataCenterForge(Forge):
         limit = validate_limit(payload.get("limit"))
         page = validate_page(payload.get("page"))
         own, more = self._authored(api, repo, author)
+        if more:
+            # The author's proposals past the ceiling were not read, so no page
+            # of this listing is whole: a later page would come back empty and
+            # end the caller's walk as if every proposal had been counted. So
+            # the listing is refused, as the tally is.
+            raise _past_the_ceiling()
         window = own[(page - 1) * limit : page * limit]
         proposals = [translate.authored(node) for node in window]
-        # The instance gives no count of a query, and the rows past the
-        # ceiling were not read, so there is no total to give.
+        # The instance gives no count of a query, so there is no total to give.
         return {
             "proposals": proposals,
             "count": len(proposals),
-            "truncated": more or len(own) > page * limit,
+            "truncated": len(own) > page * limit,
             "total": None,
         }
 
     def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         # Counted from the same read as the listing. A repository past the
-        # ceiling is refused rather than counted short.
+        # ceiling is refused rather than counted short, as the listing is.
         author = _reading_author(payload.get("author"))
         own, more = self._authored(api, repo, author)
         if more:
-            raise WorkspaceError(
-                f"Bitbucket Data Center holds more than {MAX_CONVERSATION_SIZE} pull requests in "
-                "this repository, and gives no count of one author's",
-                status=502,
-                code="FORGE_CALL_FAILED",
-            )
+            raise _past_the_ceiling()
         states = [translate.authored(node)["state"] for node in own]
         return {neutral: states.count(neutral) for neutral in ("open", "merged", "closed")}
 
@@ -671,6 +671,17 @@ class BitbucketDataCenterForge(Forge):
 #: query language, but it is held to one name with no space, colon or
 #: separator, as every forge holds its author.
 _READING_AUTHOR_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+/-]{0,254}")
+
+
+def _past_the_ceiling() -> WorkspaceError:
+    """The refusal for a repository whose proposals the broker could not read whole."""
+    return WorkspaceError(
+        f"Bitbucket Data Center holds more than {MAX_CONVERSATION_SIZE} pull requests in this "
+        "repository; it cannot filter them by a token's user or count them, so one author's "
+        "proposals cannot be read whole",
+        status=502,
+        code="FORGE_CALL_FAILED",
+    )
 
 
 def _reading_author(value: Any) -> str:
