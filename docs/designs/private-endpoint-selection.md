@@ -262,7 +262,7 @@ yields no flag from all three.
   the broker's own; one that names an endpoint is run as given; a kubeconfig written from a
   provisional decision, or from none, by either writer, is served inside its window and
   refetched after it; a settled fetch or a caller's own flag clears the mark; a failed refetch
-  serves the file on disk; a caller's fetch files its result without the kubeconfig lock.
+  serves the file on disk; a caller's fetch files its result without the cluster's kubeconfig lock.
 - `test_cluster_preflight.py`: check 5's JSON carries the bullets and the remedy on a connection
   failure, the bullets without the remedy on a 403, and today's text when there are no bullets.
 - `test_gke_endpoint_parity.py`: the added case above.
