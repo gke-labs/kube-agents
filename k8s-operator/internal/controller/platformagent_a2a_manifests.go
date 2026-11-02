@@ -1430,12 +1430,15 @@ func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 }
 
 // peopleReadingEnabled reports whether the usage poller reads the A2A
-// gateway's people reading for the install: only while no chat platform it
-// enables is served through Hermes, since the gateway counts only the people
-// who write through it, and a count beside a Hermes-served platform would say
-// nobody wrote while that platform's users were writing.
+// gateway's people reading for the install: only while the install renders
+// the A2A stack (a2aStackRendering, the gate the gateway Deployment renders
+// under), since an install with no gateway has nothing to read, and only
+// while no chat platform it enables is served through Hermes, since the
+// gateway counts only the people who write through it, and a count beside a
+// Hermes-served platform would say nobody wrote while that platform's users
+// were writing.
 func peopleReadingEnabled(agent *agentv1alpha1.PlatformAgent) bool {
-	return !legacyChatConsumer(agent) && !legacySlackConsumer(agent) && !teamsEnabled(agent)
+	return a2aStackRendering(agent) && !legacyChatConsumer(agent) && !legacySlackConsumer(agent) && !teamsEnabled(agent)
 }
 
 // slackEnabled is the enabled test the Slack render sites make, in one place.

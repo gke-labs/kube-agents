@@ -305,10 +305,12 @@ func (p *UsageCounterPoller) noteGatewayReading(agent *agentv1alpha1.PlatformAge
 // noteReadings records, per reading, whether this poll's bodies carried it for
 // the CR, and returns each reading's run of misses: a reading read ends its
 // run. The people reading is not counted, and any run it had is dropped,
-// while peopleReadingEnabled is false or no target this poll carries it (an
-// install with no A2A gateway pod to read): its kind is then absent from the
-// map returned, and usageReadingsForPoll clears its fields without a miss.
-func (p *UsageCounterPoller) noteReadings(agent *agentv1alpha1.PlatformAgent, targets []usageTarget, scraped []usageScrapedPod) map[usageReadingKind]int {
+// while peopleReadingEnabled is false (no A2A stack, or a chat platform on
+// Hermes): its kind is then absent from the map returned, and
+// usageReadingsForPoll clears its fields without a miss. With the gate open,
+// a poll that reads no A2A gateway body, its pod missing or unreadable, is a
+// miss like any other.
+func (p *UsageCounterPoller) noteReadings(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod) map[usageReadingKind]int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	key := usagePollKey(agent)
@@ -320,7 +322,7 @@ func (p *UsageCounterPoller) noteReadings(agent *agentv1alpha1.PlatformAgent, ta
 	}
 	misses := map[usageReadingKind]int{}
 	for _, kind := range usageReadingKinds {
-		if kind == usageReadingPeople && (!peopleReadingEnabled(agent) || !slices.ContainsFunc(targets, func(t usageTarget) bool { return slices.Contains(t.readings, kind) })) {
+		if kind == usageReadingPeople && !peopleReadingEnabled(agent) {
 			delete(p.readingMisses[key], kind)
 			continue
 		}
@@ -550,7 +552,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	watcherDown := p.noteGatewayReading(cached, gatewayRead)
 	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, watcherDown)
 	volume, volumeKnown := usageDataVolumeForPoll(cached, scraped, gatewayRead, watcherDown)
-	readings, readingsKnown := usageReadingsForPoll(cached, scraped, p.noteReadings(cached, targets, scraped))
+	readings, readingsKnown := usageReadingsForPoll(cached, scraped, p.noteReadings(cached, scraped))
 	// The scrape and ConfigMap causes are not recorded here: both are standing
 	// failures that would each spend one of the CR's event-bucket tokens every
 	// poll, and two per poll drains the bucket and starves one of them. They are
@@ -642,16 +644,14 @@ func usageClusterGaugesForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usa
 // carried it, for fewer polls in a row than the event streak, so the fields
 // keep their last values. known true with nil values clears the reading's
 // fields to absent: no body has carried it for the event streak, or, for the
-// people reading, peopleReadingEnabled is false or noteReadings did not count
-// it (no target to read). known true with values is the largest of each field
-// across the bodies that carried the reading: the broker is one pod by
-// design, and every A2A gateway replica counts from the one shared bucket.
-// A zero is a reading, and is written as one.
+// people reading, peopleReadingEnabled is false. known true with values is
+// the largest of each field across the bodies that carried the reading: the
+// broker is one pod by design, and every A2A gateway replica counts from the
+// one shared bucket. A zero is a reading, and is written as one.
 func usageReadingsForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod, misses map[usageReadingKind]int) (values map[string]*int64, known map[usageReadingKind]bool) {
 	values = map[string]*int64{}
 	known = map[usageReadingKind]bool{}
-	_, peopleCounted := misses[usageReadingPeople]
-	peopleOpen := peopleReadingEnabled(agent) && peopleCounted
+	peopleOpen := peopleReadingEnabled(agent)
 	for _, s := range scraped {
 		for _, spec := range usageReadingSpecs {
 			if !s.ReadingsPresent[spec.reading] || (spec.reading == usageReadingPeople && !peopleOpen) {

@@ -4120,28 +4120,54 @@ func TestUsagePoller_ThePeopleReadingsHaveTheirOwnPruningRecord(t *testing.T) {
 	}
 }
 
+// An install that renders no A2A stack has no people reading to take: the
+// pair stays absent and no miss is counted. A next install whose gateway pod
+// goes missing has a configured target with no body: one poll is a miss and
+// keeps the pair, the second clears it.
 func TestUsagePoller_NoA2AGatewayPodLeavesThePairAbsentWithoutAMiss(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
-	for _, tc := range []struct {
-		name  string
-		agent *agentv1alpha1.PlatformAgent
-	}{
-		{"today", usageTestAgent(created)},
-		{"next without the A2A gateway pod", usagePeopleTestAgent(created, false)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newUsageHarness(t, tc.agent, usageDefaultObjects(created)...)
-			h.stub.set(gatewayAddr(), 0, nil)
-			h.stub.set(brokerAddr(), 0, nil)
-			h.poll(5)
-			h.poll(10)
-			h.poll(15)
-			if status := h.status(); status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
-				t.Fatalf("people = %d/%d with no A2A gateway, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
-			}
-			if misses, ok := h.peopleMisses(tc.agent); ok {
-				t.Fatalf("no A2A gateway recorded a people miss streak of %d, want none", misses)
-			}
-		})
-	}
+	t.Run("today", func(t *testing.T) {
+		agent := usageTestAgent(created)
+		h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+		h.stub.set(gatewayAddr(), 0, nil)
+		h.stub.set(brokerAddr(), 0, nil)
+		h.poll(5)
+		h.poll(10)
+		h.poll(15)
+		if status := h.status(); status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+			t.Fatalf("people = %d/%d with no A2A gateway, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		}
+		if misses, ok := h.peopleMisses(agent); ok {
+			t.Fatalf("no A2A gateway recorded a people miss streak of %d, want none", misses)
+		}
+	})
+	t.Run("next, the gateway pod gone", func(t *testing.T) {
+		agent := usagePeopleTestAgent(created, false)
+		objects := usagePeopleObjects(created)
+		h := newUsageHarness(t, agent, objects...)
+		h.stub.set(gatewayAddr(), 0, nil)
+		h.stub.set(brokerAddr(), 0, nil)
+		h.setPeople(3, 11)
+		h.poll(5)
+		if status := h.status(); gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+			t.Fatalf("people = %d/%d, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		}
+		if err := h.cl.Delete(context.Background(), objects[len(objects)-1]); err != nil {
+			t.Fatalf("deleting the A2A gateway pod: %v", err)
+		}
+		h.poll(10)
+		if status := h.status(); gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+			t.Fatalf("one poll without the gateway pod: people = %d/%d, want 3/11 kept", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		}
+		if misses, _ := h.peopleMisses(agent); misses != 1 {
+			t.Fatalf("one poll without the gateway pod: %d people misses, want 1", misses)
+		}
+		h.poll(15)
+		if status := h.status(); status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+			t.Fatalf("two polls without the gateway pod: people = %d/%d, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		}
+		if misses, _ := h.peopleMisses(agent); misses != 2 {
+			t.Fatalf("two polls without the gateway pod: %d people misses, want 2", misses)
+		}
+	})
 }

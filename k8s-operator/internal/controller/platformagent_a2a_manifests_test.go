@@ -8340,6 +8340,7 @@ func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
 		{"next, Teams", agent(next, false, false, true), false},
 		{"next, no platform", agent(next, false, false, false), true},
 		{"today, Chat", agent(today, true, false, false), false},
+		{"today, no platform: no A2A stack", agent(today, false, false, false), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := peopleReadingEnabled(tc.agent); got != tc.want {
