@@ -4730,11 +4730,16 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # outside event (an autoscaler scale-down) restarted between lease setup and here.
 scheduled_audits pause "fan-out"
 
-# Rep-ascending FIRST, cost-descending within a rep: repetitions of one task
-# serialize on the task lock, so a same-task unit launched early just parks a
-# lane sleeping on it -- the pool run of 2026-08-31 (build 2094432646640701440)
-# spent two of four lanes that way for its first twelve minutes under the
-# cost-first ordering this replaces.
+# Case by case, cost-descending: every repetition of a case is queued before
+# the next case's first, so a night cut off by its deadline holds whole cases,
+# which finish_case grades and records as they complete. The rep-major order
+# this replaces finished rep 1 and rep 2 of all 151 cases on the night of
+# 2026-10-25 (build 2114144982938947584) and graded 1 of them (#3939).
+# Repetitions of one task serialize on the task lock, so launch_units holds a
+# unit back while another repetition of its task is in flight and gives the
+# lane to the next case instead -- under the cost-first order before the
+# rep-major one, the pool run of 2026-08-31 (build 2094432646640701440) spent
+# two of four lanes parked on that lock for its first twelve minutes.
 
 # Two phases on both lanes (#2079, #2260): for the GitHub-write safeguard,
 # whose window holds every write made to the run's one repository while it
@@ -4789,7 +4794,7 @@ UNIT_QUEUE="$(
       fi
       i=$((i + 1))
     done
-  done | sort -k1,1n -k2,2rn
+  done | sort -k2,2rn -k3,3n -k1,1n
 )"
 UNIT_QUEUE_WRITERS="$(
   for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
@@ -4800,7 +4805,7 @@ UNIT_QUEUE_WRITERS="$(
       fi
       i=$((i + 1))
     done
-  done | sort -k1,1n -k2,2rn
+  done | sort -k2,2rn -k3,3n -k1,1n
 )"
 UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c . || true)"
 WRITER_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_WRITERS}" | grep -c . || true)"
@@ -4840,11 +4845,13 @@ INFRA_IN_FLIGHT_MAX=2
 # doing nothing: on 2026-10-24 the main nightly's waits held 25.7 of its ~70
 # slot-hours and it ran out of time (#3821). Past the limit, a counted lock
 # taker is held back in the queue and the next unit that is not one gets the
-# slot; the held one launches as soon as a counted lock taker's job ends. Queue
-# order is otherwise unchanged.
+# slot; the held one launches as soon as a counted lock taker's job ends. A
+# unit whose task already has a repetition in flight is held back the same way
+# (#3939): it would only sleep on the task lock. Queue order is otherwise
+# unchanged.
 launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch>
   local queue="$1" parallelism="$2" pause="$3"
-  local pending=() line i pick running pid alive infra_pids="" counted
+  local pending=() line i pick running pid alive infra_pids="" counted task_jobs="" job
   # Each line carries whether its unit counts toward INFRA_IN_FLIGHT_MAX, worked
   # out once here rather than on every poll.
   while read -r line; do
@@ -4868,16 +4875,24 @@ EOF_UNIT_QUEUE
       case "${running}" in *" ${pid} "*) alive="${alive} ${pid}" ;; esac
     done
     infra_pids="${alive}"
+    # Each running unit as "<pid>:<task index>".
+    alive=""
+    for job in ${task_jobs}; do
+      case "${running}" in *" ${job%%:*} "*) alive="${alive} ${job}" ;; esac
+    done
+    task_jobs="${alive}"
     pick=""
     for i in "${!pending[@]}"; do
       read -r REP _COST IDX counted <<<"${pending[i]}"
+      case " ${task_jobs} " in *":${IDX} "*) continue ;; esac
       if [ "${counted}" = 0 ] || [ "$(printf '%s\n' ${infra_pids} | grep -c .)" -lt "${INFRA_IN_FLIGHT_MAX}" ]; then
         pick="${i}"
         break
       fi
     done
     if [ -z "${pick}" ]; then
-      # Only counted lock takers are left and the limit is in flight: wait.
+      # Everything left is a counted lock taker past the limit or a task
+      # already in flight: wait.
       sleep 3
       continue
     fi
@@ -4897,6 +4912,7 @@ EOF_UNIT_QUEUE
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
+    task_jobs="${task_jobs} $!:${IDX}"
     if [ "${counted}" = 1 ]; then
       infra_pids="${infra_pids} $!"
     fi

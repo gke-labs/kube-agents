@@ -177,15 +177,15 @@ class QueueOrderTest(unittest.TestCase):
                 rows.append((int(rep), int(cost), int(idx)))
         return rows
 
-    def test_rep_major_then_cost_descending(self):
+    def test_case_major_cost_descending_then_rep_ascending(self):
         rows = self.queue(reps=3)
         self.assertEqual(len(rows), 6)
-        # All rep-1 units precede any rep-2 unit: a task's second repetition
-        # must not launch while its first plausibly still runs.
-        self.assertEqual([r for r, _, _ in rows], [1, 1, 2, 2, 3, 3])
-        # Within a repetition, the expensive unit launches first.
-        for pair in (rows[0:2], rows[2:4], rows[4:6]):
-            self.assertGreaterEqual(pair[0][1], pair[1][1])
+        # Every repetition of a case precedes the next case's first (#3939), so
+        # a deadline kill leaves whole cases graded; the expensive case first.
+        # launch_units, not the queue, keeps a task's next repetition from
+        # launching while its last still runs.
+        self.assertEqual([(r, i) for r, _, i in rows], [(1, 1), (2, 1), (3, 1), (1, 0), (2, 0), (3, 0)])
+        self.assertGreater(rows[0][1], rows[3][1])
 
 
 class DelegationCeilingTest(unittest.TestCase):
