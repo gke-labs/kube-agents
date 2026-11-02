@@ -7915,6 +7915,72 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertEqual(result["candidates"], [])
         self.assertEqual(len(result["commands"]), 15)
 
+    def test_the_five_built_in_reads_are_paged_raw_reads_one_kind_at_a_time(self):
+        """The real paging, not the module's adapter: the workload, RBAC,
+        NetworkPolicy/Namespace, Service and ServiceAccount reads each go out
+        as `kubectl get --raw` collection pages, one kind at a time, and each
+        record names that paged read under the cluster's kubeconfig. A
+        `_collect_compliance` that went back to a one-shot
+        `kubectl get <kinds> -A -o json` for any of the five passes every other
+        test in this class, because the adapter answers that argv; here it
+        fails."""
+        issued = []
+        one_shot_kinds = {
+            collect.COMPLIANCE_DUMP_KINDS, collect.RBAC_DUMP_KINDS, collect.NETPOL_DUMP_KINDS,
+            collect.SERVICE_DUMP_KINDS, collect.SERVICEACCOUNT_DUMP_KINDS,
+        }
+        # One in-scope pod on the pods page, as a raw list carries it (no
+        # `kind`), so the workload- and account-scoped checks run and record
+        # their reads rather than being declared inapplicable.
+        pod = {k: v for k, v in self.benign_pod().items() if k not in ("kind", "apiVersion")}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                items = [pod] if argv[3].startswith("/api/v1/pods?") else []
+                return Run(argv, 0, json.dumps({"metadata": {}, "items": items}), "", 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                if argv[2] in one_shot_kinds:
+                    raise AssertionError(f"a one-shot dump was issued: {argv}")
+                # The CRD and category reads keep their one-shot shape; a
+                # cluster without any of them is their ordinary answer.
+                return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{argv[2]}"', 0.05)
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "acme.svc.id.goog"}}), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, "[]", "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump):
+            result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(
+            [
+                "/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/statefulsets?limit=500",
+                "/apis/apps/v1/daemonsets?limit=500", "/apis/batch/v1/cronjobs?limit=500", "/api/v1/pods?limit=500",
+                "/apis/rbac.authorization.k8s.io/v1/clusterroles?limit=500", "/apis/rbac.authorization.k8s.io/v1/roles?limit=500",
+                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings?limit=500", "/apis/rbac.authorization.k8s.io/v1/rolebindings?limit=500",
+                "/apis/networking.k8s.io/v1/networkpolicies?limit=500", "/api/v1/namespaces?limit=500",
+                "/api/v1/services?limit=500",
+                "/api/v1/serviceaccounts?limit=500",
+            ],
+            raw,
+        )
+        commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
+        kubeconfig = commands_by_slug["privileged-container"].split(" ", 1)[0].removeprefix("KUBECONFIG=")
+        self.assertTrue(kubeconfig.startswith(tmp), kubeconfig)
+        for slug, kinds in (
+            ("privileged-container", collect.COMPLIANCE_DUMP_KINDS),
+            ("cluster-admin-binding", collect.RBAC_DUMP_KINDS),
+            ("netpol-missing", collect.NETPOL_DUMP_KINDS),
+            ("lb-world-open", collect.SERVICE_DUMP_KINDS),
+            ("default-sa-automount", collect.SERVICEACCOUNT_DUMP_KINDS),
+        ):
+            self.assertEqual(collect.paged_command_text(kinds.split(","), kubeconfig=kubeconfig), commands_by_slug[slug], slug)
+
     def test_a_dirty_cluster_reports_across_multiple_sources(self):
         privileged_pod = compliance_pod("bad")
         privileged_pod["spec"]["containers"][0]["securityContext"] = {"privileged": True}
