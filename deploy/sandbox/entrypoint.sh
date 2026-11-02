@@ -487,7 +487,7 @@ write_kube_proxy_kubeconfig() {
   local seen=" ${ctx} "
   local filtered_extras=()
   local extra
-  for extra in "${extra_ctxs[@]}"; do
+  for extra in ${extra_ctxs[@]+"${extra_ctxs[@]}"}; do
     [ -n "$extra" ] || continue
     case "$seen" in
     *" ${extra} "*) continue ;;
@@ -505,7 +505,7 @@ clusters:
     server: ${KUBE_PROXY_URL%/}/clusters/${ctx}
     certificate-authority: ${ca_file}
 EOF
-    for extra in "${filtered_extras[@]}"; do
+    for extra in ${filtered_extras[@]+"${filtered_extras[@]}"}; do
       cat <<EOF
 - name: ${extra}
   cluster:
@@ -524,7 +524,7 @@ contexts:
     cluster: ${ctx}
     user: kube-proxy-caller
 EOF
-    for extra in "${filtered_extras[@]}"; do
+    for extra in ${filtered_extras[@]+"${filtered_extras[@]}"}; do
       cat <<EOF
 - name: ${extra}
   context:
@@ -551,7 +551,7 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
     while IFS= read -r existing_ctx; do
       existing_ctx="$(printf '%s' "$existing_ctx" | tr -d "'\"[:space:]")"
       case "$existing_ctx" in
-      *[!A-Za-z0-9._:-]* | "") continue ;;
+      *[!A-Za-z0-9._-]* | "") continue ;;
       esac
       discovered_ctxs+=("$existing_ctx")
     done < <(awk '/^[[:space:]]*-[[:space:]]*name:[[:space:]]*gke_/{sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/,""); print}' "$DATA/.kubeconfig" 2>/dev/null || true)
@@ -577,14 +577,14 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
       kc_ctx="$default_ctx"
     fi
     case "$kc_ctx" in
-    *[!A-Za-z0-9._:-]* | "") continue ;;
+    *[!A-Za-z0-9._-]* | "") continue ;;
     esac
     discovered_ctxs+=("$kc_ctx")
     if grep -q "gke-gcloud-auth-plugin" "$kc" 2>/dev/null; then
       write_kube_proxy_kubeconfig "$kc" "$kc_ctx" || log "WARNING: could not rewrite legacy kubeconfig $kc"
     fi
   done
-  write_kube_proxy_kubeconfig "$DATA/.kubeconfig" "$default_ctx" "${discovered_ctxs[@]}"
+  write_kube_proxy_kubeconfig "$DATA/.kubeconfig" "$default_ctx" ${discovered_ctxs[@]+"${discovered_ctxs[@]}"}
 fi
 
 # 2. The agent's public key. Failing loudly here is the point: without it sshd

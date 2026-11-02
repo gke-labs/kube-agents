@@ -839,74 +839,109 @@ def _merge_context_into_kubeconfig_file(
     ca_file: str,
     token_file: str,
 ) -> None:
+    import fcntl
     import yaml
 
     try:
-        if not path.is_file() or path.stat().st_uid != os.geteuid():
+        if not path.parent.is_dir():
             return
-        doc = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, yaml.YAMLError, RecursionError):
-        return
-    if not isinstance(doc, dict):
-        return
-    expected_server = f"{proxy_url}/clusters/{context}"
-    existing_clusters = list(doc.get("clusters") or [])
-    existing_contexts = list(doc.get("contexts") or [])
-    has_cluster = any(
-        isinstance(c, dict)
-        and c.get("name") == context
-        and isinstance(c.get("cluster"), dict)
-        and c["cluster"].get("server") == expected_server
-        and c["cluster"].get("certificate-authority") == ca_file
-        for c in existing_clusters
-    )
-    has_context = any(
-        isinstance(c, dict)
-        and c.get("name") == context
-        and isinstance(c.get("context"), dict)
-        and c["context"].get("cluster") == context
-        and c["context"].get("user") == KUBE_PROXY_USER_NAME
-        for c in existing_contexts
-    )
-    if has_cluster and has_context:
-        return
-    clusters = [c for c in existing_clusters if isinstance(c, dict) and c.get("name") != context]
-    clusters.append(
-        {
-            "name": context,
-            "cluster": {
-                "server": expected_server,
-                "certificate-authority": ca_file,
-            },
-        }
-    )
-    doc["clusters"] = clusters
-    users = list(doc.get("users") or [])
-    users = [
-        u for u in users if isinstance(u, dict) and u.get("name") != KUBE_PROXY_USER_NAME
-    ]
-    users.append(
-        {
-            "name": KUBE_PROXY_USER_NAME,
-            "user": {"tokenFile": token_file},
-        }
-    )
-    doc["users"] = users
-    contexts = [c for c in existing_contexts if isinstance(c, dict) and c.get("name") != context]
-    contexts.append(
-        {
-            "name": context,
-            "context": {
-                "cluster": context,
-                "user": KUBE_PROXY_USER_NAME,
-            },
-        }
-    )
-    doc["contexts"] = contexts
-    try:
-        _replace_file(path, yaml.safe_dump(doc, sort_keys=False))
+        lock_path = path.with_name(f".{path.name}.lock")
+        lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        lock_fd = os.open(lock_path, lock_flags, 0o600)
     except OSError:
-        pass
+        return
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            if path.is_symlink() or not path.is_file():
+                return
+            st = path.stat()
+            if st.st_uid != os.geteuid() or st.st_nlink != 1:
+                return
+            doc = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, yaml.YAMLError, RecursionError):
+            return
+        if not isinstance(doc, dict):
+            return
+        expected_server = f"{proxy_url}/clusters/{context}"
+        existing_clusters = list(doc.get("clusters") or [])
+        existing_contexts = list(doc.get("contexts") or [])
+        existing_users = list(doc.get("users") or [])
+        has_cluster = any(
+            isinstance(c, dict)
+            and c.get("name") == context
+            and isinstance(c.get("cluster"), dict)
+            and c["cluster"].get("server") == expected_server
+            and c["cluster"].get("certificate-authority") == ca_file
+            for c in existing_clusters
+        )
+        has_context = any(
+            isinstance(c, dict)
+            and c.get("name") == context
+            and isinstance(c.get("context"), dict)
+            and c["context"].get("cluster") == context
+            and c["context"].get("user") == KUBE_PROXY_USER_NAME
+            for c in existing_contexts
+        )
+        has_user = any(
+            isinstance(u, dict)
+            and u.get("name") == KUBE_PROXY_USER_NAME
+            and u.get("user") == {"tokenFile": token_file}
+            for u in existing_users
+        )
+        if has_cluster and has_context and has_user:
+            return
+        clusters = [
+            c for c in existing_clusters if isinstance(c, dict) and c.get("name") != context
+        ]
+        clusters.append(
+            {
+                "name": context,
+                "cluster": {
+                    "server": expected_server,
+                    "certificate-authority": ca_file,
+                },
+            }
+        )
+        doc["clusters"] = clusters
+        users = [
+            u
+            for u in existing_users
+            if isinstance(u, dict) and u.get("name") != KUBE_PROXY_USER_NAME
+        ]
+        users.append(
+            {
+                "name": KUBE_PROXY_USER_NAME,
+                "user": {"tokenFile": token_file},
+            }
+        )
+        doc["users"] = users
+        contexts = [
+            c for c in existing_contexts if isinstance(c, dict) and c.get("name") != context
+        ]
+        contexts.append(
+            {
+                "name": context,
+                "context": {
+                    "cluster": context,
+                    "user": KUBE_PROXY_USER_NAME,
+                },
+            }
+        )
+        doc["contexts"] = contexts
+        try:
+            _replace_file(path, yaml.safe_dump(doc, sort_keys=False))
+        except OSError:
+            pass
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
 
 
 def merge_context_into_default_kubeconfig(context: str) -> None:

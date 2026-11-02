@@ -246,7 +246,7 @@ Before parsing the path, `pkg/k8sapiproxy` rejects any request whose raw path co
 
 In [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile):
 
-- The stock `kubectl` binary is installed at `/usr/local/bin/kubectl`.
+- The stock `kubectl` binary is installed at `/usr/local/libexec/kubectl`, with a thin `/usr/local/bin/kubectl` wrapper that invokes `credential_proxy_client.py --ensure-kubectl-context` when `KUBE_PROXY_URL` is set and `--context` is passed before `exec`ing `/usr/local/libexec/kubectl`.
 - `/opt/credential-proxy/bin/kubectl` is removed; `/opt/credential-proxy/bin/gcloud` remains a symlink to `/usr/local/bin/credential-proxy-exec`.
 - No client-side `kubectl` `exec` auth plugin (such as `gke-gcloud-auth-plugin`) is installed in the sandbox. Running `gke-gcloud-auth-plugin` inside the sandbox would place the upstream Google Cloud access token (**Asset A1**) inside the untrusted environment. Instead, `kube-proxy` attaches the upstream token outside the sandbox.
 

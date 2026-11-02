@@ -747,6 +747,64 @@ class SandboxEntrypointKubeconfigMigrationTest(_SandboxEntrypointHarness):
         )
         self.assertEqual(original, legacy.read_text())
 
+    def test_existing_kubeconfig_preserves_valid_gke_contexts_and_drops_invalid_ones(self) -> None:
+        existing_kc = self.data / ".kubeconfig"
+        existing_kc.write_text(
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "clusters:\n"
+            "- name: gke_my-proj_us-central1-a_default\n"
+            "- name: gke_fleet-proj_us-east1_cluster-a\n"
+            "- name: gke_fleet-proj_us-east1_cluster-a\n"
+            "- name: 'gke_bad_colon:'\n"
+            "- name: non_gke_context\n"
+            "current-context: gke_my-proj_us-central1-a_default\n"
+        )
+        self._run(
+            ". profiles/platform",
+            extra_env={
+                "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                "KUBE_CONTEXT_NAME": "gke_my-proj_us-central1-a_default",
+            },
+        )
+        default_kc = existing_kc.read_text()
+        self.assertEqual(
+            1,
+            default_kc.count(
+                "server: https://agent-kube-proxy:8443/clusters/gke_fleet-proj_us-east1_cluster-a"
+            ),
+        )
+        self.assertNotIn("gke_bad_colon", default_kc)
+        self.assertNotIn("non_gke_context", default_kc)
+
+    def test_existing_kubeconfig_with_multiple_links_or_wrong_owner_is_ignored(self) -> None:
+        stat_stub = self.bin_dir / "stat"
+        stat_stub.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-c" ] && [ "$2" = "%h %U" ]; then\n'
+            '  echo "2 agent"\n'
+            "  exit 0\n"
+            "fi\n"
+            'exec /usr/bin/stat "$@"\n'
+        )
+        stat_stub.chmod(0o755)
+        existing_kc = self.data / ".kubeconfig"
+        existing_kc.write_text(
+            "apiVersion: v1\n"
+            "kind: Config\n"
+            "clusters:\n"
+            "- name: gke_fleet-proj_us-east1_hardlinked\n"
+        )
+        self._run(
+            ". profiles/platform",
+            extra_env={
+                "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                "KUBE_CONTEXT_NAME": "gke_my-proj_us-central1-a_default",
+            },
+        )
+        default_kc = existing_kc.read_text()
+        self.assertNotIn("gke_fleet-proj_us-east1_hardlinked", default_kc)
+
 
 if __name__ == "__main__":
     unittest.main()
