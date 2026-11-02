@@ -1342,9 +1342,10 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # ``idempotency_key`` (which ``kanban_worker_children`` attributes when it is
 # under a minute old) is printed ``foreign <id>`` and left alone, files
 # included. A taken card is kept, printed ``kept <id>``, while it runs (its
-# worker would write to a deleted row) and while any fan-out card of its
-# creator or of its own is unsettled: ``kanban_fanout_reaper`` finds an overdue
-# fan-out card only through its creator's row and a sibling's attribution row.
+# worker would write to a deleted row) and while a fan-out card of its creator
+# or of its own can still run (``LIVE``) and is not a ``task_links`` follow-up:
+# ``kanban_fanout_reaper`` finds an overdue running fan-out card only through
+# its creator's row and a sibling's attribution row, and skips follow-ups.
 #
 # Raw ``sqlite3`` rather than ``hermes kanban archive --rm``: that is two cold
 # hermes starts, over a minute in the sandboxed container, and its ``archived``
@@ -1358,6 +1359,7 @@ KEPT, FOREIGN, DONE, ATTACHMENTS, LOGS = sys.argv[3:8]
 rest = [a for a in sys.argv[9:] if a]
 roots, fanned = rest[:int(sys.argv[8])], rest[int(sys.argv[8]):]
 BY_TASK = ("task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")
+LIVE = ("todo", "scheduled", "ready", "running")
 try:
     kb = sqlite3.connect("%s/kanban.db" % ROOT, timeout=BUSY, isolation_level=None)
     kb.execute("BEGIN IMMEDIATE")
@@ -1367,7 +1369,9 @@ try:
     if children:
         held = {r[0] for r in kb.execute(
             "SELECT DISTINCT c.creator_id FROM kanban_worker_children c JOIN tasks t ON t.id = c.child_id "
-            "WHERE t.status NOT IN ('done', 'archived')"
+            "WHERE t.status IN (%s) AND NOT EXISTS (SELECT 1 FROM task_links l "
+            "WHERE l.parent_id = c.creator_id AND l.child_id = c.child_id)" % ",".join("?" * len(LIVE)),
+            LIVE,
         )}
     taken = set(roots)
     for tid in roots + fanned:
@@ -1476,8 +1480,9 @@ def _purge_card_state(task_ids: list[str], timeout: float, fanned_out: Sequence[
 
     if kept := marked(_PURGE_KEPT_MARKER):
         _log.warning(
-            "cards %s were still running, or in a fan-out with a card that was, and stay on the "
-            "board; the next run's role-history digest can show their summaries", ", ".join(kept),
+            "cards %s were still running, or in a fan-out with a card that can still run (follow-ups "
+            "aside), and stay on the board; the next run's role-history digest can show their "
+            "summaries", ", ".join(kept),
         )
     if foreign := marked(_PURGE_FOREIGN_MARKER):
         _log.info(

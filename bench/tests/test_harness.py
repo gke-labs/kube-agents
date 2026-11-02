@@ -3906,17 +3906,25 @@ def test_the_purge_leaves_a_card_the_run_adopted_but_did_not_create(tmp_path: Pa
     _purge_card(kb, "t_mine", "done", creator="t_done", attributed_to="t_done")
     _purge_card(kb, "t_cron", "done", creator=None, attributed_to="t_done")
     _purge_card(kb, "t_cron_kid", "done", creator="t_cron", attributed_to="t_cron")
+    _purge_card(kb, "t_garbled", "done", attributed_to="t_done")
+    _purge_card(kb, "t_listed", "done", attributed_to="t_done")
+    kb.execute("UPDATE task_events SET payload = 'not json' WHERE task_id = 't_garbled'")
+    kb.execute("UPDATE task_events SET payload = '[1]' WHERE task_id = 't_listed'")
     kb.commit()
     (tmp_path / "attachments" / "t_cron").mkdir(parents=True)
     (tmp_path / "attachments" / "t_mine").mkdir()
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "t_mine.log").write_text("worker transcript")
+    (tmp_path / "logs" / "t_cron.log").write_text("someone else's transcript")
 
-    out = _run_purge(tmp_path, ["t_done"], ["t_mine", "t_cron", "t_cron_kid"])
+    out = _run_purge(tmp_path, ["t_done"], ["t_mine", "t_cron", "t_cron_kid", "t_garbled", "t_listed"])
 
-    assert out == ["foreign t_cron", "foreign t_cron_kid", "purged"]
+    assert out == ["foreign t_cron", "foreign t_cron_kid", "foreign t_garbled", "foreign t_listed", "purged"]
     on_board = {r[0] for r in kb.execute("SELECT id FROM tasks")}
-    assert {"t_cron", "t_cron_kid"} <= on_board and not {"t_done", "t_mine"} & on_board
-    assert (tmp_path / "attachments" / "t_cron").is_dir()
+    assert {"t_cron", "t_cron_kid", "t_garbled", "t_listed"} <= on_board and not {"t_done", "t_mine"} & on_board
+    assert (tmp_path / "attachments" / "t_cron").is_dir() and (tmp_path / "logs" / "t_cron.log").exists()
     assert not (tmp_path / "attachments" / "t_mine").exists()
+    assert not (tmp_path / "logs" / "t_mine.log").exists()
 
 
 def test_the_purge_keeps_a_fan_out_while_one_of_its_cards_runs(tmp_path: Path) -> None:
@@ -3932,6 +3940,20 @@ def test_the_purge_keeps_a_fan_out_while_one_of_its_cards_runs(tmp_path: Path) -
     assert out == ["kept t_parent", "kept t_c1", "kept t_c2", "purged"]
     rows = kb.execute("SELECT child_id FROM kanban_worker_children WHERE creator_id = 't_parent' ORDER BY 1")
     assert [r[0] for r in rows] == ["t_c1", "t_c2"]
+
+
+def test_the_purge_holds_no_fan_out_for_a_card_that_cannot_run(tmp_path: Path) -> None:
+    """A blocked fan-out card is no reaper's, nor a parent-linked follow-up: the rest goes."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_parent", "done", creator=None)
+    _purge_card(kb, "t_c1", "done", creator="t_parent", attributed_to="t_parent")
+    _purge_card(kb, "t_blocked", "blocked", creator="t_parent", attributed_to="t_parent")
+    _purge_card(kb, "t_follow", "ready", creator="t_parent", attributed_to="t_parent")
+    kb.execute("INSERT INTO task_links VALUES ('t_parent', 't_follow')")
+    kb.commit()
+
+    assert _run_purge(tmp_path, ["t_parent"], ["t_c1", "t_blocked", "t_follow"]) == ["purged"]
+    assert not {r[0] for r in kb.execute("SELECT id FROM tasks")} & {"t_parent", "t_c1", "t_blocked", "t_follow"}
 
 
 def test_a_purge_that_cannot_reach_the_board_is_a_warning(
@@ -3963,15 +3985,16 @@ def test_settle_purges_the_cards_the_workers_fanned_out(
         ]},
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
-    purged: list[str] = []
+    calls: list[tuple[list[str], list[str]]] = []
     monkeypatch.setattr(
-        harness, "_purge_card_state", lambda ids, to, fanned_out=(): purged.extend([*ids, *fanned_out])
+        harness, "_purge_card_state", lambda ids, to, fanned_out=(): calls.append((list(ids), list(fanned_out)))
     )
 
     res = harness.AgentResult(output="ok", trajectory=[{"name": "kanban_create"}])
     harness.KubeAgentsHarness._settle(res, [], ["t_1"])
 
-    assert purged == ["t_1", "t_child", "t_grandchild"]
+    # The run's own card is taken as given; the fan-out is checked against hermes' record.
+    assert calls == [(["t_1"], ["t_child", "t_grandchild"])]
 
 
 def test_artifacts_are_read_before_the_card_state_is_purged(
