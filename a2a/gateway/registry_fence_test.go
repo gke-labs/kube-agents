@@ -18,8 +18,8 @@ func fencedPair(t *testing.T) (old, cur *Registry) {
 	t.Helper()
 	r := startRig(t)
 	old, cur = NewRegistry(r.client), NewRegistry(r.client)
-	old.SetEpoch(1)
-	cur.SetEpoch(2)
+	old.setEpoch(1)
+	cur.setEpoch(2)
 	return old, cur
 }
 
@@ -251,7 +251,7 @@ func TestBeginTermCountsUpFromTheMarkerWhateverTheRegistryHeld(t *testing.T) {
 	// A third leader whose own count restarted (SetEpoch(0) stands in for a
 	// recreated Lease) still lands past the records.
 	third := NewRegistry(r.client)
-	third.SetEpoch(0)
+	third.setEpoch(0)
 	if got, err := third.BeginTerm(ctx); err != nil || got != 3 {
 		t.Fatalf("BeginTerm after a reset = %d, %v, want 3", got, err)
 	}
@@ -266,7 +266,7 @@ func TestASameEpochRaceRetriesAndWins(t *testing.T) {
 	ctx := context.Background()
 	_, cur := fencedPair(t)
 	other := NewRegistry(cur.c)
-	other.SetEpoch(2)
+	other.setEpoch(2)
 	key := "slack:T1/C1/same-term"
 	if err := cur.Put(ctx, &SessionRecord{Key: key, Addressee: "first"}); err != nil {
 		t.Fatal(err)
@@ -294,7 +294,7 @@ func TestDeletesAreConditionalOnTheCheckedRevision(t *testing.T) {
 	ctx := context.Background()
 	_, cur := fencedPair(t)
 	other := NewRegistry(cur.c)
-	other.SetEpoch(2)
+	other.setEpoch(2)
 	key := "slack:T1/C1/delete-race"
 	if err := cur.Put(ctx, &SessionRecord{Key: key, Addressee: "platform"}); err != nil {
 		t.Fatal(err)
@@ -345,7 +345,7 @@ func TestAnUnreadableMarkerNamesItselfAndARecordThatDoesNotParseIsReplaced(t *te
 	if _, err := kv.Put(ctx, termKey, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	reg.SetEpoch(1) // term 0 doesn't read the marker
+	reg.setEpoch(1) // term 0 doesn't read the marker
 	err = reg.Put(ctx, &SessionRecord{Key: key, Addressee: "blocked"})
 	if err == nil || !strings.Contains(err.Error(), termKey) {
 		t.Fatalf("Put under an unreadable marker = %v, want an error naming %s", err, termKey)
@@ -356,7 +356,7 @@ func TestAReplicatedStreamsConflictIsARevisionConflict(t *testing.T) {
 	// Replicated streams answer a lost compare-and-swap with 10164, which
 	// nats.go wraps as ErrKeyRevisionMismatch rather than the 10071 an R1
 	// test server returns.
-	replicated := fmt.Errorf("%w: %w", &jetstream.APIError{ErrorCode: 10164}, jetstream.ErrKeyRevisionMismatch)
+	replicated := fmt.Errorf("%w: %w", &jetstream.APIError{ErrorCode: jetstream.JSErrCodeStreamWrongLastSequenceConstant}, jetstream.ErrKeyRevisionMismatch)
 	if !isRevisionConflict(replicated) {
 		t.Fatal("a replicated stream's conflict isn't a revision conflict")
 	}
@@ -392,5 +392,48 @@ func TestTermZeroIsUnfencedSoAPreElectionBuildCanRollBack(t *testing.T) {
 	}
 	if err := rolledBack.DeleteSession(ctx, key); err != nil {
 		t.Fatalf("DeleteSession at term 0: %v", err)
+	}
+}
+
+// TestTermZeroIsTheUnfencedRegistry: at term 0 the registry never reads the
+// counter, so even one that won't parse can't stop a write, and Put and the
+// deletes are the unconditional calls they always were.
+func TestTermZeroIsTheUnfencedRegistry(t *testing.T) {
+	ctx := context.Background()
+	r := startRig(t)
+	kv, err := r.client.KV(ctx, lib.SessionStateBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, termKey, []byte("not a term")); err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry(r.client)
+	key := "slack:T1/C1/term-zero"
+	if err := reg.Put(ctx, &SessionRecord{Key: key, Addressee: "platform"}); err != nil {
+		t.Fatalf("Put at term 0 under an unreadable counter: %v", err)
+	}
+	if err := reg.Create(ctx, &SessionRecord{Key: "slack:T1/C1/term-zero-new"}); err != nil {
+		t.Fatalf("Create at term 0 under an unreadable counter: %v", err)
+	}
+	if err := reg.IndexTask(ctx, "task-tz", key); err != nil {
+		t.Fatalf("IndexTask at term 0: %v", err)
+	}
+	if err := reg.DropTask(ctx, "task-tz"); err != nil {
+		t.Fatalf("DropTask at term 0: %v", err)
+	}
+	if err := reg.DeleteSession(ctx, key); err != nil {
+		t.Fatalf("DeleteSession at term 0: %v", err)
+	}
+}
+
+// TestACreateOverADeletedKeyLosingARaceIsARevisionConflict: Create over a
+// deleted key returns the wrong-last-sequence error unwrapped, which a
+// fenced Put must still read as a lost race and retry.
+func TestACreateOverADeletedKeyLosingARaceIsARevisionConflict(t *testing.T) {
+	for _, code := range []jetstream.ErrorCode{jetstream.JSErrCodeStreamWrongLastSequence, jetstream.JSErrCodeStreamWrongLastSequenceConstant} {
+		if !isRevisionConflict(&jetstream.APIError{ErrorCode: code}) {
+			t.Errorf("an unwrapped %d isn't a revision conflict", code)
+		}
 	}
 }

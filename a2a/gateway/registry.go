@@ -28,9 +28,10 @@ const relayedSeqCap = 256
 const (
 	// termKey holds the current gateway term's epoch: the election raises it
 	// on each acquisition, before the new leader starts work, so a deposed
-	// leader's write is refused on every record, not only on records the new
-	// leader has already written. One token, outside the "sessions." and
-	// "tasks." listings.
+	// leader's write is refused on records the new leader hasn't written too,
+	// except one whose counter read came before the new term began
+	// (docs/designs/gateway-replicas.md, "Fencing"). One token, outside the
+	// "sessions." and "tasks." listings.
 	termKey = "gateway-term"
 	// fencedWriteAttempts bounds a fenced write's revision races: each loss
 	// re-reads and re-checks the epoch, and only a write landing every time
@@ -88,9 +89,10 @@ type ActiveTask struct {
 // Runtime state is not git and not pod annotations; KV is the house answer.
 type SessionRecord struct {
 	Key string `json:"key"`
-	// Epoch is the gateway term that last wrote the
-	// record (docs/designs/gateway-replicas.md, "Fencing"). Registry.Put
-	// refuses a write from an older epoch. Zero until the election exists.
+	// Epoch is the gateway term that last wrote the record
+	// (docs/designs/gateway-replicas.md, "Fencing"). Put, Create, IndexTask,
+	// DropTask and DeleteSession refuse a write from an older term. Zero
+	// until the election exists.
 	Epoch        uint64    `json:"epoch,omitempty"`
 	ContextID    string    `json:"contextId"`
 	BusSession   string    `json:"busSession,omitempty"`
@@ -661,9 +663,10 @@ type Registry struct {
 // it, and this replica has been deposed.
 var ErrFenced = errors.New("session record belongs to a newer gateway term")
 
-// SetEpoch sets the term this registry writes under, without touching the
-// marker; BeginTerm is how a leader takes a new one.
-func (r *Registry) SetEpoch(epoch uint64) {
+// setEpoch sets the term this registry writes under without touching the
+// counter. Tests only: a term above the counter would stamp records no
+// BeginTerm hands out yet. BeginTerm is how a leader takes a term.
+func (r *Registry) setEpoch(epoch uint64) {
 	r.epoch.Store(epoch)
 }
 
@@ -675,9 +678,11 @@ func (r *Registry) Epoch() uint64 {
 // BeginTerm starts a new gateway term: it increments the term marker and
 // writes under the result from then on. The election calls it on each
 // acquisition, before the new leader starts work. The epoch lives in the
-// same bucket as the records it fences, so it only ever rises with them:
-// a Lease that is deleted and recreated, or an install restored around a
-// kept bus volume, can't hand a new leader a number older than the records.
+// same bucket as the records it fences, so a Lease that is deleted and
+// recreated, or an install restored around a kept bus volume, can't hand a
+// new leader a number older than the records. Deleting or corrupting the
+// counter key by hand can: a counter that won't parse refuses every write
+// above term 0 and BeginTerm itself, and the error names the key.
 func (r *Registry) BeginTerm(ctx context.Context) (uint64, error) {
 	kv, err := r.kv(ctx)
 	if err != nil {
@@ -730,20 +735,9 @@ func readTerm(ctx context.Context, kv jetstream.KeyValue) (uint64, uint64, error
 // written. A record that doesn't parse carries no epoch to check, so the
 // conditional write goes ahead and replaces it, as an unfenced Put did.
 //
-// Term 0 is a gateway without the election, which fences nothing: it reads
-// only the revision. A build from before the election can then be rolled
-// back to after terms have started, and its writes still land.
+// Callers at term 0 don't call it: term 0 writes exactly as an unfenced
+// registry did (unfenced).
 func fencedRecord(ctx context.Context, kv jetstream.KeyValue, sessionKey string, mine uint64) (uint64, error) {
-	if mine == 0 {
-		entry, err := kv.Get(ctx, kvKey(sessionKey))
-		if errors.Is(err, jetstream.ErrKeyNotFound) {
-			return 0, nil
-		}
-		if err != nil {
-			return 0, fmt.Errorf("session %s: %w", sessionKey, err)
-		}
-		return entry.Revision(), nil
-	}
 	term, _, err := readTerm(ctx, kv)
 	if err != nil {
 		return 0, err
@@ -867,6 +861,7 @@ func (r *Registry) Create(ctx context.Context, rec *SessionRecord) error {
 // the revision it checked, so a newer leader's write can't land between the
 // check and this one. A lost revision race re-checks and tries again. Within
 // one epoch the last write wins, as it always has with one active replica.
+// At term 0 it's the unconditional put it always was (unfenced).
 func (r *Registry) Put(ctx context.Context, rec *SessionRecord) error {
 	kv, err := r.kv(ctx)
 	if err != nil {
@@ -877,6 +872,12 @@ func (r *Registry) Put(ctx context.Context, rec *SessionRecord) error {
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return err
+	}
+	if mine == 0 {
+		if _, err := kv.Put(ctx, kvKey(rec.Key), data); err != nil {
+			return fmt.Errorf("session %s: %w", rec.Key, err)
+		}
+		return nil
 	}
 	for attempt := 0; ; attempt++ {
 		rev, err := fencedRecord(ctx, kv, rec.Key, mine)
@@ -901,11 +902,17 @@ func (r *Registry) Put(ctx context.Context, rec *SessionRecord) error {
 }
 
 // isRevisionConflict reports a conditional KV write that lost to another
-// writer. nats.go wraps Update's conflict as ErrKeyRevisionMismatch whether
-// the stream answered 10071 (R1) or 10164 (replicated, as production runs
-// the bus), and Create's as ErrKeyExists.
+// writer: Update's conflict (which nats.go wraps as ErrKeyRevisionMismatch),
+// Create's on a live key (ErrKeyExists), and the wrong-last-sequence codes
+// themselves, which Create over a deleted key returns unwrapped: 10071 on R1,
+// 10164 on a replicated stream, as production runs the bus.
 func isRevisionConflict(err error) bool {
-	return errors.Is(err, jetstream.ErrKeyRevisionMismatch) || errors.Is(err, jetstream.ErrKeyExists)
+	if errors.Is(err, jetstream.ErrKeyRevisionMismatch) || errors.Is(err, jetstream.ErrKeyExists) {
+		return true
+	}
+	var apiErr *jetstream.APIError
+	return errors.As(err, &apiErr) && (apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence ||
+		apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequenceConstant)
 }
 
 // IndexTask records taskId -> session key so the relay can route an event to
@@ -913,14 +920,19 @@ func isRevisionConflict(err error) bool {
 //
 // The index value stays the bare session key, so an older gateway can still
 // read it after a rollback; the write is fenced by the session record's
-// epoch instead.
+// epoch instead. That check and the index write are two keys, so the index
+// write isn't conditional on the record revision checked: a newer leader's
+// record write landing between them doesn't stop it (unlike Put). At term 0
+// it's the unconditional put it always was.
 func (r *Registry) IndexTask(ctx context.Context, taskID, sessionKey string) error {
 	kv, err := r.kv(ctx)
 	if err != nil {
 		return err
 	}
-	if _, err := fencedRecord(ctx, kv, sessionKey, r.epoch.Load()); err != nil {
-		return err
+	if mine := r.epoch.Load(); mine != 0 {
+		if _, err := fencedRecord(ctx, kv, sessionKey, mine); err != nil {
+			return err
+		}
 	}
 	if _, err := kv.Put(ctx, taskKey(taskID), []byte(sessionKey)); err != nil {
 		return fmt.Errorf("task index %s: %w", taskID, err)
@@ -932,11 +944,16 @@ func (r *Registry) IndexTask(ctx context.Context, taskID, sessionKey string) err
 // rendered — the stream is the durable record; the index only routes live
 // events, and one key per task forever is unbounded growth.
 //
-// Fenced by the indexed session's record, as IndexTask is.
+// Fenced by the indexed session's record, as IndexTask is, and conditional
+// on the index entry's revision, not the record's. At term 0 it's the plain
+// delete it always was.
 func (r *Registry) DropTask(ctx context.Context, taskID string) error {
 	kv, err := r.kv(ctx)
 	if err != nil {
 		return err
+	}
+	if r.epoch.Load() == 0 {
+		return kv.Delete(ctx, taskKey(taskID))
 	}
 	entry, err := kv.Get(ctx, taskKey(taskID))
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
@@ -961,11 +978,18 @@ func (r *Registry) DropTask(ctx context.Context, taskID string) error {
 // rather than accumulating full records, rosters, and task histories.
 //
 // Fenced like Put: a record a later epoch wrote isn't deleted, and the delete
-// is conditional on the revision checked.
+// is conditional on the revision checked. At term 0 it's the plain delete it
+// always was.
 func (r *Registry) DeleteSession(ctx context.Context, sessionKey string) error {
 	kv, err := r.kv(ctx)
 	if err != nil {
 		return err
+	}
+	if r.epoch.Load() == 0 {
+		if err := kv.Delete(ctx, kvKey(sessionKey)); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+			return fmt.Errorf("session %s: %w", sessionKey, err)
+		}
+		return nil
 	}
 	rev, err := fencedRecord(ctx, kv, sessionKey, r.epoch.Load())
 	if err != nil {
