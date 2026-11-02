@@ -205,7 +205,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.project, "project", "",
 		"GCP project holding the drift audit subscription. Required. With --in-cluster or --kubeconfig this must be the project ID and not the project number: a Pub/Sub path accepts either, but the join matches this against each record's project_id for the directly reached cluster, so a number would match nothing. On --profiles-dir alone it names only the subscription, and either form works.")
 	fs.StringVar(&f.subscription, "subscription", defaultSubscriptionName, "Pub/Sub subscription to pull audit records from.")
-	fs.Int64Var(&f.maxMessages, "max-messages", defaultMaxMessages, "Messages requested per pull.")
+	fs.Int64Var(&f.maxMessages, "max-messages", defaultMaxMessages, "Most messages requested per pull; the window halves after the broker refuses an answer as oversize and returns here once the backlog drains.")
 	fs.StringVar(&f.automationPrincipals, "automation-principals", "",
 		"Comma-separated principals to classify as automation rather than human, in addition to every *"+gcpServiceAccountSuffix+" service account. Applies to every cluster the subscription carries; changes without a rebuild.")
 	fs.StringVar(&f.humanDomains, "human-domains", "",

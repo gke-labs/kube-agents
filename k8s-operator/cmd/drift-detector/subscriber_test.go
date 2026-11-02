@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 	"google.golang.org/api/pubsub/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -892,6 +893,202 @@ func TestNewSubscriberDefaultsMaxMessages(t *testing.T) {
 	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, 0, defaultBatchJoinBudget)
 	if sub.maxMessages != defaultMaxMessages {
 		t.Errorf("maxMessages = %d, want %d", sub.maxMessages, defaultMaxMessages)
+	}
+	if sub.window != defaultMaxMessages {
+		t.Errorf("window = %d, want the ceiling %d", sub.window, defaultMaxMessages)
+	}
+}
+
+// sizedMessage is a message with the size its serialized form would have on
+// the relay, declared rather than carried: the cap arithmetic is what the
+// capped source models, and 20 MiB of real padding would buy nothing.
+type sizedMessage struct {
+	msg  receivedMessage
+	size int64
+}
+
+// cappedSource models the credential broker's watcher relay in front of a
+// subscription: a pull whose answer would serialize past capBytes is refused
+// with the relay's 502, and Pub/Sub, which had already delivered the batch to
+// the broker, holds it under its lease for one simulated ack deadline -- the
+// next pull -- before it is available again. Every delivery is counted per
+// ack id, so a test can assert that nothing was handed out twice.
+type cappedSource struct {
+	fakeSource
+	capBytes int64
+
+	queue     []sizedMessage
+	leased    []sizedMessage
+	leaseLeft int
+
+	windows    []int64
+	refusals   int
+	deliveries map[string]int
+
+	// stopAfter cancels the loop once this many pulls have been made, so the
+	// test can read the source without racing the goroutine running Run.
+	stopAfter int
+	stop      context.CancelFunc
+}
+
+func (c *cappedSource) Pull(ctx context.Context, maxMessages int64) ([]receivedMessage, error) {
+	c.pulls++
+	c.windows = append(c.windows, maxMessages)
+	if c.stopAfter > 0 && c.pulls >= c.stopAfter {
+		c.stop()
+	}
+	if len(c.leased) > 0 {
+		if c.leaseLeft == 0 {
+			c.queue = append(c.leased, c.queue...)
+			c.leased = nil
+		} else {
+			c.leaseLeft--
+		}
+	}
+	n := int(maxMessages)
+	if n > len(c.queue) {
+		n = len(c.queue)
+	}
+	batch := c.queue[:n]
+	var total int64
+	for _, m := range batch {
+		total += m.size
+	}
+	c.queue = c.queue[n:]
+	if total > c.capBytes {
+		c.refusals++
+		c.leased = append([]sizedMessage(nil), batch...)
+		c.leaseLeft = 1
+		return nil, fmt.Errorf("pull sub: %w", &googleapi.Error{Code: http.StatusBadGateway, Message: "UPSTREAM_UNRELAYABLE"})
+	}
+	out := make([]receivedMessage, 0, n)
+	for _, m := range batch {
+		c.deliveries[m.msg.AckID]++
+		out = append(out, m.msg)
+	}
+	return out, nil
+}
+
+// The issue's acceptance line, rewritten for the adaptive window: a batch of
+// 100 messages totalling 20 MiB, against a 16 MiB relay cap, is drained within
+// three pulls of the one refused pull, with no message delivered twice, and
+// the window returns to the ceiling once the backlog is gone.
+//
+// The refused pull strands its batch for one ack deadline, which this source
+// models as one pull: the pull right after the refusal comes back empty. The
+// window must hold at 50 through that empty pull rather than restore to 100,
+// or the next deadline would see the same oversize pull refused again.
+func TestRunDrainsAnOversizeBacklogByHalvingTheWindow(t *testing.T) {
+	const (
+		messages    = 100
+		messageSize = 200 * 1024
+		relayCap    = 16 * 1024 * 1024
+		// Enough pulls to see the refusal, the leased empty pull, the two
+		// batches that fit, the empty pull that restores the window, and one
+		// pull at the restored ceiling.
+		pullsToObserve = 6
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source := &cappedSource{capBytes: relayCap, deliveries: map[string]int{}, stopAfter: pullsToObserve, stop: cancel}
+	for i := 0; i < messages; i++ {
+		source.queue = append(source.queue, sizedMessage{
+			msg:  receivedMessage{AckID: fmt.Sprintf("ack-%03d", i), Data: []byte(notKubernetesEntry)},
+			size: messageSize,
+		})
+	}
+	var buf syncBuffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	sub := newSubscriber(source, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
+	sub.idleWait = time.Millisecond
+
+	done := make(chan error, 1)
+	go func() { done <- sub.Run(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop after the pulls were observed")
+	}
+
+	wantWindows := []int64{100, 50, 50, 50, 50, 100}
+	if fmt.Sprint(source.windows) != fmt.Sprint(wantWindows) {
+		t.Errorf("pull windows = %v, want %v", source.windows, wantWindows)
+	}
+	if source.refusals != 1 {
+		t.Errorf("refused pulls = %d, want 1", source.refusals)
+	}
+	if len(source.acked) != messages {
+		t.Errorf("acked %d message(s), want %d", len(source.acked), messages)
+	}
+	for ackID, n := range source.deliveries {
+		if n != 1 {
+			t.Errorf("message %s delivered %d time(s), want once", ackID, n)
+		}
+	}
+	if len(source.deliveries) != messages {
+		t.Errorf("%d distinct message(s) delivered, want %d", len(source.deliveries), messages)
+	}
+	if sub.window != defaultMaxMessages {
+		t.Errorf("window after the drain = %d, want the ceiling %d", sub.window, defaultMaxMessages)
+	}
+	out := buf.String()
+	for _, want := range []string{"window halved to 50 of max-messages=100", "window restored to max-messages=100"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// The floor: a refusal at a window of one leaves it at one, because a single
+// message always fits under the relay's cap and no smaller pull exists.
+func TestShrinkWindowFloorsAtOne(t *testing.T) {
+	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, 4, defaultBatchJoinBudget)
+	refused := &googleapi.Error{Code: http.StatusBadGateway}
+	for _, want := range []int64{2, 1, 1, 1} {
+		sub.shrinkWindow(refused)
+		if sub.window != want {
+			t.Fatalf("window = %d, want %d", sub.window, want)
+		}
+	}
+}
+
+// Only the relay's refusal shrinks the window: a permission error, a plain
+// transport failure and any other status leave it where it was.
+func TestShrinkWindowIgnoresOtherErrors(t *testing.T) {
+	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
+	for _, err := range []error{
+		errors.New("permission denied"),
+		&googleapi.Error{Code: http.StatusServiceUnavailable},
+		&googleapi.Error{Code: http.StatusForbidden},
+		fmt.Errorf("pull sub: %w", &googleapi.Error{Code: http.StatusTooManyRequests}),
+	} {
+		sub.shrinkWindow(err)
+		if sub.window != defaultMaxMessages {
+			t.Errorf("window = %d after %v, want %d", sub.window, err, defaultMaxMessages)
+		}
+	}
+	sub.shrinkWindow(fmt.Errorf("pull sub: %w", &googleapi.Error{Code: http.StatusBadGateway}))
+	if sub.window != defaultMaxMessages/2 {
+		t.Errorf("window = %d after a wrapped 502, want %d", sub.window, defaultMaxMessages/2)
+	}
+}
+
+// An empty pull restores the window only once the reduced window has
+// delivered a batch; before that it is the refused batch under its lease.
+func TestRestoreWindowWaitsForADeliveryAtTheReducedWindow(t *testing.T) {
+	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
+	sub.shrinkWindow(&googleapi.Error{Code: http.StatusBadGateway})
+	sub.restoreWindow()
+	if sub.window != defaultMaxMessages/2 {
+		t.Fatalf("window = %d after an empty pull under the lease, want %d", sub.window, defaultMaxMessages/2)
+	}
+	sub.windowDelivered = true
+	sub.restoreWindow()
+	if sub.window != defaultMaxMessages {
+		t.Fatalf("window = %d after the drain, want %d", sub.window, defaultMaxMessages)
 	}
 }
 

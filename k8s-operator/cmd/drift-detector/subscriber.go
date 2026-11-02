@@ -20,9 +20,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"time"
 
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 	pubsub "google.golang.org/api/pubsub/v1"
 
@@ -30,7 +32,8 @@ import (
 )
 
 const (
-	// defaultMaxMessages is how many messages one Pull asks for. The surviving
+	// defaultMaxMessages is the most messages one Pull asks for (the window
+	// below starts here and shrinks only after a refused answer). The surviving
 	// post-sink stream measured about 0.7 messages a second on a two-cluster
 	// project and up to 10 a second on three busier ones, so a round trip
 	// drains somewhere between ten seconds and two minutes of backlog -- and
@@ -72,6 +75,27 @@ const (
 
 	// pullBackoffMultiplier is the growth factor between retries.
 	pullBackoffMultiplier = 2
+
+	// oversizeAnswerStatus is the HTTP status the credential broker's watcher
+	// relay answers when a pull's body ran past its response cap (16 MiB, a
+	// cap no single Pub/Sub message can exceed but a batch of them can). It is
+	// the one pull failure that retrying at the same size cannot clear: Pub/Sub
+	// has leased the batch by then, re-leases it at every ack deadline, and
+	// every retry asks for the same batch, so the loop makes no progress until
+	// it asks for less. A 502 from anywhere else is transient and the window
+	// grows back once the backlog drains, so it costs a few smaller pulls.
+	oversizeAnswerStatus = http.StatusBadGateway
+
+	// pullWindowShrinkDivisor is how much the pull window shrinks by after an
+	// oversize answer. Halving reaches a fitting size from the ceiling in a
+	// handful of refused pulls, each of which strands its batch for one ack
+	// deadline, so a gentler step would cost a minute per step.
+	pullWindowShrinkDivisor = 2
+
+	// pullWindowFloor is the smallest window. One message always fits under
+	// the relay's Pub/Sub cap, so a window that reached the floor and is still
+	// refused is not oversize and no smaller window would help.
+	pullWindowFloor = 1
 
 	// nackAckDeadlineSeconds is the deadline set on a message being returned
 	// to the subscription. Zero means "redeliver now", after which the
@@ -421,6 +445,24 @@ type subscriber struct {
 	idleWait    time.Duration
 	counts      subscriberCounts
 
+	// window is how many messages the next Pull asks for: maxMessages, the
+	// --max-messages ceiling, until a pull is refused as oversize, then halved
+	// per refusal down to pullWindowFloor, and back to the ceiling once the
+	// smaller window has drained the backlog (windowDelivered, below). Held
+	// rather than grown while pulls keep returning messages: doubling back on
+	// every success would overshoot on every other pull under a sustained
+	// stream of large entries, and each overshoot strands a batch for an ack
+	// deadline.
+	window int64
+
+	// windowDelivered is whether the current, reduced window has returned at
+	// least one batch. The window is restored to the ceiling on an empty pull
+	// only once it has: the pull right after a refusal comes back empty
+	// because Pub/Sub still holds the refused batch for its ack deadline, and
+	// restoring on that empty pull would ask for the same oversize batch again
+	// when the deadline expires, forever.
+	windowDelivered bool
+
 	// idleReport is how long the loop tolerates delivering nothing before
 	// logging that fact. A field rather than the constant read directly, so a
 	// test can drive the branch without waiting a quarter of an hour.
@@ -461,6 +503,7 @@ func newSubscriber(source messageSource, handle recordHandler, maxMessages int64
 		source:      source,
 		handle:      handle,
 		maxMessages: maxMessages,
+		window:      maxMessages,
 		idleWait:    idlePollInterval,
 		idleReport:  idleReportInterval,
 		joinBudget:  joinBudget,
@@ -492,11 +535,12 @@ func (s *subscriber) Run(ctx context.Context) error {
 		}
 
 		pullStart := s.clock()
-		messages, err := s.source.Pull(ctx, s.maxMessages)
+		messages, err := s.source.Pull(ctx, s.window)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			s.shrinkWindow(err)
 			log.Printf("drift-detector: pull failed, retrying in %s: %v", backoff, err)
 			if !sleepCtx(ctx, backoff) {
 				return ctx.Err()
@@ -511,6 +555,7 @@ func (s *subscriber) Run(ctx context.Context) error {
 		s.pulledAt = pullStart
 
 		if len(messages) == 0 {
+			s.restoreWindow()
 			// Reset on report rather than only on delivery, so a subscription
 			// that stays empty says so every interval instead of once.
 			if now := s.clock(); now.Sub(lastDelivery) >= s.idleReport {
@@ -522,6 +567,7 @@ func (s *subscriber) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		s.windowDelivered = true
 
 		s.processBatch(ctx, messages)
 		// After the batch, not before: a subscription delivering steadily must
@@ -530,6 +576,49 @@ func (s *subscriber) Run(ctx context.Context) error {
 		// interval before the work rather than at the end of it.
 		lastDelivery = s.clock()
 	}
+}
+
+// shrinkWindow halves the pull window when err says the answer was refused
+// for size, and leaves it alone for any other failure. Logged at the new size
+// so the loop's progress through an oversize backlog is readable in the pod
+// log: a refusal, a smaller window, and then batches that fit.
+func (s *subscriber) shrinkWindow(err error) {
+	if !isOversizeAnswer(err) {
+		return
+	}
+	if s.window <= pullWindowFloor {
+		log.Printf("drift-detector: pull answer refused as oversize at a window of %d message(s), which is the floor; no smaller pull would help", s.window)
+		return
+	}
+	s.window /= pullWindowShrinkDivisor
+	if s.window < pullWindowFloor {
+		s.window = pullWindowFloor
+	}
+	s.windowDelivered = false
+	log.Printf("drift-detector: pull answer refused as oversize; window halved to %d of max-messages=%d until the backlog drains", s.window, s.maxMessages)
+}
+
+// restoreWindow puts the window back at the --max-messages ceiling after an
+// empty pull, once the reduced window has delivered at least one batch (see
+// the field comments). An empty pull before that is the refused batch still
+// under its lease, not a drained backlog, and the window stays.
+func (s *subscriber) restoreWindow() {
+	if s.window == s.maxMessages || !s.windowDelivered {
+		return
+	}
+	log.Printf("drift-detector: backlog drained at a window of %d; window restored to max-messages=%d", s.window, s.maxMessages)
+	s.window = s.maxMessages
+}
+
+// isOversizeAnswer reports whether a pull failed because the relay refused
+// the answer for size: an HTTP 502 from the API client, which pubsubSource.Pull
+// wraps and errors.As still reaches. The broker's own body names the code
+// UPSTREAM_UNRELAYABLE, but the generated client surfaces the status and not
+// a parsed body, and a plain 502 from Pub/Sub itself costs only a smaller
+// pull or two before the window grows back.
+func isOversizeAnswer(err error) bool {
+	var apiErr *googleapi.Error
+	return errors.As(err, &apiErr) && apiErr.Code == oversizeAnswerStatus
 }
 
 // processBatch parses each message and settles the whole batch in two calls,
