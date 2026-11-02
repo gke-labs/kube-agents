@@ -856,11 +856,12 @@ after applying `crds/` on an existing install ([Notes](#notes)). The tier thresh
 
 `platformAgent.telemetry.peopleSeen` is the CR's `spec.telemetry.peopleSeen`. Under
 `spec.mode: next`, the A2A gateway keeps one hashed key and a last-active time per chat person
-for 30 days, and `status.usage` counts them as `peopleSeen7d` and `peopleSeen30d`. Under
+for 30 days, and serves the people seen in the last 7 and 30 days as
+`kubeagents_a2a_gateway_people_seen`. Under
 `today` there is no gateway, so the value has no effect.
 It defaults to `true`, which renders no field, and the CRD default (`true`) applies.
 `false` renders the field: the gateway writes no key, purges the bucket at its next start, and
-both counts stay absent. Set it with `--set platformAgent.telemetry.peopleSeen=false`, or on an
+serves no sample. Set it with `--set platformAgent.telemetry.peopleSeen=false`, or on an
 `install.sh` install with
 `TF_VAR_extra_helm_values='{platformAgent={telemetry={peopleSeen=false}}}'` in `install.env`.
 The render fails on a live install whose CRD predates `spec.telemetry.peopleSeen`. The

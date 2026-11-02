@@ -11751,10 +11751,10 @@ spec:
                       description: |-
                         PeopleSeen keeps one hashed key and a last-active time per verified
                         chat person in the gateway's people bucket, for 30 days after their
-                        last turn, and serves the two counts the operator reads as
-                        peopleSeen7d and peopleSeen30d. False writes no key, deletes every
-                        key the bucket holds at the gateway's next start, and leaves the two
-                        readings absent.
+                        last turn, and serves the people seen in the last 7 and 30 days as
+                        kubeagents_a2a_gateway_people_seen. Next mode only. False writes no
+                        key, deletes every key the bucket holds at the gateway's next start,
+                        and serves no sample.
                       type: boolean
                   type: object
               required:

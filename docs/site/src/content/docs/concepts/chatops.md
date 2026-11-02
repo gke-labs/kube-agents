@@ -470,7 +470,7 @@ Under `next`, the gateway keeps a record of the people who write to it, so an in
 
 The doors and the A2A console are not people and get no key. A platform the install still serves through Hermes, such as Slack while Google Chat holds the gateway, is outside the record, and a `today` install keeps none.
 
-The record is the `people` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which are the hashes alone. The bucket drops each key 30 days after the person's last turn. Nothing is sent anywhere else.
+The record is the `people` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which are the hashes alone. Whoever holds the gateway's attribution salt and a directory of addresses can re-identify a Google Chat sender's key by hashing the directory, as they can the other pseudonyms the gateway stamps on each turn today. The bucket drops each key 30 days after the person's last turn. Nothing is sent anywhere else.
 
 The gateway's metrics serve two counts, the people seen in the last 7 days and in the last 30 ([Observability](/kube-agents/concepts/observability/#a2a-gateway-series)). Each is one number; no key is in a label. The keys derive from the gateway's salt, which the installer keeps across upgrades. If the salt changes, everyone gets a new key, and the counts read as new people for one window.
 

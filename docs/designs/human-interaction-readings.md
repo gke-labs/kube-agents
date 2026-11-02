@@ -1,6 +1,6 @@
 # Human interaction: chat sessions and the people behind them
 
-**Status:** implementing, 2026-11-02: the first pull request (2.1, the bucket and the series) is on this branch; the operator's people reading, the summary rows and the five answers (2.4) follow. Proposed 2026-10-30. Workstream 4 of the telemetry epic that asked five product
+**Status:** implementing, 2026-11-02: the first pull request (2.1, the bucket and the series) is on main; the operator's people reading, the summary rows and the five answers (2.4) follow. Proposed 2026-10-30. Workstream 4 of the telemetry epic that asked five product
 questions of `status.usage` (its question: how often do customers interact with kube-agents).
 Builds on [`usage-counters-producer.md`](usage-counters-producer.md) (the counters and the poller)
 and [`proposal-outcome-readings.md`](proposal-outcome-readings.md) (the readings slot: a gauge the

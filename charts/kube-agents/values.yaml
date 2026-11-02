@@ -815,10 +815,10 @@ platformAgent:
   mode: null
   telemetry:
     # Under spec.mode next, the A2A gateway keeps one hashed key and a
-    # last-active time per chat person for 30 days, which status.usage counts
-    # as peopleSeen7d and peopleSeen30d.
+    # last-active time per chat person for 30 days, and serves the people seen
+    # in the last 7 and 30 days as kubeagents_a2a_gateway_people_seen.
     # false writes no key, purges the bucket at the gateway's next start, and
-    # leaves both counts absent. Under "today" there is no gateway and no record.
+    # serves no sample. Under "today" there is no gateway and no record.
     peopleSeen: true
   storage:
     # The PlatformAgent's spec.storage.size: the request of the agent's
