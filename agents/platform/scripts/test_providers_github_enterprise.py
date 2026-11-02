@@ -627,15 +627,18 @@ class RefusedGitCallTest(unittest.TestCase):
 
 class HelperPrintModeTest(unittest.TestCase):
     def test_it_mints_for_the_host_and_installs_nothing(self):
-        keys = [f"github:{HOST}/acme/infra", f"github:{HOST}/acme/web", f"github:{HOST}/other/x",
-                "github:github.com/acme/dotcom"]
+        # The mint names the one repository asked for: the minter's policy for
+        # a managed repository covers that repository alone, so the other
+        # managed repositories of the organisation are not asked for and the
+        # managed list is not read.
         with mock.patch.object(github_token_refresh, "broker_oidc_token", return_value="oidc"), \
                 mock.patch.object(github_token_refresh, "request_minty_token", return_value=TOKEN) as minty, \
-                mock.patch.object(gitops_workspace, "get_managed_repo_keys", return_value=keys), \
+                mock.patch.object(gitops_workspace, "get_managed_repo_keys") as managed, \
                 mock.patch.object(github_token_refresh.subprocess, "run") as run:
             answer = github_token_refresh.mint_write_token("acme/infra", HOST)
-        self.assertEqual({"token": TOKEN, "repositories": ["acme/infra", "acme/web"]}, answer)
-        minty.assert_called_once_with("oidc", "acme", ["infra", "web"], github_token_refresh.MINTY_WRITE_SCOPE)
+        self.assertEqual({"token": TOKEN, "repositories": ["acme/infra"]}, answer)
+        minty.assert_called_once_with("oidc", "acme", ["infra"], github_token_refresh.MINTY_WRITE_SCOPE)
+        managed.assert_not_called()
         run.assert_not_called()
 
     def test_it_refuses_github_com_and_a_bad_repository(self):
