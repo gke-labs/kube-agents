@@ -140,6 +140,24 @@ EVAL_LOG_DIR="${EVAL_LOG_DIR:-/tmp}"
 mkdir -p "${EVAL_LOG_DIR}"
 EVAL_LOG_DIR="$(CDPATH='' cd -- "${EVAL_LOG_DIR}" && pwd)"
 readonly EVAL_LOG_DIR
+# Where every artifact lands (the per-case hand-offs, the verdict files, the
+# logs ci-env.sh collects); Prow uploads it beside the job log.
+ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
+mkdir -p "${ARTIFACT_DIR}"
+# Grading and ledger detail (per-repetition verdicts and reasons, phase
+# breakdowns, the verdict table, ledger titles, token lifetimes) is appended
+# here and rides to Prow as an artifact, never printed: Deck streams a public
+# repository's live job log to anyone (oss.gprow.dev/log?job=...) and its
+# Spyglass page renders the finished one. Who can read the artifact is the
+# bucket's IAM, which today includes Deck, so Spyglass serves it by name too;
+# the lanes' move to a bucket Deck cannot read is what closes that. The job
+# log keeps the step banners, the launch and finish
+# markers and the final verdict word; scripts/eval_dashboard/collect.py reads
+# the blocks from this file.
+readonly EVAL_GRADING_LOG_FILE="eval-grading.log"
+readonly EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EVAL_GRADING_LOG_FILE}"
+# The suite's markdown verdict table, written beside the grading log.
+readonly EVAL_VERDICT_MARKDOWN_FILE="eval-verdict.md"
 
 # EVAL_MODE_NEXT=1 is the flag hack/ci-deploy.sh flipped the install to
 # `spec.mode: next` under, in the same job environment. Under it the matrix
@@ -742,7 +760,7 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 # were downstream of the fan-out's `wait`; the dashboard counted each night
 # 0/0/0/0 (#1491). The grading is per case now (finish_case, in the fan-out),
 # so on exit every case whose last repetition finished already has its
-# case-<name>.json, its `Task <name> Result:` block in this log and, on a main
+# case-<name>.json, its `Task <name> Result:` block in the grading artifact and, on a main
 # run, its baseline line; this tables those cases.
 #
 # What it writes is NOT the run's verdict and must not read as one.
@@ -783,7 +801,7 @@ report_partial_verdict() {
   # 1 (the covered cases are red) and 2 (not evaluated) are returned after the
   # table is written; only a table that never landed is worth a warning.
   [ -f "${ARTIFACT_DIR}/eval-verdict.md" ] || \
-    echo "WARNING: the partial verdict table could not be written (bench-gate suite --partial exited ${suite_status}); the graded cases are still in this log and in case-*.json."
+    echo "WARNING: the partial verdict table could not be written (bench-gate suite --partial exited ${suite_status}); the graded cases are still in ${EVAL_GRADING_LOG_FILE} and in case-*.json."
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Eval ended before its verdict: ${graded} of ${total} cases graded, ${recorded} recorded to the baseline store; partial table in ${ARTIFACT_DIR}/eval-verdict.md ==="
 }
 
@@ -860,7 +878,7 @@ trap profile_and_dump_on_exit EXIT
 # entrypoint waits for them because they hold this job's stdout -- on the
 # night of 2026-09-21 six units finished up to three minutes after the trap
 # had run. A unit that completes its case in that window grades it itself
-# (finish_case), so its block lands in this log after the cut-off line.
+# (finish_case), so its block lands in the grading artifact after the cut-off line.
 trap 'exit 143' TERM INT
 
 # ─── Boskos lease heartbeat for the eval's own lifetime ──────────────────────
@@ -1304,7 +1322,7 @@ mint_ledger_token() { # <label>
   done
   rm -f "${diagnostics}"
   export BENCH_GITHUB_TOKEN="${minted%% *}"
-  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }"
+  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }" >> "${EVAL_GRADING_LOG}"
 }
 
 # Keeps a unit's grading token alive for as long as its devops-bench runs.
@@ -1661,7 +1679,7 @@ reset_audit_ledgers() { # <label> [audit-id]
   [ -n "${audit_id}" ] && args+=(--audit "${audit_id}")
   # The token rides in the environment of this one process, never on argv.
   out="$(LEDGER_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_audit_ledgers.py" "${args[@]}" 2>&1)" || rc=$?
-  [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Ledger reset (${label}): /"
+  [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Ledger reset (${label}): /" >> "${EVAL_GRADING_LOG}"
   [ "${rc}" -eq 0 ] || echo "WARNING: Ledger reset (${label}): the helper exited ${rc}; ${scope} may keep an open ledger and this run grades against it as every run before did." >&2
   return 0
 }
@@ -1751,7 +1769,7 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
   # One record per call beside the artifacts, named for the call, so a run
   # carries its own proof of what each unit started on.
   slug="$(printf '%s' "${label}" | tr -c 'A-Za-z0-9._-' '_')"
-  record="${ARTIFACT_DIR:-${ARTIFACTS:-/tmp/artifacts}}/agent-pulls-reset/${slug}.json"
+  record="${ARTIFACT_DIR}/agent-pulls-reset/${slug}.json"
   # The token rides in the environment of this one process, never on argv.
   out="$(AGENT_PULLS_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_agent_pulls.py" \
     --repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" \
@@ -3599,11 +3617,10 @@ export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"
 # run, which is how a revoked grant would announce itself.
 export EVAL_BASELINE_STORE="${EVAL_BASELINE_STORE:-}"
 
-# Where the per-case hand-offs land. `bench-gate case` writes one per task and
-# `bench-gate suite` reads them back to decide the exit status; both files ride
-# to Prow as artifacts, which is what makes a verdict reviewable after the job.
-ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
-mkdir -p "${ARTIFACT_DIR}"
+# The per-case hand-offs. `bench-gate case` writes one per task into
+# ARTIFACT_DIR (declared with the other paths at the top) and `bench-gate
+# suite` reads them back to decide the exit status; both files ride to Prow
+# as artifacts, which is what makes a verdict reviewable after the job.
 CASE_RESULTS=()
 
 # Whether this run appends to the baseline store, decided once here and read
@@ -4310,18 +4327,13 @@ record_case() { # <task-name>
 # Grade one finished case and, on a main run, record it. One case at a time:
 # `bench-gate case` reads the whole store (up to sixteen gcloud processes for a
 # GCS store), and six lanes finishing together would run six of those at once;
-# serialized, the load is the old loop's, just earlier. The lock keeps two
-# gradings apart; it is not what keeps one case's block contiguous in the job
-# log, since the launcher's `>>>` and the other lanes' `<<<` lines never take
-# it. That is the single `cat` below: a block under PIPE_BUF (4096 bytes; the
-# fixtures measure 550-2054) reaches the stdout pipe in one write. It matters
-# because scripts/eval_dashboard/collect.py attaches `rep N:` lines to the
-# `Task <name> Result:` line above them and closes the block at the next
-# `>>>`/`===`/`---` header, so a launch marker landing inside a block would
-# orphan the rest of it -- keep the block small. A lock whose holder died is a
-# throttle failure, not a reason to skip the grading. The sentinel is written only on a
-# grading that produced its JSON; anything else is left for the loop after the
-# fan-out, and says so.
+# serialized, the load is the old loop's, just earlier. The block goes to
+# EVAL_GRADING_LOG in one `cat` under the same lock, so two cases' blocks never
+# interleave there (scripts/eval_dashboard/collect.py attaches `rep N:` lines
+# to the `Task <name> Result:` line above them); the job log gets one pointer
+# line. A lock whose holder died is a throttle failure, not a reason to skip
+# the grading. The sentinel is written only on a grading that produced its
+# JSON; anything else is left for the loop after the fan-out, and says so.
 finish_case() { # <task-path> <task-name>
   local task="$1" name="$2" status=0
   # Its own `local`: the words of one `local` are expanded before any of
@@ -4333,9 +4345,13 @@ finish_case() { # <task-path> <task-name>
     record_case "${name}" >> "${block}" 2>&1 || true
   else
     status=$?
-    echo "WARNING: grading ${name} inside the fan-out failed (status ${status}); it is graded again after the fan-out." >> "${block}"
   fi
-  cat "${block}"
+  cat "${block}" >> "${EVAL_GRADING_LOG}"
+  if [ "${status}" -eq 0 ]; then
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name}: graded; its block is in ${EVAL_GRADING_LOG_FILE} <<<"
+  else
+    echo "WARNING: grading ${name} inside the fan-out failed (status ${status}); it is graded again after the fan-out."
+  fi
   lock_release "${STATE_DIR}/lock-grade"
 }
 
@@ -5006,9 +5022,16 @@ for TASK in "${TASKS[@]}"; do
   i=$((i + 1))
   CASE_JSON="${ARTIFACT_DIR}/case-${TASK_NAME}.json"
   if [ -f "${STATE_DIR}/${TASK_NAME}.graded" ] && [ -f "${CASE_JSON}" ]; then
-    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${TASK_NAME}: graded inside the fan-out when its last repetition finished; its block is above <<<"
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${TASK_NAME}: graded inside the fan-out when its last repetition finished; its block is in ${EVAL_GRADING_LOG_FILE} <<<"
   else
-    grade_case "${TASK}" "${TASK_NAME}"
+    # A grading that could not run (bench-gate's exit 2) stops the job as it
+    # always did; the reason now sits in the artifact, so the job log says so.
+    grade_case "${TASK}" "${TASK_NAME}" >> "${EVAL_GRADING_LOG}" 2>&1 || {
+      rc=$?
+      echo "ERROR: grading ${TASK_NAME} failed (status ${rc}); its output is in ${EVAL_GRADING_LOG_FILE}" >&2
+      exit "${rc}"
+    }
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${TASK_NAME}: graded; its block is in ${EVAL_GRADING_LOG_FILE} <<<"
   fi
   CASE_RESULTS+=(--case-result "${CASE_JSON}")
 done
@@ -5303,7 +5326,8 @@ EVAL_SUITE_REACHED=1
 (cd "${BENCH_DIR}" && uv run bench-gate suite \
   "${CASE_RESULTS[@]}" \
   --markdown-out "${ARTIFACT_DIR}/eval-verdict.md" \
-  --json-out "${ARTIFACT_DIR}/eval-verdict.json") || SUITE_STATUS=$?
+  --json-out "${ARTIFACT_DIR}/eval-verdict.json") >> "${EVAL_GRADING_LOG}" || SUITE_STATUS=$?
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verdict table written to ${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE} ==="
 run_rollback_roundtrip || true
 announce_suite_verdict "${SUITE_STATUS}" "${ARTIFACT_DIR}/eval-verdict.json" \
   "${ARTIFACT_DIR}/eval-verdict.md" "${TOTAL_DURATION}" || exit $?

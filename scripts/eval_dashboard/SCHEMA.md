@@ -59,7 +59,9 @@ only — anything that renames, removes or re-types a field bumps
 
 ### `runs[]` — one entry per finished Prow build, oldest first
 
-Parsed from `build-log.txt` plus Prow's `started.json`/`finished.json`.
+Parsed from `artifacts/eval-grading.log` (the per-case grading blocks and the suite
+table; builds from before the artifact existed carry them in the log) and `build-log.txt`,
+read as one text in that order, plus Prow's `started.json`/`finished.json`.
 A build with no `finished.json` is still running and is skipped entirely.
 Three jobs feed it, each a source with a watermark of its own: the
 presubmit gate (`pull-kube-agents-smoke-test`, one build per pull-request

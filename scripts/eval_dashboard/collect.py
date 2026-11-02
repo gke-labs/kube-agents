@@ -2,11 +2,13 @@
 """Collect eval smoke-test runs from Prow build logs into data.json.
 
 The presubmit (hack/ci-eval-pr.sh, run by pull-kube-agents-smoke-test) prints
-one `Task <name> Result:` line per bench case and a final verdict line, and
-Prow archives the whole thing as build-log.txt next to started.json and
-finished.json under gs://kube-agents-prow. Nothing structured survives the
-run, so this collector re-derives structure from those lines and writes the
-data.json the dashboard renders.
+a final verdict line into the job log, which Prow archives as build-log.txt
+next to started.json and finished.json under gs://kube-agents-prow, and
+writes one `Task <name> Result:` block per bench case to
+artifacts/eval-grading.log beside it (builds from before the artifact
+existed carry the blocks in the log itself). Nothing structured survives
+the run, so this collector re-derives structure from those lines and writes
+the data.json the dashboard renders.
 
 data.json is a CONTRACT: the renderer and the publisher are built against the
 exact shape documented in SCHEMA.md. Changes must be additive optional fields
@@ -332,6 +334,13 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 # the health adjudicator needs to tell a lost pod from a clone failure.
 PODINFO_FILE = "podinfo.json"
 BUILD_LOG_FILE = "build-log.txt"
+# The grading detail hack/ci-eval-pr.sh keeps out of the job log
+# (EVAL_GRADING_LOG there): the `Task <name> Result:` blocks with their
+# `rep N:` lines, and `bench-gate suite`'s table with its pass-rate line.
+# Read for every build and parsed ahead of build-log.txt, whose final verdict
+# line closes the grading; a build from before the file existed parses as it
+# always did.
+EVAL_GRADING_FILE = "artifacts/eval-grading.log"
 # The suite's own verdict, written by `bench-gate suite --json-out` into
 # the job's artifacts and uploaded by Prow beside the log (module
 # docstring). Read only for a build whose final line carries the marker
@@ -662,6 +671,28 @@ def _attach_tokens(task: dict, n: int, fields: str) -> None:
             return
 
 
+def read_retrying(read, name: str) -> str | None:
+    """One file, read up to LOG_READ_ATTEMPTS times. A recorded build is
+    never re-read, so a transient miss on a file that carries its tasks
+    would otherwise record the build with none for good."""
+    text = None
+    for _attempt in range(LOG_READ_ATTEMPTS):
+        text = read(name)
+        if text is not None:
+            break
+    return text
+
+
+def with_grading(grading_text: str | None, log_text: str | None) -> str:
+    """The grading artifact's lines ahead of the build log's, as one text.
+
+    The blocks come first, where they sat when the log carried them, so the
+    log's final verdict line still closes the grading, and its banners still
+    end any block a truncated artifact left open.
+    """
+    return (grading_text or "") + "\n" + (log_text or "")
+
+
 def parse_build_log(text: str) -> dict:
     """Extract the eval facts from one build-log.txt, best effort.
 
@@ -952,12 +983,8 @@ def build_run(
         except ValueError:
             started = {}
 
-    log_text = None
-    for _attempt in range(LOG_READ_ATTEMPTS):
-        log_text = read(BUILD_LOG_FILE)
-        if log_text is not None:
-            break
-    parsed = parse_build_log(log_text or "")
+    log_text = read_retrying(read, BUILD_LOG_FILE)
+    parsed = parse_build_log(with_grading(read_retrying(read, EVAL_GRADING_FILE), log_text))
     result = finished.get("result")
 
     # The suite's own verdict (module docstring): one read of the artifact,
@@ -1168,7 +1195,7 @@ def build_release(build_id: str, read) -> dict | None:
     run = build_run(build_id, read)
     if run is None:
         return None
-    banner = parse_rc_banner(read("build-log.txt") or "")
+    banner = parse_rc_banner(with_grading(read_retrying(read, EVAL_GRADING_FILE), read(BUILD_LOG_FILE)))
     return {
         "build_id": run["build_id"],
         "rc_tag": banner["rc_tag"],
@@ -1547,10 +1574,11 @@ def _build_dirs(listing: str) -> list[tuple[str, str]]:
 def _gcs_reader(base: str, gcloud: str):
     """A build_run/build_release reader over one GCS build directory.
 
-    Caches per file: build_run asks for finished.json, started.json and
-    build-log.txt (plus podinfo.json and clone-records.json for a build that
-    ended with no tasks), and build_release re-asks for the log. A failed read is not cached, so
-    build_run's retry of the log is a real second attempt.
+    Caches per file: build_run asks for finished.json, started.json,
+    artifacts/eval-grading.log and build-log.txt (plus podinfo.json and
+    clone-records.json for a build that ended with no tasks), and
+    build_release re-asks for the log and the grading file. A failed read is
+    not cached, so build_run's retries are real second attempts.
     """
     cache: dict[str, str] = {}
 

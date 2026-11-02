@@ -2449,6 +2449,93 @@ class TestPrMerged(unittest.TestCase):
 
 
 
+class TestGradingArtifact(unittest.TestCase):
+    """The per-case blocks and the suite table ride in artifacts/eval-grading.log
+    (hack/ci-eval-pr.sh, EVAL_GRADING_LOG) and the job log keeps the pointer
+    lines and the final verdict; a build from before the artifact existed
+    parses as it always did."""
+
+    LOG = (
+        "=== [2026-11-02T01:00:00Z] Running PR Smoke Test Evaluation for PR #4500 in Namespace: kubeagents-system ===\n"
+        "Successfully leased project: kube-agents-evals-8\n"
+        ">>> [2026-11-02T01:30:00Z] some-case: graded; its block is in eval-grading.log <<<\n"
+        "=== [2026-11-02T02:00:00Z] Verdict table written to /logs/artifacts/eval-verdict.md ===\n"
+        "=== [2026-11-02T02:00:01Z] PR Smoke Test Evaluation Succeeded (Total Duration: 3600s) ===\n"
+    )
+    GRADING = (
+        ">>> [2026-11-02T01:29:00Z] Grading Task: some-case (./tasks/some-case/task.yaml) x3 <<<\n"
+        "Task some-case Result: [UNSTABLE] passed 2 of 3 repetitions\n"
+        "  deployer: noop\n"
+        "  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
+        "  rep 1 timing: agent_s=143.2 turn1_s=6.4\n"
+        "  rep 2: fail -- VerificationCorrectness=0.0 (floor 1.0) -- names-the-pool: required phrases absent [OutcomeScore=0.0]\n"
+        "  rep 2 report: I looked for the pool and found nothing\n"
+        "  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
+        "  admission: admitted by BOOTSTRAP_ADMITTED\n"
+        "Admitted-case pass rate: 66.7% (main: 92.5%, margin -25.8%)\n"
+    )
+
+    def build(self, tmp, log=LOG, grading=GRADING):
+        build = pathlib.Path(tmp) / "2117"
+        build.mkdir()
+        (build / "started.json").write_text('{"timestamp": 1793660400}')
+        (build / "finished.json").write_text('{"timestamp": 1793664000, "result": "SUCCESS"}')
+        (build / "build-log.txt").write_text(log)
+        if grading is not None:
+            (build / "artifacts").mkdir()
+            (build / "artifacts" / "eval-grading.log").write_text(grading)
+        return build
+
+    def test_the_blocks_are_read_from_the_artifact_and_the_verdict_from_the_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = collect.build_run("2117", collect._dir_reader(self.build(tmp)))
+        self.assertEqual(run["eval_verdict"], "GREEN")
+        self.assertEqual(run["project"], "kube-agents-evals-8")
+        (task,) = run["tasks"]
+        self.assertEqual((task["name"], task["result"]), ("some-case", "fail"))
+        self.assertEqual([r["result"] for r in task["reps"]], ["pass", "fail", "pass"])
+        self.assertEqual(task["reps"][0]["agent_s"], 143.2)
+        self.assertTrue(task["reps"][1]["reason"].startswith("VerificationCorrectness=0.0 (floor 1.0) --"))
+        self.assertEqual(task["reps"][1]["excerpt"], "I looked for the pool and found nothing")
+
+    def test_a_truncated_artifact_is_closed_by_the_logs_first_banner(self):
+        """A grading file cut inside a block (the run died mid-write) must not
+        let a rep-shaped line in the job log attach to that case."""
+        grading = (
+            "Task some-case Result: [UNSTABLE] passed 2 of 3 repetitions\n"
+            "  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
+        )
+        log = (
+            "--- [PROFILE 2026-11-02T01:00:00Z] step: bootstrap ---\n"
+            "  rep 2: fail -- a stray line in the job log\n"
+        ) + self.LOG
+        with tempfile.TemporaryDirectory() as tmp:
+            run = collect.build_run("2117", collect._dir_reader(self.build(tmp, log=log, grading=grading)))
+        (task,) = run["tasks"]
+        self.assertEqual([r["n"] for r in task["reps"]], [1])
+
+    def test_a_build_without_the_artifact_parses_as_before(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = collect.build_run("2117", collect._dir_reader(self.build(tmp, grading=None)))
+        self.assertEqual(run["eval_verdict"], "GREEN")
+        self.assertEqual(run["tasks"], [])
+        self.assertIs(run["has_build_log"], True)
+
+    def test_the_release_pass_rate_is_read_from_the_artifact(self):
+        log = (
+            "🏷️ RELEASE CANDIDATE EVAL\n"
+            "Candidate:   v0.30.0-rc.1 (0cc8ee53708febe7a3510f7f9d261dd9059e9525)\n"
+            "Tier:        release\n"
+            "Verdict:     GREEN (GREEN promotes this candidate to staging)\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            self.build(tmp, log=log)
+            release = collect.releases_from_dir(pathlib.Path(tmp))[0]
+        self.assertEqual(release["verdict"], "GREEN")
+        self.assertEqual(release["pass_rate"], 0.667)
+        self.assertEqual(release["baseline_rate"], 0.925)
+
+
 class TestNotEvaluatedRun(unittest.TestCase):
     """runs[].eval_outcome and runs[].not_evaluated (SCHEMA.md), from the
     DERIVED build under testdata_notevaluated/ -- no real run had ended with

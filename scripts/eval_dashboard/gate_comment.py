@@ -157,7 +157,7 @@ SHARED_NO_INCIDENT = "{case} is also failing on {also} right now, so it may not 
 UNEXPLAINED = "{case} failed here and nothing on other PRs matches it yet; read the transcript."
 HARD_FAILURE = (
     "🔴 **The run failed without a gate case failing all of its repetitions.** An absolute check tripped"
-    " (a forbidden cluster change, a verifier that errored) or the log was cut short; the build log has the reason."
+    " (a forbidden cluster change, a verifier that errored; the run's artifacts/eval-grading.log has the reason) or the log was cut short (the build log says where)."
 )
 HELD_OUT_NOTE = " {n} held-out {cases} also failed; held-out cases do not block."
 LINK_RUN = "[Why this run failed →]({url})"
