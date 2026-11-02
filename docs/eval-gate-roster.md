@@ -333,8 +333,9 @@ recorded run(s), 5 more needed …` at the presubmit's key (gemini-4-argon, mode
   seat. Rule (c): it declares no `fixtures:` role and names no seeded cluster, so the
   seeded-fleet scan has nothing of its own to watch; what it depends on instead is the pool
   project's `roles/monitoring.alertPolicyEditor` grant to both runners, which
-  `scripts/verify_ci_pool_project.py` checks on every scan (#3632), and a stack apply that
-  fails there is a deployer death graded INFRA, which reds nobody. Rule (d): both graded
+  `scripts/verify_ci_pool_project.py` checks on every scan (#3632). A stack apply that fails
+  there is a deployer death, INFRA for that repetition; three in one run make the run NOT
+  EVALUATED, which reds the job until a `/retest` and blames nobody. Rule (d): both graded
   objectives are exact checks. What it costs: it requests no pull request, so it runs in the
   first phase, its three repetitions one after another on its task lock, hinted at 600 s in
   `unit_cost_hint` (up from the 200 s default it ran the nightly at), which takes the
@@ -992,7 +993,8 @@ as infrastructure. If either holds, demote the case the same day and say why.
 A collapse of monitoring-alert-policy-read on several unrelated pull requests at once is a
 pool or broker question before it is a case question. Its stack plants the policy with the
 runner's `roles/monitoring.alertPolicyEditor` on the leased project; a project without the
-grant fails the apply, which grades INFRA and reds nobody, and the pool verifier reports it. A
+grant fails the apply, which is INFRA per repetition; three in one run make the run NOT
+EVALUATED, red until a `/retest`, blaming nobody, and the pool verifier reports the grant. A
 graded collapse is the agent no longer reading the policy: check that the broker still allows
 `gcloud monitoring policies list` and `describe` (`GCLOUD_READ_COMMANDS` in
 `agents/platform/scripts/command_policy.py`) before reading it as the case's flake. A red on
