@@ -560,13 +560,12 @@ what the renderer does with them.
   the bucket the nightly used before 2026-09-15, `gs://kube-agents-prow`;
   `nightly.py` links it there.
 - `runs[].gcs_base` — the build directory the run was read from, as a
-  `gs://` URL with its trailing slash, on every run read from a bucket. The
-  pages and the health bot derive a build's links from it, so a run keeps
-  its links when a lane changes buckets (the smoke lanes moved to
-  `gs://kube-agents-evals-presubmit-logs`, which Deck cannot read, so those
-  links open the Cloud Console's bucket browser rather than Spyglass).
-  Absent on a from-dir run and on a record from before the field, which
-  keeps its Spyglass link under `gs://kube-agents-prow`.
+  `gs://` URL with its trailing slash, on a run read from a bucket Deck
+  cannot read (`PRIVATE_LOG_BUCKETS`: the smoke lanes'
+  `gs://kube-agents-evals-presubmit-logs`). The pages and the health bot
+  link such a run's build and transcripts in the Cloud Console; a run
+  without the field, in `gs://kube-agents-prow` or from before the field,
+  keeps its Spyglass link, which still renders it.
 - `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
   `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
   pod**: `classify.py` gives it its own run-level headline (`infra`, never
@@ -913,7 +912,7 @@ is the case's last `strip_runs` presubmit appearances, oldest first,
 `{build, pr, at, state, event}` with `state` in `pass|partial|fail|infra`
 and `event` true for a run-level event. `last_failure` is the newest `fail`
 or `partial` appearance — the presubmit's, else the nightly's — as `{tier,
-build, pr, gcs_base, at, state, reps, reason, excerpt, cls, also_failing_prs, event}`
+build, pr, at, state, reps, reason, excerpt, cls, also_failing_prs, event}`
 (`cls` and `also_failing_prs` from the Brief's classification of that run
 when it is in `runs[]`, else `null` and `0`), or `null` when there is none.
 `latency` is data.json's `cases[].latency`, its keys with finite numbers

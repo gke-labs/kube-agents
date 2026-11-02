@@ -342,6 +342,11 @@ BUILD_LOG_FILE = "build-log.txt"
 # line closes the grading; a build from before the file existed parses as it
 # always did.
 EVAL_GRADING_FILE = "artifacts/eval-grading.log"
+# Buckets Deck has no read on, so Spyglass shows nothing for a build there:
+# a run read from one records its directory (runs[].gcs_base) and the pages
+# and the health bot link the Cloud Console instead. A run in any other
+# bucket keeps the Spyglass link, which still renders it.
+PRIVATE_LOG_BUCKETS = frozenset({"kube-agents-evals-presubmit-logs"})
 # The suite's own verdict, written by `bench-gate suite --json-out` into
 # the job's artifacts and uploaded by Prow beside the log (module
 # docstring). Read only for a build whose final line carries the marker
@@ -1579,19 +1584,34 @@ def _gcs_reader(base: str, gcloud: str):
     artifacts/eval-grading.log and build-log.txt (plus podinfo.json and
     clone-records.json for a build that ended with no tasks), and
     build_release re-asks for the log and the grading file. A failed read is
-    not cached, so build_run's retries are real second attempts.
+    not cached, so build_run's retries are real second attempts; an absent
+    object is, so a file a build never wrote costs one call.
     """
-    cache: dict[str, str] = {}
+    cache: dict[str, str | None] = {}
 
     def reader(name: str) -> str | None:
         if name not in cache:
-            text = _gcloud_storage(["cat", base + name], gcloud)
+            text, stderr = _gcloud_storage_call(["cat", base + name], gcloud)
             if text is None:
+                # A definitive absence (the object is not there) is cached as
+                # None, so a retry costs no second process; any other failure
+                # is not cached and the retry is a real attempt.
+                if _NO_OBJECTS.search(stderr or ""):
+                    cache[name] = None
                 return None
             cache[name] = text
         return cache[name]
 
     return reader
+
+
+def records_location(base: str) -> bool:
+    """Whether a run read from `base` carries `gcs_base`: only for a bucket
+    Deck cannot read (PRIVATE_LOG_BUCKETS); elsewhere Spyglass still renders
+    the build and the pages keep that link."""
+    if not isinstance(base, str) or not base.startswith(GS_SCHEME):
+        return False
+    return base[len(GS_SCHEME):].split("/", 1)[0] in PRIVATE_LOG_BUCKETS
 
 
 def spyglass_url(base: str) -> str | None:
@@ -1641,9 +1661,10 @@ def _read_build(
         return build_id, None, _UNFINISHED
     if periodic:
         run["log_url"] = spyglass_url(base)
-    # Where the run was read from, so its links follow it when a lane changes
-    # buckets (SCHEMA.md, runs[].gcs_base).
-    run["gcs_base"] = base
+    # Where the run was read from, when that is a bucket Deck cannot read, so
+    # its links follow it (SCHEMA.md, runs[].gcs_base).
+    if records_location(base):
+        run["gcs_base"] = base
     return build_id, run, _RECORDED
 
 

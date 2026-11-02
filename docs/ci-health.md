@@ -95,9 +95,9 @@ no files to anyone (this Prow has no login, and the lanes grade a public reposit
 model in the loop). The collector reads it with its own identity, and each lane's old
 archive alongside until that leaves the window; the pool-pressure check and step 0's verdict reuse
 read the new bucket only, so a green from before the move is not reused and the pool gauge's window
-fills over its first week. Each run records where it lives (`runs[].gcs_base`), and the
-dashboard's and the health bot's build links open that directory in the Cloud Console for a
-project reader; runs from before the field keep their Prow links.
+fills over its first week. A run in that bucket records where it lives (`runs[].gcs_base`), and
+the dashboard's and the health bot's build links open that directory in the Cloud Console for a
+project reader; a run in the old bucket keeps its Prow link, which still renders it.
 
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`

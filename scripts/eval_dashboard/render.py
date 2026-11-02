@@ -1164,7 +1164,6 @@ def last_failure(name: str, gate: list[tuple[dict, dict]], nightly: list[tuple[d
                 "tier": tier,
                 "build": build,
                 "pr": run.get("pr") if isinstance(run.get("pr"), int) else None,
-                "gcs_base": run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None,
                 "at": run_when(run),
                 "state": state,
                 "reps": {"pass": passed, "fail": failed, "infra": infra},

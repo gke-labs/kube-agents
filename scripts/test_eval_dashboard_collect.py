@@ -961,10 +961,8 @@ class TestIndexDiscovery(_MergeBase):
                     pr_globs=[FAKE_GLOB], gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX, now=now, **kwargs
                 )
                 self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
-                # Where it was read from travels with it (gcs_base), so the
-                # pages link the build wherever the lane logs.
-                base = merged["runs"][0]["gcs_base"]
-                self.assertTrue(base.startswith("gs://") and base.endswith(f"/{BUILD_998_FULL}/"), base)
+                # A Deck-readable bucket: no gcs_base, the Spyglass link stays.
+                self.assertNotIn("gcs_base", merged["runs"][0])
                 listings = [c for c in log.read_text().splitlines() if c.startswith("ls ")]
                 self.assertEqual(listings, [f"ls {FAKE_GLOB}"])
 
@@ -982,6 +980,32 @@ class TestIndexDiscovery(_MergeBase):
         self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
         self.assertIn("note: directory index " + FAKE_BUCKET + "pr-logs/directory/pull-kube-agents-smoke-test-moved/ did not list", err)
         self.assertNotIn("warning: gcloud storage ls failed", err)
+
+    def test_only_a_run_in_a_bucket_deck_cannot_read_records_its_location(self):
+        """gcs_base turns a build's links into Console links, which need a
+        sign-in; a run in a bucket Spyglass still renders must not get it."""
+        self.assertTrue(collect.records_location("gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1/pull-kube-agents-smoke-test/2/"))
+        self.assertFalse(collect.records_location("gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1/pull-kube-agents-smoke-test/2/"))
+        self.assertFalse(collect.records_location(FAKE_BUCKET + "pr-logs/pull/gke-labs_kube-agents/1/pull-kube-agents-smoke-test/2/"))
+        self.assertFalse(collect.records_location("/tmp/not-a-bucket/2/"))
+
+    def test_an_absent_object_is_read_once_and_a_failed_read_twice(self):
+        """The grading artifact is absent on every build from before it
+        existed and on every build that died before grading; its retry must
+        not pay a second process for a definitive 404, while a read that
+        failed for another reason keeps its real second attempt."""
+        gcloud, log = self.fake_gcloud([BUILD_998_FULL])
+        base = FAKE_BUCKET + f"pull/gke-labs_kube-agents/998/pull-kube-agents-smoke-test/{BUILD_998_FULL}/"
+        reader = collect._gcs_reader(base, gcloud)
+        self.assertIsNone(collect.read_retrying(reader, collect.EVAL_GRADING_FILE))
+        calls = [c for c in log.read_text().splitlines() if c.startswith("cat ") and c.endswith(collect.EVAL_GRADING_FILE)]
+        self.assertEqual(len(calls), 1, "a 404 is cached; the second attempt spawns nothing")
+        # A gcloud that fails for any other reason (a 403 here) is retried.
+        failing = pathlib.Path(self.tmp) / "gcloud-denied"
+        failing.write_text('#!/bin/sh\necho "$@" >> "$0.log"\necho "ERROR: (gcloud.storage.cat) HTTPError 403: no storage.objects.get access" >&2\nexit 1\n')
+        failing.chmod(0o755)
+        self.assertIsNone(collect.read_retrying(collect._gcs_reader(base, str(failing)), "build-log.txt"))
+        self.assertEqual(len(pathlib.Path(str(failing) + ".log").read_text().splitlines()), 2, "a denial is not cached; the retry is real")
 
     def test_merge_with_alone_still_touches_no_bucket(self):
         """--merge-with without --pr-glob recomputes; the index is how a
@@ -1793,19 +1817,20 @@ class TestHowTheBuildEnded(unittest.TestCase):
         # And the GCS reader does not cache the failure, so the retry is real.
         calls = []
 
-        def gcloud_storage_fake(args, gcloud):
+        def gcloud_storage_call_fake(args, gcloud):
             calls.append(args[-1])
-            return None if len(calls) == 1 else "text"
+            # A failure that is not a 404 (here: a transient 500) is not cached.
+            return (None, "ERROR: HTTPError 500") if len(calls) == 1 else ("text", "")
 
-        original = collect._gcloud_storage
-        collect._gcloud_storage = gcloud_storage_fake
+        original = collect._gcloud_storage_call
+        collect._gcloud_storage_call = gcloud_storage_call_fake
         try:
             gcs = collect._gcs_reader("gs://b/", "gcloud")
             self.assertIsNone(gcs("build-log.txt"))
             self.assertEqual(gcs("build-log.txt"), "text")
             self.assertEqual(gcs("build-log.txt"), "text")
         finally:
-            collect._gcloud_storage = original
+            collect._gcloud_storage_call = original
         self.assertEqual(len(calls), 2)
 
     def test_neither_log_nor_podinfo_leaves_how_it_ended_unknown(self):
