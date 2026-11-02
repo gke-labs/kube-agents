@@ -607,17 +607,21 @@ def _annotate_entry(
         left = _time_left(deadline, clock)
         if not left:
             return _budget_spent()
-        from collect import kubeconfig_path, prepare_kubeconfig  # noqa: PLC0415 -- the one rule for the shared directory, in collect.py
+        from collect import fetch_credentials  # noqa: PLC0415 -- the one get-credentials, in collect.py
 
-        kubeconfig = kubeconfig_path(project, cluster, location)
-        note = prepare_kubeconfig(kubeconfig)
-        if note:
-            return {UNREAD_FIELD: f"{note}, so whether Config Connector applies its objects here is not known."}
-        argv = ["gcloud", "container", "clusters", "get-credentials", cluster, "--location", location, "--project", project]
-        # Through the broker too, so it takes a slot like the reads.
-        fetched = _with_proxy_slot(run, argv, kubeconfig, CREDENTIALS_TIMEOUT_S, deadline, clock)
+        ran: list[str] = []
+
+        def in_slot(argv: list[str], env: dict) -> "Result | None":
+            # Through the broker too, so it takes a slot like the reads.
+            ran.append(argv[0])
+            return _with_proxy_slot(run, argv, Path(env["KUBECONFIG"]), CREDENTIALS_TIMEOUT_S, deadline, clock)
+
+        kubeconfig, fetched = fetch_credentials(project, cluster, location, run=in_slot)
         if fetched is None:
             return _budget_spent()
+        if not ran:
+            # `fetch_credentials` refused the kubeconfig directory and ran nothing.
+            return {UNREAD_FIELD: f"{fetched.stderr}, so whether Config Connector applies its objects here is not known."}
         if fetched.rc != 0:
             excerpt = " ".join(fetched.stderr.split())[:MAX_ERROR_CHARS] or "no stderr"
             return {

@@ -528,6 +528,21 @@ class AnnotateManifestTest(unittest.TestCase):
         self.assertEqual({kubeconfig for _, kubeconfig in run.calls}, {str(named)})
         self.assertFalse(hasattr(kcc_health, "KUBECONFIG_NAME"))
 
+    def test_the_credentials_come_from_collects_fetch(self):
+        """`collect.fetch_credentials` builds the `get-credentials` command,
+        not a copy of it, and its run takes a proxy slot."""
+        run = FakeRun({"hub": listing()})
+        manifest = {"clusters": [self.manifest()["clusters"][0]]}
+        with mock.patch.object(collect, "fetch_credentials", wraps=collect.fetch_credentials) as fetch, mock.patch.object(
+            kcc_health, "_with_proxy_slot", wraps=kcc_health._with_proxy_slot
+        ) as slot:
+            kcc_health.annotate_manifest(manifest, deadline=self.deadline, run=run, clock=self.clock)
+        self.assertEqual(fetch.call_args.args, ("acme", "hub", "us-central1"))
+        self.assertIn("get-credentials", slot.call_args_list[0].args[1])
+        self.assertEqual(manifest["clusters"][0]["kcc_unready"], [])
+        source = Path(kcc_health.__file__).read_text()
+        self.assertNotIn('"get-credentials"', source)
+
     def test_a_kubeconfig_the_collector_fetched_is_reused(self):
         run = FakeRun({"hub": listing(STALLED_TOPIC)})
         manifest = {"clusters": [self.manifest()["clusters"][0]]}
