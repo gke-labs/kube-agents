@@ -252,7 +252,7 @@ ingress gap above.
   `A2A_GATEWAY_IMAGE` pin, a tag taken from `PLATFORM_AGENT_IMAGE`, or the first roll of any image
   when no gateway has been elected yet), and moves to two once a pod on that image holds the
   Lease. The condition describes the gateway that's running, not one that once ran: the operator
-  clears it whenever the gateway Deployment rolls to an image other than the one it names, and when
+  clears it whenever the gateway Deployment rolls to an image outside the operator's own release, and when
   the mode goes back to today, as `BusProvisioned` is. So a pin to a pre-election image clears it,
   and removing the pin rolls once at one replica again. A deleted Lease or its held-back recreate
   doesn't change the running image, so it leaves the condition, and the two replicas, in place. A status condition doesn't
@@ -312,7 +312,7 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    step 4, so nothing meets a standby it can't route around.
 4. **Operator:** replicas, the readiness probe, the strategy (held at one replica and `Recreate`
    until `GatewayElected` names the running image, for the first roll ever and for any image
-   outside the operator's own release; the condition cleared on any roll to another image), the
+   outside the operator's own release; the condition cleared on a roll to any image outside it), the
    PDB, the spread, the Lease (with its owner reference and
    an `Owns` watch, recreated one `leaseDuration` after a deletion) and its Role. Its tests pin
    each, including the held-back recreate, the first roll across the election, and a pin to a
