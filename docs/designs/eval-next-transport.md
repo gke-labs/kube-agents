@@ -258,8 +258,8 @@ other; an active task with no executor event, nobody took it, infrastructure, wh
 gateway has released the conversation yet; an active task at `submitted` and never `working`, an
 executor accepted it and queued it for the whole budget, infrastructure; an active task at
 `working`, a graded timeout; and an active task whose stream already folds to a terminal, which
-is the relay's lost record write, the event acked when the relay enqueued it, before the queued
-write cleared `ActiveTask`, and an acked event is never redelivered. That fifth outcome is graded
+is the relay's lost record write: the relay acks a terminal once it has rendered it, whether or
+not the record write after it cleared `ActiveTask`, and an acked event is never redelivered. That fifth outcome is graded
 like the first, with the answer read from the fold rather than the posted message, and gets no
 cancel, because there is nothing left to cancel; the record then holds a finished task until
 something releases it, which on a key never reused is nothing and costs nothing. The sixth is

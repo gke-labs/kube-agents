@@ -43,6 +43,15 @@ NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # route, home channel or not (platformagent_a2a_manifests.go,
 # a2aNotifyConversationsEnvVar): the platform whose backend the gateway holds.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+# The operator projects the home channel it admitted (the CR field, else the
+# channel the gateway learned) into a ConfigMap mounted as a directory in the
+# agent pod, so a learned channel reaches the pod without a restart. One file,
+# the Slack channel id or empty; the directory is absent on an operator older
+# than the projection and in today mode. No env override: the agent's own
+# .env is loaded into its environment, so a seam there would let a line on
+# the writable volume point the readers at a file of its own.
+HOME_FILE_DIR = "/etc/kube-agents/chat-home"
+HOME_FILE_KEY = "slack_home"
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
@@ -104,9 +113,46 @@ def alert_update_key(session_id: str) -> str:
     return ALERT_UPDATE_FORMAT.format(session=session_id) if session_id else ""
 
 
+def home_file() -> tuple[str, bool]:
+    """The projected Slack home channel, trimmed, and whether the file is mounted.
+
+    Read on every call: the kubelet refreshes the file in place when the
+    operator's projection changes, within about a minute, and no process
+    restarts for it. Mounted means the directory is there: the Optional
+    volume gives an empty directory until the operator writes the ConfigMap,
+    and in that gap the home is still the operator's to say. No directory at
+    all is today mode, or an operator older than the projection: ("", False).
+    """
+    try:
+        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
+            try:
+                return handle.read().strip(), True
+            except ValueError:
+                # Not text: mounted, but no channel to read, as the gateway reads it.
+                return "", True
+    except OSError:
+        return "", os.path.isdir(HOME_FILE_DIR)
+
+
+def home_file_value() -> str:
+    """The Slack home channel the operator projected into the pod, or "" when none."""
+    return home_file()[0]
+
+
 def routed_platform() -> str:
-    """The platform whose posts go through the gateway, or "" when none does."""
-    return os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+    """The platform whose posts go through the gateway, or "" when none does.
+
+    The rendered env names it when the CR sets the home channel. A learned
+    channel is never rendered into the pod, so with the env empty the answer
+    is derived: the gateway holds Slack (``A2A_NOTIFY_CONVERSATIONS``) and the
+    projected file names a home channel.
+    """
+    routed = os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+    if routed:
+        return routed
+    if gateway_platform() == SLACK_PLATFORM and home_file_value():
+        return SLACK_PLATFORM
+    return ""
 
 
 def gateway_platform() -> str:

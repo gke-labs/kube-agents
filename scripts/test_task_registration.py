@@ -436,6 +436,84 @@ class TestTheValidatorItself(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
 
+    def test_a_quoted_boolean_against_a_boolean_field_is_rejected(self):
+        """The verifier compares `value` raw and the API holds a bool, so a
+        quoted boolean never compares equal and the check asserts nothing; the
+        run would go red only after the lease. Judged by (parent, field) pair,
+        read as a JSONPath parser would: filters stripped, every other bracket
+        selector dropped (an index, a negative index, a slice, a union, a
+        wildcard), padding ignored, quoted keys whole, the object root as
+        parent ""."""
+        flagged = (
+            ("resource_property", "eq", "spec.suspend"),
+            ("fleet_resource_property", "ne", "spec.suspend"),
+            ("resource_property", "ne", "$.spec['suspend']"),
+            ("fleet_resource_property", "eq", "spec.template.spec.hostNetwork"),
+            ("resource_property", "eq", "spec.template.spec.containers[?(@.name=='app')].securityContext.privileged"),
+            ("resource_property", "eq", "spec.template.spec.volumes[?(@.name=='data')].configMap.optional"),
+            ("resource_property", "eq", "spec.template.spec.volumes[0].configMap.optional"),
+            ("resource_property", "ne", "spec.template.spec.containers[0].volumeMounts[?(@.name=='data')].readOnly"),
+            ("resource_property", "eq", "spec.template.spec.containers[0].volumeMounts[*].readOnly"),
+            ("fleet_resource_property", "eq", "$.immutable"),
+            ("resource_property", "eq", "spec.template.spec.containers[0].volumeMounts[-1].readOnly"),
+            ("resource_property", "eq", "spec.template.spec.containers[0:2].securityContext.privileged"),
+            ("resource_property", "eq", "spec.template.spec.volumes[0,1].configMap.optional"),
+            ("resource_property", "eq", "spec.template.spec.containers[*].securityContext.privileged"),
+            ("resource_property", "eq", "spec. suspend"),
+            ("fleet_resource_property", "eq", "automountServiceAccountToken"),
+            ("resource_property", "eq", "spec.nodePoolAutoCreation.enabled"),
+        )
+        for check_type, op, path in flagged:
+            problems = []
+            validator._check_assertions(
+                {"type": check_type, "path": path, "op": op, "value": " True "},
+                "check 'x'", problems,
+            )
+            self.assertEqual(len(problems), 1, (check_type, op, path, problems))
+            self.assertIn("asserts nothing", problems[0])
+            self.assertIn("value: true", problems[0])
+            self.assertIn("BOOLEAN_FIELD_PAIRS", problems[0])
+        problems = []
+        validator._check_assertions(
+            {"type": "resource_property", "path": "spec.suspend", "op": "eq", "value": "true", "across_matches": "none"},
+            "check 'x'", problems,
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("asserts nothing", problems[0])
+
+    def test_string_fields_bare_booleans_and_other_shapes_pass_the_boolean_rule(self):
+        """Only a known (parent, field) pair is judged: a Service selector, a
+        label, a data key, a quoted dotted key, a CRD's own `spec.enabled`, an
+        unknown map and a condition status compared to "true" are correct
+        cases. A wrong parent is silent. A path the reader does not follow,
+        recursive descent, is a miss and never a wrong flag. A bare boolean,
+        `op: exists` and malformed shapes raise no problem from this rule and
+        must not crash."""
+        for node in (
+            {"type": "resource_property", "path": "spec.suspend", "op": "eq", "value": True},
+            {"type": "fleet_resource_property", "path": "spec.suspend", "op": "ne", "value": False},
+            {"type": "resource_property", "path": "spec.selector.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "metadata.labels.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.template.metadata.annotations['safe-to-evict']", "op": "eq", "value": "false"},
+            {"type": "resource_property", "path": "data.enabled", "op": "eq", "value": "false"},
+            {"type": "resource_property", "path": "spec.hard['feature.enabled']", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "metadata.annotations['autoscaling.enabled']", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.foo.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.jobTemplate.suspend", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec..suspend", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "$..privileged", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.taints[?(@.key=='seeded-role')].value", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "status.conditions[?(@.type=='Ready')].status", "op": "eq", "value": "True"},
+            {"type": "resource_property", "path": "spec.suspend", "op": "exists", "value": "true"},
+            {"type": "resource_property", "path": "spec.suspend", "op": ["eq"], "value": "true"},
+            {"type": "resource_property", "path": "spec.suspend", "op": "eq", "value": ["true"]},
+            {"type": "resource_property", "path": None, "op": "eq", "value": "true"},
+        ):
+            problems = []
+            validator._check_assertions(node, "check 'x'", problems)
+            self.assertEqual(problems, [], node)
+
     def test_a_check_that_asserts_without_a_field_is_not_rejected(self):
         # An empty CHECK_ASSERTIONS tuple is the "no field can switch this off"
         # case, not a missing entry: pull_request_opened fails on a report
@@ -707,6 +785,14 @@ class TestTheRulesReject(unittest.TestCase):
 
     def test_a_declared_scope_exclusion_passes(self):
         self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"]}), [])
+
+    def test_a_scope_exclusion_with_absent_clusters_passes(self):
+        self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"], "absent": 1}), [])
+
+    def test_an_absent_count_out_of_range_is_rejected(self):
+        for absent in (0, -1, 9, True, "1"):
+            with self.subTest(absent=absent):
+                self._only("must be {slots:", scope_exclude={"slots": ["b"], "absent": absent})
 
     def test_a_slot_the_catalogue_does_not_declare_is_rejected(self):
         self._only("does not declare", scope_exclude={"slots": ["b", "z"]})

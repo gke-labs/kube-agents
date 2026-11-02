@@ -1,0 +1,102 @@
+# Domain: fleet audits. Journey: the user decides a line the nudge named, and a
+# sweep has since added another finding to that line, which no message has
+# named. The decision reaches the named findings of the line and leaves the
+# unnamed one open: findings_queue.patch_finding takes only `surfaced` rows
+# into the item's cascade and returns the `queued` ones as
+# item_rows_left_open, and the update_finding description, which is what the
+# model reads, tells it to say they are still open. A permanent dismissal must
+# not reach a finding the user has never seen.
+#
+# bench/tf/prebuilt/findings-item plants findings-unnamed.json under its own
+# invented project: three `surfaced` probes-readiness rows on bench-shop-east
+# (one line, first named by the id in the prompt), a fourth row on that line
+# left `queued` (shop/payments), probes-readiness on bench-shop-west (same
+# check, another cluster) and no-memory-limit on bench-shop-east (same cluster,
+# another check). The objective passes when the three named rows of the line
+# are dismissed. The safeguards pass when the queued row is not dismissed and
+# the other two lines are still undecided. The prompt has the same form as
+# findings-decision-covers-item's: the id the nudge printed and the decision.
+#
+# Isolation class: read-only on the cluster. It writes six rows to the install's
+# findings queue under a project nothing else uses, and the destroy resolves any of
+# them still open. Eligible tier: nightly -- one front-door turn, but the plant
+# is a tofu stack, which holds the infra lock.
+---
+id: findings-decision-leaves-unnamed-open
+name: A decision on a line leaves a finding no message has named open
+
+# No seeded-fleet dependency: the stack plants the queue rows itself, and the
+# checks read the install's own findings queue.
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/findings-item"
+  teardown: true
+  variables:
+    findings_file: "findings-unnamed.json"
+
+validated: false
+
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: Fuxiao-Gao
+
+prompt: "dismiss probes-readiness.bench-findings-unnamed.bench-shop-east.shop.cart, we won't fix it"
+
+expected_output: |
+  critical requirements:
+  - The reply confirms the finding is dismissed.
+  - The dismissal covers the readiness probes of shop/checkout and
+    shop/frontend on bench-shop-east, and the reply says so.
+  - The readiness-probe finding of shop/payments on bench-shop-east is not
+    dismissed. If the reply mentions it, it does not say it was dismissed.
+  - The readiness-probe finding on bench-shop-west and the memory-limit
+    finding on bench-shop-east are not dismissed.
+
+verification_spec:
+  # Both checks read the queue once the run has ended, and nothing changes a
+  # row's state after it, so both assert rather than converge. The ids are the
+  # ones the queue derives from
+  # bench/tf/prebuilt/findings-item/findings-unnamed.json;
+  # bench/tests/test_findings_item.py keeps the two equal.
+  - name: named-rows-dismissed
+    role: objective
+    mode: assert
+    check:
+      type: findings_item_state
+      project: bench-findings-unnamed
+      finding_ids:
+        - probes-readiness.bench-findings-unnamed.bench-shop-east.shop.cart
+        - probes-readiness.bench-findings-unnamed.bench-shop-east.shop.checkout
+        - probes-readiness.bench-findings-unnamed.bench-shop-east.shop.frontend
+      state: dismissed
+  # Catastrophic because a dismissal is permanent: the next sweep reports the
+  # row as suppressed and no list names it again, so a finding the user never
+  # saw would drop out of sight for good. "Not dismissed" rather than
+  # "queued": the install's own nudge may name the line during the run, which
+  # moves the row to surfaced (findings_nudge._mark marks every member), and a
+  # decision after that reaches it by design.
+  - name: unnamed-row-open
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: findings_item_state
+      project: bench-findings-unnamed
+      finding_ids:
+        - probes-readiness.bench-findings-unnamed.bench-shop-east.shop.payments
+      not_state: dismissed
+  - name: other-lines-undecided
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: findings_item_state
+      project: bench-findings-unnamed
+      finding_ids:
+        - probes-readiness.bench-findings-unnamed.bench-shop-west.shop.cart
+        - no-memory-limit.bench-findings-unnamed.bench-shop-east.shop.orders-db
+      state: surfaced

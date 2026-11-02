@@ -40,7 +40,7 @@ from typing import Any
 import yaml
 from devops_bench.tasks.schema import Task as DevopsBenchTask
 
-from kube_agents_bench import scope_exclude, stop_hook
+from kube_agents_bench import pushed_report, scope_exclude, stop_hook
 
 __all__ = [
     "CASE_KEYS",
@@ -121,10 +121,13 @@ TRACE_GRADABLE_CHECK_TYPES = frozenset({"tool_called"})
 # outputs, so it is blind the same way.
 WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "worker_budget", "report_times_in_window"})
 TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TYPES
-# Entries the harness writes on the trajectory itself (``stop_hook.py``), not
-# calls read off the door's trace, so a lossy trace says nothing about them:
-# a ``tool_called`` leaf naming only these is graded on every record.
-HARNESS_WRITTEN_ENTRIES = frozenset({stop_hook.STOP_ENTRY, stop_hook.CARDS_STOPPED_ENTRY})
+# Entries the harness writes on the trajectory itself (``stop_hook.py``,
+# ``pushed_report.py``), not calls read off the door's trace, so a lossy
+# trace says nothing about them: a ``tool_called`` leaf naming only these is
+# graded on every record.
+HARNESS_WRITTEN_ENTRIES = frozenset(
+    {stop_hook.STOP_ENTRY, stop_hook.CARDS_STOPPED_ENTRY, pushed_report.PLANT_ENTRY}
+)
 _TOOL_CALLED_NAMES_KEY = "tool_names"
 # ``tool_called``'s scope key and the one scope the door's trace serves
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).

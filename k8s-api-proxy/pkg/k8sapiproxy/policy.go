@@ -23,8 +23,9 @@ const (
 	// run in this mode.
 	ModeReadOnlyWithDryRun Mode = "read-only-dry-run"
 	// ModeReadWrite permits create, update, patch, delete and deletecollection, for platforms
-	// that authorize writes. Credential minting and pod placement stay refused, and stream
-	// upgrades unless Policy.AllowUpgradeSubresources is set.
+	// that authorize writes. Credential minting through subresources and pod placement stay
+	// refused, and stream upgrades unless Policy.AllowUpgradeSubresources is set. See
+	// Policy.RedactSecrets for a token reachable through a created Secret.
 	ModeReadWrite Mode = "read-write"
 )
 
@@ -33,14 +34,23 @@ const DefaultMode = ModeReadOnlyWithDryRun
 
 // ParseMode validates raw, returning DefaultMode for an empty string.
 func ParseMode(raw string) (Mode, error) {
-	switch m := Mode(raw); m {
-	case "":
+	m := Mode(raw)
+	switch {
+	case m == "":
 		return DefaultMode, nil
-	case ModeReadOnly, ModeReadOnlyWithDryRun, ModeReadWrite:
+	case m.valid():
 		return m, nil
 	default:
 		return "", fmt.Errorf("invalid proxy mode %q: expected %q, %q or %q", raw, ModeReadOnly, ModeReadOnlyWithDryRun, ModeReadWrite)
 	}
+}
+
+func (m Mode) valid() bool {
+	switch m {
+	case ModeReadOnly, ModeReadOnlyWithDryRun, ModeReadWrite:
+		return true
+	}
+	return false
 }
 
 // RejectionReason classifies a refusal. The values are a closed vocabulary, so they can be
@@ -247,12 +257,16 @@ func SplitClusterPath(u *url.URL, defaultClusterID string) (clusterID, apiPath s
 // Policy decides which requests reach the API server.
 type Policy struct {
 	Mode Mode
-	// RedactSecrets keeps Secret values out of what the Secrets API returns. Besides the
-	// response redaction the handler applies, it refuses Secret subresources, and Secret update
-	// and patch in every mode: a dry-run patch can copy a value into a field that is returned
+	// RedactSecrets keeps Secret values out of what the Secrets API returns: the handler asks
+	// the API server for metadata or a Table, never values, and redacts what comes back. Evaluate refuses Secret
+	// subresources, and Secret update and patch in every mode: a dry-run patch can copy a value into a field that is returned
 	// unredacted, a JSON patch `test` op answers whether a guess is right, and a validation
 	// error can echo a copied value back. It does not cover a value a workload exposes: in
 	// ModeReadWrite a caller can create a pod that prints a Secret and read its log.
+	// Turning it off in ModeReadWrite exposes more than existing Secrets: a caller can create
+	// a Secret of type kubernetes.io/service-account-token, which the token controller fills
+	// with a long-lived token for the ServiceAccount it names, and read it back. Evaluate does
+	// not read request bodies, so it cannot refuse that create.
 	RedactSecrets bool
 	// AllowUpgradeSubresources permits exec, attach, portforward and proxy in ModeReadWrite.
 	// Ignored in the read-only modes.
@@ -265,9 +279,7 @@ func (p Policy) Evaluate(r *http.Request, info *request.RequestInfo) *PolicyErro
 	if r == nil || info == nil {
 		return invalidRoute("the request could not be classified")
 	}
-	switch p.Mode {
-	case ModeReadOnly, ModeReadOnlyWithDryRun, ModeReadWrite:
-	default:
+	if !p.Mode.valid() {
 		return &PolicyError{
 			Code:            http.StatusInternalServerError,
 			Reason:          metav1.StatusReasonInternalError,
@@ -306,7 +318,7 @@ func (p Policy) Evaluate(r *http.Request, info *request.RequestInfo) *PolicyErro
 		}
 	}
 
-	upgradePermitted := p.Mode == ModeReadWrite && p.AllowUpgradeSubresources && upgradeSubresources.Has(sub)
+	upgradePermitted := p.permitsUpgrade(info)
 	switch {
 	case sub == "":
 	case mintingSubresources.Has(sub):
@@ -369,6 +381,12 @@ func evaluateNonResource(r *http.Request, info *request.RequestInfo) *PolicyErro
 	return forbidden(ReasonDiscoveryPathBlocked, fmt.Sprintf(
 		"%snon-resource path %q: only Kubernetes discovery and health paths are permitted.%s",
 		policyPrefix, info.Path, boundaryNotice))
+}
+
+// permitsUpgrade reports whether info names a stream upgrade the policy admits.
+func (p Policy) permitsUpgrade(info *request.RequestInfo) bool {
+	return p.Mode == ModeReadWrite && p.AllowUpgradeSubresources && info.IsResourceRequest &&
+		upgradeSubresources.Has(strings.ToLower(info.Subresource))
 }
 
 // evaluateSubresource decides a subresource that neither mints credentials nor upgrades.

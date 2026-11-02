@@ -8,12 +8,14 @@ case a `api_command(...) -> argv` interface would have quietly ruled out.
 
 The neutral request is:
 
-    api(method, path, *, params=None, body=None, raw=None) -> Any
+    api(method, path, *, params=None, body=None, raw=None, with_headers=False) -> Any
 
 `params` is a dict rather than something a verb formats into the path, because
 a dict is what gets URL-encoded; `f"...?state={state}"` does not. `raw` names a
 media type rather than smuggling one through as a header, so a transport with
-no notion of headers can still honour it.
+no notion of headers can still honour it. `with_headers` asks for the answer's
+headers as well, `(payload, headers)` with lower-case names, for a forge that
+counts a listing in a header; only the HTTP transport has them.
 
 What a transport owns, and no forge may:
 
@@ -43,6 +45,7 @@ from urllib.parse import urlencode
 
 from workspace_paths import WorkspaceError
 
+from .base import ForgeUnsupported
 from .errors import (
     Guidance,
     Override,
@@ -83,6 +86,7 @@ class Transport(Protocol):
         params: Mapping[str, Any] | None = None,
         body: Mapping[str, Any] | None = None,
         raw: str | None = None,
+        with_headers: bool = False,
     ) -> Any: ...
 
     def whoami(self) -> str:
@@ -150,7 +154,15 @@ class CliTransport:
         params: Mapping[str, Any] | None = None,
         body: Mapping[str, Any] | None = None,
         raw: str | None = None,
+        with_headers: bool = False,
     ) -> Any:
+        if with_headers:
+            # `<cli> api` prints the body alone, so the headers a count is read
+            # from never reach this side. Refused before anything runs.
+            raise ForgeUnsupported(
+                f"the `{self._executable}` CLI transport cannot answer `with-headers`; "
+                "a call that reads response headers needs the HTTP transport"
+            )
         argv = [self._executable, "api", "--method", method, _with_query(path, params)]
         if raw:
             argv += ["-H", f"Accept: {raw}"]
@@ -559,6 +571,7 @@ class HttpTransport:
         params: Mapping[str, Any] | None = None,
         body: Mapping[str, Any] | None = None,
         raw: str | None = None,
+        with_headers: bool = False,
     ) -> Any:
         # A forge composes paths from validated segments; this is the backstop
         # that keeps one from naming its own host or climbing out of the API
@@ -571,7 +584,7 @@ class HttpTransport:
                 code="FORGE_CALL_FAILED",
             )
         url = f"{self._base}/{_with_query(path, params).lstrip('/')}"
-        return self._call(method, url, body=body, raw=raw)
+        return self._call(method, url, body=body, raw=raw, with_headers=with_headers)
 
     def _call(
         self,
@@ -580,8 +593,14 @@ class HttpTransport:
         *,
         body: Mapping[str, Any] | None = None,
         raw: str | None = None,
+        with_headers: bool = False,
     ) -> Any:
-        """One authenticated request to `url`, which the caller composed and checked."""
+        """One authenticated request to `url`, which the caller composed and checked.
+
+        With `with_headers`, `(payload, headers)`, the header names in lower
+        case: HTTP names are case-blind, and a forge reads its count by one
+        spelling.
+        """
         data = None if body is None else json.dumps(body).encode("utf-8")
         request = urllib.request.Request(url, data=data, method=method)
         request.add_header("Accept", raw or "application/json")
@@ -627,6 +646,8 @@ class HttpTransport:
         try:
             with self._open(request, timeout=socket_timeout) as response:
                 payload = self._read_within(response, deadline, slow=slow)
+                received = getattr(response, "headers", None) or {}
+                headers = {str(name).lower(): value for name, value in received.items()}
         except urllib.error.HTTPError as exc:
             return self._refused(exc.code, self._error_text(exc, deadline))
         except WorkspaceError:
@@ -659,15 +680,17 @@ class HttpTransport:
             raise forge_error(0, _broken_answer(exc)) from exc
         text = payload.decode("utf-8", "replace")
         if raw:
-            return text
-        try:
-            return json.loads(text or "null")
-        except (json.JSONDecodeError, RecursionError) as exc:
-            raise WorkspaceError(
-                "the forge returned something that is not JSON",
-                status=502,
-                code="FORGE_CALL_FAILED",
-            ) from exc
+            parsed: Any = text
+        else:
+            try:
+                parsed = json.loads(text or "null")
+            except (json.JSONDecodeError, RecursionError) as exc:
+                raise WorkspaceError(
+                    "the forge returned something that is not JSON",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
+                ) from exc
+        return (parsed, headers) if with_headers else parsed
 
     def _error_text(self, exc: urllib.error.HTTPError, deadline: float) -> str:
         """What a refusal said, read under the same deadline as an answer.

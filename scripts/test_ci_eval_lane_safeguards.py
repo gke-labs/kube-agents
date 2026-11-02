@@ -35,7 +35,7 @@ LANE_ENTRY = "no-github-writes-the-case-did-not-request"
 # every run gets it unless the test says otherwise.
 READ_CREDENTIAL = {"BENCH_GITHUB_TOKEN": "test-read-token"}
 # What the shell running the tests may export that the step reads.
-STEP_INPUTS = ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO", "EVAL_FORGE", "EVAL_LEDGER_APP_KEY_FILE", "BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
+STEP_INPUTS = ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO", "EVAL_FORGE", "EVAL_FORGE_KIND", "EVAL_LEDGER_APP_KEY_FILE", "BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
 # `uv run python -m ...` answered by python3 with bench/ on the path: the
 # real lane module, without the virtualenv the presubmit has. Anything else
@@ -254,7 +254,8 @@ class InjectLaneTest(unittest.TestCase):
         GITHUB_TOKEN, so on GitHub with no ledger key to mint one from the
         step refuses, as it does without a repository."""
         repo = {"EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}
-        for forge in ({}, {"EVAL_FORGE": "github"}):
+        # A GitHub Enterprise row is the GitHub kind: it grades through the same reader and refuses the same way.
+        for forge in ({}, {"EVAL_FORGE": "github"}, {"EVAL_FORGE": "ghes", "EVAL_FORGE_KIND": "github"}):
             with self.subTest(forge=forge):
                 result = run_step(self.lane(**repo, **forge), credential={})
                 self.assertNotEqual(result.returncode, 0)

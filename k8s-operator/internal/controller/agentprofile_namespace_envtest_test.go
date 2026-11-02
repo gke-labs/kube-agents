@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -41,8 +42,8 @@ func TestTheProfileQuotaAndFenceLandInTheNamespace(t *testing.T) {
 		t.Fatalf("the profile quota: %v", err)
 	}
 	// No AgentProfiles, so no warm pools: the ceiling alone.
-	if pods := q.Spec.Hard[corev1.ResourcePods]; pods.Value() != agentv1alpha1.DefaultProfileCeiling {
-		t.Errorf("quota pods = %s, want %d", pods.String(), agentv1alpha1.DefaultProfileCeiling)
+	if pods := q.Spec.Hard[corev1.ResourcePods]; pods.Value() != defaultKanbanMaxInProgress {
+		t.Errorf("quota pods = %s, want %d", pods.String(), defaultKanbanMaxInProgress)
 	}
 	var np networkingv1.NetworkPolicy
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns-profiles", Name: "test-agent-profile-netpol"}, &np); err != nil {
@@ -655,5 +656,99 @@ func TestTheIdentityMapRendersProfilesOnlyWithTheProfileNamespace(t *testing.T) 
 	}
 	if !kept {
 		t.Error("a failed namespace read rewrote the map without the profile")
+	}
+}
+
+// The dispatcher's intervals are bounded against each other, each absent
+// field counting at its default, and the child reserve stays below the
+// ceiling.
+func TestThePlatformAgentCRDBoundsTheDispatchIntervals(t *testing.T) {
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const ns = "platformagent-intervals"
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatal(err)
+	}
+	for i, tc := range []struct {
+		tuning        agentv1alpha1.ProfileTuning
+		want          string // "" admits
+		maxInProgress *int
+	}{
+		{agentv1alpha1.ProfileTuning{}, "", nil},
+		{agentv1alpha1.ProfileTuning{LeaseSeconds: ptr.To(60), RenewSeconds: ptr.To(20)}, "", nil},
+		{agentv1alpha1.ProfileTuning{LeaseSeconds: ptr.To(59)}, "leaseSeconds must be at least three renewSeconds", nil},
+		{agentv1alpha1.ProfileTuning{RenewSeconds: ptr.To(31)}, "leaseSeconds must be at least three renewSeconds", nil},
+		// The default grace (60) is short of two renewals of 31.
+		{agentv1alpha1.ProfileTuning{RenewSeconds: ptr.To(31), LeaseSeconds: ptr.To(100)}, "restartGraceSeconds must be at least two renewSeconds", nil},
+		{agentv1alpha1.ProfileTuning{RenewSeconds: ptr.To(31), LeaseSeconds: ptr.To(100), RestartGraceSeconds: ptr.To(62)}, "", nil},
+		{agentv1alpha1.ProfileTuning{RenewSeconds: ptr.To(30), LeaseSeconds: ptr.To(90)}, "", nil},
+		{agentv1alpha1.ProfileTuning{Ceiling: ptr.To(4), ChildReserve: ptr.To(3)}, "", nil},
+		{agentv1alpha1.ProfileTuning{Ceiling: ptr.To(4), ChildReserve: ptr.To(4)}, "childReserve must be below the profile ceiling", nil},
+		// With the ceiling unset, the reserve is held to maxInProgress's default (6).
+		{agentv1alpha1.ProfileTuning{ChildReserve: ptr.To(6)}, "childReserve must be below the profile ceiling", nil},
+		{agentv1alpha1.ProfileTuning{ChildReserve: ptr.To(5)}, "", nil},
+		// With the ceiling unset and maxInProgress set, the reserve is held to it.
+		{agentv1alpha1.ProfileTuning{ChildReserve: ptr.To(3)}, "childReserve must be below the profile ceiling", ptr.To(3)},
+		{agentv1alpha1.ProfileTuning{ChildReserve: ptr.To(2)}, "", ptr.To(3)},
+		// A set ceiling wins over maxInProgress.
+		{agentv1alpha1.ProfileTuning{Ceiling: ptr.To(8), ChildReserve: ptr.To(5)}, "", ptr.To(3)},
+		// The task deadline cap may only be lowered from 6h.
+		{agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(900)}, "", nil},
+		{agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(21601)}, "maxTaskDeadlineSeconds", nil},
+		{agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(59)}, "maxTaskDeadlineSeconds", nil},
+	} {
+		agent := a2aTestAgent()
+		agent.Name = fmt.Sprintf("agent-%d", i)
+		agent.Namespace = ns
+		tuning := tc.tuning
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+			ProjectID: envtestHarnessProject, Location: envtestHarnessLocation, ClusterName: envtestHarnessCluster,
+			Tuning: &agentv1alpha1.TuningSpec{Profiles: &tuning, MaxInProgress: tc.maxInProgress},
+		}
+		err := c.Create(ctx, agent)
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("case %d (%+v) refused: %v", i, tc.tuning, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+			t.Errorf("case %d (%+v) = %v, want a refusal saying %q", i, tc.tuning, err, tc.want)
+		}
+	}
+}
+
+// A declared parameter is a lower-case identifier, named once.
+func TestTheAgentProfileCRDBoundsItsParameters(t *testing.T) {
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const ns = "agentprofile-parameters"
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatal(err)
+	}
+	p := func(name string) agentv1alpha1.AgentProfileParameter {
+		return agentv1alpha1.AgentProfileParameter{Name: name, Required: true}
+	}
+	for i, tc := range []struct {
+		params []agentv1alpha1.AgentProfileParameter
+		ok     bool
+	}{
+		{[]agentv1alpha1.AgentProfileParameter{p("project"), p("location"), p("cluster")}, true},
+		{nil, true},
+		{[]agentv1alpha1.AgentProfileParameter{p("Project")}, false},
+		{[]agentv1alpha1.AgentProfileParameter{p("a-b")}, false},
+		{[]agentv1alpha1.AgentProfileParameter{p("project"), p("project")}, false},
+	} {
+		profile := testAgentProfile(ns, fmt.Sprintf("params-%d", i), func(prof *agentv1alpha1.AgentProfile) { prof.Spec.Parameters = tc.params })
+		profile.ResourceVersion, profile.Generation, profile.UID = "", 0, ""
+		err := c.Create(ctx, &profile)
+		if tc.ok != (err == nil) {
+			t.Errorf("parameters %+v: create = %v, want admitted %v", tc.params, err, tc.ok)
+		}
 	}
 }

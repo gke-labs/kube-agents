@@ -190,7 +190,9 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
 # adapter.py upstream) restores placeholders in insertion order, so a header/bold/link wrapping inline
 # code leaks its \x00GCn\x00 key; reversing the restore fixes nesting (kube-agents #277). (2) The standalone
 # REST send (_standalone_send, used by send_message from cron) posts thread.name without messageReplyOption,
-# which the Chat API ignores by default -- upstream's _create_kwargs docstring says so, SDK path only.
+# which the Chat API ignores by default -- upstream's _create_kwargs docstring says so, SDK path only. With
+# GOOGLE_CHAT_RELAY_URL set, google_chat_relay_patch replaces that sender and sets the option itself, so this
+# edit matters only on an install that sends with its own credential.
 # Both edits are exact-count guarded (c.count(t) == 1) until they become an applier + verifier.
 RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/plugins/platforms/google_chat/cards.py'); c = p.read_text(); t = 'for key, value in placeholders.items():'; r = 'for key, value in reversed(list(placeholders.items())):'; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
     /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/plugins/platforms/google_chat/adapter.py'); c = p.read_text(); t = 'f\"https://chat.googleapis.com/v1/{chat_id}/messages\", json=_thread_body(message, thread_id),'; r = 'f\"https://chat.googleapis.com/v1/{chat_id}/messages\" + (\"?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD\" if thread_id else \"\"), json=_thread_body(message, thread_id),'; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
@@ -2050,9 +2052,19 @@ COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 # to 1`), and an unpinned tip broke every cache-cold build (#1817). Bumping
 # the ref means checking the installer's supported manifest version first.
 ARG HERMES_OTEL_REF=b7ece46a5c883a619686b6c698b0316d9fd50962
+# root_span_ttl_ms is the plugin's orphan sweep: a turn whose root span is
+# still open past it is closed as `timed_out` and its later spans lose their
+# parent. The plugin's 10-minute default sat under a fleet audit's length, so
+# Cloud Trace showed live runs "cut" at 600 s (#3220). Nothing bounds a turn's
+# wall clock in this pod, so 4 h is a chosen ceiling, far above the longest
+# turn observed (1552 s), not a limit derived from anything; it keeps the sweep
+# off live runs while still closing a span whose turn never ends.
+# otel_config.py carries this file into every profile's copy at start.
+ARG HERMES_OTEL_ROOT_SPAN_TTL_MS=14400000
 RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install --ref "${HERMES_OTEL_REF}" briancaffey/hermes-otel/hermes_otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
-    /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
+    /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; c['root_span_ttl_ms'] = int('${HERMES_OTEL_ROOT_SPAN_TTL_MS}'); p.write_text(yaml.safe_dump(c))" && \
+    grep -q "^root_span_ttl_ms: ${HERMES_OTEL_ROOT_SPAN_TTL_MS}$" /opt/defaults/plugins/hermes_otel/config.yaml
 
 # The two files that name the speaking profile to the shell sandbox on every
 # connection Hermes' backend opens: the ssh client drop-in, and the wrapper that
@@ -2340,8 +2352,9 @@ COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/go
 # reason in step 2a.
 COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hindsight/
 
-# Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
-# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
+# Copy the Cluster Agent profile TEMPLATE (SOUL, config, skills), scaffolded
+# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py,
+# plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
 # Copy the GKE Support Agent (tse) profile TEMPLATE (persona, config, skills),
@@ -2384,9 +2397,15 @@ COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
 # real worker process started as the dispatcher starts one; see its module
 # docstring.
 #
+# verify_scheduler_failure_line.py rides along for the same two reasons: the
+# layer budget, and session_kv_server.py. It is the half of
+# verify_chat_relay.py's check 11 that needs the relay and the image's cron
+# roster as well as the scheduler: each failure line the scheduler writes still
+# carries the words the relay matches, and the roster still reads as daily.
+#
 # check_skill_commands.py rides along the same way, with skill_documents.py,
 # which it imports. It runs every shell block in the skill documents of the
-# image's three skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
+# image's four skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
 # It scans with the image's pinned tirith (--tirith-bin), the binary that ships.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
@@ -2394,6 +2413,7 @@ COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
      deploy/docker/patches/verify_slack_relay_registry_contract.py \
      deploy/docker/patches/verify_card_stop.py \
+     deploy/docker/plugins/verify_scheduler_failure_line.py \
      deploy/docker/check_skill_commands.py \
      deploy/docker/skill_documents.py \
      /tmp/platform-config/
@@ -2409,10 +2429,12 @@ assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.ma
 assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_card_stop.py && \
+    cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_scheduler_failure_line.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
         --tirith-bin /usr/local/bin/tirith \
         agents/platform/skills=/opt/platform-template/skills \
         agents/cluster/skills=/opt/cluster-template/skills \
+        agents/cluster/persona/skills=/opt/cluster-template/persona/skills \
         agents/tse/skills=/opt/tse-template/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \
     rm -rf /tmp/platform-config

@@ -36,6 +36,8 @@ func summaryCR() map[string]any {
 				"chatMessagesInboundTotal": int64(41), "sessionsTotal": int64(7),
 				"toolExecutionsTotal": int64(19127), "eventsIngestedTotal": int64(10),
 				"remediationsProposedTotal": int64(4), "remediationsMergedTotal": int64(1),
+				"proposalsAuthored": int64(6), "remediationsOpen": int64(2),
+				"remediationsClosedUnmergedTotal": int64(3), "proposalHumanTouches": int64(5),
 				"lastActiveTime":   "2026-10-21T11:34:06Z",
 				"activeInterfaces": []any{"slack", "googlechat"},
 			},
@@ -128,7 +130,10 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 		"kube-agents usage & feedback summary (2026-10-21)",
 		"  version: 0.14.0", "  mode: next", "  kubernetes: v1.33.4-gke.1234000",
 		"  installed: 19 days; ready: true", "  interfaces: googlechat, slack",
-		"  toolExecutionsTotal: 19127", "  sessionsTotal: 7", "  remediationsMergedTotal: 1",
+		"  toolExecutionsTotal: 19127", "  sessionsTotal: 7", "  remediationsProposedTotal: 4\n",
+		"  remediationsMergedTotal: 1 (as the forge reports)\n", "  proposalsAuthored: 6 (as the forge reports)\n",
+		"  remediationsOpen: 2 (as the forge reports)\n", "  remediationsClosedUnmergedTotal: 3 (as the forge reports)\n",
+		"  proposalHumanTouches: 5 (as the forge reports)\n",
 		"  lastActive: 2026-10-21T11:34:06Z",
 		"chat turns (14 days): 6 (ended 3, cancelled 2, active 1)",
 		"performance: " + usageSummaryPerformanceNote,
@@ -144,6 +149,33 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 		}
 	}
 	if leaked := auditUsageSummary(text, usageIdentifiers(summaryCR())); len(leaked) != 0 {
+		t.Errorf("audit of a clean block reported %v", leaked)
+	}
+}
+
+func TestRenderUsageSummaryPrintsNoReadingForAnAbsentReading(t *testing.T) {
+	cr := summaryCR()
+	cr["status"].(map[string]any)["usage"] = map[string]any{"remediationsOpen": int64(0)}
+	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	for _, reading := range []string{"remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"} {
+		if want := "  " + reading + ": no reading (as the forge reports)\n"; !strings.Contains(text, want) {
+			t.Errorf("block lacks %q:\n%s", want, text)
+		}
+	}
+	if want := "  remediationsOpen: 0 (as the forge reports)\n"; !strings.Contains(text, want) {
+		t.Errorf("block lacks %q:\n%s", want, text)
+	}
+	for _, counter := range []string{"clustersRegistered", "toolExecutionsTotal", "remediationsProposedTotal"} {
+		if want := "  " + counter + ": 0\n"; !strings.Contains(text, want) {
+			t.Errorf("block lacks %q:\n%s", want, text)
+		}
+	}
+	for _, field := range usageSummaryCounters {
+		if field == "remediationsAppliedTotal" {
+			t.Error("usageSummaryCounters still names the retired remediationsAppliedTotal")
+		}
+	}
+	if leaked := auditUsageSummary(text, usageIdentifiers(cr)); len(leaked) != 0 {
 		t.Errorf("audit of a clean block reported %v", leaked)
 	}
 }

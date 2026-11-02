@@ -347,8 +347,9 @@ alone does not mean shown: `expire_snoozes`, a `PATCH` and a pull all set it wit
 An _item_ is the rows that share check, project and cluster, one gathered line: they are named and
 marked together, the item is pending while any of them is, and its severity is the highest among its
 pending and never-shown members. A decision (accept, snooze, dismiss) on any row of an item is
-applied to every other row of it that is still `queued` or `surfaced`, so the one id the nudge
-prints is enough to decide the line; the count the nudge prints beside that id is the number of rows
+applied to every other row of it that is still `surfaced`, so the one id the nudge
+prints is enough to decide the line it named; a `queued` row of the item, which no message has
+named, keeps its state (§7.2); the count the nudge prints beside that id is the number of rows
 the decision reaches, which includes shown rows a sweep stopped reporting; the nudge does not list
 those, and says how many of the count they are. Two consequences of the
 severity rule are accepted rather than designed around: a new critical row that joins a pending
@@ -999,7 +1000,10 @@ what makes that visible. An undecided critical holds every new non-critical back
 stays pending, while new criticals still arrive within the day's budget; the daily reminder names
 it only if it is in the day's top, and nothing says that non-criticals are waiting. On a standard
 install only a person's decision (dismiss, snooze or accept) releases a pending item: clearing one without a person needs §7.4's verification, which is not
-built. The onboarding sweep runs once, so for its rows no recurring complete sweep lowers a fixed
+built. A decision reaches only the rows of the item a message has named: the nudge marks every
+member of a line it names, so its count is what the decision covers, while a row a sweep adds to the
+line after the message stays `queued` and keeps its state, and the decision returns its id as left
+open (`item_rows_left_open`) until a later message names it. The onboarding sweep runs once, so for its rows no recurring complete sweep lowers a fixed
 row's `C` unless someone re-runs the sweep by hand; the weekly upgrade readiness review is such a
 sweep for its own `upgrade-` rows, so a shown row of that family that a Saturday no longer reports
 is not pending and is not reminded from that Saturday on, and comes back at the confidence the

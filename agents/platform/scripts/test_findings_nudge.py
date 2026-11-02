@@ -115,7 +115,11 @@ class ComposeTests(unittest.TestCase):
         self.assertIn("no limits", message)
         self.assertIn("id: m0", message)
         self.assertIn("dismiss (won't fix), snooze until a date, or accept (being worked on)", message)
-        self.assertIn("A decision on an id covers every undecided object in its item.", message)
+        self.assertIn(
+            "A decision on an id covers the objects counted beside it; "
+            "a finding added to the line later stays open until a message names it.",
+            message,
+        )
         self.assertNotIn("New: ", message)
 
     def test_the_waiting_count_says_how_many_are_critical(self):

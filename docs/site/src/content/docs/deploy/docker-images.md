@@ -22,7 +22,9 @@ the same registry and tag, so an install at a release pulls them at that release
 install pulls them from the mirror. A `PlatformAgent`'s own `spec.deployment.image` does not move
 them;
 `A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`, `A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE` and
-`A2A_CONSOLE_IMAGE` on the operator override one at a time. The Hermes bridge sidecar the
+`A2A_CONSOLE_IMAGE` on the operator override one at a time. `A2A_DISPATCHER_IMAGE` is
+different: the AgentProfile dispatcher's image is not in the release set yet, so nothing is
+derived for it, and with it unset the operator renders no dispatcher at all. The Hermes bridge sidecar the
 operator renders into the agent pod under `next` is built from the `platform-agent` image of the
 same commit, so the operator takes its registry and tag from the agent image instead, and
 `A2A_BRIDGE_IMAGE` on the operator overrides it. A `PlatformAgent` that declares its own

@@ -984,7 +984,7 @@ main() {
 
   print_step "🎉 Uninstall Complete!"
   echo -e "${C_GREEN}${C_BOLD}🏆 All kube-agents infrastructure elements have been safely removed.${C_RESET}"
-  print_info "Kept by design: the Cloud KMS key rings (GCP cannot delete them; the next install adopts them) and the Terraform state bucket gs://$(tf_state_bucket)."
+  print_info "Kept by design: the Cloud KMS key rings (GCP cannot delete them; the next install adopts them), the cluster key's grant to the GKE service agent if this install made it (other installs that use the key need it), and the Terraform state bucket gs://$(tf_state_bucket)."
   print_info "Cluster-level settings kept on pre-existing clusters: CMEK database encryption, Workload Identity pool, GKE_METADATA node pool migrations, and Calico NetworkPolicy are preserved and not reverted."
   print_info "If this project will not host kube-agents again, delete the bucket yourself: gcloud storage rm -r gs://$(tf_state_bucket)"
 }

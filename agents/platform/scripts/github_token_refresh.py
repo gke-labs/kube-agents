@@ -63,18 +63,27 @@ GH_TIMEOUT_RC = 124
 #: resolves there and is the one refresh_git_credentials forwards to.
 SANDBOX_REFRESH_SCRIPT = "/opt/data/scripts/github_token_refresh.py"
 
-#: The two Minty scopes the rule ConfigMap declares (charts/kube-agents/templates/
+#: The three Minty scopes the rule ConfigMap declares (charts/kube-agents/templates/
 #: github-minter.yaml). The write scope is what every managed repository rides;
 #: the read scope grants `contents: read` alone and is minted per clone of a
-#: context repository, by the broker, for its own git and nothing else.
+#: context repository, by the broker, for its own git and nothing else; the
+#: sweep scope reads contents, pull requests and issues of one managed
+#: repository, for the broker's read of the agent's own proposals.
 MINTY_WRITE_SCOPE = "platform-agent-scope"
 MINTY_READ_SCOPE = "platform-agent-read-scope"
+MINTY_SWEEP_SCOPE = "platform-agent-sweep-scope"
 
 #: The flag that selects the read-only mint. `credential_proxy.CommandExecutor`
 #: spells the same flag when it runs this script; it cannot import this module
 #: for the constant without also importing the CLI side, so the two copies are
 #: kept in step by `test_credential_proxy.py`.
 READ_ONLY_FLAG = "--read-only"
+
+#: The flag that selects the sweep mint: a token in the sweep scope for one
+#: managed repository, printed bare on stdout, nothing installed.
+#: `credential_proxy.FORGE_SWEEP_FLAG` is the same string, kept in step by
+#: `test_credential_proxy.py`.
+SWEEP_FLAG = "--sweep"
 
 #: The flags that select the write mint for a GitHub Enterprise Server host:
 #: the token and the repositories it covers are printed as JSON, and nothing is
@@ -692,6 +701,28 @@ def mint_read_only_token(target_repo: str | None) -> str:
     return token
 
 
+def mint_sweep_token(target_repo: str | None) -> str:
+    """A sweep-scope installation token for one managed repository, and nothing else.
+
+    Reads contents, pull requests and issues, and writes nothing: what the
+    broker presents to the forge API when it reads the outcome of the agent's
+    own proposals. Like `mint_read_only_token` it goes straight to Minty for
+    this one repository and installs nothing; the broker admits managed
+    repositories only before it runs this.
+    """
+    repository = target_repo.strip().strip("/") if target_repo else ""
+    if not repo_ref.is_github_slug(repository):
+        raise RuntimeError(
+            f"Could not identify target repository '{repository}'. Must be in 'owner/repo' format."
+        )
+    org_name, repo_name = repository.split("/", 1)
+    token = request_minty_token(
+        broker_oidc_token(), org_name, [repo_name], MINTY_SWEEP_SCOPE
+    )
+    log(f"Minted a sweep installation token for repository: {repository}")
+    return token
+
+
 def mint_write_token(target_repo: str | None, host: str) -> dict:
     """A write installation token for one repository on a GitHub Enterprise Server host.
 
@@ -989,6 +1020,13 @@ def main():
         "stdout, installing nothing; the broker's clone of a context repository",
     )
     parser.add_argument(
+        SWEEP_FLAG,
+        action="store_true",
+        help="print a contents, pull-request and issue read installation token "
+        "for the repository on stdout, installing nothing; the broker's read of "
+        "the agent's own proposals in a managed repository",
+    )
+    parser.add_argument(
         PRINT_WRITE_FLAG,
         action="store_true",
         help="print a write installation token for the repository on a GitHub "
@@ -999,6 +1037,9 @@ def main():
     try:
         if args.print_write_token:
             print(json.dumps(mint_write_token(args.repository, args.host)), end="")
+            return
+        if args.sweep:
+            print(mint_sweep_token(args.repository), end="")
             return
         if args.read_only:
             print(mint_read_only_token(args.repository), end="")
