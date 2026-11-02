@@ -21,11 +21,12 @@ no pattern over the router's call can read the confirm-first criterion. The
 case reads the filing in two entries. ``the-fix-is-filed`` reads the router's
 ``kanban_create`` by tool name alone, which both transports keep; it is
 trace-blind, so the scorer grades it on the inject lane too.
-``the-fix-is-filed-with-confirm-first`` reads the router's call with its
-readable ``body`` and then a ``kanban_show`` by the platform worker whose
-result carries the criterion (any platform show in the run: ``tool_called``
-has no card selector, #4572); it is worker-blind, graded on the api lane and
-set aside on inject.
+``the-fix-is-filed-with-confirm-first`` is an any-of: the router's call with
+its readable ``body``, or, behind a successful ``kanban_create``, a
+``kanban_show`` by the platform worker whose result carries the criterion (any platform show in the run: ``tool_called``
+has no card selector, #4572). On the api lane the router leaf decides; on the
+inject lane only the worker read can, once the scorer grades worker entries
+there (#2619); until then the entry is worker-blind, set aside on inject.
 
 Every fixture runs through the whole entry as the runner grades it, built
 from the shapes the nightly recorded: the api lane's readable call
@@ -182,15 +183,11 @@ def test_the_api_lanes_readable_create_passes_both_entries():
     assert _status(CONFIRM_FIRST, API_LANE) == "pass"
 
 
-def test_the_inject_lanes_card_body_as_the_worker_read_it_carries_the_criterion():
-    """What the scorer sets aside on inject still holds on the recorded body:
-    the worker leaf alone, over the inject lane's kanban_show."""
-    entry = _entry(CONFIRM_FIRST)
-    worker_leaf = VerificationEntry.model_validate(
-        {"name": "worker-leaf", "role": "objective", "mode": "assert", "check": entry.check.checks[1].model_dump()}
-    )
-    transcript.set(REPLY, INJECT_LANE, final_message=REPLY, started_at=1.0)
-    assert VerifierAgent().run_entry(worker_leaf, timeout_sec=TIMEOUT_SEC).status == "pass"
+def test_the_inject_lanes_card_as_the_worker_read_it_passes_the_criterion_entry():
+    """What the scorer sets aside on inject today still holds on the recorded
+    record through the whole entry: the shaped create fails the router leaf,
+    the worker's show of the card decides."""
+    assert _status(CONFIRM_FIRST, INJECT_LANE) == "pass"
 
 
 def test_a_card_without_the_confirm_step_fails_the_criterion_and_passes_the_filing():
@@ -198,16 +195,25 @@ def test_a_card_without_the_confirm_step_fails_the_criterion_and_passes_the_fili
     assert _status(CONFIRM_FIRST, NO_CONFIRM) == "fail"
 
 
-def test_a_card_filed_and_never_read_is_unobserved_not_a_pass():
-    """The workers scope has nothing to read: the entry answers ``error``,
-    which the coverage rung blocks before any fail is tallied."""
+def test_a_confirm_first_card_never_read_passes_on_the_api_lane():
+    """The filing is the claim where the router's body is readable; the
+    worker read is the other way in, not a second condition."""
     assert _status(FILED, [_readable_create()]) == "pass"
-    assert _status(CONFIRM_FIRST, [_readable_create()]) == "error"
+    assert _status(CONFIRM_FIRST, [_readable_create()]) == "pass"
+
+
+def test_a_shaped_create_with_a_show_of_a_card_without_the_criterion_fails():
+    """The show leaf keeps its `result` read: with the router's body shaped,
+    only a show that carries the criterion can decide."""
+    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE] + _worked(NO_CONFIRM_BODY)) == "fail"
 
 
 def test_no_card_at_all_fails_both_entries():
+    """The worker arm sits behind a successful `kanban_create`, so a run that
+    filed nothing is a graded fail on both lanes, not a blocked repetition."""
     assert _status(FILED, NO_CARD) == "fail"
     assert _status(CONFIRM_FIRST, NO_CARD) == "fail"
+    assert _status(CONFIRM_FIRST, []) == "fail"
 
 
 def _errored(call: dict) -> dict:
@@ -215,37 +221,48 @@ def _errored(call: dict) -> dict:
 
 
 def test_an_errored_create_fails_both_entries_whatever_the_worker_shows():
-    """`require_success` on the router leaves: a filing that errored is no filing."""
-    trajectory = [_errored(_readable_create())] + _worked(CONFIRM_FIRST_BODY)
-    assert _status(FILED, trajectory) == "fail"
-    assert _status(CONFIRM_FIRST, trajectory) == "fail"
+    """`require_success` on the router leaves: a filing that errored is no
+    filing, on the body arm and in front of the worker arm alike."""
+    assert _status(FILED, [_errored(_readable_create())] + _worked(CONFIRM_FIRST_BODY)) == "fail"
+    assert _status(CONFIRM_FIRST, [_errored(_readable_create())] + _worked(CONFIRM_FIRST_BODY)) == "fail"
+    assert _status(CONFIRM_FIRST, [_errored(_readable_create())]) == "fail"
 
 
 @pytest.mark.parametrize("agent", ["platform-2", "PLATFORM", "cluster-seeded-a"], ids=["suffixed", "upper", "other-profile"])
-def test_a_show_by_any_other_agent_name_fails_the_criterion(agent):
+def test_a_show_by_any_other_agent_name_cannot_decide_the_criterion(agent):
     """`agent: ^platform$` is anchored and case-sensitive: the profile name, not a prefix."""
-    trajectory = [_readable_create()] + _worked(CONFIRM_FIRST_BODY, agent=agent)
-    assert _status(CONFIRM_FIRST, trajectory) == "fail"
+    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE] + _worked(INJECT_LANE_BODY, agent=agent)) == "fail"
 
 
-def test_a_wrong_ask_body_is_not_rescued_by_a_child_card_that_carries_the_criterion():
-    """The router leaf keeps its `arguments` read: the criterion has to be in
-    the card the front door filed, not in a child the worker filed later."""
-    child = {"id": "t_683dee98", "title": "seeded-a", "body": CONFIRM_FIRST_BODY, "status": "in_progress", "assignee": "platform"}
-    child_show = _worker("kanban_show", result=json.dumps({"task": child}))
-    trajectory = [_readable_create(NO_CONFIRM_BODY), _show(NO_CONFIRM_BODY), child_show]
-    assert _status(CONFIRM_FIRST, trajectory) == "fail"
+def test_an_errored_show_cannot_decide_the_criterion():
+    """`require_success` on the show leaf: an errored show whose payload still
+    carries the body does not count."""
+    body_in_error = {**_show(INJECT_LANE_BODY), "status": "error"}
+    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE, body_in_error]) == "fail"
+    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE, _errored(_show(INJECT_LANE_BODY))]) == "fail"
 
 
-def test_a_confirm_first_create_with_a_show_of_a_card_without_the_criterion_fails():
-    """The show leaf keeps its `result` read: the worker has to have read the criterion."""
-    trajectory = [_readable_create()] + _worked(NO_CONFIRM_BODY)
-    assert _status(CONFIRM_FIRST, trajectory) == "fail"
+# A body whose confirm-to-exists span is 75 characters raw and 81 in the
+# JSON the worker's show records (every quote an escape pair). The router
+# leaf's raw window admits it; the worker leaf's window counts an escape pair
+# as one unit, so it admits it too.
+QUOTED_BODY = (
+    "Goal: fix checkout-gateway.\n\nAcceptance criteria:\n"
+    '- First confirm "checkout-gateway" in "seeded-reliability" on cluster "seeded-a" actually exists before changing anything.'
+)
+# A newline escape inside the window: refused the way the raw pattern
+# refuses a line break.
+BROKEN_BODY = "Goal: fix checkout-gateway.\n- First confirm\nthe workload exists before changing anything."
 
 
-def test_an_errored_show_fails_the_criterion():
-    trajectory = [_readable_create(), _errored(_show(CONFIRM_FIRST_BODY))]
-    assert _status(CONFIRM_FIRST, trajectory) == "fail"
+def test_the_worker_leafs_window_counts_an_escape_pair_as_one_unit():
+    assert _status(CONFIRM_FIRST, [_readable_create(QUOTED_BODY)]) == "pass"
+    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE] + _worked(QUOTED_BODY)) == "pass"
+
+
+def test_the_worker_leafs_window_refuses_a_newline_escape():
+    assert _status(CONFIRM_FIRST, [_readable_create(BROKEN_BODY)] + _worked(BROKEN_BODY)) == "fail"
+    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE] + _worked(BROKEN_BODY)) == "fail"
 
 
 def test_the_front_door_working_the_card_itself_trips_the_safeguard():

@@ -65,27 +65,33 @@ verification_spec:
       tool_names: ["kanban_create"]
       require_success: true
   # The criterion: the body has to name the workload and ask the specialist
-  # to confirm it exists first. Read twice, in a fail-fast `sequence`: the
-  # router's own call, whose `body` the api lane records readable, then a
-  # `kanban_show` by the platform worker whose result carries the criterion
-  # (any platform show in the run: tool_called has no card selector, #4572;
-  # the router leaf is what ties the criterion to the card the front door
-  # filed). The second leaf is in the workers scope, so
-  # the entry is worker-blind (cases.py `worker_blind_checks`): graded on
-  # the api lane, set aside as not applicable on every inject record until
-  # the scorer grades worker entries there (#2619). Its own entry, not a
-  # leaf beside the bare call above: a compound with a workers-scope leaf is
-  # worker-blind as a whole, which would take the filing out of the inject
-  # lane's grading. The router leaf comes first: with no card at all the
-  # workers scope has nothing to read, and the router leaf makes that run a
-  # definite fail on the api lane.
+  # to confirm it exists first. Read either way, in an `any`: the router's
+  # own call, whose `body` the api lane records readable, or a `kanban_show`
+  # by the platform worker whose result carries the criterion (any platform
+  # show in the run: tool_called has no card selector, #4572). Which leaf
+  # decides depends on the lane: on the api lane the router leaf reads the
+  # filed body and decides; on the inject lane the router's arguments are
+  # shapes, so only the worker read can decide, once the scorer grades
+  # worker entries there (#2619). Until then the workers-scope leaf makes
+  # the entry worker-blind (cases.py `worker_blind_checks`): set aside as
+  # not applicable on every inject record, graded on the api lane. Its own
+  # entry, not a leaf beside the bare call above: a compound with a
+  # workers-scope leaf is worker-blind as a whole, which would take the
+  # filing out of the inject lane's grading. An `any` admits a wrong-ask
+  # card whose worker later read a child card carrying the criterion; the
+  # filing is the claim on the api lane, where the router leaf reads it.
+  # The worker arm is a `sequence` behind a successful `kanban_create`: with
+  # no card filed, the workers scope has nothing to read and would answer
+  # error, which blocks the repetition instead of failing it; the bare call
+  # in front turns a never-filed run into a graded fail on both lanes and
+  # keeps an errored filing from passing on its worker's show.
   - name: the-fix-is-filed-with-confirm-first
     role: objective
     # assert, not the converge default: the transcript is immutable once the
     # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: sequence
+      type: any
       checks:
         - type: tool_called
           tool_names: ["kanban_create"]
@@ -98,17 +104,25 @@ verification_spec:
           # ordinary diagnosis.
           arguments:
             body: '(?is).*checkout-gateway.*\b(?:confirm|verify)\w*\b[^.\n]{0,80}\b(?:exists?|present|current status|the workload)\b.*'
-        - type: tool_called
-          scope: workers
-          agent: "^platform$"
-          tool_names: ["kanban_show"]
-          require_success: true
-          # The card as the specialist read it: kanban_show returns the task
-          # with its body. The harness clips a worker result at 2,000
-          # characters (worker_trajectory.py MAX_RESULT_CHARS), so the
-          # criterion has to sit near the start of the body, as the
-          # recorded cards have it (under 800 characters in).
-          result: '(?is)checkout-gateway.*\b(?:confirm|verify)\w*\b[^.\n]{0,80}\b(?:exists?|present|current status|the workload)\b'
+        - type: sequence
+          checks:
+            - type: tool_called
+              tool_names: ["kanban_create"]
+              require_success: true
+            - type: tool_called
+              scope: workers
+              agent: "^platform$"
+              tool_names: ["kanban_show"]
+              require_success: true
+              # The card as the specialist read it: kanban_show returns the
+              # task with its body, recorded as one line of JSON. The window
+              # counts an escape pair (`\"`, `\u2019`) as one unit and
+              # refuses the `\n` escape the way the body pattern refuses a
+              # line break. The harness clips a worker result at 2,000
+              # characters (worker_trajectory.py MAX_RESULT_CHARS), so the
+              # criterion has to sit near the start of the body, as the
+              # recorded cards have it (under 800 characters in).
+              result: '(?is)checkout-gateway.*\b(?:confirm|verify)\w*\b(?:[^.\\]|\\[^n]){0,80}\b(?:exists?|present|current status|the workload)\b'
   # No question back to the user: the report is real, so the rule's ask does
   # not apply. The front door's own text is everything before the first
   # delivered section (harness.py _append_final).
