@@ -193,7 +193,7 @@ func TestShippedSkillsMarkEveryWrite(t *testing.T) {
 				}
 			}
 			if inFence && otherProgramRE.MatchString(l) && lastNote != unavailableNote && lastNote != proposeOnlyNote {
-				t.Errorf("%s:%d: a program the image does not ship, unmarked: %s", name, i+1, trimmed)
+				t.Errorf("%s:%d: a program a session does not run, unmarked: %s", name, i+1, trimmed)
 			}
 		}
 	}

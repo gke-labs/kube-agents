@@ -1,15 +1,18 @@
 # cluster - the generic cluster agent (#3658), and a pinned variant of it.
 #
 # The first profile serves every cluster in the install's scope. Each task names
-# its target with the project, location and cluster parameters. The gateway's
-# profile routing (#4127) checks that target against spec.scope, and the
+# its target with the project, location and cluster parameters, and the
 # credential broker holds the task's kubectl and gcloud calls to it. The chart
 # renders this one with profiles.cluster.enabled.
 #
 # The second is a pinned variant, for a cluster that needs a different persona
-# or tier. Its clusterRef names the one cluster it takes, and the gateway sends
-# that cluster's tasks to it instead of the generic profile. Two profiles
-# pinned to the same cluster are refused.
+# or tier. Its clusterRef names the one cluster it takes.
+#
+# Routing is the gateway's, and it isn't on main yet. The design
+# (docs/designs/spec-profiles-dispatch.md, "How tasks are routed") checks a
+# task's target against spec.scope and sends a pinned cluster's tasks to its
+# pinned profile, not the generic one. The gateway change that does it (#4127)
+# also refuses a target that two pinned profiles claim.
 #
 # Both run the same persona, so both declare its parameters, in its order: the
 # design has the worker refuse a task when the CR's list and the persona's

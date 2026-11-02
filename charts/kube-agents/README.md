@@ -1228,7 +1228,7 @@ controlling its `AgentProfile` spec. When bound, the operator passes
 scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
-generic cluster agent (#3658): one profile for every cluster in scope, with the
+generic cluster agent: one profile for every cluster in scope, with the
 target named per task by the `project`, `location` and `cluster` parameters.
 Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
 and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
