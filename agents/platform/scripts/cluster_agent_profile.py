@@ -451,7 +451,7 @@ def _profile_lock(name: str):
         locks.mkdir(parents=True, exist_ok=True)
         handle = open(locks / f"{name}.lock", "w")  # noqa: SIM115 - closed below
     except OSError as e:
-        log(f"{name}: could not open the profile lock ({e}); running without it")
+        log(f"{name}: could not open the profile lock ({e}); a create refuses, a delete leaves the sandbox home")
         yield False
         return
     with handle:
