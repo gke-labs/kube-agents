@@ -4291,6 +4291,22 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         "metadata:\n  name: {name}\nspec:\n  loggingService: none\n"
     )
 
+    def test_a_declaration_in_any_namespace_still_holds_the_field(self):
+        """The index now keys on the namespace too; a `gcloud` fix, which names
+        no namespace, still meets the first declaration of its cluster."""
+        declarations = {}
+        for namespace in ("team-a", "team-b"):
+            audit_report._index_kcc_text(
+                declarations, __import__("yaml"), self.KCC_TEXT.format(name="prod").replace("metadata:\n", f"metadata:\n  namespace: {namespace}\n"),
+                "", f"{namespace}/prod.yaml",
+            )
+        self.assertEqual(len(declarations), 2)
+        finding = make_finding(fid="g", cluster="acme/us-central1/prod", obj="Cluster/prod",
+                               remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --logging=SYSTEM"})
+        problem = audit_report.reverted_gcloud_problem(finding, declarations)
+        self.assertIsNotNone(problem)
+        self.assertEqual(problem[0].path, "team-a/prod.yaml")
+
     def test_a_request_budget_skip_is_asked_for_again(self):
         files = {
             "gcp/a.yaml": self.KCC_TEXT.format(name="a"),
@@ -4300,9 +4316,9 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         self.assertFalse(scan.truncated)
         self.assertEqual(
             sorted(scan.declarations),
-            [("ContainerCluster", "a", "a", ""), ("ContainerCluster", "b", "b", "")],
+            [("ContainerCluster", "a", "a", "", ""), ("ContainerCluster", "b", "b", "", "")],
         )
-        self.assertEqual(scan.declarations[("ContainerCluster", "b", "b", "")].path, "gcp/b.yaml")
+        self.assertEqual(scan.declarations[("ContainerCluster", "b", "b", "", "")].path, "gcp/b.yaml")
 
     def test_a_file_the_broker_withholds_marks_the_scan_truncated(self):
         files = {
@@ -4311,7 +4327,7 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         }
         scan = self.broker_scan(files, [[{"path": "gcp/big.yaml", "reason": "tooLarge"}]])
         self.assertTrue(scan.truncated)
-        self.assertEqual(list(scan.declarations), [("ContainerCluster", "a", "a", "")])
+        self.assertEqual(list(scan.declarations), [("ContainerCluster", "a", "a", "", "")])
 
     def test_a_broker_that_never_relents_stops_and_marks_the_scan_truncated(self):
         files = {"gcp/a.yaml": self.KCC_TEXT.format(name="a")}
@@ -23423,6 +23439,22 @@ metadata:
         self.assertEqual(finding["remediation"]["note"], once)
         self.assertEqual(self.disclose([finding], kcc_manifest()), ["pool"])
         self.assertEqual(finding["remediation"]["note"], "Spread the pool.")
+
+    def test_two_namespaces_with_one_object_name_are_two_declarations(self):
+        """team-a/events and team-b/events are two objects in two files; each
+        finding's paragraph names its own file."""
+        topic = "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: {ns}\n"
+        self.write("a/topic.yaml", topic.format(ns="team-a"))
+        self.write("b/topic.yaml", topic.format(ns="team-b"))
+        declarations = audit_report.kcc_declaration_index([("", self.root)])
+        for ns, path in (("team-a", "a/topic.yaml"), ("team-b", "b/topic.yaml")):
+            with self.subTest(namespace=ns):
+                finding = make_finding(fid=ns, check="kcc-object-wedged", cluster="hubp/us-central1/hub", obj="PubSubTopic/events",
+                                       namespace=ns, remediation={"kind": "manual", "note": "Fix the IAM role."})
+                manifest = {"clusters": [{"name": "hubp/us-central1/hub", "outcome": "collected", "kcc_unready": [
+                    {"kind": "PubSubTopic", "namespace": ns, "name": "events", "project": "p", "why": "UpdateFailed: 403"}]}]}
+                audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations)
+                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
 
     def test_the_cycle_guard_ends_a_chain_that_waits_on_itself(self):
         """A waits on B and B waits on A: the chain ends."""

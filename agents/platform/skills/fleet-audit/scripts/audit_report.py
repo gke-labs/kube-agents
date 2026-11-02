@@ -18345,13 +18345,16 @@ class KccDeclaration(NamedTuple):
     also: tuple[tuple[str, str], ...] = ()
 
 
-# `(kind, name, cluster, location)`: `cluster` is the bare GKE name the resource
+# `(kind, name, cluster, location, namespace)`: `cluster` is the bare GKE name the resource
 # belongs to (its own name for a `ContainerCluster`, the `clusterRef` for a
 # `ContainerNodePool`) and `location` is `spec.location`, empty when the spec
 # omits it. A node pool's name alone is not an identity -- every cluster has a
 # `default-pool` -- and a match on it alone sends one cluster's correct fix to
 # another cluster's file.
-KccKey = tuple[str, str, str, str]
+# `namespace` is the file's `metadata.namespace`, empty when the file leaves
+# it to the tool that applies it: two objects of one name in two namespaces
+# are two declarations, not one declared twice.
+KccKey = tuple[str, str, str, str, str]
 
 
 def kcc_declarations(root: Path, repo: str = "") -> dict[KccKey, KccDeclaration]:
@@ -18447,7 +18450,7 @@ def _index_kcc_text(
             str(meta.get("namespace") or ""),
             str((meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}).get(KCC_PROJECT_ANNOTATION) or ""),
         )
-        _add_kcc_declaration(index, (kind, name, cluster, location), entry)
+        _add_kcc_declaration(index, (kind, name, cluster, location, entry.namespace), entry)
 
 
 def _add_kcc_declaration(index: dict[KccKey, KccDeclaration], key: KccKey, entry: KccDeclaration) -> None:
@@ -18595,6 +18598,11 @@ def _kcc_candidate(finding: dict) -> bool:
     return remediation.get("kind") == "gcloud" and prefix in _KCC_OBJECT_KINDS
 
 
+def _first_declaration(declarations: dict[KccKey, KccDeclaration], key: tuple[str, str, str, str]) -> KccDeclaration | None:
+    """The first declaration whose key starts with `key`, in any namespace."""
+    return next((value for full, value in declarations.items() if full[:4] == key), None)
+
+
 def reverted_gcloud_problem(
     finding: dict, declarations: dict[KccKey, KccDeclaration]
 ) -> tuple[KccDeclaration, str] | None:
@@ -18622,8 +18630,10 @@ def reverted_gcloud_problem(
     cluster = parts[-1]
     location = parts[-2] if len(parts) > 2 else ""
     for kind in kinds:
-        entry = declarations.get((kind, name, cluster, location)) if location else None
-        entry = entry or declarations.get((kind, name, cluster, ""))
+        # The finding names no namespace, so the first declaration of the
+        # object in any namespace answers, as when the key had none.
+        entry = _first_declaration(declarations, (kind, name, cluster, location)) if location else None
+        entry = entry or _first_declaration(declarations, (kind, name, cluster, ""))
         if entry is None and not location:
             # A finding naming its cluster bare cannot say which location's
             # declaration it means; any one of them holds the field.
@@ -19032,7 +19042,7 @@ def _remediation_file_stalls(
     # nothing about the project or the location its object manages: only the
     # declaration can give those.
     about_managed_cluster = str(finding.get("object") or "").partition("/")[0] in _KCC_OBJECT_KINDS
-    for (kind, _, cluster_ref, file_location), declaration in index.items():
+    for (kind, _, cluster_ref, file_location, _), declaration in index.items():
         # The index keys a node pool on its `clusterRef`, every other kind on
         # its own name.
         file_ref = cluster_ref if kind in _KCC_OBJECT_KINDS["NodePool"] else ""
