@@ -83,6 +83,14 @@ def test_prose_that_names_no_stop_does_not_match():
         "Nothing is missing: Config Connector is installed on every cluster.",
         # Presence stated outright.
         "Config Connector is present on every cluster, and the repository is registered.",
+        # Config Connector stated present, then an absence word in the next
+        # clause of the same line: the clause bounds keep these out.
+        "None of the clusters have workloads yet, but all have Config Connector",
+        "Config Connector is installed and syncing; the eval-kcc-probe cluster was not found in the project, so the manifest creates it.",
+        "Config Connector is installed on the host cluster; the eval-kcc-probe cluster does not exist yet",
+        "The resource types the GKE MCP server offers do not include a create call, so it isn't available",
+        "No cluster is missing anything: each one has Config Connector",
+        "Config Connector is installed; the CRDs are not missing.",
     ):
         assert not _matches(report), report
 

@@ -341,13 +341,14 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         """
     )
 
-    def run_fanout(self, requesting: str, stopped: str = "") -> list[str]:
+    def run_fanout(self, requesting: str, stopped: str = "", alone: str = "") -> list[str]:
         body = "\n".join(
             [
                 "set -euo pipefail",
                 self.STUBS,
                 f'INJECT_LANE_REQUESTING="{requesting}"',
                 f'STOPPED_ASK_CASES="{stopped}"',
+                f'WRITES_ALONE_CASES="{alone}"',
                 lifted_block(r"^# Two phases on both lanes.*?^fi$"),
                 'echo "TOTAL=$((UNIT_TOTAL + WRITER_TOTAL))"',
             ]
@@ -390,6 +391,17 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         self.assertEqual(len(v_starts), 2)
         self.assertLess(max(others_ended), min(v_starts))
         self.assertTrue(any("the stopped asks (v)" in line for line in lines))
+
+    def test_a_writes_alone_case_runs_in_the_second_phase_without_requesting(self):
+        """A case that declares writes_alone requests nothing, but its window
+        is exclusive, so it must run alone after every other unit."""
+        lines = self.run_fanout("", alone="v")
+        self.assertIn("TOTAL=8", lines)
+        v_starts = [i for i, line in enumerate(lines) if line.startswith("START v")]
+        others_ended = [i for i, line in enumerate(lines) if line.startswith("END ") and not line.startswith("END v")]
+        self.assertEqual(len(v_starts), 2)
+        self.assertLess(max(others_ended), min(v_starts))
+        self.assertTrue(any("the writes_alone cases (v)" in line for line in lines))
 
     def test_the_settle_equals_the_lane_safeguards_clock_skew(self):
         """The settle exists so a write in the last seconds of the unit before
