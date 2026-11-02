@@ -23618,6 +23618,26 @@ metadata:
         audit_report.disclose_stalled_kcc_remediations([second], kcc_manifest(), self.root, {})
         self.assertEqual(second["remediation"]["note"], worker)
 
+    def test_a_declaration_of_another_project_or_location_is_not_named(self):
+        """A proj-a/us-central1 file is not the declaration of a
+        proj-b/europe-west1 stall of the same name."""
+        cluster = ("apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+                   "  name: prod\n  namespace: infra\n  annotations:\n    cnrm.cloud.google.com/project-id: {project}\n"
+                   "spec:\n  location: {location}\n")
+        self.write("a/prod.yaml", cluster.format(project="proj-a", location="us-central1"))
+        stall = {"kind": "ContainerCluster", "namespace": "infra", "name": "prod", "why": "UpdateFailed",
+                 "project": "proj-b", "location": "europe-west1"}
+        finding = make_finding(fid="c", cluster="proj-b/europe-west1/prod", obj="Cluster/prod",
+                               remediation={"kind": "manual", "note": "Set the channel."})
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
+        note = finding["remediation"]["note"]
+        self.assertNotIn("a/prod.yaml", note)
+        self.assertIn("found no declaration", note)
+        self.write("b/prod.yaml", cluster.format(project="proj-b", location="europe-west1"))
+        finding["remediation"]["note"] = "Set the channel."
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
+        self.assertIn("The declaration is `b/prod.yaml`.", finding["remediation"]["note"])
+
     def test_the_cycle_guard_ends_a_chain_that_waits_on_itself(self):
         """A waits on B and B waits on A: the chain ends."""
         a = audit_report.KccStall("PubSubTopic", "infra", "a", "DependencyNotReady: reference PubSubTopic infra/b is not ready", "", "", "h")

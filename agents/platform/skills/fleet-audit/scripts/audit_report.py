@@ -19213,7 +19213,9 @@ def _declarations_of(
 ) -> "list[tuple[KccKey, KccDeclaration]]":
     """The declarations in the repository index that declare `stall`'s object:
     the same kind and `metadata.name`, the same namespace when the file sets
-    one, and the same `clusterRef` when both name one. One per file."""
+    one, the same `clusterRef` when both name one, and, as
+    `_remediation_file_stalls` asks, the same location and project when both
+    sides know them (`_location_agrees`). One per file."""
     found: list[tuple[KccKey, KccDeclaration]] = []
     files: set[tuple[str, str]] = set()
     for key, declaration in declarations.items():
@@ -19223,7 +19225,10 @@ def _declarations_of(
             continue
         if key[0] in _KCC_OBJECT_KINDS["NodePool"] and stall.cluster and key[2] != stall.cluster:
             continue
-
+        if not _location_agrees(stall, key[3]):
+            continue
+        if stall.project and declaration.project and stall.project != declaration.project:
+            continue
         for where in ((declaration.repo, declaration.path), *declaration.also):
             if where not in files:
                 files.add(where)
