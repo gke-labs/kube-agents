@@ -30,10 +30,12 @@ the CR.
 
 The install's model is the model LiteLLM serves under `model-default`: the `litellm_params.model`
 of the `model_list` entry named `model-default` in `litellm-config`, split at its first `/` into
-the provider and the name. One rule covers every config: the entry named `model-default` is the
-answer when it exists; when it exists but its model carries no `/` (LiteLLM accepts a bare
-`gpt-4o`), the default is known but unqualified and the two fields are absent, with no fallback
-to another entry; only when no entry carries that name does the operator fall back to the first
+the provider and the name, both of which must be non-empty. One rule covers every config: the
+entry named `model-default` is the answer when it exists; when it exists but its model carries no
+`/` (LiteLLM accepts a bare `gpt-4o`), or a `/` at either end (`gemini/`, which a kustomize
+`deploy-litellm` run with `MODEL_DEFAULT_NAME` unset writes, since `envsubst` leaves an unset
+variable empty), the default is known but malformed and the two fields are absent, with no
+fallback to another entry; only when no entry carries that name does the operator fall back to the first
 provider-qualified entry. Profiles that run other models do not change it, and the model that
 served a given request does not either: the headcount wants one stable label per install, and the
 configured default is the value that does not move with traffic. "Which model served the
@@ -69,8 +71,8 @@ A new status block beside `status.usage`, not inside it:
 | `status.inference.model`    | string | the model name as typed after the provider (`gemini-3.5-flash`, `claude-opus-5`, `meta-llama/Llama-3.1-8B-Instruct`), or the resource id alone for a resource reference                 |
 
 Both absent on a definite negative: no candidate ConfigMap in the namespace, a `model-default`
-entry whose model carries no provider, or no `model-default` entry and no provider-qualified
-`litellm_params.model`. A read that fails (a timed-out or rate-limited API call) is not a
+entry whose model has an empty provider or an empty name after the split, or no `model-default`
+entry and no provider-qualified `litellm_params.model`. The pair is written whole or not at all. A read that fails (a timed-out or rate-limited API call) is not a
 negative: the operator keeps the last-written pair, as the telemetry discovery keeps its last
 known endpoint on an inconclusive probe, so a transient error never blanks the status or drops
 the install from the headcount. Never an empty string standing in for "unknown". `AgentStatus` gains `Inference InferenceStatus` with
@@ -94,17 +96,25 @@ in `usage_gauges.go`, so that file gains the one call. The gauge itself lives in
 label sets. `sum by (provider, model) (kubeagents_platformagent_model)` over a shared project is
 the headcount.
 
-The summary prints the pair. The script's `model:` line reads `status.inference` first and falls
-back to the ConfigMap it reads today, so an install on an older operator still prints a model. The
-gateway's Go copy gains the line from the CR, which it already reads, so the two blocks stop
-differing on this line. Both copies run the finished block through an audit that refuses it when
-a spec identifier (the cluster, project, repository or channel strings) appears as a whole token,
-and `/` is a token boundary; a self-hosted or Azure deployment name can coincide with one. The
-model line is printed by design, like `spec.mode` and `spec.deployment.tag`: both copies add the
-two inference values to their printed set (`PRINTED_SPEC_PATHS` and `printed`), so the audit
-never refuses a block over the model line. The environment line keys become a shared list in both
-copies, as the counters are, so `GatewayCopyTest` can hold them in step; today both copies write
-them inline.
+The summary prints the pair. The script's `model:` line reads `status.inference` first. It falls
+back to the ConfigMap it reads today only when the `inference` key is absent from the status (an
+operator from before this change never writes it, and a served CRD from before it prunes the
+whole key); a present key with no fields is the operator's definite negative, and the line prints
+`unavailable`, as the gateway's does. The fallback ports the entry rule of section 2.1 as well as
+the trimming rule (the `model-default` lookup, the first qualified entry only when no entry
+carries the name, the non-empty split), so an older operator's block and a new one's agree on
+every config. The gateway's Go copy gains the line from the CR, which it already reads, so the
+two blocks stop differing on this line. Both copies run the finished block through an audit that
+refuses it when a spec identifier (the cluster, project, repository or channel strings) appears
+as a whole token, and `/`, `:` and `@` are token boundaries; a self-hosted or Azure deployment
+name can carry such a token (`hosted_vllm/acme/llama-8b` beside an integration `org` of `acme`).
+The model line is printed by design: both copies run the audit over the block with the `model:`
+line removed, so the line is never the reason a block is refused and no identifier leaves the
+audit for the rest of the block (the printed-set mechanism `spec.mode` and `spec.deployment.tag`
+use would exempt a value only on whole-value equality, which a multi-segment name does not
+satisfy, and would exempt it for the whole block). The environment line keys become a shared list
+in both copies, as the counters are, so `GatewayCopyTest` can hold them in step; today both copies
+write them inline.
 
 ### 2.3 The source: the operator reads `litellm-config`
 
@@ -171,8 +181,8 @@ and states the rule.
   `kubeagents_platformagent_model` gauge published beside `publishPhase` with the delete-before-set
   and cleared by `forget`, the pruning record for the block. Tests beside `usage_gauges_test.go`
   and the controller tests: parse (a plain name, a name with an organisation prefix, a Vertex AI
-  resource path, a Bedrock ARN in both forms, a `model-default` entry whose model has no provider
-  beside a qualified entry, a `model_list` without `model-default`, no provider-qualified entry,
+  resource path, a Bedrock ARN in both forms, a `model-default` entry whose model has no provider beside a qualified entry, a `model-default`
+  entry with an empty side (`gemini/`, `/gpt-4o`), a `model_list` without `model-default`, no provider-qualified entry,
   no ConfigMap, the Deployment absent with several candidates), the status written and cleared on
   a definite negative and kept on a read error, the gauge's single sample, the label swap on a
   change and its removal on delete, and both watch mappings (a LiteLLM Deployment generation
@@ -180,7 +190,9 @@ and states the rule.
 - **Feedback summary** (`feedback_summary.py`, `a2a/gateway/feedback_summary.go`,
   `test_feedback_summary.py`, `feedback_summary_test.go`): the status-first `model:` line in the
   script and its narrowed trimming rule (the two resource-reference shapes), the new line in the
-  Go copy, the two inference values in both copies' printed sets so the audit passes the line,
+  Go copy, the audit run over the block with the `model:` line removed in both copies, the status-first
+  line's fallback condition (the `inference` key absent) with the entry rule ported into the
+  script's fallback,
   the environment keys as a shared list, the copy test extended to it.
 - **Docs**: `platformagent-fields.md` (generated), `platformagent-crd.md` (`## status`, the skew
   list), `observability.md` (the gauges table, the summary paragraph, the headcount query),
