@@ -9,18 +9,18 @@ One root cause per loop. A classified cause with quoted evidence before any code
 
 ## First-day addendum (2026-11-02)
 
-1. Before anything, take one row from the certification queue file and write your session name in its claims column.
+1. Before anything, take one row from the batch file the planner names (`~/.claude/handoffs/cert-batch-<date>.md`, outside the repository) and write your session name in its claims column.
 2. Read the store state first: `expected_fail` on `main`, passes and fails per model, `fail` against `not_applicable`.
 3. Search open issues and open pull requests three ways: the case name, the failing check's reason string, the mechanism. A fix in flight ends the loop with a page row note.
 4. The red is on the record: quote the store rows and two failing run directories, and replay them through the check as it is on `main`.
 5. For a check-only fix the green is the replay of every recorded answer with the new check: all addressed fails pass, zero passes turn to fails. Three live greens are for an agent or product change only.
 6. A wording check admits every phrasing of the fact and excludes nothing; a safeguard grades the action. Narrowing is measured on the record.
-7. Pin every wording check through the whole check with `check_passes` in `bench/tests/conftest.py`, never with a regex alone.
+7. Pin every wording check through the whole check, never with a regex alone: the helper `check_passes` in `bench/tests/conftest.py` once #4530 merges, until then the four-line form (`transcript.set`, then `ReportContainsVerifier(**check).verify(5.0).status`).
 8. Prefer the case folder. A change under `bench/kube_agents_bench/` must still work when the presubmit grades with the base commit's bench.
-9. A case that can stop declares `writes_alone: true`, so the lane safeguard charges any pull request the reply did not name.
-10. The body keeps every sentence at 25 words or fewer. It says `Closes #<issue>` and names the former owner as reviewer. It carries `Part of #3978` (rule 51), no `Co-Authored-By` trailer, and ends with "Generated with the help of Claude Code."
-11. One session, one PR: mind it to the first human lgtm, then hand it to the minder with a written handoff (rule 50). Post `/review` only if the bot did not review on open.
-12. Step 8 is "send the numbers": record them in your own status with `cd ~/ka-overseer && python3 overseer/ovsr.py report --from <session>` (rule 52): fails flipped, passes kept, the PR number, the page row note. Message the Overseer only for an ask. The store takes the night at the 06:27 EST read.
+9. A case whose wrong answer may open a pull request the reply never names declares `writes_alone: true`; it then runs alone, and the lane safeguard charges it any write in its window.
+10. The body keeps every sentence at 25 words or fewer. It says `Closes #<issue>` and names the former owner as reviewer. It carries `Part of #3978`, the certification epic, no `Co-Authored-By` trailer, and ends with "Generated with the help of Claude Code."
+11. One session, one PR: mind it to the first human lgtm, then hand it to the PR minder with a written handoff. Post `/review` only if the bot did not review on open.
+12. Step 8 is "send the numbers": record them in your own status with `cd ~/ka-overseer && python3 overseer/ovsr.py report --from <session>` : fails flipped, passes kept, the PR number, the page row note. Message the Overseer only for an ask. The store takes the night at the morning store read.
 
 ## Inputs
 
