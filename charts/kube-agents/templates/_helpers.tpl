@@ -2886,7 +2886,8 @@ render, so the refusals inside quotaRequirements reach a quota-less namespace an
 template` through it (the doc block above quotaRequirements says which), and
 install.sh's pre-flight summary renders the same template through a throwaway chart holding
 this file and a one-line probe (print_footprint_summary in
-scripts/installer/installer_common.sh), so the installer prints the figures Helm will. The
+scripts/installer/installer_common.sh), so the installer prints the figures the notes carry
+(its Terraform apply shows no notes; `helm get notes` does, after the apply). The
 rates below are pinned list prices rather than a lookup, and they are applied to the declared
 requests, so the figure is a model: it excludes model tokens, Autopilot's per-Pod minimums and
 request rounding, ephemeral-storage requests, node-level overheads and anything outside the

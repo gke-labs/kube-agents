@@ -105,8 +105,11 @@ readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
 # (kube-agents.footprintSummary in charts/kube-agents/templates/_helpers.tpl);
 # the installer renders that template through a throwaway chart holding only
 # the chart's helpers, values and footprint file plus a one-template probe, so
-# it prints the figures Helm will without crossing any other template's gates
-# (a minter without an App ID, a console on a cluster without NetworkPolicy).
+# it prints the figures the chart's notes carry without crossing any other
+# template's gates (a minter without an App ID, a console on a cluster without
+# NetworkPolicy). The apply goes through Terraform, which shows no notes, so
+# this summary is the one place the front door prints them; after the apply,
+# `helm get notes` is the command that does.
 readonly FOOTPRINT_CHART_SUBDIR="charts/kube-agents"
 readonly FOOTPRINT_HELPERS_TEMPLATE="templates/_helpers.tpl"
 readonly FOOTPRINT_PROBE_TEMPLATE="templates/footprint-summary.yaml"
@@ -121,6 +124,10 @@ readonly FOOTPRINT_PROBE_INDENT=4
 # billed for its node pools instead.
 readonly FOOTPRINT_CLUSTER_MODE_KEY="cluster_mode"
 readonly FOOTPRINT_STANDARD_CLUSTER_MODE="standard"
+# The tfvars key the release namespace is written under, for the `helm get
+# notes` hint; the placeholder stands in when the file does not carry it.
+readonly FOOTPRINT_NAMESPACE_KEY="namespace"
+readonly FOOTPRINT_NAMESPACE_PLACEHOLDER="<namespace>"
 # The variables files Terraform loads on its own from the directory holding the
 # generated terraform.tfvars; an extra_helm_values carried in one reaches the
 # apply but not the footprint render. Assigned, then marked readonly (bash 3.2).
@@ -1002,8 +1009,12 @@ footprint_extra_values_may_apply_unseen() {
   return 1
 }
 
+# The apply goes through Terraform, which renders the chart's notes and shows
+# none, so the hints name the one command that prints them afterwards.
 print_footprint_summary() {
-  local repo_dir="$1" tfvars_file="$2" summary err_file
+  local repo_dir="$1" tfvars_file="$2" summary err_file namespace notes_cmd
+  namespace="$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_NAMESPACE_KEY")"
+  notes_cmd="helm get notes ${KUBE_AGENTS_HELM_RELEASE} -n ${namespace:-$FOOTPRINT_NAMESPACE_PLACEHOLDER}"
   err_file="$(mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
   if summary="$(render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
     printf '%s\n' "$summary" | sed 's/^/      /'
@@ -1011,11 +1022,11 @@ print_footprint_summary() {
       print_info "This is a GKE Standard cluster: the modeled cost prices pod requests at Autopilot rates, and a Standard cluster is billed for its node pools whatever the pods request."
     fi
     if footprint_extra_values_may_apply_unseen "$tfvars_file"; then
-      print_info "Chart values set through the composition's extra_helm_values are not in this figure; the chart's install notes after the apply show the release as applied."
+      print_info "Chart values set through the composition's extra_helm_values are not in this figure; after the apply, '${notes_cmd}' prints it for the release as applied."
     fi
   else
     print_warning "Could not render the release footprint summary: $(tr '\n' ' ' < "$err_file" | sed 's/[[:space:]]*$//')"
-    print_info "The chart's install notes print the same figures after the apply, and a helm install --dry-run of ${FOOTPRINT_CHART_SUBDIR} with the install's values prints them without applying."
+    print_info "The chart's notes carry the same figures, and the apply shows none (Terraform discards them); after the apply, '${notes_cmd}' prints them."
   fi
   rm -f "$err_file"
 }

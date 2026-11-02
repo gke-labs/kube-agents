@@ -5948,6 +5948,7 @@ web_console_enabled      = true   # trailing comment
 memory_provider          = "kube_agents_memory"
 platform_agent_mode = "next"
 cluster_mode = "autopilot"
+namespace    = "agents-ns"
 """
 _MAIN_TF = _REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
 
@@ -5990,15 +5991,18 @@ _HCL_TOKEN = re.compile(
     r'"[^"\\]*(?:\\.[^"\\]*)*"|#[^\n]*|\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?![=>])'
     r"|\bmerge\(|\bvar\.([A-Za-z_][A-Za-z0-9_]*)|[{}()\[\]]"
 )
+# A `{` that opens a `for` comprehension is an expression, not an object literal.
+_HCL_FOR_AHEAD = re.compile(r"\s*for\b")
 
 
 def _hcl_chart_vars(src, pos=0):
     """Every (chart key, tfvar) pair the HCL object opening at src[pos] assigns.
 
     Walks the object with a stack of enclosing keys: `key = {` and `key = merge(` push the
-    key, `(` and `[` push an anonymous frame, and a `var.x` anywhere in the right-hand side
-    of `leaf =` records the path: right after the `=`, or inside anonymous frames under it
-    (`leaf = try(var.x, false)`, `leaf = [for r in var.x : ...]`), never past a named one.
+    key, `(`, `[` and a `{ for` comprehension push an anonymous frame, and a `var.x` anywhere
+    in the right-hand side of `leaf =` records the path: right after the `=`, or inside
+    anonymous frames under it (`leaf = try(var.x, false)`, `leaf = [for r in var.x : ...]`,
+    `leaf = { for k in var.x : k => ... }`), never past a named one.
     A closer ends the leaves inside and at the frame it closes, and the next `key =` at a
     depth ends the leaf there, so a `var.x` that follows a block (the condition in
     `}, var.x ? {} : {`) has no leaf and is skipped: it decides whether a block renders,
@@ -6016,7 +6020,8 @@ def _hcl_chart_vars(src, pos=0):
             leaf_at[depth] = m.group(1)
             continue
         if tok in ("merge(", "{", "(", "["):
-            stack.append(leaf_at.get(depth) if tok in ("merge(", "{") else None)
+            named = tok == "merge(" or (tok == "{" and not _HCL_FOR_AHEAD.match(src, pos))
+            stack.append(leaf_at.get(depth) if named else None)
             closers.append("}" if tok == "{" else ")" if tok.endswith("(") else "]")
             continue
         if tok in "})]":
@@ -6083,9 +6088,14 @@ class CompositionChartVarsWalkerTest(unittest.TestCase):
           b = coalesce(var.y, "50Gi")
           c = [for r in var.z.rules : { for k, v in r : k => v if v != null }]
           d = [{ e = local.n }, var.w]
+          e = { for k in var.v : k => k }
+          f = {
+            for k, v in var.u : k => v
+          }
         }"""
         self.assertEqual(
-            _hcl_chart_vars(src), {("a", "x"), ("b", "y"), ("c", "z"), ("d", "w")}
+            _hcl_chart_vars(src),
+            {("a", "x"), ("b", "y"), ("c", "z"), ("d", "w"), ("e", "v"), ("f", "u")},
         )
 
     def test_a_var_in_a_condition_after_a_block_is_not_credited_to_the_previous_leaf(self):
@@ -6218,6 +6228,10 @@ class FootprintSummaryTest(unittest.TestCase):
         proc = self._run("export TF_VAR_extra_helm_values='{litellm={replicaCount=4}}'\n" + script, helm_script=_ECHO_HELM)
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn(caveat, proc.stdout)
+        # The apply goes through Terraform, which shows no notes: the hint names the
+        # command that prints them, for the namespace the tfvars carry.
+        self.assertIn("'helm get notes kube-agents -n agents-ns' prints it", proc.stdout)
+        self.assertNotIn("install notes", proc.stdout)
         # Every variables file Terraform auto-loads beside the generated terraform.tfvars.
         for name in ("extra.auto.tfvars", "extra.auto.tfvars.json", "terraform.tfvars.json"):
             proc = self._run(f'touch "$(dirname "$TFVARS")/{name}"\n' + script, helm_script=_ECHO_HELM)
@@ -6241,6 +6255,17 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("WARN: Could not render the release footprint summary: helm is not on PATH", proc.stdout)
         self.assertNotIn("Release footprint", proc.stdout)
+        # The fallback is the one command that shows the notes after a Terraform apply,
+        # not the notes the apply never prints nor a dry run the operator cannot value.
+        self.assertIn("'helm get notes kube-agents -n agents-ns' prints them", proc.stdout)
+        self.assertNotIn("install notes", proc.stdout)
+        self.assertNotIn("helm install", proc.stdout)
+        # Without a namespace in the tfvars the hint carries the placeholder.
+        proc = self._run(
+            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            tfvars=_FOOTPRINT_TFVARS.replace('namespace    = "agents-ns"\n', ""), without_helm=True,
+        )
+        self.assertIn("'helm get notes kube-agents -n <namespace>' prints them", proc.stdout)
 
     def test_print_warns_and_goes_on_when_the_chart_is_not_in_the_checkout(self):
         proc = self._run('print_footprint_summary /nonexistent "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM)
