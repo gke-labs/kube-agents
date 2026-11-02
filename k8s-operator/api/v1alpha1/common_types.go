@@ -1835,9 +1835,9 @@ type ForgeSpec struct {
 	// Host is the forge hostname. Omit it for the provider's default
 	// ("github.com" for GitHub, "gitlab.com" for GitLab, "bitbucket.org" for
 	// Bitbucket Cloud); a bitbucket-datacenter forge has no default and must
-	// set it. It is the hostname alone: a port or a path is refused, because
-	// the broker reaches every forge at the root path of its host on port
-	// 443. A host the declared
+	// set it. It is the hostname alone: a port or a path is refused here; a
+	// provider that supports another port takes it in `port`, and an instance
+	// at a context path is not supported. A host the declared
 	// provider does not serve is rejected, and an alternative spelling of one
 	// it does serve resolves to the provider's canonical host. It may also be a
 	// self-managed instance's hostname: a GitLab instance, a Gitea instance, a
@@ -1961,9 +1961,11 @@ type ForgeSpec struct {
 	// It is for bitbucket and bitbucket-datacenter forges only. On Bitbucket
 	// Cloud it is the account UUID, such as `{0f3b2c1d-...}`, with or without
 	// its braces, and any other value is refused: an access token has a bot
-	// account, which the current-user call refuses. On Bitbucket Data Center it is the username
-	// of the account the token acts as. GitHub and GitLab name the account
-	// through their own API, so they refuse the field.
+	// account, which the current-user call refuses. On Bitbucket Data Center it
+	// is the username of the account the token acts as; a project or repository
+	// token needs none, because the instance names its user in every answer.
+	// GitHub, GitLab and Gitea name the account through their own API, so they
+	// refuse the field.
 	// +kubebuilder:validation:MaxLength=255
 	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9._@+{}-]+$`
 	// +optional
