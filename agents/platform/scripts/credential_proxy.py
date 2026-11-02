@@ -509,6 +509,10 @@ SHUTDOWN_DRAINING_ERROR = "the credential broker is stopping; retry"
 # and a line appended to its stderr after the bound, as the kubectl timeout's is.
 DRAINED_COMMAND_EXIT_CODE = 143
 DRAINED_COMMAND_NOTE = "\n[credential-proxy] command ended: the credential broker stopped before it finished\n"
+# What a command answers when it was admitted after the drain ended the commands
+# in flight and so never started: the same exit code, and a line that says
+# nothing ran, so a caller can resend it to the replacement pod.
+DRAINED_NOT_STARTED_NOTE = "[credential-proxy] command not started: the credential broker is stopping; retry\n"
 
 # Bounds on the pre-authentication body drain in AgentAPIProxyHandler. The body has
 # to be read in full for the 401 to survive the close, so these bound what reading it
@@ -7116,9 +7120,11 @@ def _capture_output(
             remaining = until - time.monotonic()
             if remaining <= 0:
                 return True, False
-            if watch_caller and stop is not None and process.poll() is None and stop():
+            if watch_caller and stop is not None and stop() and not _reap(process, 0)[0]:
                 # Only while it still runs: a command that exited just now
-                # finished, and gets its own exit code.
+                # finished, and gets its own exit code. Asked through `_reap`,
+                # which keeps the child's peak; a bare poll() would reap it
+                # without one.
                 nonlocal stopped
                 stopped = True
                 return False, True
@@ -9865,7 +9871,7 @@ class CommandExecutor:
                 return ExecutionResult(
                     exit_code=DRAINED_COMMAND_EXIT_CODE,
                     stdout="",
-                    stderr=DRAINED_COMMAND_NOTE.lstrip("\n"),
+                    stderr=DRAINED_NOT_STARTED_NOTE,
                     duration_ms=0,
                     truncated=False,
                     timed_out=False,
@@ -11122,10 +11128,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     slack_relay: SlackRelay | None = None
     teams_relay: TeamsRelay | None = None
     # Set by the SIGTERM handler (install_shutdown_handler). While set, the
-    # two Chat event-pull routes answer 503 SHUTDOWN_ERROR and nothing else
-    # changes: the settle routes, the Slack pull and every other route serve
-    # until the server stops, so the gateway's acks for pulls already
-    # answered still land.
+    # two Chat event-pull routes answer 503 SHUTDOWN_ERROR, and the settle
+    # routes and the Slack pull serve until the server stops, so the gateway's
+    # acks for pulls already answered still land. In the sidecar roles every
+    # other route serves too; in the broker role `draining` below refuses them.
     shutting_down = threading.Event()
     # Set by the SIGTERM handler in the broker role, where the stop is a drain
     # (install_shutdown_handler): a request outside DRAIN_OPEN_ROUTES is refused
@@ -14353,7 +14359,7 @@ def serve(args: argparse.Namespace) -> None:
         # Only the standalone broker pod drains: the operator gives it the grace
         # period for one (credentialProxyTerminationGraceSeconds), and the
         # sidecar roles' pods keep the short stop.
-        drain_seconds=SHUTDOWN_DRAIN_SECONDS if role == "broker" else 0,
+        drain_seconds=SHUTDOWN_DRAIN_SECONDS if role == ROLE_BROKER else 0,
     )
     server.serve_forever()
     LOGGER.info("credential proxy stopped")

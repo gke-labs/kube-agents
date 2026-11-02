@@ -4885,6 +4885,9 @@ class CommandExecutorTest(unittest.TestCase):
         popen.assert_not_called()
         self.assertEqual(credential_proxy.DRAINED_COMMAND_EXIT_CODE, result.exit_code)
         self.assertFalse(result.abandoned)
+        # Its own line: nothing ran, so the caller can resend it.
+        self.assertEqual(credential_proxy.DRAINED_NOT_STARTED_NOTE, result.stderr)
+        self.assertNotIn(credential_proxy.DRAINED_COMMAND_NOTE.strip(), result.stderr)
 
     def test_a_hang_up_during_no_drain_is_still_abandoned(self):
         # end_commands is what tells the two apart: without it, a killed command
@@ -9206,6 +9209,27 @@ class GracefulDrainTest(unittest.TestCase):
         self.assertEqual(["release", "shutdown"], events)
         self.assertFalse(executor.end_commands.is_set())
         self.assertIn("refusing new Chat event pulls; settling receipts", "\n".join(logs.output))
+
+    def test_a_stop_check_after_the_child_exited_keeps_its_peak(self):
+        # The child has exited and is not reaped yet: the stop check reaps it
+        # through `_reap`, so the peak the reap returns is kept.
+        process = subprocess.Popen(
+            ["sh", "-c", "echo done; exit 3"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except OSError:
+                break
+            if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                break
+            time.sleep(0.05)
+        captured = credential_proxy._capture_output(process, None, 1 << 16, 30, stop=lambda: True)
+        self.assertFalse(captured.stopped)
+        self.assertEqual(3, process.returncode)
+        self.assertIsNotNone(captured.peak_rss_bytes)
 
     def test_a_stop_check_after_the_command_exited_leaves_its_own_exit_code(self):
         # The command finished; ending it as drained would make a retry run it twice.
