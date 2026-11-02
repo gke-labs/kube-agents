@@ -433,15 +433,14 @@ def _call(command: str, at: float) -> dict:
     }
 
 
-def _route_status(check: dict, pins: list[tuple[str, str]]) -> str:
+def _route_status(check: dict, pins: list[tuple[str, str]], output: str = "ok", result: str = "") -> str:
     """The route verdict on one card whose log holds the rendered rows and whose tagged calls read the typed text."""
     for rendered, _ in pins:
         assert "\n" not in rendered, rendered
-    transcript.set(
-        "ok",
-        [_call(typed, 100.0 + i) for i, (_, typed) in enumerate(pins)],
-        worker_commands=[{"task": "t_1", "command": rendered} for rendered, _ in pins],
-    )
+    calls = [_call(typed, 100.0 + i) for i, (_, typed) in enumerate(pins)]
+    for call in calls:
+        call["result"] = result
+    transcript.set(output, calls, worker_commands=[{"task": "t_1", "command": rendered} for rendered, _ in pins])
     try:
         result = WorkerCommandsVerifier(**check).verify(5.0)
     finally:
@@ -548,3 +547,14 @@ def test_a_read_of_the_helper_does_not_satisfy_the_route_check():
 
 def test_the_helper_route_alone_passes_the_route_check():
     assert _route_status(_route_check(), _as_calls(HELPER_COMMANDS)) == "pass"
+
+
+THE_RUN_IN_PROSE = "Ran `python3 scripts/analyze_trace_latency.py --project-id p --hours 24 --limit 3` through the broker."
+
+
+def test_the_reply_and_a_tool_result_cannot_stand_in_for_the_route():
+    """Only a command the worker typed counts: the same sentence in the final
+    reply, or in a call's result, satisfies nothing."""
+    unrelated = [("gcloud config get-value project", "gcloud config get-value project")]
+    assert _route_status(_route_check(), unrelated, output=THE_RUN_IN_PROSE) == "fail"
+    assert _route_status(_route_check(), unrelated, result=THE_RUN_IN_PROSE) == "fail"

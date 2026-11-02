@@ -141,15 +141,14 @@ def _call(command: str, at: float) -> dict:
     }
 
 
-def _status(check: dict, run: list[tuple[str, str]]) -> str:
+def _status(check: dict, run: list[tuple[str, str]], output: str = "ok", result: str = "") -> str:
     """The verdict on one card whose log holds the rendered rows and whose tagged calls read the typed text."""
     for rendered, _ in run:
         assert "\n" not in rendered, rendered
-    transcript.set(
-        "ok",
-        [_call(typed, 100.0 + i) for i, (_, typed) in enumerate(run)],
-        worker_commands=[{"task": CARD, "command": rendered} for rendered, _ in run],
-    )
+    calls = [_call(typed, 100.0 + i) for i, (_, typed) in enumerate(run)]
+    for call in calls:
+        call["result"] = result
+    transcript.set(output, calls, worker_commands=[{"task": CARD, "command": rendered} for rendered, _ in run])
     try:
         result = WorkerCommandsVerifier(**check).verify(5.0)
     finally:
@@ -171,3 +170,17 @@ def test_each_run_earns_the_verdict_the_case_states(run, verdict):
 def test_the_rendering_alone_misses_a_chained_probe(run):
     without = {k: v for k, v in _check().items() if k != AS_TYPED}
     assert _status(without, run) == "fail", "a probe is missing from the rendered rows; the switch is what reads the typed call"
+
+
+BOTH_PROBES_IN_PROSE = (
+    "Ran `gcloud compute regions describe us-central1` for the quota and "
+    "`gcloud beta compute advice capacity` for Spot and Flex-Start across two zones."
+)
+
+
+def test_the_reply_and_a_tool_result_cannot_stand_in_for_the_probes():
+    """Only a command the worker typed counts: the same sentence in the final
+    reply, or in a call's result, satisfies nothing."""
+    unrelated = [("gcloud config get-value project", "gcloud config get-value project")]
+    assert _status(_check(), unrelated, output=BOTH_PROBES_IN_PROSE) == "fail"
+    assert _status(_check(), unrelated, result=BOTH_PROBES_IN_PROSE) == "fail"
