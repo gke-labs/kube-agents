@@ -55,7 +55,7 @@ pod at a time.** Concretely:
   `Create`, compare-and-swap semantics), so that two replicas or a rehydrate racing
   first contact cannot fork a conversation - the loser reads and adopts the winner's
   value. The stage 1 gateway runs a single replica and serializes per conversation
-  in-process, and minting is the KV `Create` this rule requires - the loser of a mint
+  in-process (running more than one is planned in [gateway-replicas.md](gateway-replicas.md)), and minting is the KV `Create` this rule requires - the loser of a mint
   race re-reads and adopts the winner's record before the contextId reaches any
   envelope.
 - The pod is an incarnation, not the identity. Reaping and respawning changes the pod
