@@ -221,6 +221,20 @@ const (
 	shellSandboxImageTreesCPULimit      = "500m"
 	shellSandboxImageTreesMemoryLimit   = "256Mi"
 
+	// The shell container's default requests and limits, which
+	// spec.harness.experimental.shellSandbox.resources overrides per key
+	// (resolveShellSandboxResources). Requests and limits on every container,
+	// always: the platform-baseline-quota in kubeagents-system rejects a pod
+	// that omits them, and the rejection surfaces as a StatefulSet that never
+	// creates a pod. The requests pair sits at 2.5 GiB per vCPU, inside the band
+	// GKE Autopilot admits unchanged. The chart's footprint
+	// (charts/kube-agents/files/footprint.yaml) carries the same figures,
+	// summed from the default golden.
+	shellSandboxCPURequest    = "200m"
+	shellSandboxMemoryRequest = "512Mi"
+	shellSandboxCPULimit      = "2"
+	shellSandboxMemoryLimit   = "2Gi"
+
 	// The agent pod's side of the same keypair. Two volumes rather than one for
 	// a reason spelled out at buildShellSandboxClientKeyInitContainer: the
 	// Secret cannot be handed to `ssh -i` directly.
@@ -893,6 +907,37 @@ func buildShellSandboxImageTreesInitContainer(agent *agentv1alpha1.PlatformAgent
 	}
 }
 
+// resolveShellSandboxResources merges the CR's
+// spec.harness.experimental.shellSandbox.resources override over the operator's
+// defaults, one key at a time, so a CR that sets only requests.memory keeps
+// every other default. A nil override returns the defaults unchanged, which the
+// goldens and the chart's quota preflight carry. ValidateShellSandboxResources
+// reads the same merged result, and reconcileShellSandbox renders the defaults
+// in place of an override it refuses.
+func resolveShellSandboxResources(agent *agentv1alpha1.PlatformAgent) corev1.ResourceRequirements {
+	resolved := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(shellSandboxCPURequest),
+			corev1.ResourceMemory: resource.MustParse(shellSandboxMemoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(shellSandboxCPULimit),
+			corev1.ResourceMemory: resource.MustParse(shellSandboxMemoryLimit),
+		},
+	}
+	spec := shellSandboxSpec(agent)
+	if spec == nil || spec.Resources == nil {
+		return resolved
+	}
+	for name, quantity := range spec.Resources.Requests {
+		resolved.Requests[name] = quantity.DeepCopy()
+	}
+	for name, quantity := range spec.Resources.Limits {
+		resolved.Limits[name] = quantity.DeepCopy()
+	}
+	return resolved
+}
+
 func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1.EnvVar) corev1.Container {
 	env = append(slices.Clone(env),
 		corev1.EnvVar{Name: shellSandboxImageTreesEnvVar, Value: shellSandboxImageTreesMode},
@@ -940,20 +985,11 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 			InitialDelaySeconds: 5,
 			PeriodSeconds:       5,
 		},
-		// Requests and limits on every container, always: the
-		// platform-baseline-quota in kubeagents-system rejects a pod
-		// that omits them, and the rejection surfaces as a StatefulSet
-		// that never creates a pod.
-		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("200m"),
-				corev1.ResourceMemory: resource.MustParse("512Mi"),
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("2"),
-				corev1.ResourceMemory: resource.MustParse("2Gi"),
-			},
-		},
+		// The operator's defaults with the CR's
+		// spec.harness.experimental.shellSandbox.resources merged over them
+		// per key; the constants' comment says why every container carries
+		// both sides.
+		Resources: resolveShellSandboxResources(agent),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: shellSandboxKeysVolume, MountPath: shellSandboxKeysPath, ReadOnly: true},
 			{Name: shellSandboxDataVolume, MountPath: shellSandboxDataPath},

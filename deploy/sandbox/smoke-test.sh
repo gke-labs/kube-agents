@@ -36,6 +36,23 @@ readonly IMAGE_TREE_HOMES=("" profiles/platform)
 readonly IMAGE_TREE_PINS=(profiles profiles/platform)
 # shellSandboxImageTreesMode: what the operator sets SANDBOX_IMAGE_TREES to.
 readonly IMAGE_TREES_MODE=read-only-mounts
+# Section 4g: the limits sshd_config sets, the sessions opened on one shared
+# connection (the issue's acceptance figure, under the limit with room for the
+# sessions the agent's own tools hold), and how long each holds its channel so
+# that all of them overlap.
+readonly CHANNEL_SESSION_LIMIT=128
+readonly CHANNEL_STARTUP_LIMIT=64:30:256
+readonly CHANNEL_FANOUT=64
+# How long the test waits for every session to be open at once before it lets
+# them finish; how long each session itself waits for the barrier (longer than
+# that wait plus the lift, so no session gives up under a barrier about to be
+# lifted, and finite, so a lift that never arrives ends in returned=0 rather
+# than a `wait` only the image build's timeout ends); and how long a smoke
+# master lingers idle (sections 4f and 4g) if the script aborts between opening
+# and closing it.
+readonly CHANNEL_BARRIER_TIMEOUT_SECONDS=60
+readonly CHANNEL_SESSION_TIMEOUT_SECONDS=$((CHANNEL_BARRIER_TIMEOUT_SECONDS * 2))
+readonly SMOKE_MASTER_PERSIST_SECONDS=60
 
 IMAGE="${1:-agent-sandbox:latest}"
 PORT="${2:-12222}"
@@ -807,17 +824,90 @@ if docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1; then
       umask 077 && mkdir -p /tmp/smoke && cat >/tmp/smoke/id || exit 1
       port=$1 host=$2
       opts="-n -i /tmp/smoke/id -p $port -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 -o ControlPath=/tmp/smoke/control"
-      HERMES_HOME=$SMOKE_MASTER_HOME ssh $opts -o ControlMaster=yes -o ControlPersist=60 "agent@$host" \
+      HERMES_HOME=$SMOKE_MASTER_HOME ssh $opts -o ControlMaster=yes -o "ControlPersist=$3" "agent@$host" \
         "echo \"master: home=[\$HERMES_HOME] named=[\$HERMES_PROFILE_HOME]\""
       HERMES_HOME=$SMOKE_CLIENT_HOME ssh $opts -o ControlMaster=auto "agent@$host" \
         "echo \"mux: home=[\$HERMES_HOME] named=[\$HERMES_PROFILE_HOME]\""
-      ssh -o ControlPath=/tmp/smoke/control -O exit "agent@$host" 2>/dev/null' _ "$PORT" "$SANDBOX_ALIAS" <"$WORK/id" 2>&1)
+      ssh -o ControlPath=/tmp/smoke/control -O exit "agent@$host" 2>/dev/null' _ "$PORT" "$SANDBOX_ALIAS" "$SMOKE_MASTER_PERSIST_SECONDS" <"$WORK/id" 2>&1)
   check "the master session is its own profile" "master: home=[$PP] named=[$PP]" "$mux"
   check "a session multiplexed over it is the caller's, not the master's" "mux: home=[$CP] named=[$CP]" "$mux"
 else
   echo "SKIP  $AGENT_IMAGE is not loaded; docker-build.yml loads it before this script and runs these there"
 fi
 "${SSH[@]}" "rm -rf $CP $SWS $PP/kanban /opt/data/scratch/smoke-$$" >/dev/null 2>&1
+
+echo
+echo "== 4g. channels on one shared connection =="
+# Every ssh the agent image spawns rides one ControlMaster connection per
+# user@host:port, so concurrent commands are sessions on a single connection
+# and sshd's MaxSessions is the ceiling on fan-out. OpenSSH's default is 10:
+# the eleventh concurrent command is refused by the master, and a client under
+# ControlMaster=auto then says so on stderr and falls back to a connection of
+# its own, where MaxStartups decides whether it runs or exits 255 with nothing
+# said. sshd_config sets 128, and this opens one master, runs 64 sessions over
+# it, each blocking on a barrier file until the test has seen all 64 open at
+# once on the server side, then lifts the barrier and counts the ones that
+# returned and the ones that fell back. The barrier is what makes the
+# concurrency real rather than a product of fork timing: a loaded runner that
+# forks the clients slowly still has to reach 64 open sessions before any may
+# finish; the fallback check is what ties the 64 to the one connection, since
+# the server-side count is of sessions whatever connection carries them. A
+# failure here is the default back in force (a dropped line, an Include that
+# overrides it), or a MaxStartups so low that the master itself is refused.
+check "sshd reports the raised session limit" "maxsessions $CHANNEL_SESSION_LIMIT" \
+  "$(docker exec "$NAME" sshd -T 2>&1 | grep -i '^maxsessions')"
+check "and the raised startup limit" "maxstartups $CHANNEL_STARTUP_LIMIT" \
+  "$(docker exec "$NAME" sshd -T 2>&1 | grep -i '^maxstartups')"
+CONTROL_PATH="$WORK/cm-%C"
+MASTER_OPTS=(-o ControlMaster=auto -o "ControlPath=$CONTROL_PATH" -o "ControlPersist=$SMOKE_MASTER_PERSIST_SECONDS")
+ssh "${SSH_OPTS[@]}" "${MASTER_OPTS[@]}" agent@127.0.0.1 true 2>&1
+check "a master opens over the control socket" "Master running" \
+  "$(ssh "${SSH_OPTS[@]}" -o "ControlPath=$CONTROL_PATH" -O check agent@127.0.0.1 2>&1)"
+CHANNEL_OUT="$WORK/channels"
+mkdir -p "$CHANNEL_OUT"
+# The barrier lives on the model's volume, where a session can see it, and is
+# named per run so a leftover from an aborted run cannot lift it early. A
+# session waits for it a bounded time and prints its marker only once it has
+# seen it, so a lift that never arrives is counted as sessions that did not
+# return, not waited for by the bare `wait` below until the job's timeout.
+BARRIER="/opt/data/.smoke-barrier-$$"
+for i in $(seq 1 "$CHANNEL_FANOUT"); do
+  (
+    ssh "${SSH_OPTS[@]}" "${MASTER_OPTS[@]}" agent@127.0.0.1 \
+      "d=\$((SECONDS + $CHANNEL_SESSION_TIMEOUT_SECONDS)); until [ -e $BARRIER ] || [ \$SECONDS -ge \$d ]; do sleep 0.2; done; [ -e $BARRIER ] && echo smoke-channel-$i"
+    echo "rc=$?"
+  ) > "$CHANNEL_OUT/$i" 2>&1 &
+done
+# Each session's command carries its own marker, so the server-side count is
+# of distinct sessions open at once, whatever the wrapper forks around them.
+open_sessions() {
+  docker exec "$NAME" ps -eo args 2>/dev/null | grep -o 'smoke-channel-[0-9]*' | sort -u | wc -l
+}
+peak=0
+deadline=$((SECONDS + CHANNEL_BARRIER_TIMEOUT_SECONDS))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  peak=$(open_sessions)
+  [ "$peak" -ge "$CHANNEL_FANOUT" ] && break
+  sleep 0.5
+done
+check "all $CHANNEL_FANOUT sessions were open at once" "open=$CHANNEL_FANOUT" "open=$peak"
+"${SSH[@]}" "touch $BARRIER" 2>&1
+wait
+returned=$(grep -l '^smoke-channel-' "$CHANNEL_OUT"/* | wc -l)
+check "and all $CHANNEL_FANOUT returned" "returned=$CHANNEL_FANOUT" "returned=$returned"
+# A session the master refuses is the client exiting 255 with nothing else
+# said, which is the failure the limit exists to end.
+check_absent "and none was refused by the master" "rc=255" \
+  "$(cat "$CHANNEL_OUT"/*)"
+# A session the master could not open ran on a connection of its own, and the
+# client said so (an error-level line, so it survives LogLevel=ERROR). Without
+# this check, MaxSessions back at 10 under a raised MaxStartups passes the
+# three above: 54 fallbacks, 55 connections, every marker seen, every session
+# returned.
+check_absent "and none fell back to a connection of its own" "disabling multiplexing" \
+  "$(cat "$CHANNEL_OUT"/*)"
+"${SSH[@]}" "rm -f $BARRIER" 2>&1
+ssh "${SSH_OPTS[@]}" -o "ControlPath=$CONTROL_PATH" -O exit agent@127.0.0.1 2>/dev/null
 
 echo
 echo "== 5. credential-proxy wrappers =="

@@ -519,3 +519,84 @@ func TestAgentAPIAuthUnknownResourceNameIsRefusedAtAdmission(t *testing.T) {
 	}))
 	assertFieldError(t, err, "spec.deployment.agentAPIAuth.resources.limits.nvidia.com/gpu")
 }
+
+func sandboxResourcesAgent(override *corev1.ResourceRequirements) *agentv1alpha1.PlatformAgent {
+	return &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID: "p", Location: "l", ClusterName: "c",
+				Experimental: &agentv1alpha1.ExperimentalSpec{
+					ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Resources: override},
+				},
+			},
+		},
+	}
+}
+
+// The webhook refuses a spec.harness.experimental.shellSandbox.resources
+// override at apply, on the field the override crossed, so a webhook-on
+// install is told at admission what the reconciler would otherwise only report
+// as Degraded a moment later.
+func TestShellSandboxCrossedPairIsRefusedAtAdmission(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), sandboxResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("5Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.harness.experimental.shellSandbox.resources.requests.memory")
+	if !strings.Contains(msg, "exceeds the 4Gi memory limit set beside it") {
+		t.Errorf("message %q does not name the crossed limit", msg)
+	}
+}
+
+// A claims entry under the sandbox override is refused at admission, naming the
+// sandbox pod rather than the credential proxy's.
+func TestShellSandboxClaimsAreRefusedAtAdmission(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), sandboxResourcesAgent(&corev1.ResourceRequirements{
+		Claims: []corev1.ResourceClaim{{Name: "c"}},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.harness.experimental.shellSandbox.resources.claims")
+	if !strings.Contains(msg, "the shell sandbox pod declares no resourceClaims") {
+		t.Errorf("message %q does not name the sandbox pod", msg)
+	}
+}
+
+// Raising the memory pair with the default 200m CPU request kept (5 GiB per
+// vCPU, inside the Autopilot band) is admitted with neither a refusal nor a
+// warning: the shape the field exists for passes clean.
+func TestShellSandboxMemoryPairInBandIsAdmittedWithoutANote(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	warnings, err := val.ValidateCreate(context.Background(), sandboxResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
+	}))
+	if err != nil {
+		t.Fatalf("a raised memory pair was refused: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("warnings = %v, want none", warnings)
+	}
+}
+
+// A memory limit set alone draws the limit-without-request note, naming the
+// shell and the sandbox field path.
+func TestShellSandboxLimitAloneDrawsTheNote(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	warnings, err := val.ValidateCreate(context.Background(), sandboxResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
+	}))
+	if err != nil {
+		t.Fatalf("a raised memory limit was refused: %v", err)
+	}
+	var noted bool
+	for _, w := range warnings {
+		if strings.Contains(w, "spec.harness.experimental.shellSandbox.resources.limits.memory is set without requests.memory") && strings.Contains(w, "the shell runs at the 512Mi request") {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Errorf("warnings = %v; want the limit-without-request note naming the shell", warnings)
+	}
+}
