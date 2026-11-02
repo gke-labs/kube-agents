@@ -2190,7 +2190,10 @@ returns the entry's six numbers and pod count as JSON.
 {{- if and .autopilot (not (include "kube-agents.declaredQuantity" (dict "value" (index $req "cpu") "fallback" ""))) -}}
 {{- /* floor(bytes x 1000 / 2^30), split so the product cannot overflow. */ -}}
 {{- $bandMilli := add (mul (div $memReq 1073741824) 1000) (div (mul (mod $memReq 1073741824) 1000) 1073741824) | int64 -}}
-{{- if and (gt $bandMilli 0) (gt $cpuReq $bandMilli) -}}
+{{- /* Rounded down to a multiple of 250m, 250m at least: Autopilot rounds a CPU request up
+       to one, as the operator holds it. */ -}}
+{{- $bandMilli = max (mul (div $bandMilli 250) 250) 250 | int64 -}}
+{{- if gt $cpuReq $bandMilli -}}
 {{- $cpuReq = $bandMilli -}}
 {{- end -}}
 {{- end -}}
@@ -2228,12 +2231,18 @@ the request buys CPU; the quota preflight counts them where kube-agents.gkeAutop
 
 {{/*
 Whether the cluster is GKE Autopilot: it serves auto.gke.io's AllowlistedWorkload, the
-resource the operator's isGKEAutopilot probes; the chart checks it at v1 and v1beta1.
-helm template without --api-versions sees no cluster and answers no, which only the
-quota preflight (a live cluster) reads anyway.
+resource the operator's isGKEAutopilot probes, at any served version, as the operator
+accepts it. helm template without --api-versions sees no cluster and answers no, which
+only the quota preflight (a live cluster) reads anyway.
 */}}
 {{- define "kube-agents.gkeAutopilot" -}}
-{{- if or (.Capabilities.APIVersions.Has "auto.gke.io/v1/AllowlistedWorkload") (.Capabilities.APIVersions.Has "auto.gke.io/v1beta1/AllowlistedWorkload") -}}
+{{- $autopilot := false -}}
+{{- range .Capabilities.APIVersions -}}
+{{- if and (hasPrefix "auto.gke.io/" .) (hasSuffix "/AllowlistedWorkload" .) -}}
+{{- $autopilot = true -}}
+{{- end -}}
+{{- end -}}
+{{- if $autopilot -}}
 true
 {{- end -}}
 {{- end }}

@@ -181,12 +181,23 @@ func TestCredentialProxyAutopilotCPURequestStaysInTheBand(t *testing.T) {
 	assertQuantity(t, resolveCredentialProxyResources(smallMemory).Requests, corev1.ResourceCPU, "500m")
 	assertQuantity(t, resolveCredentialProxyResourcesFor(smallMemory, true).Requests, corev1.ResourceCPU, "250m")
 
-	// A byte count just under 2Gi rounds the CPU request down, so the pair
-	// stays in the band and draws no band warning.
+	// A byte count just under 2Gi rounds the CPU request down to the 250m
+	// step below it, so the pair stays in the band and draws no band warning.
+	// 672Mi gives 656m before the step, which Autopilot would round up to
+	// 750m and then raise the memory to 768Mi, over the CR's limit.
 	justUnder := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2147483647")},
 	}).Spec.Deployment
-	assertQuantity(t, resolveCredentialProxyResourcesFor(justUnder, true).Requests, corev1.ResourceCPU, "1999m")
+	assertQuantity(t, resolveCredentialProxyResourcesFor(justUnder, true).Requests, corev1.ResourceCPU, "1750m")
+	atFloor := proxyAgentWithResources(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
+	}).Spec.Deployment
+	assertQuantity(t, resolveCredentialProxyResourcesFor(atFloor, true).Requests, corev1.ResourceCPU, "500m")
+	// Under 256Mi the step still leaves 250m, Autopilot's smallest request.
+	tiny := proxyAgentWithResources(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+	}).Spec.Deployment
+	assertQuantity(t, resolveCredentialProxyResourcesFor(tiny, true).Requests, corev1.ResourceCPU, "250m")
 	_, warnings := ValidateCredentialProxyResources(justUnder, field.NewPath("spec"))
 	for _, w := range warnings {
 		if strings.Contains(w, "GiB per vCPU") {

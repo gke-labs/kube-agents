@@ -197,8 +197,11 @@ const (
 	credentialProxyMemoryRequest          = "1Gi"
 	credentialProxyAutopilotCPURequest    = "2"
 	credentialProxyAutopilotMemoryRequest = "2Gi"
-	// The band arithmetic above: resource.Quantity reports CPU in millicores.
-	credentialProxyMilliPerCore int64 = 1000
+	// The band arithmetic above: resource.Quantity reports CPU in millicores,
+	// and Autopilot without bursting rounds a CPU request up to a multiple of
+	// 250m, so a band-held request is rounded down to one.
+	credentialProxyMilliPerCore          int64 = 1000
+	credentialProxyAutopilotCPUStepMilli int64 = 250
 	// The limits. CPU is the ceiling a mint or a listing may burst to on
 	// Standard; memory is what the comment above sizes; ephemeral storage
 	// bounds the content workspace (the broker's own clone of a repository
@@ -377,14 +380,17 @@ func resolveCredentialProxyResourcesFor(deployment *agentv1alpha1.DeploymentSpec
 	// On Autopilot, a CPU request the CR did not set stays at or under one CPU
 	// per GiB of the memory request, the band's floor: below it Autopilot
 	// raises the memory request, and without bursting the memory limit with
-	// it, past the figure the CR set.
+	// it, past the figure the CR set. The value is rounded down to a multiple
+	// of 250m (250m at least), because Autopilot rounds a request up to one,
+	// and a request rounded up would cross the floor again.
 	if _, setCPURequest := override.Requests[corev1.ResourceCPU]; autopilot && !setCPURequest {
 		memory := resolved.Requests[corev1.ResourceMemory]
 		cpu := resolved.Requests[corev1.ResourceCPU]
 		// floor(bytes × 1000 / the band floor), split so the product cannot overflow.
 		bytes := memory.Value()
 		bandMilli := bytes/autopilotMinMemoryBytesPerVCPU*credentialProxyMilliPerCore + bytes%autopilotMinMemoryBytesPerVCPU*credentialProxyMilliPerCore/autopilotMinMemoryBytesPerVCPU
-		if bandMilli > 0 && cpu.MilliValue() > bandMilli {
+		bandMilli = max(bandMilli/credentialProxyAutopilotCPUStepMilli*credentialProxyAutopilotCPUStepMilli, credentialProxyAutopilotCPUStepMilli)
+		if cpu.MilliValue() > bandMilli {
 			resolved.Requests[corev1.ResourceCPU] = *resource.NewMilliQuantity(bandMilli, resource.DecimalSI)
 		}
 	}

@@ -148,9 +148,11 @@ _PROXY_FLOAT_CPU_LIMIT_MILLIS = 2500
 _PROXY_EPHEMERAL_LIMIT_BYTES = 8 * 1024**3
 _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
-# The APIs kube-agents.gkeAutopilot reads: the resource the operator's isGKEAutopilot probes, at v1 and v1beta1.
+# The API kube-agents.gkeAutopilot reads: the resource the operator's isGKEAutopilot probes,
+# at any served version.
 _AUTOPILOT_API = "auto.gke.io/v1/AllowlistedWorkload"
 _AUTOPILOT_API_V1BETA1 = "auto.gke.io/v1beta1/AllowlistedWorkload"
+_AUTOPILOT_API_V2 = "auto.gke.io/v2/AllowlistedWorkload"
 
 # The agent-api-auth sidecar's defaults (agentAPIAuth* in platformagent_manifests.go);
 # it is one container of the agent pod, so these are already in agentPod.base and an
@@ -363,9 +365,14 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(small_on["requestsCpu"] - base["requestsCpu"], 250 - 500)
         # A cluster serving the resource at v1beta1 only is Autopilot to the operator too.
         self.assertEqual(self._requirements(extra_args=["--api-versions", _AUTOPILOT_API_V1BETA1]), on)
-        # Just under 2Gi rounds the CPU request down, as the operator does.
+        self.assertEqual(self._requirements(extra_args=["--api-versions", _AUTOPILOT_API_V2]), on)
+        # Another resource in the group is not Autopilot: Standard serves auto.gke.io too.
+        self.assertEqual(self._requirements(extra_args=["--api-versions", "auto.gke.io/v1/WorkloadAllowlist"]), base)
+        # Just under 2Gi rounds the CPU request down to the 250m step, as the operator does.
         under = self._requirements([f"{_PROXY_VALUE}.limits.memory=2147483647"], extra_args=autopilot)
-        self.assertEqual(under["requestsCpu"] - base["requestsCpu"], 1999 - 500)
+        self.assertEqual(under["requestsCpu"] - base["requestsCpu"], 1750 - 500)
+        at_floor = self._requirements([f"{_PROXY_VALUE}.limits.memory=672Mi"], extra_args=autopilot)
+        self.assertEqual(at_floor["requestsCpu"] - base["requestsCpu"], 500 - 500)
 
     def test_credential_proxy_cpu_written_as_a_float_is_counted(self) -> None:
         # A values file's `cpu: 1.5` arrives as a YAML float, not the string `--set` gives.

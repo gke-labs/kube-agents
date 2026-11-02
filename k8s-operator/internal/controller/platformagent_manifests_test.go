@@ -1644,17 +1644,20 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	//
 	// The children are the second assertion below, in the broker's own terms.
 	//
-	// The resting footprint is the broker's two fixed reserves, the figures its
-	// own budget holds back for what the container keeps with nothing in
-	// flight (Envoy and the broker process, and the content workspace). The
-	// memory request no longer models it: it is 2Gi to sit on Autopilot's
-	// CPU:memory band at 2 CPU (#4106), the same as the limit.
+	// The resting footprint is the container's own memory request rather than
+	// a measured constant: the ~250Mi the old sidecar held steady was mostly
+	// the event watcher's informer caches, which stayed in the gateway Pod
+	// when #913 moved the proxy out, and the request is upstream's statement
+	// of what this pod holds with nothing in flight.
 	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
 	if err != nil || inFlight < 1 {
 		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
 	}
 	burst := int64(capBytes) * credentialProxyOutputCopiesPerCommand * inFlight
-	steadyStateBytes := credentialProxyResidentReserveBytes + credentialProxyWorkspaceReserveBytes
+	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
+	if steadyStateBytes == 0 {
+		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
+	}
 	limit := proxy.Resources.Limits.Memory().Value()
 	if burst+steadyStateBytes > limit {
 		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower one of the two caps",
