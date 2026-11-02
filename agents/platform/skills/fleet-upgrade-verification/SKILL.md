@@ -102,8 +102,9 @@ project number), each with a 60-second timeout, and
 with `--readiness` three `gcloud` list reads per project (`compute backend-services list`,
 `compute instances list`, `container operations list`, each projected to the fields the per-entry
 rules read), one `gcloud container clusters get-credentials` and the `kubectl get`s per
-member that "Check upgrade readiness" lists (the PDB rule's, the webhook rule's, then one per
-group of kinds the per-entry rules read), plus whatever a registered rule reads itself through the
+member that "Check upgrade readiness" lists (the PDB rule's, the webhook rule's, then, per group
+of kinds the per-entry rules read, one paged read per kind, the nodes through a jsonpath
+template), plus whatever a registered rule reads itself through the
 script's own runner under the same cap (a rule that reads the audit log runs paged `gcloud logging
 read`s).
 It changes nothing in GCP or in any cluster; the only things it writes are its own record under

@@ -458,6 +458,7 @@ class KubectlRawPathTest(unittest.TestCase):
         # gke-upgrades reads /metrics; capacity-obtainability reads the
         # metrics API's node collection. Both ran on main and keep running.
         for argv in (
+            ["kubectl", "get", "--raw", "/metrics"],
             ["kubectl", "get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"],
             ["kubectl", "get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods?limit=500"],
         ):
