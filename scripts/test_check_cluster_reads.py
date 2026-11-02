@@ -31,6 +31,7 @@ from scripts.check_cluster_reads import (  # noqa: E402
     RULE_UNRESOLVED,
     SCAN_ROOT,
     SKIP_PATH_PREFIXES,
+    WARNING_MARKER,
     check,
     count_lines,
     judge,
@@ -597,6 +598,24 @@ class ShellAndMarkdownReadingTest(unittest.TestCase):
     def test_stray_backtick_does_not_pair_across_a_blank_line(self):
         page = "A stray ` here.\n\nNever run kubectl get pods -A -o json on a big cluster` again.\n"
         self.assertEqual(markdown_findings(Path("agents/x.md"), page), [])
+
+    def test_a_span_on_a_line_marked_as_a_warning_is_not_read(self):
+        page = textwrap.dedent(
+            f"""
+            - Filter large outputs (`kubectl get pods -A -o json`, `gcloud ...`) at the source. {WARNING_MARKER}
+            - Never run `kubectl get pods,svc -A -o json` on a large cluster.
+            - {WARNING_MARKER} `kubectl get pods -A -o json` and `kubectl get deploy,sts -A -o yaml` are the shapes.
+
+            ```bash
+            kubectl get svc -A -o json  # {WARNING_MARKER}
+            ```
+            """
+        )
+        found = markdown_findings(Path("agents/x.md"), page)
+        self.assertEqual(
+            sorted((f.line, f.rule, f.text) for f in found),
+            [(3, RULE_MULTI_KIND, "kubectl get pods,svc -A -o json"), (7, RULE_UNPAGED, "kubectl get svc -A -o json")],
+        )
 
     def test_unbalanced_quote_in_a_span_is_still_read(self):
         found = markdown_findings(Path("agents/x.md"), "Run `kubectl get pods -A -o json | jq 'it's`.\n")

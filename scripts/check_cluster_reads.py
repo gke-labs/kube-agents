@@ -70,7 +70,11 @@ What is read, under ``agents/`` with the mirrored ``gke-*`` skills skipped
 * ``*.md``: the fenced code blocks (a fence closes on a run of the same
   character at least as long as the one that opened it, so a fence quoted
   inside a longer one stays inside) and the inline code spans. Prose is not
-  read, so a sentence that names the shape to warn against it is not a hit.
+  read. A span is read wherever it stands, a warning included, so a line that
+  quotes the shape in a span to warn against it (the personas' "filter large
+  outputs at the source" example) carries ``<!-- cluster-reads-check: warning -->``
+  and its spans are skipped; the marker binds the line it is on and nothing
+  in a fence.
 
 The reads the tree carried when the check arrived are pinned in
 ``scripts/cluster_reads_allowlist.txt``: one line per file and rule, with the
@@ -243,6 +247,11 @@ UNREAD_OUTPUT_MARKS = (FORMAT_PLACEHOLDER, SHELL_EXPANSION_MARK)
 # (a paragraph ends there, so a stray backtick pairs with nothing past it).
 FENCE_RE = re.compile(r"^[\s>*+-]*(?:\d+[.)]\s+)?(?P<fence>`{3,}|~{3,})")
 CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(?P<code>(?:(?!\n\n).)+?)(?<!`)\1(?!`)", re.DOTALL)
+# A span is read wherever it stands, so a line that quotes the shape only to
+# warn against it carries this marker and its spans are skipped. It binds the
+# line it is on (the line a span starts on), never a fence: a fence is a
+# command to run, and a comment inside one is its content.
+WARNING_MARKER = "<!-- cluster-reads-check: warning -->"
 LINE_BREAK = "\n"
 SPACE = " "
 
@@ -269,7 +278,10 @@ ALLOWLIST_CLEAN_ERROR = (
     "{path}: no finding of rule {rule!r} left, the allow-list entry at {allowlist}:{line} allows {allowed}; "
     "remove the entry"
 )
-UNPINNED_ERROR = "{path}: {found} finding(s) of rule {rule!r} and no allow-list entry; convert the read, or pin it with a reason"
+UNPINNED_ERROR = (
+    "{path}: {found} finding(s) of rule {rule!r} and no allow-list entry; convert the read, mark a Markdown span that "
+    "only warns against it with " + WARNING_MARKER + " on its line, or pin it with a reason"
+)
 FINDING_LINE = "  {path}:{line}: {rule}: {text}"
 HINT_LINE = "    {hint}"
 COUNT_LINE = "{path} {rule} {count}"
@@ -757,6 +769,8 @@ def markdown_code(text: str) -> tuple[list[tuple[int, str]], list[tuple[int, str
         offsets.append(offsets[-1] + len(line) + len(LINE_BREAK))
     for match in CODE_SPAN_RE.finditer(joined):
         index = max(i for i, offset in enumerate(offsets) if offset <= match.start())
+        if WARNING_MARKER in prose[index][1]:
+            continue
         spans.append((prose[index][0], match.group("code").replace(LINE_BREAK, SPACE)))
     return fenced, spans
 

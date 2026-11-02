@@ -134,8 +134,10 @@ fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 every namespace as full objects (`-A -o json|yaml`), because the credential proxy cuts such a reply
 at its output cap on a large cluster. Read one kind per call, project the fields with
 `-o jsonpath=` or `custom-columns=`, or read per namespace; the reads already in the tree are pinned
-with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks. CI runs the same check
-through `scripts/test_check_cluster_reads.py`.
+with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks. A Markdown span that
+quotes the shape only to warn against it carries `<!-- cluster-reads-check: warning -->` on its
+line, and the check skips the spans on that line. CI runs the same check through
+`scripts/test_check_cluster_reads.py`.
 
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
