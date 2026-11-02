@@ -41,11 +41,12 @@ image's renderer wrote them for the typed pins, with the verdict each earns,
 the limits included, so the case header's claim and this suite say the same
 thing; ``SPLIT_WORD_LIMIT`` holds the other stated limit, a listed word split
 by an empty quote inside it, which the list does not see. The route check
-reads each tagged ``terminal`` call as typed (``after_result_pattern:
-"(?!)"``) with the card log's rows beside it, so its pins feed both:
-``ROUTE_PINS`` holds the rendered row and the typed call of each shape with
-the verdict the run earns, the nightly's ``printenv ...; python3 ...`` chain
-first, and the typed lists are graded as calls.
+reads each tagged ``terminal`` or ``execute_code`` call as typed
+(``after_result_pattern: "(?!)"``; the fixtures here are terminal calls) with
+the card log's rows beside it, so its pins feed both: ``ROUTE_PINS`` holds
+the rendered row, as the image's renderer wrote it, and the typed call of
+each shape with the verdict the run earns, the nightly's ``printenv ...;
+python3 ...`` chain first, and the typed lists are graded as calls.
 """
 
 from __future__ import annotations
@@ -457,8 +458,8 @@ def _route_check() -> dict:
 
 def _as_calls(commands: list[str]) -> list[tuple[str, str]]:
     """Typed commands graded as tagged calls. The typed text's first line stands
-    in for the card log's row: the row is only set-joined beside the call, so
-    it cannot earn a verdict the call does not."""
+    in for the card log's row and is joined as one more command beside the
+    call."""
     return [(c.split("\n")[0], c) for c in commands]
 
 

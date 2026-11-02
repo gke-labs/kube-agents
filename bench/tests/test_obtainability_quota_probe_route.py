@@ -19,8 +19,9 @@ regional quota read and the capacity advice probe. The nightly answers typed
 both behind a ``printenv`` or a ``cd``, or inside a ``for`` loop over the
 provisioning models, and the card log's rendering of such a command
 (``summarize_shell_command`` in hermes ``agent/display.py``) carries the
-first command plus `` + N commands`` and neither probe. The check reads each
-tagged ``terminal`` call as typed (``after_result_pattern: "(?!)"``), with the
+first command plus `` + N commands`` and at most one probe. The check reads
+each tagged ``terminal`` or ``execute_code`` call as typed
+(``after_result_pattern: "(?!)"``; the fixtures here are terminal calls), with the
 card log's rows beside it. Each fixture here is one worker run: its rendered
 rows and its typed calls together, with the verdict the run earns.
 ``RECORDED`` holds three runs in the nightly's shapes, each row rendered by
@@ -111,7 +112,8 @@ NOT_THE_PROBES = [
 # The chained shapes: a probe is missing from their rendered rows. In the
 # first run both are (`printenv ... + 2 commands`, `for m ... + 7 commands`);
 # in the second the regions row is whole (the renderer drops the leading
-# `cd` and the boundary `echo rc=$?`) and the advice loop is collapsed.
+# `cd` and the boundary `echo rc=$?`, as the image's renderer wrote it for
+# this row) and the advice loop is collapsed.
 CHAINED = [
     [REGIONS_BEHIND_PRINTENV, ADVICE_IN_A_LOOP],
     [REGIONS_BEHIND_CD, ADVICE_IN_A_LOOP_BEHIND_CD],

@@ -47,9 +47,9 @@
 # token the first check is red because the helper exits 1, and a worker
 # that improvises around it reds the second.
 #
-# The text the token safeguard reads is not the command as typed but
-# the one-line rendering hermes writes to the card log (`summarize_shell_
-# command` in its agent/display.py): a newline becomes a space; a chain
+# The text the token safeguard reads, for a card the front agent filed,
+# is not the command as typed but the one-line rendering hermes writes to
+# the card log (`summarize_shell_command` in its agent/display.py): a newline becomes a space; a chain
 # joined by `;`, `&&` or `||` arrives as its first command, a leading `cd`,
 # `export`, `set`, `source`, `true` or `false` skipped, plus ` + N
 # command(s)`; a redirection is dropped; a pipe, a `$(...)` substitution and
@@ -69,10 +69,10 @@
 # the admitting side of a text pattern; and the card log's rows join the
 # typed set only beside at least one readable tagged call, so a capture
 # that carried none is `error`, not a pass on the log alone. The switch
-# cannot carry the safeguard: it grades a forbidden set only inside the
+# cannot carry the safeguard: it grades forbidden patterns only inside the
 # window its pattern opens, and `(?!)` opens none, so the safeguard stays on
-# the rendering until worker_commands reads the trajectory for forbidden sets
-# too, a verifier change a maintainer files, not a pattern.
+# the rendering until worker_commands reads the trajectory for forbidden
+# patterns too, a verifier change a maintainer files, not a pattern.
 # bench/tests/test_worker_command_safeguards.py holds the rendered shapes
 # the safeguard grades and the typed shapes the route check grades, with
 # the verdict each earns. The command as typed is on the run's trajectory
