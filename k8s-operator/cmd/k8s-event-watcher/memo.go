@@ -19,8 +19,9 @@ import "time"
 // boundedEntries is the per-UID map the watcher's memos share: a value and
 // the time it is dated, expiring after ttl and capped at max entries with
 // expired entries evicted before the oldest. pullClassMemo dates an entry by
-// arrival and scaleUpMemo by the event's own timestamp; what "latest" means
-// and what supersedes what stays with each memo. Not safe for concurrent use:
+// arrival, scaleUpMemo by the event's own timestamp and the filter's
+// FailedScheduling log memo (fsLogged) by the watcher's clock at the line;
+// what "latest" means and what supersedes what stays with each memo. Not safe for concurrent use:
 // each memo holds its own lock around these calls.
 type boundedEntries[V any] struct {
 	entries map[string]memoEntry[V]
