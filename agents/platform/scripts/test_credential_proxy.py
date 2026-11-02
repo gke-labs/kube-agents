@@ -17776,6 +17776,11 @@ class ExecPodRouteGateTest(unittest.TestCase):
             ("authenticator", credential_proxy.NullAuthenticator()), ("profile_gate", None),
             ("max_request_bytes", 65536), ("chat_relay", None), ("a2a_chat_relay", None),
             ("slack_relay", None), ("teams_relay", None),
+            # The admission route reads the executor; set here, not left by an earlier test.
+            ("executor", types.SimpleNamespace(
+                max_concurrent_commands=8, requests_the_budget_admits=lambda: 9, admitted_requests=lambda: 8,
+            )),
+            ("session_slots", None),
         ):
             patcher = mock.patch.object(CredentialProxyHandler, name, value, create=True)
             patcher.start()
@@ -17824,7 +17829,8 @@ class ExecPodRouteGateTest(unittest.TestCase):
         self.assertIn("argv", json.loads(body)["error"])
         status, body = self._request("GET", credential_proxy.ADMISSION_PATH, exec_role)
         self.assertEqual(HTTPStatus.OK, status)
-        self.assertIn("admitted", json.loads(body))
+        report = json.loads(body)
+        self.assertEqual((8, 9, 8), (report["slot_cap"], report["budget_admits"], report["admitted"]))
 
     def test_an_unknown_caller_gets_401_before_the_gate(self):
         class Refuses:
