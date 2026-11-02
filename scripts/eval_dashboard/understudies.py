@@ -105,11 +105,14 @@ def scorecard(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
     """The scorecard document. Raises as ``coverage_gaps.find_gaps`` does on
     a read that cannot be trusted (no domains, a gap off the allowlist)."""
     rows, _ = coverage_gaps.load_domains(repo_root)
-    gaps = {g["slug"]: g for g in coverage_gaps.find_gaps(repo_root, data, store, now)}
-    claims = domain_coverage.domain_claims(repo_root)
     candidates = coverage_gaps.domain_candidates(repo_root, data, store)
+    gaps = {g["slug"]: g for g in coverage_gaps.find_gaps(repo_root, data, store, now, candidates)}
+    claims = domain_coverage.domain_claims(repo_root)
     reds = red_counts(red_issues, now)
-    store_read = coverage_gaps.store_records(store, data) is not None
+    # A candidate carries a store verdict exactly when the store was read; with
+    # none to look at, read the store once more.
+    ranked_any = [c for cs in (candidates or {}).values() for c in cs]
+    store_read = ranked_any[0]["store"] is not None if ranked_any else coverage_gaps.store_records(store, data) is not None
     domains = []
     for row in rows:
         slug = row["slug"]

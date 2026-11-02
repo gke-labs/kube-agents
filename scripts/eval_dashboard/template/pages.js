@@ -2015,7 +2015,7 @@ const scorecardDoc = () => (brief.scorecard && typeof brief.scorecard === "objec
 function understudyHtml(u, bar) {
   const record = u.graded ? `${u.passed}/${u.graded} over ${plural(u.nights, "night")}` : "no graded night";
   const store = u.store && u.store.state ? `store ${u.store.state}${Number.isInteger(u.store.runs) && u.store.runs ? `, ${u.store.passes}/${u.store.runs}` : ""}` : "";
-  const tip = `nightly record over the last ${plural(bar.nights ?? "", "nightly night")}; the bar is ${pct(bar.rate ?? 0)} over at least ${bar.min_runs ?? ""} graded runs${u.meets_bar ? ", met" : ""}`;
+  const tip = `nightly record over the last ${plural(bar.nights ?? "", "night")}; the bar is ${pct(bar.rate ?? 0)} over at least ${bar.min_runs ?? ""} graded runs${u.meets_bar ? ", met" : ""}`;
   return `<div><a href="${esc(caseHref(u.case))}">${esc(u.case)}</a>${u.held_out ? ' <span class="mut">(held out)</span>' : ""} <span class="mut"${tipAttr(tip)}>${esc([record, store].filter(Boolean).join(" · "))}</span></div>`;
 }
 

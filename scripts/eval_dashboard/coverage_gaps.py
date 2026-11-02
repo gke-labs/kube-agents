@@ -352,10 +352,12 @@ def domain_candidates(repo_root: pathlib.Path, data: dict, store: dict | None) -
             for slug, cases in by_domain.items()}
 
 
-def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: datetime.datetime) -> list[dict]:
+def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: datetime.datetime,
+              candidates: dict[str, list[dict]] | None = None) -> list[dict]:
     """Every domain with no blocking seat, oldest gap first, each with its
     owner, how long, why, and its ranked candidates (None when ``data``
-    holds no cases to rank). Raises ValueError when domains.yaml gives no
+    holds no cases to rank; ``candidates`` is ``domain_candidates``' result
+    when the caller already has it). Raises ValueError when domains.yaml gives no
     domains (an unreadable file must not read as every domain covered), and
     BadRead when a gap is off the allowlist (a bad roster or task read must
     not file or close anything)."""
@@ -363,7 +365,8 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
     if not rows:
         raise ValueError(f"{repo_root / case_owner.DOMAINS_PATH} gave no domains")
     claims = domain_coverage.domain_claims(repo_root)
-    candidates = domain_candidates(repo_root, data, store)
+    if candidates is None:
+        candidates = domain_candidates(repo_root, data, store)
     # One calendar for both day counts in the body, UTC, the one expiry is
     # read on: they roll over on the same tick.
     today = now.astimezone(datetime.timezone.utc).date()
