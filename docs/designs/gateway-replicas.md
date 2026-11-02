@@ -251,9 +251,11 @@ ingress gap above.
   runs the election by construction. Anything else first rolls as one replica with `Recreate` (an
   `A2A_GATEWAY_IMAGE` pin, a tag taken from `PLATFORM_AGENT_IMAGE`, or the first roll of any image
   when no gateway has been elected yet), and moves to two once a pod on that image holds the
-  Lease. A deleted Lease or its held-back recreate doesn't change the image,
-  so it doesn't flip the Deployment back. The condition is
-  cleared when the mode goes back to today, as `BusProvisioned` is. A status condition doesn't
+  Lease. The condition describes the gateway that's running, not one that once ran: the operator
+  clears it whenever the gateway Deployment rolls to an image other than the one it names, and when
+  the mode goes back to today, as `BusProvisioned` is. So a pin to a pre-election image clears it,
+  and removing the pin rolls once at one replica again. A deleted Lease or its held-back recreate
+  doesn't change the running image, so it leaves the condition, and the two replicas, in place. A status condition doesn't
   survive most restores, so a restored install starts at one replica until a
   gateway takes the Lease again. A CI install, which always pins the image, spends its first roll
   at one replica and runs two after that. A gateway from before the election never takes the
@@ -309,7 +311,8 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    helper, and the eval harness, the CI scripts and the docs resolving the holder. It lands before
    step 4, so nothing meets a standby it can't route around.
 4. **Operator:** replicas, the readiness probe, the strategy (held at one replica and `Recreate`
-   for an image outside the operator's own release until `GatewayElected` names it), the
+   until `GatewayElected` names the running image, for the first roll ever and for any image
+   outside the operator's own release; the condition cleared on any roll to another image), the
    PDB, the spread, the Lease (with its owner reference and
    an `Owns` watch, recreated one `leaseDuration` after a deletion) and its Role. Its tests pin
    each, including the held-back recreate and the first roll across the election.
