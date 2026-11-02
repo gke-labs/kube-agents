@@ -8306,3 +8306,49 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 			float64(sum)/(1<<30), float64(store)/(1<<30), float64(store-sum)/(1<<30), a2aJetStreamCapMargin>>30, b.String())
 	}
 }
+
+// The people reading is read only while no chat platform the install enables
+// is served through Hermes: Chat or Slack on its legacy consumer, or Teams,
+// which only Hermes serves.
+func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
+	on := ptr.To(true)
+	agent := func(mode string, chat, slack, teams bool) *agentv1alpha1.PlatformAgent {
+		a := a2aTestAgent()
+		a.Spec.Mode = ptr.To(mode)
+		integration := &agentv1alpha1.PlatformAgentIntegrationSpec{}
+		if chat {
+			integration.GoogleChat = &agentv1alpha1.GoogleChatSpec{Enabled: on}
+		}
+		if slack {
+			integration.Slack = &agentv1alpha1.SlackSpec{Enabled: on}
+		}
+		if teams {
+			integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: on}
+		}
+		a.Spec.Integration = integration
+		return a
+	}
+	next, today := string(ModeNext), string(ModeToday)
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  bool
+	}{
+		{"next, Chat only", agent(next, true, false, false), true},
+		{"next, Slack only", agent(next, false, true, false), true},
+		{"next, Chat and Slack: Slack on Hermes", agent(next, true, true, false), false},
+		{"next, Teams", agent(next, false, false, true), false},
+		{"next, no platform", agent(next, false, false, false), true},
+		{"today, Chat", agent(today, true, false, false), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := peopleReadingEnabled(tc.agent); got != tc.want {
+				t.Fatalf("peopleReadingEnabled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	noIntegration := a2aTestAgent()
+	if teamsEnabled(noIntegration) || !peopleReadingEnabled(noIntegration) {
+		t.Fatal("a CR with no spec.integration: want Teams off and the reading enabled")
+	}
+}

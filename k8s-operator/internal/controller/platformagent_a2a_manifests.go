@@ -1419,6 +1419,25 @@ func legacySlackConsumer(agent *agentv1alpha1.PlatformAgent) bool {
 	return slackEnabled(agent) && !a2aSlackArmed(agent)
 }
 
+// teamsEnabled is the enabled test for Teams, which only Hermes serves: the
+// A2A gateway has no Teams backend, so an enabled Teams is always on Hermes.
+func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Integration == nil {
+		return false
+	}
+	teams := agent.Spec.Integration.Teams
+	return teams != nil && teams.Enabled != nil && *teams.Enabled
+}
+
+// peopleReadingEnabled reports whether the usage poller reads the A2A
+// gateway's people reading for the install: only while no chat platform it
+// enables is served through Hermes, since the gateway counts only the people
+// who write through it, and a count beside a Hermes-served platform would say
+// nobody wrote while that platform's users were writing.
+func peopleReadingEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	return !legacyChatConsumer(agent) && !legacySlackConsumer(agent) && !teamsEnabled(agent)
+}
+
 // slackEnabled is the enabled test the Slack render sites make, in one place.
 // The status interfaces list still spells it inline, as it does Chat's.
 func slackEnabled(agent *agentv1alpha1.PlatformAgent) bool {

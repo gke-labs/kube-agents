@@ -338,6 +338,9 @@ func (p *UsageCounterPoller) expireNewerFieldsRecordForTest(agent *agentv1alpha1
 // what a CRD without them strips from a stored status.
 const usageTestReadingsNulls = `"remediationsMergedTotal":null,"remediationsOpen":null,"proposalsAuthored":null,"remediationsClosedUnmergedTotal":null,"proposalHumanTouches":null,"proposalsMergedUntouched":null`
 
+// usageTestPeopleNulls is the two people readings as merge-patch deletions.
+const usageTestPeopleNulls = `"peopleSeen7d":null,"peopleSeen30d":null`
+
 // usageHarness is a poller over a fake client, with the writes it makes
 // counted.
 type usageHarness struct {
@@ -381,6 +384,8 @@ type usageHarness struct {
 	pruningFeedback   bool
 	// pruningChatSessions is a CRD serving all but chatSessionsTotal.
 	pruningChatSessions bool
+	// pruningPeople is a CRD serving all but the two people readings.
+	pruningPeople bool
 	// pruningStorage makes the fake behave like a served CRD from before
 	// status.storageStatus carried its byte fields.
 	pruningStorage bool
@@ -397,8 +402,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningChatSessions) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"chatSessionsTotal":null}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningChatSessions || h.pruningPeople) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"chatSessionsTotal":null,` + usageTestPeopleNulls + `}}}`
 				if h.pruningReadings {
 					strip = `{"status":{"usage":{` + usageTestReadingsNulls + `}}}`
 				}
@@ -425,6 +430,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				}
 				if h.pruningChatSessions {
 					strip = `{"status":{"usage":{"chatSessionsTotal":null}}}`
+				}
+				if h.pruningPeople {
+					strip = `{"status":{"usage":{` + usageTestPeopleNulls + `}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -470,6 +478,10 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			}
 			if isAgent && (h.pruningGauges || h.pruningChatSessions) {
 				pa.Status.Usage.ChatSessionsTotal = 0
+			}
+			if isAgent && (h.pruningGauges || h.pruningPeople) {
+				pa.Status.Usage.PeopleSeen7d = nil
+				pa.Status.Usage.PeopleSeen30d = nil
 			}
 			if err == nil && isAgent && h.pruningStorage {
 				stored := pa.DeepCopy()
@@ -3930,4 +3942,206 @@ func TestUsagePoller_ARequestedHAInstallReadsItsOnePodsChatListener(t *testing.T
 		}
 	}
 	t.Fatalf("the one gateway pod's chat listener %s is not among the targets: %+v", chatAddr(), targets)
+}
+
+// usagePeopleTestAgent is a next-mode CR with Chat on and, when slack is set,
+// Slack too; Slack then stays on its legacy consumer, served through Hermes.
+func usagePeopleTestAgent(created time.Time, slack bool) *agentv1alpha1.PlatformAgent {
+	agent := usageTestAgent(created)
+	agent.Spec.Mode = ptr.To(string(ModeNext))
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
+	}
+	if slack {
+		agent.Spec.Integration.Slack = &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)}
+	}
+	return agent
+}
+
+// usagePeopleObjects is the default pods and the A2A gateway pod.
+func usagePeopleObjects(created time.Time) []client.Object {
+	return append(usageDefaultObjects(created), usageA2AGatewayPod("agent-a2a-gateway-ccc", "a2a-c", usageTestA2AIP, created))
+}
+
+// setPeople gives the A2A gateway's body the people reading.
+func (h *usageHarness) setPeople(short, long int64) {
+	h.stub.set(a2aAddr(), 0, ptr.To(1.0))
+	h.stub.setReadings(a2aAddr(), map[string]int64{usageExportPeopleSeen7d: short, usageExportPeopleSeen30d: long}, usageReadingPeople)
+}
+
+// peopleMisses is the CR's run of polls without a people reading, and whether
+// the poller keeps one at all.
+func (h *usageHarness) peopleMisses(agent *agentv1alpha1.PlatformAgent) (int, bool) {
+	h.p.mu.Lock()
+	defer h.p.mu.Unlock()
+	misses, ok := h.p.readingMisses[usagePollKey(agent)][usageReadingPeople]
+	return misses, ok
+}
+
+func TestUsagePoller_ThePeopleReadingsLandAsPointerFieldsAndNeverMoveLastActiveTime(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usagePeopleTestAgent(created, false), usagePeopleObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.setPeople(3, 11)
+	h.poll(5)
+	status := h.status()
+	if gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+		t.Fatalf("people = %d/%d, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	if status.LastActiveTime != nil || status.LastHumanActiveTime != nil {
+		t.Fatalf("the people reading moved a time: lastActiveTime %v, lastHumanActiveTime %v", status.LastActiveTime, status.LastHumanActiveTime)
+	}
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOutcomes, usageReadingDetails) {
+		if got, want := usageReadingValue(status, spec.field), usageTestReadings(1)[spec.field]; got != want {
+			t.Errorf("broker reading %s = %d, want %d", spec.field, got, want)
+		}
+	}
+}
+
+func TestUsagePoller_ThePeopleReadingStaysAbsentWhileSlackIsOnHermes(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usagePeopleTestAgent(created, true)
+	h := newUsageHarness(t, agent, usagePeopleObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.setPeople(3, 11)
+	h.poll(5)
+	h.poll(10)
+	status := h.status()
+	if status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+		t.Fatalf("people = %d/%d with Slack on Hermes, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	if misses, _ := h.peopleMisses(agent); misses != 0 {
+		t.Fatalf("a closed gate recorded %d people misses, want 0", misses)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	stored.Spec.Integration.Slack.Enabled = ptr.To(false)
+	if err := h.cl.Update(context.Background(), stored); err != nil {
+		t.Fatalf("disabling Slack: %v", err)
+	}
+	h.poll(15)
+	status = h.status()
+	if gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+		t.Fatalf("people = %d/%d after Slack left Hermes, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+}
+
+func TestUsagePoller_PeopleReadingsClearAfterTwoPollsWithoutASample(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usagePeopleTestAgent(created, false), usagePeopleObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.setPeople(3, 11)
+	h.poll(5)
+	h.stub.setReadings(a2aAddr(), nil)
+	h.poll(10)
+	if status := h.status(); gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+		t.Fatalf("one poll without a sample: people = %d/%d, want 3/11 kept", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	h.poll(15)
+	if status := h.status(); status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+		t.Fatalf("two polls without a sample: people = %d/%d, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	h.setPeople(4, 12)
+	h.poll(20)
+	if status := h.status(); gaugeValue(status.PeopleSeen7d) != 4 || gaugeValue(status.PeopleSeen30d) != 12 {
+		t.Fatalf("the sample back: people = %d/%d, want 4/12", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+}
+
+func TestUsagePoller_ThePeopleReadingDoesNotShareTheBrokersStreak(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usagePeopleTestAgent(created, false), usagePeopleObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.setPeople(3, 11)
+	h.poll(5)
+	h.stub.fail(brokerAddr(), usageScrapeKindRefused)
+	h.poll(10)
+	h.poll(15)
+	h.poll(20)
+	status := h.status()
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOutcomes, usageReadingDetails) {
+		if got := usageReadingValue(status, spec.field); got != -1 {
+			t.Errorf("three failed broker reads: %s = %d, want absent", spec.field, got)
+		}
+	}
+	if gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+		t.Fatalf("people = %d/%d with the broker down, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+}
+
+func TestUsagePoller_ThePeopleReadingsHaveTheirOwnPruningRecord(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usagePeopleTestAgent(created, false)
+	h := newUsageHarness(t, agent, usagePeopleObjects(created)...)
+	h.pruningPeople = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.setPeople(3, 11)
+	h.poll(5)
+	status := h.status()
+	if status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+		t.Fatalf("people = %d/%d under a CRD without them, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	if !h.p.newerFieldPruned(agent, usageNewerFieldPeople) || h.p.newerFieldPruned(agent, usageNewerFieldReadings) {
+		t.Fatal("the absence of the people readings was not recorded against their own record alone")
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the absence of the people readings was recorded as the counters' pruning")
+	}
+	h.stub.setReadings(brokerAddr(), usageTestReadings(4), usageReadingOutcomes, usageReadingDetails)
+	h.poll(10)
+	status = h.status()
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOutcomes, usageReadingDetails) {
+		if got, want := usageReadingValue(status, spec.field), usageTestReadings(4)[spec.field]; got != want {
+			t.Errorf("broker reading %s = %d under a CRD without the people readings, want %d", spec.field, got, want)
+		}
+	}
+	patches := h.patches
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with the people readings alone behind re-patched the status while their record was fresh")
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	held := h.r.heldUsageFields(stored)
+	if !held[usageExportPeopleSeen7d] || !held[usageExportPeopleSeen30d] || held[usageExportRemediationsMerged] {
+		t.Fatalf("held fields %v, want the people readings held and remediationsMergedTotal published", held)
+	}
+}
+
+func TestUsagePoller_NoA2AGatewayPodLeavesThePairAbsentWithoutAMiss(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+	}{
+		{"today", usageTestAgent(created)},
+		{"next without the A2A gateway pod", usagePeopleTestAgent(created, false)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newUsageHarness(t, tc.agent, usageDefaultObjects(created)...)
+			h.stub.set(gatewayAddr(), 0, nil)
+			h.stub.set(brokerAddr(), 0, nil)
+			h.poll(5)
+			h.poll(10)
+			h.poll(15)
+			if status := h.status(); status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+				t.Fatalf("people = %d/%d with no A2A gateway, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+			}
+			if misses, ok := h.peopleMisses(tc.agent); ok {
+				t.Fatalf("no A2A gateway recorded a people miss streak of %d, want none", misses)
+			}
+		})
+	}
 }
