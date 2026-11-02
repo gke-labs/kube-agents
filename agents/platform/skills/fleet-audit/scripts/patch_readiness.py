@@ -2317,9 +2317,14 @@ def main(argv: list[str] | None = None) -> int:
     # The Config Connector reads below end inside a budget measured from here.
     started = time.monotonic()
     manifest = collect_fleet(args.project)
-    # Only with `--config-connector` (`kcc_health.FLAG`): the SOP command,
-    # scheduled or on demand, passes it; the chat route does not.
-    if args.config_connector:
+    # With `--config-connector` (`kcc_health.FLAG`), which the SOP command
+    # passes, or while an audit run of this stream is in flight, so the read
+    # does not depend on the model copying the flag; a chat fleet question
+    # with no run in flight does not read. The manifest says which
+    # (`kcc_health.READ_STAMP_FIELD`).
+    reason = kcc_health.read_reason(args.config_connector, AUDIT_ID)
+    manifest[kcc_health.READ_STAMP_FIELD] = reason
+    if reason:
         # After the sweep, in a new pool of the sweep's size: a credential fetch
         # and one Config Connector read per collected cluster (discovery, then one
         # list request per container kind, `kcc_health.CONTAINER_KINDS`,

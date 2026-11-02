@@ -6,6 +6,7 @@ import copy
 import io
 import inspect
 import json
+from pathlib import Path
 import os
 import shutil
 import subprocess
@@ -2685,6 +2686,34 @@ class CandidateSummaryTest(unittest.TestCase):
         entry = json.loads(out.getvalue())["clusters"][0]
         self.assertNotIn("kcc_unread", entry)
         self.assertNotIn("kcc_unready", entry)
+
+    def test_main_reads_config_connector_while_an_audit_run_is_in_flight(self):
+        """The live run never passed `--config-connector`. The read must not
+        depend on the model copying the flag: while `start`'s in-flight note
+        of this stream is there, `main` reads without it, and the manifest
+        says why (`config_connector_read`)."""
+        import contextlib as _contextlib  # noqa: PLC0415
+        import io as _io  # noqa: PLC0415
+        import tempfile as _tempfile  # noqa: PLC0415
+        from unittest import mock as _mock  # noqa: PLC0415
+
+        def run(argv, scratch, note):
+            manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1",
+                                       "outcome": "collected", "candidates": []}]}
+            if note:
+                Path(scratch, f"inflight_{fd.AUDIT_ID}.json").write_text("{}", encoding="utf-8")
+            out = _io.StringIO()
+            with _mock.patch.dict(os.environ, {"FLEET_AUDIT_SCRATCH_DIR": scratch}), _mock.patch.object(
+                fd, "collect_fleet", return_value=manifest
+            ), _mock.patch.object(fd.kcc_health, "annotate_manifest") as annotate:
+                with _contextlib.redirect_stdout(out), _contextlib.redirect_stderr(_io.StringIO()):
+                    fd.main(argv)
+            return annotate.called, json.loads(out.getvalue())["config_connector_read"]
+
+        for argv, note, expected in (([], True, (True, "in-flight")), ([], False, (False, False)),
+                                     (["--config-connector"], False, (True, "flag"))):
+            with self.subTest(argv=argv, note=note), _tempfile.TemporaryDirectory() as scratch:
+                self.assertEqual(run(argv, scratch, note), expected)
 
     def test_main_adds_the_config_connector_read_before_it_prints(self):
         """A drift fix can edit a `ContainerCluster` declaration, so `main`

@@ -903,5 +903,61 @@ class CopiedConstantsTest(unittest.TestCase):
                 self.assertEqual(getattr(kcc_health, name), source)
 
 
+    def test_the_in_flight_note_equals_audit_reports(self):
+        import audit_report  # noqa: PLC0415
+
+        with mock.patch.dict(os.environ, {kcc_health.SCRATCH_DIR_ENV: audit_report.SCRATCH_DIR}):
+            self.assertEqual(str(kcc_health.inflight_note_path("stockout-prevention")),
+                             audit_report.inflight_path_for("stockout-prevention"))
+        self.assertEqual(kcc_health.INFLIGHT_TTL_SECONDS, audit_report.INFLIGHT_TTL_SECONDS)
+        with mock.patch.dict(os.environ, {kcc_health.SCRATCH_DIR_ENV: ""}):
+            self.assertEqual(str(kcc_health.inflight_note_path("a").parent), kcc_health.DEFAULT_SCRATCH_DIR)
+
+
+class ReadWantedTest(unittest.TestCase):
+    """The read runs with the flag, or while the stream's audit run is in
+    flight, so it does not depend on the model copying the flag."""
+
+    STREAM = "stockout-prevention"
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.scratch = Path(scratch.name)
+        patcher = mock.patch.dict(os.environ, {kcc_health.SCRATCH_DIR_ENV: scratch.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def note(self, stream=STREAM, text='{"audit": "x", "started_at": 1}', age=0):
+        path = self.scratch / f"inflight_{stream}.json"
+        path.write_text(text, encoding="utf-8")
+        stamp = time.time() - age
+        os.utime(path, (stamp, stamp))
+
+    def test_the_flag_alone_reads(self):
+        self.assertTrue(kcc_health.read_wanted(True, self.STREAM))
+        self.assertEqual(kcc_health.read_reason(True, self.STREAM), kcc_health.READ_BY_FLAG)
+
+    def test_no_note_does_not_read(self):
+        self.assertFalse(kcc_health.read_wanted(False, self.STREAM))
+        self.assertIs(kcc_health.read_reason(False, self.STREAM), False)
+
+    def test_a_fresh_note_of_the_stream_reads(self):
+        self.note()
+        self.assertTrue(kcc_health.read_wanted(False, self.STREAM))
+        self.assertEqual(kcc_health.read_reason(False, self.STREAM), kcc_health.READ_IN_FLIGHT)
+
+    def test_another_streams_note_does_not_read(self):
+        self.note(stream="fleet-consistency-drift")
+        self.assertFalse(kcc_health.read_wanted(False, self.STREAM))
+
+    def test_a_stale_note_does_not_read(self):
+        self.note(age=kcc_health.INFLIGHT_TTL_SECONDS + 60)
+        self.assertFalse(kcc_health.read_wanted(False, self.STREAM))
+
+    def test_a_note_that_does_not_parse_still_reads(self):
+        self.note(text="{not json")
+        self.assertTrue(kcc_health.read_wanted(False, self.STREAM))
+
 if __name__ == "__main__":
     unittest.main()

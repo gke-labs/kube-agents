@@ -210,17 +210,31 @@ GLOBAL_LOCATION = "global"
 # is not read and is not a host.
 CLUSTER_STATUS_FIELD = "cluster_status"
 READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
-# The flag that turns the read on. A collector reads Config Connector only
-# with it: only `finish` uses the result. The SOP command passes it whenever
-# the audit runs by its SOP, scheduled or on demand
-# (references/on-demand.md); a chat fleet question runs the same collectors
-# without it and pays nothing for a read that nothing uses.
+# The flag that forces the read on. Only `finish` uses the result, so a
+# collector also reads Config Connector without the flag while an audit run
+# of its stream is in flight (`read_reason`): the read must not depend on the
+# model copying the flag from the SOP. The SOP commands still pass it. A chat
+# fleet question with no audit run in flight pays nothing for a read that
+# nothing uses.
 FLAG = "--config-connector"
 FLAG_HELP = (
-    "after the sweep, read Config Connector on each collected cluster and record kcc_unready or "
-    "kcc_unread on its entry, for finish; the SOP command passes it, scheduled or on demand, and a "
-    "chat fleet question does not"
+    "read Config Connector after the sweep on each collected cluster and record kcc_unready or "
+    "kcc_unread on its entry, for finish; the read also runs without this flag while an audit run "
+    "of this stream is in flight (audit_report.py start wrote its note)"
 )
+# The note that `audit_report.py start` writes while a run of a stream is in
+# flight, and how long it is believed: copies of `audit_report.inflight_path_for`
+# and `audit_report.INFLIGHT_TTL_SECONDS`, which a test holds equal. A
+# collector does not import audit_report.
+SCRATCH_DIR_ENV = "FLEET_AUDIT_SCRATCH_DIR"
+DEFAULT_SCRATCH_DIR = "/opt/data/scratch"
+INFLIGHT_NOTE = "{scratch}/inflight_{audit_id}.json"
+INFLIGHT_TTL_SECONDS = 2 * 60 * 60
+# The top-level manifest key that says why the read ran: `READ_BY_FLAG`,
+# `READ_IN_FLIGHT`, or false when it did not run.
+READ_STAMP_FIELD = "config_connector_read"
+READ_BY_FLAG = "flag"
+READ_IN_FLIGHT = "in-flight"
 # The carried key a collector sets on a cluster whose `clusters list` record
 # shows the Config Connector add-on enabled
 # (`addonsConfig.configConnectorConfig.enabled`). Those clusters are read
@@ -614,6 +628,33 @@ def read_cluster(
     if kinds is not None and UNREADY_FIELD in fields:
         fields[KINDS_READ_FIELD] = sorted(kind for _, kind in kinds)
     return fields
+
+
+def inflight_note_path(audit_id: str) -> Path:
+    """Where `audit_report.py start` leaves the in-flight note of `audit_id`."""
+    scratch = os.environ.get(SCRATCH_DIR_ENV) or DEFAULT_SCRATCH_DIR
+    return Path(INFLIGHT_NOTE.format(scratch=scratch, audit_id=audit_id))
+
+
+def read_reason(flag: bool, audit_id: str, *, now: Callable[[], float] = time.time) -> str | bool:
+    """Why the collector of `audit_id` reads Config Connector, or False.
+
+    `READ_BY_FLAG` when `FLAG` is set. `READ_IN_FLIGHT` when the stream's
+    in-flight note exists and its mtime is within `INFLIGHT_TTL_SECONDS`. A
+    note that does not parse still counts, as `audit_report` treats it: an
+    unreadable note is a claim, not an absence."""
+    if flag:
+        return READ_BY_FLAG
+    try:
+        modified = inflight_note_path(audit_id).stat().st_mtime
+    except OSError:
+        return False
+    return READ_IN_FLIGHT if now() - modified <= INFLIGHT_TTL_SECONDS else False
+
+
+def read_wanted(flag: bool, audit_id: str) -> bool:
+    """Whether the collector of `audit_id` reads Config Connector (`read_reason`)."""
+    return bool(read_reason(flag, audit_id))
 
 
 def add_flag(parser) -> None:
