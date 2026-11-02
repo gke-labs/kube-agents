@@ -621,3 +621,25 @@ func TestSpawnMountsTheTranscriptPrimerForTheWorker(t *testing.T) {
 		t.Errorf("primer not wired: env %s=%q, mount %q, downward-API file at the env's path %v", lib.EnvPrimerFile, envPath, mountPath, fileOK)
 	}
 }
+
+// The operator renders the exec tier's URL as A2A_CREDENTIAL_PROXY_EXEC_URL;
+// FromEnv reads that name, and an unset variable leaves the field empty.
+func TestFromEnvReadsTheExecTierURL(t *testing.T) {
+	setBaseEnv(t)
+	const execURL = "http://agent-credential-proxy-exec-tier.test-ns.svc.cluster.local:8765"
+	t.Setenv("A2A_CREDENTIAL_PROXY_EXEC_URL", execURL)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CredentialProxyExecURL != execURL {
+		t.Errorf("CredentialProxyExecURL = %q, want %q", cfg.CredentialProxyExecURL, execURL)
+	}
+	t.Setenv("A2A_CREDENTIAL_PROXY_EXEC_URL", "")
+	if cfg, err = FromEnv(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CredentialProxyExecURL != "" {
+		t.Errorf("CredentialProxyExecURL = %q with the variable unset, want empty", cfg.CredentialProxyExecURL)
+	}
+}

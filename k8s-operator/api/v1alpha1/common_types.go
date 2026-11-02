@@ -1295,13 +1295,14 @@ type CredentialProxySpec struct {
 type CredentialProxyExecSpec struct {
 	// Replicas is the number of exec-tier pods. Unset or 0 renders no exec
 	// tier, and callers send every request to the stateful broker. At a
-	// positive count the shell sandbox, the session pods under the cluster
-	// view and the profile workers send /v1/exec and /v1/gcp/ to the tier.
-	// Each replica requests and is limited to 2 CPU and 2Gi of memory, with
-	// no override. A change between 0 and a positive value restarts the shell
-	// sandbox, which reads the tier's address when it starts; a change between
-	// two positive values rewrites the count the pods read and restarts
-	// nothing. The operator does not derive the count from the fleet size.
+	// positive count the shell sandbox and the session pods under the cluster
+	// view are given the tier's address for /v1/exec and /v1/gcp/, and the
+	// profile namespace may reach it. Each replica requests and is limited to
+	// 2 CPU and 2Gi of memory, with no override. A change between 0 and a
+	// positive value restarts the shell sandbox, and under the cluster view
+	// the A2A gateway, which read the tier's address when they start; a change
+	// between two positive values rewrites the count the pods read and
+	// restarts nothing. The operator does not derive the count from the fleet size.
 	// Above 0 the agent's name must be at most 36 characters, so the tier's
 	// objects fit a 63-character name; a longer one is refused, and the tier
 	// is not rendered.

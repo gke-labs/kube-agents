@@ -1054,6 +1054,17 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 	return container
 }
 
+// sandboxBrokerPeers is the broker, and the exec tier while it renders.
+func sandboxBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
+	peers := []networkingv1.NetworkPolicyPeer{{
+		PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
+	}}
+	if credentialProxyExecTierEnabled(agent) {
+		peers = append(peers, credentialProxyExecTierPodPeer(agent))
+	}
+	return peers
+}
+
 // buildShellSandboxNetworkPolicy is deny-by-default in both directions, with
 // three holes: ssh in from the gateway, DNS out, and the broker's Service out.
 //
@@ -1067,20 +1078,10 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 // selects pods, so a broker sharing this pod would make every address it needs —
 // a GKE control plane per registered cluster, googleapis.com, chat.googleapis.com,
 // slack.com, github.com, the token minter — an address the *shell* may reach.
-// Off-pod, the shell's whole outbound world is DNS and one ClusterIP.
+// Off-pod, the shell's whole outbound world is DNS and the broker's pods: the
+// stateful broker, and the exec tier while it renders.
 // dnsIPs is the resolved Cluster DNS VIP list, the same one the gateway policy is
 // built from; an empty slice falls back to the standard VIP inside clusterDNSPeers.
-// sandboxBrokerPeers is the broker, and the exec tier while it renders.
-func sandboxBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
-	peers := []networkingv1.NetworkPolicyPeer{{
-		PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
-	}}
-	if credentialProxyExecTierEnabled(agent) {
-		peers = append(peers, credentialProxyExecTierPodPeer(agent))
-	}
-	return peers
-}
-
 func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsIPs []string) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	udp := corev1.ProtocolUDP

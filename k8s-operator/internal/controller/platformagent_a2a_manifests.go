@@ -2635,7 +2635,8 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 	}
 	if a2aSessionClusterViewEnabled(agent) {
 		// The credential broker, under the cluster-view flag: the one
-		// widening of this fence, to one pod on one port, and the pod on
+		// widening of this fence, to the broker's pods on one port (the
+		// stateful broker, and the exec tier while it renders), and the pod on
 		// the other end authenticates the token and confers the session
 		// role. The API server stays unreachable from here; kubectl runs
 		// in the broker. Header comment: this IS the design change.

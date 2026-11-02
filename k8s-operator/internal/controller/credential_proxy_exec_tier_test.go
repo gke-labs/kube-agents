@@ -477,6 +477,19 @@ func hasExecTierPeer(agent *agentv1alpha1.PlatformAgent, peers []networkingv1.Ne
 	return false
 }
 
+// hasNamespacedExecTierPeer reports whether the peers select the exec tier's
+// pods in the agent's namespace, for a caller in another namespace: a peer
+// that lost its namespace selector would match nothing there.
+func hasNamespacedExecTierPeer(agent *agentv1alpha1.PlatformAgent, peers []networkingv1.NetworkPolicyPeer) bool {
+	want := namespacedPodPeer(agent.Namespace, credentialProxyExecTierSelector(agent))
+	for _, p := range peers {
+		if reflect.DeepEqual(p, want) {
+			return true
+		}
+	}
+	return false
+}
+
 func execTierEnvValue(env []corev1.EnvVar, name string) (string, bool) {
 	for _, e := range env {
 		if e.Name == name {
@@ -496,7 +509,8 @@ func TestTheSandboxReachesTheExecTierOnlyWhileItRenders(t *testing.T) {
 		for _, c := range sts.Spec.Template.Spec.Containers {
 			env = append(env, c.Env...)
 		}
-		url, set := execTierEnvValue(env, credentialProxyExecURLEnv)
+		// The literal name: the shim reads CREDENTIAL_PROXY_EXEC_URL (§12).
+		url, set := execTierEnvValue(env, "CREDENTIAL_PROXY_EXEC_URL")
 		if replicas > 0 && url != "http://test-agent-credential-proxy-exec-tier.test-ns.svc.cluster.local:8765" {
 			t.Errorf("at %d replicas the sandbox's %s = %q", replicas, credentialProxyExecURLEnv, url)
 		}
@@ -528,7 +542,8 @@ func TestSessionPodsReachTheExecTierOnlyUnderTheClusterView(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(a2aSessionClusterViewEnvVar, tc.view)
 			agent := execTierTestAgent(ptr.To(tc.replicas))
-			url, set := execTierEnvValue(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env, a2aCredentialProxyExecURLEnv)
+			// The literal name a2a/gateway's FromEnv reads.
+			url, set := execTierEnvValue(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env, "A2A_CREDENTIAL_PROXY_EXEC_URL")
 			if set != tc.want || (tc.want && url != credentialProxyExecTierURL(agent)) {
 				t.Errorf("%s = %q (set %v), want set %v", a2aCredentialProxyExecURLEnv, url, set, tc.want)
 			}
@@ -541,8 +556,8 @@ func TestSessionPodsReachTheExecTierOnlyUnderTheClusterView(t *testing.T) {
 				}
 				return
 			}
-			if got := hasExecTierPeer(agent, brokerEgressPeers(t, np)); got != tc.want {
-				t.Errorf("session egress to the exec tier = %v, want %v", got, tc.want)
+			if got := hasNamespacedExecTierPeer(agent, brokerEgressPeers(t, np)); got != tc.want {
+				t.Errorf("session egress to the exec tier in the agent's namespace = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -553,8 +568,8 @@ func TestProfileWorkersReachTheExecTierOnlyWhileItRenders(t *testing.T) {
 	for _, replicas := range []int32{0, 2} {
 		agent := execTierTestAgent(ptr.To(replicas))
 		peers := brokerEgressPeers(t, buildProfileNetworkPolicy(agent, []string{"10.96.0.10"}))
-		if hasExecTierPeer(agent, peers) != (replicas > 0) {
-			t.Errorf("at %d replicas the profile egress to the exec tier is %v", replicas, hasExecTierPeer(agent, peers))
+		if hasNamespacedExecTierPeer(agent, peers) != (replicas > 0) {
+			t.Errorf("at %d replicas the profile egress to the exec tier in the agent's namespace is %v", replicas, hasNamespacedExecTierPeer(agent, peers))
 		}
 	}
 }
@@ -571,5 +586,15 @@ func TestARefusedNameGivesCallersNoExecTier(t *testing.T) {
 	}
 	if hasExecTierPeer(agent, brokerEgressPeers(t, buildShellSandboxNetworkPolicy(agent, []string{"10.96.0.10"}))) {
 		t.Error("the sandbox's egress opens to a refused tier")
+	}
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	if _, set := execTierEnvValue(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env, "A2A_CREDENTIAL_PROXY_EXEC_URL"); set {
+		t.Error("the A2A gateway gets the URL of a refused tier")
+	}
+	if hasNamespacedExecTierPeer(agent, brokerEgressPeers(t, buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"}))) {
+		t.Error("the session fence opens to a refused tier")
+	}
+	if hasNamespacedExecTierPeer(agent, brokerEgressPeers(t, buildProfileNetworkPolicy(agent, []string{"10.96.0.10"}))) {
+		t.Error("the profile fence opens to a refused tier")
 	}
 }
