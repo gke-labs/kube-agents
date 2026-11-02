@@ -243,6 +243,31 @@ func newMetrics() *metrics {
 	return m
 }
 
+// deleteClusterGauges drops the two gauge series labelled with one cluster's
+// triple, cluster_up and active_incidents, when the cluster's profile is
+// removed (clusterSet.stop) or the direct entry is restarted under its
+// profile's triple (clusterSet.restartDirect). Without it a torn-down cluster
+// would read as a cluster at cluster_up=0 for the life of the process, and the
+// operator's count of clustersRegistered, which is the number of cluster_up
+// series, would keep it.
+//
+// The cluster's counter series stay. The operator's usage poller sums the
+// pod's injected and triage families over every label set and refuses a sum
+// that falls under an unchanged process start time (usageBranch in
+// internal/controller/usage_counters_fold.go: a counter cannot fall inside
+// one process), advancing its baseline to the fallen sample. Deleting a
+// counter series would make the pod's sum fall by the cluster's lifetime
+// count on the next poll and lose up to a poll window of every other
+// cluster's increments. An idle counter series for a removed cluster costs
+// memory only, and no more than the cluster cost while it ran.
+// clusterDiscoveryErrors is labelled by profile, not cluster, and is a
+// counter too: what it counted happened.
+func (m *metrics) deleteClusterGauges(cluster, project, location string) {
+	labels := prometheus.Labels{"cluster": cluster, "project": project, "location": location}
+	m.activeIncidents.DeletePartialMatch(labels)
+	m.clusterUp.DeletePartialMatch(labels)
+}
+
 // processStartSeconds is t as the gauge exports it: seconds since the epoch,
 // with the sub-second part kept.
 func processStartSeconds(t time.Time) float64 {

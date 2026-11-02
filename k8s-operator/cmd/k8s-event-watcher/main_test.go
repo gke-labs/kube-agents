@@ -439,6 +439,11 @@ func TestBuildWatchSet_ProfileDuplicateIsDroppedAndItsIdentityKept(t *testing.T)
 	if !mgmt[0].Autopilot {
 		t.Error("the absorbed profile's Autopilot bit did not reach the direct entry")
 	}
+	// So does the profile's name: the rescan's duplicate report names it as
+	// the owner of the host's identity, and a copy of it as the duplicate.
+	if mgmt[0].Source != "cluster-projA-mgmt-us-central1" {
+		t.Errorf("direct entry's Source = %q, want the absorbed profile cluster-projA-mgmt-us-central1", mgmt[0].Source)
+	}
 	// Absorbing one profile must not disturb the others.
 	if clusters[0].Name != "prod" || clusters[0].Profile != "cluster-projA-prod-us-central1" {
 		t.Errorf("prod is watched as %s/%s, want it untouched", clusters[0].Name, clusters[0].Profile)

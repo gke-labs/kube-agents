@@ -49,6 +49,12 @@ const (
 	// is the reflector's queue bookkeeping, whose map keeps its buckets at
 	// the size of the largest list it has seen, at roughly a tenth of that.
 	retentionCeilingBytesPerEvent = 256
+	// heldCeilingBytesPerEvent bounds what the queue holds per listed event
+	// while the initial batch waits for delivery. The Event of this shape
+	// costs about 2.3 KiB with its managedFields and about 1.2 KiB without
+	// them, so the ceiling sits between the two: the stripped batch fits, the
+	// batch queued as listed does not.
+	heldCeilingBytesPerEvent = 1700
 )
 
 // countingDispatcher counts Dispatch calls and keeps nothing else, so what
@@ -164,6 +170,68 @@ func TestRun_RetainsNothingOfTheEventsItHasDelivered(t *testing.T) {
 			retained, retentionListSize, ceiling)
 	}
 
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Run returned %v; want nil on shutdown", err)
+	}
+}
+
+// TestRun_QueueHoldsTheInitialListWithoutManagedFields pins the transformer
+// on Run's queue: the initial batch sits in the DeltaFIFO until the single
+// delivery goroutine has popped it, and that residency is what the startup
+// burst costs per cluster, so an Event is held without its managedFields. The
+// dispatcher stalls on the first delivery, which keeps the whole list in the
+// queue and the delivery channel, and the live heap is measured while it
+// waits there: under the ceiling with the transformer, over it with the batch
+// queued as the API server listed it.
+func TestRun_QueueHoldsTheInitialListWithoutManagedFields(t *testing.T) {
+	captureLog(t)
+	client := fake.NewClientset()
+	allowPreflight(client)
+	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+		list := &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "10"}}
+		list.Items = make([]corev1.Event, 0, retentionListSize)
+		for i := 0; i < retentionListSize; i++ {
+			list.Items = append(list.Items, kubeletShapedEvent(i))
+		}
+		return true, list, nil
+	})
+	client.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
+		return true, watch.NewFakeWithChanSize(1, false), nil
+	})
+	rec := &stallingDispatcher{release: make(chan struct{})}
+	w := newWatcher(client, rec, targetCluster{Name: "large"})
+
+	before := liveHeapBytes()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	synced := make(chan struct{})
+	go func() {
+		done <- w.Run(ctx, func(watching bool) {
+			if watching {
+				close(synced)
+			}
+		})
+	}()
+	// The reflector queues the whole list in one Replace before the first
+	// pop, so once a delivery has entered the dispatcher the batch is held.
+	eventually(t, 30*time.Second, func() bool { return rec.entered.Load() >= 1 }, "the first delivery to enter the dispatcher")
+
+	held := int64(liveHeapBytes()) - int64(before)
+	ceiling := int64(retentionListSize * heldCeilingBytesPerEvent)
+	t.Logf("live heap while the queue holds %d undelivered events: %+d bytes over the baseline (%d per event)", retentionListSize, held, held/retentionListSize)
+	if held > ceiling {
+		t.Errorf("the queue holds %d bytes for %d undelivered events; want under %d (the events are queued with their managedFields)",
+			held, retentionListSize, ceiling)
+	}
+
+	close(rec.release)
+	select {
+	case <-synced:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the reflector never synced once delivery was released")
+	}
 	cancel()
 	if err := <-done; err != nil {
 		t.Errorf("Run returned %v; want nil on shutdown", err)

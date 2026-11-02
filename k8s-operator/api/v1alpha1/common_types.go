@@ -2585,15 +2585,17 @@ type AgentUsageStatus struct {
 	// +optional
 	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
 
-	// ClustersRegistered is the number of clusters the event watcher built a
-	// client for at its last start: the management cluster and the Cluster
-	// Agent profiles the GKE API would describe, the management cluster
-	// counted once even where a profile also covers it. Read every five
-	// minutes as the number of k8s_event_watcher_cluster_up series the watcher
-	// exports, the largest reading across gateway replicas. The watcher
-	// discovers its fleet once per process, so a cluster that joins or leaves
-	// is counted after the gateway pod restarts, not before. A gauge, not a
-	// counter: it falls after such a restart. Absent when the operator has no
+	// ClustersRegistered is the number of clusters the event watcher has
+	// built a client for: the management cluster and the Cluster Agent
+	// profiles the GKE API would describe, the management cluster counted
+	// once even where a profile also covers it. Read every five minutes as
+	// the number of k8s_event_watcher_cluster_up series the watcher exports,
+	// the largest reading across gateway replicas. The watcher re-reads its
+	// profiles directory every minute, so a cluster that joins is counted
+	// within about two minutes and one whose profile is removed drops out on
+	// the next read; a restart rebuilds the count from the directory as it
+	// stands. A gauge, not a counter: it falls on a removal or after such a
+	// restart. Absent when the operator has no
 	// current reading: before the first poll, while the event watcher is
 	// disabled, and after two polls in a row in which no gateway replica
 	// could be read, whether its listener failed, its pod was not running, or

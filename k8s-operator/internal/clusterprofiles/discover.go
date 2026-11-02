@@ -303,12 +303,17 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 // Discover scans a Hermes profiles directory (normally /opt/data/profiles) and
 // returns one Cluster per Cluster Agent profile found.
 //
-// This runs once, at the caller's startup, so the result is a snapshot rather
-// than something kept in step with the directory. A cluster onboarded later is
-// not reached until the process restarts, and one torn down later leaves the
-// caller holding a config for a control plane that is gone. Re-scanning on an
-// interval and reconciling against the result is deliberate follow-up work, not
-// done here.
+// Each call is a snapshot of the directory, not something kept in step with
+// it; keeping in step is the caller's loop. The drift detector runs it once at
+// startup, so a cluster onboarded later is not reached until that process
+// restarts. The event watcher runs it at startup and again on an interval,
+// with Want excluding every cluster it already watches, and reconciles the
+// result against its running set: a profile written since the last call starts
+// a watcher, one skipped on an earlier call because the describe was refused
+// (a 429 or a 5xx is a skip here, never a retry) is described again, and one
+// whose directory is gone is stopped. That is why a refused describe is left as
+// a skip: the retry is the caller's next call, and a backoff inside this
+// function would hold the drift detector's single startup scan for it.
 //
 // A subdirectory is treated as a cluster profile only if its config.yaml
 // carries a complete cluster_identity block. That is how non-cluster profiles
