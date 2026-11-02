@@ -38,6 +38,13 @@ def test_the_missing_config_connector_matches():
         "The host cluster does not have Config Connector installed.",
         "No cluster in the project has Config Connector installed.",
         "containerclusters.container.cnrm.cloud.google.com is not installed on any cluster.",
+        # A label and a value, a contraction, "not found" and the backward forms.
+        "- **Config Connector:** not installed on any cluster in reach.",
+        "Config Connector CRDs: missing on platform-agent-host and seeded-a through seeded-d.",
+        "Config Connector isn't enabled on any cluster in the project.",
+        "The ContainerCluster CRD was not found on any cluster.",
+        "No cluster in reach has Config Connector.",
+        "The clusters do not have Config Connector CRDs.",
     ):
         assert _matches(report), report
 
@@ -48,5 +55,6 @@ def test_prose_that_names_no_absence_does_not_match():
         "The Config Connector CRDs are installed on the management cluster; the manifest applies on merge.",
         "I installed Config Connector on the host cluster and created eval-kcc-probe from the manifest.",
         "The repository has no clusters/eval-kcc-probe/provisioning/ path yet, so the manifest goes in a new folder.",
+        "eval-kcc-probe was not found in the project, so the manifest creates it.",
     ):
         assert not _matches(report), report
