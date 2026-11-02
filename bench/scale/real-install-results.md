@@ -1,65 +1,73 @@
 # Real-install test results: one install at the L container size
 
-Status on 2026-11-01: Steps 1 to 5 and the Step 6 restart and failing-Pod checks are complete. Step 7 is
-re-running after its first try proved invalid. The 12-hour soak is running, and Step 8 follows.
+Status on 2026-11-02: Steps 1 to 8 and the stress stage are complete. One stress run, 5 questions
+at once, is being re-run.
 
 ## High level summary
 
-One install at the L container size holds the first-run flow of a 40-cluster fleet safely. The
-first-run flow is the onboarding that a new install does by itself. No container restarted. No
-container was killed for memory. The credential proxy refused no command. All 36 tasks of the
-flow finished. The largest resource use was 63% of the sandbox shell's CPU limit. The other
-containers used less than half of their limits.
+One install at the L container size handles a fleet of 40 to 42 clusters safely, at fair use and
+beyond it. An install is one kube-agents deployment. The L size gives the agent 8 CPU and 16 GB,
+the credential proxy 8 CPU and 8 GB, and the event watcher 2 CPU and 4 GB. The test ran for about
+40 hours. In that time no container was killed for memory, no brokered command was refused, and
+no prompt failed. A brokered command is a `kubectl` or `gcloud` command that the credential proxy
+runs for the agent. The credential proxy restarted once, at 8 questions at once, for a reason that
+is not known. No container that the L size sets used more than half of its limit.
 
-The onboarding inventory report appeared 63 minutes after the install was ready. About 30 of
-those minutes came from a test-environment fault: an external IAM process removed the install's
-permissions, and one task had to be restarted. Without that fault, the report takes about 35
-minutes.
+The first-run flow finished in 63 minutes. The first-run flow is the onboarding that a new install
+does by itself. About 30 of the 63 minutes came from a fault in the test environment: an external
+IAM process removed the install's permissions. Without the fault, the flow takes about 35 minutes.
 
-Two limits are close at 40 clusters, and neither is a container size:
+A heavy question takes 10 to 25 minutes when it runs alone. Eight questions at once all finished
+in 71 minutes. The time of a question does not grow with the cluster count. A question about 10
+named clusters took longer than one about the whole fleet, because the upgrade script reads the
+whole fleet.
 
-- Stall Watch takes 25 minutes to read 40 clusters, and it runs every 30 minutes. Stall Watch
-  is the scheduled job that looks for stuck controllers. It is busy 84% of the time, so 40
-  clusters is near its maximum.
-- A heavy question takes 10 to 25 minutes at 40 clusters when it runs alone. The one slow run
-  shared the sandbox shell with 15 triage tasks and did not finish within the test harness's
-  30-minute wait.
+The limits that matter at 40 clusters are not container sizes:
 
-The answers have a scope defect. One upgrade report reported on the clusters that the install is
-told to exclude, and left out the 40 clusters it manages. The fleet health answers also counted
-the excluded clusters.
+- Stall Watch takes 25 minutes of its 30-minute cycle. Stall Watch is the scheduled job that looks
+  for stuck controllers. About 40 clusters is its maximum.
+- The sandbox shell has a fixed size of 2 CPU and 2 GiB. At 8 questions at once its memory reached
+  94%. It is the first limit beyond fair use.
 
-Model tokens are the largest running cost. The first five hours used 288 million input tokens, of
-which 84% were cached. At the list price this is about $111, or about $22 per hour. One install
-on GKE costs about $0.40 per hour. The 40-cluster test fleet costs about $15 per hour.
+The S container size does not crash on this fleet. The S size sets each container to its request.
+The first-run flow still finished, but brokered commands waited up to 60 seconds and the audits
+took up to 3.6 times as long.
 
-The event watcher watched no cluster during the first run. It builds its watch list when it
-starts, and the first run's cluster profiles appeared five minutes later. After a restart it
-watches every cluster, and its session quota then suppresses about 100 to 250 triage sessions per
-minute.
+The test found six defects in the product:
 
-The onboarding report has two defects. It says "Scanned 6 clusters", but the agent examined all
-40 clusters. The agent also could not register its findings, because the connection was refused.
+1. The event watcher does not watch clusters that are registered after it starts. On a new
+   install it watches no cluster until the gateway restarts.
+2. The upgrade report is not stable in scope. In 3 of 4 runs it reported on clusters that the
+   install is told to exclude, and once it left out the managed clusters.
+3. The fleet health answers also count the excluded clusters.
+4. The onboarding report says "Scanned 6 clusters", but the agent examined all 40.
+5. The agent could not register its findings, because the connection was refused.
+6. After an outage, the event watcher creates a large queue of triage tasks at once: about 120 in
+   10 minutes.
+
+Model tokens are the largest running cost. In steady operation the install used $16.6 of tokens
+per hour, about $400 per day. One install on GKE costs about $0.40 per hour. The 40-cluster test
+fleet costs about $15 per hour.
 
 ## Expected conclusions
 
 Each prediction comes from the first-run data above and the Phase 1 to 4 forecast. After the test,
 the Result column says whether the data confirms the prediction.
 
-| #   | Step | Prediction                                                                                                                                                                                                                                       | Basis                                                                                                                                                                                                                                  | Result                                                                                                                                                                                                |
-| --- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | 5    | No safe limit breaks when one question runs at a time.                                                                                                                                                                                           | First-run peaks are below half of every limit except the shell's CPU.                                                                                                                                                                  | Confirmed for the 6 one-at-a-time runs: no restart, OOMKill, refusal or 429; longest command wait 15 s.                                                                                               |
-| 2   | 5    | An upgrade readiness report takes 35 to 60 minutes at 40 clusters, so it passes the harness's 30-minute wait. With the wait raised to 90 minutes, it finishes.                                                                                   | Run 1 took 24 minutes to list 40 clusters. Phase 4 measured 51 to 72 s per cluster for an audit.                                                                                                                                       | Disproved: finished reports took 16 to 18 minutes at 40 to 42 clusters. Run 1 passed the wait only because 15 triage tasks shared the shell.                                                          |
-| 2b  | 5    | The report's time is a fixed part plus a part per cluster. For 1 cluster it takes 5 to 12 minutes, for 10 clusters 15 to 25 minutes, for 42 clusters 40 to 60 minutes. The per-cluster part is 50 to 70 s.                                       | The fixed part is the skill read, the fleet listing and the answer. Phase 4 measured 51 to 72 s per cluster for an audit. The 1- and 10-cluster runs name their clusters in the prompt, so the install keeps all 42 clusters in scope. | Disproved: 8 minutes for 1 cluster, 26 to 37 for 10 named clusters, 16 for the whole fleet of 42. The fixed part is about 8 minutes; above it, the agent's path sets the time, not the cluster count. |
-| 3   | 5    | The fleet health answer names the hot Deployment on `scale-07`, and the upgrade answer names `signal-old` as behind. The zone skew on `signal-skew` is found less reliably.                                                                      | Both are visible with one `kubectl top` or one cluster list. The skew needs Pod-to-zone joins.                                                                                                                                         | Confirmed: the zone pin was named in 3 of 3 fleet health answers, the hot Deployment in 2 of 3, and `signal-old` in the 42-cluster upgrade report.                                                    |
-| 4   | 5    | With 2 and 3 questions at once, containers stay inside their limits. The shell CPU reaches its 2-core limit, and each answer takes longer in proportion to the number of questions. At 3 at once, at least one answer passes the 30-minute wait. | All work goes through the one sandbox shell, which already peaked at 1.26 cores.                                                                                                                                                       | Pending                                                                                                                                                                                               |
-| 5   | 6    | After an agent restart, the event watcher watches all clusters again within 10 to 15 minutes.                                                                                                                                                    | The runner's gateway restarts took about 11 minutes to settle.                                                                                                                                                                         | Disproved, faster: all 43 clusters watched again about 3 minutes after the restart.                                                                                                                   |
-| 6   | 6    | A window with 20 failing Pods does not start a session storm. The event watcher's quota holds new sessions, and the triage queue clears within 1 hour.                                                                                           | 15 triage tasks at 21:18 ran 2 to 3 at a time and cleared in 37 minutes.                                                                                                                                                               | Confirmed for sessions: the quota suppressed all 11,683 session starts in the hour, and no container restarted. The hour still cost $69.5 in tokens.                                                  |
-| 7   | 6    | Stall Watch reads every cluster once in each 30-minute cycle at 42 clusters, with less than 15% margin.                                                                                                                                          | 25 minutes per run at 40 clusters, about 37 s per cluster.                                                                                                                                                                             | Pending                                                                                                                                                                                               |
-| 8   | 6    | The steady token cost after onboarding is $15 to $20 per hour, or $360 to $480 per day, and the agent's memory stays under 3 GB for 12 hours.                                                                                                    | $111 in the first 5 hours, which include the onboarding burst.                                                                                                                                                                         | Pending                                                                                                                                                                                               |
-| 9   | 7    | High Pod churn does not harm the install. The test cluster cannot reach 3,000 Pods per minute before the install shows strain. The event watcher stays under 0.5 CPU and 1 GB.                                                                   | The event watcher reacts to warnings and failures, not to normal Pod creation.                                                                                                                                                         | Pending                                                                                                                                                                                               |
-| 10  | 8    | At the S size the install fails. The first limit is CPU throttling of the credential proxy and the shell, seen as long command waits. Then the agent is killed for memory during onboarding.                                                     | At L, the proxy peaked at 3.45 cores (S gives 0.5), the shell at 1.26 cores (S gives 0.2), and the agent at 2.29 GB (S gives 2 GiB = 2.15 GB).                                                                                         | Pending                                                                                                                                                                                               |
-| 11  | All  | One L install is enough for 40 clusters, and Stall Watch's cycle sets the maximum, not a container size.                                                                                                                                         | Every container peak at 40 clusters is below half of its L limit.                                                                                                                                                                      | Pending                                                                                                                                                                                               |
+| #   | Step | Prediction                                                                                                                                                                                                                                       | Basis                                                                                                                                                                                                                                  | Result                                                                                                                                                                                                                              |
+| --- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | 5    | No safe limit breaks when one question runs at a time.                                                                                                                                                                                           | First-run peaks are below half of every limit except the shell's CPU.                                                                                                                                                                  | Confirmed for the 6 one-at-a-time runs: no restart, OOMKill, refusal or 429; longest command wait 15 s.                                                                                                                             |
+| 2   | 5    | An upgrade readiness report takes 35 to 60 minutes at 40 clusters, so it passes the harness's 30-minute wait. With the wait raised to 90 minutes, it finishes.                                                                                   | Run 1 took 24 minutes to list 40 clusters. Phase 4 measured 51 to 72 s per cluster for an audit.                                                                                                                                       | Disproved: finished reports took 16 to 18 minutes at 40 to 42 clusters. Run 1 passed the wait only because 15 triage tasks shared the shell.                                                                                        |
+| 2b  | 5    | The report's time is a fixed part plus a part per cluster. For 1 cluster it takes 5 to 12 minutes, for 10 clusters 15 to 25 minutes, for 42 clusters 40 to 60 minutes. The per-cluster part is 50 to 70 s.                                       | The fixed part is the skill read, the fleet listing and the answer. Phase 4 measured 51 to 72 s per cluster for an audit. The 1- and 10-cluster runs name their clusters in the prompt, so the install keeps all 42 clusters in scope. | Disproved: 8 minutes for 1 cluster, 26 to 37 for 10 named clusters, 16 for the whole fleet of 42. The fixed part is about 8 minutes; above it, the agent's path sets the time, not the cluster count.                               |
+| 3   | 5    | The fleet health answer names the hot Deployment on `scale-07`, and the upgrade answer names `signal-old` as behind. The zone skew on `signal-skew` is found less reliably.                                                                      | Both are visible with one `kubectl top` or one cluster list. The skew needs Pod-to-zone joins.                                                                                                                                         | Confirmed: the zone pin was named in 3 of 3 fleet health answers, the hot Deployment in 2 of 3, and `signal-old` in the 42-cluster upgrade report.                                                                                  |
+| 4   | 5    | With 2 and 3 questions at once, containers stay inside their limits. The shell CPU reaches its 2-core limit, and each answer takes longer in proportion to the number of questions. At 3 at once, at least one answer passes the 30-minute wait. | All work goes through the one sandbox shell, which already peaked at 1.26 cores.                                                                                                                                                       | Partly confirmed: containers stayed inside their limits and 3 at once passed the 30-minute wait. Disproved: the shell's CPU stayed at 0.8 cores, not 2.                                                                             |
+| 5   | 6    | After an agent restart, the event watcher watches all clusters again within 10 to 15 minutes.                                                                                                                                                    | The runner's gateway restarts took about 11 minutes to settle.                                                                                                                                                                         | Disproved, faster: all 43 clusters watched again about 3 minutes after the restart.                                                                                                                                                 |
+| 6   | 6    | A window with 20 failing Pods does not start a session storm. The event watcher's quota holds new sessions, and the triage queue clears within 1 hour.                                                                                           | 15 triage tasks at 21:18 ran 2 to 3 at a time and cleared in 37 minutes.                                                                                                                                                               | Confirmed for sessions: the quota suppressed all 11,683 session starts in the hour, and no container restarted. The hour still cost $69.5 in tokens.                                                                                |
+| 7   | 6    | Stall Watch reads every cluster once in each 30-minute cycle at 42 clusters, with less than 15% margin.                                                                                                                                          | 25 minutes per run at 40 clusters, about 37 s per cluster.                                                                                                                                                                             | Confirmed: 23 soak runs of 25 minutes each in the 30-minute cycle, a margin of 5 minutes (17%).                                                                                                                                     |
+| 8   | 6    | The steady token cost after onboarding is $15 to $20 per hour, or $360 to $480 per day, and the agent's memory stays under 3 GB for 12 hours.                                                                                                    | $111 in the first 5 hours, which include the onboarding burst.                                                                                                                                                                         | Confirmed: $16.6 per hour ($398 per day) over 12 hours; agent memory peak 2.57 GB, with no growth.                                                                                                                                  |
+| 9   | 7    | High Pod churn does not harm the install. The test cluster cannot reach 3,000 Pods per minute before the install shows strain. The event watcher stays under 0.5 CPU and 1 GB.                                                                   | The event watcher reacts to warnings and failures, not to normal Pod creation.                                                                                                                                                         | Confirmed: the test cluster reached at most about 800 Pods per minute. The event watcher stayed at 0.03 CPU and 0.18 GB.                                                                                                            |
+| 10  | 8    | At the S size the install fails. The first limit is CPU throttling of the credential proxy and the shell, seen as long command waits. Then the agent is killed for memory during onboarding.                                                     | At L, the proxy peaked at 3.45 cores (S gives 0.5), the shell at 1.26 cores (S gives 0.2), and the agent at 2.29 GB (S gives 2 GiB = 2.15 GB).                                                                                         | Partly confirmed: the throttled credential proxy made commands wait up to 60 s and the audits ran up to 3.6 times as long. Disproved: no container was killed for memory, and the first run finished in 56 minutes.                 |
+| 11  | All  | One L install is enough for 40 clusters, and Stall Watch's cycle sets the maximum, not a container size.                                                                                                                                         | Every container peak at 40 clusters is below half of its L limit.                                                                                                                                                                      | Confirmed: in the soak and the stress runs no L-sized container passed half of its limit. Stall Watch used 25 of its 30 minutes. Beyond fair use, the sandbox shell's fixed memory is the first limit (94% at 8 questions at once). |
 
 ## Setup
 
@@ -311,37 +319,104 @@ starts per window and the quota suppressed almost all of them.
     cluster, it asked for about 100 to 250 triage sessions per minute, mostly for the 785 Pods that
     the test fleet cannot schedule. The quota suppressed nearly all of them.
 
-## Step 7: high Pod churn (re-run pending)
+## Step 6: the 12-hour soak
+
+The window ran from 07:29 to 19:29 UTC on 2026-11-01, with all 42 clusters watched. It covers the
+daily audits from 07:45 to 18:00. The compliance (06:20) and obtainability (06:50) audits ran
+before it; their durations are in the first-run timeline.
+
+| Measure                                                           | Value                                                                                             |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Restarts, OOMKills, refused commands, failed prompts, lost triage | 0                                                                                                 |
+| Model 429s                                                        | 20, all retried                                                                                   |
+| Token cost                                                        | $198.7, or $16.6 per hour ($398 per day)                                                          |
+| Agent memory peak                                                 | 2.57 GB of 16 GB                                                                                  |
+| Credential proxy CPU peak                                         | 3.54 of 8 cores                                                                                   |
+| Sandbox shell peak                                                | 0.89 cores, 0.80 GB                                                                               |
+| Brokered commands                                                 | 72,830; median wait 0.1 s, longest 5 s                                                            |
+| Event watcher                                                     | 565 events per minute; 139,633 session starts asked, 139,601 suppressed by the quota, 10 injected |
+| Stall Watch                                                       | 23 runs, each 25 minutes of its 30-minute cycle                                                   |
+
+| Scheduled audit         | Started (UTC) | Minutes |
+| ----------------------- | ------------- | ------- |
+| GCE fleet audit         | 07:45         | 18      |
+| Networking audit        | 08:00         | 2       |
+| AI security audit       | 08:50         | 11      |
+| Stockout prevention     | 09:20         | 19      |
+| Upgrade readiness watch | 10:11         | 26      |
+| Upgrade retrospective   | 18:00         | 13      |
+
+Every scheduled job finished. The agent's memory did not grow over the 12 hours.
+
+## Step 7: high Pod churn
 
 The first try is invalid. Its churn Job targeted `scale-01`'s `churn-pool`, which the runner's
-fixture Pods had already filled ("Too many pods"), so every churn Pod stayed Pending and no churn
-happened. Its records leave the data file. The re-run uses a pool of its own, `churn-fast`
-(6 × e2-standard-4, 110 Pods per node), tainted so that only churn Pods run on it. A check with
-10 Pods at once completed 105 Pods in about 80 seconds. The re-run sets 65, 130 and 400 Pods at once
-for about 500, 1,000 and 3,000 Pods per minute.
+fixture Pods had already filled, so no churn happened. Its records were removed from the data file.
+The re-run used a pool of its own, `churn-fast` (6 × e2-standard-4, 110 Pods per node), tainted so
+that only churn Pods run on it.
 
-## Steps 6 and 8 (pending)
+| Target per minute | Pods at once | Reached per minute (median) | Events seen per minute | Event watcher CPU / memory | Agent memory peak |
+| ----------------- | ------------ | --------------------------- | ---------------------- | -------------------------- | ----------------- |
+| 500               | 65           | 447                         | 2,357                  | 0.03 / 0.17 GB             | 3.33 GB           |
+| 1,000             | 130          | 585                         | 2,493                  | 0.03 / 0.17 GB             | 3.39 GB           |
+| 3,000             | 400          | 800                         | 2,993                  | 0.03 / 0.18 GB             | 3.18 GB           |
 
-The 12-hour soak runs from 07:17 to about 19:20 UTC. It covers the daily audits from 07:45 to 10:10
-but not the compliance (06:20) and obtainability (06:50) audits, which ran during the first try of
-Step 7; their durations are in the first-run timeline. The red test at the S size follows the
-Step 7 re-run.
+The test cluster could not create Pods faster than about 800 per minute. At that rate the event
+watcher saw five times its usual event rate and its CPU and memory did not move. No run had a
+restart, an OOMKill or a refused command.
 
-## Stress beyond fair use (pending)
+## Stress beyond fair use
 
-This stage goes past the fair-use limit of the plan, to find what breaks first at the L size. It
-runs after the soak and before the Step 7 re-run.
+| Run                                                        | Window (UTC)     | Result                                                                                                                                                                                                                                        |
+| ---------------------------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 5 questions at once                                        | 2026-11-01 19:46 | Not measured yet. One delegated task stopped at its 150-step budget ("Iteration budget exhausted (150/150)"); then a credential outage on the test machine ended the run. The re-run is in progress.                                          |
+| 8 questions at once                                        | 00:31 to 01:42   | All 8 answers finished in 71 minutes. Sandbox shell memory 2.02 GB of its fixed 2.15 GB (94%). The credential proxy restarted once (not an OOMKill). The longest command wait reached 60 s. Agent memory 3.77 GB. 37 model 429s, all retried. |
+| 100 failing Pods, 30 minutes                               | 01:59 to 02:31   | Safe. 725 events per minute; the quota suppressed 5,302 of 5,498 session starts. Agent memory 3.21 GB.                                                                                                                                        |
+| 32 command workers, 5 minutes, during the 100 failing Pods | 02:31 to 02:37   | 551 commands, 0 errors, 1.76 per second. Each command took 18 s at the median and 23 s at most. Credential proxy CPU 3.0 of 8 cores.                                                                                                          |
 
-| Run                        | Plan                            | Load                                                                            |
-| -------------------------- | ------------------------------- | ------------------------------------------------------------------------------- |
-| `stress_questions` level 1 | `real-install-stress.yaml`      | 5 questions at once, harness wait 90 minutes                                    |
-| `stress_questions` level 2 | `real-install-stress.yaml`      | 8 questions at once, harness wait 90 minutes                                    |
-| `storm_100`                | `real-install-stress-load.yaml` | 100 failing Pods for 30 minutes                                                 |
-| `proxy_burst`              | `real-install-stress-load.yaml` | 32 workers sending brokered commands for 5 minutes, during the 100 failing Pods |
+The 8 questions ran while about 130 triage tasks waited in the queue. The event watcher created
+about 120 of them in 10 minutes at 00:21, right after model access came back from an IAM strip.
 
-Expected: the containers stay inside their L limits. The answers at 5 and 8 at once take longer in
-proportion and finish within 90 minutes. The session quota holds the event storm. The burst raises
-the credential proxy's CPU toward its 8-core limit and brokered-command waits past 15 s.
+### Findings
+
+11. **The first limit beyond fair use is the sandbox shell.** At 8 questions at once its memory
+    reached 94% of its fixed 2 GiB, and brokered commands waited up to 60 s. The containers that
+    the L size sets stayed below half of their limits.
+12. **The command path is not CPU-bound.** 32 workers drove the credential proxy to 3 of its 8
+    cores, and each command still took 18 s.
+13. **The triage queue builds after an outage.** About 120 triage tasks appeared in 10 minutes
+    when model access returned, and they drain a few at a time.
+
+## Step 8: red test at the S size
+
+The agent got 1 CPU and 2 GiB, the credential proxy 0.5 CPU and 1 GiB, and the event watcher
+0.15 CPU and 384 MiB, from 04:28 UTC on 2026-11-02. The sandbox shell kept its fixed 2 CPU and
+2 GiB. The runner reset the install's state at 04:45 and measured a 2-hour first-run window, then
+one upgrade question.
+
+| Measure                                 | S size                        | L size (first run)                              |
+| --------------------------------------- | ----------------------------- | ----------------------------------------------- |
+| Onboarding inventory report ready       | 56 minutes after the reset    | 63 minutes, of which about 30 were an IAM strip |
+| Restarts and OOMKills                   | 0                             | 0                                               |
+| Brokered command wait, median / longest | 2.5 s / 60 s                  | 0.1 s / 5 s                                     |
+| Credential proxy CPU peak               | 0.58 of 0.5 cores (throttled) | 3.45 of 8                                       |
+| Compliance audit                        | 54 minutes                    | 15 minutes                                      |
+| Stall Watch run                         | 25 to 28 minutes of 30        | 25 minutes of 30                                |
+| Fleet cost analysis                     | 21 minutes                    | 7 minutes                                       |
+
+The upgrade question at the S size failed: its delegated task blocked after two failed turns, and
+the answer blamed the service account. An IAM strip removed 10 of the install's roles during that
+question (re-added at 07:09 to 07:10), so this run does not show an S-size effect.
+
+The event watcher was blind again in this window (5.5 events per minute), for the same reason as
+in the first run (finding 9). So the S size did not carry the event watcher's load.
+
+### Findings
+
+14. **The S size degrades by time, not by a crash.** The first run finished, but brokered commands
+    queued behind a throttled credential proxy and reached the 60-second limit, the compliance audit
+    took 3.6 times as long, and Stall Watch came within 2 minutes of its cycle. No container was
+    killed for memory.
 
 ## Cost
 
@@ -364,8 +439,15 @@ input tokens, $9.00 per million output tokens.
 | Output                 | 0.79 M  | $7.1                         |
 | **Total**              |         | **$111, about $22 per hour** |
 
-The first hour holds the onboarding burst. The later hours are the scheduled audits and Stall
-Watch every 30 minutes. The overnight soak (Step 6) gives the steady daily token cost.
+| Window                                       | Hours      | Token cost  | Per hour |
+| -------------------------------------------- | ---------- | ----------- | -------- |
+| 12-hour soak (steady operation, 42 clusters) | 12.0       | $198.7      | $16.6    |
+| One question alone                           | 0.2 to 0.6 | $2.5 to $24 |          |
+| 8 questions at once                          | 1.2        | $71.6       | $60.7    |
+| S-size first run                             | 2.0        | $50.0       | $24.6    |
+
+The steady cost of one install at 42 clusters is about $400 per day in tokens and about $10 per
+day on GKE. The test fleet itself costs about $360 per day.
 
 ## Data
 
