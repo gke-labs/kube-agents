@@ -69,7 +69,7 @@ def _no_pod(monkeypatch):
     advance a fake clock instead of waiting."""
     PURGED.clear()
     ARCHIVED.clear()
-    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, timeout: PURGED.extend(ids))
+    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, timeout, floor=None: PURGED.extend(ids))
     monkeypatch.setattr(harness, "_archive_stalled_cards", lambda ids, timeout: ARCHIVED.extend(ids))
     clock = [0.0]
     monkeypatch.setattr(harness.time, "monotonic", lambda: clock[0])
