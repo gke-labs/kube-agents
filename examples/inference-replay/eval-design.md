@@ -183,20 +183,17 @@ replace it.
 
 ### Where the proxy runs
 
-Eval installs only. `hack/ci-deploy.sh` renders the proxy beside LiteLLM after its last Helm
-upgrade (the next-mode flip) and points `inference-gateway` at it, since a Helm upgrade can revert
-the Service; customer installs never carry it. The proxy pod has to carry `app: litellm`, because
-that is the label the agents' and Cluster Agents' egress policies admit for the model gateway. A second label (`replay: proxy`)
-selects it for `inference-gateway`, an `inference-gateway-upstream` Service selects the real LiteLLM
-pods, and one extra NetworkPolicy lets the proxy reach them. The upstream selector is the hard part:
-the chart's LiteLLM pods carry only `app: litellm`, so a Service selecting that also selects the
-proxy and loops. The prototype selected on the LiteLLM ReplicaSet's `pod-template-hash`, which breaks
-on the next LiteLLM roll; CI needs a stable label on the LiteLLM pods (a chart value) that the proxy
-does not carry. The shared label also enrols the proxy in LiteLLM's PodDisruptionBudget, its topology spread, its
-`PodMonitoring` scrape and the console's metrics Service. The scrape and the console sum
-`/metrics` across every `app: litellm` address, so the proxy must answer `/metrics` itself (its own
-counters, or empty) rather than pass it through to a LiteLLM replica, which would count that
-replica twice.
+The proxy runs only on eval installs; customer installs never get it. `hack/ci-deploy.sh` adds it
+after its last Helm upgrade (the switch to next mode), because a Helm upgrade can undo the change
+to the `inference-gateway` Service.
+
+How traffic reaches it:
+
+- **Agents → proxy.** The agents' network policies only let them talk to pods labelled
+  `app: litellm`. So the proxy pod carries that label too, plus a second label, `replay: proxy`.
+  The `inference-gateway` Service is pointed at pods with both labels, which means only the proxy.
+- **Proxy → LiteLLM.** A second Service, `inference-gateway-upstream`, points at the real LiteLLM
+  pods, and one extra network policy lets the proxy reach them.
 
 ```mermaid
 flowchart LR
@@ -208,127 +205,154 @@ flowchart LR
     agents --> svc --> proxy --> up --> lite
 ```
 
-### One shared cache for the evaluation pool
+**The tricky part is the upstream Service.** The real LiteLLM pods only carry `app: litellm`, the
+same label the proxy has. A Service that picks pods by that label would pick the proxy too, and
+the proxy would end up sending requests to itself. The prototype got around this with a label that
+only the current LiteLLM pods have (`pod-template-hash`), but that label changes whenever LiteLLM
+restarts with a new version. CI needs a fixed label on the LiteLLM pods (set through the chart)
+that the proxy doesn't have.
 
-The cache is shared across the pool's projects, not split per project. A hit requires the full
-normalized request to match, tool results included, so two projects whose fleets differ in a way
-that matters miss anyway; a per-project split only removes hits whose inputs were the same, and it
-multiplies the live runs needed to warm the cache after each prompt change by the pool size. The
-cache lives in an eval-owned bucket and is never shared with dev or customer installs, because
-recorded answers carry cluster details.
+**Side effects of sharing the `app: litellm` label.** The proxy also gets counted as a LiteLLM pod
+by LiteLLM's disruption budget, its pod spreading rule, its metrics scraping, and the console's
+metrics. The metrics matter most: those tools add up `/metrics` from every `app: litellm` pod. If
+the proxy forwarded `/metrics` to LiteLLM, one LiteLLM pod's numbers would be counted twice. So the
+proxy answers `/metrics` itself, with its own numbers or nothing.
 
-**Presubmits read it; only jobs running `main`'s tree write it.** A presubmit runs the pull
-request's tree, including `hack/ci-deploy.sh` and whatever pins the proxy, so code pinning cannot
-stop a presubmit holding write access from putting any answer under `main`'s keys, and every later
-pull request would be graded from it. That breaks the rule
-[`testing-strategy.md`](../../docs/designs/testing-strategy.md) §4.2 states for the evidence store
-(a pull request cannot move the baseline it is judged against), and the evidence store holds that
-rule structurally: the presubmit's identity has read access only. The cache does the same. The
-presubmit identity gets object read on the bucket and nothing else; the nightly and a post-merge
-job, which run `main`'s tree, are the only writers. The cost is freshness: after a prompt change
-merges, presubmits miss until the post-merge job has run the affected cases.
+### One shared cache for all eval projects
+
+CI runs evals in a small pool of GCP projects. We keep one cache for all of them instead of one per
+project.
+
+Splitting it by project wouldn't make replay any safer. A saved answer is only reused when the
+whole request matches, including every tool result. So if two projects really differ (different
+cluster versions, different planted problems), their requests differ and the cache misses anyway. A
+cache per project would only lose hits we could have had, and every time a prompt changes we'd have
+to refill it once per project instead of once.
+
+The cache lives in a storage bucket that only the eval projects use. It's never shared with dev
+installs or customer installs, because the saved answers contain details about our test clusters.
+
+**Pull requests can read the cache but never write to it.** The eval run on a pull request (the
+presubmit) uses that pull request's code, including the scripts that set up the proxy. If that run
+could write to the cache, a pull request could change those scripts and save any answer it wanted,
+and every pull request after it would be graded using those answers. The evidence store, where pass
+rates are kept, already has a rule against this in
+[`testing-strategy.md`](../../docs/designs/testing-strategy.md) §4.2: a pull request must not be able
+to change the baseline it's compared against. It enforces that by giving pull request runs
+read-only access, and the cache works the same way. Only the nightly run and a run after each merge
+to `main` can write to it, and both use `main`'s code.
+
+The downside: after a prompt change is merged, pull requests won't get cache hits until the
+after-merge run has refreshed the affected cases.
 
 ```mermaid
 flowchart LR
-    subgraph trusted["Jobs running main's tree"]
-        nightly["Nightly<br/>(records, never replays)"]
-        post["Post-merge job"]
+    subgraph trusted["Use main's code"]
+        nightly["Nightly run<br/>(saves answers, never replays)"]
+        post["After-merge run"]
     end
-    pre["Presubmit<br/>(the pull request's tree)"]
+    pre["Pull request run<br/>(uses the pull request's code)"]
     cache[("Shared replay cache<br/>eval-only bucket")]
-    shadow[("Shadow bucket<br/>stage 1 only, never served")]
-    nightly -- "write passing runs" --> cache
-    post -- "write passing runs" --> cache
+    shadow[("Shadow bucket<br/>stage 1 only, never replayed from")]
+    nightly -- "saves passing runs" --> cache
+    post -- "saves passing runs" --> cache
     cache -- "read only" --> pre
-    pre -. "stage 1: write, log would-hits" .-> shadow
+    pre -. "stage 1: saves, logs would-be hits" .-> shadow
 ```
 
-**The key includes what the request does not show.** Agents send the alias `model-default`; LiteLLM
-resolves the real model, `reasoning_effort` and thinking on its side, and rewrites requests through
-callback modules mounted beside it (the thinking-replay hook, redaction), so a pull request that
-changes any of those sends byte-identical requests. The chart already hashes all of it into the
-LiteLLM Deployment's `checksum/config` annotation; the key includes that checksum and the LiteLLM
-image. A fallback answer is never recorded. The chart's fallback alias is the same upstream model at a
-lower `reasoning_effort`, so the response body's `model` field is the same for both, but LiteLLM's
-response headers say which alias answered: `x-litellm-model-group` names it and
-`x-litellm-attempted-fallbacks` counts the fallbacks tried (per
-[the gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)). The proxy
-stores an answer only when the model group is the primary alias and no fallback was attempted;
-otherwise it passes the answer through unrecorded. The prototype did not read these headers, so
-this is unmeasured.
+**What goes into the cache key.** Agents don't ask for a specific model. They send the name
+`model-default`, and LiteLLM decides which model that means and how hard it thinks. LiteLLM also
+edits requests with a few plugins (for example, one that strips old thinking text). So a pull
+request that changes any of that sends exactly the same requests as before, and without extra care
+it would get answers from the old setup. To stop that, the key also includes LiteLLM's config
+fingerprint (the chart already keeps one, in the `checksum/config` annotation) and the LiteLLM image
+version.
 
-### Which recordings may be served
+**Backup-model answers are never saved.** LiteLLM can be set up with a backup it uses when the main
+model fails. The backup is the same model with less thinking, so the model name in the reply looks
+the same either way. But LiteLLM adds headers to each reply saying what happened:
+`x-litellm-model-group` says which setup answered, and `x-litellm-attempted-fallbacks` says whether
+it fell back (see [the gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)).
+The proxy only saves an answer when it came from the main setup with no fallback. Our prototype
+didn't check these headers, so this part hasn't been tested yet.
 
-Only recordings from runs that passed. A hit replays its recording's outcome, so one flaky failure
-in the cache would red every pull request on that prompt version until the prompt changes. With
-pass-only recordings a pull request that does not touch a case replays a pass, and one that does
-touches a request and is graded live. New entries are held per run and committed when the run's
-verdict is in.
+### Only save answers from runs that passed
 
-Ideally each repetition replays its own recording, with the repetition index in the key, so the
-three repetitions keep three samples rather than one served three times. That needs a run's
-requests to carry its identity, which they do not today (open questions). Without it, all three
-repetitions of a case replay the same recording. The measurements above were taken that way: one
-recording, served to three replays.
+A replayed answer leads to the same result as the run it came from. If we saved answers from a run
+that failed by bad luck, every pull request that hit those answers would fail too, until a prompt
+change cleared them. So we only keep answers from runs that passed. That way a pull request that
+doesn't touch a case replays a passing run, and a pull request that does touch it changes the
+requests and runs live. To do this, the proxy holds on to a run's new answers and only saves them
+once the run's result is known.
 
-### Prompt churn
+Each case runs three times on a pull request. Ideally each of those three would replay its own
+recording, so we still get three different samples instead of the same one three times. For that,
+the proxy needs to know which run a request belongs to, and today requests don't carry that (see
+open questions). Until then, all three runs of a case replay the same recording. That's also how
+our measurements were done: one recording, replayed three times.
 
-On weekdays 1–9 commits a day change system-prompt content (`SOUL.md`, profile `AGENTS.md`,
-profile config, skill descriptions), and each one misses every request of every profile it
-touches. A recording made only by the nightly would be stale for most presubmits, which is why a
-post-merge job writes too: the first merge after a prompt change pays for the live runs, and the
-presubmits after it hit. Whether that job runs every case or only those whose requests the merge
-changed is a cost question for shadow mode to answer; there were 150–290 presubmit builds a weekday
-in late October, cancelled ones included, so even a full post-merge run is amortised quickly.
+### Prompts change often
 
-### What stays live
+On weekdays, 1 to 9 commits a day change something that goes into the agents' system prompt
+(`SOUL.md`, a profile's `AGENTS.md` or config, or a skill's description). Each one makes every
+request from the affected agents miss. If only the nightly saved answers, the cache would be out of
+date for most of the day. That's why the after-merge run also saves: the first merge after a prompt
+change pays for running live, and the pull requests after it get hits. Whether that run should cover
+every case or only the ones the merge affected is something shadow mode will tell us. There were 150
+to 290 pull request eval runs a weekday in late October (including cancelled ones), so the
+after-merge cost is shared across a lot of runs.
 
-The nightly. It measures each case's true pass rate, which is what admission and the dashboard
-read, and replay would bias it towards the recordings.
+### The nightly stays live
+
+The nightly never replays. It's what measures each case's real pass rate, which the dashboard and
+the blocking roster rely on, and replay would make those numbers look better than they are.
 
 ## What changes for the gate
 
-Repetitions stop being independent where they replay. With pass-only recordings an untouched case
-passes on replay, so collapse (all three repetitions failing) can only come from the live part of a
-run. That is the intent for a pull request that did not cause the failure. These consequences need
-the eval crew's decision before stage 2 of the rollout below:
+When runs replay, the three runs of a case are no longer independent. And because we only save
+passing runs, a case a pull request didn't touch will pass on replay. So the "all three runs failed"
+rule can only be triggered by the parts of a run that ran live. That's what we want for a pull
+request that didn't cause the failure. But it raises three things the eval crew needs to decide
+before stage 2 of the rollout:
 
-- Every comparison against `main`'s baseline is skewed the same way. The aggregate rule compares a
-  pull request's pass rate with `main`'s from the evidence store, which the live nightly writes; it
-  is advisory until `EVAL_AGGREGATE_ARMED` is set, but it is what arming would make block. Rung 6
-  compares judged scores with the same baseline, and caching the judge (open questions) would add
-  to it. Replayed passes inflate the pull request's side of both. Either they count only
-  repetitions that went live before the case's first verifier-relevant call, or they read a
-  replayed baseline.
-- A case that is flaky on `main` stops showing its flakiness on unrelated pull requests. The nightly
-  still reports it.
-- Token accounting. A hit returns the recorded answer's `usage`, so the record's token counts, and
-  rung 3's check that a run billed a model call, behave as if the model ran. Splitting replayed
-  tokens from billed ones in the record needs the proxy's hit or miss to reach it, which goes
-  through the same run identity as attribution (open questions); until then the saving is read
-  from the proxy's own log, not the eval records.
+- **Comparisons with `main` get biased.** Two checks compare a pull request with `main`'s numbers
+  from the nightly: the overall pass rate (advisory for now, until `EVAL_AGGREGATE_ARMED` is set),
+  and rung 6, which compares judged scores. Replayed passes make the pull request look better in
+  both. One option is to count only runs that went live before the part of the case that gets
+  checked; another is to compare against a `main` baseline that was also replayed. Caching the judge
+  (open questions) would make this worse.
+- **Flaky cases look stable.** A case that's flaky on `main` stops showing its flakiness on unrelated
+  pull requests. The nightly still shows it.
+- **Token counts look like the model ran.** A replayed answer comes with the token counts from the
+  original run. So the eval record's token numbers, and rung 3's check that the run really called a
+  model, both act as if the model was called. To count replayed tokens separately, the proxy has to
+  tell the eval record which answers were replayed, and that needs the same "which run is this"
+  information as above. Until then, we read the savings from the proxy's own log.
 
 ## Rollout
 
-1. **Shadow mode.** The proxy records every presubmit's answers to a shadow bucket that nothing is
-   served from, checks whether each request would have hit, logs it with the recording's project and
-   whether a presubmit or a `main` job wrote it, and always calls the model. Only hits on
-   `main`-written entries count towards the design's hit rate; the rest show what the freshness
-   cost of read-only presubmits is. No verdict changes. A week of it gives the real hit rate under prompt
-   churn and project rotation, the token and cost saving per build, and the misses worth
-   normalizing. Cheap and reversible.
-2. **Replay on the presubmit**, after the eval crew settles the gate questions above and #1730
-   is fixed or the digest stripping is accepted.
-3. **Polling.** If shadow mode shows the fan-out `sleep` loop is where most remaining misses fall,
-   look at the poll, not the cache.
+1. **Shadow mode.** The proxy saves every pull request's answers into a separate bucket that's never
+   used for replay. For each request it checks whether it would have been a hit, writes that down
+   along with which project and which kind of job (pull request or `main`) saved the matching
+   answer, and then calls the model anyway. Only hits on answers saved by `main` jobs count, because
+   those are the only ones the real design would use; the rest show how much we lose by not letting
+   pull requests write. No pass or fail changes. After a week we'll know the real hit rate with real
+   prompt changes and project rotation, how many tokens and dollars it would save per build, and
+   which misses are worth fixing. It's cheap and easy to undo.
+2. **Turn on replay for pull requests**, once the eval crew has decided the three gate questions above
+   and #1730 is fixed (or they're happy with stripping the recent-work section from the key).
+3. **Look at polling.** If shadow mode shows most of the remaining misses come from the `sleep 60`
+   polling loop, fix the polling rather than the cache.
 
 ## Open questions
 
-- **How a run's entries are attributed.** Pass-only commit needs to know which cached entries a
-  run produced. Requests reach LiteLLM from several agents and concurrent cases with no run
-  identity. Candidates: carry a run tag from the inject message through the gateway and Hermes into
-  the request's `metadata`; or link entries by conversation, since each worker's first request
-  names its card, whose body the parent's recorded answer wrote.
-- **Whether the judge is cached.** On a fully replayed run the judge's input is identical too; the
-  judge is 11–19% of a run's time. Same key rules apply.
-- **Cache size and expiry.** Entries for a superseded prompt version are dead; expire by age.
+- **How does the proxy know which run a request belongs to?** We need this to save only passing runs
+  and to give each of the three runs its own recording. Requests from many agents and many cases
+  arrive at the same time with nothing saying which run they're from. Two ideas: pass a run tag from
+  the eval harness through the gateway and Hermes into each request's `metadata`, or link requests
+  together by conversation (each worker's first request names its card, and the card's text came
+  from the parent's recorded answer).
+- **Should the judge be cached too?** When a whole run is replayed, the judge gets exactly the same
+  input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
+- **How big does the cache get, and when do entries expire?** Answers recorded for an old version of
+  a prompt can never be hit again, so entries should expire by age.
