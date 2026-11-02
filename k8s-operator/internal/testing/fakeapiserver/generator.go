@@ -89,6 +89,7 @@ const (
 	podMemoryRequest      = "256Mi"
 	podCPULimit           = "1"
 	podMemoryLimit        = "512Mi"
+	podCacheSizeLimit     = "1Gi"
 	podPort               = 8080
 	podTerminationGrace   = 30
 	podPriority           = 0
@@ -470,6 +471,7 @@ func (g *Generator) Pod(i int) *corev1.Pod {
 	nonRoot := true
 	noEscalation := false
 	fsGroup := int64(podFSGroup)
+	cacheSizeLimit := resource.MustParse(podCacheSizeLimit)
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              name,
@@ -498,7 +500,7 @@ func (g *Generator) Pod(i int) *corev1.Pod {
 			Priority:                      &priority,
 			EnableServiceLinks:            &controller,
 			SecurityContext:               &corev1.PodSecurityContext{FSGroup: &fsGroup, SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
-			Volumes:                       []corev1.Volume{{Name: "cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
+			Volumes:                       []corev1.Volume{{Name: "cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &cacheSizeLimit}}}},
 			Containers: []corev1.Container{{
 				Name:            containerName,
 				Image:           g.image(i),
