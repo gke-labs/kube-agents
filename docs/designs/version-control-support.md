@@ -3454,7 +3454,8 @@ forge. On an install with none it is read from github.com with no credential,
 because github.com is not in that install's host table and a URL cannot name
 it, unless the install's own forge lists the name as managed or context; then
 it is read there, as `clone` reads it. The MCP role cannot call `snapshot`. The verb is reachable to the `shell` role;
-`capabilities` does not list it (`LIBRARY_VERBS`), because no `vcs.py` command runs it, and no skill calls it yet.
+`capabilities` does not list it (`LIBRARY_VERBS`), because no `vcs.py` command runs it.
+`fleet-upgrade-verification`'s `api_deprecation_scan.py` reads every repository through it.
 
 **Registered context repositories** are the one unmanaged read the install does
 grant a credential for. A repository under `context_repos` is read for declared intent and

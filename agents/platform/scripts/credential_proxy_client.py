@@ -66,6 +66,33 @@ MAX_KUBECONFIG_BYTES = 1 << 20
 # the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
 API_RELAY_PREFIX = "/v1/gcp/"
 
+# The exec tier's shared names, here for the same reason as the relay prefix:
+# the broker and the shim both spell them, and this is the module both import.
+# docs/designs/credential-broker-exec-tier.md §12 is the contract, and
+# test_exec_tier_contract.py checks that these match it.
+EXEC_ROLE = "exec"
+EXEC_URL_ENV = "CREDENTIAL_PROXY_EXEC_URL"
+EXEC_REPLICAS_FILE_ENV = "CREDENTIAL_PROXY_EXEC_REPLICAS_FILE"
+EXEC_REPLICAS_FILE = "/etc/credential-proxy-exec-tier/replicas"
+BUSY_BOUND_KEY = "bound"
+ADMISSION_BOUND_DRAINING = "draining"
+ADMISSION_BOUND_BACKGROUND = "background"
+# A busy answer under one of these bounds is retried once on a new connection;
+# another replica can admit it. The session cap is a caller's own limit, and
+# the others name no replica-local shortage.
+RETRYABLE_BUSY_BOUNDS = frozenset(
+    {"slot", "budget", ADMISSION_BOUND_BACKGROUND, ADMISSION_BOUND_DRAINING, "profile"}
+)
+CLASS_INTERACTIVE = "interactive"
+CLASS_BACKGROUND = "background"
+CLASS_LABEL = "class"
+BACKGROUND_NICE = 10
+BROKER_TIER_EXEC = "exec"
+BROKER_TIER_STATEFUL = "stateful"
+AUDIT_BROKER_TIER = "broker_tier"
+AUDIT_CLASS = "class"
+AUDIT_BROKER_POD = "broker_pod"
+
 # Where a `get-credentials` that named no destination leaves its file:
 # `$HERMES_HOME/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
 # the convention agents/platform/AGENTS.md ("Cluster Credentials") teaches and
@@ -797,6 +824,12 @@ def report_task_kubeconfig(generated: str) -> None:
 
 _GET_CREDENTIALS_WORDS = ("container", "clusters", "get-credentials")
 
+# gcloud's short flags that take a value: the single-dash members of
+# `command_policy._GCLOUD_FLAGS_WITH_VALUE`, which the shim can't import. A
+# test holds the two equal, so a short valued flag added there fails it.
+_GCLOUD_SHORT_FLAGS_WITH_VALUE = frozenset({"-z"})
+_GCLOUD_RELEASE_TRACKS = frozenset({"alpha", "beta"})
+
 
 def is_get_credentials(argv: list[str]) -> bool:
     """Is this the one command that legitimately authors a kubeconfig?
@@ -804,9 +837,10 @@ def is_get_credentials(argv: list[str]) -> bool:
     Read the way the broker reads it: the command words past gcloud's flags, so
     a flag between the words (`container clusters --location l get-credentials`)
     is the same command. The shim can't import the broker's policy, so this walk
-    doesn't know every flag's arity. A bare `--flag` takes the next token as its
-    value unless that token is one of the command words, and none of the three
-    is a plausible flag value.
+    doesn't know every flag's arity. A short valued flag (`-z`) always takes the
+    next token. A bare `--flag` takes the next token as its value unless that
+    token is one of the command words, and none of the three is a plausible
+    flag value.
     """
     if not argv or argv[0] != "gcloud":
         return False
@@ -816,7 +850,15 @@ def is_get_credentials(argv: list[str]) -> bool:
         token = argv[index]
         if token == "--":
             break
+        if token in _GCLOUD_SHORT_FLAGS_WITH_VALUE:
+            index += 2
+            continue
         if token.startswith("-"):
+            # Known and harmless: a bare `--flag` never takes one of the three
+            # command words as its value, so `clusters --format get-credentials
+            # list` is get-credentials here but not to the broker, which knows
+            # `--format` takes a value. The shim then asks for a file the broker
+            # doesn't send and nothing lands. The parity test lists it.
             if (
                 token.startswith("--")
                 and "=" not in token
@@ -829,7 +871,7 @@ def is_get_credentials(argv: list[str]) -> bool:
             continue
         words.append(token)
         index += 1
-    if words[:1] and words[0] in ("alpha", "beta"):
+    if words[:1] and words[0] in _GCLOUD_RELEASE_TRACKS:
         words = words[1:]
     return words[:3] == list(_GET_CREDENTIALS_WORDS)
 

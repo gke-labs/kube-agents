@@ -33,7 +33,8 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS="${CLOUDSDK_CORE_DISABLE_PROMPTS:-1}"
 # gives up after the budget so a day-long outage does not hold the runner.
 # Both knobs are environment overrides so a test runs with no wait. Any
 # failure that is not this message returns as it is. The caller's
-# timeout-minutes in deploy-environment.yml is sized to this budget.
+# timeout-minutes in deploy-environment.yml is sized to this budget and to
+# teardown_common.sh's second run of a failed uninstall.sh.
 readonly PROVISION_STOCKOUT_PATTERN='does not have enough resources available to fulfill request|ZONE_RESOURCE_POOL_EXHAUSTED'
 PROVISION_STOCKOUT_ATTEMPTS="${PROVISION_STOCKOUT_ATTEMPTS:-3}"
 PROVISION_STOCKOUT_WAIT_SECONDS="${PROVISION_STOCKOUT_WAIT_SECONDS:-600}"
@@ -41,16 +42,9 @@ PROVISION_STOCKOUT_WAIT_SECONDS="${PROVISION_STOCKOUT_WAIT_SECONDS:-600}"
 # below exit 2, which an if reads as false, and the loop would retry until
 # the job timeout; a value past six digits does the same, because `[` calls it
 # not an integer; and a leading zero is octal to the arithmetic below, where
-# 09 is an error that abandons the loop and 0600 reads as 384.
-for _knob in PROVISION_STOCKOUT_ATTEMPTS PROVISION_STOCKOUT_WAIT_SECONDS; do
-  case "${!_knob}" in
-    "" | *[!0-9]* | 0?* | ???????*)
-      echo "::error title=${_knob} is not a plain decimal::${_knob}='${!_knob}' must be a whole number of at most six digits with no leading zero." >&2
-      exit 1
-      ;;
-  esac
-done
-unset _knob
+# 09 is an error that abandons the loop and 0600 reads as 384. The check is
+# teardown_common.sh's, shared with the teardown knobs.
+teardown_require_plain_decimal PROVISION_STOCKOUT_ATTEMPTS PROVISION_STOCKOUT_WAIT_SECONDS
 
 # Verify required GCP/GKE inputs before executing any destructive teardown.
 teardown_require_inputs
