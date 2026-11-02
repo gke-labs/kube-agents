@@ -115,6 +115,7 @@ const (
 	a2aRuntimeStateBucket  = "runtime-state"
 	a2aSessionStateBucket  = "session-state"
 	a2aFeedbackBucket      = "feedback"
+	a2aPeopleBucket        = "people"
 	a2aKVStreamPrefix      = "KV_"
 
 	// a2aProfileSubmitStream holds the profiles' submissions, every subject
@@ -1630,10 +1631,10 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 // than as seed, and provisionIdentity enumerates the same objects for itself
 // rather than from this slice. So the refusal the pair describes is provision's
 // to hit now; seed keeps the scoped grant because the hand-applied seed tooling
-// still connects with it. Nothing yet binds that third spelling to this list.
+// still connects with it. The same test holds that third spelling to this list.
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
-	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback",
+	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people",
 	"KV_PROFILE_LEASES", "PROFILE_SUBMITS",
 }
 
@@ -1899,6 +1900,12 @@ func a2aAgentJetStreamGrants() []string {
 //     reads, and the watcher's CONSUMER.CREATE and CONSUMER.DELETE for the
 //     export's key list. Put and Delete are publishes on $KV.feedback.>.
 //
+//   - KV_people, one hashed key per chat person (a2a/gateway/people.go): the
+//     same four verbs -- STREAM.INFO to bind it and read its max age at
+//     start, DIRECT.GET for a key's read, and the watcher's CONSUMER.CREATE
+//     and CONSUMER.DELETE for the desk's watch and the purge's key list. Put
+//     and Delete are publishes on $KV.people.>.
+//
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
 // --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
@@ -1980,6 +1987,7 @@ func a2aAgentJetStreamGrants() []string {
 func a2aGatewayJetStreamGrants() []string {
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
 	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
+	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
@@ -1993,6 +2001,10 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + kvFeedback + ".>",
 		"$JS.API.CONSUMER.CREATE." + kvFeedback + ".>",
 		"$JS.API.CONSUMER.DELETE." + kvFeedback + ".*",
+		"$JS.API.STREAM.INFO." + kvPeople,
+		"$JS.API.DIRECT.GET." + kvPeople + ".>",
+		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>",
+		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*",
 	}
 }
 
@@ -2825,7 +2837,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 	}}
 }
 
-// a2aProvisionScript is the provisioning payload: the five streams, five KV
+// a2aProvisionScript is the provisioning payload: the five streams, six KV
 // buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
@@ -3136,6 +3148,14 @@ $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --re
 # at their caps (ask, answer and note, about 22KB) and more at a typical
 # size; past it the write is refused, and the rating is counted but not kept.
 $NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas=1 --storage=file --max-bucket-size=67108864 --ttl=720h
+
+# people: one hashed key and a last-put time per chat person the gateway has
+# seen (a2a/gateway/people.go). The max age is the retention: NATS deletes a
+# person 30 days after their last turn, and the gateway counts nobody in a
+# bucket without one. Only the gateway's user reads or writes its records
+# (provision and seed can list its keys). 32MiB holds about a hundred thousand
+# entries; past it the put is refused, and the count under-counts.
+$NATS kv info people        >/dev/null 2>&1 || $NATS kv add people --history=1 --replicas=1 --storage=file --max-bucket-size=33554432 --ttl=720h
 # PROFILE_LEASES: each profile task's liveness lease, written only by the
 # dispatcher (lib.ProfileLeaseBucket; contract on #3655). No TTL: the
 # dispatcher reads expiry from each record, so a restarted one can still read

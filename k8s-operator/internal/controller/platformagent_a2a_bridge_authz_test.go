@@ -249,11 +249,17 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 			t.Fatalf("provision bucket %s as seed: %v", bucket, err)
 		}
 	}
-	// `nats kv add feedback --ttl=720h`: the one bucket with a max age.
+	// `nats kv add feedback --ttl=720h` and `nats kv add people --ttl=720h`:
+	// the two buckets with a max age.
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket: "feedback", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 67108864, TTL: 720 * time.Hour,
 	}); err != nil {
 		t.Fatalf("provision bucket feedback as seed: %v", err)
+	}
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "people", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 33554432, TTL: 720 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket people as seed: %v", err)
 	}
 	// `nats kv add PROFILE_LEASES`: the dispatcher's leases, no TTL.
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
