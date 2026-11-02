@@ -183,7 +183,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: "KUBE_PROXY_REDACT_SECRETS", Value: "true"},
 		{Name: "KUBE_PROXY_DEFAULT_CLUSTER", Value: defaultCluster},
 		{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
-		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent, false)},
+		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent, brokerCallerOwnership{})},
 		{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 	}
