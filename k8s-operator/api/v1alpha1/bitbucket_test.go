@@ -74,8 +74,12 @@ func TestBothBitbucketProvidersAreAvailable(t *testing.T) {
 	if paths := problemPaths(resolved); len(paths) != 0 {
 		t.Errorf("Problems() = %v, expected none", paths)
 	}
-	if forges := resolved.BrokerForges("/t", "/c"); len(forges) != 2 {
-		t.Errorf("BrokerForges() = %+v, expected one entry for each forge", forges)
+	names := map[string]bool{}
+	for _, forge := range resolved.BrokerForges("/t", "/c") {
+		names[forge.Name] = true
+	}
+	if !names["bb"] || !names["dc"] {
+		t.Errorf("BrokerForges() names %v, expected an entry for each Bitbucket forge", names)
 	}
 	egress := strings.Join(ForgeEgressPatterns(spec), ",")
 	for _, host := range []string{"bitbucket.org", "bitbucket.example.com"} {

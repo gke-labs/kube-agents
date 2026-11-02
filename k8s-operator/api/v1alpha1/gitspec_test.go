@@ -715,8 +715,8 @@ func TestProblemsNameTheFieldAtFault(t *testing.T) {
 			Repositories: []RepositorySpec{repo("github", "git@gitlab.com:group/project.git", RepositoryRoleManaged)}},
 			want: []string{"repositories[0].repository"}},
 		{name: "unregistered provider", spec: &IntegrationSpec{
-			Forges:       []ForgeSpec{{Name: "gt", Provider: "gitea"}},
-			Repositories: []RepositorySpec{repo("gt", "group/project", RepositoryRoleGitOps)}},
+			Forges:       []ForgeSpec{{Name: "gg", Provider: "gogs"}},
+			Repositories: []RepositorySpec{repo("gg", "group/project", RepositoryRoleGitOps)}},
 			want: []string{"forges[0].provider"}},
 		{name: "gitlab without credentials", spec: &IntegrationSpec{
 			Forges:       []ForgeSpec{{Name: "gl", Provider: "gitlab"}},
@@ -1018,9 +1018,7 @@ func TestForgeEgressPatternsNeverDropGitHub(t *testing.T) {
 			Forges: []ForgeSpec{ghForge("github", "gke-labs")},
 			GitHub: &GitHubSpec{GitRepo: "other/repo"},
 		},
-		"unregistered provider": {Forges: []ForgeSpec{{Name: "gt", Provider: "gitea"}}},
-		"provider refused in this release": {Forges: []ForgeSpec{{Name: "bb", Provider: "bitbucket",
-			Namespace: "acme", CredentialsRef: &ForgeCredentialsRef{Name: "bb-token"}}}},
+		"unregistered provider": {Forges: []ForgeSpec{{Name: "gg", Provider: "gogs"}}},
 		"gitlab with no credentials": {Forges: []ForgeSpec{{Name: "gl", Provider: "gitlab"}}},
 		"host github does not serve": {Forges: []ForgeSpec{{Name: "gh", Host: "registry.gitlab.com"}}},
 		"github's own service host":  {Forges: []ForgeSpec{{Name: "gh", Host: "acme.ghe.com"}}},

@@ -570,14 +570,14 @@ class ChartGitIntegrationTest(unittest.TestCase):
         """The CRD's enum would reject it at apply; the chart names the values
         key while the administrator is still looking at their values file."""
         result = _render(
-            _CR_TEMPLATE, *_forge(0, name="gitea", provider="gitea")
+            _CR_TEMPLATE, *_forge(0, name="gogs", provider="gogs")
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(f"{_P}forges[0].provider", result.stderr)
 
-    def test_a_bitbucket_provider_fails_the_render_in_this_release(self):
-        """The operator refuses both Bitbucket providers in this release, so
-        the chart does not render them either."""
+    def test_a_bitbucket_provider_fails_the_render_until_the_chart_has_its_rules(self):
+        """The chart does not render a Bitbucket forge yet: one is declared on
+        the PlatformAgent resource until the chart learns the providers' rules."""
         for provider in ("bitbucket", "bitbucket-datacenter"):
             with self.subTest(provider=provider):
                 result = _render(
