@@ -45,11 +45,18 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
+      # The absence in the words a reply uses: "isn't" and "aren't" beside
+      # "not"; "resource types" and "containercluster" beside "crds"; "none of
+      # the clusters has Config Connector installed"; and a parenthetical that
+      # holds the CRD's dotted domain inside a span, which a period outside
+      # one still ends. bench/tests/test_kcc_stop_patterns.py pins the shapes
+      # the nightly answers wrote and the prose that must not pass.
       any_of_patterns:
-        - '\bconfig connector\b[^.\n]{0,80}\b(?:not installed|is not available|is not set up|missing|no crds?)\b'
+        - '\bconfig connector\b[^.\n]*?(?:\([^)\n]*\))?[^.\n]{0,80}?\b(?:not installed|(?:is|are)n''t installed|is not available|is not set up|missing|no crds?)\b'
         - '\b(?:lacks?|without|missing)\b[^.\n]{0,80}\bconfig connector\b[^.\n]{0,20}\b(?:crds?|installed|installation|controller)\b'
-        - '\bno (?:config connector|kcc|cnrm)\b[^.\n]{0,40}\bcrds?\b'
-        - '\bcrds?\b[^.\n]{0,60}\b(?:not installed|not found|missing)\b'
+        - '\bno (?:config connector|kcc|cnrm)\b[^.\n]{0,40}\b(?:crds?|resource types?|containerclusters?)\b'
+        - '\b(?:crds?|resource types?|containerclusters?)\b[^.\n]*?(?:\([^)\n]*\))?[^.\n]{0,60}?\b(?:not installed|(?:is|are)n''t (?:installed|there|present)|not found|missing)\b'
+        - '\bnone of\b[^.\n]*?(?:\([^)\n]*\))?[^.\n]{0,60}?\b(?:has|have|runs?)\b[^.\n]{0,20}\b(?:config connector|kcc|cnrm|containerclusters?)\b'
   # The same direct-create objective as provisioning-cluster-request-never-creates.
   - name: no-worker-ran-a-gcloud-cluster-create
     role: objective
