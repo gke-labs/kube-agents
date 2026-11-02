@@ -23424,6 +23424,21 @@ metadata:
         self.assertEqual(self.disclose([finding], kcc_manifest()), ["pool"])
         self.assertEqual(finding["remediation"]["note"], "Spread the pool.")
 
+    def test_the_cycle_guard_ends_a_chain_that_waits_on_itself(self):
+        """A waits on B and B waits on A: the chain ends."""
+        a = audit_report.KccStall("PubSubTopic", "infra", "a", "DependencyNotReady: reference PubSubTopic infra/b is not ready", "", "", "h")
+        b = audit_report.KccStall("PubSubTopic", "infra", "b", "DependencyNotReady: reference PubSubTopic infra/a is not ready", "", "", "h")
+        self.assertEqual(audit_report._kcc_dependencies(a, [a, b]), [b])
+        # A waits on B, B on C, and C on B: a cycle that does not pass
+        # through A still ends.
+        b2 = b._replace(why="DependencyNotReady: reference PubSubTopic infra/c is not ready")
+        c = audit_report.KccStall("PubSubTopic", "infra", "c", "DependencyNotReady: reference PubSubTopic infra/b is not ready", "", "", "h")
+        self.assertEqual(audit_report._kcc_dependencies(a, [a, b2, c]), [b2, c])
+
+    def test_a_fix_path_outside_the_repository_declares_nothing(self):
+        finding = kcc_finding(path="../../x.yaml")
+        self.assertEqual(audit_report._remediation_file_index(finding, self.root), {})
+
     def test_the_copied_constants_equal_the_collectors(self):
         """audit_report.py does not import the collectors, so it copies two of
         kcc_health.py's constants; this holds the copies equal."""
