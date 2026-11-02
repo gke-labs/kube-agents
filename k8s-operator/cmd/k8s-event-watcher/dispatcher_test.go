@@ -1890,13 +1890,15 @@ func TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen(t *testing.T) {
 	}
 }
 
-// TestWorkloadOfFoldsLikeTheDaemon pins the suppressed counter's workload
-// label to the daemon's own fold (_fold_key): a Deployment's pod on its
-// Deployment, a non-Pod object on its own name, and every other pod (a
+// TestWorkloadOfKeepsOnlyNamedWorkloads pins the suppressed counter's
+// workload label: a Deployment's pod on its Deployment (the daemon's
+// _fold_key), a Deployment, StatefulSet, DaemonSet or CronJob on its own name,
+// and everything else on the empty string: a pod that does not fold (a
 // StatefulSet ordinal, a Job's or CronJob run's pod, a DaemonSet's or a bare
-// pod) on the empty string, so a pod name that changes every run never mints
-// a counter child of its own.
-func TestWorkloadOfFoldsLikeTheDaemon(t *testing.T) {
+// pod) and a kind whose names are minted per instance (a Node, a ReplicaSet,
+// a Job), so no name that changes per run, rollout or node mints a counter
+// child of its own.
+func TestWorkloadOfKeepsOnlyNamedWorkloads(t *testing.T) {
 	for _, tc := range []struct {
 		kind, name, want string
 	}{
@@ -1908,8 +1910,16 @@ func TestWorkloadOfFoldsLikeTheDaemon(t *testing.T) {
 		{"Pod", "db-migrate-20261021-abcde", ""},
 		{"Pod", "node-exporter-x7k2p", ""},
 		{"Pod", "bare", ""},
-		{"Deployment", "api-5b8c7d9f6-abcde", "api-5b8c7d9f6-abcde"},
-		{"Node", "gke-pool-1-abc", "gke-pool-1-abc"},
+		{"Deployment", "api", "api"},
+		{"deployment", "api", "api"},
+		{"StatefulSet", "web", "web"},
+		{"DaemonSet", "node-exporter", "node-exporter"},
+		{"CronJob", "backup", "backup"},
+		{"Node", "gk3-robot-host-pool-1-8f3a2b1c-x7k2", ""},
+		{"Node", "gk3-robot-host-pool-1-8f3a2b1c-m3q8", ""},
+		{"ReplicaSet", "api-5b8c7d9f6", ""},
+		{"Job", "backup-29312345", ""},
+		{"HorizontalPodAutoscaler", "api", ""},
 	} {
 		if got := workloadOf(TriageEvent{KindOfObject: tc.kind, Name: tc.name}); got != tc.want {
 			t.Errorf("workloadOf(%s %s) = %q; want %q", tc.kind, tc.name, got, tc.want)

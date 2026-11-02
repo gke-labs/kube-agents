@@ -102,6 +102,21 @@ const (
 	followupOutcomeError    = "error"
 )
 
+// namedWorkloadKinds are the non-Pod kinds whose object name workloadOf keeps
+// for the suppressed counter's workload label: the ones an operator names once
+// and that outlive a rollout, a run or a node. Every other kind gets the
+// empty string, because its names are minted per instance and would each be
+// a counter child that lives until the process restarts: a Node on an
+// autoscaled or Autopilot cluster (NodeNotReady and FailedToDrainNode are on
+// the shipped --reason lists), a ReplicaSet per rollout, a Job per CronJob
+// run, and any kind a --reason an operator adds brings in.
+var namedWorkloadKinds = map[string]struct{}{
+	"deployment":  {},
+	"statefulset": {},
+	"daemonset":   {},
+	"cronjob":     {},
+}
+
 // flags holds the CLI-based configurations parsed once during startup.
 type flags struct {
 	daemonURL         string
@@ -708,19 +723,27 @@ func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
 var podTemplateHashPodPattern = regexp.MustCompile(`^(.*?)-[4-9bcdf]{8,10}-[a-z0-9]{5}$`)
 
 // workloadOf names the workload an event belongs to for the suppressed
-// counter, the daemon's own fold key (_fold_key): a Deployment's pod on its
-// Deployment, a non-Pod object on its own name, and the empty string for any
-// other pod. A StatefulSet's ordinal, a Job's or a CronJob run's pod, a
-// DaemonSet's or a bare pod does not fold, and naming it would mint a counter
-// child per pod: a CronJob failing through a hold is a new pod name, and a
-// new child, per run, on a vector whose children live until the process
-// restarts. Empty, those pods share the {namespace,kind} child, so the label's
-// distinct values are bounded by the Deployments and non-Pod objects held,
-// as the daemon's are. The watcher sets no controller reference on its events
-// (watcher.go), so the pod name is what there is to fold.
+// counter: a Deployment's pod on its Deployment, through the daemon's own
+// fold (_fold_key), a Deployment, StatefulSet, DaemonSet or CronJob on its
+// own name (namedWorkloadKinds), and the empty string for everything else.
+// The label is the one place in the watcher an object name becomes a series,
+// on a vector whose children live until the process restarts, so only a name
+// that is one workload's for the process's life is kept: a StatefulSet's
+// ordinal, a Job's or a CronJob run's pod, a DaemonSet's or a bare pod does
+// not fold and is a new name per run or per restart, and a Node, ReplicaSet
+// or Job is a new name per node, rollout or run. Empty, those share the
+// {namespace,kind} child, so the label's distinct values are bounded by the
+// named workloads held, whoever creates objects on the watched cluster. The
+// daemon keys every non-Pod object by its exact name because its row is a
+// database row, not a series; the label departs from it there and nowhere
+// else. The watcher sets no controller reference on its events (watcher.go),
+// so the name is what there is to fold.
 func workloadOf(ev TriageEvent) string {
 	if !strings.EqualFold(ev.KindOfObject, kindPod) {
-		return ev.Name
+		if _, ok := namedWorkloadKinds[strings.ToLower(ev.KindOfObject)]; ok {
+			return ev.Name
+		}
+		return ""
 	}
 	if m := podTemplateHashPodPattern.FindStringSubmatch(ev.Name); m != nil {
 		return m[1]
