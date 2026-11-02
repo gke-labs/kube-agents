@@ -5120,6 +5120,14 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// changes which cards the front door files and nothing else: the pull
 		// request still goes through submit-suggestion and a human merges it.
 		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
+
+		// Seconds the kanban dispatcher holds its effective cap at one worker
+		// after a pressure signal, and between the steps that climb it back
+		// (KANBAN_AIMD_COOLDOWN_SECONDS in hermes_cli/kanban_aimd.py, the
+		// dispatcher patch). Parsed as a number, and a value that is not finite
+		// and positive falls back to the 60 s default with a warning, so it
+		// bounds how long a step-down lasts and reaches nothing else.
+		"KANBAN_AIMD_COOLDOWN_SECONDS": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

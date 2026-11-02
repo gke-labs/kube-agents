@@ -1478,6 +1478,16 @@ func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesKanbanCooldown(t *testing.T) {
+	// The kanban dispatcher reads the cooldown from the agent container's
+	// environment; off the allowlist, the documented spec.deployment.env
+	// entry never reaches it and the gateway keeps the default with no log line.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "KANBAN_AIMD_COOLDOWN_SECONDS", Value: "120"}})
+	if len(got) != 1 || got[0].Name != "KANBAN_AIMD_COOLDOWN_SECONDS" || got[0].Value != "120" {
+		t.Errorf("expected KANBAN_AIMD_COOLDOWN_SECONDS=120 to pass, got %#v", got)
+	}
+}
+
 func TestBuildCredentialProxyContainer(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
