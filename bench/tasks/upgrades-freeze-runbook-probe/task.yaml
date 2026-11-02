@@ -48,9 +48,10 @@ verification_spec:
       # (gcloud takes flags on either side of the cluster name), walking only
       # argument-shaped tokens with no `--master` and no next `gcloud` between
       # them. Tokens are separated by a space or by a shell line continuation
-      # (a backslash, the line break, the next line's indent), because the
-      # verifier matches patterns line by line and a runbook writes one flag
-      # per line. Prose that names `clusters upgrade` without the `gcloud`
+      # (a backslash, the line break, the next line's indent): the verifier
+      # searches the report with its line breaks kept, so a space in the
+      # pattern does not cross one, and a runbook writes one flag per line.
+      # Prose that names `clusters upgrade` without the `gcloud`
       # head, a sentence whose words carry `:`, `;` or `,`, or a flag on the
       # next line with no backslash does not open or extend the match;
       # bench/tests/test_upgrades_freeze_runbook_pattern.py pins all three.

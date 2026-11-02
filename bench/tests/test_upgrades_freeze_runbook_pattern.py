@@ -1,13 +1,14 @@
 """upgrades-freeze-runbook-probe's node-pool check matches the command, not prose about it.
 
-The report_contains verifier runs ``re.search`` over ``_normalize_lines``: the
-report lowercased and whitespace-collapsed line by line, newlines kept. A
+The report_contains verifier runs ``re.search`` over ``pattern_surface``: the
+report lowercased and whitespace-collapsed line by line, line breaks kept. A
 sentence naming ``clusters upgrade`` and ``--node-pool`` looks like a command
 unless the pattern insists on the ``gcloud`` head and on argument-shaped
 tokens between the head and the flag; and a runbook that writes one flag per
 line behind a backslash is one command, so the pattern walks a shell line
 continuation as a token separator. These tests run the pattern on the surface
-the verifier uses, not on the flattened text, where a continuation is a space.
+the verifier uses, not on the flattened text, where a continuation becomes a
+backslash token and a space and any pattern crosses it.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from kube_agents_bench.verifiers import _normalize_lines
+from kube_agents_bench.verifiers import pattern_surface
 
 TASK = Path(__file__).resolve().parent.parent / "tasks" / "upgrades-freeze-runbook-probe" / "task.yaml"
 CHECK = "the-runbook-uses-clusters-upgrade-node-pool"
@@ -26,7 +27,7 @@ CHECK = "the-runbook-uses-clusters-upgrade-node-pool"
 def _matches(report: str) -> bool:
     doc = yaml.safe_load(TASK.read_text())
     (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
-    return any(re.search(p, _normalize_lines(report)) for p in check["check"]["any_of_patterns"])
+    return any(re.search(p, pattern_surface(report)) for p in check["check"]["any_of_patterns"])
 
 
 def test_node_pool_upgrade_commands_match():
