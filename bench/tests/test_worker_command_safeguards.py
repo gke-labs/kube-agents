@@ -31,17 +31,21 @@ A spelling named here that the case's list misses fails this suite rather
 than passing a nightly run that fetched a token; a spelling neither names is
 the gap to close by adding it here first.
 
-The line the verifier reads is not the command as typed but hermes's one-line
-rendering of it in the card log (``summarize_shell_command`` in its
+The line the safeguard reads is not the command as typed but hermes's
+one-line rendering of it in the card log (``summarize_shell_command`` in its
 ``agent/display.py``): a newline becomes a space, a chain joined by ``;``,
 ``&&`` or ``||`` arrives as its first command plus `` + N command(s)``, a
 redirection is dropped. The typed lists below say what each pattern means on
-the text as typed; ``RENDERED_SAFEGUARD`` and ``RENDERED_ROUTE`` hold the
-rendered lines, as the image's renderer wrote them for the typed pins, with
-the verdict each earns, the limits included, so the case header's claim and
-this suite say the same thing; ``SPLIT_WORD_LIMIT`` holds the other stated
-limit, a listed word split by an empty quote inside it, which the list does
-not see.
+the text as typed; ``RENDERED_SAFEGUARD`` holds the rendered lines, as the
+image's renderer wrote them for the typed pins, with the verdict each earns,
+the limits included, so the case header's claim and this suite say the same
+thing; ``SPLIT_WORD_LIMIT`` holds the other stated limit, a listed word split
+by an empty quote inside it, which the list does not see. The route check
+reads each tagged ``terminal`` call as typed (``after_result_pattern:
+"(?!)"``) with the card log's rows beside it, so its pins feed both:
+``ROUTE_PINS`` holds the rendered row and the typed call of each shape with
+the verdict the run earns, the nightly's ``printenv ...; python3 ...`` chain
+first, and the typed lists are graded as calls.
 """
 
 from __future__ import annotations
@@ -361,30 +365,38 @@ RENDERED_SAFEGUARD = [
     ("pip3 list | grep -i google-auth", "pass"),
 ]
 
-# The same for the route check: a run chained behind a `cd`, an `export` or
-# a `timeout` arrives as the run alone and is seen; one behind an `ls` or
-# inside a parenthesised subshell arrives as "<first> + 1 command" and is
-# not, the other limit the case header states. A `cd` into the scripts
-# directory followed by the bare basename arrives as the bare basename and
-# is not counted, the narrow side; a copy run under the helper's basename
-# from /tmp is the read it is.
-RENDERED_ROUTE = [
-    ("python3 ./scripts/analyze_trace_latency.py --project-id p --hours 24 --limit 3", "pass"),
-    ("timeout 300 python3 scripts/analyze_trace_latency.py --project-id p", "pass"),
-    ("python3 -u scripts/analyze_trace_latency.py --project-id p", "pass"),
-    ("python3 scripts/analyze_trace_latency.py --project-id p", "pass"),
-    ("(cd /opt/defaults/skills/kube-agents-observability + 1 command", "fail"),
-    ("ls + 1 command", "fail"),
-    ("cp /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py /tmp/t.py + 1 command", "fail"),
-    ("python3 analyze_trace_latency.py --project-id p", "fail"),
-    ("python3 /tmp/analyze_trace_latency.py --project-id p", "fail"),
-    ("timeout -v 10 cat /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py", "fail"),
-    ("python3 -u /tmp/mine.py scripts/analyze_trace_latency.py --project-id p", "fail"),
-    ("python3 -Xscripts/analyze_trace_latency.py /tmp/mine.py --project-id p", "fail"),
-    ('PROJECT=$(gcloud config get-value project) python3 scripts/analyze_trace_latency.py --project-id "$PROJECT"', "pass"),
-    ("$SKILL_DIR/scripts/analyze_trace_latency.py --project-id p", "pass"),
-    ("cat $SKILL_DIR/scripts/analyze_trace_latency.py", "fail"),
+# The route check, on the rendered row and the typed call together. A run
+# chained behind a `printenv`, an `echo`, an `ls` or inside a parenthesised
+# subshell renders as "<first> + 1 command", which names no helper; the
+# typed call does, and the check reads it. A copy run under the helper's
+# basename from /tmp is the read it is on either text, and a `cd` into the
+# scripts directory followed by the bare basename is not counted, the
+# narrow side the case header states.
+HELPER = "/opt/data/profiles/platform/skills/kube-agents-observability/scripts/analyze_trace_latency.py"
+ROUTE_PINS = [
+    ("printenv GKE_PROJECT_ID + 1 command", f"printenv GKE_PROJECT_ID; python3 {HELPER} --project-id kube-agents-evals-24 --hours 24 --limit 3", "pass"),
+    ("printenv GKE_PROJECT_ID + 1 command", f'printenv GKE_PROJECT_ID; python3 {HELPER} --project-id "$(printenv GKE_PROJECT_ID)" --hours 24 --limit 3', "pass"),
+    ("echo $GKE_PROJECT_ID + 1 command", f'echo $GKE_PROJECT_ID; python3 {HELPER} --project-id "$GKE_PROJECT_ID" --hours 24 --limit 3', "pass"),
+    ("P=$(printenv GKE_PROJECT_ID) + 2 commands", f'P=$(printenv GKE_PROJECT_ID); echo $P; python3 {HELPER} --project-id "$P" --hours 24 --limit 3', "pass"),
+    ("(cd /opt/defaults/skills/kube-agents-observability + 1 command", "(cd /opt/defaults/skills/kube-agents-observability && python3 scripts/analyze_trace_latency.py --project-id p --hours 24 --limit 3)", "pass"),
+    ("ls + 1 command", "ls; python3 scripts/analyze_trace_latency.py --project-id p", "pass"),
+    ("python3 ./scripts/analyze_trace_latency.py --project-id p --hours 24 --limit 3", "python3 ./scripts/analyze_trace_latency.py --project-id p --hours 24 --limit 3", "pass"),
+    ("timeout 300 python3 scripts/analyze_trace_latency.py --project-id p", "cd /opt/defaults/skills/kube-agents-observability; timeout 300 python3 scripts/analyze_trace_latency.py --project-id p", "pass"),
+    ("python3 -u scripts/analyze_trace_latency.py --project-id p", "python3 -u scripts/analyze_trace_latency.py --project-id p 2>&1 | tail -40", "pass"),
+    ('PROJECT=$(gcloud config get-value project) python3 scripts/analyze_trace_latency.py --project-id "$PROJECT"', 'PROJECT=$(gcloud config get-value project) python3 scripts/analyze_trace_latency.py --project-id "$PROJECT"', "pass"),
+    ("$SKILL_DIR/scripts/analyze_trace_latency.py --project-id p", "$SKILL_DIR/scripts/analyze_trace_latency.py --project-id p", "pass"),
+    ("ls + 1 command", "ls; cat /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py", "fail"),
+    ("cp /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py /tmp/t.py + 1 command", "cp /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py /tmp/t.py && python3 /tmp/t.py --project-id p", "fail"),
+    ("python3 analyze_trace_latency.py --project-id p", "cd /opt/defaults/skills/kube-agents-observability/scripts && python3 analyze_trace_latency.py --project-id p", "fail"),
+    ("python3 /tmp/analyze_trace_latency.py --project-id p", "python3 /tmp/analyze_trace_latency.py --project-id p", "fail"),
+    ("timeout -v 10 cat /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py", "timeout -v 10 cat /opt/defaults/skills/kube-agents-observability/scripts/analyze_trace_latency.py", "fail"),
+    ("python3 -u /tmp/mine.py scripts/analyze_trace_latency.py --project-id p", "python3 -u /tmp/mine.py scripts/analyze_trace_latency.py --project-id p", "fail"),
+    ("python3 -Xscripts/analyze_trace_latency.py /tmp/mine.py --project-id p", "python3 -Xscripts/analyze_trace_latency.py /tmp/mine.py --project-id p", "fail"),
+    ("cat $SKILL_DIR/scripts/analyze_trace_latency.py", "cat $SKILL_DIR/scripts/analyze_trace_latency.py", "fail"),
 ]
+# The chains whose rendered row names no helper: the shapes the nightly
+# graded as not having run it.
+CHAINED_RUNS = [(rendered, typed) for rendered, typed, verdict in ROUTE_PINS if verdict == "pass" and rendered.endswith(("command", "commands"))]
 
 
 def _check(name: str) -> WorkerCommandsVerifier:
@@ -399,7 +411,50 @@ def _safeguard() -> WorkerCommandsVerifier:
 
 
 def _stash(commands: list[str]) -> None:
+    """The card log's rows alone: what the safeguard reads."""
     transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": c} for c in commands])
+
+
+def _call(command: str, at: float) -> dict:
+    """One tagged terminal call of the worker card, as worker_trajectory records it."""
+    return {
+        "name": "terminal",
+        "args": {"command": command},
+        "result": "",
+        "status": "completed",
+        "agent": "platform",
+        "task": "t_1",
+        "session": "s_1",
+        "at": at,
+    }
+
+
+def _route_status(check: dict, pins: list[tuple[str, str]]) -> str:
+    """The route verdict on one card whose log holds the rendered rows and whose tagged calls read the typed text."""
+    for rendered, _ in pins:
+        assert "\n" not in rendered, rendered
+    transcript.set(
+        "ok",
+        [_call(typed, 100.0 + i) for i, (_, typed) in enumerate(pins)],
+        worker_commands=[{"task": "t_1", "command": rendered} for rendered, _ in pins],
+    )
+    try:
+        result = WorkerCommandsVerifier(**check).verify(5.0)
+    finally:
+        transcript.clear()
+    assert result.status != "error", result.reason
+    return result.status
+
+
+def _route_check() -> dict:
+    spec = yaml.safe_load(CASE.read_text(encoding="utf-8"))
+    (entry,) = [e for e in spec["verification_spec"] if e.get("name") == ROUTE]
+    return entry["check"]
+
+
+def _as_calls(commands: list[str]) -> list[tuple[str, str]]:
+    """Typed commands graded as tagged calls; a one-line command is its own row."""
+    return [(c.split("\n")[0], c) for c in commands]
 
 
 @pytest.mark.parametrize("command", TOKEN_COMMANDS)
@@ -454,29 +509,36 @@ def test_the_rendered_line_earns_the_verdict_the_case_header_states(rendered, ve
         assert f"matched {rendered!r}" in res.reason, res.reason
 
 
-@pytest.mark.parametrize("rendered, verdict", RENDERED_ROUTE)
-def test_the_rendered_run_earns_the_route_verdict_the_case_header_states(rendered, verdict):
-    _stash(READS_THE_HELPER + [rendered])
-    res = _check(ROUTE).verify(5.0)
-    assert res.status == verdict, f"{rendered!r}: {res.reason}"
+def test_the_route_check_reads_the_calls_as_typed():
+    assert _route_check()["after_result_pattern"] == "(?!)", "the switch opens no window and reads the calls as typed"
+
+
+@pytest.mark.parametrize("rendered, typed, verdict", ROUTE_PINS)
+def test_each_route_pin_earns_the_verdict_the_case_header_states(rendered, typed, verdict):
+    assert _route_status(_route_check(), _as_calls(READS_THE_HELPER) + [(rendered, typed)]) == verdict, rendered
+
+
+@pytest.mark.parametrize("rendered, typed", CHAINED_RUNS)
+def test_the_rendering_alone_misses_a_chained_run(rendered, typed):
+    without = {k: v for k, v in _route_check().items() if k != "after_result_pattern"}
+    assert _route_status(without, [(rendered, typed)]) == "fail", "the rendered row names no helper; the switch is what reads the typed call"
 
 
 @pytest.mark.parametrize("command", RUNS_THE_HELPER)
 def test_each_run_of_the_helper_satisfies_the_route_check(command):
-    _stash(READS_THE_HELPER + [command])
-    res = _check(ROUTE).verify(5.0)
-    assert res.status == "pass", f"{command!r} did not satisfy the route check: {res.reason}"
+    assert _route_status(_route_check(), _as_calls(READS_THE_HELPER + [command])) == "pass", command
 
 
 def test_a_read_of_the_helper_does_not_satisfy_the_route_check():
     beside = [c for c in HELPER_COMMANDS if "analyze_trace_latency" not in c]
-    _stash(READS_THE_HELPER + beside)
-    res = _check(ROUTE).verify(5.0)
+    transcript.set("ok", [_call(c, 100.0 + i) for i, c in enumerate(READS_THE_HELPER + beside)], worker_commands=[])
+    try:
+        res = _check(ROUTE).verify(5.0)
+    finally:
+        transcript.clear()
     assert res.status == "fail", f"a read of the helper satisfied the route check: {res.reason}"
     assert "no worker command matched required pattern" in res.reason
 
 
 def test_the_helper_route_alone_passes_the_route_check():
-    _stash(HELPER_COMMANDS)
-    res = _check(ROUTE).verify(5.0)
-    assert res.status == "pass", res.reason
+    assert _route_status(_route_check(), _as_calls(HELPER_COMMANDS)) == "pass"
