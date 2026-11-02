@@ -40,9 +40,10 @@ not run on one either: the eval crew decided that the presubmit runs the blockin
 ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), so `presubmit-cases.txt` holds
 the roster's cases plus, since 2026-09-29, one documented exception: the held-out seat a
 coverage tracker puts in the presubmit file without a roster line, one per tracker
-([#2013](https://github.com/gke-labs/kube-agents/issues/2013) for the compliance canary;
-[#2016](https://github.com/gke-labs/kube-agents/issues/2016)'s seat for pdb-remediation-pr took
-its roster line on 2026-10-14).
+([#2016](https://github.com/gke-labs/kube-agents/issues/2016)'s seat for pdb-remediation-pr took
+its roster line on 2026-10-14, and
+[#2013](https://github.com/gke-labs/kube-agents/issues/2013)'s for the compliance canary on
+2026-11-02, so the section is empty today).
 Such a seat runs on every pull request, cannot red one on a graded failure under the default
 `roster` mode below (a switch to `record` mode would let the record admit it), and earns its
 record at presubmit volume; `scripts/test_eval_rosters.py` pins the set (`HELD_OUT_IN_PRESUBMIT`)
@@ -100,8 +101,9 @@ meets" at the end of this section.
 
 Every other case but those seats runs in the nightly only — one data point a night, at three
 repetitions — and its admission is one pull request that adds its line to both presubmit files
-and cites that record. Of the seven that left the presubmit on 2026-09-22, three are held out
-with a filed issue naming the exit condition:
+and cites that record. Of the seven that left the presubmit on 2026-09-22, two are still held
+out with a filed issue naming the exit condition, and a third, the compliance canary, took its
+roster line on 2026-11-02 (its bullet stays for the record):
 
 - **cluster-agent-healthy-workload-no-finding** —
   [#1010](https://github.com/gke-labs/kube-agents/issues/1010): the delegation receipt is
@@ -123,12 +125,14 @@ with a filed issue naming the exit condition:
   2026-09-22 to 2026-09-29; since 2026-09-29 seated held out in `presubmit-cases.txt`
   ([#2013](https://github.com/gke-labs/kube-agents/issues/2013) step 2) after the eval install's
   kanban cap (#2022, for the dispatcher-stall residual #2032) and the credential-proxy
-  workspace-leak fix (#2069, for #2011) landed. It runs on
-  every pull request, cannot red one on rungs 4 or 6, and does red one on rungs 1–3 like every
-  case. The Cases page's pill still reads demoted 09-02 (dated from this bullet) until the
-  roster line. Enters the roster when #2013 step 3 holds: three clean days at ≥ 90 % of graded
-  repetitions with no all-reps collapse, infra classes the harness excludes not counted (#1171
-  closed 2026-09-08; the bar lives on #2013); that edit takes `fleet-audits` off the
+  workspace-leak fix (#2069, for #2011) landed. As a held-out seat it ran on every pull
+  request, could not red one on rungs 4 or 6, and did red one on rungs 1–3 like every case;
+  the Cases page's pill read demoted 09-02 (dated from this bullet) until the roster line. The
+  bar was #2013 step 3: three clean days at ≥ 90 % of graded repetitions with no all-reps
+  collapse, infra classes the harness excludes not counted (#1171 closed 2026-09-08). It held
+  from 2026-10-23, and the roster line landed on 2026-11-02 (#2013 step 4,
+  [#4094](https://github.com/gke-labs/kube-agents/issues/4094); the first entry under "Admitted
+  on the record since the split" below has the record), which took `fleet-audits` off the
   `domains.yaml` allowlist.
 - **rca-remediation-pr** —
   [#1189](https://github.com/gke-labs/kube-agents/issues/1189): demoted 2026-09-02 evening
@@ -285,6 +289,51 @@ the reds that once argued for un-arming it belonged to the old vocabulary check.
 
 Admitted on the record since the split:
 
+- **compliance-rbac-overgrant**, 2026-11-02, the fleet-audits domain's roster seat and the
+  audit-machinery canary (the hold-out bullet above has how it got here), moved from the held-out
+  section of the presubmit file onto the roster in one edit
+  ([#2013](https://github.com/gke-labs/kube-agents/issues/2013) step 4,
+  [#4094](https://github.com/gke-labs/kube-agents/issues/4094)). It is the full
+  `compliance-audit` stream over the seeded `debug-binding` over-grant, graded on the ledger it
+  publishes (`ledger_issue_contains`: the binding in the prose and in the finding ids, and a
+  `cluster-admin-binding` or `wildcard-rbac` finding id). The record, read on 2026-11-02 from the
+  dashboard's `data.json` (generated 18:25 UTC) and the evidence store: 36 of 36 graded
+  repetitions on the twelve main nightlies that graded it, 2026-10-20 to 11-02, every night
+  3/3 (10-21 and 10-25 did not grade it; 10-24 and 10-26 graded it in runs that ended with no
+  job verdict, so the coverage bot's ten-night reading is 30 of 30); 15 of 15 at the
+  presubmit's own key, `gemini-4-argon-kubeagents-mcp` under `spec.mode next`, over the five
+  nightlies 10-29 to 11-02, the store reading `collecting: 15/15 runs recorded at this key
+across 5 recorded run(s), 5 more needed before this case can collapse`; and, because the seat
+  ran on every pull request, the presubmit itself: 1068 of 1117 graded repetitions (95.6 %)
+  over the 399 builds of 2026-10-27 to 11-02, 78 more set aside as infra, and no build in
+  which every graded repetition failed. The last such build was 2026-10-22 (build
+  2113373630183247872), the day before the fleet audits got their own turn budget (#3602) and
+  the open-ledger lookup fix (#3910) merged; from 2026-10-23 to 11-02, 678 builds carried the
+  case with no collapse. So the citation is the nightly record plus the presubmit's own, and
+  the eval crew's approval of this line is the call that it suffices before the window fills,
+  as for the three entries below. The 49 presubmit misses of the week fell in 46 builds, three
+  of them with two misses and none with three, and read: 31 "the run's report names no
+  github.com issue URL" (the worker published no ledger,
+  [#2856](https://github.com/gke-labs/kube-agents/issues/2856), the residual the canary
+  carries at about 3 % of repetitions; 10-31 was the worst day, 18 misses in 35 builds); 10
+  "the report names 2 issues that each claim to be the compliance-audit ledger" and 2 a ledger
+  without the planted binding, two shapes with no issue yet; 5 a ledger the harness's own ledger
+  reset closed before the verifier read it; 1 an erroring safeguard (rung 2, which blocked
+  already). Rung 6 is armed by the same line but cannot fire at this key: main's
+  OutcomeValidity mean there is 0.30–0.50, so the 0.5 margin puts the threshold below zero.
+  It reads seeded-a's `rbac-overgrant` role, whose two catalog `state` assertions (the binding's
+  `roleRef.name` is `cluster-admin`, its ServiceAccount subject is in `seeded-security`) the
+  hourly seeded-fleet scan runs, so rule (c) holds without an exemption; rule (d) holds on the
+  three objectives above. What it costs: nothing new, since the seat already ran; it requests
+  no pull request, so it runs in the first phase, its three repetitions one after another on
+  its task lock, hinted at 1000 s in `unit_cost_hint` against a measured 732 s median and
+  1450 s p90 over the week's 1068 passing repetitions (2990 s at the slowest, under the 3000 s
+  delegation ceiling). Taking the line took `fleet-audits` off the `docs/designs/domains.yaml`
+  allowlist and made the compliance stream blocking (below). The same line arms rung 4 for the
+  case on every lane that reads the roster: the release-candidate lane (`hack/ci-eval-rc.sh`)
+  and the nightlies. One reader effect: the dashboard classifies every past build against the
+  current roster, so the canary's collapses of 2026-10-20 to 10-22 now read as rung-4 collapses
+  in the replayed history.
 - **consistency-drift-outlier**, 2026-10-26, the consistency domain's roster seat since its probe,
   consistency-authorized-networks-probe, was demoted on 2026-10-21 (above), moved from
   `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit. It is not
@@ -563,8 +612,9 @@ write, the `ledger_issue_contains` verifier) and pdb-remediation-pr's (submit-su
 a pull request on the leased `*-infra` repository, the `pull_request_opened` verifier) — so a
 change that breaks either path is seen on the pull request that introduces it again: an
 erroring verifier or an empty record is a rung-1–3 red for every case, admitted or not. A
-graded miss on the canary's seat (no ledger URL or the planted binding skipped) is reported as
-UNSTABLE and "(held out)" and blocks nothing; pdb-remediation-pr's (no pull request URL in the
+graded miss on the canary's seat (no ledger URL or the planted binding skipped) was reported as
+UNSTABLE and "(held out)" and blocked nothing until its roster line on 2026-11-02; since then it
+arms rung 4 like any roster case. pdb-remediation-pr's (no pull request URL in the
 final answer) arms rung 4 like any roster case, as it did from 2026-10-14 until its demotion to
 the nightly on 2026-10-17 (#3120) and again since 2026-10-26. From 2026-10-17 until 2026-10-23
 the submit-suggestion path was not in the presubmit at all; since then `vcs-spent-branch-reuse`,
@@ -578,8 +628,8 @@ that trade with the policy. The ledger path blocks since 2026-10-26: consistency
 on the roster, runs the `fleet-consistency-drift` audit through the minted token, the cloned
 `*-infra` workspace and the ledger write, and is graded by `ledger_issue_contains`, so a change
 that stops a ledger being published is a rung-4 red, or a rung-1–3 red when the verifier errors.
-What the canary alone grades, the compliance stream and its planted binding, still blocks only at
-its roster line (#2013 step 4).
+What the canary alone grades, the compliance stream and its planted binding, blocks since
+2026-11-02, its roster line (#2013 step 4).
 
 ## The whole-suite rate
 

@@ -2623,9 +2623,11 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # `python3 scripts/eval_rosters.py --summary` counts the files. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
-# tracker seats it in the presubmit file held out (#2013; #2016's seat took
-# its roster line 2026-10-14, was demoted back here 2026-10-17, #3120, and
-# returned to the roster 2026-10-26; the presubmit file's last section).
+# tracker seats it in the presubmit file held out (the presubmit file's
+# last section, empty since 2026-11-02: #2016's seat took its roster line
+# 2026-10-14, was demoted back here 2026-10-17, #3120, and returned to the
+# roster 2026-10-26; #2013's, the compliance canary, took its roster line
+# 2026-11-02).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -3369,6 +3371,11 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # of the thirteen-case matrix measure it, and until they have, this is the
 # projection. No Prow deadline change.
 #
+# 2026-11-02: the canary took its roster line (#2013 step 4) on 36/36 main
+# nightlies 10-20 to 11-02 and 1068/1117 graded presubmit repetitions
+# 10-27 to 11-02 with no all-reps collapse; same matrix, same units, rung 4
+# armed for it from then on.
+#
 # pdb-remediation-pr, seat opened 2026-09-28, was seated held out beside it
 # (#2016 step 2; roster line 2026-10-14): FOURTEEN tasks, 42 units, against the same 360m deadline.
 # What arrived is three units of ~15-25min each (420-1153s on the four
@@ -3792,14 +3799,16 @@ unit_cost_hint() {
     # A general fleet health question that runs the health sweep (#3302): one
     # card and a sweep of seconds; the drift chat route's band.
     health-chat-request-runs-collector) echo 400 ;;
-    # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
-    # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
-    # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,
-    # over 903 presubmit repetitions 2026-09-04 to 09-15; priced at that
-    # median, the way capacity (540) and the incident probe (700) are, so it
-    # launches first in each presubmit repetition round. Its three repetitions
-    # serialize on the task lock, so ~50min at the median and ~104min at p90
-    # is the chain a presubmit carries for it.
+    # On the blocking roster since 2026-11-02 (#2013 step 4); presubmit held
+    # out 2026-09-29 to then (#2013 step 2); nightly-only 2026-09-22 to
+    # 2026-09-29 (#1023; held out on #1171, closed 2026-09-08). The canary
+    # measured 1002s median, 2074s p90, over 903 presubmit repetitions
+    # 2026-09-04 to 09-15, and 732s median, 1450s p90, over the 1068 passing
+    # presubmit repetitions of 2026-10-27 to 11-02; priced between the two
+    # medians, the way capacity (540) and the incident probe (700) are priced
+    # at theirs, so it launches first in each presubmit repetition round. Its
+    # three repetitions serialize on the task lock, so ~37-50min at the
+    # medians and ~72-104min at p90 is the chain a presubmit carries for it.
     compliance-rbac-overgrant) echo 1000 ;;
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.

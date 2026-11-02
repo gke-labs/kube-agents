@@ -48,9 +48,9 @@ only — anything that renames, removes or re-types a field bumps
     }
   ],
   "coverage": {
-    "domains_total": 11,
-    "domains_covered": 10,
-    "uncovered": ["fleet-audits"]
+    "domains_total": 13,
+    "domains_covered": 12,
+    "uncovered": ["observability"]
   }
 }
 ```
@@ -888,7 +888,7 @@ confidence, times, transcript_url}`. `status` is
 `blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
 (active, off the roster, no demotion date: the held-out seat a coverage tracker takes in the
 presubmit file, which is what pdb-remediation-pr showed while seated, 2026-09-28 to 10-14; a dated one reads
-`demoted`, which is what the compliance canary shows while seated),
+`demoted`, which is what the compliance canary showed while seated, 2026-09-29 to 11-02),
 `demoted` (off the roster, active or nightly-only, with `demoted_on` read from the hold-out
 entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`; a case demoted under the
 2026-09-22 protocol is a nightly case and keeps this status and its date), `nightly_only`

@@ -247,7 +247,7 @@ STATUS_BLOCKING = "blocking"  # active and in hack/eval/blocking-roster.txt
 STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record): pdb-remediation-pr while seated, 2026-09-28 to 10-14, #2016
 # Off the roster with a demotion date on the roster page -- nightly-only
 # since 2026-09-22 (#1023: the presubmit runs the roster only), or active as
-# a held-out presubmit seat (the compliance canary since 2026-09-29, #2013).
+# a held-out presubmit seat (the compliance canary 2026-09-29 to 11-02, #2013).
 STATUS_DEMOTED = "demoted"
 STATUS_NIGHTLY_ONLY = "nightly_only"  # in hack/eval/nightly-cases.txt only, no demotion date
 STATUS_RETIRED = "retired"  # in neither matrix on this checkout

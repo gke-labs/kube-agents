@@ -401,8 +401,9 @@
 # The seven cases the presubmit ran without letting them block, when the
 # eval crew decided the presubmit runs the blocking roster and nothing else.
 # Six remain here; compliance-rbac-overgrant went back to the presubmit file
-# held out on 2026-09-29 (#2013), the documented exception. None was
-# admitted; each # line is the hold-out reason as it stood that day, with
+# held out on 2026-09-29 (#2013), the documented exception, and onto the
+# blocking roster on 2026-11-02 (#2013 step 4). None was
+# admitted that day; each # line is the hold-out reason as it stood then, with
 # the case's presubmit record from #1626's merge to the move (graded
 # repetitions in the dashboard's data.json, 2026-09-15 to 09-22, 734 runs)
 # so the nightly record starts from a known point. The admission edit for any
