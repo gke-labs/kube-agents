@@ -755,6 +755,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 # inject door can carry. An edit to the file edits this set.
 API_LANE_EXCLUDED = [
     "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
+    "chat-stop-mid-turn-files-no-card",  # #3263: the same, while the opening turn runs
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
     "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
 ]
@@ -1282,6 +1283,7 @@ class PresubmitWallTimeTest(unittest.TestCase):
         from kube_agents_bench import stop_hook
 
         self.assertEqual(eval_rosters.STOP_DIRECTIVE, stop_hook.STOP_DIRECTIVE)
+        self.assertEqual(eval_rosters.MID_TURN_DIRECTIVE, stop_hook.MID_TURN_DIRECTIVE)
         stopped = []
         for case in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases():
             with self.subTest(case=case):
