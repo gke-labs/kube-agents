@@ -34,11 +34,12 @@ message id, as the door does.
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -2863,6 +2864,270 @@ def test_inject_transport_delegated_worker_rate_limit_marks_run_infra(
     assert result.has_errors()
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "card on board recorded rate_limit" in result.errors[0]
+
+
+def test_inject_transport_delegated_worker_rate_limit_triage_marks_run_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On inject transport, when a card enters triage with the Hermes rate limit summary, mark infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+    real_shell = local_shell(tmp_path, monkeypatch)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
+
+
+def test_inject_transport_delegated_worker_mid_wait_rate_limit_triage_marks_run_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card starting 'running' that transitions to 'triage' with rate limit summary during polling retires and marks infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "running")
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+
+    def advance(n: int) -> None:
+        if n == 2:
+            set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+
+    real_shell = local_shell(tmp_path, monkeypatch, advance)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "2")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
+    assert not any(harness.DELEGATION_CEILING_MARKER in e or "did not finish within" in e for e in result.errors)
+
+
+def test_inject_transport_delegated_worker_triage_and_running_card_does_not_flap(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A triage card carrying rate limit alongside a running card does not flap back into outstanding."""
+    caplog.set_level(logging.INFO)
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+    set_card(tmp_path, CARD_B, "running")
+
+    def advance(n: int) -> None:
+        if n == 3:
+            set_card(tmp_path, CARD_B, "done", result="finished task b")
+
+    real_shell = local_shell(tmp_path, monkeypatch, advance)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n{harness._LOG_PRESENT} {CARD_B} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "2")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+
+    # CARD_A must not flap back into outstanding during polling.
+    # While CARD_B is still running, log output must not wait on CARD_A.
+    wait_logs = [
+        r.message
+        for r in caplog.records
+        if "waiting" in r.message and "delegated tasks" in r.message
+    ]
+    assert wait_logs, "expected delegation wait log entries"
+    assert all(CARD_A not in msg for msg in wait_logs), (
+        f"CARD_A flapped into outstanding waiting logs: {wait_logs}"
+    )
+    assert all(CARD_B in msg for msg in wait_logs)
+
+    # Reads:
+    # Read 0: initial read
+    # Read 1: initial deliverables fetch for created cards
+    # Read 2: in-loop poll for awaited tasks
+    # Read 3: post-loop final read for settled cards
+    reads: list[str] = getattr(real_shell, "reads", [])
+    assert len(reads) == 4, (
+        f"expected 4 reads (initial, initial fetch, loop poll, final), got {len(reads)}"
+    )
+    loop_poll_script = reads[2]
+    assert CARD_B in loop_poll_script
+
+
+def test_inject_transport_delegated_worker_triage_does_not_deliver_result_or_drop_sibling_ceiling(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate-limited triage card's 429 summary is not delivered as a result and does not drop sibling ceiling marker."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    stashed_result = "stashed completed answer from refused turn"
+    set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg, result=stashed_result)
+    set_card(tmp_path, CARD_B, "running")
+
+    real_shell = local_shell(tmp_path, monkeypatch)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n{harness._LOG_PRESENT} {CARD_B} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[{"name": "terminal", "args": {"command": "echo test"}, "result": "ok"}],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    # Sibling CARD_B outrunning the budget must receive the ceiling marker because CARD_A delivered no answer
+    assert any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    # Neither the 429 failure reason nor the stashed result must be delivered into output as a task result
+    assert "Result of delegated task" not in result.output
+    assert rate_limit_msg not in result.output
+    assert stashed_result not in result.output
+
+
+def test_inject_transport_delegated_worker_triage_initial_exhaustion_raises_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a triage card without summary exhausts all retry attempts on the initial fetch, raise transport exhausted."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "triage")
+
+    call_count = 0
+    real_read = board.read_session_cards
+
+    def failing_read(shell: Any, sid: str, to: float, want: Sequence[str] = (), max_want: int = 32) -> board.SessionCards | None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return real_read(shell, sid, to, want=want, max_want=max_want)
+        return None
+
+    monkeypatch.setattr(board, "read_session_cards", failing_read)
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert f"still waiting on: {CARD_A}" in result.errors[0]
+    # 1 initial discovery read + 3 retry attempts on triage_initial = 4 reads total (no second loop retry cycle)
+    assert call_count == 4
+
+
+def test_inject_transport_delegated_worker_blocked_to_triage_transition_marks_infra(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card starting blocked that unblocks and enters rate-limited triage mid-wait is recognized immediately."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    set_card(tmp_path, CARD_A, "blocked")
+    set_card(tmp_path, CARD_B, "running")
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+
+    def advance(n: int) -> None:
+        if n == 2:
+            set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+            time.sleep(0.06)
+
+    real_shell = local_shell(tmp_path, monkeypatch, advance)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n{harness._LOG_PRESENT} {CARD_B} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert f"{CARD_A} (triage)" not in "\n".join(result.errors)
+    assert f"{CARD_B} (running)" in "\n".join(result.errors)
 
 
 def test_a_board_that_stops_answering_is_infrastructure(

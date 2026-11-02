@@ -252,6 +252,13 @@ type fakeChatRelay struct {
 	tokens    []string
 }
 
+// fakeChatAPIError, as a response, makes the fake relay answer a call with
+// the Chat API's own refusal.
+type fakeChatAPIError struct {
+	status int
+	reason string
+}
+
 type relayCall struct {
 	resource  []string
 	method    string
@@ -283,6 +290,14 @@ func newFakeChatRelay(t *testing.T) *fakeChatRelay {
 		if !ok {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]any{"error": "Google Chat operation failed"})
+			return
+		}
+		if apiErr, ok := resp.(fakeChatAPIError); ok {
+			// The relay's shape for a Chat API refusal: the API's status
+			// and reason under "chat" (gchatRelayError).
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]any{"error": "Google Chat operation failed",
+				"chat": map[string]any{"status": apiErr.status, "reason": apiErr.reason}})
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"response": resp})
@@ -372,7 +387,7 @@ func TestGchatEditPatchesText(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := f.call(0)
-	if c.method != "patch" || c.arguments["name"] != "spaces/S1/messages/M77" || c.arguments["updateMask"] != "text" {
+	if c.method != "patch" || c.arguments["name"] != "spaces/S1/messages/M77" || c.arguments["updateMask"] != gchatLayoutUpdateMask {
 		t.Errorf("patch = %+v", c)
 	}
 	if c.arguments["body"].(map[string]any)["text"] != "✅ *completed*" {
@@ -538,10 +553,89 @@ func TestToGchatText(t *testing.T) {
 		// (TestToGchatTextDefangsAfterAChunkedFence), the defang does not
 		// lean on that. The bold and link passes still read it as a fence.
 		"see ``` <https://evil.example|https://good.example>": "see ``` < https://evil.example|https://good.example>",
+		// The line forms Chat's text format has no syntax for, rewritten by
+		// the pass the Slack adapter runs (#3108): a heading is a bold
+		// line, a rule goes, a table is a fenced block with its columns
+		// padded, and a list marker becomes the one Chat draws a bullet
+		// from. Fenced code is left as written.
+		"### Pods\n---\nthree ready": "*Pods*\nthree ready",
+		"Summary\n===\nok":           "*Summary*\nok",
+		"* one\n+ two\n  - sub":      "- one\n- two\n  - sub",
+		"| Cluster | Nodes |\n|:---|---:|\n| prod-east | **3** |\n| `dev` | 1 |": "```\nCluster   | Nodes\n----------+------\nprod-east | 3\ndev       | 1\n```",
+		"```\n# comment\n- flag\n---\n```":                                       "```\n# comment\n- flag\n---\n```",
+		// A table cell's link shows its URL inside the block, where Chat
+		// renders no link, and the defang does not read the block as prose.
+		"| pr |\n|---|\n| [#1](https://github.com/x/y/pull/1) |": "```\npr\n----------------------------------\n#1 (https://github.com/x/y/pull/1)\n```",
+		"| cmd |\n|---|\n| sort <f\\|uniq |":                     "```\ncmd\n------------\nsort <f|uniq\n```",
+		// A link in Chat's own form inside a cell is one cell, shown as its
+		// label and URL like a markdown link, not split on its pipe; and a
+		// mention in a cell is defanged before the column is measured, so
+		// the rows stay lined up.
+		"| PR | State |\n|---|---|\n| <https://github.com/x/y/pull/1|#1> | open |": "```\nPR                                 | State\n-----------------------------------+------\n#1 (https://github.com/x/y/pull/1) | open\n```",
+		"| who | n |\n|---|---|\n| <users/all> | 1 |\n| me | 2 |":                  "```\nwho          | n\n-------------+--\n< users/all> | 1\nme           | 2\n```",
+		// A `.#` inside a kept link's label is not a glued heading: the
+		// link stays whole and kept.
+		"see <https://x.example|v1.# Notes> now":    "see <https://x.example|v1.# Notes> now",
+		"see [v1.# Notes](https://x.example/p) now": "see <https://x.example/p|v1.# Notes> now",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {
 			t.Errorf("toGchatText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A chunk whose padded table would run past Chat's message cap posts its
+// table as written: one 700-character cell over a hundred short rows is
+// under the relay's chunk size raw and tens of thousands of bytes padded,
+// which Chat would refuse along with the rest of the answer.
+func TestToGchatTextLeavesATableThatWouldOverflowChat(t *testing.T) {
+	wide := strings.Repeat("x", 700)
+	rows := []string{"| Pod | Ready |", "|---|---|", "| " + wide + " | 1/1 |"}
+	for i := 0; i < 110; i++ {
+		rows = append(rows, "| p | - |")
+	}
+	in := "Pods:\n\n" + strings.Join(rows, "\n")
+	if len(in) > discordChunk {
+		t.Fatalf("the probe must fit one chunk: %d bytes", len(in))
+	}
+	if rendered := rewriteLineForms(in, gchatBullet, true); len(rendered) <= gchatTextMax {
+		t.Fatalf("the probe must overflow when rendered: %d bytes", len(rendered))
+	}
+	got := toGchatText(in)
+	if len(got) > gchatTextMax {
+		t.Errorf("toGchatText posted %d bytes, past gchatTextMax", len(got))
+	}
+	if strings.Contains(got, "```") || !strings.Contains(got, "|---|---|") {
+		t.Errorf("the table should be left as written:\n%s", got[:200])
+	}
+	// A table that fits still renders.
+	small := "| a | b |\n|---|---|\n| 1 | 2 |"
+	if got := toGchatText(small); !strings.Contains(got, "```") {
+		t.Errorf("a small table should render: %q", got)
+	}
+}
+
+// Through toGchatText, the fleet answer #3108 reported posting as raw pipes
+// ends as Chat's bold and a fenced block, with the links and mentions in its
+// prose still handled as before.
+func TestToGchatTextRendersAMarkdownReport(t *testing.T) {
+	in := "# Fleet Report\n\n---\n\n## Clusters\n\n* 2 clusters, both **Ready** ([board](https://x.example/b))\n\n| Cluster | Location | Nodes |\n|:---|:---|---:|\n| prod-east | us-east1 | 12 |\n| dev | us-central1 | 3 |\n\ncc <users/all>"
+	got := toGchatText(in)
+	for _, want := range []string{
+		"*Fleet Report*",
+		"*Clusters*",
+		"- 2 clusters, both *Ready* (<https://x.example/b|board>)",
+		"```\nCluster   | Location    | Nodes\n----------+-------------+------\nprod-east | us-east1    | 12\ndev       | us-central1 | 3\n```",
+		"cc < users/all>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("toGchatText output lacks %q:\n%s", want, got)
+		}
+	}
+	for _, raw := range []string{"# ", "\n---\n", "|:---|", "* 2"} {
+		if strings.Contains(got, raw) {
+			t.Errorf("toGchatText output still carries raw %q:\n%s", raw, got)
 		}
 	}
 }
@@ -1104,10 +1198,14 @@ func TestGchatOpenDirectUsesTheLearnedIDForAKnownEmail(t *testing.T) {
 }
 
 // realGchatFixture loads one captured payload from testdata/gchat and
-// base64-encodes it the way the relay hands events over. Every file there
-// is real traffic from the Chat app in bnaylor-kagents-dev (2026-09-09),
-// scrubbed only of identity fields and the one-time redirect token; field
-// set, key order and every other byte are as Chat published them.
+// base64-encodes it the way the relay hands events over. The addon-dm-*.json
+// files are real traffic from the Chat app in bnaylor-kagents-dev
+// (2026-09-09), and legacy-dm-button-click.json from the one in
+// bhoekstra-gkedemos (2026-10-30), scrubbed only of identity fields and the
+// one-time redirect token; field set, key order and every other byte are as
+// Chat published them. addon-dm-button-click.json is the exception: a click
+// composed in the add-on layout from Google's documented shape, since the
+// measured app delivers clicks in the legacy layout.
 func realGchatFixture(t *testing.T, name string) (raw []byte, b64 string) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("testdata", "gchat", name))

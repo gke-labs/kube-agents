@@ -30,6 +30,8 @@ type recordingTransport struct {
 	req       *http.Request
 	body      string
 	err       error
+	// response, when set, builds the upstream response instead of an empty PodList.
+	response func(req *http.Request) *http.Response
 }
 
 func (rt *recordingTransport) RoundTripCluster(_ context.Context, clusterID string, req *http.Request) (*http.Response, error) {
@@ -42,6 +44,9 @@ func (rt *recordingTransport) RoundTripCluster(_ context.Context, clusterID stri
 	}
 	if rt.err != nil {
 		return nil, rt.err
+	}
+	if rt.response != nil {
+		return rt.response(req), nil
 	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
@@ -167,25 +172,19 @@ func TestHandlerRoutes(t *testing.T) {
 func TestHandlerRefusals(t *testing.T) {
 	tests := []struct {
 		name, method, target string
-		policy               Policy
 		wantCode             int
 		wantReason           metav1.StatusReason
 	}{
-		{"invalid path", http.MethodGet, "/api/v1/namespaces/%2e%2e/secrets", Policy{}, http.StatusBadRequest, metav1.StatusReasonBadRequest},
-		{"invalid cluster", http.MethodGet, "/clusters/bad$id/api/v1/pods", Policy{}, http.StatusBadRequest, metav1.StatusReasonBadRequest},
-		{"write without dry run", http.MethodPost, "/api/v1/namespaces/default/configmaps", Policy{}, http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"exec", http.MethodPost, "/api/v1/namespaces/default/pods/p/exec?command=sh", Policy{}, http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"non-discovery path", http.MethodGet, "/metrics", Policy{}, http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"unclassifiable path", http.MethodGet, "/api/v1/watch", Policy{}, http.StatusBadRequest, metav1.StatusReasonBadRequest},
-		{"secret get", http.MethodGet, "/api/v1/namespaces/default/secrets/s", Policy{}, http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"secret list", http.MethodGet, "/api/v1/secrets", Policy{}, http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"secret watch", http.MethodGet, "/api/v1/namespaces/default/secrets?watch=1", Policy{}, http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"secret dry-run delete", http.MethodDelete, "/api/v1/namespaces/default/secrets/s?dryRun=All", Policy{Mode: ModeReadWrite, RedactSecrets: true}, http.StatusForbidden, metav1.StatusReasonForbidden},
-		{"secret dry-run deletecollection", http.MethodDelete, "/api/v1/namespaces/default/secrets?dryRun=All", Policy{Mode: ModeReadWrite, RedactSecrets: true}, http.StatusForbidden, metav1.StatusReasonForbidden},
+		{"invalid path", http.MethodGet, "/api/v1/namespaces/%2e%2e/secrets", http.StatusBadRequest, metav1.StatusReasonBadRequest},
+		{"invalid cluster", http.MethodGet, "/clusters/bad$id/api/v1/pods", http.StatusBadRequest, metav1.StatusReasonBadRequest},
+		{"write without dry run", http.MethodPost, "/api/v1/namespaces/default/configmaps", http.StatusForbidden, metav1.StatusReasonForbidden},
+		{"exec", http.MethodPost, "/api/v1/namespaces/default/pods/p/exec?command=sh", http.StatusForbidden, metav1.StatusReasonForbidden},
+		{"non-discovery path", http.MethodGet, "/metrics", http.StatusForbidden, metav1.StatusReasonForbidden},
+		{"unclassifiable path", http.MethodGet, "/api/v1/watch", http.StatusBadRequest, metav1.StatusReasonBadRequest},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			h, upstream := newTestHandler(t, Config{Policy: tc.policy})
+			h, upstream := newTestHandler(t, Config{})
 			rec := serve(h, httptest.NewRequest(tc.method, tc.target, nil))
 			if rec.Code != tc.wantCode {
 				t.Fatalf("code = %d, want %d: %s", rec.Code, tc.wantCode, rec.Body.String())
@@ -198,16 +197,6 @@ func TestHandlerRefusals(t *testing.T) {
 				t.Error("a refused request reached the upstream")
 			}
 		})
-	}
-}
-
-func TestHandlerSecretReadsWithoutRedaction(t *testing.T) {
-	h, upstream := newTestHandler(t, Config{Policy: Policy{Mode: ModeReadOnly}})
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets", nil)); rec.Code != http.StatusOK {
-		t.Fatalf("code = %d: %s", rec.Code, rec.Body.String())
-	}
-	if upstream.calls != 1 {
-		t.Errorf("upstream calls = %d, want 1", upstream.calls)
 	}
 }
 

@@ -20,7 +20,7 @@ Platform Agent investigates
 
 Every step is real code shipping in the repo. The SOPs live in [`agents/platform/governance/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/governance); the [`submit-suggestion`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion) skill wraps the git flow; [Minty](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github) brokers short-lived tokens.
 
-The loop ends at the repo. A watchdog's findings reach you as the ledger issue and the pull requests linked to it. Its scheduled report arrives in chat, usually as one line of counts ending with the ledger link (in Slack with `KAGE_SLACK_UX` on, as a headline), and the issue stays the full record. The harness's other unprompted messages come from a cluster event posted to the in-pod triage endpoint, and the first-run inventory report ([ChatOps → Proactive alerts](/kube-agents/concepts/chatops/#proactive-alerts-both-channels)).
+The loop ends at the repo. A watchdog's findings reach you as the ledger issue and the pull requests linked to it. Its scheduled report arrives in chat, usually as one line of counts ending with the ledger link (in Slack with `KAGE_SLACK_UX` on, and in Google Chat under `spec.mode: next`, as a headline), and the issue stays the full record. The harness's other unprompted messages come from a cluster event posted to the in-pod triage endpoint, and the first-run inventory report ([ChatOps → Proactive alerts](/kube-agents/concepts/chatops/#proactive-alerts-both-channels)).
 
 ## What runs on its own
 

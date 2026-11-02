@@ -102,11 +102,12 @@ DEFAULT_TIMEOUT_S = 60
 # Was 64, sized so every cluster's ten-minute sampling window ran
 # concurrently rather than queuing behind an earlier one. Nothing sleeps any
 # more -- per-cluster work is a handful of subprocess reads and a few HTTP
-# reads -- so this is the figure every other collector in the stream uses,
-# the credential proxy's admitted count at the operator's default limit
-# (collect.py's MAX_WORKERS comment has the reasoning), which also keeps the
-# shared Monitoring session inside urllib3's default connection pool.
-MAX_WORKERS = 4
+# reads -- so the width is the one every other collector in the stream uses,
+# broker_admission.sweep_width(), resolved in collect_fleet (collect.py's
+# comment above its own collect_fleet has the reasoning). Six at the default
+# broker, inside urllib3's default connection pool of ten for the shared
+# Monitoring session; a broker configured past twelve slots makes urllib3 warn
+# that the pool is full and open the extra connections anyway.
 
 # What the manifest calls a target. A GKE name is unique only inside one
 # project and location, so every cluster is `<project>/<location>/<name>`, and
@@ -151,6 +152,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 from collect import declaration_for, indexed_workspace, release_declaration_for, release_declarations, workload_declarations  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
@@ -5806,7 +5808,8 @@ def _only_a_scope_note(entry: dict, project: str | None) -> bool:
     return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE) or entry["error"].startswith(fleet_scope_args.DECLARED_SCOPE_NOTE_PREFIX)
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None, workspace: Path | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int | None = None, now: datetime | None = None, workspace: Path | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(MONITORING_TIME_FORMAT, time.gmtime())
     deadline = time.monotonic() + project_budget_s

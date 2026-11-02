@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "✅ seeded-a · 1.33.4 = default\n⏳ seeded-b · waiting on you\n⚙️ seeded-c · reading version\n  ◌ reading version",
+    "widgets": null
+  }
+]

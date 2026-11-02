@@ -248,16 +248,28 @@ Gaps on main that the build closes (#3659):
    2. it checks that the target is in scope (`spec.scope`, including `exclude.clusters`);
    3. it mints the task's grant against the **resolved** profile, with the requester's tier
       and the target cluster in the grant's scope;
-   4. it publishes the submission on `a2a.tasks.<profile>.<tier>.<kind>.<task>.submit`, where
-      `<kind>` is `top` for a task a client asked for and `child` for a task another task
-      started. The target cluster is a task parameter rather than a subject token, so queues are
+   4. it publishes the submission on `a2a.submit.<profile>.<tier>.<kind>.<task>`, on the
+      `PROFILE_SUBMITS` stream, where `<kind>` is `top` for a task a client asked for and
+      `child` for a task another task started. The target cluster is a task parameter rather than a subject token, so queues are
       per profile, tier and kind, never per cluster.
 
-**Subjects (decided 2026-10-22).** Only new submissions use the `.submit` subject, and only it
-carries the tier and kind tokens, because they exist to route queues. Follow-ups and cancels
+**Subjects (decided 2026-10-22).** Only new submissions use the submission subject, and only
+it carries the tier and kind tokens, because they exist to route queues. Follow-ups and cancels
 for a running task stay on the task's own `a2a.tasks.<profile>.<task>.in`, read by the
 task's per-task reader, and `.events` and `.supervisor` keep their per-task shape. Addressees
 that aren't profiles (`platform`, sessions) keep today's subjects.
+
+**Amended 10/28 (#4121): submissions have their own stream.** They were first planned as
+`a2a.tasks.<profile>.<tier>.<kind>.<task>.submit` on TASKS. On TASKS, any principal that can
+create consumers there (the bridge, the gateway, and the `web` and `console` credentials a
+browser is handed) could create a consumer that pulls a profile's submissions, or rewrite
+the operator's durable in place, because JetStream carries a consumer's settings in the
+request body where a subject grant can't see them. `PROFILE_SUBMITS` on `a2a.submit.>`
+closes that: the operator is the only principal with a consumer verb on it, the dispatcher
+holds only fetch and ack on the durables it is configured for, the gateway holds only
+publish on `a2a.submit.*.*.*.*`, and the console holds direct get by subject, so it can show
+a profile task's prompt and nothing more. Session queues on TASKS keep the exposure; that
+is #4173.
 
 ### Admission and holding
 
@@ -265,7 +277,8 @@ that aren't profiles (`platform`, sessions) keep today's subjects.
 paths:
 
 - There is **one shared durable consumer per (profile, tier, kind)** on
-  `a2a.tasks.<profile>.<tier>.<kind>.*.submit`, created and owned by the operator. The
+  `a2a.submit.<profile>.<tier>.<kind>.*`, on `PROFILE_SUBMITS`, created and owned by the
+  operator. The
   dispatcher is its only reader. `max_ack_pending` is per consumer, so each durable caps its own
   in-flight count, and a `child` durable has its own cap separate from its profile's `top`
   durable.
@@ -291,8 +304,14 @@ paths:
   sets the effective value, which never exceeds `spec.concurrency`. An install-wide ceiling on
   the PlatformAgent caps the total across profiles, and reserves `max(1, ceil(ceiling / 3))`
   slots for interactive tiers, so unattended work cannot starve users. Caps must be dynamic,
-  from 10 clusters to 10,000.
-- Each durable counts against the TASKS consumer budget (#2077), so that formula includes them.
+  from 10 clusters to 10,000. Amended 10/28 (#3655): a child reserve keeps waiting parents
+  from holding every slot; the reserves are disjoint, filled child first, and leave at least
+  one slot for top-level unattended work, so at a ceiling that can't fit both (1, 2 and 4
+  with the default reserves) not every reserve is honoured in full, and the PlatformAgent
+  carries a `ProfileReservesShort` warning saying which and the smallest ceiling that does.
+- ~~Each durable counts against the TASKS consumer budget (#2077), so that formula includes
+  them.~~ Amended 10/28: the durables live on `PROFILE_SUBMITS`, whose `max_consumers` is
+  their allowance (64, so 16 profiles with both tiers). They take no TASKS slot.
 
 ### Execution
 
@@ -343,12 +362,12 @@ The build PRs amend these; this list is what they must cover.
   format replacing per-profile SOUL files, the allowed-tiers list on the CR, the worker
   namespace separate from the CR's (the binding rule itself is unchanged), and the CRD doc
   comments (persona contents, `clusterRef` usage, lifecycle on warm pools).
-- **`spec-nats-deployment.md`:** the shared durables per (profile, tier, kind) on the `.submit`
-  subjects, operator-created and read only by the dispatcher, replacing per-pod consumer
+- **`spec-nats-deployment.md`:** the `PROFILE_SUBMITS` stream, and the shared durables per
+  (profile, tier, kind) on it, operator-created and read only by the dispatcher, replacing per-pod consumer
   narrowing for new submissions, and their `max_ack_pending`; and a KV bucket for per-task
   liveness leases.
 - **`spec-a2a-payloads.md`:** the new submission subject
-  `a2a.tasks.<profile>.<tier>.<kind>.<task>.submit`, with follow-ups and cancels staying on
+  `a2a.submit.<profile>.<tier>.<kind>.<task>`, with follow-ups and cancels staying on
   the per-task `.in`; children of a profile task are gateway-minted (the gateway stays the only
   author of submissions); a child's terminal is delivered to its parent task.
 - **`spec-chatops-gateway.md`:** delegation to any profile (not only `platform`), multiple

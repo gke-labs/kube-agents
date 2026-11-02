@@ -30,8 +30,22 @@ func profileTunedAgent(ceiling, warm *int) *agentv1alpha1.PlatformAgent {
 
 func TestProfileTuningDefaults(t *testing.T) {
 	agent := a2aTestAgent()
-	if got := resolveProfileCeiling(agent); got != agentv1alpha1.DefaultProfileCeiling {
-		t.Errorf("ceiling = %d, want the default %d", got, agentv1alpha1.DefaultProfileCeiling)
+	if got := resolveProfileCeiling(agent); got != defaultKanbanMaxInProgress {
+		t.Errorf("ceiling = %d, want maxInProgress's default %d", got, defaultKanbanMaxInProgress)
+	}
+	// While both exist the ceiling follows maxInProgress, so moving work from
+	// kanban to profiles doesn't change an install's footprint.
+	kanban := a2aTestAgent()
+	kanban.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(11)}}
+	if got := resolveProfileCeiling(kanban); got != 11 {
+		t.Errorf("ceiling = %d, want maxInProgress's 11", got)
+	}
+	// maxInProgress has no maximum, so a ceiling taken from it is clamped
+	// to the ceiling field's own.
+	huge := a2aTestAgent()
+	huge.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(agentv1alpha1.MaxProfileCeiling + 1)}}
+	if got := resolveProfileCeiling(huge); got != agentv1alpha1.MaxProfileCeiling {
+		t.Errorf("ceiling = %d from a maxInProgress past the ceiling's maximum, want %d", got, agentv1alpha1.MaxProfileCeiling)
 	}
 	if got := resolveProfileWarmReplicas(agent); got != agentv1alpha1.DefaultProfileWarmReplicas {
 		t.Errorf("warm replicas = %d, want the default %d", got, agentv1alpha1.DefaultProfileWarmReplicas)
@@ -62,9 +76,9 @@ func TestBuildProfileQuota(t *testing.T) {
 		profiles []agentv1alpha1.AgentProfile
 		pods     int64
 	}{
-		{"no profiles: the ceiling alone", a2aTestAgent(), nil, agentv1alpha1.DefaultProfileCeiling},
-		// Two read pools (a, b): 2 warm + 2 surge + ceiling 8. c has no warm pool.
-		{"two read pools at the defaults", a2aTestAgent(), []agentv1alpha1.AgentProfile{readOnly, bothTiers, unattended}, 2*1 + 2 + 8},
+		{"no profiles: the ceiling alone", a2aTestAgent(), nil, defaultKanbanMaxInProgress},
+		// Two read pools (a, b): 2 warm + 2 surge + the ceiling. c has no warm pool.
+		{"two read pools at the defaults", a2aTestAgent(), []agentv1alpha1.AgentProfile{readOnly, bothTiers, unattended}, 2*1 + 2 + defaultKanbanMaxInProgress},
 		{"tuned", profileTunedAgent(ptr.To(5), ptr.To(3)), []agentv1alpha1.AgentProfile{readOnly}, 1*3 + 1 + 5},
 		{"no warm workers", profileTunedAgent(ptr.To(5), ptr.To(0)), []agentv1alpha1.AgentProfile{readOnly}, 0 + 1 + 5},
 	} {
@@ -362,5 +376,36 @@ func TestAProfileDeleteRefusalHoldsNothing(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	if err := r.cleanupA2A(context.Background(), today); err != nil {
 		t.Errorf("cleanupA2A with a refused profile delete = %v, want it logged", err)
+	}
+}
+
+// The child reserve and the intervals default as the contract on #3655 says,
+// and the reserve stays below the ceiling.
+func TestProfileDispatchTuningDefaults(t *testing.T) {
+	agent := a2aTestAgent()
+	for name, tc := range map[string]struct{ got, want int }{
+		"childReserve":         {func() int { c, _ := dispatchReserves(agent, resolveProfileCeiling(agent)); return c }(), 2}, // ceil(6/3)
+		"leaseSeconds":         {resolveProfileLeaseSeconds(agent), 90},
+		"renewSeconds":         {resolveProfileRenewSeconds(agent), 20},
+		"restartGraceSeconds":  {resolveProfileRestartGraceSeconds(agent), 60},
+		"acceptTimeoutSeconds": {resolveProfileAcceptTimeoutSeconds(agent), 10},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d", name, tc.got, tc.want)
+		}
+	}
+	for ceiling, want := range map[int]int{1: 0, 2: 1, 3: 1, 4: 2, 9: 3, 10: 4} {
+		if got, _ := dispatchReserves(profileTunedAgent(ptr.To(ceiling), nil), ceiling); got != want {
+			t.Errorf("ceiling %d: childReserve = %d, want %d", ceiling, got, want)
+		}
+	}
+	tuned := profileTunedAgent(ptr.To(10), nil)
+	tuned.Spec.Harness.Tuning.Profiles.ChildReserve = ptr.To(7)
+	tuned.Spec.Harness.Tuning.Profiles.LeaseSeconds = ptr.To(300)
+	if got, _ := dispatchReserves(tuned, 10); got != 7 {
+		t.Errorf("childReserve = %d, want the CR's 7", got)
+	}
+	if got := resolveProfileLeaseSeconds(tuned); got != 300 {
+		t.Errorf("leaseSeconds = %d, want the CR's 300", got)
 	}
 }

@@ -62,7 +62,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
-from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
+from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
 
 __all__ = [
@@ -863,16 +863,29 @@ def _inject_trace_vouched(trajectory: list[Any]) -> bool:
     not show, and a check graded over it could fail a call that was made or
     pass a safeguard over one; such a record is treated as blind, like one
     with no marker. A marker whose args are not a mapping vouches for
-    nothing.
+    nothing. A record of more than one task (a pushed-report replay's two
+    turns, ``pushed_report.merge``) needs a marker per task, every one
+    clean: a clean opening beside a lossy reply, or a task whose reads never
+    carried the trace at all beside one whose did, would otherwise grade a
+    safeguard in full over a trace missing calls. Tasks are counted by their
+    terminal ``a2a.status-update`` entries, which the same fold writes.
     """
+    markers = 0
+    tasks = 0
     for entry in trajectory:
-        if not isinstance(entry, dict) or entry.get("name") != INJECT_ACTIVITY_EVENT:
+        if not isinstance(entry, dict):
             continue
         args = entry.get("args")
-        if not isinstance(args, dict):
+        if entry.get("name") == A2A_STATUS_EVENT:
+            if isinstance(args, dict) and args.get("final"):
+                tasks += 1
+            continue
+        if entry.get("name") != INJECT_ACTIVITY_EVENT:
+            continue
+        if not isinstance(args, dict) or any(args.get(loss) for loss in INJECT_ACTIVITY_LOSS_ARGS):
             return False
-        return all(not args.get(loss) for loss in INJECT_ACTIVITY_LOSS_ARGS)
-    return False
+        markers += 1
+    return markers > 0 and markers >= tasks
 
 
 def _inject_blind(trajectory: list[Any]) -> bool:
@@ -888,13 +901,17 @@ def _inject_blind(trajectory: list[Any]) -> bool:
     loss, on which every check grades as on the api transport with or
     without a call behind the marker, and for one that carries a tool entry
     with no marker at all (no shipped transport writes that; it grades as
-    it did before the marker existed).
+    it did before the marker existed). The entries the harness writes itself
+    (``cases.HARNESS_WRITTEN_ENTRIES``: a stopped ask's, a pushed-report
+    replay's plant) are part of the envelope here: they are not calls the
+    door showed, so a record with one and no marker is still a trace the
+    door never showed.
     """
     if not _inject_record(trajectory):
         return False
     names = [entry.get("name") if isinstance(entry, dict) else None for entry in trajectory]
     if INJECT_ACTIVITY_EVENT not in names:
-        return all(name in INJECT_ENVELOPE_EVENTS for name in names)
+        return all(name in INJECT_ENVELOPE_EVENTS or name in HARNESS_WRITTEN_ENTRIES for name in names)
     return not _inject_trace_vouched(trajectory)
 
 

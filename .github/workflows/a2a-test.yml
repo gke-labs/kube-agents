@@ -54,6 +54,10 @@ on:
       - "agents/cluster/persona/**"
       - "agents/platform/scripts/stall_report.py"
       - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+      # hermes-bridge's incident_test.go reads the incident_context hook to
+      # keep the bridge's copy of its frame and token list in step; an edit
+      # to the hook alone has to run that test.
+      - "agents/platform/plugins/incident_context/**"
       # lib/chatmsg validates every shared chat case, so a case-only change
       # has to run it.
       - "tests/conformance/chat/**"
@@ -105,6 +109,7 @@ jobs:
               - "agents/cluster/persona/**"
               - "agents/platform/scripts/stall_report.py"
               - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
+              - "agents/platform/plugins/incident_context/**"
               - "tests/conformance/chat/**"
 
       - name: Set up Go

@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "text": "*Which GitOps repository should I open the pull request against to revert the ConfigMap change?*\n\nThe GitOps state ConfigMap currently lists no managed repositories, so I cannot tell which one holds the change.",
+    "widgets": null
+  }
+]

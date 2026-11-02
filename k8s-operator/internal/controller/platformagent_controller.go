@@ -114,6 +114,11 @@ const (
 	minterReadScope         = "platform-agent-read-scope"
 	minterScopeField        = "scope"
 	minterRepositoriesField = "repositories"
+	// minterSweepScope reads contents, pull requests and issues for a managed
+	// repository. renderRepoPolicy carries it over from default.yaml with the
+	// write scope; renderReadOnlyPolicy keeps minterReadScope alone, so a
+	// context repository's policy never carries it.
+	minterSweepScope = "platform-agent-sweep-scope"
 
 	// metadataLinkLocalIP is the address a workload dials for GCP metadata and Workload
 	// Identity tokens. It is only ever the pre-DNAT destination.
@@ -354,6 +359,19 @@ const (
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
+	// credentialBrokerDownMessageSuffix follows the Provisioning message
+	// while the credential broker is the workload (or one of them) with no
+	// ready replica: an eviction, a drain or a Recreate rollout of its one
+	// pod. The workload's name alone says what to describe, not what the
+	// install is doing meanwhile, and that is what the reader watching a
+	// silent chat needs. Brokered commands are the shell's kubectl, git, gh
+	// and gcloud, every one of which dials the broker's Service. The Chat
+	// clause is added only where googleChatEnabled: the A2A gateway pulls
+	// Chat through the broker's relay and the messages wait in Pub/Sub,
+	// whereas Slack on a next install is the gateway's own socket, and an
+	// install with no Chat has no such queue to name.
+	credentialBrokerDownMessageSuffix     = "; while the credential broker is away, brokered commands fail" // #nosec G101 -- Condition message, not a credential
+	credentialBrokerDownChatMessageSuffix = " and Google Chat messages wait in Pub/Sub"                     // #nosec G101 -- Condition message, not a credential
 	// conditionReasonInvalidCredentialProxyResources: the CR's
 	// spec.deployment.credentialProxy.resources fails
 	// ValidateCredentialProxyResources, so the override is ignored and the
@@ -366,6 +384,12 @@ const (
 	// the operator's default resources.
 	conditionReasonInvalidAgentAPIAuthResources = "InvalidAgentAPIAuthResources"
 	invalidAgentAPIAuthResourcesMsgFmt          = "Invalid spec.deployment.agentAPIAuth.resources (%s); the override is ignored and the agent-api-auth sidecar runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
+	// conditionReasonInvalidShellSandboxResources: the CR's
+	// spec.harness.experimental.shellSandbox.resources fails
+	// ValidateShellSandboxResources, so the override is ignored and the shell
+	// StatefulSet is rendered at the operator's default resources.
+	conditionReasonInvalidShellSandboxResources = "InvalidShellSandboxResources"
+	invalidShellSandboxResourcesMsgFmt          = "Invalid spec.harness.experimental.shellSandbox.resources (%s); the override is ignored and the shell sandbox runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
@@ -422,6 +446,7 @@ type PlatformAgentReconciler struct {
 	prunedUsageStatus sync.Map
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
+	// the proposal readings as one (usageNewerFieldReadings),
 	// lastHumanActiveTime, and each counter after the first schema by its
 	// name -- the last poll in which the usage counters poller wrote the field
 	// and it came back absent: a served CRD at a previous schema, which has
@@ -448,6 +473,13 @@ type PlatformAgentReconciler struct {
 	// the CR is deleted. Separate from the proxy's gate: the two containers'
 	// overrides change independently.
 	agentAPIAuthWarningsLogged sync.Map
+
+	// shellSandboxWarningsLogged records, per CR, the spec generation whose
+	// shell-sandbox resources warnings reconcileShellSandbox last logged, so
+	// each generation logs them once. Keyed by ObjectKey, value int64; cleared
+	// when the CR is deleted. Its own gate, as the two above: the overrides
+	// change independently.
+	shellSandboxWarningsLogged sync.Map
 
 	// replicasLimitedLogged records, per CR, the spec generation whose replica
 	// cap reconcileWorkload last logged, so each generation logs it once
@@ -1254,6 +1286,16 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// until the chart's uninstall deletes the namespace. Removing the
 		// quota on deletion, and what a refused delete should do to the
 		// finalizer, is #3827.
+		//
+		// The dispatcher's pod-read binding there is removed, for the
+		// ClusterRoleBinding's reason above: left behind, anyone who later
+		// creates a ServiceAccount of the dispatcher's name inherits pod read
+		// in that namespace. A failure is logged and never holds the
+		// finalizer, under the profile-namespace rule (#3827 settles what a
+		// refused delete should do).
+		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
+			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's pod-read Role on deletion", err)
+		}
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
 		// is absent or terminating. litellm-policy is owned by Deployment/litellm (via OwnerReference)
@@ -1294,6 +1336,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.forgetUsageStatus(agent)
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
@@ -2617,7 +2660,33 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 // the one place that decides, and credential_proxy_manifests.go carries the
 // reasoning.
 func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash string) error {
-	sts := buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), credentialProxySandboxURL(agent), settingsHash)
+	// The resources override is checked here as well as at admission, because
+	// the chart installs with the webhook off. Rendered, a request above its
+	// limit is refused by the API server as Invalid, which
+	// applyShellSandboxStatefulSet reads as an immutable-field change and
+	// answers by deleting the running sandbox. Refused, the override is ignored
+	// rather than the StatefulSet withheld: it is rendered at the operator's
+	// default resources, so the image, the settings hash and the keys keep
+	// flowing, and updateStatusReady reports the refusal as Degraded. The
+	// warnings are logged once per spec generation, with the same in-memory
+	// gate reconcileCredentialProxy uses and for the reasons given there.
+	refusal, warnings := shellSandboxResourcesRefusal(agent)
+	key := client.ObjectKeyFromObject(agent)
+	if logged, ok := r.shellSandboxWarningsLogged.Load(key); !ok || logged.(int64) != agent.Generation {
+		for _, warning := range warnings {
+			logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
+		}
+		r.shellSandboxWarningsLogged.Store(key, agent.Generation)
+	}
+	rendered := agent
+	if refusal != "" {
+		logf.FromContext(ctx).Info("refusing spec.harness.experimental.shellSandbox.resources; the shell sandbox is rendered at the operator's default resources",
+			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidShellSandboxResources, refusal)
+		rendered = agent.DeepCopy()
+		rendered.Spec.Harness.Experimental.ShellSandbox.Resources = nil
+	}
+	sts := buildShellSandboxStatefulSet(rendered, shellSandboxAuthorizedKeysSecretName(agent), credentialProxySandboxURL(agent), settingsHash)
 	objs := []client.Object{
 		buildShellSandboxServiceAccount(agent),
 		buildShellSandboxService(agent),
@@ -3045,6 +3114,9 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 		return err
 	}
 	objs = append(objs, proxy)
+	// The budget after the Deployment whose pods it selects, as the callout's
+	// and the verifier's are.
+	objs = append(objs, buildCredentialProxyPDB(agent))
 	objs = append(objs, withCredentialProxyProfilePeer(credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace), agent, profiles))
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
@@ -3053,6 +3125,14 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 		apply := r.applyManaged
 		if _, isDeployment := obj.(*appsv1.Deployment); isDeployment {
 			apply = r.applyCredentialProxyDeployment
+		}
+		// A hand-set minAvailable on the budget would make every apply merge
+		// to both fields and be refused, failing this step and the
+		// NetworkPolicy after it on every pass; the clear is the callout's.
+		if pdb, isPDB := obj.(*policyv1.PodDisruptionBudget); isPDB {
+			if err := r.clearForeignPDBBudgetField(ctx, pdb); err != nil {
+				return err
+			}
 		}
 		if err := apply(ctx, agent, obj); err != nil {
 			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
@@ -4297,9 +4377,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		return "", errSplit
 	}
 	notReady := make([]string, 0, len(splitWorkloads))
+	brokerNotReady := false
 	for _, w := range splitWorkloads {
 		if w.ready == 0 {
 			notReady = append(notReady, fmt.Sprintf("%s %s", w.kind, w.name))
+			if w.name == credentialBrokerName(agent) {
+				brokerNotReady = true
+			}
 		}
 	}
 
@@ -4336,6 +4420,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			// generic "waiting for replicas" message would point at the one
 			// workload that is fine. Say which of the other two is missing.
 			condMsg = fmt.Sprintf("Waiting for %s to become ready", strings.Join(notReady, " and "))
+			if brokerNotReady {
+				condMsg += credentialBrokerDownMessageSuffix
+				if googleChatEnabled(agent) {
+					condMsg += credentialBrokerDownChatMessageSuffix
+				}
+			}
 		}
 	}
 
@@ -4363,6 +4453,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	proxyResourcesRefusal, _ := credentialProxyResourcesRefusal(agent)
 	agentAPIAuthRefusal, _ := agentAPIAuthResourcesRefusal(agent)
+	sandboxResourcesRefusal, _ := shellSandboxResourcesRefusal(agent)
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
@@ -4427,6 +4518,14 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonInvalidAgentAPIAuthResources
 		degradedMsg = fmt.Sprintf(invalidAgentAPIAuthResourcesMsgFmt, agentAPIAuthRefusal)
+	} else if sandboxResourcesRefusal != "" {
+		// The third resource refusal, ranked after the two above for the same
+		// reason: the shell runs at the operator's defaults, so Ready and the
+		// phase keep what the workload says, and a reason reporting lost
+		// function must not be masked by it.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonInvalidShellSandboxResources
+		degradedMsg = fmt.Sprintf(invalidShellSandboxResourcesMsgFmt, sandboxResourcesRefusal)
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg

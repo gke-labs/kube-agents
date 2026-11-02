@@ -556,6 +556,11 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          volume, which this container does not share, so the agent
 #                          reads it through the platform MCP server's fleet_scope tool
 #                          and passes the flags on; this module parses them
+#   broker_admission.py    how wide the fleet-audit collectors sweep: it reads what
+#                          the broker admits at once (GET /v1/exec/admission)
+#                          through credential_proxy_client and sizes their pools
+#                          from it, falling back to four. Every sweep collector
+#                          imports it at load
 #   vcs_client.py          the client half of the verb surface: it composes a
 #                          request, sends it over the line above, and raises on a
 #                          refusal. `vcs.py`, `forge.py` and submit-suggestion all
@@ -629,6 +634,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/feedback_broker.py \
      agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/collector_run.py \
+     agents/platform/scripts/broker_admission.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \
