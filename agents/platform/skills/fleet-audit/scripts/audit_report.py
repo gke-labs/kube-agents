@@ -2178,31 +2178,38 @@ KCC_DEPENDENCY_PATTERN = re.compile(
 # whose file declares an object Config Connector does not apply. One line, so
 # `KCC_STALLED_NOTE_PATTERN` removes all of it.
 KCC_STALLED_NOTE_MARK = "**Config Connector is not applying this file.**"
-KCC_STALLED_NOTE = (
-    KCC_STALLED_NOTE_MARK + " When the audit ran, Config Connector reported {objects}. "
+# Each paragraph is a core and a tail. The tail is the part a note can lose
+# when the core does not fit otherwise (`_fit_kcc_paragraph`).
+KCC_STALLED_NOTE_CORE = KCC_STALLED_NOTE_MARK + " When the audit ran, Config Connector reported {objects}."
+KCC_STALLED_NOTE_TAIL = (
     "The cloud resource does not change after the merge until Config Connector applies the object again. "
     "If the reason rejects the change in this file, correct the declaration. Otherwise the change takes "
     "effect when Config Connector applies the object again, and this finding comes back on each run until then."
 )
+KCC_STALLED_NOTE = KCC_STALLED_NOTE_CORE + " " + KCC_STALLED_NOTE_TAIL
 # The paragraph for any other fix of a finding whose own object Config
 # Connector does not apply: a `manual` or `gcloud` fix, a fix degraded to
 # `manual`, or a `manifest` fix to another file. When exactly one file in the
 # repository declares the object, the paragraph keeps the first sentence above
 # and names that file; when none or more than one does, it starts with
 # `KCC_STALLED_OBJECT_MARK` and says so.
-KCC_STALLED_DECLARED_NOTE = (
-    KCC_STALLED_NOTE_MARK + " The declaration is {path}. When the audit ran, Config Connector reported {objects}. "
+KCC_STALLED_DECLARED_CORE = (
+    KCC_STALLED_NOTE_MARK + " The declaration is {path}. When the audit ran, Config Connector reported {objects}."
+)
+KCC_STALLED_OBJECT_TAIL = (
     "Config Connector does not apply the object until that reason is gone, so a change to the declaration "
-    "does not take effect before then, and this finding comes back on each run until then. "
-    "If the reason rejects the declaration, correct it there."
+    "does not take effect before then, and this finding comes back on each run until then."
+)
+KCC_STALLED_DECLARED_NOTE = (
+    KCC_STALLED_DECLARED_CORE + " " + KCC_STALLED_OBJECT_TAIL + " If the reason rejects the declaration, correct it there."
 )
 KCC_STALLED_OBJECT_MARK = "**Config Connector is not applying the declaration of this object.**"
-KCC_STALLED_UNDECLARED_NOTE = (
+KCC_STALLED_UNDECLARED_CORE = (
     KCC_STALLED_OBJECT_MARK + " When the audit ran, Config Connector reported {objects}. "
-    "The audit found {found} of this object in the GitOps repository, so it names no file. "
-    "Config Connector does not apply the object until that reason is gone, so a change to the declaration "
-    "does not take effect before then, and this finding comes back on each run until then. "
-    "If the reason rejects the declaration, correct the declaration."
+    "The audit found {found} of this object in the GitOps repository, so it names no file."
+)
+KCC_STALLED_UNDECLARED_NOTE = (
+    KCC_STALLED_UNDECLARED_CORE + " " + KCC_STALLED_OBJECT_TAIL + " If the reason rejects the declaration, correct the declaration."
 )
 KCC_DECLARATION_NONE = "no declaration"
 KCC_DECLARATION_MANY = "more than one declaration ({count} files)"
@@ -2249,6 +2256,10 @@ KCC_STALLED_FINDING_FIELD = "kcc_stalled"
 # the list of objects takes, so the note leaves room in `MAX_NOTE_CHARS` for
 # the start of the worker's note.
 KCC_STALLED_NAMED = 2
+# The paragraph's steps from whole to core, as (objects named, follow the
+# dependency chain, keep the tail): `_fit_kcc_paragraph` takes the first
+# that fits.
+KCC_PARAGRAPH_STEPS = ((KCC_STALLED_NAMED, True, True), (1, True, True), (1, False, True), (1, False, False))
 # How the list names one object, joins two, names what one waits on, and
 # counts the ones it leaves out.
 KCC_STALLED_OBJECT = "`Ready=False` on {name} ({why})"
@@ -18156,6 +18167,10 @@ def _fit_route_notes(worker_note: str, notes: list[str]) -> tuple[str, str]:
     if _is_kcc_reverted_note(worker_note):
         # All of it is text that `finish` wrote, so nothing in it is cut.
         head = KustomizeNoteHead(worker_note, None, True, "")
+    elif worker_note.startswith(GENERATED_FIX_NOTE):
+        # The text `finish` wrote at the start of a fix it derived, which the
+        # renderer reads with `startswith`: kept whole.
+        head = KustomizeNoteHead(GENERATED_FIX_NOTE, None, True, worker_note[len(GENERATED_FIX_NOTE) :].strip())
     else:
         head = _split_kustomize_head(worker_note)
     block = ""
@@ -19191,15 +19206,19 @@ def _kcc_declaration_path(declaration: KccDeclaration) -> str:
     return KCC_DECLARATION_IN_REPO.format(path=path, repo=f"`{KCC_NAME_UNSAFE.sub(KCC_NAME_REPLACEMENT, declaration.repo)}`")
 
 
-def kcc_object_paragraph(matched: list[KccStall], objects: str, declarations: "dict[KccKey, KccDeclaration]") -> str:
+def kcc_object_paragraph(
+    matched: list[KccStall], objects: str, declarations: "dict[KccKey, KccDeclaration]", tail: bool = True
+) -> str:
     """The paragraph for a fix that is not a `manifest` fix of the object's
     own file: it names the one declaration of the first matched object, or
-    says that the audit found none or more than one."""
+    says that the audit found none or more than one. Without `tail`, only
+    the core (`_fit_kcc_paragraph`)."""
     found = _declarations_of(matched[0], declarations)
     if len(found) == 1:
-        return KCC_STALLED_DECLARED_NOTE.format(path=_kcc_declaration_path(found[0][1]), objects=objects)
+        template = KCC_STALLED_DECLARED_NOTE if tail else KCC_STALLED_DECLARED_CORE
+        return template.format(path=_kcc_declaration_path(found[0][1]), objects=objects)
     count = KCC_DECLARATION_NONE if not found else KCC_DECLARATION_MANY.format(count=len(found))
-    return KCC_STALLED_UNDECLARED_NOTE.format(found=count, objects=objects)
+    return (KCC_STALLED_UNDECLARED_NOTE if tail else KCC_STALLED_UNDECLARED_CORE).format(found=count, objects=objects)
 
 
 def _kcc_name(stall: KccStall) -> str:
@@ -19217,26 +19236,29 @@ def _kcc_why(stall: KccStall) -> str:
     return f"`{why}`"
 
 
-def kcc_stalled_objects(matched: list[KccStall], stalled: list[KccStall]) -> str:
+def kcc_stalled_objects(
+    matched: list[KccStall], stalled: list[KccStall], named: int = KCC_STALLED_NAMED, chains: bool = True
+) -> str:
     """The objects a note or a comment names, with what each waits on.
 
     `Ready=False` on the first `KCC_STALLED_NAMED` matched objects, each with
     the deepest unready object it waits on (`_kcc_dependencies`, the root
     cause) and a count of the ones between them, within
     `KCC_STALLED_OBJECTS_MAX_CHARS`; the rest are counted. The first object is
-    always named.
+    always named. A shorter list names `named` objects, and without
+    `chains` names no object they wait on (`_fit_kcc_paragraph`).
     """
     parts: list[str] = []
     for count, stall in enumerate(matched):
         text = KCC_STALLED_OBJECT.format(name=_kcc_name(stall), why=_kcc_why(stall))
-        chain = _kcc_dependencies(stall, stalled)
+        chain = _kcc_dependencies(stall, stalled) if chains else []
         if chain:
             root = chain[-1]
             text += f"{KCC_STALLED_WAITS_ON}{_kcc_name(root)} ({_kcc_why(root) if root.read else KCC_STALLED_NOT_READ})"
             if len(chain) > 1:
                 text += KCC_STALLED_WAITS_MORE.format(rest=len(chain) - 1)
         joined = KCC_STALLED_SEPARATOR.join([*parts, text])
-        if parts and (count >= KCC_STALLED_NAMED or len(joined) > KCC_STALLED_OBJECTS_MAX_CHARS):
+        if parts and (count >= named or len(joined) > KCC_STALLED_OBJECTS_MAX_CHARS):
             break
         parts.append(text)
     rest = len(matched) - len(parts)
@@ -19253,27 +19275,46 @@ def _strip_kcc_stalled_note(remediation: object) -> None:
         remediation["note"] = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
 
 
-def _with_kcc_stalled_note(note: str, stalled_note: str) -> str:
-    """`note` with `stalled_note` as its last paragraph, inside `MAX_NOTE_CHARS`.
+def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> None:
+    """Put the first of `paragraphs` that fits on `remediation`'s note.
 
-    The renderer clips a note from the end, which would take this note first.
-    So the worker's note is cut instead (`_cut_worker_note`), and the text
-    `finish` wrote at its start (`GENERATED_FIX_NOTE`, which the renderer
-    reads with `startswith`) is kept whole.
+    `paragraphs` go from the whole paragraph to its core with one object.
+    The fit is `_fit_route_notes`, the route-note pass's: it cuts only the
+    worker's own text and never the text `finish` wrote (the Kustomize note
+    and its copied file, the closing text of `degrade_missing_remediations`,
+    the note of `degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`),
+    and never inside a code block. The route notes already on the note stay,
+    and a paragraph that would push out the reconciler note does not fit, so
+    the reconciler note is always shown. When even the core does not fit
+    beside the text `finish` wrote, that text stays whole and the core goes
+    after it, past `MAX_NOTE_CHARS`: the renderer then cuts the core's end,
+    and its first sentence still shows. The worker's note before a cut goes
+    in `ROUTE_UNCUT_NOTE_FIELD`, as the route-note pass keeps it, so the carry
+    puts the whole note back once the stall is gone.
     """
-    head = GENERATED_FIX_NOTE if note.startswith(GENERATED_FIX_NOTE) else ""
-    body = note[len(head) :].strip()
-    fitted = _cut_worker_note(body, "", stalled_note, head)
-    if fitted is None:
-        fitted = head
-    # The Config Connector paragraph is never the part that is cut: drop
-    # what is before it, the worker's text first and then the head, until
-    # the note fits.
-    for before in (fitted, head, ""):
-        joined = ROUTE_PARAGRAPH_BREAK.join(part for part in (before, stalled_note) if part)
-        if len(publishable_text(joined).strip()) <= MAX_NOTE_CHARS:
-            return joined
-    return stalled_note
+    note = str(remediation.get("note") or "").strip()
+    uncut = remediation.get(ROUTE_UNCUT_NOTE_FIELD)
+    route = [found.group(0) for found in ROUTE_NOTE_PATTERN.finditer(note)]
+    worker = uncut if isinstance(uncut, str) else ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
+    reconciler = [text for text in route if text.startswith(RECONCILED_NOTE_LEDE)]
+    fitted, added = _fit_route_notes(worker, route)
+    for paragraph in paragraphs:
+        # On a paragraph of its own after the route notes, so that a later
+        # strip of it (`KCC_STALLED_NOTE_PATTERN`) leaves them whole.
+        shown = ROUTE_PARAGRAPH_BREAK + paragraph if route else paragraph
+        candidate, candidate_added = _fit_route_notes(worker, [*route, shown])
+        if shown in candidate_added and all(text in candidate_added for text in reconciler):
+            fitted, added = candidate, candidate_added.replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
+            break
+    else:
+        # No room even for the core: the text `finish` wrote stays whole, and
+        # so do the route notes, and the core goes after them.
+        added = ROUTE_PARAGRAPH_BREAK.join(part for part in (added, paragraphs[-1]) if part)
+    if fitted != worker:
+        remediation[ROUTE_UNCUT_NOTE_FIELD] = worker
+    else:
+        remediation.pop(ROUTE_UNCUT_NOTE_FIELD, None)
+    remediation["note"] = ROUTE_PARAGRAPH_BREAK.join(part for part in (fitted, added) if part)
 
 
 def disclose_stalled_kcc_remediations(
@@ -19353,16 +19394,22 @@ def disclose_stalled_kcc_remediations(
             else []
         )
         if matched:
-            objects = kcc_stalled_objects(matched, stalled)
-            finding[KCC_STALLED_FINDING_FIELD] = objects
-            if in_file:
-                paragraph = KCC_STALLED_NOTE.format(objects=objects)
-            else:
-                paragraph = kcc_object_paragraph(matched, objects, declarations or {})
+            finding[KCC_STALLED_FINDING_FIELD] = kcc_stalled_objects(matched, stalled)
+            # From the whole paragraph to its core with one object, for a note
+            # that has no room for more (`_fit_kcc_paragraph`).
+            paragraphs: list[str] = []
+            for named, chains, tail in KCC_PARAGRAPH_STEPS:
+                objects = kcc_stalled_objects(matched, stalled, named, chains)
+                if in_file:
+                    text = (KCC_STALLED_NOTE if tail else KCC_STALLED_NOTE_CORE).format(objects=objects)
+                else:
+                    text = kcc_object_paragraph(matched, objects, declarations or {}, tail)
+                if text not in paragraphs:
+                    paragraphs.append(text)
             if isinstance(remediation, dict) and remediation.get("kind") == "gcloud":
-                finding[KCC_STALLED_PARAGRAPH_FIELD] = paragraph
+                finding[KCC_STALLED_PARAGRAPH_FIELD] = paragraphs[0]
             elif isinstance(remediation, dict):
-                remediation["note"] = _with_kcc_stalled_note(str(remediation.get("note") or "").strip(), paragraph)
+                _fit_kcc_paragraph(remediation, paragraphs)
         moved = isinstance(remediation, dict) and remediation.get("note") != before
         if moved or finding.get(KCC_STALLED_PARAGRAPH_FIELD) != before_paragraph:
             changed.append(fid)

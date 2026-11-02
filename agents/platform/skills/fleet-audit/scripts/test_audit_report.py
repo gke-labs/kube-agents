@@ -23456,6 +23456,80 @@ metadata:
                 audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations)
                 self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
 
+    POOL_STALL = {"kind": "ContainerNodePool", "namespace": "infra", "name": "pinned-inference-pool", "cluster": "c1",
+                  "project": "p", "why": "DependencyNotFound: reference ContainerCluster infra/c1 is not found"}
+
+    def harness_finding(self, note):
+        return make_finding(fid="f1", cluster="p/us-central1/c1", obj="NodePool/pinned-inference-pool",
+                            remediation={"kind": "manual", "note": note})
+
+    def test_the_paragraph_never_cuts_the_kustomize_note_or_its_copied_file(self):
+        """The Kustomize note's block is the only published copy of a degraded
+        fix: it stays whole, and the paragraph's first sentence still shows."""
+        reason = ("did not open a pull request for this fix. `clusters/a/provisioning/pool.yaml` is a new file in the "
+                  "Kustomize root `clusters/a`, and `clusters/a/kustomization.yaml` does not list it. "
+                  f"{audit_report.KUSTOMIZE_NOTE_MARK} To apply the fix, add the file and add the line `- provisioning/pool.yaml` "
+                  "under `resources:` in `clusters/a/kustomization.yaml`")
+        prefix = f"_(The audit {reason}.)_"
+        lines = ["apiVersion: container.cnrm.cloud.google.com/v1beta1", "kind: ContainerNodePool", "metadata:",
+                 "  name: pinned-inference-pool", "spec:", "  location: us-central1"] + [
+            f"  # a long explanatory comment line in the worker file, number {i:02d}, kept as is" for i in range(40)]
+        block = audit_report._sized_manifest_block(
+            lines, True, lambda b: len(audit_report.publishable_text(prefix + b)) <= audit_report.MAX_NOTE_CHARS
+        )
+        finding = self.harness_finding(prefix + block + " Raise the cap.")
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+        note = finding["remediation"]["note"]
+        self.assertTrue(note.startswith(prefix + block), note[:200])
+        self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, note.split(block, 1)[1])
+        self.assertEqual(note.count("```"), block.count("```"))
+
+    def test_the_paragraph_never_cuts_the_degraded_fix_text(self):
+        worker = ("Raise the pool's max node count and add a second zone. " * 24).strip()
+        degraded = (f"{audit_report.DEGRADED_REMEDIATION_LEDE}did not find the file `clusters/a/provisioning/x.yaml` that "
+                    f"the fix names. {audit_report.DEGRADED_REMEDIATION_TAIL}")
+        finding = self.harness_finding(worker + " " + degraded)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+        note = finding["remediation"]["note"]
+        self.assertIn(degraded, note)
+        self.assertTrue(audit_report._harness_wrote_note(finding["remediation"]))
+        self.assertIn(audit_report.ROUTE_NOTE_TRUNCATED, note)
+        self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, note)
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+
+    def test_the_reconciler_note_stays_when_the_paragraph_is_added(self):
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `web`")
+        worker = ("Scale the pool by hand. " * 70).strip()
+        finding = self.harness_finding(worker + "\n\n" + reconciled)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+        note = finding["remediation"]["note"]
+        self.assertIn(reconciled, note)
+        self.assertTrue(note.split("\n\n")[-1].startswith(audit_report.KCC_STALLED_OBJECT_MARK), note[-300:])
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+        # The paragraph comes off whole, and the reconciler note with it stays.
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(), self.root, {})
+        self.assertIn(reconciled, finding["remediation"]["note"])
+
+    def test_a_cut_worker_note_comes_back_after_the_stall_clears(self):
+        """Run 1 cuts the worker's note for the paragraph and keeps the whole
+        note; run 2 has no stall, and the carry publishes the whole note."""
+        worker = ("Raise the pool's max node count by hand in the console. " * 26).strip()
+
+        def finding():
+            return make_finding(fid="pool-skew-p-us-central1-c1-pool-a", check="pool-skew", cluster="p/us-central1/c1",
+                                obj="NodePool/pool-a", remediation={"kind": "manual", "note": worker})
+
+        stall = {"kind": "ContainerNodePool", "namespace": "infra", "name": "pool-a", "cluster": "c1", "project": "p",
+                 "why": "UpdateFailed: googleapi: Error 400: total_max_node_count and max_node_count both set"}
+        first = finding()
+        audit_report.disclose_stalled_kcc_remediations([first], kcc_manifest(stall), self.root, {})
+        self.assertIn(audit_report.ROUTE_NOTE_TRUNCATED, first["remediation"]["note"])
+        self.assertEqual(first["remediation"][audit_report.ROUTE_UNCUT_NOTE_FIELD], worker)
+        second = finding()
+        audit_report.carry_unchanged_findings([second], {"findings": [copy.deepcopy(first)]})
+        audit_report.disclose_stalled_kcc_remediations([second], kcc_manifest(), self.root, {})
+        self.assertEqual(second["remediation"]["note"], worker)
+
     def test_the_cycle_guard_ends_a_chain_that_waits_on_itself(self):
         """A waits on B and B waits on A: the chain ends."""
         a = audit_report.KccStall("PubSubTopic", "infra", "a", "DependencyNotReady: reference PubSubTopic infra/b is not ready", "", "", "h")
