@@ -83,3 +83,29 @@ def test_prose_that_names_no_stop_does_not_match():
         "Nothing is missing: Config Connector is installed on every cluster.",
     ):
         assert not _matches(report), report
+
+
+def test_the_two_provisioning_cases_read_the_same_absence():
+    # The absence list and the backward head are copied verbatim between this
+    # case and provisioning-kcc-cluster-without-crds-stops; this holds them
+    # together, and a recorded KCC stop that names Config Connector is a stop
+    # in both checks.
+    import re
+    from pathlib import Path
+
+    tasks = Path(__file__).resolve().parent.parent / "tasks"
+    this = (tasks / CASE / "task.yaml").read_text()
+    kcc = (tasks / "provisioning-kcc-cluster-without-crds-stops" / "task.yaml").read_text()
+    tail = re.compile(r"\{0,80\}\?(\(\?:.*)'$", re.M)
+    assert tail.search(this).group(1) == tail.search(kcc).group(1)
+    head = re.compile(r"^        - '(\\b\(\?:lacks\?.*?\(\?:has\|have\|runs\?\)\) \(\?:a \|an \|any \|the \|this \|these \|those \)\?)", re.M)
+    assert head.search(this).group(1) == head.search(kcc).group(1)
+    for report in (
+        "Config Connector isn't installed on any of the 5 clusters in kube-agents-evals-38 (platform-agent-host and seeded-a to seeded-d).",
+        "None of the 5 clusters in kube-agents-evals-38 (platform-agent-host and seeded-a through seeded-d) has Config Connector installed, so nothing would apply a ContainerCluster or ContainerNodePool manifest.",
+        "Config Connector has not been installed on any cluster.",
+        "The host cluster does not have Config Connector installed.",
+        "KCC (Config Connector) is not installed on the host cluster.",
+    ):
+        assert _matches(report), report
+        assert check_passes("provisioning-kcc-cluster-without-crds-stops", "the-reply-names-the-missing-config-connector", report), report
