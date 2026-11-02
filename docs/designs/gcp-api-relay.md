@@ -285,8 +285,7 @@ class ApiSession:
         ...  # endpoint defaults to the exec tier's URL, else CREDENTIAL_PROXY_URL; http to a lazily imported requests.Session()
 
     def get(self, url: str, *, params=None, timeout=None):
-        return self._http.get(self.relay_url(url), params=params,
-                              headers=authorization_headers(), timeout=timeout)
+        ...  # self._http.get(self.relay_url(url), params=params, headers=authorization_headers(), timeout=timeout), with the exec tier's fallback
 ```
 
 `relay_url` rewrites `https://<host>/<path>?<query>` onto `{broker}/v1/gcp/<host>/<path>?<query>`,

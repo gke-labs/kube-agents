@@ -1131,6 +1131,7 @@ def execute(
                 and fallback is not None
                 and exc.code == BUSY_STATUS
                 and not retried
+                and isinstance(reply.get(BUSY_BOUND_KEY), str)
                 and reply.get(BUSY_BOUND_KEY) in RETRYABLE_BUSY_BOUNDS
             ):
                 # Refused at admission, before the command started, under a
@@ -1150,6 +1151,11 @@ def execute(
                 targets = targets[1:]
                 continue
             print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
+            return 1
+        except http.client.InvalidURL as exc:
+            # Raised while the connection is built, before a socket opens:
+            # nothing was sent.
+            print(f"credential proxy unavailable: {exc}", file=sys.stderr)
             return 1
         except (http.client.HTTPException, OSError) as exc:
             # The request was sent and the connection dropped: the command may

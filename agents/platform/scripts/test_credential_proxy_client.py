@@ -1888,7 +1888,7 @@ class TestExecTierRouting(unittest.TestCase):
                 self.assertEqual(1, len({request_id for _, request_id in calls}))
 
     def test_a_refusal_under_any_other_bound_is_not_retried(self):
-        for bound in ("session", "refresh-lock", "other", "scope", None):
+        for bound in ("session", "refresh-lock", "other", "scope", None, ["slot"], {"slot": 1}):
             with self.subTest(bound=bound):
                 code, calls, stderr = self.run_shim([busy_error(bound)])
                 self.assertEqual(1, code)
@@ -1995,6 +1995,17 @@ class TestExecTierRouting(unittest.TestCase):
                 self.assertEqual(1, code)
                 self.assertEqual(1, len(calls))
                 self.assertIn("the command may have run", stderr)
+
+    def test_a_malformed_url_is_not_reported_as_a_drop(self):
+        """urllib builds the connection outside its own try, so a bad port is raised
+        bare, before a socket opens: nothing was sent."""
+        stderr = io.StringIO()
+        with patch.dict("os.environ", self.environ, clear=False), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+            code = credential_proxy_client.execute("http://broker:abc", ["kubectl", "get", "pods"], fallback=self.STATEFUL)
+        self.assertEqual(1, code)
+        self.assertIn("credential proxy unavailable", stderr.getvalue())
+        self.assertNotIn("may have run", stderr.getvalue())
 
 
 class TestBrokerUnreachable(unittest.TestCase):
