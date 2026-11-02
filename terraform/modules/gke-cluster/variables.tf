@@ -176,7 +176,7 @@ variable "standard_machine_type" {
 }
 
 variable "standard_node_count" {
-  description = "Node count per zone for the Standard cluster's default node pool. Only used when cluster_mode = \"standard\"."
+  description = "Node count per zone the Standard cluster's default node pool is created with. It is google_container_cluster's initial_node_count, which the google provider treats as ForceNew on the cluster itself: changing it on a live cluster plans the cluster's destruction and recreation, so resize a live default pool with gcloud instead. Only used when cluster_mode = \"standard\"."
   type        = number
   default     = 1
 }

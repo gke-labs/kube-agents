@@ -61,7 +61,7 @@ variable "standard_machine_type" {
 }
 
 variable "standard_node_count" {
-  description = "Node count per zone for the Standard cluster's default node pool. Passed through to the gke-cluster module."
+  description = "Node count per zone the Standard cluster's default node pool is created with: the cluster's initial_node_count, ForceNew on the cluster itself, so a changed value on a live cluster plans the cluster's destruction and recreation, which lifecycle.sh's guard_standard_node_count refuses. Passed through to the gke-cluster module."
   type        = number
   default     = 1
 }

@@ -8,6 +8,8 @@ Tests safety guards in lifecycle.sh before terraform apply:
 - guard_kms_identity: prevents the CMEK key ring or key being replaced (and the live
   key's versions scheduled for destruction) when GKE_DB_KMS_KEYRING / GKE_DB_KMS_KEY
   disagree with state.
+- guard_standard_node_count: prevents the Standard cluster's replacement when
+  standard_node_count (its ForceNew initial_node_count) disagrees with state.
 """
 
 import os
@@ -105,6 +107,7 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_enable_stockout="false",
                    tfvar_stockout_topic='"gke-stockout-alerts-topic"',
                    tfvar_stockout_sub='"gke-stockout-alerts-sub"',
+                   tfvar_standard_node_count="1",
                    console_fail_var="",
                    apply_stub="exit 0",
                    show_rc=0,
@@ -230,6 +233,9 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"stockout_pubsub_subscription"* ]]; then
         echo '{tfvar_stockout_sub}'
+        exit 0
+    elif [[ "$expr" == *"standard_node_count"* ]]; then
+        echo '{tfvar_standard_node_count}'
         exit 0
     fi
     echo 'null'
@@ -655,6 +661,50 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
         self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
+
+    # terraform state show prints a number bare and the top-level attributes
+    # before the nested blocks; the node_pool block repeats the name.
+    _STANDARD_CLUSTER_STATE = (
+        'resource "google_container_cluster" "standard" {\n'
+        '    initial_node_count = 1\n'
+        '    name               = "fleet-host"\n'
+        '    node_pool {\n'
+        '        initial_node_count = 1\n'
+        '        name               = "default-pool"\n'
+        '    }\n'
+        '}'
+    )
+
+    def test_guard_standard_node_count_no_op_without_a_standard_cluster_in_state(self):
+        """An Autopilot install, or an adopted cluster, has no standard[0] to replace."""
+        proc = self._run_guard(
+            "guard_standard_node_count",
+            state_list="module.gke_cluster.google_container_cluster.autopilot[0]",
+            tfvar_standard_node_count="3",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_standard_node_count_passes_when_configuration_matches_state(self):
+        proc = self._run_guard(
+            "guard_standard_node_count",
+            state_list="module.gke_cluster.google_container_cluster.standard[0]",
+            state_show=self._STANDARD_CLUSTER_STATE,
+            tfvar_standard_node_count="1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_standard_node_count_refuses_a_changed_count(self):
+        """initial_node_count is ForceNew on the cluster: a changed count plans its destroy-and-recreate."""
+        proc = self._run_guard(
+            "guard_standard_node_count",
+            state_list="module.gke_cluster.google_container_cluster.standard[0]",
+            state_show=self._STANDARD_CLUSTER_STATE,
+            tfvar_standard_node_count="2",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("standard_node_count resolved to '2', but this state's cluster was created with 1 node(s) per zone", proc.stderr)
+        self.assertIn("cluster's DESTRUCTION", proc.stderr)
+        self.assertIn("TF_VAR_standard_node_count=1", proc.stderr)
 
     def test_guard_pubsub_subscription_no_op_when_chat_disabled(self):
         """A subscription in state whose feature is switched off is a teardown, not a rename."""

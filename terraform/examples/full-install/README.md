@@ -244,7 +244,11 @@ release namespace (`NAMESPACE` in `install.env`) has the same guard,
 so do the CMEK key ring and key names (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`,
 `guard_kms_identity`): on a cluster this state created, a renamed key would be
 destroyed and recreated, which schedules the live key's versions for destruction.
-A key is rotated in Cloud KMS, not by renaming it here.
+A key is rotated in Cloud KMS, not by renaming it here. On a Standard cluster
+`standard_node_count` is the cluster's own `initial_node_count`, ForceNew on the
+cluster itself, and a `TF_VAR_standard_node_count` line in `install.env` reaches
+it: `guard_standard_node_count` refuses a count other than the one the cluster
+was created with, because the plan would be the cluster's destroy-and-recreate.
 And a distinct GSA name un-collides creation, not identity: the Workload
 Identity principal names a namespace and KSA project-wide, no cluster, so two
 installs that share the namespace and the default KSA name bind the same

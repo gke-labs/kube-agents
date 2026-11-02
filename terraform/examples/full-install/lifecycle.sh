@@ -34,6 +34,9 @@
 #      destructive replacement under -auto-approve. `guard_gsa_identity` refuses
 #      the apply before Terraform runs. The release namespace is ForceNew the
 #      same way; `guard_release_namespace` refuses a move on apply and destroy.
+#      So is the Standard cluster's initial_node_count, which standard_node_count
+#      feeds and a `TF_VAR_standard_node_count` line in install.env reaches;
+#      `guard_standard_node_count` refuses a changed count on apply.
 #   7. A state left by an interrupted install can hold the cluster's CMEK
 #      entries next to a create_cluster that the retry computes as false, and
 #      the module then plans their destruction. `forget_unmanaged_cluster_kms`
@@ -154,9 +157,10 @@ readonly SCOPE_OVERRIDE_FILE="$SCOPE_RESOLVER_MODULE_DIR/scope_resolver_lifecycl
 # State addresses the guards below read. The cluster has three spellings:
 # one per mode, plus the index-less autopilot address a state predating the
 # mode switch still carries until its first plan renames it.
+readonly STANDARD_CLUSTER_ADDRESS="module.gke_cluster.google_container_cluster.standard[0]"
 CLUSTER_ADDRESSES=(
   "module.gke_cluster.google_container_cluster.autopilot[0]"
-  "module.gke_cluster.google_container_cluster.standard[0]"
+  "$STANDARD_CLUSTER_ADDRESS"
   "module.gke_cluster.google_container_cluster.autopilot"
 )
 readonly CLUSTER_ADDRESSES
@@ -423,6 +427,14 @@ in_tainted() { grep -Fxq "$1" <<<"$TAINTED_LIST"; }
 state_attr() {
   terraform state show -no-color "$1" 2>/dev/null |
     sed -n "s/^ *$2 *= *\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+# The same for a number attribute, which state show prints bare
+# (`initial_node_count = 1`); state_attr's pattern wants the quotes a string
+# carries and would read it as absent.
+state_number_attr() {
+  terraform state show -no-color "$1" 2>/dev/null |
+    sed -n "s/^ *$2 *= *\([0-9][0-9]*\) *$/\1/p" | head -1
 }
 
 # terraform import configures every provider, and the helm provider here is built
@@ -829,6 +841,36 @@ guard_release_namespace() {
   warn "and the agent's gateway endpoint is fixed to the release namespace, so the moved release would not work."
   warn "Set NAMESPACE=\"$recorded\" in install.env (or drop the key to take the default), or set namespace in"
   warn "terraform.tfvars for a hand-driven apply."
+  exit 1
+}
+
+# initial_node_count on google_container_cluster is ForceNew on the cluster
+# itself, and the composition forwards standard_node_count to it, so a
+# `TF_VAR_standard_node_count` line in install.env reaches a cluster that
+# already exists: the front doors source install.env with `set -a` and apply
+# under -auto-approve, and the plan a changed count produces is the cluster's
+# destroy and recreate, with the release, the gVisor pool and the agent's
+# state on it. Same shape as guard_release_namespace. A live default pool is
+# resized with gcloud; the input is the count the cluster was created with.
+guard_standard_node_count() {
+  load_state
+  local addr="$STANDARD_CLUSTER_ADDRESS"
+  in_state "$addr" || return 0
+
+  local recorded
+  recorded=$(state_number_attr "$addr" initial_node_count)
+  [[ -n "$recorded" ]] || return 0
+
+  local desired
+  desired=$(tfvar standard_node_count)
+  [[ "$recorded" == "$desired" ]] && return 0
+
+  warn "standard_node_count resolved to '$desired', but this state's cluster was created with $recorded node(s) per zone ($addr)."
+  warn "initial_node_count is ForceNew on google_container_cluster: applying now would plan the cluster's DESTRUCTION and"
+  warn "recreation under -auto-approve, with the release, the gVisor pool and the agent's state on it."
+  warn "Set TF_VAR_standard_node_count=$recorded in install.env (the count the cluster was created with; drop the line when"
+  warn "that is the default, 1), or set standard_node_count in terraform.tfvars for a hand-driven apply. Resize a live"
+  warn "default pool with 'gcloud container clusters resize <cluster> --node-pool default-pool --num-nodes <n>' instead."
   exit 1
 }
 
@@ -1680,6 +1722,7 @@ case "${1:-}" in
     guard_gsa_identity
     guard_kms_identity
     guard_release_namespace
+    guard_standard_node_count
     guard_pubsub_subscription
     guard_drift_adoption
     forget_unmanaged_cluster_kms
@@ -1744,7 +1787,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,87p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,90p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac
