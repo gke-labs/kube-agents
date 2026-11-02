@@ -8187,7 +8187,9 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 
 	// natscli's create spellings, aliases included, and the edits that can raise a cap.
 	creates := regexp.MustCompile(`\b(stream (?:add|create|new)|kv (?:add|new|create))\s+(\S+)(.*)$`)
-	edits := regexp.MustCompile(`\b(stream (?:edit|update))\s+(\S+)(.*)$`)
+	// Every edit or update, stream or bucket: one this test can't read fails rather
+	// than raising a cap it never sees.
+	edits := regexp.MustCompile(`\b((?:stream|kv) (?:edit|update))\b\s*(\S*)(.*)$`)
 	capOf := func(name, flag, rest string) (int64, bool) {
 		for _, f := range strings.Fields(rest) {
 			if v, ok := strings.CutPrefix(f, flag); ok {
@@ -8222,7 +8224,11 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 			caps[name] = max(caps[name], n)
 		}
 		if m := edits.FindStringSubmatch(line); m != nil {
-			if n, found := capOf(m[2], "--max-bytes=", m[3]); found && n > caps[m[2]] {
+			n, found := capOf(m[2], "--max-bytes=", m[3])
+			if !strings.HasPrefix(m[1], "stream ") || !found {
+				t.Fatalf("unparsed cap-changing command; teach the test: %q", strings.TrimSpace(line))
+			}
+			if n > caps[m[2]] {
 				caps[m[2]] = n
 			}
 		}
