@@ -36,6 +36,11 @@ readonly TSE_TEMPLATE="/opt/tse-template"
 readonly DEFAULTS_PLUGINS_DIR="/opt/defaults/plugins"
 readonly OPTIONAL_PROFILE_STAMP=".optional-profile"
 readonly DELETED_PROFILES_DIR=".deleted"
+# The boot stamp at the root of a cluster profile home: the digest of everything
+# step 2.6's cluster loop reads from the image, written after a pass with no
+# warning. A home whose stamp matches this start's digest is skipped by the loop.
+# STAMP_FILE in cluster_boot_stamp.py; change both together.
+readonly CLUSTER_BOOT_STAMP_FILE=".scaffold-stamp"
 readonly OPTIONAL_SYNC_ITEMS="config.yaml SOUL.md AGENTS.md CAPABILITIES.md"
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
@@ -1622,8 +1627,58 @@ CLUSTER_IMAGE_PLUGINS="tool_call_audit common"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
     CLUSTER_PROFILE_SCRIPT="/opt/defaults/scripts/cluster_agent_profile.py"
     [ -f "$CLUSTER_PROFILE_SCRIPT" ] || CLUSTER_PROFILE_SCRIPT="$TARGET_DIR/scripts/cluster_agent_profile.py"
+    # The boot stamp. Every step of the loop below is a function of the image: the
+    # template tree (personas, config, skills), the shared plugin code, the two
+    # scaffold scripts and this file, which holds the config repairs. A home the
+    # loop brought up to date for this image has nothing left to take from it, and
+    # at a few hundred homes the serial loop outlives the pod's readiness budget.
+    # So the inputs are hashed once per start, every cluster-* home whose
+    # $CLUSTER_BOOT_STAMP_FILE carries that digest is skipped, and a home the loop
+    # refreshes without a warning is stamped with it at the end of its pass. The
+    # image's copy of the script, as for the scaffolder above, falling back to the
+    # volume's; with neither, or when either call fails, every home is refreshed
+    # and none is stamped, which is what the loop always did. Deleting a home's
+    # stamp forces its next start through the whole pass.
+    CLUSTER_BOOT_STAMP_SCRIPT="/opt/defaults/scripts/cluster_boot_stamp.py"
+    [ -f "$CLUSTER_BOOT_STAMP_SCRIPT" ] || CLUSTER_BOOT_STAMP_SCRIPT="$TARGET_DIR/scripts/cluster_boot_stamp.py"
+    CLUSTER_BOOT_DIGEST=""
+    CLUSTER_STALE_PROFILES=""
+    if [ -f "$CLUSTER_BOOT_STAMP_SCRIPT" ]; then
+        # In a command substitution so the `set --` that builds the argument list
+        # is local to it: the script's own positional parameters are the command
+        # `exec "$@"` runs at the end. $0 is this file, the entrypoint.
+        CLUSTER_BOOT_DIGEST="$(
+            set -- --input "$CLUSTER_TEMPLATE"
+            for _plugin in $CLUSTER_IMAGE_PLUGINS; do
+                set -- "$@" --input "$CLUSTER_SHARED_PLUGINS/$_plugin"
+            done
+            exec "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_BOOT_STAMP_SCRIPT" digest "$@" \
+                --input "$CLUSTER_PROFILE_SCRIPT" --input "$SCAFFOLD" --input "$0"
+        )" || CLUSTER_BOOT_DIGEST=""
+    fi
+    if [ -n "$CLUSTER_BOOT_DIGEST" ]; then
+        CLUSTER_STALE_PROFILES="$("$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_BOOT_STAMP_SCRIPT" stale \
+            --profiles-dir "$TARGET_DIR/profiles" --digest "$CLUSTER_BOOT_DIGEST")" \
+            || { CLUSTER_STALE_PROFILES=""; CLUSTER_BOOT_DIGEST=""; }
+    fi
+    [ -n "$CLUSTER_BOOT_DIGEST" ] || echo "cluster boot stamp unavailable; every cluster profile is refreshed this start and none is stamped"
+    _cluster_refreshed=0
+    _cluster_current=0
+    _nl="
+"
     for d in "$TARGET_DIR"/profiles/cluster-*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
+        # The stale list is one name per line; the newline padding makes the match
+        # whole-line, so cluster-a does not stand for cluster-ab.
+        if [ -n "$CLUSTER_BOOT_DIGEST" ]; then
+            case "${_nl}${CLUSTER_STALE_PROFILES}${_nl}" in
+                *"${_nl}${d##*/}${_nl}"*) ;;
+                *) _cluster_current=$((_cluster_current + 1)); continue ;;
+            esac
+        fi
+        # Cleared by any step below that warns: a pass that left something undone is
+        # not stamped, so the next start runs it again for this home.
+        _cluster_clean=1
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
@@ -1634,9 +1689,16 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # keep their identity in SOUL.md.
         if [ -f "$d/SOUL.md" ] && [ -w "$d/SOUL.md" ] && [ -f "$d/config.yaml" ] && [ -f "$CLUSTER_PROFILE_SCRIPT" ]; then
             "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_PROFILE_SCRIPT" stamp-soul --profile-dir "$d" \
-                || echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2
+                || { echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2; _cluster_clean=0; }
         fi
-        sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
+        # The skills sync never returns non-zero and says what it could not do on
+        # stderr, so its stderr is read back: anything there is a warning, replayed
+        # where it would have gone and counted against the stamp.
+        _skills_warned="$(sync_profile_skills "$CLUSTER_TEMPLATE" "$d" 2>&1 >/dev/null)"
+        if [ -n "$_skills_warned" ]; then
+            printf '%s\n' "$_skills_warned" >&2
+            _cluster_clean=0
+        fi
         # Refresh the image-owned plugin code (see CLUSTER_IMAGE_PLUGINS). Each file is
         # copied to a temporary name beside its target and renamed over it, so a copy
         # that fails part-way leaves the old file whole, never a truncated module that
@@ -1656,6 +1718,7 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
                     || { rm -f "$_tmp" 2>/dev/null; exit 1; }
             done; then
                 echo "WARN: could not refresh the $_plugin plugin in $d; each file not yet replaced keeps the copy it was scaffolded with" >&2
+                _cluster_clean=0
             fi
         done
         # Targeted self-heal: drop `memory.provider` from cluster configs already
@@ -1675,7 +1738,7 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # mode this whole change exists to fix.
         if [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             "$INSTALL_DIR/.venv/bin/python3" -c "import os, sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {}; m = c.get('memory'); sys.exit(0) if not isinstance(m, dict) or 'provider' not in m else None; m.pop('provider'); t = p.with_name(p.name + '.tmp'); t.write_text(yaml.safe_dump(c)); os.replace(t, p)" "$d/config.yaml" \
-                || echo "WARN: failed to strip memory.provider from $d/config.yaml; this cluster agent keeps an inert provider" >&2
+                || { echo "WARN: failed to strip memory.provider from $d/config.yaml; this cluster agent keeps an inert provider" >&2; _cluster_clean=0; }
         fi
         # Keys the template adds after a profile was scaffolded, filled with step 2d's
         # program: without this a cluster profile keeps the template it was onboarded
@@ -1686,7 +1749,7 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # the User-Agent repair, the same order step 2.6b uses.
         if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             backfill_config_from_template "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
-                || echo "WARN: config back-fill failed for $d/config.yaml; this cluster agent keeps the keys it was scaffolded with" >&2
+                || { echo "WARN: config back-fill failed for $d/config.yaml; this cluster agent keeps the keys it was scaffolded with" >&2; _cluster_clean=0; }
         fi
         # Third targeted self-heal, same file: move the model-call stale bound from the
         # 600s every profile shipped with to the template's worker bound. Fill-only
@@ -1694,7 +1757,7 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # set on purpose and stays. Before the User-Agent repair, after the back-fill.
         if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             migrate_stale_timeout_from_template "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
-                || echo "WARN: stale timeout migration failed for $d/config.yaml; this cluster agent keeps its old model-call bound" >&2
+                || { echo "WARN: stale timeout migration failed for $d/config.yaml; this cluster agent keeps its old model-call bound" >&2; _cluster_clean=0; }
         fi
         # Second targeted self-heal, same file, same reason it is not force-synced: the
         # User-Agent the profile's remote MCP calls carry is image-owned, and lives in
@@ -1709,16 +1772,28 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # current is not rewritten.
         if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             repair_remote_mcp_user_agent "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
-                || echo "WARN: failed to repair the remote MCP entries in $d/config.yaml; this cluster agent keeps the header and server URLs it was scaffolded with, and if the back-fill added MCP_REMOTE_BEARER_FILE beside a Google URL its gke and developer_knowledge calls fail until the repair succeeds" >&2
+                || { echo "WARN: failed to repair the remote MCP entries in $d/config.yaml; this cluster agent keeps the header and server URLs it was scaffolded with, and if the back-fill added MCP_REMOTE_BEARER_FILE beside a Google URL its gke and developer_knowledge calls fail until the repair succeeds" >&2; _cluster_clean=0; }
         fi
         # Backfill default legacy risk onto any unannotated jobs in this cluster profile's
         # cron store if one exists on the PVC.
         if [ -f "$d/cron/jobs.json" ] && [ -w "$d/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
             HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
                 "$SCAFFOLD" --backfill-cron "$d/cron/jobs.json" \
-                || echo "WARN: failed to backfill risk tier in $d/cron/jobs.json" >&2
+                || { echo "WARN: failed to backfill risk tier in $d/cron/jobs.json" >&2; _cluster_clean=0; }
         fi
+        # The stamp, last, and only after a pass in which nothing warned. Written
+        # beside its target under the pod's name and renamed into place, as the plugin
+        # files are, so a start killed mid-write leaves no half stamp that reads as
+        # current. A failed write is a warning and nothing more: the home is simply
+        # refreshed again next start.
+        if [ -n "$CLUSTER_BOOT_DIGEST" ] && [ "$_cluster_clean" = 1 ]; then
+            _stamp_tmp="$d/$CLUSTER_BOOT_STAMP_FILE.$_refresh_tag"
+            { printf '%s\n' "$CLUSTER_BOOT_DIGEST" > "$_stamp_tmp" && mv -f "$_stamp_tmp" "$d/$CLUSTER_BOOT_STAMP_FILE"; } 2>/dev/null \
+                || { rm -f "$_stamp_tmp" 2>/dev/null; echo "WARN: could not write $d/$CLUSTER_BOOT_STAMP_FILE; this cluster profile is refreshed again on the next start" >&2; }
+        fi
+        _cluster_refreshed=$((_cluster_refreshed + 1))
     done
+    echo "cluster profiles: $_cluster_refreshed refreshed from the image, $_cluster_current current (stamp matched, skipped)"
 fi
 
 # 2.6b Back-fill the platform profile's config.yaml when it is the front door.
