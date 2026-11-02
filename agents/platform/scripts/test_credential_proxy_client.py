@@ -1996,16 +1996,18 @@ class TestExecTierRouting(unittest.TestCase):
                 self.assertEqual(1, len(calls))
                 self.assertIn("the command may have run", stderr)
 
-    def test_a_malformed_url_is_not_reported_as_a_drop(self):
-        """urllib builds the connection outside its own try, so a bad port is raised
-        bare, before a socket opens: nothing was sent."""
-        stderr = io.StringIO()
-        with patch.dict("os.environ", self.environ, clear=False), \
-                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
-            code = credential_proxy_client.execute("http://broker:abc", ["kubectl", "get", "pods"], fallback=self.STATEFUL)
-        self.assertEqual(1, code)
-        self.assertIn("credential proxy unavailable", stderr.getvalue())
-        self.assertNotIn("may have run", stderr.getvalue())
+    def test_a_malformed_url_is_reported_not_raised_and_not_as_a_drop(self):
+        """A bad port is raised bare by urllib, before a socket opens, and a URL
+        with no scheme fails while the request is built: nothing was sent."""
+        for url in ("http://broker:abc", "agent-credential-proxy-exec-tier"):
+            with self.subTest(url=url):
+                stderr = io.StringIO()
+                with patch.dict("os.environ", self.environ, clear=False), \
+                        patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+                    code = credential_proxy_client.execute(url, ["kubectl", "get", "pods"], fallback=self.STATEFUL)
+                self.assertEqual(1, code)
+                self.assertIn("credential proxy unavailable", stderr.getvalue())
+                self.assertNotIn("may have run", stderr.getvalue())
 
 
 class TestBrokerUnreachable(unittest.TestCase):

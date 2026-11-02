@@ -1111,12 +1111,17 @@ def execute(
     while True:
         # The same bytes, `requestId` included, to whichever broker this round
         # reaches: a fallback or a retry is the same request again.
-        request = urllib.request.Request(
-            targets[0].rstrip("/") + "/v1/exec",
-            data=body,
-            headers=headers,
-            method="POST",
-        )
+        try:
+            request = urllib.request.Request(
+                targets[0].rstrip("/") + "/v1/exec",
+                data=body,
+                headers=headers,
+                method="POST",
+            )
+        except ValueError as exc:
+            # A URL with no scheme, such as a bare Service name: nothing was sent.
+            print(f"credential proxy unavailable: {exc}", file=sys.stderr)
+            return 1
         try:
             with open_broker_request(request) as response:
                 payload = json.load(response)
