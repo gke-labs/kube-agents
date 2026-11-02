@@ -808,6 +808,17 @@ class BuildDocumentTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in document["projects"]], ["mon-proj-a"])
         self.assertEqual([pub.SCOPE_ARGUMENT_RETRY_SECONDS] * 2, clock.slept)
 
+    def test_a_nearly_spent_budget_cuts_the_wait_to_what_is_left(self):
+        # The Job's activeDeadlineSeconds is the listing budget plus 120 s, the length of
+        # the retry window: a run whose budget is mostly spent must not wait the window out.
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
+        budget = 14
+        with mock.patch.object(rec, "_list_budget_seconds", return_value=budget):
+            document, clock = self._build_through_client(broker, {FOLDER_A: 10_000}, _scope(folders=["111111111111"]))
+        self.assertLessEqual(sum(clock.slept), budget)
+        self.assertEqual([pub.SCOPE_ARGUMENT_RETRY_SECONDS], clock.slept)
+        self.assertEqual(document["state"], pub.STATE_ERROR)  # the only source, and no earlier run
+
     def test_a_source_the_broker_always_refuses_is_carried_after_the_window(self):
         previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
             {"id": "team-a", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}]}
