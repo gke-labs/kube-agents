@@ -4,10 +4,12 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 """
 
 import copy
+import importlib
 import json
 import os
 import pathlib
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -82,6 +84,47 @@ class AcceptTest(GateTestCase):
         self.assertEqual(stored["ran_at"], "1970-01-01T00:00:00Z")
         self.assertTrue(result.startswith("**node-b is down.**\n\n" + kvc.EVIDENCE_HEADING))
         self.assertIn(f"```\n$ {NODES_CMD}\n```\n```\nnode-b    NotReady <none>\n```", result)
+
+    def test_the_section_goes_above_a_trailing_step_line(self):
+        record()
+        answer = "**node-b is down.**\n\nIt stopped at 09:00.\n\n[next: drain node-b]\n"
+        _, result, _ = run_rules(CARD, [GOOD], answer, None)
+        self.assertTrue(result.startswith("**node-b is down.**\n\nIt stopped at 09:00.\n\n" + kvc.EVIDENCE_HEADING))
+        self.assertTrue(result.endswith("```\n\n[next: drain node-b]"), result)
+        self.assertEqual(result.count("[next:"), 1)
+
+    def test_every_trailing_step_shaped_line_stays_last(self):
+        record()
+        answer = "**node-b is down.**\n[next: drain node-b]\n\n  [Next: cordon node-b]  \n"
+        _, result, _ = run_rules(CARD, [GOOD], answer, None)
+        self.assertTrue(result.endswith("```\n\n[next: drain node-b]\n  [Next: cordon node-b]"), result)
+
+    def test_a_step_line_inside_the_text_is_left_where_it_is(self):
+        record()
+        answer = "[next: drain node-b]\n\n**node-b is down.**"
+        _, result, _ = run_rules(CARD, [GOOD], answer, None)
+        self.assertTrue(result.startswith(answer + "\n\n" + kvc.EVIDENCE_HEADING))
+
+    def test_an_answer_that_is_only_a_step_line_keeps_it_last(self):
+        record()
+        _, result, _ = run_rules(CARD, [GOOD], "[next: drain node-b]", None)
+        self.assertTrue(result.startswith(kvc.EVIDENCE_HEADING))
+        self.assertTrue(result.endswith("```\n\n[next: drain node-b]"), result)
+
+    def test_the_step_line_grammar_is_the_presenters(self):
+        # In the image slack_moments is on PYTHONPATH from /opt/defaults/scripts; here the scripts directory stands in.
+        scripts = pathlib.Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts"
+        with mock.patch.object(sys, "path", [str(scripts), *sys.path]):
+            slack_moments = importlib.import_module("slack_moments")
+        cases = ["[next: drain node-b]", "[NEXT: drain]", "[next:]", "[next: a]b", "next: a", "[next: a\nb]", "- [next: a]"]
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertEqual(
+                    kvc.NEXT_STEP_LINE.fullmatch(case) is not None,
+                    slack_moments.NEXT_STEP_LINE.fullmatch(case) is not None,
+                )
+        answer = "**node-b is down.**\n[next: drain node-b]\n\n  [Next: cordon node-b]  \n"
+        self.assertEqual(kvc.append_section(answer, "S").split("\n\nS\n\n")[0], slack_moments.visible_text(answer))
 
     def test_a_multi_line_command_stays_in_its_own_fence(self):
         command = "kubectl get nodes \\\n  -o wide --context prod"
