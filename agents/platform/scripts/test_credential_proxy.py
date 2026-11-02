@@ -9499,14 +9499,15 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
 
     def test_the_sweep_env_turns_it_off_and_nothing_else_does(self):
         # Installs sharing one App installation (the eval lanes, #4611) turn
-        # the sweep off; an unset, "on" or misspelt value leaves it on, so a
-        # typo can't quietly stop a real install's readings.
+        # the sweep off, in any of the spellings the broker's other switches
+        # take; an unset, "on" or misspelt value leaves it on, so a typo can't
+        # quietly stop a real install's readings.
         managed = mock.Mock(return_value=frozenset({"github.com/acme/infra"}))
         env = credential_proxy.VCS_READINGS_ENV
-        for value in ("off", " OFF "):
+        for value in ("off", " OFF ", "false", "0", "no"):
             with self.subTest(value=value):
                 self.assertIsNone(self._served_sweep("broker", managed, {env: value}))
-        for value in ("", "on", "0", "banana"):
+        for value in ("", "on", "true", "1", "banana"):
             with self.subTest(value=value):
                 self.assertIsNotNone(self._served_sweep("broker", managed, {env: value}))
         with mock.patch.dict(os.environ, {env: "banana"}), \

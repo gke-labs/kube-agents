@@ -9991,25 +9991,32 @@ def sweep_app_credential(forge) -> bool:
     )
 
 
-# Set to "off" to start no proposal readings sweep (spec.deployment.env). The
-# sweep's hourly budget is sized for one install per App installation, so
-# installs that share one -- the eval lanes, forty projects on one
-# installation -- drain its quota between them and the agents' own forge
-# calls fail (#4611). Any other value, or none, leaves it on.
+# Set to "off" (or "false", "0", "no", the spellings
+# CREDENTIAL_PROXY_REQUIRE_GIT_LEASE takes) to start no proposal readings sweep
+# (spec.deployment.env). The sweep's hourly budget is sized for one install per
+# App installation, so installs that share one -- the eval lanes, forty
+# projects on one installation -- drain its quota between them and the agents'
+# own forge calls fail (#4611). Unset or an "on" spelling leaves it on, and so
+# does anything else, with a warning: a typo must not stop a real install's
+# readings.
 VCS_READINGS_ENV = "CREDENTIAL_PROXY_VCS_READINGS"
 VCS_READINGS_OFF = "off"
+VCS_READINGS_OFF_VALUES = frozenset({VCS_READINGS_OFF, "false", "0", "no"})
+VCS_READINGS_ON_VALUES = frozenset({"", "on", "true", "1", "yes"})
 
 
 def readings_sweep_enabled() -> bool:
     """Whether VCS_READINGS_ENV leaves the readings sweep on (the default)."""
     value = os.environ.get(VCS_READINGS_ENV, "").strip().lower()
-    if value and value not in (VCS_READINGS_OFF, "on"):
+    if value in VCS_READINGS_OFF_VALUES:
+        return False
+    if value not in VCS_READINGS_ON_VALUES:
         LOGGER.warning(
             "%s=%r is neither on nor off; the proposal readings sweep stays on",
             VCS_READINGS_ENV,
             _sanitize_for_logging(value),
         )
-    return value != VCS_READINGS_OFF
+    return True
 
 
 def start_readings_sweep(executor: CommandExecutor, broker) -> None:
@@ -10022,7 +10029,7 @@ def start_readings_sweep(executor: CommandExecutor, broker) -> None:
     registered later is read on the next interval.
     """
     if not readings_sweep_enabled():
-        LOGGER.info("proposal readings sweep off (%s=%s)", VCS_READINGS_ENV, VCS_READINGS_OFF)
+        LOGGER.info("proposal readings sweep off (%s)", VCS_READINGS_ENV)
         return
     vcs_readings.ReadingsSweep(
         registry=broker.registry,
