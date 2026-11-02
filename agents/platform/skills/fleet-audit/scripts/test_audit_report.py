@@ -23973,6 +23973,39 @@ class TestStalledKccInFinish(HarnessTestCase):
         self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, self.out)
         self.assertNotIn("could not search", self.out)
 
+    def test_no_index_is_built_when_no_finding_can_match_a_stall(self):
+        """Review finding: `finish` built the whole declaration index whenever
+        any object was not ready. It builds it only for a finding whose own
+        object can be stalled."""
+        built = []
+        real = audit_report.kcc_declaration_index
+
+        def spy(*args, **kwargs):
+            built.append(args)
+            return real(*args, **kwargs)
+
+        self.patch_attr("kcc_declaration_index", spy)
+        workload = make_finding(remediation={"kind": "manual", "note": "Add a NetworkPolicy."})
+        rc = self.run_finish(make_doc(findings=[workload]), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(built, [])
+        rc = self.run_finish(self.doc_and_file(), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(len(built), 1)
+
+    def test_which_findings_need_the_index(self):
+        manifest = self.stalled_manifest()
+        cluster = make_finding(obj="Cluster/prod-usc1")
+        other = make_finding(obj="Cluster/prod-use1")
+        wedged = make_finding(check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/fleet-events")
+        elsewhere = make_finding(check="kcc-object-wedged", cluster="acme/us-east1/other", obj="PubSubTopic/fleet-events")
+        host = manifest["clusters"][0]["name"]
+        wedged["cluster"] = host
+        self.assertTrue(audit_report.kcc_index_needed([cluster], manifest))
+        self.assertTrue(audit_report.kcc_index_needed([wedged], manifest))
+        self.assertFalse(audit_report.kcc_index_needed([other, elsewhere, make_finding()], manifest))
+        self.assertFalse(audit_report.kcc_index_needed([cluster], _full_manifest()))
+
     def test_a_merged_fix_that_still_reproduces_says_config_connector_is_not_applying_it(self):
         doc = self.doc_and_file()
         branch = audit_report.group_branch_for(AUDIT, doc["findings"])

@@ -19222,6 +19222,34 @@ def _generic_object_stalls(
     return certain if _one_object(certain) else []
 
 
+def kcc_index_needed(findings: list[dict], manifest: dict | None) -> bool:
+    """Whether a finding's own object can be one that the manifest records as
+    not ready, so the Config Connector paragraph can need the declaration
+    index: a `Cluster/` or `NodePool/` finding whose object matches a stall
+    (`_object_stalls`), or a `kcc-object-wedged` finding with a stall of its
+    kind and name on its cluster. A superset of the findings that get the
+    paragraph, decided before the index exists, so a run with no such
+    finding builds no index and makes no broker search for it."""
+    health = kcc_health(manifest)
+    if not health.stalled:
+        return False
+    for finding in findings:
+        prefix, _, name = str(finding.get("object") or "").partition("/")
+        if not name:
+            continue
+        if prefix in _KCC_OBJECT_KINDS:
+            if _object_stalls(finding, health.stalled, health.hosts, health.targets):
+                return True
+        elif str(finding.get("check") or "") == KCC_OBJECT_CHECK:
+            cluster = str(finding.get("cluster") or "")
+            if any(
+                _on_finding_cluster(stall, cluster) and stall.kind == prefix and stall.name == name
+                for stall in health.stalled
+            ):
+                return True
+    return False
+
+
 def _on_finding_cluster(stall: KccStall, cluster: str) -> bool:
     """Whether `stall` was read on the finding's cluster: the same
     `project/location/name` target, or the same bare name when the finding
@@ -20717,7 +20745,7 @@ def _handle_finish_dry_run(
         manifest,
         root,
         prefix="DRY RUN: ",
-        declarations=kcc_declaration_index(kcc_roots) if kcc_health(manifest).stalled else {},
+        declarations=kcc_declaration_index(kcc_roots) if kcc_index_needed(findings, manifest) else {},
     )
     paths = manifest_paths(findings)
 
@@ -23071,9 +23099,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # a failed `finish` does not hold a broker slot until the idle reclaim.
     atexit.register(probe.close)
     # The Config Connector paragraph names the declaration of a stalled
-    # object (`disclose_stalled_kcc_remediations`), so a manifest that
-    # records a stall needs a declaration index (below).
-    kcc_stalls = bool(kcc_health(manifest).stalled)
+    # object (`disclose_stalled_kcc_remediations`), so a finding whose own
+    # object can be stalled needs a declaration index (below).
+    kcc_index_wanted = kcc_index_needed(findings, manifest)
     if content_mode() and any(_kcc_candidate(finding) for finding in findings):
         # The probe's open is the scan's, and a failed one is retried once on
         # the probe's count: the backstop keeps its retry, and planning, which
@@ -23098,10 +23126,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             )
     kcc_roots = kcc_declaration_roots(audit_id, root, record)
     # The index the Config Connector paragraph names a declaration from: read
-    # only when the manifest records a stall, with its own broker search in
+    # only when a finding's own object can be stalled (`kcc_index_needed`), with its own broker search in
     # content mode (every kind, `every_kind`), apart from the gcloud check's.
     kcc_index: dict[KccKey, KccDeclaration] = {}
-    if kcc_stalls and content_mode():
+    if kcc_index_wanted and content_mode():
         paragraph_scan = _kcc_paragraph_scan(repo, probe)
         if paragraph_scan.truncated or paragraph_scan.failed:
             log(
@@ -23110,7 +23138,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 "a paragraph can name no declaration file that the repository has."
             )
         kcc_index = kcc_declaration_index(kcc_roots, paragraph_scan.declarations)
-    elif kcc_stalls:
+    elif kcc_index_wanted:
         kcc_index = kcc_declaration_index(kcc_roots)
     for fid in degrade_reverted_gcloud_remediations(
         findings, kcc_roots, prebuilt=kcc_prebuilt
