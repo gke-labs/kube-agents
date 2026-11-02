@@ -236,7 +236,10 @@ adopts the running release. Absent means `false`, today's behaviour, and destroy
 nothing, so it is not among the required settings. Set it only on a long-lived
 environment whose own state owns the release: it also takes over, silently, a
 release another Terraform state or a manual `helm install` owns in that namespace,
-where `false` fails loudly instead.
+where `false` fails loudly instead. Turning it on for a running install is an
+in-place change that runs one `helm upgrade` (a new release revision). It does not
+recover a release left in a `pending-install` or `pending-upgrade` state; Helm still
+refuses those with "another operation is in progress".
 
 `PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`; the
 renderer refuses anything else and writes `today` as no key, because an absent

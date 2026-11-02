@@ -912,6 +912,15 @@ resource "helm_release" "kube_agents" {
   # first install fails loudly.
   upgrade_install = var.helm_upgrade_install
 
+  # The chart's own version, stated so the provider never infers it. With
+  # upgrade_install on and version unset, the provider's plan asks the cluster
+  # for the installed release's version: that fails before the cluster exists,
+  # so a from-nothing install could not plan, and it plans the installed
+  # version, so the apply after any chart version change fails with
+  # "Provider produced inconsistent result". This is the value the provider
+  # computes from the chart anyway, so it changes no existing plan.
+  version = yamldecode(file("${path.module}/../../../charts/kube-agents/Chart.yaml")).version
+
   values = [yamlencode({
     # Reaches every image this release pulls, including the two the chart
     # does not render itself — the agent Deployment and the shell sandbox

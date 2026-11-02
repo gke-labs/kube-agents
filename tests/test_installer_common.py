@@ -3104,7 +3104,7 @@ class InstallerCommonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
-                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                f'write_tfvars_from_state "{dest}"',
                 env={"API_SERVER_KEY": "k"},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -3113,14 +3113,14 @@ class InstallerCommonTest(unittest.TestCase):
             for spelling in ("true", "True", "yes", "1"):
                 with self.subTest(spelling=spelling):
                     proc = self._run(
-                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        f'write_tfvars_from_state "{dest}"',
                         env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": spelling},
                     )
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     self.assertIn("helm_upgrade_install = true\n", dest.read_text())
 
             proc = self._run(
-                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                f'write_tfvars_from_state "{dest}"',
                 env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": "false"},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -3135,6 +3135,16 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIsNotNone(
             re.search(r"(?m)^  upgrade_install\s*=\s*var\.helm_upgrade_install\s*$", release),
             "helm_release.kube_agents does not set upgrade_install = var.helm_upgrade_install",
+        )
+        # With upgrade_install on and version unset, the provider's plan reads the
+        # installed release's version from the cluster: a from-nothing install
+        # cannot plan, and a chart version change fails the apply (#4108).
+        self.assertIsNotNone(
+            re.search(
+                r'(?m)^  version\s*=\s*yamldecode\(file\("\$\{path\.module\}/\.\./\.\./\.\./charts/kube-agents/Chart\.yaml"\)\)\.version\s*$',
+                release,
+            ),
+            "helm_release.kube_agents does not pin version to the chart's Chart.yaml version",
         )
         variables_tf = (composition / "variables.tf").read_text()
         block = variables_tf.split('variable "helm_upgrade_install" {', 1)[1].split("\n}\n", 1)[0]
