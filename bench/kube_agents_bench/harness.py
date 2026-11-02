@@ -1338,8 +1338,8 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # Raw ``sqlite3`` rather than ``hermes kanban archive --rm``: that is two cold
 # hermes starts, over a minute in the sandboxed container, and its ``archived``
 # event is one the gateway's notifier delivers to the card's subscribers.
-# The busy timeout and both output markers are passed in, so no literal is
-# spelled twice.
+# The busy timeout and both output markers are passed in (:func:`_purge_argv`),
+# so the markers the harness parses are spelled once.
 _PURGE_ROWS_SCRIPT = r"""
 import sqlite3, sys
 ROOT, BUSY, KEPT, DONE = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
@@ -1378,14 +1378,25 @@ _PURGE_KEPT_MARKER = "kept"
 _PURGE_DONE_MARKER = "purged"
 
 
+def _purge_argv(task_ids: list[str]) -> list[str]:
+    """:data:`_PURGE_ROWS_SCRIPT`'s arguments, in the order it reads them."""
+    return [
+        worker_trajectory.DATA_ROOT,
+        str(_PURGE_BUSY_TIMEOUT_SECONDS),
+        _PURGE_KEPT_MARKER,
+        _PURGE_DONE_MARKER,
+        *task_ids,
+    ]
+
+
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
     """Delete the attachments, worker log and board rows of every card this run filed.
 
     The agent pod outlives the run, so without this each finished task leaves
     its report and its worker transcript on disk for the next run to find --
     which is how a repeat of a task reads back the previous attempt's answer
-    instead of doing the work. Scoped to cards this harness delegated, so it
-    cannot touch anything the run did not create.
+    instead of doing the work. Scoped to cards this run filed (the harness's,
+    and those its workers filed), so it cannot touch anything else.
 
     The board rows go too (:data:`_PURGE_ROWS_SCRIPT`): every card view ends
     with a "Recent work by @<assignee>" digest of that profile's last completed
@@ -1396,16 +1407,7 @@ def _purge_card_state(task_ids: list[str], timeout: float) -> None:
     if not task_ids:
         return
     listing = " ".join(_shell_quote(t) for t in task_ids)
-    args = " ".join(
-        _shell_quote(a)
-        for a in [
-            worker_trajectory.DATA_ROOT,
-            str(_PURGE_BUSY_TIMEOUT_SECONDS),
-            _PURGE_KEPT_MARKER,
-            _PURGE_DONE_MARKER,
-            *task_ids,
-        ]
-    )
+    args = " ".join(_shell_quote(a) for a in _purge_argv(task_ids))
     script = (
         f"for t in {listing}; do "
         f'  rm -rf {_ATTACHMENTS_DIR}/"$t" {_LOGS_DIR}/"$t".log; '

@@ -3807,8 +3807,7 @@ def test_a_cards_board_rows_are_deleted_with_its_state(
 
     (purge,) = [s for s in no_cluster_exec if "rm -rf" in s]
     assert harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in purge
-    q = harness._shell_quote
-    assert purge.endswith(f"{q(harness._PURGE_DONE_MARKER)} {q(_TASK_ID)}")
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID])))
 
 
 # hermes v2026.9.14's ``_ctx_role_history`` query, verbatim: what the next
@@ -3855,12 +3854,11 @@ def test_the_purge_script_drops_a_settled_card_from_the_role_history(tmp_path: P
     before = [r[0] for r in kb.execute(_ROLE_HISTORY_SQL, ("platform", "t_next"))]
     assert before == ["t_done", "t_run", "t_other"]
 
+    # The harness's own argv, with the board root pointed at the temporary one.
+    argv = harness._purge_argv(["t_done", "t_run", "t_gone"])
+    assert argv[0] == worker_trajectory.DATA_ROOT
     proc = subprocess.run(
-        [
-            sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, str(tmp_path),
-            str(harness._PURGE_BUSY_TIMEOUT_SECONDS), harness._PURGE_KEPT_MARKER,
-            harness._PURGE_DONE_MARKER, "t_done", "t_run", "t_gone",
-        ],
+        [sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, str(tmp_path), *argv[1:]],
         capture_output=True, text=True, check=True,
     )
 
