@@ -517,11 +517,11 @@ Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs
 hourly and this tick reads its latest finished build every fifteen minutes, so
 every build is read and counted once, and one failed build followed by a clean
-one is a flap. The sweep's note
-waits until two consecutive checks have failed; the reconciles' first failed
-build is the news. Any project's failure fails a sweep run, so a per-project
-threshold could never fire before the run's; the per-project counts name, in
-the message, the projects that failed in this check and the ones before it.
+one is a flap. The sweep's note waits until two consecutive checks have failed;
+the reconciles' first failed build is the news. Any project's failure fails a
+sweep run, so a per-project threshold could never fire before the run's; the
+per-project counts name, in the message, the projects that failed in this check
+and the ones before it.
 The counts are `periodics_streaks` in `health.json`, advanced once per newly
 read build and carried across ticks; a failed build that did not reach a
 project (busy) keeps its count, and a clean build clears every count. A tick
@@ -529,7 +529,7 @@ that could not fetch the previous `health.json` has no counts to carry, so it
 notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
-build is older than its stale window (an hour for the sweep, 36 hours for the
+build is older than its stale window (two hours for the sweep, 36 hours for the
 daily reconcile; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for

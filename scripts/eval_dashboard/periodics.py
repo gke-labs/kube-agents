@@ -151,9 +151,10 @@ SCOPE_LINE = "CI eval infrastructure only."
 # latest finished build every fifteen minutes, so every build is read and
 # counted once, and one failed build followed by a clean one is a flap: the
 # sweep is said once it has failed this many consecutive checks. The
-# reconciles run daily and on every merge: their first failed build is the news. Any project's failure fails a run, so a per-project
-# threshold could never fire before the run's; the per-project counts name the
-# projects that have failed in every one of those checks.
+# reconciles run daily and on every merge: their first failed build is the
+# news. Any project's failure fails a run, so a per-project threshold could
+# never fire before the run's; the per-project counts name the projects that
+# have failed in every one of those checks.
 SWEEP_RUN_ALERT_AFTER = 2
 FIRST_FAILURE = 1
 # A project named as persisting in the message: failed in this many consecutive
