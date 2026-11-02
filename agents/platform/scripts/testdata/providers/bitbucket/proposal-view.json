@@ -1,273 +1,474 @@
 {
   "payload": {
-    "number": 7,
+    "number": 11,
     "comments": true,
     "diff": true
   },
   "responses": [
     {
+      "comment_count": 3,
+      "task_count": 0,
       "type": "pullrequest",
-      "id": 7,
-      "title": "Raise the replica floor",
-      "description": "Body of the pull request.",
-      "summary": {
-        "type": "rendered",
-        "raw": "Body of the pull request.",
-        "markup": "markdown",
-        "html": "<p>Body of the pull request.</p>"
+      "id": 11,
+      "title": "Raise the replica floor to two",
+      "description": "Two replicas survive one eviction.",
+      "rendered": {
+        "title": {
+          "type": "rendered",
+          "raw": "Raise the replica floor to two",
+          "markup": "markdown",
+          "html": "<p>Raise the replica floor to two</p>"
+        },
+        "description": {
+          "type": "rendered",
+          "raw": "Two replicas survive one eviction.",
+          "markup": "markdown",
+          "html": "<p>Two replicas survive one eviction.</p>"
+        }
       },
-      "state": "OPEN",
+      "state": "DECLINED",
       "draft": false,
-      "queued": false,
-      "author": {
+      "merge_commit": null,
+      "close_source_branch": false,
+      "closed_by": {
         "type": "app_user",
-        "uuid": "{2f7c1d0e-5b8a-4c3e-9f61-0a4b7d2e9c11}",
-        "display_name": "kube-agents",
-        "account_id": "712020:00000000-0000-0000-0000-000000000001",
-        "kind": "repository_access_token",
         "links": {
           "avatar": {
-            "href": "https://bitbucket.org/account/kube-agents/avatar/"
-          }
-        }
-      },
-      "source": {
-        "branch": {
-          "name": "platform-agent/replicas"
-        },
-        "commit": {
-          "type": "commit",
-          "hash": "4e7a1c9b2d30",
-          "links": {
-            "self": {
-              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/4e7a1c9b2d30"
-            }
+            "href": "https://bitbucket.org/account/example/avatar/"
           }
         },
-        "repository": {
-          "type": "repository",
-          "full_name": "acme/infra",
-          "name": "infra",
-          "uuid": "{0c1d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f}",
-          "links": {
-            "html": {
-              "href": "https://bitbucket.org/acme/infra"
-            }
-          }
-        }
+        "created_on": "2026-11-02T15:08:55.432081+00:00",
+        "display_name": "kube-agents",
+        "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+        "account_id": "712020:00000000-0000-0000-0000-000000000001",
+        "account_status": "active",
+        "kind": "repository_access_token"
       },
+      "author": {
+        "type": "app_user",
+        "links": {
+          "avatar": {
+            "href": "https://bitbucket.org/account/example/avatar/"
+          }
+        },
+        "created_on": "2026-11-02T15:08:55.432081+00:00",
+        "display_name": "kube-agents",
+        "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+        "account_id": "712020:00000000-0000-0000-0000-000000000001",
+        "account_status": "active",
+        "kind": "repository_access_token"
+      },
+      "reason": "",
+      "created_on": "2026-11-02T18:33:16.036861+00:00",
+      "updated_on": "2026-11-02T18:34:46.183019+00:00",
       "destination": {
         "branch": {
           "name": "main"
         },
         "commit": {
-          "type": "commit",
-          "hash": "9a8b7c6d5e4f"
+          "hash": "d613b799d16e",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/d613b799d16e"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/commits/d613b799d16e"
+            }
+          },
+          "type": "commit"
         },
         "repository": {
           "type": "repository",
           "full_name": "acme/infra",
-          "name": "infra",
-          "uuid": "{0c1d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f}",
           "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+            },
             "html": {
               "href": "https://bitbucket.org/acme/infra"
+            },
+            "avatar": {
+              "href": "https://bitbucket.org/account/example/avatar/"
             }
-          }
+          },
+          "name": "infra",
+          "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
         }
       },
-      "merge_commit": null,
-      "comment_count": 0,
-      "task_count": 0,
-      "close_source_branch": false,
-      "closed_by": null,
-      "reason": "",
-      "created_on": "2026-10-20T14:03:11.432110+00:00",
-      "updated_on": "2026-10-20T15:10:42.118204+00:00",
+      "source": {
+        "branch": {
+          "name": "platform-agent/replicas-1793644373",
+          "links": {},
+          "sync_strategies": [
+            "merge_commit",
+            "rebase"
+          ]
+        },
+        "commit": {
+          "hash": "5615ea33d336",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/commits/5615ea33d336"
+            }
+          },
+          "type": "commit"
+        },
+        "repository": {
+          "type": "repository",
+          "full_name": "acme/infra",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra"
+            },
+            "avatar": {
+              "href": "https://bitbucket.org/account/example/avatar/"
+            }
+          },
+          "name": "infra",
+          "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+        }
+      },
+      "reviewers": [],
+      "participants": [
+        {
+          "type": "participant",
+          "user": {
+            "type": "app_user",
+            "links": {
+              "avatar": {
+                "href": "https://bitbucket.org/account/example/avatar/"
+              }
+            },
+            "created_on": "2026-11-02T15:08:55.432081+00:00",
+            "display_name": "kube-agents",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "account_id": "712020:00000000-0000-0000-0000-000000000001",
+            "account_status": "active",
+            "kind": "repository_access_token"
+          },
+          "role": "PARTICIPANT",
+          "approved": false,
+          "state": null,
+          "participated_on": "2026-11-02T18:34:46.887073+00:00"
+        }
+      ],
       "links": {
         "self": {
-          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/7"
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11"
         },
         "html": {
-          "href": "https://bitbucket.org/acme/infra/pull-requests/7"
+          "href": "https://bitbucket.org/acme/infra/pull-requests/11"
+        },
+        "commits": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/commits"
+        },
+        "approve": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/approve"
+        },
+        "request-changes": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/request-changes"
         },
         "diff": {
-          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/7/diff"
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diff/acme/infra:5615ea33d336%0Dd613b799d16e?from_pullrequest_id=11&topic=true"
+        },
+        "diffstat": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diffstat/acme/infra:5615ea33d336%0Dd613b799d16e?from_pullrequest_id=11&topic=true"
+        },
+        "comments": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/comments"
+        },
+        "activity": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/activity"
+        },
+        "merge": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/merge"
+        },
+        "decline": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/decline"
+        },
+        "statuses": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/statuses"
+        },
+        "mergeability_checks": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/mergeability/checks"
         }
-      }
+      },
+      "summary": {
+        "type": "rendered",
+        "raw": "Two replicas survive one eviction.",
+        "markup": "markdown",
+        "html": "<p>Two replicas survive one eviction.</p>"
+      },
+      "queued": false
     },
     {
       "type": "commit",
-      "hash": "4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f",
-      "date": "2026-10-20T14:01:02+00:00",
-      "message": "Raise the replica floor\n",
+      "hash": "5615ea33d336d318f1891b7fed5dcac0a819884f",
+      "date": "2026-11-02T18:33:01+00:00",
       "author": {
         "type": "author",
-        "raw": "kube-agents <noreply@bots.bitbucket.org>",
+        "raw": "kube-agents <kube-agents@bots.bitbucket.org>",
         "user": {
           "type": "app_user",
-          "uuid": "{2f7c1d0e-5b8a-4c3e-9f61-0a4b7d2e9c11}",
-          "display_name": "kube-agents",
-          "account_id": "712020:00000000-0000-0000-0000-000000000001",
-          "kind": "repository_access_token",
           "links": {
             "avatar": {
-              "href": "https://bitbucket.org/account/kube-agents/avatar/"
+              "href": "https://bitbucket.org/account/example/avatar/"
             }
-          }
+          },
+          "created_on": "2026-11-02T15:08:55.432081+00:00",
+          "display_name": "kube-agents",
+          "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+          "account_id": "712020:00000000-0000-0000-0000-000000000001",
+          "account_status": "active",
+          "kind": "repository_access_token"
+        }
+      },
+      "message": "Keep one replica through an eviction\n",
+      "summary": {
+        "type": "rendered",
+        "raw": "Keep one replica through an eviction\n",
+        "markup": "markdown",
+        "html": "<p>Keep one replica through an eviction</p>"
+      },
+      "links": {
+        "self": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f"
+        },
+        "html": {
+          "href": "https://bitbucket.org/acme/infra/commits/5615ea33d336d318f1891b7fed5dcac0a819884f"
+        },
+        "diff": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diff/5615ea33d336d318f1891b7fed5dcac0a819884f"
+        },
+        "approve": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f/approve"
+        },
+        "comments": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f/comments"
+        },
+        "statuses": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f/statuses"
+        },
+        "patch": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/patch/5615ea33d336d318f1891b7fed5dcac0a819884f"
         }
       },
       "parents": [
         {
-          "type": "commit",
-          "hash": "9a8b7c6d5e4f00112233445566778899aabbccdd"
+          "hash": "a2469319b1eaeaec4ac27c63a4f08363d2641265",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/a2469319b1eaeaec4ac27c63a4f08363d2641265"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/commits/a2469319b1eaeaec4ac27c63a4f08363d2641265"
+            }
+          },
+          "type": "commit"
         }
       ],
-      "links": {
-        "html": {
-          "href": "https://bitbucket.org/acme/infra/commits/4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f"
+      "rendered": {
+        "message": {
+          "type": "rendered",
+          "raw": "Keep one replica through an eviction\n",
+          "markup": "markdown",
+          "html": "<p>Keep one replica through an eviction</p>"
         }
       },
       "repository": {
         "type": "repository",
         "full_name": "acme/infra",
-        "name": "infra",
-        "uuid": "{0c1d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f}",
         "links": {
+          "self": {
+            "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+          },
           "html": {
             "href": "https://bitbucket.org/acme/infra"
+          },
+          "avatar": {
+            "href": "https://bitbucket.org/account/example/avatar/"
           }
-        }
-      }
+        },
+        "name": "infra",
+        "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+      },
+      "participants": []
     },
     {
-      "pagelen": 100,
-      "size": 3,
-      "page": 1,
       "values": [
         {
-          "type": "pullrequest_comment",
-          "id": 301,
-          "created_on": "2026-10-20T14:20:00.000000+00:00",
-          "updated_on": "2026-10-20T14:20:00.000000+00:00",
+          "id": 893081678,
+          "created_on": "2026-11-02T18:33:19.264757+00:00",
+          "updated_on": "2026-11-02T18:33:19.291760+00:00",
           "content": {
             "type": "rendered",
-            "raw": "Why one replica and not two?",
+            "raw": "Rebased onto the new base image. <!-- agent:ack -->",
             "markup": "markdown",
-            "html": ""
-          },
-          "user": {
-            "type": "user",
-            "uuid": "{8d3b6a51-1c2e-4f7a-b9d0-3e5f6a7b8c9d}",
-            "display_name": "Example Maintainer",
-            "nickname": "example-maintainer",
-            "account_id": "557058:00000000-0000-0000-0000-000000000002",
-            "links": {
-              "html": {
-                "href": "https://bitbucket.org/%7B8d3b6a51-1c2e-4f7a-b9d0-3e5f6a7b8c9d%7D/"
-              }
-            }
-          },
-          "deleted": false,
-          "pending": false,
-          "links": {
-            "self": {
-              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/7/comments/301"
-            },
-            "html": {
-              "href": "https://bitbucket.org/acme/infra/pull-requests/7/_/diff#comment-301"
-            }
-          },
-          "pullrequest": {
-            "type": "pullrequest",
-            "id": 7,
-            "title": "Raise the replica floor"
-          }
-        },
-        {
-          "type": "pullrequest_comment",
-          "id": 302,
-          "created_on": "2026-10-20T14:25:00.000000+00:00",
-          "updated_on": "2026-10-20T14:25:00.000000+00:00",
-          "content": {
-            "type": "rendered",
-            "raw": "",
-            "markup": "markdown",
-            "html": ""
-          },
-          "user": {
-            "type": "user",
-            "uuid": "{8d3b6a51-1c2e-4f7a-b9d0-3e5f6a7b8c9d}",
-            "display_name": "Example Maintainer",
-            "nickname": "example-maintainer",
-            "account_id": "557058:00000000-0000-0000-0000-000000000002",
-            "links": {
-              "html": {
-                "href": "https://bitbucket.org/%7B8d3b6a51-1c2e-4f7a-b9d0-3e5f6a7b8c9d%7D/"
-              }
-            }
-          },
-          "deleted": true,
-          "pending": false,
-          "links": {
-            "self": {
-              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/7/comments/302"
-            },
-            "html": {
-              "href": "https://bitbucket.org/acme/infra/pull-requests/7/_/diff#comment-302"
-            }
-          },
-          "pullrequest": {
-            "type": "pullrequest",
-            "id": 7,
-            "title": "Raise the replica floor"
-          }
-        },
-        {
-          "type": "pullrequest_comment",
-          "id": 303,
-          "created_on": "2026-10-20T14:30:00.000000+00:00",
-          "updated_on": "2026-10-20T14:30:00.000000+00:00",
-          "content": {
-            "type": "rendered",
-            "raw": "Two would double the cost of the idle hours.",
-            "markup": "markdown",
-            "html": ""
+            "html": "<p>Rebased onto the new base image. &lt;!-- agent:ack --&gt;</p>"
           },
           "user": {
             "type": "app_user",
-            "uuid": "{2f7c1d0e-5b8a-4c3e-9f61-0a4b7d2e9c11}",
-            "display_name": "kube-agents",
-            "account_id": "712020:00000000-0000-0000-0000-000000000001",
-            "kind": "repository_access_token",
             "links": {
               "avatar": {
-                "href": "https://bitbucket.org/account/kube-agents/avatar/"
+                "href": "https://bitbucket.org/account/example/avatar/"
               }
-            }
+            },
+            "created_on": "2026-11-02T15:08:55.432081+00:00",
+            "display_name": "kube-agents",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "account_id": "712020:00000000-0000-0000-0000-000000000001",
+            "account_status": "active",
+            "kind": "repository_access_token"
           },
           "deleted": false,
           "pending": false,
+          "type": "pullrequest_comment",
           "links": {
             "self": {
-              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/7/comments/303"
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/comments/893081678"
             },
             "html": {
-              "href": "https://bitbucket.org/acme/infra/pull-requests/7/_/diff#comment-303"
+              "href": "https://bitbucket.org/acme/infra/pull-requests/11/_/diff#comment-893081678"
             }
           },
           "pullrequest": {
             "type": "pullrequest",
-            "id": 7,
-            "title": "Raise the replica floor"
+            "id": 11,
+            "title": "Raise the replica floor to two",
+            "draft": false,
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra/pull-requests/11"
+              }
+            },
+            "queued": false
+          }
+        },
+        {
+          "id": 893082383,
+          "created_on": "2026-11-02T18:34:46.165078+00:00",
+          "updated_on": "2026-11-02T18:34:46.183019+00:00",
+          "content": {
+            "type": "rendered",
+            "raw": "Two is the floor the budget needs.",
+            "markup": "markdown",
+            "html": "<p>Two is the floor the budget needs.</p>"
           },
+          "user": {
+            "type": "app_user",
+            "links": {
+              "avatar": {
+                "href": "https://bitbucket.org/account/example/avatar/"
+              }
+            },
+            "created_on": "2026-11-02T15:08:55.432081+00:00",
+            "display_name": "kube-agents",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "account_id": "712020:00000000-0000-0000-0000-000000000001",
+            "account_status": "active",
+            "kind": "repository_access_token"
+          },
+          "deleted": false,
           "inline": {
             "from": null,
-            "to": 12,
-            "path": "apps/ingest/deployment.yaml"
+            "to": 1,
+            "path": "ingest.yaml",
+            "start_from": null,
+            "start_to": null
+          },
+          "pending": false,
+          "type": "pullrequest_comment",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/comments/893082383"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/pull-requests/11/_/diff#comment-893082383"
+            },
+            "code": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diff/acme/infra:5615ea33d336..d613b799d16e?path=ingest.yaml"
+            }
+          },
+          "pullrequest": {
+            "type": "pullrequest",
+            "id": 11,
+            "title": "Raise the replica floor to two",
+            "draft": false,
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra/pull-requests/11"
+              }
+            },
+            "queued": false
+          }
+        },
+        {
+          "id": 893082387,
+          "created_on": "2026-11-02T18:34:46.880539+00:00",
+          "updated_on": "2026-11-02T18:34:46.887073+00:00",
+          "content": {
+            "type": "rendered",
+            "raw": "A second note on the change.",
+            "markup": "markdown",
+            "html": "<p>A second note on the change.</p>"
+          },
+          "user": {
+            "type": "app_user",
+            "links": {
+              "avatar": {
+                "href": "https://bitbucket.org/account/example/avatar/"
+              }
+            },
+            "created_on": "2026-11-02T15:08:55.432081+00:00",
+            "display_name": "kube-agents",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "account_id": "712020:00000000-0000-0000-0000-000000000001",
+            "account_status": "active",
+            "kind": "repository_access_token"
+          },
+          "deleted": false,
+          "pending": false,
+          "type": "pullrequest_comment",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/comments/893082387"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/pull-requests/11/_/diff#comment-893082387"
+            }
+          },
+          "pullrequest": {
+            "type": "pullrequest",
+            "id": 11,
+            "title": "Raise the replica floor to two",
+            "draft": false,
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra/pull-requests/11"
+              }
+            },
+            "queued": false
           }
         }
-      ]
+      ],
+      "pagelen": 100,
+      "size": 3,
+      "page": 1
     }
   ]
 }

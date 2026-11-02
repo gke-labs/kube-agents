@@ -6,14 +6,21 @@ The same contract `test_providers_contract.py` holds every forge to, and the sam
 
 ## Provenance
 
-**These files are not recordings.** They are written by hand from Atlassian's published Bitbucket Data Center REST specification (`10.2.swagger.v3.json`), because no Data Center instance was available when the package was written. So they hold what the author read in the specification, not what an instance answers. They are to be replaced with responses recorded from a live instance, trimmed and redacted as `../gitlab/README.md` describes.
+These files are recordings. They are the answers Bitbucket Data Center 8.19 (the `atlassian/bitbucket` image, a 3-hour timebomb test licence) gave to the broker's own provider code on 2026-11-02, during the live check of pull request #3687 on the test cluster `ka-bb-pr2`, recorded by wrapping the forge's HTTP transport and saving each answer in order. Nothing was added by hand.
 
-Known defects of the hand-written data: a commit is listed as its own parent; pull request 6 in `proposal-list.json` has its author as its only reviewer; the declined pull request in `proposal-close.json` has a `closedDate` later than its `updatedDate`.
+They were anonymized before they were committed:
 
-Fields not yet checked against a live response:
+- the accounts are `example-maintainer` (the person who approves, comments and declines) and the install's own account, with placeholder UUIDs, account ids, names and e-mail addresses;
+- the workspace, project, host and branch names became `acme` and `bitbucket.acme.example`;
+- avatar links are a placeholder;
+- the install's git identity is the contract's `platform-agent <platform-agent@kube-agents.invalid>`, as the other forges' recordings show it.
 
-- where an activity carries the anchor of a comment on a line (`comment.anchor` or `commentAnchor`);
-- `closedDate` on a merged or declined pull request;
-- the `SERVICE` user type of the account a project or repository token acts as;
-- the `draft` field (Data Center 8.18 and later);
-- the readings: `role.1=AUTHOR` with `username.1`, the order `NEWEST`, the `APPROVED` and `REVIEWED` actions of `activities`, and the `DECLINED` action that names who declined.
+No token, cookie or header that carries a credential is in a recording.
+
+What the live answers settled:
+
+- A project HTTP access token acts as `access-token-user/<project>/<token>` (`type: SERVICE`), which every answer names in `X-AUSERNAME` and the `whoami` servlet does not answer.
+- The participant filter `role.1=AUTHOR&username.1=` finds no proposal of that user, so the forge filters the author itself.
+- A comment on a line carries its anchor in `commentAnchor` on the activity.
+- `closedDate` is set on a declined pull request.
+- The token user has no e-mail address, so it cannot merge; the merged pull requests were merged by the admin account.

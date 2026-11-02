@@ -1,51 +1,57 @@
 {
   "payload": {
-    "number": 3
+    "number": 9
   },
   "responses": [
     {
-      "size": 3,
+      "size": 2,
       "limit": 100,
       "isLastPage": true,
-      "start": 0,
       "values": [
         {
-          "id": 6002,
-          "createdDate": 1791300000000,
+          "id": 30,
+          "createdDate": 1793643185225,
           "user": {
             "name": "example-maintainer",
             "emailAddress": "maintainer@acme.example",
+            "active": true,
             "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
             "type": "NORMAL",
-            "slug": "example-maintainer"
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/users/example-maintainer"
+                }
+              ]
+            }
           },
           "action": "DECLINED"
         },
         {
-          "id": 6001,
-          "createdDate": 1791100000000,
+          "id": 29,
+          "createdDate": 1793643185077,
           "user": {
-            "name": "svc-kube-agents",
-            "emailAddress": "kube-agents@acme.example",
-            "displayName": "kube-agents",
-            "type": "SERVICE",
-            "slug": "svc-kube-agents"
-          },
-          "action": "RESCOPED"
-        },
-        {
-          "id": 6000,
-          "createdDate": 1791000000000,
-          "user": {
-            "name": "svc-kube-agents",
-            "emailAddress": "kube-agents@acme.example",
-            "displayName": "kube-agents",
-            "type": "SERVICE",
-            "slug": "svc-kube-agents"
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/users/example-maintainer"
+                }
+              ]
+            }
           },
           "action": "OPENED"
         }
-      ]
+      ],
+      "start": 0
     }
   ]
 }

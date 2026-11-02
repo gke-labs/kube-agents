@@ -1,77 +1,154 @@
 {
   "payload": {
-    "number": 6
+    "number": 7
   },
   "responses": [
     {
       "size": 4,
       "limit": 100,
       "isLastPage": true,
-      "start": 0,
       "values": [
         {
-          "id": 7003,
-          "createdDate": 1791590000000,
+          "id": 25,
+          "createdDate": 1793643184604,
           "user": {
             "name": "example-maintainer",
             "emailAddress": "maintainer@acme.example",
+            "active": true,
             "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
             "type": "NORMAL",
-            "slug": "example-maintainer"
-          },
-          "action": "APPROVED"
-        },
-        {
-          "id": 7002,
-          "createdDate": 1791580000000,
-          "user": {
-            "name": "example-maintainer",
-            "emailAddress": "maintainer@acme.example",
-            "displayName": "Example Maintainer",
-            "type": "NORMAL",
-            "slug": "example-maintainer"
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/users/example-maintainer"
+                }
+              ]
+            }
           },
           "action": "COMMENTED",
           "commentAction": "ADDED",
           "comment": {
-            "id": 901,
-            "text": "Looks right.",
+            "properties": {
+              "repositoryId": 1
+            },
+            "id": 2,
+            "version": 0,
+            "text": "Looks right to me.",
             "author": {
               "name": "example-maintainer",
               "emailAddress": "maintainer@acme.example",
+              "active": true,
               "displayName": "Example Maintainer",
+              "id": 2,
+              "slug": "example-maintainer",
               "type": "NORMAL",
-              "slug": "example-maintainer"
+              "links": {
+                "self": [
+                  {
+                    "href": "https://bitbucket.acme.example/users/example-maintainer"
+                  }
+                ]
+              }
             },
-            "createdDate": 1791580000000,
-            "comments": []
+            "createdDate": 1793643184599,
+            "updatedDate": 1793643184599,
+            "comments": [],
+            "threadResolved": false,
+            "severity": "NORMAL",
+            "state": "OPEN",
+            "permittedOperations": {
+              "editable": false,
+              "transitionable": true,
+              "deletable": false
+            }
           }
         },
         {
-          "id": 7001,
-          "createdDate": 1791500000000,
+          "id": 23,
+          "createdDate": 1793643184536,
           "user": {
             "name": "example-maintainer",
             "emailAddress": "maintainer@acme.example",
+            "active": true,
             "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
             "type": "NORMAL",
-            "slug": "example-maintainer"
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/users/example-maintainer"
+                }
+              ]
+            }
           },
-          "action": "REVIEWED"
+          "action": "UPDATED",
+          "addedReviewers": [
+            {
+              "name": "example-maintainer",
+              "emailAddress": "maintainer@acme.example",
+              "active": true,
+              "displayName": "Example Maintainer",
+              "id": 2,
+              "slug": "example-maintainer",
+              "type": "NORMAL",
+              "links": {
+                "self": [
+                  {
+                    "href": "https://bitbucket.acme.example/users/example-maintainer"
+                  }
+                ]
+              }
+            }
+          ],
+          "removedReviewers": []
         },
         {
-          "id": 7000,
-          "createdDate": 1791000000000,
+          "id": 24,
+          "createdDate": 1793643184494,
           "user": {
-            "name": "svc-kube-agents",
-            "emailAddress": "kube-agents@acme.example",
-            "displayName": "kube-agents",
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/users/example-maintainer"
+                }
+              ]
+            }
+          },
+          "action": "APPROVED"
+        },
+        {
+          "id": 20,
+          "createdDate": 1793643122459,
+          "user": {
+            "name": "access-token-user/1/1",
+            "active": true,
+            "displayName": "Access Token User - acme",
+            "emailAddress": null,
+            "id": 4,
+            "slug": "access-token-user_1_1",
             "type": "SERVICE",
-            "slug": "svc-kube-agents"
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+                }
+              ]
+            }
           },
           "action": "OPENED"
         }
-      ]
+      ],
+      "start": 0
     }
   ]
 }

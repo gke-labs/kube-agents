@@ -1,75 +1,68 @@
 {
   "payload": {
-    "number": 7
+    "number": 10
   },
   "responses": [
     {
-      "size": 3,
-      "limit": 100,
-      "isLastPage": true,
-      "start": 0,
       "values": [
         {
-          "id": "4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f",
-          "displayId": "4e7a1c9b2d3",
+          "id": "ae20e95ac2776c278e49aa1de74cb7f3839a3291",
+          "displayId": "ae20e95ac27",
           "author": {
-            "name": "svc-kube-agents",
-            "emailAddress": "kube-agents@acme.example",
-            "displayName": "kube-agents"
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL"
           },
-          "authorTimestamp": 1792506900000,
+          "authorTimestamp": 1793644393000,
           "committer": {
-            "name": "svc-kube-agents",
-            "emailAddress": "kube-agents@acme.example"
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL"
           },
-          "committerTimestamp": 1792506900000,
-          "message": "Raise the replica floor to two",
+          "committerTimestamp": 1793644393000,
+          "message": "Keep one replica through an eviction",
           "parents": [
             {
-              "id": "9a8b7c6d5e4f00112233445566778899aabbccdd",
-              "displayId": "9a8b7c6d5e4"
+              "id": "a2c792f9f4a487fc0ed38d3aff35d0fff0523958",
+              "displayId": "a2c792f9f4a"
             }
           ]
         },
         {
-          "id": "9a8b7c6d5e4f00112233445566778899aabbccdd",
-          "displayId": "9a8b7c6d5e4",
+          "id": "a2c792f9f4a487fc0ed38d3aff35d0fff0523958",
+          "displayId": "a2c792f9f4a",
           "author": {
-            "name": "svc-kube-agents",
-            "emailAddress": "kube-agents@acme.example",
-            "displayName": "kube-agents"
+            "name": "platform-agent",
+            "emailAddress": "platform-agent@kube-agents.invalid"
           },
-          "authorTimestamp": 1792505000000,
+          "authorTimestamp": 1793644386000,
           "committer": {
-            "name": "svc-kube-agents",
-            "emailAddress": "kube-agents@acme.example"
+            "name": "platform-agent",
+            "emailAddress": "platform-agent@kube-agents.invalid"
           },
-          "committerTimestamp": 1792505000000,
+          "committerTimestamp": 1793644386000,
           "message": "Raise the replica floor",
           "parents": [
             {
-              "id": "9a8b7c6d5e4f00112233445566778899aabbccdd",
-              "displayId": "9a8b7c6d5e4"
+              "id": "adae32302776860009d732ce2599f15be92954d9",
+              "displayId": "adae3230277"
             }
           ]
-        },
-        {
-          "id": "5b6c7d8e9f00112233445566778899aabbccddee",
-          "displayId": "5b6c7d8e9f0",
-          "author": {
-            "name": "platform-agent",
-            "emailAddress": "platform-agent@kube-agents.invalid"
-          },
-          "authorTimestamp": 1792500000000,
-          "committer": {
-            "name": "platform-agent",
-            "emailAddress": "platform-agent@kube-agents.invalid"
-          },
-          "committerTimestamp": 1792500000000,
-          "message": "ingest: read the floor from values",
-          "parents": []
         }
-      ]
+      ],
+      "size": 2,
+      "isLastPage": true,
+      "start": 0,
+      "limit": 100,
+      "nextPageStart": null
     }
   ]
 }
