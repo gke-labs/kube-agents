@@ -2495,8 +2495,10 @@ def enabled_chat_platforms() -> list[str]:
     ``spec.mode: next`` the
     managed scope says that platform's Hermes consumer is off because the A2A
     gateway holds the backend, and posts to it go through the gateway instead,
-    so it is still a platform this install posts to. The operator renders the
-    variable only then, and it is reserved against every other source.
+    so it is still a platform this install posts to, with a home channel or
+    (when it is the only chat platform) without one, the gateway keeping the
+    refused posts for a digest. The operator renders the variable only then,
+    and it is reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
@@ -2598,7 +2600,9 @@ def _no_chat_route_error() -> str:
     chat and the `chat_delivery_watch` ledger issue. The gateway names its
     backend whether or not a home channel is set, so with one named the cause is
     the missing home channel; without one this cannot tell no chat from a
-    misconfigured one, so it guesses at neither.
+    misconfigured one, so it guesses at neither. A pod the operator has routed
+    never reaches this: its send goes to the gateway, whose refusal says the
+    post is kept.
     """
     platform = chat_notify.gateway_platform()
     setting = HOME_CHANNEL_SETTINGS.get(platform)
@@ -2646,6 +2650,10 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 #: falling through would post it a second time somewhere else. Deliberately not
 #: a plausible thread id, so a caller that ignores it addresses nothing.
 ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
+# `_post_initial_alert`'s fourth outcome: the gateway refused the alert for want
+# of a home channel and kept it for the digest it posts once one is set
+# (chat_notify.kept). Nothing posted now; the caller must not re-send.
+ALERT_KEPT_FOR_DIGEST = "\x00alert-kept-for-digest"
 
 
 def _run_alert_send(active_platform: str, alert_msg: str, session_id: str = "") -> subprocess.CompletedProcess:
@@ -2704,6 +2712,9 @@ def _post_initial_alert(active_platform: str, alert_msg: str, session_id: str = 
             # alert may well be in the channel, so it must not be sent again.
             logger.error(f"Alert to '{active_platform}' got no answer in time; treating it as sent. Stderr: {exc.stderr}")
             return ALERT_SENT_WITHOUT_THREAD
+        if chat_notify.kept(exc.returncode):
+            logger.warning(f"Alert to '{active_platform}' was refused for want of a home channel and kept by the gateway for its digest")
+            return ALERT_KEPT_FOR_DIGEST
         logger.error(f"Failed to post warning alert. Stdout: {exc.stdout}. Stderr: {exc.stderr}. Exc: {exc}")
     except Exception as exc:
         logger.error(f"Failed to post warning alert or parse message_id response: {exc}")
@@ -4475,8 +4486,15 @@ def _trigger_agent_troubleshooter(
     else:
         active_platform = get_active_platform(platforms)
         thread_id = None
+        kept = False
         for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
             thread_id = _post_initial_alert(candidate, _alert_for(candidate, alert_msg, slack_alert_msg), session_id)
+            if thread_id == ALERT_KEPT_FOR_DIGEST:
+                # Refused for want of a home channel and kept by the gateway for
+                # the digest it posts once one is set. Stop: the next platform
+                # is the same install, and the record below says kept, not lost.
+                active_platform, thread_id, kept = candidate, None, True
+                break
             if thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Delivered, and unthreadable. Stop: the reader has the alert, and
                 # trying the next platform would post it to a second channel to
@@ -4527,8 +4545,9 @@ def _trigger_agent_troubleshooter(
             # mode is false reassurance.
             mark_delivery_failed(
                 event_row_id,
-                f"no message id from {' or '.join(repr(p) for p in platforms)}; "
-                "see the session server log",
+                f"kept by the gateway for its digest: no home channel on {active_platform!r}"
+                if kept
+                else f"no message id from {' or '.join(repr(p) for p in platforms)}; see the session server log",
             )
             logger.error(
                 f"Alert for session {session_id} was not delivered to any enabled platform "
@@ -5739,8 +5758,10 @@ def relay_cron_report(
     they are skipped rather than missed.
 
     An install with no chat route gets no send at all, where the fallback to
-    DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): a
-    `next` install whose gateway holds Slack with no home channel. The error
+    DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): one
+    with neither platform, or a pod rendered before the operator routed its only
+    platform without a home channel (a routed pod sends, and the gateway refuses
+    and keeps the post). The error
     names the platform and the setting that arms it, in the wording
     `chat_delivery_watch` reads the platform from; see
     :func:`_no_chat_route_error`.
@@ -6619,6 +6640,12 @@ def _send_drift_backlog_digest(platform: str, message: str) -> bool:
         logger.warning(f"Drift backlog digest to '{platform}' timed out; treating it as sent")
         return True
     except subprocess.CalledProcessError as exc:
+        if chat_notify.kept(exc.returncode):
+            # Refused for want of a home channel and kept by the gateway for the
+            # digest it posts once one is set: handled for this run, so the rows
+            # are digested rather than re-sent every retry into the keep.
+            logger.warning(f"Drift backlog digest to '{platform}' was kept by the gateway for its digest (no home channel)")
+            return True
         if chat_notify.outcome_unknown(exc.returncode):
             logger.warning(f"Drift backlog digest to '{platform}' got no answer in time; treating it as sent")
             return True

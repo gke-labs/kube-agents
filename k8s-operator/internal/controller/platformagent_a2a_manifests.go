@@ -1329,6 +1329,34 @@ func a2aSlackNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
 	return strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "" || a2aSlackHomeChannel(agent) != ""
 }
 
+// a2aGchatHomeRouted says the agent routes its home posts (alerts, drift
+// and scheduled reports) to the gateway's Chat backend: the home channel is
+// a space name, or it is empty and Slack is not enabled, so the posts have
+// nowhere else to go and the gateway keeps the refused ones for the digest
+// it posts once a channel is set (a2a/gateway/notify_refused.go). With Slack
+// enabled beside an unset Chat home the posts keep going to Slack through
+// its Hermes platform (legacySlackConsumer) rather than into the keep. A
+// malformed home channel routes nothing: the gateway refuses it at start.
+func a2aGchatHomeRouted(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aChatArmed(agent) {
+		return false
+	}
+	if a2aGchatHomeSpace(agent) != "" {
+		return true
+	}
+	return strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" && !slackEnabled(agent)
+}
+
+// a2aSlackHomeRouted is Slack's half of a2aGchatHomeRouted. Slack holds the
+// gateway only when Chat is not enabled (a2aSlackArmed), so an unset home
+// channel always routes: Slack is the install's one chat platform.
+func a2aSlackHomeRouted(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aSlackArmed(agent) {
+		return false
+	}
+	return a2aSlackHomeChannel(agent) != "" || strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == ""
+}
+
 // a2aSlackHomeChannel is slack.homeChannel trimmed, when it is a public
 // ("C...") or private ("G...") channel id, and "" otherwise: the same test
 // the gateway arms its Slack chat.notify route on (a2a/gateway/notify.go,

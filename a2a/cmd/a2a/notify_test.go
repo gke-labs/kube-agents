@@ -142,6 +142,28 @@ func TestNotifyWithNoAnswerIsOutcomeUnknown(t *testing.T) {
 	}
 }
 
+// A home post the gateway refused and kept answers with kept set, and main
+// exits notifyExitKept so a sender that re-sends on failure stops.
+func TestNotifyAKeptRefusalExitsKept(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	if _, err := nc.Subscribe(lib.NotifySubjectGchat, func(m *nats.Msg) {
+		_ = m.Respond([]byte(`{"error":"no home channel is configured","kept":true}`))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = nc.Flush()
+	err = run([]string{"notify", "--platform", "google_chat", "x"})
+	if !errors.Is(err, errNotifyKept) {
+		t.Errorf("err = %v, want kept", err)
+	}
+}
+
 // An unreachable bus is route-unavailable, like an unarmed route: nothing was
 // posted, and nothing about the destination is known.
 func TestNotifyWithNoBusIsRouteUnavailable(t *testing.T) {

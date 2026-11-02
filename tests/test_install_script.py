@@ -8060,7 +8060,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("went on ASKED=7", proc.stdout, out)
         self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
         self.assertIn("SLACK_HOME_CHANNEL is empty", out)
-        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
         proc = self._interview("--mode=next", "", lead + ["", "y", "#ops"])
         out = proc.stdout + proc.stderr
         self.assertIn("went on ASKED=6", proc.stdout, out)
@@ -8077,12 +8077,12 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 lead = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD"]
                 proc = self._interview("--mode=next", "", lead + ["\u00a0", "n", "C0123ABCD", "#ops"], locale=locale)
                 out = proc.stdout + proc.stderr
-                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
                 self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
             with self.subTest(locale=locale, platform="google_chat"):
                 proc = self._interview("--mode=next", "", ["", "", "", "\u3000\u202f", "y"], choice="1", locale=locale)
                 out = proc.stdout + proc.stderr
-                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
                 self.assertIn("went on ASKED=5", proc.stdout, out)
 
     def test_the_google_chat_home_channel_under_next_is_confirmed_too(self):
@@ -8094,7 +8094,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("went on ASKED=6", proc.stdout, out)
         self.assertIn("PROMPT: Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)", out)
         self.assertIn("GOOGLE_CHAT_HOME_CHANNEL is empty", out)
-        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
         proc = self._interview("--mode=next", "", lead + ["", "y"], choice="1")
         self.assertIn("went on ASKED=5", proc.stdout, proc.stdout + proc.stderr)
         # Under today the prompt stays optional and nothing is confirmed.

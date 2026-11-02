@@ -46,9 +46,9 @@ const (
 	// posts arrive a few at a time; a full queue is a sender in a loop, and
 	// is refused at once rather than left to time out.
 	notifyQueueDepth = 32
-	// notifyStopGrace bounds how long Stop waits for the worker to finish the
-	// post in flight and refuse the rest, inside the pod's 30s termination
-	// grace period.
+	// notifyStopGrace bounds how long Stop waits, in all, for the worker to
+	// finish the post in flight and refuse the rest and for a refused-post
+	// keep in flight to land, inside the pod's 30s termination grace period.
 	notifyStopGrace = 20 * time.Second
 	// notifyStoppingRefusal is the answer to a request the gateway will not
 	// post because it is stopping. A refusal (exit 1 at the CLI), never
@@ -72,6 +72,12 @@ const (
 	// notifyNoHome refuses a home-channel post on an install that names no
 	// home channel: the route then serves conversation requests only.
 	notifyNoHome = "no home channel is configured; only a request naming a conversation is posted"
+	// notifyNoHomeKept is the same refusal on a route that keeps refused
+	// home posts (notify_refused.go); the reply also carries Kept, which the
+	// a2a CLI turns into its own exit status so a sender that re-sends on
+	// failure (the drift digest, the data-volume warning) treats the post as
+	// handled. The keep itself runs just after this answer, best effort.
+	notifyNoHomeKept = "no home channel is configured; the gateway keeps the post for one digest once a home channel is set; only a request naming a conversation is posted now"
 	// notifyHomeRefused answers a home post whose channel Slack refuses now
 	// (homeVerify): the word is one the operator matches.
 	notifyHomeRefused = "home channel refused: %s"
@@ -193,6 +199,9 @@ type Notifier struct {
 	// post; a check that cannot be made posts as before.
 	homeVerify func(ctx context.Context, home string) (refused string, err error)
 	poster     notifyPoster
+	// backend names the route's backend on the posts it keeps
+	// (notify_refused.go): lib's NotifyPlatform name.
+	backend string
 	// threadOK is the backend's test that a requested thread may be
 	// replied on. The home channel is the bound either way: Chat's thread
 	// names its space, so it is checked against the home space (inHome);
@@ -234,6 +243,19 @@ type Notifier struct {
 	// conversation's marks draw in the order their posts landed.
 	marks     chan notifyMarkJob
 	marksOnce sync.Once
+
+	// kept keeps the home posts refused for want of a home channel
+	// (notify_refused.go); keptMu orders the keeps, the reads and the
+	// digest so the count is exact, and keptWG counts them for Stop.
+	// keptPrimed, under keptMu, says the count left by an earlier process
+	// has been read, keptPriming that the read is in flight; keptPending
+	// that a digest is owed to the next home channel this route sees.
+	kept        refusedStore
+	keptMu      sync.Mutex
+	keptWG      sync.WaitGroup
+	keptPrimed  bool
+	keptPriming bool
+	keptPending bool
 }
 
 // notifyMarkJob is one conversation mark waiting to be drawn.
@@ -256,7 +278,7 @@ func NewGchatNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 		log = slog.Default()
 	}
 	n := &Notifier{subject: lib.NotifySubjectGchat, home: home, poster: poster, log: log,
-		convPrefix: gchatKeyPrefix}
+		convPrefix: gchatKeyPrefix, backend: lib.NotifyPlatformGchat}
 	n.threadOK = inHome
 	return n, nil
 }
@@ -276,7 +298,7 @@ func NewSlackNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 		log = slog.Default()
 	}
 	n := &Notifier{subject: lib.NotifySubjectSlack, home: home, poster: poster, log: log,
-		convPrefix: slackKeyPrefix}
+		convPrefix: slackKeyPrefix, backend: lib.NotifyPlatformSlack}
 	n.threadOK, n.threadTS = slackThreadOK, slackThreadTS
 	return n, nil
 }
@@ -363,6 +385,10 @@ func (n *Notifier) Start(client *lib.Client) (lib.Subscription, error) {
 	go n.work()
 	home, source := n.homeState()
 	n.log.Info("chat.notify route armed", "subject", n.subject, "home", home, "homeSource", source, "conversations", n.ServesConversations())
+	// What an earlier process refused is read now, and digested at once
+	// when this start already has a home channel (the CR's, or a projected
+	// one), else at the first home request that finds one.
+	n.primeKept()
 	return &notifierSub{sub: sub, n: n}, nil
 }
 
@@ -456,10 +482,23 @@ func (s *notifierSub) Stop() {
 		s.n.mu.Lock()
 		close(s.n.jobs)
 		s.n.mu.Unlock()
+		// One grace for both waits, inside the pod's termination grace: an
+		// instant, not a one-shot channel, so the second wait keeps whatever
+		// the first left.
+		end := time.Now().Add(notifyStopGrace)
 		select {
 		case <-s.n.done:
-		case <-time.After(notifyStopGrace):
+		case <-time.After(time.Until(end)):
 			s.n.log.Warn("chat.notify worker did not finish before shutdown", "grace", notifyStopGrace)
+		}
+		// A keep or a digest in flight finishes inside its own store
+		// timeout; wait for it so a refused post is not lost to the exit.
+		kept := make(chan struct{})
+		go func() { s.n.keptWG.Wait(); close(kept) }()
+		select {
+		case <-kept:
+		case <-time.After(time.Until(end)):
+			s.n.log.Warn("a refused-post keep did not finish before shutdown", "grace", notifyStopGrace)
 		}
 	})
 }
@@ -590,8 +629,18 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, string, *lib.Notify
 	home, source := n.homeState()
 	if home == "" {
 		n.log.Debug("notify refused: no home channel", "homeSource", source)
+		if n.kept != nil {
+			n.keepRefused(req)
+			r := n.refuse(notifyNoHomeKept)
+			r.Kept = true
+			return req, "", &r
+		}
 		return refuse(notifyNoHome)
 	}
+	// A home channel this route has: the digest owed to it posts beside
+	// this request (the projected file arriving is seen here, not by an
+	// event).
+	n.digestKept(home)
 	if req.Thread != "" && !n.threadOK(req.Thread, home) {
 		return refuse(fmt.Sprintf("thread %q is not a thread of the home channel", req.Thread))
 	}
