@@ -93,6 +93,64 @@ class SubmittedPayloadTestCase(unittest.TestCase):
         return self.send(argv, environ, endpoint)["payload"]
 
 
+class TestTruncatedReplyExitsNonZero(SubmittedPayloadTestCase):
+    """A cut payload is not the command's answer: the shim exits
+    EXIT_OUTPUT_TRUNCATED on every reply that says `truncated`, whatever the
+    command itself exited, and the stderr marker keeps the prefix the collectors
+    match while adding the counts the broker gave."""
+
+    ARGV = ["kubectl", "get", "pods", "-A", "-o", "json"]
+
+    def run_with(self, response):
+        captured = {}
+
+        def fake_open(request, *args, **kwargs):
+            return RecordingResponse(json.dumps(response).encode("utf-8"))
+
+        # An empty KUBECONFIG: the shim then names no context and resolves no file.
+        with patch.dict("os.environ", {"KUBECONFIG": ""}, clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                with patch("sys.stdout", new=io.StringIO()) as out, patch("sys.stderr", new=io.StringIO()) as err:
+                    captured["exit_code"] = credential_proxy_client.execute(self.LOCAL_ENDPOINT, self.ARGV)
+        captured["stdout"], captured["stderr"] = out.getvalue(), err.getvalue()
+        return captured
+
+    def test_a_cut_reply_exits_74_with_the_counts_on_the_marker(self):
+        got = self.run_with({"exitCode": 0, "stdout": '{"items": [{"kind": "Pod"', "stderr": "",
+                             "truncated": True, "bytesWritten": 8388608, "limit": 8388608})
+        self.assertEqual(credential_proxy_client.EXIT_OUTPUT_TRUNCATED, got["exit_code"])
+        self.assertEqual(74, got["exit_code"])
+        # What was kept still reaches stdout: a caller that pages wants it.
+        self.assertEqual('{"items": [{"kind": "Pod"', got["stdout"])
+        self.assertIn("credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)", got["stderr"])
+
+    def test_the_marker_keeps_its_prefix_without_counts_from_an_older_broker(self):
+        got = self.run_with({"exitCode": 0, "stdout": "{", "truncated": True})
+        self.assertEqual(74, got["exit_code"])
+        self.assertEqual("credential proxy output truncated\n", got["stderr"])
+
+    def test_a_failed_and_cut_command_still_reports_the_cut(self):
+        # The cut is the fact that decides what the caller holds; the child's
+        # own exit code is in the output it already printed.
+        got = self.run_with({"exitCode": 1, "stdout": "", "stderr": "error: x\n", "truncated": True,
+                             "bytesWritten": 0, "limit": 4096})
+        self.assertEqual(74, got["exit_code"])
+        self.assertTrue(got["stderr"].startswith("error: x\n"))
+
+    def test_a_whole_reply_passes_the_exit_code_through(self):
+        for exit_code in (0, 1, 3):
+            with self.subTest(exit_code=exit_code):
+                got = self.run_with({"exitCode": exit_code, "stdout": "{}", "truncated": False,
+                                     "bytesWritten": 2, "limit": 8388608})
+                self.assertEqual(exit_code, got["exit_code"])
+                self.assertNotIn("truncated", got["stderr"])
+
+    def test_counts_that_are_not_integers_fall_back_to_the_bare_marker(self):
+        got = self.run_with({"exitCode": 0, "stdout": "", "truncated": True, "bytesWritten": "8", "limit": None})
+        self.assertEqual(74, got["exit_code"])
+        self.assertEqual("credential proxy output truncated\n", got["stderr"])
+
+
 class TestKubeconfigResolution(SubmittedPayloadTestCase):
     """The pin crosses as a cluster name, because the file itself cannot.
 

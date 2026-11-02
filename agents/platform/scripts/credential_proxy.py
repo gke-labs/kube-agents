@@ -5802,6 +5802,11 @@ class ExecutionResult:
     # The caller's connection closed while the command ran, and the command was
     # killed for it. There is nobody to answer; the handler logs and returns.
     abandoned: bool = False
+    # How much of stdout the caller receives, in UTF-8 bytes, and the per-stream
+    # cap it was held to. Answered with `truncated` so a caller that was cut can
+    # say how much it kept and page the rest, rather than only that it was cut.
+    stdout_bytes: int = 0
+    output_limit: int = 0
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
@@ -10842,6 +10847,10 @@ class CommandExecutor:
             truncated=captured.truncated or stdout_cut or stderr_cut,
             timed_out=captured.timed_out,
             abandoned=captured.abandoned and not drained,
+            # Text that decoded cleanly is the captured bytes, measured once;
+            # only a cut re-decode is re-encoded to be measured.
+            stdout_bytes=len(stdout_text.encode("utf-8")) if stdout_cut else len(captured.stdout),
+            output_limit=self.max_output_bytes,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -12938,6 +12947,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "stderr": result.stderr,
                     "durationMs": result.duration_ms,
                     "truncated": result.truncated,
+                    # Beside `truncated`: how much of stdout survived the cap,
+                    # and the cap. The shim prints both on a cut, so a caller
+                    # knows how much it holds and that the rest is to be paged.
+                    "bytesWritten": result.stdout_bytes,
+                    "limit": result.output_limit,
                     "timedOut": result.timed_out,
                 }
                 # Only `get-credentials` fills this, and only when the caller
