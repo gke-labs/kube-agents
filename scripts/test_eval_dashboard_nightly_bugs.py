@@ -707,6 +707,26 @@ class HeldStateTest(Harness):
             _, _, err = self.run_once(self.THREE_RED(), FakeGh(empty_open=True), extra=["--state", str(self.state)])
         self.assertIn("could not update", err)
 
+    def test_a_failed_read_leaves_the_record_alone(self):
+        # #4573 review: a gcloud failure is not "no hold on record"; a
+        # fresh count written over a 9-tick hold would lose the line.
+        before = self.held_tick(empty_open=True)
+        with unittest.mock.patch.object(nightly_bugs, "read_held_state", side_effect=nightly_bugs.StateUnreadable("HTTP 503")):
+            _, _, err = self.run_once(self.THREE_RED(), FakeGh(empty_open=True), extra=["--state", str(self.state)])
+        self.assertIn("could not update", err)
+        self.assertEqual(json.loads(self.state.read_text()), before)
+
+    def test_a_gs_read_tells_an_absent_object_from_a_failed_read(self):
+        location = "gs://bucket/nightly-bugs-state.json"
+
+        def runner(stdout="", stderr="", rc=0):
+            return lambda argv, **kw: GhResult(rc=rc, stdout=stdout, stderr=stderr)
+
+        self.assertEqual(nightly_bugs.read_held_state(location, runner('{"held_ticks": 3}')), {"held_ticks": 3})
+        self.assertIsNone(nightly_bugs.read_held_state(location, runner(rc=1, stderr="ERROR: The following URLs matched no objects or files")))
+        with self.assertRaises(nightly_bugs.StateUnreadable):
+            nightly_bugs.read_held_state(location, runner(rc=1, stderr="ERROR: HTTPError 503: Service Unavailable"))
+
     def test_without_state_nothing_is_written(self):
         self.run_once(self.THREE_RED(), FakeGh(empty_open=True))
         self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["data.json", "repo"])

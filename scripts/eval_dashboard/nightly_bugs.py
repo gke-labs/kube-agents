@@ -168,6 +168,9 @@ HELD_TICKS_DIGEST = 8
 # A state file not rewritten for this long says nothing about filing now:
 # the step stopped running or could not write, and the job log says why.
 HELD_STATE_FRESH = datetime.timedelta(hours=1)
+# What `gcloud storage cat` says of an absent object: the patterns
+# ci-health.yml greps for. Any other failed read is not "no hold on record".
+STATE_ABSENT_RE = re.compile(r"matched no objects|not found: 404")
 HELD_DIGEST_LINE = "🚫 Nightly bug filing held since {since}: the nightly-red issue listing is untrusted ({doubt}), so no bugs are filed or commented on."
 GRAPHQL_PATH = "graphql"
 GRAPHQL_FIRST = 100
@@ -673,6 +676,29 @@ def held_state(prev: dict | None, doubt: str | None, live: bool, now: datetime.d
     return {"held_ticks": ticks + 1, "held_since": (prev.get("held_since") if ticks else None) or stamp, "doubt": doubt, "updated_at": stamp}
 
 
+class StateUnreadable(OSError):
+    """The ``--state`` object exists, or may, and could not be read."""
+
+
+def read_held_state(location: str, runner=subprocess.run) -> dict | None:
+    """The ``--state`` document, or None when there is none yet. A gs://
+    read that failed for any reason but an absent object raises
+    StateUnreadable, so the filer does not write a fresh count over the
+    record and the digest does not take the failure for no hold."""
+    if not location.startswith(post_health.GS_PREFIX):
+        return post_health.read_state(location)
+    result = runner([post_health.GCLOUD, post_health.STORAGE_GROUP, "cat", location], capture_output=True, text=True)
+    if result.returncode != 0:
+        if STATE_ABSENT_RE.search(result.stderr or ""):
+            return None
+        raise StateUnreadable(f"gcloud storage cat {location} failed: {(result.stderr or '').strip()[:200]}")
+    try:
+        loaded = json.loads(result.stdout)
+    except ValueError:
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
 def held_digest_lines(state: dict | None, now: datetime.datetime) -> list[str]:
     """The digest's line while filing has been held HELD_TICKS_DIGEST ticks
     in a row; none otherwise, or when the state is stale (HELD_STATE_FRESH)."""
@@ -1020,7 +1046,7 @@ def main(argv=None, gh_runner=None) -> int:
     # was: it neither trusted nor doubted them.
     if args.state and filer.doubt is not None:
         try:
-            state = held_state(post_health.read_state(args.state), filer.doubt, not args.dry_run, datetime.datetime.now(datetime.timezone.utc))
+            state = held_state(read_held_state(args.state), filer.doubt, not args.dry_run, datetime.datetime.now(datetime.timezone.utc))
             post_health.write_state(args.state, state)
         except (OSError, subprocess.CalledProcessError) as exc:
             log(f"warning: could not update {args.state}: {exc}; the held-tick count is retried next tick")

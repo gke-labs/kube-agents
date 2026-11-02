@@ -862,7 +862,8 @@ carries one line, "Nightly bug filing held since <time>", with the last
 reason; the first trusted tick clears it. The count lives in
 `nightly-bugs-state.json` beside `health.json`; a dry run records no hold, and
 a count the step has not rewritten in the last hour is not reported and
-starts over at the next held tick. When a comment read
+starts over at the next held tick. A failed read of the object, other than
+its absence, leaves the count as it was; on the digest tick it costs that day's line. When a comment read
 returns fewer comments than the issue listing counts, the step skips that
 issue for the tick, so a recovery or night comment is not posted twice. When a case with an open issue passes every graded
 repetition on a graded night after its last failing one, and that night

@@ -2125,7 +2125,7 @@ def filing_lines(location: str | None, now: datetime, runner=subprocess.run) -> 
     try:
         from eval_dashboard import nightly_bugs
 
-        return nightly_bugs.held_digest_lines(read_state(location, runner), now)
+        return nightly_bugs.held_digest_lines(nightly_bugs.read_held_state(location, runner), now)
     except Exception:  # noqa: BLE001 -- the digest must still go out
         traceback.print_exc()
         log("warning: held bug-filing line skipped")

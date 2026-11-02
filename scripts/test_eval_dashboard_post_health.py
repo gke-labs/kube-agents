@@ -609,6 +609,12 @@ class Digest(RunHarness):
         self.tick(health(), now, extra=["--bugs-state", str(bugs)])
         self.assertIn("🚫 Nightly bug filing held since Fri 6:30 AM ET: the nightly-red issue listing is untrusted (the GraphQL cross-check could not be read)", self.opener.texts[-1])
         # An unreadable state file costs the line, not the digest.
+        # A failed gs:// read costs the line with a warning, not the digest.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            failed = post_health.filing_lines("gs://b/s.json", now, lambda argv, **kw: GhResult(rc=1, stderr="HTTPError 503"))
+        self.assertEqual(failed, [])
+        self.assertIn("held bug-filing line skipped", err.getvalue())
         bugs.write_text("not json")
         self.tick(health(), self.at(DIGEST_UTC, 5, day=5), extra=["--bugs-state", str(bugs)])
         self.assertNotIn("bug filing held", self.opener.texts[-1])
