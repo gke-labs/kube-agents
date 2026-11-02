@@ -6997,11 +6997,10 @@ def _inject_followup(
     touching the board, for the retry the watcher sends when its client gave
     up on a slow board after the comment had landed.
 
-    A reply, not an edit of the alert: the gateway edits by update key only
-    inside a conversation request (a2a/gateway/notify.go, postConversation),
-    and the alert was a home-channel post whose key was never bound, so a
-    keyed send here would post anew at best and at worst overwrite whatever
-    message had taken that key since, the triage report included.
+    A reply, not an edit of the alert: the gateway keeps the alert's update
+    key on its thread (a2a/gateway/notify.go, postHome) and the triage edits
+    the alert through it, so a keyed send here would overwrite whatever
+    message holds the key by now, the triage report included.
     """
     platform, chat_id, thread_id = _lookup_session_routing(session_id)
     text = _followup_message(session_id, payload)
