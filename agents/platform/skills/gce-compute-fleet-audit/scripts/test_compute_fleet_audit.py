@@ -1217,7 +1217,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             "object": candidate["object"],
             "impact": candidate["impact"],
             "evidence": {
-                "command": "gcloud compute instances list --project proj-1 --format=json",
+                "command": f"gcloud compute instances list --project proj-1 {cf.INSTANCES_FORMAT}",
                 "excerpt": candidate["excerpt"],
             },
             "recommendation": {
@@ -1311,7 +1311,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         data["scope"]["clusters"][0]["checks_run"].append(
             {
                 "check": "sole-tenant-headroom",
-                "command": "gcloud compute sole-tenancy node-groups list --project proj-1 --format=json",
+                "command": f"gcloud compute sole-tenancy node-groups list --project proj-1 {cf.NODE_GROUPS_FORMAT}",
             }
         )
         with self.assertRaises(audit_report.ValidationError) as caught:
@@ -1392,7 +1392,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                         "checks_run": [
                             {
                                 "check": "gce-startup-script-status",
-                                "command": "gcloud compute instances list --project proj-1 --format=json",
+                                "command": f"gcloud compute instances list --project proj-1 {cf.INSTANCES_FORMAT}",
                             }
                         ],
                     }

@@ -263,6 +263,18 @@ SNAPSHOT_SCHEDULE_KEYS = ("sourceSnapshotSchedulePolicy", "sourceSnapshotSchedul
 # §2.4's threshold, as a percentage of the node group's aggregate capacity.
 SOLE_TENANT_UTILISATION_PCT = 90
 
+# `--format=json(...)` projections of the five list reads, each the fields
+# its reader names in the contract above and nothing else. An instance's
+# whole resource (network interfaces, disks, labels, scheduling, shielded-VM
+# config) is tens of times the four fields §2.1 reads, and a project with
+# thousands of instances took the list past the credential proxy's output cap;
+# the projection keeps the reply and this process at a few fields per object.
+INSTANCES_FORMAT = "--format=json(name,status,zone,metadata.items.key)"
+MIGS_FORMAT = "--format=json(name,size,targetSize,status,currentActions,zone,region)"
+NODE_GROUPS_FORMAT = "--format=json(name,size,zone,region,autoscalingPolicy)"
+DISKS_FORMAT = "--format=json(name,selfLink)"
+SNAPSHOTS_FORMAT = "--format=json(name,sourceDisk,creationTimestamp,sourceSnapshotSchedulePolicy,sourceSnapshotSchedulePolicyId)"
+
 # The two `NodeGroup.autoscalingPolicy.mode` values that actually add nodes, out
 # of the four the Compute v1 discovery document defines. The other two --
 # MODE_UNSPECIFIED and OFF -- leave the group a fixed reservation, which is
@@ -1189,7 +1201,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
     try:
         # --- 2.1 startup script failures ---------------------------------- #
         instances = gated(
-            ["gcloud", "compute", "instances", "list", "--project", project, "--format=json"],
+            ["gcloud", "compute", "instances", "list", "--project", project, INSTANCES_FORMAT],
             STARTUP_SLUG,
         )
         running = running_instances(instances)
@@ -1278,7 +1290,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         migs = gated(
             [
                 "gcloud", "compute", "instance-groups", "managed", "list",
-                "--project", project, "--format=json",
+                "--project", project, MIGS_FORMAT,
             ],
             MIG_SLUG,
         )
@@ -1296,7 +1308,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         groups = gated(
             [
                 "gcloud", "compute", "sole-tenancy", "node-groups", "list",
-                "--project", project, "--format=json",
+                "--project", project, NODE_GROUPS_FORMAT,
             ],
             SOLE_TENANT_SLUG,
         )
@@ -1363,11 +1375,11 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         # check and no sign that the other had been abandoned. It is now what
         # it is — a read that failed, and a project the run could not cover.
         disks = gated(
-            ["gcloud", "compute", "disks", "list", "--project", project, "--format=json"],
+            ["gcloud", "compute", "disks", "list", "--project", project, DISKS_FORMAT],
             SNAPSHOT_SLUG,
         )
         snapshots = gated(
-            ["gcloud", "compute", "snapshots", "list", "--project", project, "--format=json"],
+            ["gcloud", "compute", "snapshots", "list", "--project", project, SNAPSHOTS_FORMAT],
             SNAPSHOT_SLUG,
         )
         active = active_disk_index(disks)

@@ -801,10 +801,10 @@ def project_entry(project):
         "location": "global",
         "project": project,
         "checks_run": [
-            {"check": "cloud-nat-exhaustion", "command": f"gcloud compute routers list --project={project} --format=json"},
+            {"check": "cloud-nat-exhaustion", "command": f"gcloud compute routers list --project={project} '{na.ROUTERS_FORMAT}'"},
             {"check": "psc-routing-deadlock", "command": f"gcloud compute forwarding-rules list --project {project} --format=json"},
-            {"check": "mtu-packet-fragmentation", "command": f"gcloud compute networks list --project={project} --format=json"},
-            {"check": "cloud-armor-false-positive", "command": f"gcloud compute security-policies list --project={project} --format=json"},
+            {"check": "mtu-packet-fragmentation", "command": f"gcloud compute networks list --project={project} '{na.NETWORKS_FORMAT}'"},
+            {"check": "cloud-armor-false-positive", "command": f"gcloud compute security-policies list --project={project} '{na.SECURITY_POLICIES_FORMAT}'"},
         ],
         "checks_not_applicable": [{
             "check": "subnet-ip-exhaustion",
