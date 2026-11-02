@@ -61,10 +61,10 @@ verification_spec:
       # the shapes the nightly answers wrote and prose that names Config
       # Connector as present.
       any_of_patterns:
-        - '\b(?:config connector|containerclusters?|crds?|resource types?)\b(?:[^.;?!()\n]|\([^)\n]*\)|\.(?=\w)){0,80}?\b(?:not (?:installed|enabled|available|set up|present|found|deployed|there)|(?:is|are|was|were)n''t (?:installed|enabled|available|set up|present|found|deployed|there)|missing|absent|unavailable|no crds?)\b'
+        - '\b(?:config connector|containerclusters?|crds?|resource types?)\b(?:[^.;?!()\n]|\([^)\n]*\)|\.(?=\w)){0,80}?\b(?:not (?:yet |been )?(?:installed|enabled|available|set up|present|found|deployed|running|there)|(?:is|are|was|were)n''t (?:installed|enabled|available|set up|present|found|deployed|running|there|on)|(?:do|does|did)(?: not|n''t) exist|missing|absent|unavailable|no crds?)\b'
         - '\b(?:lacks?|lacking|without|missing|(?:does|do|did)(?: not|n''t) have|(?:has|have|had) no)\b[^.;?!\n]{0,80}\b(?:config connector|containerclusters?|crds?)\b'
-        - '\bno (?:config connector|kcc|cnrm)\b'
-        - '\b(?:none of|no cluster|no clusters)\b(?:[^.;?!()\n]|\([^)\n]*\)|\.(?=\w)){0,60}?\b(?:has|have|runs?)\b[^.;?!\n]{0,20}\b(?:config connector|containerclusters?|crds?)\b'
+        - '\bno (?:config connector|kcc|cnrm)\b(?!-)'
+        - '\b(?:none(?: of)?|no clusters?)\b(?:[^.;?!()\n]|\([^)\n]*\)|\.(?=\w)){0,60}?\b(?:has|have|runs?)\b[^.;?!\n]{0,20}\b(?:config connector|containerclusters?|crds?)\b'
   - name: no-worker-ran-a-gcloud-cluster-create
     role: objective
     mode: assert

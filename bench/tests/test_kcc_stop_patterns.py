@@ -45,6 +45,13 @@ def test_the_missing_config_connector_matches():
         "The ContainerCluster CRD was not found on any cluster.",
         "No cluster in reach has Config Connector.",
         "The clusters do not have Config Connector CRDs.",
+        # More absence wordings: "not yet", "has not been", "do not exist",
+        # "not running", and "none has".
+        "Config Connector has not been installed on any cluster.",
+        "Config Connector is not yet installed on any cluster.",
+        "The Config Connector CRDs do not exist on any cluster.",
+        "Config Connector is not running on any cluster.",
+        "I checked all 5 clusters; none has the Config Connector CRDs.",
     ):
         assert _matches(report), report
 
@@ -56,5 +63,6 @@ def test_prose_that_names_no_absence_does_not_match():
         "I installed Config Connector on the host cluster and created eval-kcc-probe from the manifest.",
         "The repository has no clusters/eval-kcc-probe/provisioning/ path yet, so the manifest goes in a new folder.",
         "eval-kcc-probe was not found in the project, so the manifest creates it.",
+        "No kcc-probe cluster exists yet; Config Connector is installed and the PR creates it.",
     ):
         assert not _matches(report), report
