@@ -156,9 +156,9 @@ URL.
 
 Interactively, give `--gitops-forge=bitbucket` or `--gitops-forge=bitbucket-datacenter`. The
 interview's forge question does not offer Bitbucket, so the flag is how you choose it. The
-installer then asks for what the flags do not give: the host (Data Center), the repository path,
-the name of the Secret, and, for Data Center, the PEM CA file (leave it empty when a public CA
-signed the certificate). It asks for the token only after the cluster is up, at the health check
+installer then asks for what the flags do not give: the host (Data Center), the repository path
+and the name of the Secret. For Data Center, it also asks for the PEM CA file: leave it empty when
+a public CA signed the certificate. It asks for the token only after the cluster is up, at the health check
 step. The prompt does not echo.
 
 Non-interactively, the token comes from a file, or from a process substitution such as a password
@@ -197,16 +197,16 @@ Bitbucket Data Center:
 
 For an instance behind a private CA, add `--gitops-ca-file`.
 
-| Flag                    | `install.env` key                      | Meaning                                                                                                                                                                                                      |
-| ----------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--gitops-forge`        | `GITOPS_FORGE`                         | `bitbucket` (Cloud) or `bitbucket-datacenter`.                                                                                                                                                               |
-| `--gitops-host`         | `GITOPS_HOST`                          | Data Center only: the instance's hostname, with no scheme, port or path. Omit it for Cloud (`bitbucket.org` is accepted and dropped).                                                                        |
+| Flag                    | `install.env` key                      | Meaning                                                                                                                                                                                                                                                                                                                               |
+| ----------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--gitops-forge`        | `GITOPS_FORGE`                         | `bitbucket` (Cloud) or `bitbucket-datacenter`.                                                                                                                                                                                                                                                                                        |
+| `--gitops-host`         | `GITOPS_HOST`                          | Data Center only: the instance's hostname, with no scheme, port or path. Omit it for Cloud (`bitbucket.org` is accepted and dropped).                                                                                                                                                                                                 |
 | `--gitops-repo`         | `GITOPS_REPO`                          | Cloud: `workspace/repo-slug`, or the repository's `https://bitbucket.org/...` URL. Data Center: `PROJECTKEY/repo-slug`, or its `https://<host>/scm/...` clone URL or `https://<host>/projects/...` page URL. The installer reduces a URL to `workspace/repo-slug` or `PROJECTKEY/repo-slug`, the only form the PlatformAgent accepts. |
-| `--gitops-token-file`   | _never recorded_                       | A file, `/dev/stdin` (not under `curl … \| bash`) or `<(command)` that holds the token. The installer reads it once after the apply and writes it only into the Secret. Alias: `--gitlab-token-file`.        |
-| _none_                  | `GITOPS_READ_TOKEN_FILE`               | Optional. A file or `<(command)` that holds a read-only token for private context repositories, read as `--gitops-token-file` is, and never recorded. Alias: `GITLAB_READ_TOKEN_FILE`.                       |
-| `--gitops-token-secret` | `GITLAB_TOKEN_SECRET`                  | The Secret's name, default `bitbucket-forge-token`. Alias: `--gitlab-token-secret`. `install.env` records the name under the `GITLAB_TOKEN_SECRET` key for every forge with a token.                         |
-| `--gitops-identity`     | `GITOPS_IDENTITY`                      | Cloud access tokens only: the account UUID the token acts as, with or without braces. See [Find the identity of an access token](#find-the-identity-of-an-access-token).                                     |
-| `--gitops-ca-file`      | `GITOPS_CA_SECRET` (the Secret's name) | Data Center only: a PEM file with the CA certificates of an instance behind a private CA. The installer stores it in Secret `bitbucket-forge-ca`. Its path is not recorded.                                  |
+| `--gitops-token-file`   | _never recorded_                       | A file, `/dev/stdin` (not under `curl … \| bash`) or `<(command)` that holds the token. The installer reads it once after the apply and writes it only into the Secret. Alias: `--gitlab-token-file`.                                                                                                                                 |
+| _none_                  | `GITOPS_READ_TOKEN_FILE`               | Optional. A file or `<(command)` that holds a read-only token for private context repositories, read as `--gitops-token-file` is, and never recorded. Alias: `GITLAB_READ_TOKEN_FILE`.                                                                                                                                                |
+| `--gitops-token-secret` | `GITLAB_TOKEN_SECRET`                  | The Secret's name, default `bitbucket-forge-token`. Alias: `--gitlab-token-secret`. `install.env` records the name under the `GITLAB_TOKEN_SECRET` key for every forge with a token.                                                                                                                                                  |
+| `--gitops-identity`     | `GITOPS_IDENTITY`                      | Cloud access tokens only: the account UUID the token acts as, with or without braces. See [Find the identity of an access token](#find-the-identity-of-an-access-token).                                                                                                                                                              |
+| `--gitops-ca-file`      | `GITOPS_CA_SECRET` (the Secret's name) | Data Center only: a PEM file with the CA certificates of an instance behind a private CA. The installer stores it in Secret `bitbucket-forge-ca`. Its path is not recorded.                                                                                                                                                           |
 
 The installer refuses `--github-app-id` and `--github-pem-path` with a Bitbucket forge.
 
