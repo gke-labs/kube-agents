@@ -902,11 +902,16 @@ Consequences:
   `503 CREDENTIAL_PROXY_BUSY`, naming the slot cap
   (`the credential proxy is at its limit of 8 concurrent commands …`) or the budget
   (`the credential proxy is at its child memory budget (… MiB in use of … MiB: … MiB reserved for children, … MiB of output allowance for … requests) …`),
+  the background share (`the credential proxy keeps … of its … admissions for interactive work …`)
+  or the interactive cap (`the credential proxy keeps one of its … admissions for background work …`),
   whichever held it, or, when the request itself fits and only requests ahead of it that
   are waiting for the budget kept it queued, the queue
   (`the credential proxy's admission queue is held by requests waiting for its child memory budget (…) …`).
-  The queue is in arrival order, except that a forge refresh that fits the budget passes
-  requests the slot cap alone holds, since it takes no slot.
+  The queue is in arrival order inside each admission class, with interactive requests ahead
+  of queued background ones (`designs/credential-broker-exec-tier.md` §4.2), except that a
+  forge refresh that fits the budget passes requests only a slot cap holds (the full slot cap,
+  or their own class's full cap), since it takes
+  no slot.
   A long-running command holds its slot and reservation for as long as it runs,
   and a caller that stops reading its response is given up on after 60 seconds
   so that it cannot keep them.
@@ -916,8 +921,8 @@ Consequences:
   applies at the deadline. On the exec, vcs and forge refresh routes, a caller
   that disconnects while queued for admission (a slot, the child memory budget,
   or both) is dropped without anything being started; a vcs verb's own git commands, once started, run to completion
-  unwatched. Admission goes in arrival order, so the caller refused after the wait
-  is the one that waited longest. Disconnecting means the peer closed for good
+  unwatched. Admission goes in arrival order inside each class, so the caller refused
+  after the wait is the one of its class that waited longest. Disconnecting means the peer closed for good
   (`POLLHUP` on the broker's Unix socket); a peer that only shut its writing
   half is still answered, and a broker spoken to over TCP, where a closed peer
   and a half-closed one look alike, runs its commands unwatched.
