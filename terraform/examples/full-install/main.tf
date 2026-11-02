@@ -1303,12 +1303,17 @@ resource "helm_release" "kube_agents" {
       error_message = "gitops_forge = \"bitbucket\" is Bitbucket Cloud at bitbucket.org: leave gitops_host and gitops_ca_secret_name unset. For a Data Center instance, use gitops_forge = \"bitbucket-datacenter\"."
     }
     precondition {
-      condition = var.gitops_forge != "bitbucket-datacenter" || (var.gitops_host != "" && !can(regex("(^|\\.)(bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net|github\\.com|gitlab\\.com)$", var.gitops_host)))
+      condition = var.gitops_forge != "bitbucket-datacenter" || (var.gitops_host != "" && !can(regex("(^|\\.)(bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net|github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host)))
       error_message = "gitops_forge = \"bitbucket-datacenter\" needs gitops_host: the instance's own hostname, not bitbucket.org or another hosted service's domain."
     }
     precondition {
       condition = var.gitops_forge != "bitbucket" || var.gitops_identity == "" || can(regex("^(\\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\\}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$", var.gitops_identity))
       error_message = "gitops_identity on Bitbucket Cloud is the account UUID the access token acts as, with or without braces."
+    }
+    # The CRD's grammar for identity, on both Bitbucket providers.
+    precondition {
+      condition     = var.gitops_identity == "" || can(regex("^[A-Za-z0-9._@+{}-]{1,255}$", var.gitops_identity))
+      error_message = "gitops_identity is 1 to 255 letters, digits and . _ @ + { } -."
     }
     # The Bitbucket inputs under another forge would be dropped silently.
     precondition {
@@ -1337,8 +1342,8 @@ resource "helm_release" "kube_agents" {
     # it; github.com is the default and needs no host; and a GitLab host is
     # not GitHub's.
     precondition {
-      condition     = !local.gitops_is_ghes || !can(regex("(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host))
-      error_message = "gitops_host with gitops_forge = \"github\" is a GitHub Enterprise Server hostname. Leave it empty for github.com; a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) or gitlab.com is not one."
+      condition     = !local.gitops_is_ghes || !can(regex("(^|\\.)(github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com|bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net)$", var.gitops_host))
+      error_message = "gitops_host with gitops_forge = \"github\" is a GitHub Enterprise Server hostname. Leave it empty for github.com; a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like), gitlab.com, or a Bitbucket or Atlassian domain is not one."
     }
 
     # On a GitHub Enterprise Server, github_repo is required, as owner/name

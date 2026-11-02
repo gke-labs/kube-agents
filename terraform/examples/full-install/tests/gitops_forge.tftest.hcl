@@ -426,3 +426,33 @@ run "web_console_refuses_no_network_policy" {
   expect_failures = [helm_release.kube_agents]
 }
 
+
+run "bitbucket_datacenter_refuses_an_identity_outside_the_crd_pattern" {
+  command = plan
+  variables {
+    gitops_forge     = "bitbucket-datacenter"
+    gitops_host      = "bitbucket.example.com"
+    gitops_repo_path = "INFRA/gitops"
+    gitops_identity  = "svc bot"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "bitbucket_datacenter_refuses_a_github_service_host" {
+  command = plan
+  variables {
+    gitops_forge     = "bitbucket-datacenter"
+    gitops_host      = "acme.ghe.com"
+    gitops_repo_path = "INFRA/gitops"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "ghes_refuses_an_atlassian_host" {
+  command = plan
+  variables {
+    github_repo = "acme/infra"
+    gitops_host = "git.atlassian.net"
+  }
+  expect_failures = [helm_release.kube_agents]
+}

@@ -674,7 +674,7 @@ variable "github_repo" {
 }
 
 variable "gitops_forge" {
-  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter, on github.com or, with gitops_host, on a GitHub Enterprise Server) gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names), bitbucket (Bitbucket Cloud) or bitbucket-datacenter (gitops_repo_path, with the token in the Secret gitops_token_secret_name names). A gitlab or Bitbucket install, and a github install with gitops_host, declare one forge and its gitops repository through spec.integration.forges/repositories. A gitlab or Bitbucket install must leave github_repo and enable_github_minter unset."
+  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter, on github.com or, with gitops_host, on a GitHub Enterprise Server), gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names), bitbucket (Bitbucket Cloud, at bitbucket.org) or bitbucket-datacenter (gitops_repo_path, with the token in the Secret gitops_token_secret_name names). A gitlab or Bitbucket install, and a github install with gitops_host, declare one forge and its gitops repository through spec.integration.forges/repositories. A gitlab or Bitbucket install must leave github_repo and enable_github_minter unset."
   type        = string
   default     = "github"
   validation {

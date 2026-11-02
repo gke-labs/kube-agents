@@ -817,7 +817,9 @@ Flags for AI Agents & Automation:
   --gitops-org=ORG              GitHub organization of the GitOps repo (GitHub only)
   --gitops-repo=REPO            GitOps IaC repository: on GitHub its name (default:
                                 DEFAULT_GITOPS_REPO, currently gke-fleet-iac); on GitLab the
-                                project's full path (required, no default)
+                                project's full path; on Bitbucket workspace/repo-slug (Cloud) or
+                                PROJECTKEY/repo-slug (Data Center), or the repository's URL
+                                (required, no default, for GitLab and Bitbucket)
   --gitops-forge=FORGE          Forge holding the GitOps repo: github, gitlab, bitbucket (Bitbucket
                                 Cloud) or bitbucket-datacenter (default: github). For gitlab,
                                 --gitops-repo is the project's full path (group/subgroup/project);
@@ -5383,8 +5385,10 @@ validate_bitbucket_forge_flags() {
     print_error "--gitops-identity on Bitbucket Cloud is the account UUID the access token acts as, with or without braces (got '${PARAM_GITOPS_IDENTITY}')."
     return 1
   fi
-  if [ -n "${PARAM_GITOPS_IDENTITY:-}" ] && [[ "$PARAM_GITOPS_IDENTITY" =~ [[:space:]] ]]; then
-    print_error "--gitops-identity must not contain whitespace (got '${PARAM_GITOPS_IDENTITY}')."
+  # The CRD's grammar for identity, on both providers: a value outside it
+  # would pass here and fail at the apply, after the cluster work.
+  if [ -n "${PARAM_GITOPS_IDENTITY:-}" ] && ! [[ "$PARAM_GITOPS_IDENTITY" =~ ^[A-Za-z0-9._@+{}-]{1,255}$ ]]; then
+    print_error "--gitops-identity must be 1 to 255 letters, digits and . _ @ + { } - (got '${PARAM_GITOPS_IDENTITY}')."
     return 1
   fi
   validate_gitops_token_inputs || return 1
@@ -5463,6 +5467,12 @@ validate_gitops_forge_flags() {
     # gitlab provider refuses them (the github provider's ReservedDomains).
     if [[ "$PARAM_GITOPS_HOST" =~ $GITHUB_RESERVED_HOST_RE ]]; then
       print_error "'${PARAM_GITOPS_HOST}' is a GitHub host, not a GitLab one."
+      return 1
+    fi
+    # And every domain where Atlassian runs Bitbucket Cloud and its own
+    # services (the bitbucket provider's ReservedDomains).
+    if [[ "$PARAM_GITOPS_HOST" =~ $BITBUCKET_RESERVED_HOST_RE ]]; then
+      print_error "'${PARAM_GITOPS_HOST}' is a Bitbucket or Atlassian host, not a GitLab one. For Bitbucket Cloud, pass --gitops-forge=bitbucket."
       return 1
     fi
   fi
@@ -5711,6 +5721,10 @@ validate_github_forge_flags() {
   fi
   if [[ "$host" =~ (^|\.)gitlab\.com$ ]]; then
     print_error "'${host}' is a GitLab host, not a GitHub Enterprise Server. For GitLab, pass --gitops-forge=gitlab."
+    return 1
+  fi
+  if [[ "$host" =~ $BITBUCKET_RESERVED_HOST_RE ]]; then
+    print_error "'${host}' is a Bitbucket or Atlassian host, not a GitHub Enterprise Server. For Bitbucket Cloud, pass --gitops-forge=bitbucket."
     return 1
   fi
   # The repository is named by its organization and name on the instance, as
@@ -6086,7 +6100,12 @@ create_gitlab_token_secret() {
       return 0
     fi
   fi
-  print_info "Paste the GitLab access token (scopes: api, write_repository). It is not echoed and not saved anywhere but the Secret."
+  local scopes="scopes: api, write_repository"
+  case "${GITOPS_FORGE:-gitlab}" in
+    bitbucket) scopes="an API token with the read and write repository and pull request scopes, or an access token" ;;
+    bitbucket-datacenter) scopes="a project HTTP access token with Repository write" ;;
+  esac
+  print_info "Paste the ${label} access token (${scopes}). It is not echoed and not saved anywhere but the Secret."
   read -r -s token </dev/tty || true
   echo "" >/dev/tty
   token="$(gitlab_token_strip "$token")"

@@ -105,7 +105,7 @@ ENV_FILE="$HOME/kube-agents/install.env"
 )
 ```
 
-The subshell keeps the file's variables out of your shell. After the teardown, revoke the token in GitLab or Bitbucket, and the read-only token too, if you made one.
+The subshell keeps the file's variables out of your shell. The `gitlab-forge-token` fallback applies only to a GitLab install whose `install.env` records no Secret name; `install.sh` records the name for every GitLab and Bitbucket install, so a Bitbucket install deletes its own Secret (default `bitbucket-forge-token`). After the teardown, revoke the token in GitLab or Bitbucket, and the read-only token too, if you made one.
 
 ### What `spec.mode: next` leaves behind
 

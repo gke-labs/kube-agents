@@ -80,7 +80,7 @@ choice is recorded; unavailable when `--enable-web-console` / `WEB_CONSOLE_ENABL
 On Standard clusters, Terraform also adds a `gvisor-pool` node pool unless `--enable-gvisor=false`.
 Outside cluster adoption, two tasks stay outside Terraform: setting the managed-OTel collection scope
 on freshly created clusters (no Terraform field exists) and the GitHub App private-key import into KMS
-(the PEM must not enter Terraform state). A GitLab install has no GitHub App, so it has no import. The installer sources
+(the PEM must not enter Terraform state). A GitLab or Bitbucket install has no GitHub App, so it has no import. The installer sources
 `scripts/installer/installer_common.sh`, which reads `install.defaults.env`, so its defaults
 (region, cluster name, model provider, registry prefix) and its accepted values live in exactly
 one place; see
@@ -145,12 +145,12 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
    - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created; with Google Chat or Slack on, the commands that print the chat app's setup checklist).
 4. Exits with code `0` and writes `{"status": "GENERATE_ONLY_SUCCESS", ...}` to `/tmp/kube-agents-install-report.json`.
 
-On a GitLab install, the checks in step 2 skip the GitHub organization check. Generate-only never
-creates the GitLab token Secret. On a first install it writes the GitLab keys into `install.env`,
-and over an existing `install.env` it does not change them. After `lifecycle.sh apply`, create the
-Secret, as
+On a GitLab or Bitbucket install, the checks in step 2 skip the GitHub organization check.
+Generate-only never creates the token Secret. On a first install it writes the forge keys into
+`install.env` (for a Bitbucket Cloud access token, `GITOPS_IDENTITY` too), and over an existing
+`install.env` it does not change them. After `lifecycle.sh apply`, create the Secret, as
 [Dry run and generate-only](docs/site/src/content/docs/install/gitlab.md#dry-run-and-generate-only)
-shows.
+shows. The same rules apply to Bitbucket.
 
 ### Non-Interactive & AI Agent Execution Mode
 
@@ -186,7 +186,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --github-pem-path="/path/to/app-private-key.pem"
 ```
 
-_(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md). For GitLab or self-managed Gitea GitOps repositories, see [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) and [Gitea as the GitOps forge](docs/site/src/content/docs/install/gitea.md).)_
+_(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md). For GitLab, Bitbucket or self-managed Gitea GitOps repositories, see [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md), [Bitbucket as the GitOps forge](docs/site/src/content/docs/install/bitbucket.md) and [Gitea as the GitOps forge](docs/site/src/content/docs/install/gitea.md).)_
 
 `--github-app-id` is the App's number (its settings page, **General**, "App ID"), not its name or slug; the installer refuses anything else, `--dry-run` included. An applying run, or a `--generate-only` handoff, records `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID` in `install.env`, adding the ones the file lacks and replacing any it records with a different value, so `upgrade.sh`, which renders from the file alone, keeps GitOps on. The PEM path is never recorded: once imported, the key lives in Cloud KMS.
 
@@ -291,7 +291,7 @@ Rules for the agent:
 
 When the GitOps repository is on Bitbucket Cloud (`bitbucket.org`) or on a Bitbucket Data Center
 instance, use the Bitbucket flags in place of the GitHub App flags. Bitbucket support starts in
-release 0.17.0. Use 0.17.0 or a later release as `<RELEASE_VERSION>`. A Bitbucket install has no
+release 0.25.0. Use 0.25.0 or a later release as `<RELEASE_VERSION>`. A Bitbucket install has no
 GitHub App and no token minter. The installer refuses `--github-app-id` and `--github-pem-path` with
 a Bitbucket forge. The Go and Cloud KMS prerequisites of the PEM import do not apply.
 
@@ -588,6 +588,14 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   the agent's namespace after the apply, as
   [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) shows, so that the token
   never enters `terraform.tfvars` or the Terraform state.
+
+- **GitOps on Bitbucket**: set `gitops_forge = "bitbucket"` (Bitbucket Cloud) or
+  `"bitbucket-datacenter"`, `gitops_repo_path` (`workspace/repo-slug` or `PROJECTKEY/repo-slug`),
+  `gitops_host` for Data Center, `gitops_token_secret_name` (default `bitbucket-forge-token`), and,
+  when needed, `gitops_ca_secret_name` (Data Center behind a private CA) and `gitops_identity` (a
+  Cloud access token). Leave `github_repo` and `enable_github_minter` unset. Create the Secrets in
+  the agent's namespace after the apply, as
+  [Bitbucket as the GitOps forge](docs/site/src/content/docs/install/bitbucket.md) shows.
 
 - **Existing Infrastructure Recommendation**: When installing on pre-existing infrastructure (such as an existing GKE cluster or shared VPC), using `./install.sh --generate-only` (see [Generate-Only Mode](#generate-only-mode-recommended-for-existing-infrastructure)) is recommended to auto-generate `terraform.tfvars`, run pre-apply validation checks, and review prerequisites before applying.
 
@@ -1245,7 +1253,9 @@ spec:
 The
 [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration)
 describes the fields, and [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md)
-describes the token.
+describes the token. A Bitbucket forge is declared the same way, with `provider: bitbucket` or
+`provider: bitbucket-datacenter`: see the chart example in
+[Bitbucket as the GitOps forge](docs/site/src/content/docs/install/bitbucket.md#the-chart).
 
 `make deploy-github` renders the minter's Kubernetes half and imports nothing, so on this path the GitHub App and the Cloud KMS asymmetric signing key — the latter already holding the imported private key — must exist beforehand (see the [upstream guide](https://github.com/abcxyz/github-token-minter#readme) and [Token minter guide](docs/site/src/content/docs/deploy/token-minter.md)). `install.sh --github-pem-path` performs that import for you; this path has no equivalent.
 
@@ -1414,7 +1424,8 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 ```
 
 Each audit's report is a ledger issue in the GitOps repository, and its fixes are pull requests
-there, so those two need a GitOps repository, on GitHub or on GitLab. With no GitOps repository
+there, so those two need a GitOps repository, on GitHub or on GitLab. On Bitbucket, which has no
+issue tracker, the ledger stays in the report store and the fixes are pull requests. With no GitOps repository
 registered, the audits still run: each keeps its findings in the report store on the agent's
 volume, and a run that changed something posts a summary to chat that says no GitOps repository is connected.
 A run whose repository the broker cannot reach, or a run on an install with several managed

@@ -20,14 +20,16 @@ describes both, and marks each step that applies to one of them only.
   chat, in place of a ledger issue. They still open their fix pull requests in the GitOps
   repository. The agent marks its pull requests with a branch prefix (`platform-agent/`) and text
   in the body, not with labels.
-- **Context repositories and the fleet audits.** The broker reads a Bitbucket context repository
-  for the agent (with a read-only token, as [Private context repositories](#private-context-repositories)
-  shows). The fleet audits' declared-intent step reads only GitHub context repositories in this
-  release, so a Bitbucket context repository does not give an audit its declared intent.
+- **Context repositories and the fleet audits.** The agent can read a Bitbucket context
+  repository: `inspect-repository` gets a snapshot of its files through the broker, with the
+  read-only token if you stored one (see [Private context repositories](#private-context-repositories)).
+  The fleet audits are different. Their declared-intent step reads only `github` entries in
+  `context_repos` and skips every other entry with a warning, so a Bitbucket context repository
+  gives an audit no declared intent in this release.
 
 ## Before you start
 
-- **The release.** Bitbucket support is in release 0.17.0 and later. The latest release is on
+- **The release.** Bitbucket support is in release 0.25.0 and later. The latest release is on
   [GitHub Releases](https://github.com/gke-labs/kube-agents/releases/latest).
 - **The Data Center version.** Tested with Bitbucket Data Center 8.19.
 - **The repository.** Create the GitOps repository first. The installer does not create it. The
@@ -43,7 +45,9 @@ describes both, and marks each step that applies to one of them only.
     such as `bitbucket.example.com`. The instance must serve at the root path on port 443. An
     instance under a context path (`https://example.com/bitbucket`) or on another port (for
     example `:7990`) is not supported in this release. Put a reverse proxy in front of such an
-    instance that serves it at the root on 443. The installer refuses a host under
+    instance that serves it at the root on 443, as
+    [A Data Center instance behind a reverse proxy](#a-data-center-instance-behind-a-reverse-proxy)
+    shows. The installer refuses a host under
     `bitbucket.org`, `bitbucket.io`, `atlassian.com`, `atlassian.net`, a GitHub domain or
     `gitlab.com`.
 - **The token.** Give the token the smallest reach that works. The agent pushes its own branches
@@ -56,7 +60,9 @@ describes both, and marks each step that applies to one of them only.
     Create the token at id.atlassian.com, under **Security**, **API tokens**, **Create API token
     with scopes**, for the app **Bitbucket**, with these scopes: `read:user:bitbucket`,
     `read:workspace:bitbucket`, `read:repository:bitbucket`, `write:repository:bitbucket`,
-    `read:pullrequest:bitbucket`, `write:pullrequest:bitbucket`. See
+    `read:pullrequest:bitbucket`, `write:pullrequest:bitbucket`. The broker sends an API token as
+    `Authorization: Bearer`, with no email address, which Atlassian supports and recommends. So
+    you give the installer the token only, never the account's email. See
     [Using API tokens](https://support.atlassian.com/bitbucket-cloud/docs/using-api-tokens/).
   - **Bitbucket Cloud, Premium plan:** a workspace access token with **Repositories: Read,
     Write** and **Pull requests: Read, Write**. Workspace access tokens need Premium.
@@ -82,8 +88,9 @@ describes both, and marks each step that applies to one of them only.
   instance's host for Data Center. The agent pod never connects to Bitbucket. If you add a policy
   that limits egress in the agent's namespace, let the broker pod reach these hosts on 443. For a
   Data Center instance on a private network, the cluster needs a route and DNS to it. The
-  requirements are the same as for a self-managed GitLab: see the **Network** item in
-  [GitLab as the GitOps forge](/kube-agents/install/gitlab/#before-you-start).
+  requirements are the same as for a self-managed GitLab: see the **Network** and **An HTTPS
+  proxy** items in [GitLab as the GitOps forge](/kube-agents/install/gitlab/#before-you-start),
+  and [Check the network path](#check-the-network-path) below.
 - **The certificate (Data Center only).** The broker must trust the instance's certificate. A
   certificate from a public CA needs nothing. If a private CA signed it, give the CA with
   `--gitops-ca-file`, as [A Data Center instance with a private CA](#a-data-center-instance-with-a-private-ca)
@@ -119,17 +126,40 @@ pass show bitbucket/agent-token | head -n1 | sed 's/^/Authorization: Bearer /' |
     https://bitbucket.example.com/rest/api/latest/projects/INFRA/repos/gitops | grep -i '^x-ausername'
 ```
 
-For an instance behind a private CA, add `--cacert "$HOME/secure/internal-ca.pem"`. A `401` means
-that the token is not valid or has expired. A `404` means that the token cannot see the
-repository, or the path is wrong.
+For an instance behind a private CA, add `--cacert "$HOME/secure/internal-ca.pem"`. The answers:
+
+- The repository's name, or an `X-AUSERNAME` line: the token works.
+- `401`: Bitbucket refused the token. It is not valid, it expired, someone revoked it, or it is
+  not complete (check for a missing character). On Cloud, check that the API token was made with
+  **Create API token with scopes**, for the app **Bitbucket**, with the scopes above.
+- `403`: the token is valid but has no permission for the repository. Check its scopes or
+  permissions.
+- `404`: the token cannot see the repository, or the path is wrong.
+
+### Check the network path
+
+For Data Center, check from inside the cluster that the broker can reach the instance. The test
+runs a short-lived Pod with `curl`. Use the namespace `default` on a cluster that already exists,
+before the install, or `kubeagents-system` after it:
+
+```bash
+kubectl --context <install-context> -n <namespace> run bitbucket-reach --rm -i --restart=Never \
+  --image=curlimages/curl -- curl -sS https://bitbucket.example.com/rest/api/latest/application-properties
+```
+
+An answer with `version` shows that DNS, the route and TLS work. For an instance behind a private
+CA, and for a cluster that cannot pull `curlimages/curl`, use the variants in
+[Check the network path](/kube-agents/install/gitlab/#check-the-network-path) for GitLab, with this
+URL.
 
 ## Run the installer
 
 Interactively, give `--gitops-forge=bitbucket` or `--gitops-forge=bitbucket-datacenter`. The
 interview's forge question does not offer Bitbucket, so the flag is how you choose it. The
 installer then asks for what the flags do not give: the host (Data Center), the repository path,
-and the name of the Secret. It asks for the token only after the cluster is up, at the health
-check step. The prompt does not echo.
+the name of the Secret, and, for Data Center, the PEM CA file (leave it empty when a public CA
+signed the certificate). It asks for the token only after the cluster is up, at the health check
+step. The prompt does not echo.
 
 Non-interactively, the token comes from a file, or from a process substitution such as a password
 manager. No flag or variable takes the token itself.
@@ -171,7 +201,7 @@ For an instance behind a private CA, add `--gitops-ca-file`.
 | ----------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `--gitops-forge`        | `GITOPS_FORGE`                         | `bitbucket` (Cloud) or `bitbucket-datacenter`.                                                                                                                                                               |
 | `--gitops-host`         | `GITOPS_HOST`                          | Data Center only: the instance's hostname, with no scheme, port or path. Omit it for Cloud (`bitbucket.org` is accepted and dropped).                                                                        |
-| `--gitops-repo`         | `GITOPS_REPO`                          | Cloud: `workspace/repo-slug`, or the repository's `https://bitbucket.org/...` URL. Data Center: `PROJECTKEY/repo-slug`, or its `https://<host>/scm/...` clone URL or `https://<host>/projects/...` page URL. |
+| `--gitops-repo`         | `GITOPS_REPO`                          | Cloud: `workspace/repo-slug`, or the repository's `https://bitbucket.org/...` URL. Data Center: `PROJECTKEY/repo-slug`, or its `https://<host>/scm/...` clone URL or `https://<host>/projects/...` page URL. The installer reduces a URL to `workspace/repo-slug` or `PROJECTKEY/repo-slug`, the only form the PlatformAgent accepts. |
 | `--gitops-token-file`   | _never recorded_                       | A file, `/dev/stdin` (not under `curl … \| bash`) or `<(command)` that holds the token. The installer reads it once after the apply and writes it only into the Secret. Alias: `--gitlab-token-file`.        |
 | _none_                  | `GITOPS_READ_TOKEN_FILE`               | Optional. A file or `<(command)` that holds a read-only token for private context repositories, read as `--gitops-token-file` is, and never recorded. Alias: `GITLAB_READ_TOKEN_FILE`.                       |
 | `--gitops-token-secret` | `GITLAB_TOKEN_SECRET`                  | The Secret's name, default `bitbucket-forge-token`. Alias: `--gitlab-token-secret`. `install.env` records the name under the `GITLAB_TOKEN_SECRET` key for every forge with a token.                         |
@@ -188,6 +218,15 @@ the examples above.
 and prints the command that creates the Secret. Until the Secret exists, every Bitbucket call
 answers `FORGE_CREDENTIAL_UNAVAILABLE`. The broker reads the Secret on each call, so you do not
 have to restart anything after you create it.
+
+### Dry run and generate-only
+
+`--dry-run` and `--generate-only` work as for GitLab: they check that the token source is readable,
+and store no token. `--generate-only` never creates the token Secret or the CA Secret. Over an
+existing `install.env` it does not change the forge keys (`GITOPS_FORGE`, `GITOPS_HOST`,
+`GITOPS_REPO`, `GITLAB_TOKEN_SECRET`, `GITOPS_CA_SECRET` and `GITOPS_IDENTITY`): set them yourself
+before `lifecycle.sh apply`. See
+[Dry run and generate-only](/kube-agents/install/gitlab/#dry-run-and-generate-only) for GitLab.
 
 ### Terraform
 
@@ -218,6 +257,11 @@ platformAgent:
         repository: gitops
         role: gitops
 ```
+
+On a PlatformAgent, a Bitbucket repository is always `workspace/repo-slug` (Cloud) or
+`PROJECTKEY/repo-slug` (Data Center), or the slug alone under the forge's `namespace`. A Data
+Center clone URL (`/scm/...`) or page URL (`/projects/...`) is refused there. Only `install.sh`
+accepts those URLs, and it reduces them to `PROJECTKEY/repo-slug` first.
 
 The chart refuses what the operator refuses. On a Cloud forge, it refuses another host, a port, a
 CA, and an identity that is not a UUID. On a Data Center forge, it refuses a missing host, a port and
@@ -285,6 +329,29 @@ kubectl create secret generic bitbucket-forge-ca -n kubeagents-system \
   kubectl apply --server-side --force-conflicts -f -
 ```
 
+## A Data Center instance behind a reverse proxy
+
+If the instance serves under a context path or on a port other than 443, put a reverse proxy in
+front of it that serves it at `https://<host>/` on port 443. Then:
+
+- Set the instance's **Base URL** (Administration, **Server settings**) to the proxy's URL, for
+  example `https://bitbucket.example.com`. Bitbucket builds the links in its answers from it.
+- The proxy must pass git's smart-HTTP requests under `/scm/` (`info/refs`, `git-upload-pack`,
+  `git-receive-pack`) with their bodies unchanged and without a short body-size limit, and it
+  must pass the `Authorization` header.
+- See Atlassian's guide to
+  [proxying and securing Bitbucket](https://confluence.atlassian.com/bitbucketserver/proxy-and-secure-bitbucket-776640099.html).
+
+Before the install, check git through the proxy, from a machine with a route to it. With no
+token, git must answer with an authentication error, not a `404` or an HTML page:
+
+```bash
+GIT_TERMINAL_PROMPT=0 GIT_SSL_CAINFO="$HOME/secure/internal-ca.pem" \
+  git ls-remote https://bitbucket.example.com/scm/INFRA/gitops.git
+```
+
+Leave out `GIT_SSL_CAINFO` when a public CA signed the certificate.
+
 ## Where the token goes
 
 The installer pipes the token straight into `kubectl create secret … --from-file=token=…` and a
@@ -316,7 +383,10 @@ token for it. Without a read-only token, the broker reads a context repository w
 so a private repository refuses the read.
 
 To read a private context repository, store a read-only token in the same Secret, under the key
-`read-token`:
+`read-token`. It is a second key, not a second credential for the host: the broker presents it only
+when it reads a context repository. So a repository access token as the read token does not break
+the one-token-per-host rule, and it needs no identity, because the broker never checks the
+ownership of a read.
 
 - Bitbucket Cloud: a repository access token on the context repository with **Repositories:
   Read** only, or an API token with `read:repository:bitbucket` only.
@@ -331,9 +401,11 @@ kubectl create secret generic bitbucket-forge-token -n kubeagents-system \
     --field-manager=kube-agents-installer-read-token -f -
 ```
 
-Keep `--field-manager`, so the apply keeps the `token` key. Then register the repository in the
+Keep `--field-manager`, so the apply keeps the `token` key. Then, on a new install and on an
+existing one, register the repository in the
 `context_repos` key of the `platform-agent-gitops-state` ConfigMap, with `"type": "bitbucket"` or
-`"type": "bitbucket-datacenter"`, in the same workspace or project as the forge serves. This command
+`"type": "bitbucket-datacenter"`, in the same workspace or project as the forge serves. The installer
+does not register context repositories, so this step is necessary in both cases. This command
 replaces the value of `context_repos`, so keep any entries that are already there:
 
 ```bash

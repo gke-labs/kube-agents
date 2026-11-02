@@ -407,7 +407,7 @@ A Bitbucket install, Cloud or Data Center, records the same keys as a GitLab ins
 | `GITOPS_REPO`         | `workspace/repo-slug` (Cloud) or `PROJECTKEY/repo-slug` (Data Center)                                                             |
 | `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `bitbucket-forge-token`). The key keeps its GitLab name for every forge      |
 | `GITOPS_CA_SECRET`    | Data Center only: the name of the Secret that holds a private CA (default `bitbucket-forge-ca`); set only with `--gitops-ca-file` |
-| `GITOPS_IDENTITY`     | The account a Cloud access token acts as (`--gitops-identity`); recorded only when set                                            |
+| `GITOPS_IDENTITY`     | The account the token acts as (`--gitops-identity`): the account UUID for a Bitbucket Cloud access token. Recorded only when set |
 
 The neutral flags `--gitops-token-file` and `--gitops-token-secret` are the GitLab flags under new
 names, and `GITOPS_TOKEN_FILE`, `GITOPS_TOKEN_SECRET` and `GITOPS_READ_TOKEN_FILE` in the

@@ -74,6 +74,16 @@ class BitbucketTfvarsTest(unittest.TestCase):
         self.assertNotIn("gitops_identity", content)
 
 
+class HclStringTest(unittest.TestCase):
+    _run = _installer_common.InstallerCommonTest._run
+
+    def test_template_sequences_are_escaped(self):
+        """HCL reads `${` and `%{` in a quoted string as a template: a value
+        that holds one would be evaluated by Terraform, not written."""
+        proc = self._run("hcl_str 'a${b}c%{d}e\\f\"g'; echo")
+        self.assertIn('"a$${b}c%%{d}e\\\\f\\"g"', proc.stdout, proc.stderr)
+
+
 class BitbucketFlagsTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -166,6 +176,16 @@ class BitbucketFlagsTest(unittest.TestCase):
             ("dc at an Atlassian domain", self._dc(PARAM_GITOPS_HOST="acme.atlassian.net"), "hosted service"),
             ("dc personal repository", self._dc(PARAM_GITOPS_REPO="~alice/gitops"), "personal repository"),
             ("dc key starting with a digit", self._dc(PARAM_GITOPS_REPO="1NFRA/gitops"), "PROJECTKEY/repo-slug"),
+            ("dc identity with a space", self._dc(PARAM_GITOPS_IDENTITY="svc bot"), "--gitops-identity"),
+            ("dc identity with a quote", self._dc(PARAM_GITOPS_IDENTITY='svc"bot'), "--gitops-identity"),
+            ("dc identity with a dollar", self._dc(PARAM_GITOPS_IDENTITY="svc${x}"), "--gitops-identity"),
+            ("dc identity too long", self._dc(PARAM_GITOPS_IDENTITY="a" * 256), "--gitops-identity"),
+            ("gitlab host under atlassian",
+             {"PARAM_GITOPS_FORGE": "gitlab", "PARAM_GITOPS_REPO": "g/p", "PARAM_GITOPS_HOST": "git.atlassian.net",
+              "PARAM_GITOPS_HOST_FROM_FLAG": "true"}, "Bitbucket"),
+            ("ghes host bitbucket.org",
+             {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_REPO": "infra", "PARAM_GITOPS_ORG": "acme",
+              "PARAM_GITOPS_HOST": "bitbucket.org", "PARAM_GITOPS_HOST_FROM_FLAG": "true"}, "Bitbucket"),
             ("identity on gitlab",
              {"PARAM_GITOPS_FORGE": "gitlab", "PARAM_GITOPS_REPO": "g/p", "PARAM_GITOPS_IDENTITY": "x"},
              "--gitops-identity applies only"),

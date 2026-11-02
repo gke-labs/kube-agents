@@ -2245,6 +2245,12 @@ kms_key_enabled_version() {
 hcl_str() {
   local s="${1//\\/\\\\}"
   s="${s//\"/\\\"}"
+  # HCL reads ${ and %{ in a quoted string as a template sequence; doubling
+  # the first character writes them literally. Through variables, because
+  # bash 3.2 and bash 5 read escapes in a replacement string differently.
+  local tpl='${' tpl_lit='$${' dir='%{' dir_lit='%%{'
+  s="${s//"$tpl"/$tpl_lit}"
+  s="${s//"$dir"/$dir_lit}"
   printf '"%s"' "$s"
 }
 

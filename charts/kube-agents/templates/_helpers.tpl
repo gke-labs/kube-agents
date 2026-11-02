@@ -1215,7 +1215,7 @@ k8s-operator/api/v1alpha1.
 {{- /* ASCII only before `lower`, which is Unicode: `gİthub.com` lowers to github.com, and the operator folds ASCII only, so it is another host. */ -}}
 {{- /* A forge at a host other than github.com names its provider, as the CRD's rule, and before the host is judged as a GitHub host, so the remedy named is the provider: left to the default, a forge written for a GitLab instance would become a GitHub Enterprise Server. */ -}}
 {{- if and (not $f.provider) $host (regexMatch "^[A-Za-z0-9.-]+$" $host) (not (has (lower $host) $githubHosts)) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].provider is required: the forge is at %q, not github.com; name it github for a GitHub Enterprise Server or gitlab for a GitLab instance" $i $f.host) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].provider is required: the forge is at %q, not github.com; name it github for a GitHub Enterprise Server, gitlab for a GitLab instance, or bitbucket-datacenter for a Bitbucket Data Center instance" $i $f.host) -}}
 {{- end -}}
 {{- /* A github forge is at github.com in one of its spellings, or at a GitHub Enterprise Server host: a hostname, label by label, that is not under a domain where GitHub runs its own services and not GitLab's. */ -}}
 {{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host)) (regexMatch $bitbucketReserved (lower $host))) -}}
@@ -1408,6 +1408,10 @@ k8s-operator/api/v1alpha1.
 {{- with $f.identity -}}
 {{- if not (has $provider (list "bitbucket" "bitbucket-datacenter")) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].identity is set, but provider %s does not read it; only bitbucket and bitbucket-datacenter do" $i $provider) -}}
+{{- end -}}
+{{- /* The CRD's grammar for identity, on both providers. */ -}}
+{{- if not (regexMatch "^[A-Za-z0-9._@+{}-]{1,255}$" (toString .)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].identity is %q; it is 1 to 255 letters, digits and . _ @ + { } -" $i (toString .)) -}}
 {{- end -}}
 {{- if and (eq $provider "bitbucket") (not (regexMatch "^(\\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\\}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$" (toString .))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].identity is %q; on provider bitbucket it is the account UUID the token acts as, with or without its braces" $i (toString .)) -}}
