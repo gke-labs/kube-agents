@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -179,27 +180,49 @@ func TestTheShardPartitionIsStable(t *testing.T) {
 	}
 }
 
-// The condition's message names the version off shard 0, which every render
-// has whatever the count.
-func TestTheRenderedVersionIsReadOffShardZero(t *testing.T) {
-	scheme := setupScheme()
+// The condition's message names the version of the shard set, read back when
+// a pass parked before rendering: shard 0 carries it with the count, and every
+// shard the count names agrees with it. A set with a shard missing, or split
+// across two versions because a pass failed between two applies, is reported
+// as unknown rather than as the version shard 0 carries, which the callout is
+// not serving while it waits for the rest.
+func TestTheRenderedVersionIsReadOffTheWholeShardSet(t *testing.T) {
+	const (
+		v1 = "0123456789abcdef"
+		v2 = "fedcba9876543210"
+	)
 	agent := a2aTestAgent()
-	shard := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: a2aAuthMapShardName(agent, 0), Namespace: agent.Namespace,
-			Annotations: map[string]string{a2aAuthMapVersionAnnotation: "0123456789abcdef"},
-		},
+	shard := func(i int, version, count string) *corev1.ConfigMap {
+		return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+			Name: a2aAuthMapShardName(agent, i), Namespace: agent.Namespace,
+			Annotations: map[string]string{
+				a2aAuthMapVersionAnnotation: version,
+				a2aAuthMapShardAnnotation:   strconv.Itoa(i),
+				a2aAuthMapShardsAnnotation:  count,
+			},
+		}}
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, shard).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if got := r.renderedAuthMapVersion(context.Background(), agent); got != "0123456789abcdef" {
-		t.Errorf("renderedAuthMapVersion = %q, want the version annotated on shard 0", got)
+	cases := map[string]struct {
+		objects []client.Object
+		want    string
+	}{
+		"one shard":                        {[]client.Object{shard(0, v1, "1")}, v1},
+		"two shards of one version":        {[]client.Object{shard(0, v1, "2"), shard(1, v1, "2")}, v1},
+		"shard 1 not yet applied":          {[]client.Object{shard(0, v1, "2")}, a2aAuthMapVersionUnknown},
+		"shard 0 moved on, shard 1 behind": {[]client.Object{shard(0, v2, "2"), shard(1, v1, "2")}, a2aAuthMapVersionUnknown},
+		"the count changed under shard 1":  {[]client.Object{shard(0, v1, "2"), shard(1, v1, "3")}, a2aAuthMapVersionUnknown},
+		"shard 0 without a count":          {[]client.Object{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(agent, 0), Namespace: agent.Namespace, Annotations: map[string]string{a2aAuthMapVersionAnnotation: v1}}}}, a2aAuthMapVersionUnknown},
+		"no shard 0":                       {nil, a2aAuthMapVersionUnknown},
 	}
-	if err := cl.Delete(context.Background(), shard); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if got := r.renderedAuthMapVersion(context.Background(), agent); got != a2aAuthMapVersionUnknown {
-		t.Errorf("renderedAuthMapVersion with no shard 0 = %q, want %q", got, a2aAuthMapVersionUnknown)
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent.DeepCopy()}, tc.objects...)...).Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			if got := r.renderedAuthMapVersion(context.Background(), agent); got != tc.want {
+				t.Errorf("renderedAuthMapVersion = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
