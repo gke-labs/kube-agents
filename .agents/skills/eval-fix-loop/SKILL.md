@@ -20,7 +20,7 @@ One root cause per loop. A classified cause with quoted evidence before any code
 9. A case that can stop declares `writes_alone: true`, so the lane safeguard charges any pull request the reply did not name.
 10. The body keeps every sentence at 25 words or fewer. It says `Closes #<issue>` and names the former owner as reviewer. It carries `Part of #3978` (rule 51), no `Co-Authored-By` trailer, and ends with "Generated with the help of Claude Code."
 11. One session, one PR: mind it to the first human lgtm, then hand it to the minder with a written handoff (rule 50). Post `/review` only if the bot did not review on open.
-12. Step 8 is "send the numbers": fails flipped, passes kept, the PR number and a page row note go to the planner. The store takes the night at the 06:27 EST read.
+12. Step 8 is "send the numbers": record them in your own status with `cd ~/ka-overseer && python3 overseer/ovsr.py report --from <session>` (rule 52): fails flipped, passes kept, the PR number, the page row note. Message the Overseer only for an ask. The store takes the night at the 06:27 EST read.
 
 ## Inputs
 
