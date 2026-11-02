@@ -1120,10 +1120,14 @@ project that use the same key need that grant, so a raw destroy must
 > encrypt and a cluster that uses it cannot read its etcd. `make tf-destroy`
 > (`lifecycle.sh destroy`, which `uninstall.sh` runs) forgets the keys from
 > state first, so they stay usable; a raw destroy needs the `terraform state rm`
-> in the paragraph above. `make tf-apply` imports them back automatically, and
-> restores any cluster key version a raw destroy scheduled, as long as its
-> destruction time has not passed. A minter key with no enabled version stops
-> `make tf-apply` before that step: run `./lifecycle.sh adopt-kms` first, which
-> imports and restores both keys. Applying with bare `terraform apply` after a destroy fails with a 409 until
-> you either import them yourself or choose new key/keyring names. See
+> in the paragraph above. When `make tf-apply` imports them back, which it does
+> automatically, it also restores any cluster key version a raw destroy
+> scheduled, as long as its destruction time has not passed. A minter key with
+> no enabled version stops `make tf-apply` before that step: run
+> `./lifecycle.sh adopt-kms` first, which imports and restores both keys.
+> Applying with bare `terraform apply` after a destroy fails with a 409 until
+> you either import them yourself or choose new key/keyring names. A key you
+> import by hand is not restored: restore and enable each scheduled version
+> with `gcloud kms keys versions restore` and `enable` before its destruction
+> time. See
 > [Full teardown](../../../docs/site/src/content/docs/install/uninstall.md#full-teardown).
