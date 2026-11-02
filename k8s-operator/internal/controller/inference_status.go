@@ -65,10 +65,14 @@ func parseLiteLLMDefaultModel(configYAML string) (inferenceModel, bool) {
 }
 
 // splitInferenceModel splits a LiteLLM model at its first separator. Both sides must be
-// non-empty, the name after trimInferenceModelName included.
+// non-empty, the name after trimInferenceModelName included; a value that ends with the
+// separator, or whose provider side is a bare resource reference, is malformed.
 func splitInferenceModel(litellmModel string) (inferenceModel, bool) {
+	if strings.HasSuffix(litellmModel, inferenceProviderSeparator) {
+		return inferenceModel{}, false
+	}
 	provider, name, found := strings.Cut(litellmModel, inferenceProviderSeparator)
-	if !found || provider == "" {
+	if !found || !validInferenceProvider(provider) {
 		return inferenceModel{}, false
 	}
 	name = trimInferenceModelName(name)
@@ -76,6 +80,16 @@ func splitInferenceModel(litellmModel string) (inferenceModel, bool) {
 		return inferenceModel{}, false
 	}
 	return inferenceModel{Provider: provider, Model: name}, true
+}
+
+// validInferenceProvider reports whether provider is a provider slug. An empty side, or a
+// bare resource reference (an ARN, or a Vertex AI path with no provider before it), is
+// malformed: it would put a project id, a region or an account id in the status.
+func validInferenceProvider(provider string) bool {
+	return provider != "" &&
+		!strings.HasPrefix(provider, inferenceARNPrefix) &&
+		!strings.Contains(provider, inferenceARNFieldSeparator) &&
+		provider != strings.TrimSuffix(inferenceResourcePathPrefix, inferenceProviderSeparator)
 }
 
 // trimInferenceModelName applies the resource-reference rule to the name after the
