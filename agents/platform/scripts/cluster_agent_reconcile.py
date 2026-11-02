@@ -21,6 +21,10 @@
 #     scope has dropped, under the three conditions `reconcile()` states. Any other error path
 #     — auth, network, timeout, quota, an unreadable identity — is treated as "unknown" and
 #     the profile is left untouched: we never delete on ambiguity.
+#   • SWEEP  — removes, from the shell sandbox, the home of a Cluster Agent profile that is
+#     already gone here (left by a delete from before #4389, or one that missed the sandbox),
+#     at most SWEEP_MAX_PER_RUN a run, under that profile's lock (#4468). Hourly runs only:
+#     not under `--require-create-pass`. The sweep posts nothing; the report's `swept` lists it.
 #
 # The management cluster used to be excluded, identified via the GKE metadata server. It is
 # not any more, because an event on that cluster now needs an agent scoped to it like every
@@ -1669,7 +1673,7 @@ def _scaffold_gaps(home: Path) -> list[str]:
     return gaps
 
 
-def reconcile(dry_run: bool = False) -> dict:
+def reconcile(dry_run: bool = False, sweep: bool = True) -> dict:
     """Reconcile Cluster Agent profiles with the clusters in scope (create + prune).
 
     Returns a structured report dict with the profile names/clusters in each outcome bucket.
@@ -2351,8 +2355,12 @@ def reconcile(dry_run: bool = False) -> dict:
     # rather than in the entrypoint because this runs hourly with the sandbox up
     # and the start-time push runs before it may be; independent of the scope
     # above, and never allowed to fail the run (#4468).
+    # Not on the bootstrap gate's runs (`sweep=False`, under --require-create-pass):
+    # those come every minute against the gate's own time budget, and the hourly
+    # job sweeps.
     try:
-        report["swept"] = sweep_sandbox_orphans(dry_run=dry_run)
+        if sweep:
+            report["swept"] = sweep_sandbox_orphans(dry_run=dry_run)
     except Exception as e:  # noqa: BLE001 - housekeeping must not cost the roster its run
         log(f"the sandbox orphan sweep failed ({e}); the next run retries it")
 
@@ -2472,7 +2480,7 @@ def main() -> None:
             return
 
         try:
-            report = reconcile(dry_run=args.dry_run)
+            report = reconcile(dry_run=args.dry_run, sweep=not args.require_create_pass)
         except Exception as e:  # noqa: BLE001 - resilient: a cron producer must always exit 0
             log(f"Reconcile aborted unexpectedly: {e}")
             if args.require_create_pass:

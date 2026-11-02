@@ -2,9 +2,9 @@
 """Give the shell sandbox the same directory layout as the agent pod, and move
 the model's existing files across once.
 
-Two problems, one script, because both need the same three things: the list of
-Hermes profiles, the SSH key, and a connection to the sandbox. Only the agent
-pod has all three.
+One script for all of it, because every step needs the same three things: the
+list of Hermes profiles, the SSH key, and a connection to the sandbox. Only the
+agent pod has all three.
 
 **Layout.** The sandbox mounts its own PVC at the same absolute path as the
 agent pod's Hermes home, so a SOP that says ``/opt/data/scratch/report.md``
@@ -28,6 +28,10 @@ profile delete_profile has just removed from the agent pod (#4389): its home
 in the sandbox goes too, and the name is refused while anything of it is left
 on the agent side. Unlike the two steps below, no later start redoes a
 removal that missed the sandbox, so it exits non-zero instead.
+``--list-profiles`` is the read the reconcile's sweep starts from (#4468):
+the names under the sandbox's profiles/, as JSON, capped at
+LIST_PROFILES_MAX. It judges none of them; the sweep does, under each
+profile's lock.
 
 Neither step is fatal on its own. The sandbox is a separate pod with no ordering
 against this one, so "not up yet" is an ordinary outcome; both steps are
@@ -661,6 +665,12 @@ def removable_profile_homes(agent_home: Path, names: list[str]) -> tuple[list[st
     return homes, rejected
 
 
+# The most names --list-profiles returns. The model can make any number of
+# directories under profiles/, and a listing it can grow without bound is memory
+# this pod and the reconcile pay for; the sweep only needs a run's worth.
+LIST_PROFILES_MAX = 10000
+
+
 def list_remote_profiles(ssh: list[str], remote_root: str) -> list[str]:
     """The names under the sandbox's profiles/, for the reconcile's orphan sweep (#4468).
 
@@ -670,8 +680,13 @@ def list_remote_profiles(ssh: list[str], remote_root: str) -> list[str]:
     the caller's to decide under the profile's lock.
     """
     root = shlex.quote(f"{remote_root}/{PROFILES_DIR}")
-    result = remote(ssh, f"if [ -d {root} ]; then ls -1A -- {root}; fi")
-    return [name for name in result.stdout.splitlines() if name]
+    # -U: unsorted, so `ls` need not hold every name to sort them before head ends it.
+    result = remote(ssh, f"if [ -d {root} ]; then ls -1AU -- {root} | head -n {LIST_PROFILES_MAX + 1}; fi")
+    names = [name for name in result.stdout.splitlines() if name]
+    if len(names) > LIST_PROFILES_MAX:
+        log(f"more than {LIST_PROFILES_MAX} names under the sandbox's {PROFILES_DIR}/; listing the first {LIST_PROFILES_MAX}")
+        names = names[:LIST_PROFILES_MAX]
+    return names
 
 
 def remove_profile_homes(ssh: list[str], remote_root: str, homes: list[str]) -> None:

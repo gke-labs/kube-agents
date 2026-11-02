@@ -1403,7 +1403,10 @@ cost O(N²) (#3701). A profile delete runs it the other way: `--remove-profile <
 removes that home from the sandbox once the agent pod's copy is gone, over the same
 SSH hop, and refuses a name that still has anything under the agent pod's `profiles/`.
 Create and delete hold a per-profile lock, so a delete cannot remove the sandbox home a
-concurrent scaffold of the same name has just pushed (#4389). Nothing about it is ordered against the sandbox starting: the Deployment and
+concurrent scaffold of the same name has just pushed (#4389). The hourly reconcile runs
+`--list-profiles` to read the sandbox's `profiles/` names, and sweeps the homes of Cluster
+Agent profiles already gone on the agent pod through the same `--remove-profile`, under the
+same lock, at most 25 a run (#4468). Nothing about it is ordered against the sandbox starting: the Deployment and
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 

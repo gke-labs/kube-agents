@@ -21,10 +21,12 @@ import fcntl
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -441,6 +443,10 @@ def _remove_sandbox_layout(name: str) -> bool:
 # most. Each removal is one SSH round trip under its own lock, so this bounds the
 # time a run spends here; a backlog clears over successive hourly runs.
 SWEEP_MAX_PER_RUN = 25
+# And how long one run spends removing, after the listing: no new removal starts
+# past it. The model owns the sandbox, so it can make each `rm -rf` slow; this
+# keeps the reconcile's own budget its own.
+SWEEP_BUDGET_SECONDS = 90
 # The names the sweep may remove: the shape profile_name() makes. Anything else
 # under the sandbox's profiles/ was put there by something other than a scaffold,
 # the model included, and is not this code's to judge.
@@ -461,6 +467,8 @@ def _list_sandbox_profiles() -> list[str] | None:
             text=True,
             timeout=SANDBOX_MIRROR_TIMEOUT_SECONDS,
         )
+        if not done.stdout.strip():
+            return None  # no sandbox to list: the mirror said why on its own stderr
         names = json.loads(done.stdout)["profiles"]
         if not isinstance(names, list):
             raise ValueError("profiles is not a list")
@@ -470,7 +478,8 @@ def _list_sandbox_profiles() -> list[str] | None:
         return None
 
 
-def sweep_sandbox_orphans(limit: int = SWEEP_MAX_PER_RUN, dry_run: bool = False) -> list[str]:
+def sweep_sandbox_orphans(limit: int = SWEEP_MAX_PER_RUN, dry_run: bool = False,
+                          budget_seconds: float = SWEEP_BUDGET_SECONDS) -> list[str]:
     """Remove sandbox homes whose profile is gone here; return the names removed (#4468).
 
     For deletes from before #4389 was fixed, and any delete whose sandbox removal
@@ -478,7 +487,11 @@ def sweep_sandbox_orphans(limit: int = SWEEP_MAX_PER_RUN, dry_run: bool = False)
     profile lock, a check under that lock that nothing of it exists here, and the
     mirror's --remove-profile, which refuses the same. A scaffold of the same name
     therefore runs wholly before or after, as for a delete. Only Cluster Agent
-    names (CLUSTER_PROFILE_NAME_RE), never a reserved one, at most `limit` a run.
+    names (CLUSTER_PROFILE_NAME_RE), never a reserved one, at most `limit` a run
+    and no new removal past `budget_seconds`. A name whose lock is held is skipped
+    rather than waited for: a scaffold or delete of it is running, and the next run
+    looks again. The candidates are shuffled before the cap, so homes that always
+    fail to remove cannot pin it.
     """
     names = _list_sandbox_profiles()
     if not names:
@@ -490,17 +503,22 @@ def sweep_sandbox_orphans(limit: int = SWEEP_MAX_PER_RUN, dry_run: bool = False)
     )
     if not orphans:
         return []
+    random.shuffle(orphans)  # after sorting, so the input to the shuffle is stable
     if len(orphans) > limit:
         log(f"{len(orphans)} sandbox profile homes have no profile here; removing {limit} this run, "
             "the rest on the next")
     removed: list[str] = []
+    deadline = time.monotonic() + budget_seconds
     for name in orphans[:limit]:
+        if time.monotonic() > deadline:
+            log(f"the sandbox orphan sweep reached its {budget_seconds:g}s budget; the rest wait for the next run")
+            break
         if dry_run:
             log(f"{name}: sandbox home with no profile here — WOULD remove (dry-run).")
             continue
-        with _profile_lock(name) as locked:
+        with _profile_lock(name, blocking=False) as locked:
             if not locked:
-                log(f"{name}: sandbox home left in place; its profile lock could not be taken")
+                log(f"{name}: sandbox home left in place; its profile lock is held or could not be taken")
                 continue
             if os.path.lexists(profile_home(name)):
                 log(f"{name}: the profile exists again; its sandbox home stays")
@@ -511,7 +529,7 @@ def sweep_sandbox_orphans(limit: int = SWEEP_MAX_PER_RUN, dry_run: bool = False)
 
 
 @contextmanager
-def _profile_lock(name: str):
+def _profile_lock(name: str, blocking: bool = True):
     """Hold this profile name's lock; yield whether it is held.
 
     The reconcile's own lock keeps two reconciles apart, but not a reconcile's
@@ -521,7 +539,8 @@ def _profile_lock(name: str):
     home after such a create had pushed it would take the kubeconfig the create
     then fetched into it. Blocking: a scaffold is bounded
     by its own timeouts, and the other side waits it out rather than racing it.
-    An unopenable lock yields False, and the caller decides what that forbids.
+    An unopenable lock yields False, and the caller decides what that forbids;
+    so does a held one when `blocking` is False.
     """
     locks = HERMES_HOME / PROFILE_LOCKS_DIRNAME
     try:
@@ -532,7 +551,11 @@ def _profile_lock(name: str):
         yield False
         return
     with handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
         yield True
 
 

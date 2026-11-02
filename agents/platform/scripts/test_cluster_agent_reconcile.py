@@ -219,15 +219,36 @@ def _name_for(identity_kwargs, identities):
     raise KeyError(identity_kwargs)
 
 
+rec_reconcile = rec.reconcile
+
+
 class SweepHookTest(HomesMixin):
     """The reconcile runs the sandbox orphan sweep, and a sweep failure costs it nothing (#4468)."""
 
-    def _sweep_run(self, sweep, dry_run=False):
+    def _sweep_run(self, sweep, dry_run=False, sweep_flag=True):
         profiles = ["cluster-a"]
         identities = {"cluster-a": _identity(cluster="a")}
-        with mock.patch.object(rec, "sweep_sandbox_orphans", side_effect=sweep) as called:
+        with mock.patch.object(rec, "sweep_sandbox_orphans", side_effect=sweep) as called, \
+             mock.patch.object(rec, "reconcile", side_effect=lambda dry_run=False: rec_reconcile(dry_run=dry_run, sweep=sweep_flag)):
             report, _ = ReconcileTest._run(self, profiles, identities, {"cluster-a": True}, dry_run=dry_run)
         return report, called
+
+    def test_the_bootstrap_gate_s_runs_do_not_sweep(self):
+        report, called = self._sweep_run(lambda dry_run: ["cluster-x"], sweep_flag=False)
+        called.assert_not_called()
+        self.assertEqual(report["swept"], [])
+
+    def test_main_sweeps_on_the_hourly_job_only(self):
+        for argv, want in ((["prog"], True), (["prog", "--require-create-pass"], False)):
+            with self.subTest(argv=argv), mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(rec, "reconcile", return_value={"create_pass_ran": True}) as run, \
+                 mock.patch.object(rec, "_notify"), contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    rec.main()
+                except SystemExit:
+                    pass
+                self.assertEqual(run.call_args.kwargs.get("sweep"), want)
 
     def test_the_swept_names_are_reported(self):
         report, called = self._sweep_run(lambda dry_run: ["cluster-gone-one"])

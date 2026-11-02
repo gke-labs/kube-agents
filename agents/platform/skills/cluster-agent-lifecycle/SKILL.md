@@ -69,7 +69,7 @@ This deregisters the profile and removes its home directory, here and in the she
 
 To stop managing a cluster that still exists, exclude it instead; the reconcile below recreates a deleted profile for every in-scope cluster. Follow `manage-cluster`, "Stop managing": the exclusion is declared where the install's scope is declared (`SCOPE_EXCLUDE_CLUSTERS` in `install.env` on an install made with `install.sh`, applied with `./upgrade.sh --upgrade-mode=full`), and that section says how to tell the install shapes apart.
 
-## Automatic reconciliation (create and prune)
+## Automatic reconciliation (create, prune and sweep)
 
 The roster is also reconciled automatically. An hourly, deterministic `no_agent` cron job
 (`cluster-agent-reconcile`) runs `scripts/cluster_agent_reconcile.py`, which drives the roster in
@@ -89,6 +89,10 @@ both directions:
   kept and listed as `unmanaged`; one whose identity could not be read is kept and appears under the report's
   `skipped_no_identity`, and under the snapshot's `profiles` once an earlier run has read its identity. This closes the loop when a cluster is deleted
   out-of-band, so its profile is never left orphaned pointing at a dead kubeconfig.
+- **Sweep** — a home in the shell sandbox whose Cluster Agent profile is already gone (left by a
+  delete from before deletes removed it, or one that missed the sandbox) is removed, at most 25 a
+  run, under the same per-profile lock a delete takes. It appears in the report's `swept`, not in
+  the chat summary.
 
 A create that fails is recorded rather than only logged: the cluster goes into a `create_failed`
 bucket. Both places that bucket surfaces are narrower than it looks. The chat summary names the

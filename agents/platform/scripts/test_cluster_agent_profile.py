@@ -6,6 +6,7 @@ profile_name is a pure, deterministic function; the module imports without pyyam
 (that import is lazy, only on the scaffold path).
 """
 
+import contextlib
 import io
 import os
 import re
@@ -367,8 +368,24 @@ class SweepSandboxOrphansTest(unittest.TestCase):
 
     def test_a_run_removes_at_most_its_cap_and_says_the_rest_wait(self):
         self.listing = [f"cluster-gone-{i:02d}" for i in range(30)]
-        self.assertEqual(self.sweep(limit=25), [f"cluster-gone-{i:02d}" for i in range(25)])
+        swept = self.sweep(limit=25)
+        self.assertEqual(len(swept), 25)
+        self.assertLessEqual(set(swept), set(self.listing))
         self.assertIn("30 sandbox profile homes have no profile here; removing 25", self.log)
+
+    def test_the_cap_takes_from_shuffled_candidates(self):
+        # Sorted, a run would retry the same first names forever, so 25 homes that
+        # always fail to remove would pin the cap. A reversing "shuffle" shows the
+        # shuffle runs before the cap.
+        self.listing = [f"cluster-gone-{i:02d}" for i in range(5)]
+        with mock.patch.object(cap.random, "shuffle", lambda xs: xs.reverse()):
+            self.assertEqual(self.sweep(limit=2), ["cluster-gone-04", "cluster-gone-03"])
+
+    def test_no_removal_starts_past_the_budget(self):
+        self.listing = ["cluster-gone-one", "cluster-gone-two"]
+        self.assertEqual(self.sweep(budget_seconds=-1), [])
+        self.assertEqual(self.removed, [])
+        self.assertIn("reached its -1s budget", self.log)
 
     def test_live_profiles_do_not_use_up_the_cap(self):
         # Filtered before the cap, not only under each lock: otherwise an install with
@@ -396,22 +413,39 @@ class SweepSandboxOrphansTest(unittest.TestCase):
         self.assertEqual(self.sweep(), [])
         self.assertEqual(self.removed, [])
 
-    def test_a_create_during_the_sweep_keeps_its_sandbox_home(self):
-        # The race: the sweep has listed the name as an orphan, and a scaffold of the
-        # same name holds the lock and makes the home before the sweep gets the lock.
+    def test_a_scaffold_holding_the_lock_is_skipped_not_waited_for(self):
+        # The race, while it runs: a scaffold of the listed name holds the lock. The
+        # sweep must not remove the home it is building, and must not hold the
+        # reconcile up waiting for it either.
         self.listing = ["cluster-racing"]
         result = []
         worker = threading.Thread(target=lambda: result.append(self.sweep()))
         with cap._profile_lock("cluster-racing") as locked:
             self.assertTrue(locked)
             worker.start()
-            worker.join(0.5)
-            self.assertTrue(worker.is_alive(), "the sweep went ahead while a scaffold held the lock")
-            self.profile_here("cluster-racing")
-        worker.join(10)
-        self.assertFalse(worker.is_alive())
+            worker.join(10)
+            self.assertFalse(worker.is_alive(), "the sweep waited on a lock it should have skipped")
         self.assertEqual(result, [[]])
         self.assertEqual(self.removed, [])
+        self.assertIn("lock is held", self.log)
+
+    def test_a_scaffold_that_finished_before_the_lock_keeps_its_sandbox_home(self):
+        # The race, just ended: the name was listed and filtered as an orphan, and a
+        # scaffold made its home and let go of the lock before the sweep took it.
+        # Only the check under the lock can see that.
+        self.listing = ["cluster-racing"]
+        real_lock = cap._profile_lock
+
+        @contextlib.contextmanager
+        def scaffold_then_lock(name, blocking=True):
+            self.profile_here(name)
+            with real_lock(name, blocking=blocking) as locked:
+                yield locked
+
+        with mock.patch.object(cap, "_profile_lock", scaffold_then_lock):
+            self.assertEqual(self.sweep(), [])
+        self.assertEqual(self.removed, [])
+        self.assertIn("the profile exists again", self.log)
 
     def test_a_removal_that_misses_the_sandbox_is_not_reported_as_swept(self):
         self.listing = ["cluster-gone-one"]
@@ -450,8 +484,15 @@ class ListSandboxProfilesTest(PushSandboxLayoutTest):
             self.assertIn("could not list", self.push())
         self.assertIsNone(self.listed)
 
+    def test_no_answer_at_all_is_no_sandbox_and_says_nothing(self):
+        # The mirror exits 0 with nothing on stdout when the install has no sandbox.
+        with mock.patch.object(subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            self.assertEqual(self.push(), "")
+        self.assertIsNone(self.listed)
+
     def test_an_answer_that_is_not_the_listing_is_unreadable(self):
-        for out in ("", "not json", '{"profiles": "cluster-a"}', '{"other": []}'):
+        for out in ("not json", '{"profiles": "cluster-a"}', '{"other": []}'):
             with self.subTest(out=out), mock.patch.object(subprocess, "run") as run:
                 run.return_value = subprocess.CompletedProcess([], 0, out, "")
                 self.push()

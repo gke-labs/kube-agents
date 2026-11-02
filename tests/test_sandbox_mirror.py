@@ -400,6 +400,20 @@ class RemoveProfile(unittest.TestCase):
         self.assertEqual(code, sm.EXIT_RETRY)
         self.assertEqual(self.stdout.getvalue(), "")
 
+    def test_a_listing_is_capped_and_says_so(self):
+        many = "".join(f"cluster-{i}\n" for i in range(sm.LIST_PROFILES_MAX + 1))
+        code = self.drive("--skeleton-only", "--list-profiles", listing=many)
+        self.assertEqual(code, sm.EXIT_OK)
+        self.assertEqual(len(json.loads(self.stdout.getvalue())["profiles"]), sm.LIST_PROFILES_MAX)
+        self.assertTrue(any(f"more than {sm.LIST_PROFILES_MAX} names" in m for m in self.logged))
+        self.assertTrue(any(f"| head -n {sm.LIST_PROFILES_MAX + 1}" in c for c in self.commands), self.commands)
+
+    def test_a_listing_the_sandbox_refuses_asks_for_a_retry(self):
+        with unittest.mock.patch.object(sm, "list_remote_profiles", side_effect=RuntimeError("ls: Permission denied")):
+            code = self.drive("--skeleton-only", "--list-profiles")
+        self.assertEqual(code, sm.EXIT_RETRY)
+        self.assertEqual(self.stdout.getvalue(), "")
+
     def test_listing_is_its_own_mode(self):
         for extra in (("--list-profiles",),
                       ("--skeleton-only", "--list-profiles", "--remove-profile", "cluster-gone"),
