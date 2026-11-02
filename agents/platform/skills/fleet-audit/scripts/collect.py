@@ -100,7 +100,6 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
     :REVISION_DIGEST_CHARS
 ]
 
-SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 # The shared kubeconfig directory is this uid's and closed to every other
 # uid: 0755, so only its owner (and root, which no mode binds) creates
@@ -582,6 +581,8 @@ Run = collector_run.Run
 TIMEOUT_RC = collector_run.TIMEOUT_RC
 Discovery = collector_run.Discovery
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
 
 
 RunFn = Callable[..., Run]
@@ -1038,6 +1039,17 @@ def run_and_gate(
     return parsed, result
 
 
+def paged_and_gate(kinds: str, kubeconfig: Path, *, run: RunFn = default_run, timeout: int = DEFAULT_TIMEOUT_S) -> tuple[dict | None, Run]:
+    """`run_and_gate` for a multi-kind dump: the kinds (a kubectl kind list,
+    `"deploy,sts,ds,cronjob,pod"`) read one at a time in pages through
+    `collector_run.paged_dump`, so a cluster of a few hundred nodes no longer
+    meets the credential proxy's output cap in one reply. The gate is the
+    same one: `None` on any page that failed, was cut, or is not a list, never
+    a shorter list from the pages that answered."""
+    env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
+    return paged_dump(kinds.split(","), run=run, env=env, timeout=timeout)
+
+
 class GateFailure(Exception):
     """Raised by a stream's context builder when a required collection
     command fails its gate. `collect_cluster` turns this into
@@ -1049,29 +1061,18 @@ class GateFailure(Exception):
 
 def dump_state(
     kubeconfig: Path, cluster: str, *, project: str = "", location: str = "", run: RunFn = default_run
-) -> tuple[Path, Run, bool]:
-    """`obtainability-audit`'s one dump, behind `run_and_gate`. Kept as its
-    own function (rather than inlined into its context builder) because its
-    fixed dump-to-a-named-file shape predates the multi-collection builder
-    contract and nothing else needs a file on disk — every check reads the
-    parsed dict `run_and_gate` already returns.
-
-    Keyed the way `kubeconfig_path` is, on the whole `(project, cluster,
-    location)` triple. The design's thread-safety rule is that a worker writes
-    only to paths keyed by its own cluster, and it named this file as the
-    example of a name no two threads can collide on — but a cluster name is
-    unique within a project, not across the fleet, and this collector runs
-    several projects at once. Two clusters called `prod` in two projects wrote
-    the same path, and the loser re-read the winner's dump: not a truncated
-    file or a crash, but one cluster's workloads published under the other's
-    name, with a manifest recording a clean rc=0 read.
+) -> tuple[dict | None, Run, bool]:
+    """`obtainability-audit`'s dump, behind the paged gate: `DUMP_COMMAND_KINDS`
+    read one kind at a time (`paged_and_gate`), returned parsed. It used to be
+    written to a `wra_state_<project>_<cluster>_<location>.json` scratch file
+    and read straight back; nothing read the file after that, and a dump that
+    exists only as the parsed dict costs no disk and leaves nothing behind.
+    `cluster`, `project` and `location` are kept for the callers that name
+    the read by them.
     """
-    dump_path = Path(SCRATCH_DIR) / f"wra_state_{project}_{cluster}_{location}.json"
-    parsed, result = run_and_gate(["kubectl", "get", DUMP_COMMAND_KINDS, "-A", "-o", "json"], kubeconfig, run=run)
-    if parsed is not None:
-        dump_path.parent.mkdir(parents=True, exist_ok=True)
-        dump_path.write_text(result.stdout, encoding="utf-8")
-    return dump_path, result, parsed is not None
+    del cluster, project, location
+    parsed, result = paged_and_gate(DUMP_COMMAND_KINDS, kubeconfig, run=run)
+    return parsed, result, parsed is not None
 
 
 def output_digest(text: str) -> str:
@@ -4376,6 +4377,13 @@ COMPLIANCE_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob"
 # either exists or does not.
 _SCALABLE_WORKLOAD_KINDS = ("Deployment", "StatefulSet")
 COMPLIANCE_DUMP_KINDS = "deploy,sts,ds,cronjob,pod"
+# The other built-in kinds compliance-audit reads, each list one paged read per
+# kind (`paged_and_gate`); the two single kinds are spelled the same way so
+# every read takes the same path.
+RBAC_DUMP_KINDS = "clusterroles,roles,clusterrolebindings,rolebindings"
+NETPOL_DUMP_KINDS = "netpol,ns"
+SERVICE_DUMP_KINDS = "svc"
+SERVICEACCOUNT_DUMP_KINDS = "sa"
 _SYSTEM_SA_NAMESPACE_RE_PARTS = (
     "kube-system", "gmp-system", "cnrm-system", "configconnector-operator-system", "krmapihosting-system",
 )
@@ -7965,14 +7973,13 @@ def _record(argv_str: str, result: Run) -> dict:
 
 
 def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
-    dump_path, dump_run, gate_ok = dump_state(
+    dump, dump_run, gate_ok = dump_state(
         kubeconfig, cluster["name"], project=cluster["project"], location=cluster["location"], run=run
     )
     if not gate_ok:
         raise GateFailure(f"dump gate failed (rc={dump_run.rc}): {dump_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
-    dump = json.loads(dump_path.read_text(encoding="utf-8"))
     workloads = normalize_workloads(dump)
-    record = _record(f"KUBECONFIG={kubeconfig} kubectl get {DUMP_COMMAND_KINDS} -A -o json", dump_run)
+    record = _record(paged_command_text(DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig), dump_run)
 
     context = build_context(dump, workloads)
     commands = {spec.slug: record for spec in checks}
@@ -8238,12 +8245,19 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     def gated(argv: list[str]) -> tuple[dict | list | None, Run]:
         return run_and_gate(argv, kubeconfig, run=run)
 
+    def paged(kinds: str) -> tuple[dict | None, Run]:
+        return paged_and_gate(kinds, kubeconfig, run=run)
+
+    def paged_text(kinds: str) -> str:
+        return paged_command_text(kinds.split(","), kubeconfig=kubeconfig)
+
     # Every collection below is gate-checked independently, and a gate
     # failure raises immediately — this stream fails the whole cluster
     # closed on any missing input, the same as a single-dump stream, per
-    # `GateFailure`'s own docstring.
-    workload_argv = ["kubectl", "get", COMPLIANCE_DUMP_KINDS, "-A", "-o", "json"]
-    parsed, result = gated(workload_argv)
+    # `GateFailure`'s own docstring. The built-in kinds are read in pages,
+    # one kind at a time; the CRD and category reads further down keep their
+    # one-shot shape, since an absent CRD is their ordinary answer.
+    parsed, result = paged(COMPLIANCE_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["workloads"] = normalize_compliance_workloads(parsed)
@@ -8278,42 +8292,39 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         for i in parsed.get("items", []) or []
         if i.get("kind") == "Pod"
     ]
-    workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
+    workload_record = _record(paged_text(COMPLIANCE_DUMP_KINDS), result)
     for spec in checks:
         if spec.slug not in _COMPLIANCE_CHECK_SOURCES:
             commands[spec.slug] = workload_record
 
-    rbac_argv = ["kubectl", "get", "clusterroles,roles,clusterrolebindings,rolebindings", "-A", "-o", "json"]
-    parsed, result = gated(rbac_argv)
+    parsed, result = paged(RBAC_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"RBAC dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     items = parsed.get("items", [])
     context["roles"] = [i for i in items if i.get("kind") in ("ClusterRole", "Role")]
     context["clusterrolebindings"] = [i for i in items if i.get("kind") == "ClusterRoleBinding"]
     context["rolebindings"] = [i for i in items if i.get("kind") == "RoleBinding"]
-    record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(rbac_argv)}", result)
+    record = _record(paged_text(RBAC_DUMP_KINDS), result)
     for slug in ("cluster-admin-binding", "wildcard-rbac", "anonymous-rbac-binding"):
         commands[slug] = record
 
-    netpol_argv = ["kubectl", "get", "netpol,ns", "-A", "-o", "json"]
-    parsed, result = gated(netpol_argv)
+    parsed, result = paged(NETPOL_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"NetworkPolicy/Namespace dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     items = parsed.get("items", [])
     context["networkpolicies"] = [i for i in items if i.get("kind") == "NetworkPolicy"]
     context["namespaces"] = [i for i in items if i.get("kind") == "Namespace"]
-    commands["netpol-missing"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(netpol_argv)}", result)
+    commands["netpol-missing"] = _record(paged_text(NETPOL_DUMP_KINDS), result)
 
     # Gated like the reads above rather than treated as optional: every cluster
     # has a Services API, so a failure here is a broken read and not an absent
     # feature, and `check_lb_world_open` reading an empty list would report a
     # cluster clean on a collection it never saw.
-    service_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
-    parsed, result = gated(service_argv)
+    parsed, result = paged(SERVICE_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"Service dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["services"] = parsed.get("items", []) or []
-    commands["lb-world-open"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(service_argv)}", result)
+    commands["lb-world-open"] = _record(paged_text(SERVICE_DUMP_KINDS), result)
 
     # A deliberate exception to "every read above raises": Dataplane V2's
     # `ClusterNetworkPolicy` CRD (§2.6's Do-NOT-flag case, `kubectl get ccnp
@@ -8439,12 +8450,11 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # workload names, and a read narrowed to `default` left it nothing to find
     # -- every named account read as absent, so the check returned no hits on
     # any cluster while its command recorded a clean run.
-    sa_argv = ["kubectl", "get", "sa", "-A", "-o", "json"]
-    parsed, result = gated(sa_argv)
+    parsed, result = paged(SERVICEACCOUNT_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"ServiceAccount dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["serviceaccounts"] = parsed.get("items", [])
-    sa_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(sa_argv)}", result)
+    sa_record = _record(paged_text(SERVICEACCOUNT_DUMP_KINDS), result)
     commands["default-sa-automount"] = sa_record
     commands["unbound-sa-automount"] = sa_record
 
@@ -8540,18 +8550,16 @@ def _collect_ai_security(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpe
     `inference-endpoint-public` alone. Either failing fails the whole
     cluster closed, the same trade-off compliance-audit's several
     independent reads accept."""
-    workload_argv = ["kubectl", "get", COMPLIANCE_DUMP_KINDS, "-A", "-o", "json"]
-    parsed, result = run_and_gate(workload_argv, kubeconfig, run=run)
+    parsed, result = paged_and_gate(COMPLIANCE_DUMP_KINDS, kubeconfig, run=run)
     if parsed is None:
         raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     ai_workloads = normalize_ai_workloads(parsed)
-    workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
+    workload_record = _record(paged_command_text(COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), result)
 
-    svc_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
-    svc_parsed, svc_result = run_and_gate(svc_argv, kubeconfig, run=run)
+    svc_parsed, svc_result = paged_and_gate(SERVICE_DUMP_KINDS, kubeconfig, run=run)
     if svc_parsed is None:
         raise GateFailure(f"service dump gate failed (rc={svc_result.rc}): {svc_result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
-    svc_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(svc_argv)}", svc_result)
+    svc_record = _record(paged_command_text(SERVICE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), svc_result)
 
     context = {"ai_workloads": ai_workloads, "services": svc_parsed.get("items", [])}
     commands = {

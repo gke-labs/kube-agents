@@ -519,6 +519,7 @@ def is_non_production(name: str, labels: dict | None = None, namespace: str = ""
 Run = collector_run.Run
 run_and_gate = collector_run.run_and_gate
 paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 # The per-cluster reads. ComputeClass is a CRD (`cloud.google.com`) outside the
@@ -1808,7 +1809,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     # One record for the five kinds, as the one dump was: the two reads' command
     # lines, and a digest over both outputs.
     dump_record = _record(
-        f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}; {collector_run.paged_command_text(PAGED_DUMP_KINDS)}",
+        f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}; {paged_command_text(PAGED_DUMP_KINDS)}",
         Run(result.argv, 0, cc_result.stdout + "\n" + result.stdout, "", cc_result.duration_s + result.duration_s),
     )
 

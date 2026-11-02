@@ -877,6 +877,7 @@ def log(msg: str) -> None:
 Run = collector_run.Run
 run_and_gate = collector_run.run_and_gate
 paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
@@ -4614,7 +4615,7 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
     parsed, result = paged_dump(dump_kinds, run=run, env=env)
     if parsed is None:
         return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
-    dump_record = _record(collector_run.paged_command_text(dump_kinds, kubeconfig=kubeconfig), result)
+    dump_record = _record(paged_command_text(dump_kinds, kubeconfig=kubeconfig), result)
     context = build_context(parsed)
     fleet_facts = _fleet_facts(context)
     release_index = _releases_by_object(parsed, releases, name)
