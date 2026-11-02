@@ -22,17 +22,6 @@ import (
 	"testing"
 )
 
-// releaseBitbucket lifts this release's refusal of the two Bitbucket
-// providers for one test, so that the rules of their table entries can be
-// tested as the release that wires the fleet-audit ledger will use them. No
-// test in this package runs in parallel, so the swap is safe.
-func releaseBitbucket(t *testing.T) {
-	t.Helper()
-	saved := unreleasedGitProviders
-	unreleasedGitProviders = map[string]string{}
-	t.Cleanup(func() { unreleasedGitProviders = saved })
-}
-
 func bitbucketProvider(t *testing.T, name string) *GitProvider {
 	t.Helper()
 	provider, err := lookupGitProvider(name, gitProviders)
@@ -58,26 +47,18 @@ func dcForge(name, host, namespace string) ForgeSpec {
 	}
 }
 
-// The gate: both providers are registered and in the CRD enum, and this
-// release refuses each of them by name, at the provider field. A refused
-// forge gets no egress and no broker entry, so nothing reaches Bitbucket.
-func TestThisReleaseRefusesBothBitbucketProviders(t *testing.T) {
+// Both providers are available: LookupGitProvider returns each of them, and
+// a forge of each gets a broker entry and egress, and registers its
+// repositories.
+func TestBothBitbucketProvidersAreAvailable(t *testing.T) {
 	for _, name := range []string{GitProviderBitbucket, GitProviderBitbucketDataCenter, " Bitbucket "} {
-		_, err := LookupGitProvider(name)
-		if err == nil || !strings.Contains(err.Error(), "not available in this release") {
-			t.Errorf("LookupGitProvider(%q) = %v, expected the release refusal", name, err)
-		}
-	}
-	for _, name := range []string{GitProviderGitHub, GitProviderGitLab, ""} {
 		if _, err := LookupGitProvider(name); err != nil {
 			t.Errorf("LookupGitProvider(%q) = %v, expected the provider", name, err)
 		}
 	}
-	// What an administrator is told to write instead names only what this
-	// release serves.
-	if _, err := LookupGitProvider("gitea"); err == nil || strings.Contains(err.Error(), "bitbucket") ||
-		!strings.Contains(err.Error(), "must be one of github, gitlab") {
-		t.Errorf("LookupGitProvider(gitea) = %v, expected the list without the refused providers", err)
+	if _, err := LookupGitProvider("gogs"); err == nil ||
+		!strings.Contains(err.Error(), "must be one of bitbucket, bitbucket-datacenter, gitea, github, gitlab") {
+		t.Errorf("LookupGitProvider(gogs) = %v, expected the list of every registered provider", err)
 	}
 	spec := &IntegrationSpec{
 		Forges: []ForgeSpec{bbForge("bb", "acme"), dcForge("dc", "bitbucket.example.com", "ACME")},
@@ -90,30 +71,24 @@ func TestThisReleaseRefusesBothBitbucketProviders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	paths := problemPaths(resolved)
-	for _, path := range []string{"forges[0].provider", "forges[1].provider"} {
-		if !strings.Contains(paths[path], "not available in this release") {
-			t.Errorf("Problems()[%s] = %q, expected the release refusal", path, paths[path])
+	if paths := problemPaths(resolved); len(paths) != 0 {
+		t.Errorf("Problems() = %v, expected none", paths)
+	}
+	if forges := resolved.BrokerForges("/t", "/c"); len(forges) != 2 {
+		t.Errorf("BrokerForges() = %+v, expected one entry for each forge", forges)
+	}
+	egress := strings.Join(ForgeEgressPatterns(spec), ",")
+	for _, host := range []string{"bitbucket.org", "bitbucket.example.com"} {
+		if !strings.Contains(egress, host) {
+			t.Errorf("ForgeEgressPatterns() = %s, expected %s", egress, host)
 		}
 	}
-	if len(paths) != 2 {
-		t.Errorf("Problems() = %v, expected the two provider refusals only", paths)
-	}
-	if forges := resolved.BrokerForges("/t", "/c"); forges != nil {
-		t.Errorf("BrokerForges() = %+v, expected none for refused forges", forges)
-	}
-	for _, pattern := range ForgeEgressPatterns(spec) {
-		if strings.Contains(pattern, "bitbucket") {
-			t.Errorf("ForgeEgressPatterns() has %q for a refused forge", pattern)
-		}
-	}
-	if got := resolved.Accepted(RepositoryRoleGitOps); len(got) != 0 {
-		t.Errorf("Accepted(gitops) = %v, expected none on a refused forge", got)
+	if got := resolved.Accepted(RepositoryRoleGitOps); len(got) != 1 {
+		t.Errorf("Accepted(gitops) = %v, expected the Bitbucket Cloud repository", got)
 	}
 }
 
 func TestBitbucketCloudResolvesWorkspaceAndRepository(t *testing.T) {
-	releaseBitbucket(t)
 	provider := bitbucketProvider(t, GitProviderBitbucket)
 	for repository, want := range map[string]string{
 		"https://bitbucket.org/acme/infra.git": "https://bitbucket.org/acme/infra",
@@ -156,7 +131,6 @@ func TestBitbucketCloudResolvesWorkspaceAndRepository(t *testing.T) {
 // Bitbucket Cloud is one public host: no self-managed instance, no CA
 // bundle, and a credential the administrator supplies.
 func TestBitbucketCloudIsOneHostWithACredential(t *testing.T) {
-	releaseBitbucket(t)
 	provider := bitbucketProvider(t, GitProviderBitbucket)
 	for _, host := range []string{"", "bitbucket.org", "WWW.Bitbucket.org"} {
 		if err := provider.ValidateHost(host); err != nil {
@@ -194,7 +168,6 @@ func TestBitbucketCloudIsOneHostWithACredential(t *testing.T) {
 }
 
 func TestBitbucketDataCenterNeedsItsHost(t *testing.T) {
-	releaseBitbucket(t)
 	provider := bitbucketProvider(t, GitProviderBitbucketDataCenter)
 	if err := provider.ValidateHost(""); err == nil || !strings.Contains(err.Error(), "no default host") {
 		t.Errorf("ValidateHost(\"\") = %v, expected the missing host named", err)
@@ -216,7 +189,6 @@ func TestBitbucketDataCenterNeedsItsHost(t *testing.T) {
 // is malformed. The rule is every provider's, because the broker reaches
 // every forge that way.
 func TestAPortOrAContextPathIsRefusedByName(t *testing.T) {
-	releaseBitbucket(t)
 	for _, name := range []string{GitProviderBitbucketDataCenter, GitProviderGitLab, GitProviderGitHub} {
 		provider := bitbucketProvider(t, name)
 		for _, host := range []string{"bitbucket.example.com:7990", "bitbucket.example.com/bitbucket", "https://bitbucket.example.com"} {
@@ -231,7 +203,6 @@ func TestAPortOrAContextPathIsRefusedByName(t *testing.T) {
 // A Data Center host is never a host another provider serves or Atlassian
 // operates, and no other self-managed provider takes bitbucket.org.
 func TestBitbucketHostsAreNeverAnotherProvidersInstance(t *testing.T) {
-	releaseBitbucket(t)
 	dc := bitbucketProvider(t, GitProviderBitbucketDataCenter)
 	for _, host := range []string{
 		"bitbucket.org", "www.bitbucket.org", "api.bitbucket.org", "acme.bitbucket.io",
@@ -252,7 +223,6 @@ func TestBitbucketHostsAreNeverAnotherProvidersInstance(t *testing.T) {
 }
 
 func TestBitbucketDataCenterResolvesProjectKeyAndRepository(t *testing.T) {
-	releaseBitbucket(t)
 	provider := bitbucketProvider(t, GitProviderBitbucketDataCenter)
 	const host = "bitbucket.example.com"
 	for repository, want := range map[string]string{
@@ -289,7 +259,6 @@ func TestBitbucketDataCenterResolvesProjectKeyAndRepository(t *testing.T) {
 }
 
 func TestBitbucketEgress(t *testing.T) {
-	releaseBitbucket(t)
 	cloud := bitbucketProvider(t, GitProviderBitbucket)
 	if got := strings.Join(cloud.EgressPatterns("www.bitbucket.org"), ","); got != "bitbucket.org,*.bitbucket.org" {
 		t.Errorf("Cloud EgressPatterns = %s", got)
@@ -313,7 +282,6 @@ func TestBitbucketEgress(t *testing.T) {
 // keys as allowedPaths, its token and read-token paths, its CA (Data Center
 // only) and its identity.
 func TestBrokerForgesCarriesBothBitbucketProviders(t *testing.T) {
-	releaseBitbucket(t)
 	cloud := bbForge("bb", "acme")
 	cloud.Identity = "{0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}"
 	dc := dcForge("dc", "Bitbucket.Example.com", "")
@@ -362,7 +330,6 @@ func TestBrokerForgesCarriesBothBitbucketProviders(t *testing.T) {
 // forge is refused at its host: a repository token reaches one repository,
 // and an install with two needs a workspace token or an account's API token.
 func TestASecondBitbucketCloudForgeIsShadowed(t *testing.T) {
-	releaseBitbucket(t)
 	spec := &IntegrationSpec{
 		Forges:       []ForgeSpec{bbForge("one", "acme"), bbForge("two", "other")},
 		Repositories: []RepositorySpec{repo("one", "infra", RepositoryRoleGitOps), repo("two", "apps", RepositoryRoleManaged)},
@@ -378,7 +345,6 @@ func TestASecondBitbucketCloudForgeIsShadowed(t *testing.T) {
 
 // identity is read by the Bitbucket brokers only, and holds the broker's rule.
 func TestIdentityIsForBitbucketForgesOnly(t *testing.T) {
-	releaseBitbucket(t)
 	gitlab := glForge("gl", "", "acme")
 	gitlab.Identity = "agent"
 	github := ghForge("github", "acme")

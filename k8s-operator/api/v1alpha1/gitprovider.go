@@ -34,9 +34,7 @@ package v1alpha1
 // GitHub, GitLab, Gitea, Bitbucket Cloud and Bitbucket Data Center are
 // registered, each with the agent-side provider that honours it, because a
 // provider the CRD accepts and the agent discards is a worse failure than one
-// the CRD refuses. This release refuses the two Bitbucket providers by name
-// until the fleet audit can keep its ledger on a forge with no issue tracker
-// (gitprovider_gate.go).
+// the CRD refuses.
 //
 // Gitea has no default host: it serves whatever host the administrator
 // declares and no other, it may be reached over plain http when that is
@@ -379,9 +377,6 @@ func providerNames(table map[string]*GitProvider) []string {
 // LookupGitProvider returns the rules for a declared provider name. An empty
 // name means the default, which is what the deprecated GitHub alias resolves to.
 func LookupGitProvider(name string) (*GitProvider, error) {
-	if err := unreleasedGitProvider(name); err != nil {
-		return nil, err
-	}
 	return lookupGitProvider(name, gitProviders)
 }
 
@@ -393,7 +388,7 @@ func lookupGitProvider(name string, table map[string]*GitProvider) (*GitProvider
 	provider, ok := table[strings.ToLower(trimmed)]
 	if !ok {
 		return nil, fmt.Errorf("unsupported git provider %q; must be one of %s",
-			name, strings.Join(releasedProviderNames(table), ", "))
+			name, strings.Join(providerNames(table), ", "))
 	}
 	return provider, nil
 }

@@ -1162,10 +1162,10 @@ declares nothing -- reading it as a declaration would make it collide with the
 `forges` list that replaces it, which is the migration every install has to
 make.
 
-The provider list mirrors the CRD's enum on ForgeSpec.Provider less the
-providers that this release refuses (k8s-operator/api/v1alpha1/gitprovider_gate.go:
-bitbucket and bitbucket-datacenter), so the chart refuses them as well; the
-self-managed list mirrors the providers with SelfManaged set, the host list
+The provider list mirrors the CRD's enum on ForgeSpec.Provider less
+bitbucket and bitbucket-datacenter, which the chart does not render yet: a
+Bitbucket forge is declared on the PlatformAgent resource itself until the
+chart learns their rules. The self-managed list mirrors the providers with SelfManaged set, the host list
 mirrors githubHosts, and the GitLab and Gitea namespace patterns mirror
 gitlabNamespaceRegex and giteaNamespaceRegex, all in k8s-operator/api/v1alpha1.
 */}}

@@ -1790,9 +1790,7 @@ type ForgeSpec struct {
 	// "github", "gitlab", "gitea", "bitbucket" (Bitbucket Cloud, at
 	// bitbucket.org) and "bitbucket-datacenter" (a Bitbucket Data Center
 	// instance at the declared host) are registered; the enum grows with each
-	// agent-side provider. Omitted, it is "github". This release refuses the
-	// two Bitbucket providers, with a reason in the status, until the fleet
-	// audit can keep its ledger on a forge with no issue tracker.
+	// agent-side provider. Omitted, it is "github".
 	//
 	// A forge at a host other than a spelling of github.com must name it, so
 	// a forge written for another instance is never read as a GitHub

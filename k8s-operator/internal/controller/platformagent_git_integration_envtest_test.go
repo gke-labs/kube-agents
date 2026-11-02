@@ -252,8 +252,7 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 		"ghes-ca": {Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: "ghe.example.com",
 			Namespace:   "acme",
 			CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "ghe-ca"}}}},
-		// The API server admits both Bitbucket providers; this release's
-		// refusal is the operator's, in the status (gitprovider_gate.go).
+		// The API server admits both Bitbucket providers.
 		"bitbucket": {Forges: []agentv1alpha1.ForgeSpec{{Name: "bb", Provider: "bitbucket", Namespace: "acme",
 			Identity:       "{0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}",
 			CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "bb-token"}}}},
