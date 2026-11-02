@@ -743,10 +743,14 @@ class VcsBroker:
         as in flight before it creates it, so a tree minted while this walks
         the root is already in the set, where a snapshot of the sequence
         counter taken before the listing would call it an orphan. Returns how
-        many were removed."""
+        many this call removed: a tree whose request finished between the
+        listing and its turn is gone already, by that request's own cleanup,
+        and is not relief."""
         removed = 0
         for path in self._scratch_names():
-            if self._in_flight(path):
+            # Not in flight and gone: the request's cleanup took it (the tree
+            # goes before the path leaves the live set), not this walk.
+            if self._in_flight(path) or not path.exists():
                 continue
             _remove_tree(path)
             removed += not path.exists()

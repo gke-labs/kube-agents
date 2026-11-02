@@ -19,7 +19,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -466,7 +465,7 @@ class ResourceWatermarkGateTest(unittest.TestCase):
         self.relieved += 1
         return True
 
-    def gate(self, *, memory_percent=50.0, limit=str(_LIMIT), state_limit=_STATE_LIMIT, tmp_limit=_TMP_LIMIT, statvfs=None, thresholds=None):
+    def gate(self, *, memory_percent=50.0, limit=str(_LIMIT), state_limit=_STATE_LIMIT, tmp_limit=_TMP_LIMIT, thresholds=None):
         cgroup = _fake_memory(self.root, current=_percent(_LIMIT, memory_percent), limit=limit)
         volumes = (
             credential_proxy.WatchedVolume("state", self.root / "state", state_limit),
@@ -477,7 +476,6 @@ class ResourceWatermarkGateTest(unittest.TestCase):
             volumes,
             cgroup_dir=cgroup,
             tree_bytes=lambda path: self.sizes[path.name],
-            statvfs=statvfs or (lambda path: self.fail(f"statvfs asked for {path} with a cap known")),
             reclaimers=(lambda: self.reclaimed.append("workspaces") or 2, lambda: self.reclaimed.append("vcs") or 1),
             relieve=self._relieve,
             retry_after=self.retry,
@@ -657,20 +655,26 @@ class ResourceWatermarkGateTest(unittest.TestCase):
                         pass
                 self.sizes["tmp"] = 0
 
-    def test_a_volume_with_no_cap_is_measured_with_statvfs(self):
-        stats = {"state": (100, 15), "tmp": (0, 0)}
-
-        def statvfs(path):
-            blocks, available = stats[Path(path).name]
-            return types.SimpleNamespace(f_blocks=blocks, f_bavail=available)
-
-        gate = self.gate(memory_percent=10, state_limit=None, tmp_limit=None, statvfs=statvfs)
+    def test_a_volume_with_no_cap_is_off_and_said_so_once_at_start(self):
+        # An emptyDir sits on the node's filesystem, which the kubelet's image
+        # GC keeps at 80-85% on a busy node; statvfs there against the volume
+        # watermarks would hold a healthy node's broker at hard for good. A
+        # volume with no cap is not read at all: its tree is not walked (a
+        # walk here raises KeyError, which is not an OSError the reader
+        # swallows), it has no ratio, and the other volume still counts.
+        del self.sizes["state"]
+        self.sizes["tmp"] = _percent(_TMP_LIMIT, 10)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            gate = self.gate(memory_percent=10, state_limit=None)
+        self.assertIn("state volume off", "\n".join(logs.output))
+        with self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+            self.assertEqual("normal", gate.tick())
+        self.assertNotIn("state", gate.snapshot().ratios)
+        self.sizes["tmp"] = _percent(_TMP_LIMIT, 85)
         self.assertEqual("hard", gate.tick())
-        snapshot = gate.snapshot()
-        self.assertAlmostEqual(0.85, snapshot.ratios["state"], places=3)
-        self.assertNotIn("tmp", snapshot.ratios)
+        self.assertEqual({"memory", "tmp"}, set(gate.snapshot().ratios))
         self.assertIn("state=", gate.describe_limits())
-        self.assertIn(":statvfs", gate.describe_limits())
+        self.assertIn(":off", gate.describe_limits())
 
     def test_the_executor_runs_one_command_at_a_time_from_the_soft_watermark(self):
         gate = self.gate(memory_percent=76)
@@ -860,12 +864,12 @@ class WatermarkEnvTest(unittest.TestCase):
                 self.assertEqual((75, 85, 70, 80), tuple(thresholds))
                 self.assertIn("using 75/85", "\n".join(logs.output))
 
-    def test_a_volume_cap_is_a_positive_byte_count_or_statvfs(self):
+    def test_a_volume_cap_is_a_positive_byte_count_or_the_volume_is_off(self):
         self.assertIsNone(credential_proxy.volume_limit_from_env("CREDENTIAL_PROXY_TMP_LIMIT_BYTES", {}))
         self.assertEqual(2147483648, credential_proxy.volume_limit_from_env("CREDENTIAL_PROXY_TMP_LIMIT_BYTES", {"CREDENTIAL_PROXY_TMP_LIMIT_BYTES": "2147483648"}))
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
             self.assertIsNone(credential_proxy.volume_limit_from_env("CREDENTIAL_PROXY_TMP_LIMIT_BYTES", {"CREDENTIAL_PROXY_TMP_LIMIT_BYTES": "2Gi"}))
-        self.assertIn("measuring that volume with statvfs", "\n".join(logs.output))
+        self.assertIn("that volume's half of the resource watermark gate is off", "\n".join(logs.output))
 
 
 class ReliefStepTest(unittest.TestCase):
@@ -935,6 +939,30 @@ class ReliefStepTest(unittest.TestCase):
         self.assertTrue(minted[0].exists())
         broker._discard_scratch(minted[0])
         self.assertFalse(minted[0].exists())
+
+    def test_vcs_scratch_a_request_lets_go_after_the_listing_is_not_counted_as_relief(self):
+        import vcs_broker
+
+        root = self.root / "vcs"
+        root.mkdir()
+        broker = vcs_broker.VcsBroker(root, git_runner=lambda *args, **kwargs: None)
+        stale = root / vcs_broker.SCRATCH_NAME_FORMAT.format(kind="snapshot", pid=os.getpid(), sequence=0)
+        stale.mkdir()
+        live = broker._scratch("clone")
+        listing = broker._scratch_names
+
+        def list_then_finish():
+            # The request ends between the reclaimer's listing and its tree's
+            # turn in the loop: its own cleanup removes the tree and lets the
+            # path go, so the reclaimer finds neither a live path nor a tree.
+            listed = listing()
+            broker._discard_scratch(live)
+            return listed
+
+        with mock.patch.object(broker, "_scratch_names", list_then_finish):
+            self.assertEqual(1, broker.reclaim_orphan_scratch())
+        self.assertFalse(stale.exists())
+        self.assertFalse(live.exists())
 
     def test_vcs_scratch_stays_in_flight_until_its_tree_is_gone(self):
         import vcs_broker

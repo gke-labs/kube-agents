@@ -917,8 +917,9 @@ Consequences:
   (`CREDENTIAL_PROXY_STATE_LIMIT_BYTES`, `CREDENTIAL_PROXY_TMP_LIMIT_BYTES`: each volume's
   sizeLimit, or, when an override puts the container's ephemeral-storage limit under the
   two sizeLimits together, shares of that limit in the sizeLimits' proportion, summing to
-  it, since the kubelet sums the volumes into that one limit; statvfs when unset) on the
-  memory sampler's 30 s tick. From the soft watermark
+  it, since the kubelet sums the volumes into that one limit; a volume with no cap is off,
+  since statvfs on an emptyDir reads the node, not the cap) on the memory sampler's 30 s
+  tick. From the soft watermark
   (`CREDENTIAL_PROXY_MEM_SOFT_PCT` 75, `CREDENTIAL_PROXY_DISK_SOFT_PCT` 70) admitted commands
   run one at a time and the first tick reclaims idle content workspaces and orphaned vcs
   scratch, collects and trims the allocator. From the hard watermark

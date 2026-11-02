@@ -417,10 +417,13 @@ PERCENT = 100
 # sizeLimits (credential_proxy_manifests.go, credentialProxyStateLimitEnv and
 # credentialProxyTmpLimitEnv; tests/test_credential_proxy_sizing_parity.py
 # holds the names equal). An emptyDir is a directory on the node's filesystem,
-# so statvfs on it reports the node, not the cap the kubelet evicts on; with a
-# cap known the gate sums the tree on the sampler's tick instead, and only an
-# unset cap falls back to statvfs (1 - f_bavail / f_blocks), which still
-# catches a full node.
+# so statvfs on it reports the node's fill, not the cap the kubelet evicts on,
+# and the kubelet's image GC keeps a busy node's fill between its own
+# thresholds (80-85% by default): against the volume watermarks that is a
+# hard reading on a healthy node, which nothing the broker frees can end. So
+# the gate sums each tree against its cap on the sampler's tick, and a volume
+# whose cap is unset or malformed is off, logged once at start, as the memory
+# half is without memory.max.
 ENV_STATE_LIMIT_BYTES = "CREDENTIAL_PROXY_STATE_LIMIT_BYTES"
 ENV_TMP_LIMIT_BYTES = "CREDENTIAL_PROXY_TMP_LIMIT_BYTES"
 TMP_DIR = "/tmp"
@@ -2776,22 +2779,22 @@ def watermark_thresholds_from_env(environ: "Mapping[str, str] | None" = None) ->
 
 def volume_limit_from_env(env_name: str, environ: "Mapping[str, str] | None" = None) -> int | None:
     """A scratch volume's cap in bytes from `env_name`, or None when it is unset
-    or not a positive integer (logged), in which case the gate falls back to
-    statvfs for that volume."""
+    or not a positive integer (logged), in which case that volume's half of
+    the gate is off."""
     source = os.environ if environ is None else environ
     raw = (source.get(env_name) or "").strip()
     if not raw:
         return None
     limit = _positive_int(raw)
     if limit is None:
-        LOGGER.warning("%s=%r is not a positive integer byte count; measuring that volume with statvfs", env_name, raw)
+        LOGGER.warning("%s=%r is not a positive integer byte count; that volume's half of the resource watermark gate is off", env_name, raw)
     return limit
 
 
 class WatchedVolume(NamedTuple):
     """One scratch volume the gate watches: its label in the gauge and the log,
-    its path, and the cap in bytes the kubelet evicts on, or None to measure
-    the filesystem under it with statvfs instead."""
+    its path, and the cap in bytes the kubelet evicts on, or None when none
+    is known, which turns that volume's half of the gate off."""
 
     name: str
     path: Path
@@ -2820,14 +2823,6 @@ def tree_allocated_bytes(root: Path) -> int:
             except OSError:
                 continue
     return total
-
-
-def _statvfs_ratio(stat: Any) -> float | None:
-    """The filesystem's fill from a statvfs result: 1 - f_bavail / f_blocks,
-    the share not available to this process; None for an empty filesystem."""
-    if stat.f_blocks <= 0:
-        return None
-    return 1.0 - (stat.f_bavail / stat.f_blocks)
 
 
 _libc_trim: Callable[[int], int] | None | bool = False
@@ -2861,7 +2856,7 @@ class ResourceWatermarkGate:
       raises `ResourcePressure` before anything is queued. An interactive
       admission is counted while it is held, which is how the reserve is one
       slot and not one per arrival.
-    * `tick()` is the sampler's: the two volumes are walked (or statvfs'd),
+    * `tick()` is the sampler's: the two volumes are walked against their caps,
       memory is read again so an idle broker still notices, and the first tick
       at or past the soft watermark runs the relief step once per episode:
       the reclaimers it was built with, then a collection and the allocator
@@ -2871,10 +2866,10 @@ class ResourceWatermarkGate:
       and `_effective_cap` then admits PRESSURE_CLAMPED_CONCURRENCY at once.
 
     Every reader is injectable: `cgroup_dir` for the two memory files,
-    `tree_bytes` and `statvfs` for the volumes, `retry_after` for the
-    Retry-After draw, `relieve` for the collection and trim. A missing or
-    `max` memory.max turns the memory half off, logged once at construction;
-    the disk half stays on.
+    `tree_bytes` for the volumes, `retry_after` for the Retry-After draw,
+    `relieve` for the collection and trim. A missing or `max` memory.max turns
+    the memory half off, and a volume with no cap turns that volume off, each
+    logged once at construction; the rest stays on.
     """
 
     def __init__(
@@ -2884,7 +2879,6 @@ class ResourceWatermarkGate:
         *,
         cgroup_dir: Path = Path(CGROUP_DIR),
         tree_bytes: Callable[[Path], int] = tree_allocated_bytes,
-        statvfs: Callable[[str], Any] = os.statvfs,
         reclaimers: Sequence[Callable[[], int]] = (),
         relieve: Callable[[], bool] = release_process_memory,
         retry_after: Callable[[int, int], int] = random.randint,
@@ -2894,7 +2888,6 @@ class ResourceWatermarkGate:
         self.volumes = tuple(volumes)
         self._cgroup_dir = cgroup_dir
         self._tree_bytes = tree_bytes
-        self._statvfs = statvfs
         self._reclaimers = tuple(reclaimers)
         self._relieve = relieve
         self._retry_after = retry_after
@@ -2910,6 +2903,14 @@ class ResourceWatermarkGate:
                 "resource watermark gate: memory half off (%s missing or unlimited); the disk half is on",
                 self._cgroup_dir / Path(CGROUP_MEMORY_MAX_PATH).name,
             )
+        for volume in self.volumes:
+            if volume.limit_bytes is None:
+                LOGGER.info(
+                    "resource watermark gate: %s volume off (no cap for %s; statvfs there would read the node's "
+                    "filesystem, not the cap the kubelet evicts on)",
+                    volume.name,
+                    volume.path,
+                )
 
     def set_reclaimers(self, reclaimers: Sequence[Callable[[], int]]) -> None:
         """Replace the relief step's reclaimers: serve() builds the gate
@@ -2948,15 +2949,12 @@ class ResourceWatermarkGate:
         return working_set / self.memory_limit_bytes
 
     def read_volume_ratio(self, volume: WatchedVolume) -> float | None:
-        """The volume's fill: its tree against its cap, or the filesystem
-        under it when no cap is known; None when neither can be read."""
-        if volume.limit_bytes is not None:
-            try:
-                return self._tree_bytes(volume.path) / volume.limit_bytes
-            except OSError:
-                return None
+        """The volume's fill: its tree against its cap. None with no cap
+        (that volume is off) or the tree unreadable."""
+        if volume.limit_bytes is None:
+            return None
         try:
-            return _statvfs_ratio(self._statvfs(str(volume.path)))
+            return self._tree_bytes(volume.path) / volume.limit_bytes
         except OSError:
             return None
 
@@ -3010,7 +3008,7 @@ class ResourceWatermarkGate:
             f"memory={self.memory_limit_bytes // MEBIBYTE}MiB" if self.memory_limit_bytes is not None else "memory=off"
         )
         volumes = " ".join(
-            f"{volume.name}={volume.path}:" + (f"{volume.limit_bytes // MEBIBYTE}MiB" if volume.limit_bytes is not None else "statvfs")
+            f"{volume.name}={volume.path}:" + (f"{volume.limit_bytes // MEBIBYTE}MiB" if volume.limit_bytes is not None else "off")
             for volume in self.volumes
         )
         return (
@@ -14614,7 +14612,7 @@ def serve(args: argparse.Namespace) -> None:
     memory_reader = MemoryReader(executor.child_peaks)
     CredentialProxyHandler.metrics.set_memory_reader(memory_reader.read)
     # The resource watermark gate: the two scratch volumes against the caps
-    # the operator passes (statvfs when it does not), memory against the
+    # the operator passes (a volume with no cap is off), memory against the
     # cgroup limit. Its reclaimers are wired once the stores exist, below;
     # the sampler ticks it on the memory cadence.
     gate = ResourceWatermarkGate(
