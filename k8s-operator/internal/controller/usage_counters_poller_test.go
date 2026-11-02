@@ -1612,6 +1612,9 @@ func TestUsagePoller_ProjectsTheChatHalfAsChatSessionsTotal(t *testing.T) {
 	if status.LastHumanActiveTime != nil {
 		t.Fatalf("a chat session alone moved lastHumanActiveTime: %v", status.LastHumanActiveTime)
 	}
+	if status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(10)) {
+		t.Fatalf("the sessions did not move lastActiveTime: %v", status.LastActiveTime)
+	}
 	agent := &agentv1alpha1.PlatformAgent{}
 	if err := h.cl.Get(context.Background(), client.ObjectKey{Namespace: usageTestNamespace, Name: usageTestAgentName}, agent); err != nil {
 		t.Fatalf("reading the agent: %v", err)
@@ -1620,6 +1623,14 @@ func TestUsagePoller_ProjectsTheChatHalfAsChatSessionsTotal(t *testing.T) {
 	g.publishUsage(agent)
 	if got := testutil.ToFloat64(g.usage.WithLabelValues(agent.Namespace, agent.Name, usageStatusFieldChatSessions)); got != 5 {
 		t.Fatalf("usage gauge chatSessionsTotal = %v, want 5", got)
+	}
+	// The chat half alone moves lastActiveTime, as sessionsTotal does, and
+	// still not lastHumanActiveTime.
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 26)
+	h.poll(15)
+	status = h.status()
+	if status.ChatSessionsTotal != 6 || status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(15)) || status.LastHumanActiveTime != nil {
+		t.Fatalf("after one more chat session: chatSessionsTotal %d lastActiveTime %v lastHumanActiveTime %v, want 6, minute 15, nil", status.ChatSessionsTotal, status.LastActiveTime, status.LastHumanActiveTime)
 	}
 }
 

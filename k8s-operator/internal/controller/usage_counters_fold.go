@@ -282,9 +282,10 @@ func usageUnfolded(doc *usageDocument, counter string) bool {
 // are baselined at their samples, and only a counter whose field's floor is
 // zero (usageFieldFloor), so that none of any sample can be in the total, is
 // recorded in Unfolded for foldUsage to add whole, on this poll or on the
-// first that reads the pod. The two sessions halves share one field: with a
-// status that carries sessions, neither half is unfolded, since the triage
-// half's share of that status sits in the chat half's floor.
+// first that reads the pod. The two sessions halves share one field, whose
+// floor is the halves' summed floors: with a status that carries sessions,
+// neither half is unfolded, since the triage half's share of that status sits
+// in the chat half's floor, or, under a split seed, in the triage half's own.
 // A retired counter (usageRetiredCounters) loses its total, its pod entries
 // and its unfolded mark, the same at either version, so the layout keeps its
 // version: dropping is idempotent, and every other counter keeps its baseline

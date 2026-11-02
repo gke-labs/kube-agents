@@ -2459,8 +2459,8 @@ type AgentUsageStatus struct {
 	// delivered (its k8s_event_watcher_triage_sessions_total; a session
 	// whose inject was filtered, suppressed or failed is not counted) plus
 	// the chat conversations the gateway opened a session for (the session_store
-	// plugin's kubeagents_chat_sessions_total on a today install, the A2A
-	// gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// plugin's kubeagents_chat_sessions_total on a today install, that plus the
+	// A2A gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
 	// chat conversation that resumes after the session store's retention
 	// window (seven days by default) counts again. Read every five minutes
 	// and kept monotonic across restarts, like toolExecutionsTotal.
@@ -2474,9 +2474,9 @@ type AgentUsageStatus struct {
 	// install), without the event watcher's triage sessions. On an install
 	// whose usage document was re-seeded before this release, its first
 	// value carries that re-seed's triage sessions once. Read every five
-	// minutes and kept monotonic the same way as ToolExecutionsTotal. Does
-	// not move LastHumanActiveTime or LastActiveTime. Absent while the served
-	// CRD predates it.
+	// minutes and kept monotonic the same way as ToolExecutionsTotal. Moves
+	// LastActiveTime, as SessionsTotal does; does not move
+	// LastHumanActiveTime. Absent while the served CRD predates it.
 	// +optional
 	ChatSessionsTotal int64 `json:"chatSessionsTotal,omitempty"`
 
