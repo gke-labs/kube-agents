@@ -358,8 +358,8 @@ func TestHomeChannelRecordObjectsRoleAndMounts(t *testing.T) {
 	if v, ok := proj.Data[homeChannelProjectionKey]; !ok || v != "" {
 		t.Errorf("an empty projection must still carry the key: %v", proj.Data)
 	}
-	rules := buildA2AGatewayRole(a).Rules
-	rule := rules[len(rules)-1]
+	// The fourth rule; the resolved scope's read follows it under next.
+	rule := buildA2AGatewayRole(a).Rules[3]
 	if len(rule.Resources) != 1 || rule.Resources[0] != "configmaps" ||
 		len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != cm.Name ||
 		strings.Join(rule.Verbs, ",") != "get,patch" {

@@ -479,7 +479,7 @@ profile. Addressing it costs a GKE describe in its own project, answered by the 
 let the reconcile write the profile, so a describe that fails there names a real gap: the profile is
 skipped and reported with the API's answer like any other.
 
-Profile discovery follows `internal/clusterprofiles`' failure policy, which is the watcher's: a
+Profile discovery follows `internal/clusterprofiles`' failure policy, which the watcher shares at boot: a
 `--profiles-dir` that was given and is not there is fatal, because discovery runs once and a restart
 fixes it, and so is a credential proxy that cannot be reached or answers with an error about itself
 (no credential yet, its hop to Google failed, or it refused this process's own token), for the same

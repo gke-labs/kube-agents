@@ -901,6 +901,16 @@ func (s *SlackAdapter) PostNotifyMessage(channel, thread string, m OutMessage) (
 	return ts, thread, nil
 }
 
+// EditNotifyMessage is EditMessage for the chat.notify route's home posts
+// (notifyChatEditor): the message ts on channel's thread, edited in place,
+// its question tracked under the thread's key as PostNotifyMessage tracks it.
+func (s *SlackAdapter) EditNotifyMessage(channel, thread, messageID string, m OutMessage) error {
+	if !slackIsHomeChannelID(channel) {
+		return fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	return s.EditMessage(slackConversationID(slackChannelTypeChannel, channel, thread), messageID, m)
+}
+
 // slackIsHomeChannelID reports a public ("C...") or private ("G...")
 // channel id: a prefix letter and upper-case letters or digits after it. A
 // DM ("D...") is not a home channel.

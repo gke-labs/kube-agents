@@ -66,6 +66,33 @@ MAX_KUBECONFIG_BYTES = 1 << 20
 # the client; `api_policy.API_READ_ROUTES` on the broker is what it may reach.
 API_RELAY_PREFIX = "/v1/gcp/"
 
+# The exec tier's shared names, here for the same reason as the relay prefix:
+# the broker and the shim both spell them, and this is the module both import.
+# docs/designs/credential-broker-exec-tier.md §12 is the contract, and
+# test_exec_tier_contract.py checks that these match it.
+EXEC_ROLE = "exec"
+EXEC_URL_ENV = "CREDENTIAL_PROXY_EXEC_URL"
+EXEC_REPLICAS_FILE_ENV = "CREDENTIAL_PROXY_EXEC_REPLICAS_FILE"
+EXEC_REPLICAS_FILE = "/etc/credential-proxy-exec-tier/replicas"
+BUSY_BOUND_KEY = "bound"
+ADMISSION_BOUND_DRAINING = "draining"
+ADMISSION_BOUND_BACKGROUND = "background"
+# A busy answer under one of these bounds is retried once on a new connection;
+# another replica can admit it. The session cap is a caller's own limit, and
+# the others name no replica-local shortage.
+RETRYABLE_BUSY_BOUNDS = frozenset(
+    {"slot", "budget", ADMISSION_BOUND_BACKGROUND, ADMISSION_BOUND_DRAINING, "profile"}
+)
+CLASS_INTERACTIVE = "interactive"
+CLASS_BACKGROUND = "background"
+CLASS_LABEL = "class"
+BACKGROUND_NICE = 10
+BROKER_TIER_EXEC = "exec"
+BROKER_TIER_STATEFUL = "stateful"
+AUDIT_BROKER_TIER = "broker_tier"
+AUDIT_CLASS = "class"
+AUDIT_BROKER_POD = "broker_pod"
+
 # Where a `get-credentials` that named no destination leaves its file:
 # `$HERMES_HOME/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
 # the convention agents/platform/AGENTS.md ("Cluster Credentials") teaches and
