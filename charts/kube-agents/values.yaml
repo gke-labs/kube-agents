@@ -813,6 +813,13 @@ platformAgent:
   # the CR by hand with kubectl is left alone while this stays null, because
   # Helm patches only the fields its renders differ in.
   mode: null
+  telemetry:
+    # Under spec.mode next, the A2A gateway keeps one hashed key and a
+    # last-active time per chat person for 30 days, which status.usage counts
+    # as peopleSeen7d and peopleSeen30d.
+    # false writes no key, purges the bucket at the gateway's next start, and
+    # leaves both counts absent. Under "today" there is no gateway and no record.
+    peopleSeen: true
   storage:
     # The PlatformAgent's spec.storage.size: the request of the agent's
     # <name>-data claim and of the shell sandbox's data claim. The operator

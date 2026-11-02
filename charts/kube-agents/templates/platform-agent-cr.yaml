@@ -650,9 +650,16 @@ spec:
     what leaves the operator free to discover a collector; an explicit "" would look like
     a decision the chart made.
   */}}
-  {{- with .Values.telemetry.otlpEndpoint }}
+  {{- $peopleSeenOff := eq (toString .Values.platformAgent.telemetry.peopleSeen) "false" }}
+  {{- if or .Values.telemetry.otlpEndpoint $peopleSeenOff }}
   telemetry:
+    {{- with .Values.telemetry.otlpEndpoint }}
     otlpEndpoint: {{ . | quote }}
+    {{- end }}
+    {{- if $peopleSeenOff }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.telemetry.peopleSeen" "path" (list "telemetry") "field" "peopleSeen") }}
+    peopleSeen: false
+    {{- end }}
   {{- end }}
   {{- with .Values.platformAgent.networkPolicy }}
   networkPolicy:
