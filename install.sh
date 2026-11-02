@@ -5612,10 +5612,13 @@ ask_gitops_forge() {
         PARAM_GITOPS_FORGE="github"
         PARAM_GITOPS_HOST="$ghes_host"
         if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
-          prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE "$ghes_ca_file"
+          local ca_prompt="PEM CA file that signed the instance's certificate"
+          [ -z "$ghes_ca_file" ] && ca_prompt="$ca_prompt (empty if a public CA signed it)"
+          prompt_read "$ca_prompt" PARAM_GITOPS_CA_FILE "$ghes_ca_file"
           # An empty answer means a public CA signed the certificate: clear
           # any Secret name the early flag check derived from an exported file.
-          if [ -z "$PARAM_GITOPS_CA_FILE" ]; then
+          # Leave an operator-named Secret alone if it arrived without a file.
+          if [ -z "$PARAM_GITOPS_CA_FILE" ] && [ -n "$ca_file_on_entry" ]; then
             PARAM_GITOPS_CA_SECRET=""
           fi
         fi
