@@ -23,7 +23,9 @@ for itself. They get the same registry and tag, so an install at a release pulls
 release and a mirrored install pulls them from the mirror. A `PlatformAgent`'s own
 `spec.deployment.image` does not move them; `A2A_GATEWAY_IMAGE`, `A2A_WORKER_IMAGE`,
 `A2A_CALLOUT_IMAGE`, `A2A_VERIFIER_IMAGE` and `A2A_CONSOLE_IMAGE` on the operator override one at
-a time. The AgentProfile dispatcher is off by default until profiles dispatch end to end. Its image is in the release set, but the operator derives nothing for it. It renders the dispatcher only when `A2A_DISPATCHER_IMAGE` names an image, which on a mirror is the mirror's copy.
+a time.
+
+The AgentProfile dispatcher is off by default until profiles dispatch end to end. Its image is in the release set, but the operator derives nothing for it. It renders the dispatcher only when `A2A_DISPATCHER_IMAGE` names an image, which on a mirror is the mirror's copy.
 
 The Hermes bridge sidecar the operator renders into the agent pod under `next` is built from the
 `platform-agent` image of the same commit. The operator therefore takes its registry and tag from
