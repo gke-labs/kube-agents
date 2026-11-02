@@ -12,9 +12,11 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -403,6 +405,46 @@ func TestIsLiteLLMConfigMapName(t *testing.T) {
 	} {
 		if got := isLiteLLMConfigMapName(name); got != want {
 			t.Errorf("isLiteLLMConfigMapName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// A litellm-config ConfigMap maps to every PlatformAgent in its namespace; any other
+// ConfigMap maps to nothing, and the enqueue is not called for it.
+func TestReconcile_ALiteLLMConfigMapChangeEnqueuesTheAgents(t *testing.T) {
+	agents := []reconcile.Request{
+		{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "agent-a"}},
+		{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "agent-b"}},
+	}
+	var asked []string
+	enqueue := func(_ context.Context, namespace string) []reconcile.Request {
+		asked = append(asked, namespace)
+		if namespace != "ns" {
+			return nil
+		}
+		return agents
+	}
+	cm := func(name string) *corev1.ConfigMap {
+		return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name}}
+	}
+
+	for _, name := range []string{"litellm-config", "litellm-config-abc"} {
+		asked = nil
+		got := liteLLMConfigMapRequests(context.Background(), cm(name), enqueue)
+		if len(got) != len(agents) || got[0] != agents[0] || got[1] != agents[1] {
+			t.Errorf("%s maps to %v, want %v", name, got, agents)
+		}
+		if len(asked) != 1 || asked[0] != "ns" {
+			t.Errorf("%s asked for namespaces %v, want [ns]", name, asked)
+		}
+	}
+	for _, name := range []string{"other-config", "litellm-configs", "litellm-config-"} {
+		asked = nil
+		if got := liteLLMConfigMapRequests(context.Background(), cm(name), enqueue); len(got) != 0 {
+			t.Errorf("%s maps to %v, want nothing", name, got)
+		}
+		if len(asked) != 0 {
+			t.Errorf("%s asked for namespaces %v, want none", name, asked)
 		}
 	}
 }

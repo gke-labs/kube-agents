@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -169,6 +170,16 @@ func afterLast(s, sep string) string {
 func isLiteLLMConfigMapName(name string) bool {
 	return name == litellmConfigMapName ||
 		(strings.HasPrefix(name, litellmConfigMapHashedPrefix) && len(name) > len(litellmConfigMapHashedPrefix))
+}
+
+// liteLLMConfigMapRequests maps a LiteLLM config ConfigMap to the PlatformAgents in its
+// namespace, so an edited config reaches status.inference within a reconcile. Any other
+// ConfigMap maps to nothing.
+func liteLLMConfigMapRequests(ctx context.Context, obj client.Object, enqueue func(context.Context, string) []reconcile.Request) []reconcile.Request {
+	if !isLiteLLMConfigMapName(obj.GetName()) {
+		return nil
+	}
+	return enqueue(ctx, obj.GetNamespace())
 }
 
 // readInferenceModel reads the default model out of the install's LiteLLM config. The
