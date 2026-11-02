@@ -29,13 +29,7 @@ from .gitea import GiteaForge
 from .github import GitHubForge
 from .gitlab import GitLabForge
 
-AVAILABLE: tuple[type[Forge], ...] = (
-    GitHubForge,
-    GitLabForge,
-    GiteaForge,
-    BitbucketCloudForge,
-    BitbucketDataCenterForge,
-)
+AVAILABLE: tuple[type[Forge], ...] = (GitHubForge, GitLabForge, GiteaForge, BitbucketCloudForge, BitbucketDataCenterForge)
 
 
 # Hosts this design has a name and a shape for but no implementation of yet.
