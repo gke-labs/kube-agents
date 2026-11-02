@@ -1358,22 +1358,19 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
 
     def test_print_minter_restore_advice_names_the_restore_for_scheduled_versions(self):
         """A minter key whose versions a destroy scheduled needs a restore, not a
-        re-import: the helper names both of lifecycle.sh's branches and returns 0."""
+        re-import: the helper names gcloud's restore and enable and returns 0."""
         cmd = (
             f"{_SOURCE_INSTALLER_COMMON}"
             "kms_key_scheduled_version() { echo 3; }; "
-            'KUBE_AGENTS_STATE_BUCKET=b1 KUBE_AGENTS_STATE_PREFIX=kube-agents/c1; '
             'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
         )
         proc = self._run_install_func(cmd)
         out = proc.stdout + proc.stderr
         self.assertIn("rc=0", proc.stdout, out)
         self.assertIn("Its versions are scheduled for destruction, as a destroy of the key leaves them.", out)
-        # adopt-kms by hand needs this install's state backend, named in the command.
-        self.assertIn(
-            'cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET="b1" KUBE_AGENTS_STATE_PREFIX="kube-agents/c1" ./lifecycle.sh adopt-kms',
-            out,
-        )
+        # gcloud's restore works in or out of Terraform state; adopt-kms would
+        # need a checkout and state backend the installers do not have here.
+        self.assertNotIn("adopt-kms", out)
         self.assertIn(
             "gcloud kms keys versions restore <version> --key minter-key --keyring minter-ring --location us-central1 --project p1",
             out,
