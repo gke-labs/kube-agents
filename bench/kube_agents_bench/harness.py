@@ -1329,24 +1329,87 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
         )
 
 
+# Deletes the given cards' rows from the board, mirroring hermes'
+# ``kanban_db._delete_task_relations`` plus ``task_attachments`` and the
+# children patch's ``kanban_worker_children``, in one ``BEGIN IMMEDIATE``
+# transaction: the dispatcher's claim is a write too, so a card cannot start
+# running between its status read and its delete. A running card is kept (its
+# worker is alive and would write to a deleted row) and printed ``kept <id>``.
+# Raw ``sqlite3`` rather than ``hermes kanban archive --rm``: that is two cold
+# hermes starts, over a minute in the sandboxed container, and its ``archived``
+# event is one the gateway's notifier delivers to the card's subscribers.
+_PURGE_ROWS_SCRIPT = r"""
+import sqlite3, sys
+ROOT = sys.argv[1]
+ids = [a for a in sys.argv[2:] if a]
+BY_TASK = ("task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")
+try:
+    kb = sqlite3.connect("%s/kanban.db" % ROOT, timeout=10, isolation_level=None)
+    kb.execute("BEGIN IMMEDIATE")
+    tables = {r[0] for r in kb.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for tid in ids:
+        row = kb.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+        if row is None:
+            continue
+        if row[0] == "running":
+            print("kept %s" % tid)
+            continue
+        kb.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (tid, tid))
+        for table in BY_TASK:
+            if table in tables:
+                kb.execute("DELETE FROM %s WHERE task_id = ?" % table, (tid,))
+        if "kanban_worker_children" in tables:
+            kb.execute(
+                "DELETE FROM kanban_worker_children WHERE creator_id = ? OR child_id = ?", (tid, tid)
+            )
+        kb.execute("DELETE FROM tasks WHERE id = ?", (tid,))
+    kb.execute("COMMIT")
+    print("purged")
+except sqlite3.Error as exc:
+    print("rows kept: %s" % exc)
+"""
+
+
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
-    """Delete the attachments and worker log of every card this run filed.
+    """Delete the attachments, worker log and board rows of every card this run filed.
 
     The agent pod outlives the run, so without this each finished task leaves
     its report and its worker transcript on disk for the next run to find --
     which is how a repeat of a task reads back the previous attempt's answer
     instead of doing the work. Scoped to cards this harness delegated, so it
     cannot touch anything the run did not create.
+
+    The board rows go too (:data:`_PURGE_ROWS_SCRIPT`): every card view ends
+    with a "Recent work by @<assignee>" digest of that profile's last completed
+    runs on other cards (``kanban_db._ctx_role_history``, no switch to turn it
+    off), so a run left on the board hands the next run of the same case its
+    predecessor's summary in the worker's first ``kanban_show`` (#1730).
     """
     if not task_ids:
         return
     listing = " ".join(_shell_quote(t) for t in task_ids)
+    args = " ".join(_shell_quote(a) for a in [worker_trajectory.DATA_ROOT, *task_ids])
     script = (
         f"for t in {listing}; do "
         f'  rm -rf {_ATTACHMENTS_DIR}/"$t" {_LOGS_DIR}/"$t".log; '
-        "done"
+        "done; "
+        f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
+        f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
+        f'"$PY" -c {_shell_quote(_PURGE_ROWS_SCRIPT)} {args}'
     )
-    _agent_shell(script, timeout)
+    out = _agent_shell(script, timeout)
+    lines = out.splitlines()
+    kept = [line.split()[1] for line in lines if line.startswith("kept ")]
+    if kept:
+        _log.warning(
+            "cards %s were still running and stay on the board; the next run's role-history "
+            "digest can show their summaries", ", ".join(kept),
+        )
+    if "purged" not in lines:
+        _log.warning(
+            "could not delete the board rows of cards %s; the next run's role-history digest can "
+            "show their summaries (%s)", ", ".join(task_ids), out[:_LOG_EXCERPT_CHARS] or "no output",
+        )
 
 
 def _worker_token_buckets(
@@ -3852,7 +3915,14 @@ class KubeAgentsHarness(AgentHarness):
                 if infra_reason:
                     break
 
-        _purge_card_state(awaited, _EXEC_TIMEOUT)
+        # Every card the capture walked, the workers' fan-out included: a
+        # Cluster Agent profile outlives the run, and its digest would carry
+        # their summaries forward.
+        walked = [
+            str(c.get("task")) if isinstance(c, dict) else str(c)
+            for c in ((captured.summary.get("cards") if captured else None) or [])
+        ]
+        _purge_card_state(list(dict.fromkeys([*awaited, *(t for t in walked if t)])), _EXEC_TIMEOUT)
 
         if infra_reason and trajectory_clean and logs_clean and not agent_acted:
             _mark_result_infra_failure(

@@ -11,7 +11,9 @@ from __future__ import annotations
 import http.client
 import json
 import shlex
+import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -3793,6 +3795,110 @@ def test_a_cards_state_is_cleared_once_its_artifacts_are_read(
     assert _TASK_ID in purges[0]
     assert harness._ATTACHMENTS_DIR in purges[0]
     assert harness._LOGS_DIR in purges[0]
+
+
+def test_a_cards_board_rows_are_deleted_with_its_state(
+    stub_agent: _StubAgentServer, instant_polls: None, no_cluster_exec: list[str]
+) -> None:
+    """A run left on the board primes the next one through the role-history digest (#1730)."""
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    (purge,) = [s for s in no_cluster_exec if "rm -rf" in s]
+    assert harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in purge
+    q = harness._shell_quote
+    assert purge.endswith(f"{q(worker_trajectory.DATA_ROOT)} {q(_TASK_ID)}")
+
+
+# hermes v2026.9.14's ``_ctx_role_history`` query, verbatim: what the next
+# card's worker is shown as "Recent work by @<assignee>".
+_ROLE_HISTORY_SQL = (
+    "SELECT t.id, t.title, r.summary, r.ended_at "
+    "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+    "WHERE r.profile = ? AND r.task_id != ? "
+    "  AND r.outcome = 'completed' "
+    "ORDER BY r.ended_at DESC LIMIT 5"
+)
+
+
+def _purge_board(root: Path) -> sqlite3.Connection:
+    """A board with the tables the purge touches, minus ``task_attachments``."""
+    kb = sqlite3.connect(root / "kanban.db")
+    kb.executescript(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT);"
+        "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, profile TEXT,"
+        " outcome TEXT, summary TEXT, ended_at INTEGER);"
+        "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
+        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT);"
+        "CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, body TEXT);"
+        "CREATE TABLE kanban_notify_subs (task_id TEXT, chat_id TEXT);"
+        "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER);"
+    )
+    for tid, status, ended in [("t_done", "done", 3), ("t_run", "running", 2), ("t_other", "done", 1)]:
+        kb.execute("INSERT INTO tasks VALUES (?, ?, ?, 'platform')", (tid, tid, status))
+        kb.execute(
+            "INSERT INTO task_runs (task_id, profile, outcome, summary, ended_at) "
+            "VALUES (?, 'platform', 'completed', ?, ?)", (tid, f"fixed it in {tid}", ended),
+        )
+        kb.execute("INSERT INTO task_events (task_id, kind) VALUES (?, 'completed')", (tid,))
+    kb.execute("INSERT INTO task_links VALUES ('t_done', 't_other')")
+    kb.execute("INSERT INTO kanban_worker_children VALUES ('t_kid', 't_done', 0)")
+    kb.execute("INSERT INTO tasks VALUES ('t_next', 'next run', 'ready', 'platform')")
+    kb.commit()
+    return kb
+
+
+def test_the_purge_script_drops_a_settled_card_from_the_role_history(tmp_path: Path) -> None:
+    """Run in-pod against a board: the settled card is gone, a running one and others stay."""
+    kb = _purge_board(tmp_path)
+    before = [r[0] for r in kb.execute(_ROLE_HISTORY_SQL, ("platform", "t_next"))]
+    assert before == ["t_done", "t_run", "t_other"]
+
+    proc = subprocess.run(
+        [sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, str(tmp_path), "t_done", "t_run", "t_gone"],
+        capture_output=True, text=True, check=True,
+    )
+
+    assert proc.stdout.splitlines() == ["kept t_run", "purged"]
+    after = [r[0] for r in kb.execute(_ROLE_HISTORY_SQL, ("platform", "t_next"))]
+    assert after == ["t_run", "t_other"]
+    for table, column in [
+        ("tasks", "id"), ("task_runs", "task_id"), ("task_events", "task_id"),
+        ("task_links", "parent_id"), ("kanban_worker_children", "creator_id"),
+    ]:
+        assert kb.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} = 't_done'").fetchone() == (0,)
+
+
+def test_a_purge_that_cannot_reach_the_board_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "kept t_1\n")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._purge_card_state(["t_1", "t_2"], 5.0)
+    assert "cards t_1 were still running" in caplog.text
+    assert "could not delete the board rows of cards t_1, t_2" in caplog.text
+
+
+def test_settle_purges_the_cards_the_workers_fanned_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Cluster Agent profile outlives the run, so its cards' digest leaks too."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        summary={"cards": [
+            {"task": "t_1", "fanned_out": ["t_child"]},
+            {"task": "t_child", "fanned_out": []},
+        ]},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+    purged: list[str] = []
+    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, to: purged.extend(ids))
+
+    res = harness.AgentResult(output="ok", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert purged == ["t_1", "t_child"]
 
 
 def test_artifacts_are_read_before_the_card_state_is_purged(
