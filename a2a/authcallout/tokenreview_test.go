@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	authnv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -247,5 +250,225 @@ func TestValidateRefusesAnEmptyTokenWithoutCallingTheAPIServer(t *testing.T) {
 func TestNewTokenValidatorRefusesAnUnboundAudience(t *testing.T) {
 	if _, err := NewTokenValidator(fake.NewSimpleClientset(), ""); err == nil {
 		t.Fatal("a validator with no audience was built; that would accept every token in the cluster")
+	}
+}
+
+// countingReviewer is reviewer with a tally of the reviews that reached the
+// API server, so the tests below can say which presentations were answered
+// from memory.
+func countingReviewer(t *testing.T, respond func(*authnv1.TokenReview) (*authnv1.TokenReview, error)) (*fake.Clientset, *atomic.Int64) {
+	t.Helper()
+	var reviews atomic.Int64
+	c := reviewer(t, func(req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		reviews.Add(1)
+		return respond(req)
+	})
+	return c, &reviews
+}
+
+// A token presented again inside the TTL is answered from memory: a
+// reconnect burst costs one TokenReview per distinct token, not one per
+// attempt. The callout logs which, so the source is asserted too.
+func TestATokenPresentedTwiceWithinTheTTLIsReviewedOnce(t *testing.T) {
+	c, reviews := countingReviewer(t, boundToPod(gatewaySA, "chat-otter-1a2b", "uid-1234", testAudience))
+	v, _ := NewTokenValidator(c, testAudience)
+
+	first, source, err := v.validate(context.Background(), "a-token")
+	if err != nil || source != reviewFresh {
+		t.Fatalf("first presentation = %+v, %q, %v; want a fresh review", first, source, err)
+	}
+	second, source, err := v.validate(context.Background(), "a-token")
+	if err != nil || source != reviewCached {
+		t.Fatalf("second presentation = %+v, %q, %v; want the remembered answer", second, source, err)
+	}
+	if second != first {
+		t.Errorf("the remembered answer %+v differs from the reviewed one %+v", second, first)
+	}
+	if got := reviews.Load(); got != 1 {
+		t.Errorf("TokenReviews = %d for two presentations of one token; want 1", got)
+	}
+}
+
+// Only successes are remembered. A refusal is reviewed again on the next
+// presentation, so a token the cluster starts vouching for (or an API server
+// that comes back) is not held refused for the TTL.
+func TestARefusalIsNotRemembered(t *testing.T) {
+	cases := map[string]func(*authnv1.TokenReview) (*authnv1.TokenReview, error){
+		"not authenticated": func(req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+			req.Status = authnv1.TokenReviewStatus{Authenticated: false, Error: "invalid bearer token"}
+			return req, nil
+		},
+		"the wrong audience":   authenticated(gatewaySA, "https://kubernetes.default.svc"),
+		"not a ServiceAccount": authenticated("alice@example.com", testAudience),
+		"the API server unreachable": func(*authnv1.TokenReview) (*authnv1.TokenReview, error) {
+			return nil, errors.New("connection refused")
+		},
+	}
+	for name, respond := range cases {
+		t.Run(name, func(t *testing.T) {
+			c, reviews := countingReviewer(t, respond)
+			v, _ := NewTokenValidator(c, testAudience)
+			for i := 0; i < 2; i++ {
+				if _, err := v.Validate(context.Background(), "a-token"); err == nil {
+					t.Fatalf("presentation %d was accepted", i+1)
+				}
+			}
+			if got := reviews.Load(); got != 2 {
+				t.Errorf("TokenReviews = %d for two refused presentations; want 2, a refusal must not be remembered", got)
+			}
+		})
+	}
+}
+
+// After the TTL the token is reviewed again: the memory is a bound on the
+// next-connection revocation clock, and this is the bound.
+func TestARememberedTokenIsReviewedAgainAfterTheTTL(t *testing.T) {
+	c, reviews := countingReviewer(t, authenticated(gatewaySA, testAudience))
+	v, _ := NewTokenValidator(c, testAudience)
+	clock := time.Date(2026, time.November, 2, 1, 0, 0, 0, time.UTC)
+	v.now = func() time.Time { return clock }
+
+	for i := 0; i < 2; i++ {
+		if _, err := v.Validate(context.Background(), "a-token"); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+	}
+	clock = clock.Add(reviewCacheTTL - time.Second)
+	if _, err := v.Validate(context.Background(), "a-token"); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if got := reviews.Load(); got != 1 {
+		t.Fatalf("TokenReviews = %d inside the TTL; want 1", got)
+	}
+
+	clock = clock.Add(time.Second)
+	_, source, err := v.validate(context.Background(), "a-token")
+	if err != nil || source != reviewFresh {
+		t.Fatalf("presentation at the TTL = %q, %v; want a fresh review", source, err)
+	}
+	if got := reviews.Load(); got != 2 {
+		t.Errorf("TokenReviews = %d after the TTL; want 2", got)
+	}
+}
+
+// Expired entries leave with the next insert, so the map holds at most the
+// distinct tokens seen in one TTL rather than every token ever presented.
+func TestExpiredEntriesArePrunedOnInsert(t *testing.T) {
+	c, _ := countingReviewer(t, authenticated(gatewaySA, testAudience))
+	v, _ := NewTokenValidator(c, testAudience)
+	clock := time.Date(2026, time.November, 2, 1, 0, 0, 0, time.UTC)
+	v.now = func() time.Time { return clock }
+
+	for _, token := range []string{"token-one", "token-two", "token-three"} {
+		if _, err := v.Validate(context.Background(), token); err != nil {
+			t.Fatalf("Validate(%s): %v", token, err)
+		}
+	}
+	clock = clock.Add(reviewCacheTTL)
+	if _, err := v.Validate(context.Background(), "token-four"); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if len(v.cache) != 1 {
+		t.Errorf("cache holds %d entries after three expired and one was added; want 1", len(v.cache))
+	}
+}
+
+// Concurrent presentations of one token share one review: the burst a
+// reconnecting pod's connections make arrives at the API server as one call.
+func TestConcurrentPresentationsOfOneTokenShareOneReview(t *testing.T) {
+	const presentations = 32
+	var arrived sync.WaitGroup
+	arrived.Add(presentations)
+	c, reviews := countingReviewer(t, func(req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		// Hold the one review until every presentation has been made, so
+		// the collapse is the subject rather than the memory of a review
+		// that finished first.
+		arrived.Wait()
+		return authenticated(gatewaySA, testAudience)(req)
+	})
+	v, _ := NewTokenValidator(c, testAudience)
+
+	results := make(chan error, presentations)
+	for i := 0; i < presentations; i++ {
+		go func() {
+			arrived.Done()
+			att, err := v.Validate(context.Background(), "a-token")
+			if err == nil && att.ServiceAccount != gatewaySA {
+				err = errors.New("a shared review answered with " + att.ServiceAccount)
+			}
+			results <- err
+		}()
+	}
+	for i := 0; i < presentations; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("a presentation failed: %v", err)
+		}
+	}
+	if got := reviews.Load(); got != 1 {
+		t.Errorf("TokenReviews = %d for %d concurrent presentations of one token; want 1", got, presentations)
+	}
+}
+
+// Distinct tokens are distinct reviews: the memory is keyed by the token, and
+// one pod's attestation is never handed to another's presentation.
+func TestDistinctTokensAreReviewedSeparately(t *testing.T) {
+	c, reviews := countingReviewer(t, func(req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		return boundToPod(gatewaySA, "pod-for-"+req.Spec.Token, "uid-"+req.Spec.Token, testAudience)(req)
+	})
+	v, _ := NewTokenValidator(c, testAudience)
+	for _, token := range []string{"token-one", "token-two", "token-one", "token-two"} {
+		att, err := v.Validate(context.Background(), token)
+		if err != nil {
+			t.Fatalf("Validate(%s): %v", token, err)
+		}
+		if att.PodName != "pod-for-"+token {
+			t.Errorf("Validate(%s) attested pod %q; want the pod reviewed for that token", token, att.PodName)
+		}
+	}
+	if got := reviews.Load(); got != 2 {
+		t.Errorf("TokenReviews = %d for two distinct tokens presented twice each; want 2", got)
+	}
+}
+
+// A presentation waiting on another's review leaves when its own budget
+// runs out, with an error, while the review goes on for the one that started
+// it. A waiter that outlived its budget would hold a worker slot past the
+// point the client has given up.
+func TestAWaiterLeavesWhenItsOwnBudgetRunsOut(t *testing.T) {
+	release := make(chan struct{})
+	c, reviews := countingReviewer(t, func(req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		<-release
+		return authenticated(gatewaySA, testAudience)(req)
+	})
+	v, _ := NewTokenValidator(c, testAudience)
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := v.Validate(context.Background(), "a-token")
+		first <- err
+	}()
+	// The second presentation finds the first's review in flight.
+	deadline := time.Now().Add(5 * time.Second)
+	for reviews.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	att, err := v.Validate(ctx, "a-token")
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the waiter returned %+v, %v; want its own deadline", att, err)
+	}
+	if att != (Attested{}) {
+		t.Errorf("the waiter returned %+v alongside an error; it must return nothing usable", att)
+	}
+
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("the presentation that started the review failed: %v", err)
+	}
+	if got := reviews.Load(); got != 1 {
+		t.Errorf("TokenReviews = %d; want 1, the waiter must not have started another", got)
 	}
 }

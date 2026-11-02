@@ -2,13 +2,40 @@ package authcallout
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
+	"golang.org/x/sync/singleflight"
 	authnv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+)
+
+const (
+	// reviewCacheTTL is how long a successful TokenReview is remembered, so
+	// a reconnect burst costs one review per distinct token rather than one
+	// per attempt. Failures are never remembered.
+	//
+	// The number is a security trade and is documented as one: a deleted
+	// pod's token keeps opening NEW connections until the entry expires, so
+	// the next-connection revocation clock becomes the API server's own
+	// success cache (about ten seconds) plus this, about forty seconds in
+	// all. The bound on an ALREADY-OPEN connection is the grant TTL and is
+	// unchanged. docs/designs/spec-nats-deployment.md carries both clocks.
+	reviewCacheTTL = 30 * time.Second
+)
+
+// reviewSource says whether an attestation came from the API server on this
+// call or from the cache of a recent one.
+type reviewSource string
+
+const (
+	reviewFresh  reviewSource = "fresh"
+	reviewCached reviewSource = "cached"
 )
 
 // TokenValidator turns a client-presented Kubernetes ServiceAccount token into
@@ -21,9 +48,31 @@ import (
 // Local JWKS verification is the offline alternative the spec keeps for a
 // cluster where the callout must not depend on the API server; it is not
 // implemented here, and the seam to add it is this type.
+//
+// A successful review is remembered for reviewCacheTTL, keyed by the token's
+// SHA-256 so the token itself is not held on the heap, and concurrent
+// requests for one token share one review. It is safe for concurrent use;
+// the callout's worker pool calls it from many goroutines at once.
 type TokenValidator struct {
 	client   kubernetes.Interface
 	audience string
+
+	// now is injectable for tests. cacheTTL is reviewCacheTTL, or zero in
+	// a test that has to see every review.
+	now      func() time.Time
+	cacheTTL time.Duration
+
+	// group collapses concurrent reviews of one token into one call.
+	group singleflight.Group
+
+	mu    sync.Mutex
+	cache map[[sha256.Size]byte]cachedReview
+}
+
+// cachedReview is one remembered success and when it stops being one.
+type cachedReview struct {
+	att     Attested
+	expires time.Time
 }
 
 // NewTokenValidator builds a validator bound to one audience.
@@ -43,7 +92,13 @@ func NewTokenValidator(client kubernetes.Interface, audience string) (*TokenVali
 	if audience == "" {
 		return nil, fmt.Errorf("token validator needs an audience; see NewTokenValidator on why it may not be empty")
 	}
-	return &TokenValidator{client: client, audience: audience}, nil
+	return &TokenValidator{
+		client:   client,
+		audience: audience,
+		now:      time.Now,
+		cacheTTL: reviewCacheTTL,
+		cache:    map[[sha256.Size]byte]cachedReview{},
+	}, nil
 }
 
 // Attested is what the cluster vouched for about one presented token.
@@ -73,10 +128,77 @@ type Attested struct {
 // is an error and no failure returns an identity: a caller that ignores the
 // error must not be able to end up with a usable one.
 func (v *TokenValidator) Validate(ctx context.Context, token string) (Attested, error) {
+	att, _, err := v.validate(ctx, token)
+	return att, err
+}
+
+// validate is Validate, also saying whether the answer was reviewed on this
+// call or remembered from a recent one; the callout logs which.
+func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, reviewSource, error) {
 	if token == "" {
-		return Attested{}, fmt.Errorf("no token presented")
+		return Attested{}, "", fmt.Errorf("no token presented")
 	}
 
+	key := sha256.Sum256([]byte(token))
+	if att, ok := v.remembered(key); ok {
+		return att, reviewCached, nil
+	}
+
+	// One review per token however many connections present it at once:
+	// the others wait for the first's answer. DoChan rather than Do so a
+	// waiter whose own budget runs out leaves with its context's error
+	// instead of outliving it; the review itself goes on for the rest.
+	results := v.group.DoChan(string(key[:]), func() (any, error) {
+		att, err := v.review(ctx, token)
+		if err != nil {
+			return nil, err
+		}
+		v.remember(key, att)
+		return att, nil
+	})
+	select {
+	case r := <-results:
+		if r.Err != nil {
+			return Attested{}, "", r.Err
+		}
+		return r.Val.(Attested), reviewFresh, nil
+	case <-ctx.Done():
+		return Attested{}, "", fmt.Errorf("TokenReview call failed: %w", ctx.Err())
+	}
+}
+
+// remembered returns a cached success that has not expired.
+func (v *TokenValidator) remembered(key [sha256.Size]byte) (Attested, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	entry, ok := v.cache[key]
+	if !ok || !v.now().Before(entry.expires) {
+		return Attested{}, false
+	}
+	return entry.att, true
+}
+
+// remember stores a success until the TTL, and drops every entry that has
+// expired while it is there, so the map holds at most the distinct tokens
+// seen in one TTL.
+func (v *TokenValidator) remember(key [sha256.Size]byte, att Attested) {
+	if v.cacheTTL <= 0 {
+		return
+	}
+	now := v.now()
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for k, entry := range v.cache {
+		if !now.Before(entry.expires) {
+			delete(v.cache, k)
+		}
+	}
+	v.cache[key] = cachedReview{att: att, expires: now.Add(v.cacheTTL)}
+}
+
+// review asks the API server, and refuses every answer short of an
+// authenticated ServiceAccount for the bound audience.
+func (v *TokenValidator) review(ctx context.Context, token string) (Attested, error) {
 	review, err := v.client.AuthenticationV1().TokenReviews().Create(ctx, &authnv1.TokenReview{
 		ObjectMeta: metav1.ObjectMeta{},
 		Spec: authnv1.TokenReviewSpec{
