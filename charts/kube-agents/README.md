@@ -1209,17 +1209,21 @@ The install notes end with what the release asks of the cluster and what that co
 price: the total pod CPU and memory requests, the pod count, and the persistent storage over
 its claims, summed exactly as the preflight above sums them (`kube-agents.footprintSummary`
 in `_helpers.tpl` calls the same template), then a monthly figure modeled from us-central1
-GKE Autopilot list prices, $0.0445 per vCPU-hour and $0.0049225 per GiB-hour over a 730-hour
-month plus $0.10 per GiB-month of balanced persistent disk, with the $73 per month GKE
-cluster fee on its own line because it is per cluster rather than per release. The block
-is labelled `(modeled from us-central1 list prices, excluding LLM tokens)`: the rates are
-pinned in the chart, not looked up, and model tokens, node overheads and anything outside
-the release are not in it. It prints on `helm install --dry-run` and `helm template` as
-well, so it can be read before anything is applied; `install.sh` renders the same template
-in its pre-flight summary, so the installer prints the figures the notes will. It follows
+GKE Autopilot list prices: the `kube-agents.footprintPrice*` defines in `_helpers.tpl` pin the
+rate per vCPU-hour and per GiB-hour of memory, applied over the `footprintHoursPerMonth`
+billing month, and the rate per GiB-month of balanced persistent disk, with the
+`footprintClusterFeePerMonth` GKE cluster fee on its own line because it is per cluster rather
+than per release. The block is labelled `(modeled from us-central1 list prices, excluding LLM
+tokens)`: the rates are pinned in the chart, not looked up, and are applied to the declared
+requests, so model tokens, Autopilot's per-Pod minimums and request rounding, ephemeral-storage
+requests, node overheads and anything outside the release are not in it, and on a Standard
+cluster the bill is the node pools, which pod requests do not price. Helm prints the notes
+after an install or upgrade, and on `helm install --dry-run` without applying (`helm template`
+renders no notes); `install.sh` renders the same template in its pre-flight summary, so the
+installer prints the figures the notes will, for the values its generator writes. It follows
 `quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
 refusals name that switch as the way round them. Under `spec.mode: next` it says what it
-leaves out: the A2A workloads and the session pods, which the
+leaves out: the A2A workloads, NATS's JetStream claim and the session pods, which the
 [install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) list.
 
 #### Upgrade notes: operator memory floor

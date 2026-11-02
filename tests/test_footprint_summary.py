@@ -4,7 +4,7 @@ storage with a monthly cost modeled from us-central1 list prices, printed by NOT
 through the same template.
 
 The tests render a throwaway copy of the chart whose NOTES.txt is captured into a ConfigMap
-(the probe tests/test_chart_third_party_image_registry.py uses) beside a second probe that
+(tests.testing.common.chart_with_notes_probe) beside a second probe that
 emits `kube-agents.quotaRequirements` as JSON, so each figure in the notes is checked against
 the pinned formula over the totals the quota preflight sums, at defaults and with fleet-sized
 overrides.
@@ -14,6 +14,7 @@ Run: python3 -m unittest discover -s tests -p 'test_footprint_summary.py' -v
 
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -21,9 +22,13 @@ import unittest
 
 import yaml
 
+from tests.testing.common import NOTES_PROBE_CONFIGMAP, chart_with_notes_probe
+
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
 _HELM = shutil.which("helm")
+_HELPERS = _CHART / "templates" / "_helpers.tpl"
+_CHART_README = _CHART / "README.md"
 
 _REQUIRED = [
     "--set", "platformAgent.harness.clusterName=ci-cluster",
@@ -35,10 +40,20 @@ _REQUIRED = [
 # fixed them and _helpers.tpl declares them. A change to either side fails here.
 _CPU_PER_VCPU_HOUR = 0.0445
 _MEMORY_PER_GIB_HOUR = 0.0049225
-_SSD_PER_GIB_MONTH = 0.10
+_DISK_PER_GIB_MONTH = 0.10
 _HOURS_PER_MONTH = 730
 _CLUSTER_FEE_PER_MONTH = 73
 _LABEL = "(modeled from us-central1 list prices, excluding LLM tokens)"
+_COST_HEADER = "Modeled monthly cost on GKE Autopilot " + _LABEL
+# The defines that pin the prices, and what each prints.
+_PRICE_DEFINES = {
+    "kube-agents.footprintPriceRegion": "us-central1",
+    "kube-agents.footprintPriceCpuPerVcpuHour": "0.0445",
+    "kube-agents.footprintPriceMemoryPerGiBHour": "0.0049225",
+    "kube-agents.footprintPriceBalancedDiskPerGiBMonth": "0.10",
+    "kube-agents.footprintHoursPerMonth": "730",
+    "kube-agents.footprintClusterFeePerMonth": "73",
+}
 _GIB = 1024**3
 _MILLIS_PER_CORE = 1000
 
@@ -74,16 +89,16 @@ def _expected_lines(req: dict) -> dict:
     """The summary's figures from the quota totals, by the formula the template pins."""
     cores = req["requestsCpu"] / _MILLIS_PER_CORE
     memory_gib = req["requestsMemory"] / _GIB
-    ssd_gib = req["requestsStorage"] / _GIB
+    disk_gib = req["requestsStorage"] / _GIB
     cpu_cost = cores * _CPU_PER_VCPU_HOUR * _HOURS_PER_MONTH
     memory_cost = memory_gib * _MEMORY_PER_GIB_HOUR * _HOURS_PER_MONTH
-    ssd_cost = ssd_gib * _SSD_PER_GIB_MONTH
-    total = cpu_cost + memory_cost + ssd_cost
+    disk_cost = disk_gib * _DISK_PER_GIB_MONTH
+    total = cpu_cost + memory_cost + disk_cost
     return {
         "cpu": f"CPU requests:        {cores:.3f} cores",
         "memory": f"Memory requests:     {memory_gib:.2f} GiB",
         "pods": f"Pods:                {req['pods']}",
-        "storage": f"Persistent storage:  {ssd_gib:.0f} GiB over {req['persistentVolumeClaims']} claims",
+        "storage": f"Persistent storage:  {disk_gib:.0f} GiB over {req['persistentVolumeClaims']} claims",
         "cpu_cost": (
             f"CPU:      {cores:.3f} cores x ${_CPU_PER_VCPU_HOUR}/vCPU-hour"
             f" x {_HOURS_PER_MONTH} hours = ${cpu_cost:.2f}"
@@ -92,7 +107,7 @@ def _expected_lines(req: dict) -> dict:
             f"Memory:   {memory_gib:.2f} GiB x ${_MEMORY_PER_GIB_HOUR}/GiB-hour"
             f" x {_HOURS_PER_MONTH} hours = ${memory_cost:.2f}"
         ),
-        "ssd_cost": f"SSD:      {ssd_gib:.0f} GiB x ${_SSD_PER_GIB_MONTH:.2f}/GiB-month = ${ssd_cost:.2f}",
+        "disk_cost": f"Disk:     {disk_gib:.0f} GiB x ${_DISK_PER_GIB_MONTH:.2f}/GiB-month = ${disk_cost:.2f}",
         "total": (
             f"Total:    ${total:.2f}/month, plus the ${_CLUSTER_FEE_PER_MONTH:.2f}/month"
             " GKE cluster fee (per cluster, noted separately)"
@@ -105,19 +120,8 @@ class FootprintSummaryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory()
-        chart = pathlib.Path(cls._tmp.name) / "kube-agents"
-        shutil.copytree(_CHART, chart)
-        templates = chart / "templates"
-        notes = (templates / "NOTES.txt").read_text()
-        (templates / "NOTES.txt").unlink()
-        (templates / "_notes_under_test.tpl").write_text(
-            '{{- define "notes-under-test" -}}\n' + notes + "\n{{- end -}}\n"
-        )
-        (templates / "notes-under-test.yaml").write_text(
-            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes-under-test\n"
-            'data:\n  notes: {{ include "notes-under-test" . | toJson }}\n'
-        )
-        (templates / "zz-probe-requirements.yaml").write_text(_REQUIREMENTS_PROBE)
+        chart = chart_with_notes_probe(_CHART, pathlib.Path(cls._tmp.name) / "kube-agents")
+        (chart / "templates" / "zz-probe-requirements.yaml").write_text(_REQUIREMENTS_PROBE)
         cls.chart = chart
 
     @classmethod
@@ -133,7 +137,7 @@ class FootprintSummaryTest(unittest.TestCase):
         notes = requirements = None
         for doc in yaml.safe_load_all(proc.stdout):
             name = (doc or {}).get("metadata", {}).get("name")
-            if name == "notes-under-test":
+            if name == NOTES_PROBE_CONFIGMAP:
                 notes = doc["data"]["notes"]
             elif name == "probe-requirements":
                 requirements = json.loads(doc["data"]["requirements"])
@@ -142,7 +146,7 @@ class FootprintSummaryTest(unittest.TestCase):
         return notes, requirements
 
     def _assert_summary_matches(self, notes: str, req: dict) -> None:
-        self.assertIn(_LABEL, notes)
+        self.assertIn(_COST_HEADER, notes)
         for key, line in _expected_lines(req).items():
             self.assertIn(line, notes, f"{key}: expected line missing from NOTES:\n{notes}")
 
@@ -159,6 +163,9 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("$0.10/GiB-month", notes)
         self.assertIn("$73.00/month GKE cluster fee", notes)
         self.assertNotIn("Not counted: the spec.mode next workloads", notes)
+        # The disk is the balanced class on the footprint line and on the cost line alike.
+        self.assertIn("balanced persistent disk", notes)
+        self.assertNotIn("SSD", notes)
 
     def test_fleet_sized_overrides_move_every_figure(self) -> None:
         _, defaults = self._render()
@@ -182,6 +189,9 @@ class FootprintSummaryTest(unittest.TestCase):
     def test_next_mode_names_what_the_summary_leaves_out(self) -> None:
         notes, _ = self._render(["platformAgent.mode=next"])
         self.assertIn("Not counted: the spec.mode next workloads", notes)
+        self.assertIn("40 GiB JetStream claim", notes)
+        today, _ = self._render(["platformAgent.mode=today"])
+        self.assertNotIn("Not counted", today)
 
     def test_summary_follows_the_quota_preflight_switch(self) -> None:
         # The summary shares the preflight's arithmetic, and the preflight's refusals name
@@ -189,6 +199,29 @@ class FootprintSummaryTest(unittest.TestCase):
         notes, _ = self._render(["quotaPreflight.enabled=false"])
         self.assertNotIn("Release footprint", notes)
         self.assertNotIn(_LABEL, notes)
+
+
+class PinnedPricesTest(unittest.TestCase):
+    """The defines hold the pinned figures, and the README names the defines rather than
+    restating numbers that nothing would check."""
+
+    def test_the_defines_hold_the_pinned_prices(self) -> None:
+        helpers = _HELPERS.read_text()
+        for name, value in _PRICE_DEFINES.items():
+            match = re.search(r'\{\{- define "' + re.escape(name) + r'" -\}\}\n(.*)\n\{\{- end \}\}', helpers)
+            self.assertIsNotNone(match, f"{name} is not defined")
+            self.assertEqual(match.group(1).strip(), value, name)
+
+    def test_the_readme_names_the_defines_not_the_figures(self) -> None:
+        readme = _CHART_README.read_text()
+        section = readme[readme.index("#### Footprint summary and modeled cost"):readme.index("#### Upgrade notes: operator memory floor")]
+        self.assertIn("`kube-agents.footprintPrice*`", section)
+        self.assertIn("`footprintHoursPerMonth`", section)
+        self.assertIn("`footprintClusterFeePerMonth`", section)
+        for value in ("0.0445", "0.0049225", "730-hour", "$73"):
+            self.assertNotIn(value, section, f"the README restates {value}; name the define instead")
+        self.assertIn("us-central1", section)
+        self.assertNotIn("`helm template` as well", section)
 
 
 if __name__ == "__main__":

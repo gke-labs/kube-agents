@@ -99,7 +99,7 @@ The first command omits a key whose value is unset, so a requirement that is not
 
 The chart's quota check counts a `today` release only, not the `spec.mode: next` additions in the capacity row above or the session pods. Autopilot sizes nodes to fit; on a Standard cluster, check the free allocatable against those figures, or a session pod stays `Pending` when one is asked for.
 
-The chart's install notes and the `install.sh` pre-flight summary print the release's requested CPU, memory, pods and persistent storage with a monthly cost modeled from us-central1 list prices, model tokens excluded, before anything is applied.
+The `install.sh` pre-flight summary prints the release's requested CPU, memory, pods and persistent storage, with a monthly cost modeled from us-central1 list prices, model tokens excluded, before anything is applied. The chart's install notes repeat the figures after the apply.
 
 A quota is more than CPU and memory, and so is the check: a `today` install also needs 7
 pods, 4 persistent volume claims totalling 102 GiB of `requests.storage`, and 14,912 MiB of

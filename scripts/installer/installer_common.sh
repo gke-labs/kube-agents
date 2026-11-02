@@ -113,6 +113,14 @@ readonly FOOTPRINT_PROBE_TEMPLATE="templates/footprint-summary.yaml"
 readonly FOOTPRINT_PROBE_KEY="summary"
 readonly FOOTPRINT_SUMMARY_TEMPLATE="kube-agents.footprintSummary"
 readonly FOOTPRINT_PROBE_RELEASE="footprint-summary"
+# The block scalar's indent in the probe: what the template indents the summary
+# by, and what the extractor strips.
+readonly FOOTPRINT_PROBE_INDENT=4
+# The tfvars key the cluster shape is written under; the rates the summary
+# applies are Autopilot's, which price pod requests, and a Standard cluster is
+# billed for its node pools instead.
+readonly FOOTPRINT_CLUSTER_MODE_KEY="cluster_mode"
+readonly FOOTPRINT_STANDARD_CLUSTER_MODE="standard"
 # The footprint-shaping settings, read from the terraform.tfvars the generator
 # wrote (the composition's input) and passed to the chart under the key
 # terraform/examples/full-install/main.tf maps each to: tfvars key=chart value,
@@ -121,7 +129,8 @@ readonly FOOTPRINT_TFVARS_VALUE_MAP="platform_agent_storage_size=platformAgent.s
 memory_provider=platformAgent.harness.memory.provider
 hermes_dashboard_enabled=platformAgent.harness.hermes.dashboardEnabled
 web_console_enabled=webConsole.enabled
-enable_github_minter=githubMinter.enabled"
+enable_github_minter=githubMinter.enabled
+platform_agent_mode=platformAgent.mode"
 
 # ─── OpenAI-compatible model server ───────────────────────────────────────────
 # The ports a base URL without one is dialled on, and the TCP port range.
@@ -939,8 +948,8 @@ render_footprint_summary() {
   cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}"
   # A ConfigMap, so the output is one YAML document helm's manifest sorter
   # reads; the block scalar keeps the summary's lines as they are.
-  printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n  %s: |\n{{ include "%s" . | indent 4 }}\n' \
-    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}"
+  printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n  %s: |\n{{ include "%s" . | indent %s }}\n' \
+    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}"
   local -a set_args=()
   while IFS= read -r pair; do
     [ -n "$pair" ] || continue
@@ -956,8 +965,10 @@ render_footprint_summary() {
     printf '%s\n' "$rendered" >&2
     return "$rc"
   fi
-  # The block scalar's lines, their four-space indent removed.
-  printf '%s\n' "$rendered" | sed -n -E "/^  ${FOOTPRINT_PROBE_KEY}: \|\$/,\$ { /^  ${FOOTPRINT_PROBE_KEY}: \|\$/d; s/^    //p; }"
+  # The block scalar's lines, their indent removed.
+  local pad
+  printf -v pad '%*s' "$FOOTPRINT_PROBE_INDENT" ''
+  printf '%s\n' "$rendered" | sed -n -E "/^  ${FOOTPRINT_PROBE_KEY}: \|\$/,\$ { /^  ${FOOTPRINT_PROBE_KEY}: \|\$/d; s/^${pad}//p; }"
 }
 
 # install.sh's step 11 entry for the footprint: the rendered summary, indented
@@ -965,14 +976,25 @@ render_footprint_summary() {
 # rendered. Never fails: the summary informs the confirmation and decides
 # nothing, so a chart that cannot be rendered here is reported and the run goes
 # on to the apply, where the same render failing is the error that stops it.
+# Two things the render cannot see are said under it when they apply: a
+# Standard cluster, whose bill is its node pools rather than the pod requests
+# the Autopilot rates price, and chart values carried through the
+# composition's extra_helm_values (TF_VAR_extra_helm_values, or a *.auto.tfvars
+# beside the generated file), which reach the apply but not this render.
 print_footprint_summary() {
   local repo_dir="$1" tfvars_file="$2" summary err_file
   err_file="$(mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
   if summary="$(render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
     printf '%s\n' "$summary" | sed 's/^/      /'
+    if [ "$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_CLUSTER_MODE_KEY")" = "$FOOTPRINT_STANDARD_CLUSTER_MODE" ]; then
+      print_info "This is a GKE Standard cluster: the modeled cost prices pod requests at Autopilot rates, and a Standard cluster is billed for its node pools (the gVisor pool the install creates among them) whatever the pods request."
+    fi
+    if [ -n "${TF_VAR_extra_helm_values:-}" ] || compgen -G "$(dirname "$tfvars_file")/*.auto.tfvars" >/dev/null; then
+      print_info "Chart values set through the composition's extra_helm_values are not in this figure; the chart's install notes after the apply show the release as applied."
+    fi
   else
     print_warning "Could not render the release footprint summary: $(tr '\n' ' ' < "$err_file" | sed 's/[[:space:]]*$//')"
-    print_info "The same figures print in the chart's install notes (helm template or helm install --dry-run on ${FOOTPRINT_CHART_SUBDIR})."
+    print_info "The chart's install notes print the same figures after the apply, and a helm install --dry-run of ${FOOTPRINT_CHART_SUBDIR} with the install's values prints them without applying."
   fi
   rm -f "$err_file"
 }

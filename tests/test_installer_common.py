@@ -17,7 +17,12 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
+from tests.testing.common import (
+    NOTES_PROBE_TEMPLATE,
+    chart_with_notes_probe,
+    create_minimal_tools_bin,
+    get_isolated_test_env,
+)
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
@@ -5941,7 +5946,10 @@ enable_github_minter = true
 hermes_dashboard_enabled = false
 web_console_enabled      = true   # trailing comment
 memory_provider          = "kube_agents_memory"
+platform_agent_mode = "next"
+cluster_mode = "autopilot"
 """
+_MAIN_TF = _REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
 
 # The `--set` each tfvars key becomes, as terraform/examples/full-install/main.tf
 # maps them onto the chart.
@@ -5951,7 +5959,83 @@ _FOOTPRINT_EXPECTED_SETS = [
     "--set platformAgent.harness.hermes.dashboardEnabled=false",
     "--set webConsole.enabled=true",
     "--set githubMinter.enabled=true",
+    "--set platformAgent.mode=next",
 ]
+
+# The chart keys kube-agents.quotaRequirements (and the summary's own mode read) take
+# their figures from and the composition can set from a tfvar: a `var.` the composition
+# puts under one of these, or under a `resources` subtree of a summed workload, has to
+# be a line in FOOTPRINT_TFVARS_VALUE_MAP, or the installer's figure drifts from the
+# notes' while every test stays green.
+_FOOTPRINT_READ_KEYS = {
+    "operator.enabled", "operator.replicaCount",
+    "litellm.enabled", "litellm.replicaCount",
+    "hindsight.enabled", "hindsight.postgresql.storage",
+    "githubMinter.enabled", "githubMinter.replicaCount",
+    "webConsole.enabled",
+    "platformAgent.enabled", "platformAgent.mode", "platformAgent.cleanupHook.enabled",
+    "platformAgent.storage.size",
+    "platformAgent.harness.memory.provider",
+    "platformAgent.harness.hermes.dashboardEnabled",
+    "platformAgent.deployment.availability.replicas",
+}
+_FOOTPRINT_READ_SUBTREES = (
+    "operator.resources", "litellm.resources", "githubMinter.resources", "webConsole.resources",
+    "hindsight.api.resources", "hindsight.postgresql.resources",
+    "platformAgent.deployment.credentialProxy.resources",
+    "platformAgent.deployment.agentAPIAuth.resources",
+    "platformAgent.harness.experimental.shellSandbox.resources",
+)
+_HCL_TOKEN = re.compile(
+    r'"[^"\\]*(?:\\.[^"\\]*)*"|#[^\n]*|\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)'
+    r"|\bmerge\(|\bvar\.([A-Za-z_][A-Za-z0-9_]*)|[{}()\[\]]"
+)
+
+
+def _composition_chart_vars():
+    """Every (chart key, tfvar) the kube_agents helm_release's first values document assigns.
+
+    Walks the HCL with a stack of enclosing keys: `key = {` and `key = merge(` push the
+    key, other brackets push an anonymous frame, and a `var.x` met right after `leaf =`
+    records the path. A `var.x` in a condition (`var.x ? {...} : {}`) has no leaf and is
+    skipped: it decides whether a block renders, and the block's own assignments record
+    what it sets.
+    """
+    src = _MAIN_TF.read_text()
+    release = src.index('resource "helm_release" "kube_agents"')
+    pos = src.index("values = [yamlencode(", release) + len("values = [yamlencode(")
+    stack, closers, pairs, pending = [], [], set(), None
+    while True:
+        m = _HCL_TOKEN.search(src, pos)
+        assert m is not None, "unterminated values block"
+        tok, pos = m.group(0), m.end()
+        if tok.startswith('"') or tok.startswith("#"):
+            continue
+        if m.group(1):
+            pending = m.group(1)
+            continue
+        if tok in ("merge(", "{", "(", "["):
+            stack.append(pending if tok in ("merge(", "{") else None)
+            closers.append("}" if tok == "{" else ")" if tok.endswith("(") else "]")
+            pending = None
+            continue
+        if tok in "})]":
+            closers.pop()
+            stack.pop()
+            if not closers:
+                return pairs
+            continue
+        if m.group(2) and pending:
+            pairs.add((".".join(k for k in stack if k) + "." + pending, m.group(2)))
+            pending = None
+
+
+def _footprint_value_map():
+    """FOOTPRINT_TFVARS_VALUE_MAP as installer_common.sh declares it: {tfvar: chart key}."""
+    text = _INSTALLER_COMMON.read_text()
+    match = re.search(r'readonly FOOTPRINT_TFVARS_VALUE_MAP="([^"]*)"', text)
+    assert match, "FOOTPRINT_TFVARS_VALUE_MAP not declared"
+    return dict(line.split("=", 1) for line in match.group(1).splitlines() if line)
 
 # A helm that answers `template` with the probe ConfigMap's shape, the arguments it
 # was given as the summary's one line, so the test reads the --set mapping and the
@@ -5976,6 +6060,7 @@ _NOTES_SETS = [
     "--set", "platformAgent.integration.github.gitRepo=foo/bar",
     "--set", "platformAgent.integration.github.org=foo",
     "--set", "webConsole.enabled=true",
+    "--set", "platformAgent.mode=next",
 ]
 
 
@@ -6002,7 +6087,10 @@ class FootprintSummaryTest(unittest.TestCase):
                     helm.write_text(helm_script)
                     helm.chmod(helm.stat().st_mode | stat.S_IEXEC)
                 env = get_isolated_test_env(overrides={"TFVARS": str(tfvars_path)}, bin_dir=str(bin_dir))
-            body = f'set -u\n{_PRINT_STUBS}\nprint_warning() {{ echo "WARN: $*"; }}\nsource "{_INSTALLER_COMMON}"\n{script}'
+            body = (
+                f'set -u\n{_PRINT_STUBS}\nprint_warning() {{ echo "WARN: $*"; }}\n'
+                f'print_info() {{ echo "INFO: $*"; }}\nsource "{_INSTALLER_COMMON}"\n{script}'
+            )
             return subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT))
 
     def test_tfvars_scalar_reads_the_generator_shapes(self):
@@ -6044,6 +6132,42 @@ class FootprintSummaryTest(unittest.TestCase):
         for item in _FOOTPRINT_EXPECTED_SETS[1:]:
             self.assertNotIn(item.split("=")[0], proc.stdout)
 
+    def test_the_map_carries_every_footprint_key_the_composition_sets_from_a_tfvar(self):
+        # Checked against main.tf, the mapping's owner, rather than against a copy of
+        # the map: a composition variable that reaches a key the summary reads and is
+        # not forwarded makes the installer's figure differ from the notes'.
+        pairs = _composition_chart_vars()
+        self.assertGreater(len(pairs), 20, pairs)
+        value_map = _footprint_value_map()
+        footprint_pairs = {
+            (key, var) for key, var in pairs
+            if key in _FOOTPRINT_READ_KEYS or key.startswith(tuple(f"{s}." for s in _FOOTPRINT_READ_SUBTREES))
+        }
+        self.assertTrue(footprint_pairs)
+        for key, var in sorted(footprint_pairs):
+            self.assertEqual(value_map.get(var), key, f"main.tf sets {key} from var.{var}; FOOTPRINT_TFVARS_VALUE_MAP must carry {var}={key}")
+        for var, key in value_map.items():
+            self.assertIn((key, var), pairs, f"the map forwards {var} to {key}, which main.tf does not set from var.{var}")
+
+    def test_a_standard_cluster_is_told_the_rates_price_pods_not_nodes(self):
+        standard = _FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"')
+        proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM, tfvars=standard)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("This is a GKE Standard cluster", proc.stdout)
+        proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM)
+        self.assertNotIn("GKE Standard cluster", proc.stdout)
+
+    def test_extra_helm_values_are_named_as_outside_the_figure(self):
+        script = f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"'
+        caveat = "Chart values set through the composition's extra_helm_values are not in this figure"
+        proc = self._run(script, helm_script=_ECHO_HELM)
+        self.assertNotIn(caveat, proc.stdout)
+        proc = self._run("export TF_VAR_extra_helm_values='{litellm={replicaCount=4}}'\n" + script, helm_script=_ECHO_HELM)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn(caveat, proc.stdout)
+        proc = self._run('touch "$(dirname "$TFVARS")/extra.auto.tfvars"\n' + script, helm_script=_ECHO_HELM)
+        self.assertIn(caveat, proc.stdout)
+
     def test_render_fails_naming_the_cause_when_helm_refuses(self):
         proc = self._run(
             f'render_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
@@ -6076,24 +6200,15 @@ class FootprintSummaryTest(unittest.TestCase):
         # the settings the tfvars carry reached the render.
         self.assertIn("Persistent storage:  410 GiB over 5 claims", proc.stdout)
         self.assertIn("Pods:                12", proc.stdout)
+        # The tfvars say next, so the installer prints the caveat the notes print.
+        self.assertIn("Not counted: the spec.mode next workloads", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
         # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
         with tempfile.TemporaryDirectory() as tmp:
-            chart = pathlib.Path(tmp) / "kube-agents"
-            shutil.copytree(_REPO_ROOT / "charts" / "kube-agents", chart)
-            templates = chart / "templates"
-            notes = (templates / "NOTES.txt").read_text()
-            (templates / "NOTES.txt").unlink()
-            (templates / "_notes_under_test.tpl").write_text(
-                '{{- define "notes-under-test" -}}\n' + notes + "\n{{- end -}}\n"
-            )
-            (templates / "notes-under-test.yaml").write_text(
-                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes-under-test\n"
-                'data:\n  notes: {{ include "notes-under-test" . | toJson }}\n'
-            )
+            chart = chart_with_notes_probe(_REPO_ROOT / "charts" / "kube-agents", pathlib.Path(tmp) / "kube-agents")
             rendered = subprocess.run(
                 ["helm", "template", "test-release", str(chart), "--show-only",
-                 "templates/notes-under-test.yaml", *_NOTES_SETS],
+                 NOTES_PROBE_TEMPLATE, *_NOTES_SETS],
                 capture_output=True, text=True, check=True,
             )
             notes_text = json.loads(rendered.stdout.split("notes: ", 1)[1].strip())
