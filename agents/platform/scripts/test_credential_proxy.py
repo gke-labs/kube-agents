@@ -3444,6 +3444,83 @@ class ChildMemoryBudgetDerivationTest(unittest.TestCase):
         self.assertEqual(2, credential_proxy.BUDGET_MINIMUM_ADMITTED_REQUESTS)
 
 
+class KeyedLockMapTest(unittest.TestCase):
+    """`_KeyedLockMap`: one lock per key, bounded without splitting a key."""
+
+    def enters_promptly(self, locks, key, timeout=2):
+        """Whether a thread can take `key` within `timeout` seconds."""
+        entered = threading.Event()
+        release = threading.Event()
+
+        def run():
+            with locks.held(key):
+                entered.set()
+                release.wait(timeout=timeout)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        got_in = entered.wait(timeout=timeout)
+        release.set()
+        thread.join(timeout=timeout)
+        return got_in
+
+    def test_the_same_key_serialises_and_different_keys_do_not(self):
+        locks = credential_proxy._KeyedLockMap()
+        with locks.held("slow-cluster"):
+            self.assertFalse(self.enters_promptly(locks, "slow-cluster", timeout=0.2),
+                             "a second holder of the same key got in")
+            self.assertTrue(self.enters_promptly(locks, "fast-cluster"),
+                            "another key waited behind the held one")
+        self.assertTrue(self.enters_promptly(locks, "slow-cluster"), "the key stayed locked after release")
+
+    def test_a_key_seen_again_finds_its_lock_rather_than_a_new_one(self):
+        locks = credential_proxy._KeyedLockMap()
+        with locks.held("cluster-a"):
+            first = locks._entries["cluster-a"]
+        with locks.held("cluster-a"):
+            self.assertIs(first, locks._entries["cluster-a"])
+        self.assertEqual(1, len(locks))
+
+    def test_a_full_map_drops_only_the_entries_nobody_holds(self):
+        locks = credential_proxy._KeyedLockMap(max_keys=2)
+        with locks.held("released"):
+            pass
+        with locks.held("held"):
+            held_entry = locks._entries["held"]
+            self.assertEqual(2, len(locks))
+            with locks.held("new"):
+                self.assertEqual(["held", "new"], sorted(locks._entries))
+                self.assertIs(held_entry, locks._entries["held"])
+        # Both released and the map at its cap: the next lookup drops both.
+        with locks.held("another"):
+            self.assertEqual(["another"], sorted(locks._entries))
+
+    def test_an_entry_a_thread_has_found_but_not_yet_acquired_survives_eviction(self):
+        # The window a try-acquire test would miss: a thread has looked its
+        # key up and not yet taken the lock. Counted as a holder from the
+        # lookup, its entry stays, so a later arrival for the same key joins
+        # the same lock instead of being handed a second one.
+        locks = credential_proxy._KeyedLockMap(max_keys=1)
+        waiting = locks._enter("cluster-a")
+        self.assertFalse(waiting.lock.locked())
+        with locks.held("cluster-b"):
+            self.assertIs(waiting, locks._entries.get("cluster-a"), "the unacquired entry was dropped")
+        with locks.held("cluster-a"):
+            self.assertIs(waiting, locks._entries["cluster-a"])
+        locks._leave(waiting)
+        self.assertEqual(0, waiting.holders)
+        # Released by everyone, it is now fair game for the next full lookup.
+        with locks.held("cluster-c"):
+            self.assertNotIn("cluster-a", locks._entries)
+
+    def test_more_holders_than_the_cap_grow_the_map_rather_than_split_a_key(self):
+        locks = credential_proxy._KeyedLockMap(max_keys=1)
+        with locks.held("cluster-a"), locks.held("cluster-b"):
+            self.assertEqual(2, len(locks))
+            self.assertFalse(self.enters_promptly(locks, "cluster-a", timeout=0.2),
+                             "a held key above the cap was handed out again")
+
+
 class CommandExecutorTest(unittest.TestCase):
     CONTEXT = "gke_demo-project_us-central1_cluster-a"
 
@@ -4215,8 +4292,9 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertTrue(executor._provisional_window_open(marker), "the window was pushed out")
 
     def test_a_failed_broker_fetch_does_not_mark_a_settled_file_a_caller_filed_meanwhile(self):
-        # A caller's fetch files outside _kubeconfig_lock, so between the
-        # broker's miss and its failed fetch a settled file can land. Serving it
+        # A caller's fetch files outside the cluster's kubeconfig lock, so
+        # between the broker's miss and its failed fetch a settled file can
+        # land. Serving it
         # is right; marking it provisional would send it back to the fetch
         # path a minute later and let an undecided refetch overwrite it.
         executor = self.fake_gcloud(self.executor())
@@ -4314,13 +4392,13 @@ class CommandExecutorTest(unittest.TestCase):
             self.assertEqual(credential_proxy.SPLICE_DECISION_TIMEOUT_SECONDS, bound)
         self.assertLess(credential_proxy.SPLICE_DECISION_TIMEOUT_SECONDS, executor.kubectl_timeout_seconds)
 
-    def test_a_callers_fetch_files_its_result_without_the_kubeconfig_lock(self):
-        # The broker's cold read holds _kubeconfig_lock across its gcloud runs.
-        # A scaffold's fetch must not queue behind it to file a credential it
-        # already has; only the marker step is serialised, on its own lock.
+    def test_a_callers_fetch_files_its_result_without_the_clusters_kubeconfig_lock(self):
+        # The broker's cold read holds the cluster's kubeconfig lock across its
+        # gcloud runs. A scaffold's fetch for that same cluster must not queue
+        # behind it to file a credential it already has; only the marker step
+        # is serialised, on its own lock.
         executor = self.fake_gcloud(self.executor())
-        executor._kubeconfig_lock.acquire()
-        try:
+        with executor._kubeconfig_locks.held(self.CONTEXT):
             done = threading.Event()
 
             def run():
@@ -4333,8 +4411,91 @@ class CommandExecutorTest(unittest.TestCase):
 
             threading.Thread(target=run, daemon=True).start()
             self.assertTrue(done.wait(timeout=10), "the caller's fetch waited on the kubeconfig lock")
-        finally:
-            executor._kubeconfig_lock.release()
+
+    def test_a_stalled_fetch_for_one_cluster_does_not_delay_another_clusters_cold_read(self):
+        # The issue's acceptance: the kubeconfig lock is per cluster, so a
+        # get-credentials that hangs for slow-cluster holds only that cluster's
+        # lock, and a cold read of fast-cluster completes while it is held.
+        # Under one lock for every cluster the fast read could not return
+        # before the stall ended (here, after ten seconds), which is what
+        # `slow_stall_over` records; the 100 ms bound is the issue's figure and
+        # a sanity cap on top of that ordering, not the verdict on its own.
+        executor = self.fake_gcloud(self.executor())
+        slow = "gke_demo-project_us-central1_slow-cluster"
+        fast = "gke_demo-project_us-central1_fast-cluster"
+        slow_started = threading.Event()
+        release_slow = threading.Event()
+        slow_stall_over = threading.Event()
+        original = executor._execute
+
+        def stall_the_slow_fetch(argv, **kwargs):
+            if "get-credentials" in argv and "slow-cluster" in argv:
+                slow_started.set()
+                release_slow.wait(timeout=10)
+                slow_stall_over.set()
+            return original(argv, **kwargs)
+
+        slow_result = []
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([])),
+            mock.patch.object(executor, "_execute", stall_the_slow_fetch),
+        ):
+            slow_thread = threading.Thread(
+                target=lambda: slow_result.append(executor._resolve_kubeconfig(slow)), daemon=True)
+            slow_thread.start()
+            self.assertTrue(slow_started.wait(timeout=10), "the slow fetch never started")
+            started = time.monotonic()
+            served = executor._resolve_kubeconfig(fast)
+            elapsed = time.monotonic() - started
+            self.assertFalse(slow_stall_over.is_set(), "the fast read waited for the slow fetch's stall to end")
+            release_slow.set()
+            slow_thread.join(timeout=10)
+        self.assertFalse(slow_thread.is_alive())
+        self.assertEqual(executor.kubeconfig_dir / f"{fast}.yaml", served)
+        self.assertTrue(served.is_file(), "the fast cluster's kubeconfig was filed")
+        self.assertLess(elapsed, 0.1, f"the fast cluster's cold read took {elapsed:.3f}s")
+        self.assertEqual([executor.kubeconfig_dir / f"{slow}.yaml"], slow_result)
+        self.assertTrue(slow_result[0].is_file(), "the slow cluster's kubeconfig was filed once released")
+
+    def test_two_cold_reads_of_one_cluster_fetch_once(self):
+        # Sharding does not loosen what the single lock gave one cluster: the
+        # second cold read waits for the first, finds the file it filed, and
+        # runs no get-credentials of its own.
+        executor = self.fake_gcloud(self.executor())
+        first_started = threading.Event()
+        release_first = threading.Event()
+        fetches = []
+        original = executor._execute
+
+        def stall_the_first_fetch(argv, **kwargs):
+            if "get-credentials" in argv:
+                fetches.append(list(argv))
+                if len(fetches) == 1:
+                    first_started.set()
+                    release_first.wait(timeout=10)
+            return original(argv, **kwargs)
+
+        served = []
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([])),
+            mock.patch.object(executor, "_execute", stall_the_first_fetch),
+        ):
+            threads = [
+                threading.Thread(target=lambda: served.append(executor._resolve_kubeconfig(self.CONTEXT)),
+                                 daemon=True)
+                for _ in range(2)
+            ]
+            threads[0].start()
+            self.assertTrue(first_started.wait(timeout=10), "the first fetch never started")
+            threads[1].start()
+            # The second read is queued on the cluster's lock, or about to be;
+            # either way it must find the file once the first fetch files it.
+            release_first.set()
+            for thread in threads:
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual(1, len(fetches), "one get-credentials for two cold reads of one cluster")
+        self.assertEqual([executor.kubeconfig_dir / f"{self.CONTEXT}.yaml"] * 2, served)
 
     def test_dns_endpoint_probe_runs_the_resolved_gcloud_not_whatever_is_on_path(self):
         # gke_endpoint builds argv starting with the literal "gcloud". In the
@@ -5629,7 +5790,7 @@ class CommandExecutorTest(unittest.TestCase):
     def test_commands_take_no_slot_of_their_own(self):
         # A slot is a request's, held by the route around the command and the
         # response; a command never queues on its own. So the kubeconfig
-        # cache-fill under `_kubeconfig_lock`, a trusted helper and the
+        # cache-fill under the cluster's kubeconfig lock, a trusted helper and the
         # workspace's git all run inside whatever slot their request holds,
         # and none of them can hold a lock while waiting for one.
         executor = self.executor(max_concurrent_commands=1)
