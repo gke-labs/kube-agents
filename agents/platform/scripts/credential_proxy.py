@@ -384,8 +384,10 @@ MEMORY_HIGH_WATER_LOG_STEP_BYTES = 64 * MEBIBYTE
 # both directions at once (a listing child in the hundreds of MiB, a clone
 # filling the state volume), and the kernel kills the container or the kubelet
 # evicts the pod before the queue has refused anyone. The gate reads the cgroup's
-# memory.current against memory.max, and each scratch volume's fill against the
-# sizeLimit the kubelet evicts on, and answers in three steps:
+# working set (memory.current less the inactive file cache; CGROUP_INACTIVE_FILE_KEY
+# below) against memory.max, and each scratch volume's fill against the cap the
+# operator passes from the sizeLimit the kubelet evicts on (ENV_STATE_LIMIT_BYTES
+# below), and answers in three steps:
 #   * under the soft watermark, nothing changes;
 #   * from the soft watermark, admitted commands run one at a time
 #     (PRESSURE_CLAMPED_CONCURRENCY), and the first tick to see it reclaims idle
@@ -412,6 +414,13 @@ DEFAULT_DISK_HARD_PCT = 80
 # session to keep answering during a sweep, not for the last 8% of the limit.
 INTERACTIVE_MEM_CEILING_PCT = 92
 INTERACTIVE_DISK_CEILING_PCT = 90
+# A level is left this many points under the watermark it was entered at. The
+# level moves on every request's memory read as well as on the tick, so a
+# working set that sits within a reading's swing of a watermark while a sweep's
+# children come and go would otherwise flip the level on every request, write a
+# log line per flip, and arm the relief step on each flip back to normal: "once
+# per episode" would mean once per tick. The band makes an episode a crossing.
+WATERMARK_LEAVE_BAND_PCT = 3
 PERCENT = 100
 # The scratch volumes' caps, in bytes, as the operator renders their emptyDir
 # sizeLimits (credential_proxy_manifests.go, credentialProxyStateLimitEnv and
@@ -2851,7 +2860,7 @@ class ResourceWatermarkGate:
     say why and name the steps). One instance per broker, shared by the
     handler, the executor and the sampler:
 
-    * `admit(role)` is the request path: one read of memory.current, the
+    * `admit(role)` is the request path: one read of the working set, the
       level from it and the last disk reading, and the decision; a refusal
       raises `ResourcePressure` before anything is queued. An interactive
       admission is counted while it is held, which is how the reserve is one
@@ -2861,7 +2870,9 @@ class ResourceWatermarkGate:
       at or past the soft watermark runs the relief step once per episode:
       the reclaimers it was built with, then a collection and the allocator
       trim. The level's return to normal arms the step again, whichever
-      reader produced that reading.
+      reader produced that reading, and a level is left only once the
+      readings clear WATERMARK_LEAVE_BAND_PCT under the watermark it was
+      entered at, so a reading that hovers at one is one episode.
     * `clamps_concurrency` is the executor's: true from the soft watermark,
       and `_effective_cap` then admits PRESSURE_CLAMPED_CONCURRENCY at once.
 
@@ -2958,12 +2969,17 @@ class ResourceWatermarkGate:
         except OSError:
             return None
 
-    def _level_of(self, resource_name: str, ratio: float) -> str:
+    def _level_of(self, resource_name: str, ratio: float, *, leaving: bool = False) -> str:
+        """The level one resource's reading puts the gate at. `leaving` reads
+        it against the watermarks lowered by the leave band: what a reading
+        has to clear for the level entered at the watermark to be left."""
         percent = ratio * PERCENT
         if resource_name == WATERMARK_RESOURCE_MEMORY:
             soft, hard, ceiling = self.thresholds.mem_soft, self.thresholds.mem_hard, INTERACTIVE_MEM_CEILING_PCT
         else:
             soft, hard, ceiling = self.thresholds.disk_soft, self.thresholds.disk_hard, INTERACTIVE_DISK_CEILING_PCT
+        if leaving:
+            soft, hard, ceiling = (mark - WATERMARK_LEAVE_BAND_PCT for mark in (soft, hard, ceiling))
         if percent >= ceiling:
             return WATERMARK_LEVEL_CEILING
         if percent >= hard:
@@ -2980,11 +2996,13 @@ class ResourceWatermarkGate:
                 self._ratios.pop(name, None)
             else:
                 self._ratios[name] = ratio
-        level = WATERMARK_LEVEL_NORMAL
-        for name, ratio in self._ratios.items():
-            candidate = self._level_of(name, ratio)
-            if WATERMARK_LEVELS.index(candidate) > WATERMARK_LEVELS.index(level):
-                level = candidate
+        level = self._level_from_readings_locked(leaving=False)
+        if WATERMARK_LEVELS.index(level) <= WATERMARK_LEVELS.index(self._level):
+            # Not a rise: the level falls only as far as the readings hold
+            # with the leave band under each watermark, so one that hovers
+            # at a watermark does not flip the level on every read.
+            held = self._level_from_readings_locked(leaving=True)
+            level = min(held, self._level, key=WATERMARK_LEVELS.index)
         if level != self._level:
             log = LOGGER.warning if WATERMARK_LEVELS.index(level) > WATERMARK_LEVELS.index(self._level) else LOGGER.info
             log("resource watermark %s -> %s (%s)", self._level, level, self._describe_locked())
@@ -2996,6 +3014,15 @@ class ResourceWatermarkGate:
                 # begins and ends on the request path still arms the next
                 # tick's relief.
                 self._relieved_this_episode = False
+        return level
+
+    def _level_from_readings_locked(self, *, leaving: bool) -> str:
+        """The highest level any resource's last reading puts the gate at."""
+        level = WATERMARK_LEVEL_NORMAL
+        for name, ratio in self._ratios.items():
+            candidate = self._level_of(name, ratio, leaving=leaving)
+            if WATERMARK_LEVELS.index(candidate) > WATERMARK_LEVELS.index(level):
+                level = candidate
         return level
 
     def _describe_locked(self) -> str:
@@ -13371,6 +13398,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         route = self.path[len("/v1/workspace/") :]
+        body_limit = max(self.max_request_bytes, content_workspace.max_total_bytes() * 2)
         # The verbs that write the state volume take the gate's hard check,
         # as the k8s list does: `open` clones into it, which is the fill the
         # disk half exists to stop, and `commit` fetches into it. Reads take
@@ -13381,15 +13409,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 gate.check(self._caller_role())
             except ResourcePressure as exc:
                 LOGGER.warning("workspace %s refused under resource pressure: %s", route, exc)
+                # Refused before the body is read, so the body is drained
+                # before the answer, as the vcs route's refusal is: the
+                # connection closes after the response, and a commit's body
+                # still arriving would turn the 429 into a reset.
+                drain_request_body(self, body_limit)
                 self._busy(exc)
                 return
         try:
-            payload = self._read_json_body(
-                max_bytes=max(
-                    self.max_request_bytes,
-                    content_workspace.max_total_bytes() * 2,
-                )
-            )
+            payload = self._read_json_body(max_bytes=body_limit)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return

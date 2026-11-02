@@ -552,6 +552,59 @@ class ResourceWatermarkGateTest(unittest.TestCase):
         self.assertEqual("soft", gate.tick())
         self.assertEqual(2, self.relieved)
 
+    def test_a_reading_that_hovers_at_a_watermark_moves_the_level_once(self):
+        # A working set sitting within a reading's swing of the soft watermark
+        # while a sweep's children come and go: the level is entered at 75%
+        # and left only under 72% (the leave band), so the requests between
+        # neither log a transition nor arm the relief step again, and the
+        # tick that lands in the band relieves nothing a second time.
+        gate = self.gate(memory_percent=76)
+        self.assertEqual("soft", gate.tick())
+        self.assertEqual(1, self.relieved)
+        for percent in (74, 72.5, 74.5):
+            self.set_memory(gate, percent)
+            with self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+                gate.check("shell")
+            self.assertEqual("soft", gate.level, percent)
+        with self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+            self.assertEqual("soft", gate.tick())
+        self.assertEqual(1, self.relieved)
+        # Under the band the episode ends; back inside it, and up to the
+        # watermark itself, nothing is entered until the watermark is reached.
+        self.set_memory(gate, 71)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            gate.check("shell")
+        self.assertIn("resource watermark soft -> normal (memory=71%", "\n".join(logs.output))
+        self.set_memory(gate, 74)
+        with self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+            gate.check("shell")
+        self.assertEqual("normal", gate.level)
+        self.set_memory(gate, 75)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            gate.check("shell")
+        self.assertIn("resource watermark normal -> soft (memory=75%", "\n".join(logs.output))
+        gate.tick()
+        self.assertEqual(2, self.relieved)
+        # The band holds between every pair of levels: from hard, 83% is
+        # still hard and 82% is soft, not normal; from the ceiling, 89.5%.
+        self.set_memory(gate, 86)
+        with gate.admit("session"):
+            pass
+        self.assertEqual("hard", gate.level)
+        self.set_memory(gate, 83)
+        gate.check("session")
+        self.assertEqual("hard", gate.level)
+        self.set_memory(gate, 82)
+        gate.check("session")
+        self.assertEqual("soft", gate.level)
+        self.set_memory(gate, 93)
+        self.assertEqual("ceiling", gate.tick())
+        self.set_memory(gate, 89.5)
+        self.assertEqual("ceiling", gate.tick())
+        self.set_memory(gate, 88)
+        self.assertEqual("hard", gate.tick())
+        self.assertEqual(2, self.relieved)
+
     def test_at_71_percent_disk_on_either_volume_the_tick_clamps(self):
         gate = self.gate(memory_percent=10)
         self.sizes["tmp"] = _percent(_TMP_LIMIT, 71)
@@ -561,7 +614,10 @@ class ResourceWatermarkGateTest(unittest.TestCase):
         self.sizes["tmp"] = 0
         self.sizes["state"] = _percent(_STATE_LIMIT, 71)
         self.assertEqual("soft", gate.tick())
+        # 69% is inside the leave band under 70%; 66% is out of it.
         self.sizes["state"] = _percent(_STATE_LIMIT, 69)
+        self.assertEqual("soft", gate.tick())
+        self.sizes["state"] = _percent(_STATE_LIMIT, 66)
         self.assertEqual("normal", gate.tick())
 
     def test_at_86_percent_memory_a_background_caller_is_refused_at_once_and_one_session_is_admitted(self):

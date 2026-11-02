@@ -928,7 +928,11 @@ Consequences:
   `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE`, `Retry-After: N` (5 to 30, drawn at random) and
   the same envelope plus `retry_after`, with `retry in N s` in the text the shim prints; one
   slot stays open to the session role, which is the one interactive class, up to a ceiling
-  of 92% memory or 90% disk, past which it is refused too. Under the clamp that reserve is a
+  of 92% memory or 90% disk, past which it is refused too. A level is left only once the
+  readings clear three points under the watermark it was entered at, so a reading that
+  hovers at a watermark is one episode: one transition line, one relief. A workspace write
+  refused this way has its body drained before the 429, as a vcs verb's refusal does, so a
+  commit still sending its files reads the refusal rather than a reset. Under the clamp that reserve is a
   slot in the executor as well, one above the background commands running (those admitted
   before the clamp arrived keep their slots) and bounded by the configured cap: a session's
   command runs beside them, and passes background requests the clamp holds. The class is the authenticated role, never a header. The gate covers

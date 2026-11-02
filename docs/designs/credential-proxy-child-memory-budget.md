@@ -395,9 +395,11 @@ counts reclaimable page cache, eight threads can pass the check before any child
 the behaviour cannot be asserted in a unit test. The reservation model is deterministic and
 testable; a live reading could be layered on later as a second check if the constants prove
 wrong. Since #4315 the broker exports the live reading, and since #4333 it admits on it beside
-this budget, as a watermark gate rather than a per-spawn check: one `memory.current` read per
-admission, the scratch volumes summed on the sampler's tick, a concurrency clamp from the soft
-watermark and an immediate 429 for background callers from the hard one. The budget's static
+this budget, as a watermark gate rather than a per-spawn check: one working-set read per
+admission (`memory.current` less `memory.stat`'s `inactive_file`, so the page cache the first
+sentence names is not counted), the scratch volumes summed against the operator-passed caps on
+the sampler's tick, a concurrency clamp from the soft watermark and an immediate 429 for
+background callers from the hard one. The budget's static
 reservation stays what it was; the gate is the backstop for the cases above where the estimate
 is wrong. Before that: the cgroup's
 `memory.current`, `memory.peak`, `memory.max`, `memory.stat` and `memory.events`, its own and
