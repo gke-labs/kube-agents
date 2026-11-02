@@ -374,6 +374,10 @@ class KubectlRawPathTest(unittest.TestCase):
             ["kubectl", "get", "--raw", "/api/v1/namespaces/default/secrets"],
             ["kubectl", "get", "--raw", "/api/v1/%73ecrets"],
             ["kubectl", "get", "--raw", "/api/v1/pods", "--raw", "/api/v1/secrets"],
+            # The `=` spelling is the one profile confinement rewrites argv into.
+            ["kubectl", "get", "--raw=/api/v1/secrets?limit=1"],
+            ["kubectl", "get", "--raw=/api/v1/namespaces/default/secrets"],
+            ["kubectl", "get", "--raw=/api/v1/pods", "--raw=/api/v1/secrets"],
         ):
             with self.subTest(argv=argv):
                 self.refused(argv)
@@ -401,6 +405,9 @@ class KubectlRawPathTest(unittest.TestCase):
             ["kubectl", "get", "--raw", "/healthz"],
             ["kubectl", "get", "--raw", "/apis/evil.example.com/v1/pods"],
             ["kubectl", "get", "--raw", "/apis/apps/v1beta1/deployments"],
+            ["kubectl", "get", "--raw=/api/v1/pods/x/log"],
+            ["kubectl", "get", "--raw=/api/v1/nodes/n/proxy/metrics"],
+            ["kubectl", "get", "--raw=/api/v1/namespaces/default/pods/x"],
         ):
             with self.subTest(argv=argv):
                 self.refused(argv)
@@ -412,9 +419,34 @@ class KubectlRawPathTest(unittest.TestCase):
             ["kubectl", "get", "--raw", "http:/api/v1/pods"],
             ["kubectl", "get", "--raw", "/api/v1/pods?limit=1#frag"],
             ["kubectl", "get", "--raw", "/api/v1/pods%3Flimit=1"],
+            ["kubectl", "get", "--raw=https://example.com/api/v1/pods"],
+            ["kubectl", "get", "--raw=//example.com/api/v1/pods"],
         ):
             with self.subTest(argv=argv):
                 self.refused(argv)
+
+    def test_a_raw_after_a_flag_that_took_the_separator_as_its_value_is_judged(self):
+        # pflag reads the next argv element as a value-taking flag's value even
+        # when it is `--`, so `-n -- --raw <path>` is a namespace of `--` and a
+        # parsed `--raw`; a scan that stopped at `--` never saw it, and a local
+        # kubectl sent the request. A real `--` on `get` makes a later `--raw` an
+        # unresolvable resource name, so judging it refuses nothing that ran.
+        for argv in (
+            ["kubectl", "get", "-n", "--", "--raw", "/api/v1/nodes/n1/proxy/configz"],
+            ["kubectl", "get", "-n", "--", "--raw", "/api/v1/secrets"],
+            ["kubectl", "get", "-n", "--", "--raw=https://example.com/api/v1/pods"],
+            ["kubectl", "get", "-o", "--", "--raw", "/api/v1/namespaces/default/pods/x/exec"],
+            ["kubectl", "get", "pods", "--", "--raw", "/api/v1/secrets"],
+            ["kubectl", "get", "--raw", "--", "/api/v1/pods"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+        self.assertEqual(
+            ["/api/v1/secrets"],
+            command_policy._kubectl_raw_values(["kubectl", "get", "-n", "--", "--raw", "/api/v1/secrets"]),
+        )
+        # A permitted page keeps passing through the same spelling.
+        self.assertTrue(evaluate(["kubectl", "get", "-n", "--", "--raw", "/api/v1/pods?limit=500"]).allowed)
 
     def test_only_the_list_query_keys_pass(self):
         for argv in (

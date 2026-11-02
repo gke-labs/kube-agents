@@ -1371,13 +1371,21 @@ def _kubectl_refuses_identity_change(argv: list[str]) -> str | None:
 
 
 def _kubectl_raw_values(argv: list[str]) -> list[str | None]:
-    """Every value given to `--raw`, in order; None for a `--raw` with none."""
+    """Every value given to `--raw`, in order; None for a `--raw` with none.
+
+    Every token is read, as _kubectl_refuses_identity_change reads them: a
+    `--` does not end the scan, because pflag takes the next argv element as
+    a value-taking flag's value even when it is `--`, so in
+    `kubectl get -n -- --raw /api/v1/secrets` the `--` is the namespace and
+    the `--raw` after it is parsed as the flag. A scan that stopped there
+    saw no `--raw` and the read ran unjudged. `get` gives a real `--` no
+    meaning either (a `--raw` after one is a resource name kubectl cannot
+    resolve), so reading past it refuses nothing that would have run.
+    """
     values: list[str | None] = []
     index = 1
     while index < len(argv):
         token = argv[index]
-        if token == "--":
-            break
         name, separator, value = token.partition("=")
         if name == _KUBECTL_RAW_FLAG:
             if separator:
