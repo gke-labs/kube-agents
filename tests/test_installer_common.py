@@ -3132,12 +3132,16 @@ class InstallerCommonTest(unittest.TestCase):
         main_tf = (composition / "main.tf").read_text()
         release = main_tf.split('resource "helm_release" "kube_agents" {', 1)[1]
         release = release.split("\n}\n", 1)[0]
-        self.assertRegex(
-            release, r"(?m)^  upgrade_install\s*=\s*var\.helm_upgrade_install\s*$"
+        self.assertIsNotNone(
+            re.search(r"(?m)^  upgrade_install\s*=\s*var\.helm_upgrade_install\s*$", release),
+            "helm_release.kube_agents does not set upgrade_install = var.helm_upgrade_install",
         )
         variables_tf = (composition / "variables.tf").read_text()
         block = variables_tf.split('variable "helm_upgrade_install" {', 1)[1].split("\n}\n", 1)[0]
-        self.assertRegex(block, r"(?m)^\s*default\s*=\s*false\s*$")
+        self.assertIsNotNone(
+            re.search(r"(?m)^\s*default\s*=\s*false\s*$", block),
+            "helm_upgrade_install must default to false",
+        )
 
     def test_tfvars_carries_namespace_identity_and_cmek_names(self):
         # Every one of these used to be a fixed name the generator never wrote,
