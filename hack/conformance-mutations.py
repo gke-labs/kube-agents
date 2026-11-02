@@ -755,8 +755,9 @@ Mutation(
          '        if accept and not accepts_metadata_only(accept):\n'),
         "test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only",
         "let a count list through when the caller sends no Accept at all, for an "
-        "older watcher -- the one item then comes back as the whole object, a "
-        "pod's environment included, on the broker's credential",
+        "older watcher -- the one item then comes back as the whole object, spec "
+        "and status beside the ObjectMeta the metadata Accept already relays, on "
+        "the broker's credential",
     ),
     Mutation(
         "C1-watcher-count-list-widened-to-secrets",
@@ -764,8 +765,9 @@ Mutation(
         ('        "apis/batch/v1/cronjobs",\n    }\n)\n',
          '        "apis/batch/v1/cronjobs",\n        "api/v1/secrets",\n    }\n)\n'),
         "test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only",
-        "count Secrets too, for a sizing figure -- a metadata-only list of every "
-        "Secret in the fleet, names and namespaces, becomes readable on the "
+        "count Secrets too, for a sizing figure -- the first-sorted Secret's "
+        "ObjectMeta, its last-applied-configuration annotation and the data an "
+        "applied manifest carries in it included, becomes readable on the "
         "broker's credential",
     ),
     Mutation(

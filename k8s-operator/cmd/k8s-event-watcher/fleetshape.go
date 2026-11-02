@@ -50,8 +50,12 @@ const (
 	fleetShapeListLimit = "1"
 	// fleetShapeAccept asks the API server for metadata only: a
 	// PartialObjectMetadataList carries each item's ObjectMeta and nothing
-	// of its spec or status, so the one item a count returns is never a
-	// pod's environment or a CronJob's template. The credential proxy
+	// of its spec or status. ObjectMeta is the whole of it, annotations
+	// included, so the one item a count returns can still carry a
+	// kubectl.kubernetes.io/last-applied-configuration annotation, which is
+	// the manifest as applied, template and inline env and all, on an
+	// object a client-side kubectl apply created; the Accept bounds the
+	// body to one object's metadata, not to names. The credential proxy
 	// admits a count list only under this shape of Accept (watcher_policy's
 	// count-list rule), so the header is the rule as much as the saving.
 	fleetShapeAccept = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"

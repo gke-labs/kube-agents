@@ -27,9 +27,14 @@ half of the first:
   cluster-scoped lists in `COUNT_LIST_PATHS`, with `limit=1` as its whole query
   and an `Accept` every range of which asks for a `PartialObjectMetadataList`
   (the event watcher's fleet-shape probe reads one item's metadata plus the
-  server's `remainingItemCount`, never an object body). No other list, no watch
-  of anything else (the deprecated `watch/<resource>` paths included), no
-  subresource, never a Secret.
+  server's `remainingItemCount`; the item is one object's whole `ObjectMeta`,
+  so its annotations come too, a `last-applied-configuration` holding the
+  applied manifest among them, but no spec or status of its own). The four
+  controller kinds are already readable whole by name under
+  `WATCHER_NAMED_READS`; pods are not, so the first-sorted pod's metadata is
+  reach this rule adds. No other list, no watch of anything else (the
+  deprecated `watch/<resource>` paths included), no subresource, never a
+  Secret.
 
 Standard library only, like `api_policy`. `Decision` is reused from
 `command_policy`. No refusal message repeats caller text.
