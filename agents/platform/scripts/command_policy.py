@@ -858,6 +858,10 @@ KUBECTL_RAW_COLLECTIONS: frozenset[str] = frozenset(
         "/apis/batch/v1/cronjobs",
         "/apis/batch/v1/jobs",
         "/apis/discovery.k8s.io/v1/endpointslices",
+        # The metrics API's two collections: capacity-obtainability's SKILL.md
+        # reads node usage through `kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes`.
+        "/apis/metrics.k8s.io/v1beta1/nodes",
+        "/apis/metrics.k8s.io/v1beta1/pods",
         "/apis/networking.k8s.io/v1/ingresses",
         "/apis/networking.k8s.io/v1/networkpolicies",
         "/apis/policy/v1/poddisruptionbudgets",
@@ -868,6 +872,12 @@ KUBECTL_RAW_COLLECTIONS: frozenset[str] = frozenset(
         "/apis/storage.k8s.io/v1/storageclasses",
     }
 )
+# Read-only endpoints that are not collections and that shipped skills name
+# verbatim: gke-upgrades reads the API server's own metrics through
+# `kubectl get --raw /metrics`. Admitted as exact paths, with no query, so the
+# rule keeps every other non-collection path (`/proxy`, `/exec`, `/logs`,
+# `/healthz` verbosity switches) closed.
+KUBECTL_RAW_ENDPOINTS: frozenset[str] = frozenset({"/metrics"})
 # One path segment as Kubernetes names resources and namespaces: lowercase
 # DNS-label characters, so `..`, an empty segment (`//`), a backslash, a
 # percent sign left after decoding, a scheme or a host all fail to match.
@@ -887,6 +897,8 @@ _RAW_SHAPE = (
     "/apis/<group>/<version>/<resource> path, optionally under /namespaces/<name>, on a "
     "kind the fleet collectors page through, with only the list query keys "
     + ", ".join(sorted(KUBECTL_RAW_QUERY_KEYS))
+    + "; or exactly "
+    + ", ".join(sorted(KUBECTL_RAW_ENDPOINTS))
     + "."
 )
 
@@ -1370,7 +1382,9 @@ def _kubectl_raw_path_problem(value: str | None) -> str | None:
         return "--raw was given no path"
     path, _, query = value.partition("?")
     decoded = urllib.parse.unquote(path)
-    match = _RAW_PATH_RE.match(decoded)
+    if decoded in KUBECTL_RAW_ENDPOINTS:
+        return None if not query else f"{decoded} takes no query"
+    match = _RAW_PATH_RE.fullmatch(decoded)
     if match is None:
         return f"{decoded!r} is not a relative collection path"
     collection = f"{match.group('prefix')}/{match.group('resource')}"
@@ -1383,9 +1397,9 @@ def _kubectl_raw_path_problem(value: str | None) -> str | None:
         if key in seen:
             return f"query key {key!r} is repeated"
         seen.add(key)
-        if not _RAW_QUERY_VALUE_RE.match(item):
+        if not _RAW_QUERY_VALUE_RE.fullmatch(item):
             return f"query value for {key!r} carries characters a selector or token does not"
-        if key == "limit" and not item.isdigit():
+        if key == "limit" and not (item.isdigit() and int(item) > 0):
             return "limit is not a positive integer"
     return None
 

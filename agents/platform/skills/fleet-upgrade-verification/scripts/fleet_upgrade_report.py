@@ -365,10 +365,11 @@ NODE_RAW_FIELDS = 4
 NODE_POD_CIDR_KEY = "podCIDR"
 NODE_KIND = readiness_rules.KIND_NODE
 # The credential proxy caps each stream a brokered command returns; past the cap it writes
-# the cut stdout, prints a marker on stderr (readiness_rules.PROXY_TRUNCATION_MARKER, which
-# the audit-log reader checks too) and returns the command's own exit code, so a cut list
-# reads as rc 0 with output that may or may not parse. The marker, not the parse failure,
-# names the cause, and the kinds the read carried are recorded as cut.
+# the cut stdout and prints a marker on stderr (readiness_rules.PROXY_TRUNCATION_MARKER, which
+# the audit-log reader checks too), and the shim exits 74 on a cut payload (an older shim
+# returned the command's own exit code). Every reader checks the marker before the exit
+# code, so the marker, not the exit code or the parse failure, names the cause, and the
+# kinds the read carried are recorded as cut.
 PROXY_TRUNCATION_MARKER = readiness_rules.PROXY_TRUNCATION_MARKER
 KUBECTL_OUTPUT_CUT = "{cmd} output was cut at the credential proxy's output cap, so the list did not fit in one read"
 GCLOUD_OUTPUT_CUT = KUBECTL_OUTPUT_CUT  # one cap, one sentence, for a kubectl list and a gcloud list alike
@@ -569,10 +570,10 @@ def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS, env: dict | N
 def run_gcloud_json(cmd: list[str]) -> tuple[list | dict | None, str | None]:
     """Runs a gcloud command with JSON output and returns (parsed, error_message)."""
     rc, stdout, stderr = run_cmd(cmd)
-    if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
     if PROXY_TRUNCATION_MARKER in stderr:
         return None, GCLOUD_OUTPUT_CUT.format(cmd=" ".join(cmd))
+    if rc != 0:
+        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
     if not stdout.strip():
         return [], None
     try:
@@ -1110,10 +1111,10 @@ def _kubectl_nodes(env: dict) -> tuple[list[dict] | None, str | None]:
     when the cut fell on a line boundary and the lines before it parse."""
     cmd = [KUBECTL, "get", KUBECTL_NODE_RESOURCE, OUTPUT_FLAG, JSONPATH_OUTPUT_FORMAT.format(template=KUBECTL_NODE_JSONPATH)]
     rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
-    if rc != 0:
-        return None, f"{' '.join(cmd[:3])} failed ({rc}): {stderr.strip()}"
     if PROXY_TRUNCATION_MARKER in stderr:
         return None, KUBECTL_OUTPUT_CUT.format(cmd=" ".join(cmd[:3]))
+    if rc != 0:
+        return None, f"{' '.join(cmd[:3])} failed ({rc}): {stderr.strip()}"
     return parse_node_lines(stdout)
 
 

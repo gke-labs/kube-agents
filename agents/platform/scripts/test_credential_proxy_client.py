@@ -146,9 +146,25 @@ class TestTruncatedReplyExitsNonZero(SubmittedPayloadTestCase):
                 self.assertNotIn("truncated", got["stderr"])
 
     def test_counts_that_are_not_integers_fall_back_to_the_bare_marker(self):
-        got = self.run_with({"exitCode": 0, "stdout": "", "truncated": True, "bytesWritten": "8", "limit": None})
+        for kept, limit in (("8", None), (True, 8388608), (8388608, False)):
+            with self.subTest(kept=kept, limit=limit):
+                got = self.run_with({"exitCode": 0, "stdout": "", "truncated": True, "bytesWritten": kept, "limit": limit})
+                self.assertEqual(74, got["exit_code"])
+                self.assertEqual("credential proxy output truncated\n", got["stderr"])
+
+    def test_a_cut_that_fell_on_stderr_alone_keeps_the_commands_exit_code(self):
+        # `kubectl -v=9` from the shell logs every body to stderr; stdout is
+        # whole, so the payload is the command's answer and the exit code is its.
+        got = self.run_with({"exitCode": 0, "stdout": "{}", "stderr": "I0101 ...", "truncated": True,
+                             "stdoutTruncated": False, "bytesWritten": 2, "limit": 8388608})
+        self.assertEqual(0, got["exit_code"])
+        self.assertIn("credential proxy output truncated (stderr only; stdout is complete)", got["stderr"])
+        got = self.run_with({"exitCode": 3, "stdout": "", "truncated": True, "stdoutTruncated": False})
+        self.assertEqual(3, got["exit_code"])
+
+    def test_a_broker_without_the_stream_field_is_read_as_a_cut_payload(self):
+        got = self.run_with({"exitCode": 0, "stdout": "{", "truncated": True, "bytesWritten": 1, "limit": 4096})
         self.assertEqual(74, got["exit_code"])
-        self.assertEqual("credential proxy output truncated\n", got["stderr"])
 
 
 class TestKubeconfigResolution(SubmittedPayloadTestCase):

@@ -310,6 +310,43 @@ class PagedReadTest(unittest.TestCase):
         self.assertEqual("/api/v1/nodes?limit=100", cr.list_argv("nodes")[3])
         self.assertEqual("/api/v1/nodes?limit=7", cr.list_argv("no", limit=7)[3])
 
+    def test_a_query_rides_on_a_continue_page(self):
+        run, calls = self.scripted({
+            ("/api/v1/events", ""): page(["e1"], continue_token="t1"),
+            ("/api/v1/events", "t1"): page(["e2"]),
+        })
+        parsed, _ = cr.paged_dump(["events"], run=run, query={"fieldSelector": "type=Warning"})
+        self.assertEqual(["e1", "e2"], [i["metadata"]["name"] for i in parsed["items"]])
+        self.assertEqual(
+            ["/api/v1/events?limit=500&fieldSelector=type%3DWarning",
+             "/api/v1/events?limit=500&fieldSelector=type%3DWarning&continue=t1"],
+            [argv[3] for argv, _ in calls],
+        )
+
+    def test_every_kind_list_a_collector_pages_resolves(self):
+        """The collectors' kind lists are constants; a misspelt one fails here,
+        not inside a sweep."""
+        lists = []
+        for name in ("collect", "fleet_waste", "fleet_stockout", "upgrade_retrospective"):
+            mod = load_collector(name)
+            if name == "collect":
+                lists += [mod.DUMP_COMMAND_KINDS, mod.COMPLIANCE_DUMP_KINDS, mod.RBAC_DUMP_KINDS,
+                          mod.NETPOL_DUMP_KINDS, mod.SERVICE_DUMP_KINDS, mod.SERVICEACCOUNT_DUMP_KINDS]
+            elif name == "fleet_waste":
+                lists.append(mod.CLUSTER_DUMP_KINDS)
+            elif name == "fleet_stockout":
+                lists.append(",".join(mod.PAGED_DUMP_KINDS))
+            else:
+                lists += [kinds for _, kinds, _ in mod.KUBECTL_READS]
+        report = load_collector("fleet_upgrade_report")
+        lists += [report.KUBECTL_RESOURCES, report.KUBECTL_WEBHOOK_RESOURCES,
+                  *(resources for _, resources, mode in report.LATER_READS if mode != report.READ_MODE_NODE_JSONPATH)]
+        self.assertTrue(lists)
+        for kinds in lists:
+            for kind in kinds.split(","):
+                with self.subTest(kind=kind):
+                    self.assertIn(cr.canonical_resource(kind), cr.LIST_KINDS)
+
     def test_the_collectors_spellings_resolve_and_unknown_kinds_do_not(self):
         for spelled, canonical in (("deploy", "deployments"), ("sts", "statefulsets"), ("ds", "daemonsets"),
                                    ("cronjob", "cronjobs"), ("pod", "pods"), ("pdb", "poddisruptionbudgets"),

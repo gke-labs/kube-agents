@@ -399,7 +399,6 @@ class KubectlRawPathTest(unittest.TestCase):
             ["kubectl", "get", "--raw", "api/v1/pods"],
             ["kubectl", "get", "--raw", "/API/v1/pods"],
             ["kubectl", "get", "--raw", "/healthz"],
-            ["kubectl", "get", "--raw", "/metrics"],
             ["kubectl", "get", "--raw", "/apis/evil.example.com/v1/pods"],
             ["kubectl", "get", "--raw", "/apis/apps/v1beta1/deployments"],
         ):
@@ -454,6 +453,36 @@ class KubectlRawPathTest(unittest.TestCase):
 
     def test_raw_with_no_path_is_refused(self):
         self.refused(["kubectl", "get", "--raw"])
+
+    def test_the_endpoints_shipped_skills_name_stay_admitted(self):
+        # gke-upgrades reads /metrics; capacity-obtainability reads the
+        # metrics API's node collection. Both ran on main and keep running.
+        for argv in (
+            ["kubectl", "get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"],
+            ["kubectl", "get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods?limit=500"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, evaluate(argv).message)
+        for argv in (
+            ["kubectl", "get", "--raw", "/metrics?watch=true"],
+            ["kubectl", "get", "--raw", "/metrics/"],
+            ["kubectl", "get", "--raw", "/healthz"],
+            ["kubectl", "get", "--raw", "/.well-known/openid-configuration"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_the_grammar_is_anchored_at_both_ends(self):
+        # `re.match(..., "$")` would pass a trailing newline; fullmatch does not,
+        # and limit=0 asks for the unpaged list this rule exists to avoid.
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/pods\n"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?labelSelector=a%0A"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=0"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=00"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
 
     def test_the_refusal_names_the_boundary_and_the_shape(self):
         decision = self.refused(["kubectl", "get", "--raw", "/api/v1/secrets"])

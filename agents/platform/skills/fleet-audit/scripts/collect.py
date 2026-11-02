@@ -1018,11 +1018,13 @@ def run_and_gate(
     A `kubectl get <kinds> ... -o json` list response gates on `.items`
     being a list; a `gcloud ... --format=json(...)` object response has no
     such envelope, so it gates on parsing as an object at all. Both share
-    the same failure mode this function exists to catch: exit 0 with
-    truncated or empty output, which the credential proxy's output cap makes
-    a real possibility, not a theoretical one. That cap is 8 MiB per stream
+    the same failure mode this function exists to catch: truncated or empty
+    output, which the credential proxy's output cap makes a real possibility,
+    not a theoretical one (the shim now exits 74 on a cut reply; an older one
+    exited 0, and the gate holds either way). That cap is 8 MiB per stream
     as the operator deploys it, 4 MiB if `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES`
-    is unset; either way a 16-cluster `-A -o json` dump can reach it.
+    is unset; the multi-kind dumps that reached it are paged now
+    (`paged_and_gate`), and the one-shot reads left here are small.
     """
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     result = run(argv, env=env, timeout=timeout)

@@ -3099,9 +3099,16 @@ class ExecRouteTruncationReplyTest(unittest.TestCase):
         self.kubectl_that("head -c 100000 /dev/zero | tr '\\0' a")
         status, body = self.post(["kubectl", "get", "pods"])
         self.assertEqual(200, status)
-        self.assertEqual((0, True), (body["exitCode"], body["truncated"]))
+        self.assertEqual((0, True, True), (body["exitCode"], body["truncated"], body["stdoutTruncated"]))
         self.assertEqual((4096, 4096), (body["bytesWritten"], body["limit"]))
         self.assertEqual(4096, len(body["stdout"]))
+
+    def test_a_cut_on_stderr_alone_says_the_payload_is_whole(self):
+        self.kubectl_that("printf ok; head -c 100000 /dev/zero | tr '\\0' e >&2")
+        status, body = self.post(["kubectl", "get", "pods"])
+        self.assertEqual(200, status)
+        self.assertEqual((True, False), (body["truncated"], body["stdoutTruncated"]))
+        self.assertEqual(("ok", 2), (body["stdout"], body["bytesWritten"]))
 
     def test_a_whole_reply_carries_its_size_and_the_cap_too(self):
         # Always present, so a caller reads the same two keys on every reply
@@ -3109,7 +3116,7 @@ class ExecRouteTruncationReplyTest(unittest.TestCase):
         self.kubectl_that("echo pods")
         status, body = self.post(["kubectl", "get", "pods"])
         self.assertEqual(200, status)
-        self.assertEqual((0, False), (body["exitCode"], body["truncated"]))
+        self.assertEqual((0, False, False), (body["exitCode"], body["truncated"], body["stdoutTruncated"]))
         self.assertEqual((len("pods\n"), 4096), (body["bytesWritten"], body["limit"]))
 
 

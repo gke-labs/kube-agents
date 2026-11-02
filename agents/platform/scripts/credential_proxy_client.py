@@ -59,6 +59,9 @@ EXIT_OUTPUT_TRUNCATED = getattr(os, "EX_IOERR", 74)
 # much of stdout was kept and the cap it was held to, when the broker said.
 OUTPUT_TRUNCATED_MARKER = "credential proxy output truncated"
 OUTPUT_TRUNCATED_COUNTS = " at {limit} bytes (kept {kept} bytes of stdout; exit {code})"
+# The cut fell on stderr alone: stdout is whole, so the exit code is the
+# command's own and only the diagnostics are short.
+OUTPUT_TRUNCATED_STDERR_ONLY = " (stderr only; stdout is complete)"
 # The `policy verb:` line is read by the agent runtime one line at a time, so a
 # verb word (an argv token) must not carry a line break or a quote.
 _VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
@@ -1663,8 +1666,11 @@ def execute(
     sys.stdout.write(payload.get("stdout", ""))
     sys.stderr.write(payload.get("stderr", ""))
     truncated = bool(payload.get("truncated"))
+    # The exit code is for a cut payload. A broker older than the field says
+    # only that a stream was cut, and that is read as the payload.
+    stdout_cut = bool(payload.get("stdoutTruncated", truncated))
     if truncated:
-        print(_truncated_marker(payload), file=sys.stderr)
+        print(_truncated_marker(payload, stdout_cut), file=sys.stderr)
     generated = payload.get("kubeconfig")
     if generated and os.environ.get("KUBE_PROXY_URL", "").strip():
         generated = rewrite_kubeconfig_for_kube_proxy(generated)
@@ -1684,16 +1690,19 @@ def execute(
         except OSError as exc:
             print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
             return 1
-    if truncated:
+    if stdout_cut:
         # Whatever the command itself exited: a cut payload is not the
         # command's answer, and exit 0 on one is what a caller reads as success.
         return EXIT_OUTPUT_TRUNCATED
     return int(payload.get("exitCode", 1))
 
 
-def _truncated_marker(payload: dict) -> str:
+def _truncated_marker(payload: dict, stdout_cut: bool) -> str:
     """The stderr line for a cut reply: the bare marker when the broker gave no
-    counts (one older than the fields), the counts after it otherwise."""
+    counts (one older than the fields), the counts after it otherwise, and the
+    stderr-only form when the payload is whole and the cut fell on stderr."""
+    if not stdout_cut:
+        return OUTPUT_TRUNCATED_MARKER + OUTPUT_TRUNCATED_STDERR_ONLY
     kept, limit = payload.get("bytesWritten"), payload.get("limit")
     if isinstance(kept, int) and isinstance(limit, int) and not isinstance(kept, bool) and not isinstance(limit, bool):
         return OUTPUT_TRUNCATED_MARKER + OUTPUT_TRUNCATED_COUNTS.format(limit=limit, kept=kept, code=EXIT_OUTPUT_TRUNCATED)

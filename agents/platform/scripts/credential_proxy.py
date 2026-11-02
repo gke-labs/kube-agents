@@ -5811,6 +5811,9 @@ class ExecutionResult:
     # say how much it kept and page the rest, rather than only that it was cut.
     stdout_bytes: int = 0
     output_limit: int = 0
+    # Whether the cut fell on stdout. `truncated` covers either stream; the
+    # shim's non-zero exit is for a cut payload, not for cut diagnostics.
+    stdout_truncated: bool = False
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
@@ -7541,6 +7544,9 @@ class _CapturedOutput:
     truncated: bool
     timed_out: bool
     abandoned: bool
+    # Whether the cut fell on stdout: the caller's payload, as against its
+    # diagnostics. `truncated` covers either stream.
+    stdout_truncated: bool = False
     # The child's own peak resident set from the rusage its reap returned, in
     # bytes; None when the reap did not go through `_reap` (already reaped).
     peak_rss_bytes: int | None = None
@@ -7757,6 +7763,7 @@ def _capture_output(
     deadline = time.monotonic() + timeout
     outputs: dict[Any, bytearray] = {process.stdout: bytearray(), process.stderr: bytearray()}
     truncated = False
+    stdout_truncated = False
     pending = memoryview(stdin) if stdin else None
     written = 0
     stopped = False
@@ -7781,7 +7788,7 @@ def _capture_output(
 
         Returns (timed_out, abandoned).
         """
-        nonlocal truncated, written
+        nonlocal truncated, stdout_truncated, written
         if not watch_caller and caller is not None:
             with contextlib.suppress(KeyError, ValueError):
                 selector.unregister(caller)
@@ -7839,6 +7846,8 @@ def _capture_output(
                     buffer += data[:room]
                 if len(data) > room:
                     truncated = True
+                    if stream is process.stdout:
+                        stdout_truncated = True
         return False, False
 
     try:
@@ -7890,6 +7899,7 @@ def _capture_output(
         abandoned=abandoned,
         peak_rss_bytes=getattr(process, REAPED_PEAK_RSS_ATTRIBUTE, None),
         stopped=stopped,
+        stdout_truncated=stdout_truncated,
     )
 
 
@@ -10855,6 +10865,7 @@ class CommandExecutor:
             # only a cut re-decode is re-encoded to be measured.
             stdout_bytes=len(stdout_text.encode("utf-8")) if stdout_cut else len(captured.stdout),
             output_limit=self.max_output_bytes,
+            stdout_truncated=captured.stdout_truncated or stdout_cut,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -12956,6 +12967,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     # knows how much it holds and that the rest is to be paged.
                     "bytesWritten": result.stdout_bytes,
                     "limit": result.output_limit,
+                    "stdoutTruncated": result.stdout_truncated,
                     "timedOut": result.timed_out,
                 }
                 # Only `get-credentials` fills this, and only when the caller

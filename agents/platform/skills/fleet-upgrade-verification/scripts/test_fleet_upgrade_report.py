@@ -2488,10 +2488,33 @@ class ReadinessTest(unittest.TestCase):
 
     def test_a_project_list_cut_at_the_proxy_cap_is_an_error_naming_the_cap(self):
         cmd = ["gcloud", "compute", "instances", "list", "--project=p1", "--format=json(name,zone,status)"]
-        with patch.object(report, "run_cmd", return_value=(0, "[{\"name\": \"n", "credential proxy output truncated\n")):
-            data, error = report.run_gcloud_json(cmd)
-        self.assertIsNone(data)
-        self.assertEqual(error, report.GCLOUD_OUTPUT_CUT.format(cmd=" ".join(cmd)))
+        # The shim exits 74 on a cut reply; an older one exited 0. The cap is
+        # named either way, before the exit code is read.
+        for rc in (0, 74):
+            with self.subTest(rc=rc), patch.object(report, "run_cmd", return_value=(rc, "[{\"name\": \"n", "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n")):
+                data, error = report.run_gcloud_json(cmd)
+            self.assertIsNone(data)
+            self.assertEqual(error, report.GCLOUD_OUTPUT_CUT.format(cmd=" ".join(cmd)))
+
+    def test_a_node_read_the_shim_cut_names_the_cap_not_the_exit_code(self):
+        with patch.object(report, "run_cmd", return_value=(74, "n1\t", "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n")):
+            nodes, error = report._kubectl_nodes({})
+        self.assertIsNone(nodes)
+        self.assertEqual(error, report.KUBECTL_OUTPUT_CUT.format(cmd="kubectl get node"))
+
+    def test_a_paged_read_that_is_not_a_list_or_not_json_says_which(self):
+        def fake(cmd, timeout=None, env=None):
+            if cmd[3].startswith("/apis/apps/v1/deployments"):
+                return 0, '{"kind": "Status", "code": 403}', ""
+            return 0, "{not json", ""
+
+        with patch.object(report, "run_cmd", fake), patch.object(report, "paged_dump", _shared_run_tests.cr.paged_dump):
+            items, error = report._kubectl_get("deploy", {})
+            self.assertIsNone(items)
+            self.assertEqual(f"{report.paged_command_text(['deploy'])} returned no items list: paged read: the page has no `items` list", error)
+            items, error = report._kubectl_get("pods", {})
+            self.assertIsNone(items)
+            self.assertEqual(f"{report.paged_command_text(['pods'])} returned unparsable JSON", error)
 
     def test_the_addon_inventory_is_in_the_json_and_the_table_and_a_ghost_node_blocks(self):
         fluentbit = {"kind": "DaemonSet", "metadata": {"namespace": "kube-system", "name": "fluentbit-gke"}, "spec": {"template": {"spec": {"containers": [{"name": "fluentbit", "image": "gke.gcr.io/fluent-bit:v0.0.422-gke.21@sha256:abc"}, {"name": "exporter", "image": "gke.gcr.io/fluent-bit-gke-exporter:v0.27.17-gke.36"}]}}}}

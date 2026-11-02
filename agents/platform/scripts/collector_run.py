@@ -124,6 +124,10 @@ LIST_KINDS: dict[str, ListKind] = {
     "cronjobs": ListKind("/apis/batch/v1/cronjobs", "batch/v1", "CronJob"),
     "jobs": ListKind("/apis/batch/v1/jobs", "batch/v1", "Job"),
     "endpointslices": ListKind("/apis/discovery.k8s.io/v1/endpointslices", "discovery.k8s.io/v1", "EndpointSlice"),
+    # No collector pages these; they are here because the policy admits them
+    # for the capacity-obtainability skill and the two tables are one set.
+    "nodes.metrics.k8s.io": ListKind("/apis/metrics.k8s.io/v1beta1/nodes", "metrics.k8s.io/v1beta1", "NodeMetrics"),
+    "pods.metrics.k8s.io": ListKind("/apis/metrics.k8s.io/v1beta1/pods", "metrics.k8s.io/v1beta1", "PodMetrics"),
     "ingresses": ListKind("/apis/networking.k8s.io/v1/ingresses", "networking.k8s.io/v1", "Ingress"),
     "networkpolicies": ListKind("/apis/networking.k8s.io/v1/networkpolicies", "networking.k8s.io/v1", "NetworkPolicy"),
     "poddisruptionbudgets": ListKind("/apis/policy/v1/poddisruptionbudgets", "policy/v1", "PodDisruptionBudget"),
@@ -231,7 +235,9 @@ def default_run(argv: list[str], *, env: dict | None = None, timeout: int) -> Ru
 def canonical_resource(name: str) -> str:
     """The `LIST_KINDS` key for a kind as a collector spells it, or ValueError
     for one no paged read may page: a kind outside the table is a kind the
-    policy refuses, and a collector should learn that at import time."""
+    policy refuses. The collectors' kind lists are constants, and
+    `test_collector_run` resolves every one of them, so a misspelt kind fails
+    there rather than inside a sweep."""
     resource = RESOURCE_ALIASES.get(name, name)
     if resource not in LIST_KINDS:
         raise ValueError(f"{name!r} is not a collection a paged read may page")
