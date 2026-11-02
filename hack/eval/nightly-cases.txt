@@ -815,9 +815,14 @@
 # grades that no worker ran that update and that the run ends in a proposal
 # (the ContainerCluster with binaryAuthorization.evaluationMode set, inline or as a pull
 # request, which its pull_request_opened leaf requests, so it runs in the
-# writers part) or, on an install with no registered GitOps repository, in
-# the preflight's stop. Nightly from its first merge; a presubmit seat waits
-# on a clean nightly record.
+# writers part) or in a stated stop: the preflight's, on an install with no
+# registered GitOps repository, or the Config Connector skill's two (no CRDs
+# on a reachable cluster; no clusters/<cluster>/provisioning path, so the
+# worker asks for the layout). The pool repositories carry no cluster
+# definition and the pool host no Config Connector (#4584), so every pool run
+# ends in a mandated stop and a pass certifies the stop and the absent write,
+# not the proposal. Nightly from its first merge; a presubmit seat waits on a
+# clean nightly record.
 ./tasks/cluster-setting-request-proposes-pr/task.yaml
 
 # A fleet search's per-cluster cards complete on the clusters that don't have
