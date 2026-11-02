@@ -617,6 +617,14 @@ func TestPeopleSeenOffIsTheOnlyRenderedState(t *testing.T) {
 			}
 		})
 	}
+	t.Run("false with Slack armed", func(t *testing.T) {
+		agent := slackTestAgent("next", true)
+		agent.Spec.Telemetry = &agentv1alpha1.TelemetrySpec{PeopleSeen: ptr.To(false)}
+		env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+		if got, ok := env[a2aPeopleSeenEnvVar]; !ok || got.Value != "false" {
+			t.Errorf("%s = %q (rendered %v), want \"false\" (rendered true)", a2aPeopleSeenEnvVar, got.Value, ok)
+		}
+	})
 }
 
 // TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer: one CR, one answer
