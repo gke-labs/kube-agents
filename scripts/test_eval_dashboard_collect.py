@@ -1544,9 +1544,11 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # observability and source-control are new rows whose cases are all
         # nightly cases, so both start on the allowlist; source-control came
         # off on 2026-10-23, when vcs-spent-branch-reuse took a roster seat.
+        # The canary took its roster line on 2026-11-02 (#2013 step 4, #4094),
+        # covering fleet-audits.
         self.assertEqual(
             cov["uncovered"],
-            ["fleet-audits", "observability"],
+            ["observability"],
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
