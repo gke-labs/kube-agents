@@ -48,6 +48,9 @@ def test_stated_stops_match():
         "The cluster lacks Config Connector, so a merged manifest would change nothing.",
         "There is no `provisioning/` format to copy in the repository.",
         "Which `clusters/*/provisioning/` format should I use for eval-provision-probe?",
+        # The repository stop, subject first.
+        "No repository is registered for this install, so nothing was changed.",
+        "The GitOps repository is not registered, so nothing was changed.",
     ):
         assert _matches(report), report
 

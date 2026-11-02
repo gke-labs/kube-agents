@@ -15,23 +15,14 @@ backslash token and a space and any pattern crosses it.
 
 from __future__ import annotations
 
-from pathlib import Path
+from conftest import check_passes
 
-import yaml
-
-from kube_agents_bench import transcript
-from kube_agents_bench.verifiers import ReportContainsVerifier
-
-TASK = Path(__file__).resolve().parent.parent / "tasks" / "upgrades-freeze-runbook-probe" / "task.yaml"
+CASE = "upgrades-freeze-runbook-probe"
 CHECK = "the-runbook-uses-clusters-upgrade-node-pool"
 
 
 def _matches(report: str) -> bool:
-    """The whole check as the verifier grades it, phrases and patterns alike."""
-    doc = yaml.safe_load(TASK.read_text())
-    (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
-    transcript.set(report, [], final_message=report, started_at=1.0)
-    return ReportContainsVerifier(**check["check"]).verify(5.0).status == "pass"
+    return check_passes(CASE, CHECK, report)
 
 
 def test_node_pool_upgrade_commands_match():
@@ -52,6 +43,7 @@ def test_node_pool_upgrade_commands_match():
         # A global flag before the command group, as a runbook that pins the project writes it.
         "gcloud --project=$PROJECT container clusters upgrade prod-1 --node-pool pool-a",
         "gcloud --quiet container clusters upgrade prod-1 --location us-central1 --node-pool pool-a",
+        "gcloud --project foo container clusters upgrade prod-1 --node-pool pool-a",
     ):
         assert _matches(report), report
 
