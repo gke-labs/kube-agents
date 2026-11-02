@@ -756,21 +756,32 @@ class InteractionApiTest(unittest.TestCase):
             "admin_console.chat.backend.agent_runtime.AgentRuntimeProvider"
         ):
             backend = RuntimeChatBackend(target)
-        for action in (
-            lambda: backend.run("platform-agent", prompt="hi"),
-            lambda: backend.resolve_approval("platform-agent", run_id="run-1"),
-            lambda: backend.stop("platform-agent", run_id="run-1"),
+        for name, action in (
+            ("run", lambda: backend.run("platform-agent", prompt="hi")),
+            (
+                "resolve_approval",
+                lambda: backend.resolve_approval("platform-agent", run_id="run-1"),
+            ),
+            ("stop", lambda: backend.stop("platform-agent", run_id="run-1")),
         ):
-            agent_runtime._discovery_cache.lookup(
-                target, "canonical_agent", lambda: "held-agent"
-            )
-            action()
-            self.assertEqual(
-                agent_runtime._discovery_cache.lookup(
-                    target, "canonical_agent", lambda: "fresh-agent"
-                ),
-                "fresh-agent",
-            )
+            with self.subTest(action=name):
+                # Start each pass from an empty cache and check the seed took,
+                # so a pass proves its own action's invalidation rather than
+                # re-reading what the pass before it left.
+                agent_runtime.invalidate(target)
+                self.assertEqual(
+                    agent_runtime._discovery_cache.lookup(
+                        target, "canonical_agent", lambda: f"held-before-{name}"
+                    ),
+                    f"held-before-{name}",
+                )
+                action()
+                self.assertEqual(
+                    agent_runtime._discovery_cache.lookup(
+                        target, "canonical_agent", lambda: f"fresh-after-{name}"
+                    ),
+                    f"fresh-after-{name}",
+                )
 
     def test_client_explains_api_validation_errors(self):
         client, _ = client_for(ScriptedBackend())

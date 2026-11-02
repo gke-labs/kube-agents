@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import UTC, datetime
@@ -1405,16 +1406,105 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
         )
 
     def test_targets_do_not_share_answers(self):
-        other = DeploymentTarget("test-project-02", "test-cluster-01", "us-east4")
-        self.read()
-        self.read(target=other)
-        self.read()
-        self.read(target=other)
+        # One case per field of the key: dropping any one of them from
+        # `_target_key` lets the two targets of that case share an answer.
+        others = {
+            "project_id": DeploymentTarget(
+                "test-project-02", "test-cluster-01", "us-east4"
+            ),
+            "cluster_name": DeploymentTarget(
+                "test-project-01", "test-cluster-02", "us-east4"
+            ),
+            "location": DeploymentTarget(
+                "test-project-01", "test-cluster-01", "us-west1"
+            ),
+            "namespace": DeploymentTarget(
+                "test-project-01", "test-cluster-01", "us-east4", namespace="other-ns"
+            ),
+        }
+        for field, other in others.items():
+            with self.subTest(field=field):
+                self.spawned.clear()
+                cache = RuntimeDiscoveryCache(
+                    agent_runtime.DEFAULT_RUNTIME_CACHE_TTL_SECONDS, clock=self.clock
+                )
+                self.read(cache=cache)
+                self.read(target=other, cache=cache)
+                self.read(cache=cache)
+                self.read(target=other, cache=cache)
 
+                self.assertEqual(self.spawns("platformagents"), 2)
+                self.assertEqual(self.spawns("pods"), 2)
+                self.assertEqual(self.spawns("exec"), 4)
+                discoveries = {
+                    tuple(command)
+                    for command in self.spawned
+                    if "platformagents" in command
+                }
+                self.assertEqual(len(discoveries), 2)
+
+    def test_failed_discovery_evicts_the_targets_other_answer(self):
+        other = DeploymentTarget("test-project-02", "test-cluster-01", "us-east4")
+        self.read(target=other)
+        self.provider().canonical_agent()
         self.assertEqual(self.spawns("platformagents"), 2)
+        self.failing = {"pods"}
+        with self.assertRaisesRegex(AgentRuntimeError, "Gateway discovery failed"):
+            self.read()
+        self.failing = set()
         self.assertEqual(self.spawns("pods"), 2)
-        contexts = {command[command.index("--context") + 1] for command in self.spawned}
-        self.assertEqual(len(contexts), 2)
+
+        # The failed pod lookup dropped the agent name held beside it, and
+        # only for its target: the next read of the target discovers both
+        # again, and the other target's answers are still held.
+        self.read()
+        self.assertEqual(self.spawns("platformagents"), 3)
+        self.assertEqual(self.spawns("pods"), 3)
+        self.read(target=other)
+        self.assertEqual(self.spawns("platformagents"), 3)
+        self.assertEqual(self.spawns("pods"), 3)
+
+    def test_answer_computed_before_an_invalidate_is_not_held(self):
+        other = DeploymentTarget("test-project-02", "test-cluster-01", "us-east4")
+        computed: list[str] = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def compute(value: str) -> Callable[[], str]:
+            def run() -> str:
+                computed.append(value)
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+                return value
+
+            return run
+
+        def lookup(target: DeploymentTarget, value: str) -> str:
+            return self.cache.lookup(target, "canonical_agent", compute(value))
+
+        for invalidate, held in (
+            (lambda: self.cache.invalidate(other), True),
+            (lambda: self.cache.invalidate(self.TARGET), False),
+            (lambda: self.cache.invalidate(), False),
+        ):
+            with self.subTest(held=held):
+                computed.clear()
+                started.clear()
+                release.clear()
+                self.cache.invalidate()
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(lookup, self.TARGET, "stale")
+                    self.assertTrue(started.wait(timeout=5))
+                    invalidate()
+                    release.set()
+                    # The caller that computed the answer still gets it.
+                    self.assertEqual(future.result(timeout=5), "stale")
+
+                release.set()
+                self.assertEqual(
+                    lookup(self.TARGET, "fresh"), "stale" if held else "fresh"
+                )
+                self.assertEqual(computed, ["stale"] if held else ["stale", "fresh"])
 
     def test_ttl_zero_disables_the_cache(self):
         with patch.dict(os.environ, {RUNTIME_CACHE_TTL_ENV: "0"}):

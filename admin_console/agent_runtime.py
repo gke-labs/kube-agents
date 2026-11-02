@@ -668,12 +668,15 @@ class _CacheEntry:
 
 
 class _Flight:
-    """One key's single-flight state: its lock, and how its last attempt ended."""
+    """One key's single-flight state: its lock, how its last attempt ended, and
+    how many times the key was invalidated, so an answer computed before an
+    invalidation is not held after it."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.attempts = 0
         self.error: Exception | None = None
+        self.generation = 0
 
 
 class RuntimeDiscoveryCache:
@@ -684,7 +687,10 @@ class RuntimeDiscoveryCache:
     succeeds they share its answer, and when it fails the lookups queued behind
     it get its error rather than each asking in turn. A lookup that arrives
     after a failure asks again. Lookups of different keys never block each
-    other on a kubectl call.
+    other on a kubectl call. An answer whose computation began before an
+    `invalidate` of its target is returned to its caller but not held, so the
+    next lookup asks the cluster again rather than reading a pre-invalidation
+    answer for the rest of the window.
     """
 
     def __init__(
@@ -740,6 +746,7 @@ class RuntimeDiscoveryCache:
                     # is the answer, and asking again would only queue the
                     # same failure behind it.
                     raise flight.error
+                generation = flight.generation
             try:
                 value = compute()
             except Exception as exc:
@@ -748,20 +755,29 @@ class RuntimeDiscoveryCache:
                     flight.error = exc
                 raise
             with self._lock:
-                self._entries[cache_key] = _CacheEntry(value, self._clock() + ttl)
+                if flight.generation == generation:
+                    # Not held when the target was invalidated while this
+                    # attempt ran: the answer may predate what the
+                    # invalidation reacted to.
+                    self._entries[cache_key] = _CacheEntry(value, self._clock() + ttl)
                 flight.attempts += 1
                 flight.error = None
             return value
 
     def invalidate(self, target: DeploymentTarget | None = None) -> None:
-        """Forget one target's answers, or every target's when none is given."""
+        """Forget one target's answers, or every target's when none is given.
+
+        Answers still being computed for those targets are not held either.
+        """
         with self._lock:
-            if target is None:
-                self._entries.clear()
-                return
-            target_key = _target_key(target)
-            for cache_key in [k for k in self._entries if k[0] == target_key]:
+            target_key = None if target is None else _target_key(target)
+            for cache_key in [
+                k for k in self._entries if target_key is None or k[0] == target_key
+            ]:
                 del self._entries[cache_key]
+            for cache_key, flight in self._in_flight.items():
+                if target_key is None or cache_key[0] == target_key:
+                    flight.generation += 1
 
 
 _discovery_cache = RuntimeDiscoveryCache()
