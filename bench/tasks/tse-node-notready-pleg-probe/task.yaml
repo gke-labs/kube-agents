@@ -52,7 +52,7 @@ verification_spec:
       type: tool_called
       tool_names: ["kanban_create"]
       require_success: true
-  # The specialist's side: the card completed by the tse profile, read from
+  # The specialist's side: a card completed by the tse profile, read from
   # the worker's calls, which the harness reads back from the pod tagged with
   # the profile (worker_trajectory). A leaf in the workers scope is
   # worker-blind (cases.py `worker_blind_checks`): graded on the api lane,
@@ -68,10 +68,14 @@ verification_spec:
   # the api lane, the one lane that grades this entry, records the argument
   # readable, and a card the Planning Agent filed to another profile, whose
   # worker fanned a child out to tse, is not the delegation the case asks
-  # for. A card filed and never worked still
-  # has no tagged entry and reads as `error`: the run is unobserved, and
-  # coverage blocks it. `kanban_complete` rather than any tse call: a card
-  # the specialist started and dropped is not a delegation that answered.
+  # for. A card filed and never worked still has no tagged entry and reads
+  # as `error`: the run is unobserved, and coverage blocks it.
+  # `kanban_complete` rather than any tse call: a card the specialist
+  # started and dropped is not a delegation that answered. "A card", not
+  # "the card": `tool_called` has no card selector, so the leaf reads a
+  # completion by the tse profile anywhere in the run's lineage, not the
+  # completion of the card the first leaf matched; the join is a verifier
+  # feature, not a leaf.
   - name: tse-specialist-completed-the-card
     role: objective
     mode: assert

@@ -118,6 +118,8 @@ def test_no_delegation_at_all_fails_both_entries():
     assert _status(ROUTER_ENTRY, []) == "fail"
     assert _status(ROUTER_ENTRY, NO_CARD) == "fail"
     assert _status(ROUTER_ENTRY, [{**READABLE_CREATE, "status": "error"}] + _tse_run()) == "fail"
+    # A card whose creation errored filed nothing, on the worker entry too.
+    assert _status(WORKER_ENTRY, [{**READABLE_CREATE, "status": "error"}] + _tse_run()) == "fail"
     # The worker entry reads the router's card first, so a run with no card is a
     # definite fail on the api lane, not an unobserved error that blocks the run.
     assert _status(WORKER_ENTRY, []) == "fail"
