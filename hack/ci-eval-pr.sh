@@ -3730,12 +3730,12 @@ unit_cost_hint() {
     # the previous repetition's audits to finish (wait_platform_runs), then the
     # stack waits for the stage to run the four one after another (1-15 min
     # each, #985; up to its chain_wait, 3600s). 2530-3144s a repetition on the
-    # nightly of 2026-10-09; the top of the list, so it launches first in each
-    # repetition round.
+    # nightly of 2026-10-09; the top of the list, so it launches first, its
+    # repetitions back to back.
     oobe-first-run-audits) echo 3000 ;;
     # Off the infra lock too (infra_lock_exempt), unmeasured: priced as
     # autoops-warning-event-triage, the same plant-then-card shape, so it
-    # launches early in its round rather than last at the default.
+    # launches early rather than last at the default.
     autoops-warning-event-no-action-triage) echo 900 ;;
     # The full audits: 600-1300s a repetition on 2026-08-26, planted-pdb's
     # 962s the one clean measurement. Priced with the 900 band so a nightly
@@ -3746,8 +3746,8 @@ unit_cost_hint() {
     # On the blocking roster since 2026-10-26. Measured on the claude-opus-5-5
     # main nightlies 2026-10-20 to 10-26: median 198s, 165-397s over 14
     # repetitions. Priced at 600s, the floor scripts/test_ci_eval_nightly.py's
-    # audit-band test allows, rather than 900: the hint still launches it early
-    # in each round, and the presubmit wall estimate in
+    # audit-band test allows, rather than 900: the hint still launches it
+    # early, and the presubmit wall estimate in
     # scripts/eval_rosters.py (#3987) is priced from these hints.
     consistency-drift-outlier) echo 600 ;;
     consistency-no-environment-label) echo 900 ;;
@@ -3797,7 +3797,7 @@ unit_cost_hint() {
     # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,
     # over 903 presubmit repetitions 2026-09-04 to 09-15; priced at that
     # median, the way capacity (540) and the incident probe (700) are, so it
-    # launches first in each presubmit repetition round. Its three repetitions
+    # launches first in a presubmit. Its three repetitions
     # serialize on the task lock, so ~50min at the median and ~104min at p90
     # is the chain a presubmit carries for it.
     compliance-rbac-overgrant) echo 1000 ;;
@@ -3815,8 +3815,8 @@ unit_cost_hint() {
     # under pull_request_opened says otherwise. It requests a pull request, so
     # since #2260 it runs in the second phase (unit_phase), one unit at a time
     # after every other unit, and the hint orders it only among that phase's
-    # units (ahead of vcs-spent-branch-reuse's 1000 in each repetition round,
-    # which changes no total: the phase is serial). The writers nightlies
+    # units (ahead of vcs-spent-branch-reuse's 1000, which changes no total:
+    # the phase is serial). The writers nightlies
     # since #3145 measured 142-265s a repetition.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
@@ -4759,7 +4759,8 @@ scheduled_audits pause "fan-out"
 # open. The cost is one drain of the lanes at the phase boundary
 # and the settle plus the serial run of the requesting units (on the
 # presubmit tier, the requesting cases' repetitions, which launch_units runs
-# one at a time, one settle each); the order inside each phase is unchanged.
+# one at a time, one settle each); inside each phase the units keep the
+# case-by-case order below.
 # The ordering assumes a unit's writes land before the unit ends. Under the
 # bridge's api executor the harness's delegation wait holds the unit until
 # the cards the case filed are terminal, so their workers' pull requests
@@ -4831,8 +4832,8 @@ unit_counts_toward_infra_limit() { # <task-index>
 # whenever the holder waits on something other than lock-infra (its task or
 # stream lock, wait_platform_runs); two let the staged unit take lock-infra
 # in that window, at the cost of at most one counted slot parked on the lock.
-# A second counted place can go to the same task's next rep, which waits on
-# the task lock rather than lock-infra; that costs a little at rep boundaries.
+# Both places go to different tasks: launch_units never starts a task's next
+# repetition while its last is in flight.
 INFRA_IN_FLIGHT_MAX=2
 
 # One phase's units, launched in queue order at the given parallelism, each
