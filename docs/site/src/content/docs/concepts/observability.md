@@ -86,6 +86,8 @@ The `git` the broker runs itself for its version-control and workspace routes is
 
 The proposal readings take as long as the forge allows. The sweep sends GitHub's search API at most 25 calls a minute, under the 30 it serves, and reads each proposal's events within 1000 forge calls an hour. On an install whose GitHub repositories need more searches than that per sweep, a sweep takes longer than 240 seconds and `kubeagents_vcs_readings_age_seconds` grows with it. Each reading is still whole or absent: a slower sweep does not change what it counts.
 
+That hourly budget is a fifth of one GitHub App installation's quota, so several installs that share an installation share what is left of it as well. An install in that position can turn the sweep off with `KUBEAGENTS_VCS_READINGS_ENABLED=false` in `spec.deployment.env`; the readings' series are then absent.
+
 #### A2A gateway series
 
 The `spec.mode: next` stack only.
