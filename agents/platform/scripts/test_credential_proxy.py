@@ -9462,13 +9462,13 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with("banana"))
 
-    def _served_sweep(self, role, managed):
+    def _served_sweep(self, role, managed, extra_env=None):
         """The sweep `serve` started in `role`, with `start` stubbed; None if none was."""
         with mock.patch.object(credential_proxy, "resolve_role", return_value=role), \
                 mock.patch.object(credential_proxy, "managed_repositories", managed), \
                 mock.patch.object(credential_proxy, "start_agent_api_proxy", mock.MagicMock()), \
                 mock.patch.object(credential_proxy.vcs_readings.ReadingsSweep, "start", autospec=True) as start:
-            self._serve_with(None)
+            self._serve_with(None, extra_env=extra_env)
         if not start.called:
             return None
         start.assert_called_once()
@@ -9496,6 +9496,23 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             credential_proxy.serve(types.SimpleNamespace())
         proxy.serve_forever.assert_called_once_with()
         start.assert_not_called()
+
+    def test_the_sweep_env_turns_it_off_and_nothing_else_does(self):
+        # Installs sharing one App installation (the eval lanes, #4611) turn
+        # the sweep off; an unset, "on" or misspelt value leaves it on, so a
+        # typo can't quietly stop a real install's readings.
+        managed = mock.Mock(return_value=frozenset({"github.com/acme/infra"}))
+        env = credential_proxy.VCS_READINGS_ENV
+        for value in ("off", " OFF "):
+            with self.subTest(value=value):
+                self.assertIsNone(self._served_sweep("broker", managed, {env: value}))
+        for value in ("", "on", "0", "banana"):
+            with self.subTest(value=value):
+                self.assertIsNotNone(self._served_sweep("broker", managed, {env: value}))
+        with mock.patch.dict(os.environ, {env: "banana"}), \
+                self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertTrue(credential_proxy.readings_sweep_enabled())
+        self.assertIn("stays on", "\n".join(logs.output))
 
     def test_the_sweep_starts_on_an_empty_list_and_its_pass_makes_no_forge_call(self):
         sweep = self._served_sweep("broker", mock.Mock(return_value=frozenset()))

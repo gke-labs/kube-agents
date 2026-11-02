@@ -181,6 +181,12 @@ serves `GET /metrics` from the registry as today and nothing about a scrape reac
 A reading is therefore at most one interval old when the operator's five-minute poll reads it,
 so a merge reaches `status.usage` within two poll intervals end to end.
 
+**Off switch.** `CREDENTIAL_PROXY_VCS_READINGS=off` in `spec.deployment.env` starts no sweep, and
+the readings' series are simply absent. Any other value, or none, leaves it on. The step-2 budget
+below assumes one install per App installation. Installs that share one each spend their own
+budget against the same quota, which is why the eval lanes, forty projects on one installation,
+set it (#4611).
+
 **Per managed repository**, with the repository's `whoami` login as `author`:
 
 1. The install's own proposals, listed by author through a new provider method
