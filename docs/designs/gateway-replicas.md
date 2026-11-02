@@ -241,17 +241,26 @@ ingress gap above.
   standby.
 - **`RollingUpdate` with `maxSurge: 1`, `maxUnavailable: 0`,** replacing `Recreate`, so the new
   pod comes up as a standby before an old one stops. The operator renders it, and a second
-  replica, only once the Lease has had a holder. The operator records that as a condition on the
-  PlatformAgent (`GatewayElected`), set the first time it sees a holder, so a deleted Lease or its
-  held-back recreate doesn't flip the Deployment back to one replica. It's cleared when the mode
-  goes back to today, as `BusProvisioned` is. A status condition doesn't survive most restores, so
-  a restored install starts at one replica and moves to two once a gateway takes the Lease again.
-  While `A2A_GATEWAY_IMAGE` pins the gateway image, the operator holds one replica and `Recreate`
-  whatever the condition says: it can't tell whether a pinned image runs the election. A gateway
-  from before the election holds no
-  Lease and would act beside an elected one, and term 0 fences nothing. So an install upgrading
-  across the election in one roll keeps one replica and `Recreate` for that roll, and moves to two
-  once the elected gateway has taken the Lease. A surge pod needs room under the agent
+  replica, only once it knows the gateway image runs the election, because a gateway from before
+  the election holds no Lease and would act beside an elected one, and term 0 fences nothing. The
+  operator records an election as a `GatewayElected` condition on the PlatformAgent, naming the image of the
+  pod that holds the Lease (the holder is a pod name, and the operator reads the pod). It renders two
+  replicas when that condition names the image it now renders, or when the condition is set for
+  any image and the new one comes from the operator's own release (the operator image's tag, the
+  second rung of `a2aReleaseImage`): an elected gateway is running, and the operator's release
+  runs the election by construction. Anything else first rolls as one replica with `Recreate` (an
+  `A2A_GATEWAY_IMAGE` pin, a tag taken from `PLATFORM_AGENT_IMAGE`, or the first roll of any image
+  when no gateway has been elected yet), and moves to two once a pod on that image holds the
+  Lease. A deleted Lease or its held-back recreate doesn't change the image,
+  so it doesn't flip the Deployment back. The condition is
+  cleared when the mode goes back to today, as `BusProvisioned` is. A status condition doesn't
+  survive most restores, so a restored install starts at one replica until a
+  gateway takes the Lease again. A CI install, which always pins the image, spends its first roll
+  at one replica and runs two after that. A gateway from before the election never takes the
+  Lease, so a pin to one stays at one replica. The same check covers an install upgrading across
+  the election in one roll: its old gateway holds no
+  Lease, so that roll is one replica and `Recreate`, and two follow once the elected gateway has
+  taken it. A surge pod needs room under the agent
   namespace's quota; where there's none, the rollout waits, which is the reason `Recreate` was
   chosen. The operator renders `maxSurge: 0`, `maxUnavailable: 1` instead when the CR asks for one
   replica. The ReplicaSet may stop the active pod before the standby, which costs a second, graceful
@@ -300,7 +309,7 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    helper, and the eval harness, the CI scripts and the docs resolving the holder. It lands before
    step 4, so nothing meets a standby it can't route around.
 4. **Operator:** replicas, the readiness probe, the strategy (held at one replica and `Recreate`
-   until the `GatewayElected` condition is set, and while `A2A_GATEWAY_IMAGE` pins the image), the
+   for an image outside the operator's own release until `GatewayElected` names it), the
    PDB, the spread, the Lease (with its owner reference and
    an `Owns` watch, recreated one `leaseDuration` after a deletion) and its Role. Its tests pin
    each, including the held-back recreate and the first roll across the election.
