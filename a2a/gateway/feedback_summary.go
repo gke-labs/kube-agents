@@ -93,9 +93,9 @@ const (
 // : The script's USAGE_COUNTERS verbatim.
 var usageSummaryCounters = []string{
 	"clustersRegistered", "clustersMonitored", "chatMessagesInboundTotal", "sessionsTotal",
-	"toolExecutionsTotal", "eventsIngestedTotal", "remediationsProposedTotal", "remediationsMergedTotal",
-	"proposalsAuthored", "remediationsOpen", "remediationsClosedUnmergedTotal", "proposalHumanTouches",
-	"proposalsMergedUntouched",
+	"chatSessionsTotal", "toolExecutionsTotal", "eventsIngestedTotal", "remediationsProposedTotal",
+	"remediationsMergedTotal", "proposalsAuthored", "remediationsOpen", "remediationsClosedUnmergedTotal",
+	"proposalHumanTouches", "proposalsMergedUntouched",
 }
 
 // : The fields the broker reads off the forge rather than counts: absent means
