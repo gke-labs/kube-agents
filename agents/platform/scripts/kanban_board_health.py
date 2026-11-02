@@ -11,8 +11,8 @@ It reports two kinds of thing about the board, and deliberately nothing else
 about it. Ahead of both, it says when the volume the board lives on is full:
 at the Session KV server's warn line a line in that server's words leads the
 report, and a board that cannot be read because the disk is full is said as
-that, not as a bare error. Every board write fails on a full volume, so this
-is the cause of most else a full board shows.
+that, not as a bare error. The volume line is said only beside another
+finding: alone, the Session KV server's once-per-crossing warning has said it.
 
 1. **Invariant violations**, queried here directly. Every non-``running``
    transition in ``hermes_cli/kanban_db.py`` clears ``claim_lock`` inside the
@@ -193,8 +193,10 @@ DATA_VOLUME_WARNING = (
     "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent."
 )
 BYTES_PER_GIB = 1 << 30
-# What SQLite and the OS say when a write fails for want of space, lowercased.
-DISK_FULL_MARKERS = ("disk i/o error", "database or disk is full", "no space left on device")
+# What SQLite says when a write fails for want of space, lowercased. "disk I/O
+# error" has other causes too, so it is read as a full disk only while the
+# volume is past the warn line.
+DISK_FULL_MARKERS = ("disk i/o error", "database or disk is full")
 # The report when the board cannot be read for that reason.
 BOARD_DISK_FULL = "The task board cannot be read or written because the agent's disk is full ({error})."
 # What the header and its newline take of the other findings' budget.
@@ -902,7 +904,7 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
     The stuck tasks are ``stuck_tasks`` dicts, which ``main`` renders when
     ``stuck_due`` says so, or None when the engine did not answer (its line is
     among the other lines), since then which cards are stuck is unknown. The other lines (invariant violations and the
-    engine's other findings) stay <= max_chars (including
+    engine's other findings, led by the full-volume line when there is one) stay <= max_chars (including
     ``REPORT_HEADER_RESERVE``); the default leaves ``STUCK_CARD_RESERVE`` of the
     report's budget to the stuck tasks.
     """
@@ -914,7 +916,10 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
         # shell-out here is deliberate — the CLI would create one.
         return [], []
     lines = []
-    # First, because it is the cause of most else a full board shows.
+    # Read before the board, and said only beside another finding: the Session
+    # KV server's warning is the once-per-crossing alert, and a line here every
+    # day on a healthy board would repeat it, and would cost a stuck-tasks
+    # report its card. Beside a finding it leads, as the likely cause.
     volume = data_volume_line(home)
     if volume:
         lines.append(volume)
@@ -952,6 +957,8 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
     if diags:
         lines.append("Active kanban diagnostics:")
         lines.extend(diags)
+    if volume and lines == [volume]:
+        lines = []
     if any(line.startswith(DIAGNOSTICS_UNAVAILABLE) for line in diags):
         return None, lines
     return stuck_tasks(stuck, context), lines
@@ -973,10 +980,11 @@ def main(argv=None, *, env=None, now=None) -> int:
         if state != recorded:
             save_state(path, state)
         save_card(card_path(home, env), None)
-        if is_disk_full_error(exc):
+        volume = data_volume_line(home)
+        if volume and is_disk_full_error(exc):
             # Said for the channel: the board is down for want of space, and
             # what fixes it.
-            print("\n".join(filter(None, [REPORT_HEADER, BOARD_DISK_FULL.format(error=exc), data_volume_line(home)])))
+            print("\n".join([REPORT_HEADER, BOARD_DISK_FULL.format(error=exc), volume]))
             return 0
         print(f"kanban board health: cannot read {board_path(home)}: {exc}")
         return 0
