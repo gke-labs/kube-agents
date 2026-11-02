@@ -452,6 +452,10 @@ function trendStateHref(link, patch) {
   if (state.mode) params.push(`mode=${enc(state.mode)}`);
   return `${PAGE.pages.trend}#${params.join("&")}`;
 }
+// The Trend page's own domain and case titles keep the reader's series:
+// the other chips' state stays behind, but a title that switched today's
+// records for next's under the same heading would read as the same series.
+const trendModeHref = (href, link) => (link.mode ? `${href}&mode=${enc(link.mode)}` : href);
 const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 
 /* ---- links out ---- */
@@ -2402,7 +2406,7 @@ function trendHtml(link) {
     const range = trendRange([...found.map((name) => cases[name].points || []), ...found.map((name) => timedPoints(latencyPoints(t, "cases", name)))], link);
     body = found.map((name) => {
       const c = cases[name];
-      const footer = trendRecordHtml(c.record) + trendKeyChangesHtml(t, c.key_changes) + `<p class="small"><a href="${esc(caseHref(name))}">this case on the Cases page →</a> · <a href="${esc(trendDomainHref(c.domain))}">${c.domain === DOMAIN_UNKNOWN ? `every case with ${DOMAIN_UNKNOWN_LABEL}` : `its domain, ${esc(domainWords(c.domain))}`} →</a></p>`;
+      const footer = trendRecordHtml(c.record) + trendKeyChangesHtml(t, c.key_changes) + `<p class="small"><a href="${esc(caseHref(name))}">this case on the Cases page →</a> · <a href="${esc(trendModeHref(trendDomainHref(c.domain), link))}">${c.domain === DOMAIN_UNKNOWN ? `every case with ${DOMAIN_UNKNOWN_LABEL}` : `its domain, ${esc(domainWords(c.domain))}`} →</a></p>`;
       return trendCardHtml(t, `<code>${esc(name)}</code>`, esc(domainWords(c.domain)), c.points || [], c.key_changes, metric, range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() }, link, false, footer, `case:${name}`, latencyPoints(t, "cases", name));
     }).join("");
     if (missing.length) body += `<div class="tcard"><h3><code>${missing.map(esc).join("</code>, <code>")}</code></h3><p class="mut">No record in the store for ${missing.length === 1 ? "this case" : "these cases"} inside the window: ${missing.length === 1 ? "it has" : "they have"} not run on a recording night yet, or the name is not a case.</p></div>`;
@@ -2416,7 +2420,7 @@ function trendHtml(link) {
     const domainLatency = latencyPoints(t, "domains", scope.domain);
     const range = trendRange([d.points || [], ...members.map((name) => cases[name].points || []), timedPoints(domainLatency)], link);
     body = trendCardHtml(t, esc(domainWords(scope.domain)), `${plural(members.length, "case")} pooled per night`, d.points || [], d.key_changes, metric, range, link, true, "", `domain:${scope.domain}`, domainLatency) +
-      `<div class="sec"><h2>Each case in ${esc(domainWords(scope.domain))}</h2>${members.map((name) => trendCardHtml(t, `<a href="${esc(trendHref([name]))}"><code>${esc(name)}</code></a>`, "", cases[name].points || [], cases[name].key_changes, metric, range, link, false, trendRecordHtml(cases[name].record), `case:${name}`, latencyPoints(t, "cases", name))).join("")}</div>`;
+      `<div class="sec"><h2>Each case in ${esc(domainWords(scope.domain))}</h2>${members.map((name) => trendCardHtml(t, `<a href="${esc(trendModeHref(trendHref([name]), link))}"><code>${esc(name)}</code></a>`, "", cases[name].points || [], cases[name].key_changes, metric, range, link, false, trendRecordHtml(cases[name].record), `case:${name}`, latencyPoints(t, "cases", name))).join("")}</div>`;
     return head(`${esc(domainWords(scope.domain))} on main`) + trendStatusHtml(t) + ctl + readLine + body + footHtml();
   }
   const allLatency = latencyPoints(t, "all");
@@ -2424,7 +2428,7 @@ function trendHtml(link) {
   // Every case's timing pooled per night, above the domains' cards.
   const allRange = range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() };
   const allRow = `<div class="sec"><h2>Latency, all domains</h2>${trendLatencyRowHtml(t, allLatency, allRange, latencyMarkers(trendMarkers(t, [], link)), "all domains", "all")}${trendLatencyTableHtml(t, allLatency, allRange, "all")}</div>`;
-  body = allRow + domainNames.map((name) => trendCardHtml(t, `<a href="${esc(trendDomainHref(name))}">${esc(domainWords(name))}</a>`, `${plural((domains[name].cases || []).length, "case")} pooled per night`, domains[name].points || [], domains[name].key_changes, metric, range, link, true, "", `domain:${name}`, latencyPoints(t, "domains", name))).join("");
+  body = allRow + domainNames.map((name) => trendCardHtml(t, `<a href="${esc(trendModeHref(trendDomainHref(name), link))}">${esc(domainWords(name))}</a>`, `${plural((domains[name].cases || []).length, "case")} pooled per night`, domains[name].points || [], domains[name].key_changes, metric, range, link, true, "", `domain:${name}`, latencyPoints(t, "domains", name))).join("");
   return head("Scores over time on main") + trendStatusHtml(t) + ctl + readLine + body + footHtml();
 }
 

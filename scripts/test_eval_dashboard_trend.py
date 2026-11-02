@@ -803,6 +803,8 @@ class TrendPageTest(unittest.TestCase):
         today = dom_text(page, fragment="#mode=today")
         self.assertIn("· 4 today-mode records over 1 night inside the last 90 days", today)
         self.assertIn('data-mode="today" class="on"', today)
+        self.assertIn('<a href="trend.html#domain=remediation&amp;mode=today">remediation</a>', today, "a domain title keeps the series")
+        self.assertIn('<a href="trend.html#domain=remediation">remediation</a>', app, "and adds none the link did not carry")
         # The chip writes the fragment, and a scope chip keeps the series.
         script = ('document.querySelector(\'button[data-mode="today"]\').click();'
                   'window.addEventListener("hashchange", () => { document.getElementById("app").insertAdjacentHTML("afterend", `<p id="where">${location.hash}</p>`); }, { once: true });')
