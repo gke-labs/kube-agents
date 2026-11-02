@@ -1,6 +1,3 @@
-# The real-install test (bench/scale/real-install-test-plan.md): one fleet point on a new install at the
-# L container size. `runner apply real-install.yaml --factor combined --level 1` builds it; the
-# questions and the first-run flow are driven and measured outside the plan's matrix.
 # Step 6 of real-install-test-plan.md: the Step 1 fleet with 20 failing Pods for one hour, to see
 # whether the event watcher's triage sessions grow without bound. Run with --only-factor combined.
 phase: real-install-failing
