@@ -195,16 +195,20 @@ func newMetrics() *metrics {
 			Help: "Total POST /sessions attempts, labeled by outcome.",
 		}, []string{"cluster", "project", "location", "outcome"}),
 		// namespace, kind and workload are the daemon's own incident key
-		// (workloadOf folds a Deployment's pod on its Deployment the way the
-		// daemon's _fold_key does), so a hold's rows line up with the
-		// incidents it delayed. The only watcher series with an object name
-		// in its labels: a child is minted the first time a workload is held
-		// and, like any counter child, lives until the process restarts, so
-		// the distinct values are the workloads that failed during a hold
-		// over the process's life, not a snapshot of the current hold.
+		// (workloadOf is the daemon's _fold_key: a Deployment's pod on its
+		// Deployment, a non-Pod object on its name, any other pod empty), so
+		// a hold's rows line up with the incidents it delayed. The only
+		// watcher series with an object name in its labels: a child is
+		// minted the first time a workload is held and, like any counter
+		// child, lives until the process restarts, so the distinct values
+		// are the Deployments and non-Pod objects that failed during a hold
+		// over the process's life, not a snapshot of the current hold. A pod
+		// that does not fold is never a value: a CronJob or Job pod is a new
+		// name per run, and naming it would grow the vector by one child per
+		// run for as long as the process lives.
 		sessionCreatesSuppressed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_session_creates_suppressed_total",
-			Help: "Total per-incident session creates the watcher did not attempt because the daemon had answered POST /sessions with 429 or 5xx three times running and the cooldown breaker was open. No HTTP call was made; the dedup entry is rolled back so the next sighting after the cooldown opens the incident. workload is the Deployment's name for a Deployment's pod, else the object's own name.",
+			Help: "Total per-incident session creates the watcher did not attempt because the daemon had answered POST /sessions with 429 or 5xx three times running and the cooldown breaker was open. No HTTP call was made; the dedup entry is rolled back so the next sighting after the cooldown opens the incident. workload is the Deployment's name for a Deployment's pod, the object's own name for any other kind, and empty for any other pod (a StatefulSet ordinal, a Job's, CronJob run's, DaemonSet's or bare pod), which share one child per namespace and kind.",
 		}, []string{"cluster", "project", "location", "namespace", "kind", "workload"}),
 		triageSessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_triage_sessions_total",

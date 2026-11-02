@@ -708,10 +708,16 @@ func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
 var podTemplateHashPodPattern = regexp.MustCompile(`^(.*?)-[4-9bcdf]{8,10}-[a-z0-9]{5}$`)
 
 // workloadOf names the workload an event belongs to for the suppressed
-// counter, folded the way the daemon folds incidents (_fold_key): a
-// Deployment's pod on its Deployment, any other object on its own name.
-// The watcher sets no controller reference on its events (watcher.go), so
-// the pod name is what there is to fold.
+// counter, the daemon's own fold key (_fold_key): a Deployment's pod on its
+// Deployment, a non-Pod object on its own name, and the empty string for any
+// other pod. A StatefulSet's ordinal, a Job's or a CronJob run's pod, a
+// DaemonSet's or a bare pod does not fold, and naming it would mint a counter
+// child per pod: a CronJob failing through a hold is a new pod name, and a
+// new child, per run, on a vector whose children live until the process
+// restarts. Empty, those pods share the {namespace,kind} child, so the label's
+// distinct values are bounded by the Deployments and non-Pod objects held,
+// as the daemon's are. The watcher sets no controller reference on its events
+// (watcher.go), so the pod name is what there is to fold.
 func workloadOf(ev TriageEvent) string {
 	if !strings.EqualFold(ev.KindOfObject, kindPod) {
 		return ev.Name
@@ -719,7 +725,7 @@ func workloadOf(ev TriageEvent) string {
 	if m := podTemplateHashPodPattern.FindStringSubmatch(ev.Name); m != nil {
 		return m[1]
 	}
-	return ev.Name
+	return ""
 }
 
 // forgetIncident rolls back the dedup entry Observe wrote for an event the

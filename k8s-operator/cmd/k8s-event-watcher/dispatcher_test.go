@@ -1849,17 +1849,28 @@ func TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen(t *testing.T) {
 
 	// Process-wide: another cluster's dispatcher, built on the same
 	// injector, is held by the same breaker and counted under its own
-	// labels; a pod whose name does not fold is named by itself.
+	// labels. Two runs of a CronJob failing through the hold are two pod
+	// names and two UIDs; neither folds, so both land on the one child with
+	// an empty workload rather than minting a child per run.
 	other := newDisp()
 	otherEv := ev
 	otherEv.Cluster = "other-cluster"
-	otherEv.Name = "cron-job-abc"
+	otherEv.Name = "backup-29312345-k7x2p"
 	other.Dispatch(context.Background(), otherEv)
+	nextRun := otherEv
+	nextRun.Key.UID = "cron-run-2"
+	nextRun.Name = "backup-29312346-m3q8z"
+	other.Dispatch(context.Background(), nextRun)
 	if createCalls != 3 {
 		t.Fatalf("a second cluster POSTed through the open breaker (%d creates); want the hold to be process-wide", createCalls)
 	}
-	if got := suppressed("other-cluster", "cron-job-abc"); got != 1 {
-		t.Errorf("session_creates_suppressed_total for the other cluster = %v; want 1", got)
+	if got := suppressed("other-cluster", ""); got != 2 {
+		t.Errorf("session_creates_suppressed_total for the other cluster's unfolded pods = %v; want 2 on one child", got)
+	}
+	for _, name := range []string{otherEv.Name, nextRun.Name} {
+		if got := suppressed("other-cluster", name); got != 0 {
+			t.Errorf("session_creates_suppressed_total{workload=%q} = %v; want no child named after a CronJob run's pod", name, got)
+		}
 	}
 
 	// 61s past the opening failure, the daemon is back: the next event POSTs
@@ -1881,16 +1892,22 @@ func TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen(t *testing.T) {
 
 // TestWorkloadOfFoldsLikeTheDaemon pins the suppressed counter's workload
 // label to the daemon's own fold (_fold_key): a Deployment's pod on its
-// Deployment, every other name on itself.
+// Deployment, a non-Pod object on its own name, and every other pod (a
+// StatefulSet ordinal, a Job's or CronJob run's pod, a DaemonSet's or a bare
+// pod) on the empty string, so a pod name that changes every run never mints
+// a counter child of its own.
 func TestWorkloadOfFoldsLikeTheDaemon(t *testing.T) {
 	for _, tc := range []struct {
 		kind, name, want string
 	}{
 		{"Pod", "billing-service-7d9f8b6c4-xk2pq", "billing-service"},
 		{"pod", "api-5b8c7d9f6-abcde", "api"},
-		{"Pod", "web-0", "web-0"},
-		{"Pod", "backup-29312345-k7x2p", "backup-29312345-k7x2p"},
-		{"Pod", "bare", "bare"},
+		{"Pod", "web-0", ""},
+		{"Pod", "backup-29312345-k7x2p", ""},
+		{"Pod", "backup-29312346-m3q8z", ""},
+		{"Pod", "db-migrate-20261021-abcde", ""},
+		{"Pod", "node-exporter-x7k2p", ""},
+		{"Pod", "bare", ""},
 		{"Deployment", "api-5b8c7d9f6-abcde", "api-5b8c7d9f6-abcde"},
 		{"Node", "gke-pool-1-abc", "gke-pool-1-abc"},
 	} {
