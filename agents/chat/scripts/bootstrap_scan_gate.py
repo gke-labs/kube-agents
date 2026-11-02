@@ -568,9 +568,12 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
 
     if proc.returncode == RECONCILE_CREATES_DEFERRED:
         # The run made progress and stopped at its cap; the next tick continues from
-        # the profiles it left. Not a failure, so the attempt is given back: a fleet of
-        # several batches must not spend the ceiling on being large.
-        _record_reconcile_attempt(data_dir, attempts, since)
+        # the profiles it left. The listing succeeded and a cap's worth of creates did,
+        # so the reconcile can succeed here: the streak ends as it does on exit 0, and
+        # the give-up clock starts over. Carrying the old streak through would let the
+        # IAM-propagation failures a fresh install starts with trip the clock while the
+        # batches were still landing, and file the sweep against a partial roster.
+        _record_reconcile_attempt(data_dir, 0)
         sys.stderr.write(
             "bootstrap_scan_gate: reconcile created a batch of Cluster Agents and deferred the rest "
             f"to the next tick. stderr: {proc.stderr.strip()[-RECONCILE_STDERR_TAIL_CHARS:]}\n"
