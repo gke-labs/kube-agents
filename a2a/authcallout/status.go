@@ -53,6 +53,14 @@ type Status struct {
 	// render did not land, which is the state that would otherwise look
 	// identical to nothing having been rendered.
 	LastError string `json:"lastError,omitempty"`
+
+	// Shards is how many ConfigMaps this callout was told the map is cut
+	// into and watches; Pending says why the shards it holds are not yet
+	// a map it can serve (one not arrived, or two versions among them),
+	// empty once they are. A callout serving version N with Pending set is
+	// mid-way through a re-render, or stuck in one.
+	Shards  int    `json:"shards"`
+	Pending string `json:"pending,omitempty"`
 }
 
 // StatusOf snapshots the store.
@@ -62,6 +70,8 @@ func StatusOf(s *Store) Status {
 		Serving:   s.Ready(),
 		LastError: s.LastError(),
 		Users:     []string{},
+		Shards:    s.Shards(),
+		Pending:   s.Pending(),
 	}
 	if m := s.Current(); m != nil {
 		st.Users = m.Users()

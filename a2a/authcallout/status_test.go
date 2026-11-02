@@ -43,6 +43,32 @@ func TestStatusReportsTheServedVersionAndUsers(t *testing.T) {
 	if got.LastError != "" {
 		t.Errorf("LastError = %q, want empty", got.LastError)
 	}
+	if got.Shards != 1 || got.Pending != "" {
+		t.Errorf("Shards = %d, Pending = %q on a one-shard store with its map served; want 1 and empty", got.Shards, got.Pending)
+	}
+}
+
+// A half-landed re-render is visible: the status names the shard count and
+// what the set it holds is waiting on, while the served version stays.
+func TestStatusReportsWhatTheShardsAreWaitingOn(t *testing.T) {
+	s := shardedStore(t, 2)
+	if err := s.UpdateShard(0, []byte(shardDoc("v1", 0, 2, "gateway"))); err != nil {
+		t.Fatalf("UpdateShard: %v", err)
+	}
+	_, body := get(t, StatusHandler(s, nil), StatusPath)
+	var got Status
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("status body does not parse: %v\n%s", err, body)
+	}
+	if got.Shards != 2 {
+		t.Errorf("Shards = %d, want 2", got.Shards)
+	}
+	if got.Serving || got.Version != "" {
+		t.Errorf("Serving = %v, Version = %q with one shard of two; want nothing served", got.Serving, got.Version)
+	}
+	if !strings.Contains(got.Pending, "shard(s) 1 of 2") {
+		t.Errorf("Pending = %q, want it to name the missing shard", got.Pending)
+	}
 }
 
 // Readiness is what makes "every replica ready" mean "every replica serving the

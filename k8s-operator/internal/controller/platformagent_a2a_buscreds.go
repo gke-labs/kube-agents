@@ -139,13 +139,14 @@ func (r *PlatformAgentReconciler) syncBusCredentialsReady(ctx context.Context, a
 	return r.setBusCredentialsReady(ctx, agent, dep, err != nil, mapVersion)
 }
 
-// renderedAuthMapVersion reads the version off the ConfigMap the callout
-// watches. Best effort: the caller only needs it for the condition's message,
-// and a message naming no version is better than a reconcile that fails
-// because it could not read one.
+// renderedAuthMapVersion reads the version off shard 0 of the identity map,
+// which every render has and which carries the whole map's version. Best
+// effort: the caller only needs it for the condition's message, and a message
+// naming no version is better than a reconcile that fails because it could not
+// read one.
 func (r *PlatformAgentReconciler) renderedAuthMapVersion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
 	cm := &corev1.ConfigMap{}
-	if err := r.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}, cm); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aAuthMapShardName(agent, 0), Namespace: agent.Namespace}, cm); err != nil {
 		return a2aAuthMapVersionUnknown
 	}
 	if v := cm.Annotations[a2aAuthMapVersionAnnotation]; v != "" {

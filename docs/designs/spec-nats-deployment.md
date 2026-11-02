@@ -680,7 +680,13 @@ The callout reads an identity-to-permissions map rendered by the operator (**ame
 8/24** for the subagent framework; **amended 9/4** to what ships): one entry per
 callout-authenticated principal, keyed by the ServiceAccount as TokenReview spells it
 (`system:serviceaccount:<namespace>:<name>`), rendered into ConfigMap
-`<agent>-a2a-authmap` under key `identities.json`. **Amended 9/8:** that is now two
+`<agent>-a2a-authmap` under key `identities.json`. **Amended 11/2:** the map is cut into
+numbered ConfigMaps, `<agent>-a2a-authmap-0` through `-<n-1>`, each under a byte budget
+that keeps it below the API server's 1 MiB object limit (the single object crossed it near
+640 bound profiles); every shard carries the whole map's version and `shard`/`shards`
+stamps, the callout is told the count and watches each name under a Role naming each,
+and it serves a new version only once every shard of it has arrived. A map that fits is
+one shard. **Amended 9/8:** that is now two
 entries - the provisioning Job and the session principal. **Amended 9/15:** three, the
 platform agent container having joined them when `worker` was retired. **Amended 9/9:**
 four, the capability verifier having joined them; it is callout-authenticated for the

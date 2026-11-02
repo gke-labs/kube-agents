@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -167,5 +169,226 @@ func TestWaitForMapReportsWhyNothingIsServed(t *testing.T) {
 	// thing that names the render.
 	if !strings.Contains(err.Error(), "is not system:serviceaccount:") {
 		t.Errorf("error = %v, want it to carry the refusal reason", err)
+	}
+}
+
+// shardDoc is one shard of a map: the stamps the operator writes, one identity.
+func shardDoc(version string, shard, shards int, user string) string {
+	return `{"version":"` + version + `","shard":` + strconv.Itoa(shard) + `,"shards":` + strconv.Itoa(shards) + `,"identities":[
+	  {"serviceAccount":"system:serviceaccount:ns:` + user + `","user":"` + user + `","account":"APP",
+	   "grants":{"publish":["a.>"],"subscribe":["_INBOX.` + user + `.>"]}}]}`
+}
+
+func shardedStore(t *testing.T, shards int) *Store {
+	t.Helper()
+	s, err := NewShardedStore(slog.New(slog.NewTextHandler(io.Discard, nil)), shards)
+	if err != nil {
+		t.Fatalf("NewShardedStore(%d): %v", shards, err)
+	}
+	return s
+}
+
+// The map is served only once every shard of one version is in hand, and then
+// it is the whole map: an identity from each shard resolves.
+func TestAShardedMapIsServedOnceEveryShardOfOneVersionHasArrived(t *testing.T) {
+	s := shardedStore(t, 3)
+	if err := s.UpdateShard(0, []byte(shardDoc("v1", 0, 3, "gateway"))); err != nil {
+		t.Fatalf("shard 0: %v", err)
+	}
+	if err := s.UpdateShard(2, []byte(shardDoc("v1", 2, 3, "verifier"))); err != nil {
+		t.Fatalf("shard 2: %v", err)
+	}
+	if s.Ready() {
+		t.Fatal("the store serves a map with a shard still missing")
+	}
+	if !strings.Contains(s.Pending(), "shard(s) 1 of 3") {
+		t.Errorf("Pending = %q, want it to name the missing shard", s.Pending())
+	}
+	if s.LastError() != "" {
+		t.Errorf("an incomplete set is recorded as a refusal: %q", s.LastError())
+	}
+	if err := s.UpdateShard(1, []byte(shardDoc("v1", 1, 3, "session"))); err != nil {
+		t.Fatalf("shard 1: %v", err)
+	}
+	if !s.Ready() || s.Version() != "v1" {
+		t.Fatalf("ready=%v version=%q after every shard arrived, want ready at v1", s.Ready(), s.Version())
+	}
+	if s.Pending() != "" {
+		t.Errorf("Pending = %q after a complete set", s.Pending())
+	}
+	for _, user := range []string{"gateway", "session", "verifier"} {
+		if _, ok := s.Current().Lookup("system:serviceaccount:ns:" + user); !ok {
+			t.Errorf("the assembled map does not resolve %s, which arrived in one of the shards", user)
+		}
+	}
+	if got := s.Current().Users(); !slices.Equal(got, []string{"gateway", "session", "verifier"}) {
+		t.Errorf("Users = %v, want every shard's", got)
+	}
+}
+
+// A re-render lands one shard at a time. Until the last one lands the shards
+// carry two versions, and the previous map keeps serving rather than a mix of
+// the two; the status says so.
+func TestAReRenderKeepsThePreviousMapUntilEveryShardIsOnTheNewVersion(t *testing.T) {
+	s := shardedStore(t, 2)
+	for i, user := range []string{"gateway", "session"} {
+		if err := s.UpdateShard(i, []byte(shardDoc("v1", i, 2, user))); err != nil {
+			t.Fatalf("v1 shard %d: %v", i, err)
+		}
+	}
+	if err := s.UpdateShard(0, []byte(shardDoc("v2", 0, 2, "gateway"))); err != nil {
+		t.Fatalf("v2 shard 0: %v", err)
+	}
+	if s.Version() != "v1" {
+		t.Errorf("serving %q with one shard on v2, want the previous v1 until the set agrees", s.Version())
+	}
+	if !strings.Contains(s.Pending(), "v1") || !strings.Contains(s.Pending(), "v2") {
+		t.Errorf("Pending = %q, want it to name both versions", s.Pending())
+	}
+	if err := s.UpdateShard(1, []byte(shardDoc("v2", 1, 2, "worker"))); err != nil {
+		t.Fatalf("v2 shard 1: %v", err)
+	}
+	if s.Version() != "v2" {
+		t.Errorf("serving %q after both shards reached v2", s.Version())
+	}
+	if _, ok := s.Current().Lookup("system:serviceaccount:ns:session"); ok {
+		t.Error("the v2 map still resolves an identity only v1 carried; the shards were mixed")
+	}
+	if _, ok := s.Current().Lookup("system:serviceaccount:ns:worker"); !ok {
+		t.Error("the v2 map does not resolve the identity v2's second shard carried")
+	}
+}
+
+// The stamps are checked against what the callout was told and the name the
+// document arrived under: a count other than the configured one, an index
+// other than the name's, and no stamps at all on a store expecting several,
+// are each refused with the previous map kept.
+func TestAShardWhoseStampsDisagreeIsRefused(t *testing.T) {
+	cases := map[string]struct {
+		index int
+		doc   string
+		want  string
+	}{
+		"a count other than the configured one": {0, shardDoc("v2", 0, 3, "gateway"), "expects 2 shards"},
+		"an index other than the name's":        {1, shardDoc("v2", 0, 2, "gateway"), "arrived under the name of shard 1"},
+		"no stamps on a sharded store":          {0, mapWithVersion("v2", "gateway"), "carries no shard stamps"},
+		"an index past the count":               {2, shardDoc("v2", 2, 2, "gateway"), "not a place in a count"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := shardedStore(t, 2)
+			for i, user := range []string{"gateway", "session"} {
+				if err := s.UpdateShard(i, []byte(shardDoc("v1", i, 2, user))); err != nil {
+					t.Fatalf("v1 shard %d: %v", i, err)
+				}
+			}
+			err := s.UpdateShard(tc.index, []byte(tc.doc))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("UpdateShard = %v, want a refusal containing %q", err, tc.want)
+			}
+			if s.Version() != "v1" {
+				t.Errorf("serving %q after a refused shard, want the previous v1", s.Version())
+			}
+			if !strings.Contains(s.LastError(), tc.want) {
+				t.Errorf("LastError = %q, want the refusal", s.LastError())
+			}
+		})
+	}
+}
+
+// Two shards each sound on their own can name one ServiceAccount between
+// them; the assembled set is checked as the single map it becomes.
+func TestADuplicateAcrossShardsIsRefusedAtAssembly(t *testing.T) {
+	s := shardedStore(t, 2)
+	if err := s.UpdateShard(0, []byte(shardDoc("v1", 0, 2, "gateway"))); err != nil {
+		t.Fatalf("shard 0: %v", err)
+	}
+	err := s.UpdateShard(1, []byte(shardDoc("v1", 1, 2, "gateway")))
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("UpdateShard = %v, want the duplicate refused", err)
+	}
+	if s.Ready() {
+		t.Error("a map with a duplicate across shards is being served")
+	}
+}
+
+// The one-shard store takes a stamped shard 0 of 1 and an unstamped whole map
+// alike: the fixture the operator renders is the former, and a map from
+// before sharding the latter.
+func TestAOneShardStoreTakesAStampedOrUnstampedWholeMap(t *testing.T) {
+	s := quietStore()
+	if err := s.Update([]byte(shardDoc("v1", 0, 1, "gateway"))); err != nil {
+		t.Fatalf("stamped 0 of 1: %v", err)
+	}
+	if err := s.Update([]byte(mapWithVersion("v2", "gateway"))); err != nil {
+		t.Fatalf("unstamped: %v", err)
+	}
+	if s.Version() != "v2" {
+		t.Errorf("serving %q, want v2", s.Version())
+	}
+	if _, err := NewShardedStore(nil, 0); err == nil {
+		t.Error("a store expecting no shards was built; it could never serve anything")
+	}
+}
+
+// The whole reason for one informer per shard: two ConfigMap writes, under the
+// numbered names, reach the store and are served as one map.
+func TestWatchingShardsAssemblesTheMapFromEveryConfigMap(t *testing.T) {
+	const (
+		ns   = "kubeagents-system"
+		stem = "agent-a2a-authmap"
+		key  = "identities.json"
+	)
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+
+	client := fake.NewSimpleClientset(
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: ShardName(stem, 0), Namespace: ns},
+			Data:       map[string]string{key: shardDoc("v1", 0, 2, "gateway")},
+		},
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: ShardName(stem, 1), Namespace: ns},
+			Data:       map[string]string{key: shardDoc("v1", 1, 2, "session")},
+		},
+	)
+	if ShardName(stem, 1) != "agent-a2a-authmap-1" {
+		t.Fatalf("ShardName = %q, want the operator's spelling agent-a2a-authmap-1", ShardName(stem, 1))
+	}
+
+	s := shardedStore(t, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = s.WatchConfigMapShards(ctx, client, ns, stem, key) }()
+
+	if err := s.WaitForMap(ctx, 5*time.Second); err != nil {
+		t.Fatalf("the watches never delivered both shards: %v (pending: %s)", err, s.Pending())
+	}
+	if got := s.Current().Users(); !slices.Equal(got, []string{"gateway", "session"}) {
+		t.Fatalf("Users = %v, want both shards' identities", got)
+	}
+
+	// A re-render: shard 1 first, then shard 0. The served map changes once,
+	// when the second write lands.
+	for _, w := range []struct {
+		i    int
+		user string
+	}{{1, "worker"}, {0, "gateway"}} {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: ShardName(stem, w.i), Namespace: ns},
+			Data:       map[string]string{key: shardDoc("v2", w.i, 2, w.user)},
+		}
+		if _, err := client.CoreV1().ConfigMaps(ns).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+			t.Fatalf("updating shard %d: %v", w.i, err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for s.Version() != "v2" {
+		if time.Now().After(deadline) {
+			t.Fatalf("the watches did not deliver the re-render; still serving %q (pending: %s)", s.Version(), s.Pending())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := s.Current().Users(); !slices.Equal(got, []string{"gateway", "worker"}) {
+		t.Errorf("Users = %v after the re-render, want the v2 set", got)
 	}
 }

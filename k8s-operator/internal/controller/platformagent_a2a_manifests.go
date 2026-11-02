@@ -5364,15 +5364,24 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			profiles = nil
 		}
 	}
-	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent, profiles)
+	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}
-	if err := ctrl.SetControllerReference(agent, authMap, r.Scheme); err != nil {
-		return state, err
+	// Every shard, in index order, then the shards the previous render had
+	// and this one does not. The callout serves a new version only once it
+	// holds every shard of it, so a pass that dies between two applies
+	// leaves the callout on the previous version, not on half of this one.
+	for _, authMap := range authMaps {
+		if err := ctrl.SetControllerReference(agent, authMap, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, authMap); err != nil {
+			return state, fmt.Errorf("failed to apply the A2A identity map shard %s: %w", authMap.Name, err)
+		}
 	}
-	if err := r.applyManaged(ctx, agent, authMap); err != nil {
-		return state, fmt.Errorf("failed to apply the A2A identity map: %w", err)
+	if err := r.pruneA2AAuthMapShards(ctx, agent, len(authMaps)); err != nil {
+		return state, fmt.Errorf("failed to prune stale A2A identity map shards: %w", err)
 	}
 	state.AuthMapVersion = authMapVersion
 
@@ -5405,7 +5414,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// connection, so a bus standing up without it accepts only the static
 	// users and refuses everything else — and refuses it as an Authorization
 	// Violation, which reads exactly like a credential problem.
-	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public)
+	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public, len(authMaps))
 	if err != nil {
 		return state, err
 	}
@@ -6323,8 +6332,12 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// In reconcileA2A the keys Secret is created first and acts as the
 		// sentinel covering the map; deleting the map first ensures that if a
 		// cleanup pass dies on the map delete, the keys Secret is still standing
-		// to prevent the next pass from early-exiting.
-		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// to prevent the next pass from early-exiting. This entry is shard 0,
+		// which every render has; the shards above it, whose count this list
+		// cannot know, and the unsharded object releases before sharding
+		// rendered go in deleteA2AAuthMapShards, which cleanupA2A runs before
+		// this walk for the same sentinel reason.
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(agent, 0), Namespace: agent.Namespace}}, r.a2aReader()},
 		// The task-signing key, before the keys Secret for the same reason
 		// as the map: the keys Secret is the sentinel.
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
@@ -6333,6 +6346,60 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		// ServiceAccount is an Owns() kind, so this read is cached and free.
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+	}
+}
+
+// pruneA2AAuthMapShards deletes what the identity map's render no longer
+// produces: the unsharded object a release before sharding rendered, and every
+// shard at or past this pass's count. Shards are contiguous from 0 by
+// construction, so the sweep walks up from the count and stops at the first
+// name that is not there; each delete is of an object this CR owns and
+// nothing else (deleteA2AObjectIfOwned). Uncached reads, through a2aReader,
+// for the reason every ConfigMap read here is: nothing watches the kind.
+func (r *PlatformAgentReconciler) pruneA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent, shards int) error {
+	if err := r.deleteLegacyA2AAuthMap(ctx, agent); err != nil {
+		return err
+	}
+	return r.deleteA2AAuthMapShardsFrom(ctx, agent, shards)
+}
+
+// deleteA2AAuthMapShards removes every identity-map object, the unsharded
+// legacy one and every shard, for the flip to today and the CR's deletion.
+// Shard 0 is also a walk entry (a2aPreBusTeardown), which finds it gone.
+func (r *PlatformAgentReconciler) deleteA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if err := r.deleteLegacyA2AAuthMap(ctx, agent); err != nil {
+		return err
+	}
+	return r.deleteA2AAuthMapShardsFrom(ctx, agent, 0)
+}
+
+// deleteLegacyA2AAuthMap removes the unsharded object a release before
+// sharding rendered, when this CR owns it.
+func (r *PlatformAgentReconciler) deleteLegacyA2AAuthMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	legacy := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}
+	return r.deleteA2AObjectIfOwned(ctx, agent, legacy, r.a2aReader(), nil)
+}
+
+// deleteA2AAuthMapShardsFrom deletes shard first and every shard above it
+// until a name is absent.
+func (r *PlatformAgentReconciler) deleteA2AAuthMapShardsFrom(ctx context.Context, agent *agentv1alpha1.PlatformAgent, first int) error {
+	for i := first; ; i++ {
+		shard := &corev1.ConfigMap{}
+		key := types.NamespacedName{Name: a2aAuthMapShardName(agent, i), Namespace: agent.Namespace}
+		if err := r.a2aReader().Get(ctx, key, shard); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if !metav1.IsControlledBy(shard, agent) {
+			// Not this CR's: left to its owner, and the sweep stops here
+			// rather than stepping past it, since nothing above a squatted
+			// name can be this render's either.
+			logf.FromContext(ctx).V(1).Info("skipping unowned A2A object under a reserved name",
+				"kind", fmt.Sprintf("%T", shard), "namespace", key.Namespace, "name", key.Name)
+			return nil
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, shard)); err != nil {
+			return err
+		}
 	}
 }
 
@@ -6584,6 +6651,14 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// Its objects are written after the keys Secret, so a render that dies
 	// partway leaves a sentinel too.
 	if err := r.removeScopePublisher(ctx, agent); err != nil {
+		return err
+	}
+
+	// Then the identity map's shards, before the walk that deletes the
+	// callout keys Secret covering them (the sentinel argument on the walk's
+	// authmap entry). A callout still running keeps serving its last map when
+	// the objects go, so deleting them ahead of its Deployment costs nothing.
+	if err := r.deleteA2AAuthMapShards(ctx, agent); err != nil {
 		return err
 	}
 
