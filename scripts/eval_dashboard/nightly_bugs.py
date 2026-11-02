@@ -171,6 +171,12 @@ HELD_STATE_FRESH = datetime.timedelta(hours=1)
 # What `gcloud storage cat` says of an absent object: the patterns
 # ci-health.yml greps for. Any other failed read is not "no hold on record".
 STATE_ABSENT_RE = re.compile(r"matched no objects|not found: 404")
+# How much of gcloud's stderr a failed state read quotes in its warning.
+STATE_ERROR_CHARS = 200
+# A hold older than this prints its start with the date, so a week-old hold
+# does not read as this morning's (post_health.RECONCILE_RUN_DATED_AFTER).
+HELD_SINCE_DATED_AFTER = datetime.timedelta(days=1)
+HELD_SINCE_UNKNOWN = "an unrecorded time"
 HELD_DIGEST_LINE = "🚫 Nightly bug filing held since {since}: the nightly-red issue listing is untrusted ({doubt}), so no bugs are filed or commented on."
 GRAPHQL_PATH = "graphql"
 GRAPHQL_FIRST = 100
@@ -691,7 +697,7 @@ def read_held_state(location: str, runner=subprocess.run) -> dict | None:
     if result.returncode != 0:
         if STATE_ABSENT_RE.search(result.stderr or ""):
             return None
-        raise StateUnreadable(f"gcloud storage cat {location} failed: {(result.stderr or '').strip()[:200]}")
+        raise StateUnreadable(f"gcloud storage cat {location} failed: {(result.stderr or '').strip()[:STATE_ERROR_CHARS]}")
     try:
         loaded = json.loads(result.stdout)
     except ValueError:
@@ -708,7 +714,13 @@ def held_digest_lines(state: dict | None, now: datetime.datetime) -> list[str]:
     if not isinstance(ticks, int) or ticks < HELD_TICKS_DIGEST or not updated or now - updated > HELD_STATE_FRESH:
         return []
     since = post_health.parse_iso(state.get("held_since"))
-    return [HELD_DIGEST_LINE.format(since=post_health.clock(since, weekday=True), doubt=state.get("doubt") or "no reason recorded")]
+    if not since:
+        since_text = HELD_SINCE_UNKNOWN
+    elif now - since > HELD_SINCE_DATED_AFTER:
+        since_text = f"{since.astimezone(post_health.LOCAL_TZ).strftime('%a %b %-d')} {post_health.clock(since)}"
+    else:
+        since_text = post_health.clock(since, weekday=True)
+    return [HELD_DIGEST_LINE.format(since=since_text, doubt=state.get("doubt") or "no reason recorded")]
 
 
 class Filer:
@@ -1042,12 +1054,18 @@ def main(argv=None, gh_runner=None) -> int:
     filer = Filer(gh, args.repo_root)
     result = filer.run(data if isinstance(data, dict) else {})
     print(summary(result, args.dry_run))
-    # A pass that could not read the listings at all leaves the count as it
-    # was: it neither trusted nor doubted them.
-    if args.state and filer.doubt is not None:
+    # A live pass that could not read the listings at all neither trusted
+    # nor doubted them: it carries an open hold forward with the count
+    # unchanged, so an hour of failed reads does not age it out
+    # (HELD_STATE_FRESH) and restart it.
+    if args.state and (filer.doubt is not None or not args.dry_run):
         try:
-            state = held_state(read_held_state(args.state), filer.doubt, not args.dry_run, datetime.datetime.now(datetime.timezone.utc))
-            post_health.write_state(args.state, state)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            prev = read_held_state(args.state)
+            if filer.doubt is not None:
+                post_health.write_state(args.state, held_state(prev, filer.doubt, not args.dry_run, now))
+            elif (prev or {}).get("held_ticks"):
+                post_health.write_state(args.state, dict(prev, updated_at=now.isoformat(timespec="seconds")))
         except (OSError, subprocess.CalledProcessError) as exc:
             log(f"warning: could not update {args.state}: {exc}; the held-tick count is retried next tick")
     return 0

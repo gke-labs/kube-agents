@@ -1649,8 +1649,10 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
     was truncated or missing -- then the latency block's night line
     (nightly_latency.py) when last night carried timing, and a reason adds
     a line saying why the
-    section is missing. ``coverage`` is ``coverage_lines``'s: one line per
-    domain with no blocking presubmit seat, none while every domain has one."""
+    section is missing. ``coverage`` is main's ``coverage()``: the held
+    bug-filing line (``filing_lines``) while one is due, then
+    ``coverage_lines``'s one line per domain with no blocking presubmit
+    seat, none while every domain has one."""
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"
@@ -1838,7 +1840,7 @@ def run(
     once, only on a tick that sends the digest, and returns the nightly
     section (an object with `lines`) or the reason it was skipped.
     `coverage_lines`, when given, is called the same way and returns the
-    digest's coverage-gap lines.
+    digest's held bug-filing line, if due, and its coverage-gap lines.
 
     `tracker`, when given, files the tracking issue a new OUTAGE or a new
     lost-pods condition lacks before the message is rendered (so it can say

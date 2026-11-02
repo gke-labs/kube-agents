@@ -687,11 +687,21 @@ class HeldStateTest(Harness):
         self.held_tick(empty_open=True)
         self.assertEqual(self.held_tick(live=False, empty_open=True)["held_ticks"], 0, "a disarmed filer is not held")
 
-    def test_a_listing_that_could_not_be_read_leaves_the_count(self):
+    def test_a_listing_that_could_not_be_read_carries_the_hold_forward(self):
+        # #4573 review: an hour of failed reads must not age an open hold
+        # out (HELD_STATE_FRESH) and restart it with a later held_since.
         before = self.held_tick(empty_open=True)
-        self.assertEqual(self.held_tick(fail_list=True), before)
+        aged = dict(before, updated_at="2026-01-01T00:00:00+00:00")
+        self.state.write_text(json.dumps(aged))
+        after = self.held_tick(fail_list=True)
+        self.assertEqual({k: after[k] for k in ("held_ticks", "held_since", "doubt")}, {k: before[k] for k in ("held_ticks", "held_since", "doubt")})
+        self.assertNotEqual(after["updated_at"], aged["updated_at"], "refreshed, so the next held tick adds to it")
+        self.assertEqual(self.held_tick(empty_open=True)["held_ticks"], 2)
+        # No open hold, or a dry run: nothing to carry, nothing written.
         self.state.unlink()
         self.assertIsNone(self.held_tick(fail_list=True), "nothing to record")
+        self.state.write_text(json.dumps(aged))
+        self.assertEqual(self.held_tick(live=False, fail_list=True), aged)
 
     def test_a_count_older_than_an_hour_starts_over(self):
         # The ticks between went unrecorded, so they were not held in a row.
@@ -745,6 +755,14 @@ class HeldDigestLineTest(unittest.TestCase):
             nightly_bugs.held_digest_lines(self.state(nightly_bugs.HELD_TICKS_DIGEST), self.NOW),
             ["🚫 Nightly bug filing held since Tue 8:45 AM ET: the nightly-red issue listing is untrusted (the open listing holds 0 issues, GraphQL 3), so no bugs are filed or commented on."],
         )
+
+    def test_a_hold_older_than_a_day_names_its_date(self):
+        # #4573 review: a weekday alone reads a week-old hold as this morning's.
+        old = dict(self.state(700), held_since="2026-10-13T12:45:00+00:00")
+        [line] = nightly_bugs.held_digest_lines(old, self.NOW)
+        self.assertIn("held since Tue Oct 13 8:45 AM ET:", line)
+        [line] = nightly_bugs.held_digest_lines(dict(old, held_since="garbage"), self.NOW)
+        self.assertIn("held since an unrecorded time:", line)
 
     def test_a_stale_cleared_or_missing_state_says_nothing(self):
         self.assertEqual(nightly_bugs.held_digest_lines(self.state(20, updated_min_ago=61), self.NOW), [])
