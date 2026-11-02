@@ -148,8 +148,15 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 	// the others wait for the first's answer. DoChan rather than Do so a
 	// waiter whose own budget runs out leaves with its context's error
 	// instead of outliving it; the review itself goes on for the rest.
+	// The review runs on no caller's context, the first's included: the
+	// first may have spent most of its budget waiting for a worker slot,
+	// and its leaving must not tear down the review the others joined.
+	// The review gets the decision budget of its own from the moment it
+	// starts.
 	results := v.group.DoChan(string(key[:]), func() (any, error) {
-		att, err := v.review(ctx, token)
+		reviewCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), authDecisionBudget)
+		defer cancel()
+		att, err := v.review(reviewCtx, token)
 		if err != nil {
 			return nil, err
 		}

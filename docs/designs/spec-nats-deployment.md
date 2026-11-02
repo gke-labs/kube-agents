@@ -986,8 +986,9 @@ not part of stage 1.
 **The throughput ceiling, so it is known rather than discovered.** A replica decides
 sixteen authorization requests at once: the subscription is a queue-group subscription
 with an async handler, the client library dispatches one subscription's callbacks from
-one goroutine, and the handler hands each request to a goroutine that takes one of
-sixteen worker slots before it decodes, reviews, mints and responds. The under-two-second
+one goroutine, and the handler hands each request to a goroutine that decodes it, then
+takes one of sixteen worker slots before it reviews, mints and responds (the decode comes
+first because a refusal has to be addressed to the decoded user nkey). The under-two-second
 budget starts at receipt, so time spent waiting for a slot counts against it, and a
 request whose budget lapses before it gets one is refused rather than decided late. Two
 bounds then set the rate of fresh reviews per replica: sixteen divided by the TokenReview
@@ -1002,9 +1003,12 @@ never remembered, and the identity-map lookup is not cached, so a map change rea
 next connection as before. A reconnecting fleet therefore costs one review per distinct
 token per thirty seconds, its retries are free, and the log line for an authorized
 connection says whether its review was `fresh` or `cached`. Measured, not read off the
-code, by `TestTheCalloutAnswersSixteenAuthorizationsAtOnce` in `a2a/authcallout`, which
-makes the TokenReview slow, connects sixty-four clients with distinct tokens, and observes
-sixteen reviews in flight and every decision made inside a second. Before this the
+code, by two tests in `a2a/authcallout`: `TestTheCalloutAnswersSixteenAuthorizationsAtOnce`
+connects sixty-four clients with distinct tokens to the operator's rendered server, holds
+every review until sixteen are in flight, and asserts the peak is exactly sixteen; and
+`TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast` hands sixty-four requests to the
+handler directly with a 50ms review each and asserts every one is answered inside a
+second, sixteen abreast. Before this the
 handler did its TokenReview inline and a replica answered one request at a time, and
 twelve A2A workers reconnecting per replica were enough to queue past the first-ping
 timer, each failed connect reconnecting and reviewing again; that outage was the

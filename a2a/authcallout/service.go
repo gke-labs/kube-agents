@@ -402,7 +402,12 @@ func (s *Service) decide(ctx context.Context, m *nats.Msg) {
 	case <-ctx.Done():
 		// Refused rather than decided late: by now the client has failed
 		// on the server's timer, and a TokenReview for it would only hold
-		// a slot the next request needs.
+		// a slot the next request needs. No holder keeps a slot past its
+		// own budget (authorize returns at ctx's deadline), so a waiter
+		// normally sees a slot free inside its window and this is the
+		// floor: the budget and a slot coming ready together, or a slow
+		// path between. The floor still has to answer, or the client
+		// hangs to the server's timer.
 		s.log.Warn("refusing a connection",
 			"reason", "the decision budget lapsed before a worker was free",
 			"host", req.ClientInformation.Host,
@@ -553,6 +558,10 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		return decision{}, fmt.Errorf("no token presented")
 	}
 
+	// A review this request's budget cuts short goes on without it, bounded
+	// by a budget of its own (see TokenValidator): the slot is given back
+	// here, the answer is remembered when it arrives, and the client's
+	// reconnect is served from memory rather than queued for a second one.
 	att, review, err := s.validator.validate(ctx, token)
 	if err != nil {
 		return decision{}, fmt.Errorf("token rejected: %w", err)

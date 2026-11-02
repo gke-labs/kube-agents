@@ -98,22 +98,52 @@ type harness struct {
 // and refuses anything else — the shape of a real TokenReview answer, including
 // the audience the validator insists on and the pod-bound Extra fields the
 // authenticator writes for a projected token.
-//
-// It answers concurrently, which the fake clientset's reactor chain does not:
-// testing.Fake.Invokes holds one mutex across every reactor call, so a reactor
-// would serialize the reviews and hide the callout's worker pool from the
-// tests that measure it. Only TokenReviews().Create is taken over; the rest of
-// the clientset is the fake's.
 func tokenReviewer(tokens map[string]Attested, onReview func(token string) func()) kubernetes.Interface {
-	return &reviewingClientset{Clientset: fake.NewSimpleClientset(), tokens: tokens, onReview: onReview}
+	return clientWithTokenReviews(func(_ context.Context, req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		if onReview != nil {
+			defer onReview(req.Spec.Token)()
+		}
+		att, ok := tokens[req.Spec.Token]
+		if !ok {
+			req.Status = authnv1.TokenReviewStatus{Authenticated: false, Error: "invalid bearer token"}
+			return req, nil
+		}
+		user := authnv1.UserInfo{Username: att.ServiceAccount}
+		if att.PodName != "" || att.PodUID != "" {
+			user.Extra = map[string]authnv1.ExtraValue{
+				"authentication.kubernetes.io/pod-name": {att.PodName},
+				"authentication.kubernetes.io/pod-uid":  {att.PodUID},
+			}
+		}
+		req.Status = authnv1.TokenReviewStatus{
+			Authenticated: true,
+			User:          user,
+			Audiences:     req.Spec.Audiences,
+		}
+		return req, nil
+	})
 }
 
-// reviewingClientset is the fake clientset with a concurrent TokenReview
-// endpoint in front of it.
+// tokenReviewCreate answers one TokenReview, with the validator's context.
+type tokenReviewCreate func(ctx context.Context, req *authnv1.TokenReview) (*authnv1.TokenReview, error)
+
+// clientWithTokenReviews is the fake clientset with its TokenReview endpoint
+// answered by create: concurrently, and with the caller's context, neither
+// of which the fake's reactor chain offers. testing.Fake.Invokes holds one
+// mutex across every reactor call, so a reactor would serialize the reviews
+// and hide the callout's worker pool from the tests that measure it, and the
+// typed fake drops the context before the reactor sees it. Only
+// TokenReviews().Create is taken over; the rest of the clientset is the
+// fake's.
+func clientWithTokenReviews(create tokenReviewCreate) kubernetes.Interface {
+	return &reviewingClientset{Clientset: fake.NewSimpleClientset(), create: create}
+}
+
+// reviewingClientset is the fake clientset with a TokenReview endpoint of the
+// test's own in front of it.
 type reviewingClientset struct {
 	*fake.Clientset
-	tokens   map[string]Attested
-	onReview func(token string) func()
+	create tokenReviewCreate
 }
 
 func (c *reviewingClientset) AuthenticationV1() authnv1client.AuthenticationV1Interface {
@@ -133,29 +163,8 @@ func (a *reviewingAuthenticationV1) TokenReviews() authnv1client.TokenReviewInte
 // embedded fake answers the others, which nothing here calls.
 var _ authnv1client.TokenReviewInterface = (*reviewingClientset)(nil)
 
-func (c *reviewingClientset) Create(_ context.Context, req *authnv1.TokenReview, _ metav1.CreateOptions) (*authnv1.TokenReview, error) {
-	if c.onReview != nil {
-		defer c.onReview(req.Spec.Token)()
-	}
-	req = req.DeepCopy()
-	att, ok := c.tokens[req.Spec.Token]
-	if !ok {
-		req.Status = authnv1.TokenReviewStatus{Authenticated: false, Error: "invalid bearer token"}
-		return req, nil
-	}
-	user := authnv1.UserInfo{Username: att.ServiceAccount}
-	if att.PodName != "" || att.PodUID != "" {
-		user.Extra = map[string]authnv1.ExtraValue{
-			"authentication.kubernetes.io/pod-name": {att.PodName},
-			"authentication.kubernetes.io/pod-uid":  {att.PodUID},
-		}
-	}
-	req.Status = authnv1.TokenReviewStatus{
-		Authenticated: true,
-		User:          user,
-		Audiences:     req.Spec.Audiences,
-	}
-	return req, nil
+func (c *reviewingClientset) Create(ctx context.Context, req *authnv1.TokenReview, _ metav1.CreateOptions) (*authnv1.TokenReview, error) {
+	return c.create(ctx, req.DeepCopy())
 }
 
 // harnessOption tweaks one harness.
@@ -718,11 +727,13 @@ func TestIssuedUsersLandInTheAccountTheirMapEntryNames(t *testing.T) {
 // instead (tokenreview_test.go has that).
 func TestTheCalloutAnswersSixteenAuthorizationsAtOnce(t *testing.T) {
 	const clients = 64
-	// The issue's acceptance numbers: sixty-four callbacks with a 50ms
-	// review, every one finished inside a second. Serially that is 3.2s of
-	// review alone; at sixteen abreast, 200ms.
+	// A review slow enough that overlap is unmistakable. Serially sixty-four
+	// of them are 3.2s of review alone.
 	const reviewCost = 50 * time.Millisecond
-	const deadline = time.Second
+	// How long the first reviews wait for the sixteenth to join them before
+	// the test gives up on it; far past any arrival skew, and then the peak
+	// assertion below says what went wrong.
+	const gateWait = 10 * time.Second
 
 	tokens := defaultTokens()
 	clientTokens := make([]string, clients)
@@ -733,12 +744,15 @@ func TestTheCalloutAnswersSixteenAuthorizationsAtOnce(t *testing.T) {
 
 	var mu sync.Mutex
 	inFlight, peak, reviews := 0, 0, 0
-	// firstReview and lastReview bound the span the callout spent deciding:
-	// from the first review's start to the last review's end, every slot
-	// wait included. That is the handler's own time, which the server's
-	// first-ping timer measures; the clients' wall clock below adds sixty-
-	// four TLS handshakes on a loopback and is the looser number.
-	var firstReview, lastReview time.Time
+	// Every review is held until sixteen are in flight at once, and the
+	// sixteenth releases them all. Clients arrive as their TLS handshakes
+	// finish, spread over most of a second under the race detector, so an
+	// unheld pool would show whatever overlap the arrivals happened to
+	// produce; held, the peak is the pool's width or the test is wrong.
+	// A seventeenth can never join: the slot it needs is held.
+	poolFull := make(chan struct{})
+	poolFilled := false
+	var deciding time.Time
 
 	h := startHarness(t, twoIdentityMap, tokens, watchingTokenReviews(func(string) func() {
 		mu.Lock()
@@ -747,17 +761,21 @@ func TestTheCalloutAnswersSixteenAuthorizationsAtOnce(t *testing.T) {
 		if inFlight > peak {
 			peak = inFlight
 		}
-		if firstReview.IsZero() {
-			firstReview = time.Now()
+		if inFlight == calloutWorkers && !poolFilled {
+			poolFilled, deciding = true, time.Now()
+			close(poolFull)
 		}
 		mu.Unlock()
 
+		select {
+		case <-poolFull:
+		case <-time.After(gateWait):
+		}
 		time.Sleep(reviewCost)
 
 		return func() {
 			mu.Lock()
 			inFlight--
-			lastReview = time.Now()
 			mu.Unlock()
 		}
 	}))
@@ -778,7 +796,8 @@ func TestTheCalloutAnswersSixteenAuthorizationsAtOnce(t *testing.T) {
 		}(clientTokens[i])
 	}
 	wg.Wait()
-	elapsed := time.Since(start)
+	connected := time.Now()
+	elapsed := connected.Sub(start)
 	close(failures)
 	for err := range failures {
 		t.Fatalf("a client could not connect: %v", err)
@@ -786,29 +805,19 @@ func TestTheCalloutAnswersSixteenAuthorizationsAtOnce(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	deciding := lastReview.Sub(firstReview)
-	t.Logf("%d connections at %v of TokenReview each: %v deciding, %v until every client was connected, peak %d in flight",
-		clients, reviewCost, deciding, elapsed, peak)
+	t.Logf("%d connections at %v of TokenReview each: peak %d in flight, %v from the pool filling until every client was connected, %v in all",
+		clients, reviewCost, peak, connected.Sub(deciding), elapsed)
 
 	if reviews != clients {
 		t.Fatalf("TokenReviews = %d for %d connections; the measurement below is not of what it claims", reviews, clients)
 	}
-	if peak > calloutWorkers {
-		t.Errorf("peak concurrent authorizations = %d, above the %d slots; the pool is not bounding anything", peak, calloutWorkers)
-	}
-	if peak < 2 {
-		t.Errorf("peak concurrent authorizations = %d; dispatch is serial again, or the measurement is not reaching the handler", peak)
-	}
-	if deciding > deadline {
-		t.Errorf("the callout spent %v deciding %d connections at %v of TokenReview each, over the %v the issue's acceptance allows (peak %d in flight)",
-			deciding, clients, reviewCost, deadline, peak)
-	}
-	// The consequence for the clients, stated as time: serial handling held
-	// the last one behind sixty-three reviews, the floor the serial test
-	// asserted; pooled dispatch has to sit under it with the handshakes
-	// included, and does by a wide margin.
-	if ceiling := (clients - 1) * reviewCost; elapsed > ceiling {
-		t.Errorf("%d connections took %v, not less than the %v serial handling implied; dispatch is serial again", clients, elapsed, ceiling)
+	// Sixteen held at once is the whole measurement: serial dispatch cannot
+	// show it, and the pool cannot show more. The wall clock is logged and
+	// not asserted, since sixty-four TLS handshakes on a loaded runner set
+	// it; the one-second bound the issue asks for is measured without them,
+	// in TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast.
+	if peak != calloutWorkers {
+		t.Errorf("peak concurrent authorizations = %d, want exactly the %d slots: fewer means the sixteenth never arrived while the first was held, more means the pool bounds nothing", peak, calloutWorkers)
 	}
 }
 

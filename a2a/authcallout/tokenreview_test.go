@@ -472,3 +472,63 @@ func TestAWaiterLeavesWhenItsOwnBudgetRunsOut(t *testing.T) {
 		t.Errorf("TokenReviews = %d; want 1, the waiter must not have started another", got)
 	}
 }
+
+// The presentation that started a review may leave before it ends: its budget
+// began at receipt and most of it may have gone on waiting for a worker slot.
+// Its leaving must not end the review for the presentations that joined it,
+// which still have budget of their own.
+func TestTheFirstPresentationLeavingDoesNotFailTheOnesThatJoinedItsReview(t *testing.T) {
+	release := make(chan struct{})
+	var reviews atomic.Int64
+	// client-go gives up a call when its context ends, so the double does
+	// too; the fake clientset's reactors never see the context.
+	c := clientWithTokenReviews(func(ctx context.Context, req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
+		reviews.Add(1)
+		select {
+		case <-release:
+			return authenticated(gatewaySA, testAudience)(req)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	v, _ := NewTokenValidator(c, testAudience)
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() {
+		_, err := v.Validate(firstCtx, "a-token")
+		first <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for reviews.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	// The second joins the review in flight, then the first leaves.
+	second := make(chan error, 1)
+	go func() {
+		att, err := v.Validate(context.Background(), "a-token")
+		if err == nil && att.ServiceAccount != gatewaySA {
+			err = errors.New("the joined review answered with " + att.ServiceAccount)
+		}
+		second <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancelFirst()
+	if err := <-first; err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("the first presentation returned %v; want its own cancellation", err)
+	}
+
+	close(release)
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatalf("the presentation that joined the review failed with it: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the presentation that joined the review never returned")
+	}
+	if got := reviews.Load(); got != 1 {
+		t.Errorf("TokenReviews = %d; want 1, the first leaving must neither end the review nor start another", got)
+	}
+}
