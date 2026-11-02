@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import difflib
 import re
-import urllib.parse
 from dataclasses import dataclass
 
 
@@ -892,6 +891,22 @@ _RAW_PATH_RE = re.compile(
 # and field selectors (`a.b/c!=d,e in (f,g)`), a resource version, a
 # base64 token. Nothing that re-shapes a URL.
 _RAW_QUERY_VALUE_RE = re.compile(r"^[A-Za-z0-9 _.,=:!/+()*-]*$")
+# A percent-escape in a raw path or query, decoded here rather than by
+# `urllib.parse`: the conformance suite holds this module to imports that
+# cannot reach a file or a socket (tests/conformance, C3), and `urllib` is on
+# its list. The decoder below is `unquote` for the one job it has here: bytes
+# from each `%XX`, UTF-8 with replacement for what does not decode.
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_PERCENT = "%"
+_PERCENT_ESCAPE_BASE = 16
+_PERCENT_DECODE_ENCODING = "utf-8"
+_PERCENT_DECODE_ERRORS = "replace"
+# The query string's separators, as `urllib.parse.parse_qsl` reads them: `&`
+# between pairs, `=` between a key and its value, `+` for a space.
+_QUERY_PAIR_SEPARATOR = "&"
+_QUERY_KEY_VALUE_SEPARATOR = "="
+_QUERY_PLUS = "+"
+_QUERY_SPACE = " "
 _RAW_SHAPE = (
     "kubectl get --raw reads one API collection: a relative /api/v1/<resource> or "
     "/apis/<group>/<version>/<resource> path, optionally under /namespaces/<name>, on a "
@@ -1376,12 +1391,44 @@ def _kubectl_raw_values(argv: list[str]) -> list[str | None]:
     return values
 
 
+def _percent_decode(text: str) -> str:
+    """`urllib.parse.unquote` without the import: every `%XX` becomes its byte,
+    the rest is UTF-8, and a sequence that is not valid UTF-8 decodes with
+    replacement characters, as `unquote` does."""
+    if _PERCENT not in text:
+        return text
+    raw = bytearray()
+    index = 0
+    for match in _PERCENT_ESCAPE_RE.finditer(text):
+        raw += text[index:match.start()].encode(_PERCENT_DECODE_ENCODING)
+        raw.append(int(match.group()[len(_PERCENT):], _PERCENT_ESCAPE_BASE))
+        index = match.end()
+    raw += text[index:].encode(_PERCENT_DECODE_ENCODING)
+    return raw.decode(_PERCENT_DECODE_ENCODING, _PERCENT_DECODE_ERRORS)
+
+
+def _query_pairs(query: str) -> list[tuple[str, str]]:
+    """`urllib.parse.parse_qsl(query, keep_blank_values=True)` without the
+    import: pairs split on `&`, a pair without `=` is a key with an empty
+    value, an empty pair is skipped, and `+` then `%XX` decode in both halves."""
+    pairs: list[tuple[str, str]] = []
+    for pair in query.split(_QUERY_PAIR_SEPARATOR):
+        if not pair:
+            continue
+        key, _, item = pair.partition(_QUERY_KEY_VALUE_SEPARATOR)
+        pairs.append((
+            _percent_decode(key.replace(_QUERY_PLUS, _QUERY_SPACE)),
+            _percent_decode(item.replace(_QUERY_PLUS, _QUERY_SPACE)),
+        ))
+    return pairs
+
+
 def _kubectl_raw_path_problem(value: str | None) -> str | None:
     """Why one `--raw` value is not a paged collection read, or None when it is."""
     if value is None:
         return "--raw was given no path"
     path, _, query = value.partition("?")
-    decoded = urllib.parse.unquote(path)
+    decoded = _percent_decode(path)
     if decoded in KUBECTL_RAW_ENDPOINTS:
         return None if not query else f"{decoded} takes no query"
     match = _RAW_PATH_RE.fullmatch(decoded)
@@ -1391,7 +1438,7 @@ def _kubectl_raw_path_problem(value: str | None) -> str | None:
     if collection not in KUBECTL_RAW_COLLECTIONS:
         return f"{collection} is not a collection a raw read may page"
     seen: set[str] = set()
-    for key, item in urllib.parse.parse_qsl(query, keep_blank_values=True):
+    for key, item in _query_pairs(query):
         if key not in KUBECTL_RAW_QUERY_KEYS:
             return f"query key {key!r} is not a list parameter"
         if key in seen:

@@ -501,6 +501,26 @@ class KubectlRawPathTest(unittest.TestCase):
         self.assertTrue(evaluate(["kubectl", "get", "pods", "-A", "-o", "json"]).allowed)
         self.assertIsNone(command_policy._kubectl_raw_refusal(["kubectl", "get", "pods"], ("get",)))
 
+    def test_the_raw_decoders_read_as_urllib_does_without_importing_it(self):
+        # The conformance suite (tests/conformance, C3) holds the policy module
+        # to imports that cannot read a file or a socket, and `urllib` is on
+        # its list, so the module decodes percent escapes and splits the query
+        # itself. This pins the two decoders to the stdlib's reading of the
+        # same strings: a drift here would admit or refuse a different path
+        # than the one kubectl sends.
+        import urllib.parse
+
+        corpus = (
+            "", "/api/v1/pods", "/api/v1/pods%2Fx%2Flog", "/api/v1/%2e%2e/v1/pods", "%E2%9C%93",
+            "%FF%FE", "%zz%4%", "a%20b+c", "limit=500", "limit=500&continue=eyJ2IjoibWV0YS5rOHMuaW8vdjEifQ",
+            "labelSelector=app.kubernetes.io/name%3Dweb,tier%20in%20(a,b)", "labelSelector=a%3Db%26watch%3Dtrue%23",
+            "watch", "watch=", "=x", "&&limit=1&", "a=b=c", "k+e+y=v+a+l", "a;b=c",
+        )
+        for text in corpus:
+            with self.subTest(text=text):
+                self.assertEqual(urllib.parse.unquote(text), command_policy._percent_decode(text))
+                self.assertEqual(urllib.parse.parse_qsl(text, keep_blank_values=True), command_policy._query_pairs(text))
+
 
 class KubectlKubercTest(unittest.TestCase):
     """--kuberc is a flags file, and it launders the impersonation refusal."""
