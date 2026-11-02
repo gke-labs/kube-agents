@@ -3066,11 +3066,24 @@ fi
 # (bench/kube_agents_bench/lane.py, WRITES_ALONE_KEY) runs in the same second
 # phase on every transport: it requests nothing, but a wrong answer may let a
 # card open a pull request the reply never names, and the lane marks its
-# window exclusive, which is only right when it runs alone.
+# window exclusive, which is only right when it runs alone. Read here with a
+# plain YAML load rather than a bench entry point: a presubmit grades with
+# bench/ at the base commit (pin_grader above), so a module flag newer than
+# main would not exist in the grader this script runs against.
 WRITES_ALONE_CASES=""
-if ! WRITES_ALONE_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook --writes-alone "${TASKS[@]}" \
-    | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
-  echo "ERROR: could not read which cases declare writes_alone (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
+if ! WRITES_ALONE_CASES="$(cd "${BENCH_DIR}" && uv run python - "${TASKS[@]}" <<'PY' | awk '{ printf "%s%s", sep, $0; sep = "," }'
+import pathlib
+import sys
+
+import yaml
+
+for task in sys.argv[1:]:
+    doc = yaml.safe_load(pathlib.Path(task).read_text(encoding="utf-8")) or {}
+    if doc.get("writes_alone") is True:
+        print(pathlib.Path(task).parent.name)
+PY
+)"; then
+  echo "ERROR: could not read which cases declare writes_alone (the YAML read above); the fan-out cannot run them after every other unit, so the run does not start." >&2
   exit 1
 fi
 if [ -n "${WRITES_ALONE_CASES}" ]; then

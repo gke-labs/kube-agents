@@ -255,10 +255,9 @@ def test_the_case_carries_the_directive_on_its_own_line():
     assert stop is not None and "checkout-gateway" in stop.prompt
 
 
-def test_the_listing_names_stopped_asks_or_writes_alone_cases(tmp_path, capsys):
-    # The two lists hack/ci-eval-pr.sh runs in its second phase: the stopped
-    # asks (inject lane only), and with --writes-alone the cases that declare
-    # `writes_alone: true` (every transport); nothing else, and never both.
+def test_the_listing_names_stopped_asks_and_nothing_else(tmp_path, capsys):
+    # The list hack/ci-eval-pr.sh runs in its second phase on the inject lane:
+    # the stopped asks; a writes_alone case is read by the script itself.
     import yaml
 
     def task(name, doc):
@@ -270,10 +269,7 @@ def test_the_listing_names_stopped_asks_or_writes_alone_cases(tmp_path, capsys):
     paths = [
         task("stopped", {"prompt": f"{stop_hook.STOP_DIRECTIVE}\nstop this"}),
         task("alone", {"prompt": "an ordinary ask", "writes_alone": True}),
-        task("quoted", {"prompt": "an ordinary ask", "writes_alone": "true"}),
         task("ordinary", {"prompt": "an ordinary ask"}),
     ]
     assert stop_hook.main(paths) == 0
     assert capsys.readouterr().out.split() == ["stopped"]
-    assert stop_hook.main([stop_hook.WRITES_ALONE_FLAG, *paths]) == 0
-    assert capsys.readouterr().out.split() == ["alone"]
