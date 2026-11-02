@@ -18,11 +18,11 @@ commands and the session pods' reads, and interactive work may hold at most
 the broker's interactive cap (`admitted − 1`; credential-broker-exec-tier.md
 §4.2), which the broker reports as `interactive_cap`. `sweep_width` sizes
 inside that cap: it leaves the session role's cap free (two by default; the
-broker reports it) when the broker admits six or more, so a sweep doesn't take
-every admission a live chat read would wait for, and otherwise reads at most
-four wide, today's width, or the interactive cap where that is lower. The
-headroom never takes the width below four, so only a pod whose interactive cap
-is under four sweeps narrower than it did. This doesn't coordinate sweeps that
+broker reports it) when the broker admits seven or more, so a sweep doesn't
+take every admission a live chat read would wait for (at six the floor of four
+leaves one), and otherwise reads at most four wide, or the interactive cap where
+that is lower. The headroom never takes the width below four, so only a pod
+whose interactive cap is under four sweeps narrower than four. This doesn't coordinate sweeps that
 run at the same time: each sizes its own pool, and they share the interactive
 cap with the live reads.
 
@@ -49,7 +49,7 @@ FALLBACK_WIDTH = 4
 # used when the report doesn't carry one.
 CHAT_HEADROOM = 2
 # The admitted count at or above which the headroom is taken; below it the
-# width stays at most FALLBACK_WIDTH, so no install sweeps slower than before.
+# width stays at most FALLBACK_WIDTH, or the interactive cap where that is lower.
 HEADROOM_FROM = 6
 # The admission read's socket timeout: urllib applies it to the connect and to
 # each blocking read, not to the exchange as a whole. The broker client's own

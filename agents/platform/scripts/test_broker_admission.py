@@ -36,9 +36,9 @@ class WidthForTest(unittest.TestCase):
                 self.assertLessEqual(width, interactive_cap)
 
     def test_a_broker_without_the_interactive_cap_keeps_todays_width(self):
-        for admitted in (4, 8, 16):
+        for admitted, width in ((4, 4), (6, 4), (8, 6), (16, 14)):
             with self.subTest(admitted=admitted):
-                self.assertEqual(broker_admission.width_for(admitted), broker_admission.width_for(admitted, 2, None))
+                self.assertEqual(width, broker_admission.width_for(admitted, 2, None))
 
     def test_a_raised_session_cap_never_takes_the_width_below_four(self):
         # An operator can raise the session cap; the width still never drops
@@ -81,12 +81,15 @@ class ReadReportTest(unittest.TestCase):
         self.assertEqual(broker_admission.ADMISSION_TIMEOUT_S, timeout)
 
     def test_it_reads_the_interactive_cap_when_the_broker_reports_one(self):
-        with self._reading({"slot_cap": 8, "budget_admits": 9, "admitted": 8, "interactive_cap": 7, "session_cap": 2}):
+        headers = mock.patch.object(credential_proxy_client, "authorization_headers", return_value={})
+        with headers, self._reading({"slot_cap": 8, "budget_admits": 9, "admitted": 8, "interactive_cap": 7, "session_cap": 2}):
             self.assertEqual((8, 2, 7), broker_admission.read_report(self.ENDPOINT))
         for bad in (0, "7", None, True):
-            with self.subTest(interactive_cap=bad):
-                with self._reading({"admitted": 8, "interactive_cap": bad, "session_cap": 2}):
-                    self.assertEqual((8, 2, None), broker_admission.read_report(self.ENDPOINT))
+            with self.subTest(interactive_cap=bad), mock.patch.object(
+                credential_proxy_client, "authorization_headers", return_value={}
+            ), self._reading({"admitted": 8, "interactive_cap": bad, "session_cap": 2}):
+                self.assertEqual((8, 2, None), broker_admission.read_report(self.ENDPOINT))
+
     def test_a_missing_or_bad_session_cap_reads_as_the_default(self):
         for name, body in {"missing": {"admitted": 8}, "zero": {"admitted": 8, "session_cap": 0}, "text": {"admitted": 8, "session_cap": "2"}}.items():
             with self.subTest(case=name), mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
