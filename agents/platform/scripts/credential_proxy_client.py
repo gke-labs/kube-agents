@@ -849,13 +849,33 @@ def _merge_context_into_kubeconfig_file(
         return
     if not isinstance(doc, dict):
         return
-    clusters = list(doc.get("clusters") or [])
-    clusters = [c for c in clusters if isinstance(c, dict) and c.get("name") != context]
+    expected_server = f"{proxy_url}/clusters/{context}"
+    existing_clusters = list(doc.get("clusters") or [])
+    existing_contexts = list(doc.get("contexts") or [])
+    has_cluster = any(
+        isinstance(c, dict)
+        and c.get("name") == context
+        and isinstance(c.get("cluster"), dict)
+        and c["cluster"].get("server") == expected_server
+        and c["cluster"].get("certificate-authority") == ca_file
+        for c in existing_clusters
+    )
+    has_context = any(
+        isinstance(c, dict)
+        and c.get("name") == context
+        and isinstance(c.get("context"), dict)
+        and c["context"].get("cluster") == context
+        and c["context"].get("user") == KUBE_PROXY_USER_NAME
+        for c in existing_contexts
+    )
+    if has_cluster and has_context:
+        return
+    clusters = [c for c in existing_clusters if isinstance(c, dict) and c.get("name") != context]
     clusters.append(
         {
             "name": context,
             "cluster": {
-                "server": f"{proxy_url}/clusters/{context}",
+                "server": expected_server,
                 "certificate-authority": ca_file,
             },
         }
@@ -872,8 +892,7 @@ def _merge_context_into_kubeconfig_file(
         }
     )
     doc["users"] = users
-    contexts = list(doc.get("contexts") or [])
-    contexts = [c for c in contexts if isinstance(c, dict) and c.get("name") != context]
+    contexts = [c for c in existing_contexts if isinstance(c, dict) and c.get("name") != context]
     contexts.append(
         {
             "name": context,
@@ -910,6 +929,35 @@ def merge_context_into_default_kubeconfig(context: str) -> None:
         _merge_context_into_kubeconfig_file(
             path, context, proxy_url, ca_file, token_file
         )
+
+
+def ensure_kube_proxy_context_for_argv(argv: list[str]) -> None:
+    """Register a `--context=gke_...` flag's cluster in the active kubeconfig before `kubectl` runs."""
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
+    if not proxy_url:
+        return
+    normalized = argv if (argv and argv[0] == "kubectl") else ["kubectl", *argv]
+    if names_kubeconfig_flag(normalized):
+        return
+    flag = kubectl_context_flag(normalized)
+    target = parse_gke_context(flag) if flag else None
+    if target is None:
+        return
+    merge_context_into_default_kubeconfig(target.context_name)
+    env_kc = os.environ.get("KUBECONFIG", "").strip()
+    if env_kc and os.pathsep not in env_kc:
+        candidate = Path(env_kc)
+        if candidate not in _default_kubeconfig_candidates():
+            ca_file = (
+                os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_KUBE_PROXY_CA_FILE
+            ).strip()
+            token_file = (
+                os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+                or DEFAULT_KUBE_PROXY_TOKEN_FILE
+            ).strip()
+            _merge_context_into_kubeconfig_file(
+                candidate, target.context_name, proxy_url, ca_file, token_file
+            )
 
 
 def rewrite_kubeconfig_for_kube_proxy(generated: str) -> str:
@@ -1756,6 +1804,9 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--ensure-kubectl-context":
+        ensure_kube_proxy_context_for_argv(["kubectl", *sys.argv[2:]])
+        raise SystemExit(0)
     invoked_as = os.path.basename(sys.argv[0])
     if invoked_as in set(SUPPORTED_EXECUTABLES):
         endpoint = os.getenv("CREDENTIAL_PROXY_URL")

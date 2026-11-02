@@ -958,18 +958,24 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
-	// 10b. Reconcile the shell sandbox before the credential proxy, and both before
+	// 10b. Grant the broker and kube-proxy the one verb they need to authenticate
+	// their callers, and reconcile kube-proxy before the shell sandbox so the TLS
+	// CA Secret and proxy Service exist before the shell mounts and dials them.
+	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
+	otlpDisabled := otlpSource == otlpSourceNone
+	if err := r.reconcileKubeProxy(ctx, instance, otlpEndpoint, otlpDisabled); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 10c. Reconcile the shell sandbox before the credential proxy, and both before
 	// the workload that connects to them. Neither client blocks on the proxy — the
 	// wrapped CLIs report it unavailable and the chat relay retries its poll — but
 	// on a first install this order means the sandbox's ServiceAccount exists
 	// before the broker starts authenticating callers against it.
 	if err := r.reconcileShellSandbox(ctx, instance, settingsHash); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 10c. Grant the broker the one verb it needs to authenticate its callers,
-	// before anything that runs it.
-	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1023,13 +1029,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar and
-	// the Kubernetes API proxy.
-	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
-	otlpDisabled := otlpSource == otlpSourceNone
-	if err := r.reconcileKubeProxy(ctx, instance, otlpEndpoint, otlpDisabled); err != nil {
-		return ctrl.Result{}, err
-	}
+	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err

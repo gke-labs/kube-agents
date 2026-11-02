@@ -482,7 +482,21 @@ done
 write_kube_proxy_kubeconfig() {
   local target_file="$1"
   local ctx="$2"
-  cat >"$target_file" <<EOF
+  shift 2
+  local extra_ctxs=("$@")
+  local seen=" ${ctx} "
+  local filtered_extras=()
+  local extra
+  for extra in "${extra_ctxs[@]}"; do
+    [ -n "$extra" ] || continue
+    case "$seen" in
+    *" ${extra} "*) continue ;;
+    esac
+    seen="${seen}${extra} "
+    filtered_extras+=("$extra")
+  done
+  {
+    cat <<EOF
 apiVersion: v1
 kind: Config
 clusters:
@@ -490,6 +504,16 @@ clusters:
   cluster:
     server: ${KUBE_PROXY_URL%/}/clusters/${ctx}
     certificate-authority: ${ca_file}
+EOF
+    for extra in "${filtered_extras[@]}"; do
+      cat <<EOF
+- name: ${extra}
+  cluster:
+    server: ${KUBE_PROXY_URL%/}/clusters/${extra}
+    certificate-authority: ${ca_file}
+EOF
+    done
+    cat <<EOF
 users:
 - name: kube-proxy-caller
   user:
@@ -499,8 +523,19 @@ contexts:
   context:
     cluster: ${ctx}
     user: kube-proxy-caller
+EOF
+    for extra in "${filtered_extras[@]}"; do
+      cat <<EOF
+- name: ${extra}
+  context:
+    cluster: ${extra}
+    user: kube-proxy-caller
+EOF
+    done
+    cat <<EOF
 current-context: ${ctx}
 EOF
+  } >"$target_file"
   chown agent:agent "$target_file"
   chmod 0600 "$target_file"
 }
@@ -511,7 +546,16 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
   token_file="${CREDENTIAL_PROXY_TOKEN_FILE:-/var/run/secrets/kubeagents/credential-proxy/token}"
   clear_symlinks_under_data "$DATA/.kubeconfig"
   displace_if_not_a_regular_file "$DATA/.kubeconfig"
-  write_kube_proxy_kubeconfig "$DATA/.kubeconfig" "$default_ctx"
+  discovered_ctxs=()
+  if [ -f "$DATA/.kubeconfig" ] && [ "$(stat -c '%h %U' "$DATA/.kubeconfig" 2>/dev/null || true)" = "1 agent" ]; then
+    while IFS= read -r existing_ctx; do
+      existing_ctx="$(printf '%s' "$existing_ctx" | tr -d "'\"[:space:]")"
+      case "$existing_ctx" in
+      *[!A-Za-z0-9._:-]* | "") continue ;;
+      esac
+      discovered_ctxs+=("$existing_ctx")
+    done < <(awk '/^[[:space:]]*-[[:space:]]*name:[[:space:]]*gke_/{sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/,""); print}' "$DATA/.kubeconfig" 2>/dev/null || true)
+  fi
   for kc in \
     "$DATA/kubeconfig.yaml" \
     "$DATA/.kube/config" \
@@ -528,17 +572,19 @@ if [ -n "${KUBE_PROXY_URL:-}" ]; then
     if [ "$(stat -c '%h %U' "$kc" 2>/dev/null || true)" != "1 agent" ]; then
       continue
     fi
+    kc_ctx="$(awk '/^current-context:/{sub(/^current-context:[[:space:]]*/,""); print; exit}' "$kc" 2>/dev/null | tr -d "'\"[:space:]" || true)"
+    if [ -z "$kc_ctx" ]; then
+      kc_ctx="$default_ctx"
+    fi
+    case "$kc_ctx" in
+    *[!A-Za-z0-9._:-]* | "") continue ;;
+    esac
+    discovered_ctxs+=("$kc_ctx")
     if grep -q "gke-gcloud-auth-plugin" "$kc" 2>/dev/null; then
-      kc_ctx="$(awk '/^current-context:/{sub(/^current-context:[[:space:]]*/,""); print; exit}' "$kc" 2>/dev/null | tr -d "'\"[:space:]" || true)"
-      if [ -z "$kc_ctx" ]; then
-        kc_ctx="$default_ctx"
-      fi
-      case "$kc_ctx" in
-      *[!A-Za-z0-9._:-]* | "") continue ;;
-      esac
       write_kube_proxy_kubeconfig "$kc" "$kc_ctx" || log "WARNING: could not rewrite legacy kubeconfig $kc"
     fi
   done
+  write_kube_proxy_kubeconfig "$DATA/.kubeconfig" "$default_ctx" "${discovered_ctxs[@]}"
 fi
 
 # 2. The agent's public key. Failing loudly here is the point: without it sshd

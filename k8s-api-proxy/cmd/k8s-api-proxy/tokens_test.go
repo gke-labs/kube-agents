@@ -174,7 +174,8 @@ func TestScopedPoolTransportRefusesUnmappedClusterAndMintsPerProjectToken(t *tes
 
 	gcpSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/projects/-/serviceAccounts/ka-mapped-1a2b3c4d@host-proj.iam.gserviceaccount.com:generateAccessToken":
+		case "/v1/projects/-/serviceAccounts/ka-mapped-1a2b3c4d@host-proj.iam.gserviceaccount.com:generateAccessToken",
+			"/v1/projects/-/serviceAccounts/ka-second-5e6f7a8b@host-proj.iam.gserviceaccount.com:generateAccessToken":
 			iamCalls++
 			if got := r.Header.Get("Authorization"); got != "Bearer base-broker-token" {
 				t.Fatalf("unexpected base Authorization header at IAM: %q", got)
@@ -186,18 +187,37 @@ func TestScopedPoolTransportRefusesUnmappedClusterAndMintsPerProjectToken(t *tes
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatalf("decode IAM request: %v", err)
 			}
+			if len(body.Scope) != 1 || body.Scope[0] != cloudPlatformScope {
+				t.Fatalf("expected scope [%q], got %v", cloudPlatformScope, body.Scope)
+			}
 			if body.Lifetime != "900s" {
 				t.Fatalf("expected lifetime 900s, got %q", body.Lifetime)
 			}
+			token := "test-scoped-mapped-proj"
+			if strings.Contains(r.URL.Path, "ka-second-5e6f7a8b") {
+				token = "test-scoped-second-proj"
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"accessToken": "test-scoped-mapped-proj",
+				"accessToken": token,
 				"expireTime":  "2099-01-01T00:00:00Z",
 			})
 		case "/v1/projects/mapped-proj/locations/us-central1/clusters/cluster-a":
 			containerCalls++
 			if got := r.Header.Get("Authorization"); got != "Bearer test-scoped-mapped-proj" {
 				t.Fatalf("unexpected Container API Authorization header: %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"endpoint": k8sEndpoint,
+				"masterAuth": map[string]any{
+					"clusterCaCertificate": base64.StdEncoding.EncodeToString(k8sCAPEM),
+				},
+			})
+		case "/v1/projects/second-proj/locations/us-east1/clusters/cluster-c":
+			containerCalls++
+			if got := r.Header.Get("Authorization"); got != "Bearer test-scoped-second-proj" {
+				t.Fatalf("unexpected Container API Authorization header for second-proj: %q", got)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -228,6 +248,7 @@ func TestScopedPoolTransportRefusesUnmappedClusterAndMintsPerProjectToken(t *tes
 		context.Background(),
 		map[string]string{
 			"mapped-proj": "ka-mapped-1a2b3c4d@host-proj.iam.gserviceaccount.com",
+			"second-proj": "ka-second-5e6f7a8b@host-proj.iam.gserviceaccount.com",
 		},
 		baseTokens,
 		gcpSrv.URL+"/v1",
@@ -260,7 +281,7 @@ func TestScopedPoolTransportRefusesUnmappedClusterAndMintsPerProjectToken(t *tes
 		t.Fatal("expected in-cluster to be refused when scoped pool is armed")
 	}
 
-	// 3. A mapped project exchanges the base token for the project's scoped SA token and forwards it.
+	// 3. Each mapped project exchanges the base token for its own scoped SA token and forwards it.
 	mappedReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://proxy/api/v1/pods", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -278,5 +299,21 @@ func TestScopedPoolTransportRefusesUnmappedClusterAndMintsPerProjectToken(t *tes
 	}
 	if iamCalls != 1 || containerCalls != 1 || clusterCalls != 1 {
 		t.Fatalf("unexpected call counts: iam=%d container=%d cluster=%d", iamCalls, containerCalls, clusterCalls)
+	}
+
+	secondReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://proxy/api/v1/pods", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2, err := tr.RoundTripCluster(context.Background(), "gke_second-proj_us-east1_cluster-c", secondReq)
+	if err != nil {
+		t.Fatalf("second mapped cluster RoundTripCluster failed: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if seenClusterAuth != "Bearer test-scoped-second-proj" {
+		t.Fatalf("second cluster saw Authorization %q, want second scoped token", seenClusterAuth)
+	}
+	if iamCalls != 2 || containerCalls != 2 || clusterCalls != 2 {
+		t.Fatalf("unexpected call counts after second project: iam=%d container=%d cluster=%d", iamCalls, containerCalls, clusterCalls)
 	}
 }

@@ -83,11 +83,33 @@ RUN apt-get update && \
 # k9s did not come across: it is a full-screen terminal UI, and every command
 # here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
 # could not run even if a skill asked for it. Nothing in agents/ does.
+ARG KUBECTL_VERSION=1.32.3
+ARG KUBECTL_SHA256_AMD64=ab209d0c5134b61486a0486585604a616a5bb2fc07df46d304b3c95817b2d79f
+ARG KUBECTL_SHA256_ARM64=6c2c91e760efbf3fa111a5f0b99ba8975fb1c58bb3974eca88b6134bcf3717e2
 RUN ARCH=$(dpkg --print-architecture) && \
+    case "${ARCH}" in \
+      amd64) KUBECTL_SHA256="${KUBECTL_SHA256_AMD64}" ;; \
+      arm64) KUBECTL_SHA256="${KUBECTL_SHA256_ARM64}" ;; \
+      *) echo "no kubectl checksum pinned for ${ARCH}" >&2; exit 1 ;; \
+    esac && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
-    curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.31.4/bin/linux/${ARCH}/kubectl" && \
-    chmod +x /usr/local/bin/kubectl && \
+    install -d -m 0755 /usr/local/libexec && \
+    curl -sSLf --retry 5 --retry-all-errors -o /usr/local/libexec/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
+    echo "${KUBECTL_SHA256}  /usr/local/libexec/kubectl" | sha256sum -c - && \
+    chmod 0755 /usr/local/libexec/kubectl && \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
+      '  case " $* " in' \
+      '  *" --context"*)' \
+      '    PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/defaults/scripts/credential_proxy_client.py --ensure-kubectl-context "$@" 2>/dev/null || true' \
+      '    ;;' \
+      '  esac' \
+      'fi' \
+      'exec /usr/local/libexec/kubectl "$@"' \
+      >/usr/local/bin/kubectl && \
+    chmod 0755 /usr/local/bin/kubectl && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
     tar -xzf /tmp/helm.tar.gz --no-same-owner -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \

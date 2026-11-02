@@ -1670,7 +1670,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1

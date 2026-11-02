@@ -714,6 +714,16 @@ class SandboxEntrypointKubeconfigMigrationTest(_SandboxEntrypointHarness):
             rewritten,
         )
         self.assertNotIn("gke-gcloud-auth-plugin", rewritten)
+        default_kc = (self.data / ".kubeconfig").read_text()
+        self.assertIn(
+            "server: https://agent-kube-proxy:8443/clusters/gke_my-proj_us-central1-a_default",
+            default_kc,
+        )
+        self.assertIn(
+            "server: https://agent-kube-proxy:8443/clusters/gke_my-proj_us-central1-a_cluster-1",
+            default_kc,
+        )
+        self.assertIn("current-context: gke_my-proj_us-central1-a_default", default_kc)
 
     def test_legacy_kubeconfig_with_unsafe_context_characters_is_skipped(self) -> None:
         legacy = self.data / "kubeconfig.yaml"

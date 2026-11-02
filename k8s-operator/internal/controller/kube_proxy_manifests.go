@@ -495,9 +495,6 @@ func (r *PlatformAgentReconciler) ensureKubeProxyTLSSecret(ctx context.Context, 
 }
 
 func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {
-	if credentialProxySandboxURL(agent) == "" {
-		return nil
-	}
 	tlsHash, err := r.ensureKubeProxyTLSSecret(ctx, agent)
 	if err != nil {
 		return err

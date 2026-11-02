@@ -17815,6 +17815,45 @@ class TeamsRelayTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 relay._get_access_token()
 
+    def test_ensure_kube_proxy_context_for_argv_registers_fleet_context_without_get_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            default_kc = Path(tmpdir) / ".kubeconfig"
+            default_kc.write_text(
+                credential_proxy_client.build_kube_proxy_kubeconfig(
+                    "gke_host-proj_us-central1_host-cluster",
+                    proxy_url="https://agent-kube-proxy:8443",
+                    ca_file="/etc/ca.crt",
+                    token_file="/etc/token",
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                        "KUBE_PROXY_CA_FILE": "/etc/ca.crt",
+                        "CREDENTIAL_PROXY_TOKEN_FILE": "/etc/token",
+                        "KUBECONFIG": str(default_kc),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    credential_proxy_client,
+                    "_default_kubeconfig_candidates",
+                    return_value=[default_kc],
+                ),
+            ):
+                credential_proxy_client.ensure_kube_proxy_context_for_argv(
+                    ["kubectl", "--context=gke_fleet-proj_us-east1_fleet-cluster", "get", "nodes"]
+                )
+            merged = default_kc.read_text(encoding="utf-8")
+            self.assertIn("current-context: gke_host-proj_us-central1_host-cluster", merged)
+            self.assertIn(
+                "server: https://agent-kube-proxy:8443/clusters/gke_fleet-proj_us-east1_fleet-cluster",
+                merged,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
