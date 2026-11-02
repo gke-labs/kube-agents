@@ -5914,7 +5914,8 @@ validate_non_interactive_minter_config() {
 
   if [ -z "$pem_path" ]; then
     print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but no ENABLED KMS key exists in ${keyring}/${key} and no --github-pem-path was provided."
-    print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
+    print_minter_restore_advice "$key" "$keyring" "$kms_loc" "$project_id" ||
+      print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
     print_info "To install without the token minter, omit --github-app-id."
     return 1
   fi
@@ -5962,8 +5963,10 @@ resolve_missing_pem_against_kms() {
   fi
 
   print_error "GitHub App private key PEM file does not exist: '${PARAM_GITHUB_PEM_PATH}'."
-  print_info "Cloud KMS key ${pem_keyring}/${pem_key} has no ENABLED version, so the import still needs that file."
-  print_info "Point --github-pem-path at the downloaded key, or clear GITHUB_PEM_PATH from install.env to install without the token minter."
+  print_minter_restore_advice "$pem_key" "$pem_keyring" "$pem_kms_loc" "$project_id" || {
+    print_info "Cloud KMS key ${pem_keyring}/${pem_key} has no ENABLED version, so the import still needs that file."
+    print_info "Point --github-pem-path at the downloaded key, or clear GITHUB_PEM_PATH from install.env to install without the token minter."
+  }
   return 1
 }
 

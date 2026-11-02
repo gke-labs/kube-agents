@@ -1447,6 +1447,20 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertEqual(proc4.returncode, 1, proc4.stderr)
         self.assertIn("provided in non-interactive mode, but no ENABLED KMS key exists", proc4.stdout + proc4.stderr)
 
+        # 4b. The same, but the key's versions are scheduled for destruction -> the
+        # restore is named instead of the import, and the run still stops.
+        cmd4b = (
+            f'{_SOURCE_INSTALLER_COMMON}'
+            'kms_key_enabled_version() { echo ""; }; '
+            'kms_key_scheduled_version() { echo 2; }; '
+            'rc=0; validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org" || rc=$?; echo "rc=$rc"'
+        )
+        proc4b = self._run_install_func(cmd4b)
+        out4b = proc4b.stdout + proc4b.stderr
+        self.assertIn("rc=1", proc4b.stdout, out4b)
+        self.assertIn("Its versions are scheduled for destruction", out4b)
+        self.assertNotIn("for automated import, or pre-import", out4b)
+
         # 5. App ID provided with org and existing KMS key version (AOT path) -> succeeds
         cmd5 = (
             f'{_SOURCE_INSTALLER_COMMON}'
@@ -5019,6 +5033,18 @@ class MissingPemAgainstKmsTest(unittest.TestCase):
         self.assertIn("GitHub App private key PEM file does not exist", combined)
         self.assertIn("has no ENABLED version, so the import still needs that file", combined)
         self.assertIn("PEM=[/tmp/never-existed-12345.pem] RC=1", proc.stdout)
+
+    def test_a_missing_pem_names_the_restore_when_the_key_versions_are_scheduled(self):
+        """A key whose versions a destroy scheduled needs a restore, not the PEM again."""
+        proc = self._resolve(
+            "/tmp/never-existed-12345.pem", "",
+            overrides='kms_key_scheduled_version() { echo 2; }; ',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("Its versions are scheduled for destruction", combined)
+        self.assertIn("gcloud kms keys versions restore <version> --key github-token-minter-key", combined)
+        self.assertNotIn("the import still needs that file", combined)
 
     def test_an_overridden_keyring_and_key_are_what_kms_is_asked_about(self):
         """--kms-keyring/--kms-key must reach the probe, or the fallback checks the wrong key."""

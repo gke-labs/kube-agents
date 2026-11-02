@@ -3028,6 +3028,28 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("enable_github_minter = true", dest.read_text())
 
+    def test_minter_deferred_names_the_restore_for_scheduled_versions(self):
+        # A key whose versions a destroy scheduled: the generator still defers,
+        # but names the restore instead of asking for the PEM again.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            env = {
+                "API_SERVER_KEY": "k",
+                "GITOPS_ORG": "org",
+                "GITOPS_REPO": "repo",
+                "GITHUB_APP_ID": "42",
+            }
+            proc = self._run(
+                'print_info() { echo "INFO: $*"; }; print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"', env=env, kms_versions="",
+                gcloud_extra_cases="  *\"state=DESTROY_SCHEDULED\"*) printf '2'; exit 0 ;;\n",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("enable_github_minter = false", dest.read_text())
+            out = proc.stdout + proc.stderr
+            self.assertIn("Its versions are scheduled for destruction", out)
+            self.assertNotIn("Provide the PEM via --github-pem-path", out)
+
     def test_tfvars_recovery_refuses_a_foreign_kube_context(self):
         # A stale context pointing at some other install must not donate that
         # environment's credentials: recovery skips, and the generator fails

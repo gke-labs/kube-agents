@@ -4869,7 +4869,9 @@ write_tfvars_from_state() {
       enable_github_minter="true"
     else
       print_warning "GitHub minter deferred: its KMS signing key has no ENABLED version, no App private key PEM is at hand (GITHUB_PEM_PATH), and a minter deployed without the key never passes readiness."
-      print_info "Provide the PEM via --github-pem-path (or pre-import the key into Cloud KMS: https://github.com/abcxyz/github-token-minter) and re-run — the next run adds the minter to the existing install."
+      print_minter_restore_advice "${KMS_KEY:-$DEFAULT_KMS_KEY}" "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" \
+        "$(derive_kms_location "${REGION}")" "${PROJECT_ID}" ||
+        print_info "Provide the PEM via --github-pem-path (or pre-import the key into Cloud KMS: https://github.com/abcxyz/github-token-minter) and re-run — the next run adds the minter to the existing install."
     fi
   fi
 
