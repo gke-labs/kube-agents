@@ -997,8 +997,10 @@ latency (160 a second at a 100ms round trip), and the TokenReview client's own l
 which the serial handler never reached and the pool would have hit before the API server
 was asked. So a replica sustains about 50 fresh reviews a second and absorbs a burst of
 100, and two replicas twice that. In front of the API server the callout remembers a
-successful review for thirty seconds, keyed by the token's SHA-256 so the token itself is
-not held, with concurrent presentations of one token sharing one review; a failure is
+successful review for thirty seconds, keyed by an HMAC-SHA-256 of the token under a key
+each replica draws at start (the API server's own token cache uses the same construction),
+so the token itself is not held and a cache key says nothing about its token outside that
+process, with concurrent presentations of one token sharing one review; a failure is
 never remembered, and the identity-map lookup is not cached, so a map change reaches the
 next connection as before. A reconnecting fleet therefore costs one review per distinct
 token per thirty seconds, its retries are free, and the log line for an authorized

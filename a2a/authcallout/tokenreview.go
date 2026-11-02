@@ -2,6 +2,8 @@ package authcallout
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"slices"
@@ -27,6 +29,11 @@ const (
 	// all. The bound on an ALREADY-OPEN connection is the grant TTL and is
 	// unchanged. docs/designs/spec-nats-deployment.md carries both clocks.
 	reviewCacheTTL = 30 * time.Second
+
+	// cacheKeyMaterialLen is the length of the random key each validator
+	// draws at construction for the HMAC its cache entries are keyed by;
+	// see cacheKey.
+	cacheKeyMaterialLen = 32
 )
 
 // reviewSource says whether an attestation came from the API server on this
@@ -49,10 +56,11 @@ const (
 // cluster where the callout must not depend on the API server; it is not
 // implemented here, and the seam to add it is this type.
 //
-// A successful review is remembered for reviewCacheTTL, keyed by the token's
-// SHA-256 so the token itself is not held on the heap, and concurrent
-// requests for one token share one review. It is safe for concurrent use;
-// the callout's worker pool calls it from many goroutines at once.
+// A successful review is remembered for reviewCacheTTL, keyed by an HMAC of
+// the token under a key drawn at construction so the token itself is not held
+// on the heap (see cacheKey), and concurrent requests for one token share one
+// review. It is safe for concurrent use; the callout's worker pool calls it
+// from many goroutines at once.
 type TokenValidator struct {
 	client   kubernetes.Interface
 	audience string
@@ -64,6 +72,10 @@ type TokenValidator struct {
 
 	// group collapses concurrent reviews of one token into one call.
 	group singleflight.Group
+
+	// cacheKeyMaterial keys the HMAC that turns a token into a cache key;
+	// random per validator, never written anywhere. See cacheKey.
+	cacheKeyMaterial []byte
 
 	mu    sync.Mutex
 	cache map[[sha256.Size]byte]cachedReview
@@ -92,12 +104,17 @@ func NewTokenValidator(client kubernetes.Interface, audience string) (*TokenVali
 	if audience == "" {
 		return nil, fmt.Errorf("token validator needs an audience; see NewTokenValidator on why it may not be empty")
 	}
+	keyMaterial := make([]byte, cacheKeyMaterialLen)
+	if _, err := rand.Read(keyMaterial); err != nil {
+		return nil, fmt.Errorf("drawing the cache key: %w", err)
+	}
 	return &TokenValidator{
-		client:   client,
-		audience: audience,
-		now:      time.Now,
-		cacheTTL: reviewCacheTTL,
-		cache:    map[[sha256.Size]byte]cachedReview{},
+		client:           client,
+		audience:         audience,
+		now:              time.Now,
+		cacheTTL:         reviewCacheTTL,
+		cacheKeyMaterial: keyMaterial,
+		cache:            map[[sha256.Size]byte]cachedReview{},
 	}, nil
 }
 
@@ -139,7 +156,7 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 		return Attested{}, "", fmt.Errorf("no token presented")
 	}
 
-	key := sha256.Sum256([]byte(token))
+	key := v.cacheKey(token)
 	if att, ok := v.remembered(key); ok {
 		return att, reviewCached, nil
 	}
@@ -172,6 +189,23 @@ func (v *TokenValidator) validate(ctx context.Context, token string) (Attested, 
 	case <-ctx.Done():
 		return Attested{}, "", fmt.Errorf("TokenReview call failed: %w", ctx.Err())
 	}
+}
+
+// cacheKey is the map and singleflight key for a token: HMAC-SHA-256 under
+// cacheKeyMaterial, not a bare digest. A bare digest of a credential is a
+// fingerprint anyone holding a candidate token can recompute, so the key set
+// would let a reader of this process's memory confirm a token it already
+// suspects; under a key drawn at construction and held nowhere else, the keys
+// say nothing about the tokens outside this process. The same construction
+// keys the API server's own token-authenticator cache. It is a cache key,
+// not a stored password verifier: the input is a signed ServiceAccount JWT
+// with far more entropy than any guess reaches, a work factor would be
+// paid on every connection for nothing, and the entry is gone in
+// reviewCacheTTL. hash.Hash.Write never returns an error.
+func (v *TokenValidator) cacheKey(token string) [sha256.Size]byte {
+	mac := hmac.New(sha256.New, v.cacheKeyMaterial)
+	mac.Write([]byte(token))
+	return [sha256.Size]byte(mac.Sum(nil))
 }
 
 // remembered returns a cached success that has not expired.

@@ -1,7 +1,9 @@
 package authcallout
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"strings"
 	"sync"
@@ -286,6 +288,32 @@ func TestATokenPresentedTwiceWithinTheTTLIsReviewedOnce(t *testing.T) {
 	}
 	if got := reviews.Load(); got != 1 {
 		t.Errorf("TokenReviews = %d for two presentations of one token; want 1", got)
+	}
+}
+
+// The cache key is an HMAC under a key each validator draws for itself, so a
+// key says nothing about its token to anyone outside the process: it is not
+// the token's plain digest, and two validators key one token differently.
+// The entry is still found through it, which the other cache tests assert.
+func TestTheCacheKeyIsNotTheTokensPlainDigest(t *testing.T) {
+	c, _ := countingReviewer(t, boundToPod(gatewaySA, "chat-otter-1a2b", "uid-1234", testAudience))
+	v1, _ := NewTokenValidator(c, testAudience)
+	v2, _ := NewTokenValidator(c, testAudience)
+
+	if len(v1.cacheKeyMaterial) != cacheKeyMaterialLen || len(v2.cacheKeyMaterial) != cacheKeyMaterialLen {
+		t.Fatalf("key material lengths = %d, %d; want %d", len(v1.cacheKeyMaterial), len(v2.cacheKeyMaterial), cacheKeyMaterialLen)
+	}
+	if bytes.Equal(v1.cacheKeyMaterial, v2.cacheKeyMaterial) {
+		t.Fatal("two validators drew the same key material")
+	}
+	if v1.cacheKey("a-token") == sha256.Sum256([]byte("a-token")) {
+		t.Error("the cache key is the token's plain SHA-256")
+	}
+	if v1.cacheKey("a-token") == v2.cacheKey("a-token") {
+		t.Error("two validators derived the same cache key for one token")
+	}
+	if v1.cacheKey("a-token") != v1.cacheKey("a-token") {
+		t.Error("one validator derived two keys for one token")
 	}
 }
 
