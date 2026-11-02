@@ -8531,9 +8531,10 @@ class CommandExecutor:
     def _write_tokens(self) -> dict[tuple[str, str, str], tuple[float, frozenset[str], str]]:
         """(provider, host, owner) -> (minted at, repositories covered, token): in memory only.
 
-        One slot per owner, because a mint covers one organisation's
-        repositories: two organisations on one host would otherwise evict
-        each other's token on every alternate request."""
+        One slot per owner, and a mint now covers the one repository it was
+        asked for, so the slot is handed out only to a repository in its
+        covered set and a request for another repository of the same owner
+        mints again and replaces it."""
         if getattr(self, "_forge_write_tokens", None) is None:
             self._forge_write_tokens = {}
         return self._forge_write_tokens

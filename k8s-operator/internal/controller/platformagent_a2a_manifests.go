@@ -46,6 +46,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -6351,56 +6352,46 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 
 // pruneA2AAuthMapShards deletes what the identity map's render no longer
 // produces: the unsharded object a release before sharding rendered, and every
-// shard at or past this pass's count. Shards are contiguous from 0 by
-// construction, so the sweep walks up from the count and stops at the first
-// name that is not there; each delete is of an object this CR owns and
-// nothing else (deleteA2AObjectIfOwned). Uncached reads, through a2aReader,
-// for the reason every ConfigMap read here is: nothing watches the kind.
+// shard at or past this pass's count.
 func (r *PlatformAgentReconciler) pruneA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent, shards int) error {
-	if err := r.deleteLegacyA2AAuthMap(ctx, agent); err != nil {
-		return err
-	}
-	return r.deleteA2AAuthMapShardsFrom(ctx, agent, shards)
+	return r.deleteA2AAuthMapObjects(ctx, agent, a2aAuthMapShardNames(agent, shards))
 }
 
 // deleteA2AAuthMapShards removes every identity-map object, the unsharded
 // legacy one and every shard, for the flip to today and the CR's deletion.
 // Shard 0 is also a walk entry (a2aPreBusTeardown), which finds it gone.
 func (r *PlatformAgentReconciler) deleteA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	if err := r.deleteLegacyA2AAuthMap(ctx, agent); err != nil {
+	return r.deleteA2AAuthMapObjects(ctx, agent, nil)
+}
+
+// deleteA2AAuthMapObjects deletes every identity-map ConfigMap this CR owns
+// except the names in keep. Found by label rather than by walking the names
+// up from the count: every identity-map object, legacy or shard, carries
+// a2aLabels(agent, a2aAuthMapComponent), and a walk that stopped at the first
+// absent name would stop for good at the gap one failed delete leaves,
+// stranding every shard above it. One uncached List through a2aReader, for
+// the reason every ConfigMap read here is uncached; an object under one of
+// these labels that this CR does not own is left to its owner.
+func (r *PlatformAgentReconciler) deleteA2AAuthMapObjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent, keep []string) error {
+	var cms corev1.ConfigMapList
+	if err := r.a2aReader().List(ctx, &cms, client.InNamespace(agent.Namespace), client.MatchingLabels(a2aLabels(agent, a2aAuthMapComponent))); err != nil {
 		return err
 	}
-	return r.deleteA2AAuthMapShardsFrom(ctx, agent, 0)
-}
-
-// deleteLegacyA2AAuthMap removes the unsharded object a release before
-// sharding rendered, when this CR owns it.
-func (r *PlatformAgentReconciler) deleteLegacyA2AAuthMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	legacy := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}
-	return r.deleteA2AObjectIfOwned(ctx, agent, legacy, r.a2aReader(), nil)
-}
-
-// deleteA2AAuthMapShardsFrom deletes shard first and every shard above it
-// until a name is absent.
-func (r *PlatformAgentReconciler) deleteA2AAuthMapShardsFrom(ctx context.Context, agent *agentv1alpha1.PlatformAgent, first int) error {
-	for i := first; ; i++ {
-		shard := &corev1.ConfigMap{}
-		key := types.NamespacedName{Name: a2aAuthMapShardName(agent, i), Namespace: agent.Namespace}
-		if err := r.a2aReader().Get(ctx, key, shard); err != nil {
-			return client.IgnoreNotFound(err)
+	for i := range cms.Items {
+		cm := &cms.Items[i]
+		if slices.Contains(keep, cm.Name) {
+			continue
 		}
-		if !metav1.IsControlledBy(shard, agent) {
-			// Not this CR's: left to its owner, and the sweep stops here
-			// rather than stepping past it, since nothing above a squatted
-			// name can be this render's either.
+		if !metav1.IsControlledBy(cm, agent) {
 			logf.FromContext(ctx).V(1).Info("skipping unowned A2A object under a reserved name",
-				"kind", fmt.Sprintf("%T", shard), "namespace", key.Namespace, "name", key.Name)
-			return nil
+				"kind", fmt.Sprintf("%T", cm), "namespace", cm.Namespace, "name", cm.Name)
+			continue
 		}
-		if err := client.IgnoreNotFound(r.Delete(ctx, shard)); err != nil {
+		if err := client.IgnoreNotFound(r.Delete(ctx, cm)); err != nil {
 			return err
 		}
 	}
+	return nil
 }
 
 // a2aBusTeardown returns the namespaced NATS bus objects (Service, NetworkPolicy fences,

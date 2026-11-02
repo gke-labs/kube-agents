@@ -205,24 +205,28 @@ func TestTheRenderedVersionIsReadOffShardZero(t *testing.T) {
 
 // After a render the only identity-map objects standing are this pass's
 // shards: the unsharded object a release before sharding left, and the shards
-// a larger previous render left above this count, are deleted, and an object
-// under a shard name this CR does not own is left alone.
+// a larger previous render left above this count, are deleted, including one
+// stranded above a gap by an interrupted earlier prune; an object under a
+// shard name this CR does not own is left alone.
 func TestPruningRemovesTheLegacyMapAndTheShardsAboveTheCount(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 	ctx := context.Background()
 	owned := func(name string) *corev1.ConfigMap {
-		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}}
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: a2aLabels(agent, a2aAuthMapComponent)}}
 		if err := ctrl.SetControllerReference(agent, cm, scheme); err != nil {
 			t.Fatalf("owner reference: %v", err)
 		}
 		return cm
 	}
-	squatted := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(agent, 5), Namespace: agent.Namespace}}
+	squatted := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(agent, 5), Namespace: agent.Namespace, Labels: a2aLabels(agent, a2aAuthMapComponent)}}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent,
 		owned(a2aAuthMapName(agent)),
 		owned(a2aAuthMapShardName(agent, 0)), owned(a2aAuthMapShardName(agent, 1)),
 		owned(a2aAuthMapShardName(agent, 2)), owned(a2aAuthMapShardName(agent, 3)),
+		// Shard 4 is gone and 7 stands: what a prune that died between
+		// two deletes leaves. A walk up from the count would stop at 4.
+		owned(a2aAuthMapShardName(agent, 7)),
 		squatted,
 	).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
@@ -240,6 +244,7 @@ func TestPruningRemovesTheLegacyMapAndTheShardsAboveTheCount(t *testing.T) {
 		a2aAuthMapShardName(agent, 2): false,
 		a2aAuthMapShardName(agent, 3): false,
 		a2aAuthMapShardName(agent, 5): true,
+		a2aAuthMapShardName(agent, 7): false,
 	} {
 		if got := exists(name); got != want {
 			t.Errorf("after pruning to 2 shards, %s exists = %v, want %v", name, got, want)

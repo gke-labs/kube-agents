@@ -679,9 +679,8 @@ def mint_read_only_token(target_repo: str | None) -> str:
     things distinguish it from `refresh_git_credentials`, each deliberate:
 
     * The scope is `MINTY_READ_SCOPE` and the repository list is this one
-      repository. The write scope's list is widened to every managed repository
-      so one token slot serves them all; a read token is per clone, so there is
-      no slot to serve and no reason to widen.
+      repository, as the write mint's now is; each repository's minter policy
+      lists that repository alone.
     * It goes straight to Minty. There is no sidecar to delegate to, because
       this runs *in* the sidecar, and no sandbox to forward through, because the
       sandbox must never hold it.
@@ -911,10 +910,15 @@ def refresh_git_credentials(
     # policy to admit it, which made that ConfigMap quadratic in the
     # repository count and unrenderable past the API server's object limit.
     # Each policy now names its own repository alone, so a wider request is
-    # refused by the policy, and a run that writes to two managed repositories
-    # refreshes twice: refresh_credentials_once re-mints, once per process,
-    # for the repository the failing command names when the slot holds the
-    # other repository's token.
+    # refused by the policy. The broker refreshes before every credentialed
+    # verb (`BrokeredCredential.ensure` -> `refresh_forge_credential`) and
+    # coalesces refreshes only while the last one covers the repository named,
+    # so a run that writes to two managed repositories refreshes on each
+    # switch, and two such verbs running at once can each install their own
+    # repository's token in the CLI's one slot while the other verb is still
+    # running. Serialising credentialed verbs per host, or handing each verb
+    # its own credential as the GitHub Enterprise Server path does, is the
+    # change that closes that; it is not made here.
     org_name, repo_name = repository.split("/", 1)
     repositories_to_scope = [repo_name]
 

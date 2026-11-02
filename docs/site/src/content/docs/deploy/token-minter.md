@@ -31,7 +31,7 @@ Create the repo under an organization, or transfer an existing one into it. A fr
 
 ## Single-organization scoping boundary
 
-Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A single PlatformAgent instance and its associated Minty deployment manage multiple repositories within the primary GitHub Organization where the GitHub App is installed. Additional repositories registered under `managed_repos` in the `gitops-state` ConfigMap must belong to this primary organization, and so must the repositories registered under its `context_repos` key. The operator renders one `<repo>.yaml` policy per same-organization repository, listing that repository alone, and the credential broker mints a write token per repository to match. A policy listing every managed repository would grow the ConfigMap with the square of the count, past the API server's size limit near 120 repositories.
+Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A single PlatformAgent instance and its associated Minty deployment manage multiple repositories within the primary GitHub Organization where the GitHub App is installed. Additional repositories registered under `managed_repos` in the `gitops-state` ConfigMap must belong to this primary organization, and so must the repositories registered under its `context_repos` key. The operator renders one `<repo>.yaml` policy per same-organization repository, listing that repository alone, and the credential broker mints a write token per repository to match. A policy listing every managed repository would grow the ConfigMap with the square of the count, past the API server's object size limit.
 
 ## Read-only tokens for context repositories
 

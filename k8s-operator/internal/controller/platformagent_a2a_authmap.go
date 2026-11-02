@@ -94,6 +94,11 @@ const (
 	a2aAuthMapShardAnnotation  = "kubeagents.x-k8s.io/a2a-authmap-shard"
 	a2aAuthMapShardsAnnotation = "kubeagents.x-k8s.io/a2a-authmap-shards"
 
+	// a2aAuthMapComponent is the a2aLabels component every identity-map
+	// object carries, shard or legacy, which is how the prune and the
+	// teardown find them whatever their names (deleteA2AAuthMapObjects).
+	a2aAuthMapComponent = "authmap"
+
 	// a2aAuthMapVersionLength is how much of the content digest becomes the
 	// version. Sixteen hex characters matches the config hash the NATS
 	// StatefulSet already rides and is far past collision concerns for a
@@ -369,7 +374,7 @@ func buildA2AAuthMapConfigMaps(agent *agentv1alpha1.PlatformAgent, profiles []ag
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      a2aAuthMapShardName(agent, shard.Shard),
 				Namespace: agent.Namespace,
-				Labels:    a2aLabels(agent, "authmap"),
+				Labels:    a2aLabels(agent, a2aAuthMapComponent),
 				Annotations: map[string]string{
 					// The version and the stamps on the object as well as
 					// inside it, so an operator can compare what was
