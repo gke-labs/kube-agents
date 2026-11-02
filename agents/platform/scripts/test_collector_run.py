@@ -364,9 +364,15 @@ class PagedReadTest(unittest.TestCase):
 
     def test_the_command_text_names_each_kinds_first_page(self):
         text = cr.paged_command_text(["deploy", "pods"], kubeconfig="/k/c")
+        # The prefix on every read: a leading assignment scopes to the one
+        # command after it, and the line is recorded to be pasted unchanged.
         self.assertEqual(
-            "KUBECONFIG=/k/c kubectl get --raw '/apis/apps/v1/deployments?limit=500'; kubectl get --raw '/api/v1/pods?limit=500'",
+            "KUBECONFIG=/k/c kubectl get --raw '/apis/apps/v1/deployments?limit=500'; KUBECONFIG=/k/c kubectl get --raw '/api/v1/pods?limit=500'",
             text,
+        )
+        self.assertEqual(
+            "kubectl get --raw '/apis/apps/v1/deployments?limit=500'; kubectl get --raw '/api/v1/pods?limit=500'",
+            cr.paged_command_text(["deploy", "pods"]),
         )
 
     def test_the_legacy_dump_adapter_feeds_the_real_paging(self):

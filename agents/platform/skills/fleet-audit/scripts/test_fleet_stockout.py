@@ -1579,7 +1579,13 @@ class CollectClusterTest(unittest.TestCase):
         )
         self.assertEqual(1, len([a for a in issued if a[:3] == ["kubectl", "get", "computeclasses"]]))
         command = next(c["command"] for c in entry["commands"] if c["check"] == "dangling-compute-class")
-        self.assertIn("kubectl get computeclasses -A -o json; kubectl get --raw", command)
+        kubeconfig = next(part for part in command.split() if part.startswith("KUBECONFIG=")).removeprefix("KUBECONFIG=")
+        self.assertEqual(command.split("; ")[0], f"KUBECONFIG={kubeconfig} kubectl get computeclasses -A -o json")
+        # Every read of the chain under the kubeconfig, not the first alone:
+        # the line is recorded to be pasted unchanged.
+        self.assertEqual(command, f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}")
+        for read in command.split("; ")[1:]:
+            self.assertTrue(read.startswith(f"KUBECONFIG={kubeconfig} kubectl get --raw "), read)
 
         def cut_run(argv, **kwargs):
             if argv[:3] == ["kubectl", "get", "--raw"] and argv[3].startswith("/api/v1/nodes"):

@@ -259,10 +259,14 @@ def list_argv(
 
 
 def paged_command_text(resources: Iterable[str], *, query: dict[str, str] | None = None, kubeconfig=None) -> str:
-    """The shell line a paged read is recorded as: each kind's first page, with
-    the kubeconfig the reads ran under spelled out; a reader follows `continue`."""
-    lines = "; ".join(shlex.join(list_argv(resource, query=query)) for resource in resources)
-    return f"KUBECONFIG={shlex.quote(str(kubeconfig))} {lines}" if kubeconfig else lines
+    """The shell line a paged read is recorded as: each kind's first page, each
+    under the kubeconfig the reads ran under; a reader follows `continue`. The
+    prefix goes on every read, not once in front of the chain: a leading
+    `VAR=value` scopes to the one simple command it precedes, so a line pasted
+    unchanged would run every kind after the first against the pasting
+    shell's current context."""
+    prefix = f"KUBECONFIG={shlex.quote(str(kubeconfig))} " if kubeconfig else ""
+    return "; ".join(prefix + shlex.join(list_argv(resource, query=query)) for resource in resources)
 
 
 def _strip_and_stamp(items: list, listed: ListKind) -> None:

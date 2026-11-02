@@ -9776,12 +9776,14 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         result = self.run_with(workload_items=[deployment("web")], service_items=[])
         commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
         self.assertIn("kubectl get --raw '/api/v1/services?limit=500'", commands_by_slug["inference-endpoint-public"])
-        for slug in commands_by_slug:
+        for slug, command in commands_by_slug.items():
             if slug != "inference-endpoint-public":
-                self.assertEqual(
-                    collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(",")),
-                    commands_by_slug[slug].split(" ", 1)[1],
-                )
+                # Each kind's read under the cluster's kubeconfig, so the
+                # recorded line runs the whole chain against the audited
+                # cluster when pasted unchanged.
+                kubeconfig = command.split(" ", 1)[0].removeprefix("KUBECONFIG=")
+                self.assertTrue(kubeconfig.endswith(".yaml"), command)
+                self.assertEqual(collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), command)
 
 
 class TestEvidenceCommandsArePasteable(unittest.TestCase):

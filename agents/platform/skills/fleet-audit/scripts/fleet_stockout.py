@@ -1809,7 +1809,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
     # One record for the five kinds, as the one dump was: the two reads' command
     # lines, and a digest over both outputs.
     dump_record = _record(
-        f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}; {paged_command_text(PAGED_DUMP_KINDS)}",
+        f"KUBECONFIG={kubeconfig} {shlex.join(cc_argv)}; {paged_command_text(PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}",
         Run(result.argv, 0, cc_result.stdout + "\n" + result.stdout, "", cc_result.duration_s + result.duration_s),
     )
 
