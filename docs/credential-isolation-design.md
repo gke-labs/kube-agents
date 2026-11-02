@@ -909,7 +909,8 @@ Consequences:
   (`the credential proxy's admission queue is held by requests waiting for its child memory budget (…) …`).
   The queue is in arrival order inside each admission class, with interactive requests ahead
   of queued background ones (`designs/credential-broker-exec-tier.md` §4.2), except that a
-  forge refresh that fits the budget passes requests the slot cap alone holds, since it takes
+  forge refresh that fits the budget passes requests only a slot cap holds (the full slot cap,
+  or their own class's full cap), since it takes
   no slot.
   A long-running command holds its slot and reservation for as long as it runs,
   and a caller that stops reading its response is given up on after 60 seconds

@@ -1336,6 +1336,9 @@ class ProfileSlotShareTest(unittest.TestCase):
     def test_the_share_is_named_defaulted_and_clamped_to_the_background_cap(self):
         with mock.patch.dict(os.environ, {credential_proxy.ENV_PROFILE_SLOTS: ""}):
             self.assertEqual(4, credential_proxy.profile_slot_limit_from_env(6))
+            # The default clamped on a small pod is expected, so it is quiet.
+            with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertEqual(2, credential_proxy.profile_slot_limit_from_env(2))
         for raw, background_cap, want, warns in (
             ("3", 6, 3, False),
             ("10", 6, 6, True),  # P = min(P, B): the interactive reserve stays free

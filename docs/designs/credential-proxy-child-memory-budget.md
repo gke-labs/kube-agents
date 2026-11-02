@@ -237,8 +237,9 @@ background ones, and each class is held to its share
 ([`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §4.2). A slot-less reserver
 is interactive work, so it goes ahead of queued background tickets too. Among the rest there is one
 exception. A slot-less reserver that fits the budget is
-admitted past the tickets ahead of it when every one of them takes a slot and the slots are full:
-those wait on the slot cap, not the budget, and the reserver competes with them for nothing, so
+admitted past the tickets ahead of it when every one of them takes a slot and is held by a slot cap
+(the full slot cap, or its own class's full cap while it would fit the budget): those wait for a
+slot, not the budget, and the reserver competes with them for nothing, so
 `kubectl logs -f` commands holding every slot their caps allow and an exec queued behind them do not keep a forge
 refresh waiting out the bound. Behind a ticket the budget holds, order is kept, because a reserver
 admitted ahead of it would take the budget that ticket is waiting for and could starve it. A
@@ -407,7 +408,7 @@ Unit, in `agents/platform/scripts/test_credential_proxy.py`: the budget is deriv
 variable, from the cgroup file, and disabled when neither is readable or the file says `max`; a
 request waits when the sum would exceed the budget and is admitted when a reservation is
 released; the wait is in arrival order inside a class, except that a slot-less reservation that fits passes slot takers
-the full slot cap holds and keeps its place behind one the budget holds, and drops a caller that
+only a slot cap holds and keeps its place behind one the budget holds, and drops a caller that
 hangs up while queued; a request
 still waiting at the bound raises `CommandSlotUnavailable` naming the budget, and the exec, vcs
 and forge refresh routes each answer it with the existing 503 body, the vcs route before reading

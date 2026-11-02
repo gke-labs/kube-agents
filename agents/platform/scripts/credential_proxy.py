@@ -408,8 +408,8 @@ ENV_SCOPE_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SCOPE_MAX_CONCURRENT_COMMA
 #     (P = min(this, B)), so with the defaults (8 admitted, B = 6, P = 4) the
 #     shell and session pods always find two admissions.
 #   * Interactive work holds at most the admitted count less one, so a shell
-#     holding everything it may still leaves one admission, in slots and in
-#     budget room, for background work.
+#     holding everything it may still leaves one admission for background
+#     work.
 # Operator-unset: the broker default applies, and spec.deployment.env can set
 # it, as it can the session share; the clamp holds whatever value arrives.
 DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS = 4
@@ -2676,10 +2676,13 @@ def profile_slot_limit_from_env(background_cap: int) -> int:
             )
             value = DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS
     if value > background_cap:
-        LOGGER.warning(
-            "the profile share of %d is more than the background cap of %d; using %d",
-            value, background_cap, background_cap,
-        )
+        # Said only for a value the operator set: the default's clamp on a
+        # small pod (4 on a pod whose background cap is 2) is expected.
+        if raw:
+            LOGGER.warning(
+                "the profile share of %d is more than the background cap of %d; using %d",
+                value, background_cap, background_cap,
+            )
         value = background_cap
     return value
 
@@ -7643,8 +7646,8 @@ class CommandExecutor:
         """Hold a child memory reservation without a slot, for a route that
         spawns but holds no output (the forge refresh, §2.1). Same queue, same
         wait, same refusal and hang-up handling as `request_slot` while the
-        budget is on, except that it is admitted past slot-takers the full
-        slot cap holds (`_admit`). With the budget off it takes no queue at all and only
+        budget is on, except that it is admitted past slot-takers only a slot
+        cap holds, the full slot cap or their own class's (`_admit`). With the budget off it takes no queue at all and only
         marks the thread as covered, so `_execute` takes no transient
         reservation; `caller`, `yield_when`, `deadline` and `queued_at` are
         then unused. All three are passed to `_admit`."""
@@ -7702,12 +7705,12 @@ class CommandExecutor:
         to earlier arrivals and the queue ahead holds this request. Under the
         budget: this request does not fit it now, or it fits and the queue
         ahead, held by the budget, holds it (a slot-less reserver is admitted
-        past tickets the slot cap alone holds, `_admit`). The text never says
+        past tickets only a slot cap holds, `_admit`). The text never says
         a request waited without fitting when it fits."""
         if bound == ADMISSION_BOUND_BACKGROUND:
             return (
                 f"the credential proxy keeps {self.admitted_requests() - self.class_cap(CLASS_BACKGROUND)} "
-                f"of its {self.admitted_requests()} admissions for interactive work, background work holds "
+                f"of its {self.admitted_requests()} admissions for interactive work, background work may hold "
                 f"the other {self.class_cap(CLASS_BACKGROUND)}, and this request waited "
                 f"{COMMAND_SLOT_WAIT_SECONDS}s without reaching one; retry shortly"
             )

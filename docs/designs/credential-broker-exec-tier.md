@@ -1,7 +1,6 @@
 # The Credential Broker Scales Out: an Exec Tier Beside One Stateful Broker
 
-> **STATUS — proposal; not implemented.** The first measurement run is in §8.3. 16 and 32 clusters and the exec tier are not measured yet.
-> Nothing is built. This document proposes how the credential broker grows past one pod. It is
+> **STATUS — proposal; partly implemented.** Priority admission by class (§4.2) runs on the broker; the exec tier is not built. The first measurement run is in §8.3. 16 and 32 clusters and the exec tier are not measured yet. This document proposes how the credential broker grows past one pod. It is
 > meant to replace [`credential-proxy-single-pod.md`](credential-proxy-single-pod.md) once the
 > measurements in §8 exist and the design is reviewed. Issue: #4082. Partner: the sizing tiger
 > team (#3753).
