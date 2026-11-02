@@ -258,6 +258,8 @@ class FakeClock:
 SCOPE_ARGUMENT_STDERR = ("The scope caller may name only what scope.json declares, or a member an "
                          "earlier lookup returned within the last 5 hours.\npolicy rule: caller.scope-argument\n")
 SCOPE_ARGV_STDERR = "The scope caller may run only the five lookups.\npolicy rule: caller.scope-argv\n"
+UNREADABLE_DECLARATION_STDERR = ("The broker cannot read the scope declaration (FileNotFoundError); nothing is "
+                                 "admitted.\npolicy rule: caller.scope-argument\n")
 
 
 class ScopeArgumentRetryTest(unittest.TestCase):
@@ -295,6 +297,47 @@ class ScopeArgumentRetryTest(unittest.TestCase):
         self.assertEqual((0, "[]"), (result.returncode, result.stdout))
         self.assertEqual(3, len(calls))
         self.assertEqual([pub.SCOPE_ARGUMENT_RETRY_SECONDS] * 2, clock.slept)
+        self.assertTrue(pub._scope_argument_wait.caught_up)
+
+    def test_a_broker_that_cannot_read_its_scope_json_is_not_waited_for(self):
+        # The same rule, but waiting does not end it: answered at once, as before.
+        error, calls, clock = self._run([self._refused(UNREADABLE_DECLARATION_STDERR) for _ in range(5)])
+        self.assertIsInstance(error, subprocess.CalledProcessError)
+        self.assertEqual((1, []), (len(calls), clock.slept))
+
+    def test_the_undeclared_message_is_the_one_the_broker_sends(self):
+        # Pinned to scope_policy's own refusal, so a reworded message reds here.
+        import scope_policy
+        with tempfile.TemporaryDirectory() as tmp:
+            scope_file = Path(tmp) / "scope.json"
+            scope_file.write_text(json.dumps({"present": True, "folders": ["222"]}))
+            refusal, _ = scope_policy.check(self.ARGV, extras=False, scope_file=str(scope_file),
+                                            window=scope_policy.MemberWindow())
+        self.assertEqual(scope_policy.RULE_SCOPE_ARGUMENT, refusal.rule)
+        self.assertTrue(refusal.message.startswith(pub.SCOPE_ARGUMENT_UNDECLARED_PREFIX), refusal.message)
+
+    def test_a_timeout_after_a_wait_counts_as_a_catch_up(self):
+        # The broker may have admitted the attempt that ran out of time.
+        clock = FakeClock()
+        answers = [self._refused(), subprocess.TimeoutExpired(self.ARGV, 5)]
+
+        def run(cmd, **kwargs):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        with mock.patch.object(pub.subprocess, "run", side_effect=run), clock.patch(), mock.patch.object(pub, "log"):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                pub.broker_run(self.ARGV, check=True, timeout=120)
+        self.assertTrue(pub._scope_argument_wait.caught_up)
+
+    def test_another_failure_after_a_wait_also_counts_as_a_catch_up(self):
+        # Conservative: a client failure may hide an admitted answer; resolving again
+        # costs time, never an admit.
+        unavailable = subprocess.CompletedProcess([], 1, "", "credential proxy unavailable: timed out\n")
+        error, _, _ = self._run([self._refused(), unavailable])
+        self.assertIsInstance(error, subprocess.CalledProcessError)
         self.assertTrue(pub._scope_argument_wait.caught_up)
 
     def test_a_refused_probe_is_not_waited_for(self):
@@ -827,6 +870,9 @@ class BuildDocumentTest(unittest.TestCase):
         document, clock = self._build_through_client(
             broker, {FOLDER_A: 10_000}, _scope(folders=["111111111111", "222222222222"]), previous)
         self.assertLessEqual(sum(clock.slept), pub.SCOPE_ARGUMENT_RETRY_WINDOW_SECONDS)
+        # It waited, and never caught up, so the sources were not resolved again.
+        self.assertGreater(sum(clock.slept), pub.SCOPE_ARGUMENT_RETRY_WINDOW_SECONDS / 2)
+        self.assertFalse(pub._scope_argument_wait.caught_up)
         rows = self._rows(document)
         # The refused folder keeps its row as it was; the other resolved and was probed.
         self.assertEqual(rows["team-a"], previous["projects"][0])

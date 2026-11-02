@@ -124,6 +124,10 @@ POLICY_REFUSED_STDERR = "the credential proxy refused this command for the scope
 # for the whole run) lasts, never past the lookup's own timeout, and only while the next
 # attempt still gets SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS; then it is answered as before.
 SCOPE_ARGUMENT_REFUSAL_LINE = f"policy rule: {scope_policy.RULE_SCOPE_ARGUMENT}"
+# The broker's message for an argument its scope.json does not name, on the line before the
+# rule (scope_policy.check). The same rule also answers a broker that cannot read its
+# scope.json at all; that refusal does not end by waiting, so it is answered at once.
+SCOPE_ARGUMENT_UNDECLARED_PREFIX = "The scope caller may name only what scope.json declares"
 SCOPE_ARGUMENT_SOURCE_SHAPES = frozenset(
     {scope_policy.SHAPE_ASSET_SEARCH, scope_policy.SHAPE_SHARED_VPC, scope_policy.SHAPE_METRICS_SCOPE}
 )
@@ -218,9 +222,10 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
     stdout and stderr on a non-zero exit, which is what the lookups classify;
     `TimeoutExpired` when the timeout passes, after the child is killed, so no lookup thread
     outlives the run's budget. The broker URL and token file come from the client's own
-    variables (CREDENTIAL_PROXY_URL, CREDENTIAL_PROXY_TOKEN_FILE). A `caller.scope-argument`
-    refusal is retried while the broker's scope.json catches up
-    (SCOPE_ARGUMENT_REFUSAL_LINE), inside the same timeout.
+    variables (CREDENTIAL_PROXY_URL, CREDENTIAL_PROXY_TOKEN_FILE). A source lookup the broker
+    refuses because its scope.json does not name the argument yet is retried while it
+    catches up (SCOPE_ARGUMENT_REFUSAL_LINE, SCOPE_ARGUMENT_UNDECLARED_PREFIX), inside the
+    same timeout.
     """
     env = {k: v for k, v in os.environ.items() if k not in CLIENT_DROPPED_ENV}
     deadline = time.monotonic() + timeout
@@ -230,12 +235,22 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
     attempt_timeout = timeout
     waited = False
     while True:
-        result = subprocess.run([sys.executable, str(BROKER_CLIENT_SCRIPT), *argv],
-                                stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                timeout=attempt_timeout, env=env, check=False)
-        refused = (result.returncode == EXIT_SECURITY_POLICY_BLOCKED
-                   and SCOPE_ARGUMENT_REFUSAL_LINE in (result.stderr or "").splitlines())
-        if not (refused and source_lookup):
+        try:
+            result = subprocess.run([sys.executable, str(BROKER_CLIENT_SCRIPT), *argv],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                    timeout=attempt_timeout, env=env, check=False)
+        except subprocess.TimeoutExpired:
+            # An attempt after a wait that runs out of time may have been admitted: the
+            # broker's scope.json, and its member window, may have changed. Resolving again
+            # costs time and never admits anything, so the run is told it may have.
+            if waited:
+                _scope_argument_wait.caught_up = True
+            raise
+        lines = (result.stderr or "").splitlines()
+        undeclared = (result.returncode == EXIT_SECURITY_POLICY_BLOCKED
+                      and SCOPE_ARGUMENT_REFUSAL_LINE in lines
+                      and any(line.startswith(SCOPE_ARGUMENT_UNDECLARED_PREFIX) for line in lines))
+        if not (undeclared and source_lookup):
             break
         if _scope_argument_wait.until is None:
             _scope_argument_wait.until = time.monotonic() + SCOPE_ARGUMENT_RETRY_WINDOW_SECONDS
@@ -248,7 +263,9 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
         time.sleep(SCOPE_ARGUMENT_RETRY_SECONDS)
         # A retry gets what is left of the lookup's timeout, never more.
         attempt_timeout = max(deadline - time.monotonic(), 0)
-    if waited and not refused:
+    if waited and not undeclared:
+        # Any end of a wait but another "not declared" refusal: the broker's answer, or a
+        # failure that may hide one. A spurious second resolve costs time, not an admit.
         _scope_argument_wait.caught_up = True
     if result.returncode == EXIT_SECURITY_POLICY_BLOCKED:
         log(f"the broker refused {shown}: {(result.stderr or '').strip()}")
