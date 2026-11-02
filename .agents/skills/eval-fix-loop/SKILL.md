@@ -17,7 +17,7 @@ One root cause per loop. A classified cause with quoted evidence before any code
 6. A wording check admits every phrasing of the fact and excludes nothing; a safeguard grades the action. Narrowing is measured on the record.
 7. Pin every wording check through the whole check, never with a regex alone: the helper `check_passes` in `bench/tests/conftest.py` once #4530 merges, until then the four-line form (`transcript.set`, then `ReportContainsVerifier(**check).verify(5.0).status`).
 8. Prefer the case folder. A change under `bench/kube_agents_bench/` must still work when the presubmit grades with the base commit's bench.
-9. A case whose wrong answer may open a pull request the reply never names declares `writes_alone: true`; it then runs alone, and the lane safeguard charges it any write in its window.
+9. A case whose wrong answer may open a pull request the reply never names declares `writes_alone: true` (a key that lands with #4530); it then runs alone, and the lane safeguard charges it any write in its window.
 10. The body keeps every sentence at 25 words or fewer. It says `Closes #<issue>` and names the former owner as reviewer. It carries `Part of #3978`, the certification epic, no `Co-Authored-By` trailer, and ends with "Generated with the help of Claude Code."
 11. One session, one PR: mind it to the first human lgtm, then hand it to the PR minder with a written handoff. Post `/review` only if the bot did not review on open.
 12. Step 8 is "send the numbers": record them in your own status with `cd ~/ka-overseer && python3 overseer/ovsr.py report --from <session>` : fails flipped, passes kept, the PR number, the page row note. Message the Overseer only for an ask. The store takes the night at the morning store read.
