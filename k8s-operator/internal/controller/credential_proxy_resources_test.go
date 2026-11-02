@@ -489,7 +489,7 @@ func TestClusterAutopilotCachesOnlyAnAuthoritativeAnswer(t *testing.T) {
 	if !r.clusterAutopilot() || !r.autopilotResolved {
 		t.Fatal("an Autopilot cluster was not recognised once discovery answered")
 	}
-	container := buildCredentialProxyDeploymentForPlugins(proxyAgentWithResources(nil), "hash", nil, true, credentialProxyProfileConfig{}, r.clusterAutopilot()).Spec.Template.Spec.Containers[0]
+	container := buildCredentialProxyDeploymentForPlugins(proxyAgentWithResources(nil), "hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, r.clusterAutopilot()).Spec.Template.Spec.Containers[0]
 	assertQuantity(t, container.Resources.Requests, corev1.ResourceCPU, "2")
 	assertQuantity(t, container.Resources.Requests, corev1.ResourceMemory, "2Gi")
 }
