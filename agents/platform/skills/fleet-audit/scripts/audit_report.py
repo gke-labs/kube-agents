@@ -19125,7 +19125,8 @@ def _remediation_file_stalls(
             and (not declaration.namespace or stall.namespace == declaration.namespace)
             and not (file_ref and stall.cluster and stall.cluster != file_ref)
             and _location_agrees(stall, location)
-            and _project_certain(stall, project, kcc_hosts)
+            # On the finding's own cluster, the number of hosts does not matter.
+            and _project_certain(stall, project, kcc_hosts if on_host is None else 1)
         ]
         if len({stall.host for stall in fits}) > 1:
             continue
@@ -19166,7 +19167,7 @@ def _object_stalls(
     if not name:
         return []
     if not kinds:
-        return _generic_object_stalls(finding, prefix, name, stalled, kcc_hosts, namespaces, declarations or {})
+        return _generic_object_stalls(finding, prefix, name, stalled, namespaces, declarations or {})
     cluster = str(finding.get("cluster") or "").rpartition("/")[2]
     project = _finding_project(finding)
     pool_kinds = _KCC_OBJECT_KINDS["NodePool"]
@@ -19194,7 +19195,6 @@ def _generic_object_stalls(
     kind: str,
     name: str,
     stalled: list[KccStall],
-    kcc_hosts: int,
     namespaces: frozenset[str],
     declarations: "dict[KccKey, KccDeclaration]",
 ) -> list[KccStall]:
@@ -19206,7 +19206,9 @@ def _generic_object_stalls(
     (`Service`) that a Config Connector kind shares. The finding gives no
     project or location: they come from the one declaration of the object in
     `declarations`, when there is exactly one. A finding that names a
-    namespace matches only that namespace.
+    namespace matches only that namespace. Because the stall is on the
+    finding's cluster, the number of hosts does not matter; a known project
+    that differs from the declaration's still blocks the match.
     """
     if str(finding.get("check") or "") != KCC_OBJECT_CHECK:
         return []
@@ -19226,7 +19228,10 @@ def _generic_object_stalls(
         found = _declarations_of(stall, declarations)
         project = found[0][1].project if len(found) == 1 else ""
         location = found[0][0][3] if len(found) == 1 else ""
-        if _project_certain(stall, project, kcc_hosts) and _location_agrees(stall, location):
+        # The stall is on the finding's own cluster, in its namespace, with its
+        # name, so another host cannot hold it: only a known project that
+        # differs still blocks the match (one host for `_project_certain`).
+        if _project_certain(stall, project, 1) and _location_agrees(stall, location):
             certain.append(stall)
     return certain if _one_object(certain) else []
 

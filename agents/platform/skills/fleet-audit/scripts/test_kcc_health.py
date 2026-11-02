@@ -693,7 +693,7 @@ class AnnotateManifestTest(unittest.TestCase):
         namespace gives it, and the note comes back."""
         import audit_report  # noqa: PLC0415
 
-        bare = kcc_object("PubSubTopic", "events", status="False", reason="UpdateFailed")
+        bare = kcc_object("ContainerCluster", "prod", status="False", reason="UpdateFailed")
         manifest = {
             "clusters": [
                 self.manifest()["clusters"][0],
@@ -701,19 +701,19 @@ class AnnotateManifestTest(unittest.TestCase):
             ]
         }
         root = Path(self.dir).parent / "repo"
-        (root / "topics").mkdir(parents=True)
-        # The file declares the topic's Namespace with its project: a
-        # `PubSubTopic` finding is on the Config Connector host, so only the
-        # file can say which project the topic manages.
-        (root / "topics" / "events.yaml").write_text(
+        (root / "clusters").mkdir(parents=True)
+        # The file declares the cluster's Namespace with its project, and the
+        # finding is about acme's `prod`: with two possible hosts, the
+        # object's project must be known, and only the namespaces read gives it.
+        (root / "clusters" / "prod.yaml").write_text(
             "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: infra\n  annotations:\n"
             "    cnrm.cloud.google.com/project-id: acme\n---\n"
-            "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n"
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n  name: prod\n  namespace: infra\n"
         )
 
         def finding():
-            return {"id": "f", "check": "kcc-object-wedged", "cluster": "acme/us-central1/hub", "object": "PubSubTopic/events",
-                    "remediation": {"kind": "manifest", "path": "topics/events.yaml", "note": "x"}}
+            return {"id": "f", "check": "release-channel-unenrolled", "cluster": "acme/us-central1/prod", "object": "Cluster/prod",
+                    "remediation": {"kind": "manifest", "path": "clusters/prod.yaml", "note": "x"}}
 
         for namespaces, expected in ((None, []), (listing(self.namespace("infra", "acme")), ["f"])):
             with self.subTest(namespaces=bool(namespaces)):

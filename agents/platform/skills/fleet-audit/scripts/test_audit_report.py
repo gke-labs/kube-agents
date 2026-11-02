@@ -23077,19 +23077,14 @@ metadata:
         self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
 
     def test_a_host_whose_read_failed_still_counts_as_a_host(self):
-        """hub-1 lists PubSubTopic infra/events with no project; the fix
-        declares infra/events. When hub-2's read succeeds with everything
+        """hub-1 lists ContainerCluster infra/prod-usc1 with no project; the
+        fix declares it. When hub-2's read succeeds with everything
         ready, there are two hosts and no note. When hub-2's read times out,
         hub-2 is unknown, not absent, and the answer must be the same."""
-        self.write(
-            "topics/events.yaml",
-            "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
-        )
-        topic = dict(KCC_TOPIC, name="events")
+        topic = dict(KCC_CLUSTER)
         for hub2 in ({"kcc_unready": []}, {"kcc_unread": "`kubectl get gcp -A` did not finish in 240s"}):
             with self.subTest(hub2=list(hub2)):
-                finding = kcc_finding(path="topics/events.yaml")
-                finding.update(object="PubSubTopic/events", check="kcc-object-wedged", cluster="acme/us-central1/hub-1")
+                finding = kcc_finding()
                 manifest = self.two_hosts(("acme/us-central1/hub-1", [topic]), ("acme/us-east1/hub-2", []))
                 del manifest["clusters"][1]["kcc_unready"]
                 manifest["clusters"][1].update(hub2)
@@ -23097,14 +23092,10 @@ metadata:
                 self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
 
     def test_a_cluster_that_was_never_read_counts_as_a_possible_host(self):
-        """hub-1 lists infra/events with no project. hub-2 was unreachable, so
+        """hub-1 lists infra/prod-usc1 with no project. hub-2 was unreachable, so
         nothing is known about its Config Connector: no note. A cluster of
         another status, or a STOPPING one, is not a host."""
-        self.write(
-            "topics/events.yaml",
-            "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
-        )
-        topic = dict(KCC_TOPIC, name="events")
+        topic = dict(KCC_CLUSTER)
         for hub2, expected in (
             ({"outcome": "unreachable", "error": "get-credentials rc=1"}, []),
             ({"outcome": "gate-failed", "error": "dump failed"}, []),
@@ -23112,8 +23103,7 @@ metadata:
             ({"outcome": "out-of-scope"}, ["release-channel"]),
         ):
             with self.subTest(hub2=hub2):
-                finding = kcc_finding(path="topics/events.yaml")
-                finding.update(object="PubSubTopic/events", check="kcc-object-wedged", cluster="acme/us-central1/hub-1")
+                finding = kcc_finding()
                 manifest = self.two_hosts(("acme/us-central1/hub-1", [topic]), ("acme/us-east1/hub-2", []))
                 del manifest["clusters"][1]["kcc_unready"]
                 manifest["clusters"][1].update(hub2)
@@ -23122,18 +23112,13 @@ metadata:
     def test_a_project_whose_clusters_list_failed_counts_as_a_possible_host(self):
         """A `gate-failed` `project/<id>` entry hides clusters that may run
         Config Connector, so the match needs a known project."""
-        self.write(
-            "topics/events.yaml",
-            "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
-        )
-        topic = dict(KCC_TOPIC, name="events")
+        topic = dict(KCC_CLUSTER)
         for entry, expected in (
             ({"name": "project/other", "outcome": "gate-failed", "error": "clusters list rc=1"}, []),
-            ({"name": "project/other", "outcome": "collected", "location": "global"}, ["t"]),
+            ({"name": "project/other", "outcome": "collected", "location": "global"}, ["release-channel"]),
         ):
             with self.subTest(outcome=entry["outcome"]):
-                finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/events",
-                                       namespace="infra", remediation={"kind": "manifest", "path": "topics/events.yaml", "note": "x"})
+                finding = kcc_finding()
                 manifest = kcc_manifest(topic)
                 manifest["clusters"].append(entry)
                 self.assertEqual(self.disclose([finding], manifest), expected)
@@ -23315,10 +23300,11 @@ metadata:
         stall = {"kind": "ComputeFirewall", "namespace": "app", "name": "allow-ssh", "why": "UpdateFailed", "project": "app-proj"}
         finding = self.firewall_fix(self.FIREWALL)
         self.assertEqual(self.disclose([finding], self.two_hosts(("hub-proj/us-central1/hub", [stall]))), ["fw"])
-        # With two hosts the project must be known: the file's Namespace gives it.
+        # The stall is on the finding's own cluster, so a second host does
+        # not make the match uncertain.
         two = self.two_hosts(("hub-proj/us-central1/hub", [stall]), ("hub-proj/us-east1/hub-2", []))
         finding = self.firewall_fix(self.FIREWALL)
-        self.assertEqual(self.disclose([finding], two), [])
+        self.assertEqual(self.disclose([finding], two), ["fw"])
         namespace = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: app\n  annotations:\n    cnrm.cloud.google.com/project-id: app-proj\n---\n"
         finding = self.firewall_fix(namespace + self.FIREWALL)
         self.assertEqual(self.disclose([finding], two), ["fw"])
@@ -23760,6 +23746,28 @@ metadata:
         self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
         finding = self.wedged("p/us-central1/hub-b")
         self.assertEqual(self.disclose([finding], manifest), ["w"])
+
+    def test_an_unreachable_cluster_does_not_drop_a_wedged_paragraph(self):
+        """Review finding: the multi-host project rule dropped every
+        `kcc-object-wedged` paragraph when one cluster was unreachable,
+        although the stall is on the finding's own cluster. A file for
+        another project is still not named as its declaration."""
+        self.write("pubsub/events.yaml", self.TOPIC_FILE)
+        manifest = self.two_hosts(("p/us-central1/hub-a", [dict(self.TOPIC_STALL, project="")]))
+        manifest["clusters"].append({"name": "p/us-east1/far", "outcome": "unreachable"})
+        declarations = audit_report.kcc_declarations(self.root)
+        finding = self.wedged("p/us-central1/hub-a", kind="manual")
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
+        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+        # The fix of the declaring file gets the paragraph about that file.
+        finding = self.wedged("p/us-central1/hub-a")
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+        self.assertNotIn("The declaration is", finding["remediation"]["note"])
+        manifest["clusters"][0]["kcc_unready"] = [dict(self.TOPIC_STALL, project="other")]
+        finding = self.wedged("p/us-central1/hub-a", kind="manual")
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
+        self.assertNotIn("pubsub/events.yaml", finding["remediation"]["note"])
 
     def test_a_declaration_of_another_project_or_location_is_not_named(self):
         """A proj-a/us-central1 file is not the declaration of a
