@@ -315,7 +315,8 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    outside the operator's own release; the condition cleared on any roll to another image), the
    PDB, the spread, the Lease (with its owner reference and
    an `Owns` watch, recreated one `leaseDuration` after a deletion) and its Role. Its tests pin
-   each, including the held-back recreate and the first roll across the election.
+   each, including the held-back recreate, the first roll across the election, and a pin to a
+   pre-election image and back.
 5. **The cards-pending mark on the record** (planned separately).
 6. **Live runs** on a `next` lane: a rollout, a node drain and a force delete of the active pod
    while a task streams, measuring the gap and showing every event rendered once.
