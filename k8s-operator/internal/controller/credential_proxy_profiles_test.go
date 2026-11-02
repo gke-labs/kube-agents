@@ -318,7 +318,7 @@ func TestTheReadingsSweepSwitchReachesTheBrokerFromTheCR(t *testing.T) {
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 		Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_VCS_READINGS", Value: "off"}},
 	}
-	env := buildCredentialProxyEnvForPlugins(agent, nil, true, credentialProxyProfileConfig{})
+	env := buildCredentialProxyEnvForPlugins(agent, nil, allBrokerCallersOwned, credentialProxyProfileConfig{})
 	if got, ok := brokerEnvValue(env, "CREDENTIAL_PROXY_VCS_READINGS"); !ok || got != "off" {
 		t.Errorf("CREDENTIAL_PROXY_VCS_READINGS = %q (present %v), want off from spec.deployment.env", got, ok)
 	}
