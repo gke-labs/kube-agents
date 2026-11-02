@@ -84,10 +84,11 @@ session and the conversation key; a key naming a whole DM or space rather than a
 up), and frames the report ahead of the user's words with the hook's
 notice and token list.
 
-With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a
+With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report, and under
+`spec.mode: next` the Google Chat leg too, sends a
 headline in place of the report (`slack_audit_report.py`, called from
 `relay_cron_report`), provided a chat id or a Slack
-home channel is known, the job's `skills` (a list or one string, or the legacy `skill`) include
+home channel is known (or the leg is one the gateway routes, which holds its home channel), the job's `skills` (a list or one string, or the legacy `skill`) include
 `fleet-audit`, the message ends
 with a link to an issue in a managed repository, and enough of the posts' budget is
 left to read that issue. The headline reads that issue if it is open and labelled
@@ -143,7 +144,7 @@ and neither has that section, so the line is not posted for it. A fleet-audit jo
 at runtime, and a mid-run `report_to_chat`, still post the model's text, and the line
 still applies to them.
 
-Every other report (Google Chat, one that does not end with
+Every other report (Google Chat under `today`, one that does not end with
 a managed-repository issue link and is not such a failed run, a job the scheduler already delivered to Slack
 itself when it also left another platform to the relay, or any report with the
 flag off) is posted unchanged. A job whose `deliver` value claims
@@ -175,12 +176,13 @@ which leaves the other half for the sends to every platform: the Block Kit post
 stops short of it with room left for the text send, and when too little is left to
 read the ledger the report goes out as text in one send.
 
-Under `spec.mode: next` the gateway holds Slack and the broker's relay is gone, so the
-same card goes to the gateway as a `kube-agents.chat/v1` message instead
+Under `spec.mode: next` the gateway holds the chat platform, Slack or Google Chat, and the
+broker's relay is gone, so the same card goes to the gateway, for whichever leg it routes,
+as a `kube-agents.chat/v1` message instead
 (`slack_audit_report.chat_from_issue`, posted with `a2a notify --chat-file`), and the
 gateway lays it out, buttons included, as it lays out a card's post in a conversation.
 The text headline rides beside it as the fallback the gateway posts when the message
-breaks a rule or Slack refuses it; the leg's own fallbacks above are unchanged.
+breaks a rule or the platform refuses it; the leg's own fallbacks above are unchanged.
 
 A fleet-audit report with no ledger link that is fleet-audit's own summary of a run with
 no GitOps repository (`slack_audit_report.summary_card`) gets the same card, built from
@@ -195,11 +197,14 @@ of the ledger card.
 `kanban-board-health`'s report gets a card of its own when the stuck tasks are all it
 says: the script leaves its rows, each with the ids of the cards it stands for, in a file
 beside its record, and `_board_health_card` reads that file (`board_health_card.load`)
-only when its text is the report being relayed, with the flag on and a channel known.
+only when its text is the report being relayed, with the flag on and a channel known (or the
+leg routed through the gateway), on Slack and, under `spec.mode: next`, on Google Chat.
 `_post_board_health_card` posts it as Block Kit through the relay (`blocks_from_card`), or
 under `spec.mode: next` as a chat message whose rows carry `tasks` and `actions`
-(`chat_from_card`), with Retry and Drop under each row; its outcomes, and the report going
-out as text where the card does not post, are the audit card's. A tap on either is no turn:
+(`chat_from_card`), with Retry and Drop under each row on Slack; the Google Chat renderer
+draws no row actions yet, so there the rows post with their card ids carried and no buttons.
+Its outcomes, and the report going out as text where the card does not post, are the audit
+card's. A tap on either is no turn:
 it unblocks or archives the row's cards through session-kv's `POST /v1/board/actions` and
 edits the row
 ([the job's section](../../agents/platform/cron/README.md#kanban-board-health-asks-whether-the-board-is-wedged)).
@@ -466,7 +471,8 @@ The experimental
 flag re-homes the gateway onto the platform profile, so the agent that answers a
 reply in a report's thread is the Platform Agent rather than the Chat Agent.
 The relay route itself is unaffected: `hermes send` still does the posting, apart
-from a Slack fleet-audit headline posted as Block Kit (above). What changes is
+from a fleet-audit headline posted as Block Kit on Slack, or as a chat message through the
+gateway (above). What changes is
 whether anything reaches the route at all. Two things, both worth stating rather
 than discovering.
 
@@ -580,7 +586,8 @@ relay introduced — but it should be fixed, and the fix is known. It belongs in
 adapter, where routing is decided before the event is handed up: the in-process
 sender (`_create_message`) already seeds the counter on outbound, with a comment
 naming this exact symptom, and the out-of-process sender (`_standalone_send`, the
-path `hermes send` takes) does not. Bringing the two to parity fixes every
+path `hermes send` takes, or `google_chat_relay_patch`'s relayed stand-in for it
+when `GOOGLE_CHAT_RELAY_URL` is set) does not. Bringing the two to parity fixes every
 bot-opened thread rather than the ones this repository happens to hold a report
 row for — paired with a reload-on-mtime in `_ThreadCountStore.incr`, since that
 store rewrites the whole dict from memory and would otherwise erase a peer
@@ -736,8 +743,10 @@ and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
 marker as the whole response) reached both senders. The adapter therefore
 carries its own `is_silent_report`, which undresses the marker before testing,
 and the Slack sender imports the same predicate so the two ends agree. The
-scheduler's direct Google Chat leg, which a job on `"all"` uses, is upstream's
-sender and carries no such guard; no roster job uses `"all"`.
+scheduler's direct Google Chat leg, which a job on `"all"` uses, is the
+standalone sender: the relayed stand-in, when `GOOGLE_CHAT_RELAY_URL` is set,
+drops a dressed marker with the Slack sender's predicate, and upstream's, on an
+install without the relay, carries no such guard; no roster job uses `"all"`.
 
 The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
 That sentence controls silence, not delivery: a prompt without it only makes the job noisier

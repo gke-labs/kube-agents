@@ -356,6 +356,19 @@ connection was closed under the command or never opened, and that it may have
 run. A per-environment `ControlPath` would remove the sharing itself and is
 upstream's to make.
 
+The sharing also puts a ceiling on fan-out. Every concurrent command is a session on the
+one master, and `sshd` caps sessions per connection at `MaxSessions`, 10 by default: the
+eleventh concurrent command is refused by the master and the client exits 255 with
+nothing on stderr, the same shape as the teardown above. A sweep that delegates a card
+per cluster hit it on a large fleet. `deploy/sandbox/sshd_config` sets `MaxSessions 128`,
+and raises `MaxStartups` to `64:30:256` for the moment several agent processes open a
+master at once after a sandbox restart; the image's smoke test opens one master and runs
+64 sessions over it. More sessions mean more shells in the one pod, so the container's
+memory is the counterpart: `spec.harness.experimental.shellSandbox.resources` sizes the
+shell container, and the
+[CRD reference](../site/src/content/docs/operator/platformagent-crd.md#shellsandbox) owns
+its defaults, merge rule and refusals.
+
 ### What the credential proxy is for
 
 `kubectl` and `gcloud` are not real binaries in the sandbox. They are symlinks to
@@ -2666,12 +2679,12 @@ role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
 apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
-minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session, profile)`
-(the sixth role, `profile`, is below), and
+minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
+(the `profile` and `scope` roles, below, reach it too), and
 within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. One path
 under it is the shell's alone: `/v1/exec/admission`, the read-only report of how many commands
 the broker admits at once, which the shell's fleet sweeps size their pools by
-(`broker_admission.py`); the session and profile roles don't reach it, and a sweep run under
+(`broker_admission.py`); the session, profile and scope roles don't reach it, and a sweep run under
 either falls back to four. Because a
 Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
@@ -2696,6 +2709,15 @@ credential's cluster and project. Profile calls together hold at most
 ([spec-subagent-profiles.md](spec-subagent-profiles.md) owns the detail). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
+
+The scope publisher Job under `mode: next` has a role of its own, `scope`:
+its token is minted for `kubeagents-credential-proxy-scope`, it is bound to its callers through
+`CREDENTIAL_PROXY_SCOPE_CALLERS` as the mcp role is, it reaches `/v1/exec` alone, and
+`ROLE_EXECUTABLES` holds it to `gcloud`. Within that, `scope_policy.py` admits five lookups token
+for token, each on an argument the `scope.json` at `CREDENTIAL_PROXY_SCOPE_FILE` declares or
+that an earlier lookup returned to the role within five hours. That record of returned members is
+memory in the one broker process, so the role stays on the single broker pod
+([credential-proxy-single-pod.md](credential-proxy-single-pod.md#2-state-that-lives-in-the-pod)).
 
 Be precise about what the token buys: it is a **multi-tenancy control** that stops another
 workload in the cluster borrowing the agent's credentials, and not an agent-containment

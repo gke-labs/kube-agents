@@ -100,8 +100,8 @@ The first command omits a key whose value is unset, so a requirement that is not
 The chart's quota check counts a `today` release only, not the `spec.mode: next` additions in the capacity row above or the session pods. Autopilot sizes nodes to fit; on a Standard cluster, check the free allocatable against those figures, or a session pod stays `Pending` when one is asked for.
 
 A quota is more than CPU and memory, and so is the check: a `today` install also needs 7
-pods, 4 persistent volume claims totalling 102 GiB of `requests.storage`, and 8,768 MiB of
-ephemeral-storage requests against 8,768 MiB of limits. Two of those claims, the agent's data
+pods, 4 persistent volume claims totalling 102 GiB of `requests.storage`, and 14,912 MiB of
+ephemeral-storage requests against 14,912 MiB of limits. Two of those claims, the agent's data
 claim and the shell sandbox's, are 50 GiB each and follow
 [`spec.storage.size`](/kube-agents/operator/platformagent-crd/#specstorage), so each GiB
 added to it adds 2 GiB of `requests.storage`, and the chart's check counts it. A

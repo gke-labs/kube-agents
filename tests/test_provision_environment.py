@@ -293,6 +293,7 @@ exit 0
                     "GCP_REGION": MOCK_GCP_REGION,
                     "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
                     "IMAGE_TAG": MOCK_IMAGE_TAG_SEMVER,
+                    "TEARDOWN_RETRY_WAIT_SECONDS": "0",
                 }
             )
 
@@ -306,9 +307,11 @@ exit 0
 
             self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}")
             calls = recorded_calls.read_text().splitlines()
-            self.assertEqual(len(calls), 2)
-            self.assertEqual(calls[0], MOCK_UNINSTALL_FAIL_SIGNAL)
-            self.assertEqual(calls[1], MOCK_INSTALL_SUCCESS_SIGNAL)
+            # teardown_common.sh runs a failed uninstall.sh twice.
+            self.assertEqual(
+                calls,
+                [MOCK_UNINSTALL_FAIL_SIGNAL, MOCK_UNINSTALL_FAIL_SIGNAL, MOCK_INSTALL_SUCCESS_SIGNAL],
+            )
 
 
 class TeardownOutcomeTest(unittest.TestCase):
@@ -363,6 +366,9 @@ exit 0
                 # get_isolated_test_env strips GITHUB_*, so the job-summary
                 # path only exists when a test asks for it.
                 "GITHUB_STEP_SUMMARY": str(summary),
+                # teardown_common.sh's retry wait, off: a test checks the
+                # attempts, not the clock.
+                "TEARDOWN_RETRY_WAIT_SECONDS": "0",
                 **(extra_env or {}),
             }
         )
@@ -396,6 +402,19 @@ exit 0
         self.assertIn("Environment teardown failed (exit 1)", summary)
         self.assertIn("teardown blew up here", summary)
         self.assertEqual(calls[-1], MOCK_INSTALL_SUCCESS_SIGNAL)
+
+    def test_a_failed_teardown_is_tried_twice_before_it_is_reported(self):
+        """The pre-install teardown shares teardown_run's retry.
+
+        Run 41106670355 stopped here under TEARDOWN_STRICT on a credentials
+        503 that one more uninstall.sh would have outlived.
+        """
+        proc, calls, _ = self._run(
+            uninstall_exit=1, extra_env={"TEARDOWN_STRICT": "true"}
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertEqual(calls.count(MOCK_UNINSTALL_FAIL_SIGNAL), 2, calls)
+        self.assertIn("attempt 2 of 2", proc.stderr)
 
     def test_strict_mode_stops_before_provisioning(self):
         proc, calls, summary = self._run(
@@ -1342,6 +1361,7 @@ exit 0
             "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
             "IMAGE_TAG": MOCK_IMAGE_TAG_SEMVER,
             "PROVISION_STOCKOUT_WAIT_SECONDS": "0",
+            "TEARDOWN_RETRY_WAIT_SECONDS": "0",
         }
         base.update(overrides or {})
         proc = subprocess.run(
@@ -1376,7 +1396,8 @@ exit 0
             uninstall_exit_after_first=5, overrides={"TEARDOWN_STRICT": "true"},
         )
         self.assertEqual(proc.returncode, 5, "the retry's teardown failed and strict mode stops the run with its code")
-        self.assertEqual(sequence, ["uninstall", "install", "uninstall"])
+        # The failed teardown is itself run twice by teardown_common.sh.
+        self.assertEqual(sequence, ["uninstall", "install", "uninstall", "uninstall"])
 
     def test_the_zone_pool_exhausted_wording_is_retried_too(self):
         proc, calls = self._run(failures=1, message=self.EXHAUSTED)

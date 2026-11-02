@@ -41,6 +41,9 @@ Every field of the `AgentProfile` resource's `spec` and `status`, generated from
 | `queueTimeoutSeconds` | `integer` | no |  | min `0` | QueueTimeoutSeconds is how stale a queued submission may be, by its JetStream server ingest time, before the dispatcher refuses to run it. Absent or zero means DefaultAgentProfileQueueTimeoutSeconds. |
 | `concurrency` | `integer` | yes |  | min `1` | Concurrency is the most pods this profile runs at once. |
 | `allowedTiers` | `[]string` | no |  | min items `1`; max items `2`; items one of `read`, `unattended` | AllowedTiers are the tiers this profile may run at. A task runs at its requester's tier, and the dispatcher refuses one whose tier is not listed here; a pinned production profile might allow only read. Tier is authority, so it lives on the CR, never in the persona. Absent means read alone (AllowedTierList). |
+| `parameters` | `[]object` | no |  | max items `16` | Parameters are the task parameters this profile's persona declares, as the gateway and the dispatcher need them without reading the persona image: the gateway routes cluster work to a profile that declares project, location and cluster, and the dispatcher refuses a submission missing a required one. The worker checks this list against the persona's at start and refuses to run a task when they differ. |
+| `parameters[].name` | `string` | yes |  | pattern `^[a-z][a-z0-9_]{0,62}$` |  |
+| `parameters[].required` | `boolean` | no |  |  | Required means a submission without it is refused. |
 | `resources` | `object` | yes |  |  | Resources is the pod resource class. |
 | `resources.requests` | `object` | yes |  |  | AgentProfileResourceList is a cpu and memory pair. |
 | `resources.requests.cpu` | `resource.Quantity` | yes |  |  |  |

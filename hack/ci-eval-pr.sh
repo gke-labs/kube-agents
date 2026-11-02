@@ -497,8 +497,9 @@ EVAL_FORGE="${EVAL_FORGE:-github}"
 # The forge table is hack/ci-deploy.sh's forge_profile (kube-agents#3682), one
 # row per EVAL_FORGE value: the kind (github or gitlab), the host, and whether
 # the forge is self-managed (a private host whose CA the run supplies). Lifted
-# rather than sourced, as the project tables are, so the two scripts read one
-# table and the eval refuses exactly what the deploy refuses.
+# rather than sourced, as the project tables are, so the three scripts (this
+# one, the deploy and hack/ci-forge.sh) read one table and the eval refuses
+# exactly what the deploy refuses.
 eval_forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no>"
   local body
   body="$(sed -n '/^forge_profile() {/,/^}$/p' "${SCRIPT_DIR}/ci-deploy.sh")"
@@ -733,7 +734,7 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 }
 
 # ─── The cut-off report ──────────────────────────────────────────────────────
-# A Prow deadline (the nightly's 720m, the presubmit's 360m) arrives as
+# A Prow deadline (the nightly's 840m, the presubmit's 360m) arrives as
 # SIGTERM, which the trap below turns into an exit before the suite step ever
 # runs. The nights of 2026-09-18 and 09-21 (builds 2101099042170736640 and
 # 2102186223282950144) had finished 105 and 122 units when it arrived and
@@ -2206,14 +2207,22 @@ scope_exclude_settle() { # <label>
   return 1
 }
 
-# Exclude the slots' clusters for one case, and wait until the pod and the Cluster
-# Agent profiles reflect it. Non-zero means the case must not run.
-scope_exclude_apply() { # <case> <slot>...
+# The slot list as the messages print it: a trailing +<n> token is the case's
+# absent count (kube_agents_bench.scope_exclude), not a slot.
+scope_slots_shown() { # <slot>... [+<n>]
+  local slots="$*"
+  printf '%s' "${slots/ +/, absent: }"
+}
+
+# Exclude the slots' clusters for one case (and, after a +<n> token, n absent
+# ones), and wait until the pod and the Cluster Agent profiles reflect it.
+# Non-zero means the case must not run.
+scope_exclude_apply() { # <case> <slot>... [+<n>]
   local name="$1" ops
   shift
   scope_exclude_target "${name}" || return 1
   if [ -z "${BENCH_FLEET_KUBECONFIG_DIR:-}" ] || [ ! -s "${BENCH_FLEET_KUBECONFIG_DIR}/.fleet-context" ]; then
-    echo "WARNING: Scope exclusion (${name}): no .fleet-context under BENCH_FLEET_KUBECONFIG_DIR=${BENCH_FLEET_KUBECONFIG_DIR:-unset}, so slot(s) $* resolve to no cluster" >&2
+    echo "WARNING: Scope exclusion (${name}): no .fleet-context under BENCH_FLEET_KUBECONFIG_DIR=${BENCH_FLEET_KUBECONFIG_DIR:-unset}, so slot(s) $(scope_slots_shown "$@") resolve to no cluster" >&2
     return 1
   fi
   if ! ops="$(scope_exclude_cr | scope_exclude_helper patch --fleet-dir "${BENCH_FLEET_KUBECONFIG_DIR}" --slots "$@")" \
@@ -2221,7 +2230,7 @@ scope_exclude_apply() { # <case> <slot>...
     echo "WARNING: Scope exclusion (${name}): could not patch platformagent/${AGENT_SERVICE_NAME}" >&2
     return 1
   fi
-  echo "Scope exclusion (${name}): platformagent/${AGENT_SERVICE_NAME} now excludes slot(s) $*"
+  echo "Scope exclusion (${name}): platformagent/${AGENT_SERVICE_NAME} now excludes slot(s) $(scope_slots_shown "$@")"
   scope_exclude_settle "${name}"
 }
 
@@ -2528,8 +2537,8 @@ NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
 # Which lane list a forge runs (kube-agents#3682): the GitLab list on either
 # GitLab, gitlab.com or a self-managed instance, since the cases grade the
-# forge and not where it is; the GHES list on ghes (eval/ghes-cases.txt, which
-# arrives with the GHES lane, kube-agents#3684). github runs the catalogue. A
+# forge and not where it is; the GHES list on ghes (eval/ghes-cases.txt).
+# github runs the catalogue. A
 # forge whose list this checkout lacks stops here by name, not at the roster
 # reader's message for a missing file.
 lane_cases_file() { # <EVAL_FORGE> -> the list's path relative to hack/
@@ -2542,7 +2551,7 @@ lane_cases_file() { # <EVAL_FORGE> -> the list's path relative to hack/
 LANE_CASES_REL="$(lane_cases_file "${EVAL_FORGE}" 2>/dev/null)" || LANE_CASES_REL=""
 LANE_CASES_FILE="${LANE_CASES_REL:+${SCRIPT_DIR}/${LANE_CASES_REL}}"
 if [ -n "${LANE_CASES_FILE}" ] && [ ! -f "${LANE_CASES_FILE}" ]; then
-  echo "ERROR: EVAL_FORGE=${EVAL_FORGE} runs the lane list ${LANE_CASES_REL}, which this checkout does not have; the lane that adds it is kube-agents#3684." >&2
+  echo "ERROR: EVAL_FORGE=${EVAL_FORGE} runs the lane list ${LANE_CASES_REL}, which this checkout does not have." >&2
   exit 1
 fi
 
@@ -2995,7 +3004,9 @@ if [ -z "${INJECT_LANE_REPO}" ]; then
   echo "ERROR: no GitOps repository is known for PROJECT_ID=${PROJECT_ID:-unset} (gitops_repo_for_project or gitlab_project_for_project in hack/ci-deploy.sh, by EVAL_FORGE; EVAL_GITOPS_REPO on a local GitHub run); the write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot name the repository it reads, so the run does not start." >&2
   exit 1
 fi
-if [ "${EVAL_FORGE:-github}" = "github" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ] \
+# The kind, not the row: a GitHub Enterprise row grades through the GitHub
+# reader too. The row stands in where this block runs lifted without the table.
+if [ "${EVAL_FORGE_KIND:-${EVAL_FORGE:-github}}" = "github" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ] \
     && [ -z "${BENCH_GITHUB_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
   echo "ERROR: no GitHub read credential: EVAL_LEDGER_APP_KEY_FILE is unset and neither BENCH_GITHUB_TOKEN nor GITHUB_TOKEN is set; the write safeguard (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) cannot read the repository, so the run does not start. Export a token that can read ${INJECT_LANE_REPO} as BENCH_GITHUB_TOKEN." >&2
   exit 1
@@ -3976,6 +3987,9 @@ unit_delegation_timeout() {
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service) echo 3000 ;;
+    # A compliance-audit run on a pool install; a multi-stream audit took
+    # 834 s and 1310 s on a dev install (#3933), so the wait is the audit band's.
+    fleet-audit-as-many-excluded-as-managed) echo 3000 ;;
     # Two attempts of about 150 trivial calls each before the card settles; the
     # default would cut the second attempt on a slow night and grade the
     # repetition as infrastructure instead of reading the cap.
@@ -4003,7 +4017,8 @@ if ! DECLARED_STREAMS="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench
   exit 1
 fi
 # The cases that exclude seeded slots from the install's scope, one
-# `<case> <slot>...` line each (scope_exclude_apply, #3213). unit_phase puts them
+# `<case> <slot>... [+<n>]` line each, `+<n>` the case's absent count
+# (scope_exclude_apply, #3213). unit_phase puts them
 # in a phase of their own, after every other unit; a file that will not read
 # stops the run, since its case would run beside units its scope edit cuts.
 if ! SCOPE_EXCLUDE_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.scope_exclude cases "${TASKS[@]}")"; then
@@ -4922,8 +4937,8 @@ for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
   case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
     *",${SCOPE_CASE},"*) SCOPE_PAUSE="${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}" ;;
   esac
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${EVAL_REPETITIONS} repetition(s) of ${SCOPE_CASE} alone, with slot(s) ${SCOPE_SLOTS} excluded from the install's scope"
-  # shellcheck disable=SC2086 # slot letters, one argument each
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${EVAL_REPETITIONS} repetition(s) of ${SCOPE_CASE} alone, with slot(s) $(scope_slots_shown "${SCOPE_SLOTS}") excluded from the install's scope"
+  # shellcheck disable=SC2086 # slot letters and an optional +<n> absent count, one argument each
   if scope_exclude_apply "${SCOPE_CASE}" ${SCOPE_SLOTS}; then
     launch_units "$(for REP in $(seq 1 "${EVAL_REPETITIONS}"); do printf '%s 0 %s\n' "${REP}" "${SCOPE_IDX}"; done)" 1 "${SCOPE_PAUSE}"
     wait
@@ -4935,7 +4950,7 @@ for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
   else
     for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
       skip_unit "${TASKS[SCOPE_IDX]}" "${SCOPE_CASE}" "${REP}" "" "" "not run: its scope exclusion did not take effect" \
-        "scope-exclude: slot(s) ${SCOPE_SLOTS} could not be excluded from the install's scope"
+        "scope-exclude: slot(s) $(scope_slots_shown "${SCOPE_SLOTS}") could not be excluded from the install's scope"
     done
   fi
   scope_exclude_restore "${SCOPE_CASE}" settle \

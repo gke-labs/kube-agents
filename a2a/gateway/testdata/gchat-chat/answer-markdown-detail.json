@@ -1,0 +1,8 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "text": "*checkout-gateway restarts on an OOM.*\n\nIt hits its 256Mi limit within a minute of starting.\n\n*Evidence*\n- Last state: `OOMKilled`, exit code 137.\n- The limit is set in the manifest:\n  ```yaml\n  resources:\n    limits:\n      memory: 256Mi\n  ```\n  - and has not changed since March\n\n*Fix*\n1. Raise the limit to 512Mi.\n2. Watch the restarts for an hour.",
+    "widgets": null
+  }
+]

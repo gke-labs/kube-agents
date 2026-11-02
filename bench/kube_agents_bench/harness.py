@@ -163,10 +163,13 @@ from kube_agents_bench import board, card_wake, gitops, pushed_report, stop_hook
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
+    RATE_LIMIT_REASON_PREFIX as _RATE_LIMIT_REASON_PREFIX,
     STATUS_TOOL,
+    _INFRA_FAILURE_REASONS,
     _json_object,
     delegated_task_ids,
     delivered_results,
+    extract_infra_failure_reason as _extract_infra_failure_reason,
     merge_new,
     new_calls,
     parse_response,
@@ -758,22 +761,6 @@ _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({
 
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
-_INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
-_RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
-_FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
-
-
-def _extract_infra_failure_reason(text: str | None) -> str | None:
-    """Extract an infrastructure failure reason if text opens with the hermes failure prefix."""
-    if not text:
-        return None
-    text = text.strip()
-    if text.startswith(_RATE_LIMIT_REASON_PREFIX):
-        match = _FAILURE_REASON_PATTERN.search(text)
-        if match:
-            return match.group(1) if match.group(1) in _INFRA_FAILURE_REASONS else None
-        return "rate_limit"
-    return None
 
 
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
@@ -845,6 +832,19 @@ def _canonical_session_tokens(
 # set would run the wait to its ceiling and grade as the harness's, not the
 # worker's.
 _TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
+_BOARD_INFRA_STATUSES = frozenset({"blocked", "triage"})
+
+
+def _is_rate_limited_triage(
+    status: str,
+    task_id: str,
+    summaries: dict[str, str],
+) -> bool:
+    """Whether a card in triage carries an infrastructure rate limit failure reason."""
+    if status != "triage":
+        return False
+    summary = summaries.get(task_id) or ""
+    return bool(_extract_infra_failure_reason(summary))
 
 # ``kanban_show`` shares kanban_create's toolset in hermes, so a profile that
 # can file a card can always read one back.
@@ -1457,14 +1457,20 @@ def _sum_tokens(base: dict[str, Any], extra: dict[str, Any]) -> None:
             base[bucket] = value if current is None else current + value
 
 
-def _pending_first(task_ids: list[str], statuses: dict[str, str]) -> list[str]:
+def _pending_first(
+    task_ids: list[str],
+    statuses: dict[str, str],
+    is_terminal: Callable[[str], bool] | None = None,
+) -> list[str]:
     """Order cards still moving ahead of settled ones, keeping filing order.
 
     Only matters once :data:`_MAX_AWAITED_TASKS` bites: the cap keeps a prefix,
     so a fan-out whose first cards are already finished would otherwise be
     trimmed to nothing but those and the wait skipped.
     """
-    pending = [t for t in task_ids if statuses.get(t) not in _TERMINAL_STATUSES]
+    if is_terminal is None:
+        is_terminal = lambda t: statuses.get(t) in _TERMINAL_STATUSES
+    pending = [t for t in task_ids if not is_terminal(t)]
     return pending + [t for t in task_ids if t not in set(pending)]
 
 
@@ -3239,11 +3245,16 @@ class KubeAgentsHarness(AgentHarness):
         def _status(task_id: str) -> str:
             return str(read.cards.get(task_id, {}).get("status") or "unknown")
 
-        def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
-            _purge_card_state(awaited, _EXEC_TIMEOUT)
-            return _DelegationTransportExhausted(
-                f"the kanban board could not be read {_MAX_TRANSPORT_FAILURES} times running; "
-                "still waiting on: " + (", ".join(still) or "nothing (reading results)")
+        def _is_terminal(task_id: str) -> bool:
+            st = _status(task_id)
+            if st in _TERMINAL_STATUSES:
+                return True
+            card = read.cards.get(task_id, {}) if read is not None else {}
+            summary = str(card.get("summary") or "")
+            return _is_rate_limited_triage(
+                st,
+                task_id,
+                {task_id: summary},
             )
 
         # Cards the board has had no row for on consecutive reads, and the
@@ -3254,11 +3265,35 @@ class KubeAgentsHarness(AgentHarness):
         awaited: list[str] = []
         capped = False
 
+        def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
+            _purge_card_state(awaited or (read.card_ids if read is not None else []), _EXEC_TIMEOUT)
+            return _DelegationTransportExhausted(
+                f"the kanban board could not be read {_MAX_TRANSPORT_FAILURES} times running; "
+                "still waiting on: " + (", ".join(still) or "nothing (reading results)")
+            )
+
+        triage_initial = [
+            t
+            for t in read.card_ids
+            if str(read.cards.get(t, {}).get("status") or "") == "triage"
+            and not read.cards.get(t, {}).get("summary")
+        ]
+        if triage_initial:
+            fresh_triage = _read(triage_initial)
+            if fresh_triage is None:
+                raise _exhausted(triage_initial)
+            read.cards.update(
+                {t: c for t, c in fresh_triage.cards.items() if t in triage_initial}
+            )
+
         def _merge() -> list[str]:
             nonlocal awaited, capped
             merged = [t for t in dict.fromkeys(awaited + read.card_ids) if t not in missing]
             statuses = {t: _status(t) for t in merged}
-            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
+            awaited = self._capped(
+                _pending_first(merged, statuses, _is_terminal),
+                None if capped else result,
+            )
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
             for t in awaited:
                 unknown[t] = unknown.get(t, 0) + 1 if t not in read.cards else 0
@@ -3270,7 +3305,7 @@ class KubeAgentsHarness(AgentHarness):
                 )
             missing.extend(gone)
             awaited = [t for t in awaited if t not in gone]
-            return [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
+            return [t for t in awaited if not _is_terminal(t)]
 
         outstanding = _merge()
         deadline = time.monotonic() + delegation_timeout
@@ -3282,7 +3317,7 @@ class KubeAgentsHarness(AgentHarness):
                 break
             _log.info("waiting %.0fs on delegated tasks: %s", poll_interval, ", ".join(outstanding))
             time.sleep(max(0.0, min(poll_interval, remaining)))
-            fresh = _read()
+            fresh = _read(awaited)
             if fresh is None:
                 raise _exhausted(outstanding)
             read = fresh
@@ -3295,7 +3330,7 @@ class KubeAgentsHarness(AgentHarness):
         # the card is unblocked to run again), or a ``tasks.result`` stashed
         # before a refused completion -- and delivering it would both grade
         # that text and hide the ceiling from the scorer.
-        settled = [t for t in awaited if _status(t) in _TERMINAL_STATUSES]
+        settled = [t for t in awaited if _is_terminal(t)]
         if settled:
             final = _read(settled)
             if final is None:
@@ -3306,7 +3341,7 @@ class KubeAgentsHarness(AgentHarness):
         observed.extend(
             e
             for t in settled
-            if _status(t) in _TERMINAL_STATUSES and (e := read.as_shown(t)) is not None
+            if _is_terminal(t) and (e := read.as_shown(t)) is not None
         )
         result.metadata["delegated_cards"] = {t: _status(t) for t in awaited}
         if missing:
@@ -3398,10 +3433,21 @@ class KubeAgentsHarness(AgentHarness):
         # them separately let them disagree, so cards dropped from one were
         # polled to completion via the other and had their results discarded.
         capped = len(filed) > _MAX_AWAITED_TASKS
+        last_board_summaries: dict[str, str] = {}
+        last_board_errors: dict[str, str] = {}
+
+        def _is_terminal(task_id: str) -> bool:
+            st = statuses.get(task_id, "")
+            if st in _TERMINAL_STATUSES:
+                return True
+            return _is_rate_limited_triage(st, task_id, last_board_summaries)
+
         # Every card this episode waits on, including the ones that settle
         # mid-loop and leave ``outstanding``; their results are the answer.
-        awaited: list[str] = self._capped(_pending_first(filed, statuses), result)
-        outstanding = [t for t in awaited if statuses.get(t) not in _TERMINAL_STATUSES]
+        awaited: list[str] = self._capped(
+            _pending_first(filed, statuses, _is_terminal), result
+        )
+        outstanding = [t for t in awaited if not _is_terminal(t)]
         # Call ids the delegating turn already spent, so its own reads are not
         # mistaken for the first poll's.
         seen_calls: set[str] = set()
@@ -3419,8 +3465,6 @@ class KubeAgentsHarness(AgentHarness):
         transport_failures = 0
         had_answered_failure = False
         timed_out = True
-        last_board_summaries: dict[str, str] = {}
-        last_board_errors: dict[str, str] = {}
         # The freshest status seen for each card, from whichever source read
         # it last -- the board or a status turn -- for the deadline report.
         # ``statuses`` stays the agent's own readings, which are what settle a
@@ -3457,12 +3501,12 @@ class KubeAgentsHarness(AgentHarness):
             if bstate is not None:
                 on_board, bsummaries, berrors = bstate
                 for t in on_board:
-                    if on_board[t] == "blocked":
+                    if on_board[t] in _BOARD_INFRA_STATUSES:
                         if t in bsummaries:
                             last_board_summaries[t] = bsummaries[t]
                         else:
                             last_board_summaries.pop(t, None)
-                        if t in berrors:
+                        if on_board[t] == "blocked" and t in berrors:
                             last_board_errors[t] = berrors[t]
                         else:
                             last_board_errors.pop(t, None)
@@ -3471,7 +3515,8 @@ class KubeAgentsHarness(AgentHarness):
                         last_board_errors.pop(t, None)
                 latest.update(on_board)
                 if all(t in on_board for t in outstanding) and not any(
-                    on_board[t] in _TERMINAL_STATUSES for t in outstanding
+                    (on_board[t] in _TERMINAL_STATUSES or _is_rate_limited_triage(on_board[t], t, bsummaries))
+                    for t in outstanding
                 ):
                     continue
 
@@ -3559,13 +3604,19 @@ class KubeAgentsHarness(AgentHarness):
             fresh_reported = reported_statuses(new_calls(status_turn, seen_calls))
             latest.update(fresh_reported)
             for t, st in fresh_reported.items():
-                if st not in _TERMINAL_STATUSES:
+                if st not in _TERMINAL_STATUSES and not _is_rate_limited_triage(
+                    st, t, last_board_summaries
+                ):
                     last_board_summaries.pop(t, None)
                     last_board_errors.pop(t, None)
             _fold_status_turn(
                 result,
                 status_turn,
-                settled=any(s in _TERMINAL_STATUSES for s in fresh_reported.values()),
+                settled=any(
+                    s in _TERMINAL_STATUSES
+                    or _is_rate_limited_triage(s, t, last_board_summaries)
+                    for t, s in fresh_reported.items()
+                ),
             )
             # ``observed`` needs each distinct result once, so it stays on the
             # content test -- a replayed reading adds nothing to the answer.
@@ -3589,19 +3640,22 @@ class KubeAgentsHarness(AgentHarness):
             # reported only the first time, since the replayed trajectory
             # re-offers the dropped ids on every poll.
             merged = list(dict.fromkeys(awaited + delegated_task_ids(status_turn.trajectory)))
-            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
+            awaited = self._capped(
+                _pending_first(merged, statuses, _is_terminal),
+                None if capped else result,
+            )
             capped = capped or len(merged) > _MAX_AWAITED_TASKS
-            outstanding = [t for t in awaited if statuses.get(t) not in _TERMINAL_STATUSES]
+            outstanding = [t for t in awaited if not _is_terminal(t)]
 
         # Only on the deadline path: after a transport failure or a mute agent
         # the budget is untouched, and claiming it ran out would misreport why
         # the run stopped.
         if outstanding and timed_out:
             _record_ceiling(result, observed, awaited, outstanding, latest, delegation_timeout)
-        # Final board messages for cards whose terminal status is blocked
-        # (matching the guardrail's transient block); cards that completed or
+        # Final board messages for cards whose terminal status is blocked or triage
+        # (matching the guardrail's transient block or second-storm triage); cards that completed or
         # unblocked retries that failed on other grounds are not infra.
-        # If any card was recorded with a blocked summary/error, read final board state
+        # If any card was recorded with a blocked/triage summary/error, read final board state
         # for awaited cards to ensure unblocked retries have fresh board state.
         if last_board_summaries or last_board_errors:
             final_bstate = board.read_board_state(_agent_shell, awaited, _EXEC_TIMEOUT)
@@ -3611,7 +3665,7 @@ class KubeAgentsHarness(AgentHarness):
                 board_messages = [
                     f_summaries[t]
                     for t in awaited
-                    if latest.get(t) == "blocked" and t in f_summaries
+                    if latest.get(t) in _BOARD_INFRA_STATUSES and t in f_summaries
                 ] + [
                     f_errors[t]
                     for t in awaited
@@ -3621,7 +3675,7 @@ class KubeAgentsHarness(AgentHarness):
                 board_messages = [
                     last_board_summaries[t]
                     for t in awaited
-                    if latest.get(t) == "blocked" and t in last_board_summaries
+                    if latest.get(t) in _BOARD_INFRA_STATUSES and t in last_board_summaries
                 ] + [
                     last_board_errors[t]
                     for t in awaited
@@ -3779,7 +3833,7 @@ class KubeAgentsHarness(AgentHarness):
 
         all_messages: list[str] = list(board_messages)
         for tid, (status, summary) in last_observed_cards.items():
-            if status == "blocked" and summary:
+            if status in _BOARD_INFRA_STATUSES and summary:
                 all_messages.append(summary)
 
         if not infra_reason and all_messages:

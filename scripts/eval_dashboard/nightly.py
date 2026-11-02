@@ -10,7 +10,7 @@ grader's reason and a transcript link; which cases fail tonight that did not
 fail the night before; the wall clock; and whether the night finished or was
 cut short. ``render.py`` puts the result into ``brief.json`` for
 ``nightly.html`` and the Brief, ``post_health.py`` writes one line of it into
-the 9 AM digest, so the two say the same thing by construction. A night
+the 11 AM digest, so the two say the same thing by construction. A night
 still in flight -- a nightly build on the collector's ``pending_builds`` --
 is reported as running rather than missing (``running_nights``).
 
@@ -98,14 +98,15 @@ RESULT_SUCCESS = "SUCCESS"
 EVAL_VERDICT_KEY = "eval_verdict"
 # A nightly build on the collector's pending_builds (listed, no finished.json
 # yet) is a night still running only while it started this recently: the
-# longest part's budget is 12 hours (oss-test-infra: timeout 12h on the main
-# and main-b parts), plus Prow's 5-minute grace and the minutes a pod cut
-# at its deadline takes to end (seen at 12h04m-12h06m). Past that the build is a pod that
+# longest part's budget is 14 hours (oss-test-infra: timeout 840m on the main
+# and main-b parts for the gemini-4-argon window, 720m before), plus Prow's
+# 5-minute grace and the minutes a pod cut at its deadline takes to end (seen
+# at 12h04m-12h06m on the 720m budget). Past that the build is a pod that
 # died without uploading, which the collector keeps on pending_builds for
-# two days; it is not a running night. Keep it under 12h39m: the summer
-# digest window opens at 12:40 UTC, and must read a dead 00:00 UTC night as
-# missing, not still running.
-RUNNING_MAX_AGE = datetime.timedelta(hours=12, minutes=30)
+# two days; it is not a running night. Keep it under 14h39m: the summer
+# digest window opens at 14:40 UTC (11 AM Toronto, 20 minutes early), and
+# must read a dead 00:00 UTC night as missing, not still running.
+RUNNING_MAX_AGE = datetime.timedelta(hours=14, minutes=30)
 # A Prow build ID is a snowflake of this many digits: milliseconds since
 # this epoch, shifted left this many bits (scripts/pool_pressure.py reads
 # it the same way). It dates a build's start exactly; first_seen, the
@@ -116,8 +117,8 @@ PROW_BUILD_ID_EPOCH_MS = 1288834974657
 PROW_BUILD_ID_TIME_SHIFT = 22
 MILLIS_PER_SECOND = 1000
 # A night whose start is older than this when the digest goes out is not
-# "last night": the 00:00 UTC run starts 13 (EDT) or 14 (EST) hours before
-# the 9 AM ET digest, so its 12-hour budget has ended by then; 36 hours
+# "last night": the 00:00 UTC run starts 15 (EDT) or 16 (EST) hours before
+# the 11 AM ET digest, so its 14-hour budget has ended by then; 36 hours
 # tolerates one late or re-run night without reading the night before as
 # last night.
 LAST_NIGHT_MAX_AGE = datetime.timedelta(hours=36)
@@ -896,7 +897,7 @@ def turn1_note(night: dict) -> str | None:
 
 
 def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
-    """One line for the 9 AM digest. ``clock`` renders a datetime the way
+    """One line for the 11 AM digest. ``clock`` renders a datetime the way
     the rest of the digest does (post_health.clock); without one the ISO
     form is used. A truncated or missing night says so instead of numbers,
     and so does a split night whose main or main-b part is still running; a
