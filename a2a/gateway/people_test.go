@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -461,4 +462,77 @@ func TestThePutHappensAfterVerificationAndBeforeTheSessionLock(t *testing.T) {
 	if keys := peopleKeys(t, kv); len(keys) != 1 || keys[0] != key {
 		t.Fatalf("keys = %v, want only the verified sender's %s", keys, key)
 	}
+}
+
+func TestTheWindowsCountTheRecordedTimes(t *testing.T) {
+	now := time.Now().UTC()
+	logs := &lockedBuffer{}
+	r := startRigWithLogger(t, func(c *Config) {
+		kv := createPeopleBucket(t, c.NATSURL, jetstream.KeyValueConfig{History: 1, TTL: peopleTestTTL})
+		for key, value := range map[string]string{
+			"people.k1": now.Add(-time.Hour).Format(time.RFC3339),
+			"people.k2": now.Add(-10 * 24 * time.Hour).Format(time.RFC3339),
+			"people.k3": now.Add(-40 * 24 * time.Hour).Format(time.RFC3339),
+			"people.k4": "not a time",
+		} {
+			if _, err := kv.PutString(context.Background(), key, value); err != nil {
+				t.Fatalf("seed put %s: %v", key, err)
+			}
+		}
+	}, slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	desk := waitPeopleLoaded(t, r)
+	if short, long, ok := desk.count(now); !ok || short != 1 || long != 2 {
+		t.Fatalf("count = %d, %d, %v; want 1, 2, true", short, long, ok)
+	}
+	if n := strings.Count(logs.String(), peopleBadValueLog); n != 1 {
+		t.Errorf("the skipped value was logged %d times, want once:\n%s", n, logs.String())
+	}
+	_, body := scrape(t, http.MethodGet, startMetricsServer(t, r.g.Metrics())+MetricsPath)
+	for _, want := range []string{
+		`kubeagents_a2a_gateway_people_seen{window="7d"} 1`,
+		`kubeagents_a2a_gateway_people_seen{window="30d"} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the gateway's body lacks %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestAnEntryLeavesTheCountWhenItsTimeAgesOut(t *testing.T) {
+	r := startPeopleRig(t, withPeopleBucket(t, peopleTestTTL))
+	clock := fixPeopleClock(t, r)
+	desk := waitPeopleLoaded(t, r)
+	if _, err := peopleKV(t, r).PutString(context.Background(), "people.aging", clock.now().Add(-29*24*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the entry in the map", func() bool { return desk.seenLen() == 1 })
+	if short, long, ok := desk.count(clock.now()); !ok || short != 0 || long != 1 {
+		t.Fatalf("count = %d, %d, %v; want 0, 1, true", short, long, ok)
+	}
+	clock.advance(2 * 24 * time.Hour)
+	if short, long, ok := desk.count(clock.now()); !ok || short != 0 || long != 0 {
+		t.Fatalf("after two days: count = %d, %d, %v; want 0, 0, true", short, long, ok)
+	}
+}
+
+func TestADeletedKeyLeavesTheCountAtOnce(t *testing.T) {
+	r := startPeopleRig(t, withPeopleBucket(t, peopleTestTTL))
+	desk := waitPeopleLoaded(t, r)
+	kv := peopleKV(t, r)
+	ctx := context.Background()
+	const key = "people.leaving"
+	if _, err := kv.PutString(ctx, key, time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the entry counted", func() bool {
+		short, long, ok := desk.count(time.Now())
+		return ok && short == 1 && long == 1
+	})
+	if err := kv.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the entry gone from the count", func() bool {
+		short, long, ok := desk.count(time.Now())
+		return ok && short == 0 && long == 0
+	})
 }

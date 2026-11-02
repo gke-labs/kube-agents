@@ -187,6 +187,7 @@ func (g *Gateway) tryPeople(ctx context.Context, quiet bool) bool {
 		unparsable: map[string]bool{},
 	}
 	g.people.Store(desk)
+	g.metrics.setPeopleSource(desk.count)
 	go desk.watch(ctx)
 	g.log.Info(peopleOnLog, "bucket", lib.PeopleBucket, "keptFor", status.TTL().String())
 	return true
