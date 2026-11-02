@@ -356,6 +356,19 @@ connection was closed under the command or never opened, and that it may have
 run. A per-environment `ControlPath` would remove the sharing itself and is
 upstream's to make.
 
+The sharing also puts a ceiling on fan-out. Every concurrent command is a session on the
+one master, and `sshd` caps sessions per connection at `MaxSessions`, 10 by default: the
+eleventh concurrent command is refused by the master and the client exits 255 with
+nothing on stderr, the same shape as the teardown above. A sweep that delegates a card
+per cluster hit it on a large fleet. `deploy/sandbox/sshd_config` sets `MaxSessions 128`,
+and raises `MaxStartups` to `64:30:256` for the moment several agent processes open a
+master at once after a sandbox restart; the image's smoke test opens one master and runs
+64 sessions over it. More sessions mean more shells in the one pod, so the container's
+memory is the counterpart: `spec.harness.experimental.shellSandbox.resources` sizes the
+shell container, and the
+[CRD reference](../site/src/content/docs/operator/platformagent-crd.md#shellsandbox) owns
+its defaults, merge rule and refusals.
+
 ### What the credential proxy is for
 
 `kubectl` and `gcloud` are not real binaries in the sandbox. They are symlinks to
