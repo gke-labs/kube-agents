@@ -817,8 +817,9 @@ object: for `NodePool/<n>`, the `ContainerNodePool` `<n>` on the finding's clust
 of that kind and that name. A finding of another kind (a `Deployment`, a `HorizontalPodAutoscaler`)
 has no Config Connector object of its own, even when the file declares one of the same name: a
 `Deployment` fix in a file that also declares an `IAMServiceAccount` did not change that account, so
-a stall of the account gives it no note. A file with no object of
-the finding gives no note, no `kcc_stalled` and no fallback to the finding's own object.
+a stall of the account gives it no note. A file with no object of the finding gives no in-file
+match; the own-object rule below still applies, as for a fix of any other kind, and then the fix gets
+the paragraph that names the object's declaration.
 
 A match that is not certain gives no note. Two cases are by name: the same object is not ready on
 more than one host cluster and nothing tells them apart (Config Controller puts the objects of each
@@ -860,9 +861,11 @@ Config Connector declaration index the `gcloud` check reads: the clone, or
 When exactly one file declares the object, the paragraph keeps the first sentence "**Config
 Connector is not applying this file.**" and names that file. When none or more than one does, it
 starts "**Config Connector is not applying the declaration of this object.**" and says so. The index
-keeps each other file that declares the same object (`KccDeclaration.also`), so two files read as
-ambiguous. A `gcloud` fix's note is its command, so its paragraph goes in `kcc_stalled_paragraph`
-and renders after the command block. The strip-and-rewrite pattern covers both first sentences.
+keeps each other file that declares the same object (`KccDeclaration.also`), and it keys each
+declaration by its namespace as well, so two objects of one name in two namespaces are two
+declarations and two files of one object read as ambiguous. A `gcloud` fix's note is its command, so
+its paragraph goes in `kcc_stalled_paragraph` and renders after the command block. The
+strip-and-rewrite pattern covers both first sentences.
 
 The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
 anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say
@@ -871,20 +874,25 @@ that sets both `max_node_count` and `total_max_node_count` fails with `UpdateFai
 correct the declaration if the reason rejects the change, and that otherwise the change takes effect
 when Config Connector applies the object again.
 
-The note fits the note cap whole: the worker's note is cut first, then dropped, and then the text
-`finish` wrote at its start, so the Config Connector paragraph itself is never cut. Unlike a route
-note, it saves no `uncut_note`, so the carry removes the note but does not bring back the text it
-cut. The pass first removes an earlier copy of the note from every remediation, and the carry
-removes it too, so a note never shows a stall that this run's manifest does not. A cluster whose
-read failed (`kcc_unread`) records no objects, so no note names an object there, and the log has a
-warning. The absence of the note never says that Config Connector applies a file.
+The note fits the note cap through `_fit_route_notes`, the route-note pass's fit: only the worker's
+own text is cut, never inside a code block, and the text `finish` wrote stays whole (the Kustomize
+note and its copied file, the closing text of `degrade_missing_remediations`, the note of
+`degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`, and the route notes). The paragraph
+goes after the route notes, and one that would push out the reconciler note does not fit. When the
+whole paragraph does not fit, it names one object, then no object it waits on, then drops its tail;
+when even that core does not fit beside the text `finish` wrote, the core goes after it and the
+renderer cuts the core's end. A cut keeps the whole worker note in `uncut_note`, as the route-note
+pass does, so the carry puts it back once the stall is gone. The pass first removes an earlier copy
+of the note from every remediation, and the carry removes it too, so a note never shows a stall that
+this run's manifest does not. A cluster whose read failed (`kcc_unread`) records no objects, so no
+note names an object there, and the log has a warning. The absence of the note never says that
+Config Connector applies a file.
 
 The same match makes the `pr-merged-persists` row and the comment on the merged pull request state
 the stall in place of "the remediation was incomplete, or something outside this repository
 reverted it", with the same advice as the note; the comment is posted once and never updated. So
-does a `Cluster/` or `NodePool/` finding whose own object is not ready, when the fix is `manifest`
-and its file declares a Config Connector object (in a file of several, the finding's own), or when
-the fix is `gcloud` or `manual`.
+does any finding whose own object is not ready (a `Cluster/` or `NodePool/` finding, or a finding of
+a Config Connector kind, `<Kind>/<n>`), whatever the fix's kind.
 
 ### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
 

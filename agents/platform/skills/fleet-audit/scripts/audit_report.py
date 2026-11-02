@@ -19323,57 +19323,55 @@ def disclose_stalled_kcc_remediations(
     root: Path,
     declarations: "dict[KccKey, KccDeclaration] | None" = None,
 ) -> list[str]:
-    """Say so when a `manifest` fix edits a declaration Config Connector does
-    not apply. Returns the ids whose note changed.
+    """Say so on any fix whose finding's own object Config Connector does not
+    apply. Returns the ids whose note or paragraph changed.
 
     The mirror of `degrade_reverted_gcloud_remediations`. That pass catches a
     fix Config Connector will undo; this one catches a fix Config Connector
-    does not apply at all. The pull request merges, the file says what it
-    should, and the cloud resource does not change. On 2026-09-05 one
-    `PubSubTopic` failed with `UpdateFailed` on an IAM role and put fifteen
+    does not apply at all. A merged pull request changes nothing on the cloud
+    resource while the object is stalled. On 2026-09-05 one `PubSubTopic`
+    failed with `UpdateFailed` on an IAM role and put fifteen
     `ContainerCluster`s into `DependencyNotReady`; every manifest fix against
     them would have merged into a controller that applied nothing.
 
     The collectors read Config Connector (`kcc_health.py`) and record its
     unready objects in the manifest as `kcc_unready`; this pass reads no
-    cluster. A fix matches when its file declares one of those objects
-    (`_remediation_file_stalls`). The note names the object, the reason the
-    controller gave, and the unready objects it waits on when the reason is
+    cluster. A `manifest` fix matches first through its file
+    (`_remediation_file_stalls`, the finding's own object only,
+    `_fix_declarations`). Every fix kind then falls back to the finding's own
+    object (`_object_stalls`: a `Cluster/` or `NodePool/` finding, or a
+    finding of a Config Connector kind), also when the file declares no
+    Config Connector object, as a fix to a `ComputeClass` file does. A
+    finding of another kind (a `Deployment`) has no Config Connector object
+    and gets no Config Connector text.
+
+    A `manifest` fix whose file declares the object gets the paragraph for
+    that file. Any other fix (`manual`, `gcloud`, degraded to `manual`, or a
+    `manifest` fix to another file) gets one that names the one file in
+    `declarations`, the repository's Config Connector index, that declares
+    the object, or says that the audit found none or more than one
+    (`kcc_object_paragraph`). A `gcloud` fix's paragraph goes in
+    `KCC_STALLED_PARAGRAPH_FIELD`, because its note is the command. The note
+    is fitted by `_fit_kcc_paragraph`, which never cuts text `finish` wrote.
+    The paragraph names the object, the reason the controller gave, and the
+    deepest unready object it waits on when the reason is
     `DependencyNotReady` (`_kcc_dependencies`).
 
-    Discloses, never degrades: the fix belongs in that file, and the stall is
-    usually gone by the time someone reads the ledger. What is wrong is the
-    reader's inference that the merge changes something. The note does not
-    say the change is correct: the reason can reject the change itself, and
-    the note tells the reader to correct the declaration then. The
-    `kind` stays `manifest`, and the sweep and `/remediate` treat the fix as
-    before.
+    Discloses, never degrades: the fix's kind stays, and the sweep and
+    `/remediate` treat it as before. The stall is usually gone by the time
+    someone reads the ledger. The paragraph does not say the change is
+    correct: the reason can reject the change itself, and the paragraph
+    tells the reader to correct the declaration then.
 
-    The pass first removes an earlier copy of its note from every
+    The pass first removes an earlier copy of either paragraph from every
     remediation, which a worker that copies the previous ledger brings back,
     then writes it again where this run's manifest still shows the stall. A
-    cluster whose read failed (`kcc_unread`) gives no stall, so no note: the
-    pass never says that Config Connector applies a file.
+    cluster whose read failed (`kcc_unread`) gives no stall, so no
+    paragraph: the pass never says that Config Connector applies a file.
 
-    It also writes `KCC_STALLED_FINDING_FIELD` on each finding whose fix file
-    or own `Cluster/` or `NodePool/` object (`_object_stalls`) is unready, for
-    the merged-but-persisting line and comment, which then state the stall
-    in place of their guess at a cause.
-
-    The paragraph goes on any fix whose finding's own object is not ready,
-    whatever its kind: a `manifest` fix whose file declares the object gets
-    the paragraph above; any other fix (`manual`, `gcloud`, degraded to
-    `manual`, or a `manifest` fix to another file) gets one that names the
-    one file in `declarations`, the repository's Config Connector index, that
-    declares the object, or says that the audit found none or more than one
-    (`kcc_object_paragraph`). A `gcloud` fix's paragraph goes in
-    `KCC_STALLED_PARAGRAPH_FIELD`, because its note is the command. When the file declares more than one
-    Config Connector object, only the finding's own object counts
-    (`_fix_declarations`); when none is the finding's own, the fix gets no
-    Config Connector text. A `manifest` fix uses its own object
-    only when its file declares a Config Connector object: a fix to another
-    file (a `ComputeClass`, say) did not change a declaration Config
-    Connector applies, so no Config Connector text goes on it.
+    It also writes `KCC_STALLED_FINDING_FIELD` on each finding it matches,
+    for the merged-but-persisting line and comment, which then state the
+    stall in place of their guess at a cause.
     """
     health = kcc_health(manifest)
     stalled = health.stalled
