@@ -2391,6 +2391,46 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 2)
         self.assertEqual(bootstrap_scan_gate._reconcile_since(self.d), started)
 
+    def test_a_reconcile_that_deferred_creates_defers_the_sweep_and_hands_the_attempt_back(self):
+        # EXIT_CREATES_DEFERRED: the run created its cap's worth and left the rest for
+        # the next tick. Progress, not failure: the sweep waits, the ceiling is not spent,
+        # and the counts the reconcile logged are repeated for the gate's reader.
+        import cluster_agent_reconcile as rec
+        self.assertEqual(bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, rec.EXIT_CREATES_DEFERRED)
+        started = time.time()
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, 2, started)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, "",
+                "[CLUSTER-RECONCILE] Done: created=100 failed=0 deferred=150 pruned=0 kept=0 no_identity=0 unknown=0.\n")
+
+        err = io.StringIO()
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(err):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 2)
+        self.assertEqual(bootstrap_scan_gate._reconcile_since(self.d), started)
+        self.assertIn("deferred the rest to the next tick", err.getvalue())
+        self.assertIn("created=100 failed=0 deferred=150", err.getvalue())
+
+    def test_a_fleet_of_three_batches_files_the_sweep_on_the_third_tick(self):
+        # 250 clusters at the default cap: two ticks that defer, then the one that
+        # finishes; no attempt is spent along the way, so the ceiling never fires.
+        codes = iter([bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED,
+                      bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, 0])
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, next(codes), "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ticks = [bootstrap_scan_gate.ensure_cluster_agents(self.d) for _ in range(3)]
+        self.assertEqual(ticks, [False, False, True])
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+
     def test_body_forbids_creating_profiles_by_hand(self):
         """The regression that made the first roster fix worse than the bug.
 

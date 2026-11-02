@@ -3491,6 +3491,135 @@ class ProjectSourceTest(unittest.TestCase):
                 self.assertEqual(rec._project_source(), (None, False))
 
 
+class CreateCapTest(unittest.TestCase):
+    """The per-run create cap: a fleet too large for one run arrives in batches.
+
+    The bootstrap gate runs this script under a ceiling and SIGKILLs it on expiry,
+    so a run that tries to scaffold every missing profile at once on a large fleet
+    dies mid-run every tick. The cap bounds the run; the rest is deferred to the
+    next one, which finds those clusters still without a profile. Under
+    `--require-create-pass` a run that deferred exits EXIT_CREATES_DEFERRED, which
+    the gate reads as "ask again", never as a failed attempt.
+    """
+
+    CAP = 100
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.created: list[str] = []
+        self.clusters = [("p", f"c{i:03d}", "us-central1") for i in range(250)]
+
+    def _identity_of(self, home: Path):
+        name = home.name
+        if name not in self.created:
+            return None
+        return _identity(cluster=name[len("cluster-"):])
+
+    def _run(self, argv=("x", "--require-create-pass"), create=None, dry_run=False):
+        """One reconcile over the fleet, with the profiles earlier runs made still there.
+
+        Returns (exit code or None, report); `create` may replace the scaffold stub.
+        """
+        report: dict = {}
+        real = rec.reconcile
+
+        def recording(dry_run=False):
+            report.update(real(dry_run=dry_run))
+            return report
+
+        def scaffold(pr, c, l):
+            name = f"cluster-{c}"
+            self.created.append(name)
+            return name
+
+        with mock.patch.dict(os.environ, {"HERMES_HOME": self.tmp}), \
+             mock.patch.object(rec, "MAX_CREATES_PER_RUN", self.CAP), \
+             mock.patch.object(rec, "list_profiles", side_effect=lambda: list(self.created)), \
+             mock.patch.object(rec, "profile_home", side_effect=lambda name: Path(self.tmp) / name), \
+             mock.patch.object(rec, "read_cluster_identity", side_effect=self._identity_of), \
+             mock.patch.object(rec, "_scaffold_gaps", return_value=[]), \
+             mock.patch.object(rec, "_project_source", return_value=("p", True)), \
+             mock.patch.object(rec, "_list_project", return_value=_listing(self.clusters)), \
+             mock.patch.object(rec, "_cluster_exists", return_value=True), \
+             mock.patch.object(rec, "delete_profile", side_effect=AssertionError("nothing is pruned here")), \
+             mock.patch.object(rec, "create_profile", side_effect=create or scaffold), \
+             mock.patch.object(rec, "reconcile", side_effect=recording), \
+             mock.patch.object(rec.sys, "argv", list(argv) + (["--dry-run"] if dry_run else [])), \
+             mock.patch.object(rec, "_notify"), \
+             mock.patch.object(rec, "log"):
+            try:
+                rec.main()
+            except SystemExit as e:
+                return e.code, report
+        return None, report
+
+    def test_250_missing_clusters_arrive_100_100_50_over_three_runs(self):
+        outcomes = [self._run() for _ in range(3)]
+        self.assertEqual([code for code, _ in outcomes], [rec.EXIT_CREATES_DEFERRED, rec.EXIT_CREATES_DEFERRED, None])
+        self.assertEqual([len(report["created"]) for _, report in outcomes], [100, 100, 50])
+        self.assertEqual([len(report["create_deferred"]) for _, report in outcomes], [150, 50, 0])
+        self.assertEqual(len(set(self.created)), 250, "a cluster was scaffolded twice or not at all")
+        # The deferred list names the clusters the next run will take, in listing order.
+        self.assertEqual(outcomes[0][1]["create_deferred"][:2], ["c100/us-central1", "c101/us-central1"])
+        self.assertEqual(outcomes[0][1]["create_failed"], [])
+
+    def test_a_run_under_the_cap_defers_nothing_and_exits_zero(self):
+        self.clusters = self.clusters[:self.CAP]
+        code, report = self._run()
+        self.assertIsNone(code)
+        self.assertEqual(len(report["created"]), self.CAP)
+        self.assertEqual(report["create_deferred"], [])
+
+    def test_failed_attempts_count_against_the_cap(self):
+        # A run of failing creates is bounded the same way: attempts cost the time the
+        # cap exists to bound, whether or not they succeed.
+        def failing(pr, c, l):
+            raise SystemExit("ERROR: failed to fetch credentials")
+
+        code, report = self._run(create=failing)
+        self.assertEqual(len(report["create_failed"]), self.CAP)
+        self.assertEqual(len(report["create_deferred"]), 150)
+        # Every attempt failed and nothing is in place: that is the failed-roster exit, not
+        # the deferral one, so the gate counts the attempt and can give up on a permanent cause.
+        self.assertEqual(code, rec.EXIT_CREATE_PASS_SKIPPED)
+
+    def test_the_cron_path_exits_zero_and_defers_the_same(self):
+        code, report = self._run(argv=("x",))
+        self.assertIsNone(code)
+        self.assertEqual((len(report["created"]), len(report["create_deferred"])), (100, 150))
+
+    def test_a_dry_run_shows_the_cap_and_names_the_deferred(self):
+        code, report = self._run(dry_run=True)
+        self.assertEqual(code, rec.EXIT_CREATES_DEFERRED)
+        self.assertEqual(self.created, [], "a dry run scaffolded a profile")
+        self.assertEqual((len(report["created"]), len(report["create_deferred"])), (100, 150))
+
+    def test_the_notification_names_the_deferred_and_counts_the_rest(self):
+        text = rec._format_notification({"created": ["cluster-a"],
+                                         "create_deferred": [f"c{i}/us-central1" for i in range(rec.NOTIFY_UNLISTED_LIMIT + 2)]})
+        self.assertIn(f"{rec.NOTIFY_UNLISTED_LIMIT + 2} cluster(s) deferred to the next run", text)
+        self.assertIn("and 2 more", text)
+
+    def test_the_cap_is_read_from_the_environment_and_falls_back_on_nonsense(self):
+        # Read at import, so each value is checked in a fresh interpreter.
+        def cap_under(value):
+            env = {k: v for k, v in os.environ.items() if k != rec.MAX_CREATES_PER_RUN_ENV}
+            if value is not None:
+                env[rec.MAX_CREATES_PER_RUN_ENV] = value
+            proc = subprocess.run(
+                [sys.executable, "-c", "import cluster_agent_reconcile as r; print(r.MAX_CREATES_PER_RUN)"],
+                cwd=Path(__file__).parent, capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return int(proc.stdout.strip())
+
+        self.assertEqual(cap_under(None), rec.MAX_CREATES_PER_RUN_DEFAULT)
+        self.assertEqual(cap_under("25"), 25)
+        for nonsense in ("", "many", "0", "-3"):
+            with self.subTest(value=nonsense):
+                self.assertEqual(cap_under(nonsense), rec.MAX_CREATES_PER_RUN_DEFAULT)
+
+
 if __name__ == "__main__":
     unittest.main()
 
