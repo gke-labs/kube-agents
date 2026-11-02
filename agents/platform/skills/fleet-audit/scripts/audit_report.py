@@ -1943,6 +1943,11 @@ PDB_NAME_SLOT = "{name}"
 # How many times one `finish` tries to take the snapshot for its repository
 # questions: the Config Connector scan, then planning.
 PROBE_OPEN_ATTEMPTS = 2
+# How many narrow snapshots one `finish` takes once the whole tree is over the
+# broker's snapshot ceiling. Each one is a broker clone of the revision of a
+# repository that is large by definition, so past this the run stops rather
+# than cloning without bound.
+PROBE_NARROW_SNAPSHOT_CAP = 16
 # Where a read unpacks its snapshot: a directory under the vcs client's copies
 # root, named with this prefix, so a run killed mid-read leaves a directory
 # `remove_stale_snapshots` can find. The snapshot itself goes one level down.
@@ -2577,6 +2582,20 @@ class NoGitOpsRepo(RuntimeError):
     def __init__(self, message: str) -> None:
         super().__init__(f"{message} {NO_REPOSITORY_CHOSEN_AGENT_NOTE}")
         self.message = message
+
+
+class ProbeLimit(RuntimeError):
+    """A narrow snapshot is still over the broker's snapshot ceiling.
+
+    Raised in narrow mode (`_RepositoryProbe._narrow_snapshot`). It is not a
+    document the worker can fix, so it is not a `ValidationError`: `main`
+    reports it as `FATAL`, exit 1, and the run's note is released. Only an
+    operator can raise the ceiling.
+    """
+
+
+class _NarrowTooLarge(Exception):
+    """A narrow snapshot of a directory is over the ceiling; the file alone is tried next."""
 
 
 class BrokerUnavailable(ValidationError):
@@ -17018,17 +17037,28 @@ class _RepositoryProbe:
         # Directory mode's answers to `committed`, filled by `ask_committed`.
         self._committed: dict[str, tuple[bool, str]] = {}
         self._unreadable = False
+        # Narrow mode: the whole tree was over the snapshot ceiling, so each
+        # question takes a snapshot of only the path it asks about. Each path's
+        # snapshot, None for a path the revision does not hold.
+        self.narrow = False
+        self._narrow: dict[str, RepositorySnapshot | None] = {}
+        # The revision the first narrow answer was read at, a refusal's included.
+        self._narrow_revision = ""
 
     @property
     def base_sha(self) -> str:
         """The commit SHA of the snapshot already taken, or empty."""
-        return self._snapshot.revision if self._snapshot is not None else ""
+        if self._snapshot is not None:
+            return self._snapshot.revision
+        return self._narrow_revision
 
     def known_absent(self, path: str) -> bool:
         """Whether an earlier `has_path` call already found `path` absent."""
         return path in self._paths and not self._paths[path][0]
 
     def broker(self) -> RepositorySnapshot | None:
+        import vcs_client
+
         # Asked twice at most: once for the Config Connector scan and once
         # more at planning, so one refused snapshot does not end generation.
         if self._snapshot is None and self._attempts < PROBE_OPEN_ATTEMPTS:
@@ -17039,6 +17069,16 @@ class _RepositoryProbe:
                 # A retry that worked answers for the failed one before it.
                 self.outage = None
             except Exception as exc:  # noqa: BLE001 -- no snapshot: every question is a yes
+                if getattr(exc, "code", None) == vcs_client.SNAPSHOT_TOO_LARGE:
+                    # Not a failure to retry: the tree is over the ceiling, so
+                    # each question narrows its own snapshot (`_narrow_snapshot`).
+                    self.narrow = True
+                    self._attempts = PROBE_OPEN_ATTEMPTS
+                    log(
+                        f"WARNING: {self.repo} is too large for one snapshot ({exc}); "
+                        "each repository check takes a snapshot of only the path it asks about"
+                    )
+                    return None
                 self.unavailable = f"{type(exc).__name__}: {exc}"
                 self.note_outage(exc)
                 log(f"WARNING: could not take a snapshot of {self.repo} through the broker ({self.unavailable})")
@@ -17083,15 +17123,91 @@ class _RepositoryProbe:
             return answer
         self.unanswered = ""
         answer = self._broker_has_path(path)
-        if self._snapshot is not None:
+        if (self._snapshot is not None or self.narrow) and not self.unanswered:
             self._paths[path] = (answer, self.unanswered)
         return answer
 
     def _broker_has_path(self, path: str) -> bool:
         snap = self.broker()
+        if snap is None and self.narrow:
+            try:
+                narrowed = self._narrow_snapshot_for(path)
+            except ProbeLimit:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- an unanswered check cannot rule the path out
+                self.unanswered = f"a snapshot of {path}: {type(exc).__name__}: {exc}"
+                self.note_outage(exc)
+                return True
+            return narrowed is not None and narrowed.has_file(path)
         if snap is None:
             return True
         return snap.has_file(path)
+
+    @staticmethod
+    def _narrow_key(path: str) -> str:
+        """What narrow mode snapshots to answer a question about `path`.
+
+        The directory two levels down that holds it -- a `clusters/<name>`
+        tree in the GitOps layout -- so one snapshot answers every fix,
+        kustomization marker and name search in that tree. Nearer the top a
+        directory holds most of the repository, so the file alone is taken.
+        """
+        parts = PurePosixPath(path).parent.parts
+        return str(PurePosixPath(*parts[:CLUSTER_TREE_DEPTH])) if len(parts) >= CLUSTER_TREE_DEPTH else path
+
+    def _narrow_snapshot_for(self, path: str) -> "RepositorySnapshot | None":
+        """The narrow snapshot that answers for `path`; None when the revision does not hold it.
+
+        A snapshot already held of `path` or of a directory above it answers
+        first, so a run pays one snapshot per tree. Otherwise `_narrow_key`'s
+        directory is taken, and when that is over the ceiling, the file alone.
+        """
+        for key, held in self._narrow.items():
+            if path == key or path.startswith(f"{key}/"):
+                return held
+        key = self._narrow_key(path)
+        if key != path:
+            try:
+                return self._take_narrow(key, last=False)
+            except _NarrowTooLarge:
+                pass
+        return self._take_narrow(path, last=True)
+
+    def _take_narrow(self, key: str, *, last: bool) -> "RepositorySnapshot | None":
+        """A snapshot of only `key`, kept for the run; None when the revision does not hold it.
+
+        Past `PROBE_NARROW_SNAPSHOT_CAP` it takes none and raises, which the
+        question reads as unanswered: the check is skipped with that reason, as
+        when no snapshot could be taken at all. A snapshot over the ceiling
+        stops the command (`ProbeLimit`) when it is the last thing to try.
+        """
+        import vcs_client
+
+        if len(self._narrow) >= PROBE_NARROW_SNAPSHOT_CAP:
+            raise RuntimeError(
+                f"this run already took {PROBE_NARROW_SNAPSHOT_CAP} narrow snapshots of "
+                f"{self.repo} (PROBE_NARROW_SNAPSHOT_CAP), so {key} was not checked"
+            )
+        try:
+            snap: RepositorySnapshot | None = RepositorySnapshot(self.repo, paths=[key])
+        except vcs_client.VcsError as exc:
+            if exc.code == SNAPSHOT_PATH_NOT_FOUND:
+                snap = None
+                self._narrow_revision = self._narrow_revision or (exc.revision or "")
+            elif exc.code == vcs_client.SNAPSHOT_TOO_LARGE and not last:
+                raise _NarrowTooLarge(key) from exc
+            elif exc.code == vcs_client.SNAPSHOT_TOO_LARGE:
+                raise ProbeLimit(
+                    f"{key} in {self.repo} is too large for one snapshot ({exc}), so the "
+                    "repository checks `finish` makes cannot run. An operator must raise the "
+                    "broker's CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES."
+                ) from exc
+            else:
+                raise
+        if snap is not None:
+            self._narrow_revision = self._narrow_revision or snap.revision
+        self._narrow[key] = snap
+        return snap
 
     def committed(self, path: str) -> bool:
         """Whether `path` is a file at the audited commit, not only in the tree.
@@ -17157,11 +17273,18 @@ class _RepositoryProbe:
                 return None
             return shown.stdout or ""
         snap = self.broker()
-        if snap is None:
-            self.unanswered = self.unavailable or "the snapshot could not be taken"
-            return None
         try:
+            if snap is None and self.narrow:
+                snap = self._narrow_snapshot_for(path)
+                if snap is None or not snap.has_file(path):
+                    self.unanswered = f"{path} is not in the repository"
+                    return None
+            if snap is None:
+                self.unanswered = self.unavailable or "the snapshot could not be taken"
+                return None
             return snap.read_bytes(path).decode("utf-8")
+        except ProbeLimit:
+            raise
         except Exception as exc:  # noqa: BLE001 -- an unread file cannot show the entry
             self.unanswered = f"reading {path}: {type(exc).__name__}: {exc}"
             return None
@@ -17196,10 +17319,20 @@ class _RepositoryProbe:
                 if path.startswith(prefix) and path not in self.ignored
             )
         snap = self.broker()
-        if snap is None:
-            return True
+        tree = prefix.rstrip("/")
         try:
-            found = snap.grep(expression, prefix=prefix.rstrip("/") or None, regex=True)
+            if snap is None and self.narrow:
+                if not tree:
+                    self.unanswered = f"{self.repo} is too large to search whole for {name}"
+                    return True
+                snap = self._narrow_snapshot_for(tree)
+                if snap is None:
+                    return False
+            if snap is None:
+                return True
+            found = snap.grep(expression, prefix=tree or None, regex=True)
+        except ProbeLimit:
+            raise
         except Exception as exc:  # noqa: BLE001 -- an unanswered search cannot rule it out
             self.unanswered = f"searching for {name}: {type(exc).__name__}: {exc}"
             return True
@@ -17207,8 +17340,10 @@ class _RepositoryProbe:
 
     def close(self) -> None:
         snap, self._snapshot = self._snapshot, None
-        if snap is not None:
-            snap.close()
+        narrowed, self._narrow = self._narrow, {}
+        for held in (snap, *narrowed.values()):
+            if held is not None:
+                held.close()
 
 
 class _WorkingTreeProbe(_RepositoryProbe):
@@ -22232,7 +22367,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # on the probe's count: the backstop keeps its retry, and planning,
         # which fails safe without the snapshot, takes none.
         snap = probe.broker() or probe.broker()
-        if snap is None:
+        if snap is None and probe.narrow:
+            # The scan reads every declaration in the tree, which no narrow
+            # snapshot holds.
+            log(
+                f"WARNING: the Config Connector scan was skipped: {repo} is too large for one "
+                "snapshot; gcloud fixes publish as written"
+            )
+        elif snap is None:
             log(
                 f"WARNING: the Config Connector scan could not take a snapshot of "
                 f"{repo} through the broker ({probe.unavailable}); gcloud fixes "
