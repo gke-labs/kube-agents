@@ -845,6 +845,70 @@ class MainOutputContractTests(unittest.TestCase):
 
 
 
+def fake_statvfs(percent_used: int, total_gib: int = 10):
+    """An os.statvfs stand-in for a volume `percent_used` full."""
+    block = 4096
+    blocks = total_gib * (1 << 30) // block
+    free = blocks * (100 - percent_used) // 100
+    return lambda path: type("S", (), {"f_blocks": blocks, "f_frsize": block, "f_bavail": free})()
+
+
+class DataVolumeTests(unittest.TestCase):
+    """A full data volume is its own reason, ahead of what it causes."""
+
+    @staticmethod
+    def clean_runner(argv, env, timeout):
+        return 0, "[]", ""
+
+    def test_a_volume_past_the_warn_line_leads_the_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": "t", "status": "done"}])
+            with unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(95)):
+                tasks, lines = kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={})
+        self.assertEqual(tasks, [])
+        self.assertEqual(lines, [
+            "The agent's data volume is 95% full (9.5 of 10.0 GiB). Remove unused cluster profiles,"
+            " or ask an admin to raise spec.storage.size on the PlatformAgent."
+        ])
+
+    def test_a_volume_under_the_line_or_unreadable_says_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": "t", "status": "done"}])
+            for stat in (fake_statvfs(89), unittest.mock.Mock(side_effect=OSError("gone"))):
+                with unittest.mock.patch.object(kbh.os, "statvfs", stat):
+                    self.assertEqual(kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={}), ([], []))
+
+    def test_a_disk_full_board_error_is_said_for_the_channel(self):
+        for message in ("disk I/O error", "database or disk is full"):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as d:
+                def boom(home, **kwargs):
+                    raise sqlite3.OperationalError(message)
+                buffer = io.StringIO()
+                with unittest.mock.patch.object(kbh, "agent_home", return_value=Path(d)), \
+                        unittest.mock.patch.object(kbh, "report", boom), \
+                        unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(100)), \
+                        contextlib.redirect_stdout(buffer):
+                    code = kbh.main(env={kbh.STATE_ENV: str(Path(d) / "state.json")})
+                self.assertEqual(code, 0)
+                out = buffer.getvalue().splitlines()
+                self.assertEqual(out[0], kbh.REPORT_HEADER)
+                self.assertEqual(out[1], f"The task board cannot be read or written because the agent's disk is full ({message}).")
+                self.assertIn("100% full", out[2])
+                self.assertNotIn("cannot read", buffer.getvalue())
+
+    def test_another_board_error_keeps_the_plain_line(self):
+        self.assertFalse(kbh.is_disk_full_error(sqlite3.OperationalError("unable to open database file")))
+        self.assertTrue(kbh.is_disk_full_error(OSError(28, "No space left on device")))
+
+    def test_the_line_and_text_match_the_session_kv_servers(self):
+        """The two say the same thing at the same point; the server is not imported here."""
+        source = (Path(__file__).resolve().parent / "session_kv_server.py").read_text()
+        self.assertIn(f"DATA_VOLUME_WARN_PERCENT = {kbh.DATA_VOLUME_WARN_PERCENT}\n", source)
+        start = source.index("DATA_VOLUME_WARNING = (")
+        block = source[start:source.index(")\n", start) + 2]
+        self.assertEqual(eval(block.split("=", 1)[1]), kbh.DATA_VOLUME_WARNING)  # noqa: S307 - a string literal from our own file
+
+
 class DeliveryFailureTests(unittest.TestCase):
     """`main` against a real agent home, so it reads the scheduler's store as on the pod."""
 

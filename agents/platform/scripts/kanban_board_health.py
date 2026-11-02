@@ -7,7 +7,12 @@ eight-rule engine behind ``hermes kanban diagnostics`` and the dashboard plugin
 — but nothing schedules it and nothing pushes its output, so a human notices a
 stuck board by accident. This script is the half that asks.
 
-It reports two kinds of thing, and deliberately nothing else.
+It reports two kinds of thing about the board, and deliberately nothing else
+about it. Ahead of both, it says when the volume the board lives on is full:
+at the Session KV server's warn line a line in that server's words leads the
+report, and a board that cannot be read because the disk is full is said as
+that, not as a bare error. Every board write fails on a full volume, so this
+is the cause of most else a full board shows.
 
 1. **Invariant violations**, queried here directly. Every non-``running``
    transition in ``hermes_cli/kanban_db.py`` clears ``claim_lock`` inside the
@@ -177,6 +182,21 @@ MAX_INVARIANT_ITEMS = 20
 MAX_REPORT_CHARS = 8500
 # The other findings' header, under the stuck tasks when both are present.
 REPORT_HEADER = "kanban board health: attention required"
+# A full data volume, in the Session KV server's words: from its warn line, every
+# board write is at risk, and at 100% each one fails with a bare "disk I/O
+# error". The line and the text are session_kv_server.py's DATA_VOLUME_WARN_PERCENT
+# and DATA_VOLUME_WARNING (a test holds them equal); that module is not imported,
+# because it brings FastAPI in.
+DATA_VOLUME_WARN_PERCENT = 90
+DATA_VOLUME_WARNING = (
+    "The agent's data volume is {percent}% full ({used:.1f} of {total:.1f} GiB). "
+    "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent."
+)
+BYTES_PER_GIB = 1 << 30
+# What SQLite and the OS say when a write fails for want of space, lowercased.
+DISK_FULL_MARKERS = ("disk i/o error", "database or disk is full", "no space left on device")
+# The report when the board cannot be read for that reason.
+BOARD_DISK_FULL = "The task board cannot be read or written because the agent's disk is full ({error})."
 # What the header and its newline take of the other findings' budget.
 REPORT_HEADER_RESERVE = len(REPORT_HEADER) + 1
 # The room an omission line ("... and N other ... omitted") needs; below it
@@ -851,6 +871,31 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     return lines
 
 
+def data_volume_line(home: Path) -> str | None:
+    """The full-volume line when the volume holding the board is at or above
+    DATA_VOLUME_WARN_PERCENT used, else None (also when it cannot be read)."""
+    try:
+        st = os.statvfs(home)
+    except OSError:
+        return None
+    total = st.f_blocks * st.f_frsize
+    if total <= 0:
+        return None
+    free = st.f_bavail * st.f_frsize
+    percent = (total - free) * 100 // total
+    if percent < DATA_VOLUME_WARN_PERCENT:
+        return None
+    return DATA_VOLUME_WARNING.format(
+        percent=percent, used=(total - free) / BYTES_PER_GIB, total=total / BYTES_PER_GIB
+    )
+
+
+def is_disk_full_error(exc: BaseException) -> bool:
+    """Whether a board error is the disk being full rather than any other fault."""
+    text = str(exc).lower()
+    return any(marker in text for marker in DISK_FULL_MARKERS)
+
+
 def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> tuple[list | None, list]:
     """The whole check: ``(stuck tasks, other lines)``. Both empty means healthy, which means silent.
 
@@ -869,6 +914,10 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
         # shell-out here is deliberate — the CLI would create one.
         return [], []
     lines = []
+    # First, because it is the cause of most else a full board shows.
+    volume = data_volume_line(home)
+    if volume:
+        lines.append(volume)
     conn = read_only_connection(db)
     try:
         violations = invariant_violations(conn)
@@ -876,7 +925,7 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
     finally:
         conn.close()
 
-    used_chars = REPORT_HEADER_RESERVE
+    used_chars = REPORT_HEADER_RESERVE + sum(len(ln) + 1 for ln in lines)
     if violations:
         header = "Board invariant violations (a direct write to kanban.db is the usual cause):"
         lines.append(header)
@@ -924,6 +973,11 @@ def main(argv=None, *, env=None, now=None) -> int:
         if state != recorded:
             save_state(path, state)
         save_card(card_path(home, env), None)
+        if is_disk_full_error(exc):
+            # Said for the channel: the board is down for want of space, and
+            # what fixes it.
+            print("\n".join(filter(None, [REPORT_HEADER, BOARD_DISK_FULL.format(error=exc), data_volume_line(home)])))
+            return 0
         print(f"kanban board health: cannot read {board_path(home)}: {exc}")
         return 0
     out = []
