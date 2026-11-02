@@ -363,17 +363,44 @@ class PagedReadTest(unittest.TestCase):
                     cr.canonical_resource(unknown)
 
     def test_the_command_text_names_each_kinds_first_page(self):
-        text = cr.paged_command_text(["deploy", "pods"], kubeconfig="/k/c")
-        # The prefix on every read: a leading assignment scopes to the one
-        # command after it, and the line is recorded to be pasted unchanged.
+        # A chain exports the kubeconfig once, in a subshell, so every read
+        # runs against the audited cluster when the line is pasted unchanged,
+        # the pasting shell keeps its own context, and the path is spelled
+        # once however many kinds the chain reads (the published command cap).
         self.assertEqual(
-            "KUBECONFIG=/k/c kubectl get --raw '/apis/apps/v1/deployments?limit=500'; KUBECONFIG=/k/c kubectl get --raw '/api/v1/pods?limit=500'",
-            text,
+            "( export KUBECONFIG=/k/c; kubectl get --raw '/apis/apps/v1/deployments?limit=500'; kubectl get --raw '/api/v1/pods?limit=500' )",
+            cr.paged_command_text(["deploy", "pods"], kubeconfig="/k/c"),
+        )
+        # One kind is one simple command, and a leading assignment scopes to it.
+        self.assertEqual(
+            "KUBECONFIG=/k/c kubectl get --raw '/api/v1/pods?limit=500'",
+            cr.paged_command_text(["pods"], kubeconfig="/k/c"),
         )
         self.assertEqual(
             "kubectl get --raw '/apis/apps/v1/deployments?limit=500'; kubectl get --raw '/api/v1/pods?limit=500'",
             cr.paged_command_text(["deploy", "pods"]),
         )
+        # A path the shell would split is quoted, in either form.
+        self.assertEqual(
+            "( export KUBECONFIG='/k dir/c'; kubectl get --raw '/apis/apps/v1/deployments?limit=500'; kubectl get --raw '/api/v1/pods?limit=500' )",
+            cr.paged_command_text(["deploy", "pods"], kubeconfig="/k dir/c"),
+        )
+
+    def test_the_recorded_chain_runs_every_read_under_the_kubeconfig_and_leaves_the_shell_alone(self):
+        """The chain as bash runs it: a fake kubectl prints the KUBECONFIG it saw, each read
+        sees the recorded path, and the caller's own KUBECONFIG is what it was after."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "kubectl")
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\necho \"$KUBECONFIG\"\n")
+            os.chmod(fake, 0o755)
+            line = cr.paged_command_text(["deploy", "pods", "nodes"], kubeconfig="/k/c")
+            proc = subprocess.run(
+                ["bash", "-c", line + "; echo \"after=$KUBECONFIG\""],
+                capture_output=True, text=True, check=True,
+                env={"PATH": tmp + os.pathsep + os.environ.get("PATH", ""), "KUBECONFIG": "outer"},
+            )
+        self.assertEqual(["/k/c", "/k/c", "/k/c", "after=outer"], proc.stdout.split())
 
     def test_the_legacy_dump_adapter_feeds_the_real_paging(self):
         calls = []

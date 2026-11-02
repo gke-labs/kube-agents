@@ -81,6 +81,10 @@ PAGE_CEILING_TEXT = f"paged read: more than {MAX_PAGES} pages of one kind"
 #: every page as it arrived, so the manifest's `output_sha256` still changes
 #: when the content does, without the merged text being kept to digest.
 PAGED_SUMMARY_FORMAT = "{items} items in {pages} pages; sha256 {digest}"
+#: How a recorded chain of first-page reads is joined, and the variable a
+#: recorded read binds the cluster's kubeconfig to.
+CHAIN_SEPARATOR = "; "
+KUBECONFIG_VAR = "KUBECONFIG"
 
 
 class ListKind(NamedTuple):
@@ -259,14 +263,23 @@ def list_argv(
 
 
 def paged_command_text(resources: Iterable[str], *, query: dict[str, str] | None = None, kubeconfig=None) -> str:
-    """The shell line a paged read is recorded as: each kind's first page, each
-    under the kubeconfig the reads ran under; a reader follows `continue`. The
-    prefix goes on every read, not once in front of the chain: a leading
-    `VAR=value` scopes to the one simple command it precedes, so a line pasted
-    unchanged would run every kind after the first against the pasting
-    shell's current context."""
-    prefix = f"KUBECONFIG={shlex.quote(str(kubeconfig))} " if kubeconfig else ""
-    return "; ".join(prefix + shlex.join(list_argv(resource, query=query)) for resource in resources)
+    """The shell line a paged read is recorded as: each kind's first page under
+    the kubeconfig the reads ran under; a reader follows `continue`. One kind is
+    `KUBECONFIG=<path> kubectl get --raw …`, the assignment scoping to the one
+    simple command it precedes. A chain is wrapped as
+    `( export KUBECONFIG=<path>; kubectl get --raw …; … )`: the subshell exports
+    the kubeconfig once for every read in it and leaves the pasting shell's
+    environment alone. The prefix is bound once rather than repeated per read
+    because the line is published under `audit_report.MAX_COMMAND_CHARS`, and
+    fifteen copies of a profile-directory path put a collector's chain over it
+    (`test_fleet_waste` holds the longest chain under the cap)."""
+    reads = [shlex.join(list_argv(resource, query=query)) for resource in resources]
+    if not kubeconfig:
+        return CHAIN_SEPARATOR.join(reads)
+    assignment = f"{KUBECONFIG_VAR}={shlex.quote(str(kubeconfig))}"
+    if len(reads) == 1:
+        return f"{assignment} {reads[0]}"
+    return f"( export {assignment}{CHAIN_SEPARATOR}{CHAIN_SEPARATOR.join(reads)} )"
 
 
 def _strip_and_stamp(items: list, listed: ListKind) -> None:

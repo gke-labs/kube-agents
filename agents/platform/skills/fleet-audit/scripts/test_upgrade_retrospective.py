@@ -41,6 +41,17 @@ os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import upgrade_retrospective as ur  # noqa: E402
 import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
 
 # The collector pages its kinds through `kubectl get --raw`; FakeFleet below
 # still answers the one-shot dump by kind, and the adapter feeds the real
@@ -6625,3 +6636,18 @@ class ReadsTellTheShimTheirDeadlineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecordedReadsUnderTheCommandCapTest(unittest.TestCase):
+    def test_every_recorded_read_passes_the_validator_at_the_longest_path(self):
+        """`draft` copies each read's recorded command into `checks_run`, which `finish` refuses
+        over `MAX_COMMAND_CHARS`; held at the longest kubeconfig path the platform profile makes."""
+        with mock.patch.object(ur, "kubeconfig_dir", return_value=PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = ur.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        self.assertTrue(str(kubeconfig).startswith(str(PLATFORM_PROFILE_KUBECONFIG_DIR)), kubeconfig)
+        for name, kinds, query in ur.KUBECTL_READS:
+            with self.subTest(read=name):
+                text = ur.paged_command_text(kinds.split(","), query=query, kubeconfig=kubeconfig)
+                self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+                self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", ur.CHECK_NODE_BROKEN))
+

@@ -32,6 +32,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import collect  # noqa: E402
 import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
 
 # The collector pages its kinds through `kubectl get --raw`; the fakes below
 # still answer the one-shot dump, and the adapter feeds the real paging from
@@ -7970,8 +7981,9 @@ class TestComplianceCollectCluster(unittest.TestCase):
             raw,
         )
         commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
-        kubeconfig = commands_by_slug["privileged-container"].split(" ", 1)[0].removeprefix("KUBECONFIG=")
+        kubeconfig = re.search(r"KUBECONFIG=([^\s;]+)", commands_by_slug["privileged-container"]).group(1)
         self.assertTrue(kubeconfig.startswith(tmp), kubeconfig)
+        self.assertTrue(commands_by_slug["privileged-container"].startswith("( export KUBECONFIG="), commands_by_slug["privileged-container"])
         for slug, kinds in (
             ("privileged-container", collect.COMPLIANCE_DUMP_KINDS),
             ("cluster-admin-binding", collect.RBAC_DUMP_KINDS),
@@ -9844,10 +9856,10 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
         self.assertIn("kubectl get --raw '/api/v1/services?limit=500'", commands_by_slug["inference-endpoint-public"])
         for slug, command in commands_by_slug.items():
             if slug != "inference-endpoint-public":
-                # Each kind's read under the cluster's kubeconfig, so the
-                # recorded line runs the whole chain against the audited
-                # cluster when pasted unchanged.
-                kubeconfig = command.split(" ", 1)[0].removeprefix("KUBECONFIG=")
+                # The cluster's kubeconfig exported once for the chain, so the
+                # recorded line runs every read against the audited cluster
+                # when pasted unchanged.
+                kubeconfig = re.search(r"KUBECONFIG=([^\s;]+)", command).group(1)
                 self.assertTrue(kubeconfig.endswith(".yaml"), command)
                 self.assertEqual(collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), command)
 
@@ -13226,3 +13238,21 @@ class DefaultRunFailureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
+    """Every paged chain `collect.py` records is copied verbatim into `checks_run` and into
+    `evidence.command`; `finish` refuses the first over `MAX_COMMAND_CHARS` and clips the
+    second. Held at the longest kubeconfig path the platform profile can produce."""
+
+    def test_every_recorded_chain_passes_the_validator_at_the_longest_path(self):
+        with patch.object(collect, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = collect.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        for name in ("DUMP_COMMAND_KINDS", "COMPLIANCE_DUMP_KINDS", "RBAC_DUMP_KINDS", "NETPOL_DUMP_KINDS", "SERVICE_DUMP_KINDS", "SERVICEACCOUNT_DUMP_KINDS"):
+            kinds = getattr(collect, name)
+            with self.subTest(kinds=name):
+                text = collect.paged_command_text(kinds.split(","), kubeconfig=kubeconfig)
+                self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+                self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "privileged-container"))
+                self.assertEqual(text, audit_report.trim_command(text))
+

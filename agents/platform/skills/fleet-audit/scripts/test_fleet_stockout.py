@@ -33,6 +33,17 @@ os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
 
 # The collector pages its kinds through `kubectl get --raw`; the fakes below
 # still answer the one-shot dump, and the adapter feeds the real paging from
@@ -1581,11 +1592,12 @@ class CollectClusterTest(unittest.TestCase):
         command = next(c["command"] for c in entry["commands"] if c["check"] == "dangling-compute-class")
         kubeconfig = next(part for part in command.split() if part.startswith("KUBECONFIG=")).removeprefix("KUBECONFIG=")
         self.assertEqual(command.split("; ")[0], f"KUBECONFIG={kubeconfig} kubectl get computeclasses -A -o json")
-        # Every read of the chain under the kubeconfig, not the first alone:
-        # the line is recorded to be pasted unchanged.
+        # The one-shot read under the kubeconfig, then the paged chain with the
+        # kubeconfig exported once for every read in it: the line is recorded
+        # to be pasted unchanged.
         self.assertEqual(command, f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}")
-        for read in command.split("; ")[1:]:
-            self.assertTrue(read.startswith(f"KUBECONFIG={kubeconfig} kubectl get --raw "), read)
+        self.assertIn(f"; ( export KUBECONFIG={kubeconfig}; kubectl get --raw ", command)
+        self.assertEqual(2, command.count("KUBECONFIG="), command)
 
         def cut_run(argv, **kwargs):
             if argv[:3] == ["kubectl", "get", "--raw"] and argv[3].startswith("/api/v1/nodes"):
@@ -3734,3 +3746,16 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecordedChainUnderTheCommandCapTest(unittest.TestCase):
+    def test_the_recorded_chain_stays_under_the_published_command_cap(self):
+        """The compute-class read and the paged chain are recorded as one line and copied
+        verbatim into `checks_run`; held under `MAX_COMMAND_CHARS` at the longest kubeconfig
+        path the platform profile makes."""
+        with patch.object(fs, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fs.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        text = f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}"
+        self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+        self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "dangling-compute-class"))
+

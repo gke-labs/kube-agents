@@ -29,6 +29,17 @@ os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
 
 # The collector pages its kinds through `kubectl get --raw`; the fakes below
 # still answer the one-shot dump, and the adapter feeds the real paging from
@@ -5391,7 +5402,21 @@ class CollectClusterTest(unittest.TestCase):
         command = next(c["command"] for c in entry["commands"] if c["check"] == "terminal-pods")
         self.assertIn("kubectl get --raw '/api/v1/nodes?limit=100'", command)
         self.assertIn("kubectl get --raw '/api/v1/pods?limit=500'", command)
-        self.assertTrue(command.startswith("KUBECONFIG="))
+        # The kubeconfig exported once for the whole chain, in a subshell.
+        self.assertTrue(command.startswith("( export KUBECONFIG="), command)
+        self.assertTrue(command.endswith(" )"), command)
+        self.assertEqual(1, command.count("KUBECONFIG="), command)
+
+    def test_the_recorded_chain_stays_under_the_published_command_cap(self):
+        """The fifteen-kind dump is recorded once and copied verbatim into five checks'
+        `checks_run`; with the kubeconfig spelled per read, the longest legal names put it
+        over `MAX_COMMAND_CHARS` and `finish` refused the document."""
+        with patch.object(fw, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fw.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        text = fw.paged_command_text(fw.CLUSTER_DUMP_KINDS.split(","), kubeconfig=kubeconfig)
+        self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+        self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "orphan-pv"))
+        self.assertEqual(text, audit_report.trim_command(text))
 
     def test_a_dump_with_no_items_list_is_gate_failed_not_empty(self):
         def run(argv, **kwargs):
