@@ -2544,7 +2544,7 @@ So `CREDENTIAL_PROXY_ROLE` selects which services a container starts:
 
 `combined` is the default, so an image paired with an operator that does not set the
 variable starts every service; `start-services.sh` refuses any other value rather than
-falling back to it. An `exec` pod serves only the command routes that
+falling back to it. An `exec` pod serves only the exec routes that
 [`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §12 lists. The
 `api-proxy` container loads no policy and builds no `CommandExecutor`: it compares one key
 and forwards, holding no credential path. It is called `agent-api-auth`, and

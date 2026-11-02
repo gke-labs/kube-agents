@@ -17681,6 +17681,8 @@ class ExecPodRefusesTest(unittest.TestCase):
         for method, path in (
             ("POST", "/v1/exec"),
             ("GET", credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x"),
+            # Reaches the relay, which refuses it by policy and audits it.
+            ("POST", credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x"),
             ("GET", credential_proxy.ADMISSION_PATH),
             ("GET", credential_proxy.HEALTHZ_PATH),
         ):
@@ -17692,7 +17694,6 @@ class ExecPodRefusesTest(unittest.TestCase):
     def test_the_exec_routes_on_another_method_answer_404(self):
         for method, path in (
             ("GET", "/v1/exec"),
-            ("POST", credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x"),
             ("POST", credential_proxy.ADMISSION_PATH),
         ):
             with self.subTest(method=method, path=path):
@@ -17750,7 +17751,6 @@ class ExecPodRouteGateTest(unittest.TestCase):
         ("GET", credential_proxy.watcher_policy.WATCHER_K8S_PREFIX + "x"),
         ("GET", credential_proxy.watcher_policy.PLATFORM_PUBSUB_PREFIX + "x"),
         ("GET", credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "x"),
-        ("POST", _GCP_PATH),
         ("POST", credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "x"),
         ("POST", credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + "x"),
         ("POST", credential_proxy.watcher_policy.WATCHER_K8S_PREFIX + "x"),
@@ -17814,6 +17814,9 @@ class ExecPodRouteGateTest(unittest.TestCase):
         status, body = self._request("GET", credential_proxy.HEALTHZ_PATH, exec_role)
         self.assertEqual((HTTPStatus.OK, {"status": "ok"}), (status, json.loads(body)))
         status, body = self._request("GET", self._GCP_PATH, exec_role)
+        self.assertEqual((HTTPStatus.OK, {"reached": "_handle_api_relay"}), (status, json.loads(body)))
+        # A write attempt reaches the relay too, so its refusal is the policy's and is audited.
+        status, body = self._request("POST", self._GCP_PATH, exec_role)
         self.assertEqual((HTTPStatus.OK, {"reached": "_handle_api_relay"}), (status, json.loads(body)))
         # A body with no argv: the route parsed it, so the gate let it through.
         status, body = self._request("POST", "/v1/exec", exec_role)

@@ -1656,9 +1656,11 @@ def exec_pod_serves(method: str, path: str) -> bool:
     tier: the command route, the Cloud API relay's reads, the admission route
     and the readiness probe. The metrics listener is a server of its own and
     does not pass through here. Everything else is the stateful broker's.
+    A POST to the Cloud API relay passes too: the relay refuses it by policy
+    and writes the audit line, as the stateful broker does (do_POST).
     """
     if method == "POST":
-        return path == "/v1/exec"
+        return path == "/v1/exec" or path.startswith(API_RELAY_PREFIX)
     return path in (HEALTHZ_PATH, ADMISSION_PATH) or path.startswith(API_RELAY_PREFIX)
 
 
@@ -11036,9 +11038,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     workspaces: object | None = None
     # Named `vcs` rather than `vcs_broker`: a class attribute of that name does
     # not shadow the module inside a method, but it reads as though it does.
-    # Unlike `workspaces` this is never None on a running broker -- version
-    # control is not behind a switch, because it is the only way the sandbox
-    # reaches a repository at all.
+    # Unlike `workspaces` it is not behind a switch, because it is the only way
+    # the sandbox reaches a repository at all. It is None on an exec pod, which
+    # answers /v1/vcs/* with 404 (exec_pod_serves), and on no other broker.
     vcs: vcs_broker.VcsBroker | None = None
     # Set by _repository_is_permitted on a refusal: the status it answered.
     repository_refusal_status: HTTPStatus | None = None
