@@ -592,52 +592,54 @@ class BitbucketDataCenterForge(Forge):
 
     # -- the readings sweep's calls -------------------------------------------
 
-    @staticmethod
-    def _authored_params(author: str, state: str) -> dict[str, Any]:
-        """The query for the proposals `author` opened, in `state`.
+    def _authored(self, api: Callable, repo: str, author: str) -> tuple[list[dict], bool]:
+        """Every proposal `author` opened, newest activity first, up to the ceiling.
 
-        Filtered by the instance on the participant role. `order=NEWEST`
-        is newest activity first (verify live).
+        Filtered here, not by the instance: its participant filter
+        (`role.1=AUTHOR&username.1=`) finds no proposal of a project token's
+        user (`access-token-user/<p>/<t>`, seen live on 8.19), and an empty
+        answer would read as an author with no proposals. So the repository's
+        proposals are read whole, up to `MAX_CONVERSATION_SIZE` rows, and kept
+        by author. True when rows were left unread.
         """
-        return {"state": state, "order": "NEWEST", "role.1": "AUTHOR", "username.1": author}
+        nodes, more = self._pages(
+            api,
+            f"{self._repo(repo)}/pull-requests",
+            {"state": "ALL", "order": "NEWEST"},
+            MAX_CONVERSATION_SIZE,
+        )
+        return [node for node in nodes if translate.actor(node.get("author")) == author], more
 
     def proposal_list_by_author(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         author = _reading_author(payload.get("author"))
         limit = validate_limit(payload.get("limit"))
         page = validate_page(payload.get("page"))
-        nodes, more = self._pages(
-            api,
-            f"{self._repo(repo)}/pull-requests",
-            self._authored_params(author, "ALL"),
-            limit,
-            start=(page - 1) * limit,
-        )
-        proposals = [translate.authored(node) for node in nodes]
-        # The instance pages by position and gives no count of the query.
-        return {"proposals": proposals, "count": len(proposals), "truncated": more, "total": None}
+        own, more = self._authored(api, repo, author)
+        window = own[(page - 1) * limit : page * limit]
+        proposals = [translate.authored(node) for node in window]
+        # The instance gives no count of a query, and the rows past the
+        # ceiling were not read, so there is no total to give.
+        return {
+            "proposals": proposals,
+            "count": len(proposals),
+            "truncated": more or len(own) > page * limit,
+            "total": None,
+        }
 
     def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
-        # The instance gives no count of a query, so each state is counted by
-        # reading it, up to `MAX_CONVERSATION_SIZE` rows. A state past that is
-        # refused rather than counted short.
+        # Counted from the same read as the listing. A repository past the
+        # ceiling is refused rather than counted short.
         author = _reading_author(payload.get("author"))
-        tally: dict[str, Any] = {}
-        for neutral, state in TALLY_STATES.items():
-            rows, more = self._pages(
-                api,
-                f"{self._repo(repo)}/pull-requests",
-                self._authored_params(author, state),
-                MAX_CONVERSATION_SIZE,
+        own, more = self._authored(api, repo, author)
+        if more:
+            raise WorkspaceError(
+                f"Bitbucket Data Center holds more than {MAX_CONVERSATION_SIZE} pull requests in "
+                "this repository, and gives no count of one author's",
+                status=502,
+                code="FORGE_CALL_FAILED",
             )
-            if more:
-                raise WorkspaceError(
-                    f"Bitbucket Data Center holds more than {MAX_CONVERSATION_SIZE} {neutral} pull "
-                    "requests by this author, and gives no count of them",
-                    status=502,
-                    code="FORGE_CALL_FAILED",
-                )
-            tally[neutral] = len(rows)
-        return tally
+        states = [translate.authored(node)["state"] for node in own]
+        return {neutral: states.count(neutral) for neutral in ("open", "merged", "closed")}
 
     def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         # An approval and a "needs work" are rows of the activity stream,
@@ -664,9 +666,6 @@ class BitbucketDataCenterForge(Forge):
         declines = [row for row in rows if str(row.get("action") or "") == translate.DECLINED]
         return translate.closer(declines[0] if declines else None)
 
-
-#: The Bitbucket state each neutral count of `proposal_tally` reads.
-TALLY_STATES = {"open": "OPEN", "merged": "MERGED", "closed": "DECLINED"}
 
 #: A username a reading may ask about. It is a query parameter, not part of a
 #: query language, but it is held to one name with no space, colon or

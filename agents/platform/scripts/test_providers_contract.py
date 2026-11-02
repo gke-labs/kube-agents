@@ -132,6 +132,9 @@ REVIEW_STATES = frozenset({"approved", "changes_requested", "commented", "dismis
 RECORDED_TOTAL = 8
 # Forges whose listing gives no count of the query, so `total` is None.
 FORGES_WITHOUT_A_COUNT = frozenset({"bitbucket-datacenter"})
+# Forges whose author filter cannot find the install's account, so the forge
+# reads the repository's proposals and keeps the author's itself.
+FORGES_THAT_FILTER_THE_AUTHOR_HERE = frozenset({"bitbucket-datacenter"})
 RECORDED_TALLY = {"open": 2, "merged": 5, "closed": 1}
 RECORDED_CLOSER = {"actor": "example-maintainer", "bot": False}
 # The address the broker stamps the install's proxied commits with. No forge
@@ -659,10 +662,14 @@ class ContractTest(unittest.TestCase):
                 # Each recording holds one proposal in each state, so a forge
                 # that told merged from closed wrongly fails here.
                 self.assertEqual(PROPOSAL_STATES, {item["state"] for item in answer["proposals"]})
-                # Filtered at the forge, on the author the payload names.
+                # Filtered at the forge, on the author the payload names; a
+                # forge whose filter cannot find the author filters its one
+                # read itself.
                 self.assertEqual(1, len(api.calls))
                 method, _path, params, _body, _raw = api.calls[0]
                 self.assertEqual("GET", method)
+                if name in FORGES_THAT_FILTER_THE_AUTHOR_HERE:
+                    continue
                 wanted = {str(fixture["payload"]["author"]), str(fixture["payload"].get("authorId"))}
                 self.assertTrue(
                     any(token in str(value) for value in params.values() for token in wanted),
