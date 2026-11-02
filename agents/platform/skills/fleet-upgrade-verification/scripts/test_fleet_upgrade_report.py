@@ -18,6 +18,22 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_upgrade_report as report  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+
+# The report pages its JSON reads through `kubectl get --raw`; FakeReadinessCommands
+# below still answers the one-shot `kubectl get <kinds> -A -o json` by its resource
+# argument, and the adapter feeds the real paging from it
+# (test_collector_run.paged_dump_over). The test that asserts the paged argv
+# itself patches the real `paged_dump` back in.
+_PAGED_DUMP = patch.object(report, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 import credential_proxy_client  # noqa: E402 -- on sys.path through the reporter's SHARED_SCRIPT_DIRS
 import readiness_rules  # noqa: E402
 import upgrade_readiness as readiness  # noqa: E402
@@ -1685,13 +1701,16 @@ def node_line(node):
 
 
 # Literal resource lists and the literal node template, not the constants: a list that drops a
-# kind, or a template that moves, drops or renames a field, must fail here.
+# kind, or a template that moves, drops or renames a field, must fail here. The JSON reads
+# reach the fake in this one-shot shape through the paging adapter (always `-A`, since a
+# paged collection read is cluster-wide); the argv the report really issues, one
+# `kubectl get --raw` page per kind, is asserted by `test_the_json_reads_are_paged_raw_reads`.
 PDB_READ_CMD = ["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"]
 WEBHOOK_READ_CMD = ["kubectl", "get", "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces", "-A", "-o", "json"]
 NAMESPACED_READ_CMD = ["kubectl", "get", "daemonset,cronjob,pvc,networkpolicy,namespace", "-A", "-o", "json"]
 POD_READ_CMD = ["kubectl", "get", "pods", "-A", "-o", "json"]
 NODE_READ_CMD = ["kubectl", "get", "node", "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.spec.providerID}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.spec.podCIDR}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}']
-CLUSTER_READ_CMD = ["kubectl", "get", "storageclass,pv", "-o", "json"]
+CLUSTER_READ_CMD = ["kubectl", "get", "storageclass,pv", "-A", "-o", "json"]
 MEMBER_READS = [PDB_READ_CMD, WEBHOOK_READ_CMD, NAMESPACED_READ_CMD, POD_READ_CMD, NODE_READ_CMD, CLUSTER_READ_CMD]
 CUT_AT_CAP = "output was cut at the credential proxy's output cap"
 
@@ -1829,6 +1848,44 @@ class ReadinessTest(unittest.TestCase):
             data = json.load(f)
         return rc, stdout.getvalue(), data
 
+    def test_the_json_reads_are_paged_raw_reads(self):
+        """The real paging, not the adapter: every JSON read is one `kubectl get --raw`
+        collection read per kind with a page limit, a pods continue token is followed, the
+        node read keeps its jsonpath projection, and a page the shim cut (exit 74 with its
+        marker) is that read's error naming the cap."""
+        inner = FakeReadinessCommands(self.clusters, {}, objects_by_cluster={}, pods_by_cluster={})
+        raw = []
+
+        def fake(cmd, timeout=None, env=None):
+            if cmd[:3] == ["kubectl", "get", "--raw"]:
+                raw.append(cmd[3])
+                path, _, query = cmd[3].partition("?")
+                if path == "/api/v1/pods" and "continue=" not in query:
+                    return 0, json.dumps({"metadata": {"continue": "more"}, "items": [{"metadata": {"name": "p1", "namespace": "ns", "managedFields": [{}]}, "spec": {"nodeName": "n1"}}]}), ""
+                if path == "/api/v1/persistentvolumeclaims":
+                    return 74, '{"items": [{"metadata": {"name": "c', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n"
+                return 0, json.dumps({"metadata": {}, "items": []}), ""
+            if cmd[:2] == ["kubectl", "get"]:
+                self.assertEqual("node", cmd[2], f"a one-shot JSON read was issued: {cmd}")
+            return inner(cmd, timeout=timeout, env=env)
+
+        with patch.object(report, "paged_dump", _shared_run_tests.cr.paged_dump):
+            rc, _, data = self._run(fake)
+        self.assertIn("/apis/policy/v1/poddisruptionbudgets?limit=500", raw)
+        self.assertIn("/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations?limit=500", raw)
+        self.assertIn("/api/v1/pods?limit=500", raw)
+        self.assertIn("/api/v1/pods?limit=500&continue=more", raw)
+        self.assertIn("/apis/storage.k8s.io/v1/storageclasses?limit=500", raw)
+        self.assertFalse(any(p.startswith("/api/v1/nodes") for p in raw), raw)
+        self.assertTrue(any(c[:3] == ["kubectl", "get", "node"] for c in inner.calls))
+        self.assertTrue(data["members"])
+        for member in data["members"]:
+            errors = member["readiness"]["read_errors"]
+            self.assertIsNone(errors["pods"])
+            self.assertEqual(f"{report.paged_command_text(['daemonset', 'cronjob', 'pvc', 'networkpolicy', 'namespace'])} {CUT_AT_CAP}, so the list did not fit in one read", errors["pvc"])
+            self.assertEqual(errors["pvc"], errors["networkpolicy"])
+        self.assertEqual(0, rc)
+
     def test_without_readiness_no_credentials_or_kubectl_call_and_no_readiness_key(self):
         fake = FakeGcloud(self.clusters, {})  # raises on any command it does not know
         stdout = io.StringIO()
@@ -1942,7 +1999,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(by_name["seeded-a"]["webhook_read_error"].startswith(report.WEBHOOK_READ_SKIPPED))
         # The skipped read is reported as skipped, not failed: one error row, and a note that says why the webhooks are unread.
         self.assertEqual([e["cluster"] for e in data["errors"]], ["seeded-a"])
-        self.assertIn("- read failed for p1 (us-central1-a) cluster seeded-a: kubectl get pdb,deploy,statefulset -A -o json failed (1)", text)
+        self.assertIn(f"- read failed for p1 (us-central1-a) cluster seeded-a: {report.paged_command_text(['pdb', 'deploy', 'statefulset'])} failed (1)", text)
         self.assertEqual([l for l in text.splitlines() if l.startswith("- read failed") and "skipped" in l], [])
         self.assertIn("PDB read failed; PDBs not graded; webhook read skipped: the PDB read failed before the API server answered it (a connection, credential-plugin or certificate failure, or the credential proxy unreachable); webhooks not graded", by_name["seeded-a"]["note"])
         self.assertNotIn("webhook read failed", by_name["seeded-a"]["note"])
@@ -2089,7 +2146,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("webhook read failed; webhooks not graded", host["note"])
         row = next(l for l in text.splitlines() if l.startswith("| p1 | robot-host |") and "| blocked |" in l)
         self.assertIn("(2 replicas)) | read failed |", row)
-        self.assertIn("kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A -o json failed (1)", text)
+        self.assertIn(f"{report.paged_command_text(['validatingwebhookconfigurations', 'mutatingwebhookconfigurations', 'services', 'endpointslices', 'namespaces'])} failed (1)", text)
 
     def test_the_namespace_read_feeds_the_selector(self):
         # A dead Role gate that exempts kube-system and kube-public by a label the installer
@@ -2270,10 +2327,10 @@ class ReadinessTest(unittest.TestCase):
             self.assertIsNone(a["read_errors"]["node"])
             self.assertIsNone(a["read_errors"]["pv"])
             self.assertEqual([(u["rule"], u["can_block"]) for u in a["unknown"]], [("needs-netpol", True)])
-            self.assertIn("the networkpolicy read failed (kubectl get daemonset,cronjob,pvc,networkpolicy,namespace -A -o json failed (1)", a["unknown"][0]["reason"])
+            self.assertIn(f"the networkpolicy read failed ({report.paged_command_text(['daemonset', 'cronjob', 'pvc', 'networkpolicy', 'namespace'])} failed (1)", a["unknown"][0]["reason"])
             self.assertEqual(a["rules"]["needs-netpol"], {"entry": 0, "can_block": True, "blocking": 0, "risks": 0, "unknown": 1, "notes": 0})
             self.assertEqual(a["rules"]["needs-pods"]["notes"], 1)
-            self.assertIn("daemonset, cronjob, pvc, networkpolicy, namespace not read (kubectl get daemonset,cronjob,pvc,networkpolicy,namespace -A -o json failed (1)", a["note"])
+            self.assertIn("daemonset, cronjob, pvc, networkpolicy, namespace not read (kubectl get --raw '/apis/apps/v1/daemonsets?limit=500'", a["note"])
             self.assertIn("; the per-entry rules that need them say so", a["note"])
             self.assertEqual(data["errors"], [])
             self.assertNotIn("read failed for", text)
@@ -2283,7 +2340,7 @@ class ReadinessTest(unittest.TestCase):
             self.assertEqual(rc, report.EXIT_OK)
             a = data["members"][0]["readiness"]
             self.assertEqual([u["rule"] for u in a["unknown"]], ["needs-pods"])
-            self.assertIn("kubectl get pods -A -o json failed (1)", a["read_errors"]["pods"])
+            self.assertIn(f"{report.paged_command_text(['pods'])} failed (1)", a["read_errors"]["pods"])
             self.assertIsNone(a["read_errors"]["networkpolicy"])
             # The node and cluster-scoped reads refused: the pv rule cannot block, so its unknown
             # is reported and the node rule's is what makes the member unknown.
@@ -2321,12 +2378,12 @@ class ReadinessTest(unittest.TestCase):
             rc, text, data = self._run(fake)
             self.assertEqual(rc, report.EXIT_OK)
             a = data["members"][0]["readiness"]
-            self.assertEqual(a["read_errors"]["pods"], f"kubectl get pods -A -o json {CUT_AT_CAP}, so the list did not fit in one read")
+            self.assertEqual(a["read_errors"]["pods"], f"{report.paged_command_text(['pods'])} {CUT_AT_CAP}, so the list did not fit in one read")
             self.assertNotIn("unparsable", a["read_errors"]["pods"])
             self.assertEqual({k: v for k, v in a["read_errors"].items() if k != "pods"}, {kind: None for kind in readiness_rules.READ_KINDS if kind != "pods"})
             self.assertEqual([u["rule"] for u in a["unknown"]], ["needs-pods"])
             self.assertEqual(a["notes"], ["needs-netpol: saw 0 networkpolicy(s)", "needs-nodes: saw 3 node(s)"])
-            self.assertIn(f"pods not read (kubectl get pods -A -o json {CUT_AT_CAP}", a["note"])
+            self.assertIn(f"pods not read ({report.paged_command_text(['pods'])} {CUT_AT_CAP}", a["note"])
             self.assertEqual(data["errors"], [])
             # The node read cut on a line boundary: the lines before the cut parse, and the read is
             # still recorded as cut rather than as a short list.

@@ -109,6 +109,14 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+
+# The JSON reads page through `kubectl get --raw`, one kind at a time
+# (collector_run.paged_dump), so a list the credential proxy would cut at its
+# output cap in one `-A -o json` read comes back whole in pages; the node read
+# keeps its jsonpath projection.
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -327,9 +335,7 @@ KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconf
 # code. The kinds are readiness_rules.READ_KINDS, named once for the rules and the report; a
 # failed command marks every kind it carried, including a partial listing.
 # KUBECTL_READS_PER_MEMBER, derived from the table, is the count the help cites.
-ALL_NAMESPACES_FLAG = "-A"
 OUTPUT_FLAG = "-o"
-JSON_OUTPUT_ARGS = (OUTPUT_FLAG, "json")
 READ_MODE_NAMESPACED_JSON = "namespaced-json"
 READ_MODE_CLUSTER_JSON = "cluster-json"
 READ_MODE_NODE_JSONPATH = "node-jsonpath"
@@ -941,23 +947,28 @@ def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
     ]
 
 
-def _kubectl_get(resources: str, env: dict, namespaced: bool) -> tuple[list | None, str | None]:
-    """(items, error) of one `kubectl get <resources> [-A] -o json`; a list the credential
-    proxy cut at its output cap is an error naming the cap."""
-    cmd = [KUBECTL, "get", resources, *([ALL_NAMESPACES_FLAG] if namespaced else []), *JSON_OUTPUT_ARGS]
-    rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
-    if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
-    if PROXY_TRUNCATION_MARKER in stderr:
-        return None, KUBECTL_OUTPUT_CUT.format(cmd=" ".join(cmd))
-    try:
-        data = json.loads(stdout) if stdout.strip() else {}
-    except ValueError as e:
-        return None, f"{' '.join(cmd)} returned unparsable JSON: {e}"
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return None, f"{' '.join(cmd)} returned no items list"
-    return items, None
+def _paged_run(argv: list[str], *, env: dict | None = None) -> collector_run.Run:
+    """`run_cmd` in the shape the paged reader drives: one page's argv in, its `Run` out."""
+    rc, stdout, stderr = run_cmd(argv, KUBECTL_TIMEOUT_SECONDS, env)
+    return collector_run.Run(argv, rc, stdout, stderr, 0.0)
+
+
+def _kubectl_get(resources: str, env: dict) -> tuple[list | None, str | None]:
+    """(items, error) of one read of `resources` (a kubectl kind list), one kind at a time in
+    pages through `kubectl get --raw`; the read is named by each kind's first page. A page the
+    credential proxy cut at its output cap is an error naming the cap, as a cut list was."""
+    kinds = resources.split(",")
+    text = paged_command_text(kinds)
+    parsed, result = paged_dump(kinds, run=_paged_run, env=env)
+    if parsed is not None:
+        return parsed.get("items") or [], None
+    if PROXY_TRUNCATION_MARKER in result.stderr:
+        return None, KUBECTL_OUTPUT_CUT.format(cmd=text)
+    if result.rc != 0:
+        return None, f"{text} failed ({result.rc}): {result.stderr.strip()}"
+    if result.stderr.strip():
+        return None, f"{text} returned no items list: {result.stderr.strip()}"
+    return None, f"{text} returned unparsable JSON"
 
 
 def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
@@ -1109,7 +1120,7 @@ def _later_read(resources: str, mode: str, env: dict) -> tuple[list | None, str 
     """One read of LATER_READS, by its mode."""
     if mode == READ_MODE_NODE_JSONPATH:
         return _kubectl_nodes(env)
-    return _kubectl_get(resources, env, mode == READ_MODE_NAMESPACED_JSON)
+    return _kubectl_get(resources, env)
 
 
 def first_read_failed_before_the_server_answered(error: str) -> bool:
@@ -1163,12 +1174,12 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     if rc != 0:
         read["error"] = read["webhook_error"] = read["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
         return _later_reads_skipped(read, readiness_rules.NO_READ_RAN_REASON)
-    read["items"], read["error"] = _kubectl_get(KUBECTL_RESOURCES, env, True)
+    read["items"], read["error"] = _kubectl_get(KUBECTL_RESOURCES, env)
     if read["error"] is not None and first_read_failed_before_the_server_answered(read["error"]):
         read["webhook_skipped"] = True
         read["webhook_error"] = f"{WEBHOOK_READ_SKIPPED} ({read['error']})"
         return _later_reads_skipped(read, readiness_rules.LATER_READS_SKIPPED_REASON)
-    read["webhook_items"], read["webhook_error"] = _kubectl_get(KUBECTL_WEBHOOK_RESOURCES, env, True)
+    read["webhook_items"], read["webhook_error"] = _kubectl_get(KUBECTL_WEBHOOK_RESOURCES, env)
     if read["error"] is not None:
         return _later_reads_skipped(read, readiness_rules.LATER_READS_SKIPPED_REASON)
     for kinds, resources, mode in LATER_READS:
