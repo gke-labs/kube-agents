@@ -20,8 +20,10 @@ one being added; this check does. Three rules:
 * ``unresolved-kinds``: the same flags with a kinds token the check cannot
   read (a parameter, an f-string, a shell expansion, an SOP's ``<kind>``
   placeholder), so it cannot show the read is one kind; or an ``-o`` whose
-  value it cannot read, so it cannot show the read is a projection. No flag
-  on the line clears it.
+  value it cannot read, or a token it cannot read after the kinds of a
+  ``kubectl``-led argv that names no ``-o`` (the token may be the ``-o
+  json``), so it cannot show the read is a projection. No flag on the line
+  clears it.
 
 ``--chunk-size`` pages the requests kubectl makes and not the reply it
 prints, so it bounds nothing the credential proxy sees; it passes the
@@ -42,7 +44,9 @@ What is read, under ``agents/`` with the mirrored ``gke-*`` skills skipped
   string and sequence constants, a starred name or literal splices its
   elements, a starred conditional splices both branches, a starred call or
   an unreadable side of a ``+`` splices one unknown token (a helper's prefix,
-  stepped over as ``kubectl`` would be), an f-string resolves to its constant
+  stepped over as ``kubectl`` would be; after the kinds of a ``kubectl``-led
+  ``-A`` read with no ``-o``, a token that may be the ``-o json``, so the read
+  is ``unresolved-kinds``), an f-string resolves to its constant
   text with each ``{name}`` replaced by the module constant or loop element
   it names and ``{}`` where a value cannot be read, and ``for`` loops over
   literal sequences judge their body once per combination of their elements.
@@ -432,6 +436,10 @@ def judge(tokens: list[Token], python_argv: bool) -> str | None:
     # and anything after it is the value of a flag this check does not know.
     kinds = positionals[0]
     output_unread = output_named and (output is None or output.startswith(UNREAD_OUTPUT_MARKS))
+    # A `kubectl`-led list that names no `-o` is a table only when every token
+    # after the kinds is read: one the check cannot read (a spliced call, an
+    # unreadable side of a `+`) may be the `-o json`.
+    output_unread = output_unread or (not output_named and not helper_argv and None in positionals[1:])
     full_object = output in FULL_OBJECT_FORMATS if output_named else helper_argv
     if not full_object and not output_unread:
         return None

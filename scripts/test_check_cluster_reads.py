@@ -238,6 +238,20 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(judge(shell_tokens("kubectl --context <ctx> get pods,svc -A -o json"), python_argv=False), RULE_MULTI_KIND)
 
 
+    def test_an_unreadable_token_after_the_kinds_of_a_kubectl_led_read_is_unresolved(self):
+        # `["kubectl", "get", "pods", "-A", *list(JSON_OUTPUT_ARGS)]`: the token the check
+        # cannot read may be the `-o json`, so the argv is not shown to be a table.
+        self.assertEqual(judge(["kubectl", "get", "pods", "-A", None], python_argv=True), RULE_UNRESOLVED)
+        self.assertEqual(judge(["kubectl", "get", "pods", "-A", None, None], python_argv=True), RULE_UNRESOLVED)
+        # A named projection, a namespaced read, and a flag's unread value are still read as written.
+        self.assertIsNone(judge(["kubectl", "get", "pods", "-A", "-o", "jsonpath={.items}", None], python_argv=True))
+        self.assertIsNone(judge(["kubectl", "get", "pods", "-n", "x", None], python_argv=True))
+        self.assertIsNone(judge(["kubectl", "get", "pods", "-A", "-l", None], python_argv=True))
+        # A helper argv is full-object already; a shell line has no token the check cannot read.
+        self.assertEqual(judge(["get", "pods", "-A", None], python_argv=True), RULE_UNPAGED)
+        self.assertIsNone(judge(_tokens("kubectl get pods -A extra"), python_argv=False))
+
+
 class PythonReadingTest(unittest.TestCase):
     """Argv literals through ast, with the module's constants resolved."""
 
@@ -349,6 +363,7 @@ class PythonReadingTest(unittest.TestCase):
             [(f.line, f.rule, f.text) for f in found],
             [
                 (7, RULE_MULTI_KIND, "kubectl get pods,svc -A -o json"),
+                (8, RULE_UNRESOLVED, "kubectl get pods -A {}"),
                 (9, RULE_MULTI_KIND, "{} get pods,svc -A -o json"),
             ],
         )
