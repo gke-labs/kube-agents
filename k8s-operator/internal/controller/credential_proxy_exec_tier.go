@@ -128,12 +128,24 @@ func ValidateCredentialProxyExec(agent *agentv1alpha1.PlatformAgent, path *field
 		agent.Name, len(agent.Name), credentialProxyExecTierMaxAgentName, credentialProxyExecTierSuffix))}
 }
 
-func credentialProxyExecTierResources() corev1.ResourceRequirements {
-	list := corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse(credentialProxyExecTierCPU),
-		corev1.ResourceMemory: resource.MustParse(credentialProxyExecTierMemory),
+// credentialProxyExecTierResources is the broker container's resources with
+// cpu and memory fixed at the tier's figures on both sides. The broker's other
+// keys stay, ephemeral-storage among them: the tier's emptyDirs are the
+// broker's, and a namespace quota on ephemeral-storage refuses a pod that
+// declares none.
+func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1.ResourceRequirements {
+	out := corev1.ResourceRequirements{Requests: corev1.ResourceList{}, Limits: corev1.ResourceList{}}
+	for name, q := range broker.Requests {
+		out.Requests[name] = q.DeepCopy()
 	}
-	return corev1.ResourceRequirements{Requests: list, Limits: list.DeepCopy()}
+	for name, q := range broker.Limits {
+		out.Limits[name] = q.DeepCopy()
+	}
+	for _, list := range []corev1.ResourceList{out.Requests, out.Limits} {
+		list[corev1.ResourceCPU] = resource.MustParse(credentialProxyExecTierCPU)
+		list[corev1.ResourceMemory] = resource.MustParse(credentialProxyExecTierMemory)
+	}
+	return out
 }
 
 // buildCredentialProxyExecTierDeployment derives the tier's Deployment from the
@@ -149,7 +161,7 @@ func credentialProxyExecTierResources() corev1.ResourceRequirements {
 //     broker for the gap);
 //   - CREDENTIAL_PROXY_ROLE=exec, and the replica count mounted from the
 //     ConfigMap;
-//   - fixed resources;
+//   - cpu and memory fixed at the tier's figures (other keys as the broker's);
 //   - no Secret: no Secret-backed volume (forge credentials and CA bundles
 //     included) and no env read from one (chat, Teams and plugin credentials),
 //     dropped by source rather than by name so a Secret the broker gains later
@@ -241,7 +253,7 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 		c.VolumeMounts = append(mounts, corev1.VolumeMount{
 			Name: credentialProxyExecTierReplicasVolume, MountPath: credentialProxyExecTierReplicasMountPath, ReadOnly: true,
 		})
-		c.Resources = credentialProxyExecTierResources()
+		c.Resources = credentialProxyExecTierResources(c.Resources)
 	}
 	return dep
 }

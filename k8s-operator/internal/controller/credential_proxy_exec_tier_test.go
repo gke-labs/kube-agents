@@ -284,6 +284,11 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 	if !c.Resources.Requests.Memory().Equal(wantMem) || !c.Resources.Limits.Memory().Equal(wantMem) {
 		t.Errorf("memory %v/%v, want 2Gi/2Gi", c.Resources.Requests.Memory(), c.Resources.Limits.Memory())
 	}
+	// Ephemeral storage stays the broker's: a namespace quota on it refuses a
+	// pod that declares none.
+	if !c.Resources.Limits.StorageEphemeral().Equal(*bc.Resources.Limits.StorageEphemeral()) || c.Resources.Limits.StorageEphemeral().IsZero() {
+		t.Errorf("ephemeral-storage limit %v, want the broker's %v", c.Resources.Limits.StorageEphemeral(), bc.Resources.Limits.StorageEphemeral())
+	}
 	if broker.Spec.Template.Labels["kubeagents.x-k8s.io/has-credential-proxy"] != "true" || len(bc.EnvFrom) == 0 {
 		t.Error("deriving the exec tier changed the broker's Deployment")
 	}
