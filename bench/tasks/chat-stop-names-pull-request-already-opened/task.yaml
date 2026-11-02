@@ -24,8 +24,11 @@
 # ("already opened a pull request: [#N](<url>)").
 #
 # The pull request is the case's subject, so it writes one to the GitOps
-# repository: the pull_request_opened leaf requests it, and the lane allows the
-# one write. hack/ci-eval-pr.sh runs a stopped ask in the second phase, one
+# repository. No check reads GitHub for it: the answer's link is the evidence,
+# since the gateway links only a pull request session-kv read off a
+# forge-verified pr_opened event, so the case grades with no GitHub token.
+# hack/eval/inject-lane-safeguards.yaml's `requesting:` allows the lane's one
+# write, and hack/ci-eval-pr.sh runs a stopped ask in the second phase, one
 # unit at a time.
 #
 # Planted defect required: the no-pdb-workload fixture's two-replica
@@ -66,14 +69,10 @@ verification_spec:
       type: tool_called
       tool_names: ["harness_stop_sent"]
       require_success: true
-  - name: the-card-opened-the-pull-request
-    role: objective
-    mode: assert
-    check:
-      type: pull_request_opened
-      owner: gke-agentic
   # The gateway's answer to the stop names an opened pull request by its
-  # number, as a link. Matched with re.search over the recorded answer.
+  # number, as a link, which it does only for a pull request the card's
+  # pr_opened event recorded after the forge confirmed it. Matched with
+  # re.search over the recorded answer.
   - name: the-stop-answer-names-the-pull-request
     role: objective
     mode: assert

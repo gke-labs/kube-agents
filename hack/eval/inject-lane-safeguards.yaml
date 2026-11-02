@@ -80,6 +80,10 @@
 # requests by design than its checks grade: its count is the total, and it
 # stays.
 requesting:
+  # Its card opens the pull request the stop's answer has to name (#4061). No
+  # check reads GitHub for it: the answer's link, which the gateway gives only
+  # a forge-verified pull request, is the evidence.
+  chat-stop-names-pull-request-already-opened: 1
   # Opens a pull request and closes it to spend the branch name, then opens
   # the second one its check grades; the reply names both.
   vcs-spent-branch-reuse: 2

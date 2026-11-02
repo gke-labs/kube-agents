@@ -813,8 +813,8 @@ INJECT_LANE_SAFEGUARDS = [
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
     # chat-stop-names-pull-request-already-opened (#4061): the card opens the
-    # pull request the stop's answer has to name; its pull_request_opened leaf
-    # allows one.
+    # pull request the stop's answer has to name; listed in `requesting:`,
+    # since no check of its reads GitHub.
     "chat-stop-names-pull-request-already-opened",
     "cluster-agent-crashloop-fix-request",
     # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
