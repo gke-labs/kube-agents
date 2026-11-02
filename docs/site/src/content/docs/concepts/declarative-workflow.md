@@ -119,13 +119,17 @@ The compliance collector always reads Config Connector, because its own check ne
 
 An object of the file matches when it has the same kind and `metadata.name`, the same `metadata.namespace` when the file sets one, and the same `clusterRef` when the file and the object both set one. When the object's `spec.location` is known, it must be the file's `spec.location` or, for a cluster or a node pool, the location of the finding's cluster.
 
-Only the finding's own object in the file counts, also when the file declares one Config Connector object. A finding has its own Config Connector object only when its kind is a Config Connector kind, a node pool or a cluster. So a fix to a `Deployment` gets no paragraph for an `IAMServiceAccount` in the same file, whatever its name. A file with no object of the finding gets no paragraph. When the file of a `manifest` fix declares one of those objects, the fix gets a last paragraph like this:
+Only the finding's own object in the file counts, also when the file declares one Config Connector object. A finding has its own Config Connector object only when its kind is a Config Connector kind, a node pool or a cluster. So a fix to a `Deployment` gets no paragraph for an `IAMServiceAccount` in the same file, whatever its name. When the file of a `manifest` fix declares one of those objects, the fix gets a last paragraph like this:
 
 ```text
 **Config Connector is not applying this file.** When the audit ran, Config Connector reported `Ready=False` on `ContainerCluster infra/prod-usc1` (`DependencyNotReady: reference PubSubTopic infra/fleet-events is not ready`), which waits on `PubSubTopic infra/fleet-events` (`UpdateFailed: …`). The cloud resource does not change after the merge until Config Connector applies the object again. If the reason rejects the change in this file, correct the declaration. Otherwise the change takes effect when Config Connector applies the object again, and this finding comes back on each run until then.
 ```
 
-The fix stays a `manifest` fix, and it can still open a pull request, which carries the same paragraph. The paragraph does not say that the change is correct: the reason can reject the change itself, for example a node pool change that sets both `max_node_count` and `total_max_node_count`.
+The fix stays a `manifest` fix, and it can still open a pull request, which carries the same paragraph.
+
+The paragraph goes on any fix whose finding's own object Config Connector does not apply. This includes a `manual` fix, a `gcloud` fix (after its command), a fix that fell back to `manual` because the worker did not write its file, and a `manifest` fix to another file.
+
+For those fixes, the audit looks for the object's declaration in the GitOps repository. When exactly one file declares it, the paragraph starts with the same sentence and names that file ("The declaration is `clusters/prod/provisioning/gpu-pool.yaml`."). When no file or more than one declares it, the paragraph starts "**Config Connector is not applying the declaration of this object.**" and says so. The paragraph does not say that the change is correct: the reason can reject the change itself, for example a node pool change that sets both `max_node_count` and `total_max_node_count`.
 
 A `DependencyNotReady` reason names the object it waits on. When that object is also not ready on the same cluster, the paragraph names the deepest unready object in the chain, which is the root cause, and counts the ones between. When the audit did not read the kind of the object it waits on, the paragraph names that object and says that its state was not read. The paragraph names at most two objects in the file and counts the rest. When the fix's text and the paragraph are together longer than the [note cap of 2,000 characters](#where-a-manual-fix-belongs), the fix's text is cut and ends with `…(truncated)`, or is dropped; the paragraph is never cut.
 
@@ -137,7 +141,7 @@ A ready object is not in the list. So when more than one swept cluster can run C
 
 An object with no project does not match the finding's own cluster when the audit swept a cluster of the same name in another project. The finding's own object must also be in a namespace that the file sets, when it sets one. A fix whose file declares no Config Connector object never gets the paragraph.
 
-When the audit cannot read a cluster (the read times out, is refused, or has no time left before the collector must stop), no paragraph names an object on that cluster. The `finish` log then has a warning that names the cluster. A fix with no paragraph does not prove that Config Connector applies its file. The read needs no setting: on a cluster that does not run Config Connector, the cluster serves no Config Connector kind and is skipped. The identity the collectors use must be able to list the Config Connector objects on that cluster; [Security and IAM](/kube-agents/reference/security-and-iam/#roles-per-set) says which roles give it.
+When the audit cannot read a cluster (the read times out, is refused, or has no time left before the collector must stop), no paragraph names an object on that cluster. The `finish` log then has a warning that names the cluster. A fix with no paragraph does not prove that Config Connector applies its file. The read needs no install setting: on a cluster that does not run Config Connector, the cluster serves no Config Connector kind and is skipped. The identity the collectors use must be able to list the Config Connector objects on that cluster; [Security and IAM](/kube-agents/reference/security-and-iam/#roles-per-set) says which roles give it.
 
 ### Tier 2 — remediation pull requests
 

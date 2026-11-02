@@ -104,7 +104,7 @@ is `started_at`: `finish` reads it only to give the `collect_s` timer, and no de
 | `clusters[].checks_unevaluated[]`          | **read**         | `{check, reason}` for a check whose own read failed or whose inputs could not decide it on this target, so it neither ran nor was found inapplicable. The document may list it in neither `checks_run` nor `checks_not_applicable`, and must carry `limitations` on that target, which makes the run partial.                                                                                                                                                                              |
 | `clusters[].clusters_listed`               | **read**         | `0` on a `project/<id>` entry whose `clusters list` completed and came back empty, or was refused by that project's own disabled Kubernetes Engine API. Copied verbatim onto that `scope.clusters` entry, it lifts the gap for enumerating no cluster (§5); absent on a failed, zone-incomplete or unreached list.                                                                                                                                                                         |
 | `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is read only by the `major` sweep (§3.4); the stream's SOP says if the model copies it or re-judges it from fleet context.                                                                                                       |
-| `clusters[].kcc_unready`, `.kcc_unread`    | **read**         | Config Connector on that cluster: `kcc_unready` lists the objects it does not apply, and `kcc_unread` says why the read gave no answer (unknown, never healthy). The paragraph below the table has the rules.                                                                                                                                                                                                                                                                              |
+| `clusters[].kcc_unready`, `.kcc_unread`    | **read**         | Config Connector on that cluster: `kcc_unready` lists the objects it does not apply, `kcc_unread` says why the read gave no answer (unknown, never healthy), and `kcc_kinds_read` names the kinds a partial read listed. `cluster_status` (read) skips a cluster that is not running; `config_connector_addon` (carried) orders the reads. The paragraph below the table has the rules.                                                                                                    |
 | `clusters[].candidates[]` route fields     | **read**         | `declaration`, `release_declaration`, `namespace_directory` and `reconciler`, each optional. `finish` reads them for the route notes on a `manual` remediation (the issue-ledger design, §6). An absent field is no claim.                                                                                                                                                                                                                                                                 |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                                                                                                                           |
 | `finished_at`                              | **read**         | When the collector stopped. Compared against the run's `started_at`, which the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.                                                                                                |
@@ -174,9 +174,9 @@ readiness and stockout, neither container kind.
 entry carries either key, each cluster entry that the collector never read
 (`unreachable` or `gate-failed`) unless its `cluster_status` says it is not running. With more than
 one, `finish` names an object only when its `project` is known and agrees with the fix. With one, a
-known `project` that differs from the fix's is still no match. `finish` adds a note to a `manifest`
-fix whose file declares the finding's own object, and states the stall on a merged fix that still
-reproduces (the issue-ledger design, §6).
+known `project` that differs from the fix's is still no match. `finish` adds a paragraph to any fix
+whose finding's own object is not ready, and states the stall on a merged fix that still reproduces
+(the issue-ledger design, §6).
 
 Rules for a collector: every enumerated target appears with an `outcome`; a gate failure (zero-byte
 or truncated read) is `outcome: "gate-failed"`, never a shorter candidate list; a candidate is
@@ -207,6 +207,9 @@ Registry repository, and stockout's reservation and quota — which reads `<Kind
 `started_at` is a validation error, exit 2) and applies the following before
 anything is rendered or published. Every rule is scoped to what the manifest covers: a target the
 manifest never enumerated is governed by the ledger design's ordinary roster rules and nothing here.
+
+The `kcc_unready` and `kcc_unread` keys give the Config Connector paragraph, which the issue-ledger
+design §6 ([`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md)) describes.
 
 ### 3.1 Cross-check — `cross_check_manifest`
 

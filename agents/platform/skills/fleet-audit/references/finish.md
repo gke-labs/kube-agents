@@ -47,9 +47,11 @@ slug anywhere else.
 The compliance collector, and the drift, patch readiness and stockout collectors with
 `--config-connector`, also give a cluster that runs Config Connector `kcc_unready`, the Config
 Connector objects there whose `Ready` condition is `False`, or `kcc_unread` on a cluster whose read
-failed, with the reason. You copy neither into the document. `finish` reads them: a `manifest` fix
-whose file declares the finding's own object among them gets a last paragraph that starts "**Config
-Connector is not applying this file.**", and the fix stays `manifest`. Do not write that paragraph
+failed, with the reason. You copy neither into the document. `finish` reads them: any fix whose
+finding's own object is among them gets a last paragraph that starts "**Config Connector is not
+applying this file.**" (it names the declaring file when the fix is not a manifest fix of it) or, when
+`finish` finds no single declaration, "**Config Connector is not applying the declaration of this
+object.**". The fix keeps its kind. Do not write either paragraph
 yourself, and do not copy it from an earlier ledger: `finish` removes it and writes it again from
 this run's manifest.
 

@@ -795,8 +795,8 @@ remediation's `uncut_note`, and the carry of an unchanged finding puts that note
 does not stay on a later run that has room. The dry run can leave out notes the real run adds, because it reads no
 pull request and no `--decline-fix`, and so skips every fix the refusal would list.
 
-In the same place, `finish` adds a note to each `manifest` fix whose file declares an object that
-Config Connector does not apply. A merged fix of that kind changes nothing on the cloud resource: on
+In the same place, `finish` adds a note to each fix whose finding's own object Config Connector
+does not apply, whatever the fix's kind. A merged fix of that kind changes nothing on the cloud resource: on
 2026-09-05 one `PubSubTopic` failed with `UpdateFailed` on an IAM role and put fifteen
 `ContainerCluster`s into `DependencyNotReady`, and every manifest fix against them would have merged
 into a controller that applied nothing.
@@ -851,6 +851,18 @@ ones between. When the host's read did not list the referenced object's kind (th
 readiness and stockout collectors read only `ContainerCluster` and `ContainerNodePool`), the note
 names that object and says that its state was not read. It names at most two objects in the file and
 counts the rest.
+
+A `manifest` fix whose file declares the object gets the paragraph above. Any other fix (`manual`,
+`gcloud`, a fix degraded to `manual` because the worker did not write its file, or a `manifest` fix
+to another file) gets a paragraph that names the object's declaration. `finish` looks it up in the
+Config Connector declaration index the `gcloud` check reads: the clone, or
+`kcc_declarations_via_broker` in content mode, which also runs when the manifest records a stall.
+When exactly one file declares the object, the paragraph keeps the first sentence "**Config
+Connector is not applying this file.**" and names that file. When none or more than one does, it
+starts "**Config Connector is not applying the declaration of this object.**" and says so. The index
+keeps each other file that declares the same object (`KccDeclaration.also`), so two files read as
+ambiguous. A `gcloud` fix's note is its command, so its paragraph goes in `kcc_stalled_paragraph`
+and renders after the command block. The strip-and-rewrite pattern covers both first sentences.
 
 The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
 anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say
