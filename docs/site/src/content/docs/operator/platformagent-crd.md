@@ -1340,8 +1340,9 @@ so no project id, region or account id is written; every other name is kept as t
 organisation prefix such as `meta-llama/` included.
 
 The pair is written whole or not at all. Both fields are absent when the namespace has no LiteLLM
-config, or when the default model has no provider or no name; a `model-default` entry with a
-malformed model does not fall back to another entry. A read that fails keeps the last pair. The
+config, when the `litellm` Deployment mounts none, or when the default model has no provider or no
+name. A Deployment that mounts none leaves any remaining `litellm-config*` ConfigMaps unread, and a
+`model-default` entry with a malformed model does not fall back to another entry. A read that fails keeps the last pair. The
 Ready status update writes the block, and a change to the ConfigMap or to the `litellm`
 Deployment's pod template re-reads it within a reconcile.
 
