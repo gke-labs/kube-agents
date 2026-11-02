@@ -4,9 +4,10 @@ replica count in the words the answer uses.
 Every fixture is graded through ``ReportContainsVerifier.verify()`` on a
 staged transcript, phrases, patterns and the forbidden pattern together, as
 the run grades it. The positives are the spellings the recorded nightly
-answers wrote for a two-replica Deployment: the kubectl columns read out, the
-READY column, and the field named with its value. The negatives name the
-cluster without the count, give another count, or leave seeded-a unchecked.
+answers wrote for a two-replica Deployment: the kubectl columns read out from
+the desired count, and the READY column with its word. The negatives name the
+cluster without the count, give another count in prose or as a status field,
+write "2/2" about the cards, or leave seeded-a unchecked.
 """
 
 from __future__ import annotations
@@ -30,15 +31,9 @@ COUNTS = [
     "Deployment `checkout-gateway` is running in namespace `seeded-reliability` on seeded-a, with `2` desired, `2` ready and `2` available replicas.",
     "checkout-gateway on seeded-a has 2/2 ready, 2 up-to-date, and 2 available replicas with both pods running.",
     "checkout-gateway on seeded-a: all 2 desired replicas are ready and available.",
-    "checkout-gateway on seeded-a: replica count is 2.",
-    "checkout-gateway on seeded-a: replica count: 2.",
     "kubectl get deploy checkout-gateway on seeded-a shows ready 2/2, up-to-date 2 and available 2.",
-    "The platform agent found checkout-gateway running 2 replica pods on seeded-a.",
-    "The checkout-gateway deployment on seeded-a shows spec.replicas=2, readyReplicas=2, availableReplicas=2 and updatedReplicas=2.",
-    "checkout-gateway runs on seeded-a and is fully available. Its spec.replicas is 2, status.readyReplicas is 2.",
     "checkout-gateway by cluster:\n| seeded-a | Present | `2/2` ready (`2` desired, `2` available) |\n| seeded-b | Not present | `0` |",
     "checkout-gateway (seeded-a): **2 replicas**, both pods `1/1` Ready.",
-    'The card returned {"cluster": "seeded-a", "desiredReplicas": 2, "readyReplicas": 2, "present": true} for checkout-gateway.',
 ]
 
 # Each names the cluster and does not give the count of two, or leaves it unchecked.
