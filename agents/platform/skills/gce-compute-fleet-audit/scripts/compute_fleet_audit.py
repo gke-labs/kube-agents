@@ -106,6 +106,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
@@ -1201,7 +1202,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 f"{slug}: {' '.join(argv)} returned "
                 f"{type(parsed).__name__}, not a JSON array"
             )
-        reads.setdefault(slug, SlugReads()).add(" ".join(argv), result)
+        reads.setdefault(slug, SlugReads()).add(shlex.join(argv), result)
         return parsed
 
     try:
@@ -1227,7 +1228,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         ]
         info_parsed, info_result = run_and_gate(info_argv, run=run)
         if isinstance(info_parsed, dict):
-            reads.setdefault(STARTUP_SLUG, SlugReads()).add(" ".join(info_argv), info_result)
+            reads.setdefault(STARTUP_SLUG, SlugReads()).add(shlex.join(info_argv), info_result)
         project_wide = (
             True
             if not isinstance(info_parsed, dict)
@@ -1250,9 +1251,9 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 unread.append(f"{instance_name} ({zone})")
                 continue
             hit = check_startup_script(instance_name, zone, result.stdout)
-            reads.setdefault(STARTUP_SLUG, SlugReads()).add(" ".join(argv), result)
+            reads.setdefault(STARTUP_SLUG, SlugReads()).add(shlex.join(argv), result)
             if hit:
-                candidates.append(_emit(STARTUP_SLUG, hit, " ".join(argv)))
+                candidates.append(_emit(STARTUP_SLUG, hit, shlex.join(argv)))
 
         if not instances:
             not_applicable.append(
@@ -1351,13 +1352,13 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 if not isinstance(parsed, list):
                     unmeasured.append(f"{group_name} ({_scope_of(group)})")
                     continue
-                reads.setdefault(SOLE_TENANT_SLUG, SlugReads()).add(" ".join(nodes_argv), result)
+                reads.setdefault(SOLE_TENANT_SLUG, SlugReads()).add(shlex.join(nodes_argv), result)
                 hit, measured = check_sole_tenant_headroom(group, parsed)
                 measured_any = measured_any or measured
                 if not measured:
                     unmeasured.append(f"{group_name} ({_scope_of(group)})")
                 if hit:
-                    candidates.append(_emit(SOLE_TENANT_SLUG, hit, " ".join(nodes_argv)))
+                    candidates.append(_emit(SOLE_TENANT_SLUG, hit, shlex.join(nodes_argv)))
             if not measured_any:
                 unevaluated.append(
                     {

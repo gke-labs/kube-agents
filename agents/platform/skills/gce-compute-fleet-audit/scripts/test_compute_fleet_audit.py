@@ -8,6 +8,7 @@ import importlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import unittest
@@ -1037,12 +1038,15 @@ class CollectProjectTest(unittest.TestCase):
     def test_the_recorded_command_is_the_argv_that_ran(self):
         """The pre-manifest revision recorded `--project=<id>` while running
         `--project <id>`, and recorded the project-wide enumeration for a
-        finding produced by a per-instance read."""
+        finding produced by a per-instance read. Each part of the recorded
+        line is one argv that ran, quoted so a shell reads it back as the same
+        argv: the list reads' `--format=json(...)` projections carry `(`, `)`
+        and `[]`, which bash refuses unquoted."""
         seen = []
 
         def run(argv, **kwargs):
+            seen.append(list(argv))
             joined = " ".join(argv)
-            seen.append(joined)
             if "instances list" in joined:
                 return run_of(0, one_running_instance())
             if "get-serial-port-output" in joined:
@@ -1050,9 +1054,17 @@ class CollectProjectTest(unittest.TestCase):
             return run_of(0, "[]")
 
         entry = cf.collect_project("proj-1", run=run)
+        self.assertTrue(entry["commands"])
         for record in entry["commands"]:
             for part in record["command"].split(" && "):
-                self.assertIn(part.strip(), seen)
+                self.assertIn(shlex.split(part.strip()), seen, part)
+            self.assertIn("'--format=json(", record["command"])
+            # The symptom itself: bash parses the whole recorded line.
+            proc = subprocess.run(["bash", "-n", "-c", record["command"]], capture_output=True, text=True)
+            self.assertEqual(0, proc.returncode, (record["command"], proc.stderr))
+        for candidate in entry["candidates"]:
+            if candidate.get("command"):
+                self.assertIn(shlex.split(candidate["command"]), seen, candidate["command"])
 
     def test_the_serial_read_names_port_one(self):
         """§2.1's command and its evidence example both spell `--port=1`, and
@@ -1250,7 +1262,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             "object": candidate["object"],
             "impact": candidate["impact"],
             "evidence": {
-                "command": f"gcloud compute instances list --project proj-1 {cf.INSTANCES_FORMAT}",
+                "command": f"gcloud compute instances list --project proj-1 {shlex.quote(cf.INSTANCES_FORMAT)}",
                 "excerpt": candidate["excerpt"],
             },
             "recommendation": {
@@ -1344,7 +1356,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         data["scope"]["clusters"][0]["checks_run"].append(
             {
                 "check": "sole-tenant-headroom",
-                "command": f"gcloud compute sole-tenancy node-groups list --project proj-1 {cf.NODE_GROUPS_FORMAT}",
+                "command": f"gcloud compute sole-tenancy node-groups list --project proj-1 {shlex.quote(cf.NODE_GROUPS_FORMAT)}",
             }
         )
         with self.assertRaises(audit_report.ValidationError) as caught:
@@ -1425,7 +1437,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                         "checks_run": [
                             {
                                 "check": "gce-startup-script-status",
-                                "command": f"gcloud compute instances list --project proj-1 {cf.INSTANCES_FORMAT}",
+                                "command": f"gcloud compute instances list --project proj-1 {shlex.quote(cf.INSTANCES_FORMAT)}",
                             }
                         ],
                     }
