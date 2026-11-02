@@ -118,7 +118,12 @@ readonly GHES_READY_PATH="/api/v3/meta"
 # a token's expiry as a date and expires it at 00:00 UTC on that date, so one
 # day would leave a run started late in the UTC day minutes, not the day the
 # certificates get.
-readonly GITLAB_CE_IMAGE="gitlab/gitlab-ce:19.4.3-ce.0@sha256:483fb4cc5c75237a7a6c7c8b8b2a1832ed790d86e0449ff55e8b6f6d62d2d5f5"
+# 16.11, the oldest GitLab the install page supports, so the lane catches a
+# change that breaks it (the 16.x merge-request diff path). The lane also ran
+# green on 19.4 (2026-10-31); to move back to 19.x, pin
+# gitlab/gitlab-ce:19.4.3-ce.0@sha256:483fb4cc5c75237a7a6c7c8b8b2a1832ed790d86e0449ff55e8b6f6d62d2d5f5
+# here; the setup below already takes the organization 17 and later require.
+readonly GITLAB_CE_IMAGE="gitlab/gitlab-ce:16.11.10-ce.0@sha256:663478e4fd41144dc36c9cc901b6b442319cb8dec257f20ccdae56f819d5f8e7"
 readonly GITLAB_CE_MACHINE_TYPE="e2-standard-4"
 readonly GITLAB_CE_BOOT_DISK="50GB"
 readonly GITLAB_CE_READY_TIMEOUT_SECONDS="${GITLAB_CE_READY_TIMEOUT_SECONDS:-1800}"
@@ -509,15 +514,16 @@ if [ ! -e /var/gitlab/private/seeded ]; then
   # as on gitlab.com), its two tokens and root's own token set to the values
   # in the mounted files (never argv or the environment), and the group.
   # Every namespace needs the instance's organization since GitLab 17
-  # ("Namespace organization can't be blank" without it). A failed model
-  # prints its errors, not its inspect.
+  # ("Namespace organization can't be blank" without it); 16.x may have none,
+  # so it is passed only when there is one. A failed model prints its errors,
+  # not its inspect.
   docker exec -e BOT="$BOT" -e BOT_EMAIL="$BOT_EMAIL" -e TOKEN_DAYS="$TOKEN_DAYS" -e GROUP="$GROUP" gitlab gitlab-rails runner '
 admin = User.find_by_username("root")
 pw = SecureRandom.hex(24)
-org = Organizations::Organization.respond_to?(:default_organization) ? Organizations::Organization.default_organization : Organizations::Organization.first
-raise "no organization" unless org
+org = defined?(Organizations::Organization) && (Organizations::Organization.respond_to?(:default_organization) ? Organizations::Organization.default_organization : Organizations::Organization.first)
+org_args = org ? {organization_id: org.id} : {}
 def why(m) = (m.respond_to?(:errors) ? m.errors.full_messages.join("; ") : m.inspect)
-res = Users::CreateService.new(admin, username: ENV["BOT"], email: ENV["BOT_EMAIL"], name: "Eval Bot", password: pw, password_confirmation: pw, skip_confirmation: true, projects_limit: 10, organization_id: org.id).execute
+res = Users::CreateService.new(admin, username: ENV["BOT"], email: ENV["BOT_EMAIL"], name: "Eval Bot", password: pw, password_confirmation: pw, skip_confirmation: true, projects_limit: 10, **org_args).execute
 u = res.respond_to?(:payload) ? (res.payload[:user] || res[:user]) : res
 raise "user create failed: #{res.respond_to?(:message) ? res.message : why(u)}" unless u && u.persisted?
 {"agent" => ["api", "write_repository"], "ledger" => ["api"]}.each do |name, scopes|
@@ -526,7 +532,7 @@ raise "user create failed: #{res.respond_to?(:message) ? res.message : why(u)}" 
 end
 rt = admin.personal_access_tokens.build(name: "forge-seed", scopes: ["api"], expires_at: ENV["TOKEN_DAYS"].to_i.days.from_now)
 rt.set_token(File.read("/var/gitlab/private/root-token").strip); rt.save!
-g = Groups::CreateService.new(admin, name: ENV["GROUP"], path: ENV["GROUP"], visibility_level: Gitlab::VisibilityLevel::PRIVATE, organization_id: org.id).execute
+g = Groups::CreateService.new(admin, name: ENV["GROUP"], path: ENV["GROUP"], visibility_level: Gitlab::VisibilityLevel::PRIVATE, **org_args).execute
 g = g.payload[:group] if g.respond_to?(:payload)
 g = g[:group] if g.is_a?(Hash)
 raise "group create failed: #{why(g)}" unless g && g.persisted?

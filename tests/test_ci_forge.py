@@ -429,7 +429,7 @@ class ForgeScriptTest(unittest.TestCase):
         for flag in (
             "--machine-type=e2-standard-4", "--boot-disk-size=50GB", f"--private-network-ip={FORGE_IP}",
             "--labels=kube-agents-forge=gitlab-ce,kube-agents-build=1234", "host=gitlab.eval.internal",
-            "image=gitlab/gitlab-ce:19.4.3-ce.0@sha256:483fb4cc5c75237a7a6c7c8b8b2a1832ed790d86e0449ff55e8b6f6d62d2d5f5",
+            "image=gitlab/gitlab-ce:16.11.10-ce.0@sha256:663478e4fd41144dc36c9cc901b6b442319cb8dec257f20ccdae56f819d5f8e7",
             "group=gke-agentic", f"project={PROJECT}-infra", "bot-login=kube-agents-eval-bot", "token-days=2",
             "block-project-ssh-keys=TRUE", "tls-key=", "agent-token=", "ledger-token=", "manifest-path=", "manifest-message=", "manifest-content=",
         ):
@@ -440,7 +440,7 @@ class ForgeScriptTest(unittest.TestCase):
         # The startup script the VM runs: root makes the bot (a Developer), its two tokens set to the given values, the group, the project and the file; readiness last.
         startup = (self.gstate / "startup-script").read_text()
         for marker in ("gitlab-rails runner", "Users::CreateService", "set_token", '"agent" => ["api", "write_repository"]', '"ledger" => ["api"]',
-                       "Groups::CreateService.new(admin", "organization_id: org.id", 'root-token', '"$API/projects"', "initialize_with_readme=true",
+                       "Groups::CreateService.new(admin", "**org_args", 'root-token', '"$API/projects"', "initialize_with_readme=true",
                        "access_level=30", "repository/files/", "content@/var/gitlab/seed/content",
                        "gitlab_signup_enabled']=false", "/users/sign_in", "/-/readiness?all=1", 'chown -R "${GIT_UID}:${GIT_UID}" /var/gitlab/private'):
             self.assertIn(marker, startup)
