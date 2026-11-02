@@ -570,14 +570,20 @@ class ProposalListTest(CloudCase):
     def test_source_and_target_are_a_bbql_query(self):
         self.mock.routes[("GET", self.PATH)] = paged([pull(1, source="fix/a")], self.PATH)
         self.verb("proposal-list", source="fix/a", target="main")
-        self.assertEqual(['source.branch.name="fix/a" AND destination.branch.name="main"'],
+        # The states go inside `q`: Bitbucket Cloud ignores the `state`
+        # parameter when `q` is given and answers every state (seen live).
+        self.assertEqual(['source.branch.name="fix/a" AND destination.branch.name="main" AND (state="OPEN")'],
                          self.mock.requests[0]["query"]["q"])
+        self.assertNotIn("state", self.mock.requests[0]["query"])
         self.mock.requests.clear()
-        self.verb("proposal-list", target="release/1.2")
-        self.assertEqual(['destination.branch.name="release/1.2"'], self.mock.requests[0]["query"]["q"])
+        self.verb("proposal-list", target="release/1.2", state="closed")
+        self.assertEqual(['destination.branch.name="release/1.2" AND '
+                          '(state="MERGED" OR state="DECLINED" OR state="SUPERSEDED")'],
+                         self.mock.requests[0]["query"]["q"])
         self.mock.requests.clear()
         self.verb("proposal-list")
         self.assertNotIn("q", self.mock.requests[0]["query"])
+        self.assertEqual(["OPEN"], self.mock.requests[0]["query"]["state"])
 
     def test_a_forks_branch_of_the_same_name_is_not_this_repositorys(self):
         rows = [pull(1, source="fix/a", holder="stranger/infra"), pull(2, source="fix/a"),

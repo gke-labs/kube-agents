@@ -173,11 +173,15 @@ def commit(node: dict[str, Any]) -> dict[str, Any]:
     install's own commits, whose address Bitbucket links to nobody.
     """
     author = node.get("author") if isinstance(node.get("author"), dict) else {}
+    linked = author.get("user") if isinstance(author.get("user"), dict) else None
     return {
         "sha": node.get("hash") or "",
-        "author": _author_name(node),
+        # The login of the linked account, as every forge's commit author is,
+        # so that the readings can tell the install's own commits; the git
+        # author name when no account is linked.
+        "author": actor(linked) or _author_name(node),
         "email": _author_email(node),
-        "bot": is_automation(author.get("user") if isinstance(author.get("user"), dict) else None),
+        "bot": is_automation(linked),
         "committed": node.get("date") or "",
         "message": node.get("message") or "",
         "url": _href(node),

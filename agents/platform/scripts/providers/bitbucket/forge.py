@@ -440,7 +440,8 @@ class BitbucketCloudForge(Forge):
             "pagelen": min(limit, PROPOSAL_PAGE),
         }
         if clauses:
-            params["q"] = " AND ".join(clauses)
+            del params["state"]
+            params.update(_query(clauses, translate.NEUTRAL_STATES[neutral]))
         path = f"{self._repo(repo)}/pullrequests"
         if source is None:
             items, more = self._window(api, repo, path, params, page, limit)
@@ -613,8 +614,7 @@ class BitbucketCloudForge(Forge):
         matches.
         """
         params: dict[str, Any] = {
-            "q": f'author.uuid="{author}"',
-            "state": list(states),
+            **_query([f'author.uuid="{author}"'], states),
             "sort": "-updated_on",
             "pagelen": pagelen,
         }
@@ -712,6 +712,17 @@ def _account_uuid(identity: str) -> str:
             "UUID of the account that the token acts as, such as {0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}"
         )
     return "{" + match.group(1).lower() + "}"
+
+
+def _query(clauses: list[str], states: Iterable[str]) -> dict[str, Any]:
+    """The `q` parameter for `clauses`, with the states inside it.
+
+    Bitbucket Cloud ignores the `state` parameter when `q` is given, and then
+    answers every state (seen live on 2026-11-02), so a query names its states
+    in `q` itself. The parameter is left out, so nothing reads it as a filter.
+    """
+    named = " OR ".join(f'state="{state}"' for state in states)
+    return {"q": " AND ".join([*clauses, f"({named})"])}
 
 
 def _reading_author(value: Any) -> str:

@@ -798,7 +798,7 @@ class WriteTest(DataCenterCase):
         answer = self.verb("proposal-commits", number=7)
         self.assertEqual([f"c{n}" for n in range(1, 10)], [c["message"] for c in answer["commits"]])
         first = answer["commits"][0]
-        self.assertEqual((f"{1:040x}", "Jane", "2023-11-14T22:13:20Z",
+        self.assertEqual((f"{1:040x}", "jdoe", "2023-11-14T22:13:20Z",
                           f"https://{HOST}/projects/ACME/repos/infra/commits/{1:040x}"),
                          (first["sha"], first["author"], first["committed"], first["url"]))
 

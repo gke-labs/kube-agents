@@ -183,7 +183,9 @@ def commit(node: dict[str, Any], url: str = "") -> dict[str, Any]:
     author = node.get("author") if isinstance(node.get("author"), dict) else {}
     return {
         "sha": node.get("id") or "",
-        "author": str(author.get("displayName") or author.get("name") or ""),
+        # `name` is the username of a linked account, which is the login, and
+        # the git author name when no account is linked.
+        "author": str(author.get("name") or author.get("displayName") or ""),
         "email": str(author.get("emailAddress") or ""),
         "bot": is_automation(author),
         "committed": instant(node.get("committerTimestamp") or node.get("authorTimestamp")),
