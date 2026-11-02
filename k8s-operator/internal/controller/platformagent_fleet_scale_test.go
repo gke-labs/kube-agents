@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -46,6 +47,13 @@ import (
 // proves itself. A forward check that goes red on main would be turned off;
 // an inverted one turns itself into the forward check at the moment the fix
 // lands.
+//
+// Each check first confirms its fixture is the fleet the gate names, and does
+// so on the renderer's input (the repositories the sync parses, the profiles
+// the map and the dispatch config resolve), never on the rendered shape: a
+// check that pinned today's layout would fail before the gate on the day the
+// fix changes it, and the message naming the fix issue would never print.
+// Today's shape is logged for the reader instead.
 //
 // The renderers are called directly rather than through a full reconcile:
 // 2,500 profiles through the reconciler mean thousands of ServiceAccounts and
@@ -71,6 +79,9 @@ const (
 	// fleetScaleRepoURLFormat names the fixture repositories; four digits
 	// keep them sorted the way they are numbered.
 	fleetScaleRepoURLFormat = "https://github.com/" + fleetScaleOrg + "/repo-%04d"
+	// minterRepoLinePrefix opens one repository line as renderRepoPolicy
+	// writes it; the minter test counts them for the log, not the verdict.
+	minterRepoLinePrefix = "- 'repo-"
 	// A fixture profile is named the way the Platform Agent scaffolds a
 	// Cluster Agent's, cluster-<project>-<cluster>-<location>
 	// (agents/platform/scripts/cluster_agent_profile.py, profile_name), and
@@ -201,16 +212,28 @@ func shippedProfileSubscribeTopics(t *testing.T) []string {
 	return append([]string(nil), p.Spec.Bus.SubscribeTopics...)
 }
 
-// fleetScaleProfileFixtures builds N bound profiles at the shipped shape: the
-// read tier alone (AllowedTiers unset) and the shipped subscribe topics.
-func fleetScaleProfileFixtures(t *testing.T, namespace string) []agentv1alpha1.AgentProfile {
+// fleetScaleProfileFixtures builds N bound profiles at the shipped shape (the
+// read tier alone, AllowedTiers unset, and the shipped subscribe topics) and
+// confirms every one resolves to an identity. The identity map and the
+// dispatch config both leave a refused profile out, so a fixture that was
+// refused would measure a smaller fleet; the check is on the resolver's
+// verdict, the renderers' input, rather than on a count in the rendered
+// object, so the fix pull request can change the rendered shape and still
+// reach the gate.
+func fleetScaleProfileFixtures(t *testing.T, agent *agentv1alpha1.PlatformAgent) []agentv1alpha1.AgentProfile {
 	t.Helper()
 	topics := shippedProfileSubscribeTopics(t)
 	profiles := make([]agentv1alpha1.AgentProfile, 0, fleetScaleProfiles)
 	for i := 1; i <= fleetScaleProfiles; i++ {
-		profiles = append(profiles, testAgentProfile(namespace, fmt.Sprintf(fleetScaleProfileNameFormat, i), func(p *agentv1alpha1.AgentProfile) {
+		profiles = append(profiles, testAgentProfile(agent.Namespace, fmt.Sprintf(fleetScaleProfileNameFormat, i), func(p *agentv1alpha1.AgentProfile) {
 			p.Spec.Bus.SubscribeTopics = append([]string(nil), topics...)
 		}))
+	}
+	resolved := resolveAgentProfileIdentities(agent, profiles)
+	for i := range profiles {
+		if r, ok := resolved[profiles[i].Name]; !ok || r.refused != nil {
+			t.Fatalf("fixture profile %s does not resolve to an identity (%v): the fixture is not the fleet the gate measures", profiles[i].Name, r.refused)
+		}
 	}
 	return profiles
 }
@@ -276,28 +299,46 @@ func TestTheMinterPolicyConfigMapAtFleetScale(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 
-	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, fleetScaleManagedRepos(t), ""); err != nil {
+	// The fixture is the fleet the gate measures, checked on the sync's
+	// input: the list parses to R repositories, every one in the organisation
+	// the sync claims, so every one gets a policy. How the sync lays the
+	// policies out is what the fix issue changes, so it is logged below and
+	// not asserted here.
+	managedRepos := fleetScaleManagedRepos(t)
+	primaryOrg, skip := minterPrimaryOrg(agent)
+	if skip != "" {
+		t.Fatalf("the fixture agent's git integration does not resolve: %s", skip)
+	}
+	parsed, unreadable, err := minterBareRepos(logr.Discard(), managedRepos, primaryOrg, minterGitHubHost(agent), gitopsStateManagedReposKey)
+	if err != nil {
+		t.Fatalf("parsing the fixture repository list: %v", err)
+	}
+	if len(parsed) != fleetScaleRepositories || len(unreadable) != 0 {
+		t.Fatalf("the sync reads %d repositories (%d unreadable) from a fixture of %d: the fixture is not the fleet the gate measures", len(parsed), len(unreadable), fleetScaleRepositories)
+	}
+
+	if err := r.syncGithubTokenMinterConfigMap(ctx, agent, managedRepos, ""); err != nil {
 		t.Fatalf("syncing %d repositories: %v", fleetScaleRepositories, err)
 	}
 	synced := &corev1.ConfigMap{}
 	if err := cl.Get(ctx, client.ObjectKey{Name: minterConfigMapName, Namespace: agent.Namespace}, synced); err != nil {
 		t.Fatalf("reading the synced ConfigMap: %v", err)
 	}
-	// The fixture did what it says: a policy per repository, each naming
-	// them all under every scope.
-	policies := 0
+	// The sync ran: it claimed the fixture's repositories rather than
+	// skipping the list, which would leave the template alone and measure
+	// an empty object as a fix.
+	managedKeys := parseManagedKeysAnnotation(synced.Annotations[AnnotationManagedMinterKeys])
+	if len(managedKeys) == 0 {
+		t.Fatalf("the sync claimed no policy key for %d repositories: the fixture is not the fleet the gate measures", fleetScaleRepositories)
+	}
+	repoLines := 0
 	for key, content := range synced.Data {
-		if key == minterBaseTemplateKey {
-			continue
-		}
-		policies++
-		if n := strings.Count(content, "- 'repo-"); n < fleetScaleRepositories {
-			t.Fatalf("policy %s lists %d repository lines, fewer than the %d repositories every scope should name: the fixture is not the shape the gate measures", key, n, fleetScaleRepositories)
+		if key != minterBaseTemplateKey {
+			repoLines += strings.Count(content, minterRepoLinePrefix)
 		}
 	}
-	if policies != fleetScaleRepositories {
-		t.Fatalf("the sync wrote %d policies for %d repositories", policies, fleetScaleRepositories)
-	}
+	t.Logf("%s at R=%d: %d operator-managed policy keys, %d repository lines across them",
+		synced.Name, fleetScaleRepositories, len(managedKeys), repoLines)
 
 	requireConfigMapSizeGate(t, synced, fmt.Sprintf("R=%d repositories", fleetScaleRepositories), minterConfigMapFixIssue)
 }
@@ -309,7 +350,7 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 	// its identity would add every durable's name to the map on top.
 	t.Setenv(a2aDispatcherImageEnvVar, "")
 	agent := a2aTestAgent()
-	profiles := fleetScaleProfileFixtures(t, agent.Namespace)
+	profiles := fleetScaleProfileFixtures(t, agent)
 
 	cm, _, err := buildA2AAuthMapConfigMap(agent, profiles)
 	if err != nil {
@@ -319,17 +360,7 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 	if err := json.Unmarshal([]byte(cm.Data[a2aAuthMapKey]), &doc); err != nil {
 		t.Fatalf("decoding the rendered map: %v", err)
 	}
-	// Every profile resolved: a refused one is left out of the map, and a
-	// fixture that silently lost profiles would measure a smaller fleet.
-	entries := 0
-	for _, id := range doc.Identities {
-		if id.Profile != "" {
-			entries++
-		}
-	}
-	if entries != fleetScaleProfiles {
-		t.Fatalf("the map carries %d profile entries for %d profiles: the fixture is not the fleet the gate measures", entries, fleetScaleProfiles)
-	}
+	t.Logf("%s at N=%d: %d identities rendered", cm.Name, fleetScaleProfiles, len(doc.Identities))
 
 	requireConfigMapSizeGate(t, cm, fmt.Sprintf("N=%d profiles", fleetScaleProfiles), identityMapFixIssue)
 }
@@ -340,7 +371,7 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	withDispatcher(t)
 	agent := a2aTestAgent()
-	profiles := fleetScaleProfileFixtures(t, agent.Namespace)
+	profiles := fleetScaleProfileFixtures(t, agent)
 
 	cm, err := buildA2ADispatchConfigMap(agent, profiles)
 	if err != nil {
@@ -350,9 +381,7 @@ func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &cfg); err != nil {
 		t.Fatalf("decoding the rendered dispatch config: %v", err)
 	}
-	if len(cfg.Profiles) != fleetScaleProfiles {
-		t.Fatalf("the dispatch config lists %d profiles for %d: the fixture is not the fleet the gate measures", len(cfg.Profiles), fleetScaleProfiles)
-	}
+	t.Logf("%s at N=%d: %d profile blocks rendered", cm.Name, fleetScaleProfiles, len(cfg.Profiles))
 
 	requireConfigMapSizeGate(t, cm, fmt.Sprintf("N=%d profiles", fleetScaleProfiles), dispatchConfigMapFixIssue)
 }

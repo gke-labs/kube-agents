@@ -786,16 +786,25 @@ class TestFleetScaleRoster(unittest.TestCase):
             f"{ROSTER_TOKEN_BUDGET}-token budget; {ROSTER_FIX_ISSUE} owns the fix",
         )
 
+    def test_the_fixture_is_the_fleet_the_gate_measures(self):
+        # Checked on discovery, the renderer's input, not on the rendered
+        # text: a check that pinned today's one-line-per-agent shape would
+        # go red in the pull request that closes ROSTER_FIX_ISSUE, in a test
+        # not marked expectedFailure, while the pinned test flipped green.
+        with TemporaryDirectory() as tmp:
+            agents = agent_roster.discover(self._fleet(tmp))
+        self.assertIsNotNone(agents)
+        clusters = [a for a in agents if a.get(agent_roster.IDENTITY_FIELD_PREFIX + agent_roster.IDENTITY_NAME_KEY)]
+        self.assertEqual(len(clusters), FLEET_SCALE_PROFILES)
+        self.assertEqual(len({a["responsibilities"] for a in clusters}), 1, "every Cluster Agent shares one role")
+
     def test_the_roster_renders_within_the_gate_budget(self):
         with TemporaryDirectory() as tmp:
             base = self._fleet(tmp)
             started = time.monotonic()
-            out = self._render(base)
+            self._render(base)
             elapsed = time.monotonic() - started
         self.assertLess(elapsed, ROSTER_RENDER_SECONDS, f"rendering N={FLEET_SCALE_PROFILES} took {elapsed:.1f}s")
-        # The fixture is the fleet the gate measures: every agent named once.
-        self.assertIn(f"The following {FLEET_SCALE_PROFILES} agents share one role", out)
-        self.assertEqual(out.count(" cluster agent; project "), FLEET_SCALE_PROFILES)
 
 
 class TestRouterEnvCarriesTheRosterInputs(unittest.TestCase):
