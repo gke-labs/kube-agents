@@ -142,7 +142,8 @@ verification_spec:
       # every cached run of the case; the grammar is narrowed to them on
       # purpose after two review rounds of the same finding class. "pending"
       # as a whole word beside pods or replicas, with no negation (including
-      # the contraction) in between and no zero on either side; a non-zero
+      # the contraction and "rather than") in between and no zero on either
+      # side; a non-zero
       # count before it; "in pending", "pending state"; a plural "are" or a
       # stuck/remain verb; the ready-to-wanted ratio only when the numbers
       # differ ("1 of 5 replicas ready", "stalled at 1/3"; "5/5 ready" is the
@@ -157,20 +158,23 @@ verification_spec:
       # and which read a GKE operation or a zone count. No count is required,
       # for the reason above. The two-noun gaps stay on one line by design: a
       # cross-line gap would fuse a negated bullet into its neighbour. Admits
-      # accepted and stated, as main's "are pending" admitted them: "none of
-      # the pods is pending" (the negation sits before the noun), "still
-      # pending" in another sense, and "pod metrics did not trigger a
-      # scale-up". A first-turn acknowledgement that echoes the prompt
+      # accepted and stated, most of them main's too: "none of the pods is
+      # pending" and "neither pod is pending" (the negation sits before the
+      # noun), "0 of 5 replicas are pending" and "pending (0 pods)" (a zero
+      # the guards do not reach), "the PDB allows 1 unavailable replica",
+      # "unable to schedule the upgrade", "still pending" in another sense,
+      # and "pod metrics did not trigger a scale-up". The state-based
+      # objective that ends this class is the follow-up, #4600. A first-turn acknowledgement that echoes the prompt
       # ("diagnose why the replicas are stalled") names no backlog and fails,
       # as it should. bench/tests/test_pending_replicas_backlog_patterns.py
       # pins the recorded shapes, one paraphrase per pattern, the healthy
       # state, the zero and negated forms, and the prose that names no backlog.
       any_of_patterns:
         - '\bunschedulable\b'
-        - '(?<!\b0 )\b(?:pods?|replicas?)\b(?:(?!\b(?:not|no|none|never)\b|n''t\b)[^\n.]){0,40}(?<!\b0 )\bpending\b(?!\s*:?\s*0\b)(?!\s+(?:your|the|an?|my|our)\s+approval)'
-        - '(?<!\b0 )\bpending\b(?!\s*:?\s*0\b)(?!\s+(?:your|the|an?|my|our)\s+approval)[^\n.]{0,20}\b(?:pods?|replicas?)\b(?!\s*:?\s*0\b)'
+        - '(?<!\b0 )\b(?:pods?|replicas?)\b(?:(?!\b(?:not|no|none|never)\b|n''t\b|\b(?:rather|instead)\s+(?:than|of)\b)[^\n.]){0,40}(?<!\b0 )\bpending\b(?!\s*:?\s*0\b)(?!\s+(?:(?:your|the|an?|my|our)\s+)?approval)'
+        - '(?<!\b0 )\bpending\b(?!\s*:?\s*0\b)(?!\s+(?:(?:your|the|an?|my|our)\s+)?approval)[^\n.]{0,20}\b(?:pods?|replicas?)\b(?!\s*:?\s*0\b)'
         - '\b[1-9]\d*\s+pending\b'
-        - '\b(?:are|were|still|as|stuck|stay(?:s|ed)?|remain(?:s|ed)?|left|been|sit(?:s|ting)?)\s+pending\b'
+        - '(?<!\b0 pods )(?<!\b0 pod )(?<!\b0 replicas )(?<!\b0 replica )\b(?:are|were|still|as|stuck|stay(?:s|ed)?|remain(?:s|ed)?|left|been|sit(?:s|ting)?)\s+pending\b'
         - '\bin\s+(?:a\s+|the\s+)?pending\b'
         - '\bpending\s+(?:state|phase|status)\b'
         - '\b(?:cannot|can''t|unable\s+to|fail(?:s|ed|ing)?\s+to|never)\s+(?:be\s+|been\s+)?schedul(?:e|ed|able)\b'

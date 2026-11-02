@@ -88,6 +88,20 @@ NO_BACKLOG = (
     "The node pool resize operation status: PENDING.",
     "The rollout allows max 1 unavailable.",
     "1 of 3 available zones carry the pool.",
+    # A zero-count subject, a contrast, and approval with no article.
+    "0 pods are pending; all 5 are Running. nodeSelector seeded-role=pinned-inference.",
+    "The pods are Running rather than Pending; nodeSelector seeded-role=pinned-inference.",
+    "The pods are Running instead of Pending.",
+    "Scaling the replicas is pending approval.",
+    # One per guard, so a widened gap, a dropped boundary or a re-added alternative turns red.
+    "The pods are healthy. A node pool upgrade is pending.",
+    "A node pool upgrade is pending. The pods are healthy.",
+    "The pods are healthy. The HPA didn't trigger a scale-up.",
+    "Depending on the pods' requests, the scheduler picks a node.",
+    "There are 0 pending pods.",
+    "The rollout is stuck at 3/3.",
+    "An unscheduled node restart drained pinned-inference-pool.",
+    "0 unavailable replicas",
 )
 
 
