@@ -884,13 +884,15 @@ note and its copied file, the closing text of `degrade_missing_remediations`, th
 `degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`, and the route notes). The paragraph
 goes after the route notes, and one that would push out the reconciler note does not fit. When the
 whole paragraph does not fit, it names one object, then no object it waits on, then drops its tail;
-when even that core does not fit beside the text `finish` wrote, the core goes after it and the
-renderer cuts the core's end. A cut keeps the whole worker note in `uncut_note`, as the route-note
-pass does, so the carry puts it back once the stall is gone. The pass first removes an earlier copy
-of the note from every remediation, and the carry removes it too, so a note never shows a stall that
-this run's manifest does not. A cluster whose read failed (`kcc_unread`) records no objects, so no
-note names an object there, and the log has a warning. The absence of the note never says that
-Config Connector applies a file.
+when even that core does not fit beside the text `finish` wrote and the note carries a Kustomize
+copied file, that block is made shorter by whole lines, with its fences closed, as
+`_fit_route_notes` does for the reconciler note. Only when that does not fit either does the core go
+past the cap, and the log warns that the renderer cuts its end. A cut keeps the whole worker note in
+`uncut_note`, as the route-note pass does, so the carry puts it back once the stall is gone. The
+pass first removes an earlier copy of the note from every remediation, and the carry removes it too,
+so a note never shows a stall that this run's manifest does not. A cluster whose read failed
+(`kcc_unread`) records no objects, so no note names an object there, and the log has a warning. The
+absence of the note never says that Config Connector applies a file.
 
 The same match makes the `pr-merged-persists` row and the comment on the merged pull request state
 the stall in place of "the remediation was incomplete, or something outside this repository
