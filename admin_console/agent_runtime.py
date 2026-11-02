@@ -1174,8 +1174,14 @@ class AgentRuntimeProvider:
             ) from exc
 
     def gateway_endpoint(self, agent: str) -> tuple[str, str]:
-        """Return one running gateway pod and its live API container name."""
-        canonical = self.canonical_agent()
+        """Return one running gateway pod and its live API container name.
+
+        The guard compares against the stock name, which is the only answer
+        `canonical_agent` can give, so it costs no discovery of its own; with
+        the cache disabled, a discovery here would repeat the one the caller
+        just made.
+        """
+        canonical = canonical_platform_agent_name()
         if agent != canonical:
             raise ValueError(f"agentId must be the canonical PlatformAgent {canonical}")
         return self._discover(

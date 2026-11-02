@@ -1232,10 +1232,11 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
         )
 
     def read(self, **kwargs) -> None:
-        # A fresh provider per read, as every page, API request and poll does.
-        self.provider(**kwargs).get_task_updates(
-            "platform-agent", session_id="portal_session"
-        )
+        # A fresh provider per read, as every page does: it asks which agent
+        # is canonical, then reads with that name.
+        provider = self.provider(**kwargs)
+        agent = provider.canonical_agent()
+        provider.get_task_updates(agent, session_id="portal_session")
 
     def test_twenty_reads_within_the_window_discover_once(self):
         for _ in range(20):
@@ -1403,6 +1404,8 @@ class RuntimeDiscoveryCacheTest(unittest.TestCase):
             for _ in range(5):
                 self.read(cache=cache)
 
+        # Each read discovers again, and once per question: the read's guard
+        # on the agent name does not repeat the page's own discovery.
         self.assertEqual(self.spawns("platformagents"), 5)
         self.assertEqual(self.spawns("pods"), 5)
         self.assertEqual(self.spawns("exec"), 5)

@@ -48,9 +48,9 @@ The palettes live in `theme.py`, except Streamlit's base theme for `default`,
 which stays in `.streamlit/config.toml` at the repository root. The theme
 changes colours only; it adds no Google Cloud logo or font.
 
-Every runtime read first asks the cluster which PlatformAgent is canonical and
-which gateway pod runs it. Each console process holds those two answers for 30
-seconds: the API server's copy serves the API, the chat poll and the Chat, LLM
+Every console page first asks the cluster which PlatformAgent is canonical,
+and every runtime read which gateway pod runs it. Each console process holds
+those two answers for 30 seconds: the API server's copy serves the API, the chat poll and the Chat, LLM
 Gateway and Google Chat pages, and is dropped after a chat action or an LLM
 Gateway change; the Streamlit process's copy serves Task Kanban, Scheduled Cron
 and the Connection check, and lasts the window. Either copy is dropped when a

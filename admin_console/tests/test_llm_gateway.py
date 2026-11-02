@@ -182,7 +182,6 @@ class LlmGatewayServiceTest(unittest.TestCase):
                 KubeCommandResult(0, json.dumps(platform_agents())),
                 KubeCommandResult(0, json.dumps(gateway_pods("gateway-1"))),
                 KubeCommandResult(1, stderr='pods "gateway-1" not found'),
-                KubeCommandResult(0, json.dumps(platform_agents())),
                 KubeCommandResult(0, json.dumps(gateway_pods("gateway-2"))),
                 KubeCommandResult(0, stdout="200\n{}"),
             ]
@@ -296,9 +295,8 @@ class LlmGatewayServiceTest(unittest.TestCase):
                 ),
                 KubeCommandResult(0, json.dumps(pods)),
                 KubeCommandResult(1, "401\nraw upstream response"),
-                # The failed call makes the runtime discover again; the pod
-                # is unchanged, so the error is reported without a retry.
-                KubeCommandResult(0, json.dumps(platform_agents())),
+                # The failed call makes the runtime discover the pod again;
+                # it is unchanged, so the error is reported without a retry.
                 KubeCommandResult(0, json.dumps(pods)),
             ]
         )
