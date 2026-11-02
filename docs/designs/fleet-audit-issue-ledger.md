@@ -914,8 +914,8 @@ absence of the note never says that Config Connector applies a file.
 The same match makes the `pr-merged-persists` row and the comment on the merged pull request state
 the stall in place of "the remediation was incomplete, or something outside this repository
 reverted it", with the same advice as the note; the comment is posted once and never updated. So
-does any finding whose own object is not ready (a `Cluster/` or `NodePool/` finding, or a finding of
-a Config Connector kind, `<Kind>/<n>`), whatever the fix's kind.
+does any finding whose own object is not ready (a `Cluster/` or `NodePool/` finding, or a
+`kcc-object-wedged` finding of a Config Connector kind, `<Kind>/<n>`), whatever the fix's kind.
 
 ### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
 
