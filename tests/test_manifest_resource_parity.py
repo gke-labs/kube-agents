@@ -122,12 +122,12 @@ CHART_WORKLOAD_PREFIX = f"{SOURCE_CHART} "
 
 # The pods and containers rendered when this was written (2026-11-02): the
 # chart's hindsight-api, litellm, controller-manager, hindsight-postgresql and
-# cr-cleanup; each of eight goldens' shell StatefulSet, credential-proxy and
+# cr-cleanup; each of nine goldens' shell StatefulSet, credential-proxy and
 # gateway Deployments; the kustomize manager, litellm, hindsight api and
 # postgres and inference-replay. A count under the floor means a source has
 # gone blind, not that the tree got smaller.
 MIN_CHART_PODS = 5
-MIN_GOLDEN_PODS = 24
+MIN_GOLDEN_PODS = 27
 MIN_KUSTOMIZE_PODS = 5
 MIN_CONTAINERS = 40
 
