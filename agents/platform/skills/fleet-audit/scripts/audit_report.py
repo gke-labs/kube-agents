@@ -684,11 +684,14 @@ _GCLOUD_NEGATED_ENABLE_PREFIX = "--no-enable-"
 # anything else -- a Deployment, a Namespace -- is out of scope even where a
 # name collides.
 KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
-# The group both indexed kinds live in, and what the broker searches for. The
-# bare suffix also matches every `cnrm.cloud.google.com/project-id`
-# annotation, which fills the broker's match ceiling with files that declare
-# nothing this check reads.
-KCC_CONTAINER_API_GROUP = f"container.{KCC_API_GROUP_SUFFIX}"
+# What the broker searches the repository for in content mode: an
+# `apiVersion` line (YAML, or JSON, which is YAML) in any Config Connector
+# group, so that every kind is indexed, not only the container kinds the
+# gcloud check reads. Not the bare suffix: that also matches every
+# `cnrm.cloud.google.com/project-id` annotation, which fills the broker's
+# match ceiling with files that declare nothing. A `git grep -E` expression.
+KCC_DECLARATION_GREP = r'"?apiVersion"?[[:space:]]*:[[:space:]]*"?[A-Za-z0-9.-]*\.cnrm\.cloud\.google\.com/'
+
 _KCC_OBJECT_KINDS: dict[str, tuple[str, ...]] = {
     "Cluster": ("ContainerCluster",),
     "NodePool": ("ContainerNodePool",),
@@ -2204,10 +2207,11 @@ KCC_STALLED_DECLARED_NOTE = (
     KCC_STALLED_DECLARED_CORE + " " + KCC_STALLED_OBJECT_TAIL + " If the reason rejects the declaration, correct it there."
 )
 KCC_STALLED_OBJECT_MARK = "**Config Connector is not applying the declaration of this object.**"
-KCC_STALLED_UNDECLARED_CORE = (
-    KCC_STALLED_OBJECT_MARK + " When the audit ran, Config Connector reported {objects}. "
-    "The audit found {found} of this object in the GitOps repository, so it names no file."
-)
+KCC_STALLED_UNDECLARED_CORE = KCC_STALLED_OBJECT_MARK + " When the audit ran, Config Connector reported {objects}. {search}"
+# What the paragraph says about the search for the declaration: what it
+# found, when it covered the whole GitOps repository, or that it did not.
+KCC_DECLARATION_SEARCH_FOUND = "The audit found {found} of this object in the GitOps repository, so it names no file."
+KCC_DECLARATION_SEARCH_INCOMPLETE = "The audit could not search the whole GitOps repository, so it names no file."
 KCC_STALLED_UNDECLARED_NOTE = (
     KCC_STALLED_UNDECLARED_CORE + " " + KCC_STALLED_OBJECT_TAIL + " If the reason rejects the declaration, correct the declaration."
 )
@@ -18494,6 +18498,9 @@ class KccBrokerScan(NamedTuple):
 
     declarations: dict[KccKey, KccDeclaration]
     truncated: bool
+    # The scan did not run to an answer (no broker session, or a broker
+    # error): the index says nothing about what the repository declares.
+    failed: bool = False
 
 
 def kcc_declarations_via_broker(repo: str, session=None) -> KccBrokerScan:
@@ -18525,7 +18532,7 @@ def kcc_declarations_via_broker(repo: str, session=None) -> KccBrokerScan:
             else credential_proxy_client.Workspace.open(proxy_endpoint(), repo)
         )
         with opened as workspace:
-            result = workspace.grep(KCC_CONTAINER_API_GROUP)
+            result = workspace.grep(KCC_DECLARATION_GREP, regex=True)
             truncated = bool(result.get("truncated"))
             wanted = sorted(
                 {
@@ -18556,7 +18563,7 @@ def kcc_declarations_via_broker(repo: str, session=None) -> KccBrokerScan:
             f"WARNING: the Config Connector scan could not read {repo} through "
             f"the broker ({exc}); gcloud fixes publish as written"
         )
-        return KccBrokerScan({}, False)
+        return KccBrokerScan({}, False, True)
     for path in sorted(texts):
         _index_kcc_text(index, yaml, texts[path].decode("utf-8", errors="replace"), "", path)
     return KccBrokerScan(index, truncated)
@@ -19207,7 +19214,11 @@ def _kcc_declaration_path(declaration: KccDeclaration) -> str:
 
 
 def kcc_object_paragraph(
-    matched: list[KccStall], objects: str, declarations: "dict[KccKey, KccDeclaration]", tail: bool = True
+    matched: list[KccStall],
+    objects: str,
+    declarations: "dict[KccKey, KccDeclaration]",
+    tail: bool = True,
+    complete: bool = True,
 ) -> str:
     """The paragraph for a fix that is not a `manifest` fix of the object's
     own file: it names the one declaration of the first matched object, or
@@ -19217,8 +19228,16 @@ def kcc_object_paragraph(
     if len(found) == 1:
         template = KCC_STALLED_DECLARED_NOTE if tail else KCC_STALLED_DECLARED_CORE
         return template.format(path=_kcc_declaration_path(found[0][1]), objects=objects)
-    count = KCC_DECLARATION_NONE if not found else KCC_DECLARATION_MANY.format(count=len(found))
-    return (KCC_STALLED_UNDECLARED_NOTE if tail else KCC_STALLED_UNDECLARED_CORE).format(found=count, objects=objects)
+    if found:
+        search = KCC_DECLARATION_SEARCH_FOUND.format(found=KCC_DECLARATION_MANY.format(count=len(found)))
+    elif complete:
+        search = KCC_DECLARATION_SEARCH_FOUND.format(found=KCC_DECLARATION_NONE)
+    else:
+        # The search did not cover the whole repository (a truncated or failed
+        # broker scan, a dry run with no clone): an absence it did not prove
+        # is never claimed.
+        search = KCC_DECLARATION_SEARCH_INCOMPLETE
+    return (KCC_STALLED_UNDECLARED_NOTE if tail else KCC_STALLED_UNDECLARED_CORE).format(search=search, objects=objects)
 
 
 def _kcc_name(stall: KccStall) -> str:
@@ -19322,6 +19341,7 @@ def disclose_stalled_kcc_remediations(
     manifest: dict | None,
     root: Path,
     declarations: "dict[KccKey, KccDeclaration] | None" = None,
+    complete: bool | None = None,
 ) -> list[str]:
     """Say so on any fix whose finding's own object Config Connector does not
     apply. Returns the ids whose note or paragraph changed.
@@ -19350,8 +19370,12 @@ def disclose_stalled_kcc_remediations(
     `manifest` fix to another file) gets one that names the one file in
     `declarations`, the repository's Config Connector index, that declares
     the object, or says that the audit found none or more than one
-    (`kcc_object_paragraph`). A `gcloud` fix's paragraph goes in
-    `KCC_STALLED_PARAGRAPH_FIELD`, because its note is the command. The note
+    (`kcc_object_paragraph`). `complete` says whether `declarations` covered
+    the whole GitOps repository (None: whether `declarations` was given);
+    without it, the paragraph says the audit could not search the whole
+    repository, never that no file declares the object. A `gcloud` fix's
+    paragraph goes in `KCC_STALLED_PARAGRAPH_FIELD`, because its note is the
+    command. The note
     is fitted by `_fit_kcc_paragraph`, which never cuts text `finish` wrote.
     The paragraph names the object, the reason the controller gave, and the
     deepest unready object it waits on when the reason is
@@ -19401,7 +19425,9 @@ def disclose_stalled_kcc_remediations(
                 if in_file:
                     text = (KCC_STALLED_NOTE if tail else KCC_STALLED_NOTE_CORE).format(objects=objects)
                 else:
-                    text = kcc_object_paragraph(matched, objects, declarations or {}, tail)
+                    text = kcc_object_paragraph(
+                        matched, objects, declarations or {}, tail, declarations is not None if complete is None else complete
+                    )
                 if text not in paragraphs:
                     paragraphs.append(text)
             if isinstance(remediation, dict) and remediation.get("kind") == "gcloud":
@@ -19420,6 +19446,7 @@ def disclose_stalled_kcc_and_log(
     root: Path,
     prefix: str = "",
     declarations: "dict[KccKey, KccDeclaration] | None" = None,
+    complete: bool | None = None,
 ) -> None:
     """Add the Config Connector stall notes, and log what changed and what
     the manifest could not tell."""
@@ -19431,7 +19458,7 @@ def disclose_stalled_kcc_and_log(
             "publishes with no note about whether Config Connector applies it."
         )
     by_id = {str(finding.get("id", "")): finding for finding in findings}
-    for fid in disclose_stalled_kcc_remediations(findings, manifest, root, declarations):
+    for fid in disclose_stalled_kcc_remediations(findings, manifest, root, declarations, complete):
         note = str((by_id[fid].get("remediation") or {}).get("note") or "")
         if any(mark in note for mark in KCC_STALLED_NOTE_MARKS) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
             log(f"{prefix}{fid}: Config Connector is not applying the finding's own object; the fix says so.")
@@ -20599,6 +20626,9 @@ def _handle_finish_dry_run(
         root,
         prefix="DRY RUN: ",
         declarations=kcc_declaration_index(kcc_roots) if kcc_health(manifest).stalled else {},
+        # Complete only when the stream's clone is there: a content-mode dry
+        # run has none and opens no broker session.
+        complete=any(not repo_slug for repo_slug, _ in kcc_roots),
     )
     paths = manifest_paths(findings)
 
@@ -21984,6 +22014,7 @@ def _plan_remediation_files(
     unlisted: list[str],
     listing_may_refuse: bool = False,
     kcc_index: dict[KccKey, KccDeclaration] | None = None,
+    kcc_index_complete: bool = False,
 ) -> _FixPlan:
     """`finish`'s last step before it publishes: refuse an unwritten fix, then write the fixes it derives.
 
@@ -22092,7 +22123,7 @@ def _plan_remediation_files(
     # The same place, for the same reason: a `manifest` fix whose file
     # declares an object Config Connector does not apply says so on both
     # ledgers and in its pull request.
-    disclose_stalled_kcc_and_log(findings, manifest, root, declarations=kcc_index)
+    disclose_stalled_kcc_and_log(findings, manifest, root, declarations=kcc_index, complete=kcc_index_complete)
     return _FixPlan(remediation_prs, sweep_on, unlinked_paths, file_url, file_ref, listing_refusal)
 
 
@@ -22122,6 +22153,7 @@ def _finish_store_ledger(
     timers: Callable[[], dict],
     scheduled: bool = False,
     kcc_index: dict[KccKey, KccDeclaration] | None = None,
+    kcc_index_complete: bool = False,
 ) -> None:
     """Keep the ledger in the report store and chat, and open the fixes on the forge.
 
@@ -22163,7 +22195,7 @@ def _finish_store_ledger(
         audit_id, repo, args, data, findings,
         manifest=manifest, record=record, root=root, probe=probe,
         promised=promised, degraded=degraded, unlisted=unlisted,
-        listing_may_refuse=True, kcc_index=kcc_index,
+        listing_may_refuse=True, kcc_index=kcc_index, kcc_index_complete=kcc_index_complete,
     )
     remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
     # A refused listing leaves the fixes unknown: this run opens, syncs and
@@ -22949,7 +22981,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         scan = (
             kcc_declarations_via_broker(repo, session)
             if session is not None
-            else KccBrokerScan({}, False)
+            else KccBrokerScan({}, False, True)
         )
         if session is None:
             log(
@@ -22965,8 +22997,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             )
     kcc_roots = kcc_declaration_roots(audit_id, root, record)
     # The index the Config Connector paragraph names a declaration from: read
-    # only when the manifest records a stall.
+    # only when the manifest records a stall. It is complete when it covered
+    # the whole GitOps repository: the clone, or a broker scan that ran to an
+    # answer and was not truncated. Only then may the paragraph say that no
+    # file declares the object.
     kcc_index = kcc_declaration_index(kcc_roots, kcc_prebuilt) if kcc_stalls else {}
+    if content_mode():
+        kcc_index_complete = kcc_stalls and not scan.truncated and not scan.failed
+    else:
+        kcc_index_complete = any(not repo_slug for repo_slug, _ in kcc_roots)
     for fid in degrade_reverted_gcloud_remediations(
         findings, kcc_roots, prebuilt=kcc_prebuilt
     ):
@@ -23094,6 +23133,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             timers=timer_payload,
             scheduled=scheduled,
             kcc_index=kcc_index,
+            kcc_index_complete=kcc_index_complete,
         )
         return
     existing_issue, existing_url, existing_body, existing_title = find_existing_issue(
@@ -23406,6 +23446,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         audit_id, repo, args, data, findings,
         manifest=manifest, record=record, root=root, probe=probe,
         promised=promised, degraded=degraded, unlisted=unlisted, kcc_index=kcc_index,
+        kcc_index_complete=kcc_index_complete,
     )
     remediation_prs, sweep_on = fix_plan.remediation_prs, fix_plan.sweep_on
     unlinked_paths, file_url, file_ref = fix_plan.unlinked_paths, fix_plan.file_url, fix_plan.file_ref

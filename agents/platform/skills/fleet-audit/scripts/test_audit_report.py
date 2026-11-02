@@ -23367,7 +23367,8 @@ metadata:
 
     def test_no_declaration_found_gives_the_sibling_sentence(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
-        self.disclose([finding], self.live_manifest())
+        # An index that covered the whole repository and holds nothing.
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, {}, complete=True)
         paragraph = finding["remediation"]["note"].split("\n\n")[-1]
         self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_OBJECT_MARK), paragraph[:120])
         self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, paragraph)
@@ -23403,22 +23404,82 @@ metadata:
         validated = audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
         self.assertNotIn(audit_report.KCC_STALLED_PARAGRAPH_FIELD, validated["findings"][0])
 
+    @staticmethod
+    def broker(files, truncated=False):
+        """A broker workspace over `files` whose grep, like `git grep -E`, returns
+        only the files whose lines match the expression."""
+        class FakeWorkspace:
+            def grep(self, pattern, regex=False, **_):
+                expression = re.compile(pattern.replace("[[:space:]]", r"\s") if regex else re.escape(pattern))
+                matches = [
+                    {"path": path, "line": number, "text": line}
+                    for path, text in files.items()
+                    for number, line in enumerate(text.splitlines(), 1)
+                    if expression.search(line)
+                ]
+                return {"matches": matches, "total": len(matches), "truncated": truncated}
+
+            def read_many(self, paths):
+                return {path: files[path].encode() for path in paths}, []
+
+        return FakeWorkspace()
+
     def test_content_mode_names_the_declaration_from_the_brokers_index(self):
         """In content mode the repository is read through the broker
         (`kcc_declarations_via_broker`), the same scan the gcloud check uses."""
-        planted = self.PLANTED_DECLARATION
-
-        class FakeWorkspace:
-            def grep(self, pattern, **_):
-                return {"matches": [{"path": TestStalledKccRemediations.PLANTED, "line": 1, "text": pattern}], "total": 1, "truncated": False}
-
-            def read_many(self, paths):
-                return {path: planted.encode() for path in paths}, []
-
-        scan = audit_report.kcc_declarations_via_broker("acme/fleet", FakeWorkspace())
+        files = {self.PLANTED: self.PLANTED_DECLARATION, "apps/web.yaml": "kind: Deployment\nmetadata:\n  name: web\n"}
+        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files))
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
-        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, scan.declarations)
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, scan.declarations, complete=True)
         self.assertIn(f"The declaration is `{self.PLANTED}`.", finding["remediation"]["note"])
+
+    def test_content_mode_indexes_every_config_connector_kind(self):
+        """A PubSubTopic, not only the container kinds, and a file whose only
+        Config Connector text is a project annotation is not read as one."""
+        topic = ("apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n"
+                 "  name: events\n  namespace: infra\n")
+        annotated = ("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: infra\n  annotations:\n"
+                     "    cnrm.cloud.google.com/project-id: acme\n")
+        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({"pubsub/events.yaml": topic, "ns.yaml": annotated}))
+        self.assertEqual([declaration.path for declaration in scan.declarations.values()], ["pubsub/events.yaml"])
+        finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/events",
+                               namespace="infra", remediation={"kind": "manual", "note": "Grant the role."})
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(dict(KCC_TOPIC, name="events")), self.root, scan.declarations, complete=True)
+        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+
+    def test_the_wider_scan_keeps_the_gcloud_check(self):
+        """The broker scan now indexes every Config Connector kind; the
+        gcloud check still meets only the cluster's own declaration."""
+        cluster = ("apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+                   "  name: prod\nspec:\n  loggingService: none\n")
+        topic = "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: prod\n"
+        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({"c.yaml": cluster, "t.yaml": topic}))
+        self.assertEqual(sorted(key[0] for key in scan.declarations), ["ContainerCluster", "PubSubTopic"])
+        finding = make_finding(fid="g", cluster="acme/us-central1/prod", obj="Cluster/prod",
+                               remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --logging=SYSTEM"})
+        problem = audit_report.reverted_gcloud_problem(finding, scan.declarations)
+        self.assertEqual((problem[0].path, problem[1]), ("c.yaml", "loggingService"))
+
+    def test_an_incomplete_search_never_claims_that_no_file_declares_the_object(self):
+        """A truncated or failed broker scan, or a dry run with no clone, did
+        not search the whole repository."""
+        for label, declarations, complete in (("truncated", {}, False), ("not run", None, None)):
+            with self.subTest(search=label):
+                finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+                audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations, complete)
+                note = finding["remediation"]["note"]
+                self.assertNotIn("found no declaration", note)
+                self.assertIn("could not search the whole GitOps repository", note)
+
+    def test_a_failed_broker_scan_is_marked_failed(self):
+        class Broken:
+            def grep(self, *_, **__):
+                raise OSError("broker gone")
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            scan = audit_report.kcc_declarations_via_broker("acme/fleet", Broken())
+        self.assertTrue(scan.failed)
+        self.assertEqual(scan.declarations, {})
 
     def test_a_manifest_fix_of_the_declaring_file_keeps_its_paragraph(self):
         """Regression: a `manifest` fix whose file declares the object keeps
@@ -23570,7 +23631,7 @@ metadata:
             remediation={"kind": "manifest", "path": "classes/gpu.yaml", "note": "Add a fallback."},
         )
         pool = {"kind": "ContainerNodePool", "namespace": "infra", "name": "gpu-pool", "why": "UpdateFailed", "cluster": "prod-usc1"}
-        self.assertEqual(self.disclose([finding], kcc_manifest(pool)), ["p"])
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(pool), self.root, {}), ["p"])
         note = finding["remediation"]["note"]
         self.assertTrue(note.startswith("Add a fallback."))
         self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, note)
@@ -23737,6 +23798,17 @@ class TestStalledKccInFinish(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, self.out)
         self.assertIn("DRY RUN: ", self.err)
+
+    def test_a_dry_run_with_no_clone_claims_no_absence(self):
+        """A content-mode dry run has no clone and opens no broker session, so
+        it did not search the repository: no "found no declaration"."""
+        finding = make_finding(obj="Cluster/prod-usc1", remediation={"kind": "manual", "note": "Set the release channel."})
+        self.patch_attr("kcc_declaration_roots", lambda *args, **kwargs: [])
+        rc = self.run_finish(make_doc(findings=[finding]), ["--dry-run", "--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, self.out)
+        self.assertIn("could not search the whole GitOps repository", self.out)
+        self.assertNotIn("found no declaration", self.out)
 
     def test_a_merged_fix_that_still_reproduces_says_config_connector_is_not_applying_it(self):
         doc = self.doc_and_file()
