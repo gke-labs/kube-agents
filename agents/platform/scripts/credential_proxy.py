@@ -9587,7 +9587,12 @@ class CommandExecutor:
             result = self._execute([gcloud, *argv[1:]], timeout_seconds=bound)
             return result.exit_code, result.stdout
 
-        return endpoint_decision(target.project, target.cluster, target.location, run=run)
+        # The same bound on waiting for another request's first-use probe:
+        # a caller's 15 s splice must not queue behind a cold read's 60 s
+        # own-cluster describe, so each probe costs a request no more behind
+        # a holder than its own run of it would have.
+        return endpoint_decision(target.project, target.cluster, target.location,
+                                 run=run, wait_seconds=bound)
 
     def _provisional_marker(self, target: ClusterTarget) -> Path:
         """Beside the managed kubeconfig: present while that file was written
@@ -9813,7 +9818,9 @@ class CommandExecutor:
                 target = parse_gke_context(context) if context else None
                 if target is not None:
                     # Outside `_kubeconfig_locks`, as before: a scaffold never
-                    # waits behind a cold read's gcloud runs. The filing step
+                    # waits behind a cold read's fetch, and its decision's
+                    # probes wait for a cold read's run of them no longer than
+                    # their own bound (`_endpoint_decision`). The filing step
                     # takes `_marker_lock` by itself, so the file and its
                     # provisional mark cannot interleave with the broker's own
                     # fetch. The same provisional rule as that fetch: a file

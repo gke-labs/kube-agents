@@ -181,8 +181,18 @@ _HELP_TIMEOUT_SECONDS = 30
 # returns without a doomed start of its own. Two locks rather than one because
 # `endpoint_decision` runs the probes back to back, never nested, and a shared
 # lock would make a slow own describe hold up a help probe it has no part in.
+#
+# The wait is the waiter's, not the holder's: a caller passes `wait_seconds`,
+# the bound its own gcloud run would have had, and one whose wait expires
+# behind a stalled holder answers as it would have had its own probe timed
+# out -- "could not find out", nothing memoised, no backoff set -- rather than
+# inherit the holder's longer clock. The credential proxy's caller splice runs
+# under a 15 s bound while its cold read runs under kubectl's 60 s; without
+# this a splice would queue up to 60 s behind a cold read's stalled describe.
 _SUPPORT_PROBE_LOCK = threading.Lock()
 _OWN_CLUSTER_LOCK = threading.Lock()
+# What `Lock.acquire` takes as "no timeout".
+_UNBOUNDED_WAIT_SECONDS = -1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -273,7 +283,16 @@ def _default_runner(env: dict[str, str] | None, timeout: int) -> Runner:
     return run
 
 
-def gcloud_supports_dns_endpoint(run: Runner | None = None) -> bool:
+def _acquired(lock: threading.Lock, wait_seconds: float | None) -> bool:
+    """Take `lock`, waiting `wait_seconds` at most, or for as long as it takes
+    when None. False when the wait expired and the lock is not held."""
+    return lock.acquire(
+        timeout=_UNBOUNDED_WAIT_SECONDS if wait_seconds is None else wait_seconds)
+
+
+def gcloud_supports_dns_endpoint(
+    run: Runner | None = None, *, wait_seconds: float | None = None,
+) -> bool:
     """Does the gcloud on PATH understand `--dns-endpoint`?
 
     The agent image installs an unpinned `google-cloud-cli` from apt, so this is
@@ -282,12 +301,20 @@ def gcloud_supports_dns_endpoint(run: Runner | None = None) -> bool:
     is whatever they happen to have; an unrecognised flag is a hard argparse
     failure, which would turn "we could have used a better endpoint" into "the
     install stopped".
+
+    `wait_seconds` bounds how long this call waits for another thread's probe
+    in flight; a wait that expires answers False for this call only, as a
+    probe that could not run does, and memoises nothing.
     """
     global _support_cache
     if _support_cache is not None:
         return _support_cache
 
-    with _SUPPORT_PROBE_LOCK:
+    if not _acquired(_SUPPORT_PROBE_LOCK, wait_seconds):
+        _log(f"waited {wait_seconds}s behind another caller's probe for "
+             f"{DNS_ENDPOINT_FLAG} support; assuming absent for this call")
+        return False
+    try:
         # Re-read under the lock: the thread this one waited behind may have
         # just answered the question.
         if _support_cache is not None:
@@ -314,6 +341,8 @@ def gcloud_supports_dns_endpoint(run: Runner | None = None) -> bool:
         if not _support_cache:
             _log(f"the installed gcloud does not offer {DNS_ENDPOINT_FLAG}; using the IP endpoint")
         return _support_cache
+    finally:
+        _SUPPORT_PROBE_LOCK.release()
 
 
 def _describe(
@@ -360,7 +389,9 @@ def _own_identity() -> tuple[str, str, str] | None:
     return project, location, cluster
 
 
-def own_cluster(run: Runner, retry: bool = False) -> OwnCluster | None:
+def own_cluster(
+    run: Runner, retry: bool = False, *, wait_seconds: float | None = None,
+) -> OwnCluster | None:
     """The network facts of the cluster this process runs on, or None.
 
     Read from the identity in OWN_CLUSTER_ENV with one `clusters describe`,
@@ -371,6 +402,10 @@ def own_cluster(run: Runner, retry: bool = False) -> OwnCluster | None:
     `_OWN_RETRY_SECONDS` the describe is not repeated, which bounds what a
     cluster that cannot be described costs the per-request callers. `retry`
     ignores that backoff, for a caller that asks once and writes a record.
+
+    `wait_seconds` bounds how long this call waits for another thread's
+    describe in flight; a wait that expires is None for this call only, with
+    no backoff set, since gcloud has not answered this caller at all.
     """
     global _own_cluster_cache, _own_failure_at
     if _own_cluster_cache is not None:
@@ -378,7 +413,11 @@ def own_cluster(run: Runner, retry: bool = False) -> OwnCluster | None:
     identity = _own_identity()
     if identity is None:
         return None
-    with _OWN_CLUSTER_LOCK:
+    if not _acquired(_OWN_CLUSTER_LOCK, wait_seconds):
+        _log(f"waited {wait_seconds}s behind another caller's describe of this "
+             f"pod's own cluster {identity[2]}; deciding without it for this call")
+        return None
+    try:
         # Re-read under the lock: the thread this one waited behind may have
         # answered, or failed and set the backoff this one now honours.
         if _own_cluster_cache is not None:
@@ -414,6 +453,8 @@ def own_cluster(run: Runner, retry: bool = False) -> OwnCluster | None:
         network, subnetwork, pod_cidr = (field.strip() for field in fields)
         _own_cluster_cache = OwnCluster(network, subnetwork, pod_cidr, _region_of(location))
         return _own_cluster_cache
+    finally:
+        _OWN_CLUSTER_LOCK.release()
 
 
 def _within_any(cidr: str, blocks: tuple[str, ...]) -> bool:
@@ -552,6 +593,7 @@ def endpoint_decision(
     env: dict[str, str] | None = None,
     run: Runner | None = None,
     retry_own: bool = False,
+    wait_seconds: float | None = None,
 ) -> EndpointDecision | None:
     """Decide which endpoint `get-credentials` should name for this cluster.
 
@@ -575,6 +617,12 @@ def endpoint_decision(
     a failed describe left, and does not accept a cached provisional answer,
     so one transient failure does not blank the record of every cluster
     scaffolded in the minute after it.
+
+    `wait_seconds` is how long each first-use probe (the help probe, the
+    own-cluster describe) may wait for another thread's run of it, and a
+    caller that bounds its gcloud runs passes that bound: the probe then
+    costs it no more behind a holder than it would have run alone. None
+    waits as long as it takes, which is right for a single-threaded caller.
     """
     if not (project and cluster and location):
         return None
@@ -587,7 +635,7 @@ def endpoint_decision(
 
     runner = run or _default_runner(env, _DESCRIBE_TIMEOUT_SECONDS)
 
-    if not gcloud_supports_dns_endpoint(runner):
+    if not gcloud_supports_dns_endpoint(runner, wait_seconds=wait_seconds):
         if _support_cache is False:
             # Settled, not undecided: the installed gcloud answered and lacks
             # the flag, and cannot grow it while we run, so this is the empty
@@ -618,7 +666,8 @@ def endpoint_decision(
     # A provisional decision is cached like any other, mark included: the
     # window bounds what a persistently failing own describe costs the agent's
     # callers, and the credential proxy acts on the mark, not on this cache.
-    decision = _decide(described, location, lambda: own_cluster(runner, retry=retry_own),
+    decision = _decide(described, location,
+                       lambda: own_cluster(runner, retry=retry_own, wait_seconds=wait_seconds),
                        own_known=_own_identity() is not None)
     _endpoint_cache[key] = (time.monotonic(), decision)
     return decision

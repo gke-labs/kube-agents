@@ -446,6 +446,40 @@ class GcloudSupportTest(unittest.TestCase):
         self.assertEqual([True, True, True], answers)
         self.assertEqual(1, len(probes), "one help probe for three concurrent first calls")
 
+    def test_a_waiter_bounded_by_its_own_wait_answers_without_the_holders_probe(self):
+        # A caller that bounds its gcloud runs waits for another thread's probe
+        # no longer than that bound: the credential proxy's 15 s caller splice
+        # must not queue behind a cold read's 60 s run. A wait that expires is
+        # "could not find out" for that call, False with nothing memoised, so
+        # the holder's answer still lands for every caller after it.
+        probes = []
+        probe_started = threading.Event()
+        release_probe = threading.Event()
+
+        def runner(argv):
+            probes.append(argv)
+            probe_started.set()
+            self.assertTrue(release_probe.wait(timeout=10))
+            return 0, HELP_WITH_FLAG
+
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+        holder = threading.Thread(target=lambda: gke_endpoint.gcloud_supports_dns_endpoint(runner), daemon=True)
+        with redirect_stderr(io.StringIO()) as stderr:
+            holder.start()
+            self.assertTrue(probe_started.wait(timeout=10))
+            answer = gke_endpoint.gcloud_supports_dns_endpoint(runner, wait_seconds=0.05)
+            self.assertTrue(holder.is_alive(), "the waiter returned only once the holder's probe ended")
+            memo_after_wait = gke_endpoint._support_cache
+            release_probe.set()
+            holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertFalse(answer)
+        self.assertIsNone(memo_after_wait, "an expired wait was memoised as an answer")
+        self.assertIn("waited 0.05s", stderr.getvalue())
+        self.assertTrue(gke_endpoint.gcloud_supports_dns_endpoint(runner), "the holder's answer was lost")
+        self.assertEqual(1, len(probes), "the waiter ran a probe of its own")
+
     def test_a_probe_that_could_not_run_is_retried_rather_than_memoised(self):
         """Only gcloud's answer is worth keeping, never our failure to get one.
 
@@ -985,6 +1019,63 @@ class OwnNetworkTest(unittest.TestCase):
                 self.assertFalse(thread.is_alive())
         self.assertEqual([None, None], answers)
         self.assertEqual(1, len(describes), "the waiter did not repeat the failed describe")
+
+    def test_a_waiter_bounded_by_its_own_wait_decides_without_the_own_cluster(self):
+        # The same bound on the own-cluster describe. A wait that expires is
+        # None for that call with no backoff set: gcloud has not answered this
+        # caller, and the holder, not the waiter, learns whether it fails.
+        describes = []
+        describe_started = threading.Event()
+        release_describe = threading.Event()
+
+        def runner(argv):
+            describes.append(argv)
+            describe_started.set()
+            self.assertTrue(release_describe.wait(timeout=10))
+            return 0, OWN_ROW + "\n"
+
+        holder = threading.Thread(target=lambda: gke_endpoint.own_cluster(runner), daemon=True)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()) as stderr:
+            holder.start()
+            self.assertTrue(describe_started.wait(timeout=10))
+            answer = gke_endpoint.own_cluster(runner, wait_seconds=0.05)
+            self.assertTrue(holder.is_alive(), "the waiter returned only once the holder's describe ended")
+            backoff_after_wait = gke_endpoint._own_failure_at
+            release_describe.set()
+            holder.join(timeout=10)
+            self.assertFalse(holder.is_alive())
+            settled = gke_endpoint.own_cluster(runner, wait_seconds=0.05)
+        self.assertIsNone(answer)
+        self.assertIsNone(backoff_after_wait, "an expired wait set the failure backoff")
+        self.assertIn("waited 0.05s", stderr.getvalue())
+        self.assertEqual(OWN_NETWORK, settled.network, "the holder's answer was lost")
+        self.assertEqual(1, len(describes), "the waiter ran a describe of its own")
+
+    def test_endpoint_decision_passes_its_wait_to_the_own_cluster_describe(self):
+        # End to end on the module: a decision for a private target made under
+        # a bound, while another thread's own describe is in flight, comes back
+        # provisional before that describe ends rather than on its clock.
+        describe_started = threading.Event()
+        release_describe = threading.Event()
+
+        def stalling(argv):
+            describe_started.set()
+            self.assertTrue(release_describe.wait(timeout=10))
+            return 0, OWN_ROW + "\n"
+
+        holder = threading.Thread(target=lambda: gke_endpoint.own_cluster(stalling), daemon=True)
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            holder.start()
+            self.assertTrue(describe_started.wait(timeout=10))
+            decision = gke_endpoint.endpoint_decision("p", "c", "us-central1", run=runner, wait_seconds=0.05)
+            self.assertTrue(holder.is_alive(), "the decision waited for the holder's describe to end")
+            release_describe.set()
+            holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertIsNotNone(decision)
+        self.assertTrue(decision.provisional, "a decision made without the own cluster is provisional")
+        self.assertEqual([], runner.own_network_calls, "the bounded caller ran an own describe of its own")
 
     def test_the_own_cluster_describe_names_the_identity_from_the_environment(self):
         runner = FakeRunner(PRIVATE_SAME_VPC)

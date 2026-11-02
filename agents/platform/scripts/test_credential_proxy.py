@@ -4714,6 +4714,69 @@ class CommandExecutorTest(unittest.TestCase):
             threading.Thread(target=run, daemon=True).start()
             self.assertTrue(done.wait(timeout=10), "the caller's fetch waited on the kubeconfig lock")
 
+    def test_a_callers_splice_waits_behind_a_cold_reads_own_describe_only_for_its_own_bound(self):
+        # The probe locks in gke_endpoint coalesce the own-cluster describe
+        # across requests, so a caller's unflagged fetch for a private cluster
+        # can arrive while a cold read's describe is in flight. The caller's
+        # splice runs under SPLICE_DECISION_TIMEOUT_SECONDS, the cold read
+        # under kubectl's 60 s: the splice waits its own bound, not the
+        # holder's, then runs the fetch as given and files it provisional.
+        import gke_endpoint
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+        executor = self.fake_gcloud(self.executor())
+        cold = "gke_demo-project_us-central1_cold-cluster"
+        own_format = f"--format={gke_endpoint._OWN_NETWORK_FORMAT}"
+        own_started = threading.Event()
+        release_own = threading.Event()
+        own_stall_over = threading.Event()
+        private_target = {
+            "controlPlaneEndpointsConfig": {
+                "ipEndpointsConfig": {"enabled": True, "enablePublicEndpoint": False,
+                                      "privateEndpoint": "10.10.0.2"},
+            },
+            "privateClusterConfig": {"enablePrivateNodes": True, "privateEndpoint": "10.10.0.2"},
+            "networkConfig": {"network": "projects/host-proj/global/networks/shared-vpc"},
+        }
+        original = executor._execute
+
+        def answer(stdout):
+            return credential_proxy.ExecutionResult(
+                exit_code=0, stdout=stdout, stderr="", duration_ms=0, truncated=False, timed_out=False)
+
+        def stall_the_own_describe(argv, **kwargs):
+            if own_format in argv:
+                own_started.set()
+                release_own.wait(timeout=10)
+                own_stall_over.set()
+                return answer("net\tsubnet\t10.92.0.0/14\n")
+            if "describe" in argv:
+                return answer(json.dumps(private_target))
+            return original(argv, **kwargs)
+
+        own_env = dict(zip(gke_endpoint.OWN_CLUSTER_ENV, ("demo-project", "us-central1", "own-cluster")))
+        with (
+            mock.patch.dict(os.environ, own_env),
+            mock.patch.object(credential_proxy, "SPLICE_DECISION_TIMEOUT_SECONDS", 1),
+            mock.patch.object(executor, "_execute", stall_the_own_describe),
+        ):
+            cold_thread = threading.Thread(target=lambda: executor._resolve_kubeconfig(cold), daemon=True)
+            cold_thread.start()
+            self.assertTrue(own_started.wait(timeout=10), "the cold read never reached its own describe")
+            result = executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+            self.assertFalse(own_stall_over.is_set(), "the caller's splice waited for the cold read's describe to end")
+            release_own.set()
+            cold_thread.join(timeout=10)
+        self.assertFalse(cold_thread.is_alive())
+        self.assertEqual(0, result.exit_code, result.stderr)
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        self.assertTrue(executor._managed_kubeconfig(target).is_file(), "the caller's fetch was not filed")
+        self.assertTrue(executor._provisional_marker(target).exists(),
+                        "a fetch decided without the own cluster was filed as settled")
+
     def test_a_stalled_fetch_for_one_cluster_does_not_delay_another_clusters_cold_read(self):
         # The issue's acceptance: the kubeconfig lock is per cluster, so a
         # get-credentials that hangs for slow-cluster holds only that cluster's
@@ -4807,14 +4870,20 @@ class CommandExecutorTest(unittest.TestCase):
         target = credential_proxy.parse_gke_context(self.CONTEXT)
         seen = []
 
-        def fake_decision(project, cluster, location, *, run=None, env=None):
+        waits = []
+
+        def fake_decision(project, cluster, location, *, run=None, env=None, wait_seconds=None):
             seen.append(run(["gcloud", "container", "clusters", "describe", cluster]))
+            waits.append(wait_seconds)
             return None
 
         with mock.patch("gke_endpoint.endpoint_decision", fake_decision):
             executor._endpoint_decision(resolved, target)
 
         self.assertEqual(1, len(seen))
+        # The cold path's probes wait for another request's run of them no
+        # longer than the bound their own gcloud run gets.
+        self.assertEqual([executor.kubectl_timeout_seconds], waits)
         # The stub answers a describe with "{}" and exits 0; what this proves is
         # that the adapter ran *something*, and ran it through _execute.
         self.assertIsInstance(seen[0], tuple)
