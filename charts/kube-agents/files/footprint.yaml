@@ -76,3 +76,20 @@ operatorRendered:
     dataClaims: 2
     dataClaimRequest: 50Gi
     dataClaimBytesRequest: 53687091200
+operatorRenderedPerReplica:
+  credentialProxyExecTier:
+    requests:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 2Gi
+    cpuMillisRequest: 2000
+    cpuMillisLimit: 2000
+    memoryBytesRequest: 2147483648
+    memoryBytesLimit: 2147483648
+    ephemeralStorageBytesRequest: 2147483648
+    ephemeralStorageBytesLimit: 2147483648
+    pods: 1

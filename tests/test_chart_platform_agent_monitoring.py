@@ -181,10 +181,15 @@ class MonitoringShapeTest(unittest.TestCase):
         # homes, and this is what keeps them one. The template lists the
         # scrapes in _SCRAPES order.
         ports = re.findall(r"^\s+- port: (\d+)$", self.template, re.MULTILINE)
-        self.assertEqual(
-            ports,
-            [str(_scrape_port(s)) for s in _SCRAPES],
-        )
+        want = []
+        for scrape in _SCRAPES:
+            want.append(str(_scrape_port(scrape)))
+            # The exec tier's PodMonitoring follows the broker's, rendered only
+            # while the tier is on, so it is not a _SCRAPES row.
+            if scrape["suffix"] == "-credential-proxy-monitoring":
+                want.append(str(_manifest_port(_EXEC_GOLDEN, f"{_GOLDEN_AGENT}-credential-proxy-exec-tier",
+                                               "envoy-credential-proxy", "cred-metrics")))
+        self.assertEqual(ports, want)
 
     def test_the_selectors_are_the_operators_pod_labels(self):
         for scrape in _SCRAPES:
@@ -625,3 +630,49 @@ class MonitoringRenderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_EXEC_GOLDEN = _GOLDEN.with_name("platformagent-exec-2.yaml")
+_EXEC_VALUE = "platformAgent.deployment.credentialProxy.exec.replicas"
+_EXEC_KEYS = ("app", "kubeagents.x-k8s.io/component")
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+class ExecTierMonitoringRenderTest(unittest.TestCase):
+    """Every scrape object for the stateful broker has an exec-tier counterpart while
+    the tier renders, on the operator's exec pod labels and metrics port."""
+
+    def _render(self, replicas):
+        proc = subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_REQUIRED, *_ON_GKE,
+             "--set", "platformAgent.serviceMonitor=true", "--set", "platformAgent.vmPodScrape=true",
+             "--set", "platformAgent.monitoringScraperNamespace=scrapers",
+             "--set", f"{_EXEC_VALUE}={replicas}"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return {(d["kind"], d["metadata"]["name"]): d for d in yaml.safe_load_all(proc.stdout) if isinstance(d, dict)}
+
+    def test_nothing_for_the_tier_at_zero(self):
+        self.assertFalse([key for key in self._render(0) if "exec-tier" in key[1]])
+
+    def test_each_scrape_object_has_an_exec_tier_counterpart(self):
+        docs = self._render(2)
+        labels = _manifest_pod_labels(_EXEC_GOLDEN, f"{_GOLDEN_AGENT}-credential-proxy-exec-tier")
+        want = {key: labels[key].replace(_GOLDEN_AGENT, _AGENT) for key in _EXEC_KEYS}
+        port = _manifest_port(_EXEC_GOLDEN, f"{_GOLDEN_AGENT}-credential-proxy-exec-tier", "envoy-credential-proxy", "cred-metrics")
+        monitoring = docs[("PodMonitoring", f"{_AGENT}-credential-proxy-exec-tier-monitoring")]
+        self.assertEqual(monitoring["spec"]["selector"]["matchLabels"], want)
+        self.assertEqual(monitoring["spec"]["endpoints"][0]["port"], port)
+        service = docs[("Service", f"{_AGENT}-cred-metrics-exec-tier")]
+        self.assertEqual(service["spec"]["selector"], want)
+        self.assertEqual(service["spec"]["ports"][0]["port"], port)
+        monitor = docs[("ServiceMonitor", f"{_AGENT}-cred-metrics-exec-tier")]
+        self.assertEqual(monitor["spec"]["selector"]["matchLabels"], {"app": f"{_AGENT}-cred-metrics-exec-tier"})
+        scrape = docs[("VMPodScrape", f"{_AGENT}-cred-metrics-exec-tier")]
+        self.assertEqual(scrape["spec"]["selector"]["matchLabels"], want)
+        netpol = docs[("NetworkPolicy", f"{_AGENT}-cred-mon-exec-tier-netpol")]
+        self.assertEqual(netpol["spec"]["podSelector"]["matchLabels"], {"app": want["app"]})
+        self.assertEqual(netpol["spec"]["ingress"][0]["ports"][0]["port"], port)
+        # The stateful broker's objects are unchanged beside them.
+        self.assertIn(("PodMonitoring", f"{_AGENT}-credential-proxy-monitoring"), docs)

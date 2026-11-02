@@ -55,6 +55,10 @@ _GOLDEN_MANIFEST = (
     / "expected"
     / "platformagent.yaml"
 )
+# The exec tier renders only at a positive spec.deployment.credentialProxy.exec.replicas,
+# so the default golden has none; its one-replica golden gives one replica's worth,
+# which the quota preflight multiplies by the chart's replica count.
+_EXEC_TIER_GOLDEN_MANIFEST = _GOLDEN_MANIFEST.with_name("platformagent-exec-1.yaml")
 _FOOTPRINT_FILE = _ROOT / "charts" / "kube-agents" / "files" / "footprint.yaml"
 
 _HEADER = (
@@ -72,6 +76,7 @@ _SHELL_WORKLOAD = "platformagent-shell"
 _SHELL_CONTAINER = "shell"
 _CRED_PROXY_WORKLOAD = "platformagent-credential-proxy"
 _CRED_PROXY_CONTAINER = "envoy-credential-proxy"
+_EXEC_TIER_WORKLOAD = "platformagent-credential-proxy-exec-tier"
 _GATEWAY_WORKLOAD = "platformagent-gateway"
 _AGENT_CONTAINER = "platform-agent"
 _DASHBOARD_CONTAINER = "platform-agent-dashboard"
@@ -151,6 +156,8 @@ _BASE = "base"
 _DASHBOARD = "dashboard"
 _SHELL_SANDBOX = "shellSandbox"
 _CREDENTIAL_PROXY = "credentialProxy"
+_OPERATOR_RENDERED_PER_REPLICA = "operatorRenderedPerReplica"
+_CREDENTIAL_PROXY_EXEC_TIER = "credentialProxyExecTier"
 _STORAGE_SECTION = "storage"
 _PERSISTENT_VOLUME_CLAIMS = "persistentVolumeClaims"
 _STORAGE_REQUEST = "storageRequest"
@@ -476,6 +483,35 @@ def _check_completeness(pod_workloads: dict, summed_containers: set) -> None:
         )
 
 
+def _exec_tier_entry() -> dict:
+    """One exec-tier replica's footprint, from the exec tier's one-replica golden."""
+    for doc in yaml.safe_load_all(_EXEC_TIER_GOLDEN_MANIFEST.read_text()):
+        if not doc or doc.get(_KIND_FIELD) != _KIND_DEPLOYMENT:
+            continue
+        if (doc.get(_METADATA_FIELD) or {}).get(_NAME_FIELD) != _EXEC_TIER_WORKLOAD:
+            continue
+        containers = _pod_containers(_pod_spec(doc))
+        # The entry sums the broker container alone, so anything else the pod runs
+        # (a container, or an init container of either kind) would go uncounted.
+        # The tier's pod is a copy of the broker's, so a container added there lands
+        # here too; fail on it rather than undercount, as _check_completeness does
+        # for the default golden.
+        others = [c.get(_NAME_FIELD) for c in containers if c.get(_NAME_FIELD) != _CRED_PROXY_CONTAINER]
+        if others:
+            raise ValueError(
+                f"{_EXEC_TIER_WORKLOAD} in {_EXEC_TIER_GOLDEN_MANIFEST.name} runs containers"
+                f" the exec tier's footprint does not sum: {others}. {_COMPLETENESS_ADVICE}"
+            )
+        for container in containers:
+            if container.get(_NAME_FIELD) == _CRED_PROXY_CONTAINER:
+                return _workload_entry([container], pods=1)
+        raise ValueError(
+            f"container {_CRED_PROXY_CONTAINER!r} not found in {_EXEC_TIER_WORKLOAD}"
+            f" in {_EXEC_TIER_GOLDEN_MANIFEST.name}"
+        )
+    raise ValueError(f"{_EXEC_TIER_WORKLOAD} not found in {_EXEC_TIER_GOLDEN_MANIFEST.name}")
+
+
 def extract_footprint() -> dict:
     """Extract operator-rendered resource requirements from the golden manifest."""
     if not _GOLDEN_MANIFEST.is_file():
@@ -639,7 +675,12 @@ def extract_footprint() -> dict:
                 _DATA_CLAIM_REQUEST: format_bytes(data_claim_bytes[0]),
                 _DATA_CLAIM_BYTES_REQUEST: data_claim_bytes[0],
             },
-        }
+        },
+        # Outside operatorRendered, which the preflight sums once per entry: these are
+        # one replica's worth, multiplied by a replica count the chart holds.
+        _OPERATOR_RENDERED_PER_REPLICA: {
+            _CREDENTIAL_PROXY_EXEC_TIER: _exec_tier_entry(),
+        },
     }
 
 

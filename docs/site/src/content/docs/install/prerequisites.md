@@ -99,6 +99,8 @@ The first command omits a key whose value is unset, so a requirement that is not
 
 The chart's quota check counts a `today` release only, not the `spec.mode: next` additions in the capacity row above or the session pods. Autopilot sizes nodes to fit; on a Standard cluster, check the free allocatable against those figures, or a session pod stays `Pending` when one is asked for.
 
+With `platformAgent.deployment.credentialProxy.exec.replicas` above 0, each exec-tier replica is one more pod with 2 CPU and 2 GiB in requests and limits, plus the broker's ephemeral storage, and the chart's check counts them. It does not check node room. On a Standard cluster whose nodes lack 2 free CPU, a replica stays `Pending`. Turning the tier on also restarts the shell sandbox, which then needs its own room again.
+
 A quota is more than CPU and memory, and so is the check: a `today` install also needs 7
 pods, 4 persistent volume claims totalling 102 GiB of `requests.storage`, and 14,912 MiB of
 ephemeral-storage requests against 14,912 MiB of limits. Two of those claims, the agent's data
