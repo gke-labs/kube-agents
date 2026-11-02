@@ -256,6 +256,24 @@ class PagedReadTest(unittest.TestCase):
         # Nothing after the failed page is read.
         self.assertEqual(3, len(calls))
 
+    def test_a_page_that_exited_non_zero_is_not_read_however_well_formed(self):
+        # The exit code is judged before the body: a shim that exited 74 with a
+        # whole-looking page, or a kubectl that failed after printing one, hands
+        # back the page as it ran, with its own stderr and no helper text, and
+        # nothing of it is merged.
+        argv = cr.list_argv("pods")
+        for rc, stderr in ((1, "error: the server was unable to return a response"), (74, "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)")):
+            with self.subTest(rc=rc):
+                run, calls = self.scripted({
+                    ("/api/v1/pods", ""): cr.Run(argv, rc, page(["a"], continue_token="t1"), stderr, 0.01),
+                    ("/api/v1/pods", "t1"): page(["b"]),
+                })
+                parsed, result = cr.paged_dump(["pods"], run=run)
+                self.assertIsNone(parsed)
+                self.assertEqual((rc, stderr), (result.rc, result.stderr))
+                self.assertEqual(page(["a"], continue_token="t1"), result.stdout)
+                self.assertEqual(1, len(calls))
+
     def test_a_cut_page_from_an_older_shim_closes_the_dump_too(self):
         # rc 0 with a partial payload: the JSON gate, not the exit code, catches it, and the
         # failing page's stderr says so after whatever the page printed there (the marker).
