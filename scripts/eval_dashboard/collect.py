@@ -3,12 +3,13 @@
 
 The presubmit (hack/ci-eval-pr.sh, run by pull-kube-agents-smoke-test) prints
 a final verdict line into the job log, which Prow archives as build-log.txt
-next to started.json and finished.json under gs://kube-agents-prow, and
-writes one `Task <name> Result:` block per bench case to
-artifacts/eval-grading.log beside it (builds from before the artifact
-existed carry the blocks in the log itself). Nothing structured survives
-the run, so this collector re-derives structure from those lines and writes
-the data.json the dashboard renders.
+next to started.json and finished.json under the lanes' log bucket,
+gs://kube-agents-evals-presubmit-logs (runs from before the move sit in
+gs://kube-agents-prow), and writes one `Task <name> Result:` block per bench
+case to artifacts/eval-grading.log beside it (builds from before the artifact
+existed carry the blocks in the log itself). Nothing structured survives the
+run, so this collector re-derives structure from those lines and writes the
+data.json the dashboard renders.
 
 data.json is a CONTRACT: the renderer and the publisher are built against the
 exact shape documented in SCHEMA.md. Changes must be additive optional fields
@@ -221,8 +222,8 @@ SCHEMA_VERSION = 1
 # A periodic's log prefix holds one directory per build and a
 # latest-build.txt, so listing it is the directory index; there is no
 # pointer object to follow. The bucket is the nightly's own, not the
-# cluster default gs://kube-agents-prow the presubmit and the RC lane log
-# to: the nightly runs as an identity that cannot write that one (night one
+# cluster default gs://kube-agents-prow the RC lane logs to (the presubmit
+# has its own as well): the nightly runs as an identity that cannot write that one (night one
 # died in initupload on a 403), so its job overrides the bucket and
 # github-actions@kube-agents-prow reads it as objectViewer. Only the bucket
 # differs; Prow's path strategy still puts a periodic under logs/<job>/.
@@ -1640,6 +1641,9 @@ def _read_build(
         return build_id, None, _UNFINISHED
     if periodic:
         run["log_url"] = spyglass_url(base)
+    # Where the run was read from, so its links follow it when a lane changes
+    # buckets (SCHEMA.md, runs[].gcs_base).
+    run["gcs_base"] = base
     return build_id, run, _RECORDED
 
 
@@ -2336,6 +2340,11 @@ def collect(
     # The presubmit's retries are its own pending builds; a GitLab or nightly
     # one is retried by its source, which knows where it lives.
     presubmit_retry = frozenset(b for b in retry if b not in gitlab_pending and b not in nightly_pending)
+    # An index that matched no objects is a note here, as on the lanes'
+    # other sources: the lanes moved buckets, so the new index holds nothing
+    # until their first run lands and the old one may be purged later, and
+    # neither is the bucket or the grant failing (the warning the refresh
+    # workflow refuses to publish on).
     for prefix in indexes:
         fresh.extend(
             runs_from_index(
@@ -2345,6 +2354,7 @@ def collect(
                 since_cutoff=since_cutoff,
                 retry_builds=presubmit_retry,
                 unfinished=unfinished,
+                unlisted_is_note=True,
             )
         )
     if glob_only:
@@ -2569,7 +2579,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="GS_GLOB",
-        help="gs:// glob of Prow build dirs, e.g. gs://kube-agents-prow/"
+        help="gs:// glob of Prow build dirs, e.g. gs://kube-agents-evals-presubmit-logs/"
         "pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*"
         " (repeatable). Discovers builds only for a cold sweep (no watermark"
         " from --merge-with); with a watermark, --index-prefix is listed"
@@ -2581,7 +2591,7 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         metavar="GS_GLOB",
         help="gs:// glob of the GitLab lane's Prow build dirs, e.g."
-        " gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/"
+        " gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/"
         "pull-kube-agents-smoke-test-gitlab/* (repeatable). Read through"
         " the job's own directory index, whole on a cold sweep and above its"
         " own watermark after; its runs carry tier=gitlab and count in no"

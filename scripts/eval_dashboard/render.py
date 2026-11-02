@@ -1075,6 +1075,9 @@ def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
     out = {
         "build": verdict["build"],
         "pr": run.get("pr"),
+        # Where the build lives (SCHEMA.md, runs[].gcs_base); the pages link
+        # it there, Spyglass for a record without it.
+        "gcs_base": run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None,
         "head_sha": run.get("head_sha") if isinstance(run.get("head_sha"), str) else None,
         "project": run.get("project") if isinstance(run.get("project"), str) else None,
         "started": run.get("started") if iso_ms(run.get("started")) is not None else None,
@@ -1161,6 +1164,7 @@ def last_failure(name: str, gate: list[tuple[dict, dict]], nightly: list[tuple[d
                 "tier": tier,
                 "build": build,
                 "pr": run.get("pr") if isinstance(run.get("pr"), int) else None,
+                "gcs_base": run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None,
                 "at": run_when(run),
                 "state": state,
                 "reps": {"pass": passed, "fail": failed, "infra": infra},

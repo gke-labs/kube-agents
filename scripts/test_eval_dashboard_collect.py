@@ -873,7 +873,10 @@ class TestIndexDiscovery(_MergeBase):
         prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
         stages = {
             "timed out": {"FAKE_GCLOUD_SLEEP": json.dumps({f"ls {FAKE_INDEX_PREFIX}": 3})},
-            "failed": {"FAKE_GCLOUD_ROOT": str(self.tmp / "no-such-bucket")},
+            # A denied listing (the grant gone), not an empty prefix: with a
+            # watermark an index that matched no objects is a note now (the
+            # lanes moved buckets), and its own test covers that.
+            "failed": {"FAKE_GCLOUD_DENY": FAKE_INDEX_PREFIX},
         }
         original_timeout = collect.GCLOUD_TIMEOUT_S
         self.addCleanup(setattr, collect, "GCLOUD_TIMEOUT_S", original_timeout)
@@ -958,8 +961,27 @@ class TestIndexDiscovery(_MergeBase):
                     pr_globs=[FAKE_GLOB], gcloud=gcloud, index_prefix=FAKE_INDEX_PREFIX, now=now, **kwargs
                 )
                 self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
+                # Where it was read from travels with it (gcs_base), so the
+                # pages link the build wherever the lane logs.
+                base = merged["runs"][0]["gcs_base"]
+                self.assertTrue(base.startswith("gs://") and base.endswith(f"/{BUILD_998_FULL}/"), base)
                 listings = [c for c in log.read_text().splitlines() if c.startswith("ls ")]
                 self.assertEqual(listings, [f"ls {FAKE_GLOB}"])
+
+    def test_a_presubmit_index_that_matched_no_objects_is_a_note_with_a_watermark(self):
+        """The lanes moved buckets: until the first run lands in the new one
+        its directory index exists and holds nothing, and the old index
+        may be purged later. With a watermark that is nothing new, a note,
+        never the `warning: gcloud storage ls failed` the refresh workflow
+        refuses to publish on (the GitLab lane's rule, applied here)."""
+        gcloud, _ = self.fake_gcloud([BUILD_998_FULL])
+        prior = self.prior_with([BUILD_998_FULL])
+        old_glob = FAKE_BUCKET + "pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*"
+        new_glob = FAKE_BUCKET + "pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-moved/*"
+        merged, err = self.quiet_collect(pr_globs=[new_glob, old_glob], gcloud=gcloud, merge_with=prior)
+        self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
+        self.assertIn("note: directory index " + FAKE_BUCKET + "pr-logs/directory/pull-kube-agents-smoke-test-moved/ did not list", err)
+        self.assertNotIn("warning: gcloud storage ls failed", err)
 
     def test_merge_with_alone_still_touches_no_bucket(self):
         """--merge-with without --pr-glob recomputes; the index is how a

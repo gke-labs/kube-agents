@@ -624,10 +624,11 @@ fi
 #      that periodic alone" now reads "to that periodic and that workflow",
 #      still nothing a presubmit can run as.)
 #      The same identity also needs READ on the sweep's source --
-#      roles/storage.objectViewer on gs://kube-agents-prow -- unless that
-#      bucket's existing public read already covers it; without it the first
-#      armed run 403s, which the zero-runs floor below turns into a skip,
-#      never into publishing an empty dashboard over a good one.
+#      roles/storage.objectViewer on the lanes' log bucket
+#      gs://kube-agents-evals-presubmit-logs and on gs://kube-agents-prow,
+#      where the runs before the move are; without it the first armed run 403s, which
+#      the zero-runs floor below turns into a skip, never into publishing an
+#      empty dashboard over a good one.
 # Until both land this costs one log line per run.
 # scripts/test_eval_dashboard_publish.py runs this function out of this file
 # and asserts the fail-safe AND the main-branch gate hold.
@@ -698,7 +699,7 @@ publish_eval_dashboard() {
   # shellcheck disable=SC2016
   ${dash_timeout[@]+"${dash_timeout[@]}"} bash -c '
     set -euo pipefail
-    python3 "$1/collect.py" --pr-glob "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*" --out "$2/data.json"
+    python3 "$1/collect.py" --pr-glob "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*" --pr-glob "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*" --out "$2/data.json"
     python3 -c "
 import json, sys
 if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):

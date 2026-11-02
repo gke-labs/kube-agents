@@ -273,6 +273,22 @@ class Shapes(Harness):
         self.assertIn("Your 1 failure is exactly that one, so this red is not your code.", box)
         self.assertIn("| 0 / 3 reps (1 infra) |", self.gh.bodies()[0])
 
+    def test_a_run_that_records_where_it_lives_links_the_console_browser(self):
+        """runs[].gcs_base (the smoke lanes' own bucket, which Deck cannot
+        read) turns the footer's build link into the Console's bucket
+        browser; a record without it keeps the Spyglass link."""
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO)
+        mine["gcs_base"] = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100/"
+        self.tick(data(mine, *other_runs()), outage_health())
+        body = self.gh.bodies()[0]
+        self.assertTrue(
+            body.rstrip().endswith(
+                "[build log](https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100)"
+            ),
+            body,
+        )
+        self.assertNotIn("oss.gprow.dev", body)
+
 
 class RunAsAScript(Harness):
     """ci-health.yml runs gate_comment.py by path from the repository root.

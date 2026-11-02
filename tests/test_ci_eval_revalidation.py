@@ -48,7 +48,7 @@ _JOB = "pull-kube-agents-smoke-test"
 _PROW_BOT = "google-oss-prow[bot]"
 _ADMIN = "alice"
 _OVERRIDE_URL = f"https://github.com/gke-labs/kube-agents/pull/{_PR}#issuecomment-1"
-_SPYGLASS = "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
+_BUILD_URL = "https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents"
 
 # Printed by the wrapper before it sources the script, whose constants read
 # JOB_NAME as they load, so a test can pin whether the variable was absent
@@ -283,7 +283,7 @@ class RevalidationTest(unittest.TestCase):
         status_events = {}
         for build_id, passed, base_sha, head_sha in builds:
             listing.append(
-                f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/{build_id}/finished.json"
+                f"gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/{build_id}/finished.json"
             )
             if passed is not None:
                 revision = f', "revision": "{head_sha}"' if head_sha else ""
@@ -306,7 +306,7 @@ class RevalidationTest(unittest.TestCase):
                     {
                         "context": _JOB,
                         "state": "success",
-                        "target_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/{build_id}",
+                        "target_url": f"https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/{build_id}",
                     }
                 )
         for head_sha, events in status_events.items():
@@ -339,7 +339,7 @@ class RevalidationTest(unittest.TestCase):
         overrode, and crier's report of the override ProwJob with the BaseSHA
         suffix and the comment URL."""
         return [
-            self._override_event(when=when, pr=pr, url=f"{_SPYGLASS}/{pr}/{_JOB}/900"),
+            self._override_event(when=when, pr=pr, url=f"{_BUILD_URL}/{pr}/{_JOB}/900"),
             self._override_event(when=when, pr=pr, description=f"Overridden by {_ADMIN}                  BaseSHA:{self.c5}"),
         ]
 
@@ -351,7 +351,7 @@ class RevalidationTest(unittest.TestCase):
             "state": state,
             "creator": {"login": creator},
             "description": f"{description}                    BaseSHA:{self.c5}",
-            "target_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/{build}",
+            "target_url": f"https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/{build}",
             "created_at": when,
         }
 
@@ -476,7 +476,7 @@ class RevalidationTest(unittest.TestCase):
         """Humans grep build logs for this line (and future collector support
         needs a stable line to key on); the word REVALIDATED and the reused
         build id must appear together, a serial run names its one build with
-        no pull suffix, and the Spyglass URL must follow."""
+        no pull suffix, and the build's Console URL must follow."""
         self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn(
@@ -485,7 +485,7 @@ class RevalidationTest(unittest.TestCase):
         )
         self.assertEqual(proc.stdout.count("Step 0: REVALIDATED"), 1)
         self.assertIn(
-            "Reused verdict: https://oss.gprow.dev/view/gs/kube-agents-prow/"
+            "Reused verdict: https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/"
             f"pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/200",
             proc.stdout,
         )
@@ -497,7 +497,7 @@ class RevalidationTest(unittest.TestCase):
         self._plant_history([("200", True, self.c1, self.c3)])
         self._run(cur_head=self.c4, cur_base=self.c2)
         calls = self.call_log.read_text().splitlines()
-        prefix = f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}"
+        prefix = f"gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}"
         self.assertIn(f"ls {prefix}/*/finished.json", calls)
         self.assertIn(f"cat {prefix}/200/finished.json", calls)
         self.assertIn(f"cat {prefix}/200/started.json", calls)
@@ -515,7 +515,7 @@ class RevalidationTest(unittest.TestCase):
             cur_head=self.c4, cur_base=self.c2, env_overrides={"JOB_NAME": other_job}
         )
         calls = self.call_log.read_text().splitlines()
-        own = f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{other_job}"
+        own = f"gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{_PR}/{other_job}"
         self.assertIn(f"ls {own}/*/finished.json", calls)
         self.assertFalse(
             [c for c in calls if f"/{_PR}/{_JOB}/" in c],
@@ -762,7 +762,7 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("no green build among the newest", proc.stdout)
         calls = self.call_log.read_text().splitlines()
         self.assertEqual([c for c in calls if c.startswith("stat")], [], "no second object is consulted")
-        self.assertNotIn(f"cat gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/300/started.json", calls)
+        self.assertNotIn(f"cat gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/300/started.json", calls)
 
     def test_an_artifacts_directory_that_does_not_exist_yet_is_created(self):
         """At the hoisted step 0 nothing in the job has written to ARTIFACTS
@@ -908,7 +908,7 @@ class RevalidationTest(unittest.TestCase):
         the commit's newest status: crier's report points at PR 78's
         comment, and the plugin's re-posted status keeps PR 77's Spyglass
         URL. Neither is a verdict for PR 77."""
-        self._plant_statuses(self.c3, [self._override_event(pr=_OTHER_PR), self._override_event(pr=_OTHER_PR, url=f"{_SPYGLASS}/{_PR}/{_JOB}/900")])
+        self._plant_statuses(self.c3, [self._override_event(pr=_OTHER_PR), self._override_event(pr=_OTHER_PR, url=f"{_BUILD_URL}/{_PR}/{_JOB}/900")])
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertNotIn("holds a reusable verdict", proc.stdout)
@@ -931,7 +931,7 @@ class RevalidationTest(unittest.TestCase):
         """The re-posted status keeps whatever URL the commit's status had,
         even one under this pull request's own history path; without the
         comment-URL event it is not a verdict."""
-        self._plant_statuses(self.c3, [self._override_event(url=f"{_SPYGLASS}/{_PR}/{_JOB}/900")])
+        self._plant_statuses(self.c3, [self._override_event(url=f"{_BUILD_URL}/{_PR}/{_JOB}/900")])
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertNotIn("holds a reusable verdict", proc.stdout)
@@ -1140,7 +1140,7 @@ class RevalidationTest(unittest.TestCase):
         calls = self.call_log.read_text().splitlines()
         for pr in (_PR, _OTHER_PR):
             self.assertIn(
-                f"ls gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/*/finished.json",
+                f"ls gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/*/finished.json",
                 calls,
             )
 
@@ -1404,7 +1404,7 @@ class RevalidationTest(unittest.TestCase):
                 {
                     "context": _JOB,
                     "state": "success",
-                    "target_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/111",
+                    "target_url": f"https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/111",
                 },
                 {"context": _JOB, "state": "pending", "target_url": None},
             ],

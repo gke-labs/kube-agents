@@ -559,6 +559,14 @@ what the renderer does with them.
   Absent on a nightly record means it predates the field and was read from
   the bucket the nightly used before 2026-09-15, `gs://kube-agents-prow`;
   `nightly.py` links it there.
+- `runs[].gcs_base` — the build directory the run was read from, as a
+  `gs://` URL with its trailing slash, on every run read from a bucket. The
+  pages and the health bot derive a build's links from it, so a run keeps
+  its links when a lane changes buckets (the smoke lanes moved to
+  `gs://kube-agents-evals-presubmit-logs`, which Deck cannot read, so those
+  links open the Cloud Console's bucket browser rather than Spyglass).
+  Absent on a from-dir run and on a record from before the field, which
+  keeps its Spyglass link under `gs://kube-agents-prow`.
 - `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
   `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
   pod**: `classify.py` gives it its own run-level headline (`infra`, never
@@ -665,7 +673,8 @@ what the renderer does with them.
   build read through it is `tier: "nightly"`, `pr: null`, `job` the
   prefix's last segment (or `--nightly-job`). Given without a value it is
   `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/`
-  (the nightly's own bucket; the presubmit and the RC lane stay on the
+  (the nightly's own bucket; the presubmit has its own,
+  `gs://kube-agents-evals-presubmit-logs`, and the RC lane stays on the
   cluster default `gs://kube-agents-prow`); omitted, no
   nightly scan happens (`--merge-with` alone still recomputes without
   touching the bucket). A prefix that does not list is read three ways. A
@@ -904,7 +913,7 @@ is the case's last `strip_runs` presubmit appearances, oldest first,
 `{build, pr, at, state, event}` with `state` in `pass|partial|fail|infra`
 and `event` true for a run-level event. `last_failure` is the newest `fail`
 or `partial` appearance — the presubmit's, else the nightly's — as `{tier,
-build, pr, at, state, reps, reason, excerpt, cls, also_failing_prs, event}`
+build, pr, gcs_base, at, state, reps, reason, excerpt, cls, also_failing_prs, event}`
 (`cls` and `also_failing_prs` from the Brief's classification of that run
 when it is in `runs[]`, else `null` and `0`), or `null` when there is none.
 `latency` is data.json's `cases[].latency`, its keys with finite numbers
@@ -1072,8 +1081,9 @@ block, the report page and the digest say instead of "no night".
 nightly_job, nights[], night_counts{...}}` from `forge_lane.py`: the GitLab
 lane's pull-request runs (`runs[].tier == "gitlab"` with a `pr`) **newest
 first**, the last `RUNS_LISTED` (20), each `{build, job, pr, head_sha,
-project, log_url, started, finished, duration_s, result, eval_verdict, green,
-tasks{pass, fail, infra}}`; `nights[]` the same shape for the lane's nightly
+project, log_url, gcs_base, started, finished, duration_s, result, eval_verdict, green,
+tasks{pass, fail, infra}}` (a row's build link is `log_url`, else the Console
+browser for `gcs_base`, else Spyglass); `nights[]` the same shape for the lane's nightly
 runs (`pr` null, `log_url` the periodic's Spyglass page), `nightly_job` the
 newest night's job else the default, `night_counts` over every night on
 record (`green` is Prow's `SUCCESS`; `tasks` counts the
