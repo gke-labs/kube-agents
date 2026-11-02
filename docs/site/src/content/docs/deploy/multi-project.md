@@ -267,7 +267,9 @@ kubectl exec -i deployment/platform-agent-gateway -n kubeagents-system \
 did not write. Exit 4 means the hourly reconcile or the bootstrap gate holds the
 lock: retry in a minute. Exit 3 means the run could not list the host project's
 clusters, every create failed, or the run aborted; the log line above it names
-which.
+which. Exit 5 means the run created its cap's worth of profiles (100 by default)
+and left the rest for the next run: run it again. The snapshot was written on
+that exit; the chain just did not print it.
 
 ## Removing a project
 
