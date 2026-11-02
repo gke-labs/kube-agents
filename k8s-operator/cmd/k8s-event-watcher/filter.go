@@ -223,7 +223,9 @@ const (
 	// longer pending, so the entry that outlives it has nothing to suppress.
 	failedSchedulingLogEvery = failedSchedulingStaleAfter
 	// maxFailedSchedulingLogEntries caps the memo behind that: one entry per
-	// Pending pod across the fleet, about 200 bytes each. A full memo keeps
+	// Pending pod across the fleet, about 250 bytes each with its key, so
+	// the cap is about 12 MiB at worst against the watcher's soft memory
+	// limit of half a container (memoryLimitFraction). A full memo keeps
 	// what it holds and remembers nothing new: a pod it has no room for is
 	// logged on every sighting, as every pod was before the memo existed,
 	// until a sweep (below) has made room. It never evicts a live entry,
@@ -231,8 +233,10 @@ const (
 	// every pod on every sighting and scan the whole memo under the
 	// fleet-wide lock each time, which is the flood this memo exists to
 	// stop, with a scan added. The cost of a fleet over the cap is therefore
-	// one line per sighting for the pods over it, and nothing else.
-	maxFailedSchedulingLogEntries = 10_000
+	// one line per sighting for the pods over it, and nothing else; the cap
+	// is set well above the Pending count of the fleets seen so far, since
+	// the protection ends a few hundred pods above it.
+	maxFailedSchedulingLogEntries = 50_000
 	// failedSchedulingLogSweepEvery is the least time between two sweeps of
 	// expired entries out of a full memo. lookup reclaims an expired entry
 	// only when its pod is sighted again, and a pod that scheduled or was
@@ -377,9 +381,9 @@ func stringSet(xs []string) map[string]struct{} {
 
 // filter evaluates triage events using a filterConfig. One instance serves
 // every cluster's dispatcher. The decisions themselves read nothing but the
-// event and, for the FailedScheduling gate, the clock; the one piece of state
-// is the memo of what that gate last logged per pod (fsLogged), which decides
-// whether a decision is written to the log and never what it is.
+// event and, for the FailedScheduling gate, the clock; the only state is the
+// memo of what that gate last logged per pod (fsLogged) and its sweep clock,
+// which decide whether a decision is written to the log and never what it is.
 type filter struct {
 	cfg filterConfig
 	// now is the clock the FailedScheduling gate ages marks and events
@@ -612,8 +616,9 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 // live; the span is the only hold on an event's age with no verdict on record.
 // Each decision is one line naming the pod and what decided it, which is what
 // a reader has in the pod log, written when the decision for that pod is new,
-// has changed, or has stood for failedSchedulingLogEvery (see
-// logFailedSchedulingDecision), not on every sighting; the gate labels on
+// has changed, or has stood for failedSchedulingLogEvery, not on every
+// sighting, bar an event with no pod key and a memo with no room, which
+// logFailedSchedulingDecision explains; the gate labels on
 // k8s_event_watcher_events_filtered_total are every sighting's decision
 // counted.
 func (f *filter) failedSchedulingGate(ev TriageEvent) (gate filterGate) {
@@ -691,17 +696,32 @@ func (f *filter) failedSchedulingGate(ev TriageEvent) (gate filterGate) {
 // remembers no new pod (see maxFailedSchedulingLogEntries): it sweeps its
 // expired entries at most once per failedSchedulingLogSweepEvery and, if that
 // made no room, writes the lines and keeps nothing.
+//
+// The lines are written after the lock is released: the lock orders the memo,
+// not the log, and a pod's sightings arrive on its cluster's one delivery
+// goroutine, so its lines keep their order without it. Writing under the lock
+// would hold every cluster's delivery goroutine behind one stderr write, on
+// the over-cap path in particular, where every sighting writes.
 func (f *filter) logFailedSchedulingDecision(ev TriageEvent, gate filterGate, now time.Time, lines []notedLine) {
-	if ev.Key.UID == "" || ev.Namespace == "" {
-		writeNotedLines(lines)
+	if ev.Key.UID != "" && ev.Namespace != "" && !f.rememberFailedSchedulingDecision(ev, gate, now) {
 		return
 	}
+	for _, line := range lines {
+		log.Printf(line.format, line.args...)
+	}
+}
+
+// rememberFailedSchedulingDecision records gate as the decision last logged
+// for the event's pod and reports whether that is worth a line: false when
+// the memo already holds this decision for the pod inside its life, true
+// otherwise, whether or not the memo had room to remember it.
+func (f *filter) rememberFailedSchedulingDecision(ev TriageEvent, gate filterGate, now time.Time) bool {
 	key := strings.Join([]string{ev.Project, ev.Location, ev.Cluster, ev.Namespace, ev.Key.UID}, failedSchedulingLogKeySep)
 	f.fsLogMu.Lock()
 	defer f.fsLogMu.Unlock()
 	last, _, known := f.fsLogged.lookup(key, now)
 	if known && last == gate {
-		return
+		return false
 	}
 	if !known && f.fsLogged.full() {
 		if now.Sub(f.fsLastSweep) >= failedSchedulingLogSweepEvery {
@@ -709,18 +729,11 @@ func (f *filter) logFailedSchedulingDecision(ev TriageEvent, gate filterGate, no
 			f.fsLastSweep = now
 		}
 		if f.fsLogged.full() {
-			writeNotedLines(lines)
-			return
+			return true
 		}
 	}
 	f.fsLogged.store(key, gate, now, now)
-	writeNotedLines(lines)
-}
-
-func writeNotedLines(lines []notedLine) {
-	for _, line := range lines {
-		log.Printf(line.format, line.args...)
-	}
+	return true
 }
 
 // notedLine is a log line failedSchedulingGate decided to write, held

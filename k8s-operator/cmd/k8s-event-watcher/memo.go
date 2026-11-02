@@ -21,7 +21,9 @@ import "time"
 // expired entries evicted before the oldest. pullClassMemo dates an entry by
 // arrival, scaleUpMemo by the event's own timestamp and the filter's
 // FailedScheduling log memo (fsLogged) by the watcher's clock at the line;
-// what "latest" means and what supersedes what stays with each memo. Not safe for concurrent use:
+// that last one holds itself under the cap and only sweeps (see expire), so
+// the eviction below never reaches it. What "latest" means and what
+// supersedes what stays with each memo. Not safe for concurrent use:
 // each memo holds its own lock around these calls.
 type boundedEntries[V any] struct {
 	entries map[string]memoEntry[V]
