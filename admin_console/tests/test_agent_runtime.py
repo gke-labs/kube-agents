@@ -1,23 +1,34 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import patch
 
+from admin_console import agent_runtime
 from admin_console.agent_runtime import (
     _READ_FRAME_TAG,
     _READ_SCRIPT,
+    RUNTIME_CACHE_TTL_ENV,
     AgentRuntimeError,
     AgentRuntimeProvider,
     KubeCommandResult,
+    KubectlRunner,
+    RuntimeDiscoveryCache,
+    runtime_cache_ttl_seconds,
 )
 from admin_console.kanban_view import display_status
+from admin_console.kube_access import GKEKubeAccess, KubeCommandResult, KubeFailure
 from admin_console.project_config import DeploymentTarget
 
 # A result that cites a status page and a log path. It does not link a PR.
@@ -941,6 +952,8 @@ class EmbeddedReadScriptTest(unittest.TestCase):
 
 class AgentRuntimeProviderTest(unittest.TestCase):
     def setUp(self) -> None:
+        # Discovery answers are held console-wide; each test starts without.
+        agent_runtime.invalidate()
         self.runner = AgentRuntimeRunner()
         self.provider = AgentRuntimeProvider(
             DeploymentTarget(
@@ -1063,6 +1076,9 @@ class FramedReadRunner(AgentRuntimeRunner):
 
 
 class FramedReadTest(unittest.TestCase):
+    def setUp(self) -> None:
+        agent_runtime.invalidate()
+
     def _provider(self, runner: AgentRuntimeRunner) -> AgentRuntimeProvider:
         return AgentRuntimeProvider(
             DeploymentTarget("test-project-01", "test-cluster-01", "us-east4"),
@@ -1114,6 +1130,331 @@ class FramedReadTest(unittest.TestCase):
 
         with self.assertRaisesRegex(AgentRuntimeError, "Agent runtime read failed"):
             provider.check_connection("platform-agent")
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def kubectl_stdout(command: list[str], pod: str) -> tuple[int, str]:
+    """Answer the three commands a runtime read spawns, as kubectl would."""
+    if "platformagents" in command:
+        return 0, json.dumps({"items": [{"metadata": {"name": "platform-agent"}}]})
+    if "pods" in command:
+        return 0, json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"name": pod},
+                        "spec": {
+                            "containers": [
+                                {
+                                    "name": "runtime-from-pod",
+                                    "ports": [{"name": "api", "containerPort": 8642}],
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        )
+    if "exec" in command:
+        if command[command.index("exec") + 1] != pod:
+            return 1, ""
+        return 0, json.dumps({"tasks": [], "truncated": False})
+    return 1, ""
+
+
+class RuntimeDiscoveryCacheTest(unittest.TestCase):
+    """Reads over the real kubectl adapter with subprocess.run mocked."""
+
+    TARGET = DeploymentTarget("test-project-01", "test-cluster-01", "us-east4")
+
+    def setUp(self) -> None:
+        agent_runtime.invalidate()
+        self.addCleanup(agent_runtime.invalidate)
+        self.spawned: list[list[str]] = []
+        self.failing: set[str] = set()
+        self.timing_out: set[str] = set()
+        self.pod = "platform-agent-gateway-1"
+        self.spawn_lock = threading.Lock()
+        self.clock = FakeClock()
+        # Pinned, so the suite's verdict does not depend on a TTL the invoking
+        # shell exported while tuning the knob.
+        self.cache = RuntimeDiscoveryCache(
+            agent_runtime.DEFAULT_RUNTIME_CACHE_TTL_SECONDS, clock=self.clock
+        )
+        prepare = patch.object(GKEKubeAccess, "prepare", return_value=None)
+        prepare.start()
+        self.addCleanup(prepare.stop)
+        run = patch("admin_console.kube_access.subprocess.run", side_effect=self.spawn)
+        run.start()
+        self.addCleanup(run.stop)
+
+    def spawn(self, command, **_kwargs) -> subprocess.CompletedProcess:
+        with self.spawn_lock:
+            self.spawned.append(list(command))
+        if "exec" not in command:
+            # Widen the window in which concurrent readers could each discover.
+            time.sleep(0.01)
+        if any(word in self.timing_out for word in command):
+            raise subprocess.TimeoutExpired(command, 1)
+        returncode, stdout = kubectl_stdout(command, self.pod)
+        verb = next((word for word in command if word in self.failing), None)
+        if verb is not None:
+            return subprocess.CompletedProcess(command, 1, "", f"{verb} failed")
+        return subprocess.CompletedProcess(command, returncode, stdout, "pod gone")
+
+    def exec_pods(self) -> list[str]:
+        return [
+            command[command.index("exec") + 1]
+            for command in self.spawned
+            if "exec" in command
+        ]
+
+    def spawns(self, *verbs: str) -> int:
+        return sum(
+            1 for command in self.spawned if any(verb in command for verb in verbs)
+        )
+
+    def provider(
+        self,
+        target: DeploymentTarget | None = None,
+        cache: RuntimeDiscoveryCache | None = None,
+    ) -> AgentRuntimeProvider:
+        target = target or self.TARGET
+        return AgentRuntimeProvider(
+            target, runner=KubectlRunner(target), cache=cache or self.cache
+        )
+
+    def read(self, **kwargs) -> None:
+        # A fresh provider per read, as every page does: it asks which agent
+        # is canonical, then reads with that name.
+        provider = self.provider(**kwargs)
+        agent = provider.canonical_agent()
+        provider.get_task_updates(agent, session_id="portal_session")
+
+    def test_twenty_reads_within_the_window_discover_once(self):
+        for _ in range(20):
+            self.read()
+            self.clock.now += 1.0
+
+        self.assertEqual(self.spawns("platformagents"), 1)
+        self.assertEqual(self.spawns("pods"), 1)
+        self.assertEqual(self.spawns("exec"), 20)
+        self.assertEqual(len(self.spawned), 22)
+
+    def test_window_expiry_and_invalidate_each_rediscover(self):
+        self.read()
+        self.clock.now += 29.0
+        self.read()
+        self.assertEqual(self.spawns("platformagents", "pods"), 2)
+
+        self.clock.now += 1.5
+        self.read()
+        self.assertEqual(self.spawns("platformagents", "pods"), 4)
+
+        self.cache.invalidate()
+        self.read()
+        self.assertEqual(self.spawns("platformagents", "pods"), 6)
+
+    def test_module_invalidate_reaches_the_shared_cache(self):
+        # The module cache reads the TTL from the environment per lookup.
+        with patch.dict(os.environ, {RUNTIME_CACHE_TTL_ENV: ""}):
+            self.read(cache=agent_runtime._discovery_cache)
+            agent_runtime.invalidate(self.TARGET)
+            self.read(cache=agent_runtime._discovery_cache)
+
+        self.assertEqual(self.spawns("platformagents", "pods"), 4)
+
+    def test_failed_discovery_is_not_held(self):
+        self.failing = {"platformagents"}
+        with self.assertRaises(AgentRuntimeError):
+            self.read()
+        self.failing = set()
+
+        self.read()
+        self.read()
+
+        self.assertEqual(self.spawns("platformagents"), 2)
+        self.assertEqual(self.spawns("pods"), 1)
+
+    def test_failed_read_against_a_current_pod_rediscovers_and_reports(self):
+        self.read()
+        self.failing = {"exec"}
+        with self.assertRaisesRegex(AgentRuntimeError, "Agent runtime read failed"):
+            self.read()
+        self.failing = set()
+
+        self.read()
+
+        # The failed read discovered again, found the same pod, and did not
+        # retry; the read after it used the answers that discovery refreshed.
+        self.assertEqual(self.spawns("platformagents"), 2)
+        self.assertEqual(self.spawns("pods"), 2)
+        self.assertEqual(self.spawns("exec"), 3)
+
+    def test_failed_read_against_a_replaced_pod_retries_once_on_the_new_pod(self):
+        self.read()
+        self.pod = "platform-agent-gateway-2"
+
+        self.read()
+        self.read()
+
+        self.assertEqual(self.spawns("platformagents"), 2)
+        self.assertEqual(self.spawns("pods"), 2)
+        self.assertEqual(
+            self.exec_pods(),
+            [
+                "platform-agent-gateway-1",
+                "platform-agent-gateway-1",
+                "platform-agent-gateway-2",
+                "platform-agent-gateway-2",
+            ],
+        )
+
+    def test_timed_out_read_is_reported_without_rediscovery(self):
+        self.read()
+        self.timing_out = {"exec"}
+        with self.assertRaisesRegex(AgentRuntimeError, "Agent runtime read failed"):
+            self.read()
+        self.timing_out = set()
+
+        self.read()
+
+        # A timeout says nothing about the held pod, so the read is reported
+        # as it is and the next read still uses the held answers.
+        self.assertEqual(self.spawns("platformagents"), 1)
+        self.assertEqual(self.spawns("pods"), 1)
+        self.assertEqual(self.spawns("exec"), 3)
+
+    def test_read_refused_before_kubectl_ran_is_reported_without_rediscovery(self):
+        self.read()
+        refused = KubeCommandResult(
+            127, stderr="gcloud missing", failure=KubeFailure.GCLOUD_MISSING
+        )
+        with patch.object(GKEKubeAccess, "prepare", return_value=refused):
+            with self.assertRaisesRegex(AgentRuntimeError, "Agent runtime read failed"):
+                self.read()
+
+        self.read()
+
+        self.assertEqual(self.spawns("platformagents"), 1)
+        self.assertEqual(self.spawns("pods"), 1)
+        self.assertEqual(self.spawns("exec"), 2)
+
+    def test_fast_failing_read_on_an_unreachable_cluster_reports_the_read_error(self):
+        self.read()
+        # A refused connection or an expired token fails kubectl at once with a
+        # non-zero exit, which the access layer cannot tell from a cluster
+        # answer; the rediscovery then fails the same way.
+        self.failing = {"exec", "pods"}
+        with self.assertRaisesRegex(AgentRuntimeError, "Agent runtime read failed"):
+            self.read()
+        self.failing = set()
+
+        self.read()
+
+        # The read's own error was reported, not the rediscovery's; nothing was
+        # held through the failure, so the next read discovered again.
+        self.assertEqual(self.spawns("platformagents"), 2)
+        self.assertEqual(self.spawns("pods"), 3)
+        self.assertEqual(self.spawns("exec"), 3)
+
+    def test_concurrent_lookups_share_one_failed_attempt(self):
+        attempts: list[int] = []
+        first_started = threading.Event()
+        release_first = threading.Event()
+
+        def compute() -> str:
+            attempts.append(1)
+            first_started.set()
+            release_first.wait(timeout=5)
+            raise AgentRuntimeError("PlatformAgent discovery failed.")
+
+        def lookup() -> str:
+            return self.cache.lookup(self.TARGET, "canonical_agent", compute)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(lookup) for _ in range(8)]
+            self.assertTrue(first_started.wait(timeout=5))
+            time.sleep(0.1)  # let the other seven queue behind the first
+            release_first.set()
+            errors = [future.exception(timeout=5) for future in futures]
+
+        # One attempt served every lookup queued behind it; each got its error.
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(len(errors), 8)
+        self.assertTrue(all(isinstance(error, AgentRuntimeError) for error in errors))
+        self.assertEqual(len({id(error) for error in errors}), 1)
+
+        # A lookup that arrives after the failure asks again, and a success
+        # after it is held as usual.
+        with self.assertRaises(AgentRuntimeError):
+            lookup()
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(
+            self.cache.lookup(self.TARGET, "canonical_agent", lambda: "fresh"), "fresh"
+        )
+        self.assertEqual(
+            self.cache.lookup(self.TARGET, "canonical_agent", lambda: "later"), "fresh"
+        )
+
+    def test_targets_do_not_share_answers(self):
+        other = DeploymentTarget("test-project-02", "test-cluster-01", "us-east4")
+        self.read()
+        self.read(target=other)
+        self.read()
+        self.read(target=other)
+
+        self.assertEqual(self.spawns("platformagents"), 2)
+        self.assertEqual(self.spawns("pods"), 2)
+        contexts = {command[command.index("--context") + 1] for command in self.spawned}
+        self.assertEqual(len(contexts), 2)
+
+    def test_ttl_zero_disables_the_cache(self):
+        with patch.dict(os.environ, {RUNTIME_CACHE_TTL_ENV: "0"}):
+            cache = RuntimeDiscoveryCache(clock=self.clock)
+            for _ in range(5):
+                self.read(cache=cache)
+
+        # Each read discovers again, and once per question: the read's guard
+        # on the agent name does not repeat the page's own discovery.
+        self.assertEqual(self.spawns("platformagents"), 5)
+        self.assertEqual(self.spawns("pods"), 5)
+        self.assertEqual(self.spawns("exec"), 5)
+
+    def test_ttl_comes_from_the_environment(self):
+        for raw, expected in (
+            ("", 30.0),
+            ("12.5", 12.5),
+            ("0", 0.0),
+            ("abc", 30.0),
+            ("-3", 30.0),
+            ("inf", 30.0),
+        ):
+            with self.subTest(raw=raw), patch.dict(
+                os.environ, {RUNTIME_CACHE_TTL_ENV: raw}
+            ):
+                self.assertEqual(runtime_cache_ttl_seconds(), expected)
+
+    def test_concurrent_reads_discover_once(self):
+        started = threading.Barrier(8)
+
+        def read() -> None:
+            started.wait()
+            self.read()
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda _: read(), range(8)))
+
+        self.assertEqual(self.spawns("platformagents"), 1)
+        self.assertEqual(self.spawns("pods"), 1)
+        self.assertEqual(self.spawns("exec"), 8)
 
 
 if __name__ == "__main__":

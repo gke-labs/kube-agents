@@ -23,6 +23,8 @@ ADMIN_PORTAL_PORT=8601 ./scripts/admin_portal.sh
 
 Streamlit runs on a second, private loopback port, the public port plus one by default; `ADMIN_PORTAL_STREAMLIT_PORT` overrides it when that one is taken. `ADMIN_PORTAL_THEME=google-cloud` switches the console from its default dark theme to a light one in Google Cloud's colours. Ctrl-C stops the console.
 
+Each of the console's two processes holds for 30 seconds the cluster's answers to which PlatformAgent is canonical and which gateway pod runs it, instead of asking before every read; `ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS` changes that window, and `0` turns the reuse off. The data behind each page is read live every time.
+
 Past the launcher, you need an account with read access to the project and the cluster. The Connection page verifies the rest with bounded read-only checks and reports each one: project access and the required APIs, GKE discovery, recent Cloud Logging and Cloud Trace data, and the agent runtime. Cloud Trace is read with Application Default Credentials, so a failing Trace check is fixed with `gcloud auth application-default login`.
 
 ## The pages
