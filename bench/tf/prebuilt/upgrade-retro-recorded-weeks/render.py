@@ -104,7 +104,7 @@ def build(mode):
         "what_happened": {"status": ur.STATUS_UPGRADED, "reasons": ["control plane moved", f"pool {POOL} moved"], "window_start": SINCE, "channel": CHANNEL, "versions_before": {"control_plane": CONTROL_PLANE_BEFORE, "node_pools": {POOL: CONTROL_PLANE_BEFORE}}, "versions_after": versions_after, "cluster_status": "RUNNING", "operations": copy.deepcopy(OPERATIONS), "symptom_window_start": OPERATIONS[0]["start"]},
         "what_failed": [], "mitigations": [], "shapes": [], "managed_agents": 0, "next_upgrade": next_upgrade(CONTROL_PLANE_AFTER),
         "baseline": {"versions": versions_after, "pods": PODS, "budgets": BUDGETS, "shapes": 0, "symptom_count": 0, "first_seen": 0, "first_run": False, "guards": [], "shape_reads_failed": []},
-        "symptom_baseline": [], "guards": [], "read_errors": [], "reviewed": True, "partial": [], "answered": [name for name, _ in ur.KUBECTL_READS], "commands": [], "starting": [], "gated": [], "terminating": [], "skew_notes": [], "unavailable_workloads": [], "budgets_at_zero": [], "family": FAMILY_REGULAR,
+        "symptom_baseline": [], "guards": [], "read_errors": [], "reviewed": True, "partial": [], "answered": [name for name, *_ in ur.KUBECTL_READS], "commands": [], "starting": [], "gated": [], "terminating": [], "skew_notes": [], "unavailable_workloads": [], "budgets_at_zero": [], "family": FAMILY_REGULAR,
     }
     review["gate"] = ur.cluster_gate(review, ur.operation_window(OPERATIONS), RecordedSession(mode), NOW)
     assert review["gate"]["verdict"] == mode, review["gate"]
