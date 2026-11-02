@@ -799,12 +799,16 @@ class TrendPageTest(unittest.TestCase):
         app = dom_text(page)
         self.assertIn("· 8 next-mode records over 2 nights inside the last 90 days", app)
         self.assertIn('<button type="button" data-mode="next" class="on" title="The main nightly\'s records">next</button>', app)
-        self.assertIn('data-mode="today" title="The full-catalog rollback nightly', app)
+        self.assertIn('data-mode="today" title="Records in today mode: the main nightly', app)
         today = dom_text(page, fragment="#mode=today")
         self.assertIn("· 4 today-mode records over 1 night inside the last 90 days", today)
         self.assertIn('data-mode="today" class="on"', today)
         self.assertIn('<a href="trend.html#domain=remediation&amp;mode=today">remediation</a>', today, "a domain title keeps the series")
         self.assertIn('<a href="trend.html#domain=remediation">remediation</a>', app, "and adds none the link did not carry")
+        domain = dom_text(page, fragment="#domain=remediation&mode=today")
+        self.assertIn('<a href="trend.html#cases=rca-remediation-pr&amp;mode=today"><code>rca-remediation-pr</code></a>', domain, "a domain view's case links keep the series")
+        case = dom_text(page, fragment="#cases=rca-remediation-pr&mode=today")
+        self.assertIn('<a href="trend.html#domain=remediation&amp;mode=today">its domain, remediation →</a>', case, "a case's domain link keeps the series")
         # The chip writes the fragment, and a scope chip keeps the series.
         script = ('document.querySelector(\'button[data-mode="today"]\').click();'
                   'window.addEventListener("hashchange", () => { document.getElementById("app").insertAdjacentHTML("afterend", `<p id="where">${location.hash}</p>`); }, { once: true });')

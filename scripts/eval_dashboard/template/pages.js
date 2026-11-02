@@ -2015,7 +2015,8 @@ function scenariosHtml(link) {
 const trendDoc = () => (brief.trend && typeof brief.trend === "object" && !Array.isArray(brief.trend) ? brief.trend : null);
 // The series the page draws (trend.py, one series per mode): next, the main
 // nightly's, unless the link asks for today or the store holds no next
-// record. Today's records are the retired rollback nightly's, drawn while
+// record. Today's records are the main nightly's from before it moved to
+// next; no job records today mode any more, so they are drawn while
 // they last in the window. The read's own fields and the latency row stay
 // the document's; `has` says which series hold records, for the chips.
 const TREND_MODES = ["next", "today"];
@@ -2396,7 +2397,7 @@ function trendHtml(link) {
   const domainNames = Object.keys(domains).sort();
   const ctl = `<div class="ctl">scope ${chip("scope", "", "all domains", !!scope.all)}${domainNames.map((d) => chip("scope", d, domainWords(d), scope.domain === d, domainTooltip(d))).join("")}` +
     (metrics.length > 1 ? `<span class="sep">·</span>judged metric ${metrics.map((m) => chip("metric", m, m, m === metric)).join("")}` : "") +
-    (series.has.next && series.has.today ? `<span class="sep">·</span>series ${chip("mode", "next", "next", series.mode === "next", "The main nightly's records")}${chip("mode", "today", "today · retired", series.mode === "today", "The full-catalog rollback nightly's records. That nightly no longer runs, so this series ends at its last night and leaves the window after it.")}` : "") + `</div>`;
+    (series.has.next && series.has.today ? `<span class="sep">·</span>series ${chip("mode", "next", "next", series.mode === "next", "The main nightly's records")}${chip("mode", "today", "today · retired", series.mode === "today", "Records in today mode: the main nightly's, from before it moved to next. No job records today mode any more, so this series ends at that night and leaves the window after it.")}` : "") + `</div>`;
   const read = parseIso(t.read_at);
   const readLine = `<p class="mut small">Store <code>${esc(t.source)}</code> read ${esc(read != null ? et(read) : "at an unknown time")} · ${plural(t.records, `${series.mode}-mode record`)} over ${plural(trendNights(t).length, "night")} inside the last ${esc(t.window_days)} days · nightly records only (a pull request's run never writes the store).</p>`;
   let body = "";
