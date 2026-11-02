@@ -185,6 +185,20 @@ litellm:
         self.assertEqual(self._config(configmap)["router_settings"], {"num_retries": 2, "retry_after": 5})
         self.assertNotIn("MAX_RETRY_DELAY", [e["name"] for e in self._container(deployment)["env"]])
 
+    def test_a_retry_pair_whose_hold_crosses_the_agents_stale_bound_fails_the_render(self) -> None:
+        """The retries are a silent hold, (numRetries + 1) pauses long; the
+        Platform and Cluster Agents drop a stream with no first chunk at 120 s.
+        An operator pair that would hold a call that long is refused on every
+        install, not only the eval's."""
+        for retries, pause in ((1, 60), (3, 30), (2, 25)):
+            with self.subTest(retries=retries, pause=pause):
+                self._fails(
+                    _VERTEX_VALUES + f"  fallback:\n    numRetries: {retries}\n    retryAfterSeconds: {pause}\n",
+                    "stale-stream bound",
+                )
+        configmap, _ = self._documents(_VERTEX_VALUES + "  fallback:\n    numRetries: 2\n    retryAfterSeconds: 20\n")
+        self.assertEqual(self._config(configmap)["router_settings"], {"num_retries": 2, "retry_after": 20})
+
     def test_retry_after_without_retries_fails_the_render(self) -> None:
         self._fails(_VERTEX_VALUES + "  fallback:\n    retryAfterSeconds: 30\n", "without litellm.fallback.numRetries")
 

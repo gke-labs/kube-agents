@@ -388,7 +388,8 @@ litellm:
     # before each retry and one after the last failure); keep that plus the
     # model's time to first chunk under the caller's stale-stream bound, which
     # is 120s on the Platform and Cluster Agents (stale_timeout_seconds), or
-    # the caller drops the stream and never sees the 429.
+    # the caller drops the stream and never sees the 429. The render refuses a
+    # pair whose hold plus 60s for the first chunk crosses that bound.
     retryAfterSeconds: 0
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload

@@ -889,6 +889,25 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 {{- if and (gt $retryAfter 0) (le $numRetries 0) -}}
 {{- fail (printf "litellm.fallback.retryAfterSeconds %d is set without litellm.fallback.numRetries; the pause is between retries the router does not make" $retryAfter) -}}
 {{- end -}}
+{{- /*
+  The retries are a silent hold on the caller's stream, (numRetries + 1)
+  pauses long: LiteLLM sleeps before each retry and once more after the last
+  failure. The Platform and Cluster Agents drop a stream with no first chunk
+  for stale_timeout_seconds (120s in agents/platform/config.yaml and
+  agents/cluster/config.yaml) and retry blind, never seeing the 429, so the
+  hold plus the model's time to first chunk has to fit under that bound on
+  every install, not only the eval's. The allowance is what is left for the
+  first chunk at the eval's pair (2 x 20s); the Platform Agent overlay's own
+  measurement puts 1% of worker calls above 60s to first chunk.
+  tests/test_litellm_reasoning_fallback.py pins the refusal and
+  tests/test_ci_deploy_litellm_vertex.py holds the bound equal to the overlays.
+*/}}
+{{- $workerStaleSeconds := 120 -}}
+{{- $firstChunkAllowanceSeconds := 60 -}}
+{{- $gatewayHoldSeconds := mul (add $numRetries 1) $retryAfter -}}
+{{- if and (gt $retryAfter 0) (gt (add $gatewayHoldSeconds $firstChunkAllowanceSeconds) $workerStaleSeconds) -}}
+{{- fail (printf "litellm.fallback.numRetries %d with retryAfterSeconds %d holds a rate-limited call %ds at the gateway; with %ds for the model's first chunk that crosses the agents' %ds stale-stream bound (stale_timeout_seconds), and the agent would drop the stream before it sees the 429" $numRetries $retryAfter $gatewayHoldSeconds $firstChunkAllowanceSeconds $workerStaleSeconds) -}}
+{{- end -}}
 {{- $primaries := list "model-default" "hermes-agent" .model -}}
 {{- if and $fallbackName (has $fallbackName $primaries) -}}
 {{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}

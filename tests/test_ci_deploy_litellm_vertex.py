@@ -12,7 +12,6 @@ This pins the script's flag, the provider default, and — where a real `helm`
 exists — that the flag actually lands on the rendered ServiceAccount.
 """
 
-import os
 import pathlib
 import re
 import shutil
@@ -63,46 +62,35 @@ class CiDeployLitellmVertexTest(unittest.TestCase):
         self.assertIn('--set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}"', text)
         self.assertIn('--set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}"', text)
 
-    def test_the_gateway_hold_stays_under_the_agents_stale_bound(self) -> None:
+    def test_the_eval_pair_sits_under_the_charts_stale_bound_and_the_bound_is_the_overlays(self) -> None:
         """The gateway's retries are a silent hold on the agent's stream. The
         Platform and Cluster Agents drop a stream with no first chunk for
-        stale_timeout_seconds and retry blind, never seeing the 429, so the
-        hold plus the model's time to first chunk has to fit under it, and the
-        script's copy of the bound has to be the overlays' value."""
-        text = _CI_DEPLOY.read_text()
+        stale_timeout_seconds and retry blind, never seeing the 429. The chart
+        refuses a pair whose hold plus a first-chunk allowance crosses that
+        bound (tests/test_litellm_reasoning_fallback.py pins the refusal); here:
+        the chart's copy of the bound is the overlays' value, and the eval
+        install's defaults sit under it."""
+        template = (_CHART / "templates" / "_helpers.tpl").read_text()
 
-        def const(name: str) -> int:
-            match = re.search(rf'^readonly {name}=(?:"\$\{{{name}:-)?(\d+)', text, re.MULTILINE)
+        def chart_const(name: str) -> int:
+            match = re.search(rf"\$\{{?{name}\}}? := (\d+)", template) or re.search(rf"\${name} := (\d+)", template)
             self.assertIsNotNone(match, name)
             return int(match.group(1))
 
-        stale = const("EVAL_AGENT_STALE_TIMEOUT_SECONDS")
+        stale = chart_const("workerStaleSeconds")
+        allowance = chart_const("firstChunkAllowanceSeconds")
         for overlay in ("agents/platform/config.yaml", "agents/cluster/config.yaml"):
             config = yaml.safe_load((_REPO_ROOT / overlay).read_text())
             self.assertEqual(config["providers"]["custom"]["stale_timeout_seconds"], stale, overlay)
-        hold = (const("EVAL_LITELLM_NUM_RETRIES") + 1) * const("EVAL_LITELLM_RETRY_AFTER_SECONDS")
-        self.assertLessEqual(hold + const("EVAL_GATEWAY_HOLD_FIRST_CHUNK_ALLOWANCE_SECONDS"), stale)
+        script = _CI_DEPLOY.read_text()
 
-    def test_a_retry_pair_that_crosses_the_stale_bound_fails_the_deploy_early(self) -> None:
-        """The guard runs under bash with the knob block lifted from the script."""
-        text = _CI_DEPLOY.read_text()
-        start = text.index('readonly EVAL_LITELLM_NUM_RETRIES=')
-        end = text.index("\nfi\n", start) + len("\nfi\n")
-        block = text[start:end]
-        for env, ok in (
-            ({}, True),
-            ({"EVAL_LITELLM_RETRY_AFTER_SECONDS": "45"}, False),
-            ({"EVAL_LITELLM_NUM_RETRIES": "3", "EVAL_LITELLM_RETRY_AFTER_SECONDS": "30"}, False),
-            ({"EVAL_LITELLM_NUM_RETRIES": "0", "EVAL_LITELLM_RETRY_AFTER_SECONDS": "0"}, True),
-        ):
-            with self.subTest(env=env):
-                proc = subprocess.run(
-                    ["bash", "-c", "set -euo pipefail\n" + block + '\necho "HOLD=${EVAL_GATEWAY_HOLD_SECONDS}"'],
-                    capture_output=True, text=True, check=False, env={**os.environ, **env},
-                )
-                self.assertEqual(proc.returncode == 0, ok, proc.stdout + proc.stderr)
-                if not ok:
-                    self.assertIn("stale bound", proc.stderr)
+        def default(name: str) -> int:
+            match = re.search(rf'^readonly {name}="\$\{{{name}:-(\d+)\}}"', script, re.MULTILINE)
+            self.assertIsNotNone(match, name)
+            return int(match.group(1))
+
+        hold = (default("EVAL_LITELLM_NUM_RETRIES") + 1) * default("EVAL_LITELLM_RETRY_AFTER_SECONDS")
+        self.assertLessEqual(hold + allowance, stale)
 
     def test_the_litellm_gsa_is_not_the_platform_gsa(self) -> None:
         """The gateway proxies attacker-influenceable content and must hold

@@ -202,28 +202,15 @@ readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 # backoff floor would not engage. The pair below therefore has to keep
 # (EVAL_LITELLM_NUM_RETRIES + 1) pauses (LiteLLM sleeps before each retry and
 # once more after the last failed one) plus the model's time to first chunk
-# under that bound: 3 x 20s = 60s, leaving 60s for Vertex. The guard after the
-# knobs refuses a pair that does not. Each gateway response says what it did
-# in x-litellm-attempted-retries. To turn the retries off set both to 0: the
-# chart refuses a pause without retries. tests/test_ci_deploy_litellm_vertex.py
-# pins the flags, the defaults, the bound and the guard.
+# under that bound: 3 x 20s = 60s, leaving 60s for Vertex. The chart's render
+# refuses a pair that does not (kube-agents.litellmConfig in
+# charts/kube-agents/templates/_helpers.tpl), so a bad override fails the helm
+# upgrade below before anything is deployed. Each gateway response says what it
+# did in x-litellm-attempted-retries. To turn the retries off set both to 0:
+# the chart refuses a pause without retries. tests/test_ci_deploy_litellm_vertex.py
+# pins the flags and the defaults, and holds the defaults under the chart's bound.
 readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"
 readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-20}"
-# providers.custom.stale_timeout_seconds in agents/platform/config.yaml and
-# agents/cluster/config.yaml; tests/test_ci_deploy_litellm_vertex.py holds this
-# copy equal to them.
-readonly EVAL_AGENT_STALE_TIMEOUT_SECONDS=120
-# What the gateway's hold has to leave the model for its first chunk inside
-# that bound. The Platform Agent overlay's own measurement puts 1% of worker
-# calls above 60s to first chunk, so this is the floor of what is left, not
-# a typical latency.
-readonly EVAL_GATEWAY_HOLD_FIRST_CHUNK_ALLOWANCE_SECONDS=60
-EVAL_GATEWAY_HOLD_SECONDS=$(((EVAL_LITELLM_NUM_RETRIES + 1) * EVAL_LITELLM_RETRY_AFTER_SECONDS))
-readonly EVAL_GATEWAY_HOLD_SECONDS
-if [ $((EVAL_GATEWAY_HOLD_SECONDS + EVAL_GATEWAY_HOLD_FIRST_CHUNK_ALLOWANCE_SECONDS)) -gt "${EVAL_AGENT_STALE_TIMEOUT_SECONDS}" ]; then
-  echo "ERROR: EVAL_LITELLM_NUM_RETRIES=${EVAL_LITELLM_NUM_RETRIES} and EVAL_LITELLM_RETRY_AFTER_SECONDS=${EVAL_LITELLM_RETRY_AFTER_SECONDS} hold a rate-limited call ${EVAL_GATEWAY_HOLD_SECONDS}s at the gateway; with ${EVAL_GATEWAY_HOLD_FIRST_CHUNK_ALLOWANCE_SECONDS}s for the model's first chunk that crosses the agents' ${EVAL_AGENT_STALE_TIMEOUT_SECONDS}s stale bound, and the agent would drop the stream before it sees the 429." >&2
-  exit 1
-fi
 
 # The credential-proxy container's memory limit on the eval install. The broker
 # admits a request only while its child memory reservation fits the budget it
