@@ -304,6 +304,9 @@ type Gateway struct {
 	droppedNotices map[string]bool
 	// relayDurable is the event relay's durable name (Options.RelayDurable).
 	relayDurable string
+	// relayBound is set once Run has bound the event relay; Readiness
+	// answers from it.
+	relayBound atomic.Bool
 }
 
 // Options are the injectable pieces; tests provide fakes.
@@ -585,13 +588,18 @@ func New(o Options) (*Gateway, error) {
 // Metrics is the gateway's counters, for the metrics listener to serve.
 func (g *Gateway) Metrics() *Metrics { return g.metrics }
 
-// Run subscribes the event relay, starts the reap and sweep loops, and runs
-// the adapter until ctx is done.
-func (g *Gateway) Run(ctx context.Context) error {
-	g.runCtx = ctx
-	// Its first try before the relay starts, so on an install with the
-	// bucket every answer the relay posts is marked alike.
-	g.startFeedback(ctx)
+// Readiness reports whether Run has bound the event relay, and why not. Until
+// it has, the gateway serves nothing: the adapters start after the bind. The
+// metrics listener answers ReadyzPath from it.
+func (g *Gateway) Readiness() (bool, string) {
+	if g.relayBound.Load() {
+		return true, "ready"
+	}
+	return false, fmt.Sprintf("waiting for stream %s: the event relay durable %s has not bound yet", lib.TasksStream, g.relayDurable)
+}
+
+// relaySubscribeConfig is the event relay's durable subscription.
+func (g *Gateway) relaySubscribeConfig() lib.SubscribeConfig {
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to
 	// the requester and retires the task on exactly like an executor's own.
@@ -601,6 +609,29 @@ func (g *Gateway) Run(ctx context.Context) error {
 	// with the single filter, and rebinding it to the pair is an update the
 	// server accepts (lib's rebind test).
 	agreement := SupervisorAgreement(g.cfg)
+	// WaitForStream: the provision Job creates TASKS, and on a three-server
+	// bus that can trail the gateway's start by more than lib's bind window.
+	// Exiting then only restarted the pod into the same wait (two restarts at
+	// install in CI). The gateway waits instead, reporting not ready
+	// (Readiness), and lib logs the wait and warns while it lasts.
+	return lib.SubscribeConfig{
+		Stream:        lib.TasksStream,
+		Subjects:      []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
+		Durable:       g.relayDurable,
+		Session:       gatewayParty.Session,
+		Agreement:     &agreement,
+		MaxAckPending: relayMaxAckPending,
+		WaitForStream: true,
+	}
+}
+
+// Run subscribes the event relay, starts the reap and sweep loops, and runs
+// the adapter until ctx is done.
+func (g *Gateway) Run(ctx context.Context) error {
+	g.runCtx = ctx
+	// Its first try before the relay starts, so on an install with the
+	// bucket every answer the relay posts is marked alike.
+	g.startFeedback(ctx)
 	// Attributed: the subject each envelope arrived on rides with it, because
 	// it is the only thing that tells a supervisor terminal from an
 	// executor's, and the relay owes the adapter that distinction
@@ -609,17 +640,11 @@ func (g *Gateway) Run(ctx context.Context) error {
 	// Deferred-ack: each event is acked once it has been rendered, not when it
 	// is queued, and stopping gives every unrendered one back to the stream,
 	// so a gateway that stops with events queued loses none of them.
-	sub, err := g.client.SubscribeDurableDeferred(ctx, lib.SubscribeConfig{
-		Stream:        lib.TasksStream,
-		Subjects:      []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
-		Durable:       g.relayDurable,
-		Session:       gatewayParty.Session,
-		Agreement:     &agreement,
-		MaxAckPending: relayMaxAckPending,
-	}, func(d lib.DeferredDelivery) { g.relayDelivery(ctx, d) })
+	sub, err := g.client.SubscribeDurableDeferred(ctx, g.relaySubscribeConfig(), func(d lib.DeferredDelivery) { g.relayDelivery(ctx, d) })
 	if err != nil {
 		return fmt.Errorf("event relay subscription: %w", err)
 	}
+	g.relayBound.Store(true)
 	// The batches already rendering finish first, then the subscription's
 	// stop gives every event not yet rendered back to the stream.
 	// Only then do the adapters close their connections: ingress stopped

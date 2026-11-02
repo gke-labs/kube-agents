@@ -1145,6 +1145,10 @@ const (
 	// the metrics port; the usage poller names it to find the port.
 	a2aGatewayContainerName     = "gateway"
 	a2aGatewayMetricsPortEnvVar = "A2A_METRICS_PORT"
+	// a2aGatewayReadyzPath is the gateway's readiness path on the same
+	// listener (gateway.ReadyzPath): 503 until its event relay has bound,
+	// which waits for the provision Job's TASKS stream.
+	a2aGatewayReadyzPath = "/readyz"
 )
 
 func a2aNATSImage() string {
@@ -5075,6 +5079,18 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						Ports: append(injectPorts, corev1.ContainerPort{
 							Name: a2aGatewayMetricsPortName, ContainerPort: a2aGatewayMetricsPort,
 						}),
+						// Not ready until the event relay binds: until then the
+						// gateway serves nothing, and it waits for TASKS rather
+						// than exiting. Recreate (above) already stops the old
+						// pod before this one starts, so the probe opens no gap
+						// in a roll; it shows the existing one, with the reason
+						// in the probe's failure message.
+						ReadinessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{Path: a2aGatewayReadyzPath, Port: intstr.FromString(a2aGatewayMetricsPortName)},
+							},
+							PeriodSeconds: 5,
+						},
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
 						}, a2aNATSCABundleMount()}, chatMounts...), injectMounts...),

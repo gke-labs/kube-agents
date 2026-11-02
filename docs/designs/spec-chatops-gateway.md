@@ -2591,11 +2591,22 @@ gone (see the update note under "What it also settles")._
 ## Metrics (added 10/6)
 
 The gateway serves Prometheus counters on a metrics-only listener, the credential broker's
-pattern copied: its own port, `/metrics` and nothing else (any other path is 404, any method
+pattern copied: its own port, `/metrics` and `/readyz` and nothing else (any other path is 404, any method
 but GET or HEAD 405), every interface rather than loopback because its caller is the managed-Prometheus
 collector on the pod network. `A2A_METRICS_PORT` names the port; unset means no listener, and a
 value that is not a port, or is either door's port, refuses the boot. A port that will not bind
-costs the gateway its metrics and logs an `ALERT` line; conversations carry on. The operator
+costs the gateway its metrics and its readiness, and logs an `ALERT` line; conversations carry on,
+though the pod never reads Ready, so the CR and the doors' Services count it as down.
+
+`/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
+once the gateway has bound its event relay and 503 until then, with the reason as the body
+(`waiting for stream TASKS: ...`). The relay binds before anything else starts, and on an install
+whose provision Job has not created TASKS yet (a three-server bus can take longer to form than
+lib's 45-second bind window) the relay waits for the stream rather than exiting
+(`SubscribeConfig.WaitForStream`, set on the relay alone, and only a missing stream waits). It logs
+the wait every 30 seconds and warns every 10 minutes. So a gateway waiting on provisioning reads
+not Ready, and the CR `Provisioning` naming it, instead of crash-looping. The Deployment is
+Recreate, so the probe opens no gap in a roll; it shows the one Recreate already has. The operator
 renders `A2A_METRICS_PORT=9096` and declares container port `a2a-metrics` on 9096 from one
 constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitoring`
 `PodMonitoring` scrapes 9096 every 30 seconds behind the `platformAgent.podMonitoring` switch. The

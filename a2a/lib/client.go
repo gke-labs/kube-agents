@@ -148,10 +148,17 @@ const DialTimeout = 10 * time.Second
 const (
 	backoffBase = 200 * time.Millisecond
 	backoffCap  = 5 * time.Second
+)
 
-	// subscribeBindWindow bounds how long the FIRST bind of a durable retries
-	// before the error reaches the caller; see durableSub.startWithRetry.
-	subscribeBindWindow = 45 * time.Second
+// subscribeBindWindow bounds how long the FIRST bind of a durable retries
+// before the error reaches the caller; see durableSub.startWithRetry. A first
+// bind that waits for its stream (SubscribeConfig.WaitForStream) logs at most
+// once per streamWaitLogInterval, and warns once per streamWaitWarnEvery that
+// it is still waiting. Variables so a test can shorten them.
+var (
+	subscribeBindWindow   = 45 * time.Second
+	streamWaitLogInterval = 30 * time.Second
+	streamWaitWarnEvery   = 10 * time.Minute
 )
 
 // fullJitterBackoff returns a delay drawn uniformly from [0, min(cap,
@@ -573,6 +580,15 @@ type SubscribeConfig struct {
 	// each delivery until it settles it, so the cap bounds how much it can
 	// hold before the server stops delivering to every holder.
 	MaxAckPending int
+	// WaitForStream makes the first bind wait, however long, for a stream
+	// that does not exist yet, instead of failing once the bind window
+	// closes. Only a missing stream waits: every other error keeps the
+	// window, so a consumer config the server will never accept still fails
+	// the process. For a process that cannot serve until the stream exists
+	// and that someone else provisions (the gateway's relay, which the
+	// provision Job's TASKS stream can trail by more than the window while a
+	// three-server bus forms). The wait is logged; see startWithRetry.
+	WaitForStream bool
 }
 
 // filterSubjects is the consumer's filter set, however it was spelled.
@@ -666,8 +682,17 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // retrying it for the window would hand the caller whichever error the last
 // attempt happened to end on (the context's, when a caller's deadline fires
 // mid-retry) in place of the refusal. A missing durable keeps the window.
+//
+// With cfg.WaitForStream, a missing stream does not count against the
+// window: the bind retries until the stream appears or ctx ends, and the
+// window restarts from the first attempt that finds it. The wait logs its
+// first attempt and then at most once per streamWaitLogInterval, and warns
+// once per streamWaitWarnEvery, so a stream that never comes is loud, not
+// silent; the caller reports itself not ready meanwhile.
 func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream) error {
 	deadline := time.Now().Add(subscribeBindWindow)
+	var waitStart, lastLog time.Time
+	warned := 0
 	for attempt := 1; ; attempt++ {
 		err := s.start(ctx, js)
 		if err == nil {
@@ -678,6 +703,32 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 		}
 		if errors.Is(err, ErrHeldBindRefused) {
 			return err
+		}
+		if s.cfg.WaitForStream && errors.Is(err, jetstream.ErrStreamNotFound) &&
+			ctx.Err() == nil && !s.c.closing.Load() && !s.stopped.Load() {
+			now := time.Now()
+			if waitStart.IsZero() {
+				waitStart = now
+			}
+			deadline = now.Add(subscribeBindWindow)
+			waited := now.Sub(waitStart)
+			switch {
+			case waited >= time.Duration(warned+1)*streamWaitWarnEvery:
+				warned++
+				lastLog = now
+				s.c.log.Warn("still waiting for the stream; nothing has created it",
+					"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second), "attempt", attempt)
+			case lastLog.IsZero() || now.Sub(lastLog) >= streamWaitLogInterval:
+				lastLog = now
+				s.c.log.Info("waiting for the stream to be created",
+					"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second), "attempt", attempt)
+			}
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(fullJitterBackoff(attempt)):
+			}
+			continue
 		}
 		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
 			return err

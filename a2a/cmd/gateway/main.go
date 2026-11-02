@@ -264,7 +264,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())
-	return serve(ctx, cfg, gw.Metrics(), log, gw.Run)
+	return serve(ctx, cfg, gw.Metrics(), gw.Readiness, log, gw.Run)
 }
 
 // gatewayNATSOptions is how the gateway's user dials, the gateway's own
@@ -369,11 +369,12 @@ func runNotifier(ctx context.Context, n *gateway.Notifier, client *lib.Client) f
 }
 
 // serve is realMain's last step: the metrics listener beside the gateway,
-// then the gateway until ctx is done. run is gw.Run; it is a parameter so a
-// test can reach this step without a bus and see that a metrics listener
-// which cannot start leaves its ALERT line and does not stop the gateway.
-func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, log *slog.Logger, run func(context.Context) error) error {
-	startMetricsListener(ctx, cfg, metrics, log)
+// then the gateway until ctx is done. run is gw.Run and readiness
+// gw.Readiness; they are parameters so a test can reach this step without a
+// bus and see that a metrics listener which cannot start leaves its ALERT
+// line and does not stop the gateway.
+func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, readiness func() (bool, string), log *slog.Logger, run func(context.Context) error) error {
+	startMetricsListener(ctx, cfg, metrics, readiness, log)
 	if err := run(ctx); err != nil && ctx.Err() == nil {
 		log.Error("gateway exited", "err", err)
 		return err
@@ -385,7 +386,7 @@ func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, l
 // set, on a goroutine of its own. Never fatal, the broker's rule for its own
 // listener: a port that will not bind costs the gateway its metrics, not the
 // conversations it exists to carry, and the ALERT line is the signal.
-func startMetricsListener(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, log *slog.Logger) {
+func startMetricsListener(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, readiness func() (bool, string), log *slog.Logger) {
 	if cfg.MetricsPort == 0 {
 		log.Info("metrics listener disabled: A2A_METRICS_PORT is unset")
 		return
@@ -395,6 +396,7 @@ func startMetricsListener(ctx context.Context, cfg *gateway.Config, metrics *gat
 		log.Error(metricsUnavailableAlert, "err", err)
 		return
 	}
+	srv.SetReadiness(readiness)
 	go func() {
 		if err := srv.Run(ctx); err != nil {
 			log.Error(metricsUnavailableAlert, "err", err)
