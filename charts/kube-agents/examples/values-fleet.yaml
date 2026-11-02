@@ -1,0 +1,105 @@
+# Sizing for the `fleet` tier: 25 or more registered clusters, 15,000 or more
+# fleet nodes, or 50,000 or more objects in the host cluster. The thresholds,
+# what each key does and the host-cluster shapes that fit are on the site's
+# "Fleet and host-cluster sizing" page under Deploy; this file sets only what
+# the chart exposes. Pass it beside your own values:
+#
+#   helm upgrade kube-agents ./charts/kube-agents -n kubeagents-system \
+#     --reset-then-reuse-values -f charts/kube-agents/examples/values-fleet.yaml
+#
+# Before a hand-run `helm upgrade`, apply charts/kube-agents/crds/ first
+# (`kubectl apply --server-side -f charts/kube-agents/crds/`; upgrade.sh does):
+# Helm never updates CRDs on an upgrade, and the chart refuses the render when
+# the installed CRD predates spec.storage, spec.deployment.credentialProxy or
+# spec.deployment.agentAPIAuth rather than letting the API server prune the
+# values silently.
+#
+# GKE Autopilot without bursting sets every container's limits equal to its
+# requests, so each key below says what it runs at there. Autopilot also admits
+# a requests pair unchanged only between 1 and 6.5 GiB of memory per vCPU, and
+# every pair here sits in that band.
+
+operator:
+  # The manager caches every Deployment, StatefulSet, Service and claim in the
+  # host cluster, and sets its Go soft memory limit to nine tenths of the limit
+  # it reads, so a host cluster with 50,000 objects or more raises this one
+  # value. The request matches the limit so that Autopilot without bursting
+  # runs the manager at 1Gi rather than clamping it to a smaller request; the
+  # floor the chart enforces on the limit is 512Mi.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+platformAgent:
+  storage:
+    # The agent's data claim and the shell sandbox's data claim, both at this
+    # size: the sandbox's /opt/data holds every cloned GitOps repository, the
+    # fleet audits' artifacts and the model's scripts, which 25 or more clusters
+    # grow past the 50Gi default (modeled, not measured). Raising it expands
+    # both claims online where the StorageClass allows expansion; a claim never
+    # shrinks, so pass this only once you mean it. Each GiB counts twice against
+    # a namespace requests.storage quota.
+    size: 100Gi
+  harness:
+    tuning:
+      # Kanban workers running at once, board-wide. Each worker is a `hermes
+      # chat` process with its own MCP servers (about 430 MiB each) and holds
+      # a slot in the credential proxy; 3 keeps the gateway pod inside its
+      # memory limit while 25 or more clusters feed event triage. One slot is
+      # always kept for a question asked in chat.
+      maxInProgress: 3
+  deployment:
+    # The operator copies spec.deployment.env onto the agent container only for
+    # names on its allowlist, and forwards KUBEAGENTS_AUDIT_AUTO_PROMOTE to the
+    # shell sandbox, where the audits run. Both names here are forwarded; a
+    # name that is not (CLOUDSDK_CORE_DISABLE_FILE_LOGGING, MALLOC_ARENA_MAX)
+    # would be dropped silently, so none is set.
+    env:
+      # Seconds an admitted workload event folds its later events into the
+      # same incident instead of opening another: an hour, against the default
+      # of no folding, bounds the triage turns and chat messages a flapping
+      # workload can cause across a large fleet. Capped at a day.
+      - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+        value: "3600"
+      # Fleet audits report findings without opening remediation pull requests
+      # on their own; `/remediate` on a ledger still opens one. At 25 clusters
+      # or more an automatic promotion sweeps every cluster's findings into
+      # pull requests at once.
+      - name: KUBEAGENTS_AUDIT_AUTO_PROMOTE
+        value: "false"
+    credentialProxy:
+      # The broker that runs every credentialed command (gcloud, kubectl) in a
+      # pod of its own. It sizes how many commands it admits at once from
+      # limits.memory, charging each about 128 MiB, so 8Gi admits the parallel
+      # cluster reads a fleet audit fans out; at the 2Gi default the broker
+      # restarted under a 29-cluster fleet. The CPU request is the CPU it runs
+      # at on Autopilot without bursting; on Standard or with bursting it may
+      # reach 8 vCPU.
+      # ephemeral-storage keeps the operator's 8Gi default, under Autopilot's
+      # 10 GiB per-pod ceiling.
+      resources:
+        requests:
+          cpu: "4"
+          memory: 8Gi
+        limits:
+          cpu: "8"
+          memory: 8Gi
+    agentAPIAuth:
+      # The gateway sidecar that runs the event watcher and the drift detector.
+      # The watcher sets its Go soft memory limit to half of limits.memory, so
+      # 4Gi gives it 2 GiB for the informers of 25 or more watched clusters,
+      # which list every watched object at startup (modeled from the 2Gi
+      # default's share per cluster). On Autopilot without bursting the
+      # container runs at the 2Gi request and the watcher reads 1 GiB.
+      # limits.cpu is left at the default 1, because the watcher's GOMAXPROCS
+      # follows it.
+      resources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          memory: 4Gi

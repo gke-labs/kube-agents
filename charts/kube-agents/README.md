@@ -835,6 +835,23 @@ predates `spec.storage`. The
 [PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specstorage)
 is canonical for the behaviour.
 
+### Sizing for a fleet (`examples/values-fleet.yaml`)
+
+The defaults fit a fleet of under 10 clusters. `examples/values-fleet.yaml` sets what the chart
+exposes for 25 clusters or more: `operator.resources` at 1Gi, `platformAgent.storage.size` at
+100Gi, `platformAgent.harness.tuning.maxInProgress` at 3, the credential-proxy and
+`agent-api-auth` resource blocks, and two `platformAgent.deployment.env` entries
+(`INCIDENT_WORKLOAD_DEDUP_SECONDS`, `KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its
+reason and what GKE Autopilot without bursting runs it at. It does not size the agent container
+itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
+sandbox, which the operator fixes at 2 CPU and 2Gi. The two env names are ones the operator
+forwards; `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on its allowlist
+and are left out for that reason. Pass it beside your own values with
+`-f charts/kube-agents/examples/values-fleet.yaml`, after applying `crds/` on an existing
+install. The tier thresholds, the per-pod sum and the host-cluster shapes are on the
+[fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/);
+`tests/test_chart_values_fleet_example.py` holds the file to the chart and the operator.
+
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,

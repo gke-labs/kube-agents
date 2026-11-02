@@ -312,6 +312,14 @@ The operator moves before the harness because the operator owns the resources th
 Every mode needs the `kube-agents` Helm release to exist in the target namespace; an install
 without one predates the Terraform and Helm engine, and has to be re-installed to adopt it.
 
+A `helm upgrade` run by hand, for example with the fleet example values file, applies no CRDs
+either. Run `kubectl apply --server-side -f charts/kube-agents/crds/` from the target release's
+checkout first. The data volume size and the credential-proxy and `agent-api-auth` resource
+blocks need a CRD that declares their field, and the chart refuses the render against an older
+one rather than letting the API server prune the value.
+[Fleet and host-cluster sizing](/kube-agents/deploy/fleet-sizing/#applying-it) has the commands
+and the `install.env` keys that keep the values across later upgrades.
+
 ## Choosing what the run targets
 
 A release copy of the script carries the version it upgrades to, which is what makes the one-liner
