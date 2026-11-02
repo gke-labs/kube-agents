@@ -10,7 +10,8 @@ the credential proxy 8 CPU and 8 GB, and the event watcher 2 CPU and 4 GB. The t
 40 hours. In that time no container was killed for memory, and at fair use no brokered command was
 refused and no prompt failed. A brokered command is a `kubectl` or `gcloud` command that the
 credential proxy runs for the agent. Beyond fair use, at 5 questions at once, the credential proxy
-refused 2 commands. At 8 questions at once it restarted once, for a reason that is not known. No container that the L size sets used more than half of its limit.
+refused 2 commands. At 8 questions at once it restarted once, for a reason that is not known.
+No container that the L size sets used more than half of its limit.
 
 The first-run flow finished in 63 minutes. The first-run flow is the onboarding that a new install
 does by itself. About 30 of the 63 minutes came from a fault in the test environment: an external
