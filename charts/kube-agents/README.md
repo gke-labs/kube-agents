@@ -353,6 +353,11 @@ resolves to that GSA:
 instantiation creates the identity and roles, and the chart values above carry
 the annotated KSA.
 
+`litellm.vertex.sessionAffinity` (off by default) sends each Gemini
+conversation a Vertex `session_id` so a new conversation's first turn can read
+a prompt another conversation warmed:
+[Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching).
+
 #### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
 
 `openai_compatible` routes `model-default` to any server that speaks the OpenAI

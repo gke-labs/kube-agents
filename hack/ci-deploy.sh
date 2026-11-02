@@ -242,11 +242,13 @@ readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-2
 # admits at least the slot cap, and the chart rendering it onto the CR.
 readonly EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT="2Gi"
 
-# Every pool project carries Vertex's LLM_SESSION_ID label, so the gateway's
-# session-affinity hook (litellm.vertex.sessionAffinity) routes each Gemini
-# conversation to one of a few replicas per prompt and a worker's first turn
-# can read the system prompt and tools another worker warmed. Override with
-# EVAL_LITELLM_SESSION_AFFINITY=false to compare a run without it.
+# The gateway's session-affinity hook (litellm.vertex.sessionAffinity) routes
+# each Gemini conversation to one of a few replicas per prompt, so a worker's
+# first turn can read the system prompt and tools another worker warmed. It
+# takes effect only on a project with Vertex's LLM_SESSION_ID label, which is
+# granted outside this repository (docs/ci-pool-projects.md, section 1.1); on
+# one without it Vertex ignores the field and the run routes as before.
+# Override with EVAL_LITELLM_SESSION_AFFINITY=false to compare a run without it.
 readonly EVAL_LITELLM_SESSION_AFFINITY="${EVAL_LITELLM_SESSION_AFFINITY:-true}"
 
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —

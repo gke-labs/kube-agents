@@ -429,9 +429,10 @@ litellm:
     # turn, so a new conversation lands on a serving replica that another
     # conversation with the same prompt warmed and turn 1 reads its prefix
     # from cache. Needs Vertex's LLM_SESSION_ID label on the serving project;
-    # without it Vertex ignores the field. slots is how many replicas share
-    # one prompt: 1 puts every concurrent conversation of a profile on one
-    # replica, which queues; more spread them but reuse each less often.
+    # without it Vertex ignores the field. slots is how many session ids one
+    # prompt is spread across: 1 puts every concurrent
+    # conversation of a profile on one replica, which queues; more spread
+    # them but reuse each less often.
     sessionAffinity:
       enabled: false
       slots: 2
