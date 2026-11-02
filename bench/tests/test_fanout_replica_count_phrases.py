@@ -21,7 +21,6 @@ from kube_agents_bench.verifiers import ReportContainsVerifier
 TASK = Path(__file__).resolve().parent.parent / "tasks" / "fanout-absent-cluster-cards-complete" / "task.yaml"
 OBJECTIVE = "the-answer-names-the-cluster"
 TIMEOUT_SEC = 5
-HEAD = "checkout-gateway is on seeded-a. "
 
 # Each names the workload and the cluster and gives the count of two.
 COUNTS = [
@@ -33,6 +32,7 @@ COUNTS = [
     "checkout-gateway on seeded-a: all 2 desired replicas are ready and available.",
     "checkout-gateway on seeded-a: replica count is 2.",
     "checkout-gateway on seeded-a: replica count: 2.",
+    "kubectl get deploy checkout-gateway on seeded-a shows ready 2/2, up-to-date 2 and available 2.",
     "The platform agent found checkout-gateway running 2 replica pods on seeded-a.",
     "The checkout-gateway deployment on seeded-a shows spec.replicas=2, readyReplicas=2, availableReplicas=2 and updatedReplicas=2.",
     "checkout-gateway runs on seeded-a and is fully available. Its spec.replicas is 2, status.readyReplicas is 2.",
@@ -50,6 +50,13 @@ NOT_COUNTS = [
     "checkout-gateway has 2 replicas on seeded-b; seeded-a was not checked.",
     "checkout-gateway is on seeded-a. 3 replicas, 2 ready.",
     "checkout-gateway on seeded-a has 3 desired, 2 ready and 2 available replicas.",
+    # The field spellings of a wrong count.
+    "checkout-gateway on seeded-a: spec.replicas: 3, status.readyReplicas: 2.",
+    "checkout-gateway on seeded-a: replicas: 4, unavailableReplicas: 2.",
+    "checkout-gateway on seeded-a: replicas: 2 of 3 ready.",
+    "checkout-gateway on seeded-a: replica count: 2/3.",
+    # A bare 2/2 about the cards, with the seeded-a card still open.
+    "checkout-gateway: 2/2 completed cards (seeded-b, seeded-c) report it is not there; the seeded-a card is still running.",
 ]
 
 
