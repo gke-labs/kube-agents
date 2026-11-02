@@ -81,6 +81,10 @@ BROKEN_FIXTURE = TESTDATA / "broken-emptydir.yaml"
 ALLOWANCE = "64Mi"
 OPERATOR_LIMITS_SOURCE = "k8s-operator/internal/controller/emptydir_limits.go"
 OPERATOR_ALLOWANCE_RE = re.compile(r'^\s*emptyDirLogsAllowance\s*=\s*"([^"]+)"', re.MULTILINE)
+# The operator's webhook warns on the same band; its constants are written as
+# `<n> << <shift>` byte counts, which `test_memory_band_matches_the_operator` reads.
+OPERATOR_BAND_SOURCE = "k8s-operator/internal/controller/credential_proxy_validation.go"
+OPERATOR_BAND_RE = re.compile(r"^\s*autopilot(Min|Max)MemoryBytesPerVCPU\s+int64\s*=\s*(\d+)\s*<<\s*(\d+)", re.MULTILINE)
 
 RESOURCE_KEYS = ("cpu", "memory", "ephemeral-storage")
 EPHEMERAL = "ephemeral-storage"
@@ -104,19 +108,22 @@ RULE_POD_MEMORY_PER_VCPU = "pod-memory-per-vcpu"
 RULE_POD_EPHEMERAL_REQUEST = "pod-ephemeral-request"
 POD_SCOPE = ""
 
+# A workload key opens with its source: `chart <Kind>/<name>`,
+# `golden <Kind>/<name>`, or a kustomize manifest's path.
 SOURCE_CHART = "chart"
 SOURCE_GOLDEN = "golden"
 SOURCE_KUSTOMIZE = "kustomize"
 GOLDEN_WORKLOAD_PREFIX = f"{SOURCE_GOLDEN} "
+CHART_WORKLOAD_PREFIX = f"{SOURCE_CHART} "
 
 # The pods and containers rendered when this was written (2026-11-02): the
 # chart's hindsight-api, litellm, controller-manager, hindsight-postgresql and
-# cr-cleanup; each of seven goldens' shell StatefulSet, credential-proxy and
+# cr-cleanup; each of eight goldens' shell StatefulSet, credential-proxy and
 # gateway Deployments; the kustomize manager, litellm, hindsight api and
 # postgres and inference-replay. A count under the floor means a source has
 # gone blind, not that the tree got smaller.
 MIN_CHART_PODS = 5
-MIN_GOLDEN_PODS = 21
+MIN_GOLDEN_PODS = 24
 MIN_KUSTOMIZE_PODS = 5
 MIN_CONTAINERS = 40
 
@@ -404,6 +411,15 @@ def _entry_line(finding: Finding, issue: object = None) -> str:
     )
 
 
+def source_of(workload: str) -> str:
+    """The source a workload key names; a kustomize key is the manifest's path."""
+    if workload.startswith(CHART_WORKLOAD_PREFIX):
+        return SOURCE_CHART
+    if workload.startswith(GOLDEN_WORKLOAD_PREFIX):
+        return SOURCE_GOLDEN
+    return SOURCE_KUSTOMIZE
+
+
 def compare(observed: dict, baseline: dict, sources_read: set[str]) -> list[str]:
     """What the baseline and the observation disagree on, empty when they match."""
     problems = []
@@ -428,7 +444,7 @@ def compare(observed: dict, baseline: dict, sources_read: set[str]) -> list[str]
     for key, entry in sorted(baseline.items()):
         if key in observed:
             continue
-        if key[0].split(" ", 1)[0] not in sources_read:
+        if source_of(key[0]) not in sources_read:
             continue
         problems.append(f"baseline entry no longer observed; remove it: {key} (issue #{entry.get('issue')})")
     return problems
@@ -471,6 +487,12 @@ class ResourceParityGateTest(unittest.TestCase):
         match = OPERATOR_ALLOWANCE_RE.search(text)
         self.assertIsNotNone(match, f"{OPERATOR_LIMITS_SOURCE} declares no emptyDirLogsAllowance")
         self.assertEqual(ALLOWANCE, match.group(1), f"ALLOWANCE {ALLOWANCE} differs from the operator's emptyDirLogsAllowance {match.group(1)}")
+
+    def test_memory_band_matches_the_operator(self):
+        text = (REPO_ROOT / OPERATOR_BAND_SOURCE).read_text(encoding="utf-8")
+        band = {edge: Fraction(int(n) << int(shift)) for edge, n, shift in OPERATOR_BAND_RE.findall(text)}
+        self.assertEqual({"Min", "Max"}, set(band), f"{OPERATOR_BAND_SOURCE} declares no autopilotMin/MaxMemoryBytesPerVCPU in the `n << shift` form")
+        self.assertEqual((MEMORY_PER_VCPU_MIN, MEMORY_PER_VCPU_MAX), (band["Min"], band["Max"]), "the band differs from the operator's")
 
 
 class ResourceParityRulesTest(unittest.TestCase):
@@ -603,6 +625,16 @@ class ResourceParityRatchetTest(unittest.TestCase):
     def test_an_unobserved_entry_fails(self):
         [problem] = compare({}, self._baseline(2), {SOURCE_GOLDEN})
         self.assertIn("no longer observed; remove it", problem)
+
+    def test_an_unobserved_kustomize_entry_fails(self):
+        key = ("k8s-operator/config/manager/manager.yaml Deployment/controller-manager", "manager", RULE_DECLARED)
+        [problem] = compare({}, {key: {"measure": 2, "issue": 1}}, {SOURCE_GOLDEN, SOURCE_KUSTOMIZE})
+        self.assertIn("no longer observed; remove it", problem)
+
+    def test_a_workload_key_names_its_source(self):
+        self.assertEqual(SOURCE_CHART, source_of("chart Deployment/litellm"))
+        self.assertEqual(SOURCE_GOLDEN, source_of("golden Deployment/platformagent-gateway"))
+        self.assertEqual(SOURCE_KUSTOMIZE, source_of("k8s-operator/config/manager/manager.yaml Deployment/controller-manager"))
 
     def test_an_unobserved_entry_of_a_source_not_read_is_left_alone(self):
         baseline = {("chart Deployment/x", "c", RULE_DECLARED): {"measure": 2, "issue": 1}}
