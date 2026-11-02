@@ -1165,8 +1165,9 @@ not be silent about it.
   whole budget (`input-required`, say), infrastructure (an executor took it and did not run it);
   `working` at the budget, a graded timeout; and an active
   record whose stream already folds to a terminal, which is the relay's lost record write (the
-  relay acks a terminal before it clears `ActiveTask` and writes the record, and on a key never
-  reused no heal arrives) - graded like a finished run from the fold's result text when the
+  relay acks a terminal once it has rendered it, whether or not the record write after it
+  succeeded, because the posts are out and a redelivery would make them again, and on a key
+  never reused no heal arrives) - graded like a finished run from the fold's result text when the
   terminal is the executor's, infrastructure when it is the supervisor's (an executor that died
   or never ran), and never cancelled. The budget is the harness's own
   (`AGENT_INJECT_TIMEOUT`, 1800 s by default), floored at the grace plus a margin and refused
