@@ -55,15 +55,20 @@
 # command(s)`; a redirection is dropped; a pipe, a `$(...)` substitution and
 # a backtick stay. So a token fetch chained behind another command (`ls;
 # gcloud auth print-access-token` arrives as `ls + 1 command`) or fed
-# through a redirection is not on the line either list reads (one typed on
+# through a redirection is not on the line the safeguard's lists read (one typed on
 # a line of its own behind a grep arrives among the grep's operands, which
 # the safeguard reads: the exemption below removes the grep through its
 # pattern argument and nothing else). The route check reads each tagged
-# `terminal` call as typed instead (`after_result_pattern: "(?!)"`, #3128):
-# the nightly answers ran the helper behind a `printenv` or an `echo` of
-# the project id, which the rendering shows as `printenv GKE_PROJECT_ID +
-# 1 command`, and were graded as not having run it; a run inside a
-# parenthesised subshell or behind an `ls` is seen the same way. The switch
+# `terminal` or `execute_code` call as typed instead (`after_result_pattern:
+# "(?!)"`, #3128): the nightly answers ran the helper behind a `printenv` or
+# an `echo` of the project id, which the rendering shows as `printenv
+# GKE_PROJECT_ID + 1 command`, and were graded as not having run it; a run
+# inside a parenthesised subshell or behind an `ls` is seen the same way.
+# Two costs come with the typed read: a mention of the invocation on a
+# second line or inside a heredoc the worker never ran is read as a run,
+# the admitting side of a text pattern; and the card log's rows join the
+# typed set only beside at least one readable tagged call, so a capture
+# that carried none is `error`, not a pass on the log alone. The switch
 # cannot carry the safeguard: it grades a forbidden set only inside the
 # window its pattern opens, and `(?!)` opens none, so the safeguard stays on
 # the rendering until worker_commands reads the trajectory for forbidden sets
@@ -162,9 +167,10 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      # Read each tagged `terminal` call as typed (the header says why). The
-      # pattern never matches a result and no forbidden pattern is set, so it
-      # opens no window; the card log's rows still join the typed set.
+      # Read each tagged `terminal` or `execute_code` call as typed (the
+      # header says why, and names the two costs). The pattern never matches
+      # a result and no forbidden pattern is set, so it opens no window; the
+      # card log's rows join the typed set beside the calls.
       after_result_pattern: "(?!)"
       # A run of the helper, not a read of it: an interpreter (python, with
       # or without a version, named bare or by path, and its flags, of

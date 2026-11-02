@@ -393,6 +393,9 @@ ROUTE_PINS = [
     ("python3 -u /tmp/mine.py scripts/analyze_trace_latency.py --project-id p", "python3 -u /tmp/mine.py scripts/analyze_trace_latency.py --project-id p", "fail"),
     ("python3 -Xscripts/analyze_trace_latency.py /tmp/mine.py --project-id p", "python3 -Xscripts/analyze_trace_latency.py /tmp/mine.py --project-id p", "fail"),
     ("cat $SKILL_DIR/scripts/analyze_trace_latency.py", "cat $SKILL_DIR/scripts/analyze_trace_latency.py", "fail"),
+    # The admitting side the case header states: an invocation written on a
+    # second line or into a heredoc the worker never ran is read as a run.
+    ("cat <<'EOF' python3 scripts/analyze_trace_latency.py --project-id p EOF", "cat > /tmp/notes.md <<'EOF'\npython3 scripts/analyze_trace_latency.py --project-id p\nEOF", "pass"),
 ]
 # The chains whose rendered row names no helper: the shapes the nightly
 # graded as not having run it.
@@ -453,7 +456,9 @@ def _route_check() -> dict:
 
 
 def _as_calls(commands: list[str]) -> list[tuple[str, str]]:
-    """Typed commands graded as tagged calls; a one-line command is its own row."""
+    """Typed commands graded as tagged calls. The typed text's first line stands
+    in for the card log's row: the row is only set-joined beside the call, so
+    it cannot earn a verdict the call does not."""
     return [(c.split("\n")[0], c) for c in commands]
 
 

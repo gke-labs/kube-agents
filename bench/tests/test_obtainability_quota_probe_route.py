@@ -22,8 +22,10 @@ provisioning models, and the card log's rendering of such a command
 first command plus `` + N commands`` and neither probe. The check reads each
 tagged ``terminal`` call as typed (``after_result_pattern: "(?!)"``), with the
 card log's rows beside it. Each fixture here is one worker run: its rendered
-rows and its typed calls together, as the verifier receives them, with the
-verdict the run earns; ``RECORDED`` holds the nightly shapes.
+rows and its typed calls together, with the verdict the run earns.
+``RECORDED`` holds three runs in the nightly's shapes, each row rendered by
+the image's renderer (hermes ``agent/display.py``, ``summarize_shell_command``);
+``ONE_LINE`` and ``NOT_THE_PROBES`` are hand-written.
 """
 
 from __future__ import annotations
@@ -90,11 +92,14 @@ ADVICE_WITH_A_SUFFIX = (
 )
 
 # (run, verdict): the nightly shapes that were graded as not having run the
-# probes, and the runs that did not run them.
+# probes; one run with both probes on one line each; the runs that did not
+# run them.
 RECORDED = [
     ([REGIONS_BEHIND_PRINTENV, ADVICE_IN_A_LOOP], "pass"),
     ([REGIONS_BEHIND_CD, ADVICE_IN_A_LOOP_BEHIND_CD], "pass"),
     ([REGIONS_PIPED, ADVICE_IN_A_LOOP], "pass"),
+]
+ONE_LINE = [
     ([REGIONS_PIPED, ADVICE_ALONE], "pass"),
 ]
 NOT_THE_PROBES = [
@@ -103,7 +108,10 @@ NOT_THE_PROBES = [
     ([PROJECT_INFO_BEHIND_PRINTENV, ADVICE_IN_A_LOOP], "fail"),
     ([REGIONS_PIPED, ADVICE_WITH_A_SUFFIX], "fail"),
 ]
-# The chained shapes alone: neither probe is on their rendered rows.
+# The chained shapes: a probe is missing from their rendered rows. In the
+# first run both are (`printenv ... + 2 commands`, `for m ... + 7 commands`);
+# in the second the regions row is whole (the renderer drops the leading
+# `cd` and the boundary `echo rc=$?`) and the advice loop is collapsed.
 CHAINED = [
     [REGIONS_BEHIND_PRINTENV, ADVICE_IN_A_LOOP],
     [REGIONS_BEHIND_CD, ADVICE_IN_A_LOOP_BEHIND_CD],
@@ -152,7 +160,7 @@ def test_the_check_reads_the_calls_as_typed():
     assert _check()[AS_TYPED] == "(?!)", "the switch opens no window and reads the calls as typed"
 
 
-@pytest.mark.parametrize("run, verdict", RECORDED + NOT_THE_PROBES)
+@pytest.mark.parametrize("run, verdict", RECORDED + ONE_LINE + NOT_THE_PROBES)
 def test_each_run_earns_the_verdict_the_case_states(run, verdict):
     assert _status(_check(), run) == verdict, [rendered for rendered, _ in run]
 
@@ -160,4 +168,4 @@ def test_each_run_earns_the_verdict_the_case_states(run, verdict):
 @pytest.mark.parametrize("run", CHAINED)
 def test_the_rendering_alone_misses_a_chained_probe(run):
     without = {k: v for k, v in _check().items() if k != AS_TYPED}
-    assert _status(without, run) == "fail", "the rendered rows carry neither probe; the switch is what reads the typed call"
+    assert _status(without, run) == "fail", "a probe is missing from the rendered rows; the switch is what reads the typed call"
