@@ -506,3 +506,57 @@ func TestARecordAboveTheCounterSaysTheCounterWasReset(t *testing.T) {
 		t.Fatalf("Put under a reset counter = %v, want ErrFenced naming %s and the reset", err, termKey)
 	}
 }
+
+// historyFails is a bucket whose counter Get says missing and whose History
+// read fails, as a watch can during a bus leader election.
+type historyFails struct {
+	jetstream.KeyValue
+}
+
+func (historyFails) Get(context.Context, string) (jetstream.KeyValueEntry, error) {
+	return nil, jetstream.ErrKeyNotFound
+}
+
+func (historyFails) History(context.Context, string, ...jetstream.WatchOpt) ([]jetstream.KeyValueEntry, error) {
+	return nil, errors.New("no responders available for request")
+}
+
+// TestAnUnreadableCounterHistoryIsAnErrorNotTermOne: only "no history" means
+// the counter was never raised; a history read that fails can't tell a
+// deleted counter from a fresh one.
+func TestAnUnreadableCounterHistoryIsAnErrorNotTermOne(t *testing.T) {
+	_, _, err := readTerm(context.Background(), historyFails{})
+	if err == nil || !strings.Contains(err.Error(), termKey) {
+		t.Fatalf("readTerm with an unreadable history = %v, want an error naming %s", err, termKey)
+	}
+}
+
+// TestANewTermBetweenTheReadsIsNotCalledAReset: a record above the counter
+// read a moment earlier is a new term that began in between, not a reset.
+func TestANewTermBetweenTheReadsIsNotCalledAReset(t *testing.T) {
+	ctx := context.Background()
+	r := startRig(t)
+	old, cur := NewRegistry(r.client), NewRegistry(r.client)
+	if _, err := old.BeginTerm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key := "slack:T1/C1/term-race"
+	if err := old.Put(ctx, &SessionRecord{Key: key, Addressee: "platform"}); err != nil {
+		t.Fatal(err)
+	}
+	// The new term begins and writes the record between the deposed
+	// gateway's counter read and its record read.
+	old.afterTermRead = func() {
+		old.afterTermRead = nil
+		if _, err := cur.BeginTerm(ctx); err != nil {
+			t.Errorf("BeginTerm: %v", err)
+		}
+		if err := cur.Put(ctx, &SessionRecord{Key: key, Addressee: "new-leader"}); err != nil {
+			t.Errorf("new leader's Put: %v", err)
+		}
+	}
+	err := old.Put(ctx, &SessionRecord{Key: key, Addressee: "deposed"})
+	if !errors.Is(err, ErrFenced) || strings.Contains(err.Error(), "reset") {
+		t.Fatalf("deposed Put across a new term = %v, want ErrFenced without a reset", err)
+	}
+}

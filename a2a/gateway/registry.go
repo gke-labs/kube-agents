@@ -657,6 +657,9 @@ type Registry struct {
 	// afterCheck, when set, runs between a fenced write's epoch check and
 	// the write itself: tests use it to land a newer leader's write there.
 	afterCheck func()
+	// afterTermRead, when set, runs between a fenced write's counter read
+	// and its record read (tests).
+	afterTermRead func()
 }
 
 // ErrFenced reports a write refused because the term marker or the stored
@@ -722,7 +725,16 @@ func readTerm(ctx context.Context, kv jetstream.KeyValue) (uint64, uint64, error
 		// Get reports a deleted key as missing too. A counter that was
 		// deleted would restart terms at 1, beneath every record a later
 		// term stamped, so it's refused rather than read as never raised.
-		if history, herr := kv.History(ctx, termKey); herr == nil && len(history) > 0 {
+		history, herr := kv.History(ctx, termKey)
+		if errors.Is(herr, jetstream.ErrKeyNotFound) {
+			return 0, 0, nil
+		}
+		if herr != nil {
+			// Unread history can't tell a deleted counter from one never
+			// raised, and taking it as never raised restarts terms at 1.
+			return 0, 0, fmt.Errorf("term counter %s: reading its history: %w", termKey, herr)
+		}
+		if len(history) > 0 {
 			if op := history[len(history)-1].Operation(); op == jetstream.KeyValueDelete || op == jetstream.KeyValuePurge {
 				return 0, 0, fmt.Errorf("term counter %s was deleted: restore it to at least the highest term a record carries", termKey)
 			}
@@ -749,13 +761,16 @@ func readTerm(ctx context.Context, kv jetstream.KeyValue) (uint64, uint64, error
 //
 // Callers at term 0 don't call it: term 0 writes exactly as an unfenced
 // registry did (unfenced).
-func fencedRecord(ctx context.Context, kv jetstream.KeyValue, sessionKey string, mine uint64) (uint64, error) {
+func (r *Registry) fencedRecord(ctx context.Context, kv jetstream.KeyValue, sessionKey string, mine uint64) (uint64, error) {
 	term, _, err := readTerm(ctx, kv)
 	if err != nil {
 		return 0, err
 	}
 	if term > mine {
 		return 0, fmt.Errorf("session %s: term %d: %w", sessionKey, term, ErrFenced)
+	}
+	if r.afterTermRead != nil {
+		r.afterTermRead()
 	}
 	entry, err := kv.Get(ctx, kvKey(sessionKey))
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
@@ -772,10 +787,14 @@ func fencedRecord(ctx context.Context, kv jetstream.KeyValue, sessionKey string,
 	}
 	if stored.Epoch > mine {
 		if stored.Epoch > term {
-			// A record above the counter means the counter went backwards,
-			// by hand: no term hands out a number below one already used.
-			return 0, fmt.Errorf("session %s carries term %d, above the term counter %s at %d (the counter was reset): %w",
-				sessionKey, stored.Epoch, termKey, term, ErrFenced)
+			// A record above the counter read a moment ago is usually a new
+			// term that began in between. Read the counter again: only a
+			// record above the counter as it stands now means the counter
+			// went backwards, by hand.
+			if now, _, rerr := readTerm(ctx, kv); rerr == nil && stored.Epoch > now {
+				return 0, fmt.Errorf("session %s carries term %d, above the term counter %s at %d (the counter was reset): %w",
+					sessionKey, stored.Epoch, termKey, now, ErrFenced)
+			}
 		}
 		return 0, fmt.Errorf("session %s: %w", sessionKey, ErrFenced)
 	}
@@ -898,7 +917,7 @@ func (r *Registry) Put(ctx context.Context, rec *SessionRecord) error {
 		return nil
 	}
 	for attempt := 0; ; attempt++ {
-		rev, err := fencedRecord(ctx, kv, rec.Key, mine)
+		rev, err := r.fencedRecord(ctx, kv, rec.Key, mine)
 		if err != nil {
 			return err
 		}
@@ -948,7 +967,7 @@ func (r *Registry) IndexTask(ctx context.Context, taskID, sessionKey string) err
 		return err
 	}
 	if mine := r.epoch.Load(); mine != 0 {
-		if _, err := fencedRecord(ctx, kv, sessionKey, mine); err != nil {
+		if _, err := r.fencedRecord(ctx, kv, sessionKey, mine); err != nil {
 			return err
 		}
 	}
@@ -980,7 +999,7 @@ func (r *Registry) DropTask(ctx context.Context, taskID string) error {
 	if err != nil {
 		return fmt.Errorf("task index %s: %w", taskID, err)
 	}
-	if _, err := fencedRecord(ctx, kv, string(entry.Value()), r.epoch.Load()); err != nil {
+	if _, err := r.fencedRecord(ctx, kv, string(entry.Value()), r.epoch.Load()); err != nil {
 		return err
 	}
 	if r.afterCheck != nil {
@@ -1009,7 +1028,7 @@ func (r *Registry) DeleteSession(ctx context.Context, sessionKey string) error {
 		}
 		return nil
 	}
-	rev, err := fencedRecord(ctx, kv, sessionKey, r.epoch.Load())
+	rev, err := r.fencedRecord(ctx, kv, sessionKey, r.epoch.Load())
 	if err != nil {
 		return err
 	}
