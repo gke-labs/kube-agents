@@ -42,6 +42,9 @@ def test_node_pool_upgrade_commands_match():
         "```bash\ngcloud container clusters upgrade prod-1 \\\n  --node-pool=default-pool \\\n  --location=us-central1\n```",
         "- **Upgrade the pool:**\n  ```bash\n  gcloud container clusters upgrade prod-1 \\\n    --node-pool=default-pool \\\n    --location=us-central1\n  ```",
         "gcloud container clusters upgrade prod-1 \\\n  --cluster-version \"${CONTROL_PLANE_VERSION}\" \\\n  --node-pool default-pool",
+        # A break inside the head is the same command.
+        "gcloud container clusters \\\n  upgrade prod-1 --node-pool default-pool",
+        "gcloud \\\n  beta container clusters upgrade prod-1 --node-pool=pool-a",
     ):
         assert _matches(report), report
 
@@ -58,5 +61,8 @@ def test_prose_and_other_commands_do_not_match():
         # A flag on the next line with no backslash is prose, not a continuation.
         "Run gcloud container clusters upgrade\n--node-pool is the flag to add",
         "gcloud container clusters upgrade prod-1 \\\n  --master \\\n  --node-pool default-pool",
+        # No space on either side of the backslash: the shell glues the two
+        # lines into one word, so this runbook cannot run.
+        "gcloud container clusters upgrade prod-1\\\n--node-pool=default-pool",
     ):
         assert not _matches(report), report

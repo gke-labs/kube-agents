@@ -459,7 +459,9 @@ def pattern_surface(text: str, *, fold_decoration: bool = False) -> str:
     One name for it, so a test that pins a case's pattern runs on the surface
     the verifier uses rather than on a copy that can drift from it: the report
     normalized line by line with its line breaks kept, so a space in a pattern
-    does not cross one and an explicit ``\\\n`` does.
+    does not cross one and a pattern that spells out the line break does.
+    With ``fold_decoration`` each line's decoration is folded first, as the
+    check's own option says.
     """
     return _normalize_lines(text, fold_decoration=fold_decoration)
 
