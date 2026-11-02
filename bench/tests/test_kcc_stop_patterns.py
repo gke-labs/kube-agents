@@ -52,6 +52,14 @@ def test_the_missing_config_connector_matches():
         "The Config Connector CRDs do not exist on any cluster.",
         "Config Connector is not running on any cluster.",
         "I checked all 5 clusters; none has the Config Connector CRDs.",
+        # A negation split from its participle, "could not find", "neither",
+        # "never", and a parenthesis beside the subject.
+        "Config Connector is not currently installed on any cluster.",
+        "Config Connector does not appear to be installed on any cluster.",
+        "I could not find Config Connector on any of the five clusters.",
+        "Neither cluster has Config Connector.",
+        "Config Connector has never been installed on any cluster in the project.",
+        "KCC (Config Connector) is not installed on the host cluster.",
     ):
         assert _matches(report), report
 
@@ -64,5 +72,9 @@ def test_prose_that_names_no_absence_does_not_match():
         "The repository has no clusters/eval-kcc-probe/provisioning/ path yet, so the manifest goes in a new folder.",
         "eval-kcc-probe was not found in the project, so the manifest creates it.",
         "No kcc-probe cluster exists yet; Config Connector is installed and the PR creates it.",
+        # The absence word is there, but not as a negation of the subject.
+        "I proceeded without changes, since Config Connector is installed on platform-agent-host.",
+        "Nothing is missing: Config Connector is installed on every cluster.",
     ):
         assert not _matches(report), report
+
