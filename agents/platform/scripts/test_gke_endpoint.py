@@ -480,6 +480,66 @@ class GcloudSupportTest(unittest.TestCase):
         self.assertTrue(gke_endpoint.gcloud_supports_dns_endpoint(runner), "the holder's answer was lost")
         self.assertEqual(1, len(probes), "the waiter ran a probe of its own")
 
+    def test_a_bounded_waiter_behind_a_probe_that_did_not_answer_runs_none_of_its_own(self):
+        # The other way a bounded caller's budget could be overrun: it gets the
+        # lock before its wait expires, behind a holder whose probe failed and
+        # memoised nothing. Having spent part of its bound on the wait it
+        # answers "could not find out" rather than start a probe of its own
+        # under the whole bound, so the step costs it the wait or a run, never
+        # both. A caller with no bound still probes after waiting, as before.
+        holder_probes = []
+        probe_started = threading.Event()
+        release_probe = threading.Event()
+
+        def failing(argv):
+            holder_probes.append(argv)
+            probe_started.set()
+            self.assertTrue(release_probe.wait(timeout=10))
+            return 1, ""
+
+        waiter_probes = []
+
+        def waiters_runner(argv):
+            waiter_probes.append(argv)
+            return 0, HELP_WITH_FLAG
+
+        # The waiter's contended wait is the one call of `_acquired` here (the
+        # holder took the lock uncontended), so wrapping it says when the
+        # waiter is queued and the holder can be released under it.
+        waiting = threading.Event()
+        original_acquired = gke_endpoint._acquired
+
+        def acquired(lock, wait_seconds):
+            if lock is gke_endpoint._SUPPORT_PROBE_LOCK:
+                waiting.set()
+            return original_acquired(lock, wait_seconds)
+
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+        answers = []
+        holder = threading.Thread(target=lambda: gke_endpoint.gcloud_supports_dns_endpoint(failing), daemon=True)
+        waiter = threading.Thread(
+            target=lambda: answers.append(gke_endpoint.gcloud_supports_dns_endpoint(waiters_runner, wait_seconds=10)),
+            daemon=True)
+        with unittest.mock.patch.object(gke_endpoint, "_acquired", acquired), redirect_stderr(io.StringIO()) as stderr:
+            holder.start()
+            self.assertTrue(probe_started.wait(timeout=10))
+            waiter.start()
+            self.assertTrue(waiting.wait(timeout=10), "the waiter never queued on the probe lock")
+            release_probe.set()
+            holder.join(timeout=10)
+            waiter.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual([False], answers)
+        self.assertEqual([], waiter_probes, "the bounded waiter ran a probe of its own after waiting")
+        self.assertEqual(1, len(holder_probes))
+        self.assertIsNone(gke_endpoint._support_cache, "a probe that did not answer was memoised")
+        self.assertIn("did not answer within this call's 10s wait", stderr.getvalue())
+        # An unbounded caller after both, uncontended, asks gcloud itself.
+        self.assertTrue(gke_endpoint.gcloud_supports_dns_endpoint(waiters_runner))
+        self.assertEqual(1, len(waiter_probes))
+
     def test_a_probe_that_could_not_run_is_retried_rather_than_memoised(self):
         """Only gcloud's answer is worth keeping, never our failure to get one.
 

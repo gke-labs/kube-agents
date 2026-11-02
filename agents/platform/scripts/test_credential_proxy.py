@@ -4777,6 +4777,65 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertTrue(executor._provisional_marker(target).exists(),
                         "a fetch decided without the own cluster was filed as settled")
 
+    def test_a_callers_splice_behind_a_cold_reads_failed_help_probe_runs_no_probe_of_its_own(self):
+        # The help-probe half, the other way the splice's bound could be
+        # overrun: it arrives while a cold read's first help probe is in
+        # flight, and that probe then fails (not memoised) before the splice's
+        # wait expires. The splice gets the lock with part of its bound spent
+        # and must not run a 15 s probe of its own on top: one help probe runs
+        # in all, and the splice's fetch runs as given and is filed provisional.
+        import gke_endpoint
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+        executor = self.fake_gcloud(self.executor())
+        cold = "gke_demo-project_us-central1_cold-cluster"
+        help_probes = []
+        help_started = threading.Event()
+        release_help = threading.Event()
+        original = executor._execute
+
+        def fail_the_first_help_probe(argv, **kwargs):
+            if "--help" in argv:
+                help_probes.append(argv)
+                help_started.set()
+                release_help.wait(timeout=10)
+                return credential_proxy.ExecutionResult(
+                    exit_code=1, stdout="", stderr="", duration_ms=0, truncated=False, timed_out=False)
+            return original(argv, **kwargs)
+
+        # The splice's contended wait is the one call of `_acquired` on the
+        # probe lock (the cold read took it uncontended); releasing the holder
+        # once it is made has the splice acquire before its wait expires.
+        original_acquired = gke_endpoint._acquired
+
+        def release_under_the_waiter(lock, wait_seconds):
+            if lock is gke_endpoint._SUPPORT_PROBE_LOCK:
+                release_help.set()
+            return original_acquired(lock, wait_seconds)
+
+        with (
+            mock.patch.object(credential_proxy, "SPLICE_DECISION_TIMEOUT_SECONDS", 10),
+            mock.patch.object(executor, "_execute", fail_the_first_help_probe),
+            mock.patch.object(gke_endpoint, "_acquired", release_under_the_waiter),
+        ):
+            cold_thread = threading.Thread(target=lambda: executor._resolve_kubeconfig(cold), daemon=True)
+            cold_thread.start()
+            self.assertTrue(help_started.wait(timeout=10), "the cold read never reached its help probe")
+            result = executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+            cold_thread.join(timeout=10)
+        self.assertFalse(cold_thread.is_alive())
+        self.assertTrue(release_help.is_set(), "the splice never queued on the probe lock")
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual(1, len(help_probes), "the splice ran a help probe of its own after waiting")
+        self.assertIsNone(gke_endpoint._support_cache, "a probe that did not answer was memoised")
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        self.assertTrue(executor._managed_kubeconfig(target).is_file(), "the caller's fetch was not filed")
+        self.assertTrue(executor._provisional_marker(target).exists(),
+                        "a fetch decided without the help probe's answer was filed as settled")
+
     def test_a_stalled_fetch_for_one_cluster_does_not_delay_another_clusters_cold_read(self):
         # The issue's acceptance: the kubeconfig lock is per cluster, so a
         # get-credentials that hangs for slow-cluster holds only that cluster's

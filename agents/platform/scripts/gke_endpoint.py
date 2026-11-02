@@ -189,6 +189,13 @@ _HELP_TIMEOUT_SECONDS = 30
 # inherit the holder's longer clock. The credential proxy's caller splice runs
 # under a 15 s bound while its cold read runs under kubectl's 60 s; without
 # this a splice would queue up to 60 s behind a cold read's stalled describe.
+# A probe step costs a bounded caller its bound once, never twice: a waiter
+# that gets the lock before its wait expires, behind a holder whose probe did
+# not answer, has spent part of its bound on the wait and does not start a
+# probe of its own under the whole of it. It answers "could not find out" for
+# this call, as the own-cluster waiter does when it finds the holder's backoff
+# set. Only a caller with no bound, which never had a budget to overrun, runs
+# its own probe after waiting.
 _SUPPORT_PROBE_LOCK = threading.Lock()
 _OWN_CLUSTER_LOCK = threading.Lock()
 # What `Lock.acquire` takes as "no timeout".
@@ -304,13 +311,19 @@ def gcloud_supports_dns_endpoint(
 
     `wait_seconds` bounds how long this call waits for another thread's probe
     in flight; a wait that expires answers False for this call only, as a
-    probe that could not run does, and memoises nothing.
+    probe that could not run does, and memoises nothing. So does a bounded
+    wait that ends with the lock but no answer, the holder's probe having
+    failed: the caller has spent part of its bound waiting and runs no probe
+    of its own, so the step costs it the wait or a run, never both.
     """
     global _support_cache
     if _support_cache is not None:
         return _support_cache
 
-    if not _acquired(_SUPPORT_PROBE_LOCK, wait_seconds):
+    # Try without waiting first, so that once the lock is held this call knows
+    # whether it waited for it; only a contended call goes on to `_acquired`.
+    waited = not _SUPPORT_PROBE_LOCK.acquire(blocking=False)
+    if waited and not _acquired(_SUPPORT_PROBE_LOCK, wait_seconds):
         _log(f"waited {wait_seconds}s behind another caller's probe for "
              f"{DNS_ENDPOINT_FLAG} support; assuming absent for this call")
         return False
@@ -319,6 +332,13 @@ def gcloud_supports_dns_endpoint(
         # just answered the question.
         if _support_cache is not None:
             return _support_cache
+        if waited and wait_seconds is not None:
+            # It did not: its probe failed or could not run, and is not
+            # memoised. A bounded waiter has already paid part of its bound and
+            # decides without a probe; the next uncontended caller asks again.
+            _log(f"another caller's probe for {DNS_ENDPOINT_FLAG} support did not "
+                 f"answer within this call's {wait_seconds}s wait; assuming absent for this call")
+            return False
 
         probe = run or _default_runner(None, _HELP_TIMEOUT_SECONDS)
         try:
