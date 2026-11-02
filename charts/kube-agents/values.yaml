@@ -425,6 +425,16 @@ litellm:
     projectSecretRef:
       name: ""
       key: ""
+    # Sends each Gemini conversation a Vertex session_id, the same on every
+    # turn, so a new conversation lands on a serving replica that another
+    # conversation with the same prompt warmed and turn 1 reads its prefix
+    # from cache. Needs Vertex's LLM_SESSION_ID label on the serving project;
+    # without it Vertex ignores the field. slots is how many replicas share
+    # one prompt: 1 puts every concurrent conversation of a profile on one
+    # replica, which queues; more spread them but reuse each less often.
+    sessionAffinity:
+      enabled: false
+      slots: 2
   # modelProvider: openai_compatible only: any server speaking the OpenAI
   # chat-completions API (vLLM, TGI, an internal gateway), self-hosted or
   # private. Nothing here has a default, and modelDefaultName is required too:

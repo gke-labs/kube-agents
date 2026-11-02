@@ -242,6 +242,13 @@ readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-2
 # admits at least the slot cap, and the chart rendering it onto the CR.
 readonly EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT="2Gi"
 
+# Every pool project carries Vertex's LLM_SESSION_ID label, so the gateway's
+# session-affinity hook (litellm.vertex.sessionAffinity) routes each Gemini
+# conversation to one of a few replicas per prompt and a worker's first turn
+# can read the system prompt and tools another worker warmed. Override with
+# EVAL_LITELLM_SESSION_AFFINITY=false to compare a run without it.
+readonly EVAL_LITELLM_SESSION_AFFINITY="${EVAL_LITELLM_SESSION_AFFINITY:-true}"
+
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —
 # the label pair Helm stamps on every release-record Secret it writes
 # (`owner=helm` plus `name=<release>`), selecting every revision's record of
@@ -1947,6 +1954,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}" \
     --set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}" \
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --set "litellm.vertex.sessionAffinity.enabled=${EVAL_LITELLM_SESSION_AFFINITY}" \
     --set "platformAgent.deployment.availability.runtimeClassName=" \
     --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
     --set-string "platformAgent.deployment.credentialProxy.resources.limits.memory=${EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT}" \

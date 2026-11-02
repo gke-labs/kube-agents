@@ -245,6 +245,19 @@
                   "type": "string"
                 }
               }
+            },
+            "sessionAffinity": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "slots": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
             }
           }
         },
