@@ -28,7 +28,7 @@ What gets measured gets built. This list is for agents, engineers and other prod
 
 ## Gaps
 
-Only what a user can see is listed here: a missing test, a missing metric, or a step an admin does once are not gaps in this document. The audit of 2026-10-29 measured each criterion on one development install: `main` 3e5be2e0e plus #3922 (image `5dcb02145`), `spec.mode` today, Vertex AI `gemini-3.1-pro-preview` as `model-default`, `maxInProgress` 5, 47 clusters in scope (the host, two GPU clusters, four seeded clusters and 40 six-node scale clusters). Questions went through the agent's API door (`POST /v1/responses` through the auth sidecar), which is the chat path minus the chat backend's hop; each delegated card was watched on the kanban store until it was terminal. Every timed run, the baseline runs and the install's record are in the audit's tracking issue, #4354, which also tracks the changes below.
+Only what a user meets on the core flow is listed here: install, the first report, questions, audits and retries. A missing test, a missing metric, a step an admin does once, or an installer edge case are not gaps in this document. The audit of 2026-10-29 measured each criterion on one development install: `main` 3e5be2e0e plus #3922 (image `5dcb02145`), `spec.mode` today, Vertex AI `gemini-3.1-pro-preview` as `model-default`, `maxInProgress` 5, 47 clusters in scope (the host, two GPU clusters, four seeded clusters and 40 six-node scale clusters). Questions went through the agent's API door (`POST /v1/responses` through the auth sidecar), which is the chat path minus the chat backend's hop; each delegated card was watched on the kanban store until it was terminal. Every timed run, the baseline runs and the install's record are in the audit's tracking issue, #4354, which also tracks the changes below.
 
 ### SC1: agentic installation and onboarding
 
@@ -36,14 +36,12 @@ What exists: `INSTALL.md` is written for an agent, `install.sh` runs non-interac
 
 #### Gaps found
 
-Accepted and not tracked: an admin does the console steps the providers require (the Google Chat app, the Slack app, the GitHub App), so full agentic onboarding is not a criterion. The gaps below are what the person running the install sees.
+Accepted and not tracked: an admin does the console steps the providers require (the Google Chat app, the Slack app, the GitHub App), so full agentic onboarding is not a criterion, and the installer's edge cases (a dry run that cannot plan, a shortfall found mid-apply) are not part of the core flow. The gaps below are what the person running the install sees on the normal path.
 
 | Gap                                                                                                                                                                                                                                                               | Evidence                                                                      | State |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ----- |
-| The dry run reports success for a run that will be refused: without credentials or the consent flags it skips the Terraform plan and still prints `DRY_RUN_SUCCESS`.                                                                                              | `INSTALL.md` "AI-Assisted Installation", `install.sh`                         | open  |
 | The installer prints "Installation Complete" while a deployment has not reported ready (`SUCCESS_PENDING_ROLLOUT`) and hands the user a watch command instead of waiting or announcing readiness; a first boot can take over fifteen minutes.                     | `install.sh`, `docs/site/src/content/docs/install/quickstart-gke.mdx`         | open  |
 | Nothing confirms the assistant answers: the installer verifies that the deployments are up, not that a question gets a reply, so the user's first prompt is the test; on the documented first run its acknowledgement took 21 s and its result a further 6.6 min. | `docs/site/src/content/docs/install/first-prompts.md`, `docs/designs/oobe.md` | open  |
-| The caller's project role and the cluster's schedulable capacity are not checked before the apply (the quota preflight and the folder-scope IAM test are), so a shortfall surfaces mid-install as a Helm timeout or a partial apply.                              | `docs/site/src/content/docs/install/prerequisites.md`                         | open  |
 
 ### SC2: out-of-box experience
 
@@ -79,7 +77,7 @@ The install's record over the following 72 h (the two windows overlap by a day; 
 | The first report waits for the user to speak first: on this install it came 8 h 54 min after the install, against the design's two hours; when the scan does not settle, the first-run audits start 90 min plus 5 min per cluster after the sweep (5.4 h on this fleet); and on an install without a home channel, an audit that finishes before anyone opens chat posts nothing later. | `.bootstrap_greeted` on the install, `agents/chat/scripts/bootstrap_delivery.py`, `docs/designs/oobe.md`            | open  |
 | Scheduled reports never reach the channel on this Google Chat install (`HTTP 502` on every job since 2026-10-20); nothing in chat says so, and the user learns of it only from a log or by asking.                                                                                                                                                                                      | `chat-delivery-watch` output on the install; the "Overnight crons" answers, recorded on #4354                       | open  |
 | The assistant disappears and loses its work: the gateway's pod was evicted three times in four days at 3.1 to 3.3 GiB against its 2 GiB request (the limit is 8 GiB), a routine node replacement took it away for ten minutes, in-flight cards are retried from scratch, and no alert reaches the user because the health rules are off by default and carry no restart alert.          | pod status on the install, `k8s-operator/internal/controller/manifest_helpers.go`, `charts/kube-agents/values.yaml` | open  |
-| No stated size the install supports: the user cannot know whether 7, 47 or 400 clusters are within limits (the project cap, `spec.scope.maxProjects`, bounds the resolved set and is not a tested size), and an exclusion that matches no cluster is accepted silently: 32 rules naming the wrong location left 40 clusters in scope on this install.                                   | `docs/designs/multi-project-scope.md`; the install's `spec.scope.exclude` against its cluster list                  | open  |
+| No stated size the install supports: the user cannot know whether 7, 47 or 400 clusters are within limits (the project cap, `spec.scope.maxProjects`, bounds the resolved set and is not a tested size).                                                                                                                                                                                | `docs/designs/multi-project-scope.md`                                                                               | open  |
 
 ### SC3: simple questions under one minute
 
@@ -188,8 +186,7 @@ The changes that close them, ordered by what the user gains first, tracked from 
 6. Scheduled reports reach the Google Chat channel on a Workload Identity install, and a delivery failure surfaces in chat within the hour.
 7. The first report posts to the home channel when it is ready, without waiting for the user's first message.
 8. An install self-check: the assistant answers one question before the installer reports success, and the installer says when the assistant is ready.
-9. The installer refuses a dry run it cannot plan, and checks the caller's project role and the cluster's schedulable capacity before the apply.
-10. A sign of life within 10 s of every request on every backend, before the model turn.
-11. A stated, tested size the install supports, from the sizing data, and a warning for an exclusion that matches no cluster.
+9. A sign of life within 10 s of every request on every backend, before the model turn.
+10. A stated, tested size the install supports, from the sizing data.
 
 The measurements behind this document (the timed questions, the bare-model baseline, the install's record) were run by hand with the author's scripts and are recorded on #4354; they repeat on the next release with the same questions on the same install, and the numbers then replace the ones above.
