@@ -884,18 +884,31 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 }
 
 // credentialProxyVolumeLimitEnv renders the two variables that tell the broker
-// the sizeLimit of each scratch emptyDir it writes, in bytes, from the same
-// arithmetic buildCredentialProxyRuntimeVolumes sizes the volumes with, so the
-// figure the gate measures against is the figure the kubelet evicts on at any
-// override.
+// the figure the kubelet evicts each scratch emptyDir on, in bytes: the
+// volume's sizeLimit, from the same arithmetic buildCredentialProxyRuntimeVolumes
+// sizes it with, capped at the container's merged ephemeral-storage limit. The
+// kubelet sums the volumes into that limit, so under an override lowered below
+// a volume's cap the pod goes at the limit, not at the sizeLimit, and a gate
+// measuring against the sizeLimit would read a volume about to evict the pod
+// as normal.
 func credentialProxyVolumeLimitEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
 	state := credentialProxyEmptyDirSizeLimit(credentialProxyStateSizeLimit, credentialProxyEphemeralStorageLimit, ephemeralLimit)
 	tmp := resource.MustParse(credentialProxyTmpSizeLimit)
 	return []corev1.EnvVar{
-		{Name: credentialProxyStateLimitEnv, Value: strconv.FormatInt(state.Value(), 10)},
-		{Name: credentialProxyTmpLimitEnv, Value: strconv.FormatInt(tmp.Value(), 10)},
+		{Name: credentialProxyStateLimitEnv, Value: strconv.FormatInt(credentialProxyEvictionBytes(*state, ephemeralLimit), 10)},
+		{Name: credentialProxyTmpLimitEnv, Value: strconv.FormatInt(credentialProxyEvictionBytes(tmp, ephemeralLimit), 10)},
 	}
+}
+
+// credentialProxyEvictionBytes is the lower of a volume's sizeLimit and the
+// container's ephemeral-storage limit, the first of the two the kubelet acts on.
+// An unset limit (a zero quantity) bounds nothing, so the sizeLimit stands.
+func credentialProxyEvictionBytes(sizeLimit, ephemeralLimit resource.Quantity) int64 {
+	if !ephemeralLimit.IsZero() && ephemeralLimit.Cmp(sizeLimit) < 0 {
+		return ephemeralLimit.Value()
+	}
+	return sizeLimit.Value()
 }
 
 // credentialProxyEmptyDirSizeLimit is a volume's default sizeLimit plus

@@ -708,6 +708,25 @@ class ResourceWatermarkGateTest(unittest.TestCase):
         self.assertEqual("soft", gate.level)
         self.assertEqual(1, self.relieved)
 
+    def test_reclaimers_wired_during_an_episode_are_run_on_the_next_tick(self):
+        # serve() starts the sampler before the stores exist: an episode
+        # under way at boot has its first relief with no reclaimers, and
+        # wiring them owes the episode one more, once.
+        gate = self.gate(memory_percent=76)
+        gate.set_reclaimers(())
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            self.assertEqual("soft", gate.tick())
+        self.assertIn("relief: reclaimed=- trimmed=True", "\n".join(logs.output))
+        self.assertEqual(1, self.relieved)
+        gate.set_reclaimers([lambda: self.reclaimed.append("late") or 4])
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            self.assertEqual("soft", gate.tick())
+        self.assertIn("relief: reclaimed=4 trimmed=True", "\n".join(logs.output))
+        self.assertEqual(["late"], self.reclaimed)
+        self.assertEqual(2, self.relieved)
+        self.assertEqual("soft", gate.tick())
+        self.assertEqual(2, self.relieved)
+
     def test_a_reclaimer_that_fails_does_not_stop_the_relief(self):
         gate = self.gate(memory_percent=76)
 
@@ -815,6 +834,28 @@ class ReliefStepTest(unittest.TestCase):
         broker._discard_scratch(live)
         self.assertFalse(live.exists())
         self.assertEqual(0, broker.reclaim_orphan_scratch())
+
+    def test_vcs_scratch_minted_while_the_reclaimer_lists_the_root_is_kept(self):
+        import vcs_broker
+
+        root = self.root / "vcs"
+        root.mkdir()
+        broker = vcs_broker.VcsBroker(root, git_runner=lambda *args, **kwargs: None)
+        minted: list[Path] = []
+        listing = broker._scratch_names
+
+        def mint_then_list():
+            # A request's `_scratch` lands between the reclaimer's entry and
+            # its listing of the root: the tree is in the live set already,
+            # and a sequence snapshot taken at entry would not know it.
+            minted.append(broker._scratch("publish"))
+            return listing()
+
+        with mock.patch.object(broker, "_scratch_names", mint_then_list):
+            self.assertEqual(0, broker.reclaim_orphan_scratch())
+        self.assertTrue(minted[0].exists())
+        broker._discard_scratch(minted[0])
+        self.assertFalse(minted[0].exists())
 
     def test_release_process_memory_collects_and_trims_where_libc_has_it(self):
         self.assertIsInstance(credential_proxy.release_process_memory(), bool)

@@ -194,11 +194,13 @@ func TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit(t *testing.T
 
 // TestCredentialProxyVolumeLimitEnvFollowsTheRenderedSizeLimits: the broker's
 // resource watermark gate measures each scratch volume against the byte figure
-// these two variables carry, so each has to equal the sizeLimit the kubelet
-// evicts on, at the default and at a raised ephemeral-storage override; both
-// names are in the managed set a CR cannot override.
+// these two variables carry, so each has to equal the figure the kubelet
+// evicts on: the volume's sizeLimit at the default and at a raised
+// ephemeral-storage override, and the container's limit at an override lowered
+// under a volume's cap, since the kubelet sums the volumes into it. Both names
+// are in the managed set a CR cannot override.
 func TestCredentialProxyVolumeLimitEnvFollowsTheRenderedSizeLimits(t *testing.T) {
-	for _, limit := range []string{"", "8Gi", "10Gi", "16Gi"} {
+	for _, limit := range []string{"", "8Gi", "10Gi", "16Gi", "4Gi", "2Gi", "1Gi"} {
 		var override *corev1.ResourceRequirements
 		if limit != "" {
 			override = &corev1.ResourceRequirements{
@@ -210,19 +212,33 @@ func TestCredentialProxyVolumeLimitEnvFollowsTheRenderedSizeLimits(t *testing.T)
 			{Name: credentialProxyStateLimitEnv, Value: "1"},
 			{Name: credentialProxyTmpLimitEnv, Value: "1"},
 		}
-		sizes := map[string]string{}
+		ephemeral := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
+		want := map[string]string{}
 		for _, vol := range buildCredentialProxyRuntimeVolumes(agent) {
-			if vol.EmptyDir != nil && vol.EmptyDir.SizeLimit != nil {
-				sizes[vol.Name] = strconv.FormatInt(vol.EmptyDir.SizeLimit.Value(), 10)
+			if vol.EmptyDir == nil || vol.EmptyDir.SizeLimit == nil {
+				continue
 			}
+			figure := vol.EmptyDir.SizeLimit.Value()
+			if ephemeral.Cmp(*vol.EmptyDir.SizeLimit) < 0 {
+				figure = ephemeral.Value()
+			}
+			want[vol.Name] = strconv.FormatInt(figure, 10)
+		}
+		if limit == "" || limit == "8Gi" {
+			if want[credentialProxyStateVolumeName] != "5368709120" || want[credentialProxyTmpVolumeName] != "2147483648" {
+				t.Fatalf("limit %q: the default figures moved: %v", limit, want)
+			}
+		}
+		if limit == "2Gi" && (want[credentialProxyStateVolumeName] != "2147483648" || want[credentialProxyTmpVolumeName] != "2147483648") {
+			t.Fatalf("limit %q: the lowered limit should cap both figures: %v", limit, want)
 		}
 		env := map[string][]string{}
 		for _, e := range buildCredentialProxyContainer(agent).Env {
 			env[e.Name] = append(env[e.Name], e.Value)
 		}
 		for name, volume := range map[string]string{credentialProxyStateLimitEnv: credentialProxyStateVolumeName, credentialProxyTmpLimitEnv: credentialProxyTmpVolumeName} {
-			if got := env[name]; len(got) != 1 || got[0] != sizes[volume] {
-				t.Errorf("limit %q: %s = %v, want exactly the %s sizeLimit %s", limit, name, got, volume, sizes[volume])
+			if got := env[name]; len(got) != 1 || got[0] != want[volume] {
+				t.Errorf("limit %q: %s = %v, want exactly the %s eviction figure %s", limit, name, got, volume, want[volume])
 			}
 		}
 	}

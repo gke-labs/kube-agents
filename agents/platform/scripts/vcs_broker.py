@@ -730,19 +730,18 @@ class VcsBroker:
             LOGGER.info("version control start: removed %d orphaned scratch tree(s)", len(found))
 
     def reclaim_orphan_scratch(self) -> int:
-        """Remove the scratch trees no request of this process minted: a
+        """Remove the scratch trees no request of this process holds: a
         reclaimer for the broker's resource watermark gate. After the start
         sweep only this process's names exist, so this finds a tree only
         when a request of this process left one behind without reaching its
-        cleanup, which the sequence it minted is past. Returns how many were
-        removed."""
-        with self._sequence_lock:
-            issued = self._sequence
-        own = str(os.getpid())
+        cleanup. The live set alone decides: `_scratch` records a directory
+        as in flight before it creates it, so a tree minted while this walks
+        the root is already in the set, where a snapshot of the sequence
+        counter taken before the listing would call it an orphan. Returns how
+        many were removed."""
         removed = 0
         for path in self._scratch_names():
-            match = SCRATCH_NAME_RE.match(path.name)
-            if match.group("pid") == own and int(match.group("sequence")) <= issued and self._in_flight(path):
+            if self._in_flight(path):
                 continue
             _remove_tree(path)
             removed += not path.exists()

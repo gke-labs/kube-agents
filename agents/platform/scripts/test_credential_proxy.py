@@ -5509,13 +5509,13 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(1, executor.slots_in_use)
         holder.join()
 
-    def queue_a_slot_taker(self, executor, refused=None):
+    def queue_a_slot_taker(self, executor, refused=None, interactive=False):
         """Queue a slot-taking request on another thread and return once it
         is in the queue; a refusal at the bound is recorded in `refused`."""
 
         def head():
             try:
-                with executor.request_slot():
+                with executor.request_slot(interactive=interactive):
                     pass
             except credential_proxy.CommandSlotUnavailable as error:
                 if refused is not None:
@@ -5606,6 +5606,35 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertIn("waited 0.3s behind them", message)
         self.assertNotIn("without fitting", message)
         self.assertNotIn("concurrent commands", message)
+
+    def test_a_fitting_reservation_keeps_its_place_behind_an_interactive_head_the_budget_holds(self):
+        # The pressure clamp is on: a background command holds the one slot
+        # the clamp leaves, and the interactive head has the reserved slot
+        # free, so what holds it is the budget (one slot-taker's worth plus
+        # one reservation and a byte). The reservation behind it fits, and
+        # admitting it would take the budget the head is waiting for; the
+        # cap it is read against is the head's own, not the background cap.
+        mib = credential_proxy.MEBIBYTE
+        executor = self.budgeted(admits=1, max_output_bytes=mib)
+        executor.children_budget_bytes += credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + 1
+        executor.watermark_gate = types.SimpleNamespace(clamps_concurrency=True)
+        self.assertEqual(1, executor._effective_cap())
+        self.assertEqual(2, executor._effective_cap(interactive=True))
+        release = threading.Event()
+        self.hold_a_slot_until(executor, release)
+        self.assertFalse(executor._fits_budget(takes_slot=True))
+        self.assertTrue(executor._fits_budget(takes_slot=False))
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 2):
+            self.queue_a_slot_taker(executor, interactive=True)
+            with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.3):
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                    with executor.reserve_child_memory():
+                        self.fail("admitted ahead of an interactive head the budget holds")
+            self.assertEqual(1, executor.queued_requests, "the interactive head should still be queued")
+            release.set()
+        message = str(raised.exception)
+        self.assertIn("admission queue is held by requests waiting for its child memory budget", message)
+        self.assertIn("waited 0.3s behind them", message)
 
     def test_a_reservation_that_does_not_fit_is_not_admitted_past_a_slot_held_head(self):
         # One slot, a budget for one: the head waits for the slot cap, but the

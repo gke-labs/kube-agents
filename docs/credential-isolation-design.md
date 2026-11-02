@@ -913,9 +913,11 @@ Consequences:
   Beside the static budget sits the resource watermark gate, which reads what the container
   holds now: the working set (`memory.current` less `memory.stat`'s `inactive_file`, the
   kubelet's eviction signal) against `memory.max` on every admission, and the state and
-  `/tmp` emptyDirs against the sizeLimits the operator passes
-  (`CREDENTIAL_PROXY_STATE_LIMIT_BYTES`, `CREDENTIAL_PROXY_TMP_LIMIT_BYTES`; statvfs when
-  unset) on the memory sampler's 30 s tick. From the soft watermark
+  `/tmp` emptyDirs against the caps the operator passes
+  (`CREDENTIAL_PROXY_STATE_LIMIT_BYTES`, `CREDENTIAL_PROXY_TMP_LIMIT_BYTES`: each volume's
+  sizeLimit, or the container's ephemeral-storage limit when an override puts that lower,
+  since the kubelet sums the volumes into it; statvfs when unset) on the memory sampler's
+  30 s tick. From the soft watermark
   (`CREDENTIAL_PROXY_MEM_SOFT_PCT` 75, `CREDENTIAL_PROXY_DISK_SOFT_PCT` 70) admitted commands
   run one at a time and the first tick reclaims idle content workspaces and orphaned vcs
   scratch, collects and trims the allocator. From the hard watermark

@@ -2910,9 +2910,13 @@ class ResourceWatermarkGate:
 
     def set_reclaimers(self, reclaimers: Sequence[Callable[[], int]]) -> None:
         """Replace the relief step's reclaimers: serve() builds the gate
-        before the stores they reach exist."""
+        before the stores they reach exist, and the sampler may tick it in
+        between. The episode's relief is then owed again: a relief that ran
+        before this call ran without them, and an episode already under way
+        at boot would otherwise see no reclaim until it ended."""
         with self._lock:
             self._reclaimers = tuple(reclaimers)
+            self._relieved_this_episode = False
 
     # -- readings ------------------------------------------------------
 
@@ -8249,15 +8253,18 @@ class CommandExecutor:
 
     def _only_the_slot_cap_holds_ahead_of(self, ticket: _AdmissionTicket) -> bool:
         """Whether every ticket ahead of `ticket` takes a slot while the slots
-        are full. Those wait on the slot cap, not the budget, so a slot-less
-        reserver admitted past them takes nothing they are waiting for (§2.3).
-        Called under `_slot_condition`."""
-        if self._slots_in_use < self._effective_cap():
-            return False
+        its class may use are full. Those wait on the slot cap, not the
+        budget, so a slot-less reserver admitted past them takes nothing they
+        are waiting for (§2.3). Each ticket is read against its own cap:
+        under the pressure clamp an interactive ticket's cap is the clamp
+        plus the reserve, so with the clamp's slots in use and the reserve
+        free it is held by the budget, not the cap, and a reserver admitted
+        past it would take the budget it waits for. Called under
+        `_slot_condition`."""
         for ahead in self._slot_queue:
             if ahead is ticket:
                 return True
-            if not ahead.takes_slot:
+            if not ahead.takes_slot or self._slots_in_use < self._effective_cap(ahead.interactive):
                 return False
         return False
 
