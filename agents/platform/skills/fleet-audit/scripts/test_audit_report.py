@@ -23517,6 +23517,23 @@ metadata:
                 self.assertNotIn("found no declaration", note)
                 self.assertIn("could not search the whole GitOps repository", note)
 
+    def test_without_pyyaml_no_search_counts_as_complete(self):
+        """Without PyYAML nothing is parsed: the broker scan is failed and a
+        clone does not count as searched."""
+        real_import = __import__
+
+        def no_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("no yaml")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=no_yaml):
+            scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({}), every_kind=True)
+            searched = audit_report._kcc_clone_searched([("", self.root)])
+        self.assertTrue(scan.failed)
+        self.assertFalse(searched)
+        self.assertTrue(audit_report._kcc_clone_searched([("", self.root)]))
+
     def test_a_failed_broker_scan_is_marked_failed(self):
         class Broken:
             def grep(self, *_, **__):
