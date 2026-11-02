@@ -4392,7 +4392,7 @@ class CommandExecutorTest(unittest.TestCase):
             self.assertEqual(credential_proxy.SPLICE_DECISION_TIMEOUT_SECONDS, bound)
         self.assertLess(credential_proxy.SPLICE_DECISION_TIMEOUT_SECONDS, executor.kubectl_timeout_seconds)
 
-    def test_a_callers_fetch_files_its_result_without_the_kubeconfig_lock(self):
+    def test_a_callers_fetch_files_its_result_without_the_clusters_kubeconfig_lock(self):
         # The broker's cold read holds the cluster's kubeconfig lock across its
         # gcloud runs. A scaffold's fetch for that same cluster must not queue
         # behind it to file a credential it already has; only the marker step
@@ -4416,19 +4416,23 @@ class CommandExecutorTest(unittest.TestCase):
         # The issue's acceptance: the kubeconfig lock is per cluster, so a
         # get-credentials that hangs for slow-cluster holds only that cluster's
         # lock, and a cold read of fast-cluster completes while it is held.
-        # Under one lock for every cluster the fast read would wait for the
-        # slow fetch to finish, here ten seconds.
+        # Under one lock for every cluster the fast read could not return
+        # before the stall ended (here, after ten seconds), which is what
+        # `slow_stall_over` records; the 100 ms bound is the issue's figure and
+        # a sanity cap on top of that ordering, not the verdict on its own.
         executor = self.fake_gcloud(self.executor())
         slow = "gke_demo-project_us-central1_slow-cluster"
         fast = "gke_demo-project_us-central1_fast-cluster"
         slow_started = threading.Event()
         release_slow = threading.Event()
+        slow_stall_over = threading.Event()
         original = executor._execute
 
         def stall_the_slow_fetch(argv, **kwargs):
             if "get-credentials" in argv and "slow-cluster" in argv:
                 slow_started.set()
                 release_slow.wait(timeout=10)
+                slow_stall_over.set()
             return original(argv, **kwargs)
 
         slow_result = []
@@ -4443,7 +4447,7 @@ class CommandExecutorTest(unittest.TestCase):
             started = time.monotonic()
             served = executor._resolve_kubeconfig(fast)
             elapsed = time.monotonic() - started
-            self.assertFalse(release_slow.is_set(), "the fast read finished while the slow fetch was still held")
+            self.assertFalse(slow_stall_over.is_set(), "the fast read waited for the slow fetch's stall to end")
             release_slow.set()
             slow_thread.join(timeout=10)
         self.assertFalse(slow_thread.is_alive())
