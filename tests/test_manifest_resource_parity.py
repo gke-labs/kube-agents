@@ -53,6 +53,7 @@ from __future__ import annotations
 import math
 import re
 import sys
+import tempfile
 import unittest
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -66,6 +67,7 @@ sys.path.insert(0, str(_HERE))
 from _rendered_manifests import (  # noqa: E402
     HELM,
     REPO_ROOT,
+    golden_docs,
     golden_pods,
     kustomize_pods,
     rendered_chart,
@@ -75,6 +77,8 @@ from _rendered_manifests import (  # noqa: E402
 TESTDATA = _HERE / "testdata" / "manifest_resource_parity"
 BASELINE = TESTDATA / "baseline.yaml"
 BROKEN_FIXTURE = TESTDATA / "broken-emptydir.yaml"
+# What `test_an_untracked_golden_is_read` writes to a directory git does not track.
+UNTRACKED_GOLDEN_NAME = "platformagent-untracked.yaml"
 
 # The operator's allowance for a writing container's logs and writable layer
 # on top of the emptyDir it writes; the Go constant is the source of truth.
@@ -273,9 +277,12 @@ def container_findings(workload: str, pod: dict, container: dict) -> list[Findin
         findings.append(Finding(RULE_DECLARED, workload, name, len(missing), "missing " + ", ".join(missing)))
     limit = effective_limit(container, EPHEMERAL)
     disk = _disk_emptydirs(pod)
-    writable = [
-        m["name"] for m in container.get("volumeMounts") or [] if m.get("name") in disk and not m.get("readOnly")
-    ]
+    # One volume mounted at two paths (the subPath pattern) is charged once, as the kubelet charges it.
+    writable = list(
+        dict.fromkeys(
+            m["name"] for m in container.get("volumeMounts") or [] if m.get("name") in disk and not m.get("readOnly")
+        )
+    )
     if limit is not None and writable:
         total = sum(disk[v] for v in writable) + parse_quantity(ALLOWANCE)
         if total > limit:
@@ -474,6 +481,16 @@ class ResourceParityGateTest(unittest.TestCase):
         problems = compare(observe(pods), load_baseline(), sources_read)
         self.assertEqual([], problems, "\n\n".join(problems))
 
+    def test_an_untracked_golden_is_read(self):
+        # `go test -update` writes a golden without staging it; the gate reads it before `git add`.
+        with tempfile.TemporaryDirectory() as tmp:
+            golden = Path(tmp) / UNTRACKED_GOLDEN_NAME
+            golden.write_text(BROKEN_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+            [(path, docs)] = golden_docs(Path(tmp))
+        self.assertEqual(str(golden), path)
+        [(workload, spec)] = workload_pods(docs, SOURCE_GOLDEN)
+        self.assertIn(RULE_CONTAINER_EMPTYDIR, {f.rule for f in check_pod(workload, spec)})
+
     def test_baseline_entries_name_a_rule_and_an_issue(self):
         rules = {RULE_DECLARED, RULE_CONTAINER_EMPTYDIR, RULE_POD_EMPTYDIR, RULE_POD_MEMORY_PER_VCPU, RULE_POD_EPHEMERAL_REQUEST}
         for key, entry in load_baseline().items():
@@ -544,6 +561,18 @@ class ResourceParityRulesTest(unittest.TestCase):
         pod["volumes"].append({"name": "shm", "emptyDir": {"medium": MEMORY_MEDIUM, "sizeLimit": "10Gi"}})
         pod["containers"][0]["volumeMounts"].append({"name": "shm", "mountPath": "/dev/shm"})
         self.assertEqual([], check_pod("w", pod))
+
+    def test_a_volume_mounted_twice_is_charged_once(self):
+        pod = self._clean_pod()
+        # 1.5Gi + 64Mi fits under 2Gi once; summed per mount it would not.
+        pod["volumes"][0]["emptyDir"]["sizeLimit"] = "1536Mi"
+        pod["containers"][0]["volumeMounts"].append({"name": "scratch", "mountPath": "/scratch/cache", "subPath": "cache"})
+        self.assertEqual([], check_pod("w", pod))
+        pod["volumes"][0]["emptyDir"]["sizeLimit"] = "2Gi"
+        rules = {f.rule: f for f in check_pod("w", pod)}
+        self.assertIn(RULE_CONTAINER_EMPTYDIR, rules)
+        detail = rules[RULE_CONTAINER_EMPTYDIR].detail
+        self.assertEqual(1, detail.count("scratch"), f"the volume is named more than once: {detail}")
 
     def test_a_read_only_mount_owes_nothing_but_the_pod_still_does(self):
         pod = self._clean_pod()

@@ -10,7 +10,10 @@ resources and its scratch volumes fit under them). Three sources:
   decides whether that is a skip);
 - the operator goldens, `k8s-operator/internal/testing/testdata/platform/expected/`,
   which are the reconciler's output for one PlatformAgent each, parsed as YAML
-  (`golden_docs`);
+  (`golden_docs`). The directory holds nothing but goldens and is read from
+  disk, tracked or not: `go test -update` writes a new golden without staging
+  it, and a reader that listed tracked files would pass locally and go red in
+  CI at `git add`;
 - the kustomize manifests under `k8s-operator/config`, parsed as YAML, which
   they are with no templating (`kustomize_docs`). The CRD schemas name
   `emptyDir` and `resources` as properties, not as a volume or a container, so
@@ -76,10 +79,11 @@ def rendered_chart(extra_sets: tuple[str, ...] = ()) -> list:
     return [doc for doc in yaml.safe_load_all(out) if isinstance(doc, dict)]
 
 
-def _yaml_files(root: str, skip_parts: tuple[str, ...] = ()) -> list[tuple[str, list]]:
+def _yaml_files(paths: list[Path], skip_parts: tuple[str, ...] = ()) -> list[tuple[str, list]]:
+    """(path, documents) for each YAML file in paths; the path is repository-relative when it can be."""
     out = []
-    for path in tracked((root,)):
-        rel = path.relative_to(REPO_ROOT)
+    for path in paths:
+        rel = path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path
         if not rel.name.endswith(YAML_SUFFIXES) or any(part in skip_parts for part in rel.parts):
             continue
         docs = [d for d in yaml.safe_load_all(path.read_text(encoding="utf-8")) if isinstance(d, dict)]
@@ -87,14 +91,14 @@ def _yaml_files(root: str, skip_parts: tuple[str, ...] = ()) -> list[tuple[str, 
     return out
 
 
-def golden_docs() -> list[tuple[str, list]]:
-    """(path, documents) for each operator golden file."""
-    return _yaml_files(GOLDEN_DIR)
+def golden_docs(root: Path = REPO_ROOT / GOLDEN_DIR) -> list[tuple[str, list]]:
+    """(path, documents) for each operator golden file in root, whether git tracks it or not."""
+    return _yaml_files(sorted(path for path in root.iterdir() if path.is_file()))
 
 
 def kustomize_docs() -> list[tuple[str, list]]:
-    """(path, documents) for each kustomize manifest, overlays and patches included."""
-    return _yaml_files(KUSTOMIZE_ROOT, YAML_SKIP_PARTS)
+    """(path, documents) for each tracked kustomize manifest, overlays and patches included."""
+    return _yaml_files(tracked((KUSTOMIZE_ROOT,)), YAML_SKIP_PARTS)
 
 
 def is_kustomize_patch(path: str) -> bool:
