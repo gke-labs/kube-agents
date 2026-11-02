@@ -39,8 +39,9 @@ const (
 	// The two cluster gauges' field names, which share one pruning record.
 	usageExportClustersRegistered = "clustersRegistered"
 	usageExportClustersMonitored  = "clustersMonitored"
-	// The six proposal readings' field names (usageReadingSpecs), which share
-	// one pruning record (usageNewerFieldReadings).
+	// The six broker proposal readings' field names (usageReadingSpecs), which
+	// share one pruning record (usageNewerFieldReadings); the two people
+	// readings below share another.
 	usageExportRemediationsMerged         = "remediationsMergedTotal"
 	usageExportRemediationsOpen           = "remediationsOpen"
 	usageExportProposalsAuthored          = "proposalsAuthored"

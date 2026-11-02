@@ -199,13 +199,14 @@ func (t usageTarget) streakKey() usageStreakKey {
 	return usageStreakKey{uid: t.uid, port: t.port}
 }
 
-// usageTarget is a running pod whose listener the poll reads, and the counters
-// its body feeds.
+// usageTarget is a running pod whose listener the poll reads, the counters
+// its body feeds, and the readings it serves, none for most.
 type usageTarget struct {
 	uid      types.UID
 	name     string
 	created  time.Time
 	counters []string
+	readings []usageReadingKind
 	port     string
 	addr     string
 }
@@ -495,7 +496,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	scraped := make([]usageScrapedPod, 0, len(targets))
 	var failing []usageScrapeFailure
 	for _, target := range targets {
-		reading, err := p.source.Scrape(ctx, target.addr, target.counters)
+		reading, err := p.source.Scrape(ctx, target.addr, target.counters, target.readings)
 		if err != nil {
 			if ctx.Err() != nil {
 				// A poll cut short by shutdown, a leader change, or the poll
@@ -743,19 +744,21 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 	groups := []struct {
 		selector  map[string]string
 		counters  []string
+		readings  []usageReadingKind
 		container string
 		port      string
 		read      bool
 		// podRead narrows read to the pods whose container serves the port.
 		podRead func(*corev1.Pod) bool
 	}{
-		{gatewayPodSelector(agent), usageGatewayCounters, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent), everyPod},
-		{gatewayPodSelector(agent), usageChatCounters, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
+		{gatewayPodSelector(agent), usageGatewayCounters, nil, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent), everyPod},
+		{gatewayPodSelector(agent), usageChatCounters, nil, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
 		// The A2A gateway, a pod a next-mode install runs and a today install
 		// does not: the chat counter again, from the gateway that owns Chat
-		// ingress there. The selector matches no pod elsewhere.
-		{a2aGatewayPodSelector(agent), usageA2AChatCounters, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod},
-		{credentialProxySelector(agent), usageBrokerCounters, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
+		// ingress there, and the people reading. The selector matches no pod
+		// elsewhere.
+		{a2aGatewayPodSelector(agent), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod},
+		{credentialProxySelector(agent), usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails}, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
 	}
 	live := map[string]bool{}
 	var targets []usageTarget
@@ -807,6 +810,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 				name:     pod.Name,
 				created:  pod.CreationTimestamp.Time,
 				counters: group.counters,
+				readings: group.readings,
 				port:     group.port,
 				addr:     net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port))),
 			})

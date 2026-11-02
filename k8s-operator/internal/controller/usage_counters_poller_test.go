@@ -159,7 +159,7 @@ type stubUsageSource struct {
 	hook func(addr string)
 }
 
-func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []string) (usageReading, error) {
+func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []string, _ []usageReadingKind) (usageReading, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, addr)
 	block := s.blocking[addr]
@@ -231,8 +231,9 @@ func (s *stubUsageSource) setSample(addr, counter string, sample int64) {
 	s.readings[addr] = reading
 }
 
-// setReadings gives addr's reading the broker's proposal readings: values by
-// status field and the readings present, as foldUsageBody would hand them out.
+// setReadings gives addr's reading its readings, the broker's proposal readings
+// or, at a2aAddr(), the people reading: values by status field and the readings
+// present, as foldUsageBody would hand them out.
 // A value of a reading not named present is dropped, as the scrape drops it.
 func (s *stubUsageSource) setReadings(addr string, values map[string]int64, present ...usageReadingKind) {
 	s.mu.Lock()
@@ -1877,7 +1878,7 @@ func TestUsagePoller_ReadingsClearPerReading(t *testing.T) {
 	}
 	h.poll(25)
 	status = h.status()
-	for _, spec := range usageReadingSpecs {
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOutcomes, usageReadingDetails) {
 		if got := usageReadingValue(status, spec.field); got != -1 {
 			t.Errorf("two failed broker reads: %s = %d, want absent", spec.field, got)
 		}
