@@ -172,20 +172,23 @@ func isLiteLLMConfigMapName(name string) bool {
 }
 
 // readInferenceModel reads the default model out of the install's LiteLLM config. The
-// litellm Deployment's config volume names the ConfigMap; only without the Deployment,
-// or a Deployment that mounts no such ConfigMap, does the newest candidate in the
-// namespace that carries litellmConfigKey answer (ties by name). A missing ConfigMap or
-// key, or a config that states no default model, is a negative; any other API error is
-// a failed read.
+// litellm Deployment's config volume names the ConfigMap; only when the Deployment is
+// missing does the newest candidate in the namespace that carries litellmConfigKey
+// answer (ties by name). A Deployment that mounts no LiteLLM config ConfigMap, a missing
+// ConfigMap or key, or a config that states no default model, is a negative; any other
+// API error is a failed read.
 func (r *PlatformAgentReconciler) readInferenceModel(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (inferenceModel, inferenceRead) {
 	log := logf.FromContext(ctx)
 	var cm *corev1.ConfigMap
-	name, err := r.mountedLiteLLMConfigMapName(ctx, agent.Namespace)
+	name, deployed, err := r.mountedLiteLLMConfigMapName(ctx, agent.Namespace)
 	switch {
 	case err != nil:
 		log.Info("could not read the LiteLLM Deployment for status.inference; keeping the last written pair", "error", err)
 		return inferenceModel{}, inferenceReadFailed
-	case name != "":
+	case deployed && name == "":
+		// A leftover ConfigMap is not what LiteLLM serves.
+		return inferenceModel{}, inferenceReadNegative
+	case deployed:
 		cm = &corev1.ConfigMap{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: name}, cm); err != nil {
 			if errors.IsNotFound(err) {
@@ -216,21 +219,22 @@ func (r *PlatformAgentReconciler) readInferenceModel(ctx context.Context, agent 
 }
 
 // mountedLiteLLMConfigMapName returns the LiteLLM config ConfigMap the litellm
-// Deployment mounts, or "" when there is no Deployment or it mounts none.
-func (r *PlatformAgentReconciler) mountedLiteLLMConfigMapName(ctx context.Context, namespace string) (string, error) {
+// Deployment mounts. deployed is false when there is no Deployment; a Deployment that
+// mounts none returns "" with deployed true.
+func (r *PlatformAgentReconciler) mountedLiteLLMConfigMapName(ctx context.Context, namespace string) (name string, deployed bool, err error) {
 	dep := &appsv1.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: litellmDeploymentName}, dep); err != nil {
 		if errors.IsNotFound(err) {
-			return "", nil
+			return "", false, nil
 		}
-		return "", err
+		return "", false, err
 	}
 	for _, v := range dep.Spec.Template.Spec.Volumes {
 		if v.ConfigMap != nil && isLiteLLMConfigMapName(v.ConfigMap.Name) {
-			return v.ConfigMap.Name, nil
+			return v.ConfigMap.Name, true, nil
 		}
 	}
-	return "", nil
+	return "", true, nil
 }
 
 // newestLiteLLMConfigMap returns the newest LiteLLM config ConfigMap in the namespace

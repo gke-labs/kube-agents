@@ -136,6 +136,7 @@ func TestReadInferenceModelNegatives(t *testing.T) {
 		{"a ConfigMap without config.yaml", []client.Object{noKey}},
 		{"the mounted ConfigMap is missing", []client.Object{litellmDeploymentMounting("litellm-config-gone")}},
 		{"the mounted ConfigMap has no config.yaml", []client.Object{litellmDeploymentMounting("litellm-config"), noKey}},
+		{"the Deployment mounts no LiteLLM config", []client.Object{litellmDeploymentMounting("other-config"), litellmConfigMap("litellm-config", time.Now(), "gemini/leftover")}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
