@@ -1077,6 +1077,35 @@ class OwnNetworkTest(unittest.TestCase):
         self.assertTrue(decision.provisional, "a decision made without the own cluster is provisional")
         self.assertEqual([], runner.own_network_calls, "the bounded caller ran an own describe of its own")
 
+    def test_endpoint_decision_passes_its_wait_to_the_help_probe(self):
+        # The help-probe half of the same bound: a decision made under a bound
+        # while another thread's first help probe is in flight comes back
+        # before that probe ends, undecided (None, nothing memoised) rather
+        # than on the holder's clock, and runs no probe of its own.
+        probe_started = threading.Event()
+        release_probe = threading.Event()
+
+        def stalling(argv):
+            probe_started.set()
+            self.assertTrue(release_probe.wait(timeout=10))
+            return 0, HELP_WITH_FLAG
+
+        holder = threading.Thread(target=lambda: gke_endpoint.gcloud_supports_dns_endpoint(stalling), daemon=True)
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            holder.start()
+            self.assertTrue(probe_started.wait(timeout=10))
+            decision = gke_endpoint.endpoint_decision("p", "c", "us-central1", run=runner, wait_seconds=0.05)
+            self.assertTrue(holder.is_alive(), "the decision waited for the holder's help probe to end")
+            memo_after_wait = gke_endpoint._support_cache
+            release_probe.set()
+            holder.join(timeout=10)
+        self.assertFalse(holder.is_alive())
+        self.assertIsNone(decision, "a decision made without the help probe's answer is undecided")
+        self.assertIsNone(memo_after_wait, "an expired wait was memoised as an answer")
+        self.assertEqual([], runner.calls, "the bounded caller ran a probe or describe of its own")
+        self.assertTrue(gke_endpoint._support_cache, "the holder's answer was lost")
+
     def test_the_own_cluster_describe_names_the_identity_from_the_environment(self):
         runner = FakeRunner(PRIVATE_SAME_VPC)
         with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
