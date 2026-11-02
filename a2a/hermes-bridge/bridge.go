@@ -453,6 +453,10 @@ type Bridge struct {
 	// lib.Client.TasksGetOpened; nil means the client's. Tests set it to
 	// drive the retry without a bus fault.
 	tasksGet func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error)
+	// stopping ends when Run begins its shutdown, so a turn stop already in
+	// flight (turnstop.go) does not hold the shutdown up; nil reads as never.
+	stopping     context.Context
+	stopStopping context.CancelFunc
 }
 
 // New connects and sweeps but does not consume yet; Run does.
@@ -480,6 +484,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		apiClient:   newAPIClient(),
 		routeClient: newAPIClient(),
 	}
+	b.stopping, b.stopStopping = context.WithCancel(context.Background())
 	b.lookAhead = b.cancelInStream
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
 	b.deliver = b.handle
@@ -602,6 +607,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	b.mu.Lock()
 	b.closing.Store(true)
 	b.mu.Unlock()
+	b.stopStopping()
 	sub.Stop()
 	// The queue is never closed: Stop does not join an in-flight handler
 	// callback, and a handler mid-accept sending into a closed channel would
