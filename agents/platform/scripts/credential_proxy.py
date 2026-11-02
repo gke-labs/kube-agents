@@ -1577,6 +1577,10 @@ SESSION_KUBECTL_VALUE_FLAGS: frozenset[str] = frozenset({
     "--output", "--sort-by", "--container", "--tail", "--since", "--since-time",
     "--limit-bytes", "--chunk-size", "--limit", "--for", "--types", "--verbs",
     "--api-group", "--template",
+    # A paged collection read. Its value is judged by command_policy's
+    # `kubernetes.raw-path` rule downstream, the same gate the shell's raw
+    # reads pass: a relative collection path on an allowlisted kind, on `get`.
+    "--raw",
 })
 # Verbs a session may not run even though they are reads: both wait by
 # default (`rollout status` watches until the rollout completes, `wait` until

@@ -136,7 +136,12 @@ class KubectlConfinementTest(unittest.TestCase):
                 self.redirect_refused(["kubectl", "get", "pods", flag], flag.split("=")[0])
 
     def test_an_unlisted_flag_is_refused(self):
-        self.refused(["kubectl", "get", "pods", "--raw", "/api"])
+        self.refused(["kubectl", "get", "pods", "--subresource", "status"])
+
+    def test_a_raw_collection_read_passes_the_flag_table(self):
+        # The value is command_policy's to judge (`kubernetes.raw-path`); the
+        # flag table admits the flag so a profile task can page a large kind.
+        confine(["kubectl", "get", "--raw", "/api/v1/pods?limit=500"], None, TARGET)
 
     def test_a_flag_after_double_dash_is_the_remote_commands(self):
         # After `--` the words are the command kubectl exec runs in the pod.

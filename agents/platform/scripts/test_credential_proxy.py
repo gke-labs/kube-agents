@@ -4045,7 +4045,11 @@ class SessionRoleExecutableTest(unittest.TestCase):
             (S, ["kubectl", "logs", "pod/x", "-f"], "-f"),
             (S, ["kubectl", "logs", "pod/x", "--follow"], "--follow"),
             # Unknown or unlisted flags are refused rather than guessed at.
-            (S, ["kubectl", "get", "pods", "--raw", "/api"], "--raw"),
+            (S, ["kubectl", "get", "pods", "--subresource", "status"], "--subresource"),
+            # A paged collection read passes the table; command_policy's
+            # `kubernetes.raw-path` rule judges the path.
+            (S, ["kubectl", "get", "--raw", "/api/v1/pods?limit=500"], None),
+            (S, ["kubectl", "get", "--raw=/apis/apps/v1/deployments?limit=500&continue=t"], None),
             (S, ["kubectl", "get", "pods", "-v=9"], "-v"),
             (S, ["kubectl", "get", "pods", "--server=https://x"], "--server"),
             # The inspection surface passes, in the spellings a model emits.
