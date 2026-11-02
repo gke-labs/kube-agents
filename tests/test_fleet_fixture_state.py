@@ -30,7 +30,9 @@ passes is expressed.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -41,6 +43,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "hack" / "fleet-fixture-state.py"
@@ -55,6 +58,35 @@ def _load_module():
 
 
 ffs = _load_module()
+
+
+class _SteppedClock:
+    """A stand-in for the script's `time`: monotonic() moves only by sleep().
+
+    `between_passes` runs at every sleep, so a test can assert what the script
+    has not done yet. A sleep that does not move the clock, a hundredth sleep,
+    or a fiftieth read of it fails rather than looping forever on a clock
+    that never runs out: the read cap catches a loop that polls without
+    sleeping at all.
+    """
+
+    def __init__(self, between_passes=lambda: None) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        self.reads = 0
+        self.between_passes = between_passes
+
+    def monotonic(self) -> float:
+        self.reads += 1
+        assert self.reads < 50, "fifty clock reads without reaching the deadline"
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        assert seconds > 0, f"sleep({seconds}) does not move the clock; the loop would never reach its deadline"
+        assert len(self.sleeps) < 100, "a hundred sleeps without reaching the deadline"
+        self.between_passes()
+        self.sleeps.append(seconds)
+        self.now += seconds
 
 
 _STUB_KUBECTL = r'''#!/usr/bin/env python3
@@ -816,12 +848,23 @@ class PassTest(_Harness):
     def test_drift_is_recorded_only_at_the_deadline(self):
         world = _healthy_world()
         world["kubectl"]["pod?app=payments-api"] = _pods(_pod(restarts=0, last_reason=None, phase="Pending"))
-        # Long enough for a second pass on a slow machine (a pass is every
-        # role through two stub interpreters), short enough not to matter.
-        done = self.run_script(world, "--wait", "4", "--interval", "0.1")
-        assert done.returncode == 0
-        assert set(self.drift_files()) == {"crashloop-workload"}
-        assert self.log.read_text().count("get pod -l app=payments-api") >= 2
+        # In-process on a clock that moves only when the script sleeps, so the
+        # passes are counted rather than raced against the wall clock (#4415):
+        # with --wait 1.125 --interval 0.25 the loop reads at 0, 0.25, 0.5,
+        # 0.75, 1.0 and 1.125 (the last sleep cut to what was left), six passes
+        # on any machine, with no drift file written until the last.
+        def nothing_recorded_yet():
+            assert self.drift_files() == {}, "drift recorded before the deadline"
+
+        clock = _SteppedClock(nothing_recorded_yet)
+        self.world.write_text(json.dumps(world))
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "STUB_LOG": str(self.log), "STUB_WORLD": str(self.world)}
+        stderr = io.StringIO()
+        with mock.patch.object(ffs, "time", clock), mock.patch.dict(os.environ, env), contextlib.redirect_stderr(stderr):
+            assert ffs.run(self.fleet, _CATALOG, None, wait=1.125, interval=0.25) == 0, stderr.getvalue()
+        assert clock.sleeps == [0.25] * 4 + [0.125], stderr.getvalue()
+        assert set(self.drift_files()) == {"crashloop-workload"}, stderr.getvalue()
+        assert self.log.read_text().count("get pod -l app=payments-api") == 6
 
     def test_an_unreadable_subject_is_not_checked_and_leaves_no_drift_file(self):
         world = _healthy_world()
