@@ -231,7 +231,7 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
 
     def test_a_crossed_pair_is_compared_exactly(self):
         # The operator compares exact quantities; parseCpuMillis and parseBytes truncate
-        # or ceil, which would admit these or (499.5m) compare them the wrong way.
+        # or ceil, which would admit these or compare them the wrong way.
         # quantityExact scales in Sprig's decimal arithmetic, so a strict comparison
         # separates two 15-digit values one unit apart (the second case).
         cases = (

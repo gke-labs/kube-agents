@@ -172,7 +172,8 @@ func TestCredentialProxyRaisedLimitIsAdmittedWithTheLimitWithoutRequestNote(t *t
 }
 
 // With requests.memory set beside it the limit stands on Autopilot too, and
-// 2Gi per the default 500m request is inside the band.
+// 2Gi against the 2 CPU Autopilot request the webhook merges with is 1 GiB
+// per vCPU, the band's floor.
 func TestCredentialProxyLimitWithItsRequestDrawsNoNote(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
