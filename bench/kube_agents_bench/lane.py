@@ -44,7 +44,8 @@ gets ``requested_pull_requests`` set to that count, so the lane's safeguard
 leaves the case's own pull request out and fails the repetition on anything
 beyond it, and ``exclusive_window``, since such a case runs alone and a
 write in its window is its own whether or not it names it. A stopped ask
-(a prompt opening with :data:`kube_agents_bench.stop_hook.STOP_DIRECTIVE`)
+(a prompt opening with :data:`kube_agents_bench.stop_hook.STOP_DIRECTIVE` or
+:data:`kube_agents_bench.stop_hook.MID_TURN_DIRECTIVE`)
 gets ``exclusive_window`` too, with no allowance: the script runs it alone
 in the same second phase, and a stop that fails lets its card write, which
 has to fail the case whether or not anything of it names the write. The command line also reports that count per case, which the

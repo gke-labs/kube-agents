@@ -423,7 +423,7 @@ class EveryOutcomeIsAuditedTest(_BrokerWithJsonLog):
 
     def test_a_saturated_broker(self):
         CredentialProxyHandler.executor = self._Idle()
-        CredentialProxyHandler._request_slot = lambda handler: _refusing_slot(
+        CredentialProxyHandler._request_slot = lambda handler, klass=None: _refusing_slot(
             credential_proxy.CommandSlotUnavailable("limit of 8 concurrent commands")
         )
         status, body = self.post(["kubectl", "get", "pods"], request_id="req-b1")
@@ -434,7 +434,7 @@ class EveryOutcomeIsAuditedTest(_BrokerWithJsonLog):
 
     def test_a_caller_that_leaves_the_queue(self):
         CredentialProxyHandler.executor = self._Idle()
-        CredentialProxyHandler._request_slot = lambda handler: _refusing_slot(credential_proxy.CallerHungUp())
+        CredentialProxyHandler._request_slot = lambda handler, klass=None: _refusing_slot(credential_proxy.CallerHungUp())
         request = urllib.request.Request(
             self.endpoint + "/v1/exec",
             data=json.dumps({"requestId": "req-h1", "argv": ["kubectl", "get", "pods"]}).encode("utf-8"),

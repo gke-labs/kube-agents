@@ -1053,7 +1053,8 @@ const (
 	// moves the config hash and rolls the pod (docs/designs/multi-project-scope.md §5).
 	scopeConfigKey = "scope.json"
 
-	// scopeVolumeName projects scopeConfigKey into scopeDir for the agent container. The
+	// scopeVolumeName projects scopeConfigKey into scopeDir for the agent container (and,
+	// under mode next, for the scope publisher, and into brokerScopeDir for the broker). The
 	// volume is marked optional so a ConfigMap written by an older operator, which has no
 	// such key, still mounts (as an empty directory) instead of holding the pod in
 	// ContainerCreating during a roll; the reader treats the missing file as "no render",
@@ -4455,7 +4456,7 @@ func harnessOnKind(harness *agentv1alpha1.HarnessSpec) bool {
 // buildCredentialProxyEnv is buildCredentialProxyEnvForPlugins with no plugins:
 // every variable but the platform Pub/Sub relay's subscription set.
 func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
-	return buildCredentialProxyEnvForPlugins(agent, nil, true, credentialProxyProfileConfig{})
+	return buildCredentialProxyEnvForPlugins(agent, nil, allBrokerCallersOwned, credentialProxyProfileConfig{})
 }
 
 // buildCredentialProxyEnvForPlugins renders the broker's environment for an
@@ -4463,7 +4464,7 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 // variable: the subscriptions the Pub/Sub platform relay may reach. profiles
 // is the profile role's configuration (credentialProxyProfileEnv); its zero
 // value renders no profile role.
-func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool, profiles credentialProxyProfileConfig) []corev1.EnvVar {
+func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, owned brokerCallerOwnership, profiles credentialProxyProfileConfig) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
 		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
@@ -4593,7 +4594,7 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		// The profile workers' ServiceAccounts join the list only with a
 		// profile caller to confer the role on; the broker holds each to the
 		// profile audience by the identity map rendered below.
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: strings.Join(append([]string{allowedBrokerCallers(agent, mcpIdentityOwned)}, profiles.callers()...), ",")},
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: strings.Join(append([]string{allowedBrokerCallers(agent, owned)}, profiles.callers()...), ",")},
 		// The watchers' audience, in both modes: agent-api-auth always runs
 		// them.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_WATCHER_AUDIENCE", Value: credentialProxyWatcherAudience},
@@ -4615,7 +4616,8 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	}
 	// The MCP server's audience, under its flag on a mode-next install only
 	// (a2aMCPBrokerEnabled), so an install without it confers no mcp role.
-	envVars = append(envVars, a2aMCPBrokerEnv(agent, mcpIdentityOwned)...)
+	envVars = append(envVars, a2aMCPBrokerEnv(agent, owned.mcp)...)
+	envVars = append(envVars, scopeBrokerEnv(agent, owned.scope)...)
 	// The profile workers' audience, identity map and the task-signing public
 	// key, with a profile caller only (credential_proxy_profiles.go).
 	envVars = append(envVars, credentialProxyProfileEnv(profiles)...)
@@ -4805,6 +4807,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// And one that could set the MCP callers could unbind the MCP
 		// ServiceAccount from its audience, or bind another to it.
 		credentialProxyMCPCallersEnvVar,
+		// The scope role's three: one that could set the audience or the
+		// callers would decide who holds the scope role, and one that could
+		// set the file would choose the declaration that bounds its
+		// arguments.
+		credentialProxyScopeAudienceEnvVar,
+		credentialProxyScopeCallersEnvVar,
+		credentialProxyScopeFileEnvVar,
 		a2aMCPBrokerURLEnvVar,
 		a2aMCPBrokerTokenFileEnvVar,
 		// The profile role's four, by name because each is rendered only
