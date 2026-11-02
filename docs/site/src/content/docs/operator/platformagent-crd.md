@@ -388,6 +388,13 @@ below. Set it on the CR to raise or lower that. Either way the value is pinned i
 at `/etc/hermes`, so it applies over whatever the agent's own `config.yaml` says, and removing the
 field puts the default back.
 
+The value is a ceiling. The dispatcher drops its effective cap to one worker when a card reports
+that the credential proxy answered `429` or `503`, when a card's sandbox command lost its SSH
+session (exit `255` with no exit marker), or when the sandbox shell is using more than 75% of its
+memory limit. It holds there for a minute, then raises the cap by one slot for every clean minute
+until it is back at `maxInProgress`. The board endpoint reports both numbers, as
+`configuredMaxInProgress` and `effectiveMaxInProgress`, and the gateway log names each step.
+
 ```yaml
 spec:
   harness:

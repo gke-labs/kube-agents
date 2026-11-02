@@ -85,6 +85,18 @@ ADMISSION_BOUND_BACKGROUND = "background"
 RETRYABLE_BUSY_BOUNDS = frozenset(
     {"slot", "budget", ADMISSION_BOUND_BACKGROUND, ADMISSION_BOUND_DRAINING, "profile"}
 )
+# What `execute` prints on stderr, and exits with, when the broker answers
+# busy and the retry did not get past it. A kanban worker's terminal result
+# reads the two back out of the command's result as a pressure signal to the
+# dispatcher (deploy/docker/patches/kanban_aimd.py, BUSY_LINE_PREFIX and
+# BROKER_BUSY_EXIT; test_kanban_aimd pins the spellings), so both are a
+# contract, not a courtesy. The status is sysexits.h's EX_TEMPFAIL, "try again
+# later", which is what a busy broker means; the line and the status together
+# are the signal, so a log line a worker happens to read cannot forge it.
+BROKER_BUSY_STATUSES = (429, 503)
+BROKER_BUSY_LINE = "credential proxy busy (HTTP {code})"
+BROKER_BUSY_EXIT_FALLBACK = 75
+EXIT_BROKER_BUSY = getattr(os, "EX_TEMPFAIL", BROKER_BUSY_EXIT_FALLBACK)
 CLASS_INTERACTIVE = "interactive"
 CLASS_BACKGROUND = "background"
 CLASS_LABEL = "class"
@@ -999,6 +1011,13 @@ def _busy_reply(exc: urllib.error.HTTPError) -> dict | None:
 def _exec_refused(exc: urllib.error.HTTPError, busy: dict | None) -> int:
     """Print a refusal from `/v1/exec` the way the agent reads it, and its exit code."""
     payload = busy if busy is not None else getattr(exc, "shim_payload", None)
+    # A busy broker is named first, in the one line the dispatcher's pressure
+    # signal reads, whatever the body turns out to be, and the exit status
+    # below says the same.
+    broker_busy = exc.code in BROKER_BUSY_STATUSES
+    failure = EXIT_BROKER_BUSY if broker_busy else 1
+    if broker_busy:
+        print(BROKER_BUSY_LINE.format(code=exc.code), file=sys.stderr)
     if payload is None:
         # A traceback here would turn a transient sidecar blip into a shim
         # crash the agent cannot read.
@@ -1006,7 +1025,7 @@ def _exec_refused(exc: urllib.error.HTTPError, busy: dict | None) -> int:
             f"credential proxy error (HTTP {exc.code}): non-JSON response",
             file=sys.stderr,
         )
-        return 1
+        return failure
     if payload.get("code") == "SECURITY_POLICY_BLOCKED":
         print(
             payload.get("message", "Command blocked for security reasons."),
@@ -1024,7 +1043,7 @@ def _exec_refused(exc: urllib.error.HTTPError, busy: dict | None) -> int:
             print("policy render: local", file=sys.stderr)
         return EXIT_SECURITY_POLICY_BLOCKED
     print(payload.get("error", str(exc)), file=sys.stderr)
-    return 1
+    return failure
 
 
 def execute(

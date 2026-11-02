@@ -1622,6 +1622,62 @@ class TestExecutePolicyBlocked(unittest.TestCase):
         )
 
 
+class TestExecuteBusyBroker(unittest.TestCase):
+    """A 429 or 503 the retry did not get past prints the busy line first.
+
+    The line is the kanban worker's pressure signal to the dispatcher, read
+    back out of the command's output, so it is printed whatever the body is:
+    the broker's JSON, or Envoy's HTML from a sidecar restarting mid-request.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.token_path = self.tmp / "token"
+        self.token_path.write_text("valid-token\n")
+
+    def _execute(self, code, body):
+        http_error = urllib.error.HTTPError(
+            url="http://proxy/v1/exec", code=code, msg="busy",
+            hdrs=http.client.HTTPMessage(), fp=io.BytesIO(body),
+        )
+
+        def fake_open(request, *args, **kwargs):
+            raise http_error
+
+        stderr = io.StringIO()
+        environ = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+        }
+        with patch.dict("os.environ", environ, clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                with patch("sys.stderr", new=stderr):
+                    exit_code = credential_proxy_client.execute("http://proxy", ["kubectl", "get", "pods"])
+        return exit_code, stderr.getvalue()
+
+    def test_a_503_with_an_html_body_prints_the_busy_line_then_the_error(self):
+        exit_code, err = self._execute(503, b"<html>upstream connect error</html>")
+        self.assertEqual(exit_code, 1)
+        lines = err.splitlines()
+        self.assertEqual(lines[0], "credential proxy busy (HTTP 503)")
+        self.assertIn("credential proxy error (HTTP 503): non-JSON response", lines[1])
+
+    def test_a_429_with_the_brokers_json_prints_the_busy_line_then_its_error(self):
+        exit_code, err = self._execute(429, json.dumps({"error": "slot limit reached", "bound": "slot"}).encode())
+        self.assertEqual(exit_code, 1)
+        lines = err.splitlines()
+        self.assertEqual(lines[0], "credential proxy busy (HTTP 429)")
+        self.assertEqual(lines[1], "slot limit reached")
+
+    def test_other_statuses_print_no_busy_line(self):
+        for code in (400, 403, 500, 502):
+            with self.subTest(code=code):
+                _, err = self._execute(code, b"<html>no</html>")
+                self.assertNotIn("credential proxy busy", err)
+
+
 class TestConnectTimeout(unittest.TestCase):
     """A bounded connect, and a response that is not bounded.
 

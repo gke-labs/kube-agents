@@ -2,7 +2,7 @@
 """Wire the kanban scheduling repairs into ``hermes_cli/kanban_db.py`` and
 ``hermes_cli/kanban_db_dispatch.py``.
 
-Ten edits (eleven anchors) across two files plus one import trailer per file. Most of
+Eleven edits (twelve anchors) across two files plus one import trailer per file. Most of
 them used to be three separate appliers (``apply_kanban_dependency_repair``,
 ``apply_kanban_claim_fencing``, ``apply_kanban_breaker_counter``) rewriting the
 same source in sequence, each with its own idempotency story and two of them
@@ -77,13 +77,22 @@ origin module. The edits therefore land in two files:
        at the spawn; after the loop, record saturation and the queued
        notices. Modelled on upstream's review-lane reservation a few lines
        above it. The logic and the reasons are in ``kanban_priority.py``.
+   11. ``_tick_spawn_budget`` head — swap the configured ``max_in_progress``
+       for the adaptive cap before anything reads it: a worker's
+       credential-proxy 429/503 or ssh exit 255, or the sandbox shell above
+       75% of its memory limit, drops the effective cap to one worker for a
+       cooldown, and it climbs back one slot per clean interval. Placed at
+       the head so edit 8's saturation record and the budget below it see
+       the same number; upstream's gateway memory guard after them stays.
+       The limiter, its probe and its state row are in ``kanban_aimd.py``.
 
 Edits 2-4 must stay ordered before 5 for reading rather than for correctness:
 the fence decides which cards reach the breaker at all, and the charge it adds
 is a caller of the very function 5 rewrites. Edit 6 is independent of all of
 them; edits 7-10 read edit 6's counter (through ``count_running_tasks``) and
 its waiting-coordinator SQL (through ``count_waiting_on_children``) and touch
-none of the other edits' lines. The anchors do not overlap. Both files are held in memory and compiled
+none of the other edits' lines. Edit 11 rebinds the parameter edits 8 and 9
+read and shares no line with them. The anchors do not overlap. Both files are held in memory and compiled
 before either is written, so a Hermes bump that moves one anchor in the second
 file leaves the first untouched rather than half of the patch applied.
 
@@ -334,6 +343,12 @@ DB_ALREADY_PATCHED = (
 # The same, for edits 7-10: the reservation check, which the Dockerfile greps
 # for. test_kanban_scheduling asserts the Dockerfile still greps for it.
 RESERVED_BUILD_MARKER = "if _kanban_slot.holds_back(row, result):"
+# The same, for edit 11: the one line that reads the adaptive cap, which the
+# Dockerfile greps for. test_kanban_scheduling asserts the Dockerfile still
+# greps for it.
+AIMD_BUILD_MARKER = (
+    "max_in_progress = _kanban_effective_max_in_progress(conn, max_in_progress, board)"
+)
 
 DISPATCH_ALREADY_PATCHED = (
     "from hermes_cli.kanban_scheduling import",
@@ -341,6 +356,8 @@ DISPATCH_ALREADY_PATCHED = (
     BUILD_MARKER,
     "from hermes_cli.kanban_priority import",
     RESERVED_BUILD_MARKER,
+    "from hermes_cli.kanban_aimd import",
+    AIMD_BUILD_MARKER,
 )
 
 # --- 1. block_task: repair inverted fan-out edges before declaring the wait ---
@@ -660,6 +677,28 @@ RESERVE_SPAWN_PATCHED = (
     "    _kanban_slot.finish(result, dry_run=dry_run)\n"
 )
 
+# --- 11. _tick_spawn_budget head: the cap is a ceiling -----------------------
+#
+# The four lines that open the function body after its docstring, before the
+# first read of ``max_in_progress``. ``conn``, ``max_in_progress`` and
+# ``board`` are the function's own parameters; the rebinding is local to it,
+# and edits 8 and 9 read the rebound value through the same name.
+AIMD_ANCHOR = (
+    "    running_count = 0\n"
+    "    spawn_budget: Optional[int] = None\n"
+    "    if max_spawn is not None or max_in_progress is not None:\n"
+    "        running_count = count_running_tasks(conn)\n"
+)
+
+AIMD_PATCHED = (
+    "    # kube-agents patch: the cap is a ceiling. A worker's credential-proxy\n"
+    "    # 429/503 or ssh exit 255, or the sandbox shell above 75% of its memory\n"
+    "    # limit, drops the effective cap to one worker for a cooldown, and it\n"
+    "    # climbs back one slot per clean interval. Never raises; falls back to\n"
+    "    # the configured cap. See hermes_cli/kanban_aimd.py.\n"
+    f"    {AIMD_BUILD_MARKER}\n"
+) + AIMD_ANCHOR
+
 DB_TRAILER = (
     "\n\n# kube-agents patch: see hermes_cli/kanban_scheduling.py\n"
     "from hermes_cli.kanban_scheduling import (  # noqa: E402\n"
@@ -681,6 +720,10 @@ DISPATCH_TRAILER = (
     "    record_saturation as _kanban_record_saturation,\n"
     "    reserved_slot as _kanban_reserved_slot,\n"
     ")\n"
+    "\n# kube-agents patch: see hermes_cli/kanban_aimd.py\n"
+    "from hermes_cli.kanban_aimd import (  # noqa: E402\n"
+    "    effective_max_in_progress as _kanban_effective_max_in_progress,\n"
+    ")\n"
 )
 
 # ``(file, label, anchor, replacement)``. The file is part of the edit now that
@@ -698,6 +741,7 @@ EDITS = (
     (DISPATCH_RELATIVE, "capped tick queued notice", CAPPED_ANCHOR, CAPPED_PATCHED),
     (DISPATCH_RELATIVE, "ready loop reserved slot", RESERVE_HEAD_ANCHOR, RESERVE_HEAD_PATCHED),
     (DISPATCH_RELATIVE, "ready loop spawn accounting", RESERVE_SPAWN_ANCHOR, RESERVE_SPAWN_PATCHED),
+    (DISPATCH_RELATIVE, "_tick_spawn_budget adaptive cap", AIMD_ANCHOR, AIMD_PATCHED),
 )
 
 TRAILERS = (
@@ -712,7 +756,7 @@ ALREADY_PATCHED = (
 
 
 def apply(root: Path) -> None:
-    """Apply all ten edits under ``root``, or raise SystemExit with the reason.
+    """Apply all eleven edits under ``root``, or raise SystemExit with the reason.
 
     Nothing is written until every anchor in both files has matched exactly
     once and both results compile, so a Hermes bump that moves one anchor

@@ -10,6 +10,10 @@ holds the field names this module writes). No model is in the loop:
 - running: the kanban cards whose status is ``running``, the cluster their
   assignee profile is scoped to beside each;
 - prs: the newest ``pr_opened`` events (``agents/platform/plugins/pr_opened``);
+- configuredMaxInProgress and effectiveMaxInProgress: the dispatcher's cap and
+  the cap it dispatches under now, from the adaptive limiter's row in the
+  board (``deploy/docker/patches/kanban_aimd.py``); both ``None`` until the
+  dispatcher's first tick on this build writes it;
 - audit: the most recent fleet-audit run to finish, from the report store
   (``skills/fleet-audit/scripts/report_status.py``);
 - first_report_pending: onboarding has filed its sweep, its first report is
@@ -62,6 +66,13 @@ RUNNING_MAX = 5
 PRS_MAX = 5
 STATUS_RUNNING = "running"
 PR_OPENED_KIND = "pr_opened"
+# The adaptive limiter's one row in kanban.db, written by the dispatcher each
+# tick (deploy/docker/patches/kanban_aimd.py, STATE_TABLE and STATE_ROW_ID;
+# test_kanban_aimd pins both spellings). Absent on a board the dispatcher has
+# not ticked on since the limiter shipped, which is "no figure", not an error.
+AIMD_STATE_TABLE = "kube_aimd_state"
+AIMD_STATE_ROW_ID = 1
+NO_SUCH_TABLE = "no such table"
 # What a malformed row (a hand-written payload, a text timestamp) raises on the
 # way into the wire shape; that row is skipped. OSError is gmtime() refusing a
 # year past a C int, which datetime.fromtimestamp documents alongside the rest.
@@ -220,6 +231,24 @@ def prs(kanban: sqlite3.Connection) -> list[dict]:
     return out
 
 
+def dispatch_cap(kanban: sqlite3.Connection) -> tuple[int | None, int | None]:
+    """``(configured, effective)`` max_in_progress from the limiter's row, or ``(None, None)`` before it exists."""
+    try:
+        row = kanban.execute(
+            f"SELECT configured, effective FROM {AIMD_STATE_TABLE} WHERE id = ?", (AIMD_STATE_ROW_ID,)
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if NO_SUCH_TABLE in str(exc):
+            return None, None
+        raise
+    if row is None:
+        return None, None
+    try:
+        return _wire_int(row[0]), _wire_int(row[1])
+    except ROW_ERRORS:
+        return None, None  # a malformed row costs the two figures, not the board
+
+
 def last_audit(projection: dict, name_of: Callable[[str], str]) -> dict | None:
     """The newest finished run across every stream and repository in report_status's projection.
 
@@ -291,11 +320,14 @@ def snapshot(
         "cluster_count": len(fleet),
         "running": [],
         "prs": [],
+        "configuredMaxInProgress": None,
+        "effectiveMaxInProgress": None,
     }
     if kanban is not None:
         try:
             board["running"] = running(kanban, identities, labels)
             board["prs"] = prs(kanban)
+            board["configuredMaxInProgress"], board["effectiveMaxInProgress"] = dispatch_cap(kanban)
         except sqlite3.Error as exc:
             raise BoardError(f"the kanban board could not be read: {exc}") from None
     home = (profiles_dir or PROFILES_DIR).parent

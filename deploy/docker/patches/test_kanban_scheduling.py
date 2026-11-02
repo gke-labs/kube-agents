@@ -57,6 +57,9 @@ import unittest
 from pathlib import Path
 
 from apply_kanban_scheduling import (
+    AIMD_ANCHOR,
+    AIMD_BUILD_MARKER,
+    AIMD_PATCHED,
     BUILD_MARKER,
     CAPPED_ANCHOR,
     CHARGE_ANCHOR,
@@ -1414,13 +1417,14 @@ class ChildrenTableAgreementTest(unittest.TestCase):
         self.assertIn(BUILD_MARKER, text)
         self.assertIn(apply_kanban_scheduling.WAITING_BUILD_MARKER, text)
         self.assertIn(RESERVED_BUILD_MARKER, text)
+        self.assertIn(AIMD_BUILD_MARKER, text)
 
     def test_the_edit_count_matches_what_the_prose_claims(self):
-        """"Ten edits (eleven anchors)" is written into the docstring and
+        """"Eleven edits (twelve anchors)" is written into the docstring and
         asserted nowhere else; edit 10 is the one with two anchors."""
-        self.assertEqual(len(apply_kanban_scheduling.EDITS), 11)
+        self.assertEqual(len(apply_kanban_scheduling.EDITS), 12)
         self.assertIn(
-            "Ten edits (eleven anchors)", apply_kanban_scheduling.__doc__
+            "Eleven edits (twelve anchors)", apply_kanban_scheduling.__doc__
         )
 
     def test_the_unmutated_applier_succeeds(self):
@@ -1606,9 +1610,8 @@ DISPATCH_RESULT_PREAMBLE = (
 # ``total_running`` line above its ``if``.
 TICK_BUDGET_PREAMBLE = (
     "\n\ndef _tick_spawn_budget(conn, result, *, max_spawn, max_in_progress, board):\n"
-    "    running_count = count_running_tasks(conn)\n"
-    "    spawn_budget = None\n"
-    "    if max_spawn is not None:\n"
+    + AIMD_ANCHOR
+    + "    if max_spawn is not None:\n"
     "        if running_count >= max_spawn:\n"
     "            return False, None\n"
     "        spawn_budget = max_spawn - running_count\n"
@@ -1667,7 +1670,8 @@ def pristine_dispatch():
     """A fake ``kanban_db_dispatch.py`` carrying exactly one of each of its five."""
     return (
         "import re\n"
-        "from dataclasses import dataclass, field\n\n"
+        "from dataclasses import dataclass, field\n"
+        "from typing import Optional\n\n"
         "DEFAULT_FAILURE_LIMIT = 2\n\n\n"
         + CRASH_SWEEP_PREAMBLE
         + SWEEP_FIELD_ANCHOR
@@ -1785,6 +1789,10 @@ class ApplierTest(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assertIn(f"as {name},", dispatch)
+        # Edit 11 imports from its own module, once, into the dispatcher only.
+        self.assertEqual(dispatch.count("from hermes_cli.kanban_aimd import"), 1)
+        self.assertIn("as _kanban_effective_max_in_progress,", dispatch)
+        self.assertNotIn("kanban_aimd", db)
 
     def _function(self, source, name):
         tree = ast.parse(source)
@@ -1826,6 +1834,27 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("conn, result, total_running, max_in_progress, board", body[0])
         self.assertEqual(body[-1], "return (False, None)")
         self.assertEqual(ast.unparse(fn).count("_kanban_record_saturation("), 1)
+
+    def test_the_adaptive_cap_is_read_before_anything_else_in_the_tick(self):
+        """Edit 11 rebinds ``max_in_progress`` as the first statement of
+        ``_tick_spawn_budget``'s body, so the running count, the cap branch
+        (edit 8) and the budget all read the effective value."""
+        dispatch = self._applied()[DISPATCH_RELATIVE]
+        self.assertIn(AIMD_PATCHED, dispatch)
+        fn = self._function(dispatch, "_tick_spawn_budget")
+        body = [stmt for stmt in fn.body if not (
+            isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant)
+        )]
+        self.assertEqual(ast.unparse(body[0]), AIMD_BUILD_MARKER)
+        self.assertEqual(ast.unparse(fn).count("_kanban_effective_max_in_progress("), 1)
+        reads = [
+            node.lineno for node in ast.walk(fn)
+            if isinstance(node, ast.Name) and node.id == "max_in_progress"
+            and isinstance(node.ctx, ast.Load)
+        ]
+        # The call's own argument is the one read allowed on the rebinding line.
+        self.assertEqual(min(reads), body[0].lineno)
+        self.assertTrue(all(line >= body[0].lineno for line in reads))
 
     def test_a_capped_tick_notes_waiting_cards_before_returning(self):
         dispatch = self._applied()[DISPATCH_RELATIVE]

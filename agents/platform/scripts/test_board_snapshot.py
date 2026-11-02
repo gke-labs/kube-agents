@@ -116,6 +116,36 @@ class BoardSnapshotTest(unittest.TestCase):
         self.assertEqual(board["cluster_count"], 4)
         self.assertIn("seeded-a", names)
 
+    def test_the_dispatch_cap_is_unknown_until_the_limiter_has_written_it(self):
+        board = self.snap()
+        self.assertIsNone(board["configuredMaxInProgress"])
+        self.assertIsNone(board["effectiveMaxInProgress"])
+        with_board = self.snap(kanban_db())
+        self.assertEqual((with_board["configuredMaxInProgress"], with_board["effectiveMaxInProgress"]), (None, None))
+
+    def test_the_dispatch_cap_is_the_limiters_row(self):
+        kanban = kanban_db()
+        kanban.execute(
+            f"CREATE TABLE {board_snapshot.AIMD_STATE_TABLE} (id INTEGER PRIMARY KEY, configured INTEGER, "
+            "effective INTEGER, cooldown_until REAL, last_event_id INTEGER, updated_at REAL)"
+        )
+        self.assertEqual(board_snapshot.dispatch_cap(kanban), (None, None), "a table with no row yet")
+        kanban.execute(
+            f"INSERT INTO {board_snapshot.AIMD_STATE_TABLE} VALUES (?, 6, 2, 1792155060.0, 41, 1792155000.0)",
+            (board_snapshot.AIMD_STATE_ROW_ID,),
+        )
+        board = self.snap(kanban)
+        self.assertEqual(board["configuredMaxInProgress"], 6)
+        self.assertEqual(board["effectiveMaxInProgress"], 2)
+
+    def test_a_malformed_cap_row_costs_the_figures_not_the_board(self):
+        kanban = kanban_db()
+        kanban.execute(f"CREATE TABLE {board_snapshot.AIMD_STATE_TABLE} (id INTEGER PRIMARY KEY, configured, effective)")
+        kanban.execute(f"INSERT INTO {board_snapshot.AIMD_STATE_TABLE} VALUES (1, 'six', 2)")
+        board = self.snap(kanban)
+        self.assertEqual((board["configuredMaxInProgress"], board["effectiveMaxInProgress"]), (None, None))
+        self.assertEqual(board["running"], [])
+
     def test_a_closed_finding_is_not_open(self):
         findings_queue.register_findings(self.session, [finding("seeded-a", "gone", "critical")])
         self.session.execute("UPDATE findings SET state = 'resolved'")

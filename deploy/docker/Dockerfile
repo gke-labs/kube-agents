@@ -1292,6 +1292,18 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 # layer. The create-time priority stamp, the gateway's saturation warning and
 # the notifier's delivery of `queued` are wired by apply_kanban_priority.py in
 # the latency block further down. See deploy/docker/patches/kanban_priority.py.
+#
+# Edit 11 makes the cap a ceiling: a worker's credential-proxy 429/503 or ssh
+# exit 255, or the sandbox shell above 75% of its memory limit, drops the
+# effective max_in_progress to one worker for a 60s cooldown, and it climbs
+# back one slot per clean minute (#4450). Its runtime is
+# hermes_cli/kanban_aimd.py, installed here the same way as kanban_priority.py;
+# the worker half, the terminal result writing a `pressure` event on the
+# worker's card, is apply_kanban_aimd.py's one anchor in
+# tools/terminal_tool_result.py, which shares no line with the verified-claims
+# edit above or the ssh_shared_master edit below. verify_kanban_aimd.py drives
+# the patched dispatch_once over a planted pressure event and the patched
+# terminal result as a worker. See deploy/docker/patches/kanban_aimd.py.
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
@@ -1304,9 +1316,13 @@ COPY deploy/docker/patches/apply_kanban_scheduling.py \
      deploy/docker/patches/kanban_scheduling.py \
      deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/kanban_priority.py \
+     deploy/docker/patches/kanban_aimd.py \
+     deploy/docker/patches/apply_kanban_aimd.py \
+     deploy/docker/patches/verify_kanban_aimd.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-scheduling/
 RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes_cli/kanban_priority.py && \
+    install -m 0644 /tmp/kanban-scheduling/kanban_aimd.py /opt/hermes/hermes_cli/kanban_aimd.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling.py /opt/hermes && \
     grep -q "_kanban_repair_inverted_deps(conn, task_id, reason)" /opt/hermes/hermes_cli/kanban_db.py && \
     grep -q "conn, _kanban_claimer, _kb._pid_alive, _kb._resolve_crash_grace_seconds" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
@@ -1328,7 +1344,12 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
     test "$(grep -c '_kanban_record_saturation(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     test "$(grep -c '_kanban_note_waiting(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     test "$(grep -c 'from hermes_cli.kanban_priority import' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    grep -qF 'max_in_progress = _kanban_effective_max_in_progress(conn, max_in_progress, board)' /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    test "$(grep -c 'from hermes_cli.kanban_aimd import' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_aimd.py /opt/hermes && \
+    test "$(grep -c 'record_worker_pressure(env_type, returncode, output, bool((result or {}).get("cwd_observed")))' /opt/hermes/tools/terminal_tool_result.py)" = "1" && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/verify_kanban_scheduling.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/verify_kanban_aimd.py && \
     rm -rf /tmp/kanban-scheduling
 
 # Hotfix: kanban workers leaving `run_conversation` without a board write.
