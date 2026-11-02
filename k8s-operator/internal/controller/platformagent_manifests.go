@@ -294,6 +294,45 @@ const (
 	// the inference gateway. Decoupled from the backing implementation (LiteLLM,
 	// vLLM, a custom proxy) so swapping the backend does not touch agent configs.
 	inferenceGatewayServiceName = "inference-gateway"
+
+	// The gateway container's startup and readiness probes run one command
+	// (agentAPIProbe) and differ only in these timings.
+	//
+	// The startup probe covers a cold boot that scaffolds every profile onto a
+	// fresh PVC: 5 + 10×90 = 905s, the budget gatewayProgressDeadlineSeconds is
+	// sized to outlast. Readiness afterwards withdraws the pod after 3 missed
+	// checks 15s apart — 45s of a gateway that accepts connections and answers
+	// nobody, the stall the agent-api-auth sidecar's upstream timeout otherwise
+	// turns into a 502 for every caller.
+	//
+	// Each TimeoutSeconds sits under its probe's period, so a slow check never
+	// pushes the next one: kubelet runs probes on a fixed ticker, so a longer
+	// timeout costs at most one timeout of detection latency and buys that much
+	// tolerance for an answer that is slow but true. The readiness answer is
+	// slow by construction before it is slow by load: Hermes' list_sessions_rich
+	// first calls flush_token_counts(timeout=5.0), waiting up to 5s for the
+	// token-accounting writer to drain, and on a sandboxed install (the chart
+	// default) the operator pins SQLite to the DELETE journal mode, where the
+	// read that follows takes the writer's lock (hermes_state.py _read_ctx)
+	// behind any turn persisting its transcript. Up to 5s can therefore pass before a
+	// byte is read; 10s under the 15s period covers the flush with as much
+	// again for the locked read and the exec spawn. The startup probe keeps 5s
+	// under its 10s period: at boot the answer is absent rather than slow, and
+	// the 90 retries are its tolerance.
+	//
+	// agentAPIProbeCurlMarginSeconds is how far curl's own --max-time sits under
+	// TimeoutSeconds, so a hung listener is curl's 28 to report, with its
+	// stderr in the probe event, rather than kubelet's to kill with "command
+	// timed out". 2s leaves the exec spawn and sh's exit inside kubelet's budget,
+	// as the dashboard probe's --max-time 3 under 5s already does.
+	agentAPIProbeInitialDelaySeconds       int32 = 5
+	agentAPIStartupProbePeriodSeconds      int32 = 10
+	agentAPIStartupProbeFailureThreshold   int32 = 90
+	agentAPIStartupProbeTimeoutSeconds     int32 = 5
+	agentAPIReadinessProbePeriodSeconds    int32 = 15
+	agentAPIReadinessProbeFailureThreshold int32 = 3
+	agentAPIReadinessProbeTimeoutSeconds   int32 = 10
+	agentAPIProbeCurlMarginSeconds         int32 = 2
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -3661,7 +3700,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 // Past the deadline the Deployment reports ProgressDeadlineExceeded and any
 // caller's wait returns early however long it asked for, so a gate raised above
 // this number buys nothing. Kubernetes defaults it to 600s, which is *below*
-// the 905s cold boot agentAPIProbe(10, 90) already sanctions — the kubelet is
+// the 905s cold boot the startup probe already sanctions (the agentAPIStartupProbe*
+// constants at the top of this file) — the kubelet is
 // told to tolerate a boot the Deployment gives up on. 1800s clears the 1500s
 // deploy gate in upgrade.sh. hindsight-api
 // carries an explicit 900 for the same reason; see tests/test_hindsight_probes.py.
@@ -5206,15 +5246,27 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 }
 
 // agentAPIProbe returns a probe that asks the Hermes API on loopback for one
-// session. Callers supply periodSeconds and failureThreshold, which is the only
-// difference between the gateway's startup and readiness probes: the startup
-// one has to cover a cold boot that scaffolds every profile onto a fresh PVC,
-// while readiness afterwards should withdraw the pod quickly.
+// session. Callers supply the period, failure threshold and timeout, which is
+// the only difference between the gateway's startup and readiness probes: the
+// startup one has to cover a cold boot that scaffolds every profile onto a
+// fresh PVC, while readiness afterwards should withdraw the pod quickly. The
+// values, and why each is what it is, are the agentAPI*Probe* constants at the
+// top of this file.
 //
 // /api/sessions is the endpoint the agent's own callers use — see the pubsub
 // adapter and admin_console — and the Authorization: Bearer form is theirs too.
-// Every timing is explicit, per the gke-reliability skill's rule 3; kubelet's
-// 1-second default timeout is far too tight for a container this busy at boot.
+// It stays the probe's target although Hermes also serves an unauthenticated,
+// constant GET /health: that route proves the listener and nothing else, while
+// this one proves the bearer key the entrypoint handed the container matches
+// the one the API server loaded (a disagreement holds the pod out of Ready
+// instead of 401ing every in-pod caller quietly; docker-entrypoint.sh checks
+// the same agreement before exec and names this probe in its warning) and
+// that the session store the callers write to answers. Every timing is
+// explicit, per the gke-reliability skill's
+// rule 3; kubelet's 1-second default timeout is far too tight for a container
+// this busy at boot. curl's --max-time sits agentAPIProbeCurlMarginSeconds
+// under TimeoutSeconds, so a listener that accepts and then hangs is curl's
+// exit 28 rather than kubelet's exec kill.
 //
 // The exit-7 branch is what makes this probe safe above one replica. At
 // replicas > 1 the container runs leader_elect.py, and a pod that does not hold
@@ -5232,13 +5284,13 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 // which still fail. Detecting the standby by looking for the process instead
 // would not work: `hermes` is a shim that execs `s6-suid hermes $REAL "$@"`, so
 // the string "hermes gateway run" never appears in any command line to match.
-func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
+func agentAPIProbe(periodSeconds, failureThreshold, timeoutSeconds int32) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			Exec: &corev1.ExecAction{
 				Command: []string{
 					"sh", "-c",
-					`curl --fail --silent --show-error -o /dev/null ` +
+					fmt.Sprintf(`curl --fail --silent --show-error --max-time %d -o /dev/null `, timeoutSeconds-agentAPIProbeCurlMarginSeconds) +
 						`-H "Authorization: Bearer $API_SERVER_KEY" ` +
 						`http://127.0.0.1:8642/api/sessions?limit=1; rc=$?; ` +
 						`[ "$rc" -eq 0 ] && exit 0; ` +
@@ -5247,9 +5299,9 @@ func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
 				},
 			},
 		},
-		InitialDelaySeconds: 5,
+		InitialDelaySeconds: agentAPIProbeInitialDelaySeconds,
 		PeriodSeconds:       periodSeconds,
-		TimeoutSeconds:      5,
+		TimeoutSeconds:      timeoutSeconds,
 		FailureThreshold:    failureThreshold,
 	}
 }
@@ -5453,8 +5505,8 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			// The bearer key is the non-secret loopback sentinel already in this
 			// container's env, and API_SERVER_ENABLED is unconditionally true above,
 			// so the probe is valid in every configuration.
-			StartupProbe:    agentAPIProbe(10, 90),
-			ReadinessProbe:  agentAPIProbe(15, 3),
+			StartupProbe:    agentAPIProbe(agentAPIStartupProbePeriodSeconds, agentAPIStartupProbeFailureThreshold, agentAPIStartupProbeTimeoutSeconds),
+			ReadinessProbe:  agentAPIProbe(agentAPIReadinessProbePeriodSeconds, agentAPIReadinessProbeFailureThreshold, agentAPIReadinessProbeTimeoutSeconds),
 			SecurityContext: hardenedSecurityContext(),
 		},
 	}

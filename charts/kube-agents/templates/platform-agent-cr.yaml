@@ -251,13 +251,38 @@ spec:
     {{- if and (kindIs "bool" $sandbox.enabled) (not $sandbox.enabled) }}
     {{- fail "platformAgent.harness.experimental.shellSandbox.enabled: false is not supported -- the operator refuses it. Remove the key or set it true." }}
     {{- end }}
-    {{- with include "kube-agents.compactFields" (dict
+    {{- /*
+      The shell container's requests and limits, forwarded to the CR as
+      spec.harness.experimental.shellSandbox.resources. Lean, as the
+      agentAPIAuth block below: the operator and its webhook validate the
+      override (floor-free), so the chart forwards it and guards only the shape
+      it can catch cheaply through the shared check, which the quota preflight
+      calls too. Emitted only when a key is set, through
+      kube-agents.resourcesOverrideQuantities and kube-agents.resourcesOverrideBlock,
+      which hold the leaf, quoting and ordering rules the three sizing overrides
+      share, and behind kube-agents.crdFieldGuard, which fails the upgrade against
+      an installed CRD that predates the field.
+    */}}
+    {{- $sandboxResources := $sandbox.resources | default dict }}
+    {{- include "kube-agents.shellSandboxResourcesCheck" $sandboxResources }}
+    {{- $sandboxQuantities := include "kube-agents.resourcesOverrideQuantities" $sandboxResources | fromJson }}
+    {{- if $sandboxQuantities }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.harness.experimental.shellSandbox.resources" "path" (list "harness" "experimental" "shellSandbox") "field" "resources") }}
+    {{- end }}
+    {{- $sandboxFields := include "kube-agents.compactFields" (dict
           "enabled" $sandbox.enabled
           "image" $sandbox.image
           "runtimeClassName" $sandbox.runtimeClassName) }}
+    {{- if or $sandboxFields $sandboxQuantities }}
     experimental:
       shellSandbox:
+        {{- with $sandboxFields }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- if $sandboxQuantities }}
+        resources:
+          {{- include "kube-agents.resourcesOverrideBlock" $sandboxQuantities | nindent 10 }}
+        {{- end }}
     {{- end }}
   deployment:
     image: {{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) | quote }}
@@ -405,42 +430,23 @@ spec:
       `credentialProxy: {resources: {}}` onto every CR, which an API server
       serving a CRD from before the field prunes silently and a reader mistakes
       for an override. The operator merges what is here over its defaults per
-      key, so a block carrying only limits.memory is complete as written.
-
-      Each quantity is quoted rather than passed through toYaml, for the reason
-      env[].value is above: a values file's `cpu: 1.5` arrives as a float, and
-      the CRD types a quantity as int-or-string, so the API server refuses the
-      bare number. An unset leaf is skipped by kube-agents.compactFields' rule:
-      null (`memory: null`, Helm's way to drop a key) or the empty string, which
-      the CRD's quantity pattern refuses. A map holding nothing else writes no
-      block either.
+      key, so a block carrying only limits.memory is complete as written. The
+      leaf rules (an unset leaf skipped, each quantity trimmed and quoted) are
+      kube-agents.resourcesOverrideQuantities' and kube-agents.resourcesOverrideBlock's,
+      shared with the agentAPIAuth and shellSandbox blocks.
     */}}
-    {{- $proxyQuantities := dict }}
-    {{- range $side := list "limits" "requests" }}
-      {{- $set := dict }}
-      {{- range $name, $quantity := (index $proxyResources $side) | default dict }}
-        {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
-          {{- $_ := set $set $name $quantity }}
-        {{- end }}
-      {{- end }}
-      {{- if $set }}
-        {{- $_ := set $proxyQuantities $side $set }}
-      {{- end }}
-    {{- end }}
+    {{- $proxyQuantities := include "kube-agents.resourcesOverrideQuantities" $proxyResources | fromJson }}
     {{- $proxyDefaults := include "kube-agents.credentialProxyDefaults" . | fromJson }}
     {{- $proxyFloor := include "kube-agents.credentialProxyMemoryFloorBytes" . | int64 }}
     {{- $proxyMerged := dict "requests" (dict) "limits" (dict) }}
-    {{- $proxyRendered := dict "requests" (dict) "limits" (dict) }}
     {{- range $side := list "requests" "limits" }}
       {{- range $name, $raw := index $proxyDefaults $side }}
         {{- $_ := set (index $proxyMerged $side) $name $raw }}
       {{- end }}
     {{- end }}
     {{- range $side, $set := $proxyQuantities }}
-      {{- range $name, $quantity := $set }}
-        {{- $raw := toString $quantity | trim }}
+      {{- range $name, $raw := $set }}
         {{- $_ := set (index $proxyMerged $side) $name $raw }}
-        {{- $_ := set (index $proxyRendered $side) $name $raw }}
       {{- end }}
     {{- end }}
     {{- if $proxyQuantities }}
@@ -487,36 +493,11 @@ spec:
       {{- end }}
     {{- end }}
     {{- end }}
-    {{- /*
-      The same CRD guard as the scoped pool's below, for the same reason:
-      `helm upgrade` never applies crds/, and an API server serving a CRD from
-      before spec.deployment.credentialProxy admits the CR with the block
-      pruned. The proxy keeps the operator's defaults while the release record
-      carries the override, and nothing says so. `lookup` is empty under
-      `helm template`, so the guard fires only against a live install.
-    */}}
     {{- if $proxyQuantities }}
-    {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
-    {{- if $crd }}
-    {{- $deploymentProps := dict }}
-    {{- range $crd.spec.versions }}
-    {{- if .storage }}
-    {{- $deploymentProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) . }}
-    {{- end }}
-    {{- end }}
-    {{- if not (hasKey $deploymentProps "credentialProxy") }}
-    {{- fail "platformAgent.deployment.credentialProxy.resources is set, but the installed PlatformAgent CRD predates spec.deployment.credentialProxy and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
-    {{- end }}
-    {{- end }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.credentialProxy.resources" "path" (list "deployment" "credentialProxy") "field" "resources") }}
     credentialProxy:
       resources:
-        {{- range $side := keys $proxyQuantities | sortAlpha }}
-        {{ $side }}:
-          {{- $set := index $proxyRendered $side }}
-          {{- range $name := keys $set | sortAlpha }}
-          {{ $name }}: {{ index $set $name | quote }}
-          {{- end }}
-        {{- end }}
+        {{- include "kube-agents.resourcesOverrideBlock" $proxyQuantities | nindent 8 }}
     {{- end }}
     {{- /*
       The agent-api-auth sidecar's requests and limits, forwarded to the CR as
@@ -525,8 +506,7 @@ spec:
       admission count from the limit), so the chart forwards it and guards only
       the shape it can catch cheaply — an override set against a CRD that predates
       the field, which the API server would prune silently. Emitted only when a
-      key is set, each quantity quoted, for the reasons the credentialProxy block
-      above gives.
+      key is set, through the same helpers as the credentialProxy block above.
     */}}
     {{- $apiAuthResources := ((.Values.platformAgent.deployment.agentAPIAuth | default dict).resources) | default dict }}
     {{- /* Shape and grammar check, shared with the quota preflight so a mistyped side
@@ -535,43 +515,12 @@ spec:
            operator as garbage. The floor and crossed-pair checks stay the operator's
            and the webhook's. */}}
     {{- include "kube-agents.agentAPIAuthResourcesCheck" $apiAuthResources }}
-    {{- $apiAuthQuantities := dict }}
-    {{- range $side := list "limits" "requests" }}
-      {{- $set := dict }}
-      {{- range $name, $quantity := (index $apiAuthResources $side) | default dict }}
-        {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
-          {{- /* Trimmed as the check validated it and the proxy block emits it, so a
-                 value with surrounding whitespace is not emitted raw for the API server
-                 to refuse against the CRD's no-whitespace quantity pattern. */}}
-          {{- $_ := set $set $name (toString $quantity | trim) }}
-        {{- end }}
-      {{- end }}
-      {{- if $set }}
-        {{- $_ := set $apiAuthQuantities $side $set }}
-      {{- end }}
-    {{- end }}
+    {{- $apiAuthQuantities := include "kube-agents.resourcesOverrideQuantities" $apiAuthResources | fromJson }}
     {{- if $apiAuthQuantities }}
-    {{- $apiAuthCrd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
-    {{- if $apiAuthCrd }}
-    {{- $apiAuthDeploymentProps := dict }}
-    {{- range $apiAuthCrd.spec.versions }}
-    {{- if .storage }}
-    {{- $apiAuthDeploymentProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) . }}
-    {{- end }}
-    {{- end }}
-    {{- if not (hasKey $apiAuthDeploymentProps "agentAPIAuth") }}
-    {{- fail "platformAgent.deployment.agentAPIAuth.resources is set, but the installed PlatformAgent CRD predates spec.deployment.agentAPIAuth and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
-    {{- end }}
-    {{- end }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.agentAPIAuth.resources" "path" (list "deployment" "agentAPIAuth") "field" "resources") }}
     agentAPIAuth:
       resources:
-        {{- range $side := keys $apiAuthQuantities | sortAlpha }}
-        {{ $side }}:
-          {{- $set := index $apiAuthQuantities $side }}
-          {{- range $name := keys $set | sortAlpha }}
-          {{ $name }}: {{ index $set $name | quote }}
-          {{- end }}
-        {{- end }}
+        {{- include "kube-agents.resourcesOverrideBlock" $apiAuthQuantities | nindent 8 }}
     {{- end }}
   security:
     serviceAccountName: {{ .Values.platformAgent.security.serviceAccountName | quote }}
