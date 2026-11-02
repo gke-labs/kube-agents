@@ -23,6 +23,8 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+import command_policy
+import credential_proxy
 import credential_proxy_client
 
 try:
@@ -436,6 +438,83 @@ class TestGetCredentialsWithFlagsBetweenItsWords(ContextLessTestCase):
         for argv, want in cases:
             with self.subTest(argv=argv):
                 self.assertEqual(want, credential_proxy_client.is_get_credentials(argv))
+
+
+class TestTheShimAndTheBrokerAgreeOnGetCredentials(unittest.TestCase):
+    """The shim's get-credentials walk reads argv as the broker's does.
+
+    The shim can't import `command_policy` in the sandbox, so it keeps its own
+    walk. This holds the two to one table of spellings, and holds the shim's
+    short valued flags to the policy's, so a short valued flag added to the
+    policy fails here until the shim learns it too.
+    """
+
+    GC = ["gcloud", "container", "clusters"]
+
+    AGREED = [
+        (GC + ["get-credentials", "c"], True),
+        (GC + ["--location=l", "get-credentials", "c"], True),
+        (GC + ["--location", "l", "get-credentials", "c"], True),
+        (GC + ["--zone", "l", "get-credentials", "c"], True),
+        (GC + ["-z", "l", "get-credentials", "c"], True),
+        (GC + ["-z=l", "get-credentials", "c"], True),
+        (["gcloud", "container", "-z", "l", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "-z", "l", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "container", "--project=p", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "container", "--project", "p", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "--project", "p", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "--project=p", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "container", "--quiet", "clusters", "--zone", "l", "get-credentials", "c"], True),
+        (["gcloud", "alpha", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "beta", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "beta", "container", "clusters", "-z", "l", "get-credentials", "c"], True),
+        (GC + ["describe", "get-credentials"], False),
+        (GC + ["list", "--location", "l"], False),
+        (GC + ["-z", "l", "list"], False),
+        (GC + ["describe", "c", "-z", "l"], False),
+        (["gcloud", "projects", "list"], False),
+        (["gcloud", "compute", "instances", "list", "--format=json"], False),
+        (GC, False),
+        (["kubectl", "container", "clusters", "get-credentials"], False),
+        (["kubectl", "get", "pods", "-n", "default"], False),
+        ([], False),
+    ]
+
+    # Known and harmless: the shim never lets a bare `--flag` take one of the
+    # three command words as its value, so it reads `get-credentials` here as
+    # the verb where the broker reads it as `--format`'s value. The shim asks
+    # for a file the broker doesn't send, and nothing lands. (argv, shim, broker)
+    KNOWN_DISAGREEMENTS = [
+        (GC + ["--format", "get-credentials", "list"], True, False),
+        # Malformed argv the read-only policy refuses before routing: the broker
+        # can't read them and falls back to "carries the verb", the shim reads
+        # them its own way. Pinned so any other disagreement fails.
+        (["gcloud", "--", "container", "clusters", "get-credentials", "c"], False, True),
+        (GC + ["-qz", "l", "get-credentials", "c"], False, True),
+        (GC + ["--format", "-z", "get-credentials", "c"], False, True),
+    ]
+
+    def test_the_release_tracks_are_the_policys(self):
+        self.assertEqual(command_policy._GCLOUD_RELEASE_TRACKS, credential_proxy_client._GCLOUD_RELEASE_TRACKS)
+
+    def test_both_read_every_spelling_the_same(self):
+        for argv, want in self.AGREED:
+            with self.subTest(argv=argv):
+                self.assertEqual(want, credential_proxy._is_get_credentials(argv))
+                self.assertEqual(want, credential_proxy_client.is_get_credentials(argv))
+
+    def test_the_known_disagreements_are_the_only_ones(self):
+        for argv, shim, broker in self.KNOWN_DISAGREEMENTS:
+            with self.subTest(argv=argv):
+                self.assertEqual(shim, credential_proxy_client.is_get_credentials(argv))
+                self.assertEqual(broker, credential_proxy._is_get_credentials(argv))
+
+    def test_the_shim_knows_every_short_valued_flag_the_policy_does(self):
+        policy_short = {
+            flag for flag in command_policy._GCLOUD_FLAGS_WITH_VALUE
+            if flag.startswith("-") and not flag.startswith("--")
+        }
+        self.assertEqual(policy_short, set(credential_proxy_client._GCLOUD_SHORT_FLAGS_WITH_VALUE))
 
 
 class TestAShellFollowsItsOwnGetCredentials(ContextLessTestCase):
