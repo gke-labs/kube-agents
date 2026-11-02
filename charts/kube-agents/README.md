@@ -626,9 +626,9 @@ On clusters enforcing NetworkPolicy, scrapes are dropped unless admitted: set `p
 When deploying via GitOps tools like ArgoCD, `helm template` passes the destination cluster's discovered API versions by default when connected to the target cluster. If default detection does not pick up your CRDs or if running disconnected templates, explicitly set `platformAgent.serviceMonitor: true` or `platformAgent.vmPodScrape: true` in your Helm values.
 
 `operator.metrics` is the operator's own listener: the manager serves controller-runtime's
-series and every `PlatformAgent`'s `status.usage` and `status.phase` as gauges
+series and every `PlatformAgent`'s `status.usage`, `status.phase` and `status.inference` as gauges
 (`kubeagents_platformagent_usage`, `kubeagents_platformagent_usage_time_seconds`,
-`kubeagents_platformagent_phase`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
+`kubeagents_platformagent_phase`, `kubeagents_platformagent_model`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
 on port `8080` (container port `metrics`), plain HTTP on the pod network.
 `operator.metrics.podMonitoring` renders `<release>-operator-monitoring` over the operator's
 pods, the same tri-state as `platformAgent.podMonitoring`. `operator.metrics.enabled: false`

@@ -1,6 +1,6 @@
 # The install's model: which provider and model an install is on
 
-**Status:** proposed, 2026-11-02. Workstream 6 of the telemetry epic that asked which model
+**Status:** implemented 2026-11-02. Workstream 6 of the telemetry epic that asked which model
 provider and model serve an install. Builds on
 [`usage-counters-producer.md`](usage-counters-producer.md) (the status block, its gauges and its
 zero-PII contract) and [`human-interaction-readings.md`](human-interaction-readings.md) (how a

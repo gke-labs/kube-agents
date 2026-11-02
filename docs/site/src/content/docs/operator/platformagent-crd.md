@@ -1289,7 +1289,7 @@ So each base has one spelling, the one the broker targets and protects. Changing
 
 ## `status`
 
-The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, and what each condition reports, follows.
+The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, where `inference` comes from, and what each condition reports, follows.
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
 `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
@@ -1330,6 +1330,21 @@ sweep.
 
 The operator also serves every counter, cluster gauge, proposal reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
+`inference.provider` and `inference.model` are the install's default model, the one LiteLLM serves
+under `model-default`. The operator reads the LiteLLM config ConfigMap the `litellm` Deployment
+mounts, or, with no such Deployment, the newest `litellm-config` or `litellm-config-*` ConfigMap
+that carries `config.yaml`. It takes the `litellm_params.model` of the `model_list` entry named
+`model-default`, or the first provider-qualified entry when no entry has that name, and splits it at
+its first `/`. A Vertex AI endpoint path (`projects/…`) or a Bedrock ARN keeps its resource id only,
+so no project id, region or account id is written; every other name is kept as typed, an
+organisation prefix such as `meta-llama/` included.
+
+The pair is written whole or not at all. Both fields are absent when the namespace has no LiteLLM
+config, or when the default model has no provider or no name; a `model-default` entry with a
+malformed model does not fall back to another entry. A read that fails keeps the last pair. The
+Ready status update writes the block, and a change to the ConfigMap or to the `litellm`
+Deployment's pod template re-reads it within a reconcile.
+
 `usage.activeInterfaces` is `dashboard` unless `harness.hermes.dashboardEnabled` is `false`, plus
 `googlechat`, `slack` and `teams` for each `integration` entry with `enabled: true`. It is resolved
 from the spec on every reconcile and written by the Ready status update when it changes; a pass that
@@ -1341,6 +1356,7 @@ operator notices from the write's echo, stops treating the missing field as a ch
 minutes at a time, and lands it once this release's CRD is applied: within five minutes on a quiet
 install, at once when the Ready status update next writes for any other reason. The other status
 writers carry the field through as they read it, so a pass that ends `Degraded` lands nothing new.
+`inference` follows the same rule under a served CRD that predates it.
 
 The counters and the two times land through the poller above, which consults the same five-minute
 record. Under a served CRD that predates `status.usage` they accumulate in the
