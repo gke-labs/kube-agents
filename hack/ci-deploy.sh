@@ -88,16 +88,18 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 #   (autoops-warning-event-triage, autoops-crashloop-config-triage,
 #   autoops-warning-event-no-action-triage, whose plant also fails on any
 #   answer but `injected`). A window longer than the gap folds repetition 2's
-#   incident into repetition 1's and no card comes. The unit queue below is
-#   repetition-major (`sort -k1,1n`), so the rest of the matrix runs between
-#   two repetitions of one case: over 18 nightlies (2026-10) the watcher's own
-#   log (artifacts/agent-api-auth.log) put consecutive repetitions of the first
-#   two at least 48.5 and 51.8 minutes apart, and the third's 181 minutes. A
-#   matrix holding one such case alone runs them back to back, and a
-#   repetition then still lasts at least 4.5 minutes (the third's shortest).
+#   incident into repetition 1's and no card comes. The fan-out in
+#   hack/ci-eval-pr.sh queues case by case and can launch a case's next
+#   repetition as soon as its last ends (#3939), so the gap can be as short
+#   as one repetition: at least 4.5 minutes (the third's shortest). Under
+#   the repetition-major queue before it, the rest of the matrix ran in
+#   between: over 18 nightlies (2026-10) the watcher's own log
+#   (artifacts/agent-api-auth.log) put consecutive repetitions of the first
+#   two at least 48.5 and 51.8 minutes apart, and the third's 181 minutes.
 #
 # 150 s clears the first by almost five times and stays under the second's
-# floor of 270 s. tests/test_ci_deploy_alert_quota.py holds it between them.
+# floor of 270 s, a margin of 120 s. tests/test_ci_deploy_alert_quota.py holds
+# it between them.
 readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="150"
 
 # The subscription the drift detector pulls from. The pool project's own

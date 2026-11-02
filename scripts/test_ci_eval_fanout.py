@@ -8,8 +8,9 @@ out of the script, in the same style as test_ci_eval_trap.py:
   - the lock deadline: a holder that died without releasing must convert into
     a loud per-unit failure, never a silent spin `wait` can outlast;
   - lock mutual exclusion: two contenders never hold one lock at once;
-  - queue order: repetition-major, cost-descending within a repetition, so a
-    lane is never parked on the task lock of a unit launched seconds earlier
+  - queue order: case by case, cost-descending, each case's repetitions
+    together, so a deadline-cut night keeps whole cases (#3939); launch_units
+    holds a unit back while its task runs, so no lane parks on the task lock
     (the 2026-08-31 pool run paid two of four lanes for twelve minutes that
     way).
 
@@ -148,11 +149,11 @@ class LockTest(unittest.TestCase):
 
 
 class QueueOrderTest(unittest.TestCase):
-    def queue(self, reps: int) -> list[tuple[int, int, int]]:
+    def queue(self, reps: int, block: str = "UNIT_QUEUE", requesting: str = "") -> list[tuple[int, int, int]]:
         src = SCRIPT.read_text(encoding="utf-8")
-        match = re.search(r'^UNIT_QUEUE="\$\(\n.*?^\)"$', src, re.DOTALL | re.MULTILINE)
+        match = re.search(rf'^{block}="\$\(\n.*?^\)"$', src, re.DOTALL | re.MULTILINE)
         if match is None:  # pragma: no cover
-            raise AssertionError(f"UNIT_QUEUE block not found in {SCRIPT}")
+            raise AssertionError(f"{block} block not found in {SCRIPT}")
         body = "\n".join(
             [
                 lifted("unit_cost_hint"),
@@ -161,12 +162,13 @@ class QueueOrderTest(unittest.TestCase):
                 # task is in this queue, as on the api lane.
                 lifted("unit_phase"),
                 f"EVAL_REPETITIONS={reps}",
+                f'INJECT_LANE_REQUESTING="{requesting}"',
                 # compliance carries a 1000 hint, the probe 200: order within a
                 # repetition must be cost-descending.
                 'TASKS=("t/reliability-pdb-probe/task.yaml" "t/compliance-rbac-overgrant/task.yaml")',
                 'TASK_NAMES=(reliability-pdb-probe compliance-rbac-overgrant)',
                 match.group(0),
-                'printf "%s\\n" "${UNIT_QUEUE}"',
+                f'printf "%s\\n" "${{{block}}}"',
             ]
         )
         result = run_bash(body)
@@ -186,6 +188,12 @@ class QueueOrderTest(unittest.TestCase):
         # launching while its last still runs.
         self.assertEqual([(r, i) for r, _, i in rows], [(1, 1), (2, 1), (3, 1), (1, 0), (2, 0), (3, 0)])
         self.assertGreater(rows[0][1], rows[3][1])
+
+    def test_the_writers_queue_is_case_major_too(self):
+        # The second phase runs one unit at a time, so its queue order alone
+        # decides what a cut-off writers night keeps.
+        rows = self.queue(reps=3, block="UNIT_QUEUE_WRITERS", requesting="reliability-pdb-probe,compliance-rbac-overgrant")
+        self.assertEqual([(r, i) for r, _, i in rows], [(1, 1), (2, 1), (3, 1), (1, 0), (2, 0), (3, 0)])
 
 
 class DelegationCeilingTest(unittest.TestCase):
