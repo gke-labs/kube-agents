@@ -472,6 +472,7 @@ A new install at the L container size (agent 8 CPU and 16 GB, credential proxy 8
 - **The sandbox shell is the next limit.** Its memory reached 93 to 94% of its fixed 2 GiB at 5 and 8 questions at once.
 - **The S size slows down instead of crashing.** The first-run flow finished in 56 minutes, but brokered commands waited up to 60 seconds and the audits took up to 3.6 times as long.
 - **Model tokens cost about $400 a day** for one install at 42 clusters in steady operation, at the list price of `gemini-3.5-flash`.
+- **The fleet sizes count small clusters.** The test clusters had about 6 nodes each. Kube-agents' load follows Pods and namespaces more than clusters, so a fleet of larger clusters reaches these limits at fewer clusters. A cluster of 1,000 nodes (20,000 to 40,000 Pods) is not measured; at the growth the `listing_pods` runs show, listing it in full would bring the sandbox shell near its fixed 2 GiB.
 - **The event watcher watches only the clusters registered before it starts.** On a new install that is none, until the gateway restarts, so the first-run measurements in this document and in the real-install test hold none of the event watcher's load.
 
 # Data to collect next

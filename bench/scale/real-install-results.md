@@ -4,14 +4,20 @@ Status on 2026-11-02: complete. Steps 1 to 8 and the stress stage have run.
 
 ## High level summary
 
-One install at the L container size runs a fleet of 40 to 42 clusters without a crash, at fair use
-and beyond it. Its containers have room to spare. Its Stall Watch does not: it checks each cluster
-for stuck controllers only about every 7 to 12 hours on this fleet. An install is one kube-agents
-deployment. The L size gives the agent 8 CPU and 16 GB, the credential proxy 8 CPU and 8 GB, and the
-event watcher 2 CPU and 4 GB. The test ran for about 40 hours. In that time no container was killed
-for memory, and at fair use no brokered command was refused and no prompt failed. A brokered command
-is a `kubectl` or `gcloud` command that the credential proxy runs for the agent. Beyond fair use, at
-5 questions at once, the credential proxy refused 2 commands. At 8 questions at once it restarted
+The cluster count is not the only measure of a fleet. The tested fleet had 40 to 42 small clusters.
+Each cluster had about 6 nodes, 435 Pods and 42 namespaces. The whole fleet had about 250 nodes,
+17,400 Pods and 1,683 namespaces. Each result in this document holds for that shape. A fleet with
+larger clusters loads the install more per cluster. The section "What this test does not cover"
+gives the limits that larger clusters reach first.
+
+One install at the L container size runs this fleet without a crash, at fair use and beyond it. Its
+containers have room to spare. Its Stall Watch does not: it checks each cluster for stuck
+controllers only about every 7 to 12 hours on this fleet. An install is one kube-agents deployment.
+The L size gives the agent 8 CPU and 16 GB, the credential proxy 8 CPU and 8 GB, and the event
+watcher 2 CPU and 4 GB. The test ran for about 40 hours. In that time no container was killed for
+memory, and at fair use no brokered command was refused and no prompt failed. A brokered command is
+a `kubectl` or `gcloud` command that the credential proxy runs for the agent. Beyond fair use, at 5
+questions at once, the credential proxy refused 2 commands. At 8 questions at once it restarted
 once, for a reason that is not known. No container that the L size sets used more than half of its
 limit.
 
@@ -24,7 +30,7 @@ and eight took 71 minutes. The time of a question does not grow with the cluster
 about 10 named clusters took longer than one about the whole fleet, because the upgrade script reads
 the whole fleet.
 
-The limits that matter at 40 clusters are not container sizes:
+The limits that matter for this fleet are not container sizes:
 
 - Stall Watch does not cover this fleet in one run. Stall Watch is the scheduled job that looks for
   stuck controllers. It runs every 30 minutes and stops each run at a 25-minute budget. With no
@@ -52,9 +58,9 @@ The test found six defects in the product:
 6. After an outage, the event watcher creates a large queue of triage tasks at once: about 120 in 10
    minutes.
 
-Model tokens are the largest running cost. In steady operation the install used $16.6 of tokens per
-hour, about $400 per day. One install on GKE costs about $0.40 per hour. The 40-cluster test fleet
-costs about $15 per hour.
+Model tokens are the largest running cost. In steady operation, on this fleet, the install used
+$16.6 of tokens per hour, about $400 per day. One install on GKE costs about $0.40 per hour. The
+40-cluster test fleet costs about $15 per hour.
 
 ## Expected conclusions
 
@@ -87,7 +93,7 @@ the Result column says whether the data confirms the prediction.
 | Credential proxy                 | limit 8 CPU, 8 GB                                                                                                                                                                                                                                                                                                                                                      |
 | Event watcher (`agent-api-auth`) | limit 2 CPU, 4 GB                                                                                                                                                                                                                                                                                                                                                      |
 | Sandbox shell                    | 2 CPU, 2 GiB (fixed in the operator)                                                                                                                                                                                                                                                                                                                                   |
-| Test fleet                       | 40 zonal clusters in one zone, 248 nodes, 17,385 Pods, 7,643 Deployments, 7,520 Services, 7,240 HPAs, 14,003 ConfigMaps, 1,683 namespaces                                                                                                                                                                                                                              |
+| Test fleet                       | **40 clusters × about 6 nodes = 248 nodes** (2 × e2-standard-2 and about 4 × e2-small per cluster), zonal, one zone; 17,385 Pods (about 435 per cluster), 7,643 Deployments, 7,520 Services, 7,240 HPAs, 14,003 ConfigMaps, 1,683 namespaces (about 42 per cluster). From Step 5 on, 42 clusters and 253 nodes.                                                        |
 | Load                             | 3 Pods created per minute per run (2.8 achieved), 5 failing Pods                                                                                                                                                                                                                                                                                                       |
 | Planted signal                   | one hot Deployment (`payments/hot-api`, 6 busy Pods) on `scale-07`                                                                                                                                                                                                                                                                                                     |
 
@@ -434,6 +440,35 @@ in the first run (finding 9). So the S size did not carry the event watcher's lo
     took 3.6 times as long, and one Stall Watch run ran past its budget to 28 minutes. No container was
     killed for memory. The agent's memory metric read 2.35 GB against its 2 GiB limit with no OOMKill,
     so the metric likely counts memory the kernel can reclaim; the record cannot show the working set.
+
+## What this test does not cover
+
+The test varied the cluster count and kept each cluster small. Kube-agents' load follows the
+objects in a cluster more than the clusters: the Pods it lists, the namespaces Stall Watch reads,
+and the events the event watcher sees. A cluster of 1,000 nodes typically runs 20,000 to 40,000
+Pods, 50 to 90 times one test cluster.
+
+| Measured point                               | Nodes per cluster | Pods per cluster | Result                                                                                                        |
+| -------------------------------------------- | ----------------- | ---------------- | ------------------------------------------------------------------------------------------------------------- |
+| This test                                    | about 6           | about 435        | The results above                                                                                             |
+| Phase 2, `listing_pods` factor               | 50                | about 4,500      | Listing 87 to 124 s; fleet audit 8 to 30 minutes; credential proxy up to 0.74 GB; sandbox shell up to 0.32 GB |
+| Phase 1, `nodes` factor (event watcher only) | 100               | about 1,000      | Event watcher 0.18 GB                                                                                         |
+
+From these points, a projection for clusters of hundreds of nodes, not a measurement:
+
+1. The sandbox shell's memory runs out first. Every `kubectl` output passes through it, and its
+   2 GiB is fixed in the operator. Listing 30,000 Pods in full would need about 1.5 to 2.3 GB at
+   the measured growth.
+2. Questions and audits take longer in proportion to the Pods listed, and Stall Watch reads fewer
+   clusters per run.
+3. The credential proxy needs about 3 to 5.5 GB for the same listing, which is inside the L size.
+4. Tool outputs grow, so each question uses more tokens, or the agent sees truncated output.
+5. The event watcher's memory stayed flat in every test, and its session quota caps triage.
+
+So the fleet sizes in this document are counts of small clusters. A fleet of 40 clusters of 1,000
+nodes is not covered, and one such cluster may already reach the sandbox shell's limit. A test with
+simulated nodes (KWOK, Kubernetes WithOut Kubelet) at 100, 500 and 1,000 nodes per cluster would
+measure it without the cost of real nodes.
 
 ## Cost
 
