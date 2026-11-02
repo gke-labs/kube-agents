@@ -412,6 +412,26 @@ class PredictionTest(unittest.TestCase):
         self.assertAlmostEqual(prediction.value, 100)
         self.assertEqual(hl.basis(prediction), "measured at the base point")
 
+    def test_an_operation_without_a_base_run_grows_from_the_data_s_base_point(self):
+        # The second operation was run only at 24 and 32 clusters, falling as the fleet grows; anchored at
+        # its own lowest run, it would add 22 clusters of its slope at the base point itself.
+        records = clusters_line() + parse(
+            *(
+                record(
+                    "clusters",
+                    clusters,
+                    operation="daily_fan_out",
+                    metrics=((RUN_METRIC, None, value),),
+                    totals={"clusters": clusters},
+                )
+                for clusters, value in ((24, 300.0), (32, 100.0))
+            )
+        )
+
+        prediction = hl.predict(records, RUN_METRIC, None, hl.base_fleet(records))
+
+        self.assertAlmostEqual(prediction.value, 100)
+
     def test_inside_the_measured_range_the_line_interpolates(self):
         records = clusters_line()
 
@@ -1072,6 +1092,17 @@ class HarnessLimitsPageTest(unittest.TestCase):
         self.assertIn("Can this fleet be handled?", " ".join(str(item.value) for item in app.subheader))
         self.assertNotIn("Raw records", [item.label for item in app.expander])
 
+    def test_a_capacity_from_the_model_is_not_reported_as_measured(self):
+        with patch.object(hl, "measured_install_capacity", return_value=None):
+            app = self.open_page()
+
+        self.assertEqual(len(app.exception), 0, [item.value for item in app.exception])
+        verdict = " ".join(str(item.value) for item in [*app.success, *app.error])
+        self.assertIn("(the model's line)", verdict)
+        self.assertNotIn("(measured)", verdict)
+        text = " ".join(str(item.value) for item in app.markdown)
+        self.assertNotIn("the shell peaked at 0%", text)
+
     def test_the_custom_fleet_starts_at_the_measured_base(self):
         app = self.custom_fleet(self.open_page())
 
@@ -1441,10 +1472,6 @@ class UsualLimitsTest(unittest.TestCase):
         self.assertEqual(hl.usual_limits(records)["envoy-credential-proxy"], default)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ForecastNumbersTest(unittest.TestCase):
     """The Limits forecast's numbers, asserted, on a small fleet whose answers can be worked by hand."""
 
@@ -1521,3 +1548,7 @@ class ForecastNumbersTest(unittest.TestCase):
         self.assertEqual(summary.runs, 3)
         [clusters] = [item for item in summary.inputs if item.label == "Clusters"]
         self.assertEqual((clusters.low, clusters.high, clusters.levels), (2, 16, 3))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -47,7 +47,7 @@ STORY = (
 )
 SPLIT_NONE = "One install holds all {clusters:,.0f} clusters."
 SPLIT_NEEDED = (
-    "One install holds about {held:.0f} clusters (measured), so {clusters:,.0f} clusters need "
+    "One install holds about {held:.0f} clusters ({source}), so {clusters:,.0f} clusters need "
     "**{installs:,} installs of about {per_install:.0f} clusters**, or {stall_installs:,} for Stall Watch "
     "to read every cluster each half hour."
 )
@@ -66,6 +66,14 @@ SHELL_FIXED_LINE = (
     "starts there, so the command path carries about 1.5 commands per second. At {held:.0f} clusters "
     "the shell peaked at {shell:.0%} of it."
 )
+# Without a measured fleet that held there is no run at the capacity to read the shell's peak from.
+SHELL_FIXED_MODEL_LINE = (
+    "- **Sandbox shell: 2 CPU, fixed by the kube-agents operator, not by GKE.** Every brokered command "
+    "starts there, so the command path carries about 1.5 commands per second. No measured fleet held, "
+    "so the {held:.0f} clusters here are the model's line, not a measurement."
+)
+HELD_MEASURED = "measured"
+HELD_MODELLED = "the model's line"
 SHELL_SETTABLE_LINE = (
     "- **Sandbox shell: sized like the other containers here,** which assumes an operator change. "
     "Past {held:.0f} clusters nothing is measured, so the next limit there is unknown."
@@ -238,7 +246,8 @@ with st.expander("Change the fleet size"):
         )
 plan = hl.install_plan(records, containers, fleet)
 # What one install holds: the largest measured fleet that held, or the model's line without one.
-held = hl.measured_install_capacity(records) or plan.capacity
+measured_held = hl.measured_install_capacity(records)
+held = measured_held or plan.capacity
 stall_seconds = hl.stall_watch_seconds_per_cluster(records)
 stall_clusters = hl.STALL_WATCH_BUDGET_SECONDS / stall_seconds if stall_seconds else None
 per_install_clusters = min(fleet[hl.CLUSTERS], held) if held else plan.fleet[hl.CLUSTERS]
@@ -276,6 +285,7 @@ if installs == 1:
 else:
     split_text = SPLIT_NEEDED.format(
         clusters=fleet[hl.CLUSTERS], held=held or 0.0, installs=installs,
+        source=HELD_MEASURED if measured_held else HELD_MODELLED,
         per_install=install_fleet[hl.CLUSTERS], stall_installs=stall_installs,
     )
 # The same sizes the list below gives: a settable container is short where its need passes its size.
@@ -302,7 +312,11 @@ shell_limit = defaults.get(hl.SHELL_CONTAINER, {}).get(hl.LIMIT_CPU) or 1.0
 with st.expander("Why these limits cannot be raised"):
     st.markdown(
         FIXED_WHY.format(
-            shell_line=(SHELL_SETTABLE_LINE if shell_settable else SHELL_FIXED_LINE).format(
+            shell_line=(
+                SHELL_SETTABLE_LINE if shell_settable
+                else SHELL_FIXED_LINE if measured_held
+                else SHELL_FIXED_MODEL_LINE
+            ).format(
                 held=held or 0.0, shell=shell_peak / shell_limit
             ),
             held=held or 0.0,

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
+import sys
 import subprocess
 import threading
 import time
@@ -1116,6 +1119,89 @@ def test_a_held_lease_is_released_when_the_block_ends(monkeypatch):
     with runner.hold_lease(plan, "test"):
         assert calls == ["acquire"]
     assert calls == ["acquire", "release"]
+
+
+def test_the_dry_run_stops_where_limit_stops_the_run(monkeypatch, tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: ["scale-01", "scale-02"])
+    specs = [s for s in plan.matrix() if s.factor == "clusters" and s.level in (40, 32)]
+    lines = run.dry_run(specs, force=True, limit=2)
+    assert lines[0] == "2 runs to do (of 8); test clusters now: 2"
+    assert sum(line.startswith("level ") for line in lines) == 1
+    assert sum(line.startswith("  run ") for line in lines) == 2
+
+
+@pytest.mark.parametrize("command", ["apply", "teardown"])
+def test_dry_run_is_refused_where_it_is_not_implemented(command, capsys):
+    with pytest.raises(SystemExit):
+        runner.main([command, str(PHASE4), "--dry-run", "--delete-fleet"])
+    assert "--dry-run applies to run only" in capsys.readouterr().err
+
+
+def test_the_lease_script_runs_where_no_install_env_can_be_found(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    monkeypatch.setenv("CLAUDE_CWD", "/some/checkout")
+    seen = []
+
+    def lease(args, **kwargs):
+        seen.append((kwargs["env"].get("CLAUDE_CWD"), kwargs["cwd"]))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with runner.hold_lease(plan, "test"):
+        pass
+    assert all(cwd_var is None and cwd and "harness-scale-lease-" in cwd for cwd_var, cwd in seen)
+
+
+def test_the_lease_is_renewed_while_the_block_runs(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    monkeypatch.setitem(plan.settings, "lease_ttl_minutes", 1)
+    monkeypatch.setattr(runner, "SECONDS_PER_MINUTE", 0.03)
+    calls = []
+
+    def lease(args, **kwargs):
+        calls.append(args[2])
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with runner.hold_lease(plan, "test"):
+        time.sleep(0.1)
+    assert calls[0] == "acquire" and calls[-1] == "release"
+    assert "renew" in calls
+
+
+def test_a_lease_that_cannot_be_renewed_stops_the_run(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    monkeypatch.setitem(plan.settings, "lease_ttl_minutes", 1)
+    monkeypatch.setattr(runner, "SECONDS_PER_MINUTE", 0.03)
+
+    def lease(args, **kwargs):
+        code = 1 if args[2] == "renew" else 0
+        return subprocess.CompletedProcess(args, code, stdout="not the holder", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with pytest.raises(KeyboardInterrupt):
+        with runner.hold_lease(plan, "test"):
+            time.sleep(1)
+            pytest.fail("the run went on without its lease")
+
+
+def test_a_triggered_run_is_read_past_the_skip_row_a_later_tick_writes(tmp_path):
+    (tmp_path / "cron").mkdir()
+    db = sqlite3.connect(tmp_path / "cron" / "executions.db")
+    db.execute("create table executions(job_id, status, claimed_at, started_at, finished_at)")
+    db.execute("insert into executions values('stall-watch', 'completed', '2026-01-01T00:05', '2026-01-01T00:05', "
+               "'2026-01-01T00:30')")
+    db.execute("insert into executions values('stall-watch', 'skipped', '2026-01-01T00:10', NULL, '2026-01-01T00:10')")
+    db.commit()
+    out = subprocess.run([sys.executable, "-c", runner.operations.JOB_RUNS_SCRIPT, "2026-01-01T00:00", "stall-watch"],
+                         env={**os.environ, "HERMES_HOME": str(tmp_path)}, capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["stall-watch", "completed", "2026-01-01T00:30", "2026-01-01T00:05"]
+
+
+def test_a_run_inside_a_measured_stall_watch_pass_is_marked_as_sharing_the_broker():
+    # Phase 4's 32-cluster fan-out started 1,301 s after the 02:00 tick, inside a pass at the measured
+    # rate of about 50 s per cluster; at 8 clusters the pass is over by 520 s.
+    assert runner._overlaps_stall_watch("2026-10-29T02:21:41Z", "2026-10-29T02:28:00Z", 32)
+    assert not runner._overlaps_stall_watch("2026-10-29T02:10:00Z", "2026-10-29T02:15:00Z", 8)
 
 
 def test_a_run_another_phase_recorded_is_skipped_with_a_warning(monkeypatch, tmp_path, caplog):

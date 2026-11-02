@@ -123,12 +123,14 @@ JOB_TRIGGER_SCRIPT = (
     "if missed:\n    sys.exit('not marked: ' + ' '.join(missed))\n"
 )
 # Reads a roster's run rows: per job, the latest run claimed since a time, as "job status finished started".
+# The run a trigger started: the first claimed since the trigger. A tick that finds the job still
+# running writes a skip row (status 'skipped', claimed and finished at once), which is not a run.
 JOB_RUNS_SCRIPT = (
     "import os, sqlite3, sys\n"
     "db = sqlite3.connect(os.path.join(os.environ['HERMES_HOME'], 'cron', 'executions.db'))\n"
     "for job in sys.argv[2:]:\n"
     "    row = db.execute('select status, finished_at, started_at from executions where job_id = ? and claimed_at >= ? '\n"
-    "                     'order by claimed_at desc limit 1', (job, sys.argv[1])).fetchone()\n"
+    "                     \"and status != 'skipped' order by claimed_at asc limit 1\", (job, sys.argv[1])).fetchone()\n"
     "    print(job, *(row or ('unclaimed', None, None)))\n"
 )
 JOB_TIMEOUT_SECONDS = 120

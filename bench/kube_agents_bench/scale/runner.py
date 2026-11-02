@@ -27,7 +27,9 @@ import re
 import signal
 import subprocess
 import sys
+import _thread
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -61,8 +63,15 @@ LEASE_SESSION_PREFIX = "harness-scale-"
 LEASE_ENV_NAME = "harness-scale-host"
 LEASE_ENVS_NAME = "live-test-envs.json"
 LEASE_DIRECTORY_PREFIX = "harness-scale-lease-"
-# Long enough for a plan of about 30 runs; a plan sets lease_ttl_minutes for more.
-LEASE_TTL_MINUTES = 720
+# Short, and renewed while the runner works: a runner that dies without releasing holds the lease
+# this long at most, and a run of any length stays leased.
+LEASE_TTL_MINUTES = 60
+# Renewals per TTL, so one failed renewal still leaves time for the next.
+LEASE_RENEWALS_PER_TTL = 3
+# Consecutive failed renewals after which the run stops: the lease then has a third of its TTL left.
+LEASE_RENEWAL_FAILURES_TO_STOP = 2
+# The lease script discovers a checkout's install.env from this variable or its working directory.
+LEASE_CWD_VAR = "CLAUDE_CWD"
 # Operation kinds whose runs make model calls of their own: prompts, triggered jobs, an onboarding.
 MODEL_CALL_KINDS = ("prompt", "trigger_soak", "reset_soak")
 DRAIN_POLL_SECONDS = 60
@@ -75,12 +84,15 @@ PROXY_LOAD_FITS = ("proxy_load_per_second", "proxy_load_p50_seconds", "proxy_loa
 TOKEN_FITS = ("tokens_input", "tokens_output", "tokens_cached", "run_tokens_input", "run_tokens_output",
               "run_tokens_cached")
 # The Platform Agent's Stall Watch reads every cluster through the broker, one at a time, at
-# :00 and :30 (agents/platform/cron/jobs.json). How long a tick keeps the broker busy, from the
-# stored prompt runs: the ones that started 2 to 6 minutes after a tick at 2 to 16 clusters show
-# its commands and shell CPU, and the ones 4 to 8 minutes after it at 2 to 8 clusters do not.
+# :00 and :30 (agents/platform/cron/jobs.json), and stops at its budget (TICK_BUDGET_SECONDS in
+# agents/platform/scripts/stall_watch.py), which it checks only between reads, so a pass can run
+# past it: Phase 4's 32-cluster pass was still running 1,753 s after its tick. How long a tick keeps
+# the broker busy: Phase 4 measured passes of 120 s at 2 clusters and 418 s at 8 (job_seconds),
+# about 50 s per cluster, with no cap; the base is kept from the earlier rule, so the window is
+# never narrower than before.
 STALL_WATCH_PERIOD_SECONDS = 1800
 STALL_WATCH_BASE_SECONDS = 120
-STALL_WATCH_SECONDS_PER_CLUSTER = 30
+STALL_WATCH_SECONDS_PER_CLUSTER = 50
 # A trigger_soak's jobs: the slowest one's run time and how many completed, both read after the drain.
 JOB_SECONDS_METRIC = "job_seconds"
 JOBS_COMPLETED_METRIC = "jobs_completed"
@@ -678,16 +690,17 @@ class Runner:
             self.flush_peaks(awaiting, wait=True)
         return not stopped
 
-    def dry_run(self, specs: list[RunSpec], force: bool) -> list[str]:
+    def dry_run(self, specs: list[RunSpec], force: bool, limit: int = 0) -> list[str]:
         """What ``run`` would do, as lines: each level's cluster creates and deletes, and each run.
 
         Reads the project's clusters and, unless ``force``, the data file and the install's build to
         leave out runs already recorded; changes nothing.
         """
         pending = specs if force else self.pending(specs)
+        todo = pending[:limit] if limit else pending
         current = set(kube.clusters_with_prefix(self.project, self.zone, self.prefix, self.label))
-        lines = [f"{len(pending)} runs to do (of {len(specs)}); test clusters now: {len(current)}"]
-        for (factor, level), group in itertools.groupby(pending, key=lambda s: (s.factor, s.level)):
+        lines = [f"{len(todo)} runs to do (of {len(specs)}); test clusters now: {len(current)}"]
+        for (factor, level), group in itertools.groupby(todo, key=lambda s: (s.factor, s.level)):
             values = self.plan.level_values(factor, level)
             wanted = set(self.cluster_names(int(values[CLUSTERS_TOTAL])))
             create, delete = sorted(wanted - current), sorted(current - wanted)
@@ -878,12 +891,15 @@ def hold_lease(plan: Plan, note: str):
         envs.write_text(json.dumps({"installs": [
             {"name": LEASE_ENV_NAME, "context": target["host_context"], "namespace": target["namespace"]}
         ]}))
-        env = {**os.environ, LEASE_ENVS_VAR: str(envs), LEASE_SESSION_VAR: f"{LEASE_SESSION_PREFIX}{os.getpid()}"}
+        # Run the script from the empty directory with no checkout named, so it finds no install.env:
+        # a checkout's own install.env naming the same host would replace this entry and its name.
+        env = {key: value for key, value in os.environ.items() if key != LEASE_CWD_VAR}
+        env.update({LEASE_ENVS_VAR: str(envs), LEASE_SESSION_VAR: f"{LEASE_SESSION_PREFIX}{os.getpid()}"})
         ttl = str(int(plan.settings.get("lease_ttl_minutes", LEASE_TTL_MINUTES)))
 
         def lease(*args: str) -> subprocess.CompletedProcess:
             return subprocess.run([sys.executable, str(LEASE_SCRIPT), *args, "--env", LEASE_ENV_NAME],
-                                  env=env, capture_output=True, text=True, check=False)
+                                  env=env, cwd=directory, capture_output=True, text=True, check=False)
 
         acquired = lease("acquire", "--ttl", ttl, "--note", note)
         if acquired.returncode != 0:
@@ -891,10 +907,31 @@ def hold_lease(plan: Plan, note: str):
             # context, a kubectl failure): the script's own output says which.
             raise SystemExit(f"could not take the install's live-test lease (exit {acquired.returncode}); "
                              f"not running:\n{acquired.stdout}{acquired.stderr}")
-        LOG.info("holding the live-test lease on %s for up to %s minutes", target["host_cluster"], ttl)
+        LOG.info("holding the live-test lease on %s, renewed every %s minutes", target["host_cluster"],
+                 int(ttl) // LEASE_RENEWALS_PER_TTL)
+        stop = threading.Event()
+
+        def renew() -> None:
+            # A soak sleeps for hours inside one run, so the renewal runs beside the work, not between runs.
+            failures = 0
+            while not stop.wait(int(ttl) * SECONDS_PER_MINUTE / LEASE_RENEWALS_PER_TTL):
+                renewed = lease("renew", "--ttl", ttl)
+                failures = 0 if renewed.returncode == 0 else failures + 1
+                if failures:
+                    LOG.warning("could not renew the live-test lease: %s", renewed.stdout + renewed.stderr)
+                if failures >= LEASE_RENEWAL_FAILURES_TO_STOP:
+                    # Stop the run before the lease lapses, so it never changes the install unleased.
+                    LOG.error("stopping: the live-test lease could not be renewed %s times", failures)
+                    _thread.interrupt_main()
+                    return
+
+        renewer = threading.Thread(target=renew, name="lease-renewer", daemon=True)
+        renewer.start()
         try:
             yield
         finally:
+            stop.set()
+            renewer.join()
             released = lease("release")
             if released.returncode != 0:
                 LOG.warning("could not release the live-test lease; it expires on its own after %s minutes: %s",
@@ -915,6 +952,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true",
                         help="run: print each level's cluster creates and deletes and each run, and change nothing")
     args = parser.parse_args(argv)
+    if args.dry_run and args.command != "run":
+        parser.error("--dry-run applies to run only")
     # SIGTERM ends the run like Ctrl-C does, so the churner, the relay and pending peaks are cleaned up.
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(TERMINATED_EXIT_CODE))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -941,7 +980,7 @@ def main(argv: list[str] | None = None) -> int:
     atexit.register(private.unlink, missing_ok=True)
     runner = Runner(plan, data_file)
     if args.command == "run" and args.dry_run:
-        print("\n".join(runner.dry_run(specs, args.force)))
+        print("\n".join(runner.dry_run(specs, args.force, args.limit)))
         return 0
     if args.command in MUTATING_COMMANDS:
         with hold_lease(plan, f"harness scale {args.command} {args.config.name}"):

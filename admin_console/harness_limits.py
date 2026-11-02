@@ -1292,6 +1292,10 @@ def _contribution(
         return None
     fit = fit_line(points)
     base_x = _base_x(records, operation, factor)
+    if base_x is None:
+        # An operation with no base run grows from the data's base point, where the base value it is
+        # added to was measured; from its own lowest run it would leave out the growth below that.
+        base_x = fleet_value(factor, base_fleet(records))
     if base_x is None and fit is not None:
         base_x = fit.x_min
     fleet_x = fleet_value(factor, fleet)

@@ -74,7 +74,9 @@ deletes, and each run, marked where it makes model calls of its own. `run`, `app
 hold the experiment install's live-test lease while they work
 ([`docs/designs/live-test-lease.md`](../../docs/designs/live-test-lease.md)), so a second runner or
 an agent's live validation cannot change the install at the same time; a lease another holder has
-refuses the command. The lease lasts `lease_ttl_minutes` (default 720).
+refuses the command. The lease lasts `lease_ttl_minutes` (default 60) and the runner renews it
+every third of that while it works. After two failed renewals in a row it stops the run, so it never
+changes the install unleased; a runner that dies frees the lease within the TTL.
 
 An operation's `kind` says what a run does:
 
@@ -110,7 +112,7 @@ Settings with no default: `churn_pod_lifetime_seconds`, `fixture_machine_type`, 
 - `test_cluster_machine_type`: the machine type of new test clusters, for a zone short of the
   default one;
 - `cluster_registration_timeout_seconds`: how long to wait for a Cluster Agent profile.
-- `lease_ttl_minutes`: how long a run's live-test lease lasts before another holder can take it.
+- `lease_ttl_minutes`: the live-test lease's TTL; the runner renews it every third of that.
 - `trigger_drain_seconds`: how long the run after a `trigger_soak` waits for its jobs to finish.
 
 The agent API is reached through the repository's `kubectl exec` relay
@@ -191,7 +193,7 @@ run saw a provider 429 or an unfinished prompt, or, for a fleet audit or upgrade
 before answers were kept, when its completion cannot be checked. The CPU, memory and proxy metrics
 are left out too when work other than the run's own shared the broker: jobs an earlier `trigger_soak`
 started were still running; a prompt or boot-burst run started inside a Stall Watch read (2 minutes
-plus 30 seconds per cluster after :00 or :30) or held a tick; a proxy load run's broker ran a command its
+plus 50 seconds per cluster after :00 or :30) or held a tick; a proxy load run's broker ran a command its
 workers did not send (its throughput and tokens are left out as well). A prompt answered without its
 operation is left out of those and of the token metrics. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records whose operation the plan names, and warns how many it passed over; with a data file several plans wrote, run it once per plan. `remonitor` reads every stored record's Cloud
 Monitoring metrics again with the current queries, within Monitoring's retention, and writes its own

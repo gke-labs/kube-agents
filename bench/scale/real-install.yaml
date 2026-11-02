@@ -55,7 +55,6 @@ settings:
   trigger_reconcile: true
   cluster_create_parallelism: 10
   watcher_wait_seconds: 600
-  lease_ttl_minutes: 1440
 
 operations:
   # Step 3: the install's state volumes reset, so its first-run flow starts as on a new install, with
