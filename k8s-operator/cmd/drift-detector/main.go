@@ -621,7 +621,12 @@ func realMain(argv []string) error {
 	// rather than a refusal because the overrun costs redelivery and not
 	// correctness, and a probe that fails is a warning because the grant it needs
 	// is one roles/pubsub.subscriber does not include.
-	if line := ackDeadlinePreflight(ctx, source.AckDeadline, f.batchJoinBudget); line != "" {
+	deadline, line := ackDeadlinePreflight(ctx, source.AckDeadline, f.batchJoinBudget)
+	// The same read sizes how long a pull refused as oversize keeps the window
+	// small: the deadline plus the longest retry backoff, after which the
+	// refused batch has certainly been redelivered. Unread, the API ceilings.
+	sub.setAckDeadline(deadline)
+	if line != "" {
 		log.Printf("%s: %s", commandName, line)
 	}
 

@@ -35,7 +35,9 @@ const (
 	// defaultMaxMessages is the most messages one Pull asks for (the window
 	// below starts here and shrinks only after a refused answer). The surviving
 	// post-sink stream measured about 0.7 messages a second on a two-cluster
-	// project and up to 10 a second on three busier ones, so a round trip
+	// project and up to 10 a second on three busier ones, with the sink's
+	// lease exclusion then narrowed to *.iam.gserviceaccount.com (the
+	// whole-domain exclusion it carries now delivers less), so a round trip
 	// drains somewhere between ten seconds and two minutes of backlog -- and
 	// stays far below the API's 1000 ceiling at either end.
 	defaultMaxMessages = 100
@@ -76,15 +78,28 @@ const (
 	// pullBackoffMultiplier is the growth factor between retries.
 	pullBackoffMultiplier = 2
 
-	// oversizeAnswerStatus is the HTTP status the credential broker's watcher
-	// relay answers when a pull's body ran past its response cap (16 MiB, a
-	// cap no single Pub/Sub message can exceed but a batch of them can). It is
-	// the one pull failure that retrying at the same size cannot clear: Pub/Sub
-	// has leased the batch by then, re-leases it at every ack deadline, and
-	// every retry asks for the same batch, so the loop makes no progress until
-	// it asks for less. A 502 from anywhere else is transient and the window
-	// grows back once the backlog drains, so it costs a few smaller pulls.
+	// oversizeAnswerStatus and oversizeAnswerCode are the HTTP status and the
+	// body code the credential broker's watcher relay answers when a pull's
+	// body ran past its response cap (16 MiB, a cap no single Pub/Sub message
+	// can exceed but a batch of them can). It is the one pull failure that
+	// retrying at the same size cannot clear: Pub/Sub has leased the batch by
+	// then, re-leases it at every ack deadline, and every retry asks for the
+	// same batch, so the loop makes no progress until it asks for less. The
+	// code is checked as well as the status because a 502 reaches this loop
+	// from elsewhere too -- a connection the broker could not open, a Pub/Sub
+	// 5xx passed through -- and none of those is cured by a smaller pull.
 	oversizeAnswerStatus = http.StatusBadGateway
+	oversizeAnswerCode   = "UPSTREAM_UNRELAYABLE"
+
+	// pubsubMaxAckDeadline and pubsubMaxRetryBackoff are the API's ceilings on
+	// a subscription's ackDeadlineSeconds and on its retry policy's
+	// maximum_backoff. Their sum is the longest a refused batch can take to
+	// become deliverable again: the lease has to expire, and the subscription's
+	// retry policy (the drift-pubsub module sets one) then holds the batch for
+	// its backoff before redelivering it. The default hold after a refusal, used
+	// when the subscription's own deadline could not be read at startup.
+	pubsubMaxAckDeadline  = 600 * time.Second
+	pubsubMaxRetryBackoff = 600 * time.Second
 
 	// pullWindowShrinkDivisor is how much the pull window shrinks by after an
 	// oversize answer. Halving reaches a fitting size from the ceiling in a
@@ -216,14 +231,17 @@ func ackDeadlineWarning(budget, deadline time.Duration) string {
 // sits in a function no test can call. Taking the reader as a function rather
 // than a messageSource keeps that reachable without widening the interface for
 // one caller.
-func ackDeadlinePreflight(ctx context.Context, read func(context.Context) (time.Duration, error), budget time.Duration) string {
+//
+// The deadline it read comes back with the line, zero when the probe failed,
+// so the subscriber can size its hold after a refused pull from the same read.
+func ackDeadlinePreflight(ctx context.Context, read func(context.Context) (time.Duration, error), budget time.Duration) (time.Duration, string) {
 	probeCtx, cancel := context.WithTimeout(ctx, ackDeadlineProbeTimeout)
 	defer cancel()
 	deadline, err := read(probeCtx)
 	if err != nil {
-		return fmt.Sprintf("could not read the subscription's ack deadline (%v); --batch-join-budget=%s is unchecked against it", err, budget)
+		return 0, fmt.Sprintf("could not read the subscription's ack deadline (%v); --batch-join-budget=%s is unchecked against it", err, budget)
 	}
-	return ackDeadlineWarning(budget, deadline)
+	return deadline, ackDeadlineWarning(budget, deadline)
 }
 
 // receivedMessage is one Pub/Sub message with its payload already decoded.
@@ -447,21 +465,25 @@ type subscriber struct {
 
 	// window is how many messages the next Pull asks for: maxMessages, the
 	// --max-messages ceiling, until a pull is refused as oversize, then halved
-	// per refusal down to pullWindowFloor, and back to the ceiling once the
-	// smaller window has drained the backlog (windowDelivered, below). Held
-	// rather than grown while pulls keep returning messages: doubling back on
-	// every success would overshoot on every other pull under a sustained
-	// stream of large entries, and each overshoot strands a batch for an ack
-	// deadline.
+	// per refusal down to pullWindowFloor, and back to the ceiling on an empty
+	// pull once refusalHold has passed since the refusal. Held rather than
+	// grown while pulls keep returning messages: doubling back on every
+	// success would overshoot on every other pull under a sustained stream of
+	// large entries, and each overshoot strands a batch for an ack deadline.
 	window int64
 
-	// windowDelivered is whether the current, reduced window has returned at
-	// least one batch. The window is restored to the ceiling on an empty pull
-	// only once it has: the pull right after a refusal comes back empty
-	// because Pub/Sub still holds the refused batch for its ack deadline, and
-	// restoring on that empty pull would ask for the same oversize batch again
-	// when the deadline expires, forever.
-	windowDelivered bool
+	// refusedAt is when the last oversize refusal happened, zero before any.
+	// refusalHold is how long after it an empty pull may restore the window:
+	// the subscription's ack deadline plus the retry policy's longest backoff
+	// once setAckDeadline has the deadline, the API ceilings on both before.
+	// Time-keyed rather than keyed on a delivery at the smaller window, because
+	// an empty pull proves the backlog is drained only once the refused batch
+	// has had time to come back: Pub/Sub holds it for its lease and then its
+	// backoff, and on a live subscription the pulls in between deliver whatever
+	// arrived since. Restoring on one of those would ask for the same oversize
+	// batch again when it is redelivered, at every deadline.
+	refusedAt   time.Time
+	refusalHold time.Duration
 
 	// idleReport is how long the loop tolerates delivering nothing before
 	// logging that fact. A field rather than the constant read directly, so a
@@ -504,6 +526,7 @@ func newSubscriber(source messageSource, handle recordHandler, maxMessages int64
 		handle:      handle,
 		maxMessages: maxMessages,
 		window:      maxMessages,
+		refusalHold: pubsubMaxAckDeadline + pubsubMaxRetryBackoff,
 		idleWait:    idlePollInterval,
 		idleReport:  idleReportInterval,
 		joinBudget:  joinBudget,
@@ -540,7 +563,7 @@ func (s *subscriber) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			s.shrinkWindow(err)
+			s.shrinkWindow(err, pullStart)
 			log.Printf("drift-detector: pull failed, retrying in %s: %v", backoff, err)
 			if !sleepCtx(ctx, backoff) {
 				return ctx.Err()
@@ -555,7 +578,7 @@ func (s *subscriber) Run(ctx context.Context) error {
 		s.pulledAt = pullStart
 
 		if len(messages) == 0 {
-			s.restoreWindow()
+			s.restoreWindow(pullStart)
 			// Reset on report rather than only on delivery, so a subscription
 			// that stays empty says so every interval instead of once.
 			if now := s.clock(); now.Sub(lastDelivery) >= s.idleReport {
@@ -567,7 +590,6 @@ func (s *subscriber) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		s.windowDelivered = true
 
 		s.processBatch(ctx, messages)
 		// After the batch, not before: a subscription delivering steadily must
@@ -578,14 +600,28 @@ func (s *subscriber) Run(ctx context.Context) error {
 	}
 }
 
+// setAckDeadline sizes the hold after a refusal from the subscription's own
+// ack deadline, read by the startup probe: the deadline plus the longest
+// retry backoff the API allows, which is when a refused batch is certainly
+// deliverable again. A zero or negative deadline (the probe failed) keeps the
+// default, the API's ceiling on both.
+func (s *subscriber) setAckDeadline(deadline time.Duration) {
+	if deadline <= 0 {
+		return
+	}
+	s.refusalHold = deadline + pubsubMaxRetryBackoff
+}
+
 // shrinkWindow halves the pull window when err says the answer was refused
-// for size, and leaves it alone for any other failure. Logged at the new size
-// so the loop's progress through an oversize backlog is readable in the pod
-// log: a refusal, a smaller window, and then batches that fit.
-func (s *subscriber) shrinkWindow(err error) {
+// for size, and leaves it alone for any other failure. now is when the pull
+// was issued, the start of the hold. Logged at the new size so the loop's
+// progress through an oversize backlog is readable in the pod log: a refusal,
+// a smaller window, and then batches that fit.
+func (s *subscriber) shrinkWindow(err error, now time.Time) {
 	if !isOversizeAnswer(err) {
 		return
 	}
+	s.refusedAt = now
 	if s.window <= pullWindowFloor {
 		log.Printf("drift-detector: pull answer refused as oversize at a window of %d message(s), which is the floor; no smaller pull would help", s.window)
 		return
@@ -594,31 +630,31 @@ func (s *subscriber) shrinkWindow(err error) {
 	if s.window < pullWindowFloor {
 		s.window = pullWindowFloor
 	}
-	s.windowDelivered = false
-	log.Printf("drift-detector: pull answer refused as oversize; window halved to %d of max-messages=%d until the backlog drains", s.window, s.maxMessages)
+	log.Printf("drift-detector: pull answer refused as oversize; window halved to %d of max-messages=%d for at least %s", s.window, s.maxMessages, s.refusalHold)
 }
 
 // restoreWindow puts the window back at the --max-messages ceiling after an
-// empty pull, once the reduced window has delivered at least one batch (see
-// the field comments). An empty pull before that is the refused batch still
-// under its lease, not a drained backlog, and the window stays.
-func (s *subscriber) restoreWindow() {
-	if s.window == s.maxMessages || !s.windowDelivered {
+// empty pull issued at now, once refusalHold has passed since the refusal
+// (see the field comments). An empty pull before that proves nothing about
+// the refused batch, which Pub/Sub may still be holding, and the window stays.
+func (s *subscriber) restoreWindow(now time.Time) {
+	if s.window == s.maxMessages || now.Sub(s.refusedAt) < s.refusalHold {
 		return
 	}
-	log.Printf("drift-detector: backlog drained at a window of %d; window restored to max-messages=%d", s.window, s.maxMessages)
+	log.Printf("drift-detector: backlog drained at a window of %d, %s after the refusal; window restored to max-messages=%d", s.window, s.refusalHold, s.maxMessages)
 	s.window = s.maxMessages
 }
 
 // isOversizeAnswer reports whether a pull failed because the relay refused
-// the answer for size: an HTTP 502 from the API client, which pubsubSource.Pull
-// wraps and errors.As still reaches. The broker's own body names the code
-// UPSTREAM_UNRELAYABLE, but the generated client surfaces the status and not
-// a parsed body, and a plain 502 from Pub/Sub itself costs only a smaller
-// pull or two before the window grows back.
+// the answer for size: an HTTP 502 whose body carries the broker's
+// UPSTREAM_UNRELAYABLE code. The generated client keeps the raw body on the
+// error it returns, pubsubSource.Pull wraps that error and errors.As still
+// reaches it. A 502 without the code -- a connection the broker could not
+// open, a Pub/Sub 5xx passed through -- is retried on the backoff as before,
+// since no smaller pull would change it.
 func isOversizeAnswer(err error) bool {
 	var apiErr *googleapi.Error
-	return errors.As(err, &apiErr) && apiErr.Code == oversizeAnswerStatus
+	return errors.As(err, &apiErr) && apiErr.Code == oversizeAnswerStatus && strings.Contains(apiErr.Body, oversizeAnswerCode)
 }
 
 // processBatch parses each message and settles the whole batch in two calls,

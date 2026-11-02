@@ -44,7 +44,9 @@ locals {
   # That 10,000 is the query's row cap, not the window's true total, so daily
   # figures do not come from it. They come from a separate untruncated count of
   # the surviving stream: 623 non-lease calls per 15 minutes, about 60k/day,
-  # against roughly 1.35M/day unfiltered.
+  # against roughly 1.35M/day unfiltered. Both were measured with the suffix
+  # below narrowed to "\.iam\.gserviceaccount\.com$"; the whole-domain suffix
+  # delivers less.
   #
   # The exclusion is scoped by principal rather than dropping leases outright,
   # so that a person running `kubectl patch lease` still reaches the detector.
