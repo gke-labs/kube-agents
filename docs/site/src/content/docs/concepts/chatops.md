@@ -464,6 +464,20 @@ The tab is drawn when you open it and drawn again, for about ten minutes after t
 
 Only a member on the [allowed users](#allowed-users-1) list sees the dashboard; anyone else who opens the tab sees one line saying the fleet is shown only to the people the install lets ask it. With the list left empty, that is every member of the app's own workspace, checked with `users.info`; if that check fails, the tab is left blank rather than refused. A Slack Connect guest the list names as `T…:U…` sees it too, checked the same way. The app needs the Home tab turned on and the `app_home_opened` event in its manifest ([Slack app setup](/kube-agents/install/slack-app/)).
 
+### People seen
+
+Under `next`, the gateway keeps a record of the people who write to it, so an install can count them. Each person who writes on Google Chat, Slack or Discord, once the gateway has verified them, has one hashed key and the time of their last turn, within an hour. A person is the identity the gateway attributes the turn to, so a principal map that folds two member IDs into one identity makes them one person. The key is derived for this record alone and matches no other pseudonym the install keeps.
+
+The doors and the A2A console are not people and get no key. A platform the install still serves through Hermes, such as Slack while Google Chat holds the gateway, is outside the record, and a `today` install keeps none.
+
+The record is the `people` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which are the hashes alone. The bucket drops each key 30 days after the person's last turn. Nothing is sent anywhere else.
+
+The gateway's metrics serve two counts, the people seen in the last 7 days and in the last 30 ([Observability](/kube-agents/concepts/observability/#a2a-gateway-series)). Each is one number; no key is in a label. The keys derive from the gateway's salt, which the installer keeps across upgrades. If the salt changes, everyone gets a new key, and the counts read as new people for one window.
+
+To remove one person, whoever holds the gateway's NATS credentials deletes that person's key from the bucket. The count drops at once. The delete leaves a marker that carries the key's name, and the bucket's 30-day limit removes it.
+
+To turn the record off, set `spec.telemetry.peopleSeen: false` in the `PlatformAgent` CR, or the chart's `platformAgent.telemetry.peopleSeen`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={telemetry={peopleSeen=false}}}'`. The gateway then writes no key and serves no count. At its next start it deletes every key the bucket holds.
+
 ## How a chat question is answered under `next`
 
 Under `spec.mode: next`, a message from Google Chat, or from Slack when Google Chat is not also enabled, reaches the A2A gateway rather than a listener in the agent pod. The Planning Agent still answers it, and still hands cluster work to a specialist as a kanban card. What differs from `today` is how the message reaches the Planning Agent, over the message bus, and how the card's answer gets back to the thread, through the gateway. Setting up the Slack app for the gateway is covered in [Slack app setup](/kube-agents/install/slack-app/).
