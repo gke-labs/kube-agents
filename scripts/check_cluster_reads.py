@@ -18,14 +18,16 @@ one being added; this check does. Three rules:
   whole-cluster collection (``/api/v1/<kind>``, ``/apis/<group>/<version>/<kind>``)
   with no ``limit=`` in the URL.
 * ``unresolved-kinds``: the same flags with a kinds token the check cannot
-  read (a parameter, an f-string), so it cannot show the read is one kind,
-  and no flag on the line clears it.
+  read (a parameter, an f-string, a shell expansion, an SOP's ``<kind>``
+  placeholder), so it cannot show the read is one kind; or an ``-o`` whose
+  value it cannot read, so it cannot show the read is a projection. No flag
+  on the line clears it.
 
 ``--chunk-size`` pages the requests kubectl makes and not the reply it
 prints, so it bounds nothing the credential proxy sees; it passes the
 ``unpaged-list`` rule because the issue that asked for this check names it as
-the paged form, and the remedies that bound the reply are the ones the hint
-names first. Reads that pass: a namespaced ``get``; a ``-o jsonpath=``,
+the paged form. The hint does not offer it: every remedy the hint names
+bounds the reply. Reads that pass: a namespaced ``get``; a ``-o jsonpath=``,
 ``custom-columns=``, ``name`` or ``wide`` projection; a table read with no
 ``-o`` at all on a shell line; a single object (``kind/name``, or a name
 after the kind without ``-A``); and a ``--raw`` URL that names a namespace or
@@ -34,15 +36,17 @@ carries ``limit=``.
 What is read, under ``agents/`` with the mirrored ``gke-*`` skills skipped
 (their text changes on sync and is edited through the overlay):
 
-* ``*.py`` through ``ast``: every list and tuple literal is walked and judged
-  as the argv it builds. Names resolve against the module's top-level string
-  and sequence constants, a starred name or literal splices its elements, a
-  starred conditional splices both branches, a starred call splices one
-  unknown token (a helper's prefix, stepped over as ``kubectl`` would be), an
-  f-string resolves to its constant text with each ``{name}`` replaced by the
-  module constant or loop element it names and ``{}`` where a value cannot
-  be read, and a ``for`` loop over a literal sequence judges its body once
-  per element. A list that opens with ``get`` (no ``kubectl`` before it) and
+* ``*.py`` through ``ast``: every list and tuple literal, and every ``+`` of
+  a sequence constant and a literal (``KUBECTL_GET + [...]``), is walked and
+  judged as the argv it builds. Names resolve against the module's top-level
+  string and sequence constants, a starred name or literal splices its
+  elements, a starred conditional splices both branches, a starred call or
+  an unreadable side of a ``+`` splices one unknown token (a helper's prefix,
+  stepped over as ``kubectl`` would be), an f-string resolves to its constant
+  text with each ``{name}`` replaced by the module constant or loop element
+  it names and ``{}`` where a value cannot be read, and ``for`` loops over
+  literal sequences judge their body once per combination of their elements.
+  A list that opens with ``get`` (no ``kubectl`` before it) and
   carries ``-A`` with no ``-o`` is judged full-object: the audit scripts pass
   such lists to a helper that appends ``-o json``; a list that opens with
   ``kubectl`` and names no ``-o`` is a table, as on a shell line. A string
@@ -51,12 +55,17 @@ What is read, under ``agents/`` with the mirrored ``gke-*`` skills skipped
   files (``test_*.py``) and ``testdata/`` trees are not read.
 * ``*.sh``: every command line, continuations joined, comments dropped, each
   simple command of a pipeline on its own, ``kubectl`` found wherever it
-  stands in it (after ``KUBECONFIG=... ``, ``env``, ``timeout 60``). A quoted
-  word that holds a whole command (``bash -c "kubectl ..."``, the
+  stands in it (after ``KUBECONFIG=... ``, ``env``, ``timeout 60``), a shell
+  variable that names it (``$KUBECTL``, ``"${KUBECTL:-kubectl}"``) included.
+  A quoted word that holds a whole command (``bash -c "kubectl ..."``, the
   ``"command": "kubectl ..."`` of a JSON example) is read as a line of its
-  own. A kinds token that is a shell expansion (``"$KINDS"``) cannot be shown
-  to be one kind and falls under ``unresolved-kinds``.
-* ``*.md``: the fenced code blocks and the inline code spans. Prose is not
+  own, the JSON punctuation glued onto it (``",`` ``"}``) dropped. A kinds
+  token that is a shell expansion (``"$KINDS"``) or an SOP placeholder
+  (``<kind>``) cannot be shown to be one kind and falls under
+  ``unresolved-kinds``.
+* ``*.md``: the fenced code blocks (a fence closes on a run of the same
+  character at least as long as the one that opened it, so a fence quoted
+  inside a longer one stays inside) and the inline code spans. Prose is not
   read, so a sentence that names the shape to warn against it is not a hit.
 
 The reads the tree carried when the check arrived are pinned in
@@ -82,6 +91,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import itertools
 import re
 import shlex
 import sys
@@ -114,11 +124,11 @@ RULE_HINTS = {
     RULE_MULTI_KIND: "several kinds across every namespace as full objects: read one kind per call",
     RULE_UNPAGED: (
         "one kind across every namespace as full objects in one reply: project the fields (-o jsonpath=, "
-        "custom-columns=), read per namespace, or page it (--chunk-size above 0; limit= on a --raw URL)"
+        "custom-columns=), read per namespace, or bound the reply (limit= on a --raw URL)"
     ),
     RULE_UNRESOLVED: (
-        "the kinds are not a literal this check can read, so it cannot show the read is one kind: "
-        "pass a literal kind per call, or pin the site with a reason"
+        "the kinds or the output format are not a literal this check can read, so it cannot show the read "
+        "is one kind or a projection: pass a literal kind and format per call, or pin the site with a reason"
     ),
 }
 
@@ -188,16 +198,23 @@ REDIRECT_CHARS = set("<>")
 # A word with a blank inside it came off the lexer from one quoted string; one
 # that carries `kubectl` is a command of its own (`bash -c "kubectl ..."`).
 QUOTED_COMMAND_RE = re.compile(r"\s")
+# The JSON punctuation a line glues onto such a word when the quoted command
+# is not its last token (`"command": "kubectl ... -o json", "rc": 0`): shell
+# inert, and not part of the argv.
+QUOTED_COMMAND_GLUE = ",}]"
 # A shell expansion where the kinds should be (`"$KINDS"`, `${KINDS}`): the
-# check cannot show it is one kind.
+# check cannot show it is one kind. A shell variable that names kubectl
+# (`$KUBECTL`, `"${KUBECTL:-kubectl}"`) is kubectl.
 SHELL_EXPANSION_MARK = "$"
 # What may stand before a bare `get` in the Python reading: a `NAME=value`
 # assignment, `env`, or a spliced helper prefix the check could not read.
 ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 ENV_COMMAND = "env"
 # An SOP's `<ctx>` or `<target kubeconfig>` is a placeholder, not a pair of
-# redirections: it is read as one word. A real `< in > out` has blanks inside
-# the brackets and is left alone.
+# redirections: it is read as one word, marked as a shell expansion would be
+# (`$ctx`, `$target_kubeconfig`) so a `<kind>` where the kinds go is held as
+# a value the check cannot read rather than as a kind named `kind`. A real
+# `< in > out` has blanks inside the brackets and is left alone.
 PLACEHOLDER_RE = re.compile(r"<(?=\S)([^<>\n]+?)(?<=\S)>")
 PLACEHOLDER_JOIN = "_"
 SHELL_COMMENT_PREFIX = "#"
@@ -205,15 +222,22 @@ SHELL_CONTINUATION = "\\"
 # What a Python f-string resolves to where a value goes; a kinds token that
 # carries it is not one kind the check can name.
 FORMAT_PLACEHOLDER = "{}"
+# An `-o` value that opens with one of these is a value the check cannot read
+# (`-o OUTPUT` with a name it cannot resolve, `f"{FMT}"`, `"$FMT"`), so it
+# cannot show the read is a projection. A `jsonpath={}` opens with its
+# projection and passes.
+UNREAD_OUTPUT_MARKS = (FORMAT_PLACEHOLDER, SHELL_EXPANSION_MARK)
 
 # Markdown reading: a fence opens on a line whose first non-blank characters
-# (after quote markers and a bullet or numbered list marker) are three
-# backticks or tildes and closes on the next such line; the lines between are
-# shell lines. Outside fences, a code span is a run of backticks closed by a
-# run of the same length, and may wrap onto the next line but not across a
-# blank one (a paragraph ends there, so a stray backtick pairs with nothing
-# past it).
-FENCE_RE = re.compile(r"^[\s>*+-]*(?:\d+[.)]\s+)?(?:```|~~~)")
+# (after quote markers and a bullet or numbered list marker) are a run of
+# three or more backticks or tildes and closes on the next line whose run is
+# the same character and at least as long (CommonMark; scripts/check_docs_prose.py
+# reads fences the same way), so a ```` ```bash ```` quoted inside a
+# ```` ````markdown ```` fence stays inside it; the lines between are shell
+# lines. Outside fences, a code span is a run of backticks closed by a run of
+# the same length, and may wrap onto the next line but not across a blank one
+# (a paragraph ends there, so a stray backtick pairs with nothing past it).
+FENCE_RE = re.compile(r"^[\s>*+-]*(?:\d+[.)]\s+)?(?P<fence>`{3,}|~{3,})")
 CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(?P<code>(?:(?!\n\n).)+?)(?<!`)\1(?!`)", re.DOTALL)
 LINE_BREAK = "\n"
 SPACE = " "
@@ -307,7 +331,12 @@ def flag_value(token: str, following: Token) -> tuple[Token, bool]:
 
 
 def is_kubectl(token: Token) -> bool:
-    return token == KUBECTL or (token is not None and token.endswith(KUBECTL_PATH_SUFFIX))
+    """`kubectl`, a path ending in it, or a shell variable naming it (`$KUBECTL`, `${KUBECTL:-kubectl}`)."""
+    if token is None:
+        return False
+    if token == KUBECTL or token.endswith(KUBECTL_PATH_SUFFIX):
+        return True
+    return token.startswith(SHELL_EXPANSION_MARK) and KUBECTL in token.lower()
 
 
 def get_argv_start(tokens: list[Token], bare_get: bool) -> int | None:
@@ -402,10 +431,11 @@ def judge(tokens: list[Token], python_argv: bool) -> str | None:
     # kubectl refuses a name with -A, so the first positional is the kinds
     # and anything after it is the value of a flag this check does not know.
     kinds = positionals[0]
+    output_unread = output_named and (output is None or output.startswith(UNREAD_OUTPUT_MARKS))
     full_object = output in FULL_OBJECT_FORMATS if output_named else helper_argv
-    if not full_object:
+    if not full_object and not output_unread:
         return None
-    if kinds is None or FORMAT_PLACEHOLDER in kinds or SHELL_EXPANSION_MARK in kinds:
+    if output_unread or kinds is None or FORMAT_PLACEHOLDER in kinds or SHELL_EXPANSION_MARK in kinds:
         return RULE_UNRESOLVED
     if NAME_SEPARATOR in kinds:
         return None
@@ -502,6 +532,13 @@ class ModuleConstants:
                 return self.sequence(inner)
             finally:
                 self.resolving.discard(node.id)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            # `KUBECTL_GET + [...]`: a side the check cannot read stands as one
+            # unknown token, as a starred call does.
+            left, right = self.sequence(node.left), self.sequence(node.right)
+            if left is None and right is None:
+                return None
+            return ([None] if left is None else left) + ([None] if right is None else right)
         return None
 
     def starred(self, node: ast.expr) -> list[Token]:
@@ -512,20 +549,20 @@ class ModuleConstants:
         return [None] if resolved is None else resolved
 
     def bindings(self, node: ast.expr) -> Iterator[dict[str, str]]:
-        """Each binding of the loop variable a literal names directly, from the innermost loop enclosing it.
+        """Each binding of the loop variables a literal names directly, one per combination of the enclosing loops' elements.
 
         One empty binding when it names none; a loop variable that shadows a
-        module constant is read as the constant. A list or tuple names its
+        module constant is read as the constant, and one that shadows an outer
+        loop's is read from the inner loop. A list or tuple names its
         elements; an f-string the values it formats.
         """
         names = {element.id for element in direct_names(node) if element.id not in self.nodes}
-        enclosing = [loop for loop in self.loops if loop[2] in names and loop[0] <= node.lineno <= loop[1]]
-        if not enclosing:
-            yield {}
-            return
-        _, _, name, values = max(enclosing, key=lambda loop: loop[0])
-        for value in values:
-            yield {name: value}
+        enclosing = sorted(
+            (loop for loop in self.loops if loop[2] in names and loop[0] <= node.lineno <= loop[1]),
+            key=lambda loop: loop[0],
+        )
+        for combination in itertools.product(*(loop[3] for loop in enclosing)):
+            yield {loop[2]: value for loop, value in zip(enclosing, combination)}
 
 
 def direct_names(node: ast.expr) -> list[ast.Name]:
@@ -568,14 +605,15 @@ def python_findings(path: Path, text: str) -> list[Finding]:
     constants = ModuleConstants(module)
     docstrings = docstring_ids(module)
     # The fragments of an f-string or a concatenation already read as one
-    # text are not read again on their own.
-    read_as_text: set[int] = set()
+    # text, and the operands of a `+` of sequences already judged as one argv,
+    # are not read again on their own.
+    read_as_part: set[int] = set()
     findings = []
     for node in ast.walk(module):
-        if id(node) in read_as_text:
+        if id(node) in read_as_part:
             continue
         if is_string_expression(node) and id(node) not in docstrings:
-            read_as_text.update(id(inner) for inner in ast.walk(node))
+            read_as_part.update(id(inner) for inner in ast.walk(node))
             for binding in constants.bindings(node):
                 constants.bound = binding
                 text = constants.string(node)
@@ -588,7 +626,9 @@ def python_findings(path: Path, text: str) -> list[Finding]:
                         if rule is not None:
                             findings.append(Finding(path, node.lineno + offset, rule, render(argv)))
             continue
-        if not isinstance(node, (ast.List, ast.Tuple)):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            read_as_part.update(id(inner) for inner in ast.walk(node) if isinstance(inner, (ast.List, ast.Tuple, ast.BinOp)))
+        elif not isinstance(node, (ast.List, ast.Tuple)):
             continue
         for binding in constants.bindings(node):
             constants.bound = binding
@@ -607,7 +647,7 @@ def python_findings(path: Path, text: str) -> list[Finding]:
 
 
 def shell_tokens(line: str) -> list[str]:
-    line = PLACEHOLDER_RE.sub(lambda match: PLACEHOLDER_JOIN.join(match.group(1).split()), line)
+    line = PLACEHOLDER_RE.sub(lambda match: SHELL_EXPANSION_MARK + PLACEHOLDER_JOIN.join(match.group(1).split()), line)
     lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     try:
@@ -643,7 +683,7 @@ def commands(line: str) -> Iterator[list[Token]]:
             current = []
         else:
             if KUBECTL in token and QUOTED_COMMAND_RE.search(token):
-                yield from commands(token)
+                yield from commands(token.rstrip(QUOTED_COMMAND_GLUE))
             current.append(token)
     if current:
         yield current
@@ -690,12 +730,18 @@ def markdown_code(text: str) -> tuple[list[tuple[int, str]], list[tuple[int, str
     """(fenced lines, code spans) of a Markdown page, each with the line it starts on."""
     fenced: list[tuple[int, str]] = []
     prose: list[tuple[int, str]] = []
-    in_fence = False
+    opener: str | None = None
     for number, line in enumerate(text.splitlines(), start=1):
-        if FENCE_RE.match(line):
-            in_fence = not in_fence
-            continue
-        (fenced if in_fence else prose).append((number, line))
+        match = FENCE_RE.match(line)
+        if match:
+            fence = match.group("fence")
+            if opener is None:
+                opener = fence
+                continue
+            if fence[0] == opener[0] and len(fence) >= len(opener):
+                opener = None
+                continue
+        (fenced if opener is not None else prose).append((number, line))
     spans: list[tuple[int, str]] = []
     joined = LINE_BREAK.join(line for _, line in prose)
     offsets = [0]

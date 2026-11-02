@@ -38,6 +38,7 @@ from scripts.check_cluster_reads import (  # noqa: E402
     markdown_findings,
     python_findings,
     shell_findings,
+    shell_tokens,
 )
 
 
@@ -191,8 +192,50 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(judge(["kubectl", "get", None, "-A", "-o", "json", "--chunk-size=500"], python_argv=True), RULE_UNRESOLVED)
         self.assertIsNone(judge(["kubectl", "get", None, "-n", "x", "-o", "json"], python_argv=True))
 
-    def test_unknown_output_format_passes(self):
-        self.assertIsNone(judge(["kubectl", "get", "pods", "-A", "-o", None], python_argv=True))
+    def test_unknown_output_format_is_unresolved_and_no_flag_clears_it(self):
+        for argv in (
+            ["kubectl", "get", "pods", "-A", "-o", None],
+            ["kubectl", "get", "deploy,sts,ds", "-A", "-o", None],
+            ["kubectl", "get", "pods", "-A", "-o={}"],
+            ["kubectl", "get", "pods", "-A", "-o", None, "--chunk-size=500"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(judge(argv, python_argv=True), RULE_UNRESOLVED)
+        self.assertEqual(judge(shell_tokens('kubectl get pods -A -o "$FMT"'), python_argv=False), RULE_UNRESOLVED)
+        self.assertEqual(judge(shell_tokens("kubectl get pods -A --output=${FMT}"), python_argv=False), RULE_UNRESOLVED)
+        # A projection whose template the check cannot read is still a projection.
+        self.assertIsNone(judge(["kubectl", "get", "pods", "-A", "-o", "jsonpath={}"], python_argv=True))
+        self.assertIsNone(judge(shell_tokens('kubectl get pods -A -o jsonpath="$TEMPLATE"'), python_argv=False))
+        self.assertIsNone(judge(["kubectl", "get", "pods", "-n", "x", "-o", None], python_argv=True))
+
+    def test_kubectl_run_through_a_shell_variable_is_read(self):
+        for line in (
+            "$KUBECTL get pods -A -o json",
+            "${KUBECTL} get pods -A -o json",
+            '"${KUBECTL:-kubectl}" get pods -A -o json',
+            "$TIMEOUT kubectl get pods -A -o json",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(judge(shell_tokens(line), python_argv=False), RULE_UNPAGED)
+        self.assertIsNone(judge(shell_tokens("$HELM get values web -A -o json"), python_argv=False))
+        self.assertIsNone(judge(shell_tokens("$KUBECTL get pods -n x -o json"), python_argv=False))
+
+    def test_placeholder_as_the_kinds_is_unresolved(self):
+        for line in (
+            "kubectl --context <ctx> get <kind> -A -o json --chunk-size=500",
+            "kubectl get <kinds> -A -o yaml",
+            "KUBECONFIG=<target kubeconfig> kubectl get <resource> -A -o json",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(judge(shell_tokens(line), python_argv=False), RULE_UNRESOLVED)
+        for line in (
+            "kubectl get <kind> -n <ns> <name> -o yaml",
+            "kubectl get <kind> <name> -o yaml --kubeconfig <target kubeconfig>",
+            "kubectl --context <ctx> get pods -A -o name",
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(judge(shell_tokens(line), python_argv=False))
+        self.assertEqual(judge(shell_tokens("kubectl --context <ctx> get pods,svc -A -o json"), python_argv=False), RULE_MULTI_KIND)
 
 
 class PythonReadingTest(unittest.TestCase):
@@ -259,6 +302,54 @@ class PythonReadingTest(unittest.TestCase):
             [
                 (10, RULE_UNPAGED, "kubectl get rootsyncs.configsync.gke.io -A -o json"),
                 (10, RULE_UNPAGED, "kubectl get reposyncs.configsync.gke.io -A -o json"),
+            ],
+        )
+
+    def test_nested_loops_over_literal_sequences_are_judged_once_per_combination(self):
+        found = self._findings(
+            '''
+            KINDS = ("rootsyncs", "reposyncs")
+            KUBECONFIGS = ("/k/a", "/k/b")
+            def run(run_and_gate):
+                for kind in KINDS:
+                    for kc in KUBECONFIGS:
+                        run_and_gate(["kubectl", "--kubeconfig", kc, "get", kind, "-A", "-o", "json"])
+                for kc in KUBECONFIGS:
+                    for kind in KINDS:
+                        run_and_gate(f"kubectl --kubeconfig {kc} get {kind} -A -o json --chunk-size=500")
+            '''
+        )
+        self.assertEqual(
+            [(f.line, f.rule, f.text) for f in found],
+            [
+                (7, RULE_UNPAGED, "kubectl --kubeconfig /k/a get rootsyncs -A -o json"),
+                (7, RULE_UNPAGED, "kubectl --kubeconfig /k/b get rootsyncs -A -o json"),
+                (7, RULE_UNPAGED, "kubectl --kubeconfig /k/a get reposyncs -A -o json"),
+                (7, RULE_UNPAGED, "kubectl --kubeconfig /k/b get reposyncs -A -o json"),
+            ],
+        )
+
+    def test_a_sum_of_a_sequence_constant_and_a_list_is_one_argv(self):
+        found = self._findings(
+            '''
+            KUBECTL_GET = ["kubectl", "get"]
+            JSON_OUTPUT_ARGS = ("-o", "json")
+            def _kubectl(kc):
+                return ["kubectl", "--kubeconfig", kc]
+            def run(kc, rest):
+                a = KUBECTL_GET + ["pods,svc", "-A", "-o", "json"]
+                b = KUBECTL_GET + ["pods", "-A"] + list(JSON_OUTPUT_ARGS)
+                c = _kubectl(kc) + ["get", "pods,svc", "-A", "-o", "json"]
+                d = KUBECTL_GET + rest
+                e = KUBECTL_GET + ["pods", "-n", "x", "-o", "json"]
+                return a, b, c, d, e
+            '''
+        )
+        self.assertEqual(
+            [(f.line, f.rule, f.text) for f in found],
+            [
+                (7, RULE_MULTI_KIND, "kubectl get pods,svc -A -o json"),
+                (9, RULE_MULTI_KIND, "{} get pods,svc -A -o json"),
             ],
         )
 
@@ -418,10 +509,21 @@ class ShellAndMarkdownReadingTest(unittest.TestCase):
                 ```json
                 {"check": "pdb", "command": "kubectl --context prod get pdb -A -o custom-columns=NS:.metadata.namespace --no-headers"}
                 ```
+                ```json
+                {"check": "pods", "command": "kubectl --context prod get pods -A -o json", "rc": 0}
+                {"check": "svc", "command": "kubectl --context prod get svc -A -o json"}
+                ```
                 '''
             ),
         )
-        self.assertEqual([(f.line, f.rule, f.text) for f in found], [(5, RULE_MULTI_KIND, "kubectl --context gke_project_location_cluster get deploy,sts,ds -A -o json")])
+        self.assertEqual(
+            [(f.line, f.rule, f.text) for f in found],
+            [
+                (5, RULE_MULTI_KIND, "kubectl --context gke_$project_$location_$cluster get deploy,sts,ds -A -o json"),
+                (12, RULE_UNPAGED, "kubectl --context prod get pods -A -o json"),
+                (13, RULE_UNPAGED, "kubectl --context prod get svc -A -o json"),
+            ],
+        )
 
     def test_markdown_fence_and_span_fail_and_prose_does_not(self):
         found = markdown_findings(
@@ -457,6 +559,25 @@ class ShellAndMarkdownReadingTest(unittest.TestCase):
         )
         found = markdown_findings(Path("agents/x.md"), page)
         self.assertEqual([(f.line, f.rule) for f in found], [(3, RULE_MULTI_KIND)])
+
+    def test_a_fence_closes_only_on_its_own_character_and_length(self):
+        page = textwrap.dedent(
+            '''
+            ````markdown
+            ```bash
+            kubectl get pods,svc -A -o json
+            ```
+            ````
+            ~~~
+            kubectl get pods -A -o json
+            ```
+            kubectl get deploy,sts -A -o yaml
+            ~~~
+            Then kubectl get svc -A -o json is prose again.
+            '''
+        )
+        found = markdown_findings(Path("agents/x.md"), page)
+        self.assertEqual([(f.line, f.rule) for f in found], [(4, RULE_MULTI_KIND), (8, RULE_UNPAGED), (10, RULE_MULTI_KIND)])
 
     def test_stray_backtick_does_not_pair_across_a_blank_line(self):
         page = "A stray ` here.\n\nNever run kubectl get pods -A -o json on a big cluster` again.\n"
