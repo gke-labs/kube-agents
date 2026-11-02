@@ -28,7 +28,8 @@ console's Harness limits page reads `harness-limits.json`.
 - [`real-install-test-plan.md`](real-install-test-plan.md) and its plan files: `real-install.yaml`
   (the fleet point, first-run flow, questions, restart, churn, soak and S-size red test),
   `real-install-concurrent.yaml` (questions at once), `real-install-failing.yaml` (20 failing Pods),
-  `real-install-stress.yaml` and `real-install-stress-load.yaml` (stress beyond fair use). Run each
+  `real-install-stress.yaml` and `real-install-stress-load.yaml` (stress beyond fair use),
+  `real-install-scaling.yaml` (token cost at 80 and 20 clusters). Run each
   with `--only-factor combined`. [`real-install-results.md`](real-install-results.md) holds the
   results.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
