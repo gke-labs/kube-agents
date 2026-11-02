@@ -8,6 +8,13 @@ because a name outside the allowlist is dropped silently and the file would ship
 changes nothing; and the figures the page's comments rest on hold against the operator's
 rules (the operator memory floor, the Autopilot memory-per-vCPU band, requests under limits).
 
+The page's "What each pod needs" table also carries a declared column: what the chart and the
+operator render at the defaults. Those figures live in `files/footprint.yaml` (generated from
+the operator golden) and `values.yaml`, and a hand-written copy of either drifts the first time
+one moves, so `DeclaredColumnTest` derives every declared cell, the pod count, the ephemeral
+and storage totals and the Hindsight bullet from the two files and fails when the page says
+otherwise. The fleet column is modeled and is not held here.
+
 Run: python3 -m unittest discover -s tests -p 'test_chart_values_fleet_example.py' -v
 """
 
@@ -51,6 +58,20 @@ _ALLOWLIST_RE = re.compile(
 _ALLOWLIST_ENTRY_RE = re.compile(r'^\s*"(?P<name>[A-Z0-9_]+)":\s*\{\}', re.MULTILINE)
 _SANDBOX_FORWARD_RE = re.compile(r'envAuditAutoPromote\s*=\s*"(?P<name>[A-Z0-9_]+)"')
 
+# The page's declared column, derived from the two files the page cites.
+_FOOTPRINT = _CHART / "files" / "footprint.yaml"
+_VALUES = _CHART / "values.yaml"
+_PAGE_TABLE_HEADING = "## What each pod needs"
+_PAGE_ROW_PROXY = "Credential proxy"
+_PAGE_ROW_GATEWAY = "Gateway pod"
+_PAGE_ROW_SANDBOX = "Shell sandbox"
+_PAGE_ROW_OPERATOR = "Operator"
+_PAGE_ROW_LITELLM = "LiteLLM"
+_PAGE_ROW_MINTER = "GitHub token minter"
+_PAGE_ROW_TOTAL = "**Total**"
+_PAGE_HINDSIGHT_BULLET = "**Hindsight memory**"
+_PAGE_FLEET_DATA_CLAIM_GI = 100
+
 # What the operator and Autopilot hold the figures to.
 _OPERATOR_MEMORY_FLOOR_MI = 512
 _AUTOPILOT_MIN_MIB_PER_VCPU = 1024
@@ -79,6 +100,63 @@ def _mebibytes(quantity) -> float:
 
 def _example() -> dict:
     return yaml.safe_load(_EXAMPLE.read_text())
+
+
+def _decimal(value: float) -> str:
+    """Exact decimal text with trailing zeros dropped: 1506 millicores reads 1.506, 64Mi reads 0.0625 GiB."""
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _vcpu(millicores: float) -> str:
+    return _decimal(millicores / 1000)
+
+
+def _gib(mebibytes: float) -> str:
+    return _decimal(mebibytes / 1024)
+
+
+def _footprint_block(block: dict):
+    """(request millicores, request MiB, limit millicores, limit MiB, ephemeral limit MiB) of a footprint entry."""
+    return (
+        block["cpuMillisRequest"],
+        block["memoryBytesRequest"] / (1024 * 1024),
+        block["cpuMillisLimit"],
+        block["memoryBytesLimit"] / (1024 * 1024),
+        block["ephemeralStorageBytesLimit"] / (1024 * 1024),
+    )
+
+
+def _values_block(resources: dict):
+    """The same tuple from a values.yaml resources block (ephemeral-storage optional)."""
+    requests, limits = resources["requests"], resources["limits"]
+    ephemeral = limits.get("ephemeral-storage")
+    return (
+        _millicores(requests["cpu"]),
+        _mebibytes(requests["memory"]),
+        _millicores(limits["cpu"]),
+        _mebibytes(limits["memory"]),
+        _mebibytes(ephemeral) if ephemeral is not None else 0,
+    )
+
+
+def _cell(block, each=False) -> str:
+    req_cpu, req_mem, lim_cpu, lim_mem, _ = block
+    text = f"{_vcpu(req_cpu)} / {_gib(req_mem)} then {_vcpu(lim_cpu)} / {_gib(lim_mem)}"
+    return text + ", each" if each else text
+
+
+def _page_table_rows() -> dict:
+    """The pod table's rows keyed by the text their first cell opens with."""
+    page = _SITE_PAGE.read_text()
+    section = page.split(_PAGE_TABLE_HEADING, 1)[1]
+    rows = {}
+    for line in section.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        rows[cells[0]] = cells
+    return rows
 
 
 def _forwarded_env_names() -> set:
@@ -186,6 +264,104 @@ class ExampleShapeTest(unittest.TestCase):
         for entry in self.values["platformAgent"]["deployment"]["env"]:
             with self.subTest(name=entry["name"]):
                 self.assertIn(entry["name"], page)
+
+
+class DeclaredColumnTest(unittest.TestCase):
+    """The page's declared figures are the footprint's and values.yaml's, not a copy of them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.footprint = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
+        cls.values = yaml.safe_load(_VALUES.read_text())
+        cls.rows = _page_table_rows()
+
+    def _row(self, label):
+        matches = [cells for first, cells in self.rows.items() if first.startswith(label)]
+        self.assertEqual(len(matches), 1, f"expected one table row opening {label!r}, found {len(matches)}")
+        return matches[0]
+
+    def _declared(self):
+        """Every table row's block, replica count and persistent GiB, in the page's order."""
+        agent = self.footprint["agentPod"]
+        base = _footprint_block(agent["base"])
+        # The dashboard container rides in the gateway pod when hermes.dashboardEnabled is
+        # on, which the chart's null default leaves to the CRD's true; the footprint lists
+        # it apart (pods: 0) so the quota preflight can leave it out.
+        dashboard = _footprint_block(agent["dashboard"])
+        gateway = tuple(b + d for b, d in zip(base, dashboard))
+        data_claim_gi = self.footprint["storage"]["dataClaimBytesRequest"] / (1024 ** 3)
+        return {
+            _PAGE_ROW_PROXY: (_footprint_block(self.footprint["credentialProxy"]), 1, 0),
+            _PAGE_ROW_GATEWAY: (gateway, 1, data_claim_gi + 1),
+            _PAGE_ROW_SANDBOX: (_footprint_block(self.footprint["shellSandbox"]), 1, data_claim_gi + 1),
+            _PAGE_ROW_OPERATOR: (_values_block(self.values["operator"]["resources"]), self.values["operator"]["replicaCount"], 0),
+            _PAGE_ROW_LITELLM: (_values_block(self.values["litellm"]["resources"]), self.values["litellm"]["replicaCount"], 0),
+            _PAGE_ROW_MINTER: (_values_block(self.values["githubMinter"]["resources"]), self.values["githubMinter"]["replicaCount"], 0),
+        }
+
+    def test_each_row_carries_the_declared_requests_and_limits(self):
+        for label, (block, replicas, _) in self._declared().items():
+            with self.subTest(row=label):
+                cells = self._row(label)
+                self.assertEqual(cells[1], str(replicas))
+                self.assertEqual(cells[3], _cell(block, each=replicas > 1))
+
+    def test_the_ephemeral_cells_are_the_declared_limits(self):
+        declared = self._declared()
+        proxy = declared[_PAGE_ROW_PROXY][0][4]
+        gateway = declared[_PAGE_ROW_GATEWAY][0][4]
+        litellm = declared[_PAGE_ROW_LITELLM][0][4]
+        self.assertTrue(self._row(_PAGE_ROW_PROXY)[5].startswith(f"{_gib(proxy)} GiB"))
+        self.assertTrue(self._row(_PAGE_ROW_GATEWAY)[5].startswith(f"{_gib(gateway)} GiB"))
+        self.assertEqual(self._row(_PAGE_ROW_LITELLM)[5], f"{_gib(litellm)} GiB each")
+        for label in (_PAGE_ROW_SANDBOX, _PAGE_ROW_OPERATOR, _PAGE_ROW_MINTER):
+            with self.subTest(row=label):
+                self.assertEqual(declared[label][0][4], 0)
+                self.assertEqual(self._row(label)[5], "none declared")
+
+    def test_the_total_row_sums_the_declared_rows(self):
+        declared = self._declared()
+        pods = sum(replicas for _, replicas, _ in declared.values())
+        total = [0.0] * 5
+        for block, replicas, _ in declared.values():
+            for i, part in enumerate(block):
+                total[i] += part * replicas
+        cells = self._row(_PAGE_ROW_TOTAL)
+        self.assertEqual(cells[1], str(pods))
+        self.assertEqual(cells[3], f"**{_cell(tuple(total))}**")
+        self.assertEqual(cells[5], f"**{_gib(total[4])} GiB**")
+
+    def test_the_persistent_total_is_the_footprint_claims_and_the_fleet_raise(self):
+        storage = self.footprint["storage"]
+        default_gi = storage["storageBytesRequest"] / (1024 ** 3)
+        data_claim_gi = storage["dataClaimBytesRequest"] / (1024 ** 3)
+        example_gi = _mebibytes(_example()["platformAgent"]["storage"]["size"]) / 1024
+        self.assertEqual(example_gi, _PAGE_FLEET_DATA_CLAIM_GI)
+        fleet_gi = default_gi + storage["dataClaims"] * (example_gi - data_claim_gi)
+        self.assertEqual(
+            self._row(_PAGE_ROW_TOTAL)[6],
+            f"**{_decimal(default_gi)} GiB default, {_decimal(fleet_gi)} GiB fleet**",
+        )
+        gateway = self._row(_PAGE_ROW_GATEWAY)[6]
+        self.assertIn(f"{_decimal(data_claim_gi)} GiB default", gateway)
+        self.assertIn(f"{_decimal(example_gi)} GiB fleet", gateway)
+
+    def test_the_hindsight_bullet_carries_the_declared_figures(self):
+        page = _SITE_PAGE.read_text()
+        bullet = next(line for line in page.splitlines() if _PAGE_HINDSIGHT_BULLET in line)
+        # The bullet wraps over several lines; take the paragraph that follows it.
+        start = page.index(bullet)
+        paragraph = " ".join(page[start:].split("\n- ", 1)[0].split())
+        api = _values_block(self.values["hindsight"]["api"]["resources"])
+        postgres = _values_block(self.values["hindsight"]["postgresql"]["resources"])
+        for text in (
+            f"{_vcpu(api[0])} vCPU and {_gib(api[1])} GiB requests, {_vcpu(api[2])} vCPU and {_gib(api[3])} GiB limits",
+            f"{_vcpu(postgres[0])} vCPU and {_decimal(postgres[1])} MiB requests, {_vcpu(postgres[2])} vCPU and {_gib(postgres[3])} GiB limits",
+            f"{float(_gib(postgres[4])):.1f} GiB ephemeral",
+            f"{_decimal(_mebibytes(self.values['hindsight']['postgresql']['storage']) / 1024)} GiB claim",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, paragraph)
 
 
 @unittest.skipUnless(_HELM, "helm is not installed")

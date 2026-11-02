@@ -8,7 +8,8 @@
 #     --reset-then-reuse-values -f charts/kube-agents/examples/values-fleet.yaml
 #
 # Before a hand-run `helm upgrade`, apply charts/kube-agents/crds/ first
-# (`kubectl apply --server-side -f charts/kube-agents/crds/`; upgrade.sh does):
+# (`kubectl apply --server-side -f charts/kube-agents/crds/`; upgrade.sh in its
+# full and operator modes does, a harness run does not):
 # Helm never updates CRDs on an upgrade, and the chart refuses the render when
 # the installed CRD predates spec.storage, spec.deployment.credentialProxy or
 # spec.deployment.agentAPIAuth rather than letting the API server prune the
@@ -47,10 +48,11 @@ platformAgent:
   harness:
     tuning:
       # Kanban workers running at once, board-wide. Each worker is a `hermes
-      # chat` process with its own MCP servers (about 430 MiB each) and holds
-      # a slot in the credential proxy; 3 keeps the gateway pod inside its
-      # memory limit while 25 or more clusters feed event triage. One slot is
-      # always kept for a question asked in chat.
+      # chat` process with its own MCP servers (about 430 MiB each) and can
+      # have a brokered command in flight in the credential proxy, which admits
+      # eight at once; 3 keeps the gateway pod inside its memory limit while 25
+      # or more clusters feed event triage. One worker slot is always kept for
+      # a question asked in chat.
       maxInProgress: 3
   deployment:
     # The operator copies spec.deployment.env onto the agent container only for
@@ -73,12 +75,17 @@ platformAgent:
         value: "false"
     credentialProxy:
       # The broker that runs every credentialed command (gcloud, kubectl) in a
-      # pod of its own. It sizes how many commands it admits at once from
-      # limits.memory, charging each about 128 MiB, so 8Gi admits the parallel
-      # cluster reads a fleet audit fans out; at the 2Gi default the broker
-      # restarted under a 29-cluster fleet. The CPU request is the CPU it runs
-      # at on Autopilot without bursting; on Standard or with bursting it may
-      # reach 8 vCPU.
+      # pod of its own. It admits at most eight commands at once, a cap the
+      # operator fixes and no values file moves, and budgets each in-flight
+      # command against limits.memory: 128 MiB reserved for the child plus six
+      # copies of the 8 MiB output cap, 176 MiB a slot, after the broker's and
+      # Envoy's own reserves. The 2Gi default already covers all eight slots,
+      # so 8Gi admits nothing more in parallel. It buys headroom for a child
+      # that outgrows its reserve, as a kubectl or gcloud listing of a cluster
+      # with thousands of pods does: close to 1 GiB a slot with all eight in
+      # use (modeled), where the broker restarted under a 29-cluster fleet at
+      # the default. The CPU request is the CPU it runs at on Autopilot without
+      # bursting; on Standard or with bursting it may reach 8 vCPU.
       # ephemeral-storage keeps the operator's 8Gi default, under Autopilot's
       # 10 GiB per-pod ceiling.
       resources:

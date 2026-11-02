@@ -42,17 +42,18 @@ agent reads.
 The table is the `today` component stack with the GitHub minter on, the web console off and
 Hindsight off. The default column is declared. The fleet column is what
 [`values-fleet.yaml`](#the-fleet-values-file) sets, plus the one field it cannot, and is modeled.
-CPU is in vCPU, memory in GiB, and each cell reads requests then limits.
+CPU is in vCPU, memory in GiB, and each cell reads requests then limits. A test derives the
+declared column from the two files and fails when the page falls behind them.
 
-| Workload                                                     | Pods | Runtime                                               | Default (declared)                | Fleet (modeled)                 | Ephemeral (declared)     | Persistent                                               |
-| ------------------------------------------------------------ | ---- | ----------------------------------------------------- | --------------------------------- | ------------------------------- | ------------------------ | -------------------------------------------------------- |
-| Credential proxy (Envoy and the broker)                      | 1    | standard                                              | 0.5 / 1 then 1 / 2                | 4 / 8 then 8 / 8                | 8 GiB, request and limit | none                                                     |
-| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName` | 1.5 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25      | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
-| Shell sandbox `<name>-shell-0`                               | 1    | same class as the gateway pod                         | 0.2 / 0.5 then 2 / 2              | unchanged: no field raises it   | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
-| Operator                                                     | 1    | standard                                              | 0.05 / 0.125 then 0.5 / 0.5       | 0.25 / 1 then 0.5 / 1           | none declared            | none                                                     |
-| LiteLLM                                                      | 2    | standard                                              | 0.1 / 2 then 0.5 / 3, each        | unchanged                       | 1.25 GiB each            | none                                                     |
-| GitHub token minter                                          | 2    | standard                                              | 0.05 / 0.06 then 0.5 / 0.25, each | unchanged                       | none declared            | none                                                     |
-| **Total**                                                    | 8    |                                                       | **2.6 / 8.75 then 11 / 23.25**    | **6.6 / 22.25 then 18 / 35.75** | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
+| Workload                                                     | Pods | Runtime                                               | Default (declared)                  | Fleet (modeled)                 | Ephemeral (declared)     | Persistent                                               |
+| ------------------------------------------------------------ | ---- | ----------------------------------------------------- | ----------------------------------- | ------------------------------- | ------------------------ | -------------------------------------------------------- |
+| Credential proxy (Envoy and the broker)                      | 1    | standard                                              | 0.5 / 1 then 1 / 2                  | 4 / 8 then 8 / 8                | 8 GiB, request and limit | none                                                     |
+| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName` | 1.506 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25      | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
+| Shell sandbox `<name>-shell-0`                               | 1    | same class as the gateway pod                         | 0.2 / 0.5 then 2 / 2                | unchanged: no field raises it   | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
+| Operator                                                     | 1    | standard                                              | 0.05 / 0.125 then 0.5 / 0.5         | 0.25 / 1 then 0.5 / 1           | none declared            | none                                                     |
+| LiteLLM                                                      | 2    | standard                                              | 0.1 / 2 then 0.5 / 3, each          | unchanged                       | 1.25 GiB each            | none                                                     |
+| GitHub token minter                                          | 2    | standard                                              | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                       | none declared            | none                                                     |
+| **Total**                                                    | 8    |                                                       | **2.556 / 8.75 then 11 / 23.25**    | **6.6 / 22.25 then 18 / 35.75** | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
 
 The gateway pod's fleet row raises two containers. `agent-api-auth` is the example's
 `agentAPIAuth.resources`, 0.5 vCPU and 2 GiB requests with a 4 GiB memory limit. The agent
@@ -88,8 +89,8 @@ table above means there:
   `agent-api-auth` sidecar at 2 GiB (its watcher reads a 1 GiB soft limit), and every container
   whose limit is above its request runs at the request. A cluster with bursting admits the
   manifest as rendered, so the example sets the requests it means to run at.
-- **1 to 6.5 GiB of memory per vCPU** on the requests pair, and per-pod minimums of 250m CPU
-  and 512 MiB. A pair outside the band has its smaller request raised, and the chart's quota
+- **1 to 6.5 GiB of memory per vCPU** on the requests pair, and, without bursting, per-pod
+  minimums of 250m CPU and 512 MiB. A pair outside the band has its smaller request raised, and the chart's quota
   preflight, which sums the declared figures, under-counts by the difference. Every pair in the
   example is in the band.
 - **Ephemeral storage up to 10 GiB per pod** in the general-purpose class. The credential
@@ -104,8 +105,8 @@ including the cluster fee; modeled, so check the pricing calculator against your
 
 The composition creates a default pool of `e2-standard-4` nodes, one per zone, and with gVisor
 on a `gvisor-pool` of `e2-standard-4`, one per zone, carrying GKE's sandbox taint. Neither
-machine type is an installer setting, and the next apply would undo a resize of a managed pool,
-so add pools beside them for a fleet. A node has to hold the whole gateway pod and most of the
+machine type is an installer setting, and a machine type changed on a managed pool outside
+Terraform shows as drift on the next plan, so add pools beside them for a fleet. A node has to hold the whole gateway pod and most of the
 proxy's limit for either to reach it, which a 4 vCPU node cannot:
 
 | Pool             | Shape (modeled)                                                                            | Carries                                                  |
@@ -131,7 +132,10 @@ caveat beside it:
   counts twice against a namespace `requests.storage` quota.
 - `platformAgent.harness.tuning.maxInProgress: 3`: kanban workers at once, board-wide.
 - `platformAgent.deployment.credentialProxy.resources`: 4 vCPU and 8 GiB requests, 8 vCPU and
-  8 GiB limits. The broker admits commands from `limits.memory` at about 128 MiB each.
+  8 GiB limits. The broker admits at most eight commands at once, a cap the operator fixes, and
+  the 2 GiB default already covers the eight at 176 MiB a slot. The raise is headroom for a
+  child that outgrows its reserve on a large cluster, close to 1 GiB a slot (modeled), and it
+  admits nothing more in parallel.
 - `platformAgent.deployment.agentAPIAuth.resources`: 0.5 vCPU and 2 GiB requests, a 4 GiB
   memory limit, `limits.cpu` left at its default because the watcher's `GOMAXPROCS` follows it.
 - `platformAgent.deployment.env`: `INCIDENT_WORKLOAD_DEDUP_SECONDS=3600`, which folds an
@@ -149,9 +153,10 @@ has the chart-side detail.
 
 ### Applying it
 
-`upgrade.sh` applies the chart's CRDs before the chart. A hand-run `helm upgrade` does not, and
-three of the file's keys need a CRD that knows their field: `spec.storage`,
-`spec.deployment.credentialProxy` and `spec.deployment.agentAPIAuth`. Against an older CRD the
+`upgrade.sh` applies the chart's CRDs before the chart in its `full` and `operator` modes; a
+`harness` run and a hand-run `helm upgrade` do not. The data volume size and the two resource
+blocks need a CRD that knows their field: `spec.storage`, `spec.deployment.credentialProxy` and
+`spec.deployment.agentAPIAuth`. Against an older CRD the
 API server would prune the value while the release record kept it, so the chart looks up the
 installed CRD and refuses the render instead. Apply the CRDs first:
 

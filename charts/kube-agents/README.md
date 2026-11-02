@@ -849,8 +849,7 @@ forwards; `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on
 and are left out for that reason. Pass it beside your own values with
 `-f charts/kube-agents/examples/values-fleet.yaml`, after applying `crds/` on an existing
 install. The tier thresholds, the per-pod sum and the host-cluster shapes are on the
-[fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/);
-`tests/test_chart_values_fleet_example.py` holds the file to the chart and the operator.
+[fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
 
 ### Agent runtime knobs
 
