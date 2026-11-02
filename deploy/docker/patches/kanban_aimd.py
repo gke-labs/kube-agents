@@ -35,7 +35,7 @@ Three sources feed it, read once per dispatch tick by
    255 and no cwd marker, or a command that exited with the credential proxy
    shim's busy status (:data:`BROKER_BUSY_EXIT`) and printed its busy line
    (:data:`BUSY_LINE_PREFIX`; ``agents/platform/scripts/credential_proxy_client.py``
-   does both on a 429 or 503 its own retry did not get past). The status and
+   does both on a 429 or 503; the shim makes one request). The status and
    the line together are the signal: text alone would let any file or log a
    worker reads steer the dispatcher. The dispatcher already reads this table,
    and it survives a gateway restart, which an in-memory channel would not.
@@ -595,7 +595,7 @@ def worker_pressure_reason(env_type: str, returncode: int, output: str, cwd_obse
     master went away, or a connection that never opened (the shape
     ``ssh_shared_master`` hints on). A command that exited with the shim's
     busy status and whose output has the busy line at the start of a line is
-    a 429 or 503 the shim could not retry past. The line alone is not enough:
+    a 429 or 503 from the broker. The line alone is not enough:
     a log, a file or a README the worker reads could carry it.
     """
     if env_type == SSH_BACKEND and returncode == SSH_MUX_EXIT and not cwd_observed:

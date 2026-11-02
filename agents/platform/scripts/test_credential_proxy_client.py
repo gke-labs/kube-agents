@@ -1623,7 +1623,7 @@ class TestExecutePolicyBlocked(unittest.TestCase):
 
 
 class TestExecuteBusyBroker(unittest.TestCase):
-    """A 429 or 503 the retry did not get past prints the busy line first and exits EX_TEMPFAIL.
+    """A 429 or 503 from the broker prints the busy line first and exits EX_TEMPFAIL.
 
     The line and the status together are the kanban worker's pressure signal
     to the dispatcher, read back out of the command's result, so both happen

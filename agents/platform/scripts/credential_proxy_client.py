@@ -86,7 +86,7 @@ RETRYABLE_BUSY_BOUNDS = frozenset(
     {"slot", "budget", ADMISSION_BOUND_BACKGROUND, ADMISSION_BOUND_DRAINING, "profile"}
 )
 # What `execute` prints on stderr, and exits with, when the broker answers
-# busy and the retry did not get past it. A kanban worker's terminal result
+# busy (a 429 or 503; the shim makes one request). A kanban worker's terminal result
 # reads the two back out of the command's result as a pressure signal to the
 # dispatcher (deploy/docker/patches/kanban_aimd.py, BUSY_LINE_PREFIX and
 # BROKER_BUSY_EXIT; test_kanban_aimd pins the spellings), so both are a

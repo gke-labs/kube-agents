@@ -390,10 +390,10 @@ field puts the default back.
 
 The value is a ceiling for the kanban dispatcher; under `mode: next`, `profiles.ceiling` does not
 move with it. Three signals drop the kanban dispatcher's effective cap to one worker. A card
-reports that the credential proxy answered `429` or `503` and its command's own retry did not get
-past it. A card's sandbox command, or the dispatcher's own check of the sandbox shell, loses its
-SSH session (exit `255` with no exit marker). The sandbox shell, while a card is running, holds
-more than 75% of its memory limit in memory that reclaim cannot free.
+reports that the credential proxy answered its command `429` or `503`. A card's sandbox command,
+or the dispatcher's own check of the sandbox shell, loses its SSH session (exit `255` with no exit
+marker). The sandbox shell, while a card is running, holds more than 75% of its memory limit in
+memory that reclaim cannot free.
 
 The cap holds at one worker for one interval. It then rises by one slot for every clean interval
 until it is back at `maxInProgress`. A card that keeps signalling does not restart the interval on
