@@ -13,8 +13,8 @@
 # Isolation class: read-only on the cluster, the project and the GitOps
 # repository. It requests no pull request. Like every non-requesting case,
 # it relies on the lane-level no-github-writes entry
-# (hack/eval/inject-lane-safeguards.yaml), which the inject transport
-# appends; on the api transport no lane appends it.
+# (hack/eval/inject-lane-safeguards.yaml), which hack/ci-eval-pr.sh appends
+# on both transports.
 id: provisioning-kcc-cluster-without-crds-stops
 name: A Config Connector cluster request stops when the CRDs are missing, and creates nothing
 prompt: >-
@@ -45,19 +45,22 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # The absence in the words a reply uses: "isn't" and "aren't" beside
-      # "not"; "resource types" and "containercluster" beside "crds"; "none of
-      # the clusters has Config Connector installed"; and a parenthetical that
-      # holds the CRD's dotted domain inside a span, which a period outside
-      # one still ends. bench/tests/test_kcc_stop_patterns.py pins the shapes
-      # the nightly answers wrote and the prose that must not pass.
+      # The absence in every phrasing a reply uses for it: "not", "isn't" and
+      # "aren't"; "resource types" and "containercluster" beside "crds"; "none
+      # of the clusters has Config Connector installed"; "does not have" and
+      # "no cluster has"; a span that holds a dotted CRD name or a
+      # parenthetical and ends at a sentence. The patterns exclude nothing on
+      # purpose: a reply that says the words and still opened a pull request
+      # is caught by the lane safeguard no-github-writes-the-case-did-not-
+      # request, appended to every case on both transports; this check only
+      # has to read the absence. bench/tests/test_kcc_stop_patterns.py pins
+      # the shapes the nightly answers wrote and prose that names Config
+      # Connector as present.
       any_of_patterns:
-        - '\bconfig connector\b[^.\n]*?(?:\([^)\n]*\))?[^.\n]{0,80}?\b(?:not installed|(?:is|are)n''t installed|is not available|is not set up|missing|no crds?)\b'
-        - '\b(?:lacks?|without|missing)\b[^.\n]{0,80}\bconfig connector\b[^.\n]{0,20}\b(?:crds?|installed|installation|controller)\b'
-        - '\bno (?:config connector|kcc|cnrm)\b[^.\n]{0,40}\b(?:crds?|resource types?|containerclusters?)\b'
-        - '\b(?:crds?|resource types?|containerclusters?)\b[^.\n]*?(?:\([^)\n]*\))?[^.\n]{0,60}?\b(?:not installed|(?:is|are)n''t (?:installed|there|present)|not found|missing)\b'
-        - '\bnone of\b[^.\n]*?(?:\([^)\n]*\))?[^.\n]{0,60}?\b(?:has|have|runs?)\b[^.\n]{0,20}\b(?:config connector|kcc|cnrm|containerclusters?)\b'
-  # The same direct-create objective as provisioning-cluster-request-never-creates.
+        - '\b(?:config connector|kcc|cnrm|containerclusters?|crds?|resource types?)\b(?:[^.()\n]|\([^)\n]*\)|\.(?=\w)){0,80}?\b(?:not installed|(?:is|are)n''t installed|(?:is|are) not (?:available|enabled|present|deployed|set up)|(?:is|are)n''t (?:there|present|available|enabled)|not found|missing|absent|no crds?)\b'
+        - '\b(?:lacks?|without|missing|does not have|doesn''t have|do not have|don''t have)\b[^.\n]{0,80}\bconfig connector\b[^.\n]{0,20}\b(?:crds?|installed|installation|controller)\b'
+        - '\bno (?:config connector|kcc|cnrm)\b[^.\n]{0,40}\b(?:crds?|resource types?|containerclusters?|installed|is installed)\b'
+        - '\b(?:none of|no cluster|no clusters)\b(?:[^.()\n]|\([^)\n]*\)|\.(?=\w)){0,60}?\b(?:has|have|runs?)\b[^.\n]{0,20}\b(?:config connector|kcc|cnrm|containerclusters?)\b[^.\n]{0,40}\b(?:installed|present|available|enabled|crds?|resource types?)\b'
   - name: no-worker-ran-a-gcloud-cluster-create
     role: objective
     mode: assert
