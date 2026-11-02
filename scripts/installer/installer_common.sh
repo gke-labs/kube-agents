@@ -5253,6 +5253,10 @@ write_tfvars_from_state() {
     echo ""
     echo "enable_gke_backup_plan = $(hcl_bool "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}")"
     echo ""
+    # Read from install.env (or the environment) only: no flag or interview
+    # question sets it, so install.sh exports nothing over it. See the variable.
+    echo "helm_upgrade_install = $(hcl_bool "${HELM_UPGRADE_INSTALL:-$DEFAULT_HELM_UPGRADE_INSTALL}")"
+    echo ""
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."
     echo "hermes_dashboard_enabled = $(hcl_bool "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}")"

@@ -3093,6 +3093,52 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_pubsub_platform       = true", content)
             self.assertIn("enable_stockout_investigator = true", content)
 
+    def test_tfvars_generation_includes_helm_upgrade_install(self):
+        """HELM_UPGRADE_INSTALL reaches the composition's helm_upgrade_install.
+
+        Off unless install.env (or the environment) says otherwise, because
+        upgrade_install also adopts a release this install's state does not
+        own (#4108). The key has no flag and no interview question, so the
+        generator's own fallback is the only default it has.
+        """
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("helm_upgrade_install = false\n", dest.read_text())
+
+            for spelling in ("true", "True", "yes", "1"):
+                with self.subTest(spelling=spelling):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": spelling},
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn("helm_upgrade_install = true\n", dest.read_text())
+
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": "false"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("helm_upgrade_install = false\n", dest.read_text())
+
+    def test_helm_upgrade_install_reaches_the_kube_agents_release(self):
+        """The tfvars key is inert unless main.tf hands it to the release."""
+        composition = _REPO_ROOT / "terraform" / "examples" / "full-install"
+        main_tf = (composition / "main.tf").read_text()
+        release = main_tf.split('resource "helm_release" "kube_agents" {', 1)[1]
+        release = release.split("\n}\n", 1)[0]
+        self.assertRegex(
+            release, r"(?m)^  upgrade_install\s*=\s*var\.helm_upgrade_install\s*$"
+        )
+        variables_tf = (composition / "variables.tf").read_text()
+        block = variables_tf.split('variable "helm_upgrade_install" {', 1)[1].split("\n}\n", 1)[0]
+        self.assertRegex(block, r"(?m)^\s*default\s*=\s*false\s*$")
+
     def test_tfvars_carries_namespace_identity_and_cmek_names(self):
         # Every one of these used to be a fixed name the generator never wrote,
         # so install.env's NAMESPACE reached nothing and a second install in a
