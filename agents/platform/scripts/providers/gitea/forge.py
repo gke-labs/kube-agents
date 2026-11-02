@@ -32,11 +32,13 @@ import repo_ref
 from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
 from ..credentials import Credential, StaticFileCredential
 from ..validate import (
+    MAX_CONVERSATION_SIZE,
     repo_segments,
     validate_branch,
     validate_comment_limit,
     validate_labels,
     validate_limit,
+    validate_login,
     validate_number,
     validate_page,
     validate_state,
@@ -89,6 +91,26 @@ WRITE_PERMISSIONS = frozenset({"owner", "admin", "write"})
 # The reasons `issue-close` accepts. Gitea records no reason, so a valid one is
 # accepted and not sent; an invalid one is refused, as on every forge.
 CLOSE_REASONS = ("completed", "not-planned")
+# The header Gitea counts a listing's rows in.
+TOTAL_HEADER = "x-total-count"
+# The state an author's pull requests are listed in, and the one a tally can
+# count: Gitea's `state` is open or closed, with merged a flag on the item.
+AUTHORED_STATE = "all"
+OPEN_STATE = "open"
+# The order an author's pull requests are listed in: newest activity first, as
+# GitHub's search and GitLab's list are asked, so a bounded walk holds the
+# proposals that changed. Gitea's default is by creation.
+AUTHORED_SORT = "recentupdate"
+# The timeline event that records a close.
+CLOSE_EVENT = "close"
+
+
+def _total(headers: Mapping[str, str]) -> int | None:
+    """The row count Gitea sent in `X-Total-Count`, or None when it sent none."""
+    try:
+        return int(headers.get(TOTAL_HEADER, ""))
+    except ValueError:
+        return None
 
 
 class GiteaForge(Forge):
@@ -604,6 +626,79 @@ class GiteaForge(Forge):
                 break
         commits = [translate.commit(node) for node in reversed(nodes[: self.COMMIT_CAP])]
         return listing(commits[(page - 1) * limit : page * limit], limit, "commits")
+
+    # -- the readings sweep's calls -------------------------------------------
+
+    def _authored(
+        self, api: Callable, repo: str, payload: dict, state: str, limit: int, page: int
+    ) -> tuple[list, int | None]:
+        # `poster` takes the account's numeric id, which the caller looked up
+        # once; `author` is validated for parity with every forge.
+        validate_login(payload.get("author"))
+        poster = validate_number(payload.get("authorId"), "authorId")
+        nodes, headers = api(
+            "GET",
+            f"repos/{repo}/pulls",
+            params={
+                "state": state,
+                "poster": poster,
+                "sort": AUTHORED_SORT,
+                "limit": limit,
+                "page": page,
+            },
+            with_headers=True,
+        )
+        return nodes or [], _total(headers)
+
+    def proposal_list_by_author(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        limit = validate_limit(payload.get("limit"))
+        page = validate_page(payload.get("page"))
+        nodes, total = self._authored(api, repo, payload, AUTHORED_STATE, limit, page)
+        proposals = [translate.authored(node) for node in nodes]
+        # Gitea clamps `limit` to the server's `MAX_RESPONSE_ITEMS` and pages
+        # by the clamped size, so a page shorter than asked is not the end, and
+        # the rows read so far are this page's size times its number, not
+        # `limit` times it. On a short last page that undercounts, so the walk
+        # asks once more and gets an empty page: the safe side.
+        more = total is not None and bool(nodes) and page * len(nodes) < total
+        return {
+            "proposals": proposals,
+            "count": len(proposals),
+            "truncated": len(nodes) >= limit or more,
+            "total": total,
+        }
+
+    def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # Only the open ones can be counted from a header. Closed and merged
+        # are one `state=closed` total, told apart by a flag on each item, so
+        # neither count is given rather than one that holds the other.
+        _, total = self._authored(api, repo, payload, OPEN_STATE, 1, 1)
+        if total is None:
+            raise WorkspaceError(
+                "Gitea answered the open pull requests with no `X-Total-Count` count",
+                status=502,
+                code="FORGE_CALL_FAILED",
+            )
+        return {"open": total, "merged": None, "closed": None}
+
+    def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        limit = validate_comment_limit(payload.get("limit"))
+        nodes, truncated = self._conversation_pages(
+            api, f"repos/{repo}/pulls/{number}/reviews", limit
+        )
+        reviews = [item for item in (translate.review(node) for node in nodes) if item]
+        return {"reviews": reviews, "count": len(reviews), "truncated": truncated}
+
+    def proposal_closer(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # The issue comments route carries only what people wrote; a close is
+        # an event on the timeline. The last one names who closed it last.
+        number = validate_number(payload.get("number"))
+        events, _ = self._conversation_pages(
+            api, f"repos/{repo}/issues/{number}/timeline", MAX_CONVERSATION_SIZE
+        )
+        closes = [event for event in events if event.get("type") == CLOSE_EVENT]
+        return translate.closer(closes[-1] if closes else None)
 
     def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         # A conversation comment and an inline review comment are both

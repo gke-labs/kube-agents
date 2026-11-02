@@ -12,18 +12,24 @@ The full skill catalog is on the [Skill catalog](/kube-agents/skills/) page. Thi
 ## Where skills live
 
 ```text
-agents/platform/skills/
-├── gke-cluster-creation/
-│   └── SKILL.md
-├── gke-multitenancy/
-│   └── SKILL.md
-├── submit-suggestion/
-│   ├── SKILL.md
-│   └── (supporting scripts)
-└── ... (32 more)
+agents/
+├── platform/skills/            # Platform Agent
+│   ├── gke-multitenancy/
+│   │   └── SKILL.md
+│   ├── submit-suggestion/
+│   │   ├── SKILL.md
+│   │   └── scripts/
+│   └── .../
+├── cluster/skills/             # Cluster Agents
+│   └── .../
+└── tse/skills/                 # GKE Support Agent (optional)
+    └── support-escalation-bundle/
+        └── SKILL.md
 ```
 
-Skills are placed by persona: fleet-wide, provisioning, and GitOps-write skills live in `agents/platform/skills/` (the Platform Agent); the read-only, single-cluster runtime-debugging skills live in `agents/cluster/skills/` and are scaffolded into every per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) profile.
+Skills are placed by persona: fleet-wide, provisioning, and GitOps-write skills live in `agents/platform/skills/` (the Platform Agent); the read-only, single-cluster runtime-debugging skills live in `agents/cluster/skills/` and are scaffolded into every per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) profile. The [skill catalog](/kube-agents/skills/) lists each persona's skills.
+
+The GKE Support Agent's skills live in `agents/tse/skills/` and reach a pod only when the optional `tse` profile is enabled. On a `mode: next` install, applying the sample [`k8s-operator/examples/agentprofile-tse.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-tse.yaml) makes the operator set `KUBE_AGENTS_ENABLED_PROFILES=tse` on the gateway Deployment, and the entrypoint scaffolds `$HERMES_HOME/profiles/tse` from the image's `/opt/tse-template` on the next start ([AgentProfile CRD](/kube-agents/operator/agentprofile-crd/)).
 
 Some skills are pure Markdown; others carry supporting files (helper scripts, YAML templates) in the same directory. The Hermes runtime discovers `SKILL.md` files automatically at startup.
 
@@ -31,7 +37,7 @@ Some skills are pure Markdown; others carry supporting files (helper scripts, YA
 
 ```yaml
 ---
-name: gke-multi-tenancy
+name: gke-multitenancy
 description: Guidance on implementing multi-tenancy and governance in Google Kubernetes Engine (GKE) clusters.
 ---
 ```
@@ -101,7 +107,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 
 The agent discovers skills from **two** locations at startup:
 
-- **Baked into the image** — [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) copies `agents/platform/skills/` to `/opt/platform-template/skills/` (and `agents/cluster/skills/` to `/opt/cluster-template/skills/`), which are overlaid into the matching profile's home when the profile is created and then **replaced from the template on every pod start**. Skills are image-owned — nothing durable lives under them, and the agent's own tools refuse to write it: `skill_manage` refuses a skill the image ships for its profile, and the file tools refuse any path under the profile's `skills/` or `scripts/` ([`deploy/docker/patches/skill_manage_image_owned.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/skill_manage_image_owned.py)) — so an upgraded pod runs the image's skills, not whichever version first created its volume, and a skill deleted from the image disappears. (One mode-gated overlay rides that replace — see [`a2a/persona/README.md`](https://github.com/gke-labs/kube-agents/blob/main/a2a/persona/README.md).) The profile's own runtime state (`USER.md`, `memory/`, `sessions/`, `profile.yaml`) is untouched. A Cluster Agent's identity-stamped `config.yaml` is back-filled rather than replaced — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile).
+- **Baked into the image** — [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) copies `agents/platform/skills/` to `/opt/platform-template/skills/` (`agents/cluster/skills/` to `/opt/cluster-template/skills/`, and `agents/tse/skills/` to `/opt/tse-template/skills/`), which are overlaid into the matching profile's home when the profile is created and then **replaced from the template on every pod start**. Skills are image-owned — nothing durable lives under them, and the agent's own tools refuse to write it: `skill_manage` refuses a skill the image ships for its profile, and the file tools refuse any path under the profile's `skills/` or `scripts/` ([`deploy/docker/patches/skill_manage_image_owned.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/skill_manage_image_owned.py)) — so an upgraded pod runs the image's skills, not whichever version first created its volume, and a skill deleted from the image disappears. (One mode-gated overlay rides that replace — see [`a2a/persona/README.md`](https://github.com/gke-labs/kube-agents/blob/main/a2a/persona/README.md).) The profile's own runtime state (`USER.md`, `memory/`, `sessions/`, `profile.yaml`) is untouched. A Cluster Agent's identity-stamped `config.yaml` is back-filled rather than replaced — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile).
 - **The profile's runtime workspace** at `$HERMES_HOME/profiles/<profile>/skills` — `HERMES_HOME` defaults to `/opt/data`, so the Platform Agent's is `/opt/data/profiles/platform/skills`. This path is backed by the agent's persistent volume. Note it is _not_ `/opt/data/skills`: that is the `default` profile's home, which belongs to the Planning Agent, and [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml) disables the `skills` toolset there — a skill dropped in that directory is loaded by nothing.
 
 That gives you two ways to bring in additional skills — for example from the upstream [`google/skills`](https://github.com/google/skills/tree/main/skills/cloud) catalog.
@@ -166,7 +172,7 @@ The runtime discovers the skill on its next relevant turn. It does **not** survi
 A few related concepts that are easy to confuse:
 
 - **Skill** — a reusable capability the agent loads when relevant. Lives in `skills/`.
-- **Governance SOP** — a fleet-wide operating procedure (e.g. "audit blueprints daily"). Lives in `governance/`. Invoked by cron jobs.
+- **Governance SOP** — a fleet-wide operating procedure (e.g. "check fleet consistency drift"). Lives in `governance/`. Invoked by cron jobs.
 - **Cron job** — a scheduled prompt that fires an SOP or skill on a timer. Lives in `cron/jobs.json`.
 
 Skills are on-demand tools; SOPs are the codified playbooks; cron jobs are the schedules that fire them.

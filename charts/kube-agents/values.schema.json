@@ -787,6 +787,17 @@
                 }
               }
             },
+            "retention": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sessionDays": {
+                  "type": ["integer", "null"],
+                  "minimum": 90,
+                  "maximum": 365
+                }
+              }
+            },
             "stallWatch": {
               "type": "object",
               "additionalProperties": false,
@@ -850,6 +861,9 @@
                     },
                     "runtimeClassName": {
                       "type": "string"
+                    },
+                    "resources": {
+                      "type": "object"
                     }
                   }
                 }
@@ -880,6 +894,36 @@
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 100
+                    },
+                    "childReserve": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 999
+                    },
+                    "leaseSeconds": {
+                      "type": "integer",
+                      "minimum": 15,
+                      "maximum": 3600
+                    },
+                    "renewSeconds": {
+                      "type": "integer",
+                      "minimum": 5,
+                      "maximum": 300
+                    },
+                    "restartGraceSeconds": {
+                      "type": "integer",
+                      "minimum": 10,
+                      "maximum": 3600
+                    },
+                    "acceptTimeoutSeconds": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 120
+                    },
+                    "maxTaskDeadlineSeconds": {
+                      "type": "integer",
+                      "minimum": 60,
+                      "maximum": 21600
                     }
                   }
                 },
@@ -1406,7 +1450,8 @@
                   "type": "string"
                 },
                 "serviceUrl": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Ignored. Accepted so existing values files still validate; the PlatformAgent CRD has no serviceUrl field, and the adapter takes the service URL from each inbound activity."
                 },
                 "adaptiveCards": {
                   "type": "boolean"

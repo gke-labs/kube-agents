@@ -9,7 +9,9 @@ import datetime as dt
 import io
 import json
 import subprocess
+import re
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import feedback_summary as fs
@@ -46,6 +48,10 @@ CR = {
             "eventsIngestedTotal": 10,
             "remediationsProposedTotal": 4,
             "remediationsMergedTotal": 1,
+            "proposalsAuthored": 6,
+            "remediationsOpen": 2,
+            "remediationsClosedUnmergedTotal": 3,
+            "proposalHumanTouches": 5,
             "lastActiveTime": "2026-10-20T17:34:06Z",
             "activeInterfaces": ["googlechat"],
         },
@@ -135,6 +141,12 @@ class RenderTest(unittest.TestCase):
         self.assertIn("installed: 19 days", text)
         self.assertIn("toolExecutionsTotal: 19127", text)
         self.assertIn("sessionsTotal: 7", text)
+        self.assertIn("  remediationsMergedTotal: 1 (as the forge reports)\n", text)
+        self.assertIn("  proposalsAuthored: 6 (as the forge reports)\n", text)
+        self.assertIn("  remediationsOpen: 2 (as the forge reports)\n", text)
+        self.assertIn("  remediationsClosedUnmergedTotal: 3 (as the forge reports)\n", text)
+        self.assertIn("  proposalHumanTouches: 5 (as the forge reports)\n", text)
+        self.assertIn("  remediationsProposedTotal: 4\n", text)
         self.assertIn("Rating:", text)
         self.assertIn("What worked well:", text)
         self.assertIn("What failed or was slow:", text)
@@ -224,6 +236,18 @@ class RenderTest(unittest.TestCase):
         self.assertIn("toolExecutionsTotal: 0", text)
         self.assertIn("lastActive: never", text)
         self.assertIn("ready: unknown", text)
+
+    def test_readings_print_no_reading_when_absent_and_counters_print_zero(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["usage"] = {"remediationsOpen": 0}
+        text = fs.render(full_snapshot(cr=cr))
+        for reading in ("remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"):
+            self.assertIn(f"  {reading}: no reading (as the forge reports)\n", text)
+        self.assertIn("  remediationsOpen: 0 (as the forge reports)\n", text)
+        for counter in ("clustersRegistered", "toolExecutionsTotal", "remediationsProposedTotal"):
+            self.assertIn(f"  {counter}: 0\n", text)
+        self.assertNotIn("remediationsAppliedTotal", fs.USAGE_COUNTERS)
+        self.assertEqual(fs.audit(text, full_snapshot(cr=cr).identifiers), [])
 
     def test_next_mode_and_interfaces_are_printed_as_enums(self):
         cr = json.loads(json.dumps(CR))
@@ -453,6 +477,23 @@ class MainTest(unittest.TestCase):
             code = fs.main(["--namespace", NAMESPACE], stdout=io.StringIO(), stderr=err)
         self.assertEqual(code, fs.EXIT_LEAK)
         self.assertIn("refused", err.getvalue())
+
+
+
+class GatewayCopyTest(unittest.TestCase):
+    """The gateway's Go copy of the field lists is this script's, verbatim."""
+
+    GO_FILE = Path(__file__).resolve().parents[3] / "a2a" / "gateway" / "feedback_summary.go"
+
+    def _go_strings(self, var: str) -> list[str]:
+        source = self.GO_FILE.read_text()
+        start = source.index(f"var {var} = ")
+        body = source[start : source.index("}", start)]
+        return re.findall(r'"([A-Za-z]+)"', body)
+
+    def test_the_gateway_prints_the_same_counters_and_readings(self):
+        self.assertEqual(list(fs.USAGE_COUNTERS), self._go_strings("usageSummaryCounters"))
+        self.assertEqual(sorted(fs.USAGE_READINGS), sorted(self._go_strings("usageSummaryReadings")))
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ from urllib.parse import quote
 
 import repo_ref
 
-from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
+from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing, TALLY_TOTAL, tally_with_open
 from ..credentials import (
     BrokeredCredential,
     Credential,
@@ -36,12 +36,14 @@ from ..credentials import (
     NoCredential,
 )
 from ..validate import (
+    MAX_CONVERSATION_SIZE,
     MAX_PAGE_SIZE,
     repo_segments,
     validate_branch,
     validate_comment_limit,
     validate_labels,
     validate_limit,
+    validate_login,
     validate_number,
     validate_page,
     validate_state,
@@ -62,6 +64,36 @@ MAX_ISSUE_PAGES = 10
 
 # `repos/{r}/collaborators/{login}/permission` values that mean "may write".
 WRITE_PERMISSIONS = frozenset({"admin", "write", "maintain"})
+
+# How many of a pull request's commits GitHub serves: the endpoint stops there,
+# however long the branch. GitLab's and Gitea's commit readers stop at the same
+# depth, so the verb answers alike on every forge.
+COMMIT_CAP = 250
+
+# The search route an author's proposals are listed and counted through, and
+# the order a listing is asked in: newest activity first, so that a bounded
+# walk holds the proposals that changed and the same set from sweep to sweep.
+SEARCH_PATH = "search/issues"
+AUTHORED_SORT = "updated"
+AUTHORED_ORDER = "desc"
+# The search answer's flag for a query that timed out before it matched
+# everything: its items and its count may both be short.
+INCOMPLETE_RESULTS = "incomplete_results"
+
+# The qualifiers that count an author's proposals by outcome. `is:closed`
+# alone would count merged ones twice.
+# What a tally raises when GitHub's search answers no count or an incomplete
+# one: the forge call failed, as a gateway failure.
+TALLY_FAILED_STATUS = 502
+TALLY_FAILED_CODE = "FORGE_CALL_FAILED"
+# The states the tally searches; `open` is the one count less these two.
+TALLY_QUALIFIERS = {
+    "merged": "is:merged",
+    "closed": "is:unmerged is:closed",
+}
+
+# The issue event that records a close, and who made it.
+CLOSED_EVENT = "closed"
 
 
 #: The hosts the github.com forge resolves: github.com and the spelling of it a
@@ -118,6 +150,8 @@ class GitHubForge(Forge):
     error_overrides = ERROR_OVERRIDES
     acknowledges = True
     labels = True
+    search_routes = frozenset({SEARCH_PATH})
+    COMMIT_CAP = COMMIT_CAP
 
     def __init__(
         self,
@@ -614,22 +648,122 @@ class GitHubForge(Forge):
     def proposal_commits(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         number = validate_number(payload.get("number"))
         limit = validate_limit(payload.get("limit"))
-        params: dict[str, Any] = {"per_page": limit}
+        page = validate_page(payload.get("page"))
         # Oldest first, which is GitHub's order for this endpoint and the one
         # the verb promises. The commit a caller most often wants is the newest,
         # so the caller that needs it walks to the last page -- and on a
-        # proposal past 250 commits it never arrives at one. GitHub stops
-        # serving there, so the page that reaches the cap is short, `listing`
-        # reads a short page as the end and answers `truncated: false`, and the
-        # last entry of it is the 250th commit rather than the branch tip. A
-        # caller that needs the tip reads `sourceRevision` off the proposal
-        # instead; `submit_suggestion.stale_tip` says why, and is the one that
-        # was bitten.
-        page = validate_page(payload.get("page"))
+        # proposal past COMMIT_CAP commits it never arrives at one: GitHub stops
+        # serving there, and the last entry is the 250th commit rather than the
+        # branch tip. A caller that needs the tip reads `sourceRevision` off the
+        # proposal instead; `submit_suggestion.stale_tip` says why, and is the
+        # one that was bitten.
+        #
+        # One call at the caller's own page size, as every other listing
+        # verb makes. The page that reaches the cap says `truncated` from
+        # arithmetic alone: its window straddles COMMIT_CAP and GitHub served
+        # exactly up to it, where judged by its length alone a short page would
+        # read as the end of a branch GitHub has stopped serving. A page past
+        # the cap is empty without a call, so a caller walking pages stops
+        # there. The first page is asked without `page`, as GitHub's
+        # unqualified route answers it.
+        start = (page - 1) * limit
+        if start >= self.COMMIT_CAP:
+            return listing([], limit, "commits")
+        params: dict[str, Any] = {"per_page": limit}
         if page > 1:
             params["page"] = page
-        nodes = api("GET", f"repos/{repo}/pulls/{number}/commits", params=params)
-        return listing([translate.commit(node) for node in nodes], limit, "commits")
+        nodes = api("GET", f"repos/{repo}/pulls/{number}/commits", params=params) or []
+        nodes = nodes[: self.COMMIT_CAP - start]
+        answer = listing([translate.commit(node) for node in nodes], limit, "commits")
+        reaches_cap = page * limit >= self.COMMIT_CAP and len(nodes) == self.COMMIT_CAP - start
+        answer["truncated"] = answer["truncated"] or reaches_cap
+        return answer
+
+    # -- the readings sweep's calls -------------------------------------------
+
+    @staticmethod
+    def _author_query(repo: str, payload: dict) -> str:
+        # `author` is the login, or `app/<slug>` for an App installation,
+        # which the caller decides; validated because it is read from inside
+        # the query, where a space would start another qualifier.
+        author = validate_login(payload.get("author"))
+        return f"repo:{repo} is:pr author:{author}"
+
+    def proposal_list_by_author(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # The search API, because `/pulls` takes no author filter, and an
+        # author's proposals filtered out of everyone's would spend the page
+        # on other people's. Its index lags a write by seconds, which a
+        # periodic count absorbs. GitHub Enterprise Server serves the same
+        # route under its API prefix.
+        query = self._author_query(repo, payload)
+        limit = validate_limit(payload.get("limit"))
+        page = validate_page(payload.get("page"))
+        found = api(
+            "GET",
+            SEARCH_PATH,
+            params={
+                "q": query,
+                "sort": AUTHORED_SORT,
+                "order": AUTHORED_ORDER,
+                "per_page": limit,
+                "page": page,
+            },
+        ) or {}
+        answer = listing(
+            [translate.authored(node) for node in found.get("items") or []], limit, "proposals"
+        )
+        total = found.get("total_count")
+        answer["total"] = total if isinstance(total, int) and not isinstance(total, bool) else None
+        if found.get(INCOMPLETE_RESULTS) is True:
+            # The search timed out on GitHub's side and this page may lack
+            # items the total counts; it is never the end of a listing.
+            answer["truncated"] = True
+            answer["incomplete"] = True
+        return answer
+
+    def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        query = self._author_query(repo, payload)
+        tally: dict[str, Any] = {}
+        # The states are separate searches, not one snapshot; the unqualified
+        # query's count is the one number the sweep sums the states to, and
+        # `open` is derived from it rather than searched.
+        for state, qualifier in {**TALLY_QUALIFIERS, TALLY_TOTAL: ""}.items():
+            found = api("GET", SEARCH_PATH, params={"q": f"{query} {qualifier}".strip(), "per_page": 1}) or {}
+            total = found.get("total_count")
+            if not isinstance(total, int) or isinstance(total, bool):
+                raise WorkspaceError(
+                    "GitHub's search answered with no count", status=TALLY_FAILED_STATUS, code=TALLY_FAILED_CODE
+                )
+            if found.get(INCOMPLETE_RESULTS) is True:
+                raise WorkspaceError(
+                    "GitHub's search timed out and its count is incomplete",
+                    status=TALLY_FAILED_STATUS,
+                    code=TALLY_FAILED_CODE,
+                )
+            tally[state] = total
+        return tally_with_open(tally)
+
+    def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # The reviews `proposal-view` reads, without its bodiless-review drop:
+        # a plain approval is the review a count most needs. Truncated on the
+        # rows GitHub sent, as there: a pending review it drops is still a row.
+        number = validate_number(payload.get("number"))
+        limit = validate_comment_limit(payload.get("limit"))
+        nodes, truncated = self._conversation_pages(
+            api, f"repos/{repo}/pulls/{number}/reviews", limit
+        )
+        reviews = [item for item in (translate.review(node) for node in nodes) if item]
+        return {"reviews": reviews, "count": len(reviews), "truncated": truncated}
+
+    def proposal_closer(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # The last `closed` event: a proposal closed, reopened and closed
+        # again was closed by whoever closed it last.
+        number = validate_number(payload.get("number"))
+        events, _ = self._conversation_pages(
+            api, f"repos/{repo}/issues/{number}/events", MAX_CONVERSATION_SIZE
+        )
+        closes = [event for event in events if event.get("event") == CLOSED_EVENT]
+        return translate.closer(closes[-1] if closes else None)
 
     def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         # Best-effort by contract: a courtesy so the reviewer sees something

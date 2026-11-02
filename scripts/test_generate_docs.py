@@ -218,9 +218,53 @@ class CapabilitiesTest(unittest.TestCase):
         names = {
             *generate_docs._read_skills(generate_docs.SKILLS_DIR),
             *generate_docs._read_skills(generate_docs.CLUSTER_SKILLS_DIR),
+            *generate_docs._read_skills(generate_docs.TSE_SKILLS_DIR),
         }
+        self.assertTrue(names)
         for name in names:
             self.assertIn(f"`{name}`", skills)
+
+    def test_the_catalog_lists_the_support_agent_skills_under_their_own_group(self):
+        tse_skills = generate_docs._read_skills(generate_docs.TSE_SKILLS_DIR)
+        self.assertTrue(tse_skills, "agents/tse/skills holds no SKILL.md")
+        body = generate_docs.gen_skill_catalog()
+        group = body.split(f"### {generate_docs.TSE_SKILL_GROUP}\n")[1]
+        for name in tse_skills:
+            self.assertIn(
+                f"[`{name}`]({generate_docs.GITHUB_BLOB}/agents/tse/skills/{name}/SKILL.md)",
+                group,
+            )
+        self.assertTrue(body.rstrip().endswith(group.rstrip()))
+
+    def test_a_name_shared_across_personas_keeps_each_directory_s_description(self):
+        shared = next(iter(generate_docs.SKILL_GROUPS.values()))[0]
+        by_dir = {
+            generate_docs.SKILLS_DIR: {shared: "platform description"},
+            generate_docs.CLUSTER_SKILLS_DIR: {shared: "cluster description"},
+            generate_docs.TSE_SKILLS_DIR: {},
+        }
+        with mock.patch.object(generate_docs, "_read_skills", side_effect=by_dir.__getitem__):
+            body = generate_docs.gen_skill_catalog()
+        platform_rows, cluster_rows = body.split(f"### {generate_docs.CLUSTER_SKILL_GROUP}\n")
+        blob = generate_docs.GITHUB_BLOB
+        self.assertIn(
+            f"| [`{shared}`]({blob}/agents/platform/skills/{shared}/SKILL.md) | platform description |",
+            platform_rows,
+        )
+        self.assertIn(
+            f"| [`{shared}`]({blob}/agents/cluster/skills/{shared}/SKILL.md) | cluster description |",
+            cluster_rows,
+        )
+        self.assertNotIn("cluster description", platform_rows)
+
+    def test_a_persona_group_with_no_skills_is_left_out(self):
+        grouped = generate_docs.group_skills({"fleet-audit": "d"}, {})
+        for group, _ in generate_docs.PERSONA_SKILL_GROUPS:
+            self.assertEqual(grouped[group], [])
+        with mock.patch.object(generate_docs, "read_persona_skills", return_value={}):
+            body = generate_docs.gen_skill_catalog()
+        self.assertNotIn(generate_docs.TSE_SKILL_GROUP, body)
+        self.assertNotIn(generate_docs.CLUSTER_SKILL_GROUP, body)
 
     def test_daily_audits_come_first_and_untimed_schedules_last(self):
         roster = [

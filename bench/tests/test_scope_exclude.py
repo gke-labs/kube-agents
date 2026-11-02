@@ -89,6 +89,56 @@ def test_cases_prints_only_the_declaring_tasks_in_order(tmp_path, capsys):
     assert capsys.readouterr().out.splitlines() == ["one b", "two b d"]
 
 
+@pytest.mark.parametrize(
+    "body",
+    ["scope_exclude: {slots: [b, d], absent: 1}\n", "scope_exclude:\n  slots: [b, d]\n  absent: 1\n"],
+)
+def test_the_absent_count_reads_beside_the_slots(tmp_path, body):
+    assert scope_exclude.declared_scope_exclude(_task(tmp_path, "c", body)) == (["b", "d"], 1)
+    assert scope_exclude.declared_slots(_task(tmp_path, "d", body)) == ["b", "d"]
+
+
+@pytest.mark.parametrize("absent", ["0", "-1", "true", "9", "'1'", "1.5"])
+def test_an_absent_count_the_runner_cannot_use_fails_the_read(tmp_path, absent):
+    with pytest.raises(scope_exclude.ScopeExcludeError):
+        scope_exclude.declared_scope_exclude(_task(tmp_path, "c", f"scope_exclude: {{slots: [b], absent: {absent}}}\n"))
+
+
+def test_cases_passes_the_absent_count_as_a_plus_token(tmp_path, capsys):
+    task = _task(tmp_path, "nn", "scope_exclude: {slots: [b, d], absent: 1}\n")
+    assert scope_exclude.main(["cases", str(task)]) == 0
+    assert capsys.readouterr().out.splitlines() == ["nn b d +1"]
+
+
+def test_an_absent_cluster_takes_a_letter_past_the_catalogue_in_the_first_slots_place(tmp_path):
+    # The catalogue's slots end at d, so the first absent letter is e, whichever slots
+    # the runner reached; project and location are the first slot's.
+    absent = {"projectId": "pool-1", "location": "us-central1-b", "clusterName": "seeded-e"}
+    assert scope_exclude.excluded_clusters(_context(tmp_path), ["b", "d"], 1) == [SEEDED_B, SEEDED_D, absent]
+    two = scope_exclude.excluded_clusters(_context(tmp_path), ["d"], 2)
+    assert [c["clusterName"] for c in two] == ["seeded-d", "seeded-e", "seeded-f"]
+
+
+def test_absent_clusters_need_a_slot_named_prefix_dash_letter(tmp_path):
+    odd = CONTEXT.replace("cluster.b=seeded-b", "cluster.b=other")
+    with pytest.raises(scope_exclude.ScopeExcludeError):
+        scope_exclude.excluded_clusters(_context(tmp_path, odd), ["b"], 1)
+    with pytest.raises(scope_exclude.ScopeExcludeError):
+        scope_exclude.excluded_clusters(_context(tmp_path), [], 1)
+
+
+def test_split_tokens_reads_the_plus_token_back():
+    assert scope_exclude.split_tokens(["b", "d", "+1"]) == (["b", "d"], 1)
+    assert scope_exclude.split_tokens(["b"]) == (["b"], 0)
+
+
+def test_patch_cli_adds_the_absent_clusters(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"metadata": {}, "spec": {}})))
+    assert scope_exclude.main(["patch", "--fleet-dir", str(_context(tmp_path)), "--slots", "b", "d", "+1"]) == 0
+    clusters = json.loads(capsys.readouterr().out)[-1]["value"]["exclude"]["clusters"]
+    assert [c["clusterName"] for c in clusters] == ["seeded-b", "seeded-d", "seeded-e"]
+
+
 def test_each_slot_resolves_through_the_fleet_context(tmp_path):
     assert scope_exclude.excluded_clusters(_context(tmp_path), ["b", "d"]) == [SEEDED_B, SEEDED_D]
 

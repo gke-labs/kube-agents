@@ -213,7 +213,7 @@ class TestTruncatedNightlyFixture(unittest.TestCase):
         self.assertFalse(night["complete"])
         self.assertEqual(night["counts"], {"expected": 5, "recorded": 4, "passed": 3, "partial": 1, "failed": 0, "infra": 0, "missing": 1})
         self.assertEqual(night["missing"], ["agent-kanban-smoke"])
-        at = datetime(2026, 9, 22, 13, 0, tzinfo=timezone.utc)  # 9 AM ET that morning
+        at = datetime(2026, 9, 22, 13, 0, tzinfo=timezone.utc)  # 9 AM ET that morning (the test's hour; the assertion is hour-independent)
         line = nightly.digest_line(data, at)
         self.assertIn("truncated after 8h 03m", line)
         self.assertIn("4 of 5 cases recorded", line)

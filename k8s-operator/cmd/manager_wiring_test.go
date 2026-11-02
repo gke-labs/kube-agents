@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"strings"
 	"testing"
 )
 
@@ -45,7 +46,62 @@ const (
 	reconcilerType           = "controller.PlatformAgentReconciler"
 	reconcilerAPIReaderField = "APIReader"
 	reconcilerAPIReaderValue = "mgr.GetAPIReader()"
+	memoryLimitCall          = "memlimit.Apply"
+	memoryLimitCallEnvArg    = "operatorMemoryLimitEnv"
+	memoryLimitCallShareArg  = "operatorMemoryLimitFraction"
+	managerConstructorCall   = "ctrl.NewManager"
 )
+
+// The soft memory limit is the manager's one defence between "the cache
+// outgrew the limit" and the OOM killer, and like the two lines above it
+// cannot be observed without a running process: memlimit's own tests cover the
+// derivation, and nothing but this reads main.go for the call. It has to come
+// before ctrl.NewManager, because the cache's initial list is the allocation
+// it exists to pace.
+func TestMainAppliesTheMemoryLimitBeforeBuildingTheManager(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, mainSourceFile, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", mainSourceFile, err)
+	}
+	applyPos, applyArgs := callSite(file, memoryLimitCall)
+	if !applyPos.IsValid() {
+		t.Fatalf("%s never calls %s: the manager runs under the runtime's default pacing whatever the container's limit", mainSourceFile, memoryLimitCall)
+	}
+	if want := memoryLimitCallEnvArg + ", " + memoryLimitCallShareArg; applyArgs != want {
+		t.Errorf("%s is called with (%s), want (%s): the variable and the share are the two constants the manifests and the comments are written to", memoryLimitCall, applyArgs, want)
+	}
+	managerPos, _ := callSite(file, managerConstructorCall)
+	if !managerPos.IsValid() {
+		t.Fatalf("%s never calls %s", mainSourceFile, managerConstructorCall)
+	}
+	if applyPos >= managerPos {
+		t.Errorf("%s is called after %s: the cache's initial list runs under the default pacing", memoryLimitCall, managerConstructorCall)
+	}
+}
+
+// callSite returns the position of the first call to `package.Func` in file
+// and its arguments rendered as source, or an invalid position when there is
+// none.
+func callSite(file *ast.File, callee string) (token.Pos, string) {
+	pos, args := token.NoPos, ""
+	ast.Inspect(file, func(n ast.Node) bool {
+		if pos.IsValid() {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok || literalTypeName(call.Fun) != callee {
+			return true
+		}
+		rendered := make([]string, 0, len(call.Args))
+		for _, arg := range call.Args {
+			rendered = append(rendered, types.ExprString(arg))
+		}
+		pos, args = call.Pos(), strings.Join(rendered, ", ")
+		return false
+	})
+	return pos, args
+}
 
 func TestMainHandsTheManagerItsCacheAndTheReconcilerALiveReader(t *testing.T) {
 	fset := token.NewFileSet()

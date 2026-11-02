@@ -62,7 +62,7 @@ AGENT_WRITABLE = ("/opt/data", "/opt/defaults")
 # Each forwarded script and the constant naming the path its caller forwards to.
 # The constant is checked as well as the closure: staging a root-owned copy that
 # nothing points at buys nothing.
-FORWARDED = {"forge": "SANDBOX_FORGE", "resolver": "SANDBOX_RESOLVER"}
+FORWARDED = {"forge": "SANDBOX_FORGE", "resolver": "SANDBOX_RESOLVER", "gke_cluster_reads": "SANDBOX_GKE_READS"}
 
 # The interpreter's own files. Everything else a trusted process imports has to
 # come out of the root-owned directory.

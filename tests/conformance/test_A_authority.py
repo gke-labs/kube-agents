@@ -434,6 +434,47 @@ class A3TheEvalDoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
         )
 
 
+class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
+    """A3: a profile worker's cluster and project come from its signed task credential.
+
+    The broker's `profile` role (#3889) runs model output from an AgentProfile
+    worker. The cluster and project a call reaches are the ones in the
+    dispatcher's task credential, bound to the attested pod, never ones the
+    caller names; with no credential, nothing credentialed runs at all.
+    """
+
+    TARGET = h.task_confinement.ClusterTarget(project="proj-a", location="us-central1", cluster="cluster-a")
+
+    def test_A3_a_profile_call_outside_its_tasks_target_is_refused(self) -> None:
+        refusal = h.task_confinement.ConfinementRefusal
+        for argv in (
+            ["kubectl", "get", "secrets", "--context=gke_proj-b_us-central1_cluster-b"],
+            ["kubectl", "get", "secrets", "--server=https://127.0.0.1:8443"],
+            ["gcloud", "container", "clusters", "list", "--project=proj-b"],
+            ["gcloud", "projects", "list"],
+            ["gcloud", "config", "set", "project", "proj-b"],
+            ["kubectl", "config", "use-context", "gke_proj-b_us-central1_cluster-b"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(refusal):
+                    h.task_confinement.confine(argv, None, self.TARGET)
+        # And naming nothing reaches the target, not the broker's host.
+        confined = h.task_confinement.confine(["kubectl", "get", "pods"], None, self.TARGET)
+        self.assertEqual(self.TARGET.context_name, confined.kubeconfig_context)
+
+    def test_A3_a_profile_caller_without_a_task_credential_reaches_no_cluster(self) -> None:
+        for argv in (["kubectl", "get", "pods"], ["gcloud", "container", "clusters", "list"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(h.task_confinement.ConfinementRefusal):
+                    h.task_confinement.confine(argv, None, None)
+        self.assertTrue(h.task_confinement.confine(["kubectl", "version", "--client"], None, None).isolated)
+
+    def test_A3_the_profile_role_reaches_the_exec_route_alone(self) -> None:
+        profile = h.credential_proxy.CALLER_ROLE_PROFILE
+        reached = [prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles]
+        self.assertEqual(["/v1/exec"], reached)
+
+
 class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
     """A3 on the A2A door: the inject door's sibling for an agent caller, held
     to the same two properties by the same two seams.

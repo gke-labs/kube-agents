@@ -155,18 +155,20 @@ KUBECONFIG_LINK_NOT_REMOVED_FORMAT = "{path} is a symbolic link, which a kubecon
 KUBECONFIG_REFUSED_RC = 1
 ROOT_UID = 0
 DEFAULT_TIMEOUT_S = 60
-# How many clusters a sweep reads at once. Every check is a kubectl or gcloud
-# the credential proxy runs, and the proxy admits four requests at once under
-# its child memory budget at the operator's default limit
-# (docs/designs/credential-proxy-child-memory-budget.md §2.2: 704 MiB for
-# children over 176 MiB a request). A wider pool only queues the rest at the
-# proxy, where a check still waiting at its 60 s admission bound is refused
-# busy, or hits DEFAULT_TIMEOUT_S here first and reads its cluster as
-# unreachable -- which is the SOPs' cue to retry that cluster by hand, through
-# the same proxy. So the pool is the admitted count, as stall_watch.py's and
-# cluster_agent_reconcile.py's listing pools are; the procedural collectors
-# beside this file carry the same figure and point here.
-MAX_WORKERS = 4
+# How many clusters a sweep reads at once: broker_admission.sweep_width(),
+# resolved in collect_fleet. Every check is a kubectl or gcloud the credential
+# broker runs, and the broker admits its slot cap or what its child memory
+# budget fits at the container's effective limit, whichever is smaller: 8 at
+# the operator's default 2Gi limit, 4 on GKE Autopilot without bursting, where
+# the limit is the 1Gi request. A wider pool only queues the rest at the broker,
+# where a check still waiting at its 60 s admission bound is refused busy, or
+# hits DEFAULT_TIMEOUT_S here first and reads its cluster as unreachable. So the
+# width is read from the broker (GET /v1/exec/admission), less two slots of
+# headroom for chat when it admits six or more, and at most today's four below
+# that; four when the broker can't say. The procedural collectors beside this
+# file resolve the same width. stall_watch.py's and cluster_agent_reconcile.py's
+# background listing pools stay at four: they share the broker with kanban
+# workers, and their own comments say why.
 
 # A judgement this collector hands the sweep (`audit_report.py`'s
 # `NO_SWEEP_TRIAGE`, which carries the same string). A `netpol-missing` fix
@@ -247,6 +249,7 @@ for _shared_dir in _platform_script_dirs():
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -8108,7 +8111,7 @@ AUTOPILOT_ALLOWLIST_KINDS = (
 # pod against an idle hub holding 19 objects: 10-14 seconds.
 #
 # That fits inside 60 comfortably, which is why the check looked fine until it
-# ran for real. The collector sweeps `MAX_WORKERS` clusters at once, and the
+# ran for real. The collector sweeps `max_workers` clusters at once, and the
 # fifteen without Config Connector answer this read in about a tenth of a
 # second, so the hub is the only one that is still working when the rest of
 # its wave are hammering the same pod -- and on 2026-09-06, the first day
@@ -9662,9 +9665,10 @@ def collect_fleet(
     project: str | None = None,
     *,
     run: RunFn = default_run,
-    max_workers: int = MAX_WORKERS,
+    max_workers: int | None = None,
     workspace: Path | None = None,
 ) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     checks = CHECK_TABLES.get(audit_id)
     if not checks:
         raise ValueError(f"no check table for {audit_id!r} yet — see this file's module docstring")

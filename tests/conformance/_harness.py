@@ -58,6 +58,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 import mcp_policy  # noqa: E402
+import task_confinement  # noqa: E402
 import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
@@ -230,6 +231,14 @@ SOURCES: dict[str, Source] = {
     "chart_admission_policy": Source(
         "charts/kube-agents/templates/agent-rbac-admission-policy.yaml",
         ("policyName",),
+    ),
+    "gateway_pod_policy": Source(
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ("kube-agents-a2a-gateway-pod", "failurePolicy", "variables.sessionAccount"),
+    ),
+    "chart_gateway_pod_policy": Source(
+        "charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml",
+        ("kube-agents.a2aGatewayPodPolicyEnabled", "policyName"),
     ),
     # --- rendered output the operator is asserted against -----------------
     "shell_sandbox_manifests_go": Source(

@@ -1741,3 +1741,188 @@ func TestDispatcherScaleUpMarkFromAnotherReporterRecordsNoVerdict(t *testing.T) 
 		t.Fatalf("FailedScheduling after cluster-autoscaler's decline: injects = %d; want 2", *injectCount)
 	}
 }
+
+// TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen is the acceptance
+// test the breaker was asked for: the daemon answers POST /sessions 503
+// three times, the next 20 events in the bucket make no HTTP call inside the
+// 60s fake-clock window and each is counted as suppressed with the bucket's
+// labels, and the next event POSTs once the clock has advanced 61s. The
+// breaker is one per process, so a second cluster's dispatcher sharing the
+// injector is held too, with its own labels on the counter.
+func TestDispatcherHoldsSessionCreatesWhileTheBreakerIsOpen(t *testing.T) {
+	const sessionID = "sess-1"
+	var createCalls, injectCalls int
+	createStatus := http.StatusServiceUnavailable
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			createCalls++
+			w.WriteHeader(createStatus)
+			if createStatus == http.StatusCreated {
+				_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: sessionID})
+			}
+			return
+		}
+		injectCalls++
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(injectResponse{Status: "injected"})
+	}))
+	defer server.Close()
+
+	inj, err := newInjector(injectorConfig{
+		daemonURL:   server.URL,
+		bearerToken: "mock-token",
+		httpClient:  server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("build injector: %v", err)
+	}
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	inj.breaker.now = clock
+	m := newMetrics()
+	newDisp := func() *dispatcher {
+		dedup, err := newDedupCache(24*time.Hour, "")
+		if err != nil {
+			t.Fatalf("build cache: %v", err)
+		}
+		return &dispatcher{
+			filter:   newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+			dedup:    dedup,
+			injector: inj,
+			metrics:  m,
+			mode:     "per-incident",
+			now:      clock,
+		}
+	}
+	disp := newDisp()
+	ev := TriageEvent{
+		Key:          EventKey{UID: "pod-1", Reason: "CrashLoopBackOff"},
+		Cluster:      "test-cluster",
+		Project:      "proj",
+		Location:     "us-central1",
+		Namespace:    "default",
+		KindOfObject: "Pod",
+		Name:         "billing-service-7d9f8b6c4-xk2pq",
+		LastSeen:     now,
+		Message:      "back-off restarting failed container",
+	}
+	suppressed := func(cluster, workload string) float64 {
+		return testutil.ToFloat64(m.sessionCreatesSuppressed.WithLabelValues(cluster, "proj", "us-central1", "default", "Pod", workload))
+	}
+
+	// Three 503s: each rolls back its dedup entry and is counted as a
+	// create error, and the third opens the breaker.
+	for i := 0; i < 3; i++ {
+		disp.Dispatch(context.Background(), ev)
+	}
+	if createCalls != 3 {
+		t.Fatalf("got %d POST /sessions before the breaker opened; want 3", createCalls)
+	}
+	if got := testutil.ToFloat64(m.sessionCreates.WithLabelValues("test-cluster", "proj", "us-central1", "error")); got != 3 {
+		t.Errorf("session_creates_total{outcome=error} = %v; want 3", got)
+	}
+
+	// The next 20 events in the bucket, spread across the 60s window: no
+	// HTTP call, no dedup entry left behind, 20 on the counter.
+	for i := 0; i < 20; i++ {
+		now = now.Add(2 * time.Second)
+		ev.LastSeen = now
+		disp.Dispatch(context.Background(), ev)
+	}
+	if createCalls != 3 || injectCalls != 0 {
+		t.Fatalf("got %d creates and %d injects inside the cooldown; want 3 and 0", createCalls, injectCalls)
+	}
+	if disp.dedup.Len() != 0 {
+		t.Errorf("a held dispatch left %d dedup entries; want 0, so the next sighting after the cooldown opens the incident", disp.dedup.Len())
+	}
+	if got := testutil.ToFloat64(m.activeIncidents.WithLabelValues("test-cluster", "proj", "us-central1")); got != 0 {
+		t.Errorf("active_incidents = %v during the hold; want 0, the rolled-back entry re-read", got)
+	}
+	// The label is the Deployment's name, folded from the pod's as the
+	// daemon folds incidents, not the pod name.
+	if got := suppressed("test-cluster", "billing-service"); got != 20 {
+		t.Errorf("session_creates_suppressed_total for the bucket = %v; want 20", got)
+	}
+	if got := testutil.ToFloat64(m.sessionCreates.WithLabelValues("test-cluster", "proj", "us-central1", "error")); got != 3 {
+		t.Errorf("session_creates_total{outcome=error} = %v after the hold; want it unchanged at 3", got)
+	}
+
+	// Process-wide: another cluster's dispatcher, built on the same
+	// injector, is held by the same breaker and counted under its own
+	// labels. Two runs of a CronJob failing through the hold are two pod
+	// names and two UIDs; neither folds, so both land on the one child with
+	// an empty workload rather than minting a child per run.
+	other := newDisp()
+	otherEv := ev
+	otherEv.Cluster = "other-cluster"
+	otherEv.Name = "backup-29312345-k7x2p"
+	other.Dispatch(context.Background(), otherEv)
+	nextRun := otherEv
+	nextRun.Key.UID = "cron-run-2"
+	nextRun.Name = "backup-29312346-m3q8z"
+	other.Dispatch(context.Background(), nextRun)
+	if createCalls != 3 {
+		t.Fatalf("a second cluster POSTed through the open breaker (%d creates); want the hold to be process-wide", createCalls)
+	}
+	if got := suppressed("other-cluster", ""); got != 2 {
+		t.Errorf("session_creates_suppressed_total for the other cluster's unfolded pods = %v; want 2 on one child", got)
+	}
+	for _, name := range []string{otherEv.Name, nextRun.Name} {
+		if got := suppressed("other-cluster", name); got != 0 {
+			t.Errorf("session_creates_suppressed_total{workload=%q} = %v; want no child named after a CronJob run's pod", name, got)
+		}
+	}
+
+	// 61s past the opening failure, the daemon is back: the next event POSTs
+	// once and the incident opens.
+	now = now.Add(61*time.Second - 40*time.Second)
+	ev.LastSeen = now
+	createStatus = http.StatusCreated
+	disp.Dispatch(context.Background(), ev)
+	if createCalls != 4 || injectCalls != 1 {
+		t.Fatalf("got %d creates and %d injects after the cooldown; want 4 and 1", createCalls, injectCalls)
+	}
+	if disp.dedup.Len() != 1 {
+		t.Errorf("the dispatch after the cooldown left %d dedup entries; want 1", disp.dedup.Len())
+	}
+	if got := suppressed("test-cluster", "billing-service"); got != 20 {
+		t.Errorf("session_creates_suppressed_total moved to %v after the cooldown; want it at 20", got)
+	}
+}
+
+// TestWorkloadOfKeepsOnlyNamedWorkloads pins the suppressed counter's
+// workload label: a Deployment's pod on its Deployment (the daemon's
+// _fold_key), a Deployment, StatefulSet, DaemonSet or CronJob on its own name,
+// and everything else on the empty string: a pod that does not fold (a
+// StatefulSet ordinal, a Job's or CronJob run's pod, a DaemonSet's or a bare
+// pod) and a kind whose names are minted per instance (a Node, a ReplicaSet,
+// a Job), so no name that changes per run, rollout or node mints a counter
+// child of its own.
+func TestWorkloadOfKeepsOnlyNamedWorkloads(t *testing.T) {
+	for _, tc := range []struct {
+		kind, name, want string
+	}{
+		{"Pod", "billing-service-7d9f8b6c4-xk2pq", "billing-service"},
+		{"pod", "api-5b8c7d9f6-abcde", "api"},
+		{"Pod", "web-0", ""},
+		{"Pod", "backup-29312345-k7x2p", ""},
+		{"Pod", "backup-29312346-m3q8z", ""},
+		{"Pod", "db-migrate-20261021-abcde", ""},
+		{"Pod", "node-exporter-x7k2p", ""},
+		{"Pod", "bare", ""},
+		{"Deployment", "api", "api"},
+		{"deployment", "api", "api"},
+		{"StatefulSet", "web", "web"},
+		{"DaemonSet", "node-exporter", "node-exporter"},
+		{"CronJob", "backup", "backup"},
+		{"Node", "gk3-robot-host-pool-1-8f3a2b1c-x7k2", ""},
+		{"Node", "gk3-robot-host-pool-1-8f3a2b1c-m3q8", ""},
+		{"ReplicaSet", "api-5b8c7d9f6", ""},
+		{"Job", "backup-29312345", ""},
+		{"HorizontalPodAutoscaler", "api", ""},
+	} {
+		if got := workloadOf(TriageEvent{KindOfObject: tc.kind, Name: tc.name}); got != tc.want {
+			t.Errorf("workloadOf(%s %s) = %q; want %q", tc.kind, tc.name, got, tc.want)
+		}
+	}
+}

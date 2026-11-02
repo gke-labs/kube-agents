@@ -19,10 +19,12 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+import command_policy
+import credential_proxy
 import credential_proxy_client
 
 try:
@@ -401,6 +403,118 @@ class TestKubectlContextFlagNamesTheCluster(ContextLessTestCase):
             self.environ(),
         )
         self.assertNotIn("kubeconfigContext", payload)
+
+
+class TestGetCredentialsWithFlagsBetweenItsWords(ContextLessTestCase):
+    """A flag between the command words is still get-credentials to the shim."""
+
+    GET_CREDENTIALS = [
+        "gcloud", "container", "clusters", "--location", "us-central1-a",
+        "get-credentials", "seeded-a",
+    ]
+
+    def test_the_file_is_asked_for_and_lands(self):
+        captured, _ = self.fetch(self.environ())
+        self.assertEqual(0, captured["exit_code"])
+        self.assertTrue(captured["payload"]["wantsKubeconfig"])
+        self.assertEqual(SEEDED_KUBECONFIG, self.expected_file.read_text(encoding="utf-8"))
+
+    def test_the_detector_reads_the_words_past_the_flags(self):
+        cases = [
+            (["gcloud", "container", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "container", "clusters", "--location=l", "get-credentials", "c"], True),
+            (["gcloud", "container", "clusters", "--location", "l", "get-credentials", "c"], True),
+            (["gcloud", "container", "--project=p", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "container", "--project", "p", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "--project", "p", "container", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "container", "--quiet", "clusters", "--zone", "l", "get-credentials", "c"], True),
+            (["gcloud", "beta", "container", "clusters", "get-credentials", "c"], True),
+            (["gcloud", "container", "clusters", "describe", "get-credentials"], False),
+            (["gcloud", "container", "clusters", "list", "--location", "l"], False),
+            (["gcloud", "container", "clusters", "get-credentials"][:3], False),
+            (["kubectl", "container", "clusters", "get-credentials"], False),
+            ([], False),
+        ]
+        for argv, want in cases:
+            with self.subTest(argv=argv):
+                self.assertEqual(want, credential_proxy_client.is_get_credentials(argv))
+
+
+class TestTheShimAndTheBrokerAgreeOnGetCredentials(unittest.TestCase):
+    """The shim's get-credentials walk reads argv as the broker's does.
+
+    The shim can't import `command_policy` in the sandbox, so it keeps its own
+    walk. This holds the two to one table of spellings, and holds the shim's
+    short valued flags to the policy's, so a short valued flag added to the
+    policy fails here until the shim learns it too.
+    """
+
+    GC = ["gcloud", "container", "clusters"]
+
+    AGREED = [
+        (GC + ["get-credentials", "c"], True),
+        (GC + ["--location=l", "get-credentials", "c"], True),
+        (GC + ["--location", "l", "get-credentials", "c"], True),
+        (GC + ["--zone", "l", "get-credentials", "c"], True),
+        (GC + ["-z", "l", "get-credentials", "c"], True),
+        (GC + ["-z=l", "get-credentials", "c"], True),
+        (["gcloud", "container", "-z", "l", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "-z", "l", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "container", "--project=p", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "container", "--project", "p", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "--project", "p", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "--project=p", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "container", "--quiet", "clusters", "--zone", "l", "get-credentials", "c"], True),
+        (["gcloud", "alpha", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "beta", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "beta", "container", "clusters", "-z", "l", "get-credentials", "c"], True),
+        (GC + ["describe", "get-credentials"], False),
+        (GC + ["list", "--location", "l"], False),
+        (GC + ["-z", "l", "list"], False),
+        (GC + ["describe", "c", "-z", "l"], False),
+        (["gcloud", "projects", "list"], False),
+        (["gcloud", "compute", "instances", "list", "--format=json"], False),
+        (GC, False),
+        (["kubectl", "container", "clusters", "get-credentials"], False),
+        (["kubectl", "get", "pods", "-n", "default"], False),
+        ([], False),
+    ]
+
+    # Known and harmless: the shim never lets a bare `--flag` take one of the
+    # three command words as its value, so it reads `get-credentials` here as
+    # the verb where the broker reads it as `--format`'s value. The shim asks
+    # for a file the broker doesn't send, and nothing lands. (argv, shim, broker)
+    KNOWN_DISAGREEMENTS = [
+        (GC + ["--format", "get-credentials", "list"], True, False),
+        # Malformed argv the read-only policy refuses before routing: the broker
+        # can't read them and falls back to "carries the verb", the shim reads
+        # them its own way. Pinned so any other disagreement fails.
+        (["gcloud", "--", "container", "clusters", "get-credentials", "c"], False, True),
+        (GC + ["-qz", "l", "get-credentials", "c"], False, True),
+        (GC + ["--format", "-z", "get-credentials", "c"], False, True),
+    ]
+
+    def test_the_release_tracks_are_the_policys(self):
+        self.assertEqual(command_policy._GCLOUD_RELEASE_TRACKS, credential_proxy_client._GCLOUD_RELEASE_TRACKS)
+
+    def test_both_read_every_spelling_the_same(self):
+        for argv, want in self.AGREED:
+            with self.subTest(argv=argv):
+                self.assertEqual(want, credential_proxy._is_get_credentials(argv))
+                self.assertEqual(want, credential_proxy_client.is_get_credentials(argv))
+
+    def test_the_known_disagreements_are_the_only_ones(self):
+        for argv, shim, broker in self.KNOWN_DISAGREEMENTS:
+            with self.subTest(argv=argv):
+                self.assertEqual(shim, credential_proxy_client.is_get_credentials(argv))
+                self.assertEqual(broker, credential_proxy._is_get_credentials(argv))
+
+    def test_the_shim_knows_every_short_valued_flag_the_policy_does(self):
+        policy_short = {
+            flag for flag in command_policy._GCLOUD_FLAGS_WITH_VALUE
+            if flag.startswith("-") and not flag.startswith("--")
+        }
+        self.assertEqual(policy_short, set(credential_proxy_client._GCLOUD_SHORT_FLAGS_WITH_VALUE))
 
 
 class TestAShellFollowsItsOwnGetCredentials(ContextLessTestCase):
@@ -1224,6 +1338,160 @@ class TestCallerCredential(SubmittedPayloadTestCase):
         with patch.dict("os.environ", {"CREDENTIAL_PROXY_TOKEN_FILE": str(path)}, clear=False):
             with self.assertRaises(credential_proxy_client.TokenUnavailable):
                 credential_proxy_client.authorization_headers()
+
+
+class TestTaskCredential(SubmittedPayloadTestCase):
+    """A profile worker's shim sends its task credential and honours no redirecting env.
+
+    The broker confines a profile call to the cluster in the task credential
+    whatever the shim sends; these hold the shim to its half: the header on
+    every call, read fresh, and no environment choosing the cluster, project
+    or account.
+    """
+
+    TOKEN = "eyJ0eXAiOiJKV1QifQ.eyJqdGkiOiJKIn0.c2ln"
+
+    def setUp(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        self.directory = directory
+        self.token_path = directory / "task-token"
+        self.token_path.write_text(self.TOKEN + "\n", encoding="utf-8")
+        self.kubeconfig = write_kubeconfig(directory)
+
+    def run_shim(self, argv, environ):
+        captured = {}
+        stderr = io.StringIO()
+
+        def fake_open(request, *args, **kwargs):
+            captured["request"] = request
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return RecordingResponse(json.dumps({"exitCode": 0}).encode("utf-8"))
+
+        with patch.dict("os.environ", environ, clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+                    captured["exit_code"] = credential_proxy_client.execute(self.LOCAL_ENDPOINT, argv)
+        captured["stderr"] = stderr.getvalue()
+        return captured
+
+    def task_env(self, **extra):
+        return {credential_proxy_client.TASK_TOKEN_FILE_ENV: str(self.token_path), "KUBECONFIG": "", **extra}
+
+    def test_the_credential_is_sent_in_its_header(self):
+        sent = self.run_shim(["kubectl", "get", "pods"], self.task_env())
+        self.assertEqual(self.TOKEN, sent["request"].get_header("X-kube-agents-task-credential"))
+        self.assertNotIn(self.TOKEN, json.dumps(sent["payload"]), "the credential goes in a header, never the body")
+
+    def test_the_credential_is_read_on_every_call(self):
+        # A warm pod's next task writes its own credential to the same file.
+        self.run_shim(["kubectl", "get", "pods"], self.task_env())
+        self.token_path.write_text("a.b.next", encoding="utf-8")
+        sent = self.run_shim(["kubectl", "get", "pods"], self.task_env())
+        self.assertEqual("a.b.next", sent["request"].get_header("X-kube-agents-task-credential"))
+
+    def test_no_header_outside_a_task_or_after_it(self):
+        sent = self.run_shim(["kubectl", "get", "pods"], {credential_proxy_client.TASK_TOKEN_FILE_ENV: ""})
+        self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
+        # The adapter removed the file at the task's end: no task, no header,
+        # and the broker answers local-only commands only.
+        self.token_path.unlink()
+        sent = self.run_shim(["kubectl", "version", "--client"], self.task_env())
+        self.assertEqual(0, sent["exit_code"])
+        self.assertIsNone(sent["request"].get_header("X-kube-agents-task-credential"))
+
+    def test_a_malformed_credential_is_not_sent(self):
+        self.token_path.write_text("not a token\r\nX-Injected: 1", encoding="utf-8")
+        sent = self.run_shim(["kubectl", "get", "pods"], self.task_env())
+        self.assertEqual(1, sent["exit_code"])
+        self.assertNotIn("request", sent)
+        self.assertIn("does not hold a task credential", sent["stderr"])
+
+    def test_kubeconfig_does_not_choose_the_cluster_in_a_task(self):
+        sent = self.run_shim(["kubectl", "get", "pods"], self.task_env(KUBECONFIG=str(self.kubeconfig)))
+        self.assertNotIn("kubeconfigContext", sent["payload"])
+        self.assertIn("KUBECONFIG", sent["stderr"])
+        self.assertIn("not honoured for a profile task", sent["stderr"])
+        # Outside a task the same variable still pins the cluster.
+        sent = self.run_shim(
+            ["kubectl", "get", "pods"],
+            {credential_proxy_client.TASK_TOKEN_FILE_ENV: "", "KUBECONFIG": str(self.kubeconfig)},
+        )
+        self.assertEqual(GKE_CONTEXT, sent["payload"]["kubeconfigContext"])
+
+    def test_the_shell_pin_does_not_choose_the_cluster_in_a_task(self):
+        with patch.object(credential_proxy_client, "shell_context", return_value=GKE_CONTEXT):
+            sent = self.run_shim(["kubectl", "get", "pods"], self.task_env())
+            self.assertNotIn("kubeconfigContext", sent["payload"])
+            sent = self.run_shim(["kubectl", "get", "pods"], {credential_proxy_client.TASK_TOKEN_FILE_ENV: "", "KUBECONFIG": ""})
+            self.assertEqual(GKE_CONTEXT, sent["payload"]["kubeconfigContext"])
+
+    def test_get_credentials_does_not_write_to_kubeconfig_in_a_task(self):
+        sent = self.run_shim(
+            ["gcloud", "container", "clusters", "get-credentials", "c", "--location=l"],
+            self.task_env(KUBECONFIG=str(self.kubeconfig)),
+        )
+        # No destination from the environment: the file comes back to the
+        # implicit landing, never to the path KUBECONFIG names.
+        self.assertTrue(sent["payload"]["wantsKubeconfig"])
+        self.assertEqual(
+            ["gcloud", "container", "clusters", "get-credentials", "c", "--location=l"], sent["payload"]["argv"]
+        )
+
+    def test_get_credentials_in_a_task_lands_no_file_and_pins_nothing(self):
+        # The broker hands the generated kubeconfig back; in a task nothing
+        # reads it (every call is held to the task's cluster), so it is not
+        # filed, no shell context is recorded, and the shim says so in one
+        # line instead of telling the model to export a KUBECONFIG it ignores.
+        generated = write_kubeconfig(self.directory).read_text(encoding="utf-8")
+        stderr = io.StringIO()
+
+        def fake_open(request, *args, **kwargs):
+            return RecordingResponse(json.dumps({"exitCode": 0, "kubeconfig": generated}).encode("utf-8"))
+
+        pin = Mock(return_value=True)
+        write = Mock()
+        with patch.dict("os.environ", self.task_env(), clear=False):
+            with patch.object(credential_proxy_client, "open_broker_request", fake_open), \
+                    patch.object(credential_proxy_client, "record_shell_context", pin), \
+                    patch.object(credential_proxy_client, "_replace_file", write):
+                with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+                    exit_code = credential_proxy_client.execute(
+                        self.LOCAL_ENDPOINT, ["gcloud", "container", "clusters", "get-credentials", "c", "--location=l"]
+                    )
+        self.assertEqual(0, exit_code)
+        pin.assert_not_called()
+        write.assert_not_called()
+        said = stderr.getvalue()
+        self.assertNotIn("export KUBECONFIG", said)
+        self.assertNotIn("host cluster", said)
+        self.assertIn(GKE_CONTEXT, said)
+        self.assertIn("nothing to export", said)
+        self.assertEqual(1, len(said.strip().splitlines()), said)
+
+    def test_cloudsdk_settings_do_not_redirect_a_task(self):
+        redirecting = {
+            "CLOUDSDK_CORE_PROJECT": "other-project",
+            "CLOUDSDK_CORE_ACCOUNT": "someone@example.com",
+            "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT": "sa@other-project.iam.gserviceaccount.com",
+            "CLOUDSDK_ACTIVE_CONFIG_NAME": "other",
+            "CLOUDSDK_API_ENDPOINT_OVERRIDES_CONTAINER": "https://evil.invalid/",
+            "CLOUDSDK_PYTHON": "/usr/bin/python3",
+        }
+        argv = ["gcloud", "container", "clusters", "list"]
+        sent = self.run_shim(argv, self.task_env(**redirecting))
+        # Nothing about the environment crosses: the argv is the caller's, and
+        # the body carries no field that could name a project or account.
+        self.assertEqual(argv, sent["payload"]["argv"])
+        self.assertEqual({"requestId", "argv"}, set(sent["payload"]))
+        body = json.dumps(sent["payload"])
+        for value in redirecting.values():
+            self.assertNotIn(value, body)
+        for name in redirecting:
+            if name == "CLOUDSDK_PYTHON":
+                self.assertNotIn(name, sent["stderr"])
+            else:
+                self.assertIn(name, sent["stderr"])
 
 
 class TestExecutePolicyBlocked(unittest.TestCase):

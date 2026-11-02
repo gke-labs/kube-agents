@@ -33,7 +33,8 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS="${CLOUDSDK_CORE_DISABLE_PROMPTS:-1}"
 # gives up after the budget so a day-long outage does not hold the runner.
 # Both knobs are environment overrides so a test runs with no wait. Any
 # failure that is not this message returns as it is. The caller's
-# timeout-minutes in deploy-environment.yml is sized to this budget.
+# timeout-minutes in deploy-environment.yml is sized to this budget and to
+# teardown_common.sh's second run of a failed uninstall.sh.
 readonly PROVISION_STOCKOUT_PATTERN='does not have enough resources available to fulfill request|ZONE_RESOURCE_POOL_EXHAUSTED'
 PROVISION_STOCKOUT_ATTEMPTS="${PROVISION_STOCKOUT_ATTEMPTS:-3}"
 PROVISION_STOCKOUT_WAIT_SECONDS="${PROVISION_STOCKOUT_WAIT_SECONDS:-600}"
@@ -41,16 +42,9 @@ PROVISION_STOCKOUT_WAIT_SECONDS="${PROVISION_STOCKOUT_WAIT_SECONDS:-600}"
 # below exit 2, which an if reads as false, and the loop would retry until
 # the job timeout; a value past six digits does the same, because `[` calls it
 # not an integer; and a leading zero is octal to the arithmetic below, where
-# 09 is an error that abandons the loop and 0600 reads as 384.
-for _knob in PROVISION_STOCKOUT_ATTEMPTS PROVISION_STOCKOUT_WAIT_SECONDS; do
-  case "${!_knob}" in
-    "" | *[!0-9]* | 0?* | ???????*)
-      echo "::error title=${_knob} is not a plain decimal::${_knob}='${!_knob}' must be a whole number of at most six digits with no leading zero." >&2
-      exit 1
-      ;;
-  esac
-done
-unset _knob
+# 09 is an error that abandons the loop and 0600 reads as 384. The check is
+# teardown_common.sh's, shared with the teardown knobs.
+teardown_require_plain_decimal PROVISION_STOCKOUT_ATTEMPTS PROVISION_STOCKOUT_WAIT_SECONDS
 
 # Verify required GCP/GKE inputs before executing any destructive teardown.
 teardown_require_inputs
@@ -176,7 +170,7 @@ fi
 # here reverts to failing after the teardown.
 INSTALL_REFUSAL_STATUS=0
 
-for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED WEB_CONSOLE_ENABLED ENABLE_DRIFT_DETECTOR; do
+for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED WEB_CONSOLE_ENABLED ENABLE_DRIFT_DETECTOR VERTEX_MANAGE_SERVING_PROJECT; do
   [ -n "${!_bool_var:-}" ] || continue
   _canonical="$(canonical_bool "${!_bool_var}")"
   case "$_canonical" in
@@ -355,6 +349,9 @@ if [ "${SLACK_ENABLED:-false}" = "true" ]; then
   if [ -n "${SLACK_HOME_CHANNEL_NAME:-}" ]; then
     INSTALL_ARGS+=(--slack-home-channel-name="${SLACK_HOME_CHANNEL_NAME}")
   fi
+  if [ -n "${SLACK_HOME_CHANNEL_POLICY:-}" ]; then
+    INSTALL_ARGS+=(--slack-home-channel-policy="${SLACK_HOME_CHANNEL_POLICY}")
+  fi
 fi
 
 if [ -n "${ENABLE_GKE_BACKUP_PLAN:-}" ]; then
@@ -376,6 +373,11 @@ fi
 # file as the durable answer.
 if [ -n "${ENABLE_DRIFT_DETECTOR:-}" ]; then
   INSTALL_ARGS+=(--enable-drift-detector="$(canonical_bool "${ENABLE_DRIFT_DETECTOR}")")
+fi
+
+# The same shape: unset omits the flag and install.sh's default (on) answers.
+if [ -n "${VERTEX_MANAGE_SERVING_PROJECT:-}" ]; then
+  INSTALL_ARGS+=(--vertex-manage-serving-project="$(canonical_bool "${VERTEX_MANAGE_SERVING_PROJECT}")")
 fi
 
 if [ -n "${MODEL_PROVIDER:-}" ]; then

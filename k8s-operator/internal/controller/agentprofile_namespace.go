@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -81,12 +82,61 @@ func agentNamespaceOfProfileServiceAccount(ns string) (string, bool) {
 	return agentNS, ok && agentNS != ""
 }
 
-// resolveProfileCeiling is spec.harness.tuning.profiles.ceiling, defaulted.
+// resolveProfileCeiling is spec.harness.tuning.profiles.ceiling, defaulted
+// to maxInProgress's resolved value: the profile ceiling replaces kanban's
+// in-progress limit, and while both exist an install's footprint shouldn't
+// jump when it moves from one to the other (spec-profiles-dispatch.md).
 func resolveProfileCeiling(agent *agentv1alpha1.PlatformAgent) int {
-	if t := agentTuning(agent); t != nil && t.Profiles != nil && t.Profiles.Ceiling != nil {
-		return *t.Profiles.Ceiling
+	if t := profileTuning(agent); t != nil && t.Ceiling != nil {
+		return *t.Ceiling
 	}
-	return agentv1alpha1.DefaultProfileCeiling
+	// maxInProgress has no maximum of its own (it only capped kanban
+	// workers); clamp it to the ceiling's, so the quota arithmetic and the
+	// reserves never see a value the ceiling field itself would refuse.
+	return min(resolveKanbanMaxInProgress(agent), agentv1alpha1.MaxProfileCeiling)
+}
+
+// profileTuning is spec.harness.tuning.profiles, or nil.
+func profileTuning(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ProfileTuning {
+	if t := agentTuning(agent); t != nil {
+		return t.Profiles
+	}
+	return nil
+}
+
+// profileIntOr is one of the interval fields, or its default.
+func profileIntOr(agent *agentv1alpha1.PlatformAgent, field func(*agentv1alpha1.ProfileTuning) *int, def int) int {
+	if t := profileTuning(agent); t != nil {
+		if v := field(t); v != nil {
+			return *v
+		}
+	}
+	return def
+}
+
+// The dispatcher's intervals, defaulted (contract on #3655, section 5).
+func resolveProfileLeaseSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.LeaseSeconds }, agentv1alpha1.DefaultProfileLeaseSeconds)
+}
+
+func resolveProfileRenewSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.RenewSeconds }, agentv1alpha1.DefaultProfileRenewSeconds)
+}
+
+func resolveProfileRestartGraceSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.RestartGraceSeconds }, agentv1alpha1.DefaultProfileRestartGraceSeconds)
+}
+
+// resolveProfileMaxTaskDeadline is the install's task deadline cap: what the
+// dispatch config clamps every profile task's deadline to, and the auth
+// callout's longest task credential. One resolver for both, so they can't
+// disagree and the dispatcher never issues a credential the callout refuses.
+func resolveProfileMaxTaskDeadline(agent *agentv1alpha1.PlatformAgent) time.Duration {
+	return time.Duration(profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.MaxTaskDeadlineSeconds }, agentv1alpha1.DefaultProfileMaxTaskDeadlineSeconds)) * time.Second
+}
+
+func resolveProfileAcceptTimeoutSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.AcceptTimeoutSeconds }, agentv1alpha1.DefaultProfileAcceptTimeoutSeconds)
 }
 
 // resolveProfileWarmReplicas is spec.harness.tuning.profiles.warmReplicas,
@@ -155,10 +205,13 @@ func profileNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 // buildProfileNetworkPolicy fences every pod in the profile namespace: no
-// ingress, and egress to DNS, the bus and LiteLLM only, the same allowlist a
-// session pod has. The credential proxy joins it with the worker PR, together
-// with the proxy's own allowed callers, so neither half lands without the
-// other.
+// ingress, and egress to DNS, the bus, LiteLLM and the credential broker's
+// credentialed port only. The broker is where a worker's kubectl and gcloud
+// run (#3889); its side admits the profile namespace, and confines each call
+// to the task's cluster, once a profile identity exists
+// (credential_proxy_profiles.go). The egress is unconditional: a namespace
+// that exists only for profiles needs no second gate, and the broker's
+// TokenReview refuses any pod the identity map doesn't name.
 func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -195,6 +248,12 @@ func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs
 					},
 					To: []networkingv1.NetworkPolicyPeer{
 						namespacedPodPeer(agent.Namespace, map[string]string{"app": "litellm"}),
+					},
+				},
+				{
+					Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
+					To: []networkingv1.NetworkPolicyPeer{
+						namespacedPodPeer(agent.Namespace, credentialProxySelector(agent)),
 					},
 				},
 			},

@@ -34,7 +34,7 @@ NOW = "2026-09-08T14:30:00+00:00"  # Tue 10:30 AM ET
 NIGHT_1 = "3000000000000000001"
 NIGHT_2 = "3000000000000000002"
 JOB = "ci-kube-agents-eval-nightly"
-DIGEST_AT = datetime.datetime(2026, 9, 8, 13, 0, tzinfo=UTC)  # Tue 9 AM ET
+DIGEST_AT = datetime.datetime(2026, 9, 8, 15, 0, tzinfo=UTC)  # Tue 11 AM ET
 
 
 def rep(n, result, reason=None):
@@ -199,7 +199,7 @@ class NightDocumentTest(unittest.TestCase):
         data["pending_builds"] = [
             {"build_id": "3000000000000000003", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"},
             {"build_id": "3000000000000000004", "first_seen": "2026-09-08T14:10:00+00:00"},  # the presubmit's
-            {"build_id": "2999999999999999999", "first_seen": "2026-09-08T01:00:00+00:00", "tier": "nightly"},  # died 13.5 h ago
+            {"build_id": "2999999999999999999", "first_seen": "2026-09-07T23:30:00+00:00", "tier": "nightly"},  # died 15 h ago
             {"build_id": "bogus", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"},
         ]
         now = datetime.datetime.fromisoformat(NOW)
@@ -278,18 +278,36 @@ class DigestLineTest(unittest.TestCase):
         self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)")
         # Unless a night is still running: a late start, or one at its budget.
         data["pending_builds"] = [{"build_id": "3000000000000000003", "first_seen": (two_days_on - datetime.timedelta(hours=8)).isoformat(), "tier": "nightly"}]
-        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Thu 1:00 AM ET) · the report follows when it finishes")
-        self.assertEqual(self.line({"runs": [], "cases": [], "pending_builds": data["pending_builds"]}, two_days_on), "🌙 Nightly: still running (first seen Thu 1:00 AM ET) · the report follows when it finishes")
+        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Thu 3:00 AM ET) · the report follows when it finishes")
+        self.assertEqual(self.line({"runs": [], "cases": [], "pending_builds": data["pending_builds"]}, two_days_on), "🌙 Nightly: still running (first seen Thu 3:00 AM ET) · the report follows when it finishes")
         # A last night on record outranks a build in flight: the numbers are there.
         self.assertIn("newly failing: case-b", self.line(data))
         # These IDs are not snowflakes, so the first sighting dates the start.
-        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=12, minutes=20)).isoformat()
-        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "past its 12-hour budget, inside the upload slack: still running")
-        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=12, minutes=31)).isoformat()
+        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=14, minutes=20)).isoformat()
+        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "past its 14-hour budget, inside the upload slack: still running")
+        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=14, minutes=31)).isoformat()
         self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)", "past the budget: not running")
         self.assertEqual(self.line({"runs": [], "cases": []}), "🌙 Nightly: no run on record yet")
         self.assertEqual(self.line({}), "🌙 Nightly: no data.json to read a night from")
         self.assertEqual(self.line(None), "🌙 Nightly: no data.json to read a night from")
+
+    def test_the_running_window_sits_between_the_budget_and_the_digest_window(self):
+        # The two bounds RUNNING_MAX_AGE lives between (nightly.py, beside the
+        # constant): above the longest part's Prow budget plus its 5-minute
+        # grace and the minutes a deadline kill takes to end, or a healthy slow
+        # night reads as dead; below the gap from the 00:00 UTC start to the
+        # summer digest window (DEFAULT_DIGEST_HOUR on the LOCAL_TZ clock, Toronto,
+        # the window opens DIGEST_WINDOW early), or a dead night reads as
+        # running at the digest. The budget is oss-test-infra's
+        # (kube-agents-periodics.yaml, eval-nightly and -main-b: 840m); move
+        # this constant with it.
+        from eval_dashboard import post_health
+        longest_budget = datetime.timedelta(minutes=840)
+        kill_slack = datetime.timedelta(minutes=5 + 6)
+        summer_offset = datetime.datetime(2026, 7, 1, tzinfo=post_health.LOCAL_TZ).utcoffset()  # Toronto, UTC-4 in summer
+        summer_window_opens = datetime.timedelta(hours=post_health.DEFAULT_DIGEST_HOUR) - summer_offset - post_health.DIGEST_WINDOW
+        self.assertGreater(nightly.RUNNING_MAX_AGE, longest_budget + kill_slack, "a night cut at its budget must still read as running")
+        self.assertLess(nightly.RUNNING_MAX_AGE, summer_window_opens, "a dead 00:00 UTC night must read as missing when the digest window opens")
 
     def test_a_night_is_aged_from_its_build_start_not_its_first_sighting(self):
         data = two_nights()
@@ -300,10 +318,10 @@ class DigestLineTest(unittest.TestCase):
         self.assertEqual(nightly.build_started("1234", started), started, "not a snowflake: the first sighting")
         # First seen 40 minutes late, as the collector's late cron does.
         data["pending_builds"] = [{"build_id": build, "first_seen": (started + datetime.timedelta(minutes=40)).isoformat(), "tier": "nightly"}]
-        self.assertEqual(self.line(data, started + datetime.timedelta(hours=12, minutes=25)), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "cut at its deadline, not yet recorded: still running")
-        # The summer digest window opens at 12:40 UTC; a night pending then died
-        # without uploading, though first seen only 12 hours before.
-        digest = datetime.datetime(2026, 9, 10, 12, 41, tzinfo=UTC)
+        self.assertEqual(self.line(data, started + datetime.timedelta(hours=14, minutes=25)), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "cut at its deadline, not yet recorded: still running")
+        # The summer digest window opens at 14:40 UTC (11 AM Toronto); a night
+        # pending then died without uploading, though first seen only 14 hours before.
+        digest = datetime.datetime(2026, 9, 10, 14, 41, tzinfo=UTC)
         self.assertEqual(self.line(data, digest), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)", "dead at the digest: not running")
 
     def test_the_nights_turn1_percentiles_are_advice_beside_the_target(self):
