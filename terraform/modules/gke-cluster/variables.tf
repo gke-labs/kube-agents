@@ -182,13 +182,15 @@ variable "standard_node_count" {
 }
 
 variable "standard_disk_size_gb" {
-  description = "Boot disk size in GB for the Standard cluster's default node pool. Null, the default, takes the sizing_profile's size (100 under \"small\"); an explicit value wins over the profile. Only used when cluster_mode = \"standard\"."
+  description = "Boot disk size in GB for the Standard cluster's default node pool, at least 10. Null, the default, takes the sizing_profile's size (100 under \"small\"); an explicit value wins over the profile. Only used when cluster_mode = \"standard\"."
   type        = number
   default     = null
 
+  # A conditional rather than `== null || ...`: Terraform below 1.10 evaluates
+  # both operands of ||, and `null >= 10` fails the plan at the default.
   validation {
-    condition     = var.standard_disk_size_gb == null || var.standard_disk_size_gb > 0
-    error_message = "standard_disk_size_gb must be a positive number of GB."
+    condition     = var.standard_disk_size_gb == null ? true : var.standard_disk_size_gb >= 10
+    error_message = "standard_disk_size_gb must be at least 10 GB, GKE's floor for a boot disk."
   }
 }
 
@@ -198,7 +200,7 @@ variable "standard_disk_type" {
   default     = null
 
   validation {
-    condition     = var.standard_disk_type == null || contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], var.standard_disk_type)
+    condition     = var.standard_disk_type == null ? true : contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], var.standard_disk_type)
     error_message = "standard_disk_type must be pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced."
   }
 }
@@ -229,7 +231,7 @@ variable "gvisor_machine_type" {
 }
 
 variable "gvisor_min_node_count" {
-  description = "Lower autoscaling bound of the gVisor node pool, per zone (a regional location scales each zone within these bounds), and the node count the pool is created with. Only used when enable_gvisor_node_pool = true."
+  description = "Lower autoscaling bound of the gVisor node pool, per zone (a regional location scales each zone within these bounds), and the node count the pool is created with. Raising it later moves the bound in place; the creation count is left as it was. Only used when enable_gvisor_node_pool = true."
   type        = number
   default     = 1
 
@@ -251,13 +253,13 @@ variable "gvisor_max_node_count" {
 }
 
 variable "gvisor_disk_size_gb" {
-  description = "Boot disk size in GB for the gVisor node pool. Null, the default, takes the sizing_profile's size (100 under \"small\"); an explicit value wins over the profile. Only used when enable_gvisor_node_pool = true."
+  description = "Boot disk size in GB for the gVisor node pool, at least 10. Null, the default, takes the sizing_profile's size (100 under \"small\"); an explicit value wins over the profile. Only used when enable_gvisor_node_pool = true."
   type        = number
   default     = null
 
   validation {
-    condition     = var.gvisor_disk_size_gb == null || var.gvisor_disk_size_gb > 0
-    error_message = "gvisor_disk_size_gb must be a positive number of GB."
+    condition     = var.gvisor_disk_size_gb == null ? true : var.gvisor_disk_size_gb >= 10
+    error_message = "gvisor_disk_size_gb must be at least 10 GB, GKE's floor for a boot disk."
   }
 }
 
@@ -267,7 +269,7 @@ variable "gvisor_disk_type" {
   default     = null
 
   validation {
-    condition     = var.gvisor_disk_type == null || contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], var.gvisor_disk_type)
+    condition     = var.gvisor_disk_type == null ? true : contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], var.gvisor_disk_type)
     error_message = "gvisor_disk_type must be pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced."
   }
 }

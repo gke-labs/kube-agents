@@ -231,10 +231,12 @@ resource "google_container_cluster" "standard" {
 
   node_config {
     machine_type = local.standard_machine_type
-    # Both disk fields are ForceNew on the cluster's default pool. At the
-    # defaults they render GKE's own values (100 GB, pd-balanced), which is
-    # what an existing cluster's state already holds, so adding them plans no
-    # replacement; changing either on a live cluster does.
+    # machine_type and both disk fields update the default pool in place
+    # (a rolling node recreation) on the providers this module admits. At the
+    # defaults they render the values GKE has created pools with since 1.24
+    # (100 GB, pd-balanced), which such a cluster's state already holds, so
+    # adding them plans nothing there; a pool created when GKE still
+    # defaulted to pd-standard plans an in-place disk-type change instead.
     disk_size_gb = local.standard_disk_size_gb
     disk_type    = local.standard_disk_type
     # gcloud's default "gke-default" scope set.
@@ -369,6 +371,10 @@ resource "google_container_node_pool" "gvisor" {
 
   # Per zone: a regional location yields this many nodes per zone. The pool
   # starts at the autoscaling floor and the autoscaler takes it from there.
+  # initial_node_count forces replacement, so it is read once at creation
+  # and ignored after (lifecycle below): a later change to the floor is an
+  # autoscaling update in place, not a destroy and create of the only
+  # sandbox pool.
   initial_node_count = var.gvisor_min_node_count
 
   # Per-zone bounds, as GKE counts them on a regional pool. min == max keeps
@@ -392,6 +398,8 @@ resource "google_container_node_pool" "gvisor" {
   }
 
   lifecycle {
+    ignore_changes = [initial_node_count]
+
     precondition {
       condition     = var.gvisor_min_node_count <= var.gvisor_max_node_count
       error_message = "gvisor_min_node_count (${var.gvisor_min_node_count}) must not exceed gvisor_max_node_count (${var.gvisor_max_node_count})."

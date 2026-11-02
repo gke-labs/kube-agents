@@ -50,7 +50,11 @@ Standard mode only. `sizing_profile` picks the shape of both node pools in one s
 
 The gVisor pool autoscales between `gvisor_min_node_count` (default 1) and `gvisor_max_node_count` (default 2) nodes per zone and is created at the minimum; equal bounds keep it at a fixed size. The default pool stays at `standard_node_count` per zone.
 
-Changing a machine type or a boot disk on a live cluster replaces the node pool, and on the default pool that means the cluster itself: read the plan before applying. At the defaults the module renders GKE's own disk values, so upgrading to this version of the module plans no replacement; an existing gVisor pool gains the autoscaling bounds in place.
+Changing a machine type or a boot disk on a live cluster updates the pool in place with a rolling node recreation, on either pool, with the google providers this module admits. Nothing in these inputs replaces a pool: the gVisor pool's creation count is read once and ignored afterwards, so raising `gvisor_min_node_count` later moves the autoscaling bound only. At the defaults the module renders the disk values GKE has created pools with since 1.24 (100 GB, `pd-balanced`), so a cluster created on those defaults plans no change when it upgrades to this version of the module, and an existing gVisor pool gains the autoscaling bounds in place; a default pool created when GKE still defaulted to `pd-standard` plans an in-place disk-type change. Read the plan before applying.
+
+## Tests
+
+`tests/sizing_profile.tftest.hcl` plans the module against mocked `google` and `google-beta` providers and asserts what each sizing input renders: the default and `medium` give both pools the `small` shape with the gVisor pool autoscaling from 1 to 2 per zone, `fleet` gives the two fleet shapes, an explicit machine type, disk or bound wins over `fleet`, and the validations refuse an unknown profile, a boot disk under 10 GB, an unknown disk type, a bound below 1 and a floor above the ceiling. `make terraform-test` runs it; the suite needs Terraform 1.11 or newer, above the floor the module declares for an install.
 
 ## Usage
 

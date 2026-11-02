@@ -3,8 +3,8 @@
 # sizing_profile existed, so an existing caller plans no change; "fleet"
 # renders the fleet-tier shapes; an explicit machine type or disk value wins
 # over the profile; and the validations refuse an unknown profile, a disk
-# of no size, an unknown disk type, and an autoscaling floor above the
-# ceiling. Providers mocked, plan only: nothing here reaches a cloud.
+# under GKE's 10 GB floor, an unknown disk type, and an autoscaling floor
+# above the ceiling. Providers mocked, plan only: nothing here reaches a cloud.
 
 mock_provider "google" {}
 mock_provider "google-beta" {}
@@ -146,11 +146,11 @@ run "an_unknown_profile_is_refused" {
   expect_failures = [var.sizing_profile]
 }
 
-run "a_disk_of_no_size_is_refused" {
+run "a_disk_under_ten_gb_is_refused" {
   command = plan
 
   variables {
-    standard_disk_size_gb = 0
+    standard_disk_size_gb = 9
     gvisor_disk_size_gb   = 0
   }
 

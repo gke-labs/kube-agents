@@ -49,7 +49,7 @@ variable "gvisor_pool_name" {
 }
 
 variable "sizing_profile" {
-  description = "Shape of the Standard cluster's node pools when no explicit machine type or disk size is given: \"small\" (the default: e2-standard-4, 100 GB pd-balanced on both pools), \"medium\" (the same, until it has a shape of its own) or \"fleet\" (n2-standard-8 with 200 GB for the default pool, n2-standard-4 with 150 GB for the gVisor pool). An explicit standard_* or gvisor_* value wins over the profile. Passed through to the gke-cluster module; Standard mode only."
+  description = "Shape of the Standard cluster's node pools when no explicit machine type or disk size is given: \"small\" (the default, today's rendering), \"medium\" or \"fleet\"; the gke-cluster module's README, \"Sizing the node pools\", has each profile's machine types and disks. An explicit standard_* or gvisor_* value wins over the profile. Passed through to the gke-cluster module; Standard mode only."
   type        = string
   default     = "small"
 }

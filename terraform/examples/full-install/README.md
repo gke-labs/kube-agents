@@ -14,8 +14,9 @@ install without the interview.
 - A GKE cluster ([`gke-cluster`](../../modules/gke-cluster) module) — Autopilot
   by default, or `cluster_mode = "standard"` for an e2-standard-4 node pool
   (with an optional gVisor node pool; `sizing_profile = "fleet"` or the
-  `standard_*` and `gvisor_*` inputs resize both pools, as the module's README
-  describes) — with Workload Identity, Cloud KMS
+  `standard_*` and `gvisor_*` inputs resize both pools, per the module's
+  [sizing section](../../modules/gke-cluster/README.md#sizing-the-node-pools))
+  — with Workload Identity, Cloud KMS
   database encryption (CMEK), the Backup for GKE agent enabled, and the
   `kube-agents-host=true` discovery label applied. Setting
   `create_cluster = false` instead makes the module read an existing cluster:
