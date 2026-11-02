@@ -40,9 +40,10 @@ Three sources feed it, read once per dispatch tick by
    worker reads steer the dispatcher. The dispatcher already reads this table,
    and it survives a gateway restart, which an in-memory channel would not.
    Only a worker (:data:`WORKER_TASK_ENV` set) records; the front door's own
-   turns do not. One card steps the cap down at most once per cooldown: its
-   further signals while the cooldown is armed are read and dropped, so a card
-   that keeps hitting a busy broker cannot hold the cap at the floor alone.
+   turns do not. One card steps the cap down once between clean steps: its
+   further signals are read and dropped until the cap has next stepped up,
+   the tick on which the cooldown lapses included, so a card that keeps
+   hitting a busy broker cannot hold the cap at the floor alone.
 2. **The sandbox shell's memory** (:func:`probe_shell_memory`), only while a
    worker is running (an idle board has nothing to hold back, and the probe
    would otherwise keep the shared ssh master alive on its own): one
@@ -82,6 +83,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import subprocess
@@ -184,8 +186,13 @@ def cooldown_seconds() -> float:
     except ValueError:
         logger.warning("kanban aimd: %s=%r is not a number; using %ss", COOLDOWN_ENV, raw, DEFAULT_COOLDOWN_SECONDS)
         return float(DEFAULT_COOLDOWN_SECONDS)
-    if value <= 0:
-        logger.warning("kanban aimd: %s=%r is not positive; using %ss", COOLDOWN_ENV, raw, DEFAULT_COOLDOWN_SECONDS)
+    if not math.isfinite(value) or value <= 0:
+        # ``float`` parses "inf", "nan" and an overflow such as "1e999"; a
+        # deadline of now + inf never lapses, and now + nan is stored as NULL
+        # and re-armed every tick, so either pins the cap at the floor.
+        logger.warning(
+            "kanban aimd: %s=%r is not a finite positive number; using %ss", COOLDOWN_ENV, raw, DEFAULT_COOLDOWN_SECONDS,
+        )
         return float(DEFAULT_COOLDOWN_SECONDS)
     return value
 
@@ -491,8 +498,10 @@ def effective_max_in_progress(
 
     Reads the worker signals since the last tick and, while a worker is
     running, the shell probe; steps the persisted limiter; writes the state
-    back when it changed; and logs each step. A card counts once per armed
-    cooldown: its later signals are read and dropped. ``None`` stays ``None``
+    back when it changed; and logs each step. A card counts once between
+    clean steps: its later signals are read and dropped until the cap has
+    stepped up, whether the deadline has passed by the time they are read or
+    not. ``None`` stays ``None``
     (an uncapped dispatcher has no ceiling to lower). ``board`` is the
     dispatcher's own parameter and is only named in the log. Never raises: on
     any error the configured cap is returned unchanged.
@@ -524,13 +533,16 @@ def effective_max_in_progress(
                 # all: one spurious step-down is the conservative error.
                 logger.info("kanban aimd: the event cursor (%d) is past the newest event (%d); rereading", cursor, latest)
                 cursor = 0
-            armed = limiter.cooldown_until is not None and now < limiter.cooldown_until
-            signalled = list(state["signalled"]) if armed else []
+            # The cards that already stepped the cap down are kept past the
+            # deadline too: a row of theirs that lands in the last tick window
+            # before it lapses is read by the lapse tick, and counting it there
+            # would re-arm the cooldown that was about to end.
+            signalled = list(state["signalled"])
             cards = pending_pressure(conn, cursor, latest)
             fresh = [card for card in cards if card not in signalled]
             if len(fresh) < len(cards):
                 logger.debug(
-                    "kanban aimd: %d card(s) signalled again inside the cooldown; not counted",
+                    "kanban aimd: %d card(s) signalled again before a clean step; not counted",
                     len(cards) - len(fresh),
                 )
             if fresh:
@@ -543,8 +555,8 @@ def effective_max_in_progress(
             reasons.append(str(verdict))
         before = limiter.effective
         effective = limiter.tick(pressure=bool(reasons), now=now)
-        if limiter.cooldown_until is None:
-            signalled = []  # back at the ceiling: every card may signal again
+        if effective > before or limiter.cooldown_until is None:
+            signalled = []  # a clean step, or back at the ceiling: every card may signal again
         changed = state is None or (
             state["configured"], state["effective"], state["cooldown_until"],
             state["last_event_id"], sorted(state["signalled"]),

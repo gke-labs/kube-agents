@@ -167,7 +167,9 @@ class LimiterTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {ka.COOLDOWN_ENV: "15"}):
             self.assertEqual(ka.cooldown_seconds(), 15.0)
             self.assertEqual(ka.AimdConcurrencyLimiter(4, clock=Clock(0)).cooldown, 15.0)
-        for bad in ("", "  ", "soon", "0", "-5"):
+        # "inf" would arm a deadline that never lapses, "nan" one that SQLite
+        # stores as NULL and the next tick arms again; both pin the cap at the floor.
+        for bad in ("", "  ", "soon", "0", "-5", "inf", "-inf", "Infinity", "1e999", "nan"):
             with self.subTest(value=bad), mock.patch.dict(os.environ, {ka.COOLDOWN_ENV: bad}):
                 self.assertEqual(ka.cooldown_seconds(), float(ka.DEFAULT_COOLDOWN_SECONDS))
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -440,6 +442,41 @@ class EffectiveCapTest(unittest.TestCase):
         self.assertEqual(self.state()["signalled"], [], "a clean step forgets the card")
         pressure(self.conn, task_id="loud", when=7)
         self.assertEqual(self.cap(4), 1, "a new cooldown: the same card counts again")
+
+    def test_a_repeat_signal_read_on_the_lapse_tick_does_not_re_arm(self):
+        """The card's row lands in the last tick window before the deadline, so the
+        tick that reads it is the one that should step up; it must not count the
+        row as fresh because the deadline has passed by the time it looks."""
+        self.cap(4)
+        pressure(self.conn, task_id="loud", when=5)
+        self.assertEqual(self.cap(4), 1)
+        self.assertEqual(self.state()["cooldown_until"], 1_060.0)
+        self.clock.advance(60)
+        pressure(self.conn, task_id="loud", when=1_057)
+        self.assertEqual(self.cap(4), 2, "a clean step, not a new cooldown")
+        self.assertEqual(self.state()["cooldown_until"], 1_120.0)
+        self.assertEqual(self.state()["signalled"], [])
+        self.clock.advance(5)
+        pressure(self.conn, task_id="loud", when=1_062)
+        self.assertEqual(self.cap(4), 1, "after the clean step the same card counts again")
+
+    def test_a_card_stays_muted_across_a_re_armed_cooldown_until_a_clean_step(self):
+        self.cap(4)
+        pressure(self.conn, task_id="one", when=5)
+        self.assertEqual(self.cap(4), 1)
+        self.clock.advance(30)
+        pressure(self.conn, task_id="two", when=6)
+        self.assertEqual(self.cap(4), 1)
+        self.assertEqual(self.state()["cooldown_until"], 1_090.0)
+        self.clock.advance(30)
+        pressure(self.conn, task_id="one", when=7)
+        self.assertEqual(self.cap(4), 1)
+        self.assertEqual(self.state()["cooldown_until"], 1_090.0, "the first card's repeat did not re-arm")
+        self.assertEqual(self.state()["signalled"], ["one", "two"])
+        self.clock.advance(30)
+        pressure(self.conn, task_id="one", when=8)
+        self.assertEqual(self.cap(4), 2, "nor at the lapse tick")
+        self.assertEqual(self.state()["signalled"], [])
 
     def test_a_second_card_does_re_arm_the_cooldown(self):
         self.cap(4)
