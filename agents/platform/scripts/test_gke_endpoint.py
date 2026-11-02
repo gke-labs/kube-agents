@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import unittest
 import unittest.mock
 from contextlib import contextmanager, redirect_stderr
@@ -408,6 +409,42 @@ class GcloudSupportTest(unittest.TestCase):
             gke_endpoint.dns_endpoint_args("p", "c1", "us-central1", run=runner)
             gke_endpoint.dns_endpoint_args("p", "c2", "us-central1", run=runner)
         self.assertEqual(len([c for c in runner.calls if "--help" in c]), 1)
+
+    def test_concurrent_first_calls_run_the_support_probe_once(self):
+        # The answer is process-wide, so threads that find the memo empty at
+        # once share one probe: the credential proxy's cold path locks per
+        # cluster, so cold reads of different clusters overlap after a restart.
+        probes = []
+        first_probe_started = threading.Event()
+        release_probe = threading.Event()
+
+        def runner(argv):
+            if "--help" in argv:
+                probes.append(argv)
+                first_probe_started.set()
+                self.assertTrue(release_probe.wait(timeout=10))
+                return 0, HELP_WITH_FLAG
+            return 0, json.dumps(DNS_EXTERNAL)
+
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+        answers = []
+        threads = [
+            threading.Thread(target=lambda: answers.append(gke_endpoint.gcloud_supports_dns_endpoint(runner)),
+                             daemon=True)
+            for _ in range(3)
+        ]
+        with redirect_stderr(io.StringIO()):
+            threads[0].start()
+            self.assertTrue(first_probe_started.wait(timeout=10))
+            for thread in threads[1:]:
+                thread.start()
+            release_probe.set()
+            for thread in threads:
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual([True, True, True], answers)
+        self.assertEqual(1, len(probes), "one help probe for three concurrent first calls")
 
     def test_a_probe_that_could_not_run_is_retried_rather_than_memoised(self):
         """Only gcloud's answer is worth keeping, never our failure to get one.
@@ -886,6 +923,68 @@ class OwnNetworkTest(unittest.TestCase):
             gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner)
         self.assertEqual(len(runner.own_network_calls), 1)
         self.assertEqual(len(runner.describe_calls), 2)
+
+    def test_concurrent_first_calls_describe_the_own_cluster_once(self):
+        # As for the help probe: the own cluster is a fact about the process,
+        # so overlapping cold reads of different clusters share one describe.
+        describes = []
+        first_describe_started = threading.Event()
+        release_describe = threading.Event()
+
+        def runner(argv):
+            self.assertIn(OWN_NETWORK_FORMAT, argv)
+            describes.append(argv)
+            first_describe_started.set()
+            self.assertTrue(release_describe.wait(timeout=10))
+            return 0, OWN_ROW + "\n"
+
+        answers = []
+        threads = [
+            threading.Thread(target=lambda: answers.append(gke_endpoint.own_cluster(runner)), daemon=True)
+            for _ in range(3)
+        ]
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            threads[0].start()
+            self.assertTrue(first_describe_started.wait(timeout=10))
+            for thread in threads[1:]:
+                thread.start()
+            release_describe.set()
+            for thread in threads:
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual(1, len(describes), "one own-cluster describe for three concurrent first calls")
+        self.assertEqual(3, len(answers))
+        self.assertTrue(all(answer is answers[0] for answer in answers), "every caller got the one answer")
+        self.assertIsNotNone(answers[0])
+
+    def test_a_waiter_behind_a_failed_own_describe_honours_its_backoff(self):
+        # The thread that waited for a describe that then failed finds the
+        # backoff set and returns None without a doomed start of its own.
+        describes = []
+        first_describe_started = threading.Event()
+        release_describe = threading.Event()
+
+        def runner(argv):
+            describes.append(argv)
+            first_describe_started.set()
+            self.assertTrue(release_describe.wait(timeout=10))
+            return 1, ""
+
+        answers = []
+        threads = [
+            threading.Thread(target=lambda: answers.append(gke_endpoint.own_cluster(runner)), daemon=True)
+            for _ in range(2)
+        ]
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            threads[0].start()
+            self.assertTrue(first_describe_started.wait(timeout=10))
+            threads[1].start()
+            release_describe.set()
+            for thread in threads:
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+        self.assertEqual([None, None], answers)
+        self.assertEqual(1, len(describes), "the waiter did not repeat the failed describe")
 
     def test_the_own_cluster_describe_names_the_identity_from_the_environment(self):
         runner = FakeRunner(PRIVATE_SAME_VPC)

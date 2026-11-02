@@ -37,6 +37,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable
 
@@ -170,6 +171,18 @@ _OWN_RETRY_SECONDS = 60.0
 
 _DESCRIBE_TIMEOUT_SECONDS = 30
 _HELP_TIMEOUT_SECONDS = 30
+# One in-flight run of each first-use probe per process. Both answers are
+# process-wide, so two threads that find the memo empty at the same moment
+# should pay one gcloud start between them rather than one each: the credential
+# proxy's cold path holds a per-cluster lock, so cold reads of different
+# clusters overlap, and a restart followed by a burst would otherwise run a
+# help probe and an own-cluster describe per request until the first answered.
+# A thread that waited behind a failed own describe finds its backoff set and
+# returns without a doomed start of its own. Two locks rather than one because
+# `endpoint_decision` runs the probes back to back, never nested, and a shared
+# lock would make a slow own describe hold up a help probe it has no part in.
+_SUPPORT_PROBE_LOCK = threading.Lock()
+_OWN_CLUSTER_LOCK = threading.Lock()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -274,27 +287,33 @@ def gcloud_supports_dns_endpoint(run: Runner | None = None) -> bool:
     if _support_cache is not None:
         return _support_cache
 
-    probe = run or _default_runner(None, _HELP_TIMEOUT_SECONDS)
-    try:
-        exit_code, stdout = probe(
-            ["gcloud", "container", "clusters", "get-credentials", "--help"]
-        )
-    except (OSError, subprocess.SubprocessError,
-            sandbox_exec.SandboxUnavailable) as error:
-        # Not cached: this says the probe could not run, not that the flag is
-        # absent. A transient failure remembered here would disable the endpoint
-        # detection for the rest of a long-lived process.
-        _log(f"could not probe gcloud for {DNS_ENDPOINT_FLAG} support ({error}); assuming absent")
-        return False
+    with _SUPPORT_PROBE_LOCK:
+        # Re-read under the lock: the thread this one waited behind may have
+        # just answered the question.
+        if _support_cache is not None:
+            return _support_cache
 
-    if exit_code != 0:
-        _log(f"probing gcloud for {DNS_ENDPOINT_FLAG} support exited {exit_code}; assuming absent")
-        return False
+        probe = run or _default_runner(None, _HELP_TIMEOUT_SECONDS)
+        try:
+            exit_code, stdout = probe(
+                ["gcloud", "container", "clusters", "get-credentials", "--help"]
+            )
+        except (OSError, subprocess.SubprocessError,
+                sandbox_exec.SandboxUnavailable) as error:
+            # Not cached: this says the probe could not run, not that the flag is
+            # absent. A transient failure remembered here would disable the endpoint
+            # detection for the rest of a long-lived process.
+            _log(f"could not probe gcloud for {DNS_ENDPOINT_FLAG} support ({error}); assuming absent")
+            return False
 
-    _support_cache = DNS_ENDPOINT_FLAG in stdout
-    if not _support_cache:
-        _log(f"the installed gcloud does not offer {DNS_ENDPOINT_FLAG}; using the IP endpoint")
-    return _support_cache
+        if exit_code != 0:
+            _log(f"probing gcloud for {DNS_ENDPOINT_FLAG} support exited {exit_code}; assuming absent")
+            return False
+
+        _support_cache = DNS_ENDPOINT_FLAG in stdout
+        if not _support_cache:
+            _log(f"the installed gcloud does not offer {DNS_ENDPOINT_FLAG}; using the IP endpoint")
+        return _support_cache
 
 
 def _describe(
@@ -359,37 +378,42 @@ def own_cluster(run: Runner, retry: bool = False) -> OwnCluster | None:
     identity = _own_identity()
     if identity is None:
         return None
-    if (not retry and _own_failure_at is not None
-            and time.monotonic() - _own_failure_at < _OWN_RETRY_SECONDS):
-        return None
-    project, location, cluster = identity
-    argv = [
-        "gcloud", "container", "clusters", "describe", cluster,
-        f"--location={location}",
-        f"--project={project}",
-        f"--format={_OWN_NETWORK_FORMAT}",
-    ]
-    try:
-        exit_code, stdout = run(argv)
-    except (OSError, subprocess.SubprocessError,
-            sandbox_exec.SandboxUnavailable) as error:
-        _log(f"describing this pod's own cluster {cluster} failed ({error})")
-        _own_failure_at = time.monotonic()
-        return None
-    if exit_code != 0:
-        _log(f"describing this pod's own cluster {cluster} exited {exit_code}")
-        _own_failure_at = time.monotonic()
-        return None
-    # value() renders the fields tab-separated and an unset one empty; a row
-    # with fewer separators than fields is not the answer that was asked for.
-    fields = (stdout or "").strip("\r\n").split(_VALUE_SEPARATOR)
-    if len(fields) != _OWN_FIELD_COUNT or not fields[0].strip():
-        _log(f"this pod's own cluster {cluster} reports no network")
-        _own_failure_at = time.monotonic()
-        return None
-    network, subnetwork, pod_cidr = (field.strip() for field in fields)
-    _own_cluster_cache = OwnCluster(network, subnetwork, pod_cidr, _region_of(location))
-    return _own_cluster_cache
+    with _OWN_CLUSTER_LOCK:
+        # Re-read under the lock: the thread this one waited behind may have
+        # answered, or failed and set the backoff this one now honours.
+        if _own_cluster_cache is not None:
+            return _own_cluster_cache
+        if (not retry and _own_failure_at is not None
+                and time.monotonic() - _own_failure_at < _OWN_RETRY_SECONDS):
+            return None
+        project, location, cluster = identity
+        argv = [
+            "gcloud", "container", "clusters", "describe", cluster,
+            f"--location={location}",
+            f"--project={project}",
+            f"--format={_OWN_NETWORK_FORMAT}",
+        ]
+        try:
+            exit_code, stdout = run(argv)
+        except (OSError, subprocess.SubprocessError,
+                sandbox_exec.SandboxUnavailable) as error:
+            _log(f"describing this pod's own cluster {cluster} failed ({error})")
+            _own_failure_at = time.monotonic()
+            return None
+        if exit_code != 0:
+            _log(f"describing this pod's own cluster {cluster} exited {exit_code}")
+            _own_failure_at = time.monotonic()
+            return None
+        # value() renders the fields tab-separated and an unset one empty; a row
+        # with fewer separators than fields is not the answer that was asked for.
+        fields = (stdout or "").strip("\r\n").split(_VALUE_SEPARATOR)
+        if len(fields) != _OWN_FIELD_COUNT or not fields[0].strip():
+            _log(f"this pod's own cluster {cluster} reports no network")
+            _own_failure_at = time.monotonic()
+            return None
+        network, subnetwork, pod_cidr = (field.strip() for field in fields)
+        _own_cluster_cache = OwnCluster(network, subnetwork, pod_cidr, _region_of(location))
+        return _own_cluster_cache
 
 
 def _within_any(cidr: str, blocks: tuple[str, ...]) -> bool:
