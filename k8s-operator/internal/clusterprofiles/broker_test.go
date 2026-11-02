@@ -507,3 +507,45 @@ func TestABrokerRefusalReachesTheJoinAsAStatusError(t *testing.T) {
 		})
 	}
 }
+
+// TestDescribeClusterThroughTheBroker covers the exported describe a caller
+// makes after discovery: a Discoverer with a Broker and no Describe reaches the
+// broker's GKE route, and the answer's currentNodeCount, which the broker's
+// projection keeps, comes back on the Cluster.
+func TestDescribeClusterThroughTheBroker(t *testing.T) {
+	fb, broker := newFakeBroker(t)
+	fb.answers["c"] = fakeAnswer{status: http.StatusOK, body: `{"name":"c","currentNodeCount":7}`}
+	d := Discoverer{Broker: broker}
+	cluster, err := d.DescribeCluster(context.Background(), Identity{Project: "p", Location: "l", Cluster: "c"})
+	if err != nil {
+		t.Fatalf("DescribeCluster: %v", err)
+	}
+	if cluster.CurrentNodeCount != 7 {
+		t.Errorf("CurrentNodeCount = %d; want 7", cluster.CurrentNodeCount)
+	}
+	requests, _ := fb.seen()
+	want := "GET /v1/watcher/gcp/container.googleapis.com/v1/projects/p/locations/l/clusters/c"
+	if len(requests) != 1 || requests[0] != want {
+		t.Errorf("requests = %v; want exactly [%s]", requests, want)
+	}
+}
+
+// TestDescribeClusterPrefersTheStub: a Describe field wins over the broker,
+// as it does inside Discover, so a test that stubs the describe is not
+// reached through by a broker the environment names.
+func TestDescribeClusterPrefersTheStub(t *testing.T) {
+	fb, broker := newFakeBroker(t)
+	d := Discoverer{Broker: broker, Describe: func(_ context.Context, id Identity) (*container.Cluster, error) {
+		return &container.Cluster{Name: id.Cluster, CurrentNodeCount: 3}, nil
+	}}
+	cluster, err := d.DescribeCluster(context.Background(), Identity{Project: "p", Location: "l", Cluster: "c"})
+	if err != nil {
+		t.Fatalf("DescribeCluster: %v", err)
+	}
+	if cluster.CurrentNodeCount != 3 {
+		t.Errorf("CurrentNodeCount = %d; want the stub's 3", cluster.CurrentNodeCount)
+	}
+	if requests, _ := fb.seen(); len(requests) != 0 {
+		t.Errorf("the stubbed describe reached the broker: %v", requests)
+	}
+}
