@@ -19107,6 +19107,9 @@ def _remediation_file_stalls(
     # nothing about the project or the location its object manages: only the
     # declaration can give those.
     about_managed_cluster = str(finding.get("object") or "").partition("/")[0] in _KCC_OBJECT_KINDS
+    # A `kcc-object-wedged` finding is raised on the cluster that holds the
+    # object, so only a stall read there is its object (`_on_finding_cluster`).
+    on_host = str(finding.get("cluster") or "") if str(finding.get("check") or "") == KCC_OBJECT_CHECK else None
     for (kind, _, cluster_ref, file_location, _, _), declaration in index.items():
         # The index keys a node pool on its `clusterRef`, every other kind on
         # its own name.
@@ -19118,6 +19121,7 @@ def _remediation_file_stalls(
             for stall in stalled
             if stall.kind == kind
             and stall.name == declaration.name
+            and (on_host is None or _on_finding_cluster(stall, on_host))
             and (not declaration.namespace or stall.namespace == declaration.namespace)
             and not (file_ref and stall.cluster and stall.cluster != file_ref)
             and _location_agrees(stall, location)

@@ -23132,7 +23132,7 @@ metadata:
             ({"name": "project/other", "outcome": "collected", "location": "global"}, ["t"]),
         ):
             with self.subTest(outcome=entry["outcome"]):
-                finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub-1", obj="PubSubTopic/events",
+                finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/events",
                                        namespace="infra", remediation={"kind": "manifest", "path": "topics/events.yaml", "note": "x"})
                 manifest = kcc_manifest(topic)
                 manifest["clusters"].append(entry)
@@ -23327,14 +23327,14 @@ metadata:
 
     def test_a_kcc_object_wedged_finding_on_a_container_cluster_takes_nothing_from_the_host(self):
         """Compliance's finding on `ContainerCluster/prod` sits on the hub in
-        hub-proj/us-central1; the object manages app-proj in europe-west1.
+        acme/us-central1; the object manages app-proj in europe-west1.
         The hub's project and location say nothing about the object."""
         self.write(
             "clusters/prod.yaml",
             "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
             "  name: prod\n  namespace: app-proj\nspec:\n  location: europe-west1\n",
         )
-        finding = make_finding(fid="w", check="kcc-object-wedged", cluster="hub-proj/us-central1/hub", obj="ContainerCluster/prod",
+        finding = make_finding(fid="w", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="ContainerCluster/prod",
                                remediation={"kind": "manifest", "path": "clusters/prod.yaml", "note": "Fix the reference."})
         stall = {"kind": "ContainerCluster", "namespace": "app-proj", "name": "prod", "why": "UpdateFailed",
                  "project": "app-proj", "location": "europe-west1"}
@@ -23738,6 +23738,28 @@ metadata:
         self.assertNotIn("OLD", uncut)
         self.assertIn("UpdateFailed: NEW", note)
         self.assertEqual(note.count(audit_report.KCC_STALLED_OBJECT_MARK), 1)
+
+    TOPIC_FILE = ("apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n"
+                  "  namespace: infra\n  annotations:\n    cnrm.cloud.google.com/project-id: p\n")
+    TOPIC_STALL = {"kind": "PubSubTopic", "namespace": "infra", "name": "events", "project": "p", "why": "UpdateFailed: 403"}
+
+    def wedged(self, host, kind="manifest"):
+        remediation = {"kind": kind, "note": "Grant the role."}
+        if kind == "manifest":
+            remediation["path"] = "pubsub/events.yaml"
+        return make_finding(fid="w", check="kcc-object-wedged", cluster=host, obj="PubSubTopic/events", namespace="infra",
+                            remediation=remediation)
+
+    def test_a_wedged_finding_takes_no_stall_of_its_file_from_another_host(self):
+        """Review finding: the in-file match of a `kcc-object-wedged` finding
+        on hub-a took the same object's stall on hub-b."""
+        self.write("pubsub/events.yaml", self.TOPIC_FILE)
+        manifest = self.two_hosts(("p/us-central1/hub-a", []), ("p/us-central1/hub-b", [self.TOPIC_STALL]))
+        finding = self.wedged("p/us-central1/hub-a")
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        finding = self.wedged("p/us-central1/hub-b")
+        self.assertEqual(self.disclose([finding], manifest), ["w"])
 
     def test_a_declaration_of_another_project_or_location_is_not_named(self):
         """A proj-a/us-central1 file is not the declaration of a
