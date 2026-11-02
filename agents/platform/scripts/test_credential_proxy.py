@@ -2616,6 +2616,146 @@ class ExecRouteRefusesGitTest(_ExecRouteServer):
         self.assertNotIn("git", credential_proxy.EXEC_ROUTE_EXECUTABLES)
 
 
+class ResourcePressureRouteTest(unittest.TestCase):
+    """The resource watermark gate (#4333) as a caller meets it: over /v1/exec
+    and /v1/vcs/*, and on the watcher's Kubernetes reads."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        root = Path(self.temp_dir.name)
+        policy_path = root / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(root / "state"),
+            scoped_pool=None,
+        )
+        stub_dir = root / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/bash\necho pods\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+        CredentialProxyHandler.max_request_bytes = 65536
+        self.cgroup = root / "cgroup"
+        self.cgroup.mkdir()
+        (self.cgroup / "memory.max").write_text("1000\n")
+        self.set_memory_percent(86)
+        self.gate = credential_proxy.ResourceWatermarkGate(
+            credential_proxy.watermark_thresholds_from_env({}),
+            (credential_proxy.WatchedVolume("tmp", root / "tmp", 1000),),
+            cgroup_dir=self.cgroup,
+            tree_bytes=lambda path: 0,
+            retry_after=lambda low, high: 11,
+        )
+        CredentialProxyHandler.executor.watermark_gate = self.gate
+        CredentialProxyHandler.watermark_gate = self.gate
+        self.addCleanup(setattr, CredentialProxyHandler, "watermark_gate", None)
+        self.metrics = credential_proxy.ProxyMetrics()
+        self.addCleanup(setattr, CredentialProxyHandler, "metrics", CredentialProxyHandler.metrics)
+        CredentialProxyHandler.metrics = self.metrics
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def set_memory_percent(self, percent):
+        (self.cgroup / "memory.current").write_text(f"{percent * 10}\n")
+
+    def as_role(self, role):
+        authenticator = types.SimpleNamespace(
+            authenticates=True,
+            authenticate=lambda headers: credential_proxy.Principal(workload="system:serviceaccount:ns:caller", role=role),
+        )
+        patcher = mock.patch.object(CredentialProxyHandler, "authenticator", authenticator)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def post(self, payload, path="/v1/exec"):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, dict(response.headers), json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, dict(error.headers), json.loads(error.read())
+
+    def test_a_shell_caller_at_the_hard_watermark_is_answered_429_with_retry_after(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, headers, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(429, status)
+        self.assertEqual("11", headers["Retry-After"])
+        self.assertEqual(
+            {"status": "busy", "code": "CREDENTIAL_PROXY_RESOURCE_PRESSURE", "retry_after": 11},
+            {key: body[key] for key in ("status", "code", "retry_after")},
+        )
+        self.assertIn("hard resource watermark (memory=86%)", body["error"])
+        self.assertIn("command refused under resource pressure request_id=", "\n".join(logs.output))
+        self.assertEqual(0, CredentialProxyHandler.executor.slots_in_use)
+        self.assertIn('kubeagents_credential_proxy_admission_refusals_total{bound="pressure"} 1', self.metrics.render())
+        self.assertIn('status="busy"', self.metrics.render())
+
+    def test_a_session_caller_is_admitted_at_the_hard_watermark_and_everyone_under_it(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SESSION)
+        status, headers, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+        self.assertNotIn("Retry-After", headers)
+        self.set_memory_percent(50)
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        status, _, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+
+    def test_a_vcs_verb_at_the_hard_watermark_is_answered_429_before_its_body_is_read(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"probe": lambda payload: {"ok": True}}),
+        ):
+            status, headers, body = self.post({}, path="/v1/vcs/probe")
+        self.assertEqual(429, status)
+        self.assertEqual("11", headers["Retry-After"])
+        self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
+
+    def _watcher_handler(self, path):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.command = "GET"
+        handler.path = path
+        handler.headers = {}
+        handler.principal = credential_proxy.Principal(workload="system:serviceaccount:ns:gateway", role=credential_proxy.CALLER_ROLE_WATCHER)
+        handler.replies = []
+        handler._json = lambda status, payload, headers=None: handler.replies.append((status, payload, headers))
+        handler.endpoints_asked = []
+        handler._watcher_cluster_endpoint = lambda target, request_id: handler.endpoints_asked.append(target) or None
+        return handler
+
+    def test_a_watcher_list_at_the_hard_watermark_is_refused_and_a_watch_passes(self):
+        listing = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?limit=500")
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            listing._handle_watcher_k8s()
+        status, payload, headers = listing.replies[0]
+        self.assertEqual(HTTPStatus.TOO_MANY_REQUESTS, status)
+        self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", payload["code"])
+        self.assertEqual({"Retry-After": "11"}, headers)
+        self.assertEqual([], listing.endpoints_asked)
+        watch = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?watch=true&resourceVersion=1")
+        watch._handle_watcher_k8s()
+        self.assertEqual([], watch.replies)
+        self.assertEqual(1, len(watch.endpoints_asked))
+        self.set_memory_percent(50)
+        listing = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?limit=500")
+        listing._handle_watcher_k8s()
+        self.assertEqual([], listing.replies)
+        self.assertEqual(1, len(listing.endpoints_asked))
+
+
 class ExecRouteCapacityTest(unittest.TestCase):
     """The concurrency cap and the caller watch as the agent meets them: over /v1/exec."""
 

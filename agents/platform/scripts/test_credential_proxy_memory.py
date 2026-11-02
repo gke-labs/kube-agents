@@ -13,10 +13,13 @@ is read from and what an unreadable one does: absent, never zero.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -418,3 +421,358 @@ class MemorySeriesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- the resource watermark gate (#4333) ------------------------------------
+
+_GIB = 1024 * _MIB
+_STATE_LIMIT = 5 * _GIB
+_TMP_LIMIT = 2 * _GIB
+
+
+def _fake_memory(root: Path, *, current: int, limit: str | None = str(_LIMIT)) -> Path:
+    cgroup = root / "cgroup"
+    _write(cgroup / "memory.current", f"{current}\n")
+    if limit is not None:
+        _write(cgroup / "memory.max", f"{limit}\n")
+    return cgroup
+
+
+def _percent(limit: int, percent: float) -> int:
+    return int(limit * percent / 100)
+
+
+class _Retry:
+    """A Retry-After draw that records the range it was asked for."""
+
+    def __init__(self, value: int = 17) -> None:
+        self.value = value
+        self.ranges: list[tuple[int, int]] = []
+
+    def __call__(self, low: int, high: int) -> int:
+        self.ranges.append((low, high))
+        return self.value
+
+
+class ResourceWatermarkGateTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.sizes = {"state": 0, "tmp": 0}
+        self.reclaimed: list[str] = []
+        self.relieved = 0
+        self.retry = _Retry()
+
+    def _relieve(self) -> bool:
+        self.relieved += 1
+        return True
+
+    def gate(self, *, memory_percent=50.0, limit=str(_LIMIT), state_limit=_STATE_LIMIT, tmp_limit=_TMP_LIMIT, statvfs=None, thresholds=None):
+        cgroup = _fake_memory(self.root, current=_percent(_LIMIT, memory_percent), limit=limit)
+        volumes = (
+            credential_proxy.WatchedVolume("state", self.root / "state", state_limit),
+            credential_proxy.WatchedVolume("tmp", self.root / "tmp", tmp_limit),
+        )
+        return credential_proxy.ResourceWatermarkGate(
+            thresholds or credential_proxy.watermark_thresholds_from_env({}),
+            volumes,
+            cgroup_dir=cgroup,
+            tree_bytes=lambda path: self.sizes[path.name],
+            statvfs=statvfs or (lambda path: self.fail(f"statvfs asked for {path} with a cap known")),
+            reclaimers=(lambda: self.reclaimed.append("workspaces") or 2, lambda: self.reclaimed.append("vcs") or 1),
+            relieve=self._relieve,
+            retry_after=self.retry,
+        )
+
+    def set_memory(self, gate, percent):
+        (self.root / "cgroup" / "memory.current").write_text(f"{_percent(_LIMIT, percent)}\n")
+
+    def test_below_the_soft_watermark_everyone_is_admitted_and_nothing_clamps(self):
+        gate = self.gate(memory_percent=50)
+        self.sizes["state"] = _percent(_STATE_LIMIT, 60)
+        self.sizes["tmp"] = _percent(_TMP_LIMIT, 10)
+        self.assertEqual("normal", gate.tick())
+        for role in ("shell", "session", "profile", "scope", "watcher", None):
+            with gate.admit(role):
+                pass
+        gate.check("watcher")
+        self.assertFalse(gate.clamps_concurrency)
+        self.assertEqual([], self.reclaimed)
+        self.assertEqual(0, self.relieved)
+        snapshot = gate.snapshot()
+        self.assertEqual("normal", snapshot.level)
+        self.assertAlmostEqual(0.5, snapshot.ratios["memory"], places=3)
+        self.assertAlmostEqual(0.6, snapshot.ratios["state"], places=3)
+        self.assertAlmostEqual(0.1, snapshot.ratios["tmp"], places=3)
+        self.assertEqual([], self.retry.ranges)
+
+    def test_at_76_percent_memory_the_tick_clamps_and_relieves_once_per_episode(self):
+        gate = self.gate(memory_percent=76)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            self.assertEqual("soft", gate.tick())
+        self.assertIn("resource watermark normal -> soft (memory=76% state=0% tmp=0%)", "\n".join(logs.output))
+        self.assertIn("resource watermark relief: reclaimed=2,1 trimmed=True", "\n".join(logs.output))
+        self.assertTrue(gate.clamps_concurrency)
+        self.assertEqual(["workspaces", "vcs"], self.reclaimed)
+        self.assertEqual(1, self.relieved)
+        # Still soft: no second relief; a shell caller is still admitted.
+        self.assertEqual("soft", gate.tick())
+        self.assertEqual(1, self.relieved)
+        with gate.admit("shell"):
+            pass
+        # Back under, then over again: the step is armed once more.
+        self.set_memory(gate, 50)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            self.assertEqual("normal", gate.tick())
+        self.assertIn("resource watermark soft -> normal", "\n".join(logs.output))
+        self.assertFalse(gate.clamps_concurrency)
+        self.set_memory(gate, 76)
+        gate.tick()
+        self.assertEqual(2, self.relieved)
+        self.assertEqual(["workspaces", "vcs", "workspaces", "vcs"], self.reclaimed)
+
+    def test_at_71_percent_disk_on_either_volume_the_tick_clamps(self):
+        gate = self.gate(memory_percent=10)
+        self.sizes["tmp"] = _percent(_TMP_LIMIT, 71)
+        self.assertEqual("soft", gate.tick())
+        self.assertTrue(gate.clamps_concurrency)
+        self.assertEqual(1, self.relieved)
+        self.sizes["tmp"] = 0
+        self.sizes["state"] = _percent(_STATE_LIMIT, 71)
+        self.assertEqual("soft", gate.tick())
+        self.sizes["state"] = _percent(_STATE_LIMIT, 69)
+        self.assertEqual("normal", gate.tick())
+
+    def test_at_86_percent_memory_a_background_caller_is_refused_at_once_and_one_session_is_admitted(self):
+        gate = self.gate(memory_percent=86)
+        for role in ("shell", "profile", "scope", "watcher", None):
+            with self.assertRaises(credential_proxy.ResourcePressure) as raised:
+                with gate.admit(role):
+                    self.fail(f"{role!r} was admitted at the hard watermark")
+            self.assertEqual(17, raised.exception.retry_after)
+            self.assertEqual("pressure", raised.exception.bound)
+            self.assertIn("hard resource watermark (memory=86%", str(raised.exception))
+            self.assertIn("interactive sessions only", str(raised.exception))
+        self.assertEqual([(5, 30)] * 5, self.retry.ranges)
+        # The one reserved slot: a session is admitted, a second refused while
+        # the first holds it, and admitted once it is released.
+        with gate.admit("session"):
+            with self.assertRaises(credential_proxy.ResourcePressure) as raised:
+                with gate.admit("session"):
+                    self.fail("a second session was admitted into the one reserved slot")
+            self.assertIn("1 interactive slot(s) are in use", str(raised.exception))
+        with gate.admit("session"):
+            pass
+        self.assertTrue(gate.clamps_concurrency)
+
+    def test_the_memory_read_is_per_admission_not_per_tick(self):
+        gate = self.gate(memory_percent=50)
+        gate.tick()
+        self.set_memory(gate, 86)
+        with self.assertRaises(credential_proxy.ResourcePressure):
+            with gate.admit("shell"):
+                pass
+        self.assertEqual("hard", gate.level)
+
+    def test_past_the_ceiling_the_session_is_refused_too(self):
+        gate = self.gate(memory_percent=93)
+        with self.assertRaises(credential_proxy.ResourcePressure) as raised:
+            with gate.admit("session"):
+                pass
+        self.assertIn("interactive resource ceiling", str(raised.exception))
+        gate = self.gate(memory_percent=10)
+        self.sizes["tmp"] = _percent(_TMP_LIMIT, 91)
+        self.assertEqual("ceiling", gate.tick())
+        with self.assertRaises(credential_proxy.ResourcePressure):
+            with gate.admit("session"):
+                pass
+        # Under the disk ceiling but over its hard watermark, the reserve holds.
+        self.sizes["tmp"] = _percent(_TMP_LIMIT, 85)
+        self.assertEqual("hard", gate.tick())
+        with gate.admit("session"):
+            pass
+
+    def test_the_hard_check_alone_refuses_a_read_without_holding_the_reserve(self):
+        gate = self.gate(memory_percent=86)
+        with self.assertRaises(credential_proxy.ResourcePressure):
+            gate.check("watcher")
+        gate.check("session")
+        gate.check("session")
+        with gate.admit("session"):
+            pass
+
+    def test_a_missing_or_unlimited_memory_max_turns_the_memory_half_off(self):
+        for limit in (None, "max"):
+            with self.subTest(limit=limit):
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    gate = self.gate(memory_percent=99, limit=limit)
+                self.assertIn("memory half off", "\n".join(logs.output))
+                self.assertIsNone(gate.memory_limit_bytes)
+                self.assertEqual("normal", gate.tick())
+                self.assertNotIn("memory", gate.snapshot().ratios)
+                with gate.admit("shell"):
+                    pass
+                # The disk half still gates.
+                self.sizes["tmp"] = _percent(_TMP_LIMIT, 86)
+                self.assertEqual("hard", gate.tick())
+                with self.assertRaises(credential_proxy.ResourcePressure):
+                    with gate.admit("shell"):
+                        pass
+                self.sizes["tmp"] = 0
+
+    def test_a_volume_with_no_cap_is_measured_with_statvfs(self):
+        stats = {"state": (100, 15), "tmp": (0, 0)}
+
+        def statvfs(path):
+            blocks, available = stats[Path(path).name]
+            return types.SimpleNamespace(f_blocks=blocks, f_bavail=available)
+
+        gate = self.gate(memory_percent=10, state_limit=None, tmp_limit=None, statvfs=statvfs)
+        self.assertEqual("hard", gate.tick())
+        snapshot = gate.snapshot()
+        self.assertAlmostEqual(0.85, snapshot.ratios["state"], places=3)
+        self.assertNotIn("tmp", snapshot.ratios)
+        self.assertIn("state=", gate.describe_limits())
+        self.assertIn(":statvfs", gate.describe_limits())
+
+    def test_the_executor_runs_one_command_at_a_time_from_the_soft_watermark(self):
+        gate = self.gate(memory_percent=76)
+        gate.tick()
+        executor = CommandExecutor(timeout_seconds=5, max_output_bytes=4096, state_dir=str(self.root / "exec"), scoped_pool=None, max_concurrent_commands=4)
+        executor.watermark_gate = gate
+        self.assertEqual(1, executor._effective_cap())
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with executor.request_slot():
+                held.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        self.assertTrue(held.wait(5))
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                with executor.request_slot():
+                    self.fail("a second command ran under the clamp")
+        self.assertIn("limit of 1 concurrent commands (clamped under resource pressure)", str(raised.exception))
+        self.assertEqual("slot", raised.exception.bound)
+        # The clamp lifts with the level, and a waiter sees it on its next poll.
+        self.set_memory(gate, 50)
+        gate.tick()
+        self.assertEqual(4, executor._effective_cap())
+        with executor.request_slot():
+            self.assertEqual(2, executor.slots_in_use)
+        release.set()
+        thread.join(5)
+
+    def test_the_sampler_ticks_the_gate(self):
+        gate = self.gate(memory_percent=76)
+        stop = threading.Event()
+        reader = MemoryReader(ChildPeakTracker(), cgroup_dir=_fake_cgroup(self.root / "sampler"), proc_root=_fake_proc(self.root / "sampler"))
+        sampler = MemorySampler(reader, interval_s=0.01, stop=stop, gate=gate)
+        thread = threading.Thread(target=sampler.run, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 5
+        while gate.level != "soft" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stop.set()
+        thread.join(5)
+        self.assertEqual("soft", gate.level)
+        self.assertEqual(1, self.relieved)
+
+    def test_a_reclaimer_that_fails_does_not_stop_the_relief(self):
+        gate = self.gate(memory_percent=76)
+
+        def broken():
+            raise RuntimeError("no")
+
+        gate.set_reclaimers([broken, lambda: 3])
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            gate.tick()
+        self.assertIn("resource watermark reclaim failed type=RuntimeError", "\n".join(logs.output))
+        self.assertIn("reclaimed=0,3", "\n".join(logs.output))
+        self.assertEqual(1, self.relieved)
+
+    def test_the_gauge_and_the_refusal_counter_render_the_gate(self):
+        gate = self.gate(memory_percent=86)
+        self.sizes["tmp"] = _percent(_TMP_LIMIT, 25)
+        gate.tick()
+        metrics = ProxyMetrics()
+        metrics.set_watermark_reader(gate.snapshot)
+        metrics.record_refusal("pressure")
+        families = _families(metrics.render())
+        self.assertAlmostEqual(0.86, _series(families, "kubeagents_credential_proxy_resource_watermark_ratio", resource="memory"), places=3)
+        self.assertAlmostEqual(0.25, _series(families, "kubeagents_credential_proxy_resource_watermark_ratio", resource="tmp"), places=3)
+        self.assertEqual(0.0, _series(families, "kubeagents_credential_proxy_resource_watermark_ratio", resource="state"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="pressure"))
+        self.assertIn("pressure", credential_proxy.ADMISSION_BOUNDS)
+        self.assertNotIn("kubeagents_credential_proxy_resource_watermark_ratio", ProxyMetrics().render())
+
+
+class WatermarkEnvTest(unittest.TestCase):
+    def test_the_defaults(self):
+        self.assertEqual((75, 85, 70, 80), tuple(credential_proxy.watermark_thresholds_from_env({})))
+
+    def test_a_valid_pair_is_read_and_the_other_pair_keeps_its_defaults(self):
+        thresholds = credential_proxy.watermark_thresholds_from_env(
+            {"CREDENTIAL_PROXY_DISK_SOFT_PCT": "60", "CREDENTIAL_PROXY_DISK_HARD_PCT": "70"}
+        )
+        self.assertEqual((75, 85, 60, 70), tuple(thresholds))
+        self.assertEqual((75, 90, 70, 80), tuple(credential_proxy.watermark_thresholds_from_env({"CREDENTIAL_PROXY_MEM_HARD_PCT": "90"})))
+
+    def test_a_pair_out_of_order_past_the_ceiling_or_not_a_number_falls_back_with_a_warning(self):
+        for env in (
+            {"CREDENTIAL_PROXY_MEM_SOFT_PCT": "90", "CREDENTIAL_PROXY_MEM_HARD_PCT": "80"},
+            {"CREDENTIAL_PROXY_MEM_HARD_PCT": "95"},
+            {"CREDENTIAL_PROXY_MEM_SOFT_PCT": "lots"},
+            {"CREDENTIAL_PROXY_MEM_SOFT_PCT": "0"},
+            {"CREDENTIAL_PROXY_MEM_HARD_PCT": "101"},
+        ):
+            with self.subTest(env=env):
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                    thresholds = credential_proxy.watermark_thresholds_from_env(env)
+                self.assertEqual((75, 85, 70, 80), tuple(thresholds))
+                self.assertIn("using 75/85", "\n".join(logs.output))
+
+    def test_a_volume_cap_is_a_positive_byte_count_or_statvfs(self):
+        self.assertIsNone(credential_proxy.volume_limit_from_env("CREDENTIAL_PROXY_TMP_LIMIT_BYTES", {}))
+        self.assertEqual(2147483648, credential_proxy.volume_limit_from_env("CREDENTIAL_PROXY_TMP_LIMIT_BYTES", {"CREDENTIAL_PROXY_TMP_LIMIT_BYTES": "2147483648"}))
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertIsNone(credential_proxy.volume_limit_from_env("CREDENTIAL_PROXY_TMP_LIMIT_BYTES", {"CREDENTIAL_PROXY_TMP_LIMIT_BYTES": "2Gi"}))
+        self.assertIn("measuring that volume with statvfs", "\n".join(logs.output))
+
+
+class ReliefStepTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_tree_allocated_bytes_counts_blocks_and_does_not_follow_symlinks(self):
+        big = self.root / "outside.bin"
+        big.write_bytes(b"x" * _MIB)
+        tree = self.root / "tree"
+        (tree / "a").mkdir(parents=True)
+        (tree / "a" / "file").write_bytes(b"y" * (256 * _KIB))
+        (tree / "link").symlink_to(big)
+        counted = credential_proxy.tree_allocated_bytes(tree)
+        self.assertGreaterEqual(counted, 256 * _KIB)
+        self.assertLess(counted, _MIB)
+        self.assertEqual(0, credential_proxy.tree_allocated_bytes(self.root / "absent"))
+
+    def test_orphaned_vcs_scratch_of_another_process_is_removed_and_nothing_else(self):
+        own = f"clone-{os.getpid()}-1"
+        for name in ("clone-1-3", own, "notes", "publish-2-9"):
+            (self.root / name).mkdir()
+            (self.root / name / "object").write_text("x")
+        (self.root / "branch-4-4").symlink_to(self.root / "notes")
+        self.assertEqual(2, credential_proxy.reclaim_orphaned_vcs_scratch(self.root))
+        self.assertEqual({own, "notes", "branch-4-4"}, {entry.name for entry in self.root.iterdir()})
+        self.assertTrue((self.root / "notes" / "object").exists())
+        self.assertEqual(0, credential_proxy.reclaim_orphaned_vcs_scratch(self.root / "absent"))
+
+    def test_release_process_memory_collects_and_trims_where_libc_has_it(self):
+        self.assertIsInstance(credential_proxy.release_process_memory(), bool)

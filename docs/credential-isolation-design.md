@@ -366,7 +366,10 @@ including:
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default), and within that only as many
   as fit the child memory budget it derives from its container's memory limit (four at
   the operator's defaults); a request waits up to 60 seconds for admission and is then
-  refused with `503 CREDENTIAL_PROXY_BUSY`.
+  refused with `503 CREDENTIAL_PROXY_BUSY`. At the broker's hard resource watermark (live
+  cgroup memory, or a scratch volume near the sizeLimit it is evicted on) a background
+  caller is refused at once with `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and a
+  `Retry-After`; the session role keeps one slot up to a higher ceiling.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
@@ -907,6 +910,24 @@ Consequences:
   (`the credential proxy's admission queue is held by requests waiting for its child memory budget (…) …`).
   The queue is in arrival order, except that a forge refresh that fits the budget passes
   requests the slot cap alone holds, since it takes no slot.
+  Beside the static budget sits the resource watermark gate, which reads what the container
+  holds now: `memory.current` against `memory.max` on every admission, and the state and
+  `/tmp` emptyDirs against the sizeLimits the operator passes
+  (`CREDENTIAL_PROXY_STATE_LIMIT_BYTES`, `CREDENTIAL_PROXY_TMP_LIMIT_BYTES`; statvfs when
+  unset) on the memory sampler's 30 s tick. From the soft watermark
+  (`CREDENTIAL_PROXY_MEM_SOFT_PCT` 75, `CREDENTIAL_PROXY_DISK_SOFT_PCT` 70) admitted commands
+  run one at a time and the first tick reclaims idle content workspaces and orphaned vcs
+  scratch, collects and trims the allocator. From the hard watermark
+  (`CREDENTIAL_PROXY_MEM_HARD_PCT` 85, `CREDENTIAL_PROXY_DISK_HARD_PCT` 80) a background
+  caller is answered at once, before it queues, with
+  `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE`, `Retry-After: N` (5 to 30, drawn at random) and
+  the same envelope plus `retry_after`; one slot stays open to the session role, which is
+  the one interactive class, up to a ceiling of 92% memory or 90% disk, past which it is
+  refused too. The class is the authenticated role, never a header. The gate covers
+  `/v1/exec`, `/v1/vcs/*` and the feedback route; a `/v1/k8s` list without `watch=true`
+  takes the hard check alone, and a watch passes. A missing or `max` `memory.max` turns the
+  memory half off. The refusal counts under `bound="pressure"`, and
+  `kubeagents_credential_proxy_resource_watermark_ratio` carries each resource's fill.
   A long-running command holds its slot and reservation for as long as it runs,
   and a caller that stops reading its response is given up on after 60 seconds
   so that it cannot keep them.
