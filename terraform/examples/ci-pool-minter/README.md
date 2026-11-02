@@ -59,7 +59,7 @@ A project `gitops_repo_for_project()` maps is expected to have this applied, in 
 
 `location` and `namespace` default to the values `hack/ci-env.sh` uses (`us-central1`, `kubeagents-system`) and should only be overridden if that file changes: the chart derives the KMS key path from `platformAgent.harness.location`, which `hack/ci-deploy.sh` sets from `REGION`.
 
-> **KMS resources cannot be deleted.** `terraform destroy` removes the key ring and key from state only; re-applying with the same names fails with a 409. The [module README](../../modules/github-minter/README.md) covers the recovery.
+> **KMS resources cannot be deleted.** Cloud KMS key rings and keys are never actually deleted, and a raw `terraform destroy` does not leave the key usable: destroying the crypto key schedules every version of it for destruction, so the imported App PEM can no longer sign. Run `terraform state rm` on the key ring and key before a destroy. If a destroy already ran, restore and enable each version before its destruction time with `gcloud kms keys versions restore` and `enable`. Re-applying with the same names fails with a 409 until you import the key ring and key back into state or choose new names; the [module README](../../modules/github-minter/README.md) gives the import addresses.
 
 ## What Terraform cannot do
 
