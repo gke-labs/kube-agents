@@ -943,6 +943,37 @@ class DataVolumeTests(unittest.TestCase):
                 self.assertIn("cannot read", buffer.getvalue())
                 self.assertNotIn("disk is full", buffer.getvalue())
 
+    def _main_output(self, message: str, percent: int) -> str:
+        with tempfile.TemporaryDirectory() as d:
+            def boom(home, **kwargs):
+                raise sqlite3.OperationalError(message)
+            buffer = io.StringIO()
+            with unittest.mock.patch.object(kbh, "agent_home", return_value=Path(d)), \
+                    unittest.mock.patch.object(kbh, "report", boom), \
+                    unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(percent)), \
+                    contextlib.redirect_stdout(buffer):
+                kbh.main(env={kbh.STATE_ENV: str(Path(d) / "state.json")})
+            return buffer.getvalue()
+
+    def test_a_disk_io_error_is_a_full_disk_only_with_no_space_left(self):
+        """At 92% a "disk I/O error" is as likely a failing disk as a full one, and
+        raising spec.storage.size would not help; "database or disk is full" is space."""
+        self.assertIn("cannot read", self._main_output("disk I/O error", 92))
+        self.assertIn("disk is full (database or disk is full)", self._main_output("database or disk is full", 92))
+        self.assertIn("disk is full (disk I/O error)", self._main_output("disk I/O error", 100))
+
+    def test_the_volume_line_counts_against_the_report_budget(self):
+        """The line takes its share of the other findings' budget, so a report past
+        the warn line stays within max_chars."""
+        budget = 1200
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": f"t_{i:03d}", "status": "ready", "claim_lock": "ghost"} for i in range(40)])
+            with unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(95)):
+                _tasks, lines = kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={},
+                                           max_chars=budget)
+        self.assertTrue(lines[0].startswith("The agent's data volume is 95% full"))
+        self.assertLessEqual(len("\n".join(lines)) + kbh.REPORT_HEADER_RESERVE, budget)
+
     def test_the_line_and_text_match_the_session_kv_servers(self):
         """The two say the same thing at the same point; the server is not imported here."""
         source = (Path(__file__).resolve().parent / "session_kv_server.py").read_text()

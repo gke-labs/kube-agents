@@ -193,10 +193,14 @@ DATA_VOLUME_WARNING = (
     "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent."
 )
 BYTES_PER_GIB = 1 << 30
-# What SQLite says when a write fails for want of space, lowercased. "disk I/O
-# error" has other causes too, so it is read as a full disk only while the
-# volume is past the warn line.
-DISK_FULL_MARKERS = ("disk i/o error", "database or disk is full")
+PERCENT = 100
+# What SQLite says when a write fails for want of space, lowercased. "database
+# or disk is full" (SQLITE_FULL) is space by definition, so past the warn line it
+# is said as a full disk. "disk I/O error" (SQLITE_IOERR) is also a failing disk
+# or a filesystem remounted read-only, so it is said as a full disk only when no
+# space is left at all.
+SQLITE_FULL_MARKER = "database or disk is full"
+SQLITE_IOERR_MARKER = "disk i/o error"
 # The report when the board cannot be read for that reason.
 BOARD_DISK_FULL = "The task board cannot be read or written because the agent's disk is full ({error})."
 # What the header and its newline take of the other findings' budget.
@@ -873,9 +877,9 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     return lines
 
 
-def data_volume_line(home: Path) -> str | None:
-    """The full-volume line when the volume holding the board is at or above
-    DATA_VOLUME_WARN_PERCENT used, else None (also when it cannot be read)."""
+def data_volume_usage(home: Path) -> tuple[int, int] | None:
+    """The volume holding the board as (total, free) bytes, free being what a
+    non-root writer can still use; None when it cannot be read."""
     try:
         st = os.statvfs(home)
     except OSError:
@@ -883,8 +887,17 @@ def data_volume_line(home: Path) -> str | None:
     total = st.f_blocks * st.f_frsize
     if total <= 0:
         return None
-    free = st.f_bavail * st.f_frsize
-    percent = (total - free) * 100 // total
+    return total, st.f_bavail * st.f_frsize
+
+
+def data_volume_line(home: Path) -> str | None:
+    """The full-volume line when the volume holding the board is at or above
+    DATA_VOLUME_WARN_PERCENT used, else None (also when it cannot be read)."""
+    usage = data_volume_usage(home)
+    if usage is None:
+        return None
+    total, free = usage
+    percent = (total - free) * PERCENT // total
     if percent < DATA_VOLUME_WARN_PERCENT:
         return None
     return DATA_VOLUME_WARNING.format(
@@ -892,10 +905,16 @@ def data_volume_line(home: Path) -> str | None:
     )
 
 
-def is_disk_full_error(exc: BaseException) -> bool:
-    """Whether a board error is the disk being full rather than any other fault."""
+def is_disk_full_error(exc: BaseException, home: Path) -> bool:
+    """Whether a board error is the disk being full rather than any other fault:
+    SQLITE_FULL past the warn line, or SQLITE_IOERR with no space left."""
+    if data_volume_line(home) is None:
+        return False
     text = str(exc).lower()
-    return any(marker in text for marker in DISK_FULL_MARKERS)
+    if SQLITE_FULL_MARKER in text:
+        return True
+    usage = data_volume_usage(home)
+    return SQLITE_IOERR_MARKER in text and usage is not None and usage[1] == 0
 
 
 def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> tuple[list | None, list]:
@@ -981,7 +1000,7 @@ def main(argv=None, *, env=None, now=None) -> int:
             save_state(path, state)
         save_card(card_path(home, env), None)
         volume = data_volume_line(home)
-        if volume and is_disk_full_error(exc):
+        if volume and is_disk_full_error(exc, home):
             # Said for the channel: the board is down for want of space, and
             # what fixes it.
             print("\n".join([REPORT_HEADER, BOARD_DISK_FULL.format(error=exc), volume]))
