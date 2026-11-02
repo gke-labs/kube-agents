@@ -23405,19 +23405,22 @@ metadata:
         self.assertNotIn(audit_report.KCC_STALLED_PARAGRAPH_FIELD, validated["findings"][0])
 
     @staticmethod
-    def broker(files, truncated=False):
-        """A broker workspace over `files` whose grep, like `git grep -E`, returns
-        only the files whose lines match the expression."""
+    def broker(files, truncated=False, ceiling=None):
+        """A broker workspace over `files` whose grep, like `git grep -E` (or
+        `-F`), returns only the lines that match, in path order, and stops at
+        `ceiling` matches with `truncated` set, as the broker does."""
         class FakeWorkspace:
             def grep(self, pattern, regex=False, **_):
                 expression = re.compile(pattern.replace("[[:space:]]", r"\s") if regex else re.escape(pattern))
                 matches = [
                     {"path": path, "line": number, "text": line}
-                    for path, text in files.items()
+                    for path, text in sorted(files.items())
                     for number, line in enumerate(text.splitlines(), 1)
                     if expression.search(line)
                 ]
-                return {"matches": matches, "total": len(matches), "truncated": truncated}
+                cut = ceiling is not None and len(matches) > ceiling
+                kept = matches[:ceiling] if cut else matches
+                return {"matches": kept, "total": len(matches), "truncated": truncated or cut}
 
             def read_many(self, paths):
                 return {path: files[path].encode() for path in paths}, []
@@ -23428,7 +23431,7 @@ metadata:
         """In content mode the repository is read through the broker
         (`kcc_declarations_via_broker`), the same scan the gcloud check uses."""
         files = {self.PLANTED: self.PLANTED_DECLARATION, "apps/web.yaml": "kind: Deployment\nmetadata:\n  name: web\n"}
-        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files))
+        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files), every_kind=True)
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, scan.declarations, complete=True)
         self.assertIn(f"The declaration is `{self.PLANTED}`.", finding["remediation"]["note"])
@@ -23440,25 +23443,49 @@ metadata:
                  "  name: events\n  namespace: infra\n")
         annotated = ("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: infra\n  annotations:\n"
                      "    cnrm.cloud.google.com/project-id: acme\n")
-        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({"pubsub/events.yaml": topic, "ns.yaml": annotated}))
+        scan = audit_report.kcc_declarations_via_broker(
+            "acme/fleet", self.broker({"pubsub/events.yaml": topic, "ns.yaml": annotated}), every_kind=True
+        )
         self.assertEqual([declaration.path for declaration in scan.declarations.values()], ["pubsub/events.yaml"])
         finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/events",
                                namespace="infra", remediation={"kind": "manual", "note": "Grant the role."})
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(dict(KCC_TOPIC, name="events")), self.root, scan.declarations, complete=True)
         self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
 
-    def test_the_wider_scan_keeps_the_gcloud_check(self):
-        """The broker scan now indexes every Config Connector kind; the
-        gcloud check still meets only the cluster's own declaration."""
-        cluster = ("apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
-                   "  name: prod\nspec:\n  loggingService: none\n")
-        topic = "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: prod\n"
-        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({"c.yaml": cluster, "t.yaml": topic}))
-        self.assertEqual(sorted(key[0] for key in scan.declarations), ["ContainerCluster", "PubSubTopic"])
+    def test_the_gcloud_check_keeps_its_container_search_under_many_iam_files(self):
+        """The broker stops at its match ceiling in path order. The gcloud
+        check searches the container group alone, so 250 IAM declarations
+        that sort first cannot hide a late ContainerCluster from it; the
+        paragraph's every-kind search is the one that can be truncated."""
+        iam = "apiVersion: iam.cnrm.cloud.google.com/v1beta1\nkind: IAMPolicyMember\nmetadata:\n  name: m{n}\n"
+        files = {f"a-iam/m{n:03d}.yaml": iam.format(n=n) for n in range(250)}
+        files["z-clusters/prod.yaml"] = (
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+            "  name: prod\nspec:\n  loggingService: none\n"
+        )
+        broker = self.broker(files, ceiling=200)
+        scan = audit_report.kcc_declarations_via_broker("acme/fleet", broker)
+        self.assertFalse(scan.truncated)
         finding = make_finding(fid="g", cluster="acme/us-central1/prod", obj="Cluster/prod",
                                remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --logging=SYSTEM"})
         problem = audit_report.reverted_gcloud_problem(finding, scan.declarations)
-        self.assertEqual((problem[0].path, problem[1]), ("c.yaml", "loggingService"))
+        self.assertEqual((problem[0].path, problem[1]), ("z-clusters/prod.yaml", "loggingService"))
+        self.assertTrue(audit_report.kcc_declarations_via_broker("acme/fleet", broker, every_kind=True).truncated)
+
+    def test_a_single_quoted_api_version_is_indexed(self):
+        topic = "apiVersion: 'pubsub.cnrm.cloud.google.com/v1beta1'\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n"
+        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({"t.yaml": topic}), every_kind=True)
+        self.assertEqual([key[0] for key in scan.declarations], ["PubSubTopic"])
+
+    def test_a_truncated_paragraph_search_makes_no_absence_claim(self):
+        topic = "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: other\n"
+        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({"t.yaml": topic}, truncated=True), every_kind=True)
+        self.assertTrue(scan.truncated)
+        finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        audit_report.disclose_stalled_kcc_remediations(
+            [finding], self.live_manifest(), self.root, scan.declarations, complete=not scan.truncated and not scan.failed
+        )
+        self.assertIn("could not search the whole GitOps repository", finding["remediation"]["note"])
 
     def test_an_incomplete_search_never_claims_that_no_file_declares_the_object(self):
         """A truncated or failed broker scan, or a dry run with no clone, did

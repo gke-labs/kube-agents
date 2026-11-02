@@ -684,13 +684,21 @@ _GCLOUD_NEGATED_ENABLE_PREFIX = "--no-enable-"
 # anything else -- a Deployment, a Namespace -- is out of scope even where a
 # name collides.
 KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
-# What the broker searches the repository for in content mode: an
-# `apiVersion` line (YAML, or JSON, which is YAML) in any Config Connector
-# group, so that every kind is indexed, not only the container kinds the
-# gcloud check reads. Not the bare suffix: that also matches every
+# The group both kinds of the gcloud check live in, and what its broker
+# search looks for. The bare suffix also matches every
 # `cnrm.cloud.google.com/project-id` annotation, which fills the broker's
-# match ceiling with files that declare nothing. A `git grep -E` expression.
-KCC_DECLARATION_GREP = r'"?apiVersion"?[[:space:]]*:[[:space:]]*"?[A-Za-z0-9.-]*\.cnrm\.cloud\.google\.com/'
+# match ceiling with files that declare nothing this check reads.
+KCC_CONTAINER_API_GROUP = f"container.{KCC_API_GROUP_SUFFIX}"
+# What the Config Connector paragraph's own broker search looks for, only
+# when a stall needs it: an `apiVersion` line in any Config Connector group,
+# YAML or JSON, with no quote, a single quote or a double quote around the
+# key and the value, so every kind is indexed. Not the bare suffix, for the
+# reason above. A `git grep -E` expression. It is a separate search, so the
+# gcloud check's search stays on the container group, inside the broker's
+# match ceiling.
+KCC_DECLARATION_GREP = (
+    r"[\"']?apiVersion[\"']?[[:space:]]*:[[:space:]]*[\"']?[A-Za-z0-9.-]*\.cnrm\.cloud\.google\.com/"
+)
 
 _KCC_OBJECT_KINDS: dict[str, tuple[str, ...]] = {
     "Cluster": ("ContainerCluster",),
@@ -18503,7 +18511,7 @@ class KccBrokerScan(NamedTuple):
     failed: bool = False
 
 
-def kcc_declarations_via_broker(repo: str, session=None) -> KccBrokerScan:
+def kcc_declarations_via_broker(repo: str, session=None, every_kind: bool = False) -> KccBrokerScan:
     """Index the GitOps repository's Config Connector resources through the broker.
 
     Content mode's counterpart of `kcc_declarations`: there is no clone at
@@ -18517,11 +18525,16 @@ def kcc_declarations_via_broker(repo: str, session=None) -> KccBrokerScan:
     check exactly as an unreadable clone does; the run never fails over it.
     `session` is a broker workspace already open on `repo` (`_RepositoryProbe`),
     so one `finish` clones the repository once.
+
+    The gcloud check searches the container group (`KCC_CONTAINER_API_GROUP`),
+    as it always has. `every_kind` is the Config Connector paragraph's own
+    search (`KCC_DECLARATION_GREP`), for every kind. Without PyYAML nothing is
+    parsed, and the scan is marked `failed`.
     """
     try:
         import yaml  # noqa: PLC0415 -- optional; absence disables the check
     except ImportError:
-        return KccBrokerScan({}, False)
+        return KccBrokerScan({}, False, True)
     index: dict[KccKey, KccDeclaration] = {}
     try:
         import credential_proxy_client
@@ -18532,7 +18545,9 @@ def kcc_declarations_via_broker(repo: str, session=None) -> KccBrokerScan:
             else credential_proxy_client.Workspace.open(proxy_endpoint(), repo)
         )
         with opened as workspace:
-            result = workspace.grep(KCC_DECLARATION_GREP, regex=True)
+            result = (
+                workspace.grep(KCC_DECLARATION_GREP, regex=True) if every_kind else workspace.grep(KCC_CONTAINER_API_GROUP)
+            )
             truncated = bool(result.get("truncated"))
             wanted = sorted(
                 {
@@ -18676,6 +18691,16 @@ def reverted_gcloud_problem(
             if held:
                 return entry, held[0]
     return None
+
+
+def _kcc_clone_searched(roots: list[tuple[str, Path]]) -> bool:
+    """Whether the GitOps repository's clone is among `roots` and could be
+    parsed: without PyYAML, the walk reads nothing (`kcc_declarations`)."""
+    try:
+        import yaml  # noqa: F401, PLC0415 -- only whether it imports
+    except ImportError:
+        return False
+    return any(not repo for repo, _ in roots)
 
 
 def kcc_declaration_index(
@@ -19198,6 +19223,7 @@ def _declarations_of(
             continue
         if key[0] in _KCC_OBJECT_KINDS["NodePool"] and stall.cluster and key[2] != stall.cluster:
             continue
+
         for where in ((declaration.repo, declaration.path), *declaration.also):
             if where not in files:
                 files.add(where)
@@ -20628,7 +20654,7 @@ def _handle_finish_dry_run(
         declarations=kcc_declaration_index(kcc_roots) if kcc_health(manifest).stalled else {},
         # Complete only when the stream's clone is there: a content-mode dry
         # run has none and opens no broker session.
-        complete=any(not repo_slug for repo_slug, _ in kcc_roots),
+        complete=_kcc_clone_searched(kcc_roots),
     )
     paths = manifest_paths(findings)
 
@@ -22971,9 +22997,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     atexit.register(probe.close)
     # The Config Connector paragraph names the declaration of a stalled
     # object (`disclose_stalled_kcc_remediations`), so a manifest that
-    # records a stall needs the same index the gcloud check reads.
+    # records a stall needs a declaration index (below).
     kcc_stalls = bool(kcc_health(manifest).stalled)
-    if content_mode() and (kcc_stalls or any(_kcc_candidate(finding) for finding in findings)):
+    if content_mode() and any(_kcc_candidate(finding) for finding in findings):
         # The probe's open is the scan's, and a failed one is retried once on
         # the probe's count: the backstop keeps its retry, and planning, which
         # fails safe without the broker, takes none.
@@ -22981,7 +23007,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         scan = (
             kcc_declarations_via_broker(repo, session)
             if session is not None
-            else KccBrokerScan({}, False, True)
+            else KccBrokerScan({}, False)
         )
         if session is None:
             log(
@@ -22997,15 +23023,26 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             )
     kcc_roots = kcc_declaration_roots(audit_id, root, record)
     # The index the Config Connector paragraph names a declaration from: read
-    # only when the manifest records a stall. It is complete when it covered
-    # the whole GitOps repository: the clone, or a broker scan that ran to an
-    # answer and was not truncated. Only then may the paragraph say that no
-    # file declares the object.
-    kcc_index = kcc_declaration_index(kcc_roots, kcc_prebuilt) if kcc_stalls else {}
-    if content_mode():
-        kcc_index_complete = kcc_stalls and not scan.truncated and not scan.failed
-    else:
-        kcc_index_complete = any(not repo_slug for repo_slug, _ in kcc_roots)
+    # only when the manifest records a stall, with its own broker search in
+    # content mode (every kind, `every_kind`), apart from the gcloud check's.
+    # It is complete when it covered the whole GitOps repository: the clone,
+    # or a paragraph search that ran to an answer and was not truncated, and
+    # PyYAML to parse it. Only then may the paragraph say that no file
+    # declares the object.
+    kcc_index: dict[KccKey, KccDeclaration] = {}
+    kcc_index_complete = False
+    if kcc_stalls and content_mode():
+        session = probe.broker() or probe.broker()
+        paragraph_scan = (
+            kcc_declarations_via_broker(repo, session, every_kind=True)
+            if session is not None
+            else KccBrokerScan({}, False, True)
+        )
+        kcc_index = kcc_declaration_index(kcc_roots, paragraph_scan.declarations)
+        kcc_index_complete = not paragraph_scan.truncated and not paragraph_scan.failed
+    elif kcc_stalls:
+        kcc_index = kcc_declaration_index(kcc_roots)
+        kcc_index_complete = _kcc_clone_searched(kcc_roots)
     for fid in degrade_reverted_gcloud_remediations(
         findings, kcc_roots, prebuilt=kcc_prebuilt
     ):
