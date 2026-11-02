@@ -6,7 +6,9 @@ until this file the pair had never met: nothing proved the bytes the client
 sends are the bytes the server's parser accepts, or that the server's refusals
 come back as exit codes an agent can read. The third test pins the case that
 sits between them — an error body written by neither (Envoy answering 503 with
-HTML during a sidecar restart), which used to crash the shim with a traceback.
+HTML during a sidecar restart), which used to crash the shim with a traceback;
+a 503 is also a busy broker to the shim, so it exits EX_TEMPFAIL and prints the
+busy line the kanban dispatcher's pressure signal reads, before the message.
 """
 
 from __future__ import annotations
@@ -107,8 +109,10 @@ class CredentialProxyPairTest(unittest.TestCase):
 
     def test_a_non_json_error_body_is_a_message_not_a_traceback(self):
         # Envoy restarting mid-request: 503, text/html, written by neither
-        # side of this seam. The shim must degrade to a readable line and
-        # exit 1 — before the fix in this change it crashed on json.load.
+        # side of this seam. The shim must degrade to a readable line rather
+        # than crash on json.load, and a 503 is a busy broker: the busy line
+        # comes first and the exit status is EX_TEMPFAIL (75), the pair a
+        # kanban worker's terminal result reads as a pressure signal.
         class HtmlErrorHandler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
                 body = b"<html><body>upstream connect error</body></html>"
@@ -131,9 +135,13 @@ class CredentialProxyPairTest(unittest.TestCase):
             code = credential_proxy_client.execute(
                 f"http://127.0.0.1:{envoy.server_port}", ["kubectl", "get", "pods"]
             )
-        self.assertEqual(1, code)
-        self.assertIn("HTTP 503", stderr.getvalue())
-        self.assertIn("non-JSON response", stderr.getvalue())
+        self.assertEqual(credential_proxy_client.EXIT_BROKER_BUSY, code)
+        self.assertEqual(75, code)
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual("credential proxy busy (HTTP 503)", lines[0])
+        self.assertIn("HTTP 503", lines[1])
+        self.assertIn("non-JSON response", lines[1])
+        self.assertNotIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":
