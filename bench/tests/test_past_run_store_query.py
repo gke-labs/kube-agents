@@ -3,12 +3,14 @@ query however the worker typed it.
 
 Every fixture is graded through ``WorkerCommandsVerifier.verify()`` on a
 staged transcript, as the run grades it: the card log's rendered row and the
-tagged call as typed, together. The rendered rows here are what Hermes's
-``summarize_shell_command`` shows for each typed command: a chain is its
-first segment plus `` + N command(s)`` (an ``echo`` of an exit code is not
-counted), a redirect is dropped, a newline is a space. The nightly answers of 2026-10-20 to 2026-10-23 all assigned the
-script's path to a shell variable and ran the variable, so their rows showed
-the assignment only and the check failed a correct route.
+tagged call as typed, together. The rendered rows are hand-written copies of
+what Hermes's ``summarize_shell_command`` (``agent/display.py`` in the pinned
+image) prints for each typed command, checked against that code: a chain is
+its first segment plus `` + N command(s)``, where an ``echo`` of an exit code
+is not counted, a redirect is dropped, and a newline is a space. The nightly
+answers of 2026-10-20 to 2026-10-23 all assigned the script's path to a shell
+variable and ran the variable, so their rows showed the assignment only and
+the check failed a correct route.
 """
 
 from __future__ import annotations
@@ -50,6 +52,11 @@ QUERIES = [
     (f'Q={SCRIPT}; python3 "${{Q}}" diff compliance-audit', f"Q={SCRIPT} + 1 command"),
     (f"Q={SCRIPT} && python3 -u ${{Q}} --root /tmp/r checks compliance-audit", f"Q={SCRIPT} + 1 command"),
     (f"Q={SCRIPT}\npython3 $Q runs compliance-audit", f"Q={SCRIPT} python3 $Q runs compliance-audit"),
+    # The variable behind a wrapper, run bare (the script is executable),
+    # and inside a substitution.
+    (f"Q={SCRIPT}; timeout 60 python3 $Q streams", f"Q={SCRIPT} + 1 command"),
+    (f"Q={SCRIPT}; $Q show compliance-audit", f"Q={SCRIPT} + 1 command"),
+    (f"Q={SCRIPT}; OUT=`python3 $Q streams`; echo $OUT", f"Q={SCRIPT} + 2 commands"),
     # The direct forms the case always read.
     ("python3 ./skills/fleet-audit-reports/scripts/report_query.py streams",) * 2,
     (f"python3 {SCRIPT} diff compliance-audit",) * 2,
@@ -70,8 +77,6 @@ NOT_QUERIES = [
     (f"Q={SCRIPT}; QQ=/opt/other/tool.py; python3 $QQ streams", f"Q={SCRIPT} + 2 commands"),
     # The script's usage printed, no subcommand.
     (f"Q={SCRIPT}; python3 $Q", f"Q={SCRIPT} + 1 command"),
-    # The run quoted in prose after the assignment, not at a command start.
-    (f"echo 'Q={SCRIPT}; see `python3 $Q streams`'",) * 2,
 ]
 
 

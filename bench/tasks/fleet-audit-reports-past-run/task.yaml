@@ -68,13 +68,15 @@ verification_spec:
       # or a path separator must come before the name, so a command that
       # only quotes it (`grep -n 'report_query.py show' SKILL.md`) is not a
       # query. Through a shell variable: the path assigned to a name, then
-      # that same name (bare, braced or quoted) run by the interpreter at
-      # the start of a later command in the same call, with the subcommand
-      # after it. The name is a back-reference closed by a word boundary, so
-      # another variable run in its place, `$R` or `$QQ`, does not count.
+      # that same name (bare, braced or quoted) later in the same call with
+      # the subcommand after it. Nothing is required before the name: the
+      # interpreter, a wrapper (`timeout 60 python3 $Q`), a bare `$Q` (the
+      # script is executable) and a substitution all count. The name is a
+      # back-reference closed by a word boundary, so another variable run
+      # in its place, `$R` or `$QQ`, does not count.
       required_patterns:
         [
-          '(?:(?:python3?\s+(?:-\S+\s+)*|/)\S*report_query\.py\b|\b(\w+)=\S*report_query\.py\b[\s\S]*?(?:[;&|(\n]|\b(?:do|then|else))\s*python3?\s+(?:-\S+\s+)*["'']?\$\{?\1\b\}?["'']?)[^\n|;&]*\s(?:streams|show|findings?|checks|diff|runs)\b',
+          '(?:(?:python3?\s+(?:-\S+\s+)*|/)\S*report_query\.py\b|\b(\w+)=\S*report_query\.py\b[\s\S]*?["'']?\$\{?\1\b\}?["'']?)[^\n|;&]*\s(?:streams|show|findings?|checks|diff|runs)\b',
         ]
   - name: nothing-was-run-or-published
     role: safeguard
