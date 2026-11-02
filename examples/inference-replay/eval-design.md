@@ -9,8 +9,9 @@ presubmit pays for inference only from the first point where a run differs from 
 **Owns:** the cache key and its normalization rules, where the proxy sits, which recordings may be
 served, and the rollout stages. The gate's ladder and roster stay in
 [`testing-strategy.md`](../../docs/designs/testing-strategy.md) §4.2; the eval transport stays in
-[`eval-next-transport.md`](../../docs/designs/eval-next-transport.md). The example proxy in this directory ([`README.md`](README.md)) is the starting point and is
-superseded by the design here for eval use.
+[`eval-next-transport.md`](../../docs/designs/eval-next-transport.md). The example proxy in this
+directory ([`README.md`](README.md)) is the starting point and is superseded by the design here
+for eval use.
 
 ## The problem
 
@@ -31,9 +32,11 @@ call.
 Three properties make this sound for grading:
 
 - **A hit means the model saw the same input.** The key covers the whole request: system prompt,
-  tool schemas, model name, and every message so far, including every tool result. A stored answer
-  is a real sample from the model for that exact input, so serving it is as valid as sampling
-  again; what is lost is independence between samples.
+  tool schemas, the model alias, and every message so far, including every tool result, with one
+  exception (the recent-work digest, below). A stored answer is a real sample from the model for
+  that exact input. What serving it loses is independence between samples, and under pass-only
+  recordings (below) it is also a sample drawn only from runs that passed, which biases a replayed
+  run towards passing.
 - **Tools still run.** Only model calls are replayed. `kubectl`, `gcloud`, scripts and GitHub
   writes execute live, and the verifiers grade the live state and the delivered report. A tool
   result that differs from the recording changes the next request, which misses, and from there
@@ -46,8 +49,8 @@ Three properties make this sound for grading:
 
 Raw requests never repeat. Kanban task IDs, pod name suffixes, UIDs, timestamps, ages, process and
 row IDs, and scratch file names differ every run, and one difference poisons every later request
-in the conversation, because each request embeds the ones before it. Hashing raw bodies gave 5–7%
-token-weighted hits on 2026-09-04 (#1028).
+in the conversation, because each request embeds the ones before it. Hashing raw bodies, as the example proxy
+does, gave 5–7% token-weighted hits in a two-run measurement on a dev install on 2026-09-04.
 
 The normalizer replaces each identifier with a placeholder numbered by first appearance in the
 request (`⟦TASK_1⟧`, `⟦POD_2⟧`, `⟦AGEm_1⟧`), and the mapping works both ways. A stored answer
@@ -84,7 +87,8 @@ terminal-output cache file suffixes (`…-89b0.log`).
 ## Measurements
 
 All on one dev install, `spec.mode: next`, Gemini 3.1 Pro via LiteLLM. Each row is one recording
-followed by replays minutes later; "tokens" is the share of prompt tokens served from the cache.
+followed by replays of that same recording minutes later; "tokens" is the share of prompt tokens
+served from the cache.
 
 | Run                                                            | Tokens replayed  | Model time     | Verdicts               |
 | -------------------------------------------------------------- | ---------------- | -------------- | ---------------------- |
@@ -120,11 +124,18 @@ replace it.
 
 ### Where the proxy runs
 
-Eval installs only. `hack/ci-deploy.sh` renders the proxy beside LiteLLM and points
-`inference-gateway` at it; the chart and customer installs never carry it. The prototype's
-placement works unchanged: the proxy pod carries `app: litellm` so every agent egress policy admits
-it, a second label selects it for the Service, and one extra NetworkPolicy lets it reach the real
-LiteLLM pods.
+Eval installs only. `hack/ci-deploy.sh` renders the proxy beside LiteLLM after the Helm release
+is applied and points `inference-gateway` at it, since a later Helm upgrade reverts the Service;
+customer installs never carry it. The proxy pod has to carry `app: litellm`, because that is the only
+label the agents' egress policies admit for the model gateway. A second label (`replay: proxy`)
+selects it for `inference-gateway`, an `inference-gateway-upstream` Service selects the real LiteLLM
+pods, and one extra NetworkPolicy lets the proxy reach them. The upstream selector is the hard part:
+the chart's LiteLLM pods carry only `app: litellm`, so a Service selecting that also selects the
+proxy and loops. The prototype selected on the LiteLLM ReplicaSet's `pod-template-hash`, which breaks
+on the next LiteLLM roll; CI needs a stable label on the LiteLLM pods (a chart value) that the proxy
+does not carry. The shared label also enrols the proxy in LiteLLM's PodDisruptionBudget, its
+`PodMonitoring` scrape and the console's metrics Service; the proxy passes unknown paths through
+to LiteLLM, so `/metrics` still answers.
 
 ### One shared cache for the evaluation pool
 
@@ -133,8 +144,22 @@ normalized request to match, tool results included, so two projects whose fleets
 that matters miss anyway; a per-project split only removes hits whose inputs were the same, and it
 multiplies the live runs needed to warm the cache after each prompt change by the pool size. The
 cache lives in an eval-owned bucket and is never shared with dev or customer installs, because
-recorded answers carry cluster details. The key includes the model name and the LiteLLM model
-settings, so a model or thinking-mode change cannot replay old answers.
+recorded answers carry cluster details.
+
+**Only base-branch code writes to it.** A presubmit runs the pull request's tree, so a proxy built
+from that tree could write any answer under `main`'s keys and every later pull request would be
+graded from it, which breaks the rule [`testing-strategy.md`](../../docs/designs/testing-strategy.md)
+§4.2 states for the evidence store: a pull request cannot move the baseline it is judged against.
+The proxy image, its normalizer and its commit-on-pass step are therefore built from
+`PULL_BASE_SHA`, the way the scorer is pinned. What the pull request's code can still change is the
+requests, and a changed request lands under its own key, where only a run of that same input can
+read it.
+
+**The key includes what the request does not show.** Agents send the alias `model-default`; LiteLLM
+resolves the real model, `reasoning_effort`, thinking and fallbacks on its side, so a pull request
+that changes those sends byte-identical requests. The proxy reads the install's LiteLLM model
+configuration at start and puts its hash in the key, and it does not record an answer whose
+reported `model` is not the configured primary (a fallback's answer).
 
 ### Which recordings may be served
 
@@ -144,8 +169,11 @@ pass-only recordings a pull request that does not touch a case replays a pass, a
 touches a request and is graded live. New entries are held per run and committed when the run's
 verdict is in.
 
-Each repetition replays its own recording: the repetition index is part of the key, so the three
-repetitions keep three samples rather than one served three times.
+Ideally each repetition replays its own recording, with the repetition index in the key, so the
+three repetitions keep three samples rather than one served three times. That needs a run's
+requests to carry its identity, which they do not today (open questions). Without it, all three
+repetitions of a case replay the same recording. The measurements below were taken that way: one
+recording, served to three replays.
 
 ### Prompt churn
 
@@ -164,15 +192,22 @@ read, and replay would bias it towards the recordings.
 
 Repetitions stop being independent where they replay. With pass-only recordings an untouched case
 passes on replay, so collapse (all three repetitions failing) can only come from the live part of a
-run. That is the intent for a pull request that did not cause the failure. Two consequences need
-the eval crew's decision before stage 2:
+run. That is the intent for a pull request that did not cause the failure. These consequences need
+the eval crew's decision before stage 2 of the rollout below:
 
-- The aggregate rule compares a pull request's pass rate against `main`'s from the evidence store,
-  which the live nightly writes. Replayed passes inflate the pull request's side. Either the
-  aggregate counts only repetitions that went live before the case's first verifier-relevant call,
-  or the comparison reads a replayed baseline.
+- Every comparison against `main`'s baseline is skewed the same way. The aggregate rule compares a
+  pull request's pass rate with `main`'s from the evidence store, which the live nightly writes; it
+  is advisory until `EVAL_AGGREGATE_ARMED` is set, but it is what arming would make block. Rung 6
+  compares judged scores with the same baseline, and caching the judge (open questions) would add
+  to it. Replayed passes inflate the pull request's side of both. Either they count only
+  repetitions that went live before the case's first verifier-relevant call, or they read a
+  replayed baseline.
 - A case that is flaky on `main` stops showing its flakiness on unrelated pull requests. The nightly
   still reports it.
+- Token accounting. A hit returns the recorded answer's `usage`, so the record's token counts, and
+  rung 3's check that a run billed a model call, behave as if the model ran. The proxy marks each
+  response as hit or miss, and the record splits replayed tokens from billed ones; without the split
+  the saving cannot be read from the eval records.
 
 ## Rollout
 
@@ -181,7 +216,7 @@ the eval crew's decision before stage 2:
    always calls the model. No verdict changes. A week of it gives the real hit rate under prompt
    churn and project rotation, the token and cost saving per build, and the misses worth
    normalizing. Cheap and reversible.
-2. **Replay on the presubmit**, after the eval crew settles the two gate questions above and #1730
+2. **Replay on the presubmit**, after the eval crew settles the gate questions above and #1730
    is fixed or the digest stripping is accepted.
 3. **Polling.** If shadow mode shows the fan-out `sleep` loop is where most remaining misses fall,
    look at the poll, not the cache.
