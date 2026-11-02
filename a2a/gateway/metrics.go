@@ -21,7 +21,8 @@ import (
 // copied from the credential broker's (CREDENTIAL_PROXY_METRICS_PORT in
 // agents/platform/scripts/credential_proxy.py), so that the collector
 // scraping it, and the operator's usage poller, are admitted to a port that
-// serves counters and nothing else.
+// serves counters (MetricsPath) and a readiness line for the kubelet
+// (ReadyzPath) and nothing else.
 // The doors keep their own loopback listeners and never serve these series.
 // The operator renders A2A_METRICS_PORT from the constant that also declares
 // the container port and the collector's ingress rule
@@ -407,7 +408,7 @@ func (s *MetricsServer) serveReadyz(w http.ResponseWriter, _ *http.Request) {
 // unlike the doors' loopback binds, because its callers, the collector and
 // the operator's poller, are on the pod network; what keeps anyone else off
 // it is the NetworkPolicy, and
-// what it serves is counters.
+// what it serves is counters and a readiness line.
 func NewMetricsServer(port int, metrics *Metrics, log *slog.Logger) (*MetricsServer, error) {
 	if port < metricsPortMin || port > metricsPortMax {
 		return nil, fmt.Errorf("metrics listener port %d is not in %d-%d", port, metricsPortMin, metricsPortMax)

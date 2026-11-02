@@ -159,6 +159,8 @@ var (
 	subscribeBindWindow   = 45 * time.Second
 	streamWaitLogInterval = 30 * time.Second
 	streamWaitWarnEvery   = 10 * time.Minute
+	// bindBackoff spaces the first bind's attempts; a test may fix it.
+	bindBackoff = fullJitterBackoff
 )
 
 // fullJitterBackoff returns a delay drawn uniformly from [0, min(cap,
@@ -674,7 +676,8 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // Bounded, unlike the rebuild path's retry: there the process is already up
 // and serving and giving up would leave it silently deaf, while here a
 // consumer config the server will never accept must still fail the process
-// rather than hang it. Every attempt is logged, so the delay is never silent.
+// rather than hang it. Every attempt is logged, so the delay is never silent
+// (except a WaitForStream wait, below, which logs on an interval instead).
 //
 // One error is not retried at all: a held bind refused on the durable's
 // stored config (ErrHeldBindRefused). That verdict was read from the
@@ -688,7 +691,9 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // window restarts from the first attempt that finds it. The wait logs its
 // first attempt and then at most once per streamWaitLogInterval, and warns
 // once per streamWaitWarnEvery, so a stream that never comes is loud, not
-// silent; the caller reports itself not ready meanwhile.
+// silent; the caller reports itself not ready meanwhile. Each attempt of the
+// wait reads the client's current JetStream context, because a rebuild during
+// an open-ended wait replaces the one this bind started with.
 func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream) error {
 	deadline := time.Now().Add(subscribeBindWindow)
 	var waitStart, lastLog time.Time
@@ -717,17 +722,20 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 				warned++
 				lastLog = now
 				s.c.log.Warn("still waiting for the stream; nothing has created it",
-					"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second), "attempt", attempt)
+					"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
 			case lastLog.IsZero() || now.Sub(lastLog) >= streamWaitLogInterval:
 				lastLog = now
 				s.c.log.Info("waiting for the stream to be created",
-					"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second), "attempt", attempt)
+					"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
 			}
 			select {
 			case <-ctx.Done():
 				return err
-			case <-time.After(fullJitterBackoff(attempt)):
+			case <-time.After(bindBackoff(attempt)):
 			}
+			s.c.mu.RLock()
+			js = s.c.js
+			s.c.mu.RUnlock()
 			continue
 		}
 		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
@@ -738,7 +746,7 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 		select {
 		case <-ctx.Done():
 			return err
-		case <-time.After(fullJitterBackoff(attempt)):
+		case <-time.After(bindBackoff(attempt)):
 		}
 	}
 }

@@ -2596,11 +2596,12 @@ but GET or HEAD 405), every interface rather than loopback because its caller is
 collector on the pod network. `A2A_METRICS_PORT` names the port; unset means no listener, and a
 value that is not a port, or is either door's port, refuses the boot. A port that will not bind
 costs the gateway its metrics and its readiness, and logs an `ALERT` line; conversations carry on,
-though the pod never reads Ready, so the CR and the doors' Services count it as down.
+though the pod never reads Ready, so the CR stays `Provisioning` naming the Deployment and
+`kubectl rollout status` does not finish until a restart binds the port.
 
 `/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
 once the gateway has bound its event relay and 503 until then, with the reason as the body
-(`waiting for stream TASKS: ...`). The relay binds before anything else starts, and on an install
+(`waiting for stream TASKS: ...`). The relay binds before the adapters and doors start, and on an install
 whose provision Job has not created TASKS yet (a three-server bus can take longer to form than
 lib's 45-second bind window) the relay waits for the stream rather than exiting
 (`SubscribeConfig.WaitForStream`, set on the relay alone, and only a missing stream waits). It logs

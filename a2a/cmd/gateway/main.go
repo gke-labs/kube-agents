@@ -37,7 +37,7 @@ const (
 
 	// metricsUnavailableAlert is the one line a metrics listener that could
 	// not start leaves, whichever step refused it.
-	metricsUnavailableAlert = "ALERT metrics listener unavailable; the gateway serves no /metrics until it restarts, and conversations are unaffected"
+	metricsUnavailableAlert = "ALERT metrics listener unavailable; the gateway serves no /metrics and no /readyz until it restarts, so the pod never reads Ready and the PlatformAgent stays Provisioning; conversations are unaffected"
 )
 
 func main() {
@@ -384,8 +384,9 @@ func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, r
 
 // startMetricsListener serves the counters on A2A_METRICS_PORT when it is
 // set, on a goroutine of its own. Never fatal, the broker's rule for its own
-// listener: a port that will not bind costs the gateway its metrics, not the
-// conversations it exists to carry, and the ALERT line is the signal.
+// listener: a port that will not bind costs the gateway its metrics and its
+// readiness (/readyz is served there too), not the conversations it exists
+// to carry, and the ALERT line is the signal.
 func startMetricsListener(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, readiness func() (bool, string), log *slog.Logger) {
 	if cfg.MetricsPort == 0 {
 		log.Info("metrics listener disabled: A2A_METRICS_PORT is unset")

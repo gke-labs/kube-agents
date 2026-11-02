@@ -39,7 +39,11 @@ func TestReadyzAnswersTheReadinessWithItsReason(t *testing.T) {
 // A gateway started before the provision Job has created TASKS waits for it
 // instead of exiting: not ready, with the reason on /readyz, Run still
 // running, and ready once the stream exists, with no restart in between.
-func TestGatewayWaitsForTheTasksStreamAndIsNotReadyUntilItBinds(t *testing.T) {
+// newUnprovisionedGateway builds a gateway on an embedded server that has no
+// TASKS stream and no buckets yet, as a gateway started before the provision
+// Job has run sees it, and returns it with the server's URL.
+func newUnprovisionedGateway(t *testing.T) (*Gateway, string, context.Context) {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 
@@ -61,6 +65,11 @@ func TestGatewayWaitsForTheTasksStreamAndIsNotReadyUntilItBinds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	return g, url, ctx
+}
+
+func TestGatewayWaitsForTheTasksStreamAndIsNotReadyUntilItBinds(t *testing.T) {
+	g, url, ctx := newUnprovisionedGateway(t)
 	base := startMetricsServerWith(t, g.Metrics(), g.Readiness)
 
 	ran := make(chan error, 1)
@@ -110,4 +119,26 @@ func TestTheRelayWaitsForItsStream(t *testing.T) {
 	if cfg.Stream != lib.TasksStream || cfg.Durable != relayDurable {
 		t.Errorf("relay subscription = %s/%s, want %s/%s", cfg.Stream, cfg.Durable, lib.TasksStream, relayDurable)
 	}
+}
+
+// The feedback bucket comes from the same provision Job as TASKS, so a
+// gateway that waited for TASKS longer than its feedback retries last must
+// still look for the bucket once the relay binds, not have given up while it
+// waited.
+func TestFeedbackRetriesStartOnceTheRelayBinds(t *testing.T) {
+	old := feedbackRetryInterval
+	feedbackRetryInterval = 10 * time.Millisecond // 30 retries: 300ms
+	t.Cleanup(func() { feedbackRetryInterval = old })
+	g, url, ctx := newUnprovisionedGateway(t)
+	go func() { _ = g.Run(ctx) }()
+
+	// Longer than every retry put together, with no TASKS.
+	time.Sleep(time.Duration(feedbackRetries+20) * feedbackRetryInterval)
+	provision(t, url)
+	waitFor(t, "the relay to bind", func() bool { ready, _ := g.Readiness(); return ready })
+	if g.feedback.Load() != nil {
+		t.Fatal("feedback is on before its bucket exists")
+	}
+	withFeedbackBucket(t, time.Hour)(&Config{NATSURL: url})
+	waitFor(t, "answer feedback to turn on once its bucket exists", func() bool { return g.feedback.Load() != nil })
 }

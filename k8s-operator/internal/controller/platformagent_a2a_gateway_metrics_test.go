@@ -158,10 +158,6 @@ func TestTheA2AGatewayDeclaresItsMetricsListener(t *testing.T) {
 	}
 }
 
-// TestTheA2AGatewayFenceMirrorsTheBrokersCollectorRule: the gateway's one
-// ingress rule is the credential broker's second rule with the gateway's
-// metrics port in it, the same peer byte for byte, on every fence (the
-// inject door's, the A2A door's copy, and the gateway's own).
 // The gateway is not ready until its event relay binds (a2a/gateway's
 // ReadyzPath on the metrics listener), so the Deployment shows a gateway
 // waiting for the provision Job's TASKS stream instead of a crash loop. The
@@ -185,6 +181,10 @@ func TestTheA2AGatewayIsReadyOnlyOnceItsRelayBinds(t *testing.T) {
 	}
 }
 
+// TestTheA2AGatewayFenceMirrorsTheBrokersCollectorRule: the gateway's one
+// ingress rule is the credential broker's second rule with the gateway's
+// metrics port in it, the same peer byte for byte, on every fence (the
+// inject door's, the A2A door's copy, and the gateway's own).
 func TestTheA2AGatewayFenceMirrorsTheBrokersCollectorRule(t *testing.T) {
 	agent := a2aTestAgent()
 	broker := buildCredentialProxyNetworkPolicy(brokerPodAgent())

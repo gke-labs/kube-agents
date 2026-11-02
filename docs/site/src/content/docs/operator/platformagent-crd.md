@@ -61,6 +61,8 @@ Disabling Google Chat afterwards, with no other backend configured, leaves the g
 
 Under `next` the A2A gateway serves Prometheus counters on a metrics-only port, 9096 (container port `a2a-metrics`, set by `A2A_METRICS_PORT`), which the chart's `<name>-a2a-gateway-monitoring` `PodMonitoring` scrapes behind `platformAgent.podMonitoring`; the metrics are listed on [Observability](/kube-agents/concepts/observability/). The gateway's NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway does, eval door or no door. It admits the `gke-gmp-system` namespace and the operator's own pods to that port and nothing else, the operator because its usage poller reads the gateway's inbound-message counter into `status.usage.chatMessagesInboundTotal`.
 
+The same port answers `/readyz`, which the gateway Deployment's readinessProbe reads every 5 seconds: 503, with the reason, until the gateway has bound its event relay, which on a fresh install waits for the provisioning Job's `TASKS` stream. The kubelet's probe comes from the node, which the policy does not govern.
+
 ## `spec.harness`
 
 Framework-level settings passed to Hermes. `clusterName`, `location`, and `projectId` are all
@@ -1418,7 +1420,9 @@ A stream edit does not clear it: `max_consumers` is the one limit nats-server wi
 
 Deleting the Job before one of those ways out is taken (the two, or the three where the fewer-workers lever is offered) helps nothing: the same script refuses again against the same stream.
 
-Recreating the stream costs one more step, and the order matters. Once `TASKS` is back, restart the A2A gateway (`kubectl rollout restart deployment/<agent>-a2a-gateway`), and the agent workload `<agent>-gateway` with it where a Hermes bridge sidecar runs. Deleting a stream deletes every consumer on it, and neither of those two durable readers re-creates one, so a gateway left running keeps accepting delegations and spawning session pods while relaying no events, the bridge dispatches nothing, and the CR reads `Ready` over both; session pods recover by themselves, which hides it. Restarting before the stream is back only fails the subscribe.
+Recreating the stream costs one more step, and the order matters. Once `TASKS` is back, restart the A2A gateway (`kubectl rollout restart deployment/<agent>-a2a-gateway`), and the agent workload `<agent>-gateway` with it where a Hermes bridge sidecar runs. Deleting a stream deletes every consumer on it, and neither of those two durable readers re-creates one, so a gateway left running keeps accepting delegations and spawning session pods while relaying no events, the bridge dispatches nothing, and the CR reads `Ready` over both; session pods recover by themselves, which hides it.
+
+A gateway restarted before the stream is back waits for it, not ready, and binds once it is recreated; a bridge restarted early only fails its subscribe, so it is the bridge's restart that has to follow the stream.
 
 ### What `Degraded` reports
 

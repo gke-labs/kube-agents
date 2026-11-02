@@ -588,9 +588,11 @@ func New(o Options) (*Gateway, error) {
 // Metrics is the gateway's counters, for the metrics listener to serve.
 func (g *Gateway) Metrics() *Metrics { return g.metrics }
 
-// Readiness reports whether Run has bound the event relay, and why not. Until
-// it has, the gateway serves nothing: the adapters start after the bind. The
-// metrics listener answers ReadyzPath from it.
+// Readiness reports whether Run has bound the event relay, and why not. The
+// adapters and doors start only after the bind, so until then the gateway
+// takes no turns (its chat.notify routes are already up). The metrics
+// listener answers ReadyzPath from it. It latches: once bound it stays ready,
+// and a later loss of TASKS is the rebuild path's to recover, as before.
 func (g *Gateway) Readiness() (bool, string) {
 	if g.relayBound.Load() {
 		return true, "ready"
@@ -631,7 +633,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 	g.runCtx = ctx
 	// Its first try before the relay starts, so on an install with the
 	// bucket every answer the relay posts is marked alike.
-	g.startFeedback(ctx)
+	feedbackSettled := g.startFeedback(ctx)
 	// Attributed: the subject each envelope arrived on rides with it, because
 	// it is the only thing that tells a supervisor terminal from an
 	// executor's, and the relay owes the adapter that distinction
@@ -645,6 +647,9 @@ func (g *Gateway) Run(ctx context.Context) error {
 		return fmt.Errorf("event relay subscription: %w", err)
 	}
 	g.relayBound.Store(true)
+	if !feedbackSettled {
+		g.retryFeedback(ctx)
+	}
 	// The batches already rendering finish first, then the subscription's
 	// stop gives every event not yet rendered back to the stream.
 	// Only then do the adapters close their connections: ingress stopped

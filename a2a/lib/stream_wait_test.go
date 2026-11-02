@@ -16,11 +16,17 @@ import (
 // minute.
 func shortenStreamWait(t *testing.T, window, logEvery, warnEvery time.Duration) {
 	t.Helper()
-	oldWindow, oldLog, oldWarn := subscribeBindWindow, streamWaitLogInterval, streamWaitWarnEvery
+	oldWindow, oldLog, oldWarn, oldBackoff := subscribeBindWindow, streamWaitLogInterval, streamWaitWarnEvery, bindBackoff
 	subscribeBindWindow, streamWaitLogInterval, streamWaitWarnEvery = window, logEvery, warnEvery
 	t.Cleanup(func() {
-		subscribeBindWindow, streamWaitLogInterval, streamWaitWarnEvery = oldWindow, oldLog, oldWarn
+		subscribeBindWindow, streamWaitLogInterval, streamWaitWarnEvery, bindBackoff = oldWindow, oldLog, oldWarn, oldBackoff
 	})
+}
+
+// fixBindBackoff spaces the bind's attempts evenly for one test, so a
+// count of what the wait logged does not depend on the jitter.
+func fixBindBackoff(d time.Duration) {
+	bindBackoff = func(int) time.Duration { return d }
 }
 
 func createTasksStream(t *testing.T, js jetstream.JetStream, subjects ...string) {
@@ -110,6 +116,7 @@ func TestSubscribeDurable_WaitForStreamBindsAStreamThatAppearsAfterTheWindow(t *
 // until the caller's context ends: loud, not silent, and not an exit.
 func TestSubscribeDurable_WaitForStreamWarnsWhileTheStreamNeverComes(t *testing.T) {
 	shortenStreamWait(t, 100*time.Millisecond, 50*time.Millisecond, 400*time.Millisecond)
+	fixBindBackoff(20 * time.Millisecond)
 	s := startServer(t)
 	capture := &logCapture{}
 	c, err := Connect(context.Background(), clientURL(s), WithName("relay"), WithLogger(slog.New(capture)))
@@ -129,18 +136,19 @@ func TestSubscribeDurable_WaitForStreamWarnsWhileTheStreamNeverComes(t *testing.
 	if err == nil {
 		t.Fatal("SubscribeDurable succeeded against a stream that does not exist")
 	}
-	if !errors.Is(err, jetstream.ErrStreamNotFound) {
-		t.Errorf("the error = %v, want the missing stream's", err)
+	// The last attempt's error, or the context's when the deadline lands
+	// mid-request.
+	if !errors.Is(err, jetstream.ErrStreamNotFound) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("the error = %v, want the missing stream's or the context's", err)
 	}
 	if elapsed < time.Second {
 		t.Errorf("the bind gave up after %v, inside the caller's 1.5s; it should wait for the context", elapsed)
 	}
-	// The wait checks the clock at each attempt, and the jittered backoff
-	// spaces attempts unevenly, so the count is bounded rather than exact:
-	// at least one warning, and never more than one per interval waited.
+	// One warning per interval waited: attempts every 20ms over ~1.5s at a
+	// 400ms interval are three, a fourth only if the deadline falls late.
 	n := capture.count("still waiting for the stream; nothing has created it stream=TASKS durable=relay-never")
-	if limit := int(elapsed / streamWaitWarnEvery); n < 1 || n > limit {
-		t.Errorf("%d still-waiting warnings over %v at a %v interval, want 1 to %d:\n%s",
+	if limit := int(elapsed / streamWaitWarnEvery); n < 2 || n > limit {
+		t.Errorf("%d still-waiting warnings over %v at a %v interval, want 2 to %d:\n%s",
 			n, elapsed, streamWaitWarnEvery, limit, strings.Join(capture.lines, "\n"))
 	}
 	if capture.contains("durable bind failed; retrying") {
@@ -178,7 +186,7 @@ func TestSubscribeDurable_WaitForStreamKeepsTheWindowForOtherErrors(t *testing.T
 		Durable: "relay-refused", Session: agreementSupervisor, WaitForStream: true,
 	}, func(*Envelope) {})
 	if err == nil {
-		t.Fatal("SubscribeDurable bound a filter the stream does not capture")
+		t.Fatal("SubscribeDurable bound over a durable whose ack policy it cannot change")
 	}
 	if errors.Is(err, jetstream.ErrStreamNotFound) {
 		t.Fatalf("the refusal read as a missing stream: %v", err)

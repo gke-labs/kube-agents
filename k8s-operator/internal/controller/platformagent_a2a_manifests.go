@@ -1133,7 +1133,8 @@ const (
 // a2aGatewayMetricsPort is the A2A gateway's metrics-only listener
 // (a2a/gateway/metrics.go), the gateway's copy of credentialProxyMetricsPort:
 // its own port, so the managed-Prometheus collector is admitted to a listener
-// that serves counters and nothing else, and the doors keep their loopback
+// that serves counters and a readiness line (a2aGatewayReadyzPath) and nothing
+// else, and the doors keep their loopback
 // listeners. One constant for the container port, the value of
 // A2A_METRICS_PORT the gateway binds, and the collector's ingress rule in
 // buildA2AGatewayNetworkPolicy; the chart's PodMonitoring scrapes it by
@@ -4188,7 +4189,7 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		}
 	}
 	return fmt.Sprintf(
-		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. Restarting before the stream is back only fails the subscribe, so the order holds.",
+		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and binds once it exists; a bridge restarted early only fails its subscribe, so the bridge's restart is the one that has to follow the stream.",
 		need, ways, a2aTasksMaxConsumers(agent), fits, finish,
 		a2aGatewayName(agent), agent.Namespace, agent.Name)
 }
@@ -5079,8 +5080,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						Ports: append(injectPorts, corev1.ContainerPort{
 							Name: a2aGatewayMetricsPortName, ContainerPort: a2aGatewayMetricsPort,
 						}),
-						// Not ready until the event relay binds: until then the
-						// gateway serves nothing, and it waits for TASKS rather
+						// Not ready until the event relay binds: the adapters and
+						// doors start only after it, and it waits for TASKS rather
 						// than exiting. Recreate (above) already stops the old
 						// pod before this one starts, so the probe opens no gap
 						// in a roll; it shows the existing one, with the reason
