@@ -15,9 +15,11 @@
 package fakeapiserver
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -149,6 +151,9 @@ const (
 	containerIDPrefix = "containerd://"
 	// digestFormat renders four hashes as a 64-hex-digit SHA-256 digest.
 	digestFormat = "%016x%016x%016x%016x"
+	// negativeIndexFormat is the panic for an object index below zero, which
+	// no route or test produces: the generators count from zero.
+	negativeIndexFormat = "fakeapiserver: object index %d is negative"
 
 	// The managedFields payloads, as the API server records them for a
 	// Deployment-owned Pod (its controller, the scheduler's binding, the
@@ -227,9 +232,11 @@ type Sizes struct {
 // run on the cluster's Nodes and Events concern its Pods, by index modulo the
 // sizes, so the cross-references resolve inside the same cluster.
 type Generator struct {
-	seed  int64
-	sizes Sizes
-	epoch time.Time
+	// seedBytes is the seed as the eight little-endian bytes the hash takes,
+	// encoded once so a negative seed needs no conversion per call.
+	seedBytes [8]byte
+	sizes     Sizes
+	epoch     time.Time
 	// cluster names the fake cluster, from the seed, in node names and
 	// provider IDs.
 	cluster string
@@ -241,8 +248,13 @@ func NewGenerator(seed int64, sizes Sizes) *Generator {
 	if err != nil {
 		panic(err)
 	}
-	g := &Generator{seed: seed, sizes: sizes, epoch: epoch}
-	g.cluster = fmt.Sprintf(clusterNameFormat, uint32(g.hash(hashKindCluster, 0, hashFieldName)))
+	g := &Generator{sizes: sizes, epoch: epoch}
+	var seedBuf bytes.Buffer
+	if err := binary.Write(&seedBuf, binary.LittleEndian, seed); err != nil {
+		panic(err)
+	}
+	copy(g.seedBytes[:], seedBuf.Bytes())
+	g.cluster = fmt.Sprintf(clusterNameFormat, low32(g.hash(hashKindCluster, 0, hashFieldName)))
 	return g
 }
 
@@ -254,20 +266,34 @@ func (g *Generator) Sizes() Sizes { return g.sizes }
 func (g *Generator) hash(kind string, i int, field string) uint64 {
 	h := fnv.New64a()
 	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], uint64(g.seed))
-	_, _ = h.Write(buf[:])
+	_, _ = h.Write(g.seedBytes[:])
 	_, _ = h.Write([]byte(kind))
-	binary.LittleEndian.PutUint64(buf[:], uint64(i))
+	binary.LittleEndian.PutUint64(buf[:], index(i))
 	_, _ = h.Write(buf[:])
 	_, _ = h.Write([]byte(field))
 	return h.Sum64()
 }
 
+// index is the object index as the unsigned word the hash and the name
+// suffixes fold; the generators count from zero, so a negative index is a
+// caller's bug and panics rather than wrapping.
+func index(i int) uint64 {
+	if i < 0 {
+		panic(fmt.Sprintf(negativeIndexFormat, i))
+	}
+	return uint64(i)
+}
+
+// low32 and low16 are the low bits of a hash, the slices the names, uids
+// and image tags take; the mask says the truncation is the point.
+func low32(v uint64) uint32 { return uint32(v & math.MaxUint32) }
+func low16(v uint64) uint16 { return uint16(v & math.MaxUint16) }
+
 // uid is a UUID-shaped identifier for the i-th object of kind.
 func (g *Generator) uid(kind string, i int) types.UID {
 	a := g.hash(kind, i, hashFieldUID)
 	b := g.hash(kind, i, hashFieldUID+hashFieldName)
-	return types.UID(fmt.Sprintf(uidFormat, uint32(a), uint16(a>>32), uint16(a>>48)&uidClockMask, uint16(b), b>>16&uidNodeMask))
+	return types.UID(fmt.Sprintf(uidFormat, low32(a), low16(a>>32), low16(a>>48)&uidClockMask, low16(b), b>>16&uidNodeMask))
 }
 
 func (g *Generator) at(step time.Duration, i int) metav1.Time {
@@ -291,7 +317,7 @@ func (g *Generator) salt(kind string) uint64 { return g.hash(kind, 0, hashFieldS
 // hash, and the index folded with the cluster's salt, distinct for every
 // Node of a cluster under 65,536.
 func (g *Generator) NodeName(i int) string {
-	return fmt.Sprintf(nodeNameFormat, g.nodePool(i), uint32(g.hash(hashKindNode, i%nodePoolCount, hashFieldName)), uint16(i)^uint16(g.salt(hashKindNode)))
+	return fmt.Sprintf(nodeNameFormat, g.nodePool(i), low32(g.hash(hashKindNode, i%nodePoolCount, hashFieldName)), low16(index(i))^low16(g.salt(hashKindNode)))
 }
 
 func (g *Generator) namespace(i int) string {
@@ -316,7 +342,7 @@ func (g *Generator) replicaSet(i int) (name string, uid types.UID) {
 // ReplicaSet's, distinct for every Pod of a cluster under 2^25.
 func (g *Generator) PodName(i int) (name, namespace string) {
 	rs, _ := g.replicaSet(i)
-	suffix := strconv.FormatUint((uint64(i)^g.salt(hashKindPod))&podSuffixMask, hashBase)
+	suffix := strconv.FormatUint((index(i)^g.salt(hashKindPod))&podSuffixMask, hashBase)
 	suffix = strings.Repeat(podSuffixPad, podSuffixLength-len(suffix)) + suffix
 	return fmt.Sprintf(podNameFormat, rs, suffix), g.namespace(i)
 }
@@ -330,7 +356,7 @@ func (g *Generator) nodeIP(i int) string {
 }
 
 func (g *Generator) image(i int) string {
-	return fmt.Sprintf(imageFormat, g.workload(i), 1+i%imageDayCount, uint32(g.hash(hashKindPod, i, hashFieldTemplate))&imageTagMask)
+	return fmt.Sprintf(imageFormat, g.workload(i), 1+i%imageDayCount, low32(g.hash(hashKindPod, i, hashFieldTemplate))&imageTagMask)
 }
 
 func managedField(manager, operation, subresource string, at metav1.Time, fields string) metav1.ManagedFieldsEntry {
