@@ -1,7 +1,9 @@
 """upgrades-freeze-runbook-probe's node-pool check matches the command, not prose about it.
 
-The report_contains verifier runs ``re.search`` over ``pattern_surface``: the
-report lowercased and whitespace-collapsed line by line, line breaks kept. A
+These fixtures run through the whole ``report_contains`` check, phrases and
+patterns, as the verifier grades it: the phrases on the flattened report, the
+patterns on ``pattern_surface``, the report lowercased and whitespace-collapsed
+line by line with its line breaks kept. A
 sentence naming ``clusters upgrade`` and ``--node-pool`` looks like a command
 unless the pattern insists on the ``gcloud`` head and on argument-shaped
 tokens between the head and the flag; and a runbook that writes one flag per
@@ -13,21 +15,23 @@ backslash token and a space and any pattern crosses it.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import yaml
 
-from kube_agents_bench.verifiers import pattern_surface
+from kube_agents_bench import transcript
+from kube_agents_bench.verifiers import ReportContainsVerifier
 
 TASK = Path(__file__).resolve().parent.parent / "tasks" / "upgrades-freeze-runbook-probe" / "task.yaml"
 CHECK = "the-runbook-uses-clusters-upgrade-node-pool"
 
 
 def _matches(report: str) -> bool:
+    """The whole check as the verifier grades it, phrases and patterns alike."""
     doc = yaml.safe_load(TASK.read_text())
     (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
-    return any(re.search(p, pattern_surface(report)) for p in check["check"]["any_of_patterns"])
+    transcript.set(report, [], final_message=report, started_at=1.0)
+    return ReportContainsVerifier(**check["check"]).verify(5.0).status == "pass"
 
 
 def test_node_pool_upgrade_commands_match():
@@ -64,5 +68,9 @@ def test_prose_and_other_commands_do_not_match():
         # No space on either side of the backslash: the shell glues the two
         # lines into one word, so this runbook cannot run.
         "gcloud container clusters upgrade prod-1\\\n--node-pool=default-pool",
+        # A doubled backslash is an escaped character, not a continuation: the
+        # command ends at the line break and the flag is a second command.
+        "gcloud container clusters upgrade prod-1 \\\\\n  --node-pool=default-pool",
+        "gcloud \\\\\n  container clusters upgrade prod-1 --node-pool default-pool",
     ):
         assert not _matches(report), report
