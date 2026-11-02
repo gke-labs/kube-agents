@@ -593,6 +593,9 @@ const (
 	// slack.answerFeedback=false, carried to the gateway (a2a/gateway's
 	// envSlackAnswerFeedback): no rating buttons, nothing kept.
 	a2aSlackAnswerFeedbackEnvVar = "A2A_SLACK_ANSWER_FEEDBACK"
+	// telemetry.peopleSeen=false, carried to the gateway (a2a/gateway's
+	// envPeopleSeen): no per-person key, the people bucket purged at start.
+	a2aPeopleSeenEnvVar = "A2A_PEOPLE_SEEN"
 	// The shortest Slack channel id a2aSlackHomeChannel takes: the prefix
 	// letter and at least two characters after it, as the gateway checks.
 	a2aSlackMinChannelIDLen = 3
@@ -4968,6 +4971,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}}},
 	}
 	env = append(env, backendEnv...)
+	// The people record is on unless the install turns it off, whatever
+	// backend is armed; only the off is rendered, so an install that never
+	// set the field keeps the gateway's env, and its pod, as they were.
+	if agent.Spec.Telemetry != nil && agent.Spec.Telemetry.PeopleSeen != nil && !*agent.Spec.Telemetry.PeopleSeen {
+		env = append(env, corev1.EnvVar{Name: a2aPeopleSeenEnvVar, Value: strconv.FormatBool(false)})
+	}
 	env = append(env, []corev1.EnvVar{
 		// Always on (see a2aConsoleDoorEnvVar): the gateway starts
 		// on the console door when the install configures no chat

@@ -590,6 +590,35 @@ func TestAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
 	}
 }
 
+// TestPeopleSeenOffIsTheOnlyRenderedState: telemetry.peopleSeen=false
+// reaches the gateway as its off switch on a gateway with Slack not armed,
+// so the env does not hang off a backend; unset or true renders nothing.
+func TestPeopleSeenOffIsTheOnlyRenderedState(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, tc := range []struct {
+		name    string
+		value   *bool
+		want    string
+		present bool
+	}{
+		{"unset", nil, "", false},
+		{"true", ptr.To(true), "", false},
+		{"false", ptr.To(false), "false", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := slackTestAgent("next", false)
+			if tc.value != nil {
+				agent.Spec.Telemetry = &agentv1alpha1.TelemetrySpec{PeopleSeen: tc.value}
+			}
+			env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aPeopleSeenEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (rendered %v), want %q (rendered %v)", a2aPeopleSeenEnvVar, got.Value, ok, tc.want, tc.present)
+			}
+		})
+	}
+}
+
 // TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer: one CR, one answer
 // to "is every Slack member allowed", whichever consumer the mode renders.
 func TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer(t *testing.T) {

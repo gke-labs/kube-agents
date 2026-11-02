@@ -2108,6 +2108,16 @@ type TelemetrySpec struct {
 	// +kubebuilder:validation:Pattern=`^$|^https?://[^\s]+$`
 	// +optional
 	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
+
+	// PeopleSeen keeps one hashed key and a last-active time per verified
+	// chat person in the gateway's people bucket, for 30 days after their
+	// last turn, and serves the two counts the operator reads as
+	// peopleSeen7d and peopleSeen30d. False writes no key, deletes every
+	// key the bucket holds at the gateway's next start, and leaves the two
+	// readings absent.
+	// +kubebuilder:default=true
+	// +optional
+	PeopleSeen *bool `json:"peopleSeen,omitempty"`
 }
 
 // NetworkPolicySpec configures the operator-generated egress NetworkPolicy.
