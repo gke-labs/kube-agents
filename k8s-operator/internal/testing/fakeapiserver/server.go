@@ -25,7 +25,7 @@
 // sizes the issue of fleet scale names, for the collectors that page through
 // them, which have no Go consumer here yet.
 //
-// What it does not do: selectors (every request sees every object), namespaced
+// What it does not do: selectors beyond `reason=<value>` on Events (every other request sees every object), namespaced
 // paths (the three resources are served at the cluster scope only), writes
 // (AddEvent is the one way an object appears after start), and any resource
 // beyond the three and the SelfSubjectAccessReview the event watcher's
@@ -52,8 +52,11 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/selection"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -74,10 +77,17 @@ const (
 	paramAllowWatchBookmarks  = "allowWatchBookmarks"
 	paramTimeoutSeconds       = "timeoutSeconds"
 	paramTrue                 = "true"
-	retryAfterHeader          = "Retry-After"
-	resourceVersionBase       = 10
-	resourceVersionBits       = 64
-	continueTokenVersion      = 1
+	paramFieldSelector        = "fieldSelector"
+	// fieldSelectorReason is the one field the fake's Events list selects on,
+	// `reason`, with `=` or `==`, which the API server serves for Events and
+	// the watcher uses to put the autoscaler marks on record ahead of a paged
+	// list. Any other field, operator or compound selector is refused as the
+	// API server refuses an unsupported field label.
+	fieldSelectorReason  = "reason"
+	retryAfterHeader     = "Retry-After"
+	resourceVersionBase  = 10
+	resourceVersionBits  = 64
+	continueTokenVersion = 1
 
 	// initialFlushEvery is how many initial events a watch stream writes
 	// between flushes: the frames are small and the response writer buffers
@@ -96,11 +106,41 @@ const (
 	invalidLimitFormat           = "limit: Invalid value: %q: must be a non-negative integer"
 	invalidTimeoutFormat         = "timeoutSeconds: Invalid value: %q: must be a non-negative integer"
 	initialEventsBookmarkMessage = "sendInitialEvents requires watch bookmarks"
-	throttledMessage             = "the server has received too many requests and has asked the client to try again later"
-	notFoundMessage              = "the server could not find the requested resource"
-	reviewDecodeMessageFormat    = "the request body is not a SelfSubjectAccessReview: %v"
-	initialEventsEndValue        = "true"
+	// watchListUnsupportedMessage is what a kube-apiserver without the
+	// WatchList feature gate (off by default before 1.32 and at 1.33) answers
+	// a watch opened with sendInitialEvents; client-go falls back to a list.
+	watchListUnsupportedMessage    = "sendInitialEvents is forbidden for watch unless the WatchList feature gate is enabled"
+	unsupportedFieldSelectorFormat = "field label not supported: %s"
+	throttledMessage               = "the server has received too many requests and has asked the client to try again later"
+	notFoundMessage                = "the server could not find the requested resource"
+	reviewDecodeMessageFormat      = "the request body is not a SelfSubjectAccessReview: %v"
+	initialEventsEndValue          = "true"
 )
+
+// listOptionsKind is the kind the API server names when it refuses a list or
+// watch option with a 422 Invalid, as it does sendInitialEvents without the
+// WatchList feature gate.
+var listOptionsKind = schema.GroupKind{Group: metav1.GroupName, Kind: "ListOptions"}
+
+// reasonSelector parses a list's field selector the way the API server does
+// and admits the one form the fake serves: a single requirement on the
+// Events `reason` field with `=` or `==`. It returns the value and true for
+// that form, false for no selector, and an error for anything else.
+func reasonSelector(res *kind, selector string) (string, bool, error) {
+	if selector == "" {
+		return "", false, nil
+	}
+	parsed, err := fields.ParseSelector(selector)
+	if err != nil {
+		return "", false, err
+	}
+	reqs := parsed.Requirements()
+	if res.path != eventsPath || len(reqs) != 1 || reqs[0].Field != fieldSelectorReason ||
+		(reqs[0].Operator != selection.Equals && reqs[0].Operator != selection.DoubleEquals) {
+		return "", false, fmt.Errorf(unsupportedFieldSelectorFormat, selector)
+	}
+	return reqs[0].Value, true, nil
+}
 
 // Options configures a fake cluster.
 type Options struct {
@@ -117,6 +157,11 @@ type Options struct {
 	// of a fleet can so measure how many backlogs the servers had in flight
 	// at once. Called from request goroutines; it must not block.
 	OnBacklog func(inFlight bool)
+	// WatchListUnsupported makes the server behave as a control plane whose
+	// WatchList feature gate is off: a watch opened with sendInitialEvents is
+	// refused with the API server's 422 Invalid, so a client-go reflector
+	// falls back to a paged list, as it does against a 1.31 or 1.33 cluster.
+	WatchListUnsupported bool
 }
 
 // Counts is a snapshot of what a server has been asked.
@@ -130,6 +175,10 @@ type Counts struct {
 	// WatchLists is every watch-list stream that reached the bookmark ending
 	// its initial events.
 	WatchLists int64
+	// WatchListsRefused is every watch opened with sendInitialEvents that
+	// Options.WatchListUnsupported refused, so a test can tell a reflector
+	// that asked for a stream and fell back from one that never asked.
+	WatchListsRefused int64
 	// Throttled is every request answered 429.
 	Throttled int64
 	// Expired is every 410 served: a list below the floor, a watch opened
@@ -144,6 +193,8 @@ type Server struct {
 	gen       *Generator
 	onBacklog func(bool)
 	resources map[string]*kind
+	// watchListUnsupported is Options.WatchListUnsupported.
+	watchListUnsupported bool
 
 	mu sync.Mutex
 	// rv is the newest resource version; floor the oldest still resource.
@@ -160,6 +211,7 @@ type Server struct {
 	retryAfterSeconds int
 
 	requests, lists, watches, watchLists, throttled, expired atomic.Int64
+	watchListsRefused                                        atomic.Int64
 }
 
 // kind is one of the three served resources: its path, the generator for its
@@ -201,11 +253,12 @@ type continueToken struct {
 func Start(opts Options) *Server {
 	gen := NewGenerator(opts.Seed, opts.Sizes)
 	s := &Server{
-		gen:       gen,
-		onBacklog: opts.OnBacklog,
-		floor:     firstResourceVersion,
-		streams:   map[*stream]struct{}{},
-		resources: map[string]*kind{},
+		gen:                  gen,
+		onBacklog:            opts.OnBacklog,
+		watchListUnsupported: opts.WatchListUnsupported,
+		floor:                firstResourceVersion,
+		streams:              map[*stream]struct{}{},
+		resources:            map[string]*kind{},
 	}
 	var base int64
 	for _, r := range []*kind{
@@ -282,8 +335,10 @@ func (s *Server) Counts() Counts {
 		Lists:      s.lists.Load(),
 		Watches:    s.watches.Load(),
 		WatchLists: s.watchLists.Load(),
-		Throttled:  s.throttled.Load(),
-		Expired:    s.expired.Load(),
+
+		WatchListsRefused: s.watchListsRefused.Load(),
+		Throttled:         s.throttled.Load(),
+		Expired:           s.expired.Load(),
 	}
 }
 
@@ -549,20 +604,52 @@ func (s *Server) serveList(res *kind, format wireFormat, w http.ResponseWriter, 
 		return
 	}
 
+	selector := q.Get(paramFieldSelector)
+	want, selected, err := reasonSelector(res, selector)
+	if err != nil {
+		// Refused before the count, as every other refusal is: Counts.Lists
+		// is the pages served.
+		format.writeStatus(w, &apierrors.NewBadRequest(fmt.Sprintf(unsupportedFieldSelectorFormat, selector)).ErrStatus)
+		return
+	}
+
 	s.lists.Add(1)
-	end := snap.total()
-	if limit > 0 && limit < end-start {
-		end = start + limit
-	}
-	items := make([]runtime.Object, 0, end-start)
-	for j := start; j < end; j++ {
-		items = append(items, snap.object(res, j))
-	}
 	lm := metav1.ListMeta{ResourceVersion: strconv.FormatInt(snap.version, resourceVersionBase)}
-	if end < snap.total() {
-		lm.Continue = encodeContinue(continueToken{Version: continueTokenVersion, ResourceVersion: snap.version, Start: end})
-		remaining := snap.total() - end
-		lm.RemainingItemCount = &remaining
+	var items []runtime.Object
+	if selected {
+		// The page walks the snapshot from the token's start and keeps the
+		// matches, up to the limit; the next token starts after the last
+		// object examined, and a walk that reaches the end without filling
+		// the page is the last page. No remainingItemCount: the API server
+		// omits it on a filtered list too.
+		next := snap.total()
+		for j := start; j < snap.total(); j++ {
+			obj := snap.object(res, j)
+			if ev, ok := obj.(*corev1.Event); ok && ev.Reason == want {
+				items = append(items, obj)
+			}
+			if limit > 0 && int64(len(items)) == limit {
+				next = j + 1
+				break
+			}
+		}
+		if next < snap.total() {
+			lm.Continue = encodeContinue(continueToken{Version: continueTokenVersion, ResourceVersion: snap.version, Start: next})
+		}
+	} else {
+		end := snap.total()
+		if limit > 0 && limit < end-start {
+			end = start + limit
+		}
+		items = make([]runtime.Object, 0, end-start)
+		for j := start; j < end; j++ {
+			items = append(items, snap.object(res, j))
+		}
+		if end < snap.total() {
+			lm.Continue = encodeContinue(continueToken{Version: continueTokenVersion, ResourceVersion: snap.version, Start: end})
+			remaining := snap.total() - end
+			lm.RemainingItemCount = &remaining
+		}
 	}
 	s.backlog(true)
 	defer s.backlog(false)
@@ -612,6 +699,11 @@ func (s *Server) serveWatch(res *kind, format wireFormat, w http.ResponseWriter,
 		return
 	}
 	sendInitial := q.Get(paramSendInitialEvents) == paramTrue
+	if sendInitial && s.watchListUnsupported {
+		s.watchListsRefused.Add(1)
+		format.writeStatus(w, &apierrors.NewInvalid(listOptionsKind, "", field.ErrorList{field.Forbidden(field.NewPath(paramSendInitialEvents), watchListUnsupportedMessage)}).ErrStatus)
+		return
+	}
 	if sendInitial && q.Get(paramAllowWatchBookmarks) != paramTrue {
 		format.writeStatus(w, &apierrors.NewBadRequest(initialEventsBookmarkMessage).ErrStatus)
 		return
