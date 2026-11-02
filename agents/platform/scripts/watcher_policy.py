@@ -223,13 +223,17 @@ COUNT_LIST_PATHS = frozenset(
 # The whole of a count list's query: one item. Anything else -- a larger limit,
 # a selector, a continue token, a watch -- is a list, not a count.
 COUNT_LIST_QUERY = {"limit": ["1"]}
-# The Accept parameter that makes the API server answer with each item's
-# ObjectMeta and nothing of its spec or status. Required on every media range
-# the caller offers: with one plain range beside it the server may pick the
-# plain one and the one item comes back whole. Matched on the exact token the
-# Go client sends, so a spelling the server might also take (quoted, cased) is
-# refused rather than guessed at.
-COUNT_LIST_ACCEPT_PARAM = "as=PartialObjectMetadataList"
+# The parameters that make the API server answer with each item's ObjectMeta
+# and nothing of its spec or status, and the whole of what a count list's
+# Accept may carry on each media range: with one plain range beside it the
+# server may pick the plain one and the one item comes back whole. Compared as
+# the server reads them (goautoneg's ParseAccept: names and values trimmed, the
+# last duplicate winning), so a range is parsed into a name-value table, a
+# repeated name is refused outright rather than resolved, and the table has to
+# equal this one: an `as=Table` after the metadata `as` would otherwise win on
+# the server and return the printer columns, which are spec and status. A
+# spelling the server might also take (quoted, cased) is refused, not guessed at.
+COUNT_LIST_ACCEPT_PARAMS = {"as": "PartialObjectMetadataList", "g": "meta.k8s.io", "v": "v1"}
 
 
 def _validate_named_reads(table: frozenset[tuple[str, str]]) -> None:
@@ -402,16 +406,23 @@ def split_k8s_target(rest: str) -> tuple[dict[str, str], str] | None:
 def accepts_metadata_only(accept: str) -> bool:
     """True when every media range in `accept` asks for a PartialObjectMetadataList.
 
-    The range's parameters are compared as tokens: `COUNT_LIST_ACCEPT_PARAM`
-    has to be one of them, as written. An empty or blank `Accept` offers no
-    range and is False.
+    Each range's parameters are parsed into a name-value table the way the
+    API server parses them, and the table has to equal
+    `COUNT_LIST_ACCEPT_PARAMS`: no parameter missing, none extra, none
+    repeated. An empty or blank `Accept` offers no range and is False.
     """
     ranges = [media_range.strip() for media_range in accept.split(",")]
     if not all(ranges):
         return False
     for media_range in ranges:
-        params = [param.strip() for param in media_range.split(";")[1:]]
-        if COUNT_LIST_ACCEPT_PARAM not in params:
+        params: dict[str, str] = {}
+        for param in media_range.split(";")[1:]:
+            name, separator, value = param.partition("=")
+            name, value = name.strip(), value.strip()
+            if not separator or name in params:
+                return False
+            params[name] = value
+        if params != COUNT_LIST_ACCEPT_PARAMS:
             return False
     return True
 

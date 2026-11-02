@@ -311,6 +311,20 @@ class K8sTest(unittest.TestCase):
             "application/json;AS=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
             "application/json;as=partialobjectmetadatalist;g=meta.k8s.io;v=v1",
             ",application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            # The server keeps the last duplicate, so a second `as` after the
+            # metadata one would answer a Table: printer columns are spec and
+            # status.
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1;as=Table",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1;as = Table",
+            "application/json;as=Table;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1;v=v1beta1",
+            # Missing, extra or valueless parameters: not the table the Go
+            # client sends.
+            "application/json;as=PartialObjectMetadataList",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1;charset=utf-8",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1;q",
+            "application/json;as=PartialObjectMetadataList;g=example.com;v=v1",
         ):
             with self.subTest(accept=accept):
                 self.assertEqual(self.count("api/v1/pods", accept=accept).rule_id, w.RULE_K8S_ACCEPT)

@@ -704,7 +704,7 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',
          '_EVENTS_LIST = re.compile(r"api/v1/(events|pods)")\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "let the watcher list pods too, for a richer triage message -- the "
         "events-only route becomes a fleet-wide pod dump on the broker's credential",
     ),
@@ -713,7 +713,7 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('REFUSED_PATH_SEGMENTS = frozenset({"watch", "proxy"})\n',
          'REFUSED_PATH_SEGMENTS = frozenset({"proxy"})\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "drop `watch` from the refused segments as a leftover of an older API -- "
         "the server still serves watch/secrets, and the named-GET rule reads it "
         "as an object called `secrets`",
@@ -723,7 +723,7 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('        ("", "configmaps"),\n',
          '        ("", "configmaps"),\n        ("", "nodes"),\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "add nodes to the watcher's kind table so drift on a node label is "
         "enriched -- every fleet node, its addresses and taints, becomes "
         "readable on the broker's credential for a kind no person edits",
@@ -733,7 +733,7 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('    if (group, match.group("resource")) not in WATCHER_NAMED_READS:\n',
          '    if match.group("resource") not in {r for _, r in WATCHER_NAMED_READS}:\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "match the table on the plural alone to save a parse -- any CRD that "
         "names its plural `deployments` or `roles` is then read as if it were "
         "the built-in kind",
@@ -743,7 +743,7 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('REFUSED_RESOURCES = frozenset({"secrets"})\n',
          'REFUSED_RESOURCES = frozenset()\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "drop the separate Secrets refusal as redundant now that the kind table "
         "exists -- it is the only rule that refuses a Secret under a group the "
         "table may one day list, and the import check leans on it",

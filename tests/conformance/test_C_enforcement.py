@@ -241,7 +241,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         relayed = json.loads(h.watcher_policy.project_cluster(answer))
         self.assertEqual(relayed["masterAuth"], {"clusterCaCertificate": "CA"})
 
-    def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads(self) -> None:
+    def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists(self) -> None:
         policy = h.watcher_policy
         target = "kagents-dev/us-east4/fleet-a/"
         for method in ("POST", "PUT", "PATCH", "DELETE"):
@@ -316,7 +316,18 @@ class C1IsolationIsStructural(unittest.TestCase):
         for query in ({}, {"limit": ["2"]}, {"limit": ["1"], "labelSelector": ["app=web"]}, {"limit": ["1"], "watch": ["true"]}):
             decision = policy.evaluate_k8s("GET", target + "api/v1/pods", query, metadata)
             self.assertEqual(decision.rule_id, policy.RULE_K8S_QUERY, f"GET api/v1/pods with {query} is relayed")
-        for accept in ("", "application/json", "application/vnd.kubernetes.protobuf,application/json", metadata + ",application/json"):
+        # The API server keeps the last duplicate parameter, so a second `as`
+        # behind the metadata one would answer a Table whose columns are spec
+        # and status; the parse is the server's, and a repeat is refused.
+        for accept in (
+            "",
+            "application/json",
+            "application/vnd.kubernetes.protobuf,application/json",
+            metadata + ",application/json",
+            metadata + ";as=Table",
+            metadata + ";as = Table",
+            "application/json;as=PartialObjectMetadataList",
+        ):
             decision = policy.evaluate_k8s("GET", target + "api/v1/pods", one, accept)
             self.assertEqual(decision.rule_id, policy.RULE_K8S_ACCEPT, f"GET api/v1/pods?limit=1 with Accept {accept!r} is relayed whole")
 
