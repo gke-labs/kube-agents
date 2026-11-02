@@ -129,6 +129,14 @@ place, and the comment above the target says why. In a mirrored `gke-*` skill, m
 place and record it as a patch with `make skills-refresh SKILL=<skill>`, or `make skills-check`
 fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 
+**Agent blueprints.** If you add a `kubectl get` to a `.py`, `.sh` or `.md` under `agents/`, run
+`make cluster-reads-check`. It fails a read of several kinds, or of one kind in one page, across
+every namespace as full objects (`-A -o json|yaml`), because the credential proxy cuts such a reply
+at its output cap on a large cluster. Read one kind per call, project the fields with
+`-o jsonpath=` or `custom-columns=`, or read per namespace; the reads already in the tree are pinned
+with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks. CI runs the same check
+through `scripts/test_check_cluster_reads.py`.
+
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
 ```bash
