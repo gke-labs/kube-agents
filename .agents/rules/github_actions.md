@@ -118,6 +118,30 @@ exception: kind pairs that image with its own release, so naming one on the mirr
 the Kubernetes version the matrix tests, and that is a separate decision. Cloud Build pulls from
 Google's egress and is out of scope.
 
+## Cap the Actions cache segment download wait
+
+A workflow with a step that restores an Actions cache sets `SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"` in
+its top-level `env`. `@actions/cache` downloads a cache in segments of 128 MiB and waits up to ten
+minutes on each. When GitHub throttles the account's cache egress (`Failed to restore: Egress is
+over the account limit`, a 503 from the blob store) the download is refused within seconds, but the
+segment timer is cleared only on success, so the refused restore keeps the step alive until the
+timer fires. On 2026-10-30 that cost each setup step of `python-tests.yml`'s agent-image job ten
+minutes (`Set up the agent image's Python` 13:29:17 to 13:39:18, `Set up Go` 13:39:18 to 13:49:26
+in the first attempt of run 41063628607); the tests started twenty minutes into a 35-minute budget
+and the job was cancelled in its test step. A miss is not a failure for any of these steps: each
+falls through to a cold install. The throttle is account-wide, so every workflow that restores a
+cache carries the exposure, not only the one it hit.
+
+The value is a trade-off against a slow but healthy restore: one minute per 128 MiB segment aborts
+a download under about 2 MiB/s and turns it into a miss (`Aborting cache download as the download
+time exceeded the timeout`). Restores on GitHub-hosted runners run at 20 to 150 MB/s, so a segment
+takes seconds. Re-check the value if the toolkit changes its segment size. The variable affects
+restores only; saves read `CACHE_UPLOAD_CONCURRENCY` and `CACHE_UPLOAD_CHUNK_SIZE`. It reaches the
+`setup-python`, `setup-go` and `setup-node` actions and `actions/cache` alike, because all of them
+restore through the same package and read it from the process environment, and `setup-go` caches
+unless told `cache: false`. `tests/test_cache_segment_timeout.py` finds every workflow with a
+restoring step and holds the variable and its ceiling on each.
+
 ## Harden `pull_request_target` workflows
 
 `pull_request_target` runs in the base repository's context with repository secrets and writable
