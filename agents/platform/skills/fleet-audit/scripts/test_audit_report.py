@@ -23769,6 +23769,82 @@ metadata:
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
         self.assertNotIn("pubsub/events.yaml", finding["remediation"]["note"])
 
+    SERVICE_STALL = {"kind": "Service", "namespace": "billing", "name": "billing", "project": "acme", "why": "UpdateFailed: 403"}
+
+    def lb_finding(self, remediation):
+        return make_finding(fid="lb", check="lb-world-open", cluster="acme/us-central1/hub", obj="Service/billing",
+                            namespace="billing", remediation=remediation)
+
+    def test_a_kubernetes_service_finding_takes_no_paragraph_from_a_config_connector_service(self):
+        """A `Service` finding is about a Kubernetes Service. A Config
+        Connector `Service` (serviceusage) of the same name, unready in the
+        same namespace on the same cluster, is not its object."""
+        finding = self.lb_finding({"kind": "manual", "note": "Restrict the load balancer source ranges."})
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.SERVICE_STALL)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_kubernetes_service_fix_whose_file_declares_a_config_connector_service_gets_no_paragraph(self):
+        self.write(
+            "billing/service.yaml",
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: billing\n  namespace: billing\n---\n"
+            "apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1\nkind: Service\nmetadata:\n"
+            "  name: billing\n  namespace: billing\n  annotations:\n    cnrm.cloud.google.com/project-id: acme\n",
+        )
+        finding = self.lb_finding({"kind": "manifest", "path": "billing/service.yaml", "note": "Set loadBalancerSourceRanges."})
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.SERVICE_STALL)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_declaration_in_another_location_or_for_another_cluster_is_not_named(self):
+        """`clusters/eu/prod.yaml` declares `prod` in europe-west1; the stall is
+        `prod` in us-central1. A node pool file for cluster c2 is not the
+        declaration of c1's pool."""
+        self.write(
+            "clusters/eu/prod.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+            "  name: prod\n  namespace: infra\nspec:\n  location: europe-west1\n",
+        )
+        self.write(
+            "pools/pool.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerNodePool\nmetadata:\n"
+            "  name: pool\n  namespace: infra\nspec:\n  location: us-central1\n  clusterRef:\n    name: c2\n",
+        )
+        declarations = audit_report.kcc_declarations(self.root)
+        cases = (
+            (make_finding(fid="c", cluster="acme/us-central1/prod", obj="Cluster/prod", remediation={"kind": "manual", "note": "x"}),
+             {"kind": "ContainerCluster", "namespace": "infra", "name": "prod", "project": "acme", "location": "us-central1",
+              "why": "UpdateFailed"}, "clusters/eu/prod.yaml"),
+            (make_finding(fid="c", cluster="acme/us-central1/c1", obj="NodePool/pool", remediation={"kind": "manual", "note": "x"}),
+             {"kind": "ContainerNodePool", "namespace": "infra", "name": "pool", "project": "acme", "location": "us-central1",
+              "cluster": "c1", "why": "UpdateFailed"}, "pools/pool.yaml"),
+        )
+        for finding, stall, path in cases:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, declarations), ["c"]
+                )
+                note = finding["remediation"]["note"]
+                self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
+                self.assertNotIn(path, note)
+
+    def test_the_paragraph_never_pushes_out_the_reconciler_note(self):
+        """A note of a reverted gcloud command (about 1,400 characters), which
+        `finish` wrote and never cuts, leaves room for the reconciler note or
+        the whole paragraph but not both: the reconciler note stays, and the
+        paragraph takes a shorter step."""
+        prose = (f"This object is declared in the GitOps repository at `clusters/c1/pool.yaml`, whose spec sets "
+                 f"`autoscaling`. {audit_report.KCC_REVERTED_NOTE_MARK}, so the command below is reverted on the next "
+                 "reconcile and this finding returns on the next run. Make the change in that file instead.")
+        command = "gcloud container node-pools update pinned-inference-pool --cluster c1 " + "--node-locations us-central1-a " * 32
+        reverted = f"{prose}\n\n```bash\n{command.strip()}\n```"
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        finding = self.harness_finding(reverted + "\n\n" + reconciled)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+        note = finding["remediation"]["note"]
+        self.assertIn(reconciled, note)
+        self.assertIn(command.strip(), note)
+        self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, note)
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+
     def test_a_declaration_of_another_project_or_location_is_not_named(self):
         """A proj-a/us-central1 file is not the declaration of a
         proj-b/europe-west1 stall of the same name."""
