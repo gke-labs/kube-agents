@@ -370,6 +370,50 @@ func TestWatch_FromVersionCatchesUp(t *testing.T) {
 	}
 }
 
+// A Node or Pod watch resumed from a version, the re-watch a reflector
+// issues after its list, carries none of the Events added since: those
+// belong to Event streams, as they do in a snapshot and in a live delivery.
+// A Node reflector handed an Event logs a type mismatch and drops it, and a
+// typed caller asserting *corev1.Node panics.
+func TestWatch_FromVersionKeepsAddedEventsOffNodesAndPods(t *testing.T) {
+	s := startSmall(t, 2)
+	client := clientFor(t, s, k8sruntime.ContentTypeProtobuf)
+	listed := s.ResourceVersion()
+	s.AddEvent(corev1.Event{ObjectMeta: metav1.ObjectMeta{Name: "before-the-watch", Namespace: "team-0"}})
+	nodes, err := client.CoreV1().Nodes().Watch(context.Background(), metav1.ListOptions{ResourceVersion: listed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodes.Stop()
+	pods, err := client.CoreV1().Pods(metav1.NamespaceAll).Watch(context.Background(), metav1.ListOptions{ResourceVersion: listed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pods.Stop()
+	events, err := client.CoreV1().Events(metav1.NamespaceAll).Watch(context.Background(), metav1.ListOptions{ResourceVersion: listed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Stop()
+	// The Event stream delivers the catch-up and then a live one; by the time
+	// both have crossed the wire, anything the Node and Pod streams were
+	// handed at open has too.
+	if ev := receive(t, events, 5*time.Second); ev.Object.(*corev1.Event).Name != "before-the-watch" {
+		t.Fatalf("catch-up on the Event stream: %+v", ev.Object)
+	}
+	s.AddEvent(corev1.Event{ObjectMeta: metav1.ObjectMeta{Name: "while-watching", Namespace: "team-0"}})
+	if ev := receive(t, events, 5*time.Second); ev.Object.(*corev1.Event).Name != "while-watching" {
+		t.Fatalf("live Event on the Event stream: %+v", ev.Object)
+	}
+	for name, w := range map[string]watch.Interface{"nodes": nodes, "pods": pods} {
+		select {
+		case ev, ok := <-w.ResultChan():
+			t.Errorf("the %s watch from %s received %s %T (open %v); added Events belong to Event streams", name, listed, ev.Type, ev.Object, ok)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 // Expire ends an open watch with a 410 Error event, a watch resumed at the
 // version the client last saw is answered with the same, and one from no
 // version streams the state again.

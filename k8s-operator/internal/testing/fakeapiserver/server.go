@@ -643,9 +643,12 @@ func (s *Server) serveWatch(res *kind, format wireFormat, w http.ResponseWriter,
 	initial := sendInitial || requested == 0
 	snap := s.snapshotLocked(res, s.rv)
 	st := &stream{kind: res, wake: make(chan struct{}, 1)}
-	if !initial {
+	if !initial && res.live {
 		// Catch up: everything added after the requested version is the
-		// stream's first content, then what arrives from here on.
+		// stream's first content, then what arrives from here on. Added
+		// objects are Events, so a Node or Pod watch resumed from a version
+		// has nothing to catch up on and begins with what arrives, as the
+		// snapshot and AddEvent keep Events off those streams too.
 		for _, ev := range s.added {
 			if rv, _ := strconv.ParseInt(ev.ResourceVersion, resourceVersionBase, resourceVersionBits); rv > requested {
 				st.pending = append(st.pending, ev)
