@@ -5297,7 +5297,7 @@ class CommandExecutorTest(unittest.TestCase):
             executor = self.executor(memory_limit_bytes=2048 * mib, max_output_bytes=8 * mib)
         # 1,728 MiB over 176 MiB a request fits 9; the slot cap of 8 binds.
         self.assertEqual(
-            {"slot_cap": 8, "budget_admits": 9, "admitted": 8, "session_cap": 2},
+            {"slot_cap": 8, "budget_admits": 9, "admitted": 8, "interactive_cap": 7, "session_cap": 2},
             self._admission_report(executor),
         )
 
@@ -5307,14 +5307,14 @@ class CommandExecutorTest(unittest.TestCase):
             executor = self.executor(memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib)
         # GKE Autopilot without bursting: the limit is the 1Gi request, and 704 MiB fits 4.
         self.assertEqual(
-            {"slot_cap": 8, "budget_admits": 4, "admitted": 4, "session_cap": 2},
+            {"slot_cap": 8, "budget_admits": 4, "admitted": 4, "interactive_cap": 3, "session_cap": 2},
             self._admission_report(executor),
         )
 
     def test_the_admission_report_without_a_budget_is_the_slot_cap(self):
         executor = self.executor()
         self.assertEqual(
-            {"slot_cap": 8, "budget_admits": None, "admitted": 8, "session_cap": 2},
+            {"slot_cap": 8, "budget_admits": None, "admitted": 8, "interactive_cap": 7, "session_cap": 2},
             self._admission_report(executor),
         )
 
@@ -14248,6 +14248,9 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
         def admitted_requests(self):
             return 8
 
+        def class_cap(self, klass):
+            return 7 if klass == credential_proxy.CLASS_INTERACTIVE else 6
+
         def git_lease_violation(self, argv, cwd):
             return None
 
@@ -14361,7 +14364,7 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
         with urllib.request.urlopen(self.endpoint + "/healthz") as response:
             self.assertEqual(200, response.status)
 
-    def test_an_authenticated_get_on_the_admission_report_answers_the_four_numbers(self):
+    def test_an_authenticated_get_on_the_admission_report_answers_the_five_numbers(self):
         """The dispatch itself: past authentication, the exact path reaches the
         report. A regression here would only show as the sweeps' silent fallback
         to four, so it is pinned over the socket."""
@@ -14374,7 +14377,13 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
             self.assertEqual(200, response.status)
             report = json.loads(response.read())
         self.assertEqual(
-            {"slot_cap": 8, "budget_admits": 9, "admitted": 8, "session_cap": credential_proxy.DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS},
+            {
+                "slot_cap": 8,
+                "budget_admits": 9,
+                "admitted": 8,
+                "interactive_cap": 7,
+                "session_cap": credential_proxy.DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS,
+            },
             report,
         )
         self.assertEqual([], self.executor.executed, "the admission report must run nothing")

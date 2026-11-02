@@ -26,6 +26,20 @@ class WidthForTest(unittest.TestCase):
             with self.subTest(admitted=admitted):
                 self.assertEqual(width, broker_admission.width_for(admitted))
 
+    def test_the_width_leaves_the_session_cap_free_inside_the_interactive_cap(self):
+        # Priority admission holds interactive work, the sweep included, to
+        # admitted - 1: the 2Gi default's 8 gives a cap of 7, and the sweep
+        # leaves the session cap of 2 inside it.
+        for admitted, interactive_cap, width in ((8, 7, 5), (16, 15, 13), (7, 6, 4), (6, 5, 4), (5, 4, 4), (4, 3, 3), (2, 1, 1)):
+            with self.subTest(admitted=admitted, interactive_cap=interactive_cap):
+                self.assertEqual(width, broker_admission.width_for(admitted, 2, interactive_cap))
+                self.assertLessEqual(width, interactive_cap)
+
+    def test_a_broker_without_the_interactive_cap_keeps_todays_width(self):
+        for admitted in (4, 8, 16):
+            with self.subTest(admitted=admitted):
+                self.assertEqual(broker_admission.width_for(admitted), broker_admission.width_for(admitted, 2, None))
+
     def test_a_raised_session_cap_never_takes_the_width_below_four(self):
         # An operator can raise the session cap; the width still never drops
         # below today's four.
@@ -59,18 +73,25 @@ class ReadReportTest(unittest.TestCase):
     def test_it_reads_the_admitted_count_from_the_route(self):
         with mock.patch.object(credential_proxy_client, "authorization_headers", return_value={"Authorization": "Bearer t"}), \
                 self._reading({"slot_cap": 8, "budget_admits": 9, "admitted": 8, "session_cap": 2}):
-            self.assertEqual((8, 2), broker_admission.read_report(self.ENDPOINT))
+            self.assertEqual((8, 2, None), broker_admission.read_report(self.ENDPOINT))
         request, timeout = self.seen[0]
         self.assertEqual(self.ENDPOINT + "/v1/exec/admission", request.full_url)
         self.assertEqual("Bearer t", request.get_header("Authorization"))
         # Bounded end to end, unlike the broker client's exec opener.
         self.assertEqual(broker_admission.ADMISSION_TIMEOUT_S, timeout)
 
+    def test_it_reads_the_interactive_cap_when_the_broker_reports_one(self):
+        with self._reading({"slot_cap": 8, "budget_admits": 9, "admitted": 8, "interactive_cap": 7, "session_cap": 2}):
+            self.assertEqual((8, 2, 7), broker_admission.read_report(self.ENDPOINT))
+        for bad in (0, "7", None, True):
+            with self.subTest(interactive_cap=bad):
+                with self._reading({"admitted": 8, "interactive_cap": bad, "session_cap": 2}):
+                    self.assertEqual((8, 2, None), broker_admission.read_report(self.ENDPOINT))
     def test_a_missing_or_bad_session_cap_reads_as_the_default(self):
         for name, body in {"missing": {"admitted": 8}, "zero": {"admitted": 8, "session_cap": 0}, "text": {"admitted": 8, "session_cap": "2"}}.items():
             with self.subTest(case=name), mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
                     self._reading(body):
-                self.assertEqual((8, broker_admission.CHAT_HEADROOM), broker_admission.read_report(self.ENDPOINT))
+                self.assertEqual((8, broker_admission.CHAT_HEADROOM, None), broker_admission.read_report(self.ENDPOINT))
 
     def test_every_failure_reads_as_unknown(self):
         cases = {
@@ -109,12 +130,16 @@ class SweepWidthTest(unittest.TestCase):
         broker_admission._cached_width = None
         self.addCleanup(setattr, broker_admission, "_cached_width", None)
 
+    def test_it_sizes_inside_the_interactive_cap_the_broker_reports(self):
+        with mock.patch.object(broker_admission, "read_report", return_value=(8, 2, 7)):
+            self.assertEqual(5, broker_admission.sweep_width())
+
     def test_it_is_the_width_for_what_the_broker_admits(self):
-        with mock.patch.object(broker_admission, "read_report", return_value=(8, 2)):
+        with mock.patch.object(broker_admission, "read_report", return_value=(8, 2, None)):
             self.assertEqual(6, broker_admission.sweep_width())
 
     def test_it_keeps_the_session_cap_the_broker_reports(self):
-        with mock.patch.object(broker_admission, "read_report", return_value=(8, 3)):
+        with mock.patch.object(broker_admission, "read_report", return_value=(8, 3, None)):
             self.assertEqual(5, broker_admission.sweep_width())
 
     def test_it_falls_back_to_four_when_the_broker_cannot_say(self):

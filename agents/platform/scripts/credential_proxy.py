@@ -669,7 +669,8 @@ HEALTHZ_PATH = "/healthz"
 # What the broker admits at once, for the sandbox's fleet sweeps to size their
 # worker pools by (`broker_admission.sweep_width`). Read-only: the slot cap, the
 # count the child memory budget fits at this container's effective limit, the
-# smaller of the two, and the session role's own cap. Only the broker knows the
+# smaller of the two, the interactive cap inside it, and the session role's own
+# cap. Only the broker knows the
 # effective limit: on GKE Autopilot without bursting it is the memory request,
 # rewritten after the operator rendered the pod.
 ADMISSION_PATH = "/v1/exec/admission"
@@ -11387,12 +11388,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return False
 
     def _admission_report(self) -> dict[str, int | None]:
-        """The four numbers ADMISSION_PATH answers with, and nothing else of the
-        budget's internals."""
+        """The five numbers ADMISSION_PATH answers with, and nothing else of the
+        budget's internals. `interactive_cap` is what interactive work, the
+        shell's sweeps included, may hold at once (`class_cap`), which a sweep
+        sizes itself inside (`broker_admission.width_for`)."""
         return {
             "slot_cap": self.executor.max_concurrent_commands,
             "budget_admits": self.executor.requests_the_budget_admits(),
             "admitted": self.executor.admitted_requests(),
+            "interactive_cap": self.executor.class_cap(CLASS_INTERACTIVE),
             "session_cap": getattr(self.session_slots, "limit", DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS),
         }
 
