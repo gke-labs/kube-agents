@@ -99,6 +99,30 @@ readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 # disk, which the admission webhook and the chart also take as the limit.
 readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
 
+# ─── Release footprint summary ────────────────────
+# What install.sh's pre-flight summary prints about the cluster footprint and
+# its modeled cost (print_footprint_summary). The chart owns the arithmetic
+# (kube-agents.footprintSummary in charts/kube-agents/templates/_helpers.tpl);
+# the installer renders that template through a throwaway chart holding only
+# the chart's helpers, values and footprint file plus a one-template probe, so
+# it prints the figures Helm will without crossing any other template's gates
+# (a minter without an App ID, a console on a cluster without NetworkPolicy).
+readonly FOOTPRINT_CHART_SUBDIR="charts/kube-agents"
+readonly FOOTPRINT_HELPERS_TEMPLATE="templates/_helpers.tpl"
+readonly FOOTPRINT_PROBE_TEMPLATE="templates/footprint-summary.yaml"
+readonly FOOTPRINT_PROBE_KEY="summary"
+readonly FOOTPRINT_SUMMARY_TEMPLATE="kube-agents.footprintSummary"
+readonly FOOTPRINT_PROBE_RELEASE="footprint-summary"
+# The footprint-shaping settings, read from the terraform.tfvars the generator
+# wrote (the composition's input) and passed to the chart under the key
+# terraform/examples/full-install/main.tf maps each to: tfvars key=chart value,
+# one pair per line.
+readonly FOOTPRINT_TFVARS_VALUE_MAP="platform_agent_storage_size=platformAgent.storage.size
+memory_provider=platformAgent.harness.memory.provider
+hermes_dashboard_enabled=platformAgent.harness.hermes.dashboardEnabled
+web_console_enabled=webConsole.enabled
+enable_github_minter=githubMinter.enabled"
+
 # ─── OpenAI-compatible model server ───────────────────────────────────────────
 # The ports a base URL without one is dialled on, and the TCP port range.
 readonly HTTP_DEFAULT_PORT=80
@@ -876,6 +900,81 @@ is_valid_platform_agent_storage_size() {
     Ti) mi_per_unit=1048576 ;;
   esac
   [ $((number * mi_per_unit)) -le "$PLATFORM_AGENT_STORAGE_SIZE_MAX_MI" ]
+}
+
+# The value of a top-level `key = value` assignment in a terraform.tfvars file,
+# unquoted, or nothing when the key is absent. Only the scalar shape the
+# generator writes (write_tfvars_from_state): a quoted string or a bare
+# boolean on one line, with an optional trailing comment.
+tfvars_scalar() {
+  local file="$1" key="$2"
+  [ -r "$file" ] || return 0
+  sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]*[^\"# ])\"?.*$/\1/p" "$file" | head -n 1
+}
+
+# Renders the chart's footprint summary for the install terraform.tfvars
+# describes, to stdout, as the chart's NOTES.txt prints it. $1 is the checkout,
+# $2 the tfvars file. Fails, with the cause on stderr, when helm is missing,
+# the chart is not in the checkout, or the render refuses; the caller decides
+# whether that is worth more than a warning.
+render_footprint_summary() {
+  local repo_dir="$1" tfvars_file="$2" chart_dir probe_dir pair key value
+  chart_dir="${repo_dir}/${FOOTPRINT_CHART_SUBDIR}"
+  if ! command -v helm >/dev/null 2>&1; then
+    echo "helm is not on PATH" >&2
+    return 1
+  fi
+  if [ ! -f "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" ] || [ ! -f "${chart_dir}/Chart.yaml" ]; then
+    echo "the chart at ${chart_dir} has no Chart.yaml or ${FOOTPRINT_HELPERS_TEMPLATE}" >&2
+    return 1
+  fi
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/kube-agents-footprint.XXXXXX")" || return 1
+  # Chart.yaml, values and files/footprint.yaml as they are; the helpers as the
+  # only template beside the probe. values.schema.json comes too, so a value
+  # the chart would refuse is refused here as well.
+  cp "${chart_dir}/Chart.yaml" "${chart_dir}/values.yaml" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
+  [ ! -f "${chart_dir}/values.schema.json" ] || cp "${chart_dir}/values.schema.json" "$probe_dir/"
+  cp -R "${chart_dir}/files" "$probe_dir/files" || { rm -rf "$probe_dir"; return 1; }
+  mkdir -p "$probe_dir/templates"
+  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}"
+  # A ConfigMap, so the output is one YAML document helm's manifest sorter
+  # reads; the block scalar keeps the summary's lines as they are.
+  printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n  %s: |\n{{ include "%s" . | indent 4 }}\n' \
+    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}"
+  local -a set_args=()
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    key="${pair%%=*}"
+    value="$(tfvars_scalar "$tfvars_file" "$key")"
+    [ -n "$value" ] || continue
+    set_args+=(--set "${pair#*=}=${value}")
+  done <<< "$FOOTPRINT_TFVARS_VALUE_MAP"
+  local rendered rc=0
+  rendered="$(helm template "$FOOTPRINT_PROBE_RELEASE" "$probe_dir" ${set_args[@]+"${set_args[@]}"} 2>&1)" || rc=$?
+  rm -rf "$probe_dir"
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$rendered" >&2
+    return "$rc"
+  fi
+  # The block scalar's lines, their four-space indent removed.
+  printf '%s\n' "$rendered" | sed -n -E "/^  ${FOOTPRINT_PROBE_KEY}: \|\$/,\$ { /^  ${FOOTPRINT_PROBE_KEY}: \|\$/d; s/^    //p; }"
+}
+
+# install.sh's step 11 entry for the footprint: the rendered summary, indented
+# under the bullet the caller printed, or a warning naming why it could not be
+# rendered. Never fails: the summary informs the confirmation and decides
+# nothing, so a chart that cannot be rendered here is reported and the run goes
+# on to the apply, where the same render failing is the error that stops it.
+print_footprint_summary() {
+  local repo_dir="$1" tfvars_file="$2" summary err_file
+  err_file="$(mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
+  if summary="$(render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
+    printf '%s\n' "$summary" | sed 's/^/      /'
+  else
+    print_warning "Could not render the release footprint summary: $(tr '\n' ' ' < "$err_file" | sed 's/[[:space:]]*$//')"
+    print_info "The same figures print in the chart's install notes (helm template or helm install --dry-run on ${FOOTPRINT_CHART_SUBDIR})."
+  fi
+  rm -f "$err_file"
 }
 
 # The PlatformAgent and its release, read once for the scope check and the

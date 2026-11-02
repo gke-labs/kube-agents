@@ -1203,6 +1203,25 @@ identity without that permission gets `error calling lookup: resourcequotas is
 forbidden` and no install rather than a quiet pass. Grant the permission, or install with
 `--set quotaPreflight.enabled=false`.
 
+#### Footprint summary and modeled cost
+
+The install notes end with what the release asks of the cluster and what that costs at list
+price: the total pod CPU and memory requests, the pod count, and the persistent storage over
+its claims, summed exactly as the preflight above sums them (`kube-agents.footprintSummary`
+in `_helpers.tpl` calls the same template), then a monthly figure modeled from us-central1
+GKE Autopilot list prices, $0.0445 per vCPU-hour and $0.0049225 per GiB-hour over a 730-hour
+month plus $0.10 per GiB-month of balanced persistent disk, with the $73 per month GKE
+cluster fee on its own line because it is per cluster rather than per release. The block
+is labelled `(modeled from us-central1 list prices, excluding LLM tokens)`: the rates are
+pinned in the chart, not looked up, and model tokens, node overheads and anything outside
+the release are not in it. It prints on `helm install --dry-run` and `helm template` as
+well, so it can be read before anything is applied; `install.sh` renders the same template
+in its pre-flight summary, so the installer prints the figures the notes will. It follows
+`quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
+refusals name that switch as the way round them. Under `spec.mode: next` it says what it
+leaves out: the A2A workloads and the session pods, which the
+[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) list.
+
 #### Upgrade notes: operator memory floor
 
 `operator.resources.limits.memory` has a floor at its default, 512Mi, and the chart fails the

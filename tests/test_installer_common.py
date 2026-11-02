@@ -5933,5 +5933,174 @@ class SlackHomeChannelPolicyTest(unittest.TestCase):
         self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'sometimes'", proc.stdout + proc.stderr)
         self.assertIsNone(content, "the file must be left untouched")
 
+# ── print_footprint_summary: the step 11 footprint and modeled-cost block ───
+
+_FOOTPRINT_TFVARS = """# generated
+platform_agent_storage_size = "200Gi"
+enable_github_minter = true
+hermes_dashboard_enabled = false
+web_console_enabled      = true   # trailing comment
+memory_provider          = "kube_agents_memory"
+"""
+
+# The `--set` each tfvars key becomes, as terraform/examples/full-install/main.tf
+# maps them onto the chart.
+_FOOTPRINT_EXPECTED_SETS = [
+    "--set platformAgent.storage.size=200Gi",
+    "--set platformAgent.harness.memory.provider=kube_agents_memory",
+    "--set platformAgent.harness.hermes.dashboardEnabled=false",
+    "--set webConsole.enabled=true",
+    "--set githubMinter.enabled=true",
+]
+
+# A helm that answers `template` with the probe ConfigMap's shape, the arguments it
+# was given as the summary's one line, so the test reads the --set mapping and the
+# block-scalar extraction off the helper's stdout.
+_ECHO_HELM = (
+    "#!/usr/bin/env bash\n"
+    "printf 'apiVersion: v1\\nkind: ConfigMap\\nmetadata:\\n  name: footprint-summary\\n'\n"
+    "printf 'data:\\n  summary: |\\n    args: %s\\n    second line\\n' \"$*\"\n"
+)
+
+_FOOTPRINT_LABEL = "(modeled from us-central1 list prices, excluding LLM tokens)"
+_NOTES_SETS = [
+    "--set", "platformAgent.harness.clusterName=ci-cluster",
+    "--set", "platformAgent.harness.location=us-central1",
+    "--set", "platformAgent.harness.projectId=ci-project",
+    "--set", "platformAgent.storage.size=200Gi",
+    "--set", "platformAgent.harness.memory.provider=kube_agents_memory",
+    "--set", "platformAgent.harness.hermes.dashboardEnabled=false",
+    "--set", "githubMinter.enabled=true",
+    "--set", "githubMinter.org=foo",
+    "--set", "githubMinter.repo=bar",
+    "--set", "platformAgent.integration.github.gitRepo=foo/bar",
+    "--set", "platformAgent.integration.github.org=foo",
+    "--set", "webConsole.enabled=true",
+]
+
+
+class FootprintSummaryTest(unittest.TestCase):
+    def _run(self, script, helm_script=None, tfvars=_FOOTPRINT_TFVARS, without_helm=False):
+        """Source installer_common.sh and run `script` with a tfvars file at $TFVARS.
+
+        `helm_script` puts a stub helm first on PATH; `without_helm` runs on a PATH
+        of the essential tools only, where no helm exists. Otherwise the real helm
+        answers.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tfvars_path = pathlib.Path(tmp) / "terraform.tfvars"
+            tfvars_path.write_text(tfvars)
+            if without_helm:
+                bin_dir = create_minimal_tools_bin(tmp)
+                env = get_isolated_test_env(overrides={"TFVARS": str(tfvars_path)})
+                env["PATH"] = str(bin_dir)
+            else:
+                bin_dir = pathlib.Path(tmp) / "bin"
+                bin_dir.mkdir()
+                if helm_script:
+                    helm = bin_dir / "helm"
+                    helm.write_text(helm_script)
+                    helm.chmod(helm.stat().st_mode | stat.S_IEXEC)
+                env = get_isolated_test_env(overrides={"TFVARS": str(tfvars_path)}, bin_dir=str(bin_dir))
+            body = f'set -u\n{_PRINT_STUBS}\nprint_warning() {{ echo "WARN: $*"; }}\nsource "{_INSTALLER_COMMON}"\n{script}'
+            return subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT))
+
+    def test_tfvars_scalar_reads_the_generator_shapes(self):
+        proc = self._run(
+            'for k in platform_agent_storage_size enable_github_minter hermes_dashboard_enabled '
+            'web_console_enabled memory_provider absent_key; do '
+            'printf "%s=[%s]\\n" "$k" "$(tfvars_scalar "$TFVARS" "$k")"; done'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("platform_agent_storage_size=[200Gi]", proc.stdout)
+        self.assertIn("enable_github_minter=[true]", proc.stdout)
+        self.assertIn("hermes_dashboard_enabled=[false]", proc.stdout)
+        self.assertIn("web_console_enabled=[true]", proc.stdout)
+        self.assertIn("memory_provider=[kube_agents_memory]", proc.stdout)
+        self.assertIn("absent_key=[]", proc.stdout)
+
+    def test_render_passes_each_tfvars_setting_under_its_chart_key(self):
+        proc = self._run(
+            f'render_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        args_line = next((line for line in proc.stdout.splitlines() if line.startswith("args: ")), None)
+        self.assertIsNotNone(args_line, proc.stdout)
+        self.assertTrue(args_line.startswith("args: template footprint-summary "), args_line)
+        for item in _FOOTPRINT_EXPECTED_SETS:
+            self.assertIn(item, args_line)
+        # The block scalar's indent is stripped and nothing but its lines come out.
+        self.assertIn("\nsecond line\n", proc.stdout)
+        self.assertNotIn("kind: ConfigMap", proc.stdout)
+
+    def test_render_passes_nothing_for_a_key_the_tfvars_lacks(self):
+        proc = self._run(
+            f'render_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            helm_script=_ECHO_HELM,
+            tfvars='platform_agent_storage_size = "80Gi"\n',
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("--set platformAgent.storage.size=80Gi", proc.stdout)
+        for item in _FOOTPRINT_EXPECTED_SETS[1:]:
+            self.assertNotIn(item.split("=")[0], proc.stdout)
+
+    def test_render_fails_naming_the_cause_when_helm_refuses(self):
+        proc = self._run(
+            f'render_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            helm_script="#!/usr/bin/env bash\necho 'Error: values don'\"'\"'t meet the specifications' >&2\nexit 1\n",
+        )
+        self.assertIn("rc=1", proc.stdout)
+        self.assertIn("values don't meet the specifications", proc.stderr)
+        self.assertNotIn("Release footprint", proc.stdout)
+
+    def test_print_warns_and_goes_on_without_helm(self):
+        proc = self._run(
+            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', without_helm=True
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("WARN: Could not render the release footprint summary: helm is not on PATH", proc.stdout)
+        self.assertNotIn("Release footprint", proc.stdout)
+
+    def test_print_warns_and_goes_on_when_the_chart_is_not_in_the_checkout(self):
+        proc = self._run('print_footprint_summary /nonexistent "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("WARN: Could not render the release footprint summary: the chart at /nonexistent/", proc.stdout)
+
+    @unittest.skipIf(shutil.which("helm") is None, "helm is required to render the chart")
+    def test_real_render_prints_the_notes_block_for_the_tfvars(self):
+        proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"')
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
+        self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
+        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console:
+        # the settings the tfvars carry reached the render.
+        self.assertIn("Persistent storage:  410 GiB over 5 claims", proc.stdout)
+        self.assertIn("Pods:                12", proc.stdout)
+        # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
+        # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = pathlib.Path(tmp) / "kube-agents"
+            shutil.copytree(_REPO_ROOT / "charts" / "kube-agents", chart)
+            templates = chart / "templates"
+            notes = (templates / "NOTES.txt").read_text()
+            (templates / "NOTES.txt").unlink()
+            (templates / "_notes_under_test.tpl").write_text(
+                '{{- define "notes-under-test" -}}\n' + notes + "\n{{- end -}}\n"
+            )
+            (templates / "notes-under-test.yaml").write_text(
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes-under-test\n"
+                'data:\n  notes: {{ include "notes-under-test" . | toJson }}\n'
+            )
+            rendered = subprocess.run(
+                ["helm", "template", "test-release", str(chart), "--show-only",
+                 "templates/notes-under-test.yaml", *_NOTES_SETS],
+                capture_output=True, text=True, check=True,
+            )
+            notes_text = json.loads(rendered.stdout.split("notes: ", 1)[1].strip())
+        summary_lines = [line[6:] for line in proc.stdout.splitlines() if line.startswith("      ")]
+        self.assertTrue(summary_lines, proc.stdout)
+        self.assertIn("\n".join(summary_lines), notes_text)
+
+
 if __name__ == "__main__":
     unittest.main()

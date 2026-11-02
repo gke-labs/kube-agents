@@ -2869,6 +2869,79 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- end -}}
 {{- end }}
 
+{{/*
+Footprint summary: what the release asks of the cluster, and a modeled monthly cost.
+
+kube-agents.footprintSummary prints the totals kube-agents.quotaRequirements returns (the
+requests, as the preflight sums them) with a monthly cost modeled from us-central1 GKE
+Autopilot list prices. NOTES.txt prints it on every render that leaves quotaPreflight.enabled
+on, and install.sh's pre-flight summary renders the same template through a throwaway chart
+holding this file and a one-line probe (print_footprint_summary in
+scripts/installer/installer_common.sh), so the installer prints the figures Helm will. The
+rates below are pinned list prices rather than a lookup, so the figure is a model: it excludes
+model tokens, node-level overheads and anything outside the release, and the per-cluster GKE
+fee is given on its own line because it is not per release. The text is display-only; nothing
+decides on it. tests/test_footprint_summary.py pins the figures against the formula.
+*/}}
+{{- define "kube-agents.footprintPriceRegion" -}}
+us-central1
+{{- end }}
+
+{{- /* GKE Autopilot general-purpose list prices in that region: per vCPU-hour, per GiB-hour of
+       memory, and per GiB-month of balanced persistent disk. */ -}}
+{{- define "kube-agents.footprintPriceCpuPerVcpuHour" -}}
+0.0445
+{{- end }}
+
+{{- define "kube-agents.footprintPriceMemoryPerGiBHour" -}}
+0.0049225
+{{- end }}
+
+{{- define "kube-agents.footprintPriceSsdPerGiBMonth" -}}
+0.10
+{{- end }}
+
+{{- /* The hours Google bills a month at, so the hourly rates become a monthly figure. */ -}}
+{{- define "kube-agents.footprintHoursPerMonth" -}}
+730
+{{- end }}
+
+{{- /* The GKE cluster management fee, per cluster and per month. */ -}}
+{{- define "kube-agents.footprintClusterFeePerMonth" -}}
+73
+{{- end }}
+
+{{- define "kube-agents.footprintSummary" -}}
+{{- $r := include "kube-agents.quotaRequirements" . | fromJson -}}
+{{- $bytesPerGiB := 1073741824.0 -}}
+{{- $millisPerCore := 1000.0 -}}
+{{- $cores := divf (float64 $r.requestsCpu) $millisPerCore -}}
+{{- $memoryGiB := divf (float64 $r.requestsMemory) $bytesPerGiB -}}
+{{- $ssdGiB := divf (float64 $r.requestsStorage) $bytesPerGiB -}}
+{{- $cpuRate := include "kube-agents.footprintPriceCpuPerVcpuHour" . | float64 -}}
+{{- $memoryRate := include "kube-agents.footprintPriceMemoryPerGiBHour" . | float64 -}}
+{{- $ssdRate := include "kube-agents.footprintPriceSsdPerGiBMonth" . | float64 -}}
+{{- $hours := include "kube-agents.footprintHoursPerMonth" . | float64 -}}
+{{- $clusterFee := include "kube-agents.footprintClusterFeePerMonth" . | float64 -}}
+{{- $cpuCost := mulf $cores $cpuRate $hours -}}
+{{- $memoryCost := mulf $memoryGiB $memoryRate $hours -}}
+{{- $ssdCost := mulf $ssdGiB $ssdRate -}}
+{{- $total := addf $cpuCost $memoryCost $ssdCost -}}
+Release footprint (pod requests, as the quota preflight sums them):
+  CPU requests:        {{ printf "%.3f" $cores }} cores
+  Memory requests:     {{ printf "%.2f" $memoryGiB }} GiB
+  Pods:                {{ int64 $r.pods }}
+  Persistent storage:  {{ printf "%.0f" $ssdGiB }} GiB over {{ int64 $r.persistentVolumeClaims }} claims (balanced persistent disk on GKE's default StorageClass)
+Modeled monthly cost (modeled from {{ include "kube-agents.footprintPriceRegion" . }} list prices, excluding LLM tokens):
+  CPU:      {{ printf "%.3f" $cores }} cores x ${{ include "kube-agents.footprintPriceCpuPerVcpuHour" . }}/vCPU-hour x {{ include "kube-agents.footprintHoursPerMonth" . }} hours = ${{ printf "%.2f" $cpuCost }}
+  Memory:   {{ printf "%.2f" $memoryGiB }} GiB x ${{ include "kube-agents.footprintPriceMemoryPerGiBHour" . }}/GiB-hour x {{ include "kube-agents.footprintHoursPerMonth" . }} hours = ${{ printf "%.2f" $memoryCost }}
+  SSD:      {{ printf "%.0f" $ssdGiB }} GiB x ${{ include "kube-agents.footprintPriceSsdPerGiBMonth" . }}/GiB-month = ${{ printf "%.2f" $ssdCost }}
+  Total:    ${{ printf "%.2f" $total }}/month, plus the ${{ printf "%.2f" $clusterFee }}/month GKE cluster fee (per cluster, noted separately)
+{{- if eq (toString .Values.platformAgent.mode) "next" }}
+  Not counted: the spec.mode next workloads (the NATS bus, the A2A gateway and its callouts) and the session pods; the install prerequisites page lists them.
+{{- end }}
+{{- end }}
+
 {{- define "kube-agents.quotaPreflight" -}}
 {{- if .Values.quotaPreflight.enabled -}}
 {{- $rawQuotas := lookup "v1" "ResourceQuota" .Release.Namespace "" -}}
