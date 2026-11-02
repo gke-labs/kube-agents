@@ -161,13 +161,33 @@ func TestFleetSoak_TenClustersThroughThrottleAndExpiry(t *testing.T) {
 
 	runtime.GC()
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	sampler := startHeapSampler(ctx)
 	gate := newListGate(defaultInitialListConcurrency)
 	var synced, reportedDown atomic.Int64
 	runErrs := make(chan error, fleetSoakClusters)
 	start := time.Now()
 	deadline := start.Add(fleetSoakTimeout)
+	// The numbers a run is read by are logged on every exit, a phase timeout
+	// included, so a red carries them as a green does: the two durations
+	// stay zero for a phase the run did not reach. Cancelling first stops
+	// the watchers and the sampler, so the peaks are final when they print.
+	var syncedIn, elapsed time.Duration
+	dataset := "full"
+	if fakeapiserver.UnderRace {
+		dataset = "race"
+	}
+	defer func() {
+		cancel()
+		<-sampler.done
+		t.Logf("FLEET SOAK clusters=%d dataset=%s nodes=%d pods=%d events=%d gate=%d", fleetSoakClusters, dataset, sizes.Nodes, sizes.Pods, sizes.Events, defaultInitialListConcurrency)
+		t.Logf("FLEET SOAK all clusters synced in %s; synced, expired, recovered and delivered in %s", syncedIn.Round(time.Millisecond), elapsed.Round(time.Millisecond))
+		t.Logf("FLEET SOAK peak backlogs in flight across the servers: %d", peakBacklogs.Load())
+		t.Logf("FLEET SOAK peak live heap (%s): %d MiB; peak HeapAlloc (%s): %d MiB", fleetSoakLiveHeapMetric, sampler.peakLive/mebibyte, fleetSoakHeapAllocMetric, sampler.peakAlloc/mebibyte)
+		t.Logf("FLEET SOAK reported watching %d times, not watching %d times", synced.Load(), reportedDown.Load())
+		for i, srv := range servers {
+			t.Logf("FLEET SOAK %s: %+v", names[i], srv.Counts())
+		}
+	}()
 	// phase waits for cond with what is left of the run's one deadline.
 	phase := func(cond func() bool, what string) {
 		t.Helper()
@@ -191,8 +211,12 @@ func TestFleetSoak_TenClustersThroughThrottleAndExpiry(t *testing.T) {
 		}()
 	}
 
-	phase(func() bool { return synced.Load() == fleetSoakClusters }, "all ten clusters to sync")
-	syncedIn := time.Since(start)
+	// synced counts reports of watching, not clusters: a cluster that synced,
+	// broke on a non-403 failure and recovered reports true twice, so the
+	// wait is for at least ten and the reportedDown check at the end names a
+	// flap; an exact count would wait out the deadline instead.
+	phase(func() bool { return synced.Load() >= fleetSoakClusters }, "all ten clusters to sync")
+	syncedIn = time.Since(start)
 	// The sync is reported as the last initial Event is handed over, which
 	// can be an instant before its dispatch returns (see Run), so the count
 	// is given that instant; a count past the backlog would mean a relist
@@ -242,7 +266,7 @@ func TestFleetSoak_TenClustersThroughThrottleAndExpiry(t *testing.T) {
 		}
 		return true
 	}, "the post-expiry Event to reach every cluster's dispatcher")
-	elapsed := time.Since(start)
+	elapsed = time.Since(start)
 
 	cancel()
 	for range servers {
@@ -256,15 +280,6 @@ func TestFleetSoak_TenClustersThroughThrottleAndExpiry(t *testing.T) {
 		}
 	}
 	<-sampler.done
-
-	dataset := "full"
-	if fakeapiserver.UnderRace {
-		dataset = "race"
-	}
-	t.Logf("FLEET SOAK clusters=%d dataset=%s nodes=%d pods=%d events=%d gate=%d", fleetSoakClusters, dataset, sizes.Nodes, sizes.Pods, sizes.Events, defaultInitialListConcurrency)
-	t.Logf("FLEET SOAK all clusters synced in %s; synced, expired, recovered and delivered in %s", syncedIn.Round(time.Millisecond), elapsed.Round(time.Millisecond))
-	t.Logf("FLEET SOAK peak backlogs in flight across the servers: %d", peakBacklogs.Load())
-	t.Logf("FLEET SOAK peak live heap (%s): %d MiB; peak HeapAlloc (%s): %d MiB", fleetSoakLiveHeapMetric, sampler.peakLive/mebibyte, fleetSoakHeapAllocMetric, sampler.peakAlloc/mebibyte)
 
 	if n := reportedDown.Load(); n != 0 {
 		t.Errorf("%d cluster(s) were reported as not watching; a transient 429 or an expiry should take none out", n)
