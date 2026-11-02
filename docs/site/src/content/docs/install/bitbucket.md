@@ -219,9 +219,9 @@ platformAgent:
         role: gitops
 ```
 
-The chart refuses what the operator refuses: a Cloud forge at another host, or with a port, a CA
-or an identity that is not a UUID; a Data Center forge with no host, a port or plain HTTP; and an
-`identity` on any other provider. `helm upgrade` does not update CRDs: apply
+The chart refuses what the operator refuses. On a Cloud forge, it refuses another host, a port, a
+CA, and an identity that is not a UUID. On a Data Center forge, it refuses a missing host, a port and
+plain HTTP. On any other provider, it refuses `identity`. `helm upgrade` does not update CRDs: apply
 `charts/kube-agents/crds/` first.
 
 ## Check the connection

@@ -24,9 +24,8 @@ holding its private key. Either hand the installer the `.pem` with
 (AOT); see
 [Prerequisites](/kube-agents/install/prerequisites/#gitops-repo--github-token-minter-for-submit-suggestion)
 and [Token minter](/kube-agents/deploy/token-minter/). A GitOps repository on
-GitLab needs an access token instead, and no GitHub App, minter or KMS key:
-see [GitLab as the GitOps forge](/kube-agents/install/gitlab/). A GitOps repository on
-Bitbucket Cloud or Bitbucket Data Center needs a token too: see
+GitLab or Bitbucket needs an access token instead, and no GitHub App, minter or KMS key:
+see [GitLab as the GitOps forge](/kube-agents/install/gitlab/), and for Bitbucket,
 [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/). For a GitOps
 repository on a GitHub Enterprise Server, create the App on the instance and
 add `--gitops-host` (and, for a private CA, `--gitops-ca-file`): see
