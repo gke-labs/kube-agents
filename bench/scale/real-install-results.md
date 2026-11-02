@@ -466,6 +466,12 @@ input tokens, $9.00 per million output tokens.
 The steady cost of one install at 42 clusters is about $400 per day in tokens and about $10 per
 day on GKE. The test fleet itself costs about $360 per day.
 
+For the largest example fleet (XL, 2,500 clusters), the design doc gives 63 to 105 installs. At
+this install's steady cost that is about $25,000 to $42,000 per day in tokens and about $630 to
+$1,050 per day on GKE for the installs. These figures scale one install's soak cost by the install
+count; they assume clusters like the test's and the daily audits of one soak, and they leave out
+questions and triage beyond that load.
+
 ## Data
 
 - The run record: [`harness-limits.json`](harness-limits.json), key

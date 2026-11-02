@@ -4,6 +4,22 @@
 
 This test checks the sizing answer on a real setup. The sizing answer says that one install at the L container size holds 40 clusters. An install is one kube-agents deployment. The L container size gives the agent 8 CPU and 16 GB, the credential proxy 8 CPU and 8 GB, and the event watcher 2 CPU and 4 GB. The test builds 40 test clusters, makes a new install, and watches its first-run flow. The first-run flow is the onboarding that a new install does by itself. The test then asks typical heavy questions and adds a high rate of Pod churn. Pod churn is the creation and deletion of Pods. Each step records resource use, model traffic, tool calls and response times. The report says whether each step stayed inside the safe limits.
 
+## Status
+
+The test is complete. Every step ran from 2026-10-31 to 2026-11-02, and
+[`real-install-results.md`](real-install-results.md) has each step's result, the cost, and the
+predictions marked confirmed or disproved. The test differs from this plan in these ways:
+
+- The install was new on 2026-10-29. The first-run window started from a reset of the agent's state.
+- The install has no GitOps repository.
+- Two signal clusters were added during Step 5, because the 40 test clusters could not carry the
+  zone-skew and older-version signals. The fleet was then 42 clusters.
+- The first try of Step 7 created no churn and was run again on a dedicated node pool.
+- The soak ran for 12 hours. It started after the 06:20 and 06:50 UTC audits.
+- A stress stage beyond fair use was added: 5 and 8 questions at once, 100 failing Pods, and 32
+  command workers.
+- In Step 8 the sandbox shell kept its fixed size, because the operator does not let it be set.
+
 ## What "safe" means
 
 A step is safe when all of these hold:
