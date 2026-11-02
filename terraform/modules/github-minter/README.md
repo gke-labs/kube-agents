@@ -21,12 +21,9 @@ When changing regions, the GitHub App private key must be re-imported into the n
 > destroy. A later apply with the same names fails with a 409 until you import the
 > existing resources back into state
 > (`terraform import module.<name>.google_kms_key_ring.minter ...`) or choose new
-> `kms_keyring_name`/`kms_key_name` values. In the full-install composition,
-> `lifecycle.sh destroy` forgets the keys first. After a raw destroy, `lifecycle.sh apply`
-> stops while the key has no enabled version: run `lifecycle.sh adopt-kms`, which imports
-> the keys back and restores any version a raw destroy scheduled, as long as its
-> destruction time has not passed. See
-> [Full teardown](../../../docs/site/src/content/docs/install/uninstall.md#full-teardown).
+> `kms_keyring_name`/`kms_key_name` values. The full-install composition's `lifecycle.sh`
+> does both for you; its README's [Teardown and re-apply](../../examples/full-install/README.md#teardown-and-re-apply) section says how, including how to restore
+> versions a raw destroy scheduled.
 
 ## Relationship to the install
 

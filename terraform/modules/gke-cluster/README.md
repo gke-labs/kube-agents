@@ -27,14 +27,12 @@ The `cluster_endpoint` output is whichever endpoint GKE publishes for the cluste
 > encrypt: a cluster created again on it fails to start, and other clusters that share
 > the key lose it. Run `terraform state rm` on the key ring, the key and the key's grant
 > to the GKE service agent (`gke_kms_binding`, which the other clusters need) before a
-> raw destroy. A later apply with the same names fails with a 409 until
-> you import the existing resources back into state
+> raw destroy. A later apply with the same names fails with a 409 until you import the
+> existing resources back into state
 > (`terraform import module.<name>.google_kms_key_ring.gke_keyring[0] ...`) or choose new
 > `kms_keyring_name`/`kms_key_name` values. The full-install composition's `lifecycle.sh`
-> automates both directions: `destroy` forgets the keys first, and `apply` imports them
-> back and restores any version a raw destroy scheduled, as long as its destruction
-> time has not passed. See
-> [Full teardown](../../../docs/site/src/content/docs/install/uninstall.md#full-teardown).
+> does both for you; its README's [Teardown and re-apply](../../examples/full-install/README.md#teardown-and-re-apply) section says how, including how to restore
+> versions a raw destroy scheduled.
 
 ## Usage
 
