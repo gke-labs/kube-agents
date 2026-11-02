@@ -961,3 +961,58 @@ class GitRefusedTest(DataCenterCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadingsCeilingTest(unittest.TestCase):
+    """A repository past the read ceiling is refused, never counted short.
+
+    The reviewer's case (#3687, at ada3517): 50 proposals by the install,
+    34 of them among the newest 1,000 rows and 16 older. The listing filters
+    the author in the broker, so its read stops at the ceiling; a page past
+    the 34 came back empty, and the sweep read that as the end of a whole
+    listing.
+    """
+
+    AUTHOR = "access-token-user/1/1"
+
+    def rows(self) -> list[dict]:
+        rows = []
+        for n in range(1, 1201):
+            # The install's proposals: 34 in the newest 1,000, 16 past them.
+            ours = n <= 1000 and n % 29 == 0 or n > 1000 and n % 12 == 0 and n <= 1192
+            rows.append({
+                "id": n, "state": "MERGED", "title": f"t{n}",
+                "author": {"user": {"name": self.AUTHOR if ours else "someone", "type": "NORMAL"}},
+                "createdDate": 1790000000000, "updatedDate": 1790000000000 - n,
+            })
+        return rows
+
+    def api(self, rows):
+        def answer(method, path, params=None, **_):
+            start, size = int(params["start"]), int(params["limit"])
+            page = rows[start:start + size]
+            return {"values": page, "isLastPage": start + size >= len(rows), "nextPageStart": start + size}
+        return answer
+
+    def test_a_repository_past_the_ceiling_refuses_the_listing_and_the_tally(self):
+        forge = BitbucketDataCenterForge(HOST, "/nonexistent/token", ())
+        rows = self.rows()
+        self.assertEqual(34, sum(1 for r in rows[:1000] if r["author"]["user"]["name"] == self.AUTHOR))
+        self.assertEqual(50, sum(1 for r in rows if r["author"]["user"]["name"] == self.AUTHOR))
+        for verb, payload in (
+            ("proposal_list_by_author", {"author": self.AUTHOR, "limit": 100, "page": 1}),
+            ("proposal_list_by_author", {"author": self.AUTHOR, "limit": 10, "page": 4}),
+            ("proposal_tally", {"author": self.AUTHOR}),
+        ):
+            with self.subTest(verb=verb, payload=payload):
+                with self.assertRaises(WorkspaceError) as caught:
+                    getattr(forge, verb)(self.api(rows), "ACME/infra", payload)
+                self.assertEqual("FORGE_CALL_FAILED", caught.exception.fields.get("code"))
+
+    def test_a_repository_inside_the_ceiling_lists_every_proposal_of_the_author(self):
+        forge = BitbucketDataCenterForge(HOST, "/nonexistent/token", ())
+        rows = self.rows()[:1000]
+        answer = forge.proposal_list_by_author(self.api(rows), "ACME/infra", {"author": self.AUTHOR, "limit": 100})
+        self.assertEqual((34, False), (answer["count"], answer["truncated"]))
+        self.assertEqual({"open": 0, "merged": 34, "closed": 0},
+                         forge.proposal_tally(self.api(rows), "ACME/infra", {"author": self.AUTHOR}))
