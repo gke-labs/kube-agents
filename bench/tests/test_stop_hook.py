@@ -115,6 +115,22 @@ def test_a_filed_card_is_stopped_and_recorded(monkeypatch):
     assert _entry(result, stop_hook.CARDS_STOPPED_ENTRY)["status"] == "completed"
 
 
+def test_the_stop_purges_with_the_run_start_floor(monkeypatch):
+    """The stop path's purge carries the floor :meth:`run` read (#4591)."""
+    floors = []
+    monkeypatch.setattr(
+        harness, "_purge_card_state", lambda ids, timeout, floor=None: floors.append((list(ids), floor))
+    )
+    monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: _cards({"t_1": "archived"}))
+    h = harness.KubeAgentsHarness()
+    h._pod_floor = 1_700_000_000
+    h._stop_after_first_card(
+        AgentResult(output="on it", trajectory=[]), "a2a-ctx-1", stop_hook.Stop(prompt="ask", observe_seconds=0.0),
+        send_stop=lambda: (True, "stopped"), poll_interval=0.0,
+    )
+    assert floors == [(["t_1"], 1_700_000_000)]
+
+
 def test_the_stop_goes_before_any_read(monkeypatch):
     """The stop needs no card ids, so it goes first, and a card the turn
     saved a moment late is stopped too."""

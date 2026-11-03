@@ -4126,6 +4126,27 @@ def test_a_transport_exhausted_run_floors_its_purge_too(
     assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))
 
 
+def test_an_infra_status_turn_floors_its_purge_too(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status turn the endpoint marks infrastructure purges at once, with the floor."""
+    scripts, _ = _clocked_pod(monkeypatch, stub_agent)
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert len(stub_agent.requests) == 2
+    (purge,) = [s for s in scripts if _is_purge(s)]
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))
+
+
 def test_a_purge_that_cannot_reach_the_board_is_a_warning(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
