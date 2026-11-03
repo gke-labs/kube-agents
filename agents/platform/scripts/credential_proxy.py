@@ -11861,6 +11861,34 @@ def _busy_phrase(exc: CommandSlotUnavailable) -> str:
     return "refused under resource pressure" if isinstance(exc, ResourcePressure) else "queued too long"
 
 
+def mcp_relay_decision(
+    principal: Principal | None, server_name: str, message: dict[str, Any] | None
+) -> tuple[command_policy.Decision, frozenset[str] | None]:
+    """The MCP relay's decision for one message, and the tools its caller is offered.
+
+    The second value narrows a ``tools/list`` reply: None for the table's own
+    set, or a profile worker's set (empty for a server outside it, so a later
+    change to the decision can't hand a profile worker the table's list).
+
+    A profile worker (#3658) reaches the relay only inside a task: a warm pod
+    between tasks holds no task credential, so it gets no reads. With one, it
+    is held to mcp_policy.PROFILE_SERVER_TOOLS. Everyone else gets the table.
+    """
+    if principal is None or principal.role != CALLER_ROLE_PROFILE:
+        return mcp_policy.evaluate(server_name, message), None
+    offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())
+    if principal.task is None:
+        return (
+            command_policy.Decision(
+                allowed=False,
+                rule_id=RULE_TASK_CREDENTIAL,
+                message="Profile workers reach MCP servers only with a task credential.",
+            ),
+            offered,
+        )
+    return mcp_policy.evaluate_for_profile(server_name, message), offered
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
@@ -13134,19 +13162,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         message = mcp_policy.parse(self.rfile.read(content_length))
-        profile = principal is not None and principal.role == CALLER_ROLE_PROFILE
-        if profile and principal.task is None:
-            # A profile worker reaches the relay only inside a task: a warm pod
-            # between tasks holds no task credential, so it gets no reads.
-            decision = command_policy.Decision(
-                allowed=False,
-                rule_id=RULE_TASK_CREDENTIAL,
-                message="Profile workers reach MCP servers only with a task credential.",
-            )
-        elif profile:
-            decision = mcp_policy.evaluate_for_profile(server_name, message)
-        else:
-            decision = mcp_policy.evaluate(server_name, message)
+        decision, offered = mcp_relay_decision(principal, server_name, message)
         if not decision.allowed:
             LOGGER.warning("mcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
             reply = mcp_policy.refusal(message, decision) if entry is not None else None
@@ -13231,11 +13247,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             and decision.rule_id == mcp_policy.METHOD_TOOLS_LIST
             and upstream.status < HTTPStatus.MULTIPLE_CHOICES
         ):
-            filtered = mcp_policy.filter_tools_list(
-                server_name,
-                upstream.body,
-                mcp_policy.PROFILE_SERVER_TOOLS.get(server_name) if profile else None,
-            )
+            filtered = mcp_policy.filter_tools_list(server_name, upstream.body, offered)
             if filtered is None:
                 refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
             else:

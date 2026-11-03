@@ -125,6 +125,8 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
             def admit(self, principal, token):
                 if token is None:
                     return principal
+                if token == "a-refused-credential":
+                    raise credential_proxy.TaskCredentialRefused("signature does not verify")
                 return dataclasses.replace(principal, task=object(), caller=f"task:{token}")
 
         CredentialProxyHandler.profile_gate = FakeProfileGate()
@@ -207,6 +209,23 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         # The chat role still sees all three the table allows.
         status, _, body = self._request(path=self.DK, message={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         self.assertEqual(len(json.loads(body)["result"]["tools"]), 3)
+
+    def test_a_profile_worker_whose_credential_fails_is_refused_before_the_relay(self):
+        status, _, body = self._request(
+            path=self.DK, message=tools_call("search_documents"), token="profile-token",
+            headers={credential_proxy.TASK_CREDENTIAL_HEADER: "a-refused-credential"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["rule"], credential_proxy.RULE_TASK_CREDENTIAL)
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_every_method_on_gke_is_refused_to_a_profile_worker(self):
+        for method in ("initialize", "ping", "tools/list"):
+            with self.subTest(method=method):
+                status, _, body = self._profile(GKE, {"jsonrpc": "2.0", "id": 1, "method": method})
+                self.assertEqual(status, 200)
+                self.assertIn(mcp_policy.RULE_PROFILE_SERVER, json.loads(body)["error"]["message"])
+        self.assertEqual(self.upstream_requests, [])
 
     def test_a_session_pod_still_reaches_no_mcp_server(self):
         status, _, _ = self._request(path=self.DK, message=tools_call("search_documents"), token="session-token")

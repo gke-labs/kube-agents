@@ -478,18 +478,43 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         # The relay has no per-task target check, so a profile worker reaches
         # only the servers whose tools name no cluster: Developer Knowledge's
         # document reads. The gke server, whose tools take a project and
-        # cluster as arguments, stays out, and so does every write.
+        # cluster as arguments, stays out, and so does every write. Driven
+        # through the decision the handler makes (mcp_relay_decision).
+        cp = h.credential_proxy
         self.assertEqual(
             {"developer_knowledge": frozenset({"get_documents", "search_documents"})},
             h.mcp_policy.PROFILE_SERVER_TOOLS,
         )
-        call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_k8s_resource"}}
-        self.assertFalse(h.mcp_policy.evaluate_for_profile("gke", call).allowed)
+
+        def call(name):
+            return {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name}}
+
+        listing = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        in_task = cp.Principal(workload="w", role=cp.CALLER_ROLE_PROFILE, task=object())
+        no_task = cp.Principal(workload="w", role=cp.CALLER_ROLE_PROFILE)
+        chat = cp.Principal(workload="w", role=cp.CALLER_ROLE_CHAT)
+
+        for server, message in (("gke", call("get_k8s_resource")), ("gke", listing),
+                                ("developer_knowledge", call("answer_query"))):
+            with self.subTest(server=server, message=message):
+                decision, _ = cp.mcp_relay_decision(in_task, server, message)
+                self.assertFalse(decision.allowed)
+        decision, offered = cp.mcp_relay_decision(in_task, "developer_knowledge", call("search_documents"))
+        self.assertTrue(decision.allowed)
+        self.assertEqual(frozenset({"get_documents", "search_documents"}), offered)
+        self.assertEqual(frozenset(), cp.mcp_relay_decision(in_task, "gke", listing)[1])
+        decision, _ = cp.mcp_relay_decision(no_task, "developer_knowledge", call("search_documents"))
+        self.assertEqual((False, cp.RULE_TASK_CREDENTIAL), (decision.allowed, decision.rule_id))
+        # And the handler takes its decision from there, not from the table.
         source = h.text("credential_proxy")
         handler = source[source.index("def _handle_mcp_relay"):]
         handler = handler[: handler.index("\n    def ", 1)]
-        self.assertIn("mcp_policy.evaluate_for_profile(server_name, message)", handler)
-        self.assertIn("principal.task is None", handler)
+        self.assertIn("mcp_relay_decision(principal, server_name, message)", handler)
+        self.assertNotIn("mcp_policy.evaluate(", handler)
+        self.assertIn("decision.rule_id == mcp_policy.METHOD_TOOLS_LIST", handler)
+        self.assertIn("filter_tools_list(server_name, upstream.body, offered)", handler)
+        # The chat role keeps the table's whole offer.
+        self.assertIsNone(cp.mcp_relay_decision(chat, "gke", call("get_cluster"))[1])
 
 
 class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):

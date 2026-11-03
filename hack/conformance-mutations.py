@@ -107,11 +107,29 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A3-profile-mcp-without-task",
         "agents/platform/scripts/credential_proxy.py",
-        ("        if profile and principal.task is None:\n",
-         "        if False:\n"),
+        ("    if principal.task is None:\n        return (\n",
+         "    if False:\n        return (\n"),
         "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
         "let a warm profile pod between tasks read through the MCP relay "
         "with no task credential",
+    ),
+    Mutation(
+        "A3-profile-mcp-uses-the-table",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    return mcp_policy.evaluate_for_profile(server_name, message), offered\n",
+         "    return mcp_policy.evaluate(server_name, message), offered\n"),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "decide a profile worker's call on the relay's whole table, so every "
+        "gke read and answer_query reach it",
+    ),
+    Mutation(
+        "A3-profile-mcp-full-offer",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())\n',
+         '    offered = None\n'),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "offer a profile worker the table's whole tool list, answer_query "
+        "and every gke read among it",
     ),
     Mutation(
         "A3-inject-auth",
