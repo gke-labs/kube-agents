@@ -217,8 +217,8 @@ readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
 # The round trip after the suite verdict is for a next-mode run on main: a
 # pull request's next-mode run (the merge-blocking presubmit's, or a batch's
 # that Tide ran) skips it, since nobody reads a report-only result there and the
-# today lane below proves the same path every six hours on main, and on
-# demand on a pull request.
+# today lane below proves the same path on pull requests that touch the round
+# trip, or on demand.
 readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"
 # The today lane, EVAL_ROLLBACK_LANE=1 beside EVAL_MODE_NEXT=1
 # (run_rollback_lane, in section 3): the deploy brings the install up under
@@ -824,9 +824,10 @@ report_partial_verdict() {
 # was starved by 429s or a stuck dispatcher. collect_agent_pod_diagnostics
 # follows it: a pod replaced mid-run starts a fresh gateway log, and the
 # pod and event watch it stops, the previous containers and the restart
-# record are what say why. collect_litellm_log follows those: the
-# thinking-replay hook's per-request line is in the LiteLLM log alone, so a
-# green run without it cannot say whether the hook touched its traffic.
+# record are what say why. collect_litellm_log follows those: the gateway
+# hooks' per-request lines (thinking replay, cache markers) are in the LiteLLM
+# log alone, so a green run without it cannot say whether they touched its
+# traffic.
 # collect_credential_proxy_evidence follows for the same reason: the broker's
 # admission queue is in its log and its metrics alone, and a green run that
 # kept neither cannot say whether the queue came back.
@@ -1124,11 +1125,10 @@ export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 
 # ─── The today lane: roll the next install back before grading ──────────────
-# EVAL_ROLLBACK_LANE=1, set beside EVAL_MODE_NEXT=1 on the today lane's jobs
-# (ci-kube-agents-eval-today and pull-kube-agents-smoke-test-today in
-# oss-test-infra). With next the mode new installs get and the merge-blocking
-# presubmit grading it, today is what a rollback lands on, and this lane proves
-# that path: the deploy brings the install up under next exactly as for the
+# EVAL_ROLLBACK_LANE=1, set beside EVAL_MODE_NEXT=1 on the today lane's job
+# (pull-kube-agents-smoke-test-today in oss-test-infra). With next the mode
+# new installs get and the merge-blocking presubmit grading it, today is
+# what a rollback lands on, and this lane proves that path: the deploy brings the install up under next exactly as for the
 # next lane, this step runs hack/rollback-roundtrip.sh with ROLLBACK_END_MODE
 # set to EVAL_ROLLBACK_LANE_END_MODE (next -> today -> next -> today: the
 # rollback, the flip forward on the kept PVC and creds Secret, and the
@@ -2645,9 +2645,11 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # `python3 scripts/eval_rosters.py --summary` counts the files. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
-# tracker seats it in the presubmit file held out (#2013; #2016's seat took
-# its roster line 2026-10-14, was demoted back here 2026-10-17, #3120, and
-# returned to the roster 2026-10-26; the presubmit file's last section).
+# tracker seats it in the presubmit file held out (the presubmit file's
+# last section, empty since 2026-11-02: #2016's seat took its roster line
+# 2026-10-14, was demoted back here 2026-10-17, #3120, and returned to the
+# roster 2026-10-26; #2013's, the compliance canary, took its roster line
+# 2026-11-02).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -3084,6 +3086,33 @@ fi
 if [ -n "${STOPPED_ASK_CASES}" ]; then
   echo "stopped asks, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
 fi
+# A case that declares `writes_alone: true` at the top of its task.yaml
+# (bench/kube_agents_bench/lane.py, WRITES_ALONE_KEY) runs in the same second
+# phase on every transport: it requests nothing, but a wrong answer may let a
+# card open a pull request the reply never names, and the lane marks its
+# window exclusive, which is only right when it runs alone. Read here with a
+# plain YAML load rather than a bench entry point: a presubmit grades with
+# bench/ at the base commit (pin_grader above), so a module flag newer than
+# main would not exist in the grader this script runs against.
+WRITES_ALONE_CASES=""
+if ! WRITES_ALONE_CASES="$(cd "${BENCH_DIR}" && uv run python - "${TASKS[@]}" <<'PY' | awk '{ printf "%s%s", sep, $0; sep = "," }'
+import pathlib
+import sys
+
+import yaml
+
+for task in sys.argv[1:]:
+    doc = yaml.safe_load(pathlib.Path(task).read_text(encoding="utf-8")) or {}
+    if doc.get("writes_alone") is True:
+        print(pathlib.Path(task).parent.name)
+PY
+)"; then
+  echo "ERROR: could not read which cases declare writes_alone (the YAML read above); the fan-out cannot run them after every other unit, so the run does not start." >&2
+  exit 1
+fi
+if [ -n "${WRITES_ALONE_CASES}" ]; then
+  echo "writes_alone cases, run after every other unit with the cases that request a pull request: ${WRITES_ALONE_CASES}"
+fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step
 # above made one for this case, the file under bench/tasks/ otherwise. Its
@@ -3201,7 +3230,7 @@ if [ "${EVAL_TIER}" = "nightly" ]; then
     NIGHTLY_PART_KEPT=()
     for ENTRY in "${TASKS[@]}"; do
       NAME="$(basename "$(dirname "${ENTRY}")")"
-      case ",${INJECT_LANE_REQUESTING},${STOPPED_ASK_CASES:-}," in
+      case ",${INJECT_LANE_REQUESTING},${STOPPED_ASK_CASES:-},${WRITES_ALONE_CASES:-}," in
         *",${NAME},"*) ENTRY_PART="writers" ;;
         *) ENTRY_PART="main" ;;
       esac
@@ -3390,6 +3419,11 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # collector that moves check evaluation out of the worker; the first runs
 # of the thirteen-case matrix measure it, and until they have, this is the
 # projection. No Prow deadline change.
+#
+# 2026-11-02: the canary took its roster line (#2013 step 4) on 36/36 main
+# nightlies 10-20 to 11-02 and 1068/1117 graded presubmit repetitions
+# 10-27 to 11-02 with no all-reps collapse; same matrix, same units, rung 4
+# armed for it from then on.
 #
 # pdb-remediation-pr, seat opened 2026-09-28, was seated held out beside it
 # (#2016 step 2; roster line 2026-10-14): FOURTEEN tasks, 42 units, against the same 360m deadline.
@@ -3751,12 +3785,12 @@ unit_cost_hint() {
     # the previous repetition's audits to finish (wait_platform_runs), then the
     # stack waits for the stage to run the four one after another (1-15 min
     # each, #985; up to its chain_wait, 3600s). 2530-3144s a repetition on the
-    # nightly of 2026-10-09; the top of the list, so it launches first in each
-    # repetition round.
+    # nightly of 2026-10-09; the top of the list, so it launches first, its
+    # repetitions back to back.
     oobe-first-run-audits) echo 3000 ;;
     # Off the infra lock too (infra_lock_exempt), unmeasured: priced as
     # autoops-warning-event-triage, the same plant-then-card shape, so it
-    # launches early in its round rather than last at the default.
+    # launches early rather than last at the default.
     autoops-warning-event-no-action-triage) echo 900 ;;
     # The full audits: 600-1300s a repetition on 2026-08-26, planted-pdb's
     # 962s the one clean measurement. Priced with the 900 band so a nightly
@@ -3767,8 +3801,8 @@ unit_cost_hint() {
     # On the blocking roster since 2026-10-26. Measured on the claude-opus-5-5
     # main nightlies 2026-10-20 to 10-26: median 198s, 165-397s over 14
     # repetitions. Priced at 600s, the floor scripts/test_ci_eval_nightly.py's
-    # audit-band test allows, rather than 900: the hint still launches it early
-    # in each round, and the presubmit wall estimate in
+    # audit-band test allows, rather than 900: the hint still launches it
+    # early, and the presubmit wall estimate in
     # scripts/eval_rosters.py (#3987) is priced from these hints.
     consistency-drift-outlier) echo 600 ;;
     consistency-no-environment-label) echo 900 ;;
@@ -3813,14 +3847,16 @@ unit_cost_hint() {
     # A general fleet health question that runs the health sweep (#3302): one
     # card and a sweep of seconds; the drift chat route's band.
     health-chat-request-runs-collector) echo 400 ;;
-    # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
-    # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
-    # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,
-    # over 903 presubmit repetitions 2026-09-04 to 09-15; priced at that
-    # median, the way capacity (540) and the incident probe (700) are, so it
-    # launches first in each presubmit repetition round. Its three repetitions
-    # serialize on the task lock, so ~50min at the median and ~104min at p90
-    # is the chain a presubmit carries for it.
+    # On the blocking roster since 2026-11-02 (#2013 step 4); presubmit held
+    # out 2026-09-29 to then (#2013 step 2); nightly-only 2026-09-22 to
+    # 2026-09-29 (#1023; held out on #1171, closed 2026-09-08). The canary
+    # measured 1002s median, 2074s p90, over 903 presubmit repetitions
+    # 2026-09-04 to 09-15, and 732s median, 1450s p90, over the 1068 passing
+    # presubmit repetitions of 2026-10-27 to 11-02; priced between the two
+    # medians, the way capacity (540) and the incident probe (700) are priced
+    # at theirs, so it launches first in each presubmit repetition round. Its
+    # three repetitions serialize on the task lock, so ~37-50min at the
+    # medians and ~72-104min at p90 is the chain a presubmit carries for it.
     compliance-rbac-overgrant) echo 1000 ;;
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.
@@ -3836,8 +3872,8 @@ unit_cost_hint() {
     # under pull_request_opened says otherwise. It requests a pull request, so
     # since #2260 it runs in the second phase (unit_phase), one unit at a time
     # after every other unit, and the hint orders it only among that phase's
-    # units (ahead of vcs-spent-branch-reuse's 1000 in each repetition round,
-    # which changes no total: the phase is serial). The writers nightlies
+    # units (ahead of vcs-spent-branch-reuse's 1000, which changes no total:
+    # the phase is serial). The writers nightlies
     # since #3145 measured 142-265s a repetition.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
@@ -4624,7 +4660,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The repository this unit's agent writes to, emptied of every agent pull
   # request and every branch but the default and read back, so repetitions
   # 2 and 3 start as 1 did and a leftover from an earlier lease is never what
-  # the agent builds on (#2260). Only for a case that requests a pull request, or a stopped ask:
+  # the agent builds on (#2260). Only for a case that requests a pull request, a stopped ask, or a writes_alone case:
   # those run one at a time after every other unit (unit_phase), so nothing a
   # sibling is working on is open here. Not clean: the unit does not run, the
   # locks go back, and the repetition grades MISSING -- unless what stopped it
@@ -4752,11 +4788,16 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # outside event (an autoscaler scale-down) restarted between lease setup and here.
 scheduled_audits pause "fan-out"
 
-# Rep-ascending FIRST, cost-descending within a rep: repetitions of one task
-# serialize on the task lock, so a same-task unit launched early just parks a
-# lane sleeping on it -- the pool run of 2026-08-31 (build 2094432646640701440)
-# spent two of four lanes that way for its first twelve minutes under the
-# cost-first ordering this replaces.
+# Case by case, cost-descending: every repetition of a case is queued before
+# the next case's first, so a night cut off by its deadline holds whole cases,
+# which finish_case grades and records as they complete. The rep-major order
+# this replaces finished rep 1 and rep 2 of all 151 cases on the night of
+# 2026-10-25 (build 2114144982938947584) and graded 1 of them (#3939).
+# Repetitions of one task serialize on the task lock, so launch_units holds a
+# unit back while another repetition of its task is in flight and gives the
+# lane to the next case instead -- under the cost-first order before the
+# rep-major one, the pool run of 2026-08-31 (build 2094432646640701440) spent
+# two of four lanes parked on that lock for its first twelve minutes.
 
 # Two phases on both lanes (#2079, #2260): for the GitHub-write safeguard,
 # whose window holds every write made to the run's one repository while it
@@ -4776,7 +4817,8 @@ scheduled_audits pause "fan-out"
 # open. The cost is one drain of the lanes at the phase boundary
 # and the settle plus the serial run of the requesting units (on the
 # presubmit tier, the requesting cases' repetitions, which launch_units runs
-# one at a time, one settle each); the order inside each phase is unchanged.
+# one at a time, one settle each); inside each phase the units keep the
+# case-by-case order below.
 # The ordering assumes a unit's writes land before the unit ends. Under the
 # bridge's api executor the harness's delegation wait holds the unit until
 # the cards the case filed are terminal, so their workers' pull requests
@@ -4785,19 +4827,19 @@ scheduled_audits pause "fan-out"
 # are not waited for, and a write from one of those can land in the next
 # unit's window (docs/designs/eval-next-transport.md, "What the lane
 # grades"): unattributed there in the first phase, and charged to the unit
-# in the second, whose window is exclusive (a requesting case's and a stopped
-# ask's alike).
+# in the second, whose window is exclusive (a requesting case's, a stopped
+# ask's and a writes_alone case's alike).
 #
 # A case that excludes seeded slots from the install's scope (SCOPE_EXCLUDE_NAMES)
 # is phase 2, run after both and alone, each case between its own scope edit and
 # restore (scope_exclude_apply); it takes 2 even when it also writes, and then
 # keeps the writer pause but not run_one_unit's per-repetition repository reset,
 # which no scope-excluding case needs today: each of them is read-only.
-unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that requests a pull request or a stopped ask, 0 otherwise
+unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that requests a pull request, a stopped ask or a writes_alone case, 0 otherwise
   case ",${SCOPE_EXCLUDE_NAMES:-}," in
     *",$1,"*) echo 2; return ;;
   esac
-  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-},${WRITES_ALONE_CASES:-}," in
     *",$1,"*) echo 1 ;;
     *) echo 0 ;;
   esac
@@ -4811,7 +4853,7 @@ UNIT_QUEUE="$(
       fi
       i=$((i + 1))
     done
-  done | sort -k1,1n -k2,2rn
+  done | sort -k2,2rn -k3,3n -k1,1n
 )"
 UNIT_QUEUE_WRITERS="$(
   for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
@@ -4822,7 +4864,7 @@ UNIT_QUEUE_WRITERS="$(
       fi
       i=$((i + 1))
     done
-  done | sort -k1,1n -k2,2rn
+  done | sort -k2,2rn -k3,3n -k1,1n
 )"
 UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c . || true)"
 WRITER_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_WRITERS}" | grep -c . || true)"
@@ -4848,8 +4890,8 @@ unit_counts_toward_infra_limit() { # <task-index>
 # whenever the holder waits on something other than lock-infra (its task or
 # stream lock, wait_platform_runs); two let the staged unit take lock-infra
 # in that window, at the cost of at most one counted slot parked on the lock.
-# A second counted place can go to the same task's next rep, which waits on
-# the task lock rather than lock-infra; that costs a little at rep boundaries.
+# Both places go to different tasks: launch_units never starts a task's next
+# repetition while its last is in flight.
 INFRA_IN_FLIGHT_MAX=2
 
 # One phase's units, launched in queue order at the given parallelism, each
@@ -4862,11 +4904,13 @@ INFRA_IN_FLIGHT_MAX=2
 # doing nothing: on 2026-10-24 the main nightly's waits held 25.7 of its ~70
 # slot-hours and it ran out of time (#3821). Past the limit, a counted lock
 # taker is held back in the queue and the next unit that is not one gets the
-# slot; the held one launches as soon as a counted lock taker's job ends. Queue
-# order is otherwise unchanged.
+# slot; the held one launches as soon as a counted lock taker's job ends. A
+# unit whose task already has a repetition in flight is held back the same way
+# (#3939): it would only sleep on the task lock. Queue order is otherwise
+# unchanged.
 launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch>
   local queue="$1" parallelism="$2" pause="$3"
-  local pending=() line i pick running pid alive infra_pids="" counted
+  local pending=() line i pick running pid alive infra_pids="" counted task_jobs="" job
   # Each line carries whether its unit counts toward INFRA_IN_FLIGHT_MAX, worked
   # out once here rather than on every poll.
   while read -r line; do
@@ -4890,16 +4934,24 @@ EOF_UNIT_QUEUE
       case "${running}" in *" ${pid} "*) alive="${alive} ${pid}" ;; esac
     done
     infra_pids="${alive}"
+    # Each running unit as "<pid>:<task index>".
+    alive=""
+    for job in ${task_jobs}; do
+      case "${running}" in *" ${job%%:*} "*) alive="${alive} ${job}" ;; esac
+    done
+    task_jobs="${alive}"
     pick=""
     for i in "${!pending[@]}"; do
       read -r REP _COST IDX counted <<<"${pending[i]}"
+      case " ${task_jobs} " in *":${IDX} "*) continue ;; esac
       if [ "${counted}" = 0 ] || [ "$(printf '%s\n' ${infra_pids} | grep -c .)" -lt "${INFRA_IN_FLIGHT_MAX}" ]; then
         pick="${i}"
         break
       fi
     done
     if [ -z "${pick}" ]; then
-      # Only counted lock takers are left and the limit is in flight: wait.
+      # Everything left is a counted lock taker past the limit or a task
+      # already in flight: wait.
       sleep 3
       continue
     fi
@@ -4919,6 +4971,7 @@ EOF_UNIT_QUEUE
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
+    task_jobs="${task_jobs} $!:${IDX}"
     if [ "${counted}" = 1 ]; then
       infra_pids="${infra_pids} $!"
     fi
@@ -4938,7 +4991,7 @@ profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units,
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) and the stopped asks (${STOPPED_ASK_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) the stopped asks (${STOPPED_ASK_CASES:-none}) and the writes_alone cases (${WRITES_ALONE_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
   launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi
@@ -4956,7 +5009,7 @@ for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
   done
   [ -n "${SCOPE_IDX}" ] || continue
   SCOPE_PAUSE="${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
-  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-},${WRITES_ALONE_CASES:-}," in
     *",${SCOPE_CASE},"*) SCOPE_PAUSE="${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}" ;;
   esac
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${EVAL_REPETITIONS} repetition(s) of ${SCOPE_CASE} alone, with slot(s) $(scope_slots_shown "${SCOPE_SLOTS}") excluded from the install's scope"
@@ -5085,10 +5138,10 @@ profile_begin "record + final gate"
 # record once written. The candidate would then be measured for non-inferiority
 # against a window it had just moved.
 #
-# EVAL_ROLLBACK_LANE=1 is the fourth. The today lane's periodic
-# (ci-kube-agents-eval-today) carries EVAL_MODE_NEXT=1 for its deploy and
-# grades the install after rolling it back to today, over the api transport,
-# so its key reads today; but a rolled-back install is not the fresh today
+# EVAL_ROLLBACK_LANE=1 is the fourth. No today-lane job runs on main now, but
+# one with no PULL_NUMBER would carry EVAL_MODE_NEXT=1 for its deploy and
+# grade the install after rolling it back to today, over the api transport,
+# so its key would read today; but a rolled-back install is not the fresh today
 # install today's window measures. `bench-gate record` refuses it too.
 #
 # A next-mode run on main does record. The main nightly
@@ -5267,7 +5320,7 @@ run_rollback_roundtrip() {
   local skip_type
   for skip_type in ${EVAL_ROLLBACK_SKIP_JOB_TYPES}; do
     if [ "${skip_type}" = "${JOB_TYPE:-}" ]; then
-      echo "Rollback round trip skipped: a pull request's run (JOB_TYPE=${JOB_TYPE}); the today lane proves the rollback path on main and on demand"
+      echo "Rollback round trip skipped: a pull request's run (JOB_TYPE=${JOB_TYPE}); the today presubmit (pull-kube-agents-smoke-test-today) proves the rollback path on pull requests that touch the round trip, or on demand"
       return 0
     fi
   done

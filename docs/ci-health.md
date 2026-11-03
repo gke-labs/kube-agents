@@ -48,7 +48,8 @@ still running or cut short, the night counts as cut short when its main or
 main-b part is, and a night without its main or main-b part gives no verdict on
 what is newly failing. `scripts/eval_dashboard/nightly.py` derives that line
 and the report from the same nightly runs. After it, the digest carries one
-line per domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)).
+line while nightly bug filing has been held for about two hours ([Nightly bugs](#nightly-bugs)),
+then one line per domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)).
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
 the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
 and incremental) and renders the dashboard's Trend page (`trend.html`,
@@ -873,7 +874,15 @@ lacks, counts more of them than the listing holds, or cannot be read. The REST
 listing, and GitHub's issue search with it, have answered with no issues while
 the issues existed, and a dedupe that reads an empty list files every case
 again. The step reads both listings again, up to 4 times in one pass, and
-when none agrees it logs why, writes nothing, and the next tick retries. When a comment read
+when none agrees it logs why, writes nothing, and the next tick retries. When
+the armed step has held 8 ticks in a row (about two hours), the 11 AM digest
+carries one line, "Nightly bug filing held since <time>", with the last
+reason; the first trusted tick clears it. The count lives in
+`nightly-bugs-state.json` beside `health.json`; a dry run records no hold, and
+a count the step has not rewritten in the last hour is not reported and
+starts over at the next held tick. A pass that cannot read the listings at
+all keeps an open hold's count as it is, refreshing its time. A failed read of the object, other than
+its absence, leaves the count as it was; on the digest tick it costs that day's line. When a comment read
 returns fewer comments than the issue listing counts, the step skips that
 issue for the tick, so a recovery or night comment is not posted twice. When a case with an open issue passes every graded
 repetition on a graded night after its last failing one, and that night
@@ -1100,6 +1109,31 @@ It opens no roster pull request: the job holds no branch write path, and the
 eval crew approves every roster line. Locally,
 `python3 scripts/eval_dashboard/coverage_gaps.py --data data.json [--store store.json]`
 is a dry run; `--live` writes.
+
+## The domain scorecard
+
+`scripts/eval_dashboard/understudies.py` writes one row per domain in
+`domains.yaml`, covered or not, for the dashboard's domain view
+(`cases.html#view=domains`): the roster cases that cover it; for an uncovered
+domain, the days since its allowlist entry began, the entry's issue, its
+held-out case and how long ago its exception expired, read as [Coverage
+gaps](#coverage-gaps) reads them; the open `nightly-red` issues labelled
+`domain:<slug>` and the age of the oldest; and its understudies, the best two
+of the candidates Coverage gaps ranks, with their nightly record and the
+store's verdict. An understudy is **ready** when the evidence store reads it
+`would-admit`; without a store read that column says the store was not read,
+and without a trusted `nightly-red` listing (the read [Nightly
+bugs](#nightly-bugs) uses) the count says not read rather than zero. Ready is
+the record bar only: the rest of the seat bar is checked at admission
+([`eval-gate-roster.md`](eval-gate-roster.md#the-admission-bar-and-who-clears-it)).
+
+It runs every tick before the render, capped at 2 minutes, writes
+`work/scorecard.json` for `render.py --scorecard`, and writes nothing to
+GitHub. It stops without a file on the same untrusted reads that stop Coverage
+gaps, and the view then says the scorecard was not computed. It adds no digest
+line: the coverage-gap line already covers an uncovered domain. Locally,
+`python3 scripts/eval_dashboard/understudies.py --data data.json [--store store.json] --out scorecard.json`
+(`--no-github` skips the issue read).
 
 ## The weekly health email
 

@@ -14,7 +14,10 @@ sends a message only when:
                                                nightly run when --data is given
                                                (nightly_digest.py), and one
                                                line per domain with no blocking
-                                               presubmit seat (coverage_gaps.py)
+                                               presubmit seat (coverage_gaps.py),
+                                               and one while the nightly bug
+                                               filer has been held for hours
+                                               (--bugs-state, nightly_bugs.py)
 
 Everything else is silence. The last-posted state lives in a small JSON file
 (`--state`, a local path or a gs:// object) that this script is the only
@@ -1646,8 +1649,10 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
     was truncated or missing -- then the latency block's night line
     (nightly_latency.py) when last night carried timing, and a reason adds
     a line saying why the
-    section is missing. ``coverage`` is ``coverage_lines``'s: one line per
-    domain with no blocking presubmit seat, none while every domain has one."""
+    section is missing. ``coverage`` is main's ``coverage()``: the held
+    bug-filing line (``filing_lines``) while one is due, then
+    ``coverage_lines``'s one line per domain with no blocking presubmit
+    seat, none while every domain has one."""
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"
@@ -1838,7 +1843,7 @@ def run(
     once, only on a tick that sends the digest, and returns the nightly
     section (an object with `lines`) or the reason it was skipped.
     `coverage_lines`, when given, is called the same way and returns the
-    digest's coverage-gap lines.
+    digest's held bug-filing line, if due, and its coverage-gap lines.
 
     `tracker`, when given, files the tracking issue a new OUTAGE or a new
     lost-pods condition lacks before the message is rendered (so it can say
@@ -2115,6 +2120,23 @@ def coverage_lines(data: dict | None, now: datetime, store_path: pathlib.Path | 
         return []
 
 
+def filing_lines(location: str | None, now: datetime, runner=subprocess.run) -> list[str]:
+    """nightly_bugs.held_digest_lines over the filer's ``--state``: one line
+    while bug filing has been held for hours on an untrusted issue listing.
+    Imported here for the reason nightly_section is; any failure is a
+    warning and no line, never a lost digest."""
+    if not location:
+        return []
+    try:
+        from eval_dashboard import nightly_bugs
+
+        return nightly_bugs.held_digest_lines(nightly_bugs.read_held_state(location, runner), now)
+    except Exception:  # noqa: BLE001 -- the digest must still go out
+        traceback.print_exc()
+        log("warning: held bug-filing line skipped")
+        return []
+
+
 def parse_tz(name: str):
     try:
         return ZoneInfo(name)
@@ -2128,6 +2150,7 @@ def parse_args(argv):
     parser.add_argument("--state", required=True, help="last-posted state: local path or gs:// object (this script's only write)")
     parser.add_argument("--data", type=pathlib.Path, default=None, help="the collector's data.json; the digest then carries a section on last night's nightly run, or one line when the section cannot be built (unreadable: a warning and the digest says so)")
     parser.add_argument("--store", type=pathlib.Path, default=None, help="the store.json the tick read; the digest's coverage-gap lines then carry the evidence store's verdict on each domain's best candidate")
+    parser.add_argument("--bugs-state", default=None, help="the nightly bug filer's --state (local path or gs:// object); the digest then says when filing has been held for hours")
     parser.add_argument("--digest-hour", type=int, default=DEFAULT_DIGEST_HOUR, help="hour of the daily digest, in --digest-tz")
     parser.add_argument("--digest-tz", type=parse_tz, default=LOCAL_TZ, help=f"IANA zone the digest hour and day are read in (default {DEFAULT_TZ}); times in messages stay {DEFAULT_TZ} ({TZ_LABEL}) regardless")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO, help="owner/repo the tracking issue is filed in")
@@ -2171,7 +2194,9 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
         return nightly_section(data, now, gh, environ)
 
     def coverage():
-        return coverage_lines(data, now, args.store)
+        # The held-filing line rides with the coverage-gap lines: both are
+        # one-liners about a filer, read only on a digest tick.
+        return filing_lines(args.bugs_state, now, runner) + coverage_lines(data, now, args.store)
 
     prev = read_state(args.state, runner)
     state, messages, failed = run(health, prev, now, args.digest_hour, sender, args.dry_run, args.digest_tz, tracker, data, section, coverage)

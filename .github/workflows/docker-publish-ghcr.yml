@@ -254,6 +254,21 @@ jobs:
             ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/a2a-worker:latest', env.IMAGE_REPOSITORY) || '' }}
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/a2a-worker:${{ github.sha }}
 
+      # The cluster agent's persona image (#3658): the persona directory is
+      # the build context, and the image's /files is what a profile worker
+      # pod mounts at /persona.
+      - name: Build and Push Cluster Persona (GHCR)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: build-persona-cluster
+        with:
+          context: agents/cluster/persona
+          file: a2a/Dockerfile.persona-cluster
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/persona-cluster:latest', env.IMAGE_REPOSITORY) || '' }}
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/persona-cluster:${{ github.sha }}
+
       - name: Build and Push A2A Auth Callout (GHCR)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-a2a-authcallout
@@ -329,6 +344,7 @@ jobs:
           STOCKOUT_INVESTIGATOR_DIGEST: ${{ steps.build-stockout-investigator.outputs.digest }}
           A2A_GATEWAY_DIGEST: ${{ steps.build-a2a-gateway.outputs.digest }}
           A2A_WORKER_DIGEST: ${{ steps.build-a2a-worker.outputs.digest }}
+          PERSONA_CLUSTER_DIGEST: ${{ steps.build-persona-cluster.outputs.digest }}
           A2A_AUTHCALLOUT_DIGEST: ${{ steps.build-a2a-authcallout.outputs.digest }}
           A2A_CONSOLE_DIGEST: ${{ steps.build-a2a-console.outputs.digest }}
           A2A_VERIFIER_DIGEST: ${{ steps.build-a2a-verifier.outputs.digest }}
@@ -343,6 +359,7 @@ jobs:
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/gke-stockout-investigator@$STOCKOUT_INVESTIGATOR_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-gateway@$A2A_GATEWAY_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-worker@$A2A_WORKER_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/persona-cluster@$PERSONA_CLUSTER_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-authcallout@$A2A_AUTHCALLOUT_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-console@$A2A_CONSOLE_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/a2a-verifier@$A2A_VERIFIER_DIGEST"

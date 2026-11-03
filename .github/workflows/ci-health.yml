@@ -122,15 +122,20 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # NIGHTLY_BUGS_LIVE is `true` (a maintainer arms it after reading a few dry
 # runs) and CI_HEALTH_MUTE is not. It runs before the post, so the 11 AM
 # digest's nightly section (scripts/eval_dashboard/nightly_digest.py) reads
-# the issues it filed that tick. The section turns owners' GitHub logins
-# into Chat mentions through the CI_HEALTH_CHAT_MENTIONS secret (a JSON
-# object, login -> Chat user id); without it the logins print as text.
+# the issues it filed that tick. Armed, it counts the ticks it held for an
+# untrusted issue listing in nightly-bugs-state.json beside health.json, and
+# the digest says so once the hold has lasted about two hours. The section
+# turns owners' GitHub logins into Chat mentions through the
+# CI_HEALTH_CHAT_MENTIONS secret (a JSON object, login -> Chat user id);
+# without it the logins print as text.
 # A fourth, scripts/eval_dashboard/coverage_gaps.py, keeps one
 # `presubmit-gate` issue open per domain with no blocking roster seat,
 # assigned to the domain owner, and closes it when the domain is covered
 # again. It is armed by the same NIGHTLY_BUGS_LIVE / CI_HEALTH_MUTE switch
 # and needs no permission beyond issues: write. It opens no roster pull
-# request: this job holds no branch write path.
+# request: this job holds no branch write path. Before the render,
+# scripts/eval_dashboard/understudies.py writes the per-domain scorecard
+# the dashboard's domain view draws; it only reads GitHub.
 #
 # A second job, on its own hourly cron: the seeded-fleet scan (#1550). It
 # runs hack/fleet-kubeconfigs.sh and hack/fleet-fixture-state.py against
@@ -695,6 +700,22 @@ jobs:
             exit 1
           fi
 
+      # The per-domain scorecard the Cases page's domain view draws
+      # (scripts/eval_dashboard/understudies.py, docs/ci-health.md "The
+      # domain scorecard"): each domain's seat, days uncovered, open
+      # nightly-red issues and ranked understudies. It reads the
+      # nightly-red issues and writes nothing to GitHub. Best-effort: without
+      # work/scorecard.json the view says it was not computed.
+      - name: Rank each domain's understudies for the scorecard
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          store_args=()
+          [ -f work/store.json ] && store_args=(--store work/store.json)
+          python3 scripts/eval_dashboard/understudies.py --data work/data.json "${store_args[@]}" --out work/scorecard.json
+
       # Render with the verdict just taken and its history, the way
       # hack/ci-dashboard-refresh.sh does (`--health`, `--health-history`,
       # each passed only when the file exists). health.json is always there
@@ -713,6 +734,7 @@ jobs:
           # the Trend page says the store was not read this tick.
           [ -f work/store.json ] && render_args+=(--store work/store.json)
           [ -f work/store.json ] || echo "::warning::no store.json this tick; the Trend page renders as 'store not read'"
+          [ -f work/scorecard.json ] && render_args+=(--scorecard work/scorecard.json)
           # --public-url (bare) emits <base href> for the published site,
           # post_health.DASHBOARD_URL's directory, so the pages' links
           # resolve there whatever URL the console login lands on.
@@ -755,7 +777,9 @@ jobs:
         run: |
           mode=--dry-run
           if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
-          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json "$mode"
+          # --state counts the live ticks held on an untrusted issue listing,
+          # for the digest's held-filing line (post step, --bugs-state).
+          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json --state "$DASHBOARD_BUCKET/nightly-bugs-state.json" "$mode"
 
       # One `presubmit-gate` issue per domain with no blocking roster seat,
       # assigned to the domain owner, kept current, closed when a roster case
@@ -812,6 +836,7 @@ jobs:
             --health work/health.json \
             --data work/data.json \
             "${store_args[@]}" \
+            --bugs-state "$DASHBOARD_BUCKET/nightly-bugs-state.json" \
             --state "$DASHBOARD_BUCKET/health-state.json"
 
       # One comment per pull request whose smoke run went red, or lost its
