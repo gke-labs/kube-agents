@@ -114,7 +114,8 @@ check's `fixture_role:`, and a check naming a role the case does not list is rej
 one planted defect, one name, however the case refers to it. A project-scoped catalogue
 role (`cluster_slot: null`, a Compute Engine object such as `startup-fail-vm`) may appear in
 `fixtures:` but not in `fixture_role:` or `fixture_roles:`: the runner writes no kubeconfig
-and records no slot for it, and the validator refuses it there. Cases address fixtures by
+and records no slot for it, and the validator refuses it there in a case that is not in
+`FIXTURE_NOT_READY`. Cases address fixtures by
 role and never by cluster name or project id; `docs/designs/bench-fleet-catalog.md` is
 the contract for why.
 

@@ -9,9 +9,11 @@ case when one is not.
 
 **The role vocabulary is owned by `bench/tf/fleet/fixtures.json`**, which sits beside the
 Terraform that plants the fixtures and is what `hack/fleet-kubeconfigs.sh` resolves a role
-against at run time. `docs/designs/fleet-fixtures.yaml` is the machine-readable form of
-the rest of this document — the day-N gates below, and the project-scoped fixtures that
-have no cluster slot — and it may not rename a role: `scripts/validate_bench_cases.py`
+against at run time, the project-scoped `startup-fail-vm` and `world-open-ingress`
+included (`cluster_slot: null`). `docs/designs/fleet-fixtures.yaml` is the
+machine-readable form of the rest of this document — the day-N gates below, and
+`orphan-disks`, the one project-scoped fixture the catalog does not probe — and it may not
+rename a role: `scripts/validate_bench_cases.py`
 reads both and fails when they disagree about a slug or a slot. Object names in either are
 copied from `bench/tf/fleet/`, which remains the source of truth for all of them.
 

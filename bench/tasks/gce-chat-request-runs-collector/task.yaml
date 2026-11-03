@@ -21,7 +21,7 @@
 # `audit_report.py start` and `finish`, since a recoverable safeguard does
 # not gate.
 #
-# Fixture: the startup-fail-vm role (docs/designs/fleet-fixtures.yaml), the
+# Fixture: the startup-fail-vm role (bench/tf/fleet/fixtures.json), the
 # standalone VM startup-fail-<prefix> from bench/tf/fleet/main.tf
 # `google_compute_instance.startup_fail`. Its startup script exits 1 on every
 # boot, so the collector's gce-startup-script-status check (critical) flags
