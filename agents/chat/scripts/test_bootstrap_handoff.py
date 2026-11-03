@@ -593,7 +593,6 @@ class HandOffTest(unittest.TestCase):
         _board(self.board, clusters=[])
         sent, seen, minted = [], [], []
         origin = types.ModuleType("hermes_cli.kanban_origin")
-        origin.STAMP_TICKET_ENV = "KUBE_AGENTS_CARD_STAMP_TICKET"
 
         held = []
 
@@ -618,7 +617,6 @@ class HandOffTest(unittest.TestCase):
         self.assertEqual(h.CARD_ORIGIN, "chat")
         self.assertEqual(seen, ["t1cket"])
         self.assertNotIn("--origin", sent[0])
-        self.assertNotIn(origin.STAMP_TICKET_ENV, os.environ)
 
     def test_a_sweep_that_filed_no_cards_does_not_report_a_clean_fleet(self):
         # The live failure: a done sweep with no cluster cards at all.

@@ -81,7 +81,6 @@ WATCHER_SESSION_PREFIX = "k8s-evt-"
 # Bounds on what the origin and ledger routes store.
 ORIGIN_PLATFORM_MAX_CHARS = 64
 ORIGIN_JOB_ID_MAX_CHARS = 256
-ORIGIN_TASK_ID_MAX_CHARS = 64
 PROPOSAL_URL_MAX_CHARS = 2048
 PROPOSAL_OPENED_AT_MAX_CHARS = 64
 # The upward compression walk `_session_origin` takes, as
@@ -89,8 +88,8 @@ PROPOSAL_OPENED_AT_MAX_CHARS = 64
 ORIGIN_COMPRESSION_END_REASON = "compression"
 ORIGIN_COMPRESSION_WALK_MAX = 32
 ORIGIN_DB_TIMEOUT_SECONDS = 5.0
-# The board's origin stamp (`PUT /v1/board/tasks/{id}/origin`), a side table in
-# the kanban database that the first stamp wins.
+# The board's origin stamp (`_stamp_board_task_origin`, the drift backlog's
+# writer), a side table in the kanban database that the first stamp wins.
 KANBAN_TASK_ORIGINS_SCHEMA = """
     CREATE TABLE IF NOT EXISTS kanban_task_origins (
         task_id TEXT PRIMARY KEY,
@@ -101,10 +100,9 @@ KANBAN_TASK_ORIGINS_SCHEMA = """
 """
 # One-time stamp tickets (`POST /v1/board/stamp-tickets`): an in-pod writer that
 # knows its card's origin mints one with the pod's key and hands it to its
-# create through KUBE_AGENTS_CARD_STAMP_TICKET; the board's insert-time stamp
+# in-process create through a ContextVar; the board's insert-time stamp
 # (deploy/docker/patches/kanban_origin.py) redeems it once. The ticket is an
-# unguessable reference, not an origin, so a value planted in any environment
-# source is an unknown ticket. Minting needs this server's key on the agent
+# unguessable reference, not an origin. Minting needs this server's key on the agent
 # container's loopback, which the shell-sandbox pod, where the model's commands
 # run, has neither of (docs/credential-isolation-design.md, "The loopback-only
 # exception").
@@ -7478,6 +7476,22 @@ def put_session_origin(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     return {"origin": origin, "platform": platform}
 
 
+@app.get("/v1/sessions/{session_id}/origin", dependencies=[Depends(verify_api_key)])
+def get_session_origin(session_id: str) -> Dict[str, str]:
+    """The session's origin record, inherited through compression; 404 when none.
+
+    A mid-turn compression rotates the session id, and the child's row carries no
+    record, so a reader of the raw metadata row would resolve such a turn
+    `other`. `_session_origin` walks the compression parents. A walk that finds
+    no record answers 404, which the reader (deploy/docker/patches/kanban_origin.py)
+    takes as `other`, as it would a recorded `other`.
+    """
+    origin, platform = _session_origin(session_id)
+    if origin == ORIGIN_OTHER and not platform:
+        raise HTTPException(status_code=404, detail="the session has no origin record")
+    return {"origin": origin, "platform": platform}
+
+
 def _cron_job_origin(job_id: str) -> Optional[tuple[str, str]]:
     """The `(origin, platform)` recorded for a cron job id, or None."""
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
@@ -7559,33 +7573,6 @@ def get_proposals_opened_counts() -> Dict[str, Dict[str, int]]:
         if not counts[origin]:
             counts[origin][""] = 0
     return counts
-
-
-@app.put("/v1/board/tasks/{task_id}/origin", dependencies=[Depends(verify_api_key)])
-def put_board_task_origin(task_id: str, request_data: Dict[str, Any]) -> Dict[str, bool]:
-    """Stamp a card's origin in the board's side table; the first stamp wins.
-
-    No caller uses it today: the issue gate and the chat bootstrap pass their
-    origin to the insert itself through a one-time stamp ticket
-    (`POST /v1/board/stamp-tickets`), which stamps in the insert's transaction,
-    and the drift backlog, which runs in this server, calls the same write
-    (`_stamp_board_task_origin`) directly. It stays `INSERT OR IGNORE`, so it can never
-    replace a stamp. `stamped` is False when the card already carried a stamp.
-    It does not check that the card exists on the board, so a caller holding the
-    API key can stamp an id no card has yet.
-    """
-    if not task_id or len(task_id) > ORIGIN_TASK_ID_MAX_CHARS:
-        raise HTTPException(status_code=400, detail=f"task_id must be 1 to {ORIGIN_TASK_ID_MAX_CHARS} characters")
-    origin, platform = _origin_fields(request_data)
-    try:
-        stamped = _stamp_board_task_origin(task_id, origin, platform)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="the kanban board does not exist") from None
-    except ImportError as exc:
-        raise HTTPException(status_code=503, detail=f"Hermes' kanban module is not importable: {exc}") from None
-    except sqlite3.Error as exc:
-        raise HTTPException(status_code=503, detail=f"the kanban board could not be written: {exc}") from None
-    return {"stamped": stamped}
 
 
 def _stamp_board_task_origin(task_id: str, origin: str, platform: str) -> bool:

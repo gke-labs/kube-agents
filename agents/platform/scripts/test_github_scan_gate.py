@@ -606,7 +606,6 @@ class FileCardOriginTest(unittest.TestCase):
         self.assertEqual(minted, ["issue", "issue"])
         self.assertEqual([ticket for _, ticket in sent], ["ticket-1", "ticket-2"])
         self.assertNotIn("--origin", sent[0][0])
-        self.assertNotIn("KUBE_AGENTS_CARD_STAMP_TICKET", os.environ)
 
     def test_without_the_origin_module_the_card_still_files(self):
         sent = []

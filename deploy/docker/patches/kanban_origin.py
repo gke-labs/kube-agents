@@ -38,12 +38,14 @@ In this order, the first that applies:
    ``kanban_create`` and ``hermes kanban create`` pass ``HERMES_KANBAN_TASK``,
    the card the worker runs, as ``creator_task_id``; an auto-decomposed child
    passes its root. The child gets that card's stamp, or none when it has none.
-2. **A trusted writer's stamp ticket** (:data:`STAMP_TICKET_ENV`). See below.
+2. **A trusted writer's stamp ticket** (:func:`writer_ticket`). See below.
 3. **The creating turn's origin** (:func:`turn_origin`): a tick-started cron
    run's context (``tools.cron_run_scope.current_cron_origin``, when that
    Hermes has it); else the session record of the turn's trusted session id
    (``kanban_priority.trusted_origin_session``), read from the Session KV
-   server's ``GET /v1/sessions/{id}/metadata``; else ``console`` for a session
+   server's ``GET /v1/sessions/{id}/origin``, which follows a session id that
+   compression rotated back to the parent that holds the record; else
+   ``console`` for a session
    id the web console (``web-console-``) or the admin console's chat page
    (``portal_``) minted; else nothing.
 4. **The Hermes dashboard's create route** (``created_by="dashboard"``, which
@@ -78,27 +80,22 @@ create they mint a one-time ticket for their origin with
 ``POST /v1/board/stamp-tickets`` on the Session KV server (the pod's Session KV
 key) and hand it to that one create through a ``ContextVar``
 (:func:`writer_ticket`), never ``os.environ``, which is process-wide and would
-let a concurrent create in the same process redeem it. A subprocess caller
-would pass it in the child's :data:`STAMP_TICKET_ENV` instead; the seam reads
-the ``ContextVar`` first, then that variable. Before the insert's transaction,
-:func:`wrap_create_task` redeems it over loopback
+let a concurrent create in the same process redeem it. Before the insert's
+transaction, :func:`wrap_create_task` redeems it over loopback
 (``POST /v1/board/stamp-tickets/{ticket}/redeem``, also with the pod's key) and
 the insert stamps the origin the server returns, exactly and in the insert's
 own transaction. A ticket redeems once and expires after the server's
 ``STAMP_TICKET_TTL_SECONDS``.
 
-Why a ticket and not the origin itself: the variable's value is a random
-reference the server issued, not a claim. An environment variable is not a
-trusted channel here: Hermes loads ``$HERMES_HOME/.env``, which the agent can
-write, with ``override=True``, and other dotenv sources besides. A value
-planted in any of them is an unknown ticket; redeeming it fails, the variable
-is ignored, and the card takes the turn's origin as if it were absent. Minting
-a ticket that redeems needs the Session KV key and the agent container's own
+Why a ticket and not the origin itself: the ticket is a random reference the
+server issued, not a claim. Minting a ticket that redeems needs the Session KV
+key and the agent container's own
 loopback, which the gateway and the in-pod scripts have and the shell-sandbox
 pod, where the model's commands run (terminal, ``execute_code``, file tools),
 does not: see ``docs/credential-isolation-design.md``, "The loopback-only
 exception". Any failure to redeem (an unknown, spent or expired ticket, no key,
-the server down) falls back the same way. A model that schedules a shipped
+the server down) leaves the card to the turn's origin, as if there were no
+ticket. A model that schedules a shipped
 script through ``cronjob_manage`` (the issue gate, for example) re-runs a
 trusted writer with that writer's own fixed origin, not one it chooses.
 
@@ -131,8 +128,8 @@ ORIGIN_CONSOLE = "console"
 #: What an unstamped card, or an unresolved turn, reads as.
 NO_ORIGIN = (ORIGIN_OTHER, "")
 
-#: The board side table, the schema the Session KV server's
-#: ``PUT /v1/board/tasks/{id}/origin`` creates (``KANBAN_TASK_ORIGINS_SCHEMA``).
+#: The board side table, the schema the Session KV server's drift-backlog stamp
+#: creates (``KANBAN_TASK_ORIGINS_SCHEMA``).
 ORIGINS_TABLE = "kanban_task_origins"
 _TABLE_DDL = (
     f"CREATE TABLE IF NOT EXISTS {ORIGINS_TABLE} ("
@@ -157,20 +154,17 @@ CONSOLE_SESSION_PREFIXES = ("web-console-", "portal_")
 #: (``plugins/kanban/dashboard/plugin_api.py``) passes ``create_task``.
 DASHBOARD_CREATED_BY = "dashboard"
 
-#: Where a trusted writer hands its create a one-time stamp ticket.
-STAMP_TICKET_ENV = "KUBE_AGENTS_CARD_STAMP_TICKET"
-
 #: The Session KV server's loopback address and key, as ``kanban_notifier``
 #: spells them. The server binds 127.0.0.1 only.
 SESSION_KV_URL = "http://127.0.0.1:8699"
 SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
-SESSION_METADATA_PATH = "/v1/sessions/{session_id}/metadata"
+#: The session's origin record, inherited through compression; 404 when none.
+SESSION_ORIGIN_PATH = "/v1/sessions/{session_id}/origin"
 STAMP_TICKETS_PATH = "/v1/board/stamp-tickets"
 STAMP_TICKET_REDEEM_PATH = "/v1/board/stamp-tickets/{ticket}/redeem"
-#: Keys of the session record (``session_kv_server.ORIGIN_KEY`` and
-#: ``ORIGIN_PLATFORM_KEY``).
+#: Keys of the origin route's answer.
 ORIGIN_KEY = "origin"
-ORIGIN_PLATFORM_KEY = "origin_platform"
+ORIGIN_PLATFORM_KEY = "platform"
 #: A create waits at most this long for the session record. It runs before the
 #: insert's transaction, on a loopback call.
 SESSION_LOOKUP_TIMEOUT_SECONDS = 2.0
@@ -270,11 +264,15 @@ def _session_id() -> str:
     return priority.trusted_origin_session() or ""
 
 
-def _fetch_session_metadata(session_id: str) -> Optional[dict]:
-    """The session's record from the Session KV server, or None when it has none."""
+def _fetch_session_origin(session_id: str) -> Optional[dict]:
+    """The session's origin record from the Session KV server, or None when it has none.
+
+    ``GET /v1/sessions/{id}/origin`` walks compression parents, so a turn whose
+    id a mid-turn compression rotated still reads its root's record.
+    """
     token = (os.environ.get(SESSION_KV_KEY_ENV) or "").strip()
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    url = SESSION_KV_URL + SESSION_METADATA_PATH.format(
+    url = SESSION_KV_URL + SESSION_ORIGIN_PATH.format(
         session_id=urllib.parse.quote(session_id, safe="")
     )
     try:
@@ -293,7 +291,7 @@ def _fetch_session_metadata(session_id: str) -> Optional[dict]:
 
 
 def _record_origin(session_id: str) -> Optional[tuple[str, str]]:
-    meta = _fetch_session_metadata(session_id)
+    meta = _fetch_session_origin(session_id)
     if not meta:
         return None
     origin = meta.get(ORIGIN_KEY)
@@ -384,12 +382,11 @@ def writer_ticket(origin: str, platform: str = "") -> Iterator[Optional[str]]:
 def ticket_origin() -> Optional[tuple[str, str]]:
     """The origin this create's ticket carries, redeeming it; None otherwise.
 
-    The ticket is :func:`writer_ticket`'s ``ContextVar`` when set, else a
-    subprocess caller's :data:`STAMP_TICKET_ENV`. An unknown, spent or expired
-    ticket, a missing key or an unreachable server is None, as if there were
-    no ticket.
+    The ticket is :func:`writer_ticket`'s ``ContextVar``. An unknown, spent or
+    expired ticket, a missing key or an unreachable server is None, as if there
+    were no ticket.
     """
-    ticket = (_writer_ticket.get() or os.environ.get(STAMP_TICKET_ENV) or "").strip()
+    ticket = (_writer_ticket.get() or "").strip()
     if not ticket:
         return None
     try:
@@ -397,7 +394,7 @@ def ticket_origin() -> Optional[tuple[str, str]]:
             STAMP_TICKET_REDEEM_PATH.format(ticket=urllib.parse.quote(ticket, safe=""))
         )
     except Exception as exc:  # noqa: BLE001 — a planted or stale ticket changes nothing
-        logger.warning("kanban origin: ignoring %s, it did not redeem: %r", STAMP_TICKET_ENV, exc)
+        logger.warning("kanban origin: ignoring the stamp ticket, it did not redeem: %r", exc)
         return None
     origin, platform = answer.get("origin"), answer.get("platform") or ""
     if origin not in ORIGINS or origin == ORIGIN_OTHER or not isinstance(platform, str):

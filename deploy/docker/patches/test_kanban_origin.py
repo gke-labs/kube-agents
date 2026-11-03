@@ -241,7 +241,7 @@ class Hermes(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name in (kanban_origin.STAMP_TICKET_ENV, "HERMES_KANBAN_TASK", "HERMES_SESSION_ID"):
+        for name in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID"):
             os.environ.pop(name, None)
         _purge_hermes_modules()
         sys.path.insert(0, str(self.root))
@@ -258,7 +258,7 @@ class Hermes(unittest.TestCase):
         self.minted: list = []
         for name, fake in (
             ("_session_id", lambda: self.session),
-            ("_fetch_session_metadata", lambda sid: self.records.get(sid)),
+            ("_fetch_session_origin", lambda sid: self.records.get(sid)),
             ("_cron_origin", lambda: None),
             ("_session_kv", self._ticket_server),
         ):
@@ -284,7 +284,7 @@ class Hermes(unittest.TestCase):
 
     def in_chat_turn(self, platform="slack"):
         self.session = CHAT_SESSION
-        self.records[CHAT_SESSION] = {"origin": "chat", "origin_platform": platform}
+        self.records[CHAT_SESSION] = {"origin": "chat", "platform": platform}
 
     def create(self, **kwargs):
         kwargs.setdefault("title", "a card")
@@ -391,7 +391,6 @@ class StampAtInsertTest(Hermes):
         self.assertEqual(self.origin(pr_id), ("scheduled", ""))
         self.assertEqual(len(self.minted), 2, "one ticket per create")
         self.assertEqual(self.tickets, {}, "each ticket was spent by its insert")
-        self.assertNotIn(kanban_origin.STAMP_TICKET_ENV, os.environ, "the ticket does not outlive the call")
 
     def test_the_console_convention_resolves_portal_and_web_console_ids(self):
         ko = self.ko
@@ -418,28 +417,27 @@ class StampAtInsertTest(Hermes):
 
 
 class TicketTest(Hermes):
-    def test_a_planted_ticket_value_is_ignored(self):
+    def test_an_unknown_ticket_is_the_turns_origin(self):
         self.in_chat_turn()
         for planted in ("issue", "0" * 32, "drift:"):
             with self.subTest(planted=planted):
-                os.environ[kanban_origin.STAMP_TICKET_ENV] = planted
-                self.assertEqual(self.origin(self.slash("create --json --assignee platform x")), ("chat", "slack"))
-                self.assertEqual(self.origin(self.create()), ("chat", "slack"))
-        self.session = ""
-        self.assertFalse(self.stamped(self.slash("create --json --assignee platform no-turn")))
+                token = self.ko._writer_ticket.set(planted)
+                try:
+                    self.assertEqual(self.origin(self.slash("create --json --assignee platform x")), ("chat", "slack"))
+                finally:
+                    self.ko._writer_ticket.reset(token)
 
     def test_a_minted_ticket_stamps_once(self):
         self.in_chat_turn()
-        os.environ[kanban_origin.STAMP_TICKET_ENV] = self.ko.mint_ticket("drift")
-        first = self.slash("create --json --assignee platform first")
-        second = self.slash("create --json --assignee platform second")
+        with self.ko.writer_ticket("drift"):
+            first = self.slash("create --json --assignee platform first")
+            second = self.slash("create --json --assignee platform second")
         self.assertEqual(self.origin(first), ("drift", ""))
         self.assertEqual(self.origin(second), ("chat", "slack"), "a spent ticket is the turn's origin")
 
     def test_writer_ticket_never_touches_the_process_environment(self):
         with self.ko.writer_ticket("issue") as ticket:
             self.assertIsNotNone(ticket)
-            self.assertNotIn(kanban_origin.STAMP_TICKET_ENV, os.environ)
             card = self.slash("create --json --assignee platform gate")
         self.assertIsNone(self.ko._writer_ticket.get(), "reset after the call")
         self.assertEqual(self.origin(card), ("issue", ""))
@@ -479,7 +477,6 @@ class TicketTest(Hermes):
         with mock.patch.object(self.ko, "_session_kv", side_effect=OSError("refused")):
             with self.ko.writer_ticket("issue") as ticket:
                 self.assertIsNone(ticket)
-                self.assertNotIn(kanban_origin.STAMP_TICKET_ENV, os.environ)
                 card = self.slash("create --json --assignee platform x")
         self.assertFalse(self.stamped(card))
 
@@ -514,10 +511,10 @@ class ContractTest(Hermes):
                 seen.append(probe.in_transaction)
                 probe.execute("BEGIN IMMEDIATE")  # would fail under the insert's write lock
                 probe.execute("ROLLBACK")
-            return {"origin": "chat", "origin_platform": "slack"}
+            return {"origin": "chat", "platform": "slack"}
 
         self.session = CHAT_SESSION
-        with mock.patch.object(self.ko, "_fetch_session_metadata", side_effect=lookup):
+        with mock.patch.object(self.ko, "_fetch_session_origin", side_effect=lookup):
             self.assertEqual(self.origin(self.create()), ("chat", "slack"))
         self.assertEqual(seen, [False])
 
@@ -550,7 +547,22 @@ class ContractTest(Hermes):
 
 
 class SessionRecordTest(unittest.TestCase):
-    """The HTTP read, with the real ``_fetch_session_metadata``."""
+    """The HTTP read, with the real ``_fetch_session_origin``."""
+
+    @staticmethod
+    def _ticket(value):
+        """``value`` as :func:`writer_ticket`'s ContextVar for the block."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def held():
+            token = kanban_origin._writer_ticket.set(value)
+            try:
+                yield
+            finally:
+                kanban_origin._writer_ticket.reset(token)
+
+        return held()
 
     def _answer(self, status=200, body=b"{}"):
         import io
@@ -567,11 +579,11 @@ class SessionRecordTest(unittest.TestCase):
 
     def test_the_record_is_read_with_the_pods_key(self):
         with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), self._answer(
-            body=b'{"origin": "chat", "origin_platform": "slack", "chat_id": "c"}'
+            body=b'{"origin": "chat", "platform": "slack"}'
         ) as urlopen:
             self.assertEqual(kanban_origin._record_origin("s/1"), ("chat", "slack"))
         request = urlopen.call_args.args[0]
-        self.assertEqual(request.full_url, "http://127.0.0.1:8699/v1/sessions/s%2F1/metadata")
+        self.assertEqual(request.full_url, "http://127.0.0.1:8699/v1/sessions/s%2F1/origin")
         self.assertEqual(request.get_header("Authorization"), "Bearer k")
 
     def test_a_timed_out_session_lookup_still_reaches_the_console_convention(self):
@@ -585,19 +597,19 @@ class SessionRecordTest(unittest.TestCase):
             ), mock.patch.object(kanban_origin, "_cron_origin", return_value=None), mock.patch.object(
                 kanban_origin.urllib.request, "urlopen", side_effect=failure
             ):
-                self.assertIsNone(kanban_origin._fetch_session_metadata(session))
+                self.assertIsNone(kanban_origin._fetch_session_origin(session))
                 self.assertEqual(kanban_origin.turn_origin(), ("console", ""))
 
     def test_a_failing_cron_scope_does_not_skip_the_session_lookup(self):
         scope = SimpleNamespace(current_cron_origin=mock.Mock(side_effect=RuntimeError("broken")))
         with mock.patch.object(kanban_origin, "_first_module", return_value=scope), mock.patch.object(
             kanban_origin, "_session_id", return_value="s"
-        ), mock.patch.object(kanban_origin, "_fetch_session_metadata", return_value={"origin": "chat"}):
+        ), mock.patch.object(kanban_origin, "_fetch_session_origin", return_value={"origin": "chat"}):
             self.assertIsNone(kanban_origin._cron_origin())
             self.assertEqual(kanban_origin.turn_origin(), ("chat", ""))
         with mock.patch.object(kanban_origin, "_cron_origin", side_effect=RuntimeError("worse")), mock.patch.object(
             kanban_origin, "_session_id", return_value="portal_x"
-        ), mock.patch.object(kanban_origin, "_fetch_session_metadata", return_value=None):
+        ), mock.patch.object(kanban_origin, "_fetch_session_origin", return_value=None):
             self.assertEqual(kanban_origin.turn_origin(), ("console", ""))
 
     def test_no_record_and_an_other_record_are_unresolved(self):
@@ -608,12 +620,65 @@ class SessionRecordTest(unittest.TestCase):
         with self._answer(body=b'{"chat_id": "c"}'):
             self.assertIsNone(kanban_origin._record_origin("s"))
 
+    def test_the_reader_asks_the_origin_route_which_follows_compression(self):
+        # A loopback server shaped like the Session KV server: the origin route
+        # answers a compression child with its parent's record (the server's
+        # `_session_origin` walk); the child's own metadata row has none.
+        import http.server
+        import threading
+
+        answers = {"/v1/sessions/child-1/origin": {"origin": "event", "platform": ""}}
+        metadata = {"/v1/sessions/child-1/metadata": {"chat_id": "c"}}
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - the stdlib's name
+                seen.append((self.path, self.headers.get("Authorization")))
+                body = answers.get(self.path) or metadata.get(self.path)
+                if body is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                payload = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        with mock.patch.object(kanban_origin, "SESSION_KV_URL", url), \
+                mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}):
+            self.assertEqual(kanban_origin._record_origin("child-1"), ("event", ""))
+            self.assertIsNone(kanban_origin._record_origin("nobody"), "a 404 is no record")
+        self.assertEqual(
+            seen,
+            [("/v1/sessions/child-1/origin", "Bearer k"), ("/v1/sessions/nobody/origin", "Bearer k")],
+        )
+
+    def test_a_stale_process_env_session_is_no_turn(self):
+        # Hermes writes HERMES_SESSION_ID process-wide for every root agent;
+        # outside a bound turn it names the last turn, so it is never read.
+        with mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "20261103_090000_lastturn"}), \
+                mock.patch.object(kanban_origin, "_cron_origin", return_value=None), \
+                mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
+            self.assertEqual(kanban_origin._session_id(), "")
+            self.assertEqual(kanban_origin.turn_origin(), ("other", ""))
+        urlopen.assert_not_called()
+
     def test_an_absent_cron_scope_is_no_run(self):
         with mock.patch.object(kanban_origin, "_first_module", return_value=None):
             self.assertIsNone(kanban_origin._cron_origin())
 
     def test_a_ticket_is_redeemed_over_loopback_with_the_pods_key(self):
-        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k", kanban_origin.STAMP_TICKET_ENV: "ab"}), \
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), self._ticket("ab"), \
                 self._answer(body=b'{"origin": "issue", "platform": ""}') as urlopen:
             self.assertEqual(kanban_origin.ticket_origin(), ("issue", ""))
         request = urlopen.call_args.args[0]
@@ -622,17 +687,23 @@ class SessionRecordTest(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer k")
 
     def test_an_unredeemable_ticket_is_no_ticket(self):
-        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k", kanban_origin.STAMP_TICKET_ENV: "ab"}):
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), self._ticket("ab"):
             with self._answer(status=404):
                 self.assertIsNone(kanban_origin.ticket_origin())
             with mock.patch.object(kanban_origin.urllib.request, "urlopen", side_effect=OSError("down")):
                 self.assertIsNone(kanban_origin.ticket_origin())
             with self._answer(body=b'{"origin": "other"}'):
                 self.assertIsNone(kanban_origin.ticket_origin())
-        env = {kanban_origin.STAMP_TICKET_ENV: "ab"}
-        with mock.patch.dict(os.environ, env), mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
+        with mock.patch.dict(os.environ), self._ticket("ab"), \
+                mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
             os.environ.pop(kanban_origin.SESSION_KV_KEY_ENV, None)
             self.assertIsNone(kanban_origin.ticket_origin(), "no key, no redemption")
+        urlopen.assert_not_called()
+
+    def test_a_ticket_in_the_process_environment_is_not_read(self):
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k", "KUBE_AGENTS_CARD_STAMP_TICKET": "ab"}), \
+                mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
+            self.assertIsNone(kanban_origin.ticket_origin())
         urlopen.assert_not_called()
 
     def test_minting_never_raises(self):

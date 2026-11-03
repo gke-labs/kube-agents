@@ -290,7 +290,7 @@ class PrOpenedTest(unittest.TestCase):
         cron = types.ModuleType("cron_run_scope")
         priority = types.ModuleType("kanban_priority")
         state = {"card": ("audit", ""), "cron": ("scheduled", ""), "session": "sess-1", "record": None}
-        state["record"] = {"origin": "chat", "origin_platform": "slack"}
+        state["record"] = {"origin": "chat", "platform": "slack"}
         cron.current_cron_origin = lambda: state["cron"]
         priority.trusted_origin_session = lambda: state["session"]
         modules = {
@@ -306,7 +306,7 @@ class PrOpenedTest(unittest.TestCase):
         ]
         with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {plugin.TASK_ENV: TASK}, clear=True), \
                 mock.patch.object(origins, "origin_of", lambda conn, task_id: state["card"]), \
-                mock.patch.object(origins, "_fetch_session_metadata", lambda session_id: state["record"]):
+                mock.patch.object(origins, "_fetch_session_origin", lambda session_id: state["record"]):
             for change, want in steps:
                 state.update(change)
                 with self.subTest(**{key: str(value) for key, value in change.items()}):

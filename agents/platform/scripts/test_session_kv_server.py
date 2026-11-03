@@ -1297,11 +1297,11 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/tasks", None),
         ("GET", "/v1/tasks/t-1", None),
         ("PUT", "/v1/sessions/sess-1/origin", {"origin": "chat", "platform": "slack"}),
+        ("GET", "/v1/sessions/sess-1/origin", None),
         ("PUT", "/v1/cron/jobs/j-1/origin", {"origin": "chat", "platform": "slack"}),
         ("GET", "/v1/cron/jobs/j-1/origin", None),
         ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
         ("GET", "/v1/proposals/opened/counts", None),
-        ("PUT", "/v1/board/tasks/t-1/origin", {"origin": "chat", "platform": "slack"}),
         ("POST", "/v1/board/stamp-tickets", {"origin": "issue"}),
         ("POST", "/v1/board/stamp-tickets/tk-1/redeem", None),
     )
@@ -11440,7 +11440,6 @@ class TestDriftBacklog(unittest.TestCase):
         ), patch.object(session_kv_server, "_hermes_kanban", return_value=(None, None)):
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         env = run.call_args.kwargs["env"]
-        self.assertNotIn("KUBE_AGENTS_CARD_STAMP_TICKET", env)
         self.assertNotIn("KUBE_AGENTS_CARD_ORIGIN", env)
         self.assertFalse([a for a in run.call_args.args[0] if "origin" in a.lower()], "no origin argument")
         with closing_state(board) as conn:
@@ -12497,6 +12496,33 @@ class TestProposalOrigin(unittest.TestCase):
             self.assertEqual(session_kv_server._session_origin("orig-branch"), ("other", ""))
             self.assertEqual(session_kv_server._session_origin("orig-nobody"), ("other", ""))
 
+    def test_get_origin_route_answers_through_compression(self):
+        # A mid-turn compression rotates the session id; the child's row has no
+        # record, so the route answers the parent's.
+        state_db = self.tmp / "state.db"
+        with closing_state(state_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('a2a-route-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('a2a-route-child', 'a2a-route-root', NULL);
+                """
+            )
+        session_kv_server._set_session_origin("a2a-route-root", "chat", "slack")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(state_db)):
+            child = self.client.get("/v1/sessions/a2a-route-child/origin")
+            self.assertEqual(child.status_code, 200, child.text)
+            self.assertEqual(child.json(), {"origin": "chat", "platform": "slack"})
+            self.assertEqual(self.client.get("/v1/sessions/a2a-route-root/origin").json(), {"origin": "chat", "platform": "slack"})
+
+    def test_get_origin_route_is_404_without_a_record_and_401_without_the_key(self):
+        from fastapi.testclient import TestClient
+
+        self.assertEqual(self.client.get("/v1/sessions/a2a-route-nobody/origin").status_code, 404)
+        session_kv_server._set_session_origin("a2a-route-keyed", "event")
+        self.assertEqual(self.client.get("/v1/sessions/a2a-route-keyed/origin").json(), {"origin": "event", "platform": ""})
+        self.assertEqual(TestClient(session_kv_server.app).get("/v1/sessions/a2a-route-keyed/origin").status_code, 401)
+
     def test_put_origin_route_refuses_a_second_record_with_409(self):
         sid = "a2a-origin-route"
         first = self.client.put(f"/v1/sessions/{sid}/origin", json={"origin": "chat", "platform": "slack"})
@@ -12632,12 +12658,8 @@ class TestProposalOrigin(unittest.TestCase):
         with patch.object(session_kv_server, "KANBAN_DB_PATH", str(board)), patch.object(
             session_kv_server, "_hermes_kanban", return_value=(None, None)
         ):
-            first = self.client.put("/v1/board/tasks/t_abc/origin", json={"origin": "chat", "platform": "slack"})
-            self.assertEqual(first.status_code, 200, first.text)
-            self.assertEqual(first.json(), {"stamped": True})
-            second = self.client.put("/v1/board/tasks/t_abc/origin", json={"origin": "issue"})
-            self.assertEqual(second.json(), {"stamped": False})
-            self.assertEqual(self.client.put("/v1/board/tasks/t_abc/origin", json={"origin": "eval"}).status_code, 400)
+            self.assertTrue(session_kv_server._stamp_board_task_origin("t_abc", "chat", "slack"))
+            self.assertFalse(session_kv_server._stamp_board_task_origin("t_abc", "issue", ""))
         with closing_state(board) as conn:
             rows = conn.execute("SELECT task_id, origin, origin_platform FROM kanban_task_origins").fetchall()
         self.assertEqual(rows, [("t_abc", "chat", "slack")])
