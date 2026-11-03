@@ -1453,6 +1453,7 @@ TIMEOUT_RC = collector_run.TIMEOUT_RC
 default_run = functools.partial(collector_run.default_run, timeout=GCLOUD_TIMEOUT_S)
 paged_dump = collector_run.paged_dump
 paged_command_text = collector_run.paged_command_text
+failed_page_text = collector_run.failed_page_text
 
 
 RunFn = Callable[..., Run]
@@ -1476,16 +1477,21 @@ def run_json(argv: list[str], *, run: RunFn, timeout: int = GCLOUD_TIMEOUT_S, en
 def paged_json(kinds: str, query: dict[str, str] | None, *, run: RunFn, timeout: int, env: dict | None) -> tuple[list | None, str | None]:
     """`run_json` for a kubectl read: the kinds read one at a time in pages, the
     merged items, or the error that stands for them, worded as `run_json`
-    words a failed `kubectl get <kinds>` so the read's name and rc still lead.
-    A page that exited 0 and still failed carries the paged reader's own reason
+    words a failed read so the rc still leads. The command named is the page
+    that failed (`collector_run.failed_page_text`, a later page's `continue`
+    token elided), not the read's kind list: a multi-kind read's list does not
+    say which kind's page failed, and a failed read's command is recorded
+    nowhere else (the manifest's `commands` carry successful reads only). A
+    page that exited 0 and still failed carries the paged reader's own reason
     (empty, not JSON, not a list, a repeated token) in its stderr, so that is
     what the error quotes."""
     parsed, result = paged_dump(kinds.split(","), run=run, query=query, timeout=timeout, env=env)
     if parsed is not None:
         return parsed.get("items") or [], None
+    page = failed_page_text(result.argv)
     if result.rc != 0:
-        return None, f"kubectl get {kinds} rc={result.rc}: {_excerpt(result)}"
-    return None, f"kubectl get {kinds} failed: {_excerpt(result)}"
+        return None, f"{page} rc={result.rc}: {_excerpt(result)}"
+    return None, f"{page} failed: {_excerpt(result)}"
 
 
 # --------------------------------------------------------------------------- #
