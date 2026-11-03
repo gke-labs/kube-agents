@@ -2742,8 +2742,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``exempt_patterns``: each removes the text it matches from a command,
     and only that text, before the forbidden list reads it; whatever the
     match did not cover stays on the line and is graded. A command an
-    exemption touched is left out of the required list altogether, and the
-    reason says how many were. For a command that can fetch and send nothing
+    exemption touched is left out of the required list altogether, a logged
+    card's typed call in the required read included, and the reason says how
+    many were. For a command that can fetch and send nothing
     but carries a forbidden word as its argument: a worker told the helper
     holds no token may ``grep`` for the word before running it, and a case
     that exempts the ``grep`` invocation through its pattern argument, on a
@@ -2941,7 +2942,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # typed, a call that repeats a row verbatim excepted. The forbidden set
                 # keeps the rows: a typed heredoc splits into one argv per line, so a
                 # command written into a file and never run would read as a forbidden
-                # run, and an exemption is written against the rendering.
+                # run, and an exemption is written against the rendering. An exemption
+                # still takes an exempt call out of the required read, as it does a row.
                 if self.required_patterns or self.required_runs:
                     rows = set(logged_commands)
                     beside_rows = [command for card, _, command, _, _ in calls if card in logged and command not in rows]
