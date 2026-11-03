@@ -860,12 +860,14 @@ METRICS_CONNECTION_DEADLINE_SECONDS = 10
 # recent Linux kernel, 1024 inside a gVisor sandbox, so the queue is at most
 # this size and never less.
 LISTEN_BACKLOG = 4096
-# How long the credentialed handler holds an idle keep-alive connection open
-# for its next request before closing it. Envoy, the only client, closes an
-# idle upstream connection at the shorter timeout in
+# How long the credentialed handler and the agent API door hold an idle
+# keep-alive connection open for its next request before closing it, and so
+# the longest a connection that sends nothing holds a thread under the cap
+# below. Envoy, the credentialed listener's only client, closes an idle
+# upstream connection at the shorter timeout in
 # deploy/shared/envoy-credential-proxy.yaml, so the side that sends on a
 # connection is never the side that just closed it; this is the backstop for
-# a peer that does not.
+# a peer that does not, and the door's peers are under no such discipline.
 KEEPALIVE_IDLE_SECONDS = 60
 # How the stdlib's handle_one_request reports the socket timeout to
 # log_error ("Request timed out: %r"); the handler's log_error recognises an
@@ -892,12 +894,17 @@ THREAD_CAP_REFUSAL = (
     "Connection: close\r\n"
     "\r\n"
 ).encode("ascii")
-# The accept loop writes that refusal itself and then reads what the peer
-# sent until the peer closes: a socket closed with unread bytes in it resets
-# the peer, and the reset discards the 503 before the peer reads it. A peer
-# that neither closes nor stops sending holds the accept loop no longer than
-# this; Envoy, the client the cap is for, closes on reading the answer.
+# The refusal is written and then what the peer sent is read until the peer
+# closes: a socket closed with unread bytes in it resets the peer, and the
+# reset discards the 503 before the peer reads it. That wait is never the
+# accept loop's: each refusal runs on a short-lived thread of its own, at
+# most this long, and at most THREAD_CAP_REFUSAL_THREADS of them at once;
+# a refused connection past that many is closed at once, unanswered, which
+# only a peer that holds its refused connections open brings about. Envoy,
+# the client the cap is for, closes on reading the answer, so its refusal
+# thread lives a millisecond.
 THREAD_CAP_REFUSAL_SECONDS = 0.5
+THREAD_CAP_REFUSAL_THREADS = 16
 THREAD_CAP_DRAIN_CHUNK_BYTES = 64 * 1024
 # How often the cap writes a line while it is being hit: one ALERT when an
 # episode starts, then at most one per interval carrying the count refused
@@ -1353,8 +1360,11 @@ class ThreadCap(ConnectionCap):
 
     A peer past the cap is written THREAD_CAP_REFUSAL, a complete 503 with a
     Retry-After, and closed; Envoy relays that answer to the caller, where a
-    bare close would be a reset. The cap is MAX_THREADS_ENV, read once by
-    serve(); a test passes ``max_threads`` directly. The log carries one
+    bare close would be a reset. The write and the drain behind it run on a
+    short-lived thread, one per refusal and at most
+    THREAD_CAP_REFUSAL_THREADS at once, so a peer that holds its refused
+    connection open never holds the accept loop. The cap is MAX_THREADS_ENV,
+    read once by serve(); a test passes ``max_threads`` directly. The log carries one
     ALERT when the cap is first reached, at most one line per
     THREAD_CAP_LOG_INTERVAL_SECONDS while it keeps being reached, and one
     when an interval has passed without a refusal; never one per refused
@@ -1373,6 +1383,7 @@ class ThreadCap(ConnectionCap):
         self._refused_logged_at: float | None = None
         self._last_refusal_at = 0.0
         self._refused_lock = threading.Lock()
+        self._refusal_slots = threading.BoundedSemaphore(THREAD_CAP_REFUSAL_THREADS)
         cap = self.max_threads if max_threads is None else max_threads
         super().__init__(*args, cap=cap, **kwargs)
 
@@ -1396,6 +1407,24 @@ class ThreadCap(ConnectionCap):
                 MAX_THREADS_ENV,
                 refused,
             )
+        if not self._refusal_slots.acquire(blocking=False):
+            LOGGER.debug(
+                "thread cap refusal closed unanswered: %d refusals already waiting on their peers",
+                THREAD_CAP_REFUSAL_THREADS,
+            )
+            self.shutdown_request(request)
+            return
+        try:
+            threading.Thread(
+                target=self._deliver_refusal, args=(request,), daemon=True, name="thread-cap-refusal"
+            ).start()
+        except RuntimeError as exc:
+            self._refusal_slots.release()
+            LOGGER.debug("thread cap refusal closed unanswered type=%s", type(exc).__name__)
+            self.shutdown_request(request)
+
+    def _deliver_refusal(self, request: Any) -> None:
+        """Write THREAD_CAP_REFUSAL, wait for the peer's close, close; on a thread of its own."""
         deadline = time.monotonic() + THREAD_CAP_REFUSAL_SECONDS
         try:
             request.settimeout(THREAD_CAP_REFUSAL_SECONDS)
@@ -1410,7 +1439,9 @@ class ThreadCap(ConnectionCap):
                     break
         except OSError as exc:
             LOGGER.debug("thread cap refusal not delivered type=%s", type(exc).__name__)
-        self.shutdown_request(request)
+        finally:
+            self._refusal_slots.release()
+            self.shutdown_request(request)
 
     def connection_released(self) -> None:
         # The episode is over once an interval has passed with no refusal;
@@ -4488,7 +4519,17 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         # The guard the credentialed and metrics handlers carry: a peer that
         # resets while its request line is read, or while a 401 is on its
         # way, is a debug line and a closed connection, not a handler fault
-        # for the server's error hook to log with a traceback.
+        # for the server's error hook to log with a traceback. The idle
+        # timeout is armed before the request line is read, as the
+        # credentialed handler arms it: the door's peers are every pod in
+        # the namespace, and a connection that sends nothing would otherwise
+        # hold its thread, and its slot under the thread cap, for as long as
+        # the peer kept it open. The stdlib reports the timeout through
+        # log_error and closes; every served response here says
+        # `Connection: close`, so a kept-open connection is only ever one
+        # that has not sent a request.
+        with contextlib.suppress(OSError):
+            self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
         try:
             super().handle_one_request()
         except OSError as exc:
@@ -12768,7 +12809,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
             self.send_header("Allow", API_RELAY_POST)
             self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._end_headers()
             return
         if self.path.startswith("/v1/chat/slack/events"):
             if self.slack_relay is None:
@@ -13713,7 +13754,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if upstream.content_type:
             self.send_header("Content-Type", sanitize_header(upstream.content_type))
         self.send_header("Content-Length", str(len(upstream.body)))
-        self.end_headers()
+        self._end_headers()
         self.wfile.write(upstream.body)
 
     def _handle_mcp_relay(self) -> None:
@@ -13876,7 +13917,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if reply_body:
             self.send_header("Content-Type", MCP_RELAY_CONTENT_TYPE)
         self.send_header("Content-Length", str(len(reply_body)))
-        self.end_headers()
+        self._end_headers()
         self.wfile.write(reply_body)
 
     def _handle_watcher_gcp(self) -> None:
@@ -14026,7 +14067,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if upstream.content_type:
             self.send_header("Content-Type", sanitize_header(upstream.content_type))
         self.send_header("Content-Length", str(len(relayed)))
-        self.end_headers()
+        self._end_headers()
         self.wfile.write(relayed)
 
     def _watcher_cluster_endpoint(self, target: dict[str, str], request_id: str) -> tuple[str, str] | None:
@@ -15049,6 +15090,24 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return True
         return consumed - start < self._body_length
 
+    def _end_headers(self) -> None:
+        """end_headers, saying `Connection: close` first when the body is unread.
+
+        Every response that goes through here is framed by a Content-Length,
+        so the peer takes the connection as reusable unless told otherwise. A
+        response written over a body no route read (a 401, 403 or 413 on a
+        POST, a GET carrying a body, a chunked body) closes with the answer,
+        so the unread bytes are never parsed as the next request; and the
+        close is announced in the response rather than found afterwards,
+        because Envoy returns a reusable connection to its pool the moment
+        the response is complete and may dispatch another caller's request
+        onto it before an unannounced close arrives. send_header sets
+        close_connection on seeing the header.
+        """
+        if self._body_unread():
+            self.send_header("Connection", "close")
+        self.end_headers()
+
     def handle_one_request(self) -> None:
         # Counted in flight from here until its answer is written, for the
         # broker's drain (install_shutdown_handler); _refused_while_draining
@@ -15063,7 +15122,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # written, and _json guards its own writes. The idle timeout is armed
         # here, before the request line is read, so the same bound holds for
         # the first request and for every one a kept-open connection carries
-        # after it; a route that changed the timeout has it put back.
+        # after it; a route that changed the timeout has it put back. The
+        # path is cleared here too: the stdlib's parse_request resets the
+        # command and never the path, so on a kept-open connection a request
+        # line it rejects (a 400, a 414, a 431) would otherwise be counted
+        # by log_request under the previous request's route.
+        self.path = ""
         with contextlib.suppress(OSError):
             self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
         try:
@@ -15075,9 +15139,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         finally:
             self._leave_in_flight()
         if not self.close_connection and self._body_unread():
-            # A route that wrote its response directly, without _json, over a
-            # body it never read: the connection is closed rather than the
-            # body parsed as the next request.
+            # The last resort for a response written over a body no route
+            # read without going through _end_headers, which announces the
+            # close in the response: closing here is unannounced, and a peer
+            # may already have dispatched onto the connection, so every
+            # direct write goes through _end_headers and this should not fire.
             self.close_connection = True
 
     def _leave_in_flight(self) -> None:
@@ -15181,9 +15247,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # the 401 an unauthenticated caller gets, the relay's direct writes and
         # every _json() alike -- so it is the one place the request counter
         # sees them all. The label is the route family the path falls in,
-        # never the path: the path is caller text. The path is absent when the
-        # request line itself could not be parsed, and that response counts
-        # under LABEL_OTHER like any other unclaimed one.
+        # never the path: the path is caller text. The path is empty when the
+        # request line itself could not be parsed (handle_one_request clears
+        # it before each request), and that response counts under LABEL_OTHER
+        # like any other unclaimed one.
         status_code = str(int(code)) if isinstance(code, int) else str(code)
         family = _endpoint_label(getattr(self, "path", ""))
         self.metrics.record_request(family, status_code)
@@ -15238,13 +15305,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # The one extra header any route sends is Retry-After, a number.
             for name, value in (headers or {}).items():
                 self.send_header(name, value)
-            if self._body_unread():
-                # A refusal written before the body was read (a 401, a 403, a
-                # 413): the connection closes with the answer, so the unread
-                # body is never parsed as the next request. send_header sets
-                # close_connection on seeing this header.
-                self.send_header("Connection", "close")
-            self.end_headers()
+            self._end_headers()
             self.wfile.write(body)
         except OSError as exc:
             LOGGER.warning(

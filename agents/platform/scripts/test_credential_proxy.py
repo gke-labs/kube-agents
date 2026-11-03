@@ -213,6 +213,32 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.upstream.server_close()
         self.workspace_dir.cleanup()
 
+    def test_a_silent_connection_to_the_door_is_closed_at_the_idle_timeout_and_frees_its_slot(self):
+        # The door shares the capped server classes: a peer that connects and
+        # sends nothing must give its thread, and its slot under the cap,
+        # back at KEEPALIVE_IDLE_SECONDS rather than hold them for as long as
+        # it keeps the connection open.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            door = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), AgentAPIProxyHandler, max_threads=1)
+            threading.Thread(target=door.serve_forever, daemon=True).start()
+            self.addCleanup(door.server_close)
+            self.addCleanup(door.shutdown)
+            silent = socket.create_connection(("127.0.0.1", door.server_port), timeout=_CLOSE_WAIT_SECONDS)
+            self.addCleanup(silent.close)
+            time.sleep(_RESET_SETTLE_SECONDS)
+            # The one slot is held: the next connection is refused with the cap's 503.
+            with socket.create_connection(("127.0.0.1", door.server_port), timeout=_CLOSE_WAIT_SECONDS) as refused:
+                response = http.client.HTTPResponse(refused)
+                response.begin()
+                self.assertEqual(503, response.status)
+            self.assertEqual(b"", silent.recv(1), "the silent connection was not closed")
+            time.sleep(_RESET_SETTLE_SECONDS)
+            # The slot is back: a request is served.
+            connection = http.client.HTTPConnection("127.0.0.1", door.server_port, timeout=_CLOSE_WAIT_SECONDS)
+            self.addCleanup(connection.close)
+            connection.request("GET", "/health", headers={"Authorization": "Bearer external-secret"})
+            self.assertEqual(200, connection.getresponse().status)
+
     def _seed_state_db_sessions(self, rows, profile=None):
         import sqlite3
 
@@ -15618,6 +15644,10 @@ _REFUSAL_BURST = 3
 # The small cap the saturation test builds its server with.
 _SMALL_THREAD_CAP = 4
 _KEEPALIVE_REQUESTS = 5
+# A refusal drain made longer than the close wait: a test that reads a
+# second refusal inside the close wait while a first drain is parked for this
+# long shows the accept loop was not the thread doing the waiting.
+_LONG_REFUSAL_DRAIN_SECONDS = 2 * _CLOSE_WAIT_SECONDS
 
 
 class _CredentialedUnixServer(unittest.TestCase):
@@ -15777,6 +15807,28 @@ class KeepAliveTest(_CredentialedUnixServer):
         self.assertEqual("close", headers.get("connection", "").lower(), (status, headers))
         self.assertTrue(self.closed_by_server(sock))
 
+    def test_a_rejected_request_line_on_a_kept_open_connection_counts_under_other(self):
+        # The stdlib resets the command and never the path on a parse failure,
+        # so without the handler clearing it a bad second request line would
+        # be counted under the first request's route.
+        metrics = credential_proxy.ProxyMetrics()
+        with mock.patch.object(CredentialProxyHandler, "metrics", metrics):
+            sock = self.connect()
+            self.send(sock, "GET", "/healthz")
+            self.assertEqual(200, self.response(sock)[0])
+            # Four words with a version the stdlib accepts, so the 400 is a
+            # framed HTTP/1.1 response (a line it reads as HTTP/0.9 is
+            # answered body-only, with no status line to read back).
+            sock.sendall(b"GET /healthz extra HTTP/1.1\r\n\r\n")
+            status, headers, _ = self.response(sock)
+        self.assertEqual(400, status)
+        self.assertEqual("close", headers.get("connection", "").lower(), headers)
+        self.assertTrue(self.closed_by_server(sock))
+        self.assertEqual(
+            {(credential_proxy.HEALTHZ_PATH, "200"): 1, (credential_proxy.LABEL_OTHER, "400"): 1},
+            metrics._requests,
+        )
+
     def test_an_idle_connection_is_closed_at_the_timeout(self):
         with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
             sock = self.connect()
@@ -15806,9 +15858,9 @@ class KeepAliveTest(_CredentialedUnixServer):
 
 
 class ThreadCapTest(_CredentialedUnixServer):
-    """Connections past CREDENTIAL_PROXY_MAX_THREADS are answered a 503 on the
-    accept loop's thread and closed; none spends a handler thread, and the
-    health-only listener answers meanwhile."""
+    """Connections past CREDENTIAL_PROXY_MAX_THREADS are answered a 503 on a
+    short-lived thread of their own and closed; none spends a handler thread
+    or holds the accept loop, and the health-only listener answers meanwhile."""
 
     def max_threads(self):
         return _SMALL_THREAD_CAP
@@ -15863,6 +15915,42 @@ class ThreadCapTest(_CredentialedUnixServer):
         served = self.connect()
         self.send(served, "GET", "/healthz")
         self.assertEqual(200, self.response(served)[0])
+
+    def test_a_refused_peer_that_holds_its_connection_does_not_hold_the_accept_loop(self):
+        holders = [self.connect() for _ in range(_SMALL_THREAD_CAP)]
+        time.sleep(_RESET_SETTLE_SECONDS)
+        with mock.patch.object(credential_proxy, "THREAD_CAP_REFUSAL_SECONDS", _LONG_REFUSAL_DRAIN_SECONDS):
+            # Refused peers that read their answer and neither close nor send:
+            # each drain is parked for longer than any read below may wait.
+            parked = []
+            for _ in range(credential_proxy.THREAD_CAP_REFUSAL_THREADS):
+                sock = self.connect()
+                self.assertEqual(503, self.response(sock)[0])
+                parked.append(sock)
+            # The accept loop is free: a holder's slot comes back and the next
+            # connection is served, inside the close wait, with every drain
+            # still parked.
+            holders[0].close()
+            time.sleep(_RESET_SETTLE_SECONDS)
+            served = self.connect()
+            self.send(served, "GET", "/healthz")
+            self.assertEqual(200, self.response(served)[0])
+            served.close()
+            time.sleep(_RESET_SETTLE_SECONDS)
+            holders[0] = self.connect()  # the slot is held again
+            time.sleep(_RESET_SETTLE_SECONDS)
+            # Past THREAD_CAP_REFUSAL_THREADS parked drains, a refused
+            # connection is closed at once and unanswered rather than queued
+            # behind a peer that will not close; reading it is EOF or a reset.
+            unanswered = self.connect()
+            with self.assertRaises((http.client.HTTPException, OSError)):
+                self.response(unanswered)
+            self.assertTrue(self.closed_by_server(unanswered))
+            # A parked peer closing frees its refusal thread; the next refusal
+            # is answered again.
+            parked[0].close()
+            time.sleep(_RESET_SETTLE_SECONDS)
+            self.assertEqual(503, self._refused()[0])
 
     def test_the_refusal_is_one_complete_response(self):
         refusal = credential_proxy.THREAD_CAP_REFUSAL
@@ -17720,6 +17808,32 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
     def _json_request(self, *args, **kwargs):
         status, headers, body = self._request(*args, **kwargs)
         return status, headers, json.loads(body)
+
+    def test_a_get_carrying_a_body_on_a_direct_write_route_announces_its_close(self):
+        # The passthrough and the MCP 405 write their response without _json.
+        # A GET drains nothing, so a body on it is unread when the response is
+        # written; the response itself must say `Connection: close`, as the
+        # close is otherwise found by the peer after it has taken the framed
+        # response as a reusable connection.
+        body = b'{"unread":true}'
+        for label, target, token in (
+            ("passthrough", self.ALLOWED.encode("ascii"), b"shell-token"),
+            ("mcp 405", b"/v1/mcp/some-server", b"chat-token"),
+        ):
+            with self.subTest(label), socket.create_connection(
+                ("127.0.0.1", self.server.server_address[1]), timeout=_CLOSE_WAIT_SECONDS
+            ) as sock:
+                sock.sendall(
+                    b"GET " + target + b" HTTP/1.1\r\nHost: broker\r\n"
+                    b"Authorization: Bearer " + token + b"\r\n"
+                    b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+                )
+                response = http.client.HTTPResponse(sock)
+                response.begin()
+                response.read()
+                self.assertEqual(200 if label == "passthrough" else 405, response.status)
+                self.assertEqual("close", (response.getheader("Connection") or "").lower(), response.getheaders())
+                self.assertEqual(b"", sock.recv(1), "the connection stayed open")
 
     # -- the happy path --------------------------------------------------
 
