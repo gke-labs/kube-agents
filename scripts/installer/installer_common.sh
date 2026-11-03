@@ -142,6 +142,14 @@ readonly FOOTPRINT_NAMESPACE_PLACEHOLDER="<namespace>"
 # apply but not the footprint render. Assigned, then marked readonly (bash 3.2).
 FOOTPRINT_AUTOLOADED_TFVARS_GLOBS=("*.auto.tfvars" "*.auto.tfvars.json" "terraform.tfvars.json")
 readonly FOOTPRINT_AUTOLOADED_TFVARS_GLOBS
+# The variables Terraform reads extra command-line arguments from: a
+# -var-file=<path> in one brings a file from anywhere on disk to the apply, and
+# a -var can carry extra_helm_values itself. Either reaches the apply and not
+# the footprint render; -auto-approve alone (the route lifecycle.sh reads from
+# TF_CLI_ARGS_apply) carries no values and is not matched.
+FOOTPRINT_TF_CLI_ARGS_VARS=("TF_CLI_ARGS" "TF_CLI_ARGS_plan" "TF_CLI_ARGS_apply")
+readonly FOOTPRINT_TF_CLI_ARGS_VARS
+readonly FOOTPRINT_TF_CLI_ARGS_EXTRA_VALUES_PATTERN='-var-file|-var[=[:space:]]+[[:punct:]]?extra_helm_values'
 # The footprint-shaping settings, read from the terraform.tfvars the generator
 # wrote (the composition's input) and passed to the chart under the key
 # terraform/examples/full-install/main.tf maps each to: tfvars key=chart value,
@@ -1003,15 +1011,22 @@ render_footprint_summary() {
 # Two things the render cannot see are said under it when they apply: a
 # Standard cluster, whose bill is its node pools rather than the pod requests
 # the Autopilot rates price, and chart values carried through the
-# composition's extra_helm_values (TF_VAR_extra_helm_values, or a variables
-# file Terraform auto-loads beside the generated one), which reach the apply
-# but not this render.
+# composition's extra_helm_values (TF_VAR_extra_helm_values, a -var or
+# -var-file in a TF_CLI_ARGS* variable, or a variables file Terraform
+# auto-loads beside the generated one), which reach the apply but not this
+# render.
 #
 # True when extra_helm_values may reach the apply unseen: TF_VAR_extra_helm_values
-# is set, or a file matching FOOTPRINT_AUTOLOADED_TFVARS_GLOBS sits beside $1.
+# is set, a FOOTPRINT_TF_CLI_ARGS_VARS variable carries a -var-file or a -var
+# naming it, or a file matching FOOTPRINT_AUTOLOADED_TFVARS_GLOBS sits beside $1.
 footprint_extra_values_may_apply_unseen() {
-  local tfvars_dir glob
+  local tfvars_dir glob name
   [ -z "${TF_VAR_extra_helm_values:-}" ] || return 0
+  for name in "${FOOTPRINT_TF_CLI_ARGS_VARS[@]}"; do
+    if [[ "${!name:-}" =~ $FOOTPRINT_TF_CLI_ARGS_EXTRA_VALUES_PATTERN ]]; then
+      return 0
+    fi
+  done
   tfvars_dir="$(dirname "$1")"
   for glob in "${FOOTPRINT_AUTOLOADED_TFVARS_GLOBS[@]}"; do
     if compgen -G "${tfvars_dir}/${glob}" >/dev/null; then

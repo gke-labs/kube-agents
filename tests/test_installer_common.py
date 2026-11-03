@@ -5987,21 +5987,32 @@ _FOOTPRINT_READ_SUBTREES = (
     "platformAgent.deployment.agentAPIAuth.resources",
     "platformAgent.harness.experimental.shellSandbox.resources",
 )
+_HCL_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 _HCL_TOKEN = re.compile(
-    r'"[^"\\]*(?:\\.[^"\\]*)*"|#[^\n]*|\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?![=>])'
-    r"|\bmerge\(|\bvar\.([A-Za-z_][A-Za-z0-9_]*)|[{}()\[\]]"
+    r'"[^"\\]*(?:\\.[^"\\]*)*"|#[^\n]*|\b(' + _HCL_IDENT + r')\s*=(?![=>])'
+    r"|\bmerge\(|\bvar\.(" + _HCL_IDENT + r")"
+    r"|\b((?:local|module|data|each)\." + _HCL_IDENT + r"(?:\." + _HCL_IDENT + r")*)|[{}()\[\]]"
 )
 # A `{` that opens a `for` comprehension is an expression, not an object literal.
 _HCL_FOR_AHEAD = re.compile(r"\s*for\b")
+# A `${` that is not the `$${` escape: the string is a template, not a literal.
+_HCL_INTERPOLATION = re.compile(r"(?<!\$)\$\{")
 
 
 def _hcl_chart_vars(src, pos=0):
-    """Every (chart key, tfvar) pair the HCL object opening at src[pos] assigns.
+    """Every (chart key, reference) pair the HCL object opening at src[pos] assigns.
+
+    The reference is the bare tfvar name for `var.x`; for anything else the walker cannot
+    follow to a tfvar it is the text itself, so a caller can tell the two apart with
+    `_HCL_IDENT`: a `local.x`, `module.x.y`, `data.x.y` or `each.x` chain, or a string
+    carrying an interpolation (`"${var.x}"`, `"${local.p}-suffix"`; the `$${` escape is a
+    literal). The map test fails on one under a footprint key rather than resolving it,
+    because a local or a template can be anything.
 
     Walks the object with a stack of enclosing keys: `key = {` and `key = merge(` push the
-    key, `(`, `[` and a `{ for` comprehension push an anonymous frame, and a `var.x` anywhere
-    in the right-hand side of `leaf =` records the path: right after the `=`, or inside
-    anonymous frames under it (`leaf = try(var.x, false)`, `leaf = [for r in var.x : ...]`,
+    key, `(`, `[` and a `{ for` comprehension push an anonymous frame, and a reference
+    anywhere in the right-hand side of `leaf =` records the path: right after the `=`, or
+    inside anonymous frames under it (`leaf = try(var.x, false)`, `leaf = [for r in var.x : ...]`,
     `leaf = { for k in var.x : k => ... }`), never past a named one.
     A closer ends the leaves inside and at the frame it closes, and the next `key =` at a
     depth ends the leaf there, so a `var.x` that follows a block (the condition in
@@ -6013,7 +6024,7 @@ def _hcl_chart_vars(src, pos=0):
         m = _HCL_TOKEN.search(src, pos)
         assert m is not None, "unterminated values block"
         tok, pos = m.group(0), m.end()
-        if tok.startswith('"') or tok.startswith("#"):
+        if tok.startswith("#") or (tok.startswith('"') and not _HCL_INTERPOLATION.search(tok)):
             continue
         depth = len(stack)
         if m.group(1):
@@ -6031,11 +6042,11 @@ def _hcl_chart_vars(src, pos=0):
                 return pairs
             leaf_at = {d: k for d, k in leaf_at.items() if d < len(stack)}
             continue
-        if m.group(2):
-            while depth not in leaf_at and depth > 0 and stack[depth - 1] is None:
-                depth -= 1
-            if depth in leaf_at:
-                pairs.add((".".join([*(k for k in stack[:depth] if k), leaf_at[depth]]), m.group(2)))
+        ref = m.group(2) or m.group(3) or tok
+        while depth not in leaf_at and depth > 0 and stack[depth - 1] is None:
+            depth -= 1
+        if depth in leaf_at:
+            pairs.add((".".join([*(k for k in stack[:depth] if k), leaf_at[depth]]), ref))
 
 
 def _composition_chart_vars():
@@ -6098,8 +6109,29 @@ class CompositionChartVarsWalkerTest(unittest.TestCase):
         }"""
         self.assertEqual(
             _hcl_chart_vars(src),
-            {("a", "x"), ("b", "y"), ("c", "z"), ("d", "w"), ("e", "v"), ("f", "u")},
+            {("a", "x"), ("b", "y"), ("c", "z"), ("d", "w"), ("e", "local.n"), ("e", "v"), ("f", "u")},
         )
+
+    def test_a_local_a_module_output_or_a_template_string_is_recorded_as_itself(self):
+        # The shapes the walker cannot follow to a tfvar: recorded verbatim, so the map
+        # test fails on one under a footprint key instead of staying green.
+        src = """{
+          a = local.n
+          b = { size = "${var.x}" }
+          c = "${local.p}-suffix"
+          d = module.m.out
+          e = "$${literal}"
+          f = each.value.g
+          g = var.y
+        }"""
+        self.assertEqual(
+            _hcl_chart_vars(src),
+            {
+                ("a", "local.n"), ("b.size", '"${var.x}"'), ("c", '"${local.p}-suffix"'),
+                ("d", "module.m.out"), ("f", "each.value.g"), ("g", "y"),
+            },
+        )
+        self.assertEqual([ref for _, ref in _hcl_chart_vars(src) if re.fullmatch(_HCL_IDENT, ref)], ["y"])
 
     def test_a_var_in_a_condition_after_a_block_is_not_credited_to_the_previous_leaf(self):
         # main.tf's shape: a leaf set from a local, then a merge() argument gated on a var.
@@ -6113,7 +6145,8 @@ class CompositionChartVarsWalkerTest(unittest.TestCase):
           })
         }"""
         self.assertEqual(
-            _hcl_chart_vars(src), {("root.storage.size", "size"), ("root.mode", "mode")}
+            _hcl_chart_vars(src),
+            {("root.integration", "local.integration"), ("root.storage.size", "size"), ("root.mode", "mode")},
         )
 
     def test_nested_blocks_and_bare_vars_record_the_full_path(self):
@@ -6125,7 +6158,7 @@ class CompositionChartVarsWalkerTest(unittest.TestCase):
           }
           h = var.z
         }"""
-        self.assertEqual(_hcl_chart_vars(src), {("a.b.c", "x"), ("a.d", "y"), ("h", "z")})
+        self.assertEqual(_hcl_chart_vars(src), {("a.b.c", "x"), ("a.d", "y"), ("a.f", "local.g"), ("h", "z")})
 
 
 class FootprintSummaryTest(unittest.TestCase):
@@ -6207,10 +6240,19 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertGreater(len(pairs), 20, pairs)
         value_map = _footprint_value_map()
         footprint_pairs = {
-            (key, var) for key, var in pairs
+            (key, ref) for key, ref in pairs
             if key in _FOOTPRINT_READ_KEYS or key.startswith(tuple(f"{s}." for s in _FOOTPRINT_READ_SUBTREES))
         }
         self.assertTrue(footprint_pairs)
+        # A footprint key set from a local, a module output or a template string is one
+        # the walker cannot follow to a tfvar; it fails here rather than passing unseen.
+        unfollowed = sorted((key, ref) for key, ref in footprint_pairs if not re.fullmatch(_HCL_IDENT, ref))
+        self.assertFalse(
+            unfollowed,
+            f"main.tf sets footprint keys from something this test cannot follow to a tfvar: {unfollowed}. "
+            "Set them from var.<name> and carry the pair in FOOTPRINT_TFVARS_VALUE_MAP, or the installer's "
+            "figure drifts from the notes'.",
+        )
         for key, var in sorted(footprint_pairs):
             self.assertEqual(value_map.get(var), key, f"main.tf sets {key} from var.{var}; FOOTPRINT_TFVARS_VALUE_MAP must carry {var}={key}")
         for var, key in value_map.items():
@@ -6246,6 +6288,18 @@ class FootprintSummaryTest(unittest.TestCase):
             proc = self._run(f'touch "$(dirname "$TFVARS")/{name}"\n' + script, helm_script=_ECHO_HELM)
             self.assertIn(caveat, proc.stdout, name)
         proc = self._run('touch "$(dirname "$TFVARS")/notes.json"\n' + script, helm_script=_ECHO_HELM)
+        self.assertNotIn(caveat, proc.stdout)
+        # Terraform's extra command-line arguments: a -var-file from anywhere on disk in
+        # any of the three, or the variable itself; -auto-approve alone, the route
+        # lifecycle.sh reads, carries no values and prints no caveat.
+        for name in ("TF_CLI_ARGS", "TF_CLI_ARGS_plan", "TF_CLI_ARGS_apply"):
+            proc = self._run(f'export {name}="-var-file=$HOME/kube-agents.tfvars"\n' + script, helm_script=_ECHO_HELM)
+            self.assertIn(caveat, proc.stdout, name)
+        proc = self._run("export TF_CLI_ARGS_apply=\"-input=false -var 'extra_helm_values={litellm={replicaCount=4}}'\"\n" + script, helm_script=_ECHO_HELM)
+        self.assertIn(caveat, proc.stdout)
+        proc = self._run('export TF_CLI_ARGS_apply="-var=extra_helm_values={}"\n' + script, helm_script=_ECHO_HELM)
+        self.assertIn(caveat, proc.stdout)
+        proc = self._run('export TF_CLI_ARGS_apply="-auto-approve -input=false"\n' + script, helm_script=_ECHO_HELM)
         self.assertNotIn(caveat, proc.stdout)
 
     def test_render_fails_naming_the_cause_when_helm_refuses(self):
