@@ -530,6 +530,36 @@ class InPartsTest(unittest.TestCase):
         self.assertEqual([None, ("clusters",)], fake.calls)
         self.assertEqual([{"path": "top.yaml", "reason": "past the cap of 1 snapshots for one repository"}], read.unread)
 
+    def test_the_file_and_byte_caps_hold_across_parts_and_stop_before_the_next_clone(self):
+        tree = {f"{d}/{n}.yaml": CRONJOB_V1 for d in ("a", "b", "c") for n in range(2)}
+        refusals = {None: [entry("a", 900), entry("b", 900), entry("c", 900)]}
+        fake = FakeParts(tree, refusals)
+        read = scan.read_repo_content("acme/infra", max_files=3, snapshot=fake)
+        self.assertEqual((3, scan.STOPPED_MAX_FILES), (len(read.files), read.stopped))
+        self.assertEqual([None, ("a",), ("b",)], fake.calls)
+        fake = FakeParts(tree, refusals)
+        read = scan.read_repo_content("acme/infra", max_bytes=len(CRONJOB_V1) * 2, snapshot=fake)
+        self.assertEqual((2, scan.STOPPED_MAX_BYTES), (len(read.files), read.stopped))
+        self.assertEqual([None, ("a",)], fake.calls)
+
+    def test_a_batch_stays_inside_the_broker_s_path_bounds(self):
+        long_names = [entry("d" * 3000 + str(i), 1) for i in range(30)]
+        batches = scan._batches(long_names, 1 << 30)
+        self.assertGreater(len(batches), 1)
+        for batch in batches:
+            self.assertLessEqual(sum(len(e["path"].encode()) + 1 for e in batch), scan.NARROW_PATH_BYTES_PER_SNAPSHOT)
+        many = [entry(f"f{i}", 1) for i in range(300)]
+        self.assertEqual([256, 44], [len(batch) for batch in scan._batches(many, 1 << 30)])
+
+    def test_the_values_copied_from_the_broker_match_it(self):
+        import vcs_broker  # beside vcs_client, which the scan imports
+
+        self.assertEqual(scan.NARROW_PATHS_PER_SNAPSHOT, vcs_broker.MAX_SNAPSHOT_PATHS)
+        self.assertEqual(scan.NARROW_PATH_BYTES_PER_SNAPSHOT, vcs_broker.MAX_SNAPSHOT_PATHS_BYTES)
+        self.assertEqual(scan.CEILING_ENV, vcs_broker.MAX_SNAPSHOT_BYTES_ENV)
+        self.assertEqual(scan.MANIFEST_SUFFIXES, vcs_broker.SNAPSHOT_MANIFEST_SUFFIXES)
+        self.assertEqual(scan.ENTRY_TREE, vcs_broker.SNAPSHOT_ENTRY_TREE)
+
     def test_a_refusal_that_names_no_entries_is_still_an_error(self):
         fake = FakeParts(self.TREE, {None: None})
         with self.assertRaises(scan.vcs_client.VcsError):

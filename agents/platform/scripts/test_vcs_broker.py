@@ -3858,15 +3858,23 @@ class SnapshotTest(unittest.TestCase):
             **{f"deep/zeros/{index}.bin": b"\0" * (1 << 20) for index in range(2)},
             "deep/zeros/sub/a.yaml": b"kind: x\n",
         })
+        os.symlink("sub/a.yaml", self.seed / "deep/zeros/link.yaml")
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", "link")
+        git(self.seed, "push", "--quiet", "origin", "HEAD:refs/heads/main")
         self.broker.max_snapshot_bytes = 1 << 20
         with self.assertRaises(WorkspaceError) as caught:
             self.broker.snapshot({"repository": self.REPOSITORY, "paths": ["deep/zeros", "README.md"]})
         entries = caught.exception.fields["entries"]
         self.assertEqual(
-            [("README.md", "blob"), ("deep/zeros/0.bin", "blob"), ("deep/zeros/1.bin", "blob"), ("deep/zeros/sub", "tree")],
+            [
+                ("README.md", "blob"), ("deep/zeros/0.bin", "blob"), ("deep/zeros/1.bin", "blob"),
+                ("deep/zeros/link.yaml", "blob"), ("deep/zeros/sub", "tree"),
+            ],
             [(entry["path"], entry["type"]) for entry in entries],
         )
-        self.assertEqual([0, 0, 0, 1], [entry["manifests"] for entry in entries])
+        # A link named like a manifest counts, so the caller sees it and can say it skipped it.
+        self.assertEqual([0, 0, 0, 1, 1], [entry["manifests"] for entry in entries])
         # The parent directories `ls-tree` and `archive` add are in each measure.
         for entry in entries:
             with self.subTest(entry=entry["path"]):

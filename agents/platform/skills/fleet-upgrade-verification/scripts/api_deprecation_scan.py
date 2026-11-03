@@ -18,8 +18,8 @@ broker's `/v1/vcs/snapshot` into a temporary directory of its own, with no histo
 deletes it after the read. The broker chooses the credential by the repository's role, so
 a managed, a context and a public repository are all read. A tree over the broker's
 snapshot ceiling is read in parts: the refusal names the entries below it, and the scan
-takes those that hold manifests, at most NARROW_SNAPSHOT_CAP snapshots; a part it could
-not read is listed as not read and sets exit code 1. When
+takes those that hold manifests, in at most NARROW_SNAPSHOT_CAP snapshots after the refused
+one; a part it could not read is listed as not read and sets exit code 1. When
 CREDENTIAL_PROXY_URL is not set (a run outside the pod), it reads GitHub repositories
 through a leased checkout on the shared volume, under a lease of its own, so the reset
 that positions that checkout on the base branch never touches the session's working tree,
@@ -109,10 +109,15 @@ STOPPED_MAX_BYTES = "maxBytes"
 # as many to a snapshot as fit under the ceiling, and asks for an entry over
 # the ceiling alone, so its own refusal names the entries below it. Each
 # snapshot is a broker clone of a large revision, so one repository takes at
-# most NARROW_SNAPSHOT_CAP of them; what is left is listed as not read and the
-# exit code is 1. NARROW_PATHS_PER_SNAPSHOT is the broker's MAX_SNAPSHOT_PATHS.
+# most NARROW_SNAPSHOT_CAP of them after the refused whole-tree one; what is
+# left is listed as not read and the exit code is 1. The two path bounds are
+# the broker's MAX_SNAPSHOT_PATHS and MAX_SNAPSHOT_PATHS_BYTES (each path and
+# its separator), and CEILING_ENV and MANIFEST_SUFFIXES are its names too;
+# test_api_deprecation_scan holds them equal.
 NARROW_SNAPSHOT_CAP = 16
 NARROW_PATHS_PER_SNAPSHOT = 256
+NARROW_PATH_BYTES_PER_SNAPSHOT = 64 << 10
+ENTRY_TREE = "tree"
 NARROW_PART_NAME = "part-{index}"
 CEILING_ENV = "CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
 UNREAD_OVER_CEILING = "a file over the broker's {ceiling}-byte snapshot ceiling on its own ({env})"
@@ -410,13 +415,20 @@ def _batches(entries: list[dict], ceiling: int) -> list[list[dict]]:
     under the measure of the snapshot that asks for them together.
     """
     batches: list[list[dict]] = []
-    total = 0
+    total = names = 0
     for entry in sorted(entries, key=lambda e: e["path"]):
-        if not batches or total + entry["bytes"] > ceiling or len(batches[-1]) >= NARROW_PATHS_PER_SNAPSHOT:
+        name = len(entry["path"].encode()) + 1
+        if (
+            not batches
+            or total + entry["bytes"] > ceiling
+            or len(batches[-1]) >= NARROW_PATHS_PER_SNAPSHOT
+            or names + name > NARROW_PATH_BYTES_PER_SNAPSHOT
+        ):
             batches.append([])
-            total = 0
+            total = names = 0
         batches[-1].append(entry)
         total += entry["bytes"]
+        names += name
     return batches
 
 
@@ -443,13 +455,18 @@ def read_repo_in_parts(
         requests = _batches([entry for entry in pending if entry["bytes"] <= ceiling], ceiling)
         pending = []
         for entry in alone:
-            if entry.get("type") == "tree":
+            if entry.get("type") == ENTRY_TREE:
                 requests.append([entry])
             else:
                 read.unread.append(
                     {"path": entry["path"], "reason": UNREAD_OVER_CEILING.format(ceiling=ceiling, env=CEILING_ENV)}
                 )
         for batch in requests:
+            # Checked before the next clone, not only inside `read_tree` after it.
+            if len(read.files) >= max_files:
+                read.stopped = STOPPED_MAX_FILES
+            elif total_bytes >= max_bytes:
+                read.stopped = STOPPED_MAX_BYTES
             if read.stopped:
                 break
             if read.parts >= NARROW_SNAPSHOT_CAP:

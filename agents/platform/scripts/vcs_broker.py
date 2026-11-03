@@ -239,9 +239,9 @@ SNAPSHOT_ENTRY_TREE = "tree"
 SNAPSHOT_ENTRY_BLOB = "blob"
 # Each entry also counts the files under it a manifest reader reads, so a
 # caller can leave out a part of vendored archives or images without asking
-# for it. Regular files only: a link's blob is its target, not a manifest.
+# for it. A link with such a name counts too, so the caller still sees it (and
+# can say it skipped it); a tree or a submodule does not.
 SNAPSHOT_MANIFEST_SUFFIXES = (".yaml", ".yml", ".json")
-GIT_MODES_REGULAR_FILE = frozenset({"100644", "100755"})
 
 # What git prints when the remote answered the delete and said no for good: a
 # hook, branch rule or ruleset (`[remote rejected] <ref> (... declined)`), a
@@ -427,7 +427,7 @@ def _snapshot_entries(listing: str, paths: list[str]) -> list[dict[str, Any]] | 
     entries are the top level of the tree; with ``paths``, the children of
     each asked directory, and an asked file as itself. Each entry is a `tree`
     or a `blob` (a link or a submodule counts as a blob: there is nothing
-    under it to ask for) with ``manifests``, its count of regular files named
+    under it to ask for) with ``manifests``, its count of files and links named
     `*.yaml`, `*.yml` or `*.json`, and ``bytes``: what `_tar_bytes` measures for a
     snapshot of that entry alone, its parent directories included, as `ls-tree`
     lists them and `archive` writes them. So a snapshot of the entry is refused
@@ -460,7 +460,7 @@ def _snapshot_entries(listing: str, paths: list[str]) -> list[dict[str, Any]] | 
                 trees.add(child)
         grouped.setdefault(child, []).append(entry)
         manifests[child] = manifests.get(child, 0) + (
-            mode in GIT_MODES_REGULAR_FILE and path.lower().endswith(SNAPSHOT_MANIFEST_SUFFIXES)
+            mode not in GIT_MODES_DIRECTORY and path.lower().endswith(SNAPSHOT_MANIFEST_SUFFIXES)
         )
         if len(grouped) > MAX_SNAPSHOT_ENTRIES:
             return None

@@ -16,8 +16,10 @@
 # whatever versions the eval clusters run; the removal table ends at 1.32, and
 # a floor above it would leave nothing in range to find.
 #
-# Red on main: the section is `not scanned` with SNAPSHOT_TOO_LARGE, so the
-# report names neither the resource nor the apiVersion.
+# Expected red on main, not yet observed (there is no fixture): the section is
+# `not scanned` with SNAPSHOT_TOO_LARGE, so the report names neither the
+# resource nor the apiVersion. Its red and three greens are owed once #4705
+# plants the repository.
 #
 # Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
 # write). The repository is public, so the broker reads it as an unregistered
