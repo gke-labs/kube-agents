@@ -223,8 +223,9 @@ readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-2
 # Autopilot, so today this override changes nothing. It stays as a pin: if the
 # operator default moves, the eval install keeps the budget its cases were
 # measured at. The cost is that the eval does not run the operator default;
-# to run it there, drop this constant, its echo and --set-string below, and
-# tests/test_ci_deploy_credential_proxy_limit.py.
+# to run it there, drop this constant, its echo and --set-string below, and the
+# three limit tests in tests/test_ci_deploy_credential_proxy_limit.py (that
+# file's CRD-order test guards step 5b' and stays).
 # The figure comes from #2632: at the 1Gi limit the operator defaulted to then,
 # the budget admitted four, and the eval's EVAL_TASK_PARALLELISM lanes of
 # Platform Agents, each fanning Cluster Agents out over the seeded fleet, queued
