@@ -30,12 +30,17 @@ DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 DEFAULT_RETENTION_DAYS = 7
 # The session's origin (docs/designs/proposal-origin.md §2.1), the keys the
 # Session KV server reads (agents/platform/scripts/session_kv_server.py
-# ORIGIN_KEY, ORIGIN_PLATFORM_KEY). A session this plugin records is a chat
-# session unless another writer recorded its origin first. The origin platform
-# is a chat metrics label (HERMES_PLATFORM_LABELS), as the hermes-bridge writes it.
+# ORIGIN_KEY, ORIGIN_PLATFORM_KEY). A session this plugin records on a chat
+# platform is a chat session unless another writer recorded its origin first.
+# The origin platform is a chat metrics label (HERMES_PLATFORM_LABELS), as the
+# hermes-bridge writes it. The chat platforms are that map's labels less
+# API_PLATFORM_LABEL, the gateway's own API port: a session on the API port or
+# on a platform outside the map gets no origin keys here, so it resolves as
+# `other` until the agent API records its own origin.
 ORIGIN_KEY = "origin"
 ORIGIN_PLATFORM_KEY = "origin_platform"
 ORIGIN_CHAT = "chat"
+API_PLATFORM_LABEL = "api"
 CREATE_SESSION_METADATA_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS session_metadata (
     session_id TEXT PRIMARY KEY,
@@ -138,14 +143,22 @@ def _retention_days() -> int:
         return DEFAULT_RETENTION_DAYS
 
 
-def _origin_platform(platform: Any) -> str:
-    """The chat metrics label for a Hermes platform name, or the name itself when unmapped."""
+def _chat_platform_label(platform: Any) -> Optional[str]:
+    """The chat metrics label for a Hermes chat platform name, or None for any other platform."""
     name = str(platform or "").strip().lower()
-    return chat_metrics.HERMES_PLATFORM_LABELS.get(name, name)
+    label = chat_metrics.HERMES_PLATFORM_LABELS.get(name)
+    if not label or label == API_PLATFORM_LABEL:
+        return None
+    return label
 
 
 def _merge_origin(existing: Optional[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """`metadata` with the stored row's origin carried forward, or `chat` when it has none."""
+    """`metadata` with the stored row's origin carried forward.
+
+    A row with no origin is recorded as `chat` on the event's platform when
+    that platform is a chat platform; on any other platform it gets no origin
+    keys.
+    """
     merged = dict(metadata)
     stored: Any = {}
     if existing:
@@ -157,8 +170,10 @@ def _merge_origin(existing: Optional[str], metadata: Dict[str, Any]) -> Dict[str
         merged[ORIGIN_KEY] = stored[ORIGIN_KEY]
         merged[ORIGIN_PLATFORM_KEY] = stored.get(ORIGIN_PLATFORM_KEY, "")
     else:
-        merged[ORIGIN_KEY] = ORIGIN_CHAT
-        merged[ORIGIN_PLATFORM_KEY] = _origin_platform(metadata.get("platform"))
+        label = _chat_platform_label(metadata.get("platform"))
+        if label is not None:
+            merged[ORIGIN_KEY] = ORIGIN_CHAT
+            merged[ORIGIN_PLATFORM_KEY] = label
     return merged
 
 
@@ -198,7 +213,8 @@ class SessionMetadataStore:
 
         The row is read and rewritten in one `BEGIN IMMEDIATE` transaction:
         an origin already on it is carried forward, and a row without one is
-        recorded as a chat session on the event's platform.
+        recorded as a chat session on the event's platform when that is a chat
+        platform.
         """
         for attempt in range(2):
             with cls._lock:

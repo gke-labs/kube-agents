@@ -223,6 +223,22 @@ class TestWriteThrough(SaltedTestCase):
         log_event_to_db(_event(platform="slack", user_id="U1"), gateway=None, session_store=_SessionStore("sess-2"))
         self.assertEqual(("chat", "slack"), (self._row("sess-2")["origin"], self._row("sess-2")["origin_platform"]))
 
+    def test_write_sets_no_origin_off_a_chat_platform(self):
+        # The gateway's API port and a platform outside the chat metrics map
+        # are not chat: the row carries no origin keys, so the session
+        # resolves as `other`.
+        log_event_to_db(_event(platform="api_server", user_id="U1"), gateway=None, session_store=_SessionStore("sess-api"))
+        row = self._row("sess-api")
+        self.assertIsNotNone(row)
+        self.assertNotIn("origin", row)
+        self.assertNotIn("origin_platform", row)
+        log_event_to_db(_event(platform="api", user_id="U1"), gateway=None, session_store=_SessionStore("sess-api2"))
+        self.assertNotIn("origin", self._row("sess-api2"))
+        log_event_to_db(_event(platform="cli", user_id="U1"), gateway=None, session_store=_SessionStore("sess-cli"))
+        self.assertNotIn("origin", self._row("sess-cli"))
+        log_event_to_db(_event(platform="slack", user_id="U1"), gateway=None, session_store=_SessionStore("sess-slack"))
+        self.assertEqual(("chat", "slack"), (self._row("sess-slack")["origin"], self._row("sess-slack")["origin_platform"]))
+
     def test_write_merges_under_one_transaction(self):
         # Another writer (the Session KV server) holds the write lock and is
         # recording the session's origin: the plugin's write waits for it and
