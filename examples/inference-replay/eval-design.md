@@ -1,8 +1,9 @@
 # Inference replay for evals
 
-> **STATUS — proposal; measured, not built.** A prototype proxy was run against a dev install on
-> 2026-10-31 to 2026-11-02. Nothing here is wired into `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` or
-> the chart. The first stage proposed is shadow mode, which changes no verdict.
+> **STATUS — proposal; measured; shadow mode built, not deployed.** A prototype proxy was run
+> against a dev install on 2026-10-31 to 2026-11-02. The shadow-mode proxy (Rollout step 1) is in
+> [`hack/replay-proxy/`](../../hack/replay-proxy/README.md). Nothing here is wired into
+> `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` or the chart. Shadow mode changes no verdict.
 
 **Scope:** serving recorded model answers to eval runs whose model input has not changed, so a
 presubmit pays for inference only from the first point where a run differs from one already graded.

@@ -19,6 +19,8 @@ run inside it or decide whether it runs: `hack/ci-env.sh` and `hack/fleet-kubeco
 verdict in place of a run), `hack/fleet-fixture-state.py` (its report excuses cases) and
 `scripts/installer/gke_dns_endpoint.sh` (sourced by `ci-env.sh`, under `scripts/installer/OWNERS`)
 ([`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2, "Pinning and baselines").
+`hack/replay-proxy/` carries it as well, because its normalizer decides which requests match a
+recorded answer ([`eval-design.md`](../examples/inference-replay/eval-design.md#the-proxy-cant-come-from-the-pull-request)).
 Nothing else carries the rule:
 `hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
