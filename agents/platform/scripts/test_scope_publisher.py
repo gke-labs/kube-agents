@@ -973,6 +973,44 @@ class BuildDocumentTest(unittest.TestCase):
         self.assertEqual([], clock.slept)
         self.assertEqual(self._rows(document)["team-b"]["outcome"], "ok")
 
+    def test_the_recovery_pass_keeps_a_members_naming_its_second_call_did_not_repeat(self):
+        # The Metrics Scope's member was named and probed `ok`; another source's refused probe
+        # starts the recovery pass, whose naming call for the number fails. The member keeps
+        # its first naming, and its row stays `ok`.
+        broker = FakeBroker(scopes={"scope-p": ["777"]}, names={"777": "mon-proj-a"}, assets={FOLDER_A: ["team-a"]})
+        with mock.patch.object(pub, "log") as logged:
+            document, _ = self._build_through_client(
+                broker, {}, _scope(folders=["111111111111"], metricsScopes=["scope-p"]),
+                flip_on=lambda argv: self._is_probe(argv) and "team-a" in argv,
+                script={"777": ["answer", "fail"]})
+        self.assertEqual(1, self._recoveries(logged))
+        rows = self._rows(document)
+        self.assertEqual(rows["mon-proj-a"]["outcome"], "ok")
+        self.assertEqual(rows["team-a"]["outcome"], "ok")
+
+    def test_a_member_whose_sources_kept_an_earlier_answer_keeps_its_previous_row(self):
+        # The folder answered before the broker's scope.json changed, and every later lookup
+        # of it gets no answer, so its member is never recorded under the new digest and its
+        # probes are refused. Its previous row stands, as for a failed source.
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "team-a", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}]}
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"], FOLDER_B: ["team-b"]})
+        document, _ = self._build_through_client(
+            broker, {FOLDER_B: 1}, _scope(folders=["111111111111", "222222222222"]), previous,
+            script={FOLDER_A: ["answer", "fail", "fail"]})
+        rows = self._rows(document)
+        self.assertEqual(rows["team-a"], previous["projects"][0])
+        self.assertEqual(rows["team-b"]["outcome"], "ok")
+
+    def test_the_recovery_pass_waits_for_nothing_after_an_earlier_wait(self):
+        # A source refused and then caught up leaves the run's retry window open; a source the
+        # broker refuses in the recovery pass is still answered at once.
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"], FOLDER_B: ["team-b"]})
+        _, clock = self._build_through_client(
+            broker, {FOLDER_B: 1}, _scope(folders=["111111111111", "222222222222"]),
+            flip_on=self._is_probe, script={FOLDER_A: ["answer", "answer"] + ["refuse"] * 100})
+        self.assertEqual([pub.SCOPE_ARGUMENT_RETRY_SECONDS], clock.slept)
+
     def test_the_recovery_pass_runs_once(self):
         # A window that empties again before every probe: one recovery pass, then the rows
         # read as the probes left them.
@@ -1017,7 +1055,8 @@ class BuildDocumentTest(unittest.TestCase):
         self.assertEqual({p: r["outcome"] for p, r in rows.items()},
                          {"team-a1": "ok", "team-a2": "ok", "team-b1": "ok"})
         self.assertEqual([pub.SCOPE_ARGUMENT_RETRY_SECONDS] * 2, clock.slept)
-        self.assertIn("resolving every source again", " ".join(str(c) for c in logged.call_args_list))
+        self.assertIn("changed during the run; resolving every source again",
+                      " ".join(str(c) for c in logged.call_args_list))
 
     def test_a_new_source_the_brokers_mount_catches_up_with_resolves_in_the_same_run(self):
         broker = FakeBroker(scopes={"scope-project": ["111"]}, names={"111": "mon-proj-a"})

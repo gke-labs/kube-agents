@@ -139,9 +139,10 @@ SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS = 5
 # is tied to, changed after the sources resolved (an edit that adds no source, a mount that
 # caught up late). A source lookup given up as not declared may be answered once the mount
 # catches up. Either way the run resolves every source again and probes again, once, after its
-# probes, if the budget still leaves one lookup and one probe their minimum attempt. That pass
-# starts no wait of its own: a source still not declared then is answered at once.
-SCOPE_RECOVERY_MIN_SECONDS = 2 * SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS
+# probes, if the budget still leaves a Metrics Scope's three calls (the lookup, the naming of a
+# number, the probe) their minimum attempt. That pass starts no wait of its own: a source still
+# not declared then is answered at once.
+SCOPE_RECOVERY_MIN_SECONDS = 3 * SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS
 # The broker's argv flag the log leaves out: it names no source, only the output columns.
 FORMAT_FLAG_PREFIX = "--format="
 # The Kubernetes API, from the pod: the in-cluster token and CA the operator projects at the
@@ -465,13 +466,42 @@ def _excluded_members(searches: dict, selections: dict, previous: dict | None, p
                   and (rec._excluded_by(p, patterns) or ((n := number_of(p)) and rec._excluded_by(n, patterns))))
 
 
-def _merge_pass(earlier: dict, later: dict) -> dict:
+def _merge_pass(earlier: dict, later: dict, kept: set) -> dict:
     """A later resolve pass over an earlier one: a source keeps its earlier answer when its
-    later lookup gave none (a pass on what is left of the budget can run out of it)."""
+    later lookup gave none (a pass on what is left of the budget can run out of it).
+
+    `kept` holds the sources whose answer is an earlier pass's, updated here: its members were
+    recorded under the broker's scope.json as it was then, so a probe of one can be refused.
+    """
     merged = dict(earlier)
     for source, answer in later.items():
         if answer[0] is not None or source not in merged:
             merged[source] = answer
+            kept.discard(source)
+        elif merged[source][0] is not None:
+            kept.add(source)
+    return merged
+
+
+def _merge_selections(earlier: dict, later: dict) -> dict:
+    """A later naming pass over an earlier one: a selector member keeps the project ID an
+    earlier pass named its number by when its later naming call gave none."""
+    merged = dict(later)
+    for selector, (members, outcome) in later.items():
+        before = (earlier.get(selector) or (None, None))[0]
+        if members is None or not before:
+            continue
+        named_before = {member[rec.NUMBER_KEY]: (project, member) for project, member in before.items()
+                        if member.get(ROW_OUTCOME) is None and member.get(rec.NUMBER_KEY)}
+        fixed: dict = {}
+        for key, member in members.items():
+            number = member.get(rec.NUMBER_KEY)
+            if member.get(ROW_OUTCOME) is not None and number in named_before:
+                project, earlier_member = named_before[number]
+                fixed.setdefault(project, earlier_member)
+            else:
+                fixed.setdefault(key, member)
+        merged[selector] = (fixed, outcome)
     return merged
 
 
@@ -498,10 +528,12 @@ def build_document(declared: dict, management: str | None, previous: dict | None
     patterns = scope[EXCLUDE_KEY][EXCLUDE_PROJECTS_KEY]
     sources = rec._container_ids(scope) + rec._selector_ids(scope)
 
-    def place(groups: dict) -> tuple[dict, dict, dict, list, list]:
+    def place(groups: dict, earlier: dict | None = None) -> tuple[dict, dict, dict, list, list]:
         searches = {g: r for g, r in groups.items() if rec._is_container(g)}
         selector_reports = {g: r for g, r in groups.items() if rec._is_selector(g)}
         selections = rec._selector_members(selector_reports, looked_up, deadline, patterns, SCOPE_WORKERS, budget)
+        if earlier is not None:
+            selections = _merge_selections(earlier, selections)
         # With no management project named, its slot is still reserved: the cap passed on is
         # one smaller, which is what `_resolve_projects` makes of a management project it counts.
         entries, _, _, _ = rec._resolve_projects(management, scope, searches, looked_up, selections,
@@ -523,13 +555,14 @@ def build_document(declared: dict, management: str | None, previous: dict | None
                                 consequence="its row is not confirmed this run")
 
     _scope_argument_wait.reset()
+    kept: set = set()
     groups = rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget)
     if _scope_argument_wait.caught_up:
         # The broker's scope.json changed while the sources resolved, and the member
         # window went with its old digest: resolve them all again, so the members of every
         # source that answers again are recorded under the new one.
         log("the broker's scope.json changed during the run; resolving every source again")
-        groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget))
+        groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget), kept)
     searches, selector_reports, selections, members, carried = place(groups)
     probes = probe(members)
     if ((_scope_argument_wait.probe_refused or _scope_argument_wait.gave_up)
@@ -542,10 +575,9 @@ def build_document(declared: dict, management: str | None, previous: dict | None
         reason = ("the broker refused a probe as not declared" if _scope_argument_wait.probe_refused
                   else "a source's wait for the broker's scope.json ran out")
         log(f"{reason}; resolving every source again and probing again")
-        if _scope_argument_wait.until is None:
-            _scope_argument_wait.until = time.monotonic()
-        groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget))
-        searches, selector_reports, selections, members, carried = place(groups)
+        _scope_argument_wait.until = time.monotonic()
+        groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget), kept)
+        searches, selector_reports, selections, members, carried = place(groups, selections)
         probes.update(probe([e for e in members if probes.get(e[ROW_ID], (None, rec.OUTCOME_UNREACHABLE))[1]
                              == rec.OUTCOME_UNREACHABLE]))
     rows_before = {row[ROW_ID]: row for row in (previous or {}).get(DOC_PROJECTS, [])
@@ -560,6 +592,11 @@ def build_document(declared: dict, management: str | None, previous: dict | None
             _, outcome = probes[entry[ROW_ID]]
             if outcome == rec.OUTCOME_OK:
                 confirmed = resolved_at
+            elif before and kept.issuperset(entry[ROW_VIA]):
+                # Every source of it kept an answer from before the broker's scope.json changed,
+                # so the probe could not be admitted: the previous row stands, as for a failed
+                # source.
+                outcome = before.get(ROW_OUTCOME) or outcome
         elif failed_sources.issuperset(entry[ROW_VIA]):
             outcome = before.get(ROW_OUTCOME) or entry[ROW_OUTCOME]
         else:
