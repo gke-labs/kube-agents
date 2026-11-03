@@ -32,8 +32,9 @@ _FOOTER = (
 _SUMMARY_FOOTER = (
     "Where the block above counts agents rather than naming them, a named "
     "cluster's `assignee` comes from `list_agents` with `filter` set to that "
-    "cluster's name: route to the agent it returns, or to `platform` when it "
-    "returns none. Fleet inventory still goes to `platform`."
+    "cluster's name: route to the agent it returns; when it says the roster "
+    "could not be fully read, call it again; route to `platform` only when it "
+    "says no agent matches. Fleet inventory still goes to `platform`."
 )
 # Appended only when the host cluster identity is present, so it never points
 # at a section that was not rendered (agent_roster.read_host_identity).

@@ -47,11 +47,12 @@ def list_agents(filter: str = "") -> str:
     same template) are grouped so the description is stated once instead of repeated verbatim
     per agent. A group larger than the install's threshold is counted by project and location
     instead of named; pass `filter` (a cluster name, assignee id, project or location; a
-    case-insensitive substring) to get the matching agents by name, capped at a count the
-    answer's heading reports, so you can copy the one `assignee` you need. With no match the answer says so; route a named cluster that
-    has no agent to `platform`. When the roster could not be fully read, a no-match says that
-    instead and asks you to call again. Without `filter` the tool renders what the injected block
-    renders.
+    case-insensitive substring) to get the matching agents by name, the exact matches first,
+    capped at a count the answer's heading reports, so you can copy the one `assignee` you need.
+    With no match the answer says so; route a named cluster that has no agent to `platform`. When
+    the roster could not be fully read, a no-match says that instead and asks you to call again:
+    do it, rather than reading that answer as "no agent". Without `filter` the tool renders what
+    the injected block renders.
     """
     # A tool has to answer with a string, so an unreadable roster (render() -> None)
     # is spelled out rather than collapsed into "no agents exist". The injecting
