@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -473,6 +474,17 @@ func setSizingCappedByQuotaCondition(agent *agentv1alpha1.PlatformAgent, msg str
 	})
 }
 
+// sizingCappedConditionMessage is the message the SizingCappedByQuota
+// condition on the CR carries, "" when it is absent or not the condition this
+// operator writes.
+func sizingCappedConditionMessage(agent *agentv1alpha1.PlatformAgent) string {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
+	if existing == nil || existing.Status != metav1.ConditionTrue || existing.Reason != sizingCappedByQuotaReason {
+		return ""
+	}
+	return existing.Message
+}
+
 // resolveSizingTier decides the tier this pass renders and writes it to
 // status.effectiveSizingTier, with the SizingCappedByQuota condition, before
 // any builder reads renderedSizingTier, so the status is the record of what
@@ -481,11 +493,19 @@ func setSizingCappedByQuotaCondition(agent *agentv1alpha1.PlatformAgent, msg str
 // tier, whatever profile wrote it (an explicit fleet switched to auto
 // continues at fleet; small first, then auto, restarts the latch), raised to
 // what the cluster count earns when every ResourceQuota in the namespace has
-// room for the step; a count that falls, or that the operator has no reading
-// of, leaves the latch where it is, and a short quota keeps the running tier
-// and sets the condition. The write is gated on a change, as the other status
-// writers' are, because the PlatformAgent watch has no predicate and every
-// write re-enqueues the object.
+// room for the step; a short quota keeps the running tier and sets the
+// condition. A count that falls leaves the latch where it is and clears the
+// condition, since it no longer earns the step; a pass with no reading (the
+// gauges absent before the first poll, or cleared after two polls that read
+// no gateway) leaves the latch and the condition both where they are, so a
+// gateway outage neither clears a cap the quota still imposes nor records it
+// again when the reading returns. The write is gated on a change, as the
+// other status writers' are, because the PlatformAgent watch has no predicate
+// and every write re-enqueues the object; under a served CRD that prunes
+// status.effectiveSizingTier the field reads "" after every write, so the
+// gate treats "" as settled while the echo record (prunedSizingTier) is fresh,
+// as the Ready writer does for status.usage, rather than writing and logging
+// on every pass.
 func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	profile := sizingProfileOf(agent.Spec.Deployment)
 	latched, _ := parseSizingTier(agent.Status.EffectiveSizingTier)
@@ -509,9 +529,13 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					capped = fmt.Sprintf(sizingCappedByQuotaMessageFormat, earned, shortfall.quota, shortfall.key, tier, tier)
 				}
 			}
+		} else {
+			capped = sizingCappedConditionMessage(agent)
 		}
 	}
-	if agent.Status.EffectiveSizingTier == tier.String() && sizingCappedConditionCurrent(agent, capped) {
+	tierSettled := agent.Status.EffectiveSizingTier == tier.String() ||
+		(agent.Status.EffectiveSizingTier == "" && r.sizingTierPruned(agent))
+	if tierSettled && sizingCappedConditionCurrent(agent, capped) {
 		return nil
 	}
 	log := logf.FromContext(ctx)
@@ -531,5 +555,41 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 	}
 	agent.Status.EffectiveSizingTier = tier.String()
 	setSizingCappedByQuotaCondition(agent, capped, metav1.Now())
-	return r.Status().Update(ctx, agent)
+	if err := r.Status().Update(ctx, agent); err != nil {
+		return err
+	}
+	r.noteSizingTierEcho(ctx, agent)
+	return nil
+}
+
+// sizingTierPruned reports whether the served CRD has been seen to drop
+// status.effectiveSizingTier for this CR within the last
+// usageStatusReprobeInterval. A stale record reads false, which is what makes
+// the next pass probe the field again.
+func (r *PlatformAgentReconciler) sizingTierPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	recorded, pruned := r.prunedSizingTier.Load(client.ObjectKeyFromObject(agent))
+	if !pruned {
+		return false
+	}
+	return time.Since(recorded.(time.Time)) < usageStatusReprobeInterval
+}
+
+// noteSizingTierEcho reads the server's copy of status.effectiveSizingTier
+// back after resolveSizingTier's write, which always carries a tier.
+// controller-runtime decodes the response into agent through a decoder that
+// zeroes the target first, so a field the served CRD does not know comes back
+// "" although a tier was just written. An echo without the field is recorded
+// with the time, and said once per record; an echo with it clears the record.
+func (r *PlatformAgentReconciler) noteSizingTierEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+	key := client.ObjectKeyFromObject(agent)
+	if agent.Status.EffectiveSizingTier != "" {
+		r.prunedSizingTier.Delete(key)
+		return
+	}
+	fresh := r.sizingTierPruned(agent)
+	r.prunedSizingTier.Store(key, time.Now())
+	if !fresh {
+		logf.FromContext(ctx).Info("the served CRD has no status.effectiveSizingTier; apply this release's CRD to get it, which is probed again after the interval",
+			"platformagent", key.String(), "reprobeAfter", usageStatusReprobeInterval.String())
+	}
 }

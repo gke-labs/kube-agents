@@ -486,6 +486,14 @@ type PlatformAgentReconciler struct {
 	// clears it when an echo carries the pair. Under prunedNewerFieldsMu.
 	prunedNewerFieldsMu sync.Mutex
 	prunedNewerFields   map[string]map[string]time.Time
+	// prunedSizingTier records, per CR, the last write of
+	// status.effectiveSizingTier whose echo came back without the field: a
+	// served CRD that predates it. resolveSizingTier's write gate treats ""
+	// as settled while the record is fresh (usageStatusReprobeInterval), so an
+	// operator rolled ahead of its CRD writes and logs the tier once per
+	// interval rather than on every pass. Keyed by ObjectKey, value time.Time;
+	// cleared by an echo that carries the field, and when the CR is deleted.
+	prunedSizingTier sync.Map
 
 	// credentialProxyWarningsLogged records, per CR, the spec generation whose
 	// credential-proxy resources warnings reconcileCredentialProxy last logged,
@@ -4899,10 +4907,11 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 	}
 }
 
-// forgetUsageStatus drops the CR's pruning record when the CR goes away, so the
-// map does not keep an entry per deleted name for the life of the process.
+// forgetUsageStatus drops the CR's pruning records when the CR goes away, so the
+// maps do not keep an entry per deleted name for the life of the process.
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()
 	delete(r.prunedNewerFields, usagePollKey(agent))
 	r.prunedNewerFieldsMu.Unlock()

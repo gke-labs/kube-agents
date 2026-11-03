@@ -20,6 +20,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -197,6 +198,56 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		}
 		if len(recorder.Events) != 1 {
 			t.Errorf("%d events recorded, want the first pass's one", len(recorder.Events))
+		}
+	})
+	t.Run("a pass with no reading keeps the condition and the returning reading does not record it again", func(t *testing.T) {
+		t.Parallel()
+		// The first pass caps the tier. The poller then clears both gauges
+		// (two polls read no gateway), which is no reading, not a count that
+		// stopped earning the step: the condition stands, nothing is written.
+		// When the reading returns and the quota is as short as before, the
+		// message is the one already on the CR, so no second write and no
+		// second Warning. A count that falls under the threshold clears it.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+		quota := sizingQuota("platform-baseline-quota", "10Gi", "8Gi")
+		scheme := setupScheme()
+		writes := 0
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota).WithStatusSubresource(agent).
+			WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					writes++
+					return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+				},
+			}).Build()
+		recorder := record.NewFakeRecorder(8)
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("first pass: %v", err)
+		}
+		agent.Status.Usage.ClustersRegistered = nil
+		agent.Status.Usage.ClustersMonitored = nil
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("pass with no reading: %v", err)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond == nil || cond.Status != metav1.ConditionTrue {
+			t.Fatalf("SizingCappedByQuota dropped by a pass with no reading: %+v", cond)
+		}
+		agent.Status.Usage.ClustersRegistered = ptr.To[int64](12)
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("pass with the reading back: %v", err)
+		}
+		if writes != 1 {
+			t.Errorf("status written %d times across the three passes, want the first pass's one", writes)
+		}
+		if len(recorder.Events) != 1 {
+			t.Errorf("%d events recorded, want the first pass's one", len(recorder.Events))
+		}
+		agent.Status.Usage.ClustersRegistered = ptr.To[int64](3)
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("pass with the count fallen: %v", err)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil || writes != 2 {
+			t.Fatalf("after the count fell under the threshold: condition %+v, %d writes; want absent and 2", cond, writes)
 		}
 	})
 	t.Run("a quota with headroom lets the promotion through and clears the condition", func(t *testing.T) {
@@ -401,5 +452,72 @@ func TestSizingValidationFollowsTheRenderedTier(t *testing.T) {
 	}
 	if refusal, _ := shellSandboxResourcesRefusal(shell); refusal != "" {
 		t.Errorf("the reconciler refused the shell override against the fleet latch: %s", refusal)
+	}
+}
+
+// TestResolveSizingTierUnderAPruningCRDWritesOncePerInterval pins the write
+// gate under a served CRD that predates status.effectiveSizingTier. The API
+// server drops the field from every write, so it reads back "" and a gate
+// keyed on the field alone would write, and log a tier change, on every
+// pass. The echo records the pruning and the gate treats "" as settled while
+// the record is fresh; once the CRD carries the field the next probe lands it.
+func TestResolveSizingTierUnderAPruningCRDWritesOncePerInterval(t *testing.T) {
+	t.Parallel()
+	agent := sizingAgent(sizingProfileAuto, "", ptr.To[int64](4), nil)
+	scheme := setupScheme()
+	writes := 0
+	pruning := true
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				writes++
+				if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && pruning {
+					pa.Status.EffectiveSizingTier = ""
+				}
+				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+			},
+		}).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+	pass := func(what string) {
+		t.Helper()
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	pass("first pass")
+	if agent.Status.EffectiveSizingTier != "" {
+		t.Fatalf("the fixture did not prune the field (got %q); the test is not exercising the skew", agent.Status.EffectiveSizingTier)
+	}
+	pass("second pass")
+	pass("third pass")
+	if writes != 1 {
+		t.Errorf("%d status writes across three passes under a pruning CRD, want 1", writes)
+	}
+	key := client.ObjectKeyFromObject(agent)
+	// The skew persists past the interval: one probe write, then quiet again.
+	r.prunedSizingTier.Store(key, time.Now().Add(-2*usageStatusReprobeInterval))
+	pass("probe after the record expired")
+	pass("pass after the probe")
+	if writes != 2 {
+		t.Errorf("%d writes after the record expired under a still-pruning CRD, want 2", writes)
+	}
+	// The CRD is applied. A fresh record still holds the field back; once it
+	// expires the next pass writes once, lands it, and the record is cleared.
+	pruning = false
+	pass("pass under the applied CRD with a fresh record")
+	if writes != 2 {
+		t.Errorf("%d writes under the applied CRD with a fresh record, want 2", writes)
+	}
+	r.prunedSizingTier.Store(key, time.Now().Add(-2*usageStatusReprobeInterval))
+	pass("probe under the applied CRD")
+	if writes != 3 || agent.Status.EffectiveSizingTier != sizingProfileSmall {
+		t.Fatalf("after the record expired under the applied CRD: %d writes, tier %q; want 3 and small", writes, agent.Status.EffectiveSizingTier)
+	}
+	if r.sizingTierPruned(agent) {
+		t.Error("the echo carried the field and the record was not cleared")
+	}
+	pass("settled pass")
+	if writes != 3 {
+		t.Errorf("a settled tier under the applied CRD wrote %d times, want 3", writes)
 	}
 }
