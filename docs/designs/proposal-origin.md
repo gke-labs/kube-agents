@@ -12,9 +12,7 @@ install's numbers across installs).
 
 ## 1. The question and what answers it today
 
-The development team wants to know which features make customers' installs open pull requests: a
-person asking in chat, the event watcher's triage of a cluster event, drift detection, a scheduled
-fleet audit, a claimed GitHub issue, the admin console, or a caller on the agent API. They read
+The development team wants to know which features make customers' installs open pull requests: a person asking in chat, the event watcher's triage of a cluster event, drift detection, a scheduled fleet audit, a claimed GitHub issue, the web or admin console, or a caller on the agent API. They read
 the answer from the `status.usage` block, which an internal dataset ingests from every install, so
 the split has to land there; Prometheus gets it for free through the per-field gauge.
 
@@ -43,17 +41,17 @@ total stays what it is.
 Each unit of work the agent does carries one `origin`, written once by the in-pod code that
 starts it. The values, as many as the runtime can tell apart:
 
-| Origin      | The work                                                                                                                                                                                                                          |
-| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `chat`      | a person's message on a chat platform: the A2A bridge's sessions for Google Chat, Slack and Discord, and the Hermes gateway's platform sessions under `today` (Google Chat, Slack, Teams)                                         |
-| `console`   | the admin console: sessions whose id the console minted (`web-console-*`, read as a convention by the in-pod reader until the agent-API door writes a record), the A2A gateway's `console` backend, and cards the dashboard files |
-| `api`       | a caller on the agent API or an A2A door (`a2a`, `a2a-google`, `inject`): another agent or a script, not a person on a chat platform                                                                                              |
-| `event`     | the event watcher's triage: a `k8s-evt-*` session the Session KV server opens for a cluster event, decided by the first injected payload (`k8s-event`, `k8s-event-followup` and `controller-stall` are all `event`)               |
-| `drift`     | the drift detector: a `k8s-evt-*` session whose first injected payload carries `kind: gitops-drift`, and the cards the drift backlog files                                                                                        |
-| `audit`     | a scheduled fleet audit: a scheduler-started run of a job shipped in the image's `agents/platform/cron/jobs.json` whose `skills` list names `fleet-audit`                                                                         |
-| `scheduled` | a scheduler-started run of any other shipped job, the `github-repo-watcher` gate included, and the pull-request follow-up cards that gate files; a job the model created runs under the origin of the session that created it     |
-| `issue`     | a claimed GitHub issue: a worker on an issue card the `github-repo-watcher` gate filed; the gate stamps the card itself, so a card the model names `issue-resolve-*` is not `issue`                                               |
-| `other`     | work whose origin none of the above resolves, and the value a failed write defaults to                                                                                                                                            |
+| Origin      | The work                                                                                                                                                                                                                                                                                                   |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chat`      | a person's message on a chat platform: the A2A bridge's sessions for Google Chat, Slack and Discord, and the Hermes gateway's platform sessions under `today` (Google Chat, Slack, Teams)                                                                                                                  |
+| `console`   | the operator-facing consoles: sessions whose id the web console minted (`web-console-*`) or the admin console's chat page minted (`portal_*`), both read as a convention by the in-pod reader until the agent-API door writes a record, the A2A gateway's `console` backend, and cards the dashboard files |
+| `api`       | a caller on the agent API or an A2A door (`a2a`, `a2a-google`, `inject`): another agent or a script, not a person on a chat platform                                                                                                                                                                       |
+| `event`     | the event watcher's triage: a `k8s-evt-*` session the Session KV server opens for a cluster event, decided by the first injected payload (`k8s-event`, `k8s-event-followup` and `controller-stall` are all `event`)                                                                                        |
+| `drift`     | the drift detector: a `k8s-evt-*` session whose first injected payload carries `kind: gitops-drift`, and the cards the drift backlog files                                                                                                                                                                 |
+| `audit`     | a scheduled fleet audit: a scheduler-started run of a job shipped in the image's `agents/platform/cron/jobs.json` whose `skills` list names `fleet-audit`                                                                                                                                                  |
+| `scheduled` | a scheduler-started run of any other shipped job, the `github-repo-watcher` gate included, and the pull-request follow-up cards that gate files; a job the model created runs under the origin of the session that created it                                                                              |
+| `issue`     | a claimed GitHub issue: a worker on an issue card the `github-repo-watcher` gate filed; the gate stamps the card itself, so a card the model names `issue-resolve-*` is not `issue`                                                                                                                        |
+| `other`     | work whose origin none of the above resolves, and the value a failed write defaults to                                                                                                                                                                                                                     |
 
 Three kinds of unit carry the record, each written by in-pod code inside one trust boundary:
 
@@ -68,8 +66,7 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   overwrites on an alert's session with the chat platform the alert was posted to. A continuation
   after context compression inherits its parent's record through `parent_session_id`. The `session_store` plugin rewrites a session's metadata blob on every gateway message from the event alone, so it must read the row and write it back in one `BEGIN IMMEDIATE` transaction, carrying the two keys forward and writing an origin only where none is present; that plugin prunes the table after seven
   idle days and the Session KV server's own cleanup after fourteen, so a thread resumed after
-  that, or a continuation whose parent row is gone, resolves as `other`, which is accepted. The
-  web console runs outside the pod and mints its session ids itself, so it writes no record: the in-pod reader takes `console` from the `web-console-` id prefix, the convention the console's activity view already reads, until the agent-API door writes a record for the sessions it admits. Any caller holding the external agent-API key can mint such an id and count as `console` rather than `api`; both are operator-side callers, the sandbox holds no such key, and the bridge forces its own prefix, so that is accepted until the door's record replaces the convention. A caller holding that key can also join an existing session by id (an alert's `k8s-evt-*` session, a chat session), and its work then counts as that session's origin; the sandbox holds no key, so that too is accepted as operator-side. The `session_store` plugin runs only on gateway dispatch, which an agent-API turn may
+  that, or a continuation whose parent row is gone, resolves as `other`, which is accepted. The web console and the admin console's chat page run outside the pod and mint their session ids themselves (`web-console-*` and `portal_*`), so they write no record: the in-pod reader takes `console` from those id prefixes, the convention the web console's activity view already reads for its own, until the agent-API door writes a record for the sessions it admits. Any caller holding the external agent-API key can mint such an id and count as `console` rather than `api`; both are operator-side callers, the sandbox holds no such key, and the bridge forces its own prefix, so that is accepted until the door's record replaces the convention. A caller holding that key can also join an existing session by id (an alert's `k8s-evt-*` session, a chat session), and its work then counts as that session's origin; the sandbox holds no key, so that too is accepted as operator-side. The `session_store` plugin runs only on gateway dispatch, which an agent-API turn may
   not pass through; `api` for agent-API turns is therefore written by that door when its design
   lands, and until then such work resolves as `other`. A person who replies in an alert's thread runs in the gateway's own chat session (the alert's report is pasted in; nothing maps the reply to the `k8s-evt-*` session), so a proposal they ask for there counts as `chat`.
 - **A card**, as two columns the board patch writes at insert, beside the priority
@@ -77,7 +74,7 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   the model passes. The origin is never an argument of a create command: the `/kanban create`
   parser serves chat users and in-pod scripts alike, so a flag on it would let anyone who can
   chat stamp `issue` or `drift`. Instead the board stamps, at insert and only at insert, the creating turn's trusted context:
-  the session record of the turn that files it, read by the trusted Hermes session id (`chat` with its platform, `event`, `drift`, `api`, or `console` by the `web-console-` convention), a tick-started run's `audit` or `scheduled`, the dashboard's `console`; a card a worker files inherits the worker's card, and an auto-decomposed
+  the session record of the turn that files it, read by the trusted Hermes session id (`chat` with its platform, `event`, `drift`, `api`, or `console` by the id-prefix convention), a tick-started run's `audit` or `scheduled`, the dashboard's `console`; a card a worker files inherits the worker's card, and an auto-decomposed
   child inherits its parent's. The few trusted writers that know better than their own context,
   the issue gate (`issue` on its issue cards, `scheduled` on its pull-request follow-up cards),
   the drift backlog (`drift`) and the chat bootstrap (`chat`), pass the stamp to the insert
@@ -160,7 +157,7 @@ listener, the leader's, so its reading is the leader's ledger and can fall at a 
 change; the slot keeps the last reading through one miss and the next poll reads the new
 leader's; that is accepted.
 
-**Resolving the process's origin.** The hook reads, in this order: the card's stamp, for a worker, from the board it already opens for the `pr_opened` event; the run's context, for a process inside a tick-started run; the session's record by the trusted Hermes session id, or the `web-console-` convention on that id; else `other`. The trusted id is the request-scoped one an api_server turn already binds; for a gateway platform turn the `session_store` plugin binds the Hermes session id in the same context at dispatch, since the chat id it holds today is not the row's key. That binding is a named part of the implementation, not an assumption. The Chat Agent profile has no terminal, so in the stock layout a chat turn never opens a pull
+**Resolving the process's origin.** The hook reads, in this order: the card's stamp, for a worker, from the board it already opens for the `pr_opened` event; the run's context, for a process inside a tick-started run; the session's record by the trusted Hermes session id, or the `web-console-` / `portal_` convention on that id; else `other`. The trusted id is the request-scoped one an api_server turn already binds; for a gateway platform turn the `session_store` plugin binds the Hermes session id in the same context at dispatch, since the chat id it holds today is not the row's key. That binding is a named part of the implementation, not an assumption. The Chat Agent profile has no terminal, so in the stock layout a chat turn never opens a pull
 request itself: its proposals come from the cards it files, whose stamp carries the platform the
 turn arrived on, and that is what the `platform` label holds for `chat` (empty for every other
 origin). Under the experimental platform-profile front door a chat turn does run with the
@@ -245,7 +242,7 @@ holds as it stands.
   `origin_platform` in its key list; `chat` with the platform for `today` platform sessions.
 - **Chat bootstrap** (`agents/chat/scripts/bootstrap_handoff.py`): `chat` on its onboarding
   cards.
-- **The in-pod reader** (the hook's resolution): `console` from the `web-console-` id prefix.
+- **The in-pod reader** (the hook's resolution and the board patch): `console` from the `web-console-` and `portal_` id prefixes.
 - **Hermes scheduler patch** (beside `deploy/docker/patches/apply_cron_run_workdir.py`): the
   per-run origin context, `audit` or `scheduled` from the shipped file's `skills` for tick-started runs of jobs that match the template; the creating or editing session's origin recorded per job id in the Session KV server by the `cronjob` tool's handler and carried by that job's tick-started runs.
 - **`github_scan_gate.py`**: `issue` on its issue cards, `scheduled` on its pull-request
