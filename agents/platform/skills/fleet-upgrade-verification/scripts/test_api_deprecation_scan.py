@@ -66,6 +66,38 @@ class FakeSnapshot:
         return {"revision": self.sha, "path": str(into), "skipped": list(self.skipped)}
 
 
+def entry(path, size, manifests=1, kind="tree"):
+    return {"path": path, "type": kind, "manifests": manifests, "bytes": size}
+
+
+class FakeParts:
+    """vcs_client.snapshot over a tree too large to take whole.
+
+    ``refusals`` maps the `paths` asked (None for the whole tree) to the
+    entries the broker's SNAPSHOT_TOO_LARGE names, or to None for a refusal
+    that names none. Any other request is served from ``tree``.
+    """
+
+    def __init__(self, tree, refusals, ceiling=1000, revisions=("abc1234",)):
+        self.tree = tree
+        self.refusals = refusals
+        self.ceiling = ceiling
+        self.revisions = list(revisions)
+        self.calls = []
+
+    def __call__(self, repo, into=None, paths=None, **kwargs):
+        key = tuple(paths) if paths else None
+        self.calls.append(key)
+        if key in self.refusals:
+            raise scan.vcs_client.VcsError(
+                "too large", code=scan.vcs_client.SNAPSHOT_TOO_LARGE, entries=self.refusals[key], ceiling=self.ceiling
+            )
+        Path(into).mkdir(parents=True, exist_ok=True)
+        write_tree(into, {p: c for p, c in self.tree.items() if any(p == q or p.startswith(q + "/") for q in paths)})
+        revision = self.revisions.pop(0) if len(self.revisions) > 1 else self.revisions[0]
+        return {"revision": revision, "skipped": []}
+
+
 def patch_vcs_root(case):
     """Point vcs_client's copies root at a directory the test owns."""
     tmp = tempfile.TemporaryDirectory()
@@ -278,7 +310,7 @@ class ScanAndRenderTest(unittest.TestCase):
         self.assertIn("Members: p/old (1.24), p/mid (1.26)", text)
         self.assertIn(scan.DEPRECATION_INSIGHTS_COMMAND, text)
         self.assertIn(scan.DEPRECATION_INSIGHTS_URL, text)
-        self.assertEqual(report["summary"], {"sources": 1, "hits": 2, "skipped": 0, "errors": 0})
+        self.assertEqual(report["summary"], {"sources": 1, "hits": 2, "skipped": 0, "errors": 0, "unread": 0})
 
     def test_clean_section_states_source_and_counts(self):
         report = self.report({"apps/job.yaml": CRONJOB_V1, "chart/templates/d.yaml": HELM_TEMPLATE})
@@ -444,6 +476,95 @@ class ContentModeTest(unittest.TestCase):
         snapshot = scan.read_repo_content("acme/infra", max_bytes=50, snapshot=fake)
         self.assertEqual(list(snapshot.files), ["a.yaml"])
         self.assertEqual(snapshot.stopped, scan.STOPPED_MAX_BYTES)
+
+
+class InPartsTest(unittest.TestCase):
+    """A tree over the broker's snapshot ceiling, read in the parts that hold manifests."""
+
+    TREE = {
+        "clusters/a/pdb.yaml": PDB_V1BETA1,
+        "clusters/b/cron.yaml": CRONJOB_V1BETA1,
+        "charts/big.tgz": b"x",
+        "top.yaml": CRONJOB_V1,
+    }
+
+    def setUp(self):
+        patch_vcs_root(self)
+
+    def test_the_parts_that_fit_are_read_in_one_snapshot_and_parts_without_manifests_are_left_out(self):
+        fake = FakeParts(self.TREE, {None: [
+            entry("charts", 5000, manifests=0), entry("clusters", 600, manifests=2), entry("top.yaml", 20, kind="blob"),
+        ]})
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual([None, ("clusters", "top.yaml")], fake.calls)
+        self.assertEqual(sorted(read.files), ["clusters/a/pdb.yaml", "clusters/b/cron.yaml", "top.yaml"])
+        self.assertEqual((1, [], "repo manifests as of abc1234"), (read.parts, read.unread, read.source))
+        self.assertEqual([], list(scan.vcs_client.ROOT.iterdir()))
+
+    def test_an_entry_over_the_ceiling_is_asked_alone_and_its_entries_are_read(self):
+        fake = FakeParts(self.TREE, {
+            None: [entry("clusters", 3000, manifests=2), entry("top.yaml", 20, kind="blob")],
+            ("clusters",): [entry("clusters/a", 600), entry("clusters/b", 300)],
+        })
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual([None, ("top.yaml",), ("clusters",), ("clusters/a", "clusters/b")], fake.calls)
+        self.assertEqual(sorted(read.files), ["clusters/a/pdb.yaml", "clusters/b/cron.yaml", "top.yaml"])
+        self.assertEqual(3, read.parts)
+
+    def test_what_cannot_be_read_is_listed_with_its_reason(self):
+        fake = FakeParts(self.TREE, {
+            None: [entry("huge.yaml", 5000, kind="blob"), entry("clusters", 3000, manifests=2), entry("top.yaml", 20, kind="blob")],
+            ("clusters",): None,
+        })
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual(["top.yaml"], sorted(read.files))
+        reasons = {unread["path"]: unread["reason"] for unread in read.unread}
+        self.assertEqual({"huge.yaml", "clusters"}, set(reasons))
+        self.assertIn("1000-byte snapshot ceiling on its own (CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES)", reasons["huge.yaml"])
+        self.assertIn("named no entries below it", reasons["clusters"])
+
+    def test_past_the_cap_the_rest_is_listed_as_not_read(self):
+        fake = FakeParts(self.TREE, {None: [entry("clusters", 900, manifests=2), entry("top.yaml", 200, kind="blob")]})
+        with patch.object(scan, "NARROW_SNAPSHOT_CAP", 1):
+            read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual([None, ("clusters",)], fake.calls)
+        self.assertEqual([{"path": "top.yaml", "reason": "past the cap of 1 snapshots for one repository"}], read.unread)
+
+    def test_a_refusal_that_names_no_entries_is_still_an_error(self):
+        fake = FakeParts(self.TREE, {None: None})
+        with self.assertRaises(scan.vcs_client.VcsError):
+            scan.read_repo_content("acme/infra", snapshot=fake)
+
+    def test_the_section_says_how_it_was_read_and_what_it_did_not_read(self):
+        fake = FakeParts(
+            self.TREE,
+            {None: [entry("clusters", 900, manifests=2), entry("top.yaml", 200, kind="blob"), entry("huge.yaml", 5000, kind="blob")]},
+            revisions=("abc1234", "def5678"),
+        )
+        table = scan.load_table()
+        members = [scan.Member(label="c1", version=(1, 24), note=None)]
+        report = scan.build_report(table, (1, 24), (1, 27), members, [("acme/infra", lambda: scan.read_repo_content("acme/infra", snapshot=fake))])
+        out = scan.render_report(report)
+        self.assertIn("## acme/infra — repo manifests as of abc1234", out)
+        self.assertIn("- read in parts (2 snapshot(s)): the whole tree is over the broker's snapshot ceiling", out)
+        self.assertIn("- the branch moved while the parts were read; they come from abc1234, def5678", out)
+        self.assertIn("- partial: huge.yaml was not read: a file over the broker's 1000-byte", out)
+        self.assertEqual(1, report["summary"]["unread"])
+        self.assertEqual(2, report["summary"]["hits"])
+
+    def test_a_partial_read_exits_1_and_a_whole_one_in_parts_exits_0(self):
+        cases = (
+            ({None: [entry("clusters", 600, manifests=2), entry("huge.yaml", 5000, kind="blob")]}, scan.EXIT_PARTIAL),
+            ({None: [entry("clusters", 600, manifests=2)]}, scan.EXIT_OK),
+        )
+        for refusals, expected in cases:
+            with self.subTest(expected=expected), patch.object(scan.vcs_client, "snapshot", FakeParts(self.TREE, refusals)), patch.dict(
+                os.environ, {"CREDENTIAL_PROXY_URL": "http://broker"}
+            ):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = scan.main(["--repo", "acme/infra", "--current-version", "1.24", "--target-version", "1.27"])
+                self.assertEqual(expected, rc, out.getvalue())
 
 
 class DirectoryModeTest(unittest.TestCase):
