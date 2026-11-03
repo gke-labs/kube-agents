@@ -340,7 +340,9 @@ leave open:
   the pod counts as busy in memory, and a dispatcher restarted mid-offer finds no record and
   dispatches the task afresh. With no free pod the submission waits over its cap and is
   redelivered. A record past its expiry doesn't keep its pod busy, and a sweep deletes records
-  long expired that no held submission has (its submission aged off the stream). Answers a pod
+  long expired that no held submission has (its submission aged off the stream). A record
+  nobody can read counts as a running one: its task is treated as started, and the sweep
+  waits as long from the record's last write. Answers a pod
   sends for tasks it doesn't hold are held to a small budget per pod.
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every

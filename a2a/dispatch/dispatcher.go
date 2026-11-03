@@ -1443,7 +1443,8 @@ func (d *Dispatcher) prune() {
 //   - a running lease expired for longer than SweepAfter, held by no hold
 //     here, in a (profile, tier) whose durables are all bound (so a
 //     submission still on the stream would have come back and been
-//     re-adopted long since).
+//     re-adopted long since). An unreadable record counts as running and
+//     waits SweepAfter from its own write.
 func (d *Dispatcher) sweep(ctx context.Context) {
 	kctx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 	defer cancel()
@@ -1495,7 +1496,14 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 			d.log.Info("swept a tombstone past the submit stream's retention", "key", k, "finishedAt", rec.FinishedAt)
 			continue
 		}
-		if !bound || (readable && !rec.Expired(now, d.cfg.SweepAfter)) {
+		if !bound {
+			continue
+		}
+		// An unreadable record still says its task started (findLease), so
+		// it gets the same wait, counted from the entry's own write: no
+		// renewal can rewrite it, so that is its last sign of life.
+		if readable && !rec.Expired(now, d.cfg.SweepAfter) ||
+			!readable && now.Sub(entry.Created()) <= d.cfg.SweepAfter {
 			continue
 		}
 		if err := kv.Delete(kctx, k, jetstream.LastRevision(entry.Revision())); err != nil {
