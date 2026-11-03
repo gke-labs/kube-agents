@@ -1332,9 +1332,12 @@ The people reading (`peopleSeen7d`, `peopleSeen30d`) comes from the A2A gateway:
 people who wrote on a chat platform it serves in the last 7 and 30 days, the largest count across
 gateway pods. The operator reads it only while the install renders the A2A stack under `spec.mode: next` and no chat
 platform the install enables is served through Hermes: Google Chat or Slack on its legacy consumer,
-or Teams. Otherwise both fields are absent. A poll that reads no gateway body carrying both
+or Teams. Otherwise both fields are absent.
+
+A poll that reads no gateway body carrying both
 windows is a miss, and so is a poll that finds no running gateway pod. The second miss in a row
-clears both. A 0 is a reading, and neither field moves `lastActiveTime` or
+clears both. With `spec.telemetry.peopleSeen: false` the gateway serves no sample, so both fields
+clear the same way. A 0 is a reading, and neither field moves `lastActiveTime` or
 `lastHumanActiveTime`.
 
 The operator also serves every counter, cluster gauge, reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
