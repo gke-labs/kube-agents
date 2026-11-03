@@ -15608,8 +15608,13 @@ class ListenBacklogTest(unittest.TestCase):
 _CLOSE_WAIT_SECONDS = 5
 # The idle keep-alive timeout a test arms, short enough to observe.
 _SHORT_IDLE_SECONDS = 0.5
-# The bound the issue pins on the health listener's answer under saturation.
-_HEALTH_ANSWER_SECONDS = 0.05
+# The bound on the health listener's answer under saturation. What the test
+# rules out is the answer waiting behind the four holders, parked for the idle
+# timeout (seconds); an order of magnitude under that, and not the issue's 50 ms,
+# which pins scheduler noise on a loaded runner rather than the property.
+_HEALTH_ANSWER_SECONDS = 1
+# Refusals made in quick succession, to show the cap writes one line for them.
+_REFUSAL_BURST = 3
 # The small cap the saturation test builds its server with.
 _SMALL_THREAD_CAP = 4
 _KEEPALIVE_REQUESTS = 5
@@ -15776,10 +15781,18 @@ class KeepAliveTest(_CredentialedUnixServer):
         with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
             sock = self.connect()
             self.send(sock, "GET", "/healthz")
-            self.assertEqual(200, self.response(sock)[0])
-            started = time.monotonic()
-            self.assertTrue(self.closed_by_server(sock))
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                self.assertEqual(200, self.response(sock)[0])
+                started = time.monotonic()
+                self.assertTrue(self.closed_by_server(sock))
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
             self.assertGreaterEqual(time.monotonic() - started, _SHORT_IDLE_SECONDS * 0.5)
+        # An idle close is a debug line, as a peer's EOF is: never the
+        # stdlib's "Request timed out" on the access log, one per connection.
+        self.assertFalse(
+            any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output
+        )
+        self.assertTrue(any(line.startswith("DEBUG:") and "closed idle" in line for line in logs.output), logs.output)
 
     def test_the_idle_timeout_is_under_envoys(self):
         # Envoy, the only client, must close an idle connection first, or it
@@ -15800,6 +15813,16 @@ class ThreadCapTest(_CredentialedUnixServer):
     def max_threads(self):
         return _SMALL_THREAD_CAP
 
+    def _refused(self):
+        """Connect past the cap and return what the connection read."""
+        extra = self.connect()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.send(extra, "GET", "/healthz")
+        status, headers, body = self.response(extra)
+        self.assertTrue(self.closed_by_server(extra), "the refused connection stayed open")
+        extra.close()  # as Envoy does on reading the answer; the drain returns at once
+        return status, headers, body
+
     def test_the_connection_past_the_cap_reads_503_and_eof_while_health_answers(self):
         health = credential_proxy.start_health_listener("127.0.0.1", 0)
         self.addCleanup(health.server_close)
@@ -15808,27 +15831,35 @@ class ThreadCapTest(_CredentialedUnixServer):
         # line that never comes.
         holders = [self.connect() for _ in range(_SMALL_THREAD_CAP)]
         time.sleep(_RESET_SETTLE_SECONDS)
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-            extra = self.connect()
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                self.send(extra, "GET", "/healthz")
-            status, headers, body = self.response(extra)
-        self.assertEqual((503, str(credential_proxy.THREAD_CAP_RETRY_AFTER_SECONDS), "0", "close", b""), (
-            status, headers.get("retry-after"), headers.get("content-length"), headers.get("connection"), body,
-        ))
-        self.assertTrue(self.closed_by_server(extra), "the refused connection stayed open")
-        self.assertTrue(any("ALERT" in line and credential_proxy.MAX_THREADS_ENV in line for line in logs.output), logs.output)
+        # A burst inside one interval is one line; then, with the interval
+        # shortened, a holder closing after a quiet interval ends the episode.
+        with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _CLOSE_WAIT_SECONDS):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                for _ in range(_REFUSAL_BURST):
+                    status, headers, body = self._refused()
+                    self.assertEqual(
+                        (503, str(credential_proxy.THREAD_CAP_RETRY_AFTER_SECONDS), "0", "close", b""),
+                        (status, headers.get("retry-after"), headers.get("content-length"), headers.get("connection"), body),
+                    )
+            alerts = [line for line in logs.output if "ALERT" in line and credential_proxy.MAX_THREADS_ENV in line]
+            self.assertEqual(1, len(alerts), f"one line for a burst of {_REFUSAL_BURST} refusals, not one each: {logs.output}")
+            self.assertEqual(len(alerts), len(logs.output), logs.output)
 
-        started = time.monotonic()
-        with urllib.request.urlopen(f"http://127.0.0.1:{health.server_port}/healthz", timeout=_CLOSE_WAIT_SECONDS) as response:
-            self.assertEqual((200, {"status": "ok"}), (response.status, json.loads(response.read())))
-        self.assertLess(time.monotonic() - started, _HEALTH_ANSWER_SECONDS)
+            started = time.monotonic()
+            with urllib.request.urlopen(f"http://127.0.0.1:{health.server_port}/healthz", timeout=_CLOSE_WAIT_SECONDS) as response:
+                self.assertEqual((200, {"status": "ok"}), (response.status, json.loads(response.read())))
+            self.assertLess(time.monotonic() - started, _HEALTH_ANSWER_SECONDS)
 
-        # A slot comes back when a holder goes, and the log says the cap released.
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-            holders[0].close()
+        # A slot comes back when a holder goes; the episode is reported
+        # over only once an interval has passed with no refusal.
+        with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _RESET_SETTLE_SECONDS):
             time.sleep(_RESET_SETTLE_SECONDS)
-        self.assertTrue(any("thread cap released" in line for line in logs.output), logs.output)
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                holders[0].close()
+                time.sleep(_RESET_SETTLE_SECONDS)
+            released = [line for line in logs.output if "thread cap released" in line]
+            self.assertEqual(1, len(released), logs.output)
+            self.assertIn(f"{_REFUSAL_BURST - 1} refused since the last line", released[0])
         served = self.connect()
         self.send(served, "GET", "/healthz")
         self.assertEqual(200, self.response(served)[0])

@@ -2024,7 +2024,9 @@ class ServeWiringTest(unittest.TestCase):
     def test_a_health_port_the_other_listeners_hold_is_refused_by_name_and_never_bound(self):
         for health_port, named in ((8766, "metrics"), (0, None), (70000, "1-65535")):
             with self.subTest(health_port=health_port):
-                started, logs = self._serve(8766, health_port=health_port, health_started=mock.MagicMock())
+                health_started = mock.MagicMock()
+                started, logs = self._serve(8766, health_port=health_port, health_started=health_started)
+                health_started.assert_not_called()
                 if named is None:
                     self.assertTrue(any("health listener disabled" in line for line in logs), logs)
                 else:
@@ -2033,15 +2035,16 @@ class ServeWiringTest(unittest.TestCase):
                         logs,
                     )
 
-    def test_serve_sets_the_thread_cap_and_the_stack_size_before_any_listener(self):
+    def test_serve_sets_the_thread_cap_and_leaves_the_stack_size_alone(self):
         # _serve clears the environment, so the reader is stood in for; the
-        # reader itself is ThreadCapTest's.
+        # reader itself is ThreadCapTest's. The stack size stays the
+        # platform's: a smaller one overflows under the C recursion the
+        # shipped interpreter permits on a nested JSON body.
         with mock.patch.object(credential_proxy.threading, "stack_size") as stack_size, \
                 mock.patch.object(credential_proxy, "thread_cap_from_env", return_value=12):
             self.addCleanup(setattr, credential_proxy.ThreadCap, "max_threads", credential_proxy.ThreadCap.max_threads)
             self._serve(8766)
-        stack_size.assert_called_once_with(credential_proxy.THREAD_STACK_BYTES)
-        self.assertEqual(credential_proxy.MEBIBYTE, credential_proxy.THREAD_STACK_BYTES)
+        stack_size.assert_not_called()
         self.assertEqual(12, credential_proxy.ThreadCap.max_threads)
 
 

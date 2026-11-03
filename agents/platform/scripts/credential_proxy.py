@@ -867,6 +867,10 @@ LISTEN_BACKLOG = 4096
 # connection is never the side that just closed it; this is the backstop for
 # a peer that does not.
 KEEPALIVE_IDLE_SECONDS = 60
+# How the stdlib's handle_one_request reports the socket timeout to
+# log_error ("Request timed out: %r"); the handler's log_error recognises an
+# idle close by it.
+IDLE_CLOSE_LOG_PREFIX = "Request timed out"
 # The most connections the credentialed listeners (the Unix socket or TCP
 # port behind Envoy, and the agent API door) hold a thread for at once. The
 # stdlib server starts one OS thread per accepted connection with no cap; one
@@ -895,11 +899,12 @@ THREAD_CAP_REFUSAL = (
 # this; Envoy, the client the cap is for, closes on reading the answer.
 THREAD_CAP_REFUSAL_SECONDS = 0.5
 THREAD_CAP_DRAIN_CHUNK_BYTES = 64 * 1024
-# The stack reserved for every thread the broker starts. The platform default
-# (8 MiB on glibc) is virtual, but at a thousand threads it is a gigabyte of
-# address space per thousand; one mebibyte holds a handler's deepest call
-# chain with room, and the stdlib's recursion limit is reached well inside it.
-THREAD_STACK_BYTES = MEBIBYTE
+# How often the cap writes a line while it is being hit: one ALERT when an
+# episode starts, then at most one per interval carrying the count refused
+# since the last line, and one line when a connection closes after an
+# interval with no refusal. Under sustained saturation with ordinary
+# turnover, a line per refusal or per freed slot would be hundreds a second.
+THREAD_CAP_LOG_INTERVAL_SECONDS = 60
 # The health-only listener: GET /healthz and nothing else, on a TCP port of
 # its own beside the metrics listener, so a probe reads the broker's liveness
 # even while every thread the credentialed listener may spend is spent. Bound
@@ -1349,9 +1354,11 @@ class ThreadCap(ConnectionCap):
     A peer past the cap is written THREAD_CAP_REFUSAL, a complete 503 with a
     Retry-After, and closed; Envoy relays that answer to the caller, where a
     bare close would be a reset. The cap is MAX_THREADS_ENV, read once by
-    serve(); a test passes ``max_threads`` directly. The log carries one line
-    when the cap is first reached and one when it is next released, not one
-    per refused connection, so a burst cannot fill the log.
+    serve(); a test passes ``max_threads`` directly. The log carries one
+    ALERT when the cap is first reached, at most one line per
+    THREAD_CAP_LOG_INTERVAL_SECONDS while it keeps being reached, and one
+    when an interval has passed without a refusal; never one per refused
+    connection or per freed slot, so a saturated hour cannot fill the log.
     """
 
     # The cap every credentialed listener is built with unless told otherwise;
@@ -1359,21 +1366,35 @@ class ThreadCap(ConnectionCap):
     max_threads: int = DEFAULT_MAX_THREADS
 
     def __init__(self, *args: Any, max_threads: int | None = None, **kwargs: Any) -> None:
+        # Refusals since the last line, when that line was written (None
+        # outside an episode) and when the last refusal happened; see
+        # THREAD_CAP_LOG_INTERVAL_SECONDS.
         self._refused = 0
+        self._refused_logged_at: float | None = None
+        self._last_refusal_at = 0.0
         self._refused_lock = threading.Lock()
         cap = self.max_threads if max_threads is None else max_threads
         super().__init__(*args, cap=cap, **kwargs)
 
     def refuse_connection(self, request: Any) -> None:
+        now = time.monotonic()
         with self._refused_lock:
             self._refused += 1
-            first = self._refused == 1
-        if first:
+            self._last_refusal_at = now
+            due = (
+                self._refused_logged_at is None
+                or now - self._refused_logged_at >= THREAD_CAP_LOG_INTERVAL_SECONDS
+            )
+            if due:
+                refused, self._refused = self._refused, 0
+                self._refused_logged_at = now
+        if due:
             LOGGER.warning(
-                "ALERT connection refused: %d connections hold a thread (%s); answering 503 "
-                "with Retry-After until one closes",
+                "ALERT connection refused: %d connections hold a thread (%s); %d refused since "
+                "the last line, each answered 503 with Retry-After",
                 self.connection_cap,
                 MAX_THREADS_ENV,
+                refused,
             )
         deadline = time.monotonic() + THREAD_CAP_REFUSAL_SECONDS
         try:
@@ -1392,25 +1413,30 @@ class ThreadCap(ConnectionCap):
         self.shutdown_request(request)
 
     def connection_released(self) -> None:
+        # The episode is over once an interval has passed with no refusal;
+        # a slot freed in the middle of one is taken by the next accept and
+        # says nothing.
         with self._refused_lock:
+            if self._refused_logged_at is None:
+                return
+            if time.monotonic() - self._last_refusal_at < THREAD_CAP_LOG_INTERVAL_SECONDS:
+                return
             refused, self._refused = self._refused, 0
-        if refused:
-            LOGGER.warning("thread cap released after refusing %d connection(s)", refused)
+            self._refused_logged_at = None
+        LOGGER.warning(
+            "thread cap released: no connection refused for %ds, %d refused since the last line",
+            THREAD_CAP_LOG_INTERVAL_SECONDS,
+            refused,
+        )
 
 
 def thread_cap_from_env() -> int:
-    """MAX_THREADS_ENV as a positive integer, or the default with a WARNING."""
-    raw = os.getenv(MAX_THREADS_ENV, "").strip()
-    if not raw:
-        return DEFAULT_MAX_THREADS
-    value = _positive_int(raw)
-    if value is None:
-        LOGGER.warning(
-            "%s=%r is not a positive integer; using the default of %d",
-            MAX_THREADS_ENV, raw, DEFAULT_MAX_THREADS,
-        )
-        return DEFAULT_MAX_THREADS
-    return value
+    """MAX_THREADS_ENV as a positive integer, or the default with a WARNING.
+
+    The same grammar as every other positive-integer knob the broker reads
+    (session_slot_limit_from_env), so the two cannot drift.
+    """
+    return session_slot_limit_from_env(MAX_THREADS_ENV, DEFAULT_MAX_THREADS)
 
 
 class ThreadingUnixHTTPServer(HandlerErrorsToLog, ThreadCap, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -12820,7 +12846,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path != HEALTHZ_PATH:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
-        self._json(HTTPStatus.OK, {"status": "ok"})
+        self._json(HTTPStatus.OK, HEALTHZ_PAYLOAD)
 
     def do_POST(self) -> None:  # noqa: N802
         principal = self._authenticated()
@@ -15168,6 +15194,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self.metrics.record_failure(kind)
         super().log_request(code, size)
 
+    def log_error(self, message: str, *args: Any) -> None:
+        # The stdlib's handle_one_request catches the socket timeout itself
+        # and reports it here: on a kept-open connection that is the idle
+        # close at KEEPALIVE_IDLE_SECONDS, a connection ending as a peer's
+        # EOF does, not a request that went unanswered, so it is the same
+        # debug line and never an access-log-shaped INFO line per idle
+        # connection. Everything else log_error carries (send_error's code
+        # and message) goes on to log_message as before.
+        if message.startswith(IDLE_CLOSE_LOG_PREFIX):
+            LOGGER.debug("connection closed idle type=%s", type(args[0]).__name__ if args else "")
+            return
+        super().log_error(message, *args)
+
     def log_message(self, message: str, *args: Any) -> None:
         # BaseHTTPRequestHandler.log_request passes self.requestline through
         # here verbatim, and this runs on every response - including the 401 an
@@ -15624,9 +15663,12 @@ def install_shutdown_handler(
 
 
 def serve(args: argparse.Namespace) -> None:
-    # Before the first thread: every thread the broker starts, a connection's
-    # or a sampler's, reserves this much stack rather than the platform's.
-    threading.stack_size(THREAD_STACK_BYTES)
+    # Before any listener is built. The thread stack is left at the
+    # platform's: a smaller one (1 MiB was tried) is not enough for the C
+    # recursion the shipped interpreter permits, so a nested JSON body that
+    # raises RecursionError on the default stack overflows the smaller one
+    # and takes the process down with it; the default's size is address
+    # space, not memory.
     ThreadCap.max_threads = thread_cap_from_env()
     role = resolve_role()
     if role == ROLE_API_PROXY:
