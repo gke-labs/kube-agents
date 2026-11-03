@@ -116,11 +116,18 @@ including the cluster fee; modeled, so check the pricing calculator against your
 ### Option B: GKE Standard
 
 The composition creates a default pool of `e2-standard-4` nodes, one per zone, and with gVisor
-on a `gvisor-pool` of `e2-standard-4`, one per zone, carrying GKE's sandbox taint. Neither
-machine type is an installer setting, and a machine type changed on a managed pool outside
-Terraform shows as drift on the next plan, so add pools beside them for a fleet.
+on a `gvisor-pool` of `e2-standard-4`, one per zone autoscaling to two, carrying GKE's sandbox
+taint. The module's
+[sizing inputs](https://github.com/gke-labs/kube-agents/blob/main/terraform/modules/gke-cluster/README.md#sizing-the-node-pools)
+resize both: `sizing_profile = "fleet"` renders the table's machine types and boot disks, and
+an explicit input such as `gvisor_machine_type = "n2-standard-8"` wins over the profile. The
+default pool keeps `standard_node_count` nodes per zone and does not autoscale.
 
-Add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
+The installer writes none of these inputs, so set them as `TF_VAR_` lines in `install.env`. A
+machine type changed outside Terraform shows as drift on the next plan, so change it through
+the inputs, or add pools beside the managed ones.
+
+Resize or add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
 the system DaemonSets take theirs, so the example's 4 vCPU proxy request fits on none of them.
 The proxy Deployment recreates its pod rather than rolling it: applied on the default pools, the
 example leaves the new proxy pod `Pending` with the old one gone. Every brokered `gcloud` and
