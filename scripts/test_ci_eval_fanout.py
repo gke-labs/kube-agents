@@ -103,24 +103,23 @@ class EvalLogDirTest(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(os.path.realpath("/tmp"), os.path.realpath(out))
 
-    def test_a_trailing_newline_is_refused_before_anything_is_created(self):
-        # mkdir would create "logs\n" while the substitution strips the newline
-        # and names "logs", which was never created (#3394). Where "logs"
-        # already exists the value is refused all the same. Both stay relative,
-        # so a broken guard creates its stray directory inside cwd.
-        for existing in ([], ["logs"]):
-            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as cwd:
-                for name in existing:
-                    os.mkdir(os.path.join(cwd, name))
-                run = subprocess.run(
-                    ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\necho "${EVAL_LOG_DIR}"'],
-                    cwd=cwd, env={**os.environ, "EVAL_LOG_DIR": "logs\n", "CDPATH": ""},
-                    capture_output=True, text=True, check=False,
-                )
-                self.assertNotEqual(0, run.returncode, run.stdout)
-                self.assertEqual("", run.stdout)
-                self.assertIn("ends in a newline", run.stderr)
-                self.assertEqual(sorted(existing), sorted(os.listdir(cwd)))
+    def test_a_path_ending_in_a_newline_resolves_to_the_directory_mkdir_made(self):
+        # A plain substitution strips the newline and names "logs", which was
+        # never created, or names an unrelated "logs" that exists (#3394). cd
+        # drops a trailing "/" or "/.", so those values end pwd's path in a
+        # newline too. Values stay relative, so a regression writes inside cwd.
+        for value in ("logs\n", "logs\n/", "logs\n/."):
+            for existing in ([], ["logs"]):
+                with self.subTest(value=value, existing=existing), tempfile.TemporaryDirectory() as cwd:
+                    for name in existing:
+                        os.mkdir(os.path.join(cwd, name))
+                    out = subprocess.run(
+                        ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\nprintf "%s" "${EVAL_LOG_DIR}"'],
+                        cwd=cwd, env={**os.environ, "EVAL_LOG_DIR": value, "CDPATH": ""},
+                        capture_output=True, text=True, check=True,
+                    ).stdout
+                    self.assertEqual(os.path.realpath(os.path.join(cwd, "logs\n")), os.path.realpath(out))
+                    self.assertTrue(os.path.isdir(out))
 
 
 class LockTest(unittest.TestCase):
