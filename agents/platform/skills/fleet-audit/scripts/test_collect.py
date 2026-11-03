@@ -4433,6 +4433,33 @@ class TestCollectCluster(unittest.TestCase):
         )
         self.assertIn("kubectl get computeclasses", cc_cmd)
 
+    def test_every_check_records_the_paged_dump_chain_under_the_clusters_kubeconfig(self):
+        """The record, not only the reads: each obtainability check's `command` is
+        the chain `paged_command_text` builds for DUMP_COMMAND_KINDS under the
+        cluster's kubeconfig in the patched directory, the SOP's evidence command.
+        A record put back to the one-shot `kubectl get <kinds> -A -o json` fails
+        here however `dump_state` reads."""
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.1)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(deployment("api"))), "", 0.2)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            result = collect.collect_cluster(self.CLUSTER, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
+            kubeconfig = collect.kubeconfig_path(self.CLUSTER["project"], self.CLUSTER["name"], self.CLUSTER["location"])
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        self.assertTrue(str(kubeconfig).startswith(tmp), kubeconfig)
+        expected = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig)
+        self.assertTrue(expected.startswith("( export KUBECONFIG="), expected)
+        dump_slugs = {c["check"] for c in result["commands"] if c["check"] != "untargeted-compute-class-workload"}
+        self.assertEqual({spec.slug for spec in collect.OBTAINABILITY_CHECKS} - {"untargeted-compute-class-workload"}, dump_slugs)
+        for c in result["commands"]:
+            if c["check"] != "untargeted-compute-class-workload":
+                self.assertEqual(expected, c["command"], c["check"])
+
 
 class TestCollectFleet(unittest.TestCase):
     def test_every_enumerated_cluster_gets_an_entry_even_under_parallelism(self):
