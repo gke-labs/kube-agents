@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -14,6 +15,8 @@ from typing import Self
 from unittest import mock
 
 import cron_job_template
+
+SESSION_KV_SERVER = Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts" / "session_kv_server.py"
 
 API_KEY = "test-session-kv-key"
 AUDIT_PROMPT = "Run the daily fleet audit."
@@ -190,6 +193,16 @@ class RunOriginTest(unittest.TestCase):
         with mock.patch.object(cron_job_template, "SESSION_KV_URL", "http://127.0.0.1:9"):
             self.assertEqual(cron_job_template.run_origin(job), ("other", ""))
             self.assertFalse(self._record_as("a1b2c3", ("chat", "slack")))
+
+
+
+class PinTest(unittest.TestCase):
+    def test_the_origins_are_the_session_kv_servers(self):
+        # session_kv_server imports FastAPI, which these tests do not carry, so
+        # the pin reads its source text, as chat_metrics' test_metrics does.
+        match = re.search(r"^ORIGINS = \(([^)]*)\)$", SESSION_KV_SERVER.read_text(), re.M)
+        self.assertIsNotNone(match, "session_kv_server's ORIGINS moved; update this reader")
+        self.assertEqual(tuple(re.findall(r'"([a-z]+)"', match.group(1))), cron_job_template.ORIGINS)
 
 
 if __name__ == "__main__":

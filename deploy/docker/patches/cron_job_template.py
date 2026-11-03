@@ -42,7 +42,7 @@ TEMPLATE_JOBS_PATH = "/opt/platform-template/cron/jobs.json"
 FLEET_AUDIT_SKILL = "fleet-audit"
 
 #: The origin vocabulary, as ``agents/platform/scripts/session_kv_server.py``
-#: ``ORIGINS`` spells it.
+#: ``ORIGINS`` spells it (``test_cron_job_template`` pins the two together).
 ORIGINS = ("chat", "console", "api", "event", "drift", "audit", "scheduled", "issue", "other")
 ORIGIN_AUDIT = "audit"
 ORIGIN_SCHEDULED = "scheduled"

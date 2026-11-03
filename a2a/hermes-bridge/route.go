@@ -326,7 +326,9 @@ func (b *Bridge) putSessionRecord(ctx context.Context, path string, body any) er
 // The session's origin (docs/designs/proposal-origin.md §2.1): before a task's
 // first turn the bridge records which door opened the session, once, under
 // PUT /v1/sessions/{id}/origin; session-kv answers 409 when the session
-// already has a record, as a resumed session does.
+// already has a record, as a resumed session does. The origin values are the
+// Session KV server's ORIGINS (agents/platform/scripts/session_kv_server.py),
+// held to it by TestBackendOriginsArePinnedToTheSessionKVServer.
 const (
 	originPathFormat = "/v1/sessions/%s/origin"
 	originChat       = "chat"
