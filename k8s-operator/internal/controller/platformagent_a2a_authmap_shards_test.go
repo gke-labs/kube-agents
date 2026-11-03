@@ -34,13 +34,11 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// configMapSizeLimit is the API server's ceiling on a ConfigMap's data, the
-// limit the unsharded map crossed near 640 profiles.
-const configMapSizeLimit = 1 << 20
-
 // The fleet-scale render: 2,500 bound AgentProfiles, each at two tiers with
 // topic grants, which is the shape that put the unsharded map past the
-// ConfigMap limit. Every shard stays under the budget, and under the limit by
+// ConfigMap limit (configMapSizeLimit, declared with the fleet-scale gate in
+// platformagent_fleet_scale_test.go, which the unsharded map crossed near 640
+// profiles). Every shard stays under the budget, and under the limit by
 // a quarter; the identities land in the shards exactly once and in render
 // order; every shard carries the whole map's version and stamps that agree
 // with its name and its count; and the Role's resourceNames and the callout's
