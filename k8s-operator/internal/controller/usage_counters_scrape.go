@@ -331,8 +331,8 @@ var usageReadingSpecs = []usageReadingSpec{
 // usageReadingKinds is every reading, in a fixed order.
 var usageReadingKinds = []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingPeople}
 
-// usageReadingKindsOf is the specs of specs that belong to one of kinds, in
-// their order.
+// usageReadingKindsOf is the entries of specs whose reading is one of kinds,
+// in their order.
 func usageReadingKindsOf(specs []usageReadingSpec, kinds ...usageReadingKind) []usageReadingSpec {
 	var out []usageReadingSpec
 	for _, spec := range specs {

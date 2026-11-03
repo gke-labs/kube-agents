@@ -4124,7 +4124,7 @@ func TestUsagePoller_ThePeopleReadingsHaveTheirOwnPruningRecord(t *testing.T) {
 // pair stays absent and no miss is counted. A next install whose gateway pod
 // goes missing has a configured target with no body: one poll is a miss and
 // keeps the pair, the second clears it.
-func TestUsagePoller_NoA2AGatewayPodLeavesThePairAbsentWithoutAMiss(t *testing.T) {
+func TestUsagePoller_NoA2AStackLeavesThePairAbsentWithoutAMissAndAMissingGatewayPodIsAMiss(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	t.Run("today", func(t *testing.T) {
 		agent := usageTestAgent(created)

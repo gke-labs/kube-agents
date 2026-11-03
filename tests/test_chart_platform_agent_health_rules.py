@@ -84,7 +84,11 @@ def _reading_fields():
     """The six proposal readings' field names, as usage_gauges.go declares them."""
     import re
 
-    block = _GAUGES_GO.read_text().split("// The six proposal readings' field names", 1)[1].split("// usageCreatedTimeField", 1)[0]
+    block = (
+        _GAUGES_GO.read_text()
+        .split("// The six broker proposal readings' field names", 1)[1]
+        .split("// The two people readings' field names", 1)[0]
+    )
     return re.findall(r'usageExport[A-Za-z]+\s*=\s*"([a-zA-Z]+)"', block)
 
 

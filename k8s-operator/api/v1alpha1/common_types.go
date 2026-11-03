@@ -2477,8 +2477,8 @@ type AgentStatus struct {
 // RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
 // ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, and
 // the two people readings (PeopleSeen7d and PeopleSeen30d) from the A2A
-// gateway's, all of which it reads every five minutes on the leader; the agent's own
-// ServiceAccount holds no write verb on this status.
+// gateway's, all of which it reads every five minutes on the leader; the
+// agent's own ServiceAccount holds no write verb on this status.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative count of sessions the agent opened: the
 	// triage sessions the event watcher opened for events the daemon
