@@ -281,30 +281,41 @@ func TestCountList_ACompleteListIsItsLength(t *testing.T) {
 }
 
 // Before the first probe every gauge reads 0 and both outcome children
-// exist, so a scrape finds counted=0 rather than an absent series.
+// exist, so a scrape finds counted=0 rather than an absent series. The
+// registry is gathered before anything in the test touches the GaugeVec:
+// WithLabelValues creates the child it names, so a read through gauge()
+// first would make the two series this test exists to find.
 func TestNewMetrics_FleetGaugesStartAtZeroWithBothOutcomes(t *testing.T) {
 	m := newMetrics()
-	expectGauges(t, m, map[string]float64{
-		"nodes": 0, "max_cluster_nodes": 0, "controllers": 0, "pods": 0, "max_cluster_pods": 0, "counted": 0, "failed": 0,
-	})
 	families, err := m.registry.Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
-	names := map[string]int{}
+	// Every series by family, each as its labels and value, so the assertion
+	// is on what a scrape would carry.
+	series := map[string][]string{}
 	for _, f := range families {
-		names[f.GetName()] = len(f.GetMetric())
+		for _, metric := range f.GetMetric() {
+			var labels []string
+			for _, l := range metric.GetLabel() {
+				labels = append(labels, l.GetName()+"="+l.GetValue())
+			}
+			series[f.GetName()] = append(series[f.GetName()], fmt.Sprintf("{%s} %v", strings.Join(labels, ","), metric.GetGauge().GetValue()))
+		}
 	}
 	for _, name := range []string{
 		"k8s_event_watcher_fleet_nodes", "k8s_event_watcher_fleet_max_cluster_nodes", "k8s_event_watcher_fleet_controllers",
 		"k8s_event_watcher_fleet_pods", "k8s_event_watcher_fleet_max_cluster_pods",
 	} {
-		if names[name] != 1 {
-			t.Errorf("%s: %d series before the first probe; want 1", name, names[name])
+		if got := series[name]; len(got) != 1 || got[0] != "{} 0" {
+			t.Errorf("%s before the first probe = %v; want one series at 0", name, got)
 		}
 	}
-	if names["k8s_event_watcher_fleet_shape_clusters"] != 2 {
-		t.Errorf("k8s_event_watcher_fleet_shape_clusters: %d series before the first probe; want counted and failed", names["k8s_event_watcher_fleet_shape_clusters"])
+	got := append([]string(nil), series["k8s_event_watcher_fleet_shape_clusters"]...)
+	sort.Strings(got)
+	want := []string{"{outcome=counted} 0", "{outcome=failed} 0"}
+	if strings.Join(got, ";") != strings.Join(want, ";") {
+		t.Errorf("k8s_event_watcher_fleet_shape_clusters before the first probe = %v; want both children at 0: %v", got, want)
 	}
 }
 
