@@ -15197,7 +15197,10 @@ class ServeTestsPutTheSharesBackTest(unittest.TestCase):
             with self.subTest(case=case.__name__):
                 before = {attribute: getattr(CredentialProxyHandler, attribute) for attribute in _SERVE_SHARES}
                 result = unittest.TestResult()
-                unittest.defaultTestLoader.loadTestsFromTestCase(case).run(result)
+                # A fresh loader: the shared one carries any -k pattern, which
+                # would load no tests and pass having run nothing.
+                unittest.TestLoader().loadTestsFromTestCase(case).run(result)
+                self.assertTrue(result.testsRun, f"{case.__name__} ran no tests")
                 self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
                 after = {attribute: getattr(CredentialProxyHandler, attribute) for attribute in _SERVE_SHARES}
                 self.assertEqual(after, before)
