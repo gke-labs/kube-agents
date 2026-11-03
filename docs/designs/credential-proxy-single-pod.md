@@ -95,7 +95,7 @@ fleet sweeps and was OOM-killed. Since then:
 
 - The child memory budget stops the OOM. On Standard the default limit is 2Gi: the budget
   admits nine requests, and the slot cap holds it to eight. On Autopilot without bursting the limit
-  is clamped to the 1Gi request, and the budget admits four.
+  is clamped to the 2Gi Autopilot request, so the budget admits the same nine there.
 - The Controller Stall Watch reuses kubeconfigs across ticks, which removed about 290
   `get-credentials` calls per tick; each cluster's credentials are now fetched about once a day.
 - The reconciler's and the stall watch's listing pools are four wide, sized to the four requests

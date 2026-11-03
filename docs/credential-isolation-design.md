@@ -366,7 +366,10 @@ including:
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default), and within that only as many
   as fit the child memory budget it derives from its container's memory limit (four at
   the operator's defaults); a request waits up to 60 seconds for admission and is then
-  refused with `503 CREDENTIAL_PROXY_BUSY`.
+  refused with `503 CREDENTIAL_PROXY_BUSY`. At the broker's hard resource watermark (live
+  cgroup memory, or a scratch volume near the sizeLimit it is evicted on) a background
+  caller is refused at once with `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and a
+  `Retry-After`; the session role keeps one slot up to a higher ceiling.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
@@ -681,8 +684,8 @@ The cap counts a list the runtime keeps in memory, so a worker that dies without
 closing its workspace would otherwise hold a slot until the pod restarts. Two
 things bound that. A workspace no verb has named for
 `CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS` (30 minutes by default) is reclaimed by
-the next `open`, and every tree a previous process left under the root is removed
-when the runtime starts. A refusal at the cap logs each holder's handle prefix,
+the next `open` or by the broker's resource watermark relief step (below), and every
+tree a previous process left under the root is removed when the runtime starts. A refusal at the cap logs each holder's handle prefix,
 repository, caller label (the card or session id the client sends), age and idle
 time, so a full store is diagnosable from the runtime's log.
 
@@ -888,9 +891,9 @@ Consequences:
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
   sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
-  it prevents. The operator declares that request at 1Gi, above the floor, so that the
-  budget engages there too, admitting four; the floor remains for a CR override that
-  sets a smaller request.
+  it prevents. The operator declares that request at 2Gi on Autopilot (1Gi on Standard),
+  above the floor, so that the budget engages there too, admitting nine, held to eight by
+  the slot cap; the floor remains for a CR override that sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.
@@ -912,6 +915,39 @@ Consequences:
   forge refresh that fits the budget passes requests only a slot cap holds (the full slot cap,
   or their own class's full cap), since it takes
   no slot.
+  Beside the static budget sits the resource watermark gate, which reads what the container
+  holds now: the working set (`memory.current` less `memory.stat`'s `inactive_file`, the
+  kubelet's eviction signal) against `memory.max` on every admission, and the state and
+  `/tmp` emptyDirs against the caps the operator passes
+  (`CREDENTIAL_PROXY_STATE_LIMIT_BYTES`, `CREDENTIAL_PROXY_TMP_LIMIT_BYTES`: each volume's
+  sizeLimit, or, when an override puts the container's ephemeral-storage limit under the
+  two sizeLimits together, shares of that limit in the sizeLimits' proportion, summing to
+  it, since the kubelet sums the volumes into that one limit; a volume with no cap is off,
+  since statvfs on an emptyDir reads the node, not the cap) on the memory sampler's 30 s
+  tick. From the soft watermark
+  (`CREDENTIAL_PROXY_MEM_SOFT_PCT` 75, `CREDENTIAL_PROXY_DISK_SOFT_PCT` 70) admitted commands
+  run one at a time and the first tick reclaims idle content workspaces and orphaned vcs
+  scratch, collects and trims the allocator. From the hard watermark
+  (`CREDENTIAL_PROXY_MEM_HARD_PCT` 85, `CREDENTIAL_PROXY_DISK_HARD_PCT` 80) a background
+  caller is answered at once, before it queues, with
+  `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE`, `Retry-After: N` (5 to 30, drawn at random) and
+  the same envelope plus `retry_after`, with `retry in N s` in the text the shim prints; one
+  slot stays open to the session role, which is the one interactive class, up to a ceiling
+  of 92% memory or 90% disk, past which it is refused too. A level is left only once the
+  readings clear three points under the watermark it was entered at, so a reading that
+  hovers at a watermark is one episode: one transition line, one relief. A workspace write
+  refused this way has its body drained before the 429, as a vcs verb's refusal does, so a
+  commit still sending its files reads the refusal rather than a reset. Under the clamp that reserve is a
+  slot in the executor as well, one above the background commands running (those admitted
+  before the clamp arrived keep their slots) and bounded by the configured cap alone, not by
+  the interactive class cap of `designs/credential-broker-exec-tier.md` §4.2, which the
+  shell's sweep can hold when the clamp arrives: a session's command runs beside them, and
+  passes background requests the clamp holds. The class is the authenticated role, never a header. The gate covers
+  `/v1/exec`, `/v1/vcs/*` and the feedback route; a `/v1/k8s` list without `watch=true`
+  and the content workspace's `open`, `commit` and `push` take the hard check alone, and a
+  watch and the workspace reads pass. A missing or `max` `memory.max` turns the
+  memory half off. The refusal counts under `bound="pressure"`, and
+  `kubeagents_credential_proxy_resource_watermark_ratio` carries each resource's fill.
   A long-running command holds its slot and reservation for as long as it runs,
   and a caller that stops reading its response is given up on after 60 seconds
   so that it cannot keep them.

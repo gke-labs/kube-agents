@@ -1715,8 +1715,8 @@ class CiEvalWiringTest(unittest.TestCase):
 
     def test_skipped_on_a_pull_requests_run(self) -> None:
         # The merge-blocking presubmit grades next, and Tide ran it in batches
-        # too; neither reads a report-only round trip, and the today lane
-        # proves the path on main.
+        # too; neither reads a report-only round trip, and the today presubmit
+        # proves the path on pull requests that touch it, or on demand.
         for job_type in ("presubmit", "batch"):
             with self.subTest(job_type=job_type):
                 result, artifacts = self.run_wiring(mode_next="1", job_type=job_type)

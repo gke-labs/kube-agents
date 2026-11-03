@@ -245,6 +245,8 @@ func brokerStatusMessage(status int, code string) string {
 		return "the forge's answer is larger than the credential broker accepts"
 	case "CREDENTIAL_PROXY_BUSY":
 		return "the credential broker is busy with other requests; try again shortly"
+	case "CREDENTIAL_PROXY_RESOURCE_PRESSURE":
+		return "the credential broker is short of memory or scratch disk and is admitting interactive sessions only; try again after its Retry-After interval"
 	}
 	switch {
 	case status == http.StatusUnauthorized:

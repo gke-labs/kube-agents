@@ -330,3 +330,23 @@ def test_every_task_that_names_the_mid_turn_directive_parses():
         prompt = str((yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("prompt") or "")
         if MID_TURN in prompt:
             assert stop_hook.parse(prompt).mid_turn_after is not None, path
+
+
+def test_the_listing_names_stopped_asks_and_nothing_else(tmp_path, capsys):
+    # The list hack/ci-eval-pr.sh runs in its second phase on the inject lane:
+    # the stopped asks; a writes_alone case is read by the script itself.
+    import yaml
+
+    def task(name, doc):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "task.yaml").write_text(yaml.safe_dump(doc))
+        return str(d / "task.yaml")
+
+    paths = [
+        task("stopped", {"prompt": f"{stop_hook.STOP_DIRECTIVE}\nstop this"}),
+        task("alone", {"prompt": "an ordinary ask", "writes_alone": True}),
+        task("ordinary", {"prompt": "an ordinary ask"}),
+    ]
+    assert stop_hook.main(paths) == 0
+    assert capsys.readouterr().out.split() == ["stopped"]

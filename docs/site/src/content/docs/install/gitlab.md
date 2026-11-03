@@ -362,20 +362,20 @@ the command in [Rotating the token](#rotating-the-token) keeps the `read-token` 
 same command to replace the read token. The broker checks for the file on each clone, so the
 change needs no restart. kubelet can take about a minute to write the file.
 
-To check it, open the repository from the shell sandbox:
+To check it, copy the repository from the shell sandbox:
 
 ```bash
 kubectl exec -n kubeagents-system -c shell platform-agent-shell-0 -- \
-  python3 /opt/data/skills/inspect-repository/scripts/inspect_repository.py open \
-  --repo https://gitlab.example.com/platform/infra/terraform --depth 1
+  python3 /opt/data/skills/inspect-repository/scripts/inspect_repository.py clone \
+  --repo https://gitlab.example.com/platform/infra/terraform --into /tmp/read-token-check --force
 ```
 
-The answer has a `handle` and a `sha`. Close the workspace with `close --handle <handle>`. If
-the clone fails, the broker's log shows whether it had a read token:
+The answer has a `sha` and `"role": "context"`. If the copy fails, the broker's log shows
+whether it had a read token:
 
 ```bash
 kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy \
-  -c envoy-credential-proxy | grep "role=context"
+  -c envoy-credential-proxy | grep "snapshot credential.*role=context"
 ```
 
 A line that says the forge "has no usable read-only token" means that the `read-token` file is

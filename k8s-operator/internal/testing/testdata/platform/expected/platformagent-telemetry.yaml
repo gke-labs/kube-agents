@@ -1054,6 +1054,10 @@ spec:
               value: /etc/gitops/managed_repos
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
+            - name: CREDENTIAL_PROXY_STATE_LIMIT_BYTES
+              value: "5368709120"
+            - name: CREDENTIAL_PROXY_TMP_LIMIT_BYTES
+              value: "2147483648"
             - name: CREDENTIAL_PROXY_SCOPED_SA_POOL
               value: "0"
             - name: CREDENTIAL_PROXY_ROLE
@@ -1111,7 +1115,7 @@ spec:
             timeoutSeconds: 5
           resources:
             limits:
-              cpu: "1"
+              cpu: "2"
               ephemeral-storage: 8Gi
               memory: 2Gi
             requests:
