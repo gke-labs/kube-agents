@@ -10,8 +10,9 @@ admitted count, read from `GET /v1/exec/admission`, rather than a constant.
 
 The count differs by install. At the operator's default 2Gi limit the budget
 fits 9 and the slot cap of 8 binds. On GKE Autopilot without bursting the limit
-is the 1Gi memory request, and the budget fits 4. Only the broker sees the
-effective limit, so only the broker can say.
+is the memory request, 2Gi by default, so the same holds; an override with a
+smaller request fits fewer. Only the broker sees the effective limit, so only
+the broker can say.
 
 `sweep_width` leaves the session role's cap free (two by default; the broker
 reports it) when the broker admits six or more, so a sweep doesn't take every

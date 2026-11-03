@@ -298,18 +298,43 @@ def parse_lane_requesting(text: str) -> dict[str, int]:
     return out
 
 
-# The first prompt line that makes a case a stopped ask
-# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE). hack/ci-eval-pr.sh's
-# unit_phase runs a stopped ask in the serial second phase beside the
-# requesting cases; scripts/test_eval_rosters.py holds this text read to
+# The first prompt lines that make a case a stopped ask
+# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE and
+# MID_TURN_DIRECTIVE). hack/ci-eval-pr.sh's unit_phase runs a stopped ask in
+# the serial second phase beside the requesting cases;
+# scripts/test_eval_rosters.py holds this text read to
 # stop_hook.is_stopped_ask.
 STOP_DIRECTIVE = "[bench:stop-after-first-card]"
+MID_TURN_DIRECTIVE = "[bench:stop-mid-turn]"
 
 
 def is_stopped_ask(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
-    """Whether the case's task.yaml carries the stop directive outside a comment."""
+    """Whether the case's task.yaml carries a stop directive outside a comment."""
     text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
-    return any(STOP_DIRECTIVE in line.split("#", 1)[0] for line in text.splitlines())
+    return any(
+        directive in line.split("#", 1)[0]
+        for line in text.splitlines()
+        for directive in (STOP_DIRECTIVE, MID_TURN_DIRECTIVE)
+    )
+
+
+# A case that declares `writes_alone: true` at its top level runs in the
+# serial second phase as well (bench/kube_agents_bench/lane.py, WRITES_ALONE_KEY;
+# unit_phase reads it through STOPPED_ASK_CASES); scripts/test_eval_rosters.py
+# holds this text read to lane.runs_alone.
+WRITES_ALONE_RE = re.compile(r"^writes_alone:\s*true\s*$")
+
+
+def declares_writes_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case's task.yaml declares ``writes_alone: true`` at its top level."""
+    text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
+    return any(WRITES_ALONE_RE.match(line.split("#", 1)[0].rstrip()) for line in text.splitlines())
+
+
+def runs_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case runs in the serial phase without requesting a pull
+    request: a stopped ask, or a ``writes_alone`` case (lane.runs_alone)."""
+    return is_stopped_ask(case, tasks_dir) or declares_writes_alone(case, tasks_dir)
 
 
 def requests_a_pull_request(case: str, lane_requesting: dict[str, int], tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
@@ -328,7 +353,8 @@ def presubmit_wall_estimate() -> dict[str, object]:
     at a time, and a case's own repetitions one after another on its task
     lock: it takes the longer of the lane time spread over the lanes and the
     longest case's chain. Phase two runs the units of the cases that request a
-    pull request, and of the stopped asks (unit_phase in the script), one at a
+    pull request, of the stopped asks and of the ``writes_alone`` cases
+    (unit_phase in the script), one at a
     time after phase one has drained, each after the settle, so it adds
     straight onto the job. Every presubmit case counts, held-out seats too,
     because they run, and the inject lane's exclusions are not taken off.
@@ -348,7 +374,7 @@ def presubmit_wall_estimate() -> dict[str, object]:
     lane_requesting = parse_lane_requesting(INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8"))
     first, second = [], []
     for case in presubmit_cases():
-        serial = requests_a_pull_request(case, lane_requesting) or is_stopped_ask(case)
+        serial = requests_a_pull_request(case, lane_requesting) or runs_alone(case)
         (second if serial else first).append(case)
     chain = {case: hints.get(case, default) * repetitions for case in presubmit_cases()}
     phase_one = max(-(-sum(chain[c] for c in first) // parallelism), max((chain[c] for c in first), default=0))

@@ -90,7 +90,8 @@ set -euo pipefail
 # files rather than stated here, because both move: on 2026-09-29 they are 14
 # (twelve on the roster and two held-out seats, the compliance canary, #2013,
 # and pdb-remediation-pr, #2016) and 38, so 52 cases, and at three
-# repetitions 42 units against 156.
+# repetitions 42 units against 156; both seats have taken roster lines since
+# (2026-10-14 and 2026-11-02), so the held-out section is empty today.
 #
 # It is the smaller one because of the clock, not because the other cases are
 # unwanted. Step 5 of staging-promotion-pipeline.yml waits 330 minutes for this
@@ -116,7 +117,8 @@ set -euo pipefail
 # run whose cases stall rather than run: #1840's delegation block costs 45
 # minutes per repetition, and enough of those exceed any budget. That failure
 # is unsettled, so it withdraws the nomination and the next night asks again.
-# The held-out canary (#2013) adds three repetitions serialized on its task
+# The canary (#2013; held out until its roster line on 2026-11-02, blocking
+# since) adds three repetitions serialized on its task
 # lock, a ~50 minute chain at its 1002 s median and ~150 minutes if all three
 # reach the 3000 s delegation ceiling, run beside the other cases; the
 # pdb-remediation-pr (#2016; held out until its roster line on 2026-10-14)

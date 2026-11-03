@@ -278,7 +278,7 @@ __INLINE_HEALTH__
   .detail .close { margin-left:auto; font:inherit; font-size:13px; color:var(--text-muted); background:none; border:0; cursor:pointer; }
   .detail .sub { color:var(--text-muted); font-size:13px; margin:4px 0 10px; }
 
-  /* the Cases page's two views: a second row of tabs in the top bar's style */
+  /* the Cases page's three views: a second row of tabs in the top bar's style */
   .subnav { display:flex; gap:20px; margin-top:22px; border-bottom:1px solid var(--line); }
   .subnav a { color:var(--text-muted); font-size:13px; font-weight:650; padding:6px 0; margin-bottom:-1px; border-bottom:2px solid transparent; }
   .subnav a.on { color:var(--text-primary); border-bottom-color:var(--accent); }
@@ -314,8 +314,10 @@ __INLINE_HEALTH__
   .gloss li { padding:3px 0; }
   .gloss b { color:var(--text-secondary); }
   .hint { color:var(--text-muted); border-bottom:1px dotted var(--text-muted); cursor:help; }
-  .scn [data-tip] { position:relative; }
-  .scn [data-tip]:hover::after { content:attr(data-tip); position:absolute; left:0; bottom:calc(100% + 6px); z-index:4; width:max-content; max-width:320px;
+  /* The domain view's table lets its hover notes out past its rounded edge. */
+  table.rel.domains { overflow:visible; }
+  .scn [data-tip], table.domains [data-tip] { position:relative; }
+  .scn [data-tip]:hover::after, table.domains [data-tip]:hover::after { content:attr(data-tip); position:absolute; left:0; bottom:calc(100% + 6px); z-index:4; width:max-content; max-width:320px;
     white-space:normal; background:var(--text-primary); color:var(--surface-0); font:500 12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
     padding:6px 9px; border-radius:6px; box-shadow:var(--shadow); pointer-events:none; }
   .lvl { display:inline-flex; align-items:baseline; gap:6px; border-radius:6px; padding:3px 9px; font-size:11px; font-weight:750; letter-spacing:.03em; white-space:nowrap; }

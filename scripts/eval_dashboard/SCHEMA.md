@@ -48,9 +48,9 @@ only — anything that renames, removes or re-types a field bumps
     }
   ],
   "coverage": {
-    "domains_total": 11,
-    "domains_covered": 10,
-    "uncovered": ["fleet-audits"]
+    "domains_total": 13,
+    "domains_covered": 12,
+    "uncovered": ["observability"]
   }
 }
 ```
@@ -788,9 +788,9 @@ the question imports it.
 `index.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b&view=gate|agent`
 `run.html#build=<prow build id>`
 `grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
-`cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`, or `cases.html#view=scenarios[&domain=<domain slug>]`
+`cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`, or `cases.html#view=scenarios[&domain=<domain slug>]`, or `cases.html#view=domains`
 `nightly.html[#build=<prow build id>&cases=a,b]` (either key may be left out)
-`trend.html#cases=a,b`, or `trend.html#domain=<domain>`, each `[&metric=<judged metric>][&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]]`
+`trend.html#cases=a,b`, or `trend.html#domain=<domain>`, each `[&metric=<judged metric>][&mode=next|today][&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]]`
 
 Every parameter travels in the URL fragment as `key=value` pairs joined
 by `&`. `storage.cloud.google.com` answers an unauthenticated request with
@@ -842,8 +842,10 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
 - On the Trend page `cases` scopes to those cases (the case-id grammar
   above), `domain` to a domain slug (same grammar), `metric` to a judged
   metric (`[A-Za-z][A-Za-z0-9_]{0,39}`, and one the store carries, else the
-  default); `since` and `until` draw the incident's start and end as
-  markers. No parameter is the overview of every domain.
+  default), `mode` to a series (`next` or `today`, and one the store holds
+  records for, else the default, `next` when it holds any); `since` and
+  `until` draw the incident's start and end as markers. No parameter is the
+  overview of every domain.
 - On the Cases page `view=scenarios` opens the scenarios view (any other
   value is the reliability table); there `domain=<slug>` (the case-id
   grammar) shows that domain's section alone, and a slug no section has
@@ -856,7 +858,7 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
 
 `{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
 strip_runs, admitted[], health, history, merges, catches, domains[],
-confidence_bar{}, cases{}, runs[], pending[], releases[], nightly{}, gitlab{},
+scorecard, confidence_bar{}, cases{}, runs[], pending[], releases[], nightly{}, gitlab{},
 trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
@@ -888,7 +890,7 @@ confidence, times, transcript_url}`. `status` is
 `blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
 (active, off the roster, no demotion date: the held-out seat a coverage tracker takes in the
 presubmit file, which is what pdb-remediation-pr showed while seated, 2026-09-28 to 10-14; a dated one reads
-`demoted`, which is what the compliance canary shows while seated),
+`demoted`, which is what the compliance canary showed while seated, 2026-09-29 to 11-02),
 `demoted` (off the roster, active or nightly-only, with `demoted_on` read from the hold-out
 entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`; a case demoted under the
 2026-09-22 protocol is a nightly case and keeps this status and its date), `nightly_only`
@@ -947,7 +949,16 @@ case passed every graded repetition, as the Nightly report links it
 rows in file order as `{slug, meaning}` (empty when the file cannot be read),
 and `confidence_bar` is `{rate, min_runs, window_days, proving_min_rate}`,
 the thresholds `confidence` was computed with, so the view prints the rule
-it applied.
+it applied. `scorecard` is the domain view's (`cases.html#view=domains`):
+`understudies.py`'s document as written, `{schema_version, generated_at,
+bar{rate, min_runs, nights}, store_read, nightly_red_read, domains[]}`, each
+domain `{slug, name, owner, backup, seats[], uncovered_since,
+days_uncovered, allowlist_issue, held_out, expired_days, nightly_red{open,
+oldest_days}, understudies[], candidates, understudy_ready}` (an
+understudy is `{case, passed, graded, nights, rate, meets_bar, held_out,
+store{state, runs, passes}}`; `nightly_red`, `understudies` and
+`understudy_ready` are `null` when not read), or `null` when the render was
+given none ([`docs/ci-health.md`](../../docs/ci-health.md#the-domain-scorecard)).
 
 `pending[]` is `pending_builds` as `{build, first_seen}`, the Grid's "still
 running" columns — the presubmit's entries only (a night in flight,
@@ -1136,7 +1147,9 @@ Everything above is the today-mode series: records whose key has no `mode`,
 or `mode: today`. `next` is the same `{records, metrics, default_metric,
 keys{}, nights[], cases{}, domains{}}` built from the records whose key has
 `mode: next` (the main nightly's), or `null` when the store holds none;
-a key in any other mode is in neither. The page draws the today series.
+a key in any other mode is in neither. The page draws the next series, and
+the today series when its link carries `mode=today` or the store holds no
+next-mode record; it offers a chip for each when both hold records.
 
 `latency{}` is the one part of the block not read from the store, which
 carries no timing: it is from `data.json`'s nightly runs inside the same
@@ -1152,7 +1165,7 @@ target (p95, nothing gates on it) and `pct` each series' slow percentile
 (`turn1` 95, the target's `TURN1_TARGET_PCT`; `agent` 90, `SLOW_PCT`), as
 `nightly.py` has them; `nights[]` is `{id, at, build}`
 oldest first, `id` the same `build:<main part's build>` as the store's
-`nights[].id`, `at` that night's `at` when the store holds it, else the
+`nights[].id`, `at` that night's `at` when the store holds it in either series, else the
 newest finish (or start) of its parts. Each scope (`all[]` every case,
 `domains{}` a domain's cases, `cases{}` one case) has one point per night
 it recorded a repetition, oldest first: `{night, at, n_turn1, turn1_p50_s,

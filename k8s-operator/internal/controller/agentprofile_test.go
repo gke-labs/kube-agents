@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -54,13 +55,15 @@ const (
 	// The fixtures the a2a module's callout suite reads: the identity map with
 	// the operator and two profiles in it, and the card and tombstone the
 	// operator publishes.
-	profilesMapFixturePath  = "../../../a2a/authcallout/testdata/rendered-identity-map-profiles.json"
-	agentCardFixturePath    = "../../../a2a/authcallout/testdata/rendered-agent-card.json"
-	agentClosedFixturePath  = "../../../a2a/authcallout/testdata/rendered-agent-closed.json"
-	specDocPath             = "../../../docs/designs/spec-subagent-profiles.md"
-	chatProfileExamplePath  = "../../examples/agentprofile-chat.yaml"
-	tseProfileExamplePath   = "../../examples/agentprofile-tse.yaml"
-	agentProfileCRDBasePath = "../../config/crd/bases/kubeagents.x-k8s.io_agentprofiles.yaml"
+	profilesMapFixturePath     = "../../../a2a/authcallout/testdata/rendered-identity-map-profiles.json"
+	agentCardFixturePath       = "../../../a2a/authcallout/testdata/rendered-agent-card.json"
+	agentClosedFixturePath     = "../../../a2a/authcallout/testdata/rendered-agent-closed.json"
+	specDocPath                = "../../../docs/designs/spec-subagent-profiles.md"
+	chatProfileExamplePath     = "../../examples/agentprofile-chat.yaml"
+	tseProfileExamplePath      = "../../examples/agentprofile-tse.yaml"
+	clusterProfileExamplePath  = "../../examples/agentprofile-cluster.yaml"
+	clusterPersonaManifestPath = "../../../agents/cluster/persona/persona.yaml"
+	agentProfileCRDBasePath    = "../../config/crd/bases/kubeagents.x-k8s.io_agentprofiles.yaml"
 )
 
 func testAgentProfile(namespace, name string, mutate ...func(*agentv1alpha1.AgentProfile)) agentv1alpha1.AgentProfile {
@@ -1669,5 +1672,75 @@ func TestAFailedDurableSyncDropsTheBusConnection(t *testing.T) {
 	h.reconcile(agent.Namespace, "auditor")
 	if got := h.dir.durables["auditor"]; len(got) != 2 {
 		t.Errorf("after the reconnect the durables = %+v, want read top and child", got)
+	}
+}
+
+// The cluster agent's example (#3658) holds the generic profile and a pinned
+// variant. Both run the cluster persona, so both must declare its parameters
+// exactly and in its order (the design has the worker refuse a mismatch); only
+// the pinned one names a cluster, and it names all three parts of it.
+func TestTheClusterProfileExampleIsAGenericAndAPinnedProfile(t *testing.T) {
+	raw, err := os.ReadFile(clusterProfileExamplePath)
+	if err != nil {
+		t.Fatalf("reading the cluster profile example: %v", err)
+	}
+	personaRaw, err := os.ReadFile(clusterPersonaManifestPath)
+	if err != nil {
+		t.Fatalf("reading the cluster persona: %v", err)
+	}
+	var persona struct {
+		Parameters []struct {
+			Name     string `json:"name"`
+			Required bool   `json:"required"`
+		} `json:"parameters"`
+	}
+	if err := yaml.Unmarshal(personaRaw, &persona); err != nil {
+		t.Fatalf("parsing the cluster persona: %v", err)
+	}
+	// Ordered: nothing says the worker's planned comparison ignores order.
+	type param struct {
+		name     string
+		required bool
+	}
+	var want []param
+	for _, p := range persona.Parameters {
+		want = append(want, param{p.Name, p.Required})
+	}
+	if len(want) == 0 {
+		t.Fatal("the cluster persona declares no parameters; the comparison below would be vacuous")
+	}
+
+	docs := strings.Split(string(raw), "\n---\n")
+	if len(docs) != 2 {
+		t.Fatalf("the example holds %d documents, want 2 (generic and pinned)", len(docs))
+	}
+	var pinned int
+	for i, doc := range docs {
+		var p agentv1alpha1.AgentProfile
+		if err := yaml.UnmarshalStrict([]byte(doc), &p); err != nil {
+			t.Fatalf("document %d is not a strict AgentProfile: %v", i, err)
+		}
+		var got []param
+		for _, declared := range p.Spec.Parameters {
+			got = append(got, param{declared.Name, declared.Required})
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s declares parameters %v, want the persona's %v", p.Name, got, want)
+		}
+		if p.Spec.Identity.ServiceAccountName != "" {
+			t.Errorf("%s names ServiceAccount %q; it runs with operator-created ones", p.Name, p.Spec.Identity.ServiceAccountName)
+		}
+		if !reflect.DeepEqual(p.Spec.AllowedTiers, []string{"read"}) {
+			t.Errorf("%s allows tiers %v, want read alone", p.Name, p.Spec.AllowedTiers)
+		}
+		if ref := p.Spec.ClusterRef; ref != nil {
+			pinned++
+			if ref.ProjectID == "" || ref.Location == "" || ref.Cluster == "" {
+				t.Errorf("%s pins half a cluster: %+v", p.Name, *ref)
+			}
+		}
+	}
+	if pinned != 1 {
+		t.Errorf("%d documents set clusterRef, want exactly the pinned one", pinned)
 	}
 }

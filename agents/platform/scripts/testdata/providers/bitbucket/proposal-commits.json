@@ -1,0 +1,167 @@
+{
+  "payload": {
+    "number": 11
+  },
+  "responses": [
+    {
+      "values": [
+        {
+          "type": "commit",
+          "hash": "5615ea33d336d318f1891b7fed5dcac0a819884f",
+          "date": "2026-11-02T18:33:01+00:00",
+          "author": {
+            "type": "author",
+            "raw": "kube-agents <kube-agents@bots.bitbucket.org>",
+            "user": {
+              "type": "app_user",
+              "links": {
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                }
+              },
+              "created_on": "2026-11-02T15:08:55.432081+00:00",
+              "display_name": "kube-agents",
+              "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+              "account_id": "712020:00000000-0000-0000-0000-000000000001",
+              "account_status": "active",
+              "kind": "repository_access_token"
+            }
+          },
+          "message": "Keep one replica through an eviction\n",
+          "summary": {
+            "type": "rendered",
+            "raw": "Keep one replica through an eviction\n",
+            "markup": "markdown",
+            "html": "<p>Keep one replica through an eviction</p>"
+          },
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/commits/5615ea33d336d318f1891b7fed5dcac0a819884f"
+            },
+            "diff": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diff/5615ea33d336d318f1891b7fed5dcac0a819884f"
+            },
+            "approve": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f/approve"
+            },
+            "comments": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f/comments"
+            },
+            "statuses": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f/statuses"
+            },
+            "patch": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/patch/5615ea33d336d318f1891b7fed5dcac0a819884f"
+            }
+          },
+          "parents": [
+            {
+              "hash": "a2469319b1eaeaec4ac27c63a4f08363d2641265",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/a2469319b1eaeaec4ac27c63a4f08363d2641265"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra/commits/a2469319b1eaeaec4ac27c63a4f08363d2641265"
+                }
+              },
+              "type": "commit"
+            }
+          ],
+          "repository": {
+            "type": "repository",
+            "full_name": "acme/infra",
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra"
+              },
+              "avatar": {
+                "href": "https://bitbucket.org/account/example/avatar/"
+              }
+            },
+            "name": "infra",
+            "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+          }
+        },
+        {
+          "type": "commit",
+          "hash": "a2469319b1eaeaec4ac27c63a4f08363d2641265",
+          "date": "2026-11-02T18:32:54+00:00",
+          "author": {
+            "type": "author",
+            "raw": "platform-agent <platform-agent@kube-agents.invalid>"
+          },
+          "message": "Raise the replica floor\n",
+          "summary": {
+            "type": "rendered",
+            "raw": "Raise the replica floor\n",
+            "markup": "markdown",
+            "html": "<p>Raise the replica floor</p>"
+          },
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/a2469319b1eaeaec4ac27c63a4f08363d2641265"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/commits/a2469319b1eaeaec4ac27c63a4f08363d2641265"
+            },
+            "diff": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diff/a2469319b1eaeaec4ac27c63a4f08363d2641265"
+            },
+            "approve": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/a2469319b1eaeaec4ac27c63a4f08363d2641265/approve"
+            },
+            "comments": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/a2469319b1eaeaec4ac27c63a4f08363d2641265/comments"
+            },
+            "statuses": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/a2469319b1eaeaec4ac27c63a4f08363d2641265/statuses"
+            },
+            "patch": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/patch/a2469319b1eaeaec4ac27c63a4f08363d2641265"
+            }
+          },
+          "parents": [
+            {
+              "hash": "d613b799d16e75dea539b338e774a67900e2a478",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/d613b799d16e75dea539b338e774a67900e2a478"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra/commits/d613b799d16e75dea539b338e774a67900e2a478"
+                }
+              },
+              "type": "commit"
+            }
+          ],
+          "repository": {
+            "type": "repository",
+            "full_name": "acme/infra",
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra"
+              },
+              "avatar": {
+                "href": "https://bitbucket.org/account/example/avatar/"
+              }
+            },
+            "name": "infra",
+            "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+          }
+        }
+      ],
+      "pagelen": 100,
+      "page": 1
+    }
+  ]
+}
