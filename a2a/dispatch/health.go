@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // waitingForgetAfter is how many retry delays a waiting entry outlives its
@@ -14,8 +16,13 @@ const waitingForgetAfter = 3
 // Health is the dispatcher's state at one moment, as the health line logs
 // it.
 type Health struct {
-	// Running is every held task, by profile.
+	// Running is every task a worker accepted (its lease is written), by
+	// profile.
 	Running map[string]int
+	// Offering is every task out on offer to a pod that has not accepted
+	// yet, by profile. A submission re-offered after no worker took it is
+	// also in Waiting and NoWorker meanwhile.
+	Offering map[string]int
 	// Waiting is the submissions waiting, over a cap or for a free worker,
 	// by durable.
 	Waiting map[string]int
@@ -59,6 +66,18 @@ func (d *Dispatcher) noteWaiting(taskID, durable string, queued time.Time, why s
 	d.waiting[taskID] = w
 }
 
+// offeringWaiting is a reserved submission's waiting entry as its offer
+// round starts. Waiting over a cap ends there: the slot is taken. Waiting
+// for a worker doesn't: until a pod accepts, the submission still waits for
+// one, and the health line keeps saying so through the round.
+func (d *Dispatcher) offeringWaiting(taskID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if w, ok := d.waiting[taskID]; ok && w.why != ReasonNoWorker {
+		delete(d.waiting, taskID)
+	}
+}
+
 func (d *Dispatcher) clearWaiting(taskID string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -70,14 +89,27 @@ func (d *Dispatcher) Health() Health {
 	now := d.now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	h := Health{Running: map[string]int{}, Waiting: map[string]int{}, NoWorker: map[string]int{},
+	h := Health{Running: map[string]int{}, Offering: map[string]int{}, Waiting: map[string]int{}, NoWorker: map[string]int{},
 		OldestWait: map[string]time.Duration{}, DroppedAnswers: d.droppedAnswers.Load()}
+	// offering is the tasks out on offer, by durable: a waiting entry for
+	// one is not forgotten while its offer round runs, however long the
+	// accept timeouts make it.
+	offering := map[string]map[string]bool{}
 	for _, a := range d.active {
-		h.Running[a.profile]++
+		if a.confirmed {
+			h.Running[a.profile]++
+			continue
+		}
+		h.Offering[a.profile]++
+		durable := lib.ProfileDurableName(a.profile, a.tier, a.kind)
+		if offering[durable] == nil {
+			offering[durable] = map[string]bool{}
+		}
+		offering[durable][a.taskID] = true
 	}
 	forget := time.Duration(waitingForgetAfter) * d.cfg.RetryDelay
 	for id, w := range d.waiting {
-		if now.Sub(w.lastSeen) > forget {
+		if now.Sub(w.lastSeen) > forget && !offering[w.durable][id] {
 			delete(d.waiting, id)
 			continue
 		}
@@ -103,7 +135,7 @@ func (d *Dispatcher) Health() Health {
 
 func (d *Dispatcher) logHealth() {
 	h := d.Health()
-	d.log.Info("dispatcher health", "running", h.Running, "waiting", h.Waiting, "noWorker", h.NoWorker,
+	d.log.Info("dispatcher health", "running", h.Running, "offering", h.Offering, "waiting", h.Waiting, "noWorker", h.NoWorker,
 		"oldestWait", h.OldestWait, "droppedAnswers", h.DroppedAnswers)
 	if h.JobAdmission != "" {
 		d.log.Warn(jobRefusedHint, "err", h.JobAdmission)
