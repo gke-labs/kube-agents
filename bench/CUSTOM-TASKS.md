@@ -148,6 +148,17 @@ different route and lose a different tie: the provider's defaults are passed as 
 `bench/tasks/autoops-warning-event-triage/task.yaml` sets everything else there and deliberately
 not those.
 
+The same channel carries the inputs of a stack that writes to the GitOps repository or plants a
+Config Connector object, exported once for the run: `TF_VAR_gitops_repo` (the leased project's
+GitOps repository), `TF_VAR_kcc_cluster_name` and `TF_VAR_kcc_cluster_location` (seeded slot a,
+the cluster that runs Config Connector, read from the fleet's `.fleet-context`) and
+`TF_VAR_kcc_google_service_account` (`kcc-eval-context@<project>`, a service account with no
+project role, for a ConfigConnectorContext). A value the run does not know is left unset. One more
+comes per unit: a stack that declares `variable "gitops_token_file"` asks for a write token, and the
+unit gets one narrowed to the leased repository in a file that `TF_VAR_gitops_token_file` names.
+Such a stack must remove what it writes at destroy, and a destroy that cannot do that must fail
+([`docs/ci-pool-projects.md`](../docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it)).
+
 Declare each of these in your stack's `variables.tf` to receive it. An injected variable the stack
 does not declare is dropped with nothing but a log warning, so a missing declaration surfaces as a
 stack built with the wrong defaults rather than as an error. A variable the _task_ sets and the

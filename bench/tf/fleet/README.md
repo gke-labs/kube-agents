@@ -299,11 +299,10 @@ names the **role** a fixture plays and the runner resolves it inside whichever p
 the run leased.
 
 `fixtures.json` in this directory is the catalog, and the only place role and cluster
-meet. Each role gives a `cluster_slot` (`a` to `d`) and the namespace the fixture
+meet. Each role gives a `cluster_slot` (`a` to `d`, or null) and the namespace the fixture
 lives in, if any. A role with `cluster_slot: null` is project-scoped: a Compute Engine
 object no cluster carries (the startup-fail VM, the world-open firewall rule and its VM).
-Its probes are `<kind>/<name-prefix>*`, the runner lists them in the project with
-`gcloud compute`, and it publishes the role as `<role>.confirmed` with no kubeconfig. It deliberately carries **no** cluster name, prefix or location:
+The catalog deliberately carries **no** cluster name, prefix or location:
 those are this Terraform's business, and a catalog that repeated them would agree with
 reality only for as long as nobody applied the stack with a non-default
 `-var cluster_prefix` or into another region — a drift that would surface as failing
@@ -345,7 +344,10 @@ The chain, end to end:
    — which `hack/fleet-fixture-state.py` evaluates after the presence gate. For slots
    b and c the subject is the cluster itself, read back through `clusters describe`
    on the name the runner recorded in `.fleet-context`; the script discovers nothing
-   on its own.
+   on its own. A project-scoped role's probes are `<kind>/<name-prefix>*`
+   (`instance/startup-fail-*`): the runner lists them in the project with
+   `gcloud compute ... list`, publishes the role as `<role>.confirmed` with no
+   kubeconfig, and the state pass reads them the same way.
 3. A check in a `task.yaml` uses the `fleet_resource_property` verifier and names
    `fixture_role: crashloop-workload`.
 4. `kube_agents_bench.fleet.kubeconfig_for_role` turns the role into that path, and the
@@ -552,18 +554,22 @@ silence-on-a-clean-fleet case needs a clean view, which is an open fleet-design
 decision recorded with the scenario drafts. The silence case in particular must
 tolerate the declared background rows above.
 
-Rough standing cost: about $340 per month — the GKE management fee (three zonal
-clusters) is most of it, the six nodes (20 GB disks), two 10 GB orphan disks and the
-`startup-fail` e2-micro the rest. The no-surge pool on `seeded-b` adds a seventh node, a fifth e2-small, and
-seeded-d adds a fourth management fee, an e2-small and an e2-standard-2, so a project carrying
-the whole stack costs roughly $490 per month — the fee, not the nodes, is the larger
-part of the increase. No separate rollout stands between a merge and that cost: a new
-cluster or pool plans as a create, which `hack/fleet_reconcile.py` applies, so the
-postsubmit on that merge creates both in every pool project within hours
-([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) §6.2). Four of the first six nodes are e2-small; `seeded-a`'s default pool is two e2-standard-2s
-(roughly $49 per month more than the two e2-mediums it ran on), because GKE's system pods
-claim 700-860m of an e2-medium's 940m allocatable CPU and the planted fixtures' pods went
-Pending, first on a single node and then, as fixtures accrued, on the busier of two — the
-comment on `seeded_a_default` in `main.tf` has the numbers. A third e2-standard-2 joined that
-pool with the Config Connector add-on, whose pods request more CPU than the two nodes had
-spare: about $49 per month more for each project.
+Rough standing cost: about $390 per month — the GKE management fee (three zonal
+clusters) is most of it, the seven nodes (20 GB disks), two 10 GB orphan disks and the
+`startup-fail` and `world-open` e2-micros the rest. The no-surge pool on `seeded-b` adds an
+eighth node, an e2-small, and seeded-d adds a fourth management fee, an e2-small and an
+e2-standard-2, so a project carrying the whole stack costs roughly $540 per month — the fee,
+not the nodes, is the larger part of the increase. No separate rollout stands between a merge
+and that cost: a new cluster or pool plans as a create, which `hack/fleet_reconcile.py`
+applies, so the postsubmit on that merge creates both in every pool project within hours
+([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) §6.2). Four of the first
+seven nodes are e2-small; `seeded-a`'s default pool is three e2-standard-2s. The pool moved
+from e2-medium to e2-standard-2 because GKE's system pods claim 700-860m of an e2-medium's
+940m allocatable CPU and the planted fixtures' pods went Pending, first on a single node and
+then, as fixtures accrued, on the busier of two (the comment on `seeded_a_default` in
+`main.tf` has the numbers). It went from two nodes to three with the Config Connector add-on,
+which requests about 1,020m CPU at all times (`cnrm-webhook-manager` 2 × 250m,
+`cnrm-deletiondefender` 250m, `cnrm-unmanaged-detector` 250m, `cnrm-resource-stats-recorder`
+20m), 100m more for each namespaced controller while a ConfigConnectorContext exists, and
+the `configconnector-operator` pod, measured on a dev cluster that runs the add-on. That is
+more than the two nodes had spare; the third node costs about $49 per month for each project.

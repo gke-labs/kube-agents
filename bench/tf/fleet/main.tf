@@ -390,12 +390,14 @@ resource "google_container_node_pool" "seeded_a_default" {
   name     = "default-pool"
   location = var.zone
   cluster  = google_container_cluster.seeded_a.name
-  # Three since the Config Connector add-on (#4218), two before. The add-on's
-  # pods (the operator, the webhook, the deletion defender, the stats
-  # recorder and, while an eval stack holds a ConfigConnectorContext, that
-  # namespace's controller) request several hundred millicores together, more
-  # than the core each node had spare, and default-pool-headroom requires
-  # 100m spare on every node. A node_count change is an in-place resize, not a
+  # Three since the Config Connector add-on (#4218), two before. Measured on
+  # a dev cluster that runs the add-on, its pods request about 1,020m CPU at
+  # all times (cnrm-webhook-manager 2 x 250m, cnrm-deletiondefender 250m,
+  # cnrm-unmanaged-detector 250m, cnrm-resource-stats-recorder 20m), 100m
+  # more for each namespaced controller while a ConfigConnectorContext
+  # exists, and the configconnector-operator pod: more than the core each
+  # node had spare, and default-pool-headroom requires 100m spare on every
+  # node. A node_count change is an in-place resize, not a
   # replace: no reconcile-allow.json entry, and the machine type stays.
   node_count = 3
 
