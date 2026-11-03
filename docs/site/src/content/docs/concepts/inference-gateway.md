@@ -185,6 +185,8 @@ Setting `litellm.vertex.sessionAffinity.enabled=true` on a `vertex_ai` install a
 
 Vertex honours `session_id` only on a project with session routing enabled (its `LLM_SESSION_ID` label), and elsewhere accepts the field and ignores it. A `session_id` the caller sets in `extra_body` is kept. The hook runs after redaction, so the id never comes from text redaction removed; with redaction on, set `SESSION_KV_SALT` so its pseudonyms, and the ids, match across gateway replicas. The gateway log says `session affinity: sending session_id` on the first request it stamps, and `session affinity: new conversation` on each conversation's first request, with short digests of the prompt and tool list the id came from and never their text. The value is chart-only: the kustomize dev copy has no equivalent, and `terraform/examples/full-install` reaches it through `extra_helm_values`.
 
+The `LLM_SESSION_ID` label is granted per project on request, with no documented customer process, and the gateway logs the same lines whether or not a project has it. The value is unsupported: it carries no compatibility promise and may change meaning, change default or be removed between releases, so an install that sets it re-checks it at every upgrade.
+
 ### Gemini's thoughts
 
 Gemini thinks before it answers whether or not a request asks it to, but it returns those thoughts only when the request sets `thinkingConfig.includeThoughts`. With it off, Gemini 3.x has been seen writing its reasoning into the answer instead, under a first line `thought`, where nothing downstream can tell it from the answer. To give the thoughts a channel of their own, for a Gemini 2.5 or 3.x model through `gemini` or `vertex_ai` the chart renders `thinking` under every `model_list` alias:

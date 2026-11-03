@@ -435,6 +435,12 @@ litellm:
     # them but reuse each less often. With litellm.redaction on, the id is
     # hashed from redacted text, so SESSION_KV_SALT must be set for it to
     # match on every gateway replica.
+    # Unsupported: the LLM_SESSION_ID label is granted per project by Vertex
+    # on request, with no documented customer process, and nothing here can
+    # check it; the gateway logs "sending session_id" either way. No
+    # compatibility promise: this value may change meaning, change default,
+    # or be removed between releases, and an install that sets it is expected
+    # to re-check it at every upgrade.
     sessionAffinity:
       enabled: false
       slots: 2
