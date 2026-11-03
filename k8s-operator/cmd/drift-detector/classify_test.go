@@ -630,6 +630,49 @@ func TestDriftFilterDropsCoordinationResources(t *testing.T) {
 	}
 }
 
+// TestDriftFilterDropsGoogleManagedServiceAccountLeaseWrites pins the
+// detector's half of the node-lease carve-out: the drift-pubsub sink drops
+// Lease writes by *.gserviceaccount.com principals, and whatever reaches the
+// detector anyway (an install whose sink predates the widened suffix, or one
+// with exclude_machine_lease_heartbeats off) is classified as automation and
+// never handed to the join. The Compute Engine default account is the one
+// that carries no "iam" label, which is the suffix the sink used to match on.
+func TestDriftFilterDropsGoogleManagedServiceAccountLeaseWrites(t *testing.T) {
+	lease := ResourceRef{
+		Group:     "coordination.k8s.io",
+		Version:   "v1",
+		Namespace: "kube-node-lease",
+		Resource:  "leases",
+		Name:      "gke-node-pool-1a2b3c4d-xyz1",
+	}
+	records := []AuditRecord{
+		{Principal: "000000000000-compute@developer.gserviceaccount.com", Verb: "update", Resource: lease},
+		{Principal: "000000000000-compute@developer.gserviceaccount.com", Verb: "create", Resource: lease},
+		{Principal: "000000000000@cloudbuild.gserviceaccount.com", Verb: "update", Resource: lease},
+		{Principal: "service-000000000000@container-engine-robot.iam.gserviceaccount.com", Verb: "update", Resource: lease},
+	}
+
+	forwarded := 0
+	filter := newDriftFilter(NewClassifier("", ""), func(context.Context, AuditRecord) { forwarded++ }, false)
+	for _, r := range records {
+		filter.Handle(context.Background(), r)
+	}
+
+	if forwarded != 0 {
+		t.Errorf("forwarded %d record(s) to the join, want 0", forwarded)
+	}
+	counts := filter.Counts()
+	if counts.ByTier[TierAutomation] != len(records) {
+		t.Errorf("ByTier[automation] = %d, want %d", counts.ByTier[TierAutomation], len(records))
+	}
+	if counts.ByTier[TierHuman] != 0 || counts.ByTier[TierUnattributed] != 0 {
+		t.Errorf("counts = %s, want no human or unattributed record", counts)
+	}
+	if counts.Actionable != 0 {
+		t.Errorf("Actionable = %d, want 0", counts.Actionable)
+	}
+}
+
 // TestClassifierHumanDomainsAreCaseInsensitive pins the normalisation in
 // NewClassifier. DNS is case-insensitive and GCP lower-cases principalEmail, so
 // a miscased --human-domains value must still match. Unnormalised, this sends

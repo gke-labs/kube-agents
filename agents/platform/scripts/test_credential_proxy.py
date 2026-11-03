@@ -2669,7 +2669,7 @@ class ExecRouteCapacityTest(unittest.TestCase):
 
     @staticmethod
     @contextlib.contextmanager
-    def no_slot_free(caller=None):
+    def no_slot_free(caller=None, klass=None):
         """What `request_slot` does when every slot stays busy for the wait."""
         raise credential_proxy.CommandSlotUnavailable("limit of 8 concurrent commands and this request waited 60s without reaching a free slot")
         yield  # pragma: no cover -- makes this a generator, as a context manager needs
@@ -2910,7 +2910,7 @@ class ExecRouteCapacityTest(unittest.TestCase):
         why = "the caller disconnected while queued for the memory budget"
 
         @contextlib.contextmanager
-        def gone(caller=None):
+        def gone(caller=None, klass=None):
             raise credential_proxy.CallerHungUp(why)
             yield  # pragma: no cover -- makes this a generator, as a context manager needs
 
@@ -2996,6 +2996,298 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertEqual("pods\n", body["stdout"])
         self.assertEqual(1, len(seen))
         self.assertIsInstance(seen[0], socket.socket)
+
+
+class _Holder:
+    """A request admitted under `klass` on its own thread, held until released.
+
+    `admitted` is set once the request is in; `refused` holds the busy
+    exception if it was turned away instead."""
+
+    def __init__(self, executor, klass):
+        self.admitted = threading.Event()
+        self.release = threading.Event()
+        self.refused = None
+        self.thread = threading.Thread(target=self._run, args=(executor, klass), daemon=True)
+        self.thread.start()
+
+    def _run(self, executor, klass):
+        try:
+            with executor.request_slot(klass=klass):
+                self.admitted.set()
+                self.release.wait(10)
+        except credential_proxy.CommandSlotUnavailable as exc:
+            self.refused = exc
+
+    def done(self):
+        self.release.set()
+        self.thread.join(10)
+
+
+class _Reserver(_Holder):
+    """A slot-less child memory reservation (the forge refresh's kind), held on
+    its own thread until released."""
+
+    def _run(self, executor, klass):
+        try:
+            with executor.reserve_child_memory():
+                self.admitted.set()
+                self.release.wait(10)
+        except credential_proxy.CommandSlotUnavailable as exc:
+            self.refused = exc
+
+
+class ClassAdmissionTest(unittest.TestCase):
+    """Priority admission by class (credential-broker-exec-tier.md §4.2, §12)."""
+
+    I = credential_proxy.CLASS_INTERACTIVE
+    B = credential_proxy.CLASS_BACKGROUND
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.holders = []
+        self.addCleanup(self._release_all)
+        patcher = mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.6)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _release_all(self):
+        for holder in self.holders:
+            holder.done()
+
+    def executor(self, memory_limit_bytes=None, metrics=None):
+        return CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=1024,
+            state_dir=self.temp_dir.name,
+            scoped_pool=None,
+            max_concurrent_commands=8,
+            memory_limit_bytes=memory_limit_bytes,
+            metrics=metrics,
+        )
+
+    def budgeted(self, admits, metrics=None):
+        per_request = credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + credential_proxy.OUTPUT_COPIES_PER_COMMAND * 1024
+        limit = (
+            credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
+            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
+            + admits * per_request
+        )
+        with mock.patch.object(credential_proxy, "BUDGET_MINIMUM_ADMITTED_REQUESTS", min(admits, 2)):
+            executor = self.executor(memory_limit_bytes=limit, metrics=metrics)
+        self.assertEqual(admits, executor.admitted_requests())
+        return executor
+
+    def hold(self, executor, klass, count=1):
+        made = []
+        for _ in range(count):
+            holder = _Holder(executor, klass)
+            self.holders.append(holder)
+            self.assertTrue(holder.admitted.wait(5), f"a {klass} request was not admitted")
+            made.append(holder)
+        return made
+
+    def queue(self, executor, klass):
+        holder = _Holder(executor, klass)
+        self.holders.append(holder)
+        return holder
+
+    def wait_queued(self, executor, count):
+        deadline = time.monotonic() + 5
+        while executor.queued_requests < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(count, executor.queued_requests)
+
+    def test_the_class_comes_from_the_role(self):
+        for role, want in (
+            (credential_proxy.CALLER_ROLE_PROFILE, self.B),
+            (credential_proxy.CALLER_ROLE_SCOPE, self.B),
+            (credential_proxy.CALLER_ROLE_SESSION, self.I),
+            (credential_proxy.CALLER_ROLE_SHELL, self.I),
+            (credential_proxy.CALLER_ROLE_MCP, self.I),
+            ("", self.I),
+        ):
+            with self.subTest(role=role):
+                self.assertEqual(want, credential_proxy.admission_class(role))
+
+    def test_the_caps(self):
+        executor = self.executor()
+        self.assertEqual((7, 6), (executor.class_cap(self.I), executor.class_cap(self.B)))
+        budgeted = self.budgeted(4)
+        self.assertEqual((3, 2), (budgeted.class_cap(self.I), budgeted.class_cap(self.B)))
+        tiny = self.budgeted(2)
+        # Never below one: a pod too small to reserve still serves both classes.
+        self.assertEqual((1, 1), (tiny.class_cap(self.I), tiny.class_cap(self.B)))
+
+    def test_a_full_background_share_leaves_the_reserve_to_interactive_work(self):
+        executor = self.executor()
+        self.hold(executor, self.B, 6)
+        late = self.queue(executor, self.B)
+        self.hold(executor, self.I, 2)  # the reserve, admitted at once
+        late.thread.join(5)
+        self.assertIsNotNone(late.refused)
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_BACKGROUND, late.refused.bound)
+        self.assertEqual(self.B, late.refused.klass)
+        self.assertIn("for interactive work", str(late.refused))
+        self.assertIn(credential_proxy.ADMISSION_BOUND_BACKGROUND, credential_proxy.ADMISSION_BOUNDS)
+
+    def test_interactive_work_leaves_one_admission_to_background_work(self):
+        executor = self.executor()
+        self.hold(executor, self.I, 7)
+        late = self.queue(executor, self.I)
+        self.wait_queued(executor, 1)
+        self.hold(executor, self.B)  # passes the capped interactive request
+        late.thread.join(5)
+        self.assertIsNotNone(late.refused)
+
+    def test_an_interactive_request_at_its_cap_is_refused_as_a_slot_with_its_own_reason(self):
+        for executor in (self.executor(), self.budgeted(4)):
+            with self.subTest(admitted=executor.admitted_requests()):
+                self.hold(executor, self.I, executor.class_cap(self.I))
+                late = self.queue(executor, self.I)
+                late.thread.join(5)
+                self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, late.refused.bound)
+                self.assertIn("for background work", str(late.refused))
+                self.assertNotIn("memory budget", str(late.refused))
+                self._release_all()
+
+    def test_an_interactive_request_goes_ahead_of_queued_background_ones(self):
+        executor = self.executor()
+        background = self.hold(executor, self.B, 6)
+        self.hold(executor, self.I, 2)
+        waiting_background = self.queue(executor, self.B)
+        self.wait_queued(executor, 1)
+        waiting_interactive = self.queue(executor, self.I)
+        self.wait_queued(executor, 2)
+        background[0].done()  # one slot, and room under the background cap
+        self.assertTrue(waiting_interactive.admitted.wait(5))
+        self.assertFalse(waiting_background.admitted.is_set())
+
+    def test_arrival_order_holds_inside_a_class(self):
+        executor = self.executor()
+        held = self.hold(executor, self.I, 7)
+        first = self.queue(executor, self.I)
+        self.wait_queued(executor, 1)
+        second = self.queue(executor, self.I)
+        self.wait_queued(executor, 2)
+        held[0].done()
+        self.assertTrue(first.admitted.wait(5))
+        self.assertFalse(second.admitted.is_set())
+
+    def test_the_reserve_is_budget_room_as_well_as_slots(self):
+        # The budget admits 4 and binds before the 8 slots: B = 2, I = 3.
+        # Background work takes its two, and the budget's last two admissions
+        # stay free for interactive work although slots are free too.
+        executor = self.budgeted(4)
+        self.hold(executor, self.B, 2)
+        late = self.queue(executor, self.B)
+        late.thread.join(5)
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_BACKGROUND, late.refused.bound)
+        self.hold(executor, self.I, 2)
+
+    def test_running_interactive_work_uses_its_own_reserve(self):
+        # Interactive work already running counts against the reserve, not
+        # against the background share: with one interactive request in, two
+        # background requests still fit (1 + 2 + the reserve's unused 1 = 4).
+        executor = self.budgeted(4)
+        self.hold(executor, self.I)
+        self.hold(executor, self.B, 2)
+        self.hold(executor, self.I)
+
+    def test_with_the_budget_on_interactive_work_still_leaves_one_admission_to_background(self):
+        executor = self.budgeted(4)
+        self.hold(executor, self.I, 3)
+        self.hold(executor, self.B)
+
+    def test_a_freed_admission_goes_to_interactive_work_first(self):
+        # The background request queued first is under its cap, but an
+        # interactive request queued behind it takes the admission that frees.
+        executor = self.executor()
+        held = self.hold(executor, self.I, 3)
+        self.hold(executor, self.B, 5)
+        waiting_background = self.queue(executor, self.B)
+        self.wait_queued(executor, 1)
+        waiting_interactive = self.queue(executor, self.I)
+        self.wait_queued(executor, 2)
+        held[0].done()
+        self.assertTrue(waiting_interactive.admitted.wait(5))
+        self.assertFalse(waiting_background.admitted.is_set())
+
+    def test_the_reserve_holds_budget_room_a_slot_less_reservation_would_take(self):
+        # The budget admits 4 (B = 2). A forge refresh's slot-less reservation
+        # takes budget but no slot and no class share. The first background
+        # request still leaves the reserve's two admissions; a second is under
+        # its cap of two and fits the budget, but would leave room for one.
+        executor = self.budgeted(4)
+        reserver = _Reserver(executor, self.I)
+        self.holders.append(reserver)
+        self.assertTrue(reserver.admitted.wait(5))
+        self.hold(executor, self.B)
+        late = self.queue(executor, self.B)
+        late.thread.join(5)
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_BACKGROUND, late.refused.bound)
+
+    def test_a_slot_less_reservation_passes_a_request_its_class_cap_holds(self):
+        # With the budget on, the interactive cap full and a slot free, an
+        # interactive request queues on its cap; a forge refresh's reservation
+        # behind it takes no slot and is admitted past it.
+        executor = self.executor(
+            memory_limit_bytes=credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
+            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
+            + 9 * (credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + credential_proxy.OUTPUT_COPIES_PER_COMMAND * 1024)
+        )
+        self.assertEqual(8, executor.admitted_requests())
+        self.hold(executor, self.I, 7)
+        capped = self.queue(executor, self.I)
+        self.wait_queued(executor, 1)
+        reserver = _Reserver(executor, self.I)
+        self.holders.append(reserver)
+        self.assertTrue(reserver.admitted.wait(5))
+        self.assertFalse(capped.admitted.is_set())
+
+    def test_one_class_alone_keeps_todays_order(self):
+        executor = self.executor()
+        held = self.hold(executor, self.B, 6)
+        queued = [self.queue(executor, self.B) for _ in range(2)]
+        self.wait_queued(executor, 2)
+        held[0].done()
+        self.assertTrue(queued[0].admitted.wait(5))
+        self.assertFalse(queued[1].admitted.is_set())
+
+    def test_a_background_child_runs_at_the_background_nice_value(self):
+        executor = self.executor()
+        stub_dir = Path(self.temp_dir.name) / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/bash\necho ok\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["kubectl"] = str(stub)
+        for klass, lowered in ((self.B, True), (self.I, False)):
+            with self.subTest(klass=klass):
+                with mock.patch.object(credential_proxy.os, "setpriority") as setpriority:
+                    with executor.request_slot(klass=klass):
+                        result = executor.execute(["kubectl", "version"])
+                self.assertEqual(0, result.exit_code)
+                if lowered:
+                    setpriority.assert_called_once()
+                    which, _pid, value = setpriority.call_args.args
+                    self.assertEqual((credential_proxy.os.PRIO_PGRP, credential_proxy.BACKGROUND_NICE), (which, value))
+                else:
+                    setpriority.assert_not_called()
+
+    def test_a_child_already_gone_is_no_fault(self):
+        with mock.patch.object(credential_proxy.os, "setpriority", side_effect=ProcessLookupError()):
+            credential_proxy._lower_priority(12345)
+
+    def test_the_class_label_is_closed(self):
+        metrics = credential_proxy.ProxyMetrics()
+        metrics.record_refusal(credential_proxy.ADMISSION_BOUND_SLOT, "something a caller wrote")
+        metrics.observe_duration("kubectl", 0.1, self.B)
+        body = metrics.render()
+        self.assertNotIn("something a caller wrote", body)
+        self.assertIn('kubeagents_credential_proxy_admission_refusals_total{bound="slot",class="interactive"} 1', body)
+        self.assertIn('kubeagents_tool_execution_duration_seconds_count{tool="kubectl",class="background"} 1', body)
 
 
 class SessionSlotCapTest(unittest.TestCase):
@@ -3457,6 +3749,16 @@ class ChildMemoryBudgetDerivationTest(unittest.TestCase):
         self.assertEqual("/sys/fs/cgroup/memory.max", credential_proxy.CGROUP_MEMORY_MAX_PATH)
         self.assertEqual("max", credential_proxy.CGROUP_NO_LIMIT)
         self.assertEqual(2, credential_proxy.BUDGET_MINIMUM_ADMITTED_REQUESTS)
+
+
+def _without_interactive_headroom(test: unittest.TestCase) -> None:
+    """Let interactive work hold every admission, for a test of the slot cap or
+    the child memory budget that fills them with interactive requests. The
+    class caps have tests of their own (`ClassAdmissionTest`); here the cap of
+    admitted - 1 would stop the last request before the bound under test."""
+    patcher = mock.patch.object(credential_proxy, "INTERACTIVE_HEADROOM", 0)
+    patcher.start()
+    test.addCleanup(patcher.stop)
 
 
 class CommandExecutorTest(unittest.TestCase):
@@ -5018,7 +5320,7 @@ class CommandExecutorTest(unittest.TestCase):
         mib = credential_proxy.MEBIBYTE
         with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
             executor = self.executor(memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib)
-        # GKE Autopilot without bursting: the limit is the 1Gi request, and 704 MiB fits 4.
+        # GKE Autopilot without bursting, with a CR that sets a 1Gi request: the limit is the request, and 704 MiB fits 4.
         self.assertEqual(
             {"slot_cap": 8, "budget_admits": 4, "admitted": 4, "session_cap": 2},
             self._admission_report(executor),
@@ -5238,6 +5540,7 @@ class CommandExecutorTest(unittest.TestCase):
             pass
 
     def test_the_output_term_is_charged_for_slots_in_use_not_the_cap(self):
+        _without_interactive_headroom(self)
         # Budget for exactly two requests at a 1 KiB cap. With the output
         # allowance charged for the cap of eight up front, the first request
         # would cost 128 MiB + 8 x 6 KiB and the second would not fit, since
@@ -5264,6 +5567,7 @@ class CommandExecutorTest(unittest.TestCase):
         release.set()
 
     def test_four_requests_fit_at_the_defaults_and_a_fifth_waits(self):
+        _without_interactive_headroom(self)
         # Design §2.2: a 1024 MiB limit and an 8 MiB output cap leave 704 MiB
         # for children, four requests of 128 + 6 x 8 MiB. Without the
         # slots-in-use output term a fifth would fit (5 x 128 = 640 <= 704).
@@ -5310,6 +5614,7 @@ class CommandExecutorTest(unittest.TestCase):
         )
 
     def test_a_wait_behind_a_budget_held_head_is_logged_as_the_budget(self):
+        _without_interactive_headroom(self)
         # Two slots of eight in use fill the budget: the head waits for it and
         # the slot taker behind it never sees the slot cap full. Both are
         # admitted on the one wake that frees the budget, and neither wait was
@@ -7909,6 +8214,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         return route, route_results, verb_results, leave
 
     def test_a_route_caller_still_stale_after_its_yield_gives_the_lock_up_to_a_verb_that_holds_the_budget(self):
+        _without_interactive_headroom(self)
         # After its one yield the route caller re-takes the lock and waits for
         # the budget again. A second vcs verb, admitted meanwhile and so
         # holding the budget it waits for, needs that lock: the route caller
@@ -17393,46 +17699,28 @@ class ScopeRouteAdmissionTest(unittest.TestCase):
 
 
 class ScopeSlotShareTest(unittest.TestCase):
-    """The scope share takes only what session and profile work leave, and the shell keeps a slot."""
+    """The scope share defaults to one and is held to the background cap."""
 
-    def limit(self, raw, pool, session, profile):
+    def limit(self, raw, background_cap):
         with mock.patch.dict(os.environ, {credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS: raw}):
-            return credential_proxy.scope_slot_limit_from_env(pool, session, profile)
+            return credential_proxy.scope_slot_limit_from_env(background_cap)
 
-    def test_the_defaults_leave_the_shell_a_slot_with_every_bounded_role_busy(self):
-        pool = credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS
-        with mock.patch.dict(os.environ, {}, clear=True):
-            session = credential_proxy.session_slot_limit_from_env()
-            profile = credential_proxy.profile_slot_limit_from_env(pool, session)
-            scope = credential_proxy.scope_slot_limit_from_env(pool, session, profile)
+    def test_the_default_is_one(self):
         self.assertEqual(1, credential_proxy.DEFAULT_SCOPE_MAX_CONCURRENT_COMMANDS)
-        self.assertEqual(1, scope)
-        self.assertLessEqual(session + profile + scope, pool - 1)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(1, credential_proxy.scope_slot_limit_from_env(6))
 
-    def test_an_oversubscribed_config_clamps_scope_first(self):
-        for raw, pool, session, profile, want, warns in (
-            ("1", 8, 2, 4, 1, False),
-            ("4", 8, 2, 4, 1, True),   # 8 - 2 - 4 - 1: the profile share is kept, scope gives way
-            ("4", 16, 2, 4, 4, False),
-            ("2", 8, 2, 5, 0, True),   # profile left nothing: scope is answered busy, the shell keeps its slot
-            ("x", 8, 2, 4, 1, True),   # an unreadable value is the default
+    def test_the_share_is_held_to_the_background_cap(self):
+        for raw, background_cap, want, warns in (
+            ("1", 6, 1, False),
+            ("4", 6, 4, False),
+            ("8", 6, 6, True),
+            ("2", 1, 1, True),
+            ("x", 6, 1, True),   # an unreadable value is the default
         ):
-            with self.subTest(raw=raw, pool=pool, profile=profile):
+            with self.subTest(raw=raw, background_cap=background_cap):
                 with self.assertLogs(credential_proxy.LOGGER, level="WARNING") if warns else contextlib.nullcontext():
-                    got = self.limit(raw, pool, session, profile)
-                self.assertEqual(want, got)
-                self.assertLessEqual(session + profile + got, pool - 1)
-
-    def test_a_scope_share_of_zero_is_busy_and_the_shell_is_not(self):
-        slots = credential_proxy.SessionSlots(
-            0, role=credential_proxy.CALLER_ROLE_SCOPE,
-            env_name=credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS, bound=credential_proxy.ADMISSION_BOUND_SCOPE,
-        )
-        with self.assertRaises(credential_proxy.CommandSlotUnavailable):
-            with slots.acquire(credential_proxy.CALLER_ROLE_SCOPE):
-                pass
-        with slots.acquire(credential_proxy.CALLER_ROLE_SHELL):
-            pass
+                    self.assertEqual(want, self.limit(raw, background_cap))
 
 
 SCOPE_ASSET_SEARCH = [
@@ -17556,6 +17844,21 @@ class ScopeExecRouteTest(unittest.TestCase):
         self.scope_file.unlink()
         self.refused({"argv": SCOPE_ASSET_SEARCH}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
         self.assertFalse(self.calls.exists())
+
+    def test_scope_commands_are_admitted_as_background_work(self):
+        asked = []
+        real = CredentialProxyHandler.executor.request_slot
+
+        def recording(caller=None, klass=None):
+            asked.append(klass)
+            return real(caller=caller, klass=klass)
+
+        with mock.patch.object(CredentialProxyHandler.executor, "request_slot", recording):
+            status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})
+            self.assertEqual(200, status, body)
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["gcloud", "container", "clusters", "list"]})
+            self.assertEqual(200, status, body)
+        self.assertEqual([credential_proxy.CLASS_BACKGROUND, credential_proxy.CLASS_INTERACTIVE], asked)
 
     def test_the_shell_is_not_held_to_the_scope_shapes(self):
         status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["gcloud", "container", "clusters", "list"]})

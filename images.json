@@ -86,7 +86,15 @@
       "tagPolicy": "release",
       "override": "A2A_WORKER_IMAGE",
       "pulledBy": "The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image also carries the credential broker's shim as `kubectl` and `gcloud`, used only when the operator's A2A_SESSION_CLUSTER_VIEW flag gives a session pod its read-only cluster view.",
-      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, the session agent's persona and read-only skills (a2a/cmd/session-persona), and the credential broker's shim as kubectl and gcloud for the flag-gated cluster view."
+      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, the session agent's persona and read-only skills (a2a/cmd/session-persona), the credential broker's shim as kubectl and gcloud for the flag-gated cluster view, and jq, which the cluster agent's persona requires when the image runs its profile workers."
+    },
+    {
+      "name": "persona-cluster",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/persona-cluster",
+      "tagPolicy": "release",
+      "pulledBy": "The worker pods of the cluster AgentProfile under spec.mode: next, when the chart's profiles.cluster.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable.",
+      "description": "The cluster agent's persona (agents/cluster/persona) as a persona image (a2a/Dockerfile.persona-cluster): the manifest, instructions, MCP servers and skills under /files, on busybox for the staging copy."
     },
     {
       "name": "a2a-authcallout",
@@ -305,8 +313,8 @@
       "origin": "build-time",
       "repository": "docker.io/library/busybox",
       "tag": "musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8",
-      "pulledBy": "agentplugins/*/Dockerfile base images.",
-      "description": "Minimal userland (sh, cp, ls) base image for plugin images to support staging init containers."
+      "pulledBy": "agentplugins/*/Dockerfile and a2a/Dockerfile.persona-* base images.",
+      "description": "Minimal userland (sh, cp, ls) base image for plugin and persona images to support staging init containers."
     }
   ]
 }
