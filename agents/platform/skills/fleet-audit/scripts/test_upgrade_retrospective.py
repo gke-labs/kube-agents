@@ -6557,9 +6557,11 @@ class DefaultRunTest(unittest.TestCase):
         self.assertEqual(ur.default_run(["/nonexistent/binary"]).rc, -1)
 
 
-class DefaultRunTellsTheShimItsDeadlineTest(unittest.TestCase):
-    """Each read's cap holds one admission wait and one run at most, so `default_run` tells the
-    shim a retry deadline under which no retry fits, in the caller's environment or the process's."""
+class MainTellsTheShimItsDeadlineTest(unittest.TestCase):
+    """Each read's cap holds one admission wait and one run at most, so `main` puts a retry
+    deadline under which no retry fits into the process environment, which every read's
+    environment descends from. `default_run` itself stays collector_run's binding, which
+    test_collector_run.py pins, so the deadline cannot travel through a wrapper of it."""
 
     def test_the_deadline_is_the_cap_less_the_run_bound_and_admits_no_retry(self):
         client = ur.credential_proxy_client
@@ -6569,22 +6571,28 @@ class DefaultRunTellsTheShimItsDeadlineTest(unittest.TestCase):
         self.assertGreater(shortest, deadline)
         self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
 
-    def test_every_run_carries_the_deadline_in_its_environment(self):
-        calls = []
-
-        def fake(argv, *, env=None, timeout):
-            calls.append((argv, env, timeout))
-            return ur.Run(argv, 0, "", "", 0.0)
-
+    def test_main_sets_the_deadline_before_the_first_read_and_every_read_sees_it(self):
         name = ur.credential_proxy_client.RETRY_DEADLINE_ENV
-        with mock.patch.object(ur.collector_run, "default_run", fake), mock.patch.dict(os.environ, {"KUBECONFIG": "/inherited"}):
-            ur.default_run(["gcloud", "projects", "list"])
-            ur.default_run(["kubectl", "get", "nodes"], env={"KUBECONFIG": "/given"}, timeout=ur.KUBECTL_TIMEOUT_S)
-        (argv_a, env_a, timeout_a), (argv_b, env_b, timeout_b) = calls
-        self.assertEqual((["gcloud", "projects", "list"], ur.GCLOUD_TIMEOUT_S), (argv_a, timeout_a))
-        self.assertEqual(("/inherited", str(ur.SHIM_RETRY_DEADLINE_S)), (env_a["KUBECONFIG"], env_a[name]))
-        self.assertEqual((["kubectl", "get", "nodes"], ur.KUBECTL_TIMEOUT_S), (argv_b, timeout_b))
-        self.assertEqual({"KUBECONFIG": "/given", name: str(ur.SHIM_RETRY_DEADLINE_S)}, env_b)
+        fleet = FakeFleet()
+        seen = []
+
+        def recording(argv, *, timeout=None, env=None):
+            # What the shim would read: the process environment for a read that inherits it, the
+            # caller's dict for a read handed one (the kubectl reads, with their kubeconfig).
+            seen.append((argv[0], os.environ.get(name), None if env is None else env.get(name)))
+            return fleet(argv, timeout=timeout, env=env)
+
+        with tempfile.TemporaryDirectory() as home:
+            scoped = {ur.HERMES_HOME_ENV: home, ur.STORE_HOME_ENV: home}
+            with mock.patch.dict(os.environ, scoped), mock.patch.object(ur, "default_run", recording), mock.patch.object(ur, "now_utc", lambda: NOW):
+                os.environ.pop(name, None)
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), 0)
+        self.assertNotIn(name, os.environ, "the patch.dict restored the test's environment")
+        self.assertTrue(seen, "the run issued no read")
+        self.assertEqual({"gcloud", "kubectl"}, {binary for binary, _, _ in seen})
+        self.assertEqual({str(ur.SHIM_RETRY_DEADLINE_S)}, {inherited for _, inherited, _ in seen})
+        self.assertEqual({str(ur.SHIM_RETRY_DEADLINE_S)}, {given for _, _, given in seen if given is not None}, "a read handed its own environment lost the deadline")
 
 
 if __name__ == "__main__":

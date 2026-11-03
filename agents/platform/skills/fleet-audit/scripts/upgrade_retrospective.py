@@ -213,6 +213,7 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -365,9 +366,11 @@ KUBECTL_TIMEOUT_S = 120
 # broker admission wait and one run. The shim retries a refusal on its own
 # (credential_proxy_client, keeping a retry's admission wait, not its run, inside a deadline the
 # caller may shorten), and under these caps a retry would carry past the cap, where TIMEOUT_RC
-# stands in for the broker's reason. So `default_run` tells the shim the shorter cap less the
-# longer run bound, under which no retry fits, and a refused read records the refusal's text at
-# once, as cluster_preflight.sh's calls do.
+# stands in for the broker's reason. So `main` puts the shorter cap less the longer run bound,
+# under which no retry fits, into the process environment, which every read's environment is
+# (inherited, or `{**os.environ, "KUBECONFIG": ...}` built at the read), and a refused read
+# records the refusal's text at once, as cluster_preflight.sh's calls do. `default_run` itself
+# stays the shared binding collector_run owns (test_collector_run.py refuses a wrapper).
 BROKER_GCLOUD_RUN_S = 300
 BROKER_KUBECTL_RUN_S = 60
 SHIM_RETRY_DEADLINE_S = max(0, min(GCLOUD_TIMEOUT_S, KUBECTL_TIMEOUT_S) - max(BROKER_GCLOUD_RUN_S, BROKER_KUBECTL_RUN_S))
@@ -1452,15 +1455,7 @@ def is_system_namespace(namespace: str) -> bool:
 
 Run = collector_run.Run
 TIMEOUT_RC = collector_run.TIMEOUT_RC
-def default_run(argv: list[str], *, env: dict | None = None, timeout: int = GCLOUD_TIMEOUT_S) -> Run:
-    """`collector_run.default_run` under this collector's timeout, with the shim told the retry
-    deadline its cap leaves (SHIM_RETRY_DEADLINE_S), in the caller's environment or this process's."""
-    base = os.environ if env is None else env
-    return collector_run.default_run(
-        argv,
-        env={**base, credential_proxy_client.RETRY_DEADLINE_ENV: str(SHIM_RETRY_DEADLINE_S)},
-        timeout=timeout,
-    )
+default_run = functools.partial(collector_run.default_run, timeout=GCLOUD_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
@@ -6987,6 +6982,8 @@ def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, gu
 
 def main(argv: list[str] | None = None) -> int:
     run_started = time.monotonic()  # the deadline counts the lock wait too
+    # Every read's environment descends from this process's (SHIM_RETRY_DEADLINE_S's comment).
+    os.environ[credential_proxy_client.RETRY_DEADLINE_ENV] = str(SHIM_RETRY_DEADLINE_S)
     args = build_parser().parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     try:
