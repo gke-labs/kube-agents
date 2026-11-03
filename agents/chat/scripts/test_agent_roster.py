@@ -1125,11 +1125,29 @@ class TestRosterCache(unittest.TestCase):
         self.assertIn("- platform: Fleet work.", self._render())
 
     def test_an_unreadable_scope_is_not_cached(self):
-        missing = self.base.parent / "render.json"
-        self.assertIn(agent_roster.SCOPE_UNREADABLE, self._render({"KUBEAGENTS_SCOPE_FILE": str(missing)}))
-        missing.write_text('{"present": true, "projects": ["q"]}\n')
-        _age(missing)
-        self.assertIn("q (unresolved)", self._render({"KUBEAGENTS_SCOPE_FILE": str(missing)}))
+        # The render is present and aged on both renders, so the key does not
+        # move: only the degraded rule explains the second render's re-read.
+        # A missing file would not do, since the key stamps None for it and an
+        # mtime once it exists.
+        from unittest import mock
+
+        render = self.base.parent / "render.json"
+        render.write_text('{"present": true, "projects": ["q"]}\n')
+        _age(render)
+        env = {"KUBEAGENTS_SCOPE_FILE": str(render)}
+        real = Path.read_text
+
+        def flaky(path, *args, **kwargs):
+            if path == render:
+                raise OSError(5, "EIO")
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=flaky):
+            self.assertIn(agent_roster.SCOPE_UNREADABLE, self._render(env))
+        out, reads = self._reads_on_render(env)
+        self.assertGreater(reads, 0, "the unreadable scope was cached")
+        self.assertIn("q (unresolved)", out)
+        self.assertNotIn(agent_roster.SCOPE_UNREADABLE, out)
 
     def test_a_scope_render_rewrite_invalidates(self):
         # No snapshot: the scope section comes from the operator's render, a
@@ -1196,13 +1214,19 @@ class TestRosterCache(unittest.TestCase):
         self.assertIn("- platform: Fleet work.", self._render())
 
     def test_an_explicit_base_is_part_of_the_key(self):
+        # The second base carries the first's exact mtime, so the path is the
+        # only key component that separates the two.
         self._render()
         with TemporaryDirectory() as other:
             base = Path(other) / "profiles"
             (base / "tse").mkdir(parents=True)
             (base / "tse" / "CAPABILITIES.md").write_text("Support.")
-            _age(base)
-            self.assertIn("- tse: Support.", _render_roster(base, {}))
+            same = self.base.stat().st_mtime_ns
+            os.utime(base, ns=(same, same))
+            with _counting_reads() as counts:
+                out = _render_roster(base, {})
+            self.assertGreater(counts["reads"].call_count, 0, "the other base hit the first's roster")
+            self.assertIn("- tse: Support.", out)
 
 
 class TestSummaryThreshold(unittest.TestCase):
