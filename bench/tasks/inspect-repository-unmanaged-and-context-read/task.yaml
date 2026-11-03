@@ -1,0 +1,129 @@
+# FIXTURE_NOT_READY -- an entry in scripts/validate_bench_cases.py, not a
+# roster line, until the pool installs register the context repository below
+# (#4243).
+#
+# What this case grades (#4243): inspect-repository reads two repositories
+# this install does not manage, through the broker's stateless `snapshot`
+# verb, and not through a content-workspace handle:
+#   1. an unmanaged public repository: gke-labs/kube-agents at the tag
+#      0.13.0, whose tree (about 65 MiB) is over the 32 MiB snapshot cap, so
+#      a whole copy is refused with SNAPSHOT_TOO_LARGE and the agent must take
+#      `--prefix tags.env`;
+#   2. the install's context repository, registered for declared intent in
+#      the `context_repos` key of the GitOps state ConfigMap: the public
+#      kubernetes-sigs/kind, pinned to the tag v0.24.0 (about 3.6 MiB).
+# Each question has an answer that only a file holds. Both tags are
+# immutable, so the facts do not move; no model knows an image digest.
+# The prompt names the context repository. Without that, a worker can look it
+# up with gitops_preflight.py --list, which also prints its "no registered
+# GitOps repository, stop now" line on an install with no managed repository,
+# and the worker stops: a fact about the install, not about this read. The
+# broker still reads it with role=context, because it is registered.
+#
+# RED: a `main` build with the content workspace switched off on the eval
+# install (CREDENTIAL_PROXY_CONTENT_WORKSPACE=0), the state that removing the
+# workspace creates. The operator sets that variable to "1" with no CR field
+# and reconciles it back, so scale the operator to 0 replicas, then set the
+# variable on the broker Deployment, for the red run only. On `main`, inspect_repository.py asks the broker for
+# content workspaces, finds none and falls back to a leased local checkout,
+# which the sandbox cannot clone, so neither fact is read. A plain `main` run
+# with the workspace on would pass the fact checks: the red needs the switch.
+# GREEN: this branch's build, with the workspace still switched off.
+#
+# THE FIXTURE THIS CASE NEEDS (no pool install has it yet):
+#   - one entry in the install's `context_repos`, and no other:
+#       [{"type":"github","url":"https://github.com/kubernetes-sigs/kind","ref":"v0.24.0"}]
+#   - nothing else: the repository is public, so the broker reads it with no
+#     credential when the forge mints none for it.
+# scripts/provision_ci_pool_project.sh, which already seeds each pool
+# project's GitOps state, is the place to add it. Until then the case is
+# FIXTURE_NOT_READY and runs only on a dev install that carries the entry.
+#
+# THE ROUTE CHECK. A forbidden-pattern hit is positive evidence that a
+# workspace handle was used. The required `clone` pattern can miss a run whose
+# only clone sits behind another command in a chain, because the worker log
+# keeps a chain's first command (vcs-review-feedback-read-back explains it);
+# in the recorded runs each clone was its own command or followed a `cd`.
+#
+# Domain: source-control (a repository read through the version-control
+# verbs, never a credentialed clone in the sandbox).
+# Isolation class: read-only; it writes nothing to any repository or cluster.
+# Eligible tier: nightly, once the fixture exists.
+id: inspect-repository-unmanaged-and-context-read
+name: Two repositories the install does not manage are read through the snapshot verb
+prompt: >-
+  Answer two questions from the source files, not from memory, and don't
+  change anything.
+
+  1. In the public GitHub repository gke-labs/kube-agents, at the tag 0.13.0,
+  which Hermes agent image does the file tags.env pin? Give the full value,
+  digest included.
+
+  2. This install's context repository is the public GitHub repository
+  kubernetes-sigs/kind, registered at the tag v0.24.0. At that tag, which
+  default node image does the file pkg/apis/config/defaults/image.go set?
+  Give the full value, digest included.
+expected_output: >-
+  The agent reads tags.env from gke-labs/kube-agents at the tag 0.13.0 with
+  inspect-repository, narrowing the copy with --prefix when the whole tree is
+  refused as too large, and reports HERMES_AGENT_TAG as
+  v2026.9.14@sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294.
+  It reads pkg/apis/config/defaults/image.go from the install's context
+  repository, kubernetes-sigs/kind at v0.24.0, the same way, and reports
+  kindest/node:v1.31.0@sha256:53df588e04085fd41ae12de0c3fe4c72f7013bba32a20e7325357a1ac94ba865.
+  It changes nothing.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: source-control
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: Fuxiao-Gao
+
+verification_spec:
+  # The request reached a specialist: the front door holds no shell, and
+  # without a card the worker check below would error, not fail.
+  - name: the-request-was-delegated
+    role: objective
+    # assert: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  # The unmanaged public repository. The digest is the part no model can
+  # know; the first twelve hex characters are enough to be unguessable.
+  - name: the-public-fact-was-read
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns: ["99641e57ec76"]
+  # The context repository, at its registered tag. The digest, as above.
+  - name: the-context-fact-was-read
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns: ["53df588e0408"]
+  # The route: some worker command runs `inspect_repository.py clone`, the
+  # snapshot route, and none uses a broker workspace handle (the subcommands
+  # this change removed, or the workspace route). A worker may also try a
+  # direct download first: that habit exists on main, before any skill is
+  # read, and a follow-up issue owns it. A required pattern reads hermes's
+  # one-line rendering of a command, which skips a leading `cd` and keeps the
+  # first command of a chain; a `clone` chained behind another command
+  # (`mkdir d && … clone`) is not on the line, which is this check's known
+  # limit. An objective, because a safeguard cannot carry the red.
+  - name: the-snapshot-route-and-no-workspace-handle
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_patterns:
+        - 'inspect_repository\.py"?\s+clone\b'
+      forbidden_patterns:
+        - 'inspect_repository\.py"?\s+(open|list|grep|fetch|close)\b'
+        - '/v1/workspace\b'

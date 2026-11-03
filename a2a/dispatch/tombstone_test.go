@@ -1,9 +1,13 @@
 package dispatch
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -237,4 +241,94 @@ func TestATombstoneDoesNotKeepItsPodBusy(t *testing.T) {
 	if w.offerCount() != 1 {
 		t.Errorf("offered %d times", w.offerCount())
 	}
+}
+
+// A refusal is recorded before it is reported. A dispatcher that refuses a
+// submission and is stopped before its tombstone lands (here it can't write
+// the lease bucket at all) must not have published the rejection: the next
+// instance finds no record, admits the submission afresh, and, the grant
+// having been given since, runs it. A task the user saw rejected never runs.
+func TestARefusalIsRecordedBeforeItIsReported(t *testing.T) {
+	noLeases := []*natsserver.User{{Username: "disp-nokv", Password: dispPass, Permissions: &natsserver.Permissions{
+		Publish: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{"$KV." + lib.ProfileLeaseBucket + ".>"}}}}}
+	b := newBusWith(t, noLeases, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, 200*time.Millisecond)
+	ti := oneProfile("tse", 2, "tse-0")
+	var g grantSwitch
+	g.set("disp-nokv")
+	refusing := &fakeVerifier{refuse: map[string]bool{"cap-ok": true}}
+	_, stop1 := b.runDispatcherOn(b.connectAs(&g), testConfig(), ti, refusing)
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the refusal", func() bool { return len(refusing.callList()) > 0 })
+	time.Sleep(time.Second)
+	stop1()
+
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	waitFor(t, 15*time.Second, "the task to end", func() bool {
+		for _, ts := range b.terminalsOf("task-1") {
+			if ts.state == lib.StateCompleted {
+				return true
+			}
+		}
+		return false
+	})
+	for _, ts := range b.terminalsOf("task-1") {
+		if ts.state == lib.StateRejected {
+			t.Errorf("the task ran (%d starts) after it was reported rejected: %+v", w.startedCount(), b.terminalsOf("task-1"))
+		}
+	}
+}
+
+// Every hand-off reads which pods of its (profile, tier) hold a live lease,
+// and the bucket keeps every task's tombstone there for the submit stream's
+// retention. The read must cost one pass over the records, not a round trip
+// per record, or a busy (profile, tier) outgrows the read's budget and stops
+// dispatching. Here it gets a budget a round trip per record can't meet.
+func TestLeasedPodsReadsTheTombstonesInOnePass(t *testing.T) {
+	const tombstones = 20000
+	b := newBus(t, "tse-0")
+	finished := time.Now().Add(-time.Minute)
+	for i := range tombstones {
+		data, _ := json.Marshal(lib.LeaseRecord{TaskID: fmt.Sprintf("old-%d", i), Pod: "tse-old", Kind: lib.SubmitKindTop,
+			ConfirmedAt: finished, RenewedAt: finished, ExpiresAt: finished, FinishedAt: finished})
+		if _, err := b.js.PublishAsync("$KV."+lib.ProfileLeaseBucket+"."+lib.ProfileLeaseKey("tse", "read", "tse-old", fmt.Sprintf("old-%d", i)), data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-b.js.PublishAsyncComplete():
+	case <-time.After(30 * time.Second):
+		t.Fatal("seeding the tombstones")
+	}
+	now := time.Now()
+	live, _ := json.Marshal(lib.LeaseRecord{TaskID: "task-live", Pod: "tse-live", Kind: lib.SubmitKindTop,
+		ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(time.Hour)})
+	if _, err := b.js.Publish(b.ctx, "$KV."+lib.ProfileLeaseBucket+"."+lib.ProfileLeaseKey("tse", "read", "tse-live", "task-live"), live); err != nil {
+		t.Fatal(err)
+	}
+	ti := oneProfile("tse", 2, "tse-0")
+	d, err := New(testConfig(), b.connect("dispatcher"), ti.src, ti.pool, &fakeVerifier{}, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// On an idle laptop's embedded server 20000 round trips take about
+	// 800ms and one pass about 30ms; under the race detector about 3.3s and
+	// 750ms. A clustered bus's round trip is longer still.
+	budget := 300 * time.Millisecond
+	if raceEnabled {
+		budget = 2 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(b.ctx, budget)
+	defer cancel()
+	start := time.Now()
+	pods, err := d.leasedPods(ctx, "tse", "read", 0)
+	took := time.Since(start)
+	if err != nil {
+		t.Fatalf("leasedPods over %d tombstones: %v after %v", tombstones, err, took)
+	}
+	if !pods["tse-live"] || pods["tse-old"] || len(pods) != 1 {
+		t.Errorf("leased pods %v, want only tse-live", pods)
+	}
+	t.Logf("leasedPods over %d tombstones took %v", tombstones, took)
 }

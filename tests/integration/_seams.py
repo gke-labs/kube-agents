@@ -9,8 +9,10 @@ servers that stand in for the one component deliberately not under test.
 The KV server runs as a subprocess rather than in-thread because its quota
 table and platform detection are configured from environment variables read at
 module import; a subprocess gives every test its own configuration without
-module-reload games, and it is also exactly how the entrypoint runs it in the
-pod (uvicorn, backgrounded).
+module-reload games, and it is also how the entrypoint runs it in the pod
+(uvicorn, backgrounded). The one difference is the bind: the pod gives uvicorn
+a host and port, and the harness gives it a socket it has already bound, for
+the reason at `KVServer.__init__`.
 """
 
 from __future__ import annotations
@@ -33,12 +35,22 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "agents" / "platform" / "scripts"
 
 API_KEY = "integration-test-key"
-
-
-def free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+LOOPBACK_HOST = "127.0.0.1"
+# How long `KVServer` waits for the server to answer `/healthz`. Idle, the
+# server answers in about a second, but its start is CPU-bound (a 9,600-line
+# module plus FastAPI imported before uvicorn serves) and the sweep runs one
+# test file per core, each free to start subprocesses of its own. Measured
+# under contention: 10 to 24 seconds at a three-fold CPU oversubscription;
+# 31 to 34 seconds for one start at eight-fold on a shared workstation, and
+# one start there at ten-fold passed 60. A server that crashes still fails at
+# once, because `_healthy` raises as soon as the process has exited, so the
+# budget costs time only when the server hangs without exiting.
+KV_SERVER_STARTUP_TIMEOUT_SECONDS = 120.0
+# How much of the server's log a failed start carries in its message. The
+# test's temporary directory deletes the file, so the message is all a CI run
+# keeps of it. The log is written at warning level and is short; the cap keeps
+# a runaway one out of the assertion.
+KV_SERVER_LOG_TAIL_CHARS = 4000
 
 
 def wait_until(predicate, timeout=15.0, interval=0.1, message="condition"):
@@ -74,10 +86,28 @@ def http_json(url, payload=None, token=API_KEY, method=None, timeout=10.0):
 class KVServer:
     """The real session_kv_server, on a loopback port, in a subprocess."""
 
-    def __init__(self, tmp_path: Path, env: dict | None = None, path_prepend: str = ""):
-        self.port = free_port()
+    def __init__(
+        self,
+        tmp_path: Path,
+        env: dict | None = None,
+        path_prepend: str = "",
+        startup_timeout: float = KV_SERVER_STARTUP_TIMEOUT_SECONDS,
+    ):
+        # The harness binds the port itself and hands the bound socket to
+        # uvicorn by file descriptor (`--fd`, the systemd socket-activation
+        # path). Picking a free port, closing it, and passing the number for
+        # the server to bind leaves the port free for the seconds the server
+        # spends importing, and the sweep runs every seam file at once: another
+        # server's pick, or the ephemeral source port of one health poll, can
+        # take it first, and uvicorn then exits with "address already in use".
+        # Bound here, the port is held from pick to serve: this copy of the
+        # socket holds it until the server answers, and the server's inherited
+        # copy holds it from then on.
+        self.socket = socket.socket()
+        self.socket.bind((LOOPBACK_HOST, 0))
+        self.port = self.socket.getsockname()[1]
         self.db_path = str(tmp_path / "session_kv.db")
-        self.url = f"http://127.0.0.1:{self.port}"
+        self.url = f"http://{LOOPBACK_HOST}:{self.port}"
         run_env = dict(os.environ)
         run_env.update(
             {
@@ -145,16 +175,18 @@ class KVServer:
         prepends = [p for p in (path_prepend, str(guard_dir)) if p]
         run_env["PATH"] = os.pathsep.join(prepends + [run_env.get("PATH", "")])
         self.log = open(tmp_path / "kv-server.log", "wb")
+        # What the last health poll saw, for the failure message: a start that
+        # runs out its budget otherwise says only that it did, and at warning
+        # level uvicorn writes nothing a slow start could be told apart by.
+        self.last_poll = "not polled"
         self.process = subprocess.Popen(
             [
                 sys.executable,
                 "-m",
                 "uvicorn",
                 "session_kv_server:app",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.port),
+                "--fd",
+                str(self.socket.fileno()),
                 "--log-level",
                 "warning",
             ],
@@ -162,24 +194,46 @@ class KVServer:
             env=run_env,
             stdout=self.log,
             stderr=subprocess.STDOUT,
+            pass_fds=(self.socket.fileno(),),
         )
         try:
-            wait_until(self._healthy, message=f"session_kv_server on :{self.port}")
-        except AssertionError:
+            wait_until(
+                self._healthy,
+                timeout=startup_timeout,
+                message=f"session_kv_server on :{self.port}",
+            )
+        except AssertionError as error:
+            # Read the log before `stop()` closes it and the test's temporary
+            # directory deletes it.
+            tail = self._log_tail()
             self.stop()
-            raise
+            raise AssertionError(
+                f"{error} (last poll: {self.last_poll});"
+                f" last {KV_SERVER_LOG_TAIL_CHARS} chars of its log:\n{tail}"
+            ) from None
+        # Once the server listens, its copy of the socket is the one that
+        # matters, and this copy must go: the listen state is shared, so a
+        # server that dies mid-test would otherwise leave a listening port with
+        # nothing behind it, and every request to it would wait out its timeout
+        # instead of being refused at once.
+        self.socket.close()
+
+    def _log_tail(self) -> str:
+        return Path(self.log.name).read_text(errors="replace")[-KV_SERVER_LOG_TAIL_CHARS:]
 
     def _healthy(self) -> bool:
         if self.process.poll() is not None:
             raise AssertionError(
-                "session_kv_server exited early; log:\n"
-                + Path(self.log.name).read_text(errors="replace")
+                f"session_kv_server on :{self.port} exited early"
+                f" with status {self.process.returncode}"
             )
         try:
             status, _ = http_json(f"{self.url}/healthz", token=None, timeout=2.0)
-            return status == 200
-        except Exception:
+        except Exception as error:
+            self.last_poll = f"{type(error).__name__}: {error}"
             return False
+        self.last_poll = f"HTTP {status}"
+        return status == 200
 
     def stop(self):
         self.process.terminate()
@@ -189,6 +243,7 @@ class KVServer:
             self.process.kill()
             self.process.wait(timeout=10)
         self.log.close()
+        self.socket.close()
 
 
 def fake_executable(bin_dir: Path, name: str, script_body: str) -> Path:

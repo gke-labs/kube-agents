@@ -88,14 +88,15 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 	current.Store(dial())
 	v := busVerifier{conn: current.Load}
 
-	// Nobody answers: a refusal, within the caller's ctx.
+	// Nobody answers: no verdict, so the dispatcher holds the submission
+	// rather than rejecting it. It ends within the caller's ctx.
 	nctx, ncancel := context.WithTimeout(ctx, 2*time.Second)
 	err = v.CheckProfileRun(nctx, ref, "tse", "read", "namespace/ka")
 	ncancel()
-	var r *capability.Refusal
-	if !errors.As(err, &r) {
-		t.Fatalf("with no verifier, got %v, want a refusal", err)
+	if !errors.Is(err, dispatch.ErrVerifierUnreachable) {
+		t.Fatalf("with no verifier, got %v, want ErrVerifierUnreachable", err)
 	}
+	var r *capability.Refusal
 
 	verifier := dial()
 	var asked atomic.Pointer[capability.Request]
@@ -130,12 +131,12 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 		t.Errorf("the verifier was asked %+v, want profile.run for tse at read on namespace/ka", req)
 	}
 	err = v.CheckProfileRun(ctx, capability.Ref{Key: "cap-bad", Revision: 1}, "tse", "read", "namespace/ka")
-	if !errors.As(err, &r) || capability.Reason(err) != "not this one" {
+	if !errors.As(err, &r) || capability.Reason(err) != "not this one" || errors.Is(err, dispatch.ErrVerifierUnreachable) {
 		t.Errorf("refused ref: got %v, want the verifier's refusal", err)
 	}
 	current.Store(nil)
-	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka"); !errors.As(err, &r) {
-		t.Errorf("with no connection, got %v, want a refusal", err)
+	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka"); !errors.Is(err, dispatch.ErrVerifierUnreachable) {
+		t.Errorf("with no connection, got %v, want ErrVerifierUnreachable", err)
 	}
 }
 

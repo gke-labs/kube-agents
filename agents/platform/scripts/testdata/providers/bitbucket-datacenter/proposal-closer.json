@@ -1,0 +1,57 @@
+{
+  "payload": {
+    "number": 9
+  },
+  "responses": [
+    {
+      "size": 2,
+      "limit": 100,
+      "isLastPage": true,
+      "values": [
+        {
+          "id": 30,
+          "createdDate": 1793643185225,
+          "user": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/users/example-maintainer"
+                }
+              ]
+            }
+          },
+          "action": "DECLINED"
+        },
+        {
+          "id": 29,
+          "createdDate": 1793643185077,
+          "user": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/users/example-maintainer"
+                }
+              ]
+            }
+          },
+          "action": "OPENED"
+        }
+      ],
+      "start": 0
+    }
+  ]
+}

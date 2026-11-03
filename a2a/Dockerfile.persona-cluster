@@ -1,0 +1,16 @@
+# persona-cluster: the cluster agent's persona (agents/cluster/persona) as a
+# persona image, for the generic cluster AgentProfile (#3658).
+#
+# The operator mounts an image's /files at /persona in the profile's worker
+# pod (k8s-operator/internal/profilepod). Where the cluster can't mount image
+# volumes, a staging init container copies /files with the image's own /bin/sh
+# and cp, which is why the base is busybox and not scratch.
+#
+# Build with the persona directory as the context:
+#   docker build -f a2a/Dockerfile.persona-cluster -t <registry>/persona-cluster:<tag> agents/cluster/persona
+#
+# The base is the busybox pin in images.json, spelled out because the
+# inventory check (hack/check-image-inventory.sh) compares this exact two-line
+# shape to it, the same as the agent plugin images.
+FROM busybox:musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8
+COPY . /files/

@@ -1460,8 +1460,8 @@ class TestNightlySource(_MergeBase):
         self.assertTrue(cases["reliability-pdb-probe"]["nightly_active"], "TASKS is in the nightly too")
         self.assertFalse(cases["obtainability-planted-pdb"]["active"])
         self.assertTrue(cases["obtainability-planted-pdb"]["nightly_active"], "a nightly-cases.txt entry")
-        # Seated held out in the presubmit since 2026-09-29 (#2013 step 2): it runs on
-        # every pull request without a roster line, and the nightly runs the presubmit file.
+        # Seated held out in the presubmit 2026-09-29 to 2026-11-02 (#2013 step 2) and on the
+        # roster since (step 4): it runs on every pull request, and the nightly runs the presubmit file.
         self.assertTrue(cases["compliance-rbac-overgrant"]["active"])
         self.assertTrue(cases["compliance-rbac-overgrant"]["nightly_active"], "a presubmit case is a nightly case too")
 
@@ -1544,9 +1544,11 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # observability and source-control are new rows whose cases are all
         # nightly cases, so both start on the allowlist; source-control came
         # off on 2026-10-23, when vcs-spent-branch-reuse took a roster seat.
+        # The canary took its roster line on 2026-11-02 (#2013 step 4, #4094),
+        # covering fleet-audits.
         self.assertEqual(
             cov["uncovered"],
-            ["fleet-audits", "observability"],
+            ["observability"],
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 

@@ -814,6 +814,65 @@ func TestPodUsageSource_TransportUsesNoProxyAndBoundsHeaders(t *testing.T) {
 	}
 }
 
+// The watcher's body also carries its data volume reading, total and free,
+// which the poller projects to status.storageStatus. A body carrying one kind
+// or neither yields no reading and is not a failure, and neither is one whose
+// free space exceeds the total, which no statfs produces.
+func TestPodUsageSource_ReadsTheWatchersDataVolume(t *testing.T) {
+	watcher := func(volume ...string) string {
+		return strings.Join(append([]string{
+			"# TYPE k8s_event_watcher_events_injected_total counter",
+			`k8s_event_watcher_events_injected_total{cluster="a",location="l",namespace="n",project="p",reason="BackOff"} 7`,
+			"# TYPE kubeagents_data_volume_bytes gauge",
+		}, append(volume, "")...), "\n")
+	}
+	scrape := func(body string) (usageReading, error) {
+		return newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, body), []string{usageCounterEventsIngested})
+	}
+
+	reading, err := scrape(watcher(`kubeagents_data_volume_bytes{kind="free"} 1.073741824e+09`, `kubeagents_data_volume_bytes{kind="total"} 1.073741824e+10`))
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if reading.DataVolume == nil || reading.DataVolume.Total != 10737418240 || reading.DataVolume.Free != 1073741824 {
+		t.Fatalf("data volume = %+v, want 10 GiB total and 1 GiB free", reading.DataVolume)
+	}
+	if reading.sample() != 7 {
+		t.Errorf("sample = %d, want 7", reading.sample())
+	}
+
+	for name, body := range map[string]string{
+		"neither kind": watcher(),
+		"total alone":  watcher(`kubeagents_data_volume_bytes{kind="total"} 100`),
+		"another kind": watcher(`kubeagents_data_volume_bytes{kind="used"} 1`, `kubeagents_data_volume_bytes{kind="total"} 100`),
+	} {
+		reading, err := scrape(body)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if reading.DataVolume != nil {
+			t.Errorf("%s: data volume = %+v, want none", name, reading.DataVolume)
+		}
+	}
+
+	// A pair no statfs produces drops the volume reading and keeps the rest
+	// of the body: the injected counter still counts.
+	reading, err = scrape(watcher(`kubeagents_data_volume_bytes{kind="free"} 200`, `kubeagents_data_volume_bytes{kind="total"} 100`))
+	if err != nil || reading.DataVolume != nil || reading.sample() != 7 {
+		t.Errorf("free past total: reading %+v, err %v; want no volume reading and the sample kept", reading, err)
+	}
+
+	broker := serveBody(t, http.StatusOK, "kubeagents_tool_invocations_total{status=\"success\"} 1\nkubeagents_data_volume_bytes{kind=\"free\"} 1\nkubeagents_data_volume_bytes{kind=\"total\"} 2\n")
+	reading, err = newPodUsageSource().Scrape(context.Background(), broker, []string{usageCounterToolExecutions})
+	if err != nil {
+		t.Fatalf("Scrape of the broker: %v", err)
+	}
+	if reading.DataVolume != nil {
+		t.Errorf("a body other than the watcher's yielded a data volume reading: %+v", reading.DataVolume)
+	}
+}
+
 func TestPodUsageSource_ASingleSampleReadingTakesTheLargestOfARepeatedLabelSet(t *testing.T) {
 	// A body that repeats a label set is not one the broker renders; a summed
 	// field adds every sample, a single-sample field must not double.
