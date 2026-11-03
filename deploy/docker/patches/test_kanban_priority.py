@@ -251,6 +251,17 @@ class SessionPrefixPinTest(unittest.TestCase):
 
     def _minted_prefixes(self):
         tree = ast.parse(SESSION_KV_SERVER.read_text())
+        # Module-level string constants, so a mint site that builds the id from
+        # one (`f"{WATCHER_SESSION_PREFIX}..."`) is read as its literal.
+        constants = {
+            t.id: stmt.value.value
+            for stmt in tree.body
+            if isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+            for t in stmt.targets
+            if isinstance(t, ast.Name)
+        }
         found = {}
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -269,6 +280,14 @@ class SessionPrefixPinTest(unittest.TestCase):
                     head = value.values[0]
                     if isinstance(head, ast.Constant) and isinstance(head.value, str):
                         found.setdefault(node.name, set()).add(head.value)
+                    elif (
+                        isinstance(head, ast.FormattedValue)
+                        and head.conversion == -1
+                        and head.format_spec is None
+                        and isinstance(head.value, ast.Name)
+                        and head.value.id in constants
+                    ):
+                        found.setdefault(node.name, set()).add(constants[head.value.id])
         return found
 
     def test_each_background_prefix_is_minted_by_session_kv_server(self):
