@@ -158,12 +158,17 @@ verification_spec:
       # exclusion in force whose scope does not cover the upgrade, a claim
       # about another cluster within two lines of a seeded-b row, and a
       # comma-joined sentence that names the exclusion and attributes the
-      # block to the PDB. A negation guard was tried and dropped: it failed
-      # a correct report that mentions an absence first ("No PDB blocks the
-      # drain, but the exclusion ... blocks the minor upgrade"), and a check
-      # that fails a correct report is worse than one the judge backs up. A
-      # table that puts the exclusion and its verb in separate cells is not
-      # read; the readiness script writes both in one cell.
+      # block to the PDB. These shapes pass with no grader: a judged score
+      # never fails a repetition on its own (docs/designs/eval-scorer.md,
+      # "Judged quality is advisory"), so the residue is accepted at its real
+      # cost, and the record's 0 of 102 is the measure of that cost. A
+      # negation guard was tried and dropped: it failed a correct report that
+      # mentions an absence first ("No PDB blocks the drain, but the
+      # exclusion ... blocks the minor upgrade"), and a check that fails a
+      # correct report costs more than one that admits a shape no recorded
+      # answer writes. A table that puts the exclusion and its verb in
+      # separate cells is not read; the readiness script writes both in one
+      # cell.
       # Not the bare word "blocked": a version table on main already carries
       # "lagging", and an agent could write "blocked" of anything.
       # bench/tests/test_upgrades_readiness_exclusion_patterns.py pins the
