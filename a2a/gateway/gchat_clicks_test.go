@@ -713,8 +713,8 @@ func TestGchatClickOnAHomeCardInADMBindsToItsThread(t *testing.T) {
 		t.Fatalf("click after a restart = %+v (%q); want it bound to the card's thread", msg, reason)
 	}
 	unmarked := gchatClickEvent(t)
-	if msg, reason := newTestGchatAdapterWithRelay(t, f).classifyClick(unmarked); reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" {
-		t.Fatalf("an unmarked click after a restart = %+v (%q); want the event's surface, the DM root", msg, reason)
+	if msg, reason := newTestGchatAdapterWithRelay(t, f).classifyClick(unmarked); reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA/threads/BOT1" {
+		t.Fatalf("an unmarked click after a restart = %+v (%q); want the card's thread", msg, reason)
 	}
 	// Edited into the head by its key, the question keeps the thread.
 	if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "spaces/_c2fixtureAA/threads/BOT1", "spaces/_c2fixtureAA/messages/BOT1.BOT1", ask); err != nil {

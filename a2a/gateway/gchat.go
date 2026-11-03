@@ -1207,6 +1207,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 		Kind:         kind,
 		AuthorID:     sender.Email,
 		MessageID:    ev.Message.Name,
+		TopLevel:     kind == sessionKindDM && !ev.Message.ThreadReply,
 		Text:         text,
 	}
 	a.noteTypedAnswer(msg, sender)

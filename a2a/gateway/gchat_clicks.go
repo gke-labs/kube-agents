@@ -513,11 +513,10 @@ func (a *GoogleChatAdapter) answeredLayout(messageID string, m OutMessage, layou
 // thread in it to one session; no thread in a space whose threading state
 // does not support replies or in a group chat, where every message has its
 // own thread resource and binding those would fragment the chat into one
-// session per ask; and in a DM, which Chat threads too, only a message
-// typed inside an existing thread (threadReply) has one, so top-level DMs
-// share the space's one conversation and are answered top-level, the
-// default-mode Hermes Google Chat rule read from Chat's own flag
-// (spec-chatops-gateway.md, "The Google Chat adapter").
+// session per ask; and a DM message keys on the thread Chat attached to it,
+// top-level or reply, as a Slack DM keys on its thread timestamp, so each
+// top-level ask is its own conversation and a reply typed in its thread
+// joins it (spec-chatops-gateway.md, "The Google Chat adapter").
 func gchatSurface(ev *gchatEvent) (kind, thread string) {
 	kind = sessionKindGroup
 	if ev.Space.SpaceType == gchatSpaceTypeDM || ev.Space.Type == gchatLegacySpaceTypeDM {
@@ -525,9 +524,6 @@ func gchatSurface(ev *gchatEvent) (kind, thread string) {
 	}
 	thread = ev.Message.Thread.Name
 	if ev.Space.SpaceThreadingState == gchatThreadingUnthreaded || ev.Space.SpaceType == gchatSpaceTypeGroupChat {
-		thread = ""
-	}
-	if kind == sessionKindDM && !ev.Message.ThreadReply {
 		thread = ""
 	}
 	return kind, thread
