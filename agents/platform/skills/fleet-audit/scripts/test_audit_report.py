@@ -24440,6 +24440,67 @@ class TestStalledKccInFinish(HarnessTestCase):
         self.assertNotIn("UpdateFailed: OLD", proposals[0]["body"])
         self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, proposals[0]["body"])
 
+    def gcloud_and_stall_doc(self):
+        """The stalled cluster's manifest fix, and a gcloud fix of the same
+        cluster that changes `releaseChannel`, which its declaration holds."""
+        doc = self.doc_and_file()
+        doc["findings"].append(make_finding(
+            fid="g", namespace="billing", cluster="acme/us-central1/prod-usc1", obj="Cluster/prod-usc1",
+            remediation={"kind": "gcloud", "note": "gcloud container clusters update prod-usc1 --release-channel regular"},
+        ))
+        return doc
+
+    def test_the_gcloud_check_and_the_paragraph_read_the_clone_once(self):
+        """Review finding: with a gcloud fix and a possible stall, the clone
+        was walked twice, once for each index. The gcloud check now takes the
+        paragraph's index, and its answer is the same: the gcloud fix that
+        changes a field the declaration holds still becomes manual."""
+        walks = []
+        real = audit_report.kcc_declarations
+
+        def spy(root, repo=""):
+            walks.append(str(root))
+            return real(root, repo)
+
+        self.patch_attr("kcc_declarations", spy)
+        rc = self.run_finish(self.gcloud_and_stall_doc(), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("gcloud remediation changes a field a Config Connector declaration holds", self.err)
+        self.assertEqual(len(walks), 1, walks)
+
+    def test_the_gcloud_check_and_the_paragraph_read_the_snapshot_once(self):
+        """In content mode, the snapshot is read and parsed once."""
+        self.patch_attr("content_mode", lambda: True)
+        use_snapshot(self, {KCC_CLUSTER_FILE: KCC_CLUSTER_DECLARATION})
+        reads = []
+        real = audit_report.kcc_declarations_via_broker
+
+        def spy(repo, snap=None, every_kind=False):
+            reads.append(every_kind)
+            return real(repo, snap, every_kind)
+
+        self.patch_attr("kcc_declarations_via_broker", spy)
+        rc = self.run_finish(self.gcloud_and_stall_doc(), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("gcloud remediation changes a field a Config Connector declaration holds", self.err)
+        self.assertEqual(reads, [True])
+
+    def test_with_no_possible_stall_the_gcloud_check_reads_only_its_kinds(self):
+        self.patch_attr("content_mode", lambda: True)
+        use_snapshot(self, {KCC_CLUSTER_FILE: KCC_CLUSTER_DECLARATION})
+        reads = []
+        real = audit_report.kcc_declarations_via_broker
+
+        def spy(repo, snap=None, every_kind=False):
+            reads.append(every_kind)
+            return real(repo, snap, every_kind)
+
+        self.patch_attr("kcc_declarations_via_broker", spy)
+        rc = self.run_finish(self.gcloud_and_stall_doc(), ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("gcloud remediation changes a field a Config Connector declaration holds", self.err)
+        self.assertEqual(reads, [False])
+
     def test_a_merged_fix_that_still_reproduces_says_config_connector_is_not_applying_it(self):
         doc = self.doc_and_file()
         branch = audit_report.group_branch_for(AUDIT, doc["findings"])

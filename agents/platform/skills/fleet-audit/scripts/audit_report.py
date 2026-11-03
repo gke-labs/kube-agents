@@ -23413,7 +23413,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # object (`disclose_stalled_kcc_remediations`), so a finding whose own
     # object can be stalled needs a declaration index (below).
     kcc_index_wanted = kcc_index_needed(findings, manifest)
-    if content_mode() and any(_kcc_candidate(finding) for finding in findings):
+    gcloud_check_wanted = any(_kcc_candidate(finding) for finding in findings)
+    if content_mode() and gcloud_check_wanted:
         # The probe's snapshot is the scan's, and a failed one is retried once
         # on the probe's count: the backstop keeps its retry, and planning,
         # which fails safe without the snapshot, takes none.
@@ -23424,12 +23425,20 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 f"{repo} through the broker ({probe.unavailable}); gcloud fixes "
                 "publish as written"
             )
-        else:
+        elif not kcc_index_wanted:
             kcc_prebuilt = kcc_declarations_via_broker(repo, snap)
     kcc_roots = kcc_declaration_roots(audit_id, root, record)
     kcc_index = kcc_paragraph_index(repo, probe, kcc_roots) if kcc_index_wanted else {}
+    # When both need an index, the gcloud check takes the paragraph's, which
+    # holds every kind from the same snapshot and clones in the same order;
+    # it looks up only the container kinds (`_first_declaration`), so its
+    # answer is the same, and the snapshot and each clone are read once.
+    # With no possible stall, the gcloud check reads only its own kinds.
+    gcloud_roots = kcc_roots
+    if kcc_index_wanted and gcloud_check_wanted:
+        gcloud_roots, kcc_prebuilt = [], kcc_index
     for fid in degrade_reverted_gcloud_remediations(
-        findings, kcc_roots, prebuilt=kcc_prebuilt
+        findings, gcloud_roots, prebuilt=kcc_prebuilt
     ):
         log(
             f"WARNING: {fid}'s gcloud remediation changes a field a Config "
