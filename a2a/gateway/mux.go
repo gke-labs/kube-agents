@@ -265,6 +265,19 @@ func (m *MultiAdapter) ShowsTaskStatus(conversation string) bool {
 	return ok && shower.ShowsTaskStatus(conversation)
 }
 
+// HomeNotice answers for the backend that owns the conversation
+// (HomeNoticer); one without it, or one the mux cannot place, answers "".
+func (m *MultiAdapter) HomeNotice(conversation string) string {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return ""
+	}
+	if noticer, ok := a.(HomeNoticer); ok {
+		return noticer.HomeNotice(conversation)
+	}
+	return ""
+}
+
 func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if a, err := m.pick(conversation); err == nil {
 		if observer, ok := a.(VerifiedObserver); ok {

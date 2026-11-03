@@ -378,7 +378,7 @@ judgment, like all model output, is never an authorization signal: the gateway's
 verification runs before dispatch exactly as before, and the `authority` block is stamped at
 ingress as before (advisory today; see "Requester identity on the bus").
 
-The gateway owns a second slash command, `/feedback` (added 10/19). Bare, it answers
+The gateway owns a second slash command, `/feedback` (added 10/19), and on Slack a third, `/sethome` (with `/hermes sethome`), answered in place with the Home tab panel's state and where the home channel moves; a backend without the Slack adapter's `HomeNotice` passes the text on as the turn it was. Bare, it answers
 deterministically with the two places a kube-agents report goes, the issue tracker and the
 public feedback form, and starts no task; with text after it, the gateway passes the message
 through as typed, and the Planning Agent composes the report and asks for a yes before the

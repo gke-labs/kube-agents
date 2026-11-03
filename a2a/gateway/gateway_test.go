@@ -174,7 +174,9 @@ type fakeAdapter struct {
 	roster   []string
 	complete bool
 	nextID   int
-	inbox    chan InboundMessage
+	// homeNotice is what HomeNotice answers (sethome_notice_test.go).
+	homeNotice string
+	inbox      chan InboundMessage
 	// failEdits makes the next N Edit calls fail (and go unrecorded), for
 	// pinning what the relay does when a Chat edit does not land.
 	failEdits int
@@ -3544,8 +3546,8 @@ func TestStopAfterTheTurnEndedSaysACardKeepsWorking(t *testing.T) {
 	})
 }
 
-// TestBareFeedbackAnswersWithTheLinksAndStartsNoTask: a bare /feedback is the
-// gateway's second slash command (docs/designs/chat-feedback-command.md). It
+// TestBareFeedbackAnswersWithTheLinksAndStartsNoTask: a bare /feedback is one
+// of the slash commands the gateway owns (docs/designs/chat-feedback-command.md). It
 // posts the two reporting links and submits nothing to the bus.
 func TestBareFeedbackAnswersWithTheLinksAndStartsNoTask(t *testing.T) {
 	r := startRig(t)

@@ -61,6 +61,15 @@ const (
 	slackHomePickGuest           = "Only a member of this workspace can move the home channel."
 	slackHomePickNoMemberCheck   = "Could not check your account with Slack; pick again."
 
+	// The answer to a typed "/sethome" (HomeNotice): the panel's state in one
+	// sentence (the panel's own lines for no home and not armed), then where
+	// the channel moves and who may move it. The id is plain: the reply goes
+	// through the backend's markdown, which escapes a <#C…> mention; the
+	// Home tab names the channel.
+	slackHomeNoticeHome  = "Home channel now: `%s` (the Home tab's view)."
+	slackHomeNoticeMove  = "`/sethome` does not set it under `next`. Move it from the app's Home tab (the Home channel panel), or set `spec.integration.slack.homeChannel` on the PlatformAgent. A member on `allowedUsers` can move it (every full member when the list is empty); a guest account never can."
+	slackHomeNoticeNoSet = "`/sethome` does not change it."
+
 	// homePickedLine goes into the new home; homeMovedLine into the old one.
 	// Posted raw, as homeLearnedLine is: the ids are checked channel ids.
 	homePickedLine = "<#%s> is now the home channel for alerts and scheduled reports, set by <@%s> from the app's Home tab. To move it, pick another channel on the app's Home tab, or set spec.integration.slack.homeChannel on the PlatformAgent."
@@ -127,6 +136,21 @@ func (s *SlackAdapter) homeForView() string {
 		return file
 	}
 	return p.channel
+}
+
+// HomeNotice answers a typed "/sethome" (gateway.HomeNoticer): the Home tab
+// panel's state, read as the panel draws it (a move made seconds ago shows
+// over the lagging file), then where the channel moves and who may move it.
+// Fixed text, no Slack call, no model.
+func (s *SlackAdapter) HomeNotice(string) string {
+	if !s.homePickArmed() {
+		return slackHomeLineNotArmed + " " + slackHomeNoticeNoSet
+	}
+	state := slackHomeLineNoHome
+	if home := s.homeForView(); home != "" {
+		state = fmt.Sprintf(slackHomeNoticeHome, home)
+	}
+	return state + " " + slackHomeNoticeMove
 }
 
 // homeChannelBlocks draws the Home channel panel: the picker and the line

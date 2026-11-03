@@ -194,6 +194,17 @@ type VerifiedObserver interface {
 	InboundVerified(conversation, messageID string, verified bool)
 }
 
+// HomeNoticer is the optional extension an Adapter implements when its
+// backend answers a typed "/sethome" itself (chattext.IsSetHomeCommand): the
+// Slack adapter does, with one fixed sentence drawn from the same state as
+// its Home tab panel. Asked per conversation, so a wrapper (the mux, the
+// side door) answers for the backend that owns it, as StatusShower is; ""
+// means no answer, and the text goes on as the turn it was. Nothing is
+// dropped.
+type HomeNoticer interface {
+	HomeNotice(conversation string) string
+}
+
 // StatusShower is the optional extension an Adapter implements when its
 // backend shows a task's status itself, so the relay's rolling line ("⏳
 // submitted…" edited on to "✅ completed") would only repeat it. The Slack
