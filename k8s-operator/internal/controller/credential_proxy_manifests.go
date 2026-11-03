@@ -71,7 +71,7 @@ const credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- 
 // discovery answers, but while discovery fails a hand edit is read as the
 // cluster type and can restart the proxy at the other type's requests.
 const (
-	credentialProxyClusterTypeAnnotation = "kubeagents.x-k8s.io/credential-proxy-cluster-type"
+	credentialProxyClusterTypeAnnotation = "kubeagents.x-k8s.io/credential-proxy-cluster-type" // #nosec G101 -- Annotation key, not a credential.
 	credentialProxyClusterTypeAutopilot  = "autopilot"
 	credentialProxyClusterTypeStandard   = "standard"
 )
