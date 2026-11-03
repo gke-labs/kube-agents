@@ -329,7 +329,7 @@ func TestANextInstallWithNoBackendRunsAConsoleOnlyGatewayEnvtest(t *testing.T) {
 	g.settle()
 	g.assertRunning("no backend", "")
 
-	state, err := g.r.reconcileA2A(g.ctx, g.agent)
+	state, err := g.r.reconcileA2A(g.ctx, g.agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,7 +492,7 @@ func TestAnUpgradedDarkGatewayComesBackEnvtest(t *testing.T) {
 		t.Errorf("upgrade: A2A_CONSOLE_DOOR = %q (set=%v), want \"true\"", v, ok)
 	}
 	g.assertWaking("upgrade, no replica ready")
-	state, err := g.r.reconcileA2A(g.ctx, g.agent)
+	state, err := g.r.reconcileA2A(g.ctx, g.agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1092,6 +1092,31 @@ eval crew approves every roster line. Locally,
 `python3 scripts/eval_dashboard/coverage_gaps.py --data data.json [--store store.json]`
 is a dry run; `--live` writes.
 
+## The domain scorecard
+
+`scripts/eval_dashboard/understudies.py` writes one row per domain in
+`domains.yaml`, covered or not, for the dashboard's domain view
+(`cases.html#view=domains`): the roster cases that cover it; for an uncovered
+domain, the days since its allowlist entry began, the entry's issue, its
+held-out case and how long ago its exception expired, read as [Coverage
+gaps](#coverage-gaps) reads them; the open `nightly-red` issues labelled
+`domain:<slug>` and the age of the oldest; and its understudies, the best two
+of the candidates Coverage gaps ranks, with their nightly record and the
+store's verdict. An understudy is **ready** when the evidence store reads it
+`would-admit`; without a store read that column says the store was not read,
+and without a trusted `nightly-red` listing (the read [Nightly
+bugs](#nightly-bugs) uses) the count says not read rather than zero. Ready is
+the record bar only: the rest of the seat bar is checked at admission
+([`eval-gate-roster.md`](eval-gate-roster.md#the-admission-bar-and-who-clears-it)).
+
+It runs every tick before the render, capped at 2 minutes, writes
+`work/scorecard.json` for `render.py --scorecard`, and writes nothing to
+GitHub. It stops without a file on the same untrusted reads that stop Coverage
+gaps, and the view then says the scorecard was not computed. It adds no digest
+line: the coverage-gap line already covers an uncovered domain. Locally,
+`python3 scripts/eval_dashboard/understudies.py --data data.json [--store store.json] --out scorecard.json`
+(`--no-github` skips the issue read).
+
 ## The weekly health email
 
 `scripts/eval_dashboard/weekly_email.py` renders a one-page summary of the

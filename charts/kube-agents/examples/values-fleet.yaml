@@ -1,0 +1,117 @@
+# Sizing for the `fleet` tier: 25 or more registered clusters, 15,000 or more
+# fleet nodes, or 50,000 or more objects in the host cluster. The thresholds,
+# what each key does and the host-cluster shapes that fit are on the site's
+# "Fleet and host-cluster sizing" page under Deploy; this file sets only what
+# the chart exposes. Pass it beside your own values:
+#
+#   helm upgrade kube-agents ./charts/kube-agents -n kubeagents-system \
+#     --reset-then-reuse-values -f charts/kube-agents/examples/values-fleet.yaml
+#
+# On an existing install, apply charts/kube-agents/crds/ before a hand-run
+# `helm upgrade` (`kubectl apply --server-side -f charts/kube-agents/crds/`);
+# the page's "Applying it" says why, and what upgrade.sh does for you.
+#
+# GKE Autopilot without bursting sets every container's limits equal to its
+# requests, so each key below says what it runs at there. Autopilot also admits
+# a requests pair unchanged only between 1 and 6.5 GiB of memory per vCPU, and
+# every pair here sits in that band.
+
+operator:
+  # The manager caches every Deployment, StatefulSet, Service and claim in the
+  # host cluster, and sets its Go soft memory limit to nine tenths of the limit
+  # it reads, so a host cluster with 50,000 objects or more raises this one
+  # value. The request matches the limit so that Autopilot without bursting
+  # runs the manager at 1Gi rather than clamping it to a smaller request; the
+  # floor the chart enforces on the limit is 512Mi.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+platformAgent:
+  storage:
+    # The agent's data claim and the shell sandbox's data claim, both at this
+    # size: the sandbox's /opt/data holds every cloned GitOps repository, the
+    # fleet audits' artifacts and the model's scripts, which 25 or more clusters
+    # grow past the 50Gi default (modeled, not measured). Raising it expands
+    # both claims online where the StorageClass allows expansion; a claim never
+    # shrinks, so pass this only once you mean it. Each GiB counts twice against
+    # a namespace requests.storage quota.
+    size: 100Gi
+  harness:
+    tuning:
+      # Kanban workers running at once, board-wide. Each worker is a `hermes
+      # chat` process with its own MCP servers (about 430 MiB each) and can
+      # have a brokered command in flight in the credential proxy, which admits
+      # eight at once; 3 keeps the gateway pod inside its memory limit while 25
+      # or more clusters feed event triage. One worker slot is always kept for
+      # a question asked in chat. The cap costs batch time: capping at 2
+      # roughly doubled a fan-out's finish time on a live cluster, so measure
+      # before going lower.
+      maxInProgress: 3
+  deployment:
+    # The operator copies spec.deployment.env onto the agent container only for
+    # names on its allowlist, forwards KUBEAGENTS_AUDIT_AUTO_PROMOTE to the
+    # shell sandbox, where the audits run, and passes every name it does not
+    # reserve to the credential-proxy and agent-api-auth containers. Both names
+    # here reach the container that reads them. CLOUDSDK_CORE_DISABLE_FILE_LOGGING
+    # and MALLOC_ARENA_MAX are not on the agent container's allowlist: set here
+    # they would reach the proxy pod, where gcloud and kubectl run, and not the
+    # agent container. This file leaves them out.
+    env:
+      # Seconds an admitted workload event folds its later events into the
+      # same incident instead of opening another: an hour, against the default
+      # of no folding, bounds the triage turns and chat messages a flapping
+      # workload can cause across a large fleet. Capped at a day.
+      - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+        value: "3600"
+      # Fleet audits report findings without opening remediation pull requests
+      # on their own; `/remediate` on a ledger still opens one. At 25 clusters
+      # or more an automatic promotion sweeps every cluster's findings into
+      # pull requests at once.
+      - name: KUBEAGENTS_AUDIT_AUTO_PROMOTE
+        value: "false"
+    credentialProxy:
+      # The broker that runs every credentialed command (gcloud, kubectl) in a
+      # pod of its own. It admits at most eight commands at once, a cap the
+      # operator fixes and no values file moves, and budgets each in-flight
+      # command against limits.memory: 128 MiB reserved for the child plus six
+      # copies of the 8 MiB output cap, 176 MiB a slot, after the broker's and
+      # Envoy's own reserves. The 2Gi default already covers all eight slots,
+      # so 8Gi admits nothing more in parallel. It buys headroom for a child
+      # that outgrows its reserve, as a kubectl or gcloud listing of a cluster
+      # with thousands of pods does: close to 1 GiB a slot with all eight in
+      # use (modeled), where the broker restarted under a 29-cluster fleet at
+      # the default. The CPU request is the CPU it runs at on Autopilot without
+      # bursting; on Standard or with bursting it may reach 8 vCPU. On
+      # Standard the 4 vCPU request needs a node with more than that
+      # allocatable; the composition's default e2-standard-4 pool has less,
+      # and the proxy Deployment recreates its pod rather than rolling it, so
+      # add a larger pool before passing this file or the proxy stays Pending.
+      # ephemeral-storage keeps the operator's 8Gi default, under Autopilot's
+      # 10 GiB per-pod ceiling.
+      resources:
+        requests:
+          cpu: "4"
+          memory: 8Gi
+        limits:
+          cpu: "8"
+          memory: 8Gi
+    agentAPIAuth:
+      # The gateway sidecar that runs the event watcher and the drift detector.
+      # The watcher sets its Go soft memory limit to half of limits.memory, so
+      # 4Gi gives it 2 GiB for the informers of 25 or more watched clusters,
+      # which list every watched object at startup (modeled from the 2Gi
+      # default's share per cluster). On Autopilot without bursting the
+      # container runs at the 2Gi request and the watcher reads 1 GiB.
+      # limits.cpu is left at the default 1, because the watcher's GOMAXPROCS
+      # follows it.
+      resources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          memory: 4Gi
