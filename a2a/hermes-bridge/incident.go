@@ -117,7 +117,7 @@ type incidentAddress struct {
 // A key that names a whole conversation rather than a thread takes neither:
 // a Google Chat space with no thread, a thread-less Slack DM, and the
 // thread-less Google Chat DM key, which is the legacy and openDirect shape
-// now that a Google Chat DM ask keys its own thread. Every later message
+// (a Google Chat DM ask keys its own thread). Every later message
 // under such a key shares it and the session, so a row stored under it
 // would be spliced ahead of every question for the row's life, and the
 // first card's report would answer a reply to the second's. The hook never
