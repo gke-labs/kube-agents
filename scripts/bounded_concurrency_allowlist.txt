@@ -45,3 +45,11 @@ agents/platform/scripts/session_kv_server.py _card_drift_backlog_minorities 1
 # ends. Bounded by MetricsServer, which admits at most METRICS_MAX_CONNECTIONS
 # live connections; that cap is a server attribute the check does not read.
 agents/platform/scripts/credential_proxy.py MetricsHandler.handle 1
+
+# One goroutine per identity-map shard, started once: run() starts
+# WatchConfigMapShards inside a `go func() { ... }()` literal, and the shard
+# count is fixed when NewShardedStore builds the store from the operator's
+# A2A_AUTHMAP_SHARDS. A startup function's bound stops at its function literals
+# (the check cannot tell this closure, run once, from a handler's), so the
+# docstring says this shape is pinned rather than bounded.
+a2a/authcallout/store.go WatchConfigMapShards 1
