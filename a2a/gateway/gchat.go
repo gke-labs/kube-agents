@@ -600,11 +600,11 @@ func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMes
 }
 
 // EditNotifyMessage is EditMessage for the chat.notify route's home posts
-// (notifyChatEditor): the message, on thread in space, edited in place. A
-// question it carries stays bound to no conversation, as a home post's is
-// (createLaidOut), so its click binds to the thread the click's event names
-// (classifyClick).
-func (a *GoogleChatAdapter) EditNotifyMessage(space, thread, messageID string, m OutMessage) error {
+// (notifyChatEditor): the message in space, edited in place by its name, so
+// the thread argument goes unread. A question it carries stays bound to no
+// conversation, as a home post's is (createLaidOut), so its click binds to
+// the thread the click's event names (classifyClick).
+func (a *GoogleChatAdapter) EditNotifyMessage(space, _, messageID string, m OutMessage) error {
 	if !gchatIsSpaceName(space) {
 		return fmt.Errorf("gchat: not a space name: %q", space)
 	}
