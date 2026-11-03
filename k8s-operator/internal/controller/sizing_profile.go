@@ -54,9 +54,8 @@ const (
 
 	// The cluster counts at which the auto profile earns a tier, read off
 	// the larger of status.usage.clustersRegistered and clustersMonitored.
-	// The figures are the fleet-size bands the sizing guide uses: a fleet of
-	// ten clusters outgrows the small broker's two-command memory budget, and
-	// twenty-five is where the event watcher's informers outgrow a 4Gi
+	// A fleet of ten clusters outgrows the small broker's two-command memory
+	// budget, and at twenty-five the event watcher's informers outgrow a 4Gi
 	// sidecar. Below the first the tier stays small.
 	sizingMediumClusterThreshold int64 = 10
 	sizingFleetClusterThreshold  int64 = 25
@@ -99,20 +98,40 @@ const (
 	// Ready and Degraded writers carry it through as they read it. The
 	// message names the quota and the dimension, because the person reading
 	// `kubectl describe` decides between raising the quota and naming a tier.
+	// It carries no quantities: the status write and the Warning event are
+	// gated on the message, and the quota's free figure moves with every pod
+	// the namespace admits, so a figure in the message would write status and
+	// record a Warning on every session pod a busy install runs. The figures
+	// go in the event and the log line, recorded when the message changes.
 	sizingCappedByQuotaConditionType = "SizingCappedByQuota"
 	sizingCappedByQuotaReason        = "ResourceQuotaShort"
-	// sizingCappedByQuotaMessageFormat takes the cluster count, the tier
-	// earned, the quota's name, the free quantity, the quota key, the running
-	// tier, the quantity the step adds, and the running tier again.
-	sizingCappedByQuotaMessageFormat = "spec.deployment.sizingProfile is auto and the %d clusters the operator counts earn the %s tier, " +
-		"but ResourceQuota %s has %s of %s free and the step up from %s adds %s; the %s tier stays until the quota is raised " +
+	// sizingCappedByQuotaMessageFormat takes the tier earned, the quota's
+	// name, the quota key, the running tier, and the running tier again.
+	sizingCappedByQuotaMessageFormat = "spec.deployment.sizingProfile is auto and the cluster count earns the %s tier, " +
+		"but ResourceQuota %s has no room on %s for the step up from %s; the %s tier stays until the quota is raised " +
 		"or sizingProfile names the tier, which the operator applies without this check"
+	// sizingCappedByQuotaEventFormat is the Warning event's text: the
+	// condition message, then the figures as they stood when it was written.
+	// It takes the message, the cluster count, the free quantity, the quota
+	// key and the quantity the step adds.
+	sizingCappedByQuotaEventFormat = "%s (at %d clusters: %s of %s free, the step adds %s)"
 	// sizingTierChangedReason is the Normal event a tier change records, and
 	// sizingCappedByQuotaEventReason the Warning the first capped pass records.
 	sizingTierChangedReason        = "SizingTierChanged"
 	sizingCappedByQuotaEventReason = "SizingCappedByQuota"
 	sizingTierChangedMessageFormat = "sizing tier %s -> %s (spec.deployment.sizingProfile %s)"
 )
+
+// sizingShortfall is one ResourceQuota dimension without room for a step up:
+// the quota, the key, what was free and what the step adds. The condition
+// message is built from the quota and the key alone (see
+// sizingCappedByQuotaMessageFormat); the figures reach the event and the log.
+type sizingShortfall struct {
+	quota string
+	key   corev1.ResourceName
+	free  resource.Quantity
+	need  resource.Quantity
+}
 
 // sizingQuotaDimensions are the ResourceQuota hard keys the step-up check
 // reads, each with the container resource it counts and the side of the step
@@ -379,24 +398,24 @@ func addResourceDelta(total, from, to corev1.ResourceList) {
 	}
 }
 
-// sizingQuotaShortfall is "" when every ResourceQuota in the agent's
-// namespace has room for the step from tier from to tier to, or the
-// SizingCappedByQuota message naming the first quota and dimension that is
-// short, quotas in name order so the message is stable across passes. The
-// hard figure is the spec's, the used figure the quota controller's last
-// accounting (zero on a quota it has not accounted yet, which admission then
-// settles). A quota with scopes is read as if it applied: the operator does
-// not evaluate scope selectors, so a scoped quota that is short holds the
-// tier, and the message names it for the person who knows whether it binds.
-// ResourceQuota is not a watched kind, so the list goes through the API
-// reader, as the A2A session quota's reads do.
-func (r *PlatformAgentReconciler) sizingQuotaShortfall(ctx context.Context, agent *agentv1alpha1.PlatformAgent, count int64, from, to sizingTier) (string, error) {
+// sizingQuotaShortfall is nil when every ResourceQuota in the agent's
+// namespace has room for the step from tier from to tier to, or the first
+// quota and dimension that is short, quotas in name order and dimensions in
+// sizingQuotaDimensions order so the condition message is stable across
+// passes. The hard figure is the spec's, the used figure the quota
+// controller's last accounting (zero on a quota it has not accounted yet,
+// which admission then settles). A quota with scopes is read as if it
+// applied: the operator does not evaluate scope selectors, so a scoped quota
+// that is short holds the tier, and the message names it for the person who
+// knows whether it binds. ResourceQuota is not a watched kind, so the list
+// goes through the API reader, as the A2A session quota's reads do.
+func (r *PlatformAgentReconciler) sizingQuotaShortfall(ctx context.Context, agent *agentv1alpha1.PlatformAgent, from, to sizingTier) (*sizingShortfall, error) {
 	quotas := &corev1.ResourceQuotaList{}
 	if err := r.a2aReader().List(ctx, quotas, client.InNamespace(agent.Namespace)); err != nil {
-		return "", fmt.Errorf("listing ResourceQuotas for the sizing step to %s: %w", to, err)
+		return nil, fmt.Errorf("listing ResourceQuotas for the sizing step to %s: %w", to, err)
 	}
 	if len(quotas.Items) == 0 {
-		return "", nil
+		return nil, nil
 	}
 	step := sizingStepBetween(agent, r.clusterAutopilot(), from, to)
 	slices.SortFunc(quotas.Items, func(a, b corev1.ResourceQuota) int { return strings.Compare(a.Name, b.Name) })
@@ -419,11 +438,11 @@ func (r *PlatformAgentReconciler) sizingQuotaShortfall(ctx context.Context, agen
 				free.Sub(used)
 			}
 			if free.Cmp(need) < 0 {
-				return fmt.Sprintf(sizingCappedByQuotaMessageFormat, count, to, quota.Name, free.String(), dim.key, from, need.String(), from), nil
+				return &sizingShortfall{quota: quota.Name, key: dim.key, free: free, need: need}, nil
 			}
 		}
 	}
-	return "", nil
+	return nil, nil
 }
 
 // sizingCappedConditionCurrent reports whether the SizingCappedByQuota
@@ -459,29 +478,35 @@ func setSizingCappedByQuotaCondition(agent *agentv1alpha1.PlatformAgent, msg str
 // any builder reads renderedSizingTier, so the status is the record of what
 // the pods run even when a later step of the pass fails. An explicit profile
 // is its tier, applied as written. Under auto the tier is the latched status
-// tier, raised to what the cluster count earns when every ResourceQuota in
-// the namespace has room for the step; a count that falls, or that the
-// operator has no reading of, leaves the latch where it is, and a short quota
-// keeps the running tier and sets the condition. The write is gated on a
-// change, as the other status writers' are, because the PlatformAgent watch
-// has no predicate and every write re-enqueues the object.
+// tier, whatever profile wrote it (an explicit fleet switched to auto
+// continues at fleet; small first, then auto, restarts the latch), raised to
+// what the cluster count earns when every ResourceQuota in the namespace has
+// room for the step; a count that falls, or that the operator has no reading
+// of, leaves the latch where it is, and a short quota keeps the running tier
+// and sets the condition. The write is gated on a change, as the other status
+// writers' are, because the PlatformAgent watch has no predicate and every
+// write re-enqueues the object.
 func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	profile := sizingProfileOf(agent.Spec.Deployment)
 	latched, _ := parseSizingTier(agent.Status.EffectiveSizingTier)
 	tier := specSizingTier(agent.Spec.Deployment)
 	capped := ""
+	var short *sizingShortfall
+	var count int64
 	if profile == sizingProfileAuto {
 		tier = latched
-		if count, ok := observedClusterCount(agent); ok {
+		if observed, ok := observedClusterCount(agent); ok {
+			count = observed
 			if earned := sizingTierForClusterCount(count); earned > tier {
-				shortfall, err := r.sizingQuotaShortfall(ctx, agent, count, tier, earned)
+				shortfall, err := r.sizingQuotaShortfall(ctx, agent, tier, earned)
 				if err != nil {
 					return err
 				}
-				if shortfall == "" {
+				if shortfall == nil {
 					tier = earned
 				} else {
-					capped = shortfall
+					short = shortfall
+					capped = fmt.Sprintf(sizingCappedByQuotaMessageFormat, earned, shortfall.quota, shortfall.key, tier, tier)
 				}
 			}
 		}
@@ -498,9 +523,11 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 			r.recordEvent(agent, corev1.EventTypeNormal, sizingTierChangedReason, fmt.Sprintf(sizingTierChangedMessageFormat, previous, tier, profile))
 		}
 	}
-	if capped != "" && !sizingCappedConditionCurrent(agent, capped) {
-		log.Info("sizing tier capped by ResourceQuota", "name", agent.Name, "namespace", agent.Namespace, "message", capped)
-		r.recordEvent(agent, corev1.EventTypeWarning, sizingCappedByQuotaEventReason, capped)
+	if short != nil && !sizingCappedConditionCurrent(agent, capped) {
+		log.Info("sizing tier capped by ResourceQuota", "name", agent.Name, "namespace", agent.Namespace,
+			"quota", short.quota, "key", short.key, "free", short.free.String(), "adds", short.need.String(), "clusters", count)
+		r.recordEvent(agent, corev1.EventTypeWarning, sizingCappedByQuotaEventReason,
+			fmt.Sprintf(sizingCappedByQuotaEventFormat, capped, count, short.free.String(), short.key, short.need.String()))
 	}
 	agent.Status.EffectiveSizingTier = tier.String()
 	setSizingCappedByQuotaCondition(agent, capped, metav1.Now())

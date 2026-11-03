@@ -61,22 +61,30 @@ var shellSandboxResourcesPath = field.NewPath("spec", "harness", "experimental",
 // request is accepted. The webhook calls it at apply and the reconciler before
 // writing the StatefulSet, so an install without the webhook refuses the same
 // override rather than rendering it. The row the override merges over is the
-// rendered tier's (renderedSizingTier): the webhook has the whole object, and
-// under auto reads whatever latch its status carries, small when none.
+// one the spec alone fixes (specSizingTier), as for the credential proxy and
+// the agent-api-auth sidecar: small under auto, so the three overrides are
+// admitted by one rule, and the reconciler's reading against the rendered tier
+// (validateShellSandboxResourcesAt) never refuses what admission admitted.
 func ValidateShellSandboxResources(agent *agentv1alpha1.PlatformAgent, path *field.Path) (field.ErrorList, admission.Warnings) {
+	return validateShellSandboxResourcesAt(agent, specSizingTier(agent.Spec.Deployment), path)
+}
+
+// validateShellSandboxResourcesAt is ValidateShellSandboxResources against
+// the given tier's row.
+func validateShellSandboxResourcesAt(agent *agentv1alpha1.PlatformAgent, tier sizingTier, path *field.Path) (field.ErrorList, admission.Warnings) {
 	spec := shellSandboxSpec(agent)
 	if spec == nil || spec.Resources == nil {
 		return nil, nil
 	}
-	return validateContainerResources(*spec.Resources, resolveShellSandboxResources(agent, renderedSizingTier(agent)),
+	return validateContainerResources(*spec.Resources, resolveShellSandboxResources(agent, tier),
 		path, acceptedContainerResourceNames, shellSandboxMessages, nil)
 }
 
 // shellSandboxResourcesRefusal is the reconciler's reading of
-// ValidateShellSandboxResources: the first refusal with the count of the rest
-// within the shared budget, or "" when the override is valid. Warnings are not
-// refusals; the caller logs them.
+// ValidateShellSandboxResources, against the tier this pass renders: the
+// first refusal with the count of the rest within the shared budget, or ""
+// when the override is valid. Warnings are not refusals; the caller logs them.
 func shellSandboxResourcesRefusal(agent *agentv1alpha1.PlatformAgent) (string, admission.Warnings) {
-	errs, warnings := ValidateShellSandboxResources(agent, shellSandboxResourcesPath)
+	errs, warnings := validateShellSandboxResourcesAt(agent, renderedSizingTier(agent), shellSandboxResourcesPath)
 	return boundCredentialProxyRefusal(errs), warnings
 }

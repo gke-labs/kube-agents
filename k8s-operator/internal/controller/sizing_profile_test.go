@@ -144,18 +144,59 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != sizingCappedByQuotaReason || cond.ObservedGeneration != 3 {
 			t.Fatalf("SizingCappedByQuota = %+v", cond)
 		}
-		for _, want := range []string{"12 clusters", "medium tier", "ResourceQuota platform-baseline-quota", "2Gi of requests.memory free", "adds 3Gi", "the small tier stays"} {
+		for _, want := range []string{"earns the medium tier", "ResourceQuota platform-baseline-quota has no room on requests.memory", "step up from small", "the small tier stays"} {
 			if !strings.Contains(cond.Message, want) {
 				t.Errorf("message lacks %q: %s", want, cond.Message)
 			}
 		}
+		if strings.Contains(cond.Message, "Gi") {
+			t.Errorf("the message carries a quantity, which moves with the quota's used total: %s", cond.Message)
+		}
 		select {
 		case event := <-recorder.Events:
-			if !strings.Contains(event, sizingCappedByQuotaEventReason) {
-				t.Errorf("event = %q, want a %s Warning", event, sizingCappedByQuotaEventReason)
+			for _, want := range []string{sizingCappedByQuotaEventReason, "at 12 clusters", "2Gi of requests.memory free", "the step adds 3Gi"} {
+				if !strings.Contains(event, want) {
+					t.Errorf("event lacks %q: %s", want, event)
+				}
 			}
 		default:
 			t.Error("no event recorded for the capped promotion")
+		}
+	})
+	t.Run("a quota whose used total moves while still short writes nothing", func(t *testing.T) {
+		t.Parallel()
+		// The first pass caps the tier with 2Gi free; a session pod then
+		// returns 512Mi to the quota. Still short of the 3Gi the step adds, so
+		// the condition stands as written and the pass neither writes status
+		// nor records a second Warning.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+		quota := sizingQuota("platform-baseline-quota", "10Gi", "8Gi")
+		scheme := setupScheme()
+		writes := 0
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota).WithStatusSubresource(agent).
+			WithInterceptorFuncs(interceptor.Funcs{
+				SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					writes++
+					return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+				},
+			}).Build()
+		recorder := record.NewFakeRecorder(8)
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("first pass: %v", err)
+		}
+		quota.Status.Used[corev1.ResourceRequestsMemory] = resource.MustParse("7680Mi")
+		if err := cl.Update(context.Background(), quota); err != nil {
+			t.Fatalf("moving the quota's used total: %v", err)
+		}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("second pass: %v", err)
+		}
+		if writes != 1 {
+			t.Errorf("status written %d times across the two passes, want 1", writes)
+		}
+		if len(recorder.Events) != 1 {
+			t.Errorf("%d events recorded, want the first pass's one", len(recorder.Events))
 		}
 	})
 	t.Run("a quota with headroom lets the promotion through and clears the condition", func(t *testing.T) {
@@ -347,5 +388,18 @@ func TestSizingValidationFollowsTheRenderedTier(t *testing.T) {
 	agent.Spec.Deployment.SizingProfile = sizingProfileFleet
 	if errs, _ := ValidateCredentialProxyResources(agent.Spec.Deployment, credentialProxyResourcesPath); len(errs) != 0 {
 		t.Errorf("admission under an explicit fleet refused: %v", errs)
+	}
+
+	// The shell follows the same rule: a 3Gi memory request alone crosses
+	// the small row's 2Gi limit and sits under the fleet row's 4Gi.
+	shell := sizingAgent(sizingProfileAuto, sizingProfileFleet, nil, nil)
+	shell.Spec.Harness.Experimental = &agentv1alpha1.ExperimentalSpec{ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Resources: &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
+	}}}
+	if errs, _ := ValidateShellSandboxResources(shell, shellSandboxResourcesPath); len(errs) == 0 {
+		t.Error("admission under auto admitted a 3Gi shell request against the small row")
+	}
+	if refusal, _ := shellSandboxResourcesRefusal(shell); refusal != "" {
+		t.Errorf("the reconciler refused the shell override against the fleet latch: %s", refusal)
 	}
 }
