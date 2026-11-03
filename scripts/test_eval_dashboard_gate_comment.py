@@ -192,16 +192,16 @@ class Shapes(Harness):
             " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=103)",
         )
         self.assertIn("| `security-overgrant-probe` | 0 / 3 reps | no other PR |", body)
-        self.assertIn("Reason: `", body)
-        self.assertIn("sandbox pod never reached Running (ImagePullBackOff: agent-sandbox:pr-913)", body)
+        self.assertNotIn("Reason", body, "the check's reason stays off the public comment")
+        self.assertNotIn("sandbox pod never reached Running", body)
         self.assertNotIn("Incident brief", body)
         self.assertIn("6 cases passed.", body)
 
-    def test_the_reason_line_is_the_graders_check_not_the_agents_report(self):
-        # Since 2026-09-15 the collector keeps the agent's report under a
-        # failing rep as `excerpt` (the Brief's quote). The comment's Reason
-        # line must still be the check that failed; the excerpt stands in
-        # only for a rep that has no reason at all.
+    def test_the_comment_carries_neither_the_graders_check_nor_the_agents_report(self):
+        # The pull request is public; the check's reason (`reps[].reason`)
+        # and the agent's report (`reps[].excerpt`, the Brief's quote) stay
+        # on the dashboard, behind the run link. Neither reaches the comment,
+        # whether the rep carries both or only the excerpt.
         report = "🔀 Delegated to the **platform** agent Created as task `t_169f6f10`. The pod is `Running` and the service answers on port 8080."
         with_both = task("security-overgrant-probe", "fff")
         for rep in with_both["reps"]:
@@ -210,7 +210,9 @@ class Shapes(Harness):
         mine = [run(100 + i, 913, NOW - timedelta(hours=3 - i), tasks=tasks) for i in range(4)]
         self.tick(data(*mine, *green_others()), green_health())
         body = self.gh.bodies()[0]
-        self.assertIn("Reason: `sandbox pod never reached Running (ImagePullBackOff: agent-sandbox:pr-913)`", body)
+        self.assertIn("| `security-overgrant-probe` | 0 / 3 reps | no other PR |", body)
+        self.assertNotIn("Reason", body)
+        self.assertNotIn("sandbox pod never reached Running", body)
         self.assertNotIn("Delegated", body)
 
         for rep in with_both["reps"]:
@@ -219,7 +221,8 @@ class Shapes(Harness):
         gh = FakeGh()
         self.tick(data(*other_pr, *green_others()), green_health(), gh=gh)
         body = gh.bodies()[0]
-        self.assertIn("Reason: `" + report.replace("`", "'")[:gate_comment.EXCERPT_CHARS] + "`", body)
+        self.assertNotIn("Reason", body)
+        self.assertNotIn("Delegated", body)
 
     def test_a_green_night_is_not_another_pr(self):
         # The nightly periodic's run shares data.json with no pull request
@@ -242,7 +245,7 @@ class Shapes(Harness):
         self.assertIn("1 (`agent-kanban-smoke`) looks specific to your PR", box)
         self.assertIn("Fix that one; don't retest for the rest until the gate is healthy.", box)
         self.assertIn("· [Incident brief →]", box)
-        self.assertIn("Reason: `", self.gh.bodies()[0])
+        self.assertNotIn("Reason", self.gh.bodies()[0])
 
     def test_hard_failure(self):
         # FAILURE with every gate case passing: an absolute check tripped.

@@ -211,9 +211,9 @@ layout and are collected from the moment they start running.
       repetition whose `reason` is shown, so the quote and the check beside
       it come from the same run of the agent; nothing is quoted when that
       rep has none (when no rep carries a reason, the first rep with an
-      excerpt is the one the row is about, link included). The PR gate comment's Reason line stays the grader's
-      `reason` and falls back to the excerpt only for a rep that has no
-      reason at all.
+      excerpt is the one the row is about, link included). The PR gate comment carries neither the
+      `reason` nor the excerpt: the pull request is public, and both stay
+      behind the run link.
     - `agent_s`, `turn1_s` — **optional, additive**: how long the
       repetition took, in seconds, from the
       `rep N timing: agent_s=<x> turn1_s=<y>` line `bench-gate case` prints

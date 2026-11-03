@@ -616,7 +616,8 @@ a not-evaluated run, a lost pod and a deadline kill.
   counts;
 - a table of the failed cases — result as `passed / total reps`, and how many
   other pull requests the case is failing on right now;
-- the check's reason for a case that looks like the pull request's;
+- no grading text: the check's reason and the agent's words stay on the
+  dashboard's run page, behind the link, since the pull request is public;
 - how many cases passed, the run's wall clock and pool project, and links: the
   build log, `run.html#build=<build id>` on the dashboard, and the incident
   brief when there is an incident.

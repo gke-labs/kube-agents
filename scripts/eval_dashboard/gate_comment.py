@@ -119,7 +119,6 @@ OUTCOME_FAILED = classify.OUTCOME_FAILED
 # "passed on the last N runs from other PRs" counts inside classify.py's
 # only-this-PR window.
 ONLY_PR_WINDOW = classify.ONLY_PR_WINDOW
-EXCERPT_CHARS = 160
 
 # Links. The run page and the brief are the dashboard's, written by
 # post_health.run_link and post_health.incident_link (post_health owns the
@@ -235,8 +234,6 @@ CONDITION_STORM = health.STORM
 TABLE_HEAD = "| Case | Result | Also failing on |\n| --- | --- | --- |"
 TABLE_ROW = "| `{case}`{note} | {result} | {also} |"
 HELD_OUT_CELL = " (held out)"
-REASON_LINE = "Reason: `{reason}`"
-REASON_LINE_NAMED = "Reason (`{case}`): `{reason}`"
 FOOTER = "{passed} {cases} passed. Run {minutes} min on {project} · [build log]({url})"
 NO_OTHER_PR = "no other PR"
 OTHER_PRS = "{n} other {prs}"
@@ -468,16 +465,10 @@ def render_comment(red: Red, health_doc: dict, runs: list[dict]) -> str:
             note = "" if case["admitted"] else HELD_OUT_CELL
             lines.append(TABLE_ROW.format(case=case["case"], note=note, result=result_cell(case), also=also_text(case.get("also_failing_prs"))))
         lines.append("")
-    # The Reason line is the grader's check (`reps[].reason`). The agent's own
-    # words (`reps[].excerpt`, the Brief's quote) stand in only when a rep
-    # carries no reason at all, so the comment never trades the check that
-    # failed for the report's opening boilerplate.
-    reasons = [c for c in red.yours() + red.unclear() if (c.get("reason") or c.get("excerpt"))]
-    for case in reasons:
-        text = (case.get("reason") or case.get("excerpt") or "").replace("`", "'")[:EXCERPT_CHARS]
-        lines.append((REASON_LINE if len(reasons) == 1 else REASON_LINE_NAMED).format(case=case["case"], reason=text))
-    if reasons:
-        lines.append("")
+    # No grading text: the check's reason (`reps[].reason`) and the agent's
+    # words (`reps[].excerpt`) are the detail the smoke keeps off the public
+    # record (docs/ci-health.md, "The smoke lanes log to"). The run link in
+    # the box carries both for a project reader.
     project = red.raw.get("project") or UNKNOWN_PROJECT
     project = project.removeprefix(PROJECT_PREFIX)
     wall = red.run.wall_clock
