@@ -1961,7 +1961,7 @@ fence_live_cards() { # <label>
   ns="${TARGET_NAMESPACE:-}"
   ctx="${AGENT_CLUSTER_CONTEXT:-}"
   if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || [ -z "${EVAL_FANOUT_STARTED_EPOCH:-}" ] || ! command -v kubectl >/dev/null 2>&1; then
-    echo "Card fence (${label}): skipped, PROJECT_ID, AGENT_CLUSTER_CONTEXT, TARGET_NAMESPACE, EVAL_FANOUT_STARTED_EPOCH or kubectl is missing"
+    echo "WARNING: Card fence (${label}): skipped, PROJECT_ID, AGENT_CLUSTER_CONTEXT, TARGET_NAMESPACE, EVAL_FANOUT_STARTED_EPOCH or kubectl is missing" >&2
     return 0
   fi
   case "${ctx}" in
@@ -4943,8 +4943,9 @@ INFRA_IN_FLIGHT_MAX=2
 # With `fence` as the fourth argument, each launch first archives the cards an
 # earlier unit left live (fence_live_cards, #4425), then waits the pause, so
 # the settle also covers a push already in flight when a fenced worker stops.
-# Only the second phase passes it: it runs one unit at a time, so every live
-# card is an earlier unit's.
+# Only the second phase passes it: it runs one unit at a time, so no live card
+# is the next unit's (an earlier unit's, or one the install filed during the
+# fan-out, and either would write into the exclusive window).
 launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch> [fence]
   local queue="$1" parallelism="$2" pause="$3" fence="${4:-}"
   local pending=() line i pick running pid alive infra_pids="" counted task_jobs="" job

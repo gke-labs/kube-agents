@@ -9,7 +9,9 @@ the same. A card an earlier unit left running keeps its worker writing after tha
 graded, and its pull requests land in the next window (#4425). That happens when the inject
 exchange is cut and the cancel cannot be sent over the same failed transport, when a card is
 still running at the delegation ceiling, and when a worker's own fan-out children outlive
-the wait. The phase is serial, so every card still live at this point is an earlier unit's.
+the wait. The phase is serial, so a card still live at this point is an earlier unit's, or
+one the install filed for itself during the fan-out (an `oobe` stage run still going, say).
+Either would write into the exclusive window, so both are archived.
 
 A card counts as live when its status is not one the harness reads as settled
 (bench/kube_agents_bench/harness.py, _TERMINAL_STATUSES): a worker runs it now or the
@@ -100,6 +102,14 @@ def main():
         if left:
             print(f"archived {len(archived)}: {', '.join(archived)}; still live after {passes} passes: {', '.join(left)}")
             return EXIT_LEFT_LIVE
+    if refused:
+        # A card that settled between the read and its archive (its worker finished, the
+        # dispatcher archived it) is refused, but nothing of it is left to fence.
+        try:
+            still = {card for card, _ in live_cards()}
+        except sqlite3.Error:
+            still = set(refused)
+        refused = {card: why for card, why in refused.items() if card in still}
     if refused:
         print(f"archived {len(archived)}: {', '.join(archived) or 'none'}; would not archive: {'; '.join(refused.values())}")
         return EXIT_LEFT_LIVE

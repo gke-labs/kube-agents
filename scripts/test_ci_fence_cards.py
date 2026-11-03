@@ -160,6 +160,19 @@ class FenceCardsTest(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("would not archive: t_stuck (running): no such task", done.stdout)
 
+    def test_a_card_that_settled_before_its_archive_is_not_reported(self):
+        # Its worker finished between the read and the archive, which hermes then refuses.
+        self._cards([("t_late", "running", SINCE + 1)])
+        hermes = self.bin / "hermes"
+        hermes.write_text(
+            "#!/bin/sh\n"
+            f"python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE tasks SET status=? WHERE id=?\", (\"done\", sys.argv[2])); c.commit()' \"{self.board}\" \"$3\"\n"
+            'echo "task is done" >&2\nexit 1\n'
+        )
+        hermes.chmod(0o755)
+        done = self._fence()
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "nothing live"), done.stdout)
+
     def test_an_unreadable_board_exits_non_zero(self):
         self.board.write_text("not a database")
         self._hermes()
