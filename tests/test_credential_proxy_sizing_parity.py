@@ -78,6 +78,33 @@ def operator_terms() -> dict[str, int]:
     return terms
 
 
+# (broker name, operator name) of the environment variables the operator writes
+# for the broker's resource watermark gate: each scratch volume's sizeLimit in
+# bytes. The broker reads the name it declares; the operator writes the name it
+# declares; nothing but this test holds them to one spelling.
+VOLUME_LIMIT_ENV_NAMES = (
+    ("ENV_STATE_LIMIT_BYTES", "credentialProxyStateLimitEnv"),
+    ("ENV_TMP_LIMIT_BYTES", "credentialProxyTmpLimitEnv"),
+)
+
+
+def _string_constant(pattern: str, text: str, where: pathlib.Path) -> str:
+    found = re.search(pattern, text, re.MULTILINE)
+    if found is None:
+        raise AssertionError(f"{where.relative_to(REPO_ROOT)} declares nothing matching {pattern!r}")
+    return found.group(1)
+
+
+def broker_volume_limit_env_names() -> dict[str, str]:
+    text = BROKER.read_text(encoding="utf-8")
+    return {name: _string_constant(rf'^{name} = "([A-Z_]+)"$', text, BROKER) for name, _ in VOLUME_LIMIT_ENV_NAMES}
+
+
+def operator_volume_limit_env_names() -> dict[str, str]:
+    text = OPERATOR.read_text(encoding="utf-8")
+    return {name: _string_constant(rf'^\s*{name}\s*=\s*"([A-Z_]+)"', text, OPERATOR) for _, name in VOLUME_LIMIT_ENV_NAMES}
+
+
 def broker_floor_bytes() -> int:
     text = BROKER.read_text(encoding="utf-8")
     return _match(r"^CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = (\d+)$", text, BROKER)
@@ -139,6 +166,13 @@ def _quoted(pattern: str, text: str) -> str:
 
 
 class CredentialProxySizingParityTest(unittest.TestCase):
+    def test_the_volume_limit_variables_are_named_the_same_on_both_sides(self):
+        broker = broker_volume_limit_env_names()
+        operator = operator_volume_limit_env_names()
+        for broker_name, operator_name in VOLUME_LIMIT_ENV_NAMES:
+            with self.subTest(variable=broker[broker_name]):
+                self.assertEqual(broker[broker_name], operator[operator_name])
+
     def test_each_term_is_declared_equal_on_both_sides(self):
         broker = broker_terms()
         operator = operator_terms()

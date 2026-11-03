@@ -2616,6 +2616,218 @@ class ExecRouteRefusesGitTest(_ExecRouteServer):
         self.assertNotIn("git", credential_proxy.EXEC_ROUTE_EXECUTABLES)
 
 
+class ResourcePressureRouteTest(unittest.TestCase):
+    """The resource watermark gate (#4333) as a caller meets it: over /v1/exec
+    and /v1/vcs/*, and on the watcher's Kubernetes reads."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        root = Path(self.temp_dir.name)
+        policy_path = root / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(root / "state"),
+            scoped_pool=None,
+        )
+        stub_dir = root / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/bash\necho pods\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+        CredentialProxyHandler.max_request_bytes = 65536
+        self.cgroup = root / "cgroup"
+        self.cgroup.mkdir()
+        (self.cgroup / "memory.max").write_text("1000\n")
+        self.set_memory_percent(86)
+        self.gate = credential_proxy.ResourceWatermarkGate(
+            credential_proxy.watermark_thresholds_from_env({}),
+            (credential_proxy.WatchedVolume("tmp", root / "tmp", 1000),),
+            cgroup_dir=self.cgroup,
+            tree_bytes=lambda path: 0,
+            retry_after=lambda low, high: 11,
+        )
+        CredentialProxyHandler.executor.watermark_gate = self.gate
+        CredentialProxyHandler.watermark_gate = self.gate
+        self.addCleanup(setattr, CredentialProxyHandler, "watermark_gate", None)
+        self.metrics = credential_proxy.ProxyMetrics()
+        self.addCleanup(setattr, CredentialProxyHandler, "metrics", CredentialProxyHandler.metrics)
+        CredentialProxyHandler.metrics = self.metrics
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def set_memory_percent(self, percent):
+        (self.cgroup / "memory.current").write_text(f"{percent * 10}\n")
+
+    def as_role(self, role):
+        authenticator = types.SimpleNamespace(
+            authenticates=True,
+            authenticate=lambda headers: credential_proxy.Principal(workload="system:serviceaccount:ns:caller", role=role),
+        )
+        patcher = mock.patch.object(CredentialProxyHandler, "authenticator", authenticator)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def post(self, payload, path="/v1/exec"):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, dict(response.headers), json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, dict(error.headers), json.loads(error.read())
+
+    def test_a_shell_caller_at_the_hard_watermark_is_answered_429_with_retry_after(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, headers, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(429, status)
+        self.assertEqual("11", headers["Retry-After"])
+        self.assertEqual(
+            {"status": "busy", "code": "CREDENTIAL_PROXY_RESOURCE_PRESSURE", "retry_after": 11},
+            {key: body[key] for key in ("status", "code", "retry_after")},
+        )
+        self.assertIn("hard resource watermark (memory=86%)", body["error"])
+        self.assertIn("command refused under resource pressure request_id=", "\n".join(logs.output))
+        self.assertEqual(0, CredentialProxyHandler.executor.slots_in_use)
+        # The shell role is interactive to the executor's class caps (admission_class) and
+        # background to the gate (INTERACTIVE_ROLES); the counter carries the former.
+        self.assertIn(
+            'kubeagents_credential_proxy_admission_refusals_total{bound="pressure",class="interactive"} 1',
+            self.metrics.render(),
+        )
+        self.assertIn('status="busy"', self.metrics.render())
+
+    def test_a_session_caller_is_admitted_at_the_hard_watermark_and_everyone_under_it(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SESSION)
+        status, headers, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+        self.assertNotIn("Retry-After", headers)
+        self.set_memory_percent(50)
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        status, _, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+
+    def test_a_vcs_verb_at_the_hard_watermark_is_answered_429_before_its_body_is_read(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"probe": lambda payload: {"ok": True}}),
+        ):
+            status, headers, body = self.post({}, path="/v1/vcs/probe")
+        self.assertEqual(429, status)
+        self.assertEqual("11", headers["Retry-After"])
+        self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
+
+    def _watcher_handler(self, path):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.command = "GET"
+        handler.path = path
+        handler.headers = {}
+        handler.principal = credential_proxy.Principal(workload="system:serviceaccount:ns:gateway", role=credential_proxy.CALLER_ROLE_WATCHER)
+        handler.replies = []
+        handler._json = lambda status, payload, headers=None: handler.replies.append((status, payload, headers))
+        handler.endpoints_asked = []
+        handler._watcher_cluster_endpoint = lambda target, request_id: handler.endpoints_asked.append(target) or None
+        return handler
+
+    def test_a_workspace_write_at_the_hard_watermark_is_refused_and_a_read_passes(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        routed = []
+        store = types.SimpleNamespace()
+        with (
+            mock.patch.object(CredentialProxyHandler, "workspaces", store),
+            mock.patch.object(CredentialProxyHandler, "_workspace_route", lambda self, route, payload: routed.append(route) or {"ok": True}),
+        ):
+            status, headers, body = self.post({"repo": "acme/fleet"}, path="/v1/workspace/open")
+            self.assertEqual(429, status)
+            self.assertEqual("11", headers["Retry-After"])
+            self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
+            self.assertEqual([], routed)
+            # A commit fetches into the state volume and writes the changed
+            # files, so it is refused the same way; a push, which fetches
+            # nothing, still runs a git child and takes the check too.
+            for verb in ("commit", "push"):
+                status, _, body = self.post({"handle": "h", "branch": "fix/it"}, path=f"/v1/workspace/{verb}")
+                self.assertEqual(429, status, verb)
+                self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
+            self.assertEqual([], routed)
+            status, _, _ = self.post({"handle": "h", "path": "README.md"}, path="/v1/workspace/read")
+            self.assertEqual(200, status)
+            self.assertEqual(["read"], routed)
+            self.set_memory_percent(50)
+            status, _, _ = self.post({"repo": "acme/fleet"}, path="/v1/workspace/open")
+            self.assertEqual(200, status)
+
+    def test_a_workspace_write_refused_at_the_hard_watermark_still_delivers_its_429_under_a_large_body(self):
+        # The refusal is written before the body is read. A commit body larger
+        # than the socket buffers is still being sent when the handler closes,
+        # and closing on it resets the connection, which swallows the 429 and
+        # its Retry-After unless the body is drained first (the vcs route's
+        # refusal drains for the same reason). Read after the close has landed
+        # rather than into the race, as the agent API proxy's drain test does.
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        routed = []
+        body = json.dumps({"handle": "h", "pad": "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS}).encode("utf-8")
+        with (
+            mock.patch.object(CredentialProxyHandler, "workspaces", types.SimpleNamespace()),
+            mock.patch.object(CredentialProxyHandler, "_workspace_route", lambda self, route, payload: routed.append(route) or {"ok": True}),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING"),
+        ):
+            request = (
+                b"POST /v1/workspace/commit HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            received = b""
+            with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=10) as client:
+                try:
+                    client.sendall(request)
+                    time.sleep(_RESET_SETTLE_SECONDS)
+                    while chunk := client.recv(65536):
+                        received += chunk
+                except OSError as exc:
+                    self.fail(
+                        "the broker abandoned the connection instead of delivering its 429, "
+                        f"which reads to a caller as a dead broker: {exc}"
+                    )
+        head, _, payload = received.partition(b"\r\n\r\n")
+        self.assertIn(b" 429 ", head.split(b"\r\n", 1)[0])
+        self.assertIn(b"Retry-After: 11", head)
+        self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", json.loads(payload)["code"])
+        self.assertEqual([], routed)
+
+    def test_a_watcher_list_at_the_hard_watermark_is_refused_and_a_watch_passes(self):
+        listing = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?limit=500")
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            listing._handle_watcher_k8s()
+        status, payload, headers = listing.replies[0]
+        self.assertEqual(HTTPStatus.TOO_MANY_REQUESTS, status)
+        self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", payload["code"])
+        self.assertEqual({"Retry-After": "11"}, headers)
+        self.assertEqual([], listing.endpoints_asked)
+        watch = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?watch=true&resourceVersion=1")
+        watch._handle_watcher_k8s()
+        self.assertEqual([], watch.replies)
+        self.assertEqual(1, len(watch.endpoints_asked))
+        self.set_memory_percent(50)
+        listing = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?limit=500")
+        listing._handle_watcher_k8s()
+        self.assertEqual([], listing.replies)
+        self.assertEqual(1, len(listing.endpoints_asked))
+
+
 class ExecRouteCapacityTest(unittest.TestCase):
     """The concurrency cap and the caller watch as the agent meets them: over /v1/exec."""
 
@@ -5654,13 +5866,13 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(1, executor.slots_in_use)
         holder.join()
 
-    def queue_a_slot_taker(self, executor, refused=None):
+    def queue_a_slot_taker(self, executor, refused=None, interactive=False):
         """Queue a slot-taking request on another thread and return once it
         is in the queue; a refusal at the bound is recorded in `refused`."""
 
         def head():
             try:
-                with executor.request_slot():
+                with executor.request_slot(interactive=interactive):
                     pass
             except credential_proxy.CommandSlotUnavailable as error:
                 if refused is not None:
@@ -5751,6 +5963,35 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertIn("waited 0.3s behind them", message)
         self.assertNotIn("without fitting", message)
         self.assertNotIn("concurrent commands", message)
+
+    def test_a_fitting_reservation_keeps_its_place_behind_an_interactive_head_the_budget_holds(self):
+        # The pressure clamp is on: a background command holds the one slot
+        # the clamp leaves, and the interactive head has the reserved slot
+        # free, so what holds it is the budget (one slot-taker's worth plus
+        # one reservation and a byte). The reservation behind it fits, and
+        # admitting it would take the budget the head is waiting for; the
+        # cap it is read against is the head's own, not the background cap.
+        mib = credential_proxy.MEBIBYTE
+        executor = self.budgeted(admits=1, max_output_bytes=mib)
+        executor.children_budget_bytes += credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + 1
+        executor.watermark_gate = types.SimpleNamespace(clamps_concurrency=True)
+        self.assertEqual(1, executor._effective_cap())
+        self.assertEqual(2, executor._effective_cap(interactive=True))
+        release = threading.Event()
+        self.hold_a_slot_until(executor, release)
+        self.assertFalse(executor._fits_budget(takes_slot=True))
+        self.assertTrue(executor._fits_budget(takes_slot=False))
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 2):
+            self.queue_a_slot_taker(executor, interactive=True)
+            with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.3):
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                    with executor.reserve_child_memory():
+                        self.fail("admitted ahead of an interactive head the budget holds")
+            self.assertEqual(1, executor.queued_requests, "the interactive head should still be queued")
+            release.set()
+        message = str(raised.exception)
+        self.assertIn("admission queue is held by requests waiting for its child memory budget", message)
+        self.assertIn("waited 0.3s behind them", message)
 
     def test_a_reservation_that_does_not_fit_is_not_admitted_past_a_slot_held_head(self):
         # One slot, a budget for one: the head waits for the slot cap, but the
