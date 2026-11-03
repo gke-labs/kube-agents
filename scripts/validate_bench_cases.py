@@ -1333,6 +1333,12 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             "boolean; write a bare true or false. bench-gate refuses a quoted "
             "value at spec-load time, after the lease"
         )
+    if "writes_alone" in spec and not isinstance(spec["writes_alone"], bool):
+        problems.append(
+            f"'writes_alone:' {spec['writes_alone']!r} is not a YAML boolean; write a "
+            "bare true or false. The lane reads only a bare true, so a quoted value "
+            "would leave the case in the shared first phase"
+        )
 
     # Fixture roles. Cases address the seeded fleet by role, never by cluster
     # name or project id -- see docs/designs/bench-fleet-catalog.md.
