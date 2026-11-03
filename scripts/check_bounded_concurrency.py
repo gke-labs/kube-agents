@@ -16,7 +16,9 @@ instantiation (an edge to its `__init__`), `self.name(...)` or `cls.name(...)`
 to the same class's method, and a function handed on as a value where the
 handing is itself how a request's work continues: the first argument of
 `.add_task(...)` (Starlette's `BackgroundTasks`) or `.submit(...)` (an executor
-or a queue), and the callable a spawn is given (`target=`, a `Timer`'s function,
+or a queue), a FastAPI dependency (`Depends(fn)`, in a route's `dependencies=`
+or a parameter default, which runs before every request the route serves), and
+the callable a spawn is given (`target=`, a `Timer`'s function,
 `start_new_thread`'s). A call through any other receiver (a module-level
 singleton, a callback stored in one call and invoked in another) is not
 followed; that is the check's blind spot, named here so a reviewer knows it. A
@@ -31,7 +33,10 @@ handler reaches is a finding unless its shape is bounded:
 * a singleton guard: the spawn sits in the body of an `if` whose test reads a
   thread's `.is_alive()` (its `else` branch is not covered), or is the first
   spawn after such an `if` whose body returns, so at most one such thread runs
-  at a time; a second spawn after the early return is not under the guard;
+  at a time; a second spawn after the early return is not under the guard, and
+  neither is a spawn with a loop (`for`, `while`, a comprehension) opened
+  between the guard and it, since the guard was read once and the loop spawns
+  per row;
 * startup: the function is `main`.
 
 A loop over `range(n)` is not a bound, whatever `n` is: a handler that starts a
@@ -43,8 +48,10 @@ since only reachability flags a spawn.
 Go (`GO_TARGET_DIRS`), by text, since the callout has no request-handler marker
 to anchor a graph on. Comments and string literals are stripped from the whole
 file first, a raw string or block comment spanning lines included, and the rest
-is read as code. Every `go func(...)` or `go name(...)` statement in a non-test
-file, at the start of a line or after a `{`, `;` or `:` on it, is a finding
+is read as code. Every `go` statement in a non-test file, whatever call
+expression follows the keyword (`go f(m)`, `go s.handlers[i](m)`, `go (&w{}).run()`),
+at the start of a line or after a `{`, `;` or `:` on it, each one on a line
+counted on its own, is a finding
 unless it sits in a startup function, or a semaphore gates it in the same block
 before the statement (a send on a channel whose name starts with `sem` or
 carries `Sem`, or an `Acquire(...)`, written between the `{` that opens the
@@ -57,7 +64,10 @@ scan's blind spot. A startup function's bound stops at a function literal: a
 `go` statement inside a closure the function builds (`mux.HandleFunc(path,
 func(w, r) { go ... })`, a subscription callback), and whatever that closure
 calls, is not startup, since the closure runs when its caller decides, which
-for a handler is once per request. A `func(` opens a literal when the `{` that
+for a handler is once per request. A function is read from the `{` that opens
+its body on the declaration line (so a one-line function, `func f() { go g() }`,
+is read like any other and a function type in the signature opens nothing). A
+`func(` opens a literal when the `{` that
 follows its parameter list comes before a `;` or the end of that line (so a
 function type, `var cb func()` or `map[string]func()`, opens none); the body is
 the brace pair that `{` starts, and the literal is found by brace nesting, so a
@@ -128,9 +138,13 @@ THREAD_BASES = frozenset({"Thread", "Timer"})
 # Calls that hand a function on as a value and run it as the request's work:
 # the callee name, and the position of the function among the positional
 # arguments. `add_task` is Starlette's `BackgroundTasks`, `submit` an executor
-# or a queue, `Timer(interval, function)` and `start_new_thread(function, args)`
-# the spawns' own callables.
-CALLBACK_POSITIONS: dict[str, int] = {"add_task": 0, "submit": 0, "start_new_thread": 0, "Timer": 1}
+# or a queue, `Depends(fn)` a FastAPI dependency the route runs before its body,
+# `Timer(interval, function)` and `start_new_thread(function, args)` the
+# spawns' own callables.
+CALLBACK_POSITIONS: dict[str, int] = {"add_task": 0, "submit": 0, "Depends": 0, "start_new_thread": 0, "Timer": 1}
+# A loop between a liveness guard and a spawn runs the spawn per row, so the
+# guard bounds nothing under it; comprehensions are loops too.
+LOOP_NODES = (ast.For, ast.AsyncFor, ast.While, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 # Keywords that hand a function on the same way: `Thread(target=...)`,
 # `Timer(function=...)`.
 CALLBACK_KEYWORDS = frozenset({"target", "function"})
@@ -146,13 +160,20 @@ CONSTRUCTOR = "__init__"
 QUALIFIED_SEPARATOR = "."
 
 # Go, by text, on lines with comments and strings removed. A spawn is a `go`
-# statement at the start of a line or after a `{`, `;` or `:` on it (group 1 is
-# the statement, so its column is known); a function starts at column 0 with
-# `func`, optionally with a receiver, and ends at the first `}` at column 0
-# (gofmt's shape, which `go vet` in CI holds).
-GO_SPAWN_RE = re.compile(r"(?:^|[{;:])\s*(go\s+(?:func\b|[A-Za-z_][\w.]*\())")
+# statement at the start of a line or after a `{`, `;` or `:` on it, whatever
+# call expression follows the keyword (group 1 is the statement, so its column
+# is known; `go` is a keyword, so after stripping nothing else reads `go `
+# there); a function starts at column 0 with `func`, optionally with a
+# receiver, its body opens at the first `{` on that line outside parentheses
+# and brackets that no `struct` or `interface` precedes, and it ends on the
+# declaration line when that line's braces balance, else at the first `}` at
+# column 0 (gofmt's shapes, which `go vet` in CI holds).
+GO_SPAWN_RE = re.compile(r"(?:^|[{;:])\s*(go\s+(?=\S))")
 GO_FUNC_RE = re.compile(r"^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)")
 GO_FUNC_END = "}"
+GO_NEST_OPEN = frozenset({"(", "["})
+GO_NEST_CLOSE = frozenset({")", "]"})
+GO_TYPE_BLOCK_RE = re.compile(r"\b(?:struct|interface)\s*$")
 # A semaphore: a send on a channel named for one (`sem`, `semaphore`, `connSem`;
 # not `assembly` or `resemble`), or an `Acquire(` call.
 GO_SEMAPHORE_RE = re.compile(r"\b(?:sem\w*|\w*Sem\w*)\s*<-|\.Acquire\(")
@@ -307,18 +328,27 @@ def _read_unit(node: ast.AST, name: str, class_name: str | None, entry_point: bo
     spawn_callees = THREAD_SPAWN_CALLEES | facts.thread_classes
     # Iterative walk carrying the depth, so a spawn knows what encloses it: a
     # node's descendants are the ones visited at a deeper depth before the walk
-    # returns to its own depth or shallower.
-    guard_depths: list[int] = []
-    early_exit_seen = False
+    # returns to its own depth or shallower. Every loop entered takes a serial,
+    # so a guard knows whether a loop opened after it was read (a loop opened
+    # before the guard encloses it and leaves the bound alone).
+    loops_entered = 0
+    open_loops: list[tuple[int, int]] = []  # (depth, serial)
+    guards: list[tuple[int, int]] = []  # (depth, loops entered when the guard was read)
+    early_exit_mark: int | None = None
     pending: list[tuple[ast.AST, int]] = [(node, 0)]
     while pending:
         current, depth = pending.pop()
-        while guard_depths and guard_depths[-1] >= depth:
-            guard_depths.pop()
+        while guards and guards[-1][0] >= depth:
+            guards.pop()
+        while open_loops and open_loops[-1][0] >= depth:
+            open_loops.pop()
+        if isinstance(current, LOOP_NODES):
+            loops_entered += 1
+            open_loops.append((depth, loops_entered))
         if isinstance(current, ast.If) and _reads_liveness(current.test):
-            guard_depths.append(depth)
+            guards.append((depth, loops_entered))
             if _returns(current.body):
-                early_exit_seen = True
+                early_exit_mark = loops_entered
             # The guard covers the `if`'s test and body. Its `orelse` runs when
             # the test did not hold, so it is queued at the `if`'s own depth,
             # where the walk closes the guard before reading it.
@@ -328,15 +358,16 @@ def _read_unit(node: ast.AST, name: str, class_name: str | None, entry_point: bo
         if isinstance(current, ast.Call):
             callee = _callee_name(current)
             if callee in spawn_callees:
+                looped_since = {serial for _, serial in open_loops}
                 if simple == STARTUP_FUNCTION:
                     bound: str | None = BOUND_STARTUP
-                elif guard_depths:
+                elif guards and not any(serial > guards[-1][1] for serial in looped_since):
                     bound = BOUND_SINGLETON
-                elif early_exit_seen:
+                elif early_exit_mark is not None and not any(serial > early_exit_mark for serial in looped_since):
                     # The early return bounds the one spawn that follows it,
                     # not every later spawn in the function.
                     bound = BOUND_SINGLETON
-                    early_exit_seen = False
+                    early_exit_mark = None
                 else:
                     bound = None
                 unit.spawns.append((current.lineno, bound))
@@ -446,6 +477,9 @@ class _GoFunction:
     lines: list[str]
     start: int  # 1-indexed, inclusive
     end: int
+    # The column of the `{` that opens the body on the declaration line (the
+    # line's length when it has none), so the walk starts after the signature.
+    body_column: int
 
 
 @dataclass(frozen=True)
@@ -511,32 +545,56 @@ def _go_strip(lines: list[str]) -> list[str]:
     return stripped
 
 
+def _go_body_column(text: str, start: int) -> int:
+    """The column of the `{` that opens a function body on its declaration line.
+
+    The first `{` after `start` outside parentheses and brackets that no
+    `struct` or `interface` precedes, so a parameter or result type with its
+    own braces is skipped; the line's length when there is none.
+    """
+    nesting = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char in GO_NEST_OPEN:
+            nesting += 1
+        elif char in GO_NEST_CLOSE:
+            nesting -= 1
+        elif char == GO_BRACE_OPEN and nesting == 0 and GO_TYPE_BLOCK_RE.search(text[:index]) is None:
+            return index
+    return len(text)
+
+
 def _go_functions(shown: str, lines: list[str]) -> list[_GoFunction]:
-    """Every top-level function of one stripped file, with its line span."""
+    """Every top-level function of one stripped file, with its line span and body column."""
     functions: list[_GoFunction] = []
-    current: tuple[str, int] | None = None
+    current: tuple[str, int, int] | None = None
     for number, text in enumerate(lines, 1):
         match = GO_FUNC_RE.match(text)
         if match is not None:
             if current is not None:
-                functions.append(_GoFunction(current[0], shown, lines, current[1], number - 1))
-            current = (match.group(1), number)
+                functions.append(_GoFunction(current[0], shown, lines, current[1], number - 1, current[2]))
+            current = (match.group(1), number, _go_body_column(text, match.end()))
+            # A one-line function closes on its declaration line.
+            if GO_BRACE_OPEN in text and text.count(GO_BRACE_OPEN) == text.count(GO_BRACE_CLOSE):
+                functions.append(_GoFunction(current[0], shown, lines, number, number, current[2]))
+                current = None
         elif current is not None and text.rstrip() == GO_FUNC_END:
-            functions.append(_GoFunction(current[0], shown, lines, current[1], number))
+            functions.append(_GoFunction(current[0], shown, lines, current[1], number, current[2]))
             current = None
     if current is not None:
-        functions.append(_GoFunction(current[0], shown, lines, current[1], len(lines)))
+        functions.append(_GoFunction(current[0], shown, lines, current[1], len(lines), current[2]))
     return functions
 
 
 def _go_walk(function: _GoFunction, line: int | None = None, column: int = 0) -> _GoPosition:
-    """Walk the braces of a function body from the line after its declaration to a point.
+    """Walk the braces of a function body from the `{` that opens it to a point.
 
     The point is `column` characters into `line`, or the end of the function
-    when `line` is None. The declaration line is skipped, so a function type in
-    the signature opens nothing. A `func(` opens a literal when the `{` after
-    its parameter list comes before a `;` or the end of that list's line; the
-    literal is open until that brace's pair closes.
+    when `line` is None. The signature is skipped (the walk starts after the
+    body's `{` on the declaration line), so a function type in it opens
+    nothing. A `func(` opens a literal when the `{` after its parameter list
+    comes before a `;` or the end of that list's line; the literal is open
+    until that brace's pair closes.
     """
     depth = 0
     # The parenthesis depth of a `func(` parameter list being read, or None.
@@ -546,10 +604,12 @@ def _go_walk(function: _GoFunction, line: int | None = None, column: int = 0) ->
     outside: list[str] = []
     blocks: list[list[str]] = [[]]
     stop = function.end if line is None else line
-    for number in range(function.start + 1, stop + 1):
+    for number in range(function.start, stop + 1):
         code = function.lines[number - 1]
         if line is not None and number == stop:
             code = code[:column]
+        if number == function.start:
+            code = code[function.body_column + 1 :]
         index = 0
         while index < len(code):
             char = code[index]
@@ -623,23 +683,22 @@ def scan_go(paths: Iterable[Path], root: Path) -> list[Spawn]:
     for shown, lines in files:
         own = [f for f in functions if f.file == shown]
         for number, text in enumerate(lines, 1):
-            match = GO_SPAWN_RE.search(text)
-            if match is None:
-                continue
-            enclosing = next((f for f in own if f.start <= number <= f.end), None)
-            if enclosing is None:
-                spawns.append(Spawn(shown, number, GO_NO_FUNCTION, KIND_GOROUTINE, (GO_NO_GRAPH,), None))
-                continue
-            position = _go_walk(enclosing, number, match.start(1))
-            if enclosing.name == STARTUP_FUNCTION and not position.in_literal:
-                bound: str | None = BOUND_STARTUP
-            elif enclosing.name in startup and not position.in_literal:
-                bound = BOUND_GO_STARTUP
-            elif GO_SEMAPHORE_RE.search(position.block):
-                bound = BOUND_GO_SEMAPHORE
-            else:
-                bound = None
-            spawns.append(Spawn(shown, number, enclosing.name, KIND_GOROUTINE, (GO_NO_GRAPH,), bound))
+            # Every statement on the line, so `go a(); go b()` counts two.
+            for match in GO_SPAWN_RE.finditer(text):
+                enclosing = next((f for f in own if f.start <= number <= f.end), None)
+                if enclosing is None:
+                    spawns.append(Spawn(shown, number, GO_NO_FUNCTION, KIND_GOROUTINE, (GO_NO_GRAPH,), None))
+                    continue
+                position = _go_walk(enclosing, number, match.start(1))
+                if enclosing.name == STARTUP_FUNCTION and not position.in_literal:
+                    bound: str | None = BOUND_STARTUP
+                elif enclosing.name in startup and not position.in_literal:
+                    bound = BOUND_GO_STARTUP
+                elif GO_SEMAPHORE_RE.search(position.block):
+                    bound = BOUND_GO_SEMAPHORE
+                else:
+                    bound = None
+                spawns.append(Spawn(shown, number, enclosing.name, KIND_GOROUTINE, (GO_NO_GRAPH,), bound))
     return spawns
 
 

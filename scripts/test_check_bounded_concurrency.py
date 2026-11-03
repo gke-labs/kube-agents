@@ -33,12 +33,16 @@ from scripts.check_bounded_concurrency import (  # noqa: E402
     scan_python,
 )
 
-# A FastAPI module with every Python shape the check distinguishes.
+# A FastAPI module with every spawn and bounded shape the check distinguishes
+# and every edge it follows, in one spelling each: `post`/`get` of the nine
+# route decorators, `Thread` and `Timer` as bases, `self` and `cls` as
+# receivers, one `async def` route. The checker's tables list the rest.
 PYTHON_FIXTURE = textwrap.dedent(
     '''
     import _thread
     import threading
     from concurrent.futures import ThreadPoolExecutor
+    from fastapi import Depends
     from http.server import BaseHTTPRequestHandler
 
     app = object()
@@ -235,12 +239,70 @@ PYTHON_FIXTURE = textwrap.dedent(
         return {}
 
 
+    @app.post("/guard-loop-inside")
+    def post_guard_loop_inside(payload):
+        global _digest_thread
+        if _digest_thread is None or not _digest_thread.is_alive():
+            for row in payload["rows"]:
+                threading.Thread(target=_work, args=(row,), daemon=True).start()
+        return {}
+
+
+    @app.post("/guard-then-loop")
+    def post_guard_then_loop(payload):
+        with _lock:
+            if _digest_thread is not None and _digest_thread.is_alive():
+                return {}
+        for row in payload["rows"]:
+            threading.Thread(target=_work, args=(row,), daemon=True).start()
+        return {}
+
+
+    @app.post("/guard-in-loop")
+    def post_guard_in_loop(payload):
+        global _digest_thread
+        for _ in payload["rows"]:
+            if _digest_thread is None or not _digest_thread.is_alive():
+                _digest_thread = threading.Thread(target=_work, daemon=True)
+                _digest_thread.start()
+        return {}
+
+
+    @app.get("/dependent", dependencies=[Depends(_dependency)])
+    def get_dependent():
+        return {}
+
+
+    @app.get("/dependent-param")
+    async def get_dependent_param(session=Depends(_dependency)):
+        return {}
+
+
+    def _dependency():
+        threading.Thread(target=_work, daemon=True).start()
+
+
+    class Watchdog(threading.Timer):
+        pass
+
+
     class Door(BaseHTTPRequestHandler):
         def do_POST(self):
             self._proxy()
 
         def _proxy(self):
             threading.Thread(target=_work, daemon=True).start()
+
+        def do_GET(self):
+            self._arm()
+
+        @classmethod
+        def _arm(cls):
+            cls._watch()
+
+        @classmethod
+        def _watch(cls):
+            Watchdog(30, _work).start()
 
 
     def _work(*args):
@@ -316,6 +378,25 @@ GO_FIXTURE = textwrap.dedent(
     \tgo work("")
     }
 
+    func routed(m string) {
+    \tgo handlers[0](m)
+    \tgo (&S{}).Handle(m)
+    }
+
+    func twice(m string) {
+    \tgo work(m); go work(m)
+    }
+
+    func dispatched(m string) {
+    \tswitch m {
+    \tcase "": go work(m)
+    \t}
+    }
+
+    func liveHandlerOneLine() { mux.HandleFunc("/livez", func(w, r) { go audit(r) }) }
+
+    func quick(x struct{}) { go serve() }
+
     func work(m string) {}
 
     func main() {
@@ -332,12 +413,14 @@ GO_FIXTURE = textwrap.dedent(
     Handle(
     `)
     \tvar cb func()
-    \t_ = cb
+    \tif cb == nil { go work("") }
     \tgo func() {}()
     \tfor i := 0; i < 2; i++ { go work("") }
     \t_ = New()
     \tstatusHandler()
     \tliveHandler()
+    \tliveHandlerOneLine()
+    \tquick(struct{}{})
     \treturn nil
     }
 
@@ -402,12 +485,15 @@ GO_FILE = f"{GO_DIR}/callout.go"
 GO_SERVICE_FILE = f"{GO_DIR}/service.go"
 ALLOWLIST_NAME = "allow.txt"
 
-# Every finding the fixtures carry, as the allowlist that pins them exactly.
+# Every finding the fixtures carry, as the allowlist that pins them exactly:
+# one spawn per Python function, and (file, function, spawns) in Go.
 FLAGGED_PYTHON = (
     "Door._proxy",
+    "Door._watch",
     "_SizedWorkers.__init__",
     "_chained",
     "_deferred",
+    "_dependency",
     "_lookup",
     "_started",
     "_submitted",
@@ -416,8 +502,10 @@ FLAGGED_PYTHON = (
     "post_chained",
     "post_fanout",
     "post_fixed_fanout",
+    "post_guard_loop_inside",
     "post_guard_orelse",
     "post_guard_then_fanout",
+    "post_guard_then_loop",
     "post_pool_per_request",
     "post_start_new_thread",
     "post_subclass",
@@ -426,18 +514,26 @@ FLAGGED_PYTHON = (
     "post_unbounded",
 )
 FLAGGED_GO = (
-    ("callout.go", "assembled"),
-    ("callout.go", "fanout"),
-    ("callout.go", "handle"),
-    ("callout.go", "limitElsewhere"),
-    ("callout.go", "liveHandler"),
-    ("callout.go", "probe"),
-    ("callout.go", "statusHandler"),
-    ("service.go", "Handle"),
+    ("callout.go", "assembled", 1),
+    ("callout.go", "dispatched", 1),
+    ("callout.go", "fanout", 1),
+    ("callout.go", "handle", 1),
+    ("callout.go", "limitElsewhere", 1),
+    ("callout.go", "liveHandler", 1),
+    ("callout.go", "liveHandlerOneLine", 1),
+    ("callout.go", "probe", 1),
+    ("callout.go", "routed", 2),
+    ("callout.go", "statusHandler", 1),
+    ("callout.go", "twice", 2),
+    ("service.go", "Handle", 1),
 )
 FULL_ALLOWLIST = "# fixture\n" + "".join(f"{PYTHON_TARGET} {name} 1\n" for name in FLAGGED_PYTHON) + "".join(
-    f"{GO_DIR}/{file} {name} 1\n" for file, name in FLAGGED_GO
+    f"{GO_DIR}/{file} {name} {count}\n" for file, name, count in FLAGGED_GO
 )
+FLAGGED_SPAWNS = len(FLAGGED_PYTHON) + sum(count for _, _, count in FLAGGED_GO)
+# The allowlist line an entry sits on, and the first line after the list.
+ALLOWLIST_LINES = {line.split()[1]: number for number, line in enumerate(FULL_ALLOWLIST.splitlines(), 1) if number > 1}
+ALLOWLIST_NEXT_LINE = len(FULL_ALLOWLIST.splitlines()) + 1
 
 
 def _write(root: Path, rel: str, text: str) -> Path:
@@ -517,6 +613,31 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual([BOUND_SINGLETON, None], [s.bounded_by for s in spawns])
         self.assertEqual(1, sum(s.flagged for s in spawns))
 
+    def test_a_loop_between_the_guard_and_the_spawn_breaks_the_bound(self):
+        # A per-row loop in the guard's body, and one after an early return
+        # (here under the lock, the KV server's shape): both spawn per row.
+        for function in ("post_guard_loop_inside", "post_guard_then_loop"):
+            with self.subTest(function=function):
+                spawn = self._python(function)
+                self.assertIsNone(spawn.bounded_by)
+                self.assertTrue(spawn.flagged)
+        # A guard inside the loop is read on every row and still holds.
+        in_loop = self._python("post_guard_in_loop")
+        self.assertEqual(BOUND_SINGLETON, in_loop.bounded_by)
+        self.assertFalse(in_loop.flagged)
+
+    def test_a_fastapi_dependency_is_followed_from_the_route(self):
+        # `Depends(fn)` in a route's `dependencies=` and in an async route's
+        # parameter default both run fn before the route body.
+        dependency = self._python("_dependency")
+        self.assertEqual(("get_dependent", "get_dependent_param"), dependency.reachable_from)
+        self.assertTrue(dependency.flagged)
+
+    def test_a_timer_subclass_built_through_a_cls_call_is_a_spawn(self):
+        watch = self._python("Door._watch")
+        self.assertTrue(watch.flagged)
+        self.assertIn("Door.do_GET", watch.reachable_from)
+
     def test_start_new_thread_and_a_timer_function_keyword_are_spawns_whose_callee_is_followed(self):
         self.assertTrue(self._python("post_start_new_thread").flagged)
         started = self._python("_started")
@@ -575,13 +696,33 @@ class FixtureTest(unittest.TestCase):
 
     def test_a_go_statement_after_a_brace_on_its_line_is_read(self):
         by_function = self._go()
-        # `for ... { go work("") }` in run: a startup block, not a literal.
+        # `if cb == nil { go work("") }` and `for ... { go work("") }` in run: startup
+        # blocks, not literals, the first directly under a `func()` type.
         run_spawns = [s for s in scan_go(go_files(self.root / GO_DIR), self.root) if s.function == "run"]
-        self.assertEqual(2, len(run_spawns))
+        self.assertEqual(3, len(run_spawns))
         self.assertEqual({BOUND_GO_STARTUP}, {s.bounded_by for s in run_spawns})
         # A one-line HandleFunc closure built on the startup path: a literal, flagged.
         self.assertIsNone(by_function["liveHandler"].bounded_by)
         self.assertTrue(by_function["liveHandler"].flagged)
+
+    def test_a_go_statement_is_any_call_and_each_one_on_a_line_counts(self):
+        spawns = scan_go(go_files(self.root / GO_DIR), self.root)
+        # An index expression and a parenthesised receiver after `go`.
+        routed = [s for s in spawns if s.function == "routed"]
+        self.assertEqual(2, len(routed))
+        self.assertTrue(all(s.flagged for s in routed))
+        # Two statements on one line, after `;`; one after a `case` label's `:`.
+        twice = [s for s in spawns if s.function == "twice"]
+        self.assertEqual([None, None], [s.bounded_by for s in twice])
+        self.assertTrue(self._go()["dispatched"].flagged)
+
+    def test_a_one_line_function_is_read_from_its_body_brace(self):
+        by_function = self._go()
+        # A one-line HandleFunc closure on the startup path: a literal, flagged.
+        self.assertIsNone(by_function["liveHandlerOneLine"].bounded_by)
+        self.assertTrue(by_function["liveHandlerOneLine"].flagged)
+        # A one-line function run reaches, with a `struct{}` in its signature: startup.
+        self.assertEqual(BOUND_GO_STARTUP, by_function["quick"].bounded_by)
 
     def test_set_limit_does_not_bound_a_go_statement(self):
         spawn = self._go()["limitElsewhere"]
@@ -595,7 +736,7 @@ class FixtureTest(unittest.TestCase):
         # lines; none puts Handle on the startup path.
         self.assertTrue(by_function["Handle"].flagged)
         self.assertEqual(
-            sorted(name for _, name in FLAGGED_GO),
+            sorted(name for _, name, _ in FLAGGED_GO),
             sorted(s.function for s in by_function.values() if s.flagged),
         )
 
@@ -624,14 +765,16 @@ class FixtureTest(unittest.TestCase):
     def test_an_unpinned_finding_fails_and_names_the_handler(self):
         code, _, err = _run(self.root, FULL_ALLOWLIST.replace(f"{PYTHON_TARGET} post_unbounded 1\n", ""))
         self.assertEqual(EXIT_FAIL, code)
-        self.assertIn("server.py:16: post_unbounded starts a thread per request, reachable from post_unbounded", err)
+        self.assertIn("server.py:17: post_unbounded starts a thread per request, reachable from post_unbounded", err)
 
     def test_a_rise_above_the_entry_fails(self):
         spawn = "    threading.Thread(target=_work, args=(payload,), daemon=True).start()\n"
         self.py.write_text(PYTHON_FIXTURE.replace(spawn, spawn + spawn), encoding="utf-8")
         code, _, err = _run(self.root, FULL_ALLOWLIST)
         self.assertEqual(EXIT_FAIL, code)
-        self.assertIn("post_unbounded has 2 unbounded per-request spawn(s), the entry at allow.txt:21 allows 1", err)
+        self.assertIn(
+            f"post_unbounded has 2 unbounded per-request spawn(s), the entry at allow.txt:{ALLOWLIST_LINES['post_unbounded']} allows 1", err
+        )
 
     def test_a_drop_below_the_entry_fails_until_lowered(self):
         code, _, err = _run(self.root, FULL_ALLOWLIST.replace("post_unbounded 1", "post_unbounded 2"))
@@ -641,12 +784,14 @@ class FixtureTest(unittest.TestCase):
     def test_a_stale_entry_fails(self):
         code, _, err = _run(self.root, FULL_ALLOWLIST + f"{PYTHON_TARGET} post_pooled 1\n")
         self.assertEqual(EXIT_FAIL, code)
-        self.assertIn("allow.txt:30: svc/server.py post_pooled has no unbounded per-request spawn left; remove the entry", err)
+        self.assertIn(
+            f"allow.txt:{ALLOWLIST_NEXT_LINE}: svc/server.py post_pooled has no unbounded per-request spawn left; remove the entry", err
+        )
 
     def test_an_entry_for_an_unread_file_fails(self):
         code, _, err = _run(self.root, FULL_ALLOWLIST + "svc/other.py anything 1\n")
         self.assertEqual(EXIT_FAIL, code)
-        self.assertIn("allow.txt:30: svc/other.py is not a file this check reads; remove the entry", err)
+        self.assertIn(f"allow.txt:{ALLOWLIST_NEXT_LINE}: svc/other.py is not a file this check reads; remove the entry", err)
 
     def test_a_malformed_or_duplicate_line_fails(self):
         code, _, err = _run(
@@ -654,14 +799,16 @@ class FixtureTest(unittest.TestCase):
             FULL_ALLOWLIST + f"{PYTHON_TARGET} post_unbounded\n{PYTHON_TARGET} _lookup 0\n{PYTHON_TARGET} _lookup 1\n",
         )
         self.assertEqual(EXIT_FAIL, code)
-        self.assertIn("allow.txt:30: expected `<file> <function> <count>` with a count above zero", err)
-        self.assertIn("allow.txt:31: expected `<file> <function> <count>` with a count above zero", err)
-        self.assertIn("allow.txt:32: svc/server.py _lookup already has an entry at line 6", err)
+        self.assertIn(f"allow.txt:{ALLOWLIST_NEXT_LINE}: expected `<file> <function> <count>` with a count above zero", err)
+        self.assertIn(f"allow.txt:{ALLOWLIST_NEXT_LINE + 1}: expected `<file> <function> <count>` with a count above zero", err)
+        self.assertIn(
+            f"allow.txt:{ALLOWLIST_NEXT_LINE + 2}: svc/server.py _lookup already has an entry at line {ALLOWLIST_LINES['_lookup']}", err
+        )
 
     def test_a_missing_allowlist_holds_every_function_at_zero(self):
         code, _, err = _run(self.root)
         self.assertEqual(EXIT_FAIL, code)
-        self.assertEqual(len(FLAGGED_PYTHON) + len(FLAGGED_GO), err.count("bound it or pin it in"))
+        self.assertEqual(FLAGGED_SPAWNS, err.count("bound it or pin it in"))
 
     def test_a_missing_python_target_fails(self):
         code, _, err = _run(self.root, FULL_ALLOWLIST, python_targets=(PYTHON_TARGET, "svc/moved.py"))
