@@ -4436,7 +4436,13 @@ def drain_request_body(handler: BaseHTTPRequestHandler, max_bytes: int) -> None:
     it discards in AGENT_API_DRAIN_CHUNK_BYTES chunks rather than
     materialising the body, and it gives up after
     AGENT_API_DRAIN_TIMEOUT_SECONDS so a client that announces a body and
-    stalls cannot hold the handler thread.
+    stalls, or drips it, cannot hold the handler thread. That bound is the
+    drain's own, armed in place of the request's read deadline
+    (_RequestReadDeadline): a refusal that waited for admission, the vcs
+    route's queue timeout, reaches here after that deadline, counted from
+    the request's first byte, has passed, and the first read that needs the
+    socket would otherwise fail before any byte, leaving the body unread and
+    the answer to the close.
 
     Declining the oversized case has a cost worth stating: a body over
     ``max_bytes`` still loses its refusal to the reset, which is the symptom
@@ -4453,6 +4459,9 @@ def drain_request_body(handler: BaseHTTPRequestHandler, max_bytes: int) -> None:
     if content_length <= 0 or content_length > max_bytes:
         return
     previous_timeout = handler.connection.gettimeout()
+    arm = getattr(handler, "_arm_request_read_deadline", None)
+    if arm is not None:
+        arm(AGENT_API_DRAIN_TIMEOUT_SECONDS)
     try:
         handler.connection.settimeout(AGENT_API_DRAIN_TIMEOUT_SECONDS)
         remaining = content_length
@@ -4572,8 +4581,10 @@ class _RequestReadDeadline:
     the handler's handle_one_request does so once the route has returned.
     A route that bounds a late body read by a deadline of its own
     (_read_json_body_within, measured from admission) disarms this one
-    first. A handler built without a socket (the route tests' stand-ins
-    assign their own rfile) has no stream to arm, and both calls do nothing.
+    first, and a refusal's body drain, which may run after it has passed,
+    arms it again with the drain's own window (drain_request_body). A
+    handler built without a socket (the route tests' stand-ins assign their
+    own rfile) has no stream to arm, and both calls do nothing.
     """
 
     _request_stream: _DeadlineSocketIO | None = None
@@ -4590,12 +4601,14 @@ class _RequestReadDeadline:
             self._request_stream, self.rbufsize if self.rbufsize > 0 else io.DEFAULT_BUFFER_SIZE
         )
 
-    def _arm_request_read_deadline(self) -> None:
+    def _arm_request_read_deadline(self, window: float | None = None) -> None:
         if self._request_stream is None:
             return
+        if window is None:
+            window = KEEPALIVE_IDLE_SECONDS
         with contextlib.suppress(OSError):
-            self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
-        self._request_stream.arm(KEEPALIVE_IDLE_SECONDS)
+            self.connection.settimeout(window)
+        self._request_stream.arm(window)
 
     def _disarm_request_read_deadline(self) -> None:
         if self._request_stream is None:
@@ -11680,7 +11693,10 @@ def _log_socket_timeout(handler: BaseHTTPRequestHandler, message: str, args: tup
     before its response was on the wire; it went unanswered, and is a warning
     naming it, with the bytes of it that arrived. requestline is the stdlib's
     copy of the request line, caller text, sanitised as log_message sanitises
-    it, and empty when the stall came inside the line.
+    it, and empty when the stall came inside the line: the credentialed
+    handler clears it before each request line is read, since the stdlib
+    assigns it inside parse_request and never resets it, and the door's
+    kept-open connections have never served a request.
     """
     if not message.startswith(IDLE_CLOSE_LOG_PREFIX):
         return False
@@ -15283,10 +15299,14 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # parse_request resets the command and never the path, so on a
         # kept-open connection a request line it rejects (a 400, a 414, a
         # 431) would otherwise be counted by log_request under the previous
-        # request's route. raw_requestline is emptied for log_error, which
-        # reads it to tell the idle close from a request that stalled
+        # request's route. requestline, which parse_request assigns and
+        # never resets either, is cleared for the same reason: a request
+        # that stalls inside its line would otherwise be logged under the
+        # previous request's. raw_requestline is emptied for log_error,
+        # which reads it to tell the idle close from a request that stalled
         # (_log_socket_timeout).
         self.path = ""
+        self.requestline = ""
         self.raw_requestline = b""
         self._arm_request_read_deadline()
         try:

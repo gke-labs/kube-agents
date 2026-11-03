@@ -3122,6 +3122,54 @@ class ResourcePressureRouteTest(unittest.TestCase):
                 self.assertEqual((200, b'{"status":"ok"}'), (probe.status, probe.read()))
         self.assertEqual([], routed)
 
+    def test_a_vcs_request_refused_after_its_slot_wait_still_delivers_its_503_under_a_large_body(self):
+        # The queue refusal takes the same branch as the gate's, after a wait:
+        # the vcs route enters its slot before reading the body, and a wait
+        # that runs the whole of COMMAND_SLOT_WAIT_SECONDS ends after the
+        # request's own read deadline, counted from its first byte, has
+        # passed. The drain must then still read the body, under a deadline
+        # of its own, or its first read fails before any byte, the 503 is
+        # written over an unread body and the close resets a caller still
+        # sending the bundle. Drained, the 503 is framed on a connection kept
+        # open, and the next request on it is answered.
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        body = json.dumps({"repository": "acme/fleet", "pad": "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS}).encode("utf-8")
+
+        def wait_out_the_queue():
+            time.sleep(_SLOT_WAIT_PAST_THE_WINDOW_SECONDS)
+            raise credential_proxy.CommandSlotUnavailable("every slot is taken")
+
+        with (
+            mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS),
+            mock.patch.object(CredentialProxyHandler, "vcs", mock.Mock()),
+            mock.patch.object(CredentialProxyHandler, "_request_slot", side_effect=wait_out_the_queue),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING"),
+        ):
+            request = (
+                b"POST /v1/vcs/publish HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=10) as client:
+                try:
+                    client.sendall(request)
+                    refusal = http.client.HTTPResponse(client)
+                    refusal.begin()
+                    payload = refusal.read()
+                except OSError as exc:
+                    self.fail(
+                        "the broker abandoned the connection instead of delivering its 503, "
+                        f"which reads to a caller as a dead broker: {exc}"
+                    )
+                self.assertEqual(503, refusal.status)
+                self.assertNotEqual("close", (refusal.getheader("Connection") or "").lower())
+                self.assertEqual("CREDENTIAL_PROXY_BUSY", json.loads(payload)["code"])
+                client.sendall(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                probe = http.client.HTTPResponse(client)
+                probe.begin()
+                self.assertEqual((200, b'{"status":"ok"}'), (probe.status, probe.read()))
+
     def test_a_watcher_list_at_the_hard_watermark_is_refused_and_a_watch_passes(self):
         listing = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?limit=500")
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
@@ -15726,6 +15774,14 @@ _DRIP_INTERVAL_SECONDS = _SHORT_IDLE_SECONDS / 5
 # A request line, header or body long enough that, dripped at that interval,
 # it is still incomplete when every window the tests arm has passed.
 _DRIPPED_HEAD_BYTES = 400
+# The start of a request line that never finishes, sent on a connection that
+# has already served a request.
+_PARTIAL_REQUEST_LINE = b"GET /"
+# A slot wait that outlasts the short idle window, as the shipped wait and
+# window do (COMMAND_SLOT_WAIT_SECONDS and KEEPALIVE_IDLE_SECONDS, 60 s each,
+# the wait counted from admission and the window from the request's first
+# byte): a queue refusal always lands after the request's read deadline.
+_SLOT_WAIT_PAST_THE_WINDOW_SECONDS = 2 * _SHORT_IDLE_SECONDS
 
 
 def _drip(sock, data, stop):
@@ -16000,6 +16056,25 @@ class KeepAliveTest(_CredentialedUnixServer):
                     self.assertGreater(received, len(sent_whole), stalled[0])
                     self.assertFalse(any("closed idle" in line for line in logs.output), logs.output)
 
+    def test_a_request_line_that_stalls_on_a_kept_open_connection_is_not_logged_under_the_previous_one(self):
+        # The stdlib assigns requestline inside parse_request and never resets
+        # it, so unless the handler clears it before each request line is
+        # read, a second request that stalls inside its line is logged under
+        # the first request's line, and the operator chasing the stall is sent
+        # to a request that was answered.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            sock = self.connect()
+            self.send(sock, "GET", "/healthz")
+            self.assertEqual(200, self.response(sock)[0])
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                sock.sendall(_PARTIAL_REQUEST_LINE)
+                self.assertTrue(self.closed_by_server(sock), "the stalled connection was not closed")
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+        stalled = [line for line in logs.output if "request stalled" in line]
+        self.assertEqual(1, len(stalled), logs.output)
+        self.assertIn(f"requestline= received_bytes={len(_PARTIAL_REQUEST_LINE)} ", stalled[0])
+        self.assertNotIn("/healthz", stalled[0])
+
     def test_a_caller_that_stops_reading_a_response_has_its_connection_closed(self):
         # _json gives the write up at RESPONSE_WRITE_TIMEOUT_SECONDS. The
         # response is then incomplete on the wire, so the connection cannot
@@ -16030,10 +16105,17 @@ class KeepAliveTest(_CredentialedUnixServer):
         # would send on one the broker just closed. The cluster's timeout in
         # the shipped config is the one that holds.
         config = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "envoy-credential-proxy.yaml"
-        # The cluster's idle_timeout, not the listener's stream_idle_timeout.
-        match = re.search(r"(?<![a-z_])idle_timeout:\s*(\d+)s", config.read_text())
+        # The cluster's idle_timeout: searched from the clusters block on, so
+        # neither the listener's stream_idle_timeout nor an idle_timeout the
+        # connection manager above it may carry is the one read.
+        clusters = config.read_text().partition("clusters:")[2]
+        match = re.search(r"(?<![a-z_])idle_timeout:\s*(\d+)s", clusters)
         self.assertIsNotNone(match, "the broker cluster in envoy-credential-proxy.yaml sets no idle_timeout")
-        self.assertLess(int(match.group(1)), credential_proxy.KEEPALIVE_IDLE_SECONDS)
+        seconds = int(match.group(1))
+        # 0s does not mean "at once": it disables Envoy's idle close, and the
+        # broker would then be the side closing first.
+        self.assertGreater(seconds, 0, "0s disables Envoy's idle timeout")
+        self.assertLess(seconds, credential_proxy.KEEPALIVE_IDLE_SECONDS)
 
 
 class ThreadCapTest(_CredentialedUnixServer):
