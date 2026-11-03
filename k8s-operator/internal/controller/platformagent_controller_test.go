@@ -1021,17 +1021,9 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	if want := resolveCredentialProxyImage(agent.Spec.Deployment); proxy.Image != want || proxy.Image == staleImage {
 		t.Errorf("the proxy container's image = %q, want %q; a refused override must not stop the Deployment being applied", proxy.Image, want)
 	}
-	wantResources := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("500m"),
-			corev1.ResourceMemory: resource.MustParse("1Gi"),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse("1"),
-			corev1.ResourceMemory:           resource.MustParse("2Gi"),
-			corev1.ResourceEphemeralStorage: resource.MustParse("8Gi"),
-		},
-	}
+	// The operator's defaults, read from the merge with no override, so a
+	// change to them does not need a second copy here.
+	wantResources := resolveCredentialProxyResources(nil)
 	if !equality.Semantic.DeepEqual(proxy.Resources, wantResources) {
 		t.Errorf("the proxy container's resources = %v, want the operator's defaults %v; a refused override is ignored", proxy.Resources, wantResources)
 	}
@@ -1100,7 +1092,8 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyWarningLoggedOncePerGe
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
 				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
-					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+					// Above the 2Gi default request, so Autopilot's clamp is worth a note.
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 				}},
 			}},
 			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
@@ -1160,7 +1153,8 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyWarningLoggedAfterAnEa
 			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
 				Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")},
 				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
-					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+					// Above the 2Gi default request, so Autopilot's clamp is worth a note.
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 				}},
 			}},
 			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
@@ -7722,5 +7716,65 @@ func TestReconcileGitopsStateGitOpsRepoFromTheDeprecatedAlias(t *testing.T) {
 	}
 	if got, want := cm.Data[gitopsStateGitOpsRepoKey], `{"type":"github","url":"https://github.com/acme/infra"}`; got != want {
 		t.Errorf("gitops_repo = %q, expected %q", got, want)
+	}
+}
+
+// TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode: Reconcile
+// passes the discovered cluster mode to the proxy builder, so an Autopilot
+// cluster gets the Autopilot requests and a Standard one keeps the defaults.
+func TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode(t *testing.T) {
+	autopilot := &mockAutopilotDiscovery{
+		serverGroupsList: &metav1.APIGroupList{Groups: []metav1.APIGroup{{
+			Name:     "auto.gke.io",
+			Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: "auto.gke.io/v1", Version: "v1"}},
+		}}},
+		resourcesList: map[string]*metav1.APIResourceList{"auto.gke.io/v1": {
+			GroupVersion: "auto.gke.io/v1", APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+		}},
+	}
+	tests := []struct {
+		name    string
+		dc      discovery.DiscoveryInterface
+		wantCPU string
+		wantMem string
+	}{
+		{name: "standard", dc: &mockAutopilotDiscovery{}, wantCPU: "500m", wantMem: "1Gi"},
+		{name: "autopilot", dc: autopilot, wantCPU: "2", wantMem: "2Gi"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-mode", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+				},
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent, shellSandboxKeysSecret(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64), DiscoveryClient: tt.dc}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+			ctx := context.Background()
+			for i := range 2 {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d failed: %v", i+1, err)
+				}
+			}
+			dep := &appsv1.Deployment{}
+			if err := cl.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, dep); err != nil {
+				t.Fatalf("get the proxy Deployment: %v", err)
+			}
+			proxy, found := findContainer(dep.Spec.Template.Spec, credentialProxyContainerName)
+			if !found {
+				t.Fatalf("no %s container in the proxy Deployment", credentialProxyContainerName)
+			}
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceCPU, tt.wantCPU)
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceMemory, tt.wantMem)
+			assertQuantity(t, proxy.Resources.Limits, corev1.ResourceCPU, "2")
+		})
 	}
 }

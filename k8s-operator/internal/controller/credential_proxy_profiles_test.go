@@ -112,7 +112,7 @@ func TestCredentialProxyProfileEnvIsAbsentWithoutProfiles(t *testing.T) {
 // The broker Deployment carries the key: the threading from the Deployment
 // builder to the env builder.
 func TestCredentialProxyDeploymentCarriesTheTaskSigningKey(t *testing.T) {
-	dep := buildCredentialProxyDeploymentForPlugins(a2aTestAgent(), "hash", nil, allBrokerCallersOwned, profileBrokerConfig())
+	dep := buildCredentialProxyDeploymentForPlugins(a2aTestAgent(), "hash", nil, allBrokerCallersOwned, profileBrokerConfig(), false)
 	env := dep.Spec.Template.Spec.Containers[0].Env
 	if got, _ := brokerEnvValue(env, "A2A_TASK_SIGNING_PUBLIC_KEYS"); got != testTaskSigningPublic {
 		t.Errorf("the broker Deployment's A2A_TASK_SIGNING_PUBLIC_KEYS = %q, want the task-signing public key", got)

@@ -888,9 +888,9 @@ Consequences:
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
   sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
-  it prevents. The operator declares that request at 1Gi, above the floor, so that the
-  budget engages there too, admitting four; the floor remains for a CR override that
-  sets a smaller request.
+  it prevents. The operator declares that request at 2Gi on Autopilot (1Gi on Standard),
+  above the floor, so that the budget engages there too, admitting nine, held to eight by
+  the slot cap; the floor remains for a CR override that sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.

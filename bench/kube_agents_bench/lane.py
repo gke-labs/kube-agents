@@ -48,7 +48,10 @@ write in its window is its own whether or not it names it. A stopped ask
 :data:`kube_agents_bench.stop_hook.MID_TURN_DIRECTIVE`)
 gets ``exclusive_window`` too, with no allowance: the script runs it alone
 in the same second phase, and a stop that fails lets its card write, which
-has to fail the case whether or not anything of it names the write. The command line also reports that count per case, which the
+has to fail the case whether or not anything of it names the write. A case
+that declares ``writes_alone: true`` at its top level is treated the same
+way: it requests nothing, but a correct reply is a stop, and a wrong one may
+let a card write a pull request the reply never names. The command line also reports that count per case, which the
 script uses to run the requesting cases in a second phase after every other
 unit has finished, so a repetition that requests nothing never shares the
 repository with a case that writes by design.
@@ -93,6 +96,13 @@ REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_co
 WRITES_CHECK_TYPE = "github_writes"
 REQUESTED_FIELD = "requested_pull_requests"
 EXCLUSIVE_WINDOW_FIELD = "exclusive_window"
+#: A case's own declaration that it runs alone in the lane's second phase
+#: (`writes_alone: true` at the top of its task.yaml): a case that requests
+#: nothing and whose reply may still let a card write, so the safeguard has
+#: to charge a write the reply does not name. The script reads the same key
+#: itself, with a plain YAML load, to place the case on every transport; a
+#: stopped ask is placed on the inject lane only.
+WRITES_ALONE_KEY = "writes_alone"
 #: What a task file names its checks under, and the file the copy is written as.
 SPEC_KEY = "verification_spec"
 TASK_FILE = "task.yaml"
@@ -241,6 +251,18 @@ def requested_pull_requests(spec: Any) -> int:
     )
 
 
+def declares_writes_alone(doc: dict[str, Any]) -> bool:
+    """Whether a task declares ``writes_alone: true`` at its top level; only a
+    bare ``true`` counts, a string is not a declaration."""
+    return doc.get(WRITES_ALONE_KEY) is True
+
+
+def runs_alone(doc: dict[str, Any]) -> bool:
+    """Whether a task runs alone in the lane's second phase without requesting
+    a pull request: a stopped ask, or a case that declares ``writes_alone``."""
+    return stop_hook.is_stopped_ask(str(doc.get("prompt") or "")) or declares_writes_alone(doc)
+
+
 def requested_for(spec: Any, listed_allowance: int = 0) -> int:
     """How many pull requests a case requests: the larger of what its own
     checks say and the count the lane file's ``requesting:`` gives it."""
@@ -289,9 +311,10 @@ def copy_task(
     existing = list(spec) if isinstance(spec, list) else []
     taken = {str(e.get("name")) for e in existing if isinstance(e, dict) and e.get("name")}
     requested = requested_for(existing, listed_allowance)
-    # A stopped ask runs alone in the second phase as well (hack/ci-eval-pr.sh
-    # reads the same prompt test), so its window is exclusive with no allowance.
-    exclusive = bool(requested) or stop_hook.is_stopped_ask(str(doc.get("prompt") or ""))
+    # A stopped ask, or a case that declares `writes_alone`, runs alone in the
+    # second phase as well (hack/ci-eval-pr.sh reads both through
+    # kube_agents_bench.stop_hook), so its window is exclusive with no allowance.
+    exclusive = bool(requested) or runs_alone(doc)
     appended = []
     for entry in safeguards:
         if entry["name"] in taken:

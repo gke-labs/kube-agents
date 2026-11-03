@@ -751,7 +751,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	state, err := r.reconcileA2A(context.Background(), agent)
+	state, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
