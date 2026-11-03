@@ -29588,6 +29588,15 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         self.assertEqual(self.degrade_via_broker(files, [finding]), [])
         self.assertEqual(finding["remediation"]["kind"], "manifest")
 
+    def test_a_refused_tree_is_asked_for_once(self):
+        # A tree over the ceiling is remembered: the later checks under it go
+        # straight to the file alone, and the refusal counts toward the cap.
+        calls = []
+        use_large_repository(self, self.overlay(), too_large={"clusters/prod"}, calls=calls)
+        finding = kustomize_fix(self.PDB)
+        self.degrade_in_content_mode([finding])
+        self.assertEqual(calls.count(["clusters/prod"]), 1)
+
     def test_a_repository_over_the_ceiling_still_reads_the_kustomization(self):
         # Narrow mode: the overlay's kustomization is read from a snapshot of
         # its own directory, so an unlisted new file is still caught.

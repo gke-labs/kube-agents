@@ -1943,10 +1943,10 @@ PDB_NAME_SLOT = "{name}"
 # How many times one `finish` tries to take the snapshot for its repository
 # questions: the Config Connector scan, then planning.
 PROBE_OPEN_ATTEMPTS = 2
-# How many narrow snapshots one `finish` takes once the whole tree is over the
-# broker's snapshot ceiling. Each one is a broker clone of the revision of a
-# repository that is large by definition, so past this the run stops rather
-# than cloning without bound.
+# How many narrow snapshots one `finish` asks for once the whole tree is over
+# the broker's snapshot ceiling, refused ones included. Each one is a broker
+# clone of the revision of a repository that is large by definition, so past
+# this a check is skipped as unchecked rather than cloning without bound.
 PROBE_NARROW_SNAPSHOT_CAP = 16
 # Where a read unpacks its snapshot: a directory under the vcs client's copies
 # root, named with this prefix, so a run killed mid-read leaves a directory
@@ -2587,7 +2587,7 @@ class NoGitOpsRepo(RuntimeError):
 class ProbeLimit(RuntimeError):
     """A narrow snapshot is still over the broker's snapshot ceiling.
 
-    Raised in narrow mode (`_RepositoryProbe._narrow_snapshot`). It is not a
+    Raised in narrow mode (`_RepositoryProbe._take_narrow`). It is not a
     document the worker can fix, so it is not a `ValidationError`: `main`
     reports it as `FATAL`, exit 1, and the run's note is released. Only an
     operator can raise the ceiling.
@@ -17010,7 +17010,9 @@ class _RepositoryProbe:
     """What the repository already holds, for the fixes `finish` writes.
 
     Directory mode reads the clone. Content mode takes one snapshot of the
-    repository's base for the whole run and reads it locally. An answer it
+    repository's base for the whole run and reads it locally; when the whole
+    tree is over the broker's snapshot ceiling, each question takes a
+    snapshot of only the part it asks about (narrow mode). An answer it
     cannot give -- no snapshot, an unreadable file -- is a yes, so `finish`
     never writes a file it could not check.
     """
@@ -17042,6 +17044,9 @@ class _RepositoryProbe:
         # snapshot, None for a path the revision does not hold.
         self.narrow = False
         self._narrow: dict[str, RepositorySnapshot | None] = {}
+        # Directories whose narrow snapshot was refused as too large, so a
+        # later path under one goes straight to the file alone.
+        self._narrow_refused: set[str] = set()
         # The revision the first narrow answer was read at, a refusal's included.
         self._narrow_revision = ""
 
@@ -17071,7 +17076,7 @@ class _RepositoryProbe:
             except Exception as exc:  # noqa: BLE001 -- no snapshot: every question is a yes
                 if getattr(exc, "code", None) == vcs_client.SNAPSHOT_TOO_LARGE:
                     # Not a failure to retry: the tree is over the ceiling, so
-                    # each question narrows its own snapshot (`_narrow_snapshot`).
+                    # each question narrows its own snapshot (`_narrow_snapshot_for`).
                     self.narrow = True
                     self._attempts = PROBE_OPEN_ATTEMPTS
                     log(
@@ -17166,11 +17171,11 @@ class _RepositoryProbe:
             if path == key or path.startswith(f"{key}/"):
                 return held
         key = self._narrow_key(path)
-        if key != path:
+        if key != path and key not in self._narrow_refused:
             try:
                 return self._take_narrow(key, last=False)
             except _NarrowTooLarge:
-                pass
+                self._narrow_refused.add(key)
         return self._take_narrow(path, last=True)
 
     def _take_narrow(self, key: str, *, last: bool) -> "RepositorySnapshot | None":
@@ -17183,7 +17188,7 @@ class _RepositoryProbe:
         """
         import vcs_client
 
-        if len(self._narrow) >= PROBE_NARROW_SNAPSHOT_CAP:
+        if len(self._narrow) + len(self._narrow_refused) >= PROBE_NARROW_SNAPSHOT_CAP:
             raise RuntimeError(
                 f"this run already took {PROBE_NARROW_SNAPSHOT_CAP} narrow snapshots of "
                 f"{self.repo} (PROBE_NARROW_SNAPSHOT_CAP), so {key} was not checked"
@@ -22353,8 +22358,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # has none and reads a snapshot, and only when a finding could match, so
     # a run with no such fix costs no round trip.
     kcc_prebuilt: dict[KccKey, KccDeclaration] = {}
-    # One snapshot for the run's repository questions; deleted after the
-    # generated fixes are planned below.
+    # The run's repository questions share one snapshot, or in narrow mode a
+    # few kept for the run; deleted after the generated fixes are planned below.
     probe = _RepositoryProbe(repo, root)
     # The worker's budget is still in those files; it names nothing the
     # repository holds, so the name search reads past it.
