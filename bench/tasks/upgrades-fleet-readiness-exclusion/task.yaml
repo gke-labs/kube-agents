@@ -127,59 +127,42 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # The verdict as the script's readiness cell states it ("blocks
-      # auto-upgrade to <target>"), plus prose spellings of the same claim.
+      # The fact: the planted exclusion is what holds seeded-b's upgrade. Three
+      # patterns admit every phrasing of it. Each runs on the verifier's
+      # line-preserving surface (lowercased, Markdown marks dropped, so the
+      # scope reads "nominorupgrades" there).
+      # Window: the claim sits within three lines of a token naming the
+      # exclusion, its scope or seeded-b (a heading above the sentence, or
+      # the name on the bullet below it). A sentence about another cluster
+      # three or more lines from any such token is not the match; one within
+      # two lines of a seeded-b row is (0 of 102 recorded answers), as is a
+      # hypothetical ("would block if present"), both declared residue.
+      # Clause: the claim starts at the line or after . ; | : ( and carries
+      # no negation word (no, not, none, never, nothing, without, neither,
+      # nor, n't) from its start through the verb or state word, so "no
+      # exclusion blocks", "is not blocked by the exclusion" and "no longer
+      # active" are refused. A span stops at a period, a semicolon, a pipe
+      # or a line end and keeps the dot of a version number.
+      # 1. The exclusion as subject: "exclusion <...> blocks|prevents|holds
+      #    back|held|defers|excludes|stops|pauses|suspends|postpones|delays
+      #    <...> upgrade|minor|auto-|version bump"; a verb or object followed
+      #    by a hyphen is a piece of the exclusion's own name, not the claim,
+      #    and "blockers" is a noun, not the verb.
+      # 2. The cluster as subject: "blocked|held|prevented|deferred|stopped
+      #    <...> by <...> exclusion".
+      # 3. The exclusion in force: "exclusion <...> active|in effect|in
+      #    place|runs|running|valid|set <...> until|from|through|now", the spelling the
+      #    first green run on 2026-09-14 (#1582, for issue #1411) wrote; the
+      #    list gained it after that run failed this check.
       # Not the bare word "blocked": a version table on main already carries
-      # "lagging", and an agent could write "blocked" of anything. What main
-      # cannot produce without the maintenance rule is the exclusion named as
-      # the thing holding the upgrade. The "excludes exactly", "defers
-      # automatic" and "in effect" spellings were added after the first
-      # green run on 2026-09-14 (#1411), whose report wrote "excludes exactly
-      # the 1.34 -> 1.35 minor this cluster needs ... defers **automatic**
-      # upgrades only" and failed only this check; the markdown bold splits
-      # the plain phrase, hence the starred variant.
-      any_of_phrases:
-        [
-          "blocks auto-upgrade",
-          "blocks the auto-upgrade",
-          "blocks automatic upgrade",
-          "blocking auto-upgrade",
-          "blocking automatic upgrade",
-          "holds back automatic upgrade",
-          "holds back the automatic upgrade",
-          "holds the minor upgrade",
-          "holding the minor upgrade",
-          "blocks the minor upgrade",
-          "blocking the minor upgrade",
-          "prevents the minor upgrade",
-          "prevents automatic upgrade",
-          "prevents the automatic upgrade",
-          "exclusion blocks",
-          "exclusion is blocking",
-          "exclusion prevents",
-          "exclusion holds",
-          "blocked by the exclusion",
-          "blocked by the maintenance exclusion",
-          "blocked by a maintenance exclusion",
-          "held by the exclusion",
-          "held by the maintenance exclusion",
-          "held by hold-the-minor-lag",
-          "blocked by hold-the-minor-lag",
-          "excludes exactly the",
-          "excludes the minor",
-          "excludes minor upgrades",
-          "minor upgrade is excluded",
-          "minor upgrades are excluded",
-          "holds back the minor",
-          "defers automatic",
-          "defers the automatic",
-          "defers **automatic**",
-          "deferring automatic",
-          "in effect now",
-          "in effect until",
-          "currently in effect",
-          "is in effect",
-        ]
+      # "lagging", and an agent could write "blocked" of anything.
+      # bench/tests/test_upgrades_readiness_exclusion_patterns.py pins the
+      # nightly record's shapes, the negations and each clause bound through
+      # the whole check.
+      any_of_patterns:
+        - '(?m)^(?=(?:[^\n]*\n){0,2}[^\n]*(?:seeded-b|hold-the-minor-lag|nominorupgrades|no-minor-upgrades))(?:[^\n]*\n){0,2}(?:[^\n]*[.;|:(])?(?:(?!\b(?:no|not|none|never|nothing|without|neither|nor)\b|n''t)(?:[^.\n|;]|\.(?=\d)))*?(?:exclusion|hold-the-minor-lag)(?:(?!\b(?:no|not|none|never|nothing|without|neither|nor)\b|n''t)(?:[^.\n|;]|\.(?=\d))){0,80}?\b(?:block(?:s|ed|ing)?|prevent\w*|hold(?:s|ing)?(?: back)?|held(?: back)?|defer\w*|exclud\w*|stop\w*|paus\w*|suspend\w*|postpon\w*|delay\w*)\b(?!-)(?:[^.\n|;]|\.(?=\d)){0,60}?\b(?:upgrad\w*|minor(?!-)|auto\w*|version bump\w*)'
+        - '(?m)^(?=(?:[^\n]*\n){0,2}[^\n]*(?:seeded-b|hold-the-minor-lag|nominorupgrades|no-minor-upgrades))(?:[^\n]*\n){0,2}(?:[^\n]*[.;|:(])?(?:(?!\b(?:no|not|none|never|nothing|without|neither|nor)\b|n''t)(?:[^.\n|;]|\.(?=\d)))*?\b(?:blocked|held(?: back)?|prevented|deferred|stopped)\b(?:(?!\b(?:no|not|none|never|nothing|without|neither|nor)\b|n''t)(?:[^.\n|;]|\.(?=\d))){0,60}?\bby\b(?:(?!\b(?:no|not|none|never|nothing|without|neither|nor)\b|n''t)(?:[^.\n|;]|\.(?=\d))){0,60}?(?:exclusion|hold-the-minor-lag)'
+        - '(?m)^(?=(?:[^\n]*\n){0,2}[^\n]*(?:seeded-b|hold-the-minor-lag|nominorupgrades|no-minor-upgrades))(?:[^\n]*\n){0,2}(?:[^\n]*[.;|:(])?(?:(?!\b(?:no|not|none|never|nothing|without|neither|nor)\b|n''t)(?:[^.\n|;]|\.(?=\d)))*?(?:exclusion|hold-the-minor-lag)(?:(?!\b(?:no|not|none|never|nothing|without|neither|nor)\b|n''t)(?:[^.\n|;]|\.(?=\d))){0,80}?\b(?:active|in effect|in place|runs?|running|valid|set)\b(?:(?!\b(?:no|not|none|never|nothing|without|neither|nor)\b|n''t)(?:[^.\n|;]|\.(?=\d))){0,30}?\b(?:until|from|through|now)\b'
   - name: no-invented-cves
     role: objective
     mode: assert
