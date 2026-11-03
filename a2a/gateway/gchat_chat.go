@@ -34,9 +34,8 @@ const (
 	gchatChatFunction    = "kage.choice"
 	gchatChatParamReply  = "reply"
 	gchatChatParamChoice = "choice"
-	// gchatChatParamHome marks a home post's choice buttons. The parameter
-	// no longer changes where a click binds, and stays because posted cards
-	// carry it.
+	// gchatChatParamHome marks a home post's choice buttons. Posted cards
+	// carry it; the click's binding does not read it.
 	gchatChatParamHome      = "home"
 	gchatChatParamHomeValue = "1"
 	// gchatChatButtonFilled draws the one primary button filled, Chat's

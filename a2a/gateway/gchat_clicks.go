@@ -116,15 +116,10 @@ type gchatClick struct {
 // answer can rewrite it.
 type gchatQuestion struct {
 	conversation string
-	// thread is the thread the post landed in (createLaidOut's landed,
-	// EditNotifyMessage's thread; "" for an edit that names its
-	// conversation). A click no longer reads it: a home post's click binds to
-	// the thread the event names (classifyClick).
-	thread  string
-	asks    bool
-	layout  gchatChatLayout
-	choices []string
-	links   []chatmsg.Link
+	asks         bool
+	layout       gchatChatLayout
+	choices      []string
+	links        []chatmsg.Link
 }
 
 // gchatPendingClick is a click handed to the gateway and not yet verified:
@@ -181,7 +176,7 @@ func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 // and its line are forgotten. Laying a message out again without choices
 // closes it, so a late click on buttons a client still shows does not write
 // the old question back.
-func (a *GoogleChatAdapter) trackQuestion(name, conversation, thread string, m *chatmsg.Message, layout gchatChatLayout) {
+func (a *GoogleChatAdapter) trackQuestion(name, conversation string, m *chatmsg.Message, layout gchatChatLayout) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	ux := a.uxLocked()
@@ -200,7 +195,7 @@ func (a *GoogleChatAdapter) trackQuestion(name, conversation, thread string, m *
 	for i, c := range m.Choices {
 		labels[i] = c.Text
 	}
-	q := gchatQuestion{conversation: conversation, thread: thread, asks: asksQuestion(m.Choices), layout: layout, choices: labels, links: m.Links}
+	q := gchatQuestion{conversation: conversation, asks: asksQuestion(m.Choices), layout: layout, choices: labels, links: m.Links}
 	ux.questions[name] = q
 	remember(&ux.questionsOrder, name, func(k string) { ux.dropQuestionLocked(k) })
 	switch {

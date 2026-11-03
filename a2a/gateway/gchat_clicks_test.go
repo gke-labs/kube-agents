@@ -110,8 +110,8 @@ func TestGchatClickIsATurnOnce(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("click dropped: %s", reason)
 	}
-	// The bot's top-level DM post is not a thread reply, so the click
-	// lands in the DM's one conversation, as a typed reply there would.
+	// The click binds to the remembered question's conversation, the DM's
+	// thread-less key the card was posted under, not to the event's surface.
 	// The click's id is the message and the event time, so two clicks on
 	// one message are two ids in the ingress log.
 	if msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != "dm" || msg.AuthorID != "sender@example.com" ||
@@ -309,8 +309,8 @@ func TestGchatEditNotifyMessagePatchesAHomePost(t *testing.T) {
 	a.mu.Lock()
 	q, open := a.uxLocked().questions["spaces/S1/messages/M1"]
 	a.mu.Unlock()
-	if !open || q.conversation != "" || q.thread != "spaces/S1/threads/M1" {
-		t.Fatalf("question = %+v, %v; want it open, bound to no conversation and to its thread", q, open)
+	if !open || q.conversation != "" {
+		t.Fatalf("question = %+v, %v; want it open and bound to no conversation", q, open)
 	}
 	if err := a.EditNotifyMessage("spaces/S1", "spaces/S1/threads/M1", "spaces/S1/messages/M1", OutMessage{Text: "settled: prod"}); err != nil {
 		t.Fatal(err)
@@ -658,7 +658,7 @@ func TestGchatSettlingAnUnrememberedQuestionForgetsItsPendingClick(t *testing.T)
 	if pending != 1 || !waiting {
 		t.Fatalf("pending = %d, waiting = %v; want the click held", pending, waiting)
 	}
-	a.trackQuestion(ev.Message.Name, "", "", &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Settled"}, gchatChatLayout{Text: "*Settled*"})
+	a.trackQuestion(ev.Message.Name, "", &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Settled"}, gchatChatLayout{Text: "*Settled*"})
 	a.mu.Lock()
 	pending, waiting = len(a.uxLocked().pending), a.uxLocked().waiting[ev.Message.Name]
 	a.mu.Unlock()
@@ -668,7 +668,7 @@ func TestGchatSettlingAnUnrememberedQuestionForgetsItsPendingClick(t *testing.T)
 }
 
 // Every click in a DM binds to its card's thread, a home card's included,
-// remembered or not. The home mark stays on a home card's buttons, because
+// remembered or posted before a restart. The home mark stays on a home card's buttons, because
 // cards already posted carry it.
 func TestGchatClickOnAHomeCardInADMBindsToItsThread(t *testing.T) {
 	f := newFakeChatRelay(t)
@@ -715,14 +715,15 @@ func TestGchatClickOnAHomeCardInADMBindsToItsThread(t *testing.T) {
 	if msg, reason := newTestGchatAdapterWithRelay(t, f).classifyClick(unmarked); reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA/threads/BOT1" {
 		t.Fatalf("an unmarked click after a restart = %+v (%q); want the card's thread", msg, reason)
 	}
-	// Edited into the head by its key, the question keeps the thread.
+	// Edited into the head by its key, the question stays bound to no
+	// conversation.
 	if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "spaces/_c2fixtureAA/threads/BOT1", "spaces/_c2fixtureAA/messages/BOT1.BOT1", ask); err != nil {
 		t.Fatal(err)
 	}
 	a.mu.Lock()
 	q := a.uxLocked().questions["spaces/_c2fixtureAA/messages/BOT1.BOT1"]
 	a.mu.Unlock()
-	if q.thread != "spaces/_c2fixtureAA/threads/BOT1" || q.conversation != "" {
+	if q.conversation != "" {
 		t.Errorf("question after the edit = %+v", q)
 	}
 }
