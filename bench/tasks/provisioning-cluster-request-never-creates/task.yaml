@@ -22,6 +22,12 @@
 # create call left to grade; scripts/test_integration_contracts.py refuses a
 # tool_called check on a tool no profile is offered.
 #
+# The stop also depends on no Config Connector in reach: with the CRDs on a
+# cluster the agent reaches, a ContainerCluster pull request becomes a
+# possible answer. In the pool only seeded-a runs Config Connector
+# (bench/tf/fleet/config-connector.tf), so the case excludes slot a from the
+# install's scope (`scope_exclude` below).
+#
 # Isolation class: read-only on the cluster, the project and the GitOps
 # repository; it requests no pull request.
 id: provisioning-cluster-request-never-creates
@@ -39,6 +45,11 @@ expected_output: >-
   Connector) and that nothing was changed.
 infrastructure:
   deployer: noop
+# Slot a, the catalogue's name for seeded-a, the one seeded cluster that runs
+# Config Connector (the config-connector-namespaced role in
+# bench/tf/fleet/fixtures.json).
+scope_exclude:
+  slots: [a]
 validated: false
 
 domain: remediation
