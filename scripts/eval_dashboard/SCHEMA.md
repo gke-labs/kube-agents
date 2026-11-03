@@ -1123,9 +1123,10 @@ name the newest lane pull-request run carries, else the default.
 `nightly_jobs[]` is one `{job, nights[], night_counts}` per nightly, the
 lane table's jobs first (each listed with no night yet) and then any other
 job the lane's nights name; `nights[]` and `night_counts` above are over
-all of them together. Each lane's section on the Brief is its document
-and nothing else reads the block: the lanes' runs are in no gate number,
-no case history and no digest line.
+all of them together. Each lane's section on the Brief is its document;
+the daily digest's one forge line (`forge_lane.digest_line`) reads the same
+document for each nightly's last result. The lanes' runs are in no gate
+number, no case history and no digest count.
 
 `trend` is `null` in the published `brief.json` (every page polls that
 file every minute and only the Trend page reads the block, which grows a

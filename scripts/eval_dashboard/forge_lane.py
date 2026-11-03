@@ -10,7 +10,8 @@ The lane (``pull-kube-agents-smoke-test-gitlab``, kube-agents#2394) is the
 forge-grading cases of the catalogue driven against a pool project's
 GitLab repository. Its
 runs carry ``tier: gitlab`` (tiers.py) and so reach no gate verdict, no case
-history and no digest number; this block is where they are seen at all: the
+history and no digest number (the digest's one forge line, digest_line, says
+each nightly's last result); this block is where they are seen at all: the
 newest ``RUNS_LISTED`` runs with Prow's result, the eval's own verdict, how
 many cases passed, and a build link, plus the lane's builds still in
 flight. Only stdlib, like the sibling nightly.py.
