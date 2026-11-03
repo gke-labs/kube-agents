@@ -195,6 +195,11 @@ FIND_FORMAT = r"%f\t%T@\t%s\t%y\0"
 # and the install this was written against had about 150 probe scripts in one
 # home.
 INVENTORY_LIMIT = 40
+# Past INVENTORY_LIMIT, the most names one batched rm takes when each holds its
+# profile lock open until the rm: one file descriptor each, so a worker that
+# planted thousands of homes cannot exhaust the descriptors the rm's own
+# subprocess needs.
+HELD_BATCH_MAX = 200
 
 # Where the job's own record goes: `<agent home>/logs/`, which the gateway
 # pod's fluent-bit sidecar tails and ships to Cloud Logging.  Not stderr: the
@@ -357,8 +362,10 @@ def _remove_remote_batched(root: Path, names: list[str], sweep: Sweep,
     ``sweep.remote_removed`` for the caller to account for.
     """
     batches = [[name] for name in names[:INVENTORY_LIMIT]]
-    if names[INVENTORY_LIMIT:]:
-        batches.append(names[INVENTORY_LIMIT:])
+    rest = names[INVENTORY_LIMIT:]
+    # Held names keep a descriptor each until their rm, so their tail is chunked.
+    step = HELD_BATCH_MAX if hold is not None else len(rest) or 1
+    batches.extend(rest[i:i + step] for i in range(0, len(rest), step))
     removed_all: list[str] = []
     failed_all: list[str] = []
     for batch in batches:
@@ -629,11 +636,6 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
         keep=lambda name: not _pod_home_present(pod_profiles / name),
         hold=lambda name: profile_lock(lock_root, name, blocking=False,
                                        on_error=lambda e, n=name: lock_errors.append(f"{n}: {e}")))
-    if lock_errors:
-        sweep.warnings.append(
-            f"could not open the profile lock for {len(lock_errors)} stale sandbox cluster home(s), "
-            f"so they were not removed: {'; '.join(lock_errors)[:STDERR_EXCERPT_CHARS]}"
-        )
     sweep.stale_homes_removed.extend(removed)
     if failed:
         # One chat bullet for the run that names the homes, with the rm's own
@@ -645,6 +647,13 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
         more = f" and {len(failed) - INVENTORY_LIMIT} more" if len(failed) > INVENTORY_LIMIT else ""
         sweep.warnings.append(
             f"stale sandbox cluster home(s) not removed: {shown}{more}: {detail[:STDERR_EXCERPT_CHARS]}"
+        )
+    # After the rm bullet, which folds every warning appended since first_warning
+    # into itself: this one stands on its own.
+    if lock_errors:
+        sweep.warnings.append(
+            f"could not open the profile lock for {len(lock_errors)} stale sandbox cluster home(s), "
+            f"so they were not removed: {'; '.join(lock_errors)[:STDERR_EXCERPT_CHARS]}"
         )
 
 

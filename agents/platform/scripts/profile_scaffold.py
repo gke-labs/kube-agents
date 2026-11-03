@@ -148,6 +148,18 @@ log = make_log("PROFILE-SCAFFOLD")
 # the entrypoint runs, so an unbuilt profile can already have a directory (see
 # deploy/shared/profile_plugins.py for the whole failure mode).
 PROFILE_MARKER = "profile.yaml"
+# One lock file per profile name, under the data root beside profiles/, held by
+# whatever creates, deletes or removes a profile's homes (#4389): create_profile,
+# delete_profile, and kanban_workspace_gc's stale-home sweep. A dot-directory, so
+# no lister takes it for a profile.
+PROFILE_LOCKS_DIRNAME = ".profile-locks"
+# Longer names get a hashed lock-file name, the same for every caller, so a name
+# the filesystem can hold as a directory (up to 255 bytes) can always be locked:
+# the name's first PROFILE_LOCK_NAME_KEEP characters, then PROFILE_LOCK_HASH_CHARS
+# of its sha256.
+PROFILE_LOCK_NAME_MAX = 200
+PROFILE_LOCK_NAME_KEEP = 64
+PROFILE_LOCK_HASH_CHARS = 16
 
 
 def profiles_base(hermes_home: Path) -> Path:
@@ -155,25 +167,13 @@ def profiles_base(hermes_home: Path) -> Path:
     return hermes_home / "profiles"
 
 
-# One lock file per profile name, under the data root beside profiles/, held by
-# whatever creates, deletes or removes a profile's homes (#4389): create_profile,
-# delete_profile, and kanban_workspace_gc's stale-home sweep. A dot-directory, so
-# no lister takes it for a profile.
-PROFILE_LOCKS_DIRNAME = ".profile-locks"
-
-
-# Longer names get a hashed lock-file name, the same for every caller, so a name
-# the filesystem can hold as a directory (up to 255 bytes) can always be locked.
-PROFILE_LOCK_NAME_MAX = 200
-
-
 def profile_lock_file(data_root: Path, name: str) -> Path:
     """Where profile *name*'s lock lives under *data_root*."""
     if len(name.encode("utf-8", "surrogateescape")) > PROFILE_LOCK_NAME_MAX:
         import hashlib
 
-        digest = hashlib.sha256(name.encode("utf-8", "surrogateescape")).hexdigest()[:16]
-        name = f"{name[:64]}-{digest}"
+        digest = hashlib.sha256(name.encode("utf-8", "surrogateescape")).hexdigest()[:PROFILE_LOCK_HASH_CHARS]
+        name = f"{name[:PROFILE_LOCK_NAME_KEEP]}-{digest}"
     return data_root / PROFILE_LOCKS_DIRNAME / f"{name}.lock"
 
 

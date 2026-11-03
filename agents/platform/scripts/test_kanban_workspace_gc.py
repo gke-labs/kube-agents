@@ -10,6 +10,7 @@ delete set.
 Run:  python3 agents/platform/scripts/test_kanban_workspace_gc.py
 """
 
+import contextlib
 import os
 import shutil
 import sqlite3
@@ -750,6 +751,65 @@ class StaleHomesTest(_HomeFixture):
             self.assertTrue(held)
             _, sweep = self.sweep(fake)
         self.assertNotIn(long_name, sweep.stale_homes_removed)
+
+    def test_a_lock_failure_beside_an_rm_failure_keeps_its_own_warning(self):
+        # The rm bullet folds every warning appended since the sweep began; the
+        # lock warning must not be folded into it, or truncated off its end.
+        rp = self.remote / "profiles"
+        self.tree[str(rp)] += [("cluster-nolock", "1.0", "1", "d"), ("cluster-stuck", "1.0", "1", "d")]
+        real_lock = profile_scaffold.profile_lock
+
+        def lock(root, name, blocking=True, on_error=None):
+            if name == "cluster-nolock":
+                on_error(PermissionError(13, "Permission denied"))
+                return contextlib.nullcontext(False)
+            return real_lock(root, name, blocking=blocking, on_error=on_error)
+
+        class StuckRm(FakeSandbox):
+            def __call__(inner, argv, **kwargs):
+                if argv[0] == gc.REMOTE_RM and str(rp / "cluster-stuck") in argv:
+                    inner.calls.append((argv, kwargs))
+                    return subprocess.CompletedProcess(argv, 1, "", "rm: cannot remove: Directory not empty " + "x" * 500)
+                return super().__call__(argv, **kwargs)
+
+        fake = StuckRm(self.tree)
+        with patch.object(gc, "profile_lock", side_effect=lock):
+            _, sweep = self.sweep(fake)
+        self.assertIn("cluster-stuck", sweep.stale_homes_failed)
+        lock_warnings = [w for w in sweep.warnings if w.startswith("could not open the profile lock")]
+        self.assertEqual(len(lock_warnings), 1, sweep.warnings)
+        self.assertIn("cluster-nolock", lock_warnings[0])
+        rm_warnings = [w for w in sweep.warnings if w.startswith("stale sandbox cluster home(s) not removed")]
+        self.assertEqual(len(rm_warnings), 1, sweep.warnings)
+        self.assertNotIn("could not open the profile lock", rm_warnings[0])
+
+    def test_the_held_tail_is_removed_in_bounded_chunks(self):
+        # Each held name keeps a descriptor until its rm; a tail of thousands in one
+        # batch could leave the rm's own subprocess none.
+        rp = self.remote / "profiles"
+        many = [f"cluster-old-{i:03d}" for i in range(gc.INVENTORY_LIMIT + 7)]
+        self.tree[str(rp)] = [("platform", "1.0", "1", "d"), ("cluster-a", "1.0", "1", "d")] + [
+            (n, "1.0", "1", "d") for n in many]
+        home = self.home
+        held_at_rm = []
+
+        class Counting(FakeSandbox):
+            def __call__(inner, argv, **kwargs):
+                if argv[0] == gc.REMOTE_RM:
+                    busy = 0
+                    for n in many:
+                        with profile_scaffold.profile_lock(home, n, blocking=False) as free:
+                            busy += not free
+                    held_at_rm.append(busy)
+                return super().__call__(argv, **kwargs)
+
+        fake = Counting(self.tree)
+        with patch.object(gc, "HELD_BATCH_MAX", 3):
+            _, sweep = self.sweep(fake)
+        self.assertEqual(sorted(sweep.stale_homes_removed), sorted(many))
+        tail = [len(argv) - 3 for argv, _ in self.rms(fake)][gc.INVENTORY_LIMIT:]
+        self.assertEqual(tail, [3, 3, 1])
+        self.assertLessEqual(max(held_at_rm), 3)
 
     def test_a_lock_that_cannot_be_opened_removes_nothing_and_says_so(self):
         blocked = Path(self.tmp.name) / "not-a-dir"
