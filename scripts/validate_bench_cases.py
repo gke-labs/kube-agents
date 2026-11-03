@@ -433,8 +433,8 @@ FIXTURE_NOT_READY = {
     "obtainability-pdb-kustomize-overlay": (
         "#2686: bench/tf/prebuilt/kustomize-overlay-declaration plants the "
         "Kustomize root for each run with the write token hack/ci-eval-pr.sh "
-        "mints for a stack that declares gitops_token_file; the un-park cites one "
-        "pool run that shows the plant and the teardown work"
+        "mints for a stack that declares bench_gitops_write_token_file; the "
+        "un-park cites one pool run that shows the plant and the teardown work"
     ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "

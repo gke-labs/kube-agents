@@ -148,15 +148,18 @@ different route and lose a different tie: the provider's defaults are passed as 
 `bench/tasks/autoops-warning-event-triage/task.yaml` sets everything else there and deliberately
 not those.
 
-The same channel carries the inputs of a stack that writes to the GitOps repository or plants a
-Config Connector object, exported once for the run: `TF_VAR_gitops_repo` (the leased project's
-GitOps repository), `TF_VAR_kcc_cluster_name` and `TF_VAR_kcc_cluster_location` (seeded slot a,
-the cluster that runs Config Connector, read from the fleet's `.fleet-context`) and
-`TF_VAR_kcc_google_service_account` (`kcc-eval-context@<project>`, a service account with no
-project role, for a ConfigConnectorContext). A value the run does not know is left unset. One more
-comes per unit: a stack that declares `variable "gitops_token_file"` asks for a write token, and the
-unit gets one narrowed to the leased repository in a file that `TF_VAR_gitops_token_file` names.
-Such a stack must remove what it writes at destroy, and a destroy that cannot do that must fail
+A stack that writes to the GitOps repository, or plants a Config Connector object, gets more inputs,
+in its own unit only. It asks for them by declaring the marker `variable "bench_gitops_write_token_file"`,
+a name no other stack uses. The unit then gets a write token narrowed to the leased repository (contents,
+pull requests and issues write), in a file that `TF_VAR_bench_gitops_write_token_file` names, renewed until
+devops-bench returns; `TF_VAR_gitops_repo`, the leased project's GitOps repository as `owner/name`;
+`TF_VAR_kcc_cluster_name` and `TF_VAR_kcc_cluster_location`, seeded slot a, the cluster that runs Config
+Connector, read from the fleet's `.fleet-context`; and `TF_VAR_kcc_google_service_account`,
+`kcc-eval-context@<project>.iam.gserviceaccount.com`, a service account with no project role, for a
+ConfigConnectorContext. A value the run does not know is left unset. A stack without the marker sees none
+of these. A writing stack must remove what it writes at destroy. devops-bench logs a teardown error and
+goes on, so for a file a failed or killed teardown leaves, the repository reset is the backstop, for the
+paths it knows
 ([`docs/ci-pool-projects.md`](../docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it)).
 
 Declare each of these in your stack's `variables.tf` to receive it. An injected variable the stack

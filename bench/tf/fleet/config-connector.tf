@@ -54,7 +54,10 @@ resource "google_service_account" "kcc_eval_context" {
 }
 
 # The namespaced controller acts as the account through Workload Identity. The
-# binding is on the account alone; no project role goes with it.
+# binding is on the account alone; no project role goes with it. Nothing on
+# main creates a ConfigConnectorContext in that namespace yet: the stalled
+# Config Connector case's stack (#4594) does. The binding is here so that case
+# runs when it merges, with no second fleet change.
 resource "google_service_account_iam_member" "kcc_eval_context_workload_identity" {
   service_account_id = google_service_account.kcc_eval_context.name
   role               = "roles/iam.workloadIdentityUser"

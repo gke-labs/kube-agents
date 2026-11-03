@@ -1,12 +1,13 @@
 """Tests for the GitOps write token hack/ci-eval-pr.sh gives a writing stack.
 
-A stack that declares `variable "gitops_token_file"` plants a file in the
-leased GitOps repository at apply and removes it at destroy. run_one_unit
-mints it the ledger App's token, narrowed to that one repository and to
-contents, pull requests and issues write, writes it to a 0600 file, exports
-the file's name as TF_VAR_gitops_token_file, renews it while devops-bench
-runs, and removes it after. These run the real functions with the mint
-stubbed, and read the exports of the stacks' other inputs.
+A stack that declares the marker `variable "bench_gitops_write_token_file"`
+plants a file in the leased GitOps repository at apply and removes it at
+destroy. run_one_unit mints it the ledger App's token, narrowed to that one
+repository and to contents, pull requests and issues write, writes it to a
+0600 file, exports the file's name as TF_VAR_bench_gitops_write_token_file,
+renews it while devops-bench runs, and removes it after. Only such a unit
+also gets TF_VAR_gitops_repo and the TF_VAR_kcc_* inputs; no other stack
+sees a new TF_VAR_. These run the real functions with the mint stubbed.
 """
 
 import json
@@ -39,7 +40,9 @@ def _constant(name):
     return _extract(rf"^{name}=[^\n]*$", name)
 
 
-class GitopsWriteTokenTest(unittest.TestCase):
+class _Harness(unittest.TestCase):
+    """The extracted functions, with the mint stubbed."""
+
     maxDiff = None
 
     def setUp(self):
@@ -57,7 +60,12 @@ class GitopsWriteTokenTest(unittest.TestCase):
                 _constant("LEDGER_RESET_MINT_ATTEMPTS"),
                 _constant("LEDGER_RESET_MINT_RETRY_DELAY"),
                 _constant("AGENT_PULLS_RESET_PERMISSIONS"),
-                _constant("GITOPS_TOKEN_FILE_VARIABLE"),
+                _constant("BENCH_GITOPS_WRITE_MARKER"),
+                _constant("KCC_FLEET_SLOT"),
+                _constant("KCC_EVAL_CONTEXT_ACCOUNT"),
+                _function("fleet_context_value"),
+                _function("export_writing_stack_inputs"),
+                _function("unset_writing_stack_inputs"),
                 _function("task_stack"),
                 _function("ledger_reset_token"),
                 _function("forge_write_token"),
@@ -108,13 +116,16 @@ class GitopsWriteTokenTest(unittest.TestCase):
         path = self.tmp / "mint-bodies"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
+
+
+class GitopsWriteTokenTest(_Harness):
     def test_the_token_is_narrowed_written_exported_renewed_and_removed(self):
         proc = self._run(
             """\
             rc=0
             start_gitops_write_token "case rep 1" "${TOKEN_FILE}" || rc=$?
             echo "RC=${rc}"
-            echo "EXPORTED=${TF_VAR_gitops_token_file}"
+            echo "EXPORTED=${TF_VAR_bench_gitops_write_token_file}"
             echo "AT_LAUNCH=$(cat "${TOKEN_FILE}")"
             echo "MODE=$(stat -c %a "${TOKEN_FILE}" 2>/dev/null || stat -f %Lp "${TOKEN_FILE}")"
             for _ in $(seq 1 50); do grep -q tok-write-2 "${TOKEN_FILE}" && break; command sleep 0.2; done
@@ -123,7 +134,7 @@ class GitopsWriteTokenTest(unittest.TestCase):
             stop_gitops_write_token "${TOKEN_FILE}"
             kill -0 "${renewer}" 2>/dev/null && echo "RENEWER=alive" || echo "RENEWER=gone"
             [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
-            echo "UNSET=${TF_VAR_gitops_token_file:-}"
+            echo "UNSET=${TF_VAR_bench_gitops_write_token_file:-}"
             """
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
@@ -148,7 +159,7 @@ class GitopsWriteTokenTest(unittest.TestCase):
             rc=0
             start_gitops_write_token "case rep 1" "${TOKEN_FILE}" || rc=$?
             echo "RC=${rc}"
-            echo "EXPORTED=${TF_VAR_gitops_token_file:-}"
+            echo "EXPORTED=${TF_VAR_bench_gitops_write_token_file:-}"
             [ -e "${TOKEN_FILE}" ] && echo "FILE=written" || echo "FILE=none"
             """,
             MINT="refused",
@@ -182,11 +193,11 @@ class GitopsWriteTokenTest(unittest.TestCase):
             start_gitops_write_token "case rep 1" "${TOKEN_FILE}" || rc=$?
             echo "RC=${rc}"
             stop_gitops_write_token "${TOKEN_FILE}"
-            echo "STILL=${TF_VAR_gitops_token_file}"
-            [ -e "${TF_VAR_gitops_token_file}" ] && echo "OWN=kept" || echo "OWN=removed"
+            echo "STILL=${TF_VAR_bench_gitops_write_token_file}"
+            [ -e "${TF_VAR_bench_gitops_write_token_file}" ] && echo "OWN=kept" || echo "OWN=removed"
             """,
             EVAL_LEDGER_APP_KEY_FILE="",
-            TF_VAR_gitops_token_file=str(own),
+            TF_VAR_bench_gitops_write_token_file=str(own),
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("RC=0", proc.stdout)
@@ -228,20 +239,69 @@ class GitopsWriteTokenTest(unittest.TestCase):
         return f"./tasks/{name}/task.yaml"
 
     def test_only_a_stack_that_declares_the_variable_writes(self):
-        writer = self._task("writer", "prebuilt/writer", 'variable "gitops_token_file" {\n  type = string\n}\n')
+        writer = self._task("writer", "prebuilt/writer", 'variable "bench_gitops_write_token_file" {\n  type = string\n}\n')
         reader = self._task("reader", "prebuilt/reader", 'variable "gitops_repo" {\n  type = string\n}\n')
+        # gitops-fix-cycle's own variable, with another contract: not the marker.
+        other = self._task("other", "prebuilt/other", 'variable "gitops_token_file" {\n  type = string\n}\n')
         noop = self._task("noop", "", "")
         proc = self._run(
             f"""\
             stack_writes_gitops "{writer}" && echo "WRITER=yes" || echo "WRITER=no"
             stack_writes_gitops "{reader}" && echo "READER=yes" || echo "READER=no"
             stack_writes_gitops "{noop}" && echo "NOOP=yes" || echo "NOOP=no"
+            stack_writes_gitops "{other}" && echo "OTHER=yes" || echo "OTHER=no"
             """
         )
+        self.assertIn("OTHER=no", proc.stdout)
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("WRITER=yes", proc.stdout)
         self.assertIn("READER=no", proc.stdout)
         self.assertIn("NOOP=no", proc.stdout)
+
+
+class WritingStackInputsTest(_Harness):
+    def _fleet(self, lines):
+        fleet = self.tmp / "fleet"
+        fleet.mkdir(exist_ok=True)
+        (fleet / ".fleet-context").write_text("".join(f"{line}\n" for line in lines))
+        return str(fleet)
+
+    def test_the_inputs_are_exported_and_unset_again(self):
+        fleet = self._fleet(["project=kube-agents-evals-2", "cluster.a=seeded-a", "location.a=us-central1-a"])
+        proc = self._run(
+            """\
+            export_writing_stack_inputs "case rep 1"
+            echo "REPO=${TF_VAR_gitops_repo}"
+            echo "NAME=${TF_VAR_kcc_cluster_name}"
+            echo "LOC=${TF_VAR_kcc_cluster_location}"
+            echo "SA=${TF_VAR_kcc_google_service_account}"
+            unset_writing_stack_inputs
+            echo "AFTER=${TF_VAR_gitops_repo:-}${TF_VAR_kcc_cluster_name:-}${TF_VAR_kcc_cluster_location:-}${TF_VAR_kcc_google_service_account:-}"
+            """,
+            BENCH_FLEET_KUBECONFIG_DIR=fleet,
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn(f"REPO={_REPO}\n", proc.stdout)
+        self.assertIn("NAME=seeded-a\n", proc.stdout)
+        self.assertIn("LOC=us-central1-a\n", proc.stdout)
+        self.assertIn("SA=kcc-eval-context@kube-agents-evals-2.iam.gserviceaccount.com\n", proc.stdout)
+        self.assertIn("AFTER=\n", proc.stdout)
+        self.assertEqual("", proc.stderr)
+
+    def test_a_missing_slot_warns_in_the_unit_and_leaves_the_cluster_unset(self):
+        fleet = self._fleet(["project=kube-agents-evals-2", "cluster.b=seeded-b", "location.b=us-central1-a"])
+        proc = self._run(
+            """\
+            export_writing_stack_inputs "case rep 1"
+            echo "NAME=${TF_VAR_kcc_cluster_name:-unset}"
+            echo "REPO=${TF_VAR_gitops_repo}"
+            """,
+            BENCH_FLEET_KUBECONFIG_DIR=fleet,
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("NAME=unset\n", proc.stdout)
+        self.assertIn(f"REPO={_REPO}\n", proc.stdout)
+        self.assertIn("WARNING: case rep 1: no cluster for seeded slot a", proc.stderr)
 
 
 class CallSiteTest(unittest.TestCase):
@@ -258,14 +318,19 @@ class CallSiteTest(unittest.TestCase):
         self.assertLess(skip, bench)
         self.assertLess(bench, stop)
 
-    def test_the_kcc_inputs_are_exported_from_the_fleet_context(self):
+    def test_the_writing_stack_inputs_are_exported_per_unit_only(self):
+        # No run-wide export: stale-audit-ledger, unread-target-ledger and
+        # gitops-fix-cycle declare gitops_repo with other contracts, and must
+        # see no new TF_VAR_. The exports live in the marker unit's function.
         text = _CI_EVAL_PR.read_text(encoding="utf-8")
-        self.assertIn('export TF_VAR_kcc_cluster_name="${KCC_CLUSTER_NAME}" TF_VAR_kcc_cluster_location="${KCC_CLUSTER_LOCATION}"', text)
-        self.assertIn('KCC_CLUSTER_NAME="$(fleet_context_value "cluster.${KCC_FLEET_SLOT}")"', text)
-        self.assertIn('export TF_VAR_kcc_google_service_account="${KCC_EVAL_CONTEXT_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com"', text)
-        self.assertIn('export TF_VAR_gitops_repo="${EVAL_LEDGER_REPO}"', text)
-        # The exports come after the repository is resolved.
-        self.assertLess(text.index('EVAL_LEDGER_REPO="$(eval_gitops_repo'), text.index('export TF_VAR_gitops_repo='))
+        inside = _function("export_writing_stack_inputs")
+        outside = text.replace(inside, "")
+        for name in ("TF_VAR_gitops_repo", "TF_VAR_kcc_cluster_name", "TF_VAR_kcc_cluster_location", "TF_VAR_kcc_google_service_account", "TF_VAR_bench_gitops_write_token_file"):
+            with self.subTest(name=name):
+                self.assertNotRegex(outside.replace(_function("start_gitops_write_token"), ""), rf"export [^\n]*\b{name}=")
+        unit = _function("run_one_unit")
+        self.assertLess(unit.index('start_gitops_write_token "${name} rep ${rep}"'), unit.index('export_writing_stack_inputs "${name} rep ${rep}"'))
+        self.assertLess(unit.index('export_writing_stack_inputs "${name} rep ${rep}"'), unit.index("uv run devops-bench"))
 
     def test_the_account_is_the_one_the_fleet_creates(self):
         account = _constant("KCC_EVAL_CONTEXT_ACCOUNT").split("=", 1)[1].strip('"')

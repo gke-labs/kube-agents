@@ -1225,18 +1225,24 @@ LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read"
 # before its close. Narrowed to the leased repository at mint, as the ledger
 # reset's issues: write is (docs/ci-pool-projects.md 5.3).
 AGENT_PULLS_RESET_PERMISSIONS='{"pull_requests":"write","contents":"write","issues":"write"}'
-# A stack that declares this variable writes to the leased GitOps repository
-# (stack_writes_gitops, below): run_one_unit mints it a token with the three
+# The marker a stack declares to say that it writes to the leased GitOps
+# repository (stack_writes_gitops, below). No other stack uses this name:
+# gitops-fix-cycle's own gitops_token_file has another contract, so the marker
+# is a name of its own. run_one_unit mints such a stack a token with the three
 # writes above, narrowed to that one repository, and gives the stack the
-# token's file as TF_VAR_gitops_token_file (start_gitops_write_token). Only a
-# file name reaches the stack, so the token is never on argv or in tofu's
-# state.
-GITOPS_TOKEN_FILE_VARIABLE='variable "gitops_token_file"'
+# token's file as TF_VAR_bench_gitops_write_token_file
+# (start_gitops_write_token), with the other inputs of a writing stack
+# (export_writing_stack_inputs). Only a file name reaches the stack, so the
+# token is never on argv or in tofu's state.
+BENCH_GITOPS_WRITE_MARKER='variable "bench_gitops_write_token_file"'
 # The seeded slot whose cluster runs Config Connector
 # (bench/tf/fleet/config-connector.tf), and the Google service account with no
 # project role that the fleet creates there for an eval stack's
-# ConfigConnectorContext. Exported to the stacks as TF_VAR_kcc_cluster_name,
-# TF_VAR_kcc_cluster_location and TF_VAR_kcc_google_service_account.
+# ConfigConnectorContext. Given to a writing stack's unit as
+# TF_VAR_kcc_cluster_name, TF_VAR_kcc_cluster_location and
+# TF_VAR_kcc_google_service_account. No stack on main reads them yet: the
+# stalled Config Connector case's stack (#4594) does, when it declares the
+# marker.
 KCC_FLEET_SLOT="a"
 KCC_EVAL_CONTEXT_ACCOUNT="kcc-eval-context"
 # The mint itself, shared with step 0 (hack/ci-revalidate.sh); see
@@ -1392,21 +1398,21 @@ stop_ledger_token_renewal() { # <file>
   unset BENCH_GITHUB_TOKEN_FILE
 }
 
-# True when the case's stack declares GITOPS_TOKEN_FILE_VARIABLE: the stack
+# True when the case's stack declares BENCH_GITOPS_WRITE_MARKER: the stack
 # writes to the leased GitOps repository, and its unit gets a write token.
 # Read from the stack's own files, as the seeded-cluster reuse is, so a stack
 # says what it needs in one place.
 stack_writes_gitops() { # <task.yaml, relative to BENCH_DIR>
   local stack
   stack="$(task_stack "${BENCH_DIR}/$1")"
-  [ -n "${stack}" ] && grep -qsF "${GITOPS_TOKEN_FILE_VARIABLE}" "${BENCH_DIR}/tf/${stack}"/*.tf
+  [ -n "${stack}" ] && grep -qsF "${BENCH_GITOPS_WRITE_MARKER}" "${BENCH_DIR}/tf/${stack}"/*.tf
 }
 
 # The write token for a stack that writes to the leased GitOps repository:
 # the ledger App's, minted as the repository reset's is (forge_write_token,
 # AGENT_PULLS_RESET_PERMISSIONS: contents, pull requests and issues write, on
 # EVAL_LEDGER_REPO only), written to <file> with mode 0600, and exported as
-# TF_VAR_gitops_token_file. The stack plants at apply and removes at destroy,
+# TF_VAR_bench_gitops_write_token_file. The stack plants at apply and removes at destroy,
 # and devops-bench runs both, so a background loop mints it again every
 # LEDGER_TOKEN_RENEW_SECONDS until stop_gitops_write_token, as the grading
 # token's renewer does; a failed renewal keeps the previous token and is tried
@@ -1415,7 +1421,7 @@ stack_writes_gitops() { # <task.yaml, relative to BENCH_DIR>
 # Returns 0 when the stack has a token file, LEDGER_MINT_RETRYABLE when the
 # mint ran out on a transient failure (GITOPS_WRITE_TOKEN_LAST_FAILURE holds
 # its last line), and 1 otherwise; the unit does not run on a non-zero return.
-# Without the App key (a developer's loop), a TF_VAR_gitops_token_file that
+# Without the App key (a developer's loop), a TF_VAR_bench_gitops_write_token_file that
 # the environment already sets is used as it is, and nothing is minted.
 start_gitops_write_token() { # <label> <file>
   local label="$1" file="$2" owner="${BASHPID:-$$}" minted rc=0 diagnostics
@@ -1427,11 +1433,11 @@ start_gitops_write_token() { # <label> <file>
     return 1
   fi
   if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
-    if [ -n "${TF_VAR_gitops_token_file:-}" ]; then
-      echo "GitOps write token (${label}): EVAL_LEDGER_APP_KEY_FILE is unset; the stack uses the file that TF_VAR_gitops_token_file names"
+    if [ -n "${TF_VAR_bench_gitops_write_token_file:-}" ]; then
+      echo "GitOps write token (${label}): EVAL_LEDGER_APP_KEY_FILE is unset; the stack uses the file that TF_VAR_bench_gitops_write_token_file names"
       return 0
     fi
-    echo "WARNING: GitOps write token (${label}): EVAL_LEDGER_APP_KEY_FILE and TF_VAR_gitops_token_file are both unset, so the stack has no token to write to the GitOps repository with; the unit does not run." >&2
+    echo "WARNING: GitOps write token (${label}): EVAL_LEDGER_APP_KEY_FILE and TF_VAR_bench_gitops_write_token_file are both unset, so the stack has no token to write to the GitOps repository with; the unit does not run." >&2
     return 1
   fi
   if [ -z "${EVAL_LEDGER_REPO:-}" ]; then
@@ -1457,7 +1463,7 @@ start_gitops_write_token() { # <label> <file>
     return 1
   fi
   GITOPS_WRITE_TOKEN_MINTED="yes"
-  export TF_VAR_gitops_token_file="${file}"
+  export TF_VAR_bench_gitops_write_token_file="${file}"
   (
     waited=0
     failures=0
@@ -1488,7 +1494,7 @@ start_gitops_write_token() { # <label> <file>
 }
 
 # Ends the renewer and removes the file. A developer's own
-# TF_VAR_gitops_token_file (start_gitops_write_token minted nothing) stays as
+# TF_VAR_bench_gitops_write_token_file (start_gitops_write_token minted nothing) stays as
 # the environment set it.
 stop_gitops_write_token() { # <file>
   if [ -n "${GITOPS_WRITE_TOKEN_RENEWER:-}" ]; then
@@ -1498,9 +1504,36 @@ stop_gitops_write_token() { # <file>
   GITOPS_WRITE_TOKEN_RENEWER=""
   rm -f "$1" "$1.next"
   if [ -n "${GITOPS_WRITE_TOKEN_MINTED:-}" ]; then
-    unset TF_VAR_gitops_token_file
+    unset TF_VAR_bench_gitops_write_token_file
   fi
   GITOPS_WRITE_TOKEN_MINTED=""
+}
+
+# The other inputs of a writing stack, exported in its unit only, after
+# start_gitops_write_token: TF_VAR_gitops_repo (EVAL_LEDGER_REPO, owner/name,
+# the repository the resets write to) and, for a Config Connector stack, the
+# seeded fleet's KCC_FLEET_SLOT cluster and location from the .fleet-context
+# the fleet step wrote (bench/tf/fleet/config-connector.tf enables the add-on
+# there) and the account that file creates, with no project role. Not run-wide:
+# stale-audit-ledger, unread-target-ledger and gitops-fix-cycle declare
+# gitops_repo with other contracts, and no other stack sees a new TF_VAR_. A
+# value that is not known is left unset, so a stack that needs it refuses at
+# apply; a missing slot is a WARNING in this unit only.
+export_writing_stack_inputs() { # <label>
+  local cluster location
+  [ -z "${EVAL_LEDGER_REPO:-}" ] || export TF_VAR_gitops_repo="${EVAL_LEDGER_REPO}"
+  cluster="$(fleet_context_value "cluster.${KCC_FLEET_SLOT}")"
+  location="$(fleet_context_value "location.${KCC_FLEET_SLOT}")"
+  if [ -n "${cluster}" ] && [ -n "${location}" ]; then
+    export TF_VAR_kcc_cluster_name="${cluster}" TF_VAR_kcc_cluster_location="${location}"
+  else
+    echo "WARNING: $1: no cluster for seeded slot ${KCC_FLEET_SLOT} in BENCH_FLEET_KUBECONFIG_DIR=${BENCH_FLEET_KUBECONFIG_DIR:-unset}/.fleet-context; a stack that plants a Config Connector object refuses at apply" >&2
+  fi
+  [ -z "${PROJECT_ID:-}" ] || export TF_VAR_kcc_google_service_account="${KCC_EVAL_CONTEXT_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com"
+}
+
+unset_writing_stack_inputs() {
+  unset TF_VAR_gitops_repo TF_VAR_kcc_cluster_name TF_VAR_kcc_cluster_location TF_VAR_kcc_google_service_account
 }
 
 # One `<key>=<value>` line of the .fleet-context that hack/fleet-kubeconfigs.sh
@@ -2451,25 +2484,6 @@ export TF_VAR_infra_provider="gcp"
 export TF_VAR_host_cluster_name="${HOST_CLUSTER_NAME}"
 export TF_VAR_host_cluster_location="${REGION}"
 export TF_VAR_agent_namespace="${TARGET_NAMESPACE}"
-
-# The inputs a stack that writes to the leased GitOps repository, or plants a
-# Config Connector object, needs. A stack that does not declare one ignores
-# it. The GitOps repository is the one the resets write to. The Config
-# Connector cluster is the seeded fleet's KCC_FLEET_SLOT cluster, read from the
-# .fleet-context the fleet step wrote (bench/tf/fleet/config-connector.tf
-# enables the add-on there), and the account is the one that file creates,
-# with no project role, for a stack's ConfigConnectorContext. A value that is
-# not known is left unset, so a stack that needs it refuses at apply. The
-# write token comes per unit (start_gitops_write_token).
-[ -z "${EVAL_LEDGER_REPO:-}" ] || export TF_VAR_gitops_repo="${EVAL_LEDGER_REPO}"
-KCC_CLUSTER_NAME="$(fleet_context_value "cluster.${KCC_FLEET_SLOT}")"
-KCC_CLUSTER_LOCATION="$(fleet_context_value "location.${KCC_FLEET_SLOT}")"
-if [ -n "${KCC_CLUSTER_NAME}" ] && [ -n "${KCC_CLUSTER_LOCATION}" ]; then
-  export TF_VAR_kcc_cluster_name="${KCC_CLUSTER_NAME}" TF_VAR_kcc_cluster_location="${KCC_CLUSTER_LOCATION}"
-else
-  echo "WARNING: no cluster for seeded slot ${KCC_FLEET_SLOT} in BENCH_FLEET_KUBECONFIG_DIR=${BENCH_FLEET_KUBECONFIG_DIR:-unset}/.fleet-context; a stack that plants a Config Connector object refuses at apply" >&2
-fi
-[ -z "${PROJECT_ID:-}" ] || export TF_VAR_kcc_google_service_account="${KCC_EVAL_CONTEXT_ACCOUNT}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 # Per-run task-cluster name, derived from the Prow run identity. Within a
 # project, two runs can never race on one cluster because they never share a
@@ -4887,6 +4901,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
       skip_unit "${task}" "${name}" "${rep}" "${streams}" "${has_stack}" "did not run: no GitOps write token for its stack" "${gitops_infra}"
       return 0
     fi
+    export_writing_stack_inputs "${name} rep ${rep}"
   fi
   local token_file="${STATE_DIR}/${name}.rep${rep}.ledger-token"
   start_ledger_token_renewal "${name} rep ${rep}" "${token_file}"
@@ -4894,7 +4909,10 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
   stop_ledger_token_renewal "${token_file}"
-  [ -z "${gitops_writer}" ] || stop_gitops_write_token "${gitops_token_file}"
+  if [ -n "${gitops_writer}" ]; then
+    stop_gitops_write_token "${gitops_token_file}"
+    unset_writing_stack_inputs
+  fi
   # `|| true`: a run that never printed a `results:` line must still write
   # its state files and reach the artifact copy -- it is exactly the crashed
   # run someone will need the log for.

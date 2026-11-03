@@ -27,16 +27,18 @@ variable "host_cluster_location" {
   description = "Region or zone of host_cluster_name"
 }
 
+# Exported to this unit only, because the stack declares the marker below.
 variable "gitops_repo" {
   type        = string
   description = "owner/name of the GitOps repository the audit writes to"
   default     = ""
 }
 
-# Declaring this variable is what makes hack/ci-eval-pr.sh mint the unit a
-# write token for gitops_repo (contents, pull requests and issues write, on
-# that repository only) and pass its file here (stack_writes_gitops).
-variable "gitops_token_file" {
+# The marker hack/ci-eval-pr.sh reads (BENCH_GITOPS_WRITE_MARKER): declaring
+# this variable makes it mint the unit a write token for gitops_repo
+# (contents, pull requests and issues write, on that repository only) and pass
+# the token's file here. A name of its own, so no other stack gets the token.
+variable "bench_gitops_write_token_file" {
   type        = string
   description = "File that holds a GitHub token with write access to gitops_repo"
   default     = ""

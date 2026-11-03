@@ -78,9 +78,11 @@
 # that every pool repository holds, and removes it at destroy, after it
 # closes the pull requests the audit opened under the directory (labelled
 # `audit:stale-closed` first). It writes with the token hack/ci-eval-pr.sh
-# mints for a stack that declares `gitops_token_file`. `writes_alone` runs
-# the case alone in the second phase, so no other unit sees the
-# kustomization, and the repository reset runs before each repetition.
+# mints for a stack that declares `bench_gitops_write_token_file`.
+# `writes_alone` runs the case alone in the second phase, so no other unit
+# sees the kustomization, and the repository reset runs before each
+# repetition and deletes a kustomization that a failed or killed teardown
+# left.
 #
 # CONFLICT WITH obtainability-major-pdb-auto-pr (#2228). That case plants
 # checkout-gateway.yaml at the same path without a kustomization, and needs
@@ -136,7 +138,7 @@ infrastructure:
   provider: "gcp"
   stack: "prebuilt/kustomize-overlay-declaration"
   teardown: true
-  # gitops_repo, gitops_token_file and host_cluster_* arrive from the
+  # gitops_repo, bench_gitops_write_token_file and host_cluster_* arrive from the
   # environment (TF_VAR_*, exported by hack/ci-eval-pr.sh).
 validated: false
 

@@ -145,7 +145,7 @@ def test_the_plant_refuses_a_directory_without_the_declaration():
 def test_the_plant_refuses_missing_settings():
     github = FakeGitHub(files={DECLARATION: "kind: Deployment\n"})
     stack = plant.Stack(plant.Settings(gitops_repo=GITOPS, directory=DIRECTORY, token_file=""), github)
-    with pytest.raises(RuntimeError, match="gitops_token_file"):
+    with pytest.raises(RuntimeError, match="bench_gitops_write_token_file"):
         stack.plant()
 
 
@@ -227,8 +227,11 @@ def _variables():
 
 def test_the_stack_declares_the_variable_the_runner_mints_for():
     runner = (REPO / "hack" / "ci-eval-pr.sh").read_text()
-    declared = re.search(r"^GITOPS_TOKEN_FILE_VARIABLE='variable \"([a-z_]+)\"'$", runner, re.M).group(1)
+    declared = re.search(r"^BENCH_GITOPS_WRITE_MARKER='variable \"([a-z_]+)\"'$", runner, re.M).group(1)
+    assert declared == "bench_gitops_write_token_file"
     assert declared in _variables()
+    # gitops-fix-cycle's variable, with another contract, is not the marker.
+    assert "gitops_token_file" not in _variables()
     for name in ("gitops_repo", "host_cluster_name", "host_cluster_location"):
         assert f"TF_VAR_{name}=" in runner, name
 

@@ -32,9 +32,11 @@
 # rest on the success path: first the pull requests the audit opened under the
 # directory (labelled `audit:stale-closed` before the close), then the file.
 #
-# Inputs. hack/ci-eval-pr.sh exports TF_VAR_gitops_repo, and, because this
-# stack declares gitops_token_file, mints a write token narrowed to that
-# repository for the unit and exports its file as TF_VAR_gitops_token_file.
+# Inputs. Because this stack declares bench_gitops_write_token_file, the
+# marker of a writing stack, hack/ci-eval-pr.sh mints the unit a write token
+# narrowed to the leased repository, exports its file as
+# TF_VAR_bench_gitops_write_token_file, and exports TF_VAR_gitops_repo
+# (owner/name), for this unit only.
 # This file gives them to plant.py as KUSTOMIZE_EVAL_GITOPS_REPO and
 # KUSTOMIZE_EVAL_GITOPS_TOKEN_FILE, with KUSTOMIZE_EVAL_DIRECTORY.
 #
@@ -57,7 +59,7 @@ locals {
   settings = {
     KUSTOMIZE_EVAL_GITOPS_REPO       = var.gitops_repo
     KUSTOMIZE_EVAL_DIRECTORY         = var.cluster_directory
-    KUSTOMIZE_EVAL_GITOPS_TOKEN_FILE = var.gitops_token_file
+    KUSTOMIZE_EVAL_GITOPS_TOKEN_FILE = var.bench_gitops_write_token_file
   }
 }
 
@@ -76,10 +78,13 @@ resource "null_resource" "kustomize_root" {
     EOT
   }
 
-  # No on_failure = continue: a destroy that cannot close the audit's pull
-  # request or remove the planted file fails the run, rather than leaving a
-  # Kustomize root that changes obtainability-major-pdb-auto-pr while
-  # Terraform records the stack as removed.
+  # No on_failure = continue: a teardown that cannot close the audit's pull
+  # request or remove the planted file exits non-zero, so the destroy reports
+  # the failure. devops-bench logs a teardown error and goes on, and the state
+  # is the run's own, so nothing applies this destroy again. A leftover from a
+  # failed or killed teardown is removed by the repository reset
+  # (hack/ci_reset_agent_pulls.py, PLANTED_STACK_FILES), at the next lease and
+  # before each unit of a case that requests a pull request.
   provisioner "local-exec" {
     when        = destroy
     interpreter = ["/bin/bash", "-c"]

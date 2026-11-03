@@ -195,7 +195,7 @@ class Stack:
         missing = [name for name, value in (
             ("gitops_repo", self.settings.gitops_repo),
             ("cluster_directory", self.settings.directory),
-            ("gitops_token_file", self.settings.token_file),
+            ("bench_gitops_write_token_file", self.settings.token_file),
         ) if not value]
         if missing:
             raise RuntimeError(f"{', '.join(missing)} must be set: the GitOps repository, the directory of the declaration, and the file that holds a write token for the repository")

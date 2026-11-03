@@ -34,7 +34,9 @@ What goes, and what stays:
   label (`managed-by: kube-agents-bench` on a line of its own). The one entry
   is the Kustomize root that bench/tf/prebuilt/kustomize-overlay-declaration
   plants for obtainability-pdb-kustomize-overlay and removes at its destroy.
-  A unit killed before that destroy leaves it, and then
+  Two things leave it: a unit killed before that destroy, and a teardown
+  that failed (devops-bench logs a teardown error and goes on, and the state
+  is the run's own, so nothing applies the destroy again). Then
   obtainability-major-pdb-auto-pr's fix is manual on that project at every
   run. A file at that path without the label stays. The GitHub path only:
   the GitLab path (hack/ci_gitlab_forge.py) deletes no file, and the stack
