@@ -540,9 +540,12 @@ class PullsQueryTest(unittest.TestCase):
         self.assertLess(gate.PULLS_PAGE_SIZE, 50)
         self.assertGreaterEqual(gate.PULLS_PAGE_SIZE, 1)
 
-    def test_the_query_asks_for_the_page_size(self):
-        rendered = gate.PULLS_QUERY % {"removals": gate.REMOVALS_READ, "suites": gate.CHECK_SUITES_READ, "page": gate.PULLS_PAGE_SIZE}
-        self.assertIn(f"first: {gate.PULLS_PAGE_SIZE}, after: $after", rendered)
+    def test_the_query_graphql_pulls_sends_asks_for_the_page_size(self):
+        # Drives the call site, so a page key that regressed to a literal is caught.
+        api = FakeAPI()
+        with mock.patch.object(gate, "PULLS_PAGE_SIZE", 13):
+            gate.graphql_pulls(api)
+        self.assertIn("first: 13, after: $after", api.queries[0])
 
     def test_every_page_is_read_and_the_cursor_is_followed(self):
         class PagingAPI:
