@@ -1002,6 +1002,44 @@ class BuildDocumentTest(unittest.TestCase):
         self.assertEqual(rows["team-a"], previous["projects"][0])
         self.assertEqual(rows["team-b"]["outcome"], "ok")
 
+    def test_a_kept_metrics_scopes_member_whose_naming_is_refused_keeps_its_previous_row(self):
+        # The Metrics Scope answered before the broker's scope.json changed; its naming call
+        # is then refused, and its later lookup gets no answer. The member reaches the rows
+        # by the naming's outcome, not a probe, and still keeps its previous row.
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "numbers": {"777": "mon-proj-a"},
+                    "projects": [{"id": "mon-proj-a", "via": ["metricsScopes/scope-p"], "outcome": "ok",
+                                  "confirmedAt": PREVIOUS_TIME}]}
+        broker = FakeBroker(scopes={"scope-p": ["777"]}, names={"777": "mon-proj-a"})
+        document, _ = self._build_through_client(
+            broker, {}, _scope(metricsScopes=["scope-p"]), previous,
+            flip_on=lambda argv: list(argv[:3]) == ["gcloud", "projects", "describe"],
+            script={"scope-p": ["answer", "fail"]})
+        self.assertEqual(self._rows(document)["mon-proj-a"], previous["projects"][0])
+
+    def test_a_kept_sources_member_that_answered_denied_stays_denied(self):
+        # Only a refusal is replaced by the previous row: a probe that gcloud answered
+        # `denied` this run says so, whatever happened to its source's later lookups.
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "a-denied", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}]}
+        broker = FakeBroker(assets={FOLDER_A: ["a-denied"], FOLDER_B: ["team-b"]}, probes={"a-denied": DENIED_STDERR})
+        document, _ = self._build_through_client(
+            broker, {FOLDER_B: 10_000}, _scope(folders=["111111111111", "222222222222"]), previous,
+            script={FOLDER_A: ["answer", "fail"]})
+        self.assertEqual(self._rows(document)["a-denied"]["outcome"], "denied")
+
+    def test_a_member_whose_naming_was_restored_keeps_its_previous_row(self):
+        # The digest changes before the first probe. In the recovery pass the Metrics Scope
+        # answers again but its naming call fails, so the naming is the first pass's, which
+        # the new window does not hold: the re-probe is refused, and the previous row stands.
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "numbers": {"777": "mon-proj-a"},
+                    "projects": [{"id": "mon-proj-a", "via": ["metricsScopes/scope-p"], "outcome": "ok",
+                                  "confirmedAt": PREVIOUS_TIME}]}
+        broker = FakeBroker(scopes={"scope-p": ["777"]}, names={"777": "mon-proj-a"})
+        document, _ = self._build_through_client(
+            broker, {}, _scope(metricsScopes=["scope-p"]), previous,
+            flip_on=self._is_probe, script={"777": ["answer", "fail"]})
+        self.assertEqual(self._rows(document)["mon-proj-a"], previous["projects"][0])
+
     def test_the_recovery_pass_waits_for_nothing_after_an_earlier_wait(self):
         # A source refused and then caught up leaves the run's retry window open; a source the
         # broker refuses in the recovery pass is still answered at once.

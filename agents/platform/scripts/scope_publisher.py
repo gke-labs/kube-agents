@@ -483,9 +483,13 @@ def _merge_pass(earlier: dict, later: dict, kept: set) -> dict:
     return merged
 
 
-def _merge_selections(earlier: dict, later: dict) -> dict:
+def _merge_selections(earlier: dict, later: dict, restored: set) -> dict:
     """A later naming pass over an earlier one: a selector member keeps the project ID an
-    earlier pass named its number by when its later naming call gave none."""
+    earlier pass named its number by when its later naming call gave none.
+
+    Each (selector, project) whose naming is an earlier pass's goes into `restored`: the
+    broker's window holds that project ID only under its scope.json as it was then.
+    """
     merged = dict(later)
     for selector, (members, outcome) in later.items():
         before = (earlier.get(selector) or (None, None))[0]
@@ -499,6 +503,7 @@ def _merge_selections(earlier: dict, later: dict) -> dict:
             if member.get(ROW_OUTCOME) is not None and number in named_before:
                 project, earlier_member = named_before[number]
                 fixed.setdefault(project, earlier_member)
+                restored.add((selector, project))
             else:
                 fixed.setdefault(key, member)
         merged[selector] = (fixed, outcome)
@@ -533,7 +538,7 @@ def build_document(declared: dict, management: str | None, previous: dict | None
         selector_reports = {g: r for g, r in groups.items() if rec._is_selector(g)}
         selections = rec._selector_members(selector_reports, looked_up, deadline, patterns, SCOPE_WORKERS, budget)
         if earlier is not None:
-            selections = _merge_selections(earlier, selections)
+            selections = _merge_selections(earlier, selections, restored)
         # With no management project named, its slot is still reserved: the cap passed on is
         # one smaller, which is what `_resolve_projects` makes of a management project it counts.
         entries, _, _, _ = rec._resolve_projects(management, scope, searches, looked_up, selections,
@@ -556,6 +561,7 @@ def build_document(declared: dict, management: str | None, previous: dict | None
 
     _scope_argument_wait.reset()
     kept: set = set()
+    restored: set = set()
     groups = rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget)
     if _scope_argument_wait.caught_up:
         # The broker's scope.json changed while the sources resolved, and the member
@@ -592,17 +598,20 @@ def build_document(declared: dict, management: str | None, previous: dict | None
             _, outcome = probes[entry[ROW_ID]]
             if outcome == rec.OUTCOME_OK:
                 confirmed = resolved_at
-            elif before and kept.issuperset(entry[ROW_VIA]):
-                # Every source of it kept an answer from before the broker's scope.json changed,
-                # so the probe could not be admitted: the previous row stands, as for a failed
-                # source.
-                outcome = before.get(ROW_OUTCOME) or outcome
         elif failed_sources.issuperset(entry[ROW_VIA]):
             outcome = before.get(ROW_OUTCOME) or entry[ROW_OUTCOME]
         else:
             # A source that answered placed it: a Metrics Scope listed its number, which could
             # not be named.
             outcome = entry[ROW_OUTCOME]
+        if (before and outcome == rec.OUTCOME_UNREACHABLE
+                and all(via in failed_sources or via in kept or (via, entry[ROW_ID]) in restored
+                        for via in entry[ROW_VIA])):
+            # Every source of it failed, or placed it with an answer or a naming from before the
+            # broker's scope.json changed, which the window may no longer hold: the previous row
+            # stands, as for a failed source. Only `unreachable` can come from such a refusal;
+            # an answer the probe or the naming gave this run is kept.
+            outcome = before.get(ROW_OUTCOME) or outcome
         row = {ROW_ID: entry[ROW_ID], ROW_VIA: entry[ROW_VIA], ROW_OUTCOME: outcome}
         if isinstance(confirmed, str):
             row[ROW_CONFIRMED_AT] = confirmed
