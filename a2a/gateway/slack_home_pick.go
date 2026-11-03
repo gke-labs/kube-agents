@@ -59,6 +59,7 @@ const (
 	slackHomePickShared          = "A channel shared through Slack Connect cannot be the home channel."
 	slackHomePickMalformed       = "That is not a channel."
 	slackHomePickGuest           = "Only a member of this workspace can move the home channel."
+	slackHomePickNoMemberCheck   = "Could not check your account with Slack; pick again."
 
 	// homePickedLine goes into the new home; homeMovedLine into the old one.
 	// Posted raw, as homeLearnedLine is: the ids are checked channel ids.
@@ -260,6 +261,22 @@ func (s *SlackAdapter) runHomePick(member, team, channel, actionTS string) (move
 		s.publishHome(member, false)
 		return "", 0
 	}
+	// A guest account of the workspace never moves the home channel, listed
+	// or not; the pick path looks the member up itself, since homeAdmitted
+	// skips users.info for a listed member. A lookup that fails refuses: a
+	// check that cannot run admits nobody.
+	switch guest, err := s.homePickGuest(member); {
+	case err != nil:
+		s.log.Warn("slack: home pick refused: the member could not be checked", "member", member, "channel", channel, "err", err)
+		s.setPickStatus(member, slackHomePickNoMemberCheck)
+		s.publishHome(member, false)
+		return "", 0
+	case guest:
+		s.log.Info("slack: home pick refused: a guest account", "member", member, "channel", channel)
+		s.setPickStatus(member, slackHomePickGuest)
+		s.publishHome(member, false)
+		return "", 0
+	}
 	admitted, decided := s.homeAdmitted(member)
 	if !decided {
 		s.log.Info("slack: home pick dropped: the member's admission could not be decided", "member", member, "channel", channel)
@@ -355,6 +372,16 @@ func (s *SlackAdapter) postOldHomeLine(ctx context.Context, previous, refused, t
 		return
 	}
 	s.postHomeLine(previous, text)
+}
+
+// homePickGuest reports whether member is a guest account of the workspace:
+// a multi-channel or single-channel guest on users.info.
+func (s *SlackAdapter) homePickGuest(member string) (bool, error) {
+	user, err := s.api.GetUserInfo(member)
+	if err != nil {
+		return false, err
+	}
+	return user.IsRestricted || user.IsUltraRestricted, nil
 }
 
 // slackMemberOrSomeone renders a member id as a mention, or "someone" for a

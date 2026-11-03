@@ -229,6 +229,13 @@ func TestSlackHomePickRefusals(t *testing.T) {
 	}{
 		{"a foreign team id with a listed id (E1)", "U1", "T9", "C0NEW2", nil, slackHomePickGuest, true, 0},
 		{"a foreign team id the list no longer names", "U2", "T9", "C0NEW2", nil, slackHomeDenied, true, 0},
+		{"a guest account under an empty list", "UX", "T1", "C0NEW2", func(a *SlackAdapter, api *fakeSlackAPI) {
+			api.users["UX"] = &slack.User{ID: "UX", TeamID: "T1", IsRestricted: true}
+		}, slackHomePickGuest, true, 0},
+		{"a guest account the list names", "U1", "T1", "C0NEW2", func(a *SlackAdapter, api *fakeSlackAPI) {
+			api.users["U1"] = &slack.User{ID: "U1", TeamID: "T1", IsUltraRestricted: true}
+		}, slackHomePickGuest, true, 0},
+		{"a member lookup that fails", "U1", "T1", "C0NEW2", func(a *SlackAdapter, api *fakeSlackAPI) { delete(api.users, "U1") }, slackHomePickNoMemberCheck, true, 0},
 		{"a member not admitted", "U2", "T1", "C0NEW2", nil, slackHomeDenied, true, 0},
 		{"admission undecided (E5)", "UX", "T1", "C0NEW2", func(a *SlackAdapter, api *fakeSlackAPI) { delete(api.users, "UX") }, "", false, 0},
 		{"the recorded channel (E4)", "U1", "T1", "C0OLD1", nil, "already the home channel", true, 1},

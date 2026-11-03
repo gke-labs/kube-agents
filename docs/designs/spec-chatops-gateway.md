@@ -1638,7 +1638,8 @@ caught up with, is adopted after the same check with no line posted, or replaced
 refuses it; a group direct message is refused without a call and a direct message is never a
 candidate. The second writer is the Home tab's channel picker (`a2a/gateway/slack_home_pick.go`): a
 `conversations_select` on the admitted Home view, deduped on the member and `action_ts`, admitted by
-`homeAdmitted` after the other-workspace check, checked as a mention is, then one merge patch under the
+`homeAdmitted` after the other-workspace check and a `users.info` guest check (a guest account of the
+workspace never moves it, listed or not, and a lookup that fails refuses), checked as a mention is, then one merge patch under the
 read `resourceVersion`, retried once when a 409 came from a writer of a sibling key (`moveHome`; a 409
 that moved the home names the winner); the member's view shows the
 move over the projected file for at most two minutes, one line in the new channel names who moved it
