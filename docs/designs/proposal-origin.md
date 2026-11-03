@@ -95,8 +95,11 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   sets the request-scoped session id `trusted_origin_session` reads. The Platform Agent's model
   can create jobs, edit them, and run any job directly, synchronously or in the background, so:
   a tick-started run of a job that no longer matches the template, or that the model created,
-  carries the origin recorded with the job when it was created or last changed (the creating
-  session's); a direct run is not tick-started and resolves as the session that asked for it.
+  carries the origin recorded for that job id when it was created or last changed, the creating
+  or editing session's, in a table of the Session KV server written by the in-pod handler of the
+  `cronjob` tool from trusted context, never in the jobs file the agent writes; a job id with no
+  such record and no template match resolves as `other`; a direct run is not tick-started and
+  resolves as the session that asked for it.
   A tick-started run has no Session KV metadata row of its own and no gateway dispatch, so
   neither of the other two records can reach it.
 
@@ -128,14 +131,17 @@ Three things change in the hook. **The worker gate lifts for the count.** Today 
 at once outside a kanban worker, so a scheduled fleet audit, which opens its proposals inline
 in the cron run, or an api_server turn, would never reach the ledger. The check and the ledger write now run in every process that has the terminal, on every profile that does (the platform profile, the Cluster Agent profiles, the front door), where today the hook is enabled on the platform profile alone; the card event and the removal of the whole record line stay worker-only, so what the model reads in any other session changes only by the token field the hook strips. **The record binds to the call that opened the proposal.** The forge check proves the pull request
 is the agent's, not that this process opened it, so a worker that echoed another session's fresh
-record line could claim that proposal for its own origin. The broker therefore mints a one-time
-claim token with each `proposal-create` answer and keeps it with the url for the window;
-`vcs_client` puts the token on the record line; the hook presents every token it sees to a new
-`proposal-claim` verb, which does the forge check itself with the credential it holds and accepts
-each token once, so the hook no longer makes its own forge reads and the cap of five records per output goes:
-every record line in foreground output is claimed, or burned, before the model reads it, and
-the hook strips the token from any line it could not claim, in every process, so a failed claim
-never leaves a live token in what the model reads. A line without a valid token is left as text
+record line could claim that proposal for its own origin. The broker therefore mints a one-time claim token with each `proposal-create` answer and keeps it
+with the url for the window; `vcs_client` takes the token out of the answer it returns and prints
+(so `vcs.py`'s stdout never carries it) and puts it on the stderr record line alone; the hook
+presents the tokens it sees to a new `proposal-claim` verb, which does the forge check itself
+with the credential it holds and accepts each token once, so the hook no longer makes its own
+forge reads. The claim is one broker call through the sandbox hop per record line, made in line
+before the command returns, so the hook keeps today's cap of five record lines per output: the
+first five are claimed, or burned, before the model reads them, and the hook strips the token
+from every record line in the output it did not claim, those past the cap and those whose claim
+failed, in every process, so no live token reaches what the model reads. A proposal whose line
+went unclaimed counts as missed. A line without a valid token is left as text
 and counts nothing. What remains is the model keeping the broker's answer out of foreground
 output (stderr to a file, a pipe, a background run, or a request it writes itself against the
 broker instead of `vcs_client.call`) and replaying the token from another session within the
@@ -161,9 +167,7 @@ origin). Under the experimental platform-profile front door a chat turn does run
 terminal; its session record then resolves it, `chat` with its platform. A Prometheus reader can split chat by platform; the status does not. The hook is enabled on every profile that has the terminal.
 
 What the count misses, stated so the numbers are read right: a pull request opened by a
-background process (the hook reads foreground output only); one whose record line the model
-kept from the hook, or whose token the model burned; one whose claim failed the forge check or
-arrived after the fifteen-minute window; and one opened by a request the model wrote itself
+background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
 instead of `vcs_client.call`. So the origin counts sit at or below
 `remediationsProposedTotal` in the usual case, and the difference reads as "proposals the agent
 did not see itself open"; it is approximate, since the broker's total is itself folded from a
@@ -215,8 +219,7 @@ is still refused anywhere else in the block.
 
 The origin never comes from what the model types: the session record is written by in-pod
 starters, the card's stamp is written at insert by the board from the creator's trusted context,
-the run's context is set by the scheduler for shipped jobs only, a model-created job carries its
-creating session's origin, and the process reads its own origin through those records alone. The pull request itself is counted only after the forge confirms the agent opened
+the run's context is set by the scheduler for shipped jobs only, a model-created job carries its creating session's origin from the Session KV server's record, and the process reads its own origin through those records alone. The pull request itself is counted only after the forge confirms the agent opened
 it. The ledger and the readings carry no identifier that leaves the pod: the ledger's url stays
 in the pod's own store, and the series and the status carry an origin name and a platform name,
 never a repository, a url, a user or a session id. The zero-PII contract of the status block
@@ -227,14 +230,15 @@ holds as it stands.
 - **Session KV server** (`agents/platform/scripts/session_kv_server.py`): the `origin` metadata
   key (with the platform) and its write for `k8s-evt-*` sessions at the first inject; the parent
   walk for continuations; the `proposals_opened` table and the endpoint the hook writes it
-  through; the stamped-insert endpoint for cards; the drift backlog's `drift` stamp.
+  through; the stamped-insert endpoint for cards; the drift backlog's `drift` stamp; the per-job-id origin table the `cronjob` handler writes.
 - **Board patch** (`deploy/docker/patches/`, beside `kanban_priority.py`): the card's `origin`
   and `origin_platform` columns written at insert from the creating turn's session record, run
   context or dashboard, the worker's and the child's inheritance, and the insert-only stamp a
   trusted writer passes.
 - **Credential broker** (`agents/platform/scripts/credential_proxy.py`) and `vcs_client`: the
-  one-time claim token on the `proposal-create` answer and the record line, and the
-  `proposal-claim` verb that checks the forge and burns the token.
+  one-time claim token on the `proposal-create` answer, taken out of the returned answer and put
+  on the stderr record line only, and the `proposal-claim` verb that checks the forge and burns
+  the token.
 - **hermes-bridge** (`a2a/hermes-bridge/api.go`): the origin write before the first turn, from
   the backend.
 - **`session_store` plugin** (`agents/chat/defaults/plugins/session_store/`): `origin` and
@@ -243,9 +247,7 @@ holds as it stands.
   cards.
 - **The in-pod reader** (the hook's resolution): `console` from the `web-console-` id prefix.
 - **Hermes scheduler patch** (beside `deploy/docker/patches/apply_cron_run_workdir.py`): the
-  per-run origin context, `audit` or `scheduled` from the shipped file's `skills` for
-  scheduler-started runs of shipped jobs; the creating session's origin recorded with a
-  model-created job and carried by its runs.
+  per-run origin context, `audit` or `scheduled` from the shipped file's `skills` for tick-started runs of jobs that match the template; the creating or editing session's origin recorded per job id in the Session KV server by the `cronjob` tool's handler and carried by that job's tick-started runs.
 - **`github_scan_gate.py`**: `issue` on its issue cards, `scheduled` on its pull-request
   follow-up cards, passed to the insert through the loopback endpoint.
 - **`pr_opened` hook** (`agents/platform/plugins/pr_opened/__init__.py`): the claim of every
@@ -278,8 +280,7 @@ model's own report of what it did; a repository, url or user reaching the status
 ## 5. Eval exemption
 
 A deterministic guard in the sense of `.agents/rules/eval_driven_development.md`: a session
-record, a verified ledger, a reading and a status field, with no model call in any path. The one text the model sees change is a machine record line it
-already reads today, which gains an opaque token field; no prompt, instruction, tool text or
+record, a verified ledger, a reading and a status field, with no model call in any path. The one text the model sees change is a machine record line it already reads today, from which the hook now strips an opaque token field; no prompt, instruction, tool text or
 skill text changes, and a worker's output has the line removed exactly as today. Unit tests cover every origin's resolution, the inheritance through a
 card, a child card and a continuation, the `other` fallback, the ledger's once-per-url rule, the
 reading's presence rule and the summary line.
