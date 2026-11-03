@@ -23,8 +23,12 @@ both inside ``write_txn``. The applier rebinds it to
 :func:`wrap_inherit_creator_origin`, which writes the stamp in that same
 transaction, so a card never exists unstamped and a rolled-back insert leaves
 no stamp. ``create_task`` itself is rebound to :func:`wrap_create_task`, which
-resolves a top-level card's origin *before* the transaction, so the Session KV
-lookup never runs under the board's write lock. Every creator goes through
+resolves a top-level card's origin *before* its own insert's transaction. A
+caller that wraps several creates in one outer ``write_txn`` (``kanban swarm``:
+``create_swarm`` makes N+3 cards in one transaction) still resolves under that
+lock, so :func:`turn_origin` memoises the session record per session id for
+:data:`ORIGIN_CACHE_TTL_SECONDS`: one Session KV lookup per turn, not one per
+card. Every creator goes through
 these two: the ``kanban_create`` tool, ``hermes kanban create`` and
 ``/kanban create`` (``run_slash``), ``kanban swarm``, the Hermes dashboard's
 create route, and auto-decomposition. No kube-agents code inserts a card any
@@ -49,8 +53,8 @@ In this order, the first that applies:
    id the web console (``web-console-``) or the admin console's chat page
    (``portal_``) minted; else nothing.
 4. **The Hermes dashboard's create route** (``created_by="dashboard"``, which
-   the route sets itself) is ``console``. Only outside the CLI create path,
-   where ``--created-by`` is an argument anyone can type.
+   the route sets itself) is ``console``. Only outside the CLI create and
+   swarm commands, where ``--created-by`` is an argument anyone can type.
 
 A card that resolves to none of these, ``other``, gets no stamp, and reads as
 ``other`` (:func:`origin_of`). The stamp is written with ``INSERT OR IGNORE``:
@@ -112,6 +116,8 @@ import json
 import logging
 import os
 import sqlite3
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -169,6 +175,9 @@ ORIGIN_PLATFORM_KEY = "platform"
 #: insert's transaction, on a loopback call.
 SESSION_LOOKUP_TIMEOUT_SECONDS = 2.0
 HTTP_NOT_FOUND = 404
+#: A session record (or its absence) is reused this long, so the creates of one
+#: turn, such as a swarm's under one outer transaction, pay one lookup.
+ORIGIN_CACHE_TTL_SECONDS = 30
 #: Minting and redeeming a ticket each wait at most this long, on loopback.
 STAMP_TICKET_TIMEOUT_SECONDS = 2.0
 
@@ -186,10 +195,13 @@ _pending_origin: contextvars.ContextVar[Optional[tuple[str, str]]] = contextvars
 _writer_ticket: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "kanban_origin_writer_ticket", default=None
 )
-#: Set while the CLI create command runs, whose ``created_by`` is an argument.
+#: Set while the CLI create or swarm command runs, whose ``created_by`` is an argument.
 _cli_create: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "kanban_origin_cli_create", default=False
 )
+#: Session id -> (monotonic expiry, the record's ``(origin, platform)`` or None).
+_ORIGIN_CACHE: dict[str, tuple[float, Optional[tuple[str, str]]]] = {}
+_ORIGIN_CACHE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -301,11 +313,32 @@ def _record_origin(session_id: str) -> Optional[tuple[str, str]]:
     return origin, platform if isinstance(platform, str) else ""
 
 
+def _cached_record_origin(session_id: str) -> Optional[tuple[str, str]]:
+    """:func:`_record_origin`, reused for :data:`ORIGIN_CACHE_TTL_SECONDS`, a miss included.
+
+    The lookup runs outside the lock, so a slow server never serialises
+    unrelated sessions; two first lookups of one session may both run.
+    """
+    now = time.monotonic()
+    with _ORIGIN_CACHE_LOCK:
+        cached = _ORIGIN_CACHE.get(session_id)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    record = _record_origin(session_id)
+    expires = time.monotonic() + ORIGIN_CACHE_TTL_SECONDS
+    with _ORIGIN_CACHE_LOCK:
+        for stale in [key for key, (until, _) in _ORIGIN_CACHE.items() if until <= now]:
+            del _ORIGIN_CACHE[stale]
+        _ORIGIN_CACHE[session_id] = (expires, record)
+    return record
+
+
 def turn_origin() -> tuple[str, str]:
     """The creating turn's ``(origin, platform)``; ``("other", "")`` when unresolved.
 
-    The cron run's context; else the session record for the trusted session id;
-    else ``console`` by the console id convention; else ``other``. Never raises.
+    The cron run's context; else the session record for the trusted session id
+    (memoised per session id, :func:`_cached_record_origin`); else ``console``
+    by the console id convention; else ``other``. Never raises.
     Each step is guarded on its own, so a failure in one never skips the next.
     """
     cron = _step(_cron_origin, None, "the cron run's origin")
@@ -314,7 +347,7 @@ def turn_origin() -> tuple[str, str]:
     session_id = _step(_session_id, "", "the turn's session id")
     if not session_id:
         return NO_ORIGIN
-    record = _step(lambda: _record_origin(session_id), None, "the session record")
+    record = _step(lambda: _cached_record_origin(session_id), None, "the session record")
     if record:
         return record
     if session_id.startswith(CONSOLE_SESSION_PREFIXES):
@@ -473,7 +506,7 @@ def wrap_create_task(create_task: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def wrap_cli_create(command: Callable[..., Any]) -> Callable[..., Any]:
-    """``hermes_cli.kanban._cmd_create``, marked so its ``--created-by`` is not the dashboard's."""
+    """``hermes_cli.kanban._cmd_create`` or ``_cmd_swarm``, marked so its ``--created-by`` is not the dashboard's."""
 
     @functools.wraps(command)
     def wrapper(*args, **kwargs):

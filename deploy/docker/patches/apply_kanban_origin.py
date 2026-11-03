@@ -23,11 +23,12 @@ held in memory and compiled before any is written:
 
 ``hermes_cli/kanban.py``
 
-    3. ``_cmd_create`` is rebound to ``wrap_cli_create`` and put back into
-       ``_HANDLERS``, which ``kanban_command`` and so ``run_slash`` dispatch
-       through. That marks the CLI create path, whose ``--created-by`` is an
-       argument and so never reads as the dashboard's. No argument is added:
-       the create parser rejects ``--origin``.
+    3. ``_cmd_create`` and ``_cmd_swarm`` are rebound to ``wrap_cli_create``
+       and put back into ``_HANDLERS``, which ``kanban_command`` and so
+       ``run_slash`` dispatch through. That marks the CLI create and swarm
+       paths, whose ``--created-by`` is an argument and so never reads as the
+       dashboard's. No argument is added: the create parser rejects
+       ``--origin``.
 
 Why is documented in the module docstring of
 ``deploy/docker/patches/kanban_origin.py``. Usage::
@@ -81,17 +82,21 @@ DB_TRAILER = (
 
 # --- 3. the CLI create path ---------------------------------------------------
 CLI_CREATE = "_cmd_create"
+CLI_SWARM = "_cmd_swarm"
 HANDLERS = "_HANDLERS"
 HANDLERS_ENTRY = '"create": _cmd_create'
+HANDLERS_SWARM_ENTRY = '"swarm": _cmd_swarm'
 CLI_MARKER = "_kanban_origin_wrap_cli_create("
 CLI_TRAILER = (
-    "\n\n# kube-agents patch: mark the CLI create path, whose --created-by is an\n"
-    "# argument, not the dashboard. See hermes_cli/kanban_origin.py.\n"
+    "\n\n# kube-agents patch: mark the CLI create and swarm paths, whose\n"
+    "# --created-by is an argument, not the dashboard. See hermes_cli/kanban_origin.py.\n"
     "from hermes_cli.kanban_origin import (  # noqa: E402\n"
     "    wrap_cli_create as _kanban_origin_wrap_cli_create,\n"
     ")\n"
     "_cmd_create = _kanban_origin_wrap_cli_create(_cmd_create)\n"
     '_HANDLERS["create"] = _cmd_create\n'
+    "_cmd_swarm = _kanban_origin_wrap_cli_create(_cmd_swarm)\n"
+    '_HANDLERS["swarm"] = _cmd_swarm\n'
 )
 
 
@@ -126,12 +131,14 @@ def apply(root: Path) -> None:
 
     cli = patches[CLI_RELATIVE]
     cli.find_def(CLI_CREATE, label="CLI create command")
+    cli.find_def(CLI_SWARM, label="CLI swarm command")
     handlers = cli.find_assign(HANDLERS, label="CLI command table")
-    if HANDLERS_ENTRY not in handlers.value_text:
-        raise SystemExit(
-            f"{PREFIX} patch: {CLI_RELATIVE}: {HANDLERS} no longer maps "
-            f"{HANDLERS_ENTRY!r}. {cli.note}"
-        )
+    for entry in (HANDLERS_ENTRY, HANDLERS_SWARM_ENTRY):
+        if entry not in handlers.value_text:
+            raise SystemExit(
+                f"{PREFIX} patch: {CLI_RELATIVE}: {HANDLERS} no longer maps "
+                f"{entry!r}. {cli.note}"
+            )
     cli.append(CLI_TRAILER)
 
     for patch in patches.values():

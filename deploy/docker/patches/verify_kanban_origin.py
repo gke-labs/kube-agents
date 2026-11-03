@@ -103,6 +103,7 @@ print("wiring")
 check("create_task is wrapped", getattr(K.create_task, "__wrapped__", None) is not None)
 check("inherit_creator_origin is wrapped", getattr(KG.inherit_creator_origin, "__wrapped__", None) is not None)
 check("the CLI create command is wrapped", getattr(KCLI._HANDLERS["create"], "__wrapped__", None) is not None)
+check("the CLI swarm command is wrapped", getattr(KCLI._HANDLERS["swarm"], "__wrapped__", None) is not None)
 
 print("a turn's card")
 turn["session"] = CHAT_SESSION

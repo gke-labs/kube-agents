@@ -162,6 +162,10 @@ CLI_SOURCE = textwrap.dedent('''
         create.add_argument("--idempotency-key")
         create.add_argument("--created-by", default="user")
         create.add_argument("--json", action="store_true")
+        swarm = sub.add_parser("swarm", exit_on_error=False)
+        swarm.add_argument("goal")
+        swarm.add_argument("--worker", action="append")
+        swarm.add_argument("--created-by", default=None)
         return parser
 
 
@@ -177,8 +181,20 @@ CLI_SOURCE = textwrap.dedent('''
         return 0
 
 
+    def _cmd_swarm(args):
+        with contextlib.closing(kb.connect(os.environ[BOARD_ENV])) as conn:
+            with kb.write_txn(conn):
+                ids = [
+                    kb.create_task(conn, title=f"{args.goal}: {worker}", assignee=worker,
+                                   created_by=args.created_by or "user")
+                    for worker in ["root", *(args.worker or []), "verifier", "synthesizer"]
+                ]
+        print(json.dumps({"id": ids[0], "ids": ids}))
+        return 0
+
+
     _HANDLERS = {
-        "create": _cmd_create,
+        "create": _cmd_create, "swarm": _cmd_swarm,
     }
 
 
@@ -373,6 +389,22 @@ class StampAtInsertTest(Hermes):
         card = self.slash("create --json --created-by dashboard --assignee platform y")
         self.assertFalse(self.stamped(card))
 
+    def test_a_swarms_created_by_does_not_make_its_cards_the_dashboards(self):
+        out = self.kanban.run_slash("swarm --created-by dashboard --worker a --worker b goal")
+        ids = json.loads(out[out.find("{") :])["ids"]
+        self.assertEqual(len(ids), 5)
+        for task_id in ids:
+            self.assertFalse(self.stamped(task_id), task_id)
+
+    def test_a_swarm_under_one_transaction_pays_one_session_lookup(self):
+        self.in_chat_turn()
+        fetch = self.ko._fetch_session_origin
+        out = self.kanban.run_slash("swarm --worker a --worker b --worker c goal")
+        ids = json.loads(out[out.find("{") :])["ids"]
+        self.assertEqual(len(ids), 6)
+        self.assertEqual([self.origin(t) for t in ids], [("chat", "slack")] * 6)
+        self.assertEqual(fetch.call_count, 1, "one lookup for the whole swarm")
+
     def test_the_gate_stamps_issue_and_scheduled(self):
         gate = _import_gate()
         now = datetime(2026, 11, 3, 10, tzinfo=timezone.utc)
@@ -548,6 +580,25 @@ class ContractTest(Hermes):
 
 class SessionRecordTest(unittest.TestCase):
     """The HTTP read, with the real ``_fetch_session_origin``."""
+
+    def setUp(self):
+        kanban_origin._ORIGIN_CACHE.clear()
+        self.addCleanup(kanban_origin._ORIGIN_CACHE.clear)
+
+    def test_the_session_record_is_reused_within_the_ttl_and_read_again_after(self):
+        clock = [100.0]
+        with mock.patch.object(kanban_origin, "_cron_origin", return_value=None), \
+                mock.patch.object(kanban_origin, "_session_id", return_value="s-cached"), \
+                mock.patch.object(kanban_origin.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(kanban_origin, "_fetch_session_origin", return_value={"origin": "chat"}) as fetch:
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", ""))
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", ""))
+            self.assertEqual(fetch.call_count, 1)
+            clock[0] += kanban_origin.ORIGIN_CACHE_TTL_SECONDS + 1
+            fetch.return_value = None  # a miss is reused too
+            self.assertEqual(kanban_origin.turn_origin(), ("other", ""))
+            self.assertEqual(kanban_origin.turn_origin(), ("other", ""))
+            self.assertEqual(fetch.call_count, 2)
 
     @staticmethod
     def _ticket(value):
@@ -760,6 +811,8 @@ class ApplierTest(unittest.TestCase):
             (applier.GRAPH_RELATIVE, "def inherit_creator_origin("),
             (applier.CLI_RELATIVE, "def _cmd_create("),
             (applier.CLI_RELATIVE, applier.HANDLERS_ENTRY),
+            (applier.CLI_RELATIVE, "def _cmd_swarm("),
+            (applier.CLI_RELATIVE, applier.HANDLERS_SWARM_ENTRY),
         ):
             with self.subTest(anchor=anchor):
                 root, targets = self._tree({relative: PRISTINE[relative].replace(anchor, "pass  # ", 1)})

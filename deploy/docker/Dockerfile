@@ -1835,9 +1835,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # it: the bootstrap hand-off and the GitHub scan gate pass a one-time stamp
 # ticket minted on the Session KV server, which the insert redeems; the drift
 # backlog stamps the side table directly from the Session KV server after its
-# create returns. The build checks three swaps: inherit_creator_origin in
+# create returns. The build checks four swaps: inherit_creator_origin in
 # kanban_db_graph.py, create_task in kanban_db.py, and the CLI's
-# _HANDLERS["create"] in kanban.py. Runs after kanban_priority, and before
+# _HANDLERS["create"] and _HANDLERS["swarm"] in kanban.py. Runs after kanban_priority, and before
 # credential_redaction, whose create_task prologue lands inside the def this
 # wraps. hermes_cli/ is the destination no chmod loop walks, hence install -m.
 # See the module docstring in deploy/docker/patches/kanban_origin.py.
@@ -2038,6 +2038,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF 'inherit_creator_origin = _kanban_origin_wrap_inherit(inherit_creator_origin)' /opt/hermes/hermes_cli/kanban_db_graph.py && \
     grep -qF 'create_task = _kanban_origin_wrap_create_task(create_task)' /opt/hermes/hermes_cli/kanban_db.py && \
     grep -qF '_HANDLERS["create"] = _cmd_create' /opt/hermes/hermes_cli/kanban.py && \
+    grep -qF '_HANDLERS["swarm"] = _cmd_swarm' /opt/hermes/hermes_cli/kanban.py && \
     cp /tmp/latency-patches/kanban_ended_run.py /opt/hermes/tools/kanban_ended_run.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_ended_run.py /opt/hermes && \
     test "$(grep -c '_kanban_refuse_ended_run(tid, _kanban_ended_run_connect)' /opt/hermes/tools/kanban_tools.py)" = "2" && \
