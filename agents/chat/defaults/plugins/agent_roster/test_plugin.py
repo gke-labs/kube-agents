@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +22,12 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import plugin  # noqa: E402
 
+# Two different old ages for the profiles directory: the module refuses to
+# cache a tree changed within its racy window (agent_roster.CACHE_RACY_SECONDS),
+# so a directory dated this far back is cached, and one re-dated to the second
+# age is re-read only because the cache key carries the directory's mtime.
+CACHE_AGED_SECONDS = 60
+CACHE_REAGED_SECONDS = 30
 # .../agents/chat/defaults/plugins/agent_roster/test_plugin.py -> .../agents/chat
 CHAT_AGENT_DIR = Path(__file__).resolve().parents[3]
 ROSTER_SOURCE = CHAT_AGENT_DIR / "scripts" / "agent_roster.py"
@@ -92,14 +99,23 @@ class InjectionTest(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn("No specialist agents", result["context"])
 
-    def test_the_roster_is_re_read_every_turn(self):
+    def _age(self, seconds):
+        then = time.time_ns() - seconds * 1_000_000_000
+        os.utime(self.profiles, ns=(then, then))
+
+    def test_the_roster_is_re_read_when_the_tree_changes(self):
         # A cluster agent scaffolded a minute ago has to appear on the next
-        # message — that window is exactly when the user asks about it.
+        # message — that window is exactly when the user asks about it. The
+        # directory is aged past the racy window on both sides, so the second
+        # turn is a cache miss on the directory's mtime, not a racy re-read.
         self._profile("default")
         self._profile("platform", "Fleet work.")
+        self._age(CACHE_AGED_SECONDS)
+        self.assertNotIn("cluster-new", plugin.handle_pre_llm_call()["context"])
         self.assertNotIn("cluster-new", plugin.handle_pre_llm_call()["context"])
 
         self._profile("cluster-new", "Diagnostics for the new cluster.")
+        self._age(CACHE_REAGED_SECONDS)
         self.assertIn("cluster-new", plugin.handle_pre_llm_call()["context"])
 
     def _cluster_profile(self, project, cluster, location):

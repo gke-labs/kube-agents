@@ -43,6 +43,10 @@ ROSTER_FIX_ISSUE = "#4432"
 # trusts them (agent_roster.CACHE_RACY_SECONDS refuses a tree changed within
 # the last two seconds, because filesystem timestamps are coarse).
 CACHE_AGED_SECONDS = 60
+# CACHE_REAGED_SECONDS is a second, different old age: a path mutated and then
+# dated here is past the racy window, so only a key that carries its mtime
+# makes the next render re-read it.
+CACHE_REAGED_SECONDS = 30
 # One fixture profile: the name as cluster_agent_profile.profile_name derives
 # it, and the identity block the scaffold stamps into config.yaml.
 FLEET_SCALE_PROJECT = "fleet-project"
@@ -79,16 +83,15 @@ def _write_cluster_profile(base: Path, name: str, project: str, cluster: str, lo
     )
 
 
-def _age(path: Path) -> None:
-    """Date ``path`` CACHE_AGED_SECONDS back, so the cache does not treat it as racy."""
-    then = time.time_ns() - CACHE_AGED_SECONDS * 1_000_000_000
+def _age(path: Path, seconds: int = CACHE_AGED_SECONDS) -> None:
+    """Date ``path`` ``seconds`` back, so the cache does not treat it as racy."""
+    then = time.time_ns() - seconds * 1_000_000_000
     os.utime(path, ns=(then, then))
 
 
 def _forget() -> None:
     """Drop the module's cached roster, so a test starts from a miss."""
     agent_roster._cache = None
-    agent_roster._degraded = False
 
 
 @contextmanager
@@ -914,6 +917,91 @@ class TestRosterCache(unittest.TestCase):
         (self.base / "cluster-p-a-us").rmdir()
         self.assertNotIn("cluster-p-a-us", self._render())
 
+    # The tests above mutate the tree and render at once, so the re-read comes
+    # from the racy window, which refuses any stamp within two seconds of now.
+    # The ones below date the mutated path to a second, different old age
+    # before rendering: the racy guard is then silent and only a key that
+    # carries that path's mtime makes the render re-read, one per keyed stamp.
+
+    def test_an_aged_add_misses_on_the_directory_stamp(self):
+        self.assertNotIn("cluster-new", self._render())
+        _write_cluster_profile(self.base, "cluster-new", "p", "new", "us")
+        _age(self.base, CACHE_REAGED_SECONDS)
+        out, reads = self._reads_on_render()
+        self.assertGreater(reads, 0)
+        self.assertIn("cluster-new (the new cluster agent", out)
+
+    def test_an_aged_removal_misses_on_the_directory_stamp(self):
+        self.assertIn("cluster-p-a-us", self._render())
+        for child in (self.base / "cluster-p-a-us").iterdir():
+            child.unlink()
+        (self.base / "cluster-p-a-us").rmdir()
+        _age(self.base, CACHE_REAGED_SECONDS)
+        out, reads = self._reads_on_render()
+        self.assertGreater(reads, 0)
+        self.assertNotIn("cluster-p-a-us", out)
+
+    def test_an_aged_snapshot_rewrite_misses_on_the_snapshot_stamp(self):
+        snapshot = self.base.parent / "fleet_scope.json"
+        snapshot.write_text(
+            '{"boundary": true, "declared": {"projects": ["p"]}, "projects": '
+            '[{"id": "p", "state": "in-scope", "outcome": "ok", "via": ["projects"]}]}\n'
+        )
+        _age(snapshot)
+        self.assertIn("GCP projects in scope (1): p", self._render())
+        snapshot.write_text(
+            '{"boundary": true, "declared": {"projects": ["p", "q"]}, "projects": '
+            '[{"id": "p", "state": "in-scope", "outcome": "ok", "via": ["projects"]}, '
+            '{"id": "q", "state": "in-scope", "outcome": "ok", "via": ["projects"]}]}\n'
+        )
+        _age(snapshot, CACHE_REAGED_SECONDS)
+        out, reads = self._reads_on_render()
+        self.assertGreater(reads, 0)
+        self.assertIn("GCP projects in scope (2): p, q", out)
+
+    def test_an_aged_render_rewrite_misses_on_the_render_stamp(self):
+        render = self.base.parent / "render.json"
+        render.write_text('{"present": true, "projects": ["p"]}\n')
+        _age(render)
+        env = {"KUBEAGENTS_SCOPE_FILE": str(render)}
+        self.assertNotIn("q (unresolved)", self._render(env))
+        render.write_text('{"present": true, "projects": ["p", "q"]}\n')
+        _age(render, CACHE_REAGED_SECONDS)
+        out, reads = self._reads_on_render(env)
+        self.assertGreater(reads, 0)
+        self.assertIn("q (unresolved)", out)
+
+    def _aged_unstamped_profile(self, name):
+        home = self.base / name
+        home.mkdir()
+        (home / "CAPABILITIES.md").write_text(CLUSTER_ROLE)
+        (home / "config.yaml").write_text("model: x\n")
+        for path in (self.base, home, home / "config.yaml"):
+            _age(path)
+        self.assertIn(f"  - {name}\n", self._render())
+        _, reads = self._reads_on_render()
+        self.assertEqual(reads, 0, "an aged unstamped profile is cached")
+        return home
+
+    def test_an_aged_stamp_misses_on_the_unstamped_profiles_config_stamp(self):
+        # The stamp rewrites config.yaml in place: the file's mtime moves, the
+        # profile directory's and the profiles directory's do not.
+        home = self._aged_unstamped_profile("cluster-p-c-us")
+        (home / "config.yaml").write_text("model: x\ncluster_identity:\n  cluster: c\n  location: us\n  project: p\n")
+        _age(home / "config.yaml", CACHE_REAGED_SECONDS)
+        out, reads = self._reads_on_render()
+        self.assertGreater(reads, 0)
+        self.assertIn("cluster-p-c-us (the c cluster agent", out)
+
+    def test_an_aged_overlay_misses_on_the_unstamped_profiles_directory_stamp(self):
+        # An overlay adds a file beside config.yaml: the profile directory's
+        # mtime moves and nothing else does.
+        home = self._aged_unstamped_profile("cluster-p-c-us")
+        (home / "overlay.yaml").write_text("x: 1\n")
+        _age(home, CACHE_REAGED_SECONDS)
+        _, reads = self._reads_on_render()
+        self.assertGreater(reads, 0)
+
     def test_a_tree_changed_within_the_racy_window_is_not_cached(self):
         # Filesystem timestamps are coarse: two writes inside one tick share
         # an mtime, so a tree touched just now is re-read until it is quiet.
@@ -956,6 +1044,28 @@ class TestRosterCache(unittest.TestCase):
         self.assertIn(f"- platform: {agent_roster.NO_DESCRIPTION}", out)
         out, reads = self._reads_on_render()
         self.assertGreater(reads, 0)
+        self.assertIn("- platform: Fleet work.", out)
+
+    def test_a_fault_in_an_overlapping_discovery_is_not_cached_over_a_clean_one(self):
+        # The gateway runs each session's turn on its own thread, so two
+        # discoveries overlap after one invalidation. The interleaving, in one
+        # thread: discovery A's walk notes a fault; discovery B starts inside
+        # A's window, walks clean and caches; A finishes with a roster missing
+        # the faulted profile. A must not store that roster over B's.
+        from unittest import mock
+
+        real = agent_roster.discover
+
+        def interleaved(root):
+            agent_roster._note_degraded()
+            with mock.patch.object(agent_roster, "discover", real):
+                agent_roster.render(root)
+            return [a for a in real(root) if a["name"] != "platform"]
+
+        with mock.patch.object(agent_roster, "discover", side_effect=interleaved):
+            self.assertNotIn("platform", self._render())
+        out, reads = self._reads_on_render()
+        self.assertEqual(reads, 0, "B's clean roster stays cached")
         self.assertIn("- platform: Fleet work.", out)
 
     def test_a_skipped_profile_is_not_cached(self):
