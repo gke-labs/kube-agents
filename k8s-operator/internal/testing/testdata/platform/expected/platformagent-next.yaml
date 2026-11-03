@@ -1091,6 +1091,10 @@ spec:
               value: /etc/gitops/managed_repos
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
+            - name: CREDENTIAL_PROXY_STATE_LIMIT_BYTES
+              value: "5368709120"
+            - name: CREDENTIAL_PROXY_TMP_LIMIT_BYTES
+              value: "2147483648"
             - name: CREDENTIAL_PROXY_SCOPED_SA_POOL
               value: "0"
             - name: CREDENTIAL_PROXY_ROLE
@@ -1107,6 +1111,8 @@ spec:
               value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell,system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
             - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
               value: kubeagents-credential-proxy-watcher
+            - name: CREDENTIAL_PROXY_SCOPE_FILE
+              value: /etc/kube-agents/scope/scope.json
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1154,7 +1160,7 @@ spec:
             timeoutSeconds: 5
           resources:
             limits:
-              cpu: "1"
+              cpu: "2"
               ephemeral-storage: 8Gi
               memory: 2Gi
             requests:
@@ -1187,6 +1193,9 @@ spec:
               readOnly: true
             - mountPath: /etc/gitops
               name: gitops-state-volume
+              readOnly: true
+            - mountPath: /etc/kube-agents/scope
+              name: platform-agent-scope-vol
               readOnly: true
       securityContext:
         fsGroup: 10000
@@ -1243,6 +1252,14 @@ spec:
             defaultMode: 420
             name: platformagent-gitops-state
           name: gitops-state-volume
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: platform-agent-scope-vol
 status: {}
 ---
 apiVersion: policy/v1
@@ -2487,6 +2504,8 @@ data:
   identities.json: |
     {
       "version": "fdb06b6a6a1b4ee4",
+      "shard": 0,
+      "shards": 1,
       "identities": [
         {
           "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-provision",
@@ -2588,6 +2607,8 @@ data:
 kind: ConfigMap
 metadata:
   annotations:
+    kubeagents.x-k8s.io/a2a-authmap-shard: "0"
+    kubeagents.x-k8s.io/a2a-authmap-shards: "1"
     kubeagents.x-k8s.io/a2a-authmap-version: fdb06b6a6a1b4ee4
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -2595,7 +2616,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: authmap
-  name: platformagent-a2a-authmap
+  name: platformagent-a2a-authmap-0
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -3315,7 +3336,7 @@ rules:
   - apiGroups:
       - ""
     resourceNames:
-      - platformagent-a2a-authmap
+      - platformagent-a2a-authmap-0
     resources:
       - configmaps
     verbs:
@@ -3381,7 +3402,7 @@ spec:
   template:
     metadata:
       annotations:
-        a2a.kubeagents.x-k8s.io/identity-map-schema: "4"
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "5"
       labels:
         app: platformagent-a2a-callout
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -3410,6 +3431,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: A2A_AUTHMAP_NAME
               value: platformagent-a2a-authmap
+            - name: A2A_AUTHMAP_SHARDS
+              value: "1"
             - name: A2A_AUTHMAP_KEY
               value: identities.json
             - name: A2A_TOKEN_AUDIENCE
@@ -4097,6 +4120,25 @@ status:
   loadBalancer: {}
 ---
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: scope-publisher
+  name: platformagent-resolved-scope
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
 kind: ResourceQuota
 metadata:
   labels:
@@ -4192,6 +4234,14 @@ rules:
     verbs:
       - get
       - patch
+  - apiGroups:
+      - ""
+    resourceNames:
+      - platformagent-resolved-scope
+    resources:
+      - configmaps
+    verbs:
+      - get
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -4230,6 +4280,27 @@ metadata:
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: gateway
   name: platformagent-home-channel
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  slack_home: ""
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+  name: platformagent-chat-home
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -4830,6 +4901,8 @@ spec:
               value: default
             - name: A2A_GCHAT_TOKEN_PATH
               value: /var/run/secrets/a2a-chat-relay/token
+            - name: A2A_RESOLVED_SCOPE_CONFIGMAP
+              value: platformagent-resolved-scope
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
           name: gateway
           ports:

@@ -99,6 +99,68 @@ readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 # disk, which the admission webhook and the chart also take as the limit.
 readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
 
+# ─── Release footprint summary ────────────────────
+# What install.sh's pre-flight summary prints about the cluster footprint and
+# its modeled cost (print_footprint_summary). The chart owns the arithmetic
+# (kube-agents.footprintSummary in charts/kube-agents/templates/_helpers.tpl);
+# the installer renders that template through a throwaway chart holding only
+# the chart's helpers, values and footprint file plus a one-template probe, so
+# it prints the figures the chart's notes carry without crossing any other
+# template's gates (a minter without an App ID, a console on a cluster without
+# NetworkPolicy), told the cluster's shape the way the chart probes it, since
+# the notes on an Autopilot cluster count the credential proxy at the
+# operator's Autopilot requests. The apply goes through Terraform, which shows no notes, so
+# this summary is the one place the front door prints them; after the apply,
+# `helm get notes` is the command that does.
+readonly FOOTPRINT_CHART_SUBDIR="charts/kube-agents"
+readonly FOOTPRINT_HELPERS_TEMPLATE="templates/_helpers.tpl"
+readonly FOOTPRINT_PROBE_TEMPLATE="templates/footprint-summary.yaml"
+readonly FOOTPRINT_PROBE_KEY="summary"
+readonly FOOTPRINT_SUMMARY_TEMPLATE="kube-agents.footprintSummary"
+readonly FOOTPRINT_PROBE_RELEASE="footprint-summary"
+# The block scalar's indent in the probe: what the template indents the summary
+# by, and what the extractor strips.
+readonly FOOTPRINT_PROBE_INDENT=4
+# The tfvars key the cluster shape is written under; the rates the summary
+# applies are Autopilot's, which price pod requests, and a Standard cluster is
+# billed for its node pools instead.
+readonly FOOTPRINT_CLUSTER_MODE_KEY="cluster_mode"
+readonly FOOTPRINT_STANDARD_CLUSTER_MODE="standard"
+# The API the chart's kube-agents.gkeAutopilot probes to count the credential
+# proxy at the operator's Autopilot requests. `helm template` sees no cluster,
+# so the render is told the cluster serves it whenever the tfvars' cluster_mode
+# is not standard; otherwise the installer's figure would carry the Standard
+# pair footprint.yaml records while the notes on the cluster carry the
+# Autopilot pair.
+readonly FOOTPRINT_AUTOPILOT_API_VERSION="auto.gke.io/v1/AllowlistedWorkload"
+# The tfvars key the release namespace is written under, for the `helm get
+# notes` hint; the placeholder stands in when the file does not carry it.
+readonly FOOTPRINT_NAMESPACE_KEY="namespace"
+readonly FOOTPRINT_NAMESPACE_PLACEHOLDER="<namespace>"
+# The variables files Terraform loads on its own from the directory holding the
+# generated terraform.tfvars; an extra_helm_values carried in one reaches the
+# apply but not the footprint render. Assigned, then marked readonly (bash 3.2).
+FOOTPRINT_AUTOLOADED_TFVARS_GLOBS=("*.auto.tfvars" "*.auto.tfvars.json" "terraform.tfvars.json")
+readonly FOOTPRINT_AUTOLOADED_TFVARS_GLOBS
+# The variables Terraform reads extra command-line arguments from: a
+# -var-file=<path> in one brings a file from anywhere on disk to the apply, and
+# a -var can carry extra_helm_values itself. Either reaches the apply and not
+# the footprint render; -auto-approve alone (the route lifecycle.sh reads from
+# TF_CLI_ARGS_apply) carries no values and is not matched.
+FOOTPRINT_TF_CLI_ARGS_VARS=("TF_CLI_ARGS" "TF_CLI_ARGS_plan" "TF_CLI_ARGS_apply")
+readonly FOOTPRINT_TF_CLI_ARGS_VARS
+readonly FOOTPRINT_TF_CLI_ARGS_EXTRA_VALUES_PATTERN='-var-file|-var[=[:space:]]+[[:punct:]]?extra_helm_values'
+# The footprint-shaping settings, read from the terraform.tfvars the generator
+# wrote (the composition's input) and passed to the chart under the key
+# terraform/examples/full-install/main.tf maps each to: tfvars key=chart value,
+# one pair per line.
+readonly FOOTPRINT_TFVARS_VALUE_MAP="platform_agent_storage_size=platformAgent.storage.size
+memory_provider=platformAgent.harness.memory.provider
+hermes_dashboard_enabled=platformAgent.harness.hermes.dashboardEnabled
+web_console_enabled=webConsole.enabled
+enable_github_minter=githubMinter.enabled
+platform_agent_mode=platformAgent.mode"
+
 # ─── OpenAI-compatible model server ───────────────────────────────────────────
 # The ports a base URL without one is dialled on, and the TCP port range.
 readonly HTTP_DEFAULT_PORT=80
@@ -878,6 +940,124 @@ is_valid_platform_agent_storage_size() {
   [ $((number * mi_per_unit)) -le "$PLATFORM_AGENT_STORAGE_SIZE_MAX_MI" ]
 }
 
+# The value of a top-level `key = value` assignment in a terraform.tfvars file,
+# unquoted, or nothing when the key is absent. Only the scalar shape the
+# generator writes (write_tfvars_from_state): a quoted string or a bare
+# boolean on one line, with an optional trailing comment.
+tfvars_scalar() {
+  local file="$1" key="$2"
+  [ -r "$file" ] || return 0
+  sed -n -E "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"?([^\"#]*[^\"# ])\"?.*$/\1/p" "$file" | head -n 1
+}
+
+# Renders the chart's footprint summary for the install terraform.tfvars
+# describes, to stdout, as the chart's NOTES.txt prints it. $1 is the checkout,
+# $2 the tfvars file. Fails, with the cause on stderr, when helm is missing,
+# the chart is not in the checkout, or the render refuses; the caller decides
+# whether that is worth more than a warning.
+render_footprint_summary() {
+  local repo_dir="$1" tfvars_file="$2" chart_dir probe_dir pair key value
+  chart_dir="${repo_dir}/${FOOTPRINT_CHART_SUBDIR}"
+  if ! command -v helm >/dev/null 2>&1; then
+    echo "helm is not on PATH" >&2
+    return 1
+  fi
+  if [ ! -f "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" ] || [ ! -f "${chart_dir}/Chart.yaml" ]; then
+    echo "the chart at ${chart_dir} has no Chart.yaml or ${FOOTPRINT_HELPERS_TEMPLATE}" >&2
+    return 1
+  fi
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/kube-agents-footprint.XXXXXX")" || return 1
+  # Chart.yaml, values and files/footprint.yaml as they are; the helpers as the
+  # only template beside the probe. values.schema.json comes too, so a value
+  # the chart would refuse is refused here as well.
+  cp "${chart_dir}/Chart.yaml" "${chart_dir}/values.yaml" "$probe_dir/" || { rm -rf "$probe_dir"; return 1; }
+  [ ! -f "${chart_dir}/values.schema.json" ] || cp "${chart_dir}/values.schema.json" "$probe_dir/"
+  cp -R "${chart_dir}/files" "$probe_dir/files" || { rm -rf "$probe_dir"; return 1; }
+  mkdir -p "$probe_dir/templates"
+  cp "${chart_dir}/${FOOTPRINT_HELPERS_TEMPLATE}" "$probe_dir/${FOOTPRINT_HELPERS_TEMPLATE}"
+  # A ConfigMap, so the output is one YAML document helm's manifest sorter
+  # reads; the block scalar keeps the summary's lines as they are.
+  printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n  %s: |\n{{ include "%s" . | indent %s }}\n' \
+    "$FOOTPRINT_PROBE_RELEASE" "$FOOTPRINT_PROBE_KEY" "$FOOTPRINT_SUMMARY_TEMPLATE" "$FOOTPRINT_PROBE_INDENT" > "$probe_dir/${FOOTPRINT_PROBE_TEMPLATE}"
+  local -a set_args=()
+  while IFS= read -r pair; do
+    [ -n "$pair" ] || continue
+    key="${pair%%=*}"
+    value="$(tfvars_scalar "$tfvars_file" "$key")"
+    [ -n "$value" ] || continue
+    set_args+=(--set "${pair#*=}=${value}")
+  done <<< "$FOOTPRINT_TFVARS_VALUE_MAP"
+  if [ "$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_CLUSTER_MODE_KEY")" != "$FOOTPRINT_STANDARD_CLUSTER_MODE" ]; then
+    set_args+=(--api-versions "$FOOTPRINT_AUTOPILOT_API_VERSION")
+  fi
+  local rendered rc=0
+  rendered="$(helm template "$FOOTPRINT_PROBE_RELEASE" "$probe_dir" ${set_args[@]+"${set_args[@]}"} 2>&1)" || rc=$?
+  rm -rf "$probe_dir"
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$rendered" >&2
+    return "$rc"
+  fi
+  # The block scalar's lines, their indent removed.
+  local pad
+  printf -v pad '%*s' "$FOOTPRINT_PROBE_INDENT" ''
+  printf '%s\n' "$rendered" | sed -n -E "/^  ${FOOTPRINT_PROBE_KEY}: \|\$/,\$ { /^  ${FOOTPRINT_PROBE_KEY}: \|\$/d; s/^${pad}//p; }"
+}
+
+# install.sh's step 11 entry for the footprint: the rendered summary, indented
+# under the bullet the caller printed, or a warning naming why it could not be
+# rendered. Never fails: the summary informs the confirmation and decides
+# nothing, so a chart that cannot be rendered here is reported and the run goes
+# on to the apply, where the same render failing is the error that stops it.
+# Two things the render cannot see are said under it when they apply: a
+# Standard cluster, whose bill is its node pools rather than the pod requests
+# the Autopilot rates price, and chart values carried through the
+# composition's extra_helm_values (TF_VAR_extra_helm_values, a -var or
+# -var-file in a TF_CLI_ARGS* variable, or a variables file Terraform
+# auto-loads beside the generated one), which reach the apply but not this
+# render.
+#
+# True when extra_helm_values may reach the apply unseen: TF_VAR_extra_helm_values
+# is set, a FOOTPRINT_TF_CLI_ARGS_VARS variable carries a -var-file or a -var
+# naming it, or a file matching FOOTPRINT_AUTOLOADED_TFVARS_GLOBS sits beside $1.
+footprint_extra_values_may_apply_unseen() {
+  local tfvars_dir glob name
+  [ -z "${TF_VAR_extra_helm_values:-}" ] || return 0
+  for name in "${FOOTPRINT_TF_CLI_ARGS_VARS[@]}"; do
+    if [[ "${!name:-}" =~ $FOOTPRINT_TF_CLI_ARGS_EXTRA_VALUES_PATTERN ]]; then
+      return 0
+    fi
+  done
+  tfvars_dir="$(dirname "$1")"
+  for glob in "${FOOTPRINT_AUTOLOADED_TFVARS_GLOBS[@]}"; do
+    if compgen -G "${tfvars_dir}/${glob}" >/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The apply goes through Terraform, which renders the chart's notes and shows
+# none, so the hints name the one command that prints them afterwards.
+print_footprint_summary() {
+  local repo_dir="$1" tfvars_file="$2" summary err_file namespace notes_cmd
+  namespace="$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_NAMESPACE_KEY")"
+  notes_cmd="helm get notes ${KUBE_AGENTS_HELM_RELEASE} -n ${namespace:-$FOOTPRINT_NAMESPACE_PLACEHOLDER}"
+  err_file="$(mktemp "${TMPDIR:-/tmp}/kube-agents-footprint-err.XXXXXX")" || return 0
+  if summary="$(render_footprint_summary "$repo_dir" "$tfvars_file" 2>"$err_file")"; then
+    printf '%s\n' "$summary" | sed 's/^/      /'
+    if [ "$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_CLUSTER_MODE_KEY")" = "$FOOTPRINT_STANDARD_CLUSTER_MODE" ]; then
+      print_info "This is a GKE Standard cluster: the modeled cost prices pod requests at Autopilot rates, and a Standard cluster is billed for its node pools whatever the pods request."
+    fi
+    if footprint_extra_values_may_apply_unseen "$tfvars_file"; then
+      print_info "Chart values set through the composition's extra_helm_values are not in this figure; after the apply, '${notes_cmd}' prints it for the release as applied."
+    fi
+  else
+    print_warning "Could not render the release footprint summary: $(tr '\n' ' ' < "$err_file" | sed 's/[[:space:]]*$//')"
+    print_info "The chart's notes carry the same figures, and the apply shows none (Terraform discards them); after the apply, '${notes_cmd}' prints them."
+  fi
+  rm -f "$err_file"
+}
+
 # The PlatformAgent and its release, read once for the scope check and the
 # mode notice beside it. Each front door calls refuse_apply_over_undeclared_scope
 # and then announce_platform_agent_mode_for_apply against the same namespace,
@@ -1344,7 +1524,7 @@ next_home_channel_unset_remedy() {
   case "${1:-}" in
     SLACK_HOME_CHANNEL)
       [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel"
-      printf '%s' "Set SLACK_HOME_CHANNEL to a channel id (C... or G..., at the bottom of the channel details' About tab) in ${via} and run again, with the app invited to that channel. Slack app setup: ${SLACK_HOME_CHANNEL_DOC}"
+      printf '%s' "Set SLACK_HOME_CHANNEL to a channel id (C... or G..., at the bottom of the channel details' About tab) in ${via} and run again, with the app invited to that channel; or, under homeChannelPolicy auto (the default), mention the agent once, top-level, in the channel you want. Slack app setup: ${SLACK_HOME_CHANNEL_DOC}"
       ;;
     GOOGLE_CHAT_HOME_CHANNEL)
       [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel"

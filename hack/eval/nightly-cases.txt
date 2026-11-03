@@ -401,8 +401,9 @@
 # The seven cases the presubmit ran without letting them block, when the
 # eval crew decided the presubmit runs the blocking roster and nothing else.
 # Six remain here; compliance-rbac-overgrant went back to the presubmit file
-# held out on 2026-09-29 (#2013), the documented exception. None was
-# admitted; each # line is the hold-out reason as it stood that day, with
+# held out on 2026-09-29 (#2013), the documented exception, and onto the
+# blocking roster on 2026-11-02 (#2013 step 4). None was
+# admitted that day; each # line is the hold-out reason as it stood then, with
 # the case's presubmit record from #1626's merge to the move (graded
 # repetitions in the dashboard's data.json, 2026-09-15 to 09-22, 734 runs)
 # so the nightly record starts from a known point. The admission edit for any
@@ -797,10 +798,18 @@
 
 # A cluster request with nothing to write to ends in a stated stop, never a
 # direct create (#2937). On the pool it grades the stop: the pool repositories hold no
-# provisioning/ path. Read-only; requests no pull request.
+# provisioning/ path. Read-only; requests no pull request, and declares
+# writes_alone, so it runs in the fan-out's second phase, one unit at a time
+# after the write settle, and a pull request a wrong answer opens is charged
+# to it whether the reply names it or not. The nightly files it with the
+# writers part (ci-kube-agents-eval-nightly-writers), not the main halves.
 ./tasks/provisioning-cluster-request-never-creates/task.yaml
 # gcp-config-connector's no-CRDs stop holds for a new cluster, and nothing is
 # created another way (#2937). The pool's clusters carry no Config Connector.
+# Declares writes_alone, so it runs in the fan-out's second phase, one unit at
+# a time after the write settle, and a pull request a wrong answer opens is
+# charged to it whether the reply names it or not. The nightly files it with
+# the writers part (ci-kube-agents-eval-nightly-writers), not the main halves.
 ./tasks/provisioning-kcc-cluster-without-crds-stops/task.yaml
 
 # A Cluster Agent runs its gke-workload-security audit script from the path
@@ -961,6 +970,13 @@
 # the no-pdb-workload fixture, one card, a 900s observation window. Its
 # record files under the version key's `next` mode, the inject lane's.
 ./tasks/chat-stop-halts-delegated-remediation/task.yaml
+
+# gke-labs#3263, Slack Stop step 3: a `stop` sent while the opening turn still
+# runs leaves no card running, though the turn had not filed one yet when the
+# stop went. Next lane only (api-lane-exclusions.txt), as above. deployer:
+# noop, the no-pdb-workload fixture, one front-door turn and at most one card,
+# a 600s observation window.
+./tasks/chat-stop-mid-turn-files-no-card/task.yaml
 
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,

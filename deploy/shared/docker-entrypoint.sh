@@ -2284,7 +2284,8 @@ fi
 # on this pod's PVC and cluster profiles are created at runtime; the sandbox
 # cannot enumerate what it has never seen. cluster_agent_profile.py calls the
 # same script with --skeleton-only when it scaffolds one, so a profile created
-# between restarts does not wait for the next one.
+# between restarts does not wait for the next one, and with --remove-profile
+# when it deletes one.
 #
 # Foreground, and fatal on EXIT_FATAL only. It was neither, and the reason it
 # was both is sound as far as it goes: the sandbox is a separate StatefulSet

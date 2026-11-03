@@ -8511,6 +8511,16 @@ main() {
       echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
     fi
   fi
+  # What the release asks of the cluster and what that costs at list price,
+  # rendered from the chart's own template over the tfvars just written, so
+  # the figures are the ones the chart's notes carry for the values the
+  # generator wrote (extra_helm_values is outside the render, and the helper
+  # says so when one is set). The apply goes through Terraform, which shows
+  # no notes, so this is where the front door prints them; `helm get notes`
+  # does after the apply. On the dry run too: the number is the point of
+  # previewing.
+  echo -e "  • ${C_CYAN}Cluster Footprint & Modeled Cost:${C_RESET}"
+  print_footprint_summary "$repo_dir" "$tfvars_file"
   echo -e "${C_CYAN}${C_BOLD}"
   draw_separator
   echo -e "${C_RESET}"

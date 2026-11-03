@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import cluster_agent_reconcile as rec
+import scope_policy
 from credential_proxy_client import EXIT_SECURITY_POLICY_BLOCKED
 
 # The Job's environment, which the operator renders for it. The scope file is the
@@ -112,6 +113,29 @@ CLIENT_DROPPED_ENV = ("KUBECONFIG",)
 # would turn a refused probe into `denied` or `api-disabled`. This text matches neither, so
 # a refusal reads `unreachable`.
 POLICY_REFUSED_STDERR = "the credential proxy refused this command for the scope caller"
+# The one refusal worth waiting out. A source lookup names only what the publisher's own
+# scope.json declares, so a `caller.scope-argument` refusal of one means the broker's copy
+# of scope.json (a ConfigMap volume the kubelet refreshes later) does not name the source
+# yet: the Job a scope edit starts runs at once. The client prints the rule on a line of
+# its own. Only the source shapes wait: a probe or a project-number lookup is refused with
+# the same rule when the broker's member window does not hold its argument, which waiting
+# does not change. A source lookup is retried every SCOPE_ARGUMENT_RETRY_SECONDS while the
+# run's window (SCOPE_ARGUMENT_RETRY_WINDOW_SECONDS from its first such refusal, one window
+# for the whole run) lasts, never past the lookup's own timeout, and only while the next
+# attempt still gets SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS; then it is answered as before.
+SCOPE_ARGUMENT_REFUSAL_LINE = f"policy rule: {scope_policy.RULE_SCOPE_ARGUMENT}"
+# The broker's message for an argument its scope.json does not name, on the line before the
+# rule (scope_policy.check). The same rule also answers a broker that cannot read its
+# scope.json at all; that refusal does not end by waiting, so it is answered at once.
+SCOPE_ARGUMENT_UNDECLARED_PREFIX = "The scope caller may name only what scope.json declares"
+SCOPE_ARGUMENT_SOURCE_SHAPES = frozenset(
+    {scope_policy.SHAPE_ASSET_SEARCH, scope_policy.SHAPE_SHARED_VPC, scope_policy.SHAPE_METRICS_SCOPE}
+)
+SCOPE_ARGUMENT_RETRY_SECONDS = 5
+SCOPE_ARGUMENT_RETRY_WINDOW_SECONDS = 120
+SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS = 5
+# The broker's argv flag the log leaves out: it names no source, only the output columns.
+FORMAT_FLAG_PREFIX = "--format="
 # The Kubernetes API, from the pod: the in-cluster token and CA the operator projects at the
 # standard path, and the address the kubelet sets.
 KUBE_SERVICE_ACCOUNT_DIR = Path("/var/run/secrets/kubernetes.io/serviceaccount")
@@ -149,6 +173,28 @@ def log(msg: str) -> None:
     print(f"[SCOPE-PUBLISHER] {msg}", file=sys.stderr)
 
 
+class _ScopeArgumentWait:
+    """One run's wait for the broker's scope.json to name a new source (broker_run).
+
+    `until` is the run's retry window, set at its first `caller.scope-argument` refusal of
+    a source lookup. `caught_up` is set when a source lookup that had been refused then
+    answered: the broker's scope.json changed during the run, and with it the digest its
+    member window is tied to, so the members recorded before the change are gone from it.
+    build_document resets both at the start of a run and resolves the sources again when
+    `caught_up` is set.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.until: float | None = None
+        self.caught_up = False
+
+
+_scope_argument_wait = _ScopeArgumentWait()
+
+
 def member_hash(declared: dict) -> str:
     """The hash of a rendered `scope.json`'s membership fields.
 
@@ -176,14 +222,53 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
     stdout and stderr on a non-zero exit, which is what the lookups classify;
     `TimeoutExpired` when the timeout passes, after the child is killed, so no lookup thread
     outlives the run's budget. The broker URL and token file come from the client's own
-    variables (CREDENTIAL_PROXY_URL, CREDENTIAL_PROXY_TOKEN_FILE).
+    variables (CREDENTIAL_PROXY_URL, CREDENTIAL_PROXY_TOKEN_FILE). A source lookup the broker
+    refuses because its scope.json does not name the argument yet is retried while it
+    catches up (SCOPE_ARGUMENT_REFUSAL_LINE, SCOPE_ARGUMENT_UNDECLARED_PREFIX), inside the
+    same timeout.
     """
     env = {k: v for k, v in os.environ.items() if k not in CLIENT_DROPPED_ENV}
-    result = subprocess.run([sys.executable, str(BROKER_CLIENT_SCRIPT), *argv],
-                            stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                            timeout=timeout, env=env, check=False)
+    deadline = time.monotonic() + timeout
+    shape = scope_policy.match_shape(argv)
+    source_lookup = shape is not None and shape[0] in SCOPE_ARGUMENT_SOURCE_SHAPES
+    shown = " ".join(a for a in argv if not a.startswith(FORMAT_FLAG_PREFIX))
+    attempt_timeout = timeout
+    waited = False
+    while True:
+        try:
+            result = subprocess.run([sys.executable, str(BROKER_CLIENT_SCRIPT), *argv],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                    timeout=attempt_timeout, env=env, check=False)
+        except subprocess.TimeoutExpired:
+            # An attempt after a wait that runs out of time may have been admitted: the
+            # broker's scope.json, and its member window, may have changed. Resolving again
+            # costs time and never admits anything, so the run is told it may have.
+            if waited:
+                _scope_argument_wait.caught_up = True
+            raise
+        lines = (result.stderr or "").splitlines()
+        undeclared = (result.returncode == EXIT_SECURITY_POLICY_BLOCKED
+                      and SCOPE_ARGUMENT_REFUSAL_LINE in lines
+                      and any(line.startswith(SCOPE_ARGUMENT_UNDECLARED_PREFIX) for line in lines))
+        if not (undeclared and source_lookup):
+            break
+        if _scope_argument_wait.until is None:
+            _scope_argument_wait.until = time.monotonic() + SCOPE_ARGUMENT_RETRY_WINDOW_SECONDS
+        limit = min(deadline, _scope_argument_wait.until)
+        if time.monotonic() + SCOPE_ARGUMENT_RETRY_SECONDS + SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS >= limit:
+            break
+        log(f"the broker's scope.json does not name the source in {shown} yet; asking again in "
+            f"{SCOPE_ARGUMENT_RETRY_SECONDS}s")
+        waited = True
+        time.sleep(SCOPE_ARGUMENT_RETRY_SECONDS)
+        # A retry gets what is left of the lookup's timeout, never more.
+        attempt_timeout = max(deadline - time.monotonic(), 0)
+    if waited and not undeclared:
+        # Any end of a wait but another "not declared" refusal: the broker's answer, or a
+        # failure that may hide one. A spurious second resolve costs time, not an admit.
+        _scope_argument_wait.caught_up = True
     if result.returncode == EXIT_SECURITY_POLICY_BLOCKED:
-        log(f"the broker refused {' '.join(argv[:4])} ...: {(result.stderr or '').strip()}")
+        log(f"the broker refused {shown}: {(result.stderr or '').strip()}")
         result = subprocess.CompletedProcess(result.args, result.returncode, result.stdout,
                                              POLICY_REFUSED_STDERR)
     if check and result.returncode != 0:
@@ -376,8 +461,16 @@ def build_document(declared: dict, management: str | None, previous: dict | None
     budget = rec._list_budget_seconds(cap)
     deadline = time.monotonic() + budget
     patterns = scope[EXCLUDE_KEY][EXCLUDE_PROJECTS_KEY]
+    _scope_argument_wait.reset()
     groups = rec._resolve_groups(rec._container_ids(scope) + rec._selector_ids(scope), deadline,
                                  SCOPE_WORKERS, budget)
+    if _scope_argument_wait.caught_up:
+        # The broker's scope.json changed while the sources resolved, and the member
+        # window went with its old digest: resolve them all again, so every member the
+        # probes name is recorded under the new one.
+        log("the broker's scope.json changed during the run; resolving every source again")
+        groups = rec._resolve_groups(rec._container_ids(scope) + rec._selector_ids(scope), deadline,
+                                     SCOPE_WORKERS, budget)
     searches = {g: r for g, r in groups.items() if rec._is_container(g)}
     selector_reports = {g: r for g, r in groups.items() if rec._is_selector(g)}
     selections = rec._selector_members(selector_reports, looked_up, deadline, patterns, SCOPE_WORKERS, budget)

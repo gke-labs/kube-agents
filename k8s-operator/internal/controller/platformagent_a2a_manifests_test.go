@@ -872,8 +872,8 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	}
 
 	role := buildA2AGatewayRole(agent)
-	if len(role.Rules) != 4 {
-		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get, the pinned PlatformAgent get and the pinned home-channel record", len(role.Rules))
+	if len(role.Rules) != 5 {
+		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get, the pinned PlatformAgent get, the pinned home-channel record and the pinned resolved scope", len(role.Rules))
 	}
 	// The owner rule is one verb on one named object — a deployments read
 	// would be a finding.
@@ -1220,7 +1220,7 @@ func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	if workerEnv != mirror+"/a2a-worker:0.3.0" {
 		t.Errorf("A2A_WORKER_IMAGE %q does not follow the agent image's mirror (or is not rendered)", workerEnv)
 	}
-	callout := buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0]
+	callout := buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers[0]
 	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
 		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
 	}
@@ -1683,7 +1683,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent, "")
+	callout := buildA2ACalloutDeployment(agent, "", 1)
 	verifier := buildA2AVerifierDeployment(agent)
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
@@ -1770,7 +1770,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent, "")
+	callout := buildA2ACalloutDeployment(agent, "", 1)
 	verifier := buildA2AVerifierDeployment(agent)
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
@@ -1972,7 +1972,7 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-			state, err := r.reconcileA2A(context.Background(), agent)
+			state, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{})
 			if err != nil {
 				t.Fatalf("reconcileA2A: %v", err)
 			}
@@ -2192,7 +2192,7 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	t.Setenv(a2aAgentDoorEnvVar, "true")
 	t.Setenv(a2aMCPDoorEnvVar, "true")
 
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	// Precondition: the profile namespace's half rendered, so its delete
@@ -2306,7 +2306,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 	countR := &PlatformAgentReconciler{Client: countCl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, countCl, countR, next)
-	if _, err := countR.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := countR.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	if err := countR.cleanupA2A(ctx, today.DeepCopy()); err != nil {
@@ -2339,7 +2339,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			ctx := context.Background()
 			theCalloutIsServing(t, ctx, cl, r, next)
-			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 				t.Fatalf("render: %v", err)
 			}
 
@@ -2407,12 +2407,12 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err == nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err == nil {
 		t.Fatal("render: want injected error, got nil")
 	}
 
 	authMap := &corev1.ConfigMap{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(next), Namespace: next.Namespace}, authMap); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aAuthMapShardName(next, 0), Namespace: next.Namespace}, authMap); err != nil {
 		t.Fatalf("authMap was not created: %v", err)
 	}
 
@@ -2424,7 +2424,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,
 			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-				if _, isCM := obj.(*corev1.ConfigMap); isCM && obj.GetName() == a2aAuthMapName(next) && failAuthMap {
+				if _, isCM := obj.(*corev1.ConfigMap); isCM && obj.GetName() == a2aAuthMapShardName(next, 0) && failAuthMap {
 					return fmt.Errorf("injected: API server error deleting authmap")
 				}
 				return c.Delete(ctx, obj, opts...)
@@ -2435,7 +2435,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	for _, obj := range []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: next.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(next), Namespace: next.Namespace}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(next), Namespace: next.Namespace}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(next, 0), Namespace: next.Namespace}},
 	} {
 		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), obj); err == nil {
 			obj.SetResourceVersion("")
@@ -2504,7 +2504,7 @@ func TestCleanupA2AHaltsBeforeStatefulSetOnPersistentClusterRoleBindingError(t *
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, next)
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 
@@ -2614,7 +2614,7 @@ func TestCleanupA2ASkipsUnownedClusterRoleBindingAndDeletesStatefulSet(t *testin
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, next)
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 
@@ -2697,7 +2697,7 @@ func TestAFlipToTodayCompletesAroundAnUnownedDoorObject(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, next)
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	stsKey := types.NamespacedName{Name: a2aNATSName(next), Namespace: next.Namespace}
@@ -2941,7 +2941,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 
 	full := 0
 	unobstructed := &PlatformAgentReconciler{Client: buildClient(next, 0, &full), Scheme: scheme}
-	if _, err := unobstructed.reconcileA2A(context.Background(), next.DeepCopy()); err != nil {
+	if _, err := unobstructed.reconcileA2A(context.Background(), next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("unobstructed render: %v", err)
 	}
 	if full == 0 {
@@ -2955,7 +2955,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			ctx := context.Background()
 
-			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err == nil {
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err == nil {
 				t.Fatal("want the injected error, got nil: the render did not die where this case says it did")
 			}
 
@@ -5972,7 +5972,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"gateway Deployment": buildA2AGatewayDeployment(agent).Spec.Template.Spec,
 		"NATS StatefulSet":   buildA2ANATSStatefulSet(agent, "conf-hash").Spec.Template.Spec,
 		"provision Job":      buildA2AProvisionJob(agent).Spec.Template.Spec,
-		"callout Deployment": buildA2ACalloutDeployment(agent, "").Spec.Template.Spec,
+		"callout Deployment": buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
 		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
 		"MCP Deployment":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
@@ -7257,7 +7257,7 @@ func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
 	}
 	// The callout too: it is the provision Job's authentication path, and a
 	// quota that refused it would leave the Job's creation held for good.
-	for _, c := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers {
+	for _, c := range buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers {
 		containers = append(containers, container{"callout Deployment", c})
 	}
 	// The verifier too, and it is the one with the sharpest consequence: an
@@ -7319,7 +7319,7 @@ func TestA2AProvisionJobWaitsForTheCallout(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		state, err := r.reconcileA2A(ctx, agent)
+		state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 		if err != nil {
 			t.Fatalf("reconcileA2A %d: %v", i+1, err)
 		}
@@ -7344,7 +7344,7 @@ func TestA2AProvisionJobWaitsForTheCallout(t *testing.T) {
 	}
 
 	reportCalloutServing(t, ctx, cl, agent)
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("reconcileA2A after the callout came up: %v", err)
 	}
@@ -7380,13 +7380,13 @@ func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	// Two pods, one ready, none on the current template: a roll in progress
 	// or wedged at maxUnavailable 0.
 	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 0)
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}

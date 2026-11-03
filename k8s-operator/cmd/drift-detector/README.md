@@ -233,8 +233,18 @@ joins its own cluster and every Cluster Agent profile, whichever project it name
 
 Inside the agent pod the detector reaches Pub/Sub through the credential proxy (`WATCHER_BROKER_URL`
 and `WATCHER_BROKER_TOKEN_FILE`, set by the operator; the broker relays the four calls on the one
-configured subscription, and fleet reads the same way as the event watcher's). On a profile cluster
-the join's read goes through the same broker, which reads only the kinds in its table
+configured subscription, and fleet reads the same way as the event watcher's). The broker relays a
+pull's answer up to 16 MiB (`PUBSUB_RELAY_MAX_RESPONSE_BYTES` in
+`agents/platform/scripts/credential_proxy.py`) and answers 502 with the code `UPSTREAM_UNRELAYABLE`
+beyond that, and a batch of audit entries can be larger: every refused pull halves the window the
+next one asks for, down to one message, which always fits. The window goes back to `--max-messages`
+on an empty pull once a hold has passed since the refusal: the subscription's ack deadline, as read
+at startup, plus the longest retry backoff Pub/Sub allows (the API ceilings on both when the
+deadline could not be read). The hold is time-keyed because an empty pull proves nothing sooner:
+Pub/Sub holds the refused batch for its lease and then its retry backoff, the pulls in between
+deliver whatever arrived meanwhile, and a window restored on one of them would ask for the same
+oversize batch again when it is redelivered, at every deadline. On a profile cluster the join's
+read goes through the same broker, which reads only the kinds in its table
 (`WATCHER_NAMED_READS` in `agents/platform/scripts/watcher_policy.py`): built-in declarative kinds and
 the six GitOps sync objects the agent can read itself, never a Secret. A record of any other kind
 comes out `failed`, with the broker's rule in the lookup error, and so without the `reconciled`
@@ -280,7 +290,7 @@ addressed and one that was and refused.
 | ------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `--project`               | —                                | Required. The project holding the subscription. With `--in-cluster` or `--kubeconfig` it must be the project **ID**, not the project number: a Pub/Sub path accepts either, but the join matches this against each record's `project_id` for the directly reached cluster, so a number matches nothing, and is refused at startup. On `--profiles-dir` alone it names only the subscription and either form works. |
 | `--subscription`          | `platform-agent-drift-audit-sub` | A bare id, or the module's fully qualified `subscription_id` output. Both work.                                                                                                                                                                                                                                                                                                                                    |
-| `--max-messages`          | `100`                            | Messages per pull, 1 to 1000.                                                                                                                                                                                                                                                                                                                                                                                      |
+| `--max-messages`          | `100`                            | Most messages per pull, 1 to 1000. The ceiling of a window that halves when the broker refuses a pull's answer as oversize and returns to the ceiling on an empty pull once the refused batch has had time to be redelivered.                                                                                                                                                                                      |
 | `--automation-principals` | empty                            | Comma-separated principals to treat as automation. Applies to every cluster the subscription carries.                                                                                                                                                                                                                                                                                                              |
 | `--human-domains`         | empty                            | Comma-separated domains whose accounts are human. Matched exactly, so subdomains are listed separately. Empty means any principal carrying a domain.                                                                                                                                                                                                                                                               |
 | `--log-dropped`           | `false`                          | A log line per filtered record. On a live cluster that is nearly the whole stream.                                                                                                                                                                                                                                                                                                                                 |
@@ -479,7 +489,7 @@ profile. Addressing it costs a GKE describe in its own project, answered by the 
 let the reconcile write the profile, so a describe that fails there names a real gap: the profile is
 skipped and reported with the API's answer like any other.
 
-Profile discovery follows `internal/clusterprofiles`' failure policy, which is the watcher's: a
+Profile discovery follows `internal/clusterprofiles`' failure policy, which the watcher shares at boot: a
 `--profiles-dir` that was given and is not there is fatal, because discovery runs once and a restart
 fixes it, and so is a credential proxy that cannot be reached or answers with an error about itself
 (no credential yet, its hop to Google failed, or it refused this process's own token), for the same

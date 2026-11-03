@@ -66,7 +66,11 @@ SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"
 # automatic remediation pull requests (off when "false"), read by audit_report.py
 # from the root-owned file below first, then from the session's environment.
 SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"
-SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+# CREDENTIAL_PROXY_EXEC_URL: the exec tier's URL, which the shim sends kubectl,
+# gcloud and Cloud API relay calls to when the operator set it, falling back on
+# CREDENTIAL_PROXY_URL when no connection can be made. Unforwarded, a session
+# would always take the fallback and nothing would say so.
+SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_EXEC_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED KUBEAGENTS_AUDIT_AUTO_PROMOTE"
 
 # Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
 # stages are root's, everything else is the model's -- and all of it survives a
@@ -549,9 +553,10 @@ done
 #    may hold values that have no business inside the sandbox, and copying it
 #    wholesale is how one of them ends up readable there.
 #
-#    CREDENTIAL_PROXY_URL is the one that has to make it across. Without it the
-#    kubectl and gcloud wrappers exit 1 with "CREDENTIAL_PROXY_URL is not
-#    configured" (agents/platform/scripts/credential_proxy_client.py).
+#    CREDENTIAL_PROXY_URL is the one that has to make it across. Without it and
+#    without CREDENTIAL_PROXY_EXEC_URL, the kubectl and gcloud wrappers exit 1
+#    with "CREDENTIAL_PROXY_URL is not configured"
+#    (agents/platform/scripts/credential_proxy_client.py).
 #
 #    A generated sshd drop-in rather than an /etc/profile.d script, which is
 #    what this originally was: profile.d is read by login shells only, and
@@ -640,9 +645,14 @@ if ! sshd -t; then
   exit 1
 fi
 if [ -z "${CREDENTIAL_PROXY_URL:-}" ]; then
-  log "CREDENTIAL_PROXY_URL is unset — kubectl and gcloud will report that"
-  log "they are not configured, and the version-control verbs cannot reach the"
-  log "broker."
+  if [ -z "${CREDENTIAL_PROXY_EXEC_URL:-}" ]; then
+    log "CREDENTIAL_PROXY_URL is unset — kubectl and gcloud will report that"
+    log "they are not configured, and the version-control verbs cannot reach the"
+    log "broker."
+  else
+    log "CREDENTIAL_PROXY_URL is unset — kubectl and gcloud reach the exec tier"
+    log "with no fallback, and the version-control verbs cannot reach the broker."
+  fi
 fi
 
 log "ready; starting $*"

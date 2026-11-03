@@ -835,6 +835,23 @@ predates `spec.storage`. The
 [PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specstorage)
 is canonical for the behaviour.
 
+### Sizing for a fleet (`examples/values-fleet.yaml`)
+
+The defaults fit a fleet of under 10 clusters. `examples/values-fleet.yaml` sets what the chart
+exposes for 25 clusters or more: `operator.resources` at 1Gi, `platformAgent.storage.size` at
+100Gi, `platformAgent.harness.tuning.maxInProgress` at 3, the credential-proxy and
+`agent-api-auth` resource blocks, and two `platformAgent.deployment.env` entries
+(`INCIDENT_WORKLOAD_DEDUP_SECONDS`, `KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its
+reason and what GKE Autopilot without bursting runs it at. It does not size the agent container
+itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
+sandbox, whose `platformAgent.harness.experimental.shellSandbox.resources` it leaves at the
+operator's 2 CPU and 2Gi defaults. The two env names reach the containers that read them;
+`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
+allowlist, would reach only the credential-proxy and `agent-api-auth` containers, and are left
+out. Pass it beside your own values with `-f charts/kube-agents/examples/values-fleet.yaml`,
+after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
+[fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
+
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,
@@ -1113,7 +1130,11 @@ since the operator runs the gateway as a single replica whatever the value); the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
 it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
 merged over its footprint entry per key, as the operator renders it, so a raised limit is
-summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
+summed at the raised figure; on GKE Autopilot (a cluster serving the `auto.gke.io` AllowlistedWorkload resource) it is counted at
+the operator's Autopilot requests, 2 CPU and 2Gi, with a CPU request the override does not set
+held to at most one CPU per GiB of the memory request. A cpu or memory limit set alone below the default
+request lowers the counted request to that limit, as the operator does. An override setting only
+`limits.ephemeral-storage` is counted
 as a request of that size too, because the operator renders no ephemeral-storage request and
 the API server defaults it to the limit. The shell sandbox is counted the same way with
 `platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
@@ -1189,7 +1210,11 @@ under `Recreate` at any value, so that surge is an over-count.
 
 **Where it is silent, and where it is not.** The check needs a cluster to query, so it
 does nothing under `helm template` and nothing in a namespace with no ResourceQuota — a
-clean render in either case is not evidence that a quota fits.
+clean render in either case is not evidence that a quota fits. Its sum still runs there: the
+footprint summary below calls the same template on every render while `quotaPreflight.enabled`
+is on, so an input the sum refuses (an empty `hindsight.postgresql.storage`, a quantity it
+cannot parse, a damaged `footprint.yaml`) stops a quota-less render and `helm template` too,
+and `--set quotaPreflight.enabled=false` lifts the summary with the check.
 
 It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible
 to it. A LimitRange with a per-container `max`, or a `default` that rewrites what the pods
@@ -1215,6 +1240,37 @@ identity without that permission gets `error calling lookup: resourcequotas is
 forbidden` and no install rather than a quiet pass. Grant the permission, or install with
 `--set quotaPreflight.enabled=false`.
 
+#### Footprint summary and modeled cost
+
+The install notes end with what the release asks of the cluster and what that costs at list
+price: the total pod CPU and memory requests, the pod count, and the persistent storage over
+its claims, summed exactly as the preflight above sums them (`kube-agents.footprintSummary`
+in `_helpers.tpl` calls the same template), then a monthly figure modeled from us-central1
+GKE Autopilot list prices: the `kube-agents.footprintPrice*` defines in `_helpers.tpl` pin the
+rate per vCPU-hour and per GiB-hour of memory, applied over the `footprintHoursPerMonth`
+billing month, and the rate per GiB-month of balanced persistent disk, with the
+`footprintClusterFeePerMonth` GKE cluster fee on its own line because it is per cluster rather
+than per release. The block is labelled `(modeled from us-central1 list prices, excluding LLM
+tokens)`: the rates are pinned in the chart, not looked up, and are applied to the declared
+requests, so model tokens, Autopilot's per-Pod minimums and request rounding, ephemeral-storage
+requests, node overheads and anything outside the release are not in it, and on a Standard
+cluster the bill is the node pools, which pod requests do not price. Helm prints the notes
+after an install or upgrade, and on `helm install --dry-run` without applying (`helm template`
+renders no notes). `install.sh` applies through Terraform, which shows no notes, so it renders
+the same template in its pre-flight summary and prints the figures the notes carry, for the
+values its generator writes, telling the render the cluster serves the `auto.gke.io`
+AllowlistedWorkload resource unless the generated `cluster_mode` is `standard`, so the
+credential proxy is counted at the operator's Autopilot requests there as the notes count it
+on the cluster; `helm get notes kube-agents -n <namespace>` prints them after the
+apply. It follows
+`quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
+refusals name that switch as the way round them, but not the preflight's quota gate: it sums
+on every render, a namespace with no ResourceQuota and `helm template` included, so the
+refusals the preflight section lists apply wherever the summary prints. Under
+`spec.mode: next` it says what it leaves out: the A2A workloads, NATS's JetStream claim and
+the session pods, which the
+[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) list.
+
 #### Upgrade notes: operator memory floor
 
 `operator.resources.limits.memory` has a floor at its default, 512Mi, and the chart fails the
@@ -1233,7 +1289,7 @@ bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets 
 the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
 rendered manifest. A cluster with bursting admits the manifest as rendered.
 
-### Optional AgentProfiles (`profiles.tse`)
+### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`)
 
 `profiles.tse.enabled` (default `false`) renders the optional `AgentProfile/tse`
 (GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
@@ -1242,6 +1298,18 @@ rendered manifest. A cluster with bursting admits the manifest as rendered.
 controlling its `AgentProfile` spec. When bound, the operator passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
 scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+
+`profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
+generic cluster agent: one profile for every cluster in scope, with the
+target named per task by the `project`, `location` and `cluster` parameters.
+Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
+and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
+control its spec. The parameters are fixed, in the persona's order, because
+the design has the worker refuse a task when they differ from the persona's.
+No pod runs it until the profile dispatcher, worker and pool land and the
+operator runs them, though enabling it already gets the profile its
+ServiceAccounts, bus identity and agent card. A cluster that needs its own
+persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
 
 ## Uninstalling
 

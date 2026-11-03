@@ -696,7 +696,13 @@ operator has one for itself, keyed on the manager's own ServiceAccount: publish 
 profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic
 grants and no subjects. The callout derives that profile pod's task subjects from the
 profile, and its consumer names and inbox from the attested pod name (see the subagent
-profiles spec for why a static entry cannot work there).
+profiles spec for why a static entry cannot work there). **Amended 11/2:** the map is cut
+into numbered ConfigMaps, `<agent>-a2a-authmap-0` through `-<n-1>`, each under a byte budget
+that keeps it below the API server's 1 MiB object limit (the single object crossed it near
+640 bound profiles); every shard carries the whole map's version and `shard`/`shards`
+stamps, the callout is told the count and watches each name under a Role naming each, and
+it serves a new version only once every shard of it has arrived. A map that fits is one
+shard.
 
 The session entry is a different kind of entry and the difference is load-bearing. Every
 session pod runs as one shared ServiceAccount, so the ServiceAccount alone cannot tell two
@@ -894,7 +900,17 @@ first-ping timer on a connection that has not yet authenticated at roughly two s
 and the Go client aborts the connect on a PING where it required a PONG - reporting
 "expected 'PONG', got 'PING'", which names nothing about authorization and sends whoever
 is debugging it to the network layer. A merely _slow_ callout hits this too, so the real
-budget for a TokenReview round trip is under two seconds whatever this number says.
+budget for a TokenReview round trip is under two seconds whatever this number says. The
+client has ceilings of its own on the same handshake: nats.go gives the TCP dial one budget
+of its `Timeout` option, split across the resolved hosts, and then the TLS handshake and the
+CONNECT round trip a fresh deadline of the same length, on the first connect and on every
+reconnect alike. The library sets that option to ten seconds by default (`lib.DialTimeout`)
+on every connection it opens, and the worker adapter gives the raw `nats.Conn` it opens
+beside its library client the same option, so a session pod's two connections
+re-authenticate under one budget; left at nats.go's two-second default, a loaded host spends
+enough of each budget before the CONNECT that the attempt at a grant expiry fails, and the
+connection's consumers are gone until an attempt succeeds. The other raw connections under
+the callout, the verifier's and the operator's card publisher, keep nats.go's default.
 
 **The token contract.** Audience `a2a-bus`, mounted at `/var/run/secrets/a2a-bus/token`,
 3600s expiry, kubelet-rotated. The audience is the load-bearing part: a TokenReview that

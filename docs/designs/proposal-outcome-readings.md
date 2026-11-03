@@ -181,6 +181,13 @@ serves `GET /metrics` from the registry as today and nothing about a scrape reac
 A reading is therefore at most one interval old when the operator's five-minute poll reads it,
 so a merge reaches `status.usage` within two poll intervals end to end.
 
+**Off switch.** `CREDENTIAL_PROXY_VCS_READINGS=off` (or `false`, `0`, `no`) in `spec.deployment.env`
+starts no sweep, and the readings' series are simply absent. Unset or `on` leaves it on, and so does
+any other value, with a warning. The step-2 budget
+below assumes one install per App installation. Installs that share one each spend their own
+budget against the same quota, which is why the eval lanes, forty projects on one installation,
+set it (#4611).
+
 **Per managed repository**, with the repository's `whoami` login as `author`:
 
 1. The install's own proposals, listed by author through a new provider method
@@ -333,7 +340,8 @@ repository that is not a context repository, because a managed one "already has 
 credential and must keep riding it", so it gains a sweep caller that the role check admits and
 that names the sweep scope; and the helper scopes a minted token to one repository and returns
 no coverage list, so the sweep's reuse is per managed repository for the same thirty minutes the
-write token is reused, not per organization. On github.com the forge's transport is the
+write token is reused, not per organization (amended 11/2: the write token is now minted and
+reused per repository too, since each repository's minter policy lists that repository alone). On github.com the forge's transport is the
 `gh` CLI with the stored write credential, so the sweep cannot use it: it uses the in-process
 HTTP transport the GitHub Enterprise Server path already has, pointed at `api.github.com` with
 the read token, a construction the forge does not make today. On GitLab and Gitea, whose

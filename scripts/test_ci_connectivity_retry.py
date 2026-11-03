@@ -29,6 +29,9 @@ SECTION_START = "# ─── 7. Agent API Connectivity Verification"
 # The next section's header: 7b gates on the Pub/Sub platform adapter and has
 # its own test (tests/test_ci_deploy_pubsub_relay_gate.py) and constants.
 SECTION_END = "# ─── 7b. "
+# The agent's default retry count on an API error (Hermes _api_max_retries),
+# each retry preceded by a wait the backoff-floor patch can hold at up to 60s.
+AGENT_RATE_LIMIT_RETRIES = 3
 
 KUBECTL_STUB = """#!/usr/bin/env bash
 echo "$@" >> "${STUB_LOG}/kubectl.args"
@@ -131,7 +134,16 @@ def write_stub(directory: pathlib.Path, name: str, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def run_check(succeed_on: int) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+def gateway_retry_knobs() -> str:
+    """The `readonly EVAL_LITELLM_*` declarations the section's deadline reads, lifted from the script."""
+    src = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    knobs = re.findall(r"^readonly EVAL_LITELLM_[A-Z_]+=.*$", src, re.MULTILINE)
+    if len(knobs) != 2:  # pragma: no cover - a rename should say so loudly
+        raise AssertionError(f"expected the two EVAL_LITELLM_* knobs in {DEPLOY_SCRIPT}, found {knobs}")
+    return "\n".join(knobs)
+
+
+def run_check(succeed_on: int, env_overrides: dict[str, str] | None = None) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
     """Run the lifted section with the curl stub succeeding on attempt N."""
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="conncheck-"))
     stubs = tmp / "bin"
@@ -149,6 +161,7 @@ def run_check(succeed_on: int) -> tuple[subprocess.CompletedProcess, pathlib.Pat
             # stop its lease heartbeat (#3129); both are defined in section 2.
             "stop_deploy_heartbeat() { :; }",
             "deploy_exit() { dump_prow_artifacts_on_failure; }",
+            gateway_retry_knobs(),
             connectivity_section(),
             'echo "SECTION COMPLETED"',
         ]
@@ -158,6 +171,7 @@ def run_check(succeed_on: int) -> tuple[subprocess.CompletedProcess, pathlib.Pat
         PATH=f"{stubs}:{os.environ['PATH']}",
         STUB_LOG=str(tmp),
         CURL_SUCCEED_ON=str(succeed_on),
+        **(env_overrides or {}),
     )
     result = subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, check=False, env=env
@@ -211,6 +225,51 @@ class ConnectivityRetryTest(unittest.TestCase):
         _, tmp = run_check(succeed_on=1)
         curl_args = (tmp / "curl.args").read_text(encoding="utf-8")
         self.assertIn("--max-time", curl_args)
+
+    def test_the_deadline_outlasts_the_agents_and_the_gateways_rate_limit_waits(self):
+        """The ping is one real agent turn. On a 429 that names no reset window
+        the gateway holds each of the agent's calls for its own retries
+        (EVAL_LITELLM_NUM_RETRIES + 1 pauses of EVAL_LITELLM_RETRY_AFTER_SECONDS,
+        set in the same script: LiteLLM sleeps before each retry and once more
+        after the last failed one) and the image holds each of the agent's
+        three retries 30-60s (deploy/docker/patches/rate_limit_backoff_floor.py);
+        a deadline inside that sum cut the turn off mid-retry and started
+        another against the same closed quota."""
+        _, tmp = run_check(succeed_on=1)
+        curl_args = (tmp / "curl.args").read_text(encoding="utf-8")
+        match = re.search(r"--max-time\s+(\d+)", curl_args)
+        self.assertIsNotNone(match, curl_args)
+        floor = {}
+        exec(  # noqa: S102 - the module is this repository's own constants file
+            (REPO_ROOT / "deploy" / "docker" / "patches" / "rate_limit_backoff_floor.py").read_text(encoding="utf-8"),
+            floor,
+        )
+        script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+        gateway = {
+            name: int(re.search(rf'readonly EVAL_LITELLM_{name}="\$\{{EVAL_LITELLM_{name}:-(\d+)\}}"', script).group(1))
+            for name in ("NUM_RETRIES", "RETRY_AFTER_SECONDS")
+        }
+        self.assertGreater(int(match.group(1)), self._waits(gateway, floor), "the waits fit inside one turn at the defaults")
+
+        # The knobs are env overrides; the deadline has to move with them.
+        # A pair the deploy's stale-bound guard accepts: (1 + 1) x 25s = 50s of hold.
+        overridden = {"NUM_RETRIES": 1, "RETRY_AFTER_SECONDS": 25}
+        _, tmp = run_check(
+            succeed_on=1,
+            env_overrides={f"EVAL_LITELLM_{name}": str(value) for name, value in overridden.items()},
+        )
+        match = re.search(r"--max-time\s+(\d+)", (tmp / "curl.args").read_text(encoding="utf-8"))
+        self.assertIsNotNone(match)
+        self.assertGreater(int(match.group(1)), self._waits(overridden, floor), "the waits fit inside one turn under an override")
+
+    @staticmethod
+    def _waits(gateway: dict, floor: dict) -> float:
+        agent_calls = AGENT_RATE_LIMIT_RETRIES + 1
+        gateway_pauses_per_call = gateway["NUM_RETRIES"] + 1
+        return (
+            agent_calls * gateway_pauses_per_call * gateway["RETRY_AFTER_SECONDS"]
+            + AGENT_RATE_LIMIT_RETRIES * floor["FLOOR_MAX_SECONDS"]
+        )
 
 
 class FailureDumpArtifactsTest(unittest.TestCase):
