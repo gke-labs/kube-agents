@@ -1033,8 +1033,6 @@ status:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  annotations:
-    kubeagents.x-k8s.io/credential-proxy-cluster-type: standard
   labels:
     app: platformagent-credential-proxy
     app.kubernetes.io/instance: kubeagents-system-platformagent

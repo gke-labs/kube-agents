@@ -7797,6 +7797,7 @@ func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) 
 	cpuOnly := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}}
 	cpuHalf := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")}}
 	memory2Gi := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")}}
+	bothRequests := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}}
 	tests := []struct {
 		name      string
 		resources *corev1.ResourceRequirements
@@ -7809,19 +7810,22 @@ func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) 
 		unannotated      bool
 		wantCPU          string
 		wantMem          string
+		// wantType is the cluster-type annotation after the reconcile; "" is
+		// none. A guess from the requests is never recorded.
+		wantType string
 	}{
-		{name: "running at the Autopilot requests", running: ptr.To(true), wantCPU: "2", wantMem: "2Gi"},
-		{name: "running at the Standard requests", running: ptr.To(false), wantCPU: "500m", wantMem: "1Gi"},
+		{name: "running at the Autopilot requests", running: ptr.To(true), wantCPU: "2", wantMem: "2Gi", wantType: credentialProxyClusterTypeAutopilot},
+		{name: "running at the Standard requests", running: ptr.To(false), wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard},
 		{name: "no proxy yet", running: nil, wantCPU: "500m", wantMem: "1Gi"},
 		// The annotation holds across a CR edit that moves the requests, which
 		// the request comparison cannot follow.
-		{name: "Autopilot, the CR edited meanwhile", resources: lowerMemory, running: ptr.To(true), editedMeanwhile: true, wantCPU: "1500m", wantMem: "1536Mi"},
+		{name: "Autopilot, the CR edited meanwhile", resources: lowerMemory, running: ptr.To(true), editedMeanwhile: true, wantCPU: "1500m", wantMem: "1536Mi", wantType: credentialProxyClusterTypeAutopilot},
 		// A Standard proxy at 500m / 2Gi (requests.memory 2Gi), whose CR now
 		// sets only requests.cpu 500m: the new CR's Autopilot render is also
 		// 500m / 2Gi, so only the annotation keeps it Standard.
 		{
 			name: "Standard, the CR edited meanwhile", resources: cpuHalf, running: ptr.To(false), editedMeanwhile: true,
-			runningResources: memory2Gi, wantCPU: "500m", wantMem: "1Gi",
+			runningResources: memory2Gi, wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard,
 		},
 		// A Deployment an older operator wrote has no annotation, so its
 		// requests decide.
@@ -7830,6 +7834,11 @@ func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) 
 		// requests.cpu 2 on Standard runs at 2 / 1Gi: the CPU matches the
 		// Autopilot render (2 / 2Gi) and the memory does not, so it is Standard.
 		{name: "unannotated, only the CPU matches the Autopilot render", resources: cpuOnly, running: ptr.To(false), unannotated: true, wantCPU: "2", wantMem: "1Gi"},
+		// A CR that sets both requests renders the same on either type, so the
+		// comparison matches Autopilot on a Standard proxy; that guess must not
+		// be written down, or a later CR edit would render the Autopilot
+		// defaults while discovery still fails.
+		{name: "unannotated, the requests match both renders", resources: bothRequests, running: ptr.To(false), unannotated: true, wantCPU: "1", wantMem: "1Gi"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -7886,6 +7895,9 @@ func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) 
 			}
 			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceCPU, tt.wantCPU)
 			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceMemory, tt.wantMem)
+			if got := dep.Annotations[credentialProxyClusterTypeAnnotation]; got != tt.wantType {
+				t.Errorf("%s = %q, want %q", credentialProxyClusterTypeAnnotation, got, tt.wantType)
+			}
 		})
 	}
 }

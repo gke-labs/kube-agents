@@ -3145,12 +3145,20 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 		return err
 	}
 	autopilot, determined := r.clusterAutopilot()
+	recorded := true
 	if !determined {
-		if autopilot, err = r.liveCredentialProxyAutopilot(ctx, agent, rendered); err != nil {
+		if autopilot, recorded, err = r.liveCredentialProxyAutopilot(ctx, agent, rendered); err != nil {
 			return err
 		}
 	}
 	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles, autopilot)
+	// The annotation records a cluster type, so only a definite answer, or the
+	// annotation it carries forward, writes one; a guess from the requests is
+	// rendered but not recorded, or the next failed check would read it back
+	// as fact.
+	if !recorded {
+		delete(proxy.Annotations, credentialProxyClusterTypeAnnotation)
+	}
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
@@ -6121,19 +6129,19 @@ func (r *PlatformAgentReconciler) clusterAutopilot() (autopilot bool, determined
 // applied. With no proxy yet, or one matching neither render, it is Standard:
 // a smaller request than Autopilot wants delays the broker's CPU, where a
 // larger one than a Standard node can fit leaves it Pending.
-func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Context, agent, rendered *agentv1alpha1.PlatformAgent) (bool, error) {
+func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Context, agent, rendered *agentv1alpha1.PlatformAgent) (autopilot bool, recorded bool, err error) {
 	live := &appsv1.Deployment{}
 	if err := r.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, live); err != nil {
 		if errors.IsNotFound(err) {
-			return false, nil
+			return false, false, nil
 		}
-		return false, fmt.Errorf("failed to read the credential proxy Deployment: %w", err)
+		return false, false, fmt.Errorf("failed to read the credential proxy Deployment: %w", err)
 	}
 	switch live.Annotations[credentialProxyClusterTypeAnnotation] {
 	case credentialProxyClusterTypeAutopilot:
-		return true, nil
+		return true, true, nil
 	case credentialProxyClusterTypeStandard:
-		return false, nil
+		return false, true, nil
 	}
 	for _, c := range live.Spec.Template.Spec.Containers {
 		if c.Name != credentialProxyContainerName {
@@ -6144,12 +6152,12 @@ func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Conte
 			have, ok := c.Resources.Requests[name]
 			wantQ := want[name]
 			if !ok || have.Cmp(wantQ) != 0 {
-				return false, nil
+				return false, false, nil
 			}
 		}
-		return true, nil
+		return true, false, nil
 	}
-	return false, nil
+	return false, false, nil
 }
 
 type pluginFailure struct {
