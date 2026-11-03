@@ -277,9 +277,10 @@ the proxy stores anything, it runs the same cleanup that `worker_trajectory.py` 
 install's `AuditRedactor`, then the rules in `worker_transcript.py`). That cleanup already runs on the
 full tool output in today's eval records, but only the first 2,000 characters of each result are
 kept, so nobody has looked at what it leaves in the rest. We need to check it on full-length output,
-like a Secret dump or a token, before storing any request text. And if the cleanup would change an
-answer, that answer isn't saved: replaying it would put `[REDACTED]` into a tool call, and saving it
-uncleaned would put a secret in the bucket.
+like a Secret dump or a token, before storing any request text. And if the cleanup would mask a
+credential in an answer, that answer isn't saved: replaying it would put `[REDACTED]` into a tool
+call, and saving it uncleaned would put a secret in the bucket. Reformatting, or masking an email or
+an IP, doesn't count.
 
 ### Who can write to the cache
 

@@ -1,0 +1,67 @@
+"""The shadow proxy's log line: event names, field names and unstorable reasons.
+
+replay_proxy.py writes these lines and analyze_shadow.py reads them; both use
+the names here, so a renamed field breaks the tests instead of the analysis.
+"""
+
+LOG_SCHEMA_VERSION = 1
+
+REQUEST_EVENT = "replay_shadow_request"
+START_EVENT = "replay_shadow_start"
+
+# Fields of a request line.
+EVENT = "event"
+SCHEMA = "schema"
+REQUEST_ID = "request_id"
+TS = "ts"
+JOB = "job"
+MODEL = "model"
+STREAM = "stream"
+NORMALIZER_VERSION = "normalizer_version"
+LITELLM_CONFIG_CHECKSUM = "litellm_config_checksum"
+LITELLM_IMAGE = "litellm_image"
+STATUS = "status"
+LATENCY_MS = "latency_ms"
+CLIENT_DISCONNECTED = "client_disconnected"
+UPSTREAM_INCOMPLETE = "upstream_incomplete"
+OBSERVE_FAILED = "observe_failed"
+LITELLM_MODEL_GROUP = "litellm_model_group"
+LITELLM_ATTEMPTED_FALLBACKS = "litellm_attempted_fallbacks"
+PROMPT_TOKENS = "prompt_tokens"
+CACHED_TOKENS = "cached_tokens"
+COMPLETION_TOKENS = "completion_tokens"
+FINGERPRINT = "fingerprint"
+SETTINGS_HASH = "settings_hash"
+MESSAGE_HASHES = "message_hashes"
+# Per-message hashes for the closest-earlier-request search only: each message
+# frozen as it normalized when this proxy first saw it (diagnosis.py).
+DIAG_MESSAGE_HASHES = "diag_message_hashes"
+ROLES = "roles"
+ANSWER_HASH = "answer_hash"
+UNSTORABLE = "unstorable"
+STORED = "stored"
+STORE_SKIPPED = "store_skipped"
+ERROR = "error"
+
+# Fields of the start line.
+SCRUBBERS_LOADED = "scrubbers_loaded"
+SCRUBBERS_ERROR = "scrubbers_error"
+
+# Fields of `job`.
+JOB_KIND = "kind"
+JOB_PROJECT = "project"
+JOB_BUILD = "build"
+JOB_PR = "pr"
+
+# Why replay would not have saved an answer, in `unstorable`.
+UNSTORABLE_OBSERVE_FAILED = "observe_failed"
+UNSTORABLE_UPSTREAM_INCOMPLETE = "upstream_incomplete"
+UNSTORABLE_CLIENT_DISCONNECTED = "client_disconnected"
+UNSTORABLE_NO_ANSWER = "no_answer"
+UNSTORABLE_NO_MODEL_GROUP = "no_model_group_header"
+UNSTORABLE_OTHER_MODEL_GROUP = "answered_by_other_model_group"
+UNSTORABLE_FALLBACK = "fallback_attempted"
+UNSTORABLE_REPEATS_NUMBER = "repeats_swapped_number"
+UNSTORABLE_SCRUB_ADDS_CREDENTIAL = "scrub_masks_credential"
+UNSTORABLE_SCRUBBERS_UNAVAILABLE = "scrubbers_unavailable"
+UNSTORABLE_SCRUB_FAILED = "scrub_failed"

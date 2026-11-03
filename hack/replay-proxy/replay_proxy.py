@@ -32,14 +32,15 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
+import diagnosis
 import normalizer
 import request_store
+import schema as F
 
 COMPLETIONS_PATH = "/v1/chat/completions"
 HEALTH_PATH = "/replay/healthz"
 METRICS_PATH = "/metrics"
-LOG_EVENT = "replay_shadow_request"
-START_EVENT = "replay_shadow_start"
+HTTP_BAD_REQUEST = 400
 DEFAULT_BIND_HOST = "0.0.0.0"
 BODY_METHODS = ("POST", "PUT", "PATCH")
 HEAD_METHOD = "HEAD"
@@ -49,10 +50,6 @@ HOST_HEADER = "Host"
 CONTENT_TYPE_HEADER = "Content-Type"
 CONTENT_LENGTH_HEADER = "Content-Length"
 TRANSFER_ENCODING_HEADER = "Transfer-Encoding"
-# Why replay would not have saved an answer, in the line's `unstorable`.
-UNSTORABLE_UPSTREAM_INCOMPLETE = "upstream_incomplete"
-UNSTORABLE_CLIENT_DISCONNECTED = "client_disconnected"
-LOG_SCHEMA_VERSION = 1
 
 DEFAULT_LISTEN_PORT = 8080
 DEFAULT_UPSTREAM_HOST = "inference-gateway-upstream"
@@ -261,9 +258,9 @@ def usage_tokens(usage: Optional[Dict[str, Any]]) -> Dict[str, Optional[int]]:
     if cached is None:
         cached = usage.get("cache_read_input_tokens")
     return {
-        "prompt_tokens": usage.get("prompt_tokens"),
-        "cached_tokens": cached,
-        "completion_tokens": usage.get("completion_tokens"),
+        F.PROMPT_TOKENS: usage.get(F.PROMPT_TOKENS),
+        F.CACHED_TOKENS: cached,
+        F.COMPLETION_TOKENS: usage.get(F.COMPLETION_TOKENS),
     }
 
 
@@ -292,35 +289,38 @@ def answer_hash(message: Dict[str, Any], mapping: normalizer.Mapping) -> Optiona
 def unstorable_reasons(
     body: Dict[str, Any], status: int, message: Dict[str, Any], headers: Dict[str, str],
     mapping: normalizer.Mapping, scrubber: request_store.Scrubber,
-    upstream_incomplete: bool = False, client_disconnected: bool = False,
+    upstream_incomplete: bool = False, client_disconnected: bool = False, observe_failed: bool = False,
 ) -> List[str]:
     """Why replay would not have saved this answer (eval-design.md); empty when it would."""
-    reasons = []
-    if upstream_incomplete:
-        reasons.append(UNSTORABLE_UPSTREAM_INCOMPLETE)
-        return reasons
-    if client_disconnected:
-        reasons.append(UNSTORABLE_CLIENT_DISCONNECTED)
-        return reasons
+    for flag, reason in (
+        (observe_failed, F.UNSTORABLE_OBSERVE_FAILED),
+        (upstream_incomplete, F.UNSTORABLE_UPSTREAM_INCOMPLETE),
+        (client_disconnected, F.UNSTORABLE_CLIENT_DISCONNECTED),
+    ):
+        if flag:
+            return [reason]
     if status != HTTP_OK or not (message.get("content") or message.get("tool_calls")):
-        reasons.append("no_answer")
-        return reasons
+        return [F.UNSTORABLE_NO_ANSWER]
+    reasons = []
     group = headers.get(MODEL_GROUP_HEADER)
     if group is None:
-        reasons.append("no_model_group_header")
-    elif group != body.get("model"):
-        reasons.append("answered_by_other_model_group")
+        reasons.append(F.UNSTORABLE_NO_MODEL_GROUP)
+    elif group != body.get(F.MODEL):
+        reasons.append(F.UNSTORABLE_OTHER_MODEL_GROUP)
     if headers.get(ATTEMPTED_FALLBACKS_HEADER, NO_FALLBACKS) != NO_FALLBACKS:
-        reasons.append("fallback_attempted")
+        reasons.append(F.UNSTORABLE_FALLBACK)
     view = answer_view(message)
     texts = [str(view["content"] or "")] + [str(c["arguments"] or "") for c in view["tool_calls"]]
     if any(mapping.answer_repeats_bare_number(t) for t in texts):
-        reasons.append("repeats_swapped_number")
+        reasons.append(F.UNSTORABLE_REPEATS_NUMBER)
+    if not scrubber.available:
+        reasons.append(F.UNSTORABLE_SCRUBBERS_UNAVAILABLE)
+        return reasons
     try:
-        if scrubber.answer_changes(message):
-            reasons.append("scrub_changes_answer" if scrubber.available else "scrubbers_unavailable")
+        if scrubber.answer_masks_credential(message):
+            reasons.append(F.UNSTORABLE_SCRUB_ADDS_CREDENTIAL)
     except Exception:
-        reasons.append("scrub_failed")
+        reasons.append(F.UNSTORABLE_SCRUB_FAILED)
     return reasons
 
 
@@ -333,6 +333,7 @@ class ShadowProxy:
         self.scrubber = request_store.Scrubber(config.redactor_path, config.transcript_rules_path)
         self.store = request_store.RequestStore(config.store_dir, self.scrubber)
         self.metrics = Metrics(self.scrubber.available)
+        self.diagnosis = diagnosis.DiagnosisHasher()
         self.out = out if out is not None else sys.stdout
         self._log_lock = threading.Lock()
 
@@ -344,57 +345,57 @@ class ShadowProxy:
 
     def job(self) -> Dict[str, str]:
         return {
-            "kind": self.config.job_kind,
-            "project": self.config.job_project,
-            "build": self.config.job_build,
-            "pr": self.config.job_pr,
+            F.JOB_KIND: self.config.job_kind,
+            F.JOB_PROJECT: self.config.job_project,
+            F.JOB_BUILD: self.config.job_build,
+            F.JOB_PR: self.config.job_pr,
         }
 
     def startup_line(self) -> Dict[str, Any]:
         return {
-            "event": START_EVENT,
-            "schema": LOG_SCHEMA_VERSION,
-            "job": self.job(),
-            "normalizer_version": normalizer.NORMALIZER_VERSION,
-            "litellm_config_checksum": self.config.litellm_config_checksum,
-            "litellm_image": self.config.litellm_image,
-            "scrubbers_loaded": self.scrubber.available,
-            "scrubbers_error": self.scrubber.error,
+            F.EVENT: F.START_EVENT,
+            F.SCHEMA: F.LOG_SCHEMA_VERSION,
+            F.JOB: self.job(),
+            F.NORMALIZER_VERSION: normalizer.NORMALIZER_VERSION,
+            F.LITELLM_CONFIG_CHECKSUM: self.config.litellm_config_checksum,
+            F.LITELLM_IMAGE: self.config.litellm_image,
+            F.SCRUBBERS_LOADED: self.scrubber.available,
+            F.SCRUBBERS_ERROR: self.scrubber.error,
         }
 
     def analyze(self, body: Dict[str, Any], received: float, upstream: Dict[str, Any]) -> Dict[str, Any]:
         """The log line for one completed chat request; stores its scrubbed text as a side effect."""
         request_id = uuid.uuid4().hex
         entry: Dict[str, Any] = {
-            "event": LOG_EVENT,
-            "schema": LOG_SCHEMA_VERSION,
-            "request_id": request_id,
-            "ts": received,
-            "job": self.job(),
-            "model": body.get("model"),
-            "stream": bool(body.get("stream")),
-            "normalizer_version": self.key_context.normalizer_version,
-            "litellm_config_checksum": self.key_context.litellm_config_checksum,
-            "litellm_image": self.key_context.litellm_image,
-            "status": upstream["status"],
-            "latency_ms": upstream["latency_ms"],
-            "client_disconnected": upstream["client_disconnected"],
-            "upstream_incomplete": upstream["upstream_incomplete"],
-            "litellm_model_group": upstream["headers"].get(MODEL_GROUP_HEADER),
-            "litellm_attempted_fallbacks": upstream["headers"].get(ATTEMPTED_FALLBACKS_HEADER),
+            F.EVENT: F.REQUEST_EVENT,
+            F.SCHEMA: F.LOG_SCHEMA_VERSION,
+            F.REQUEST_ID: request_id,
+            F.TS: received,
+            F.JOB: self.job(),
+            F.MODEL: body.get(F.MODEL),
+            F.STREAM: bool(body.get(F.STREAM)),
+            F.NORMALIZER_VERSION: self.key_context.normalizer_version,
+            F.LITELLM_CONFIG_CHECKSUM: self.key_context.litellm_config_checksum,
+            F.LITELLM_IMAGE: self.key_context.litellm_image,
+            F.STATUS: upstream["status"],
+            F.LATENCY_MS: upstream["latency_ms"],
+            F.CLIENT_DISCONNECTED: upstream["client_disconnected"],
+            F.UPSTREAM_INCOMPLETE: upstream["upstream_incomplete"],
+            F.OBSERVE_FAILED: upstream["observe_failed"],
+            F.LITELLM_MODEL_GROUP: upstream["headers"].get(MODEL_GROUP_HEADER),
+            F.LITELLM_ATTEMPTED_FALLBACKS: upstream["headers"].get(ATTEMPTED_FALLBACKS_HEADER),
         }
         entry.update(usage_tokens(upstream["usage"]))
         normalized = normalizer.normalize_request(body, received)
         fingerprint = normalizer.fingerprint(normalized, self.key_context)
-        entry.update(
-            fingerprint=fingerprint,
-            settings_hash=normalizer.settings_hash(normalized, self.key_context),
-            roles=normalized.roles(),
-            unstorable=unstorable_reasons(
-                body, upstream["status"], upstream["message"], upstream["headers"], normalized.mapping, self.scrubber,
-                upstream_incomplete=upstream["upstream_incomplete"],
-                client_disconnected=upstream["client_disconnected"],
-            ),
+        entry[F.FINGERPRINT] = fingerprint
+        entry[F.SETTINGS_HASH] = normalizer.settings_hash(normalized, self.key_context)
+        entry[F.ROLES] = normalized.roles()
+        entry[F.UNSTORABLE] = unstorable_reasons(
+            body, upstream["status"], upstream["message"], upstream["headers"], normalized.mapping, self.scrubber,
+            upstream_incomplete=upstream["upstream_incomplete"],
+            client_disconnected=upstream["client_disconnected"],
+            observe_failed=upstream["observe_failed"],
         )
         # The per-message and answer hashes are of the normalized, unscrubbed
         # content, as the fingerprint is: the scrubber blanks the rest of a
@@ -402,14 +403,16 @@ class ShadowProxy:
         # state. That makes this log as private as the stored text: a hash of
         # request content can be guessed against, so both go to the private,
         # eval-only bucket, never to Prow artifacts.
-        entry["message_hashes"] = normalized.message_hashes
-        entry["answer_hash"] = answer_hash(upstream["message"], normalized.mapping)
+        entry[F.MESSAGE_HASHES] = normalized.message_hashes
+        messages = body.get(request_store.MESSAGES_KEY)
+        entry[F.DIAG_MESSAGE_HASHES] = self.diagnosis.hashes(messages if isinstance(messages, list) else [], received)
+        entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)
         skipped = self.store.store(request_id, fingerprint, body)
-        entry["stored"] = skipped is None
-        entry["store_skipped"] = skipped
+        entry[F.STORED] = skipped is None
+        entry[F.STORE_SKIPPED] = skipped
         self.metrics.add("stored" if skipped is None else "store_skipped")
-        if entry["prompt_tokens"]:
-            self.metrics.add("prompt_tokens", int(entry["prompt_tokens"]))
+        if entry[F.PROMPT_TOKENS]:
+            self.metrics.add("prompt_tokens", int(entry[F.PROMPT_TOKENS]))
         return entry
 
 
@@ -424,10 +427,13 @@ class Handler(BaseHTTPRequestHandler):
         return self.path.split("?", 1)[0]
 
     def _read_body(self) -> bytes:
+        """The request body; raises ValueError on a malformed length or chunk size."""
         if CHUNKED in (self.headers.get(TRANSFER_ENCODING_HEADER) or "").lower():
             data = bytearray()
             while True:
                 size = int(self.rfile.readline().split(b";", 1)[0].strip() or b"0", HEX_BASE)
+                if size < 0:
+                    raise ValueError("negative chunk size")
                 if size == 0:
                     while self.rfile.readline() not in (CRLF, b"\n", b""):
                         pass
@@ -435,6 +441,8 @@ class Handler(BaseHTTPRequestHandler):
                 data.extend(self.rfile.read(size))
                 self.rfile.readline()
         length = int(self.headers.get(CONTENT_LENGTH_HEADER) or 0)
+        if length < 0:
+            raise ValueError("negative Content-Length")
         return self.rfile.read(length) if length else b""
 
     def _send_local(self, status: int, payload: bytes, content_type: str) -> None:
@@ -460,7 +468,13 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _handle(self) -> None:
-        raw = self._read_body()
+        try:
+            raw = self._read_body()
+        except ValueError:
+            # The rest of the stream cannot be framed, so the connection ends here.
+            self.close_connection = True
+            self._send_local(HTTP_BAD_REQUEST, b'{"error": "replay proxy: malformed request framing"}', JSON_CONTENT_TYPE)
+            return
         if self._local():
             return
         self.proxy.metrics.add("requests")
@@ -469,7 +483,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 parsed = json.loads(raw)
                 body = parsed if isinstance(parsed, dict) else None
-            except ValueError:
+            except (ValueError, RecursionError):
                 body = None
         received = time.time()
         upstream = self._forward(raw, observe=body is not None, streaming=bool(body and body.get("stream")))
@@ -481,8 +495,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # the analysis must never cost the agent its answer
             self.proxy.metrics.add("analysis_errors")
             # The type name only: an exception's message can quote request text.
-            entry = {"event": LOG_EVENT, "schema": LOG_SCHEMA_VERSION, "ts": received, "job": self.proxy.job(),
-                     "status": upstream["status"], "error": type(exc).__name__}
+            entry = {F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
+                     F.JOB: self.proxy.job(), F.STATUS: upstream["status"], F.ERROR: type(exc).__name__}
         self.proxy.log(entry)
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
@@ -493,7 +507,8 @@ class Handler(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in DROPPED_REQUEST_HEADERS}
         headers[HOST_HEADER] = f"{config.upstream_host}:{config.upstream_port}"
         result: Dict[str, Any] = {"status": HTTP_BAD_GATEWAY, "headers": {}, "usage": None, "message": {},
-                                  "latency_ms": None, "client_disconnected": False, "upstream_incomplete": False}
+                                  "latency_ms": None, "client_disconnected": False, "upstream_incomplete": False,
+                                  "observe_failed": False}
         started = time.monotonic()
         conn = http.client.HTTPConnection(config.upstream_host, config.upstream_port,
                                           timeout=config.upstream_timeout_seconds)
@@ -545,7 +560,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.close_connection = True
                     break
                 if observer is not None:
-                    observer.feed(data)
+                    observer = self._observe(observer, result, data)
                 if not self._send_client(chunked, data):
                     result["client_disconnected"] = True
                     break
@@ -558,10 +573,24 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
         result["latency_ms"] = int((time.monotonic() - started) * MS_PER_SECOND)
         if observer is not None and resp.status == HTTP_OK:
-            observer.finish()
-            result["usage"] = observer.usage
+            observer = self._observe(observer, result, None)
+        if observer is not None and resp.status == HTTP_OK:
+            result["usage"] = observer.usage if isinstance(observer.usage, dict) else None
             result["message"] = observer.message if isinstance(observer.message, dict) else {}
         return result
+
+    def _observe(self, observer: "ResponseObserver", result: Dict[str, Any], data: Optional[bytes]):
+        """Feed (or, with None, finish) the observer; on any failure stop observing, never the stream."""
+        try:
+            if data is None:
+                observer.finish()
+            else:
+                observer.feed(data)
+            return observer
+        except Exception:  # an unusual chunk costs the line its usage and answer, not the client its bytes
+            result["observe_failed"] = True
+            self.proxy.metrics.add("analysis_errors")
+            return None
 
     def _send_upstream_headers(self, resp: http.client.HTTPResponse, chunked: bool, length: Optional[str]) -> bool:
         """Copy the upstream status and headers to the client; False when the client has gone."""

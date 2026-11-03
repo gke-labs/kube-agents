@@ -22,6 +22,11 @@ TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
 LOG_WAIT_SECONDS = 5
 POLL_SECONDS = 0.02
 STALL_SECONDS = 0.3
+# A stall far longer than the proxy's timeout, which is far longer than the
+# fake's header latency, so the timeout test has no narrow window.
+LONG_STALL_SECONDS = 1.0
+SHORT_TIMEOUT_SECONDS = 0.25
+DEEP_NESTING = 100_000
 SLOW_CHUNKS = 100
 SLOW_CHUNK_SECONDS = 0.05
 
@@ -38,6 +43,8 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
     # Content-Length), or "slow" (many chunks, slowly; `aborted` is set when a
     # write fails).
     mode = "normal"
+    # When set, the whole body: one SSE chunk for a stream, the JSON otherwise.
+    custom_body = None
     aborted = threading.Event()
     lock = threading.Lock()
 
@@ -65,6 +72,14 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
         body = json.loads(raw)
         task = body["messages"][-1]["content"].split()[-1]
         headers = {"x-litellm-model-group": body["model"], "x-litellm-attempted-fallbacks": self.fallbacks}
+        if not body.get("stream") and self.custom_body is not None:
+            data = self.custom_body
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if not body.get("stream"):
             data = json.dumps({
                 "id": f"resp-{number}", "object": "chat.completion",
@@ -93,7 +108,7 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
         for key, value in headers.items():
             self.send_header(key, value)
         self.end_headers()
-        chunks = self.stream_chunks(number, task)
+        chunks = self.stream_chunks(number, task) if self.custom_body is None else [self.custom_body]
         if self.mode == "slow":
             chunks = [b": keep-alive\n\n"] * SLOW_CHUNKS + chunks
         for index, chunk in enumerate(chunks):
@@ -106,6 +121,10 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
                 return
             if self.mode == "slow":
                 time.sleep(SLOW_CHUNK_SECONDS)
+            if self.mode == "stall" and index == 0:
+                time.sleep(LONG_STALL_SECONDS)
+                self.close_connection = True
+                return
             if self.mode == "stall_reset" and index == 0:
                 time.sleep(STALL_SECONDS)
                 self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
@@ -160,6 +179,7 @@ class ProxyTestCase(unittest.TestCase):
         FakeLiteLLM.calls = []
         FakeLiteLLM.fallbacks = "0"
         FakeLiteLLM.mode = "normal"
+        FakeLiteLLM.custom_body = None
         FakeLiteLLM.aborted = threading.Event()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeLiteLLM)
         threading.Thread(target=self.upstream.serve_forever, args=(POLL_SECONDS,), daemon=True).start()
@@ -301,14 +321,89 @@ class UpstreamFailureTest(ProxyTestCase):
 
 
 class UpstreamTimeoutTest(ProxyTestCase):
-    upstream_timeout = STALL_SECONDS / 3
+    upstream_timeout = SHORT_TIMEOUT_SECONDS
 
     def test_stall_past_the_timeout(self):
-        FakeLiteLLM.mode = "stall_reset"
+        FakeLiteLLM.mode = "stall"
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=True))
         line = self.lines(1)[0]
         self.assertEqual(line["unstorable"], ["upstream_incomplete"])
         self.assertEqual(self.proxy.metrics.get("upstream_errors"), 1)
+
+
+def sse(event):
+    return f"data: {event}\n\n".encode()
+
+
+MALFORMED_STREAMS = {
+    "tool_call index null": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": None, "id": "c"}]}}]})),
+    "tool_call index string": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": "0", "id": "c"}]}}]})),
+    "tool_call index negative": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": -1, "id": "c"}]}}]})),
+    "delta not a dict": sse(json.dumps({"choices": [{"delta": ["x"]}]})),
+    "choices a number": sse(json.dumps({"choices": 5})),
+    "nested too deep": sse('{"choices": ' + "[" * DEEP_NESTING + "]" * DEEP_NESTING + "}"),
+}
+
+
+class ObserveFailureTest(ProxyTestCase):
+    def check(self, body, stream):
+        FakeLiteLLM.custom_body = body
+        status, _, payload = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=stream))
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, body, "the client gets every byte")
+        line = self.lines(1)[0]
+        self.assertEqual(line["unstorable"], ["observe_failed"])
+        self.assertTrue(line["observe_failed"])
+        self.assertIsNone(line["prompt_tokens"])
+        self.assertIsNone(line["answer_hash"])
+        self.assertTrue(line["fingerprint"])
+        self.assertGreaterEqual(self.proxy.metrics.get("analysis_errors"), 1)
+
+    def test_malformed_streamed_chunks(self):
+        for name, body in MALFORMED_STREAMS.items():
+            with self.subTest(name):
+                self.out.seek(0)
+                self.out.truncate()
+                self.check(body, stream=True)
+
+    def test_malformed_non_streamed_body(self):
+        self.check(json.dumps({"choices": 5}).encode(), stream=False)
+
+
+class FramingTest(ProxyTestCase):
+    def raw(self, request):
+        client = socket.create_connection(("127.0.0.1", self.port), timeout=LOG_WAIT_SECONDS)
+        client.sendall(request)
+        data = b""
+        while True:
+            part = client.recv(4096)
+            if not part:
+                break
+            data += part
+        client.close()
+        return data
+
+    def test_bad_content_length_is_a_400(self):
+        reply = self.raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n{}")
+        self.assertTrue(reply.startswith(b"HTTP/1.1 400"), reply)
+        self.assertEqual(FakeLiteLLM.calls, [])
+
+    def test_bad_chunk_size_is_a_400(self):
+        reply = self.raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n{}\r\n0\r\n\r\n")
+        self.assertTrue(reply.startswith(b"HTTP/1.1 400"), reply)
+        self.assertEqual(FakeLiteLLM.calls, [])
+
+
+class SurrogateTest(ProxyTestCase):
+    def test_lone_surrogate_still_logs_and_stores(self):
+        body = chat("t_11111111", stream=False)
+        body["messages"].insert(1, {"role": "user", "content": "half an emoji \ud83d here"})
+        status, _, _ = self.request("POST", "/v1/chat/completions", body)
+        self.assertEqual(status, 200)
+        line = self.lines(1)[0]
+        self.assertNotIn("error", line)
+        self.assertTrue(line["fingerprint"])
+        self.assertTrue(line["stored"], line["store_skipped"])
 
 
 class ClientDisconnectTest(ProxyTestCase):
@@ -340,6 +435,18 @@ class StoreWriteFailureTest(ProxyTestCase):
         self.assertTrue(line["store_skipped"].startswith("write_failed"), line["store_skipped"])
         self.assertTrue(line["fingerprint"])
         self.assertTrue(line["message_hashes"])
+
+
+class DiagnosisHashTest(ProxyTestCase):
+    def test_line_carries_diagnosis_hashes_beside_unchanged_message_hashes(self):
+        import normalizer
+
+        body = chat("t_11111111", stream=False)
+        self.request("POST", "/v1/chat/completions", body)
+        line = self.lines(1)[0]
+        expected = normalizer.normalize_request(body, line["ts"]).message_hashes
+        self.assertEqual(line["message_hashes"], expected)
+        self.assertEqual(len(line["diag_message_hashes"]), len(body["messages"]))
 
 
 class LocalEndpointTest(ProxyTestCase):

@@ -87,8 +87,37 @@ class ScrubberTest(unittest.TestCase):
         self.assertEqual(r1["messages"], r2["messages"][:2])
 
     def test_answer_change_detection(self):
-        self.assertFalse(self.scrubber.answer_changes({"content": "the pod is healthy"}))
-        self.assertTrue(self.scrubber.answer_changes({"content": f"use {TOKEN}"}))
+        self.assertFalse(self.scrubber.answer_masks_credential({"content": "the pod is healthy"}))
+        self.assertTrue(self.scrubber.answer_masks_credential({"content": f"use {TOKEN}"}))
+
+    @staticmethod
+    def call(arguments):
+        return {"content": None, "tool_calls": [{"id": "c", "function": {"name": "terminal", "arguments": arguments}}]}
+
+    def test_reformatting_alone_keeps_an_answer_storable(self):
+        non_ascii = json.dumps({"command": "echo 'déploiement réussi ✓'"}, ensure_ascii=False)
+        folded = json.dumps({"command": "kubectl get pods \\\n  -n kube-system \\\n  -o wide"})
+        for arguments in (non_ascii, folded):
+            with self.subTest(arguments):
+                self.assertNotEqual(self.scrubber.text(request_store.KIND_TOOL_CALL, arguments), arguments)
+                self.assertFalse(self.scrubber.answer_masks_credential(self.call(arguments)))
+
+    def test_masking_an_email_or_an_ip_keeps_an_answer_storable(self):
+        self.assertFalse(self.scrubber.answer_masks_credential({"content": "ping ops@example.com about 10.4.0.12"}))
+
+    def test_a_token_in_tool_arguments_is_unstorable(self):
+        arguments = json.dumps({"command": f"gh auth login --with-token {TOKEN}"})
+        self.assertTrue(self.scrubber.answer_masks_credential(self.call(arguments)))
+
+    def test_markers_come_from_the_modules(self):
+        self.assertIn("[REDACTED_SECRET]", self.scrubber.credential_markers)
+        self.assertIn("[REDACTED_PRIVATE_KEY]", self.scrubber.credential_markers)
+        self.assertNotIn("[REDACTED_EMAIL]", self.scrubber.credential_markers)
+
+    def test_lone_surrogate_is_stored(self):
+        lone = body({"role": "user", "content": "half an emoji \ud83d"})
+        self.assertIsNone(self.store.store("r1", "fp", lone))
+        self.assertIn("\\ud83d", read_all(self.root))
 
 
 class FailClosedTest(unittest.TestCase):
@@ -136,9 +165,26 @@ class FailClosedTest(unittest.TestCase):
         reason = store.store("r1", "fp", body())
         self.assertTrue(reason.startswith("write_failed"), reason)
 
+    def test_failed_write_leaves_no_tmp_file(self):
+        root = tempfile.mkdtemp()
+        store = request_store.RequestStore(root, request_store.Scrubber(REDACTOR, RULES))
+        target = os.path.join(root, "blob.json")
+        original = os.replace
+
+        def failing_replace(src, dst):
+            raise OSError("disk gone")
+
+        os.replace = failing_replace
+        try:
+            with self.assertRaises(OSError):
+                store._write(target, "data")
+        finally:
+            os.replace = original
+        self.assertEqual(os.listdir(root), [])
+
     def test_unavailable_scrubber_counts_every_answer_as_changed(self):
         scrubber = request_store.Scrubber("/nonexistent/redactor.py", RULES)
-        self.assertTrue(scrubber.answer_changes({"content": "fine"}))
+        self.assertTrue(scrubber.answer_masks_credential({"content": "fine"}))
 
 
 if __name__ == "__main__":

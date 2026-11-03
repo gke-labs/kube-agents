@@ -334,6 +334,9 @@ class FingerprintTest(unittest.TestCase):
         )
         self.assertEqual(short.message_hashes, long.message_hashes[:2])
 
+    def test_lone_surrogate_hashes(self):
+        self.assertEqual(len(fp(request("half an emoji \ud83d"))), 64)
+
     def test_a_tool_result_change_changes_the_key(self):
         self.assertNotEqual(fp(request("READY 0/1 CrashLoopBackOff")), fp(request("READY 1/1 Running")))
 

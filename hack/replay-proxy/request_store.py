@@ -32,6 +32,11 @@ from typing import Any, Dict, List, Optional, Tuple
 REDACTOR_MODULE_NAME = "replay_proxy_audit_redactor"
 TRANSCRIPT_RULES_MODULE_NAME = "replay_proxy_worker_transcript"
 REDACTOR_CLASS = "AuditRedactor"
+# The markers that mean a credential was masked: the redactor's own list, and
+# the two the transcript rules write. Emails, IPs and configured rules (a
+# cluster name) use other markers and do not make an answer unstorable.
+REDACTOR_CREDENTIAL_MARKERS = "CREDENTIAL_MARKERS"
+RULES_CREDENTIAL_MARKERS = ("REDACTED_SECRET_MARKER", "REDACTED_PRIVATE_KEY_MARKER")
 
 # The step kinds worker_transcript.scrub_step_text takes. User and system text
 # carries card views and pasted output, so it gets the tool-result rules (the
@@ -93,7 +98,8 @@ def _load_module(name: str, path: str) -> Any:
 
 
 def _canonical(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    # ASCII, so a lone surrogate in a request is written as its JSON escape.
+    return json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
 
 
 class Scrubber:
@@ -102,10 +108,15 @@ class Scrubber:
     def __init__(self, redactor_path: str, transcript_rules_path: str):
         self.redactor: Any = None
         self.rules: Any = None
+        self.credential_markers: Tuple[str, ...] = ()
         self.error: Optional[str] = None
         try:
-            self.redactor = getattr(_load_module(REDACTOR_MODULE_NAME, redactor_path), REDACTOR_CLASS)
+            redactor_module = _load_module(REDACTOR_MODULE_NAME, redactor_path)
+            self.redactor = getattr(redactor_module, REDACTOR_CLASS)
             self.rules = _load_module(TRANSCRIPT_RULES_MODULE_NAME, transcript_rules_path)
+            markers = list(getattr(redactor_module, REDACTOR_CREDENTIAL_MARKERS))
+            markers += [getattr(self.rules, name) for name in RULES_CREDENTIAL_MARKERS]
+            self.credential_markers = tuple(dict.fromkeys(markers + [WITHHELD]))
         except Exception as exc:  # any failure to load means no text is kept
             self.redactor = None
             self.rules = None
@@ -198,15 +209,27 @@ class Scrubber:
         scrubbed_settings = json.loads(self.text(KIND_TOOL_RESULT, settings))
         return scrubbed, scrubbed_tools, scrubbed_settings
 
-    def answer_changes(self, answer: Dict[str, Any]) -> bool:
-        """Whether scrubbing would change an answer (such an answer is never saved)."""
+    def _adds_credential_marker(self, kind: str, text: str) -> bool:
+        scrubbed = self.text(kind, text)
+        return any(scrubbed.count(marker) > text.count(marker) for marker in self.credential_markers)
+
+    def answer_masks_credential(self, answer: Dict[str, Any]) -> bool:
+        """Whether scrubbing an answer would mask a credential (such an answer is never saved).
+
+        Only a credential marker the answer did not already hold counts, or
+        the withheld marker for text that could not be scrubbed. Reformatting
+        (JSON re-serialised, a folded shell command) and masking an email, an
+        IP or a configured value do not: replaying those answers puts no
+        secret in the cache.
+        """
         if not self.available:
             return True
-        if answer.get(CONTENT_KEY) and self.text(KIND_REPLY, answer[CONTENT_KEY]) != answer[CONTENT_KEY]:
+        content = answer.get(CONTENT_KEY)
+        if isinstance(content, str) and content and self._adds_credential_marker(KIND_REPLY, content):
             return True
         for call in answer.get(TOOL_CALLS_KEY) or []:
-            arguments = (call.get(FUNCTION_KEY) or {}).get(ARGUMENTS_KEY) or ""
-            if arguments and self.text(KIND_TOOL_CALL, arguments) != arguments:
+            arguments = ((call.get(FUNCTION_KEY) or {}) if isinstance(call, dict) else {}).get(ARGUMENTS_KEY) or ""
+            if isinstance(arguments, str) and arguments and self._adds_credential_marker(KIND_TOOL_CALL, arguments):
                 return True
         return False
 
@@ -231,9 +254,16 @@ class RequestStore:
     def _write(path: str, data: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-        with open(tmp, "w", encoding=TEXT_ENCODING) as handle:
-            handle.write(data)
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", encoding=TEXT_ENCODING) as handle:
+                handle.write(data)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
 
     def scrub(self, body: Dict[str, Any]) -> Tuple[Optional[Scrubbed], Optional[str]]:
         """(scrubbed request, None), or (None, why it could not be scrubbed)."""

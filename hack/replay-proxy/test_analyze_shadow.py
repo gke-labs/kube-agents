@@ -232,6 +232,27 @@ class MissTest(unittest.TestCase):
         self.assertEqual(top[1]["matched_messages"], 1)
         self.assertEqual(rep["miss_tokens_by_first_difference"], {"tool": 500, "user": 50})
 
+    def test_a_settings_difference_is_reported_as_settings(self):
+        first = line("n1", 1, "nightly", "n", "A", ["s", "u"], roles=["system", "user"])
+        second = presubmit("p1", 2, "10", "b1", "B", ["s", "u"], roles=["system", "user"])
+        second["settings_hash"] = "other-tools"
+        rep, _ = report([first, second])
+        self.assertEqual(rep["top_misses"][0]["first_difference_role"], "settings")
+        self.assertIsNone(rep["top_misses"][0]["closest_request_id"])
+
+    def test_closest_search_uses_diagnosis_hashes_when_logged(self):
+        # message_hashes drifted (a later CIDR changed message 1's IPs); the
+        # diagnosis hashes did not, so the search still finds two matching messages.
+        first = line("n1", 1, "nightly", "n", "A", ["s", "u1"], roles=["system", "user"])
+        first["diag_message_hashes"] = ["ds", "du"]
+        second = presubmit("p1", 2, "10", "b1", "B", ["s", "u1-drifted", "t"], roles=["system", "user", "tool"])
+        second["diag_message_hashes"] = ["ds", "du", "dt"]
+        rep, _ = report([first, second])
+        self.assertEqual(rep["top_misses"][0]["matched_messages"], 2)
+        self.assertEqual(rep["top_misses"][0]["first_difference_role"], "tool")
+        # Matching itself still uses message_hashes and the fingerprint.
+        self.assertEqual(rep["estimates"]["simulated"]["hits"], 0)
+
     def test_closest_skips_the_same_build_and_other_prs(self):
         rep, _ = report([
             line("n1", 1, "nightly", "n", "A", ["s"]),
@@ -244,18 +265,40 @@ class MissTest(unittest.TestCase):
         self.assertEqual(p2["matched_messages"], 1)
 
 
+class HealthTest(unittest.TestCase):
+    def test_health_counts(self):
+        records, skipped = analyze_shadow.load([write([
+            line("n1", 1, "nightly", "n", "A", ["a"]),
+            presubmit("p1", 2, "", "b1", "A", None, unstorable=["upstream_incomplete"]),
+            presubmit("p2", 3, "10", "b1", "B", ["b"], unstorable=["observe_failed"]),
+            presubmit("p3", 4, "10", "b1", "C", ["c"], unstorable=["fallback_attempted", "repeats_swapped_number"]),
+            {"event": "replay_shadow_request", "ts": 5, "error": "RuntimeError", "job": {"kind": "presubmit"}},
+        ])])
+        rep = analyze_shadow.summarize(records, skipped=skipped)
+        h = rep["health"]
+        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "presubmit": 3})
+        self.assertEqual(h["error_lines"], 1)
+        self.assertEqual(h["presubmit_without_pr"], 1)
+        self.assertEqual(h["without_message_hashes"], 1)
+        self.assertEqual(h["upstream_incomplete"], 1)
+        self.assertEqual(h["observe_failed"], 1)
+        self.assertEqual(h["unstorable_percent_by_reason"]["fallback_attempted"], 25.0)
+        self.assertIn("health (check after the first day)", analyze_shadow.render(rep, skipped))
+
+
 class LoadTest(unittest.TestCase):
     def test_skips_other_lines_and_untagged_jobs(self):
         records, skipped = analyze_shadow.load([write([
             "not json",
             {"event": "replay_shadow_start"},
             line("x", 1, "", "b", "A", ["a"]),
-            {"event": "replay_shadow_request", "ts": 1, "error": "boom", "job": {"kind": "presubmit"}},
+            {"event": "replay_shadow_request", "ts": 1, "error": "RuntimeError", "job": {"kind": "presubmit"}},
+            {"event": "replay_shadow_request", "ts": 1, "job": {"kind": "presubmit"}},
             presubmit("p", 2, "10", "b", "A", ["a"]),
         ])])
         self.assertEqual([r.request_id for r in records], ["p"])
         self.assertEqual(records[0].pr, "10")
-        self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "no_fingerprint": 1})
+        self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "no_fingerprint": 1})
 
     def test_records_from_several_files_are_merged_in_time_order(self):
         a = write([presubmit("p2", 5, "10", "b2", "A", ["a"])])

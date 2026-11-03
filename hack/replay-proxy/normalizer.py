@@ -183,6 +183,17 @@ RECENT_WORK_ESCAPED_STRIPPED = "## Recent work [stripped]"
 
 # A string that may hold a JSON document (a tool result usually does).
 JSON_OPENERS = "{["
+# Hash input encoding. A lone surrogate (`"\ud83d"`) is valid in a JSON string
+# but not in UTF-8, so it is passed through rather than raising.
+TEXT_ENCODING = "utf-8"
+ENCODING_ERRORS = "surrogatepass"
+# Answer rewriting: a value is swapped only where it is a whole token, so the
+# characters that may border a token are excluded on each side.
+TOKEN_BEFORE = r"(?<![A-Za-z0-9+/=_-])"
+TOKEN_AFTER = r"(?![A-Za-z0-9+/=_-])"
+NUMBER_BEFORE = r"(?<![\w.])"
+NUMBER_AFTER = r"(?![\w])"
+DIGIT_RE = re.compile(r"\d")
 # Joins a mapping key's class scope and its value.
 MAPPING_KEY_SEPARATOR = "\0"
 
@@ -190,7 +201,7 @@ MAPPING_KEY_SEPARATOR = "\0"
 def stable_hash(value: Any) -> str:
     """SHA-256 of a value's canonical JSON."""
     data = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+    return hashlib.sha256(data.encode(TEXT_ENCODING, ENCODING_ERRORS)).hexdigest()
 
 
 def time_bucket(when: float, now: float) -> str:
@@ -244,18 +255,18 @@ class Mapping:
         for value, token in sorted(self.swappable_values().items(), key=lambda kv: len(kv[0]), reverse=True):
             if value not in text:
                 continue
-            before = r"(?<![A-Za-z0-9+/=_-])" if value[0].isalnum() else ""
-            after = r"(?![A-Za-z0-9+/=_-])" if value[-1].isalnum() else ""
+            before = TOKEN_BEFORE if value[0].isalnum() else ""
+            after = TOKEN_AFTER if value[-1].isalnum() else ""
             text = re.sub(before + re.escape(value) + after, lambda _m, t=token: t, text)
         return text
 
     def answer_repeats_bare_number(self, text: str) -> bool:
         """Whether an answer repeats a swapped value that cannot be restored."""
-        return any(re.search(r"(?<![\w.])" + re.escape(v) + r"(?![\w])", text) for v in self.bare_numbers)
+        return any(re.search(NUMBER_BEFORE + re.escape(v) + NUMBER_AFTER, text) for v in self.bare_numbers)
 
 
 def age_unit(value: str) -> str:
-    return re.sub(r"\d", "", value)[:1]
+    return DIGIT_RE.sub("", value)[:1]
 
 
 class Normalizer:
@@ -500,9 +511,12 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
     """Normalize a chat-completions body as of request time `now` (epoch seconds).
 
     Messages are normalized first, in order, so a placeholder's number depends
-    only on what came before it: a request's first k message hashes equal those
-    of any request sharing its first k messages, which is what the offline
-    longest-prefix search relies on.
+    only on what came before it. Two requests sharing their first k messages
+    get the same first k message hashes only when they also share the CIDR
+    decision (any CIDR anywhere in the request keeps every IP literal) and
+    their timestamps fall in the same how-far-from-now buckets. The
+    closest-earlier-request search uses diagnosis.py's hashes, which freeze
+    each message at first sighting, for that reason.
     """
     kept = {k: v for k, v in body.items() if k not in KEY_DROP_FIELDS}
     keep_ips = CIDR_RE.search(json.dumps(kept, ensure_ascii=False)) is not None

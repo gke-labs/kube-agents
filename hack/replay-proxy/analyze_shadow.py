@@ -30,8 +30,10 @@ report counts those lines.
 
 Also reported: the share of hits first seen in another project, the tokens and
 model time hits would save, and for misses the closest earlier request by
-longest matching per-message-hash prefix, ranked by tokens lost. The stored,
-scrubbed text of both is under their request_id for a diff.
+longest matching per-message-hash prefix (the `diag_message_hashes`, which
+do not drift between requests of one conversation), ranked by tokens lost. The
+stored, scrubbed text of both is under their request_id for a diff. The health
+counts show a broken setup; check them after the first day.
 
 A collision audit (did two requests that matched lead to different results?)
 is a later step: it joins each `Hit` from `iter_hits` with run verdicts and the
@@ -50,12 +52,12 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
-LOG_EVENT = "replay_shadow_request"
+import schema as F
+
 NIGHTLY = "nightly"
 PRESUBMIT = "presubmit"
 JOB_KINDS = (NIGHTLY, PRESUBMIT)
 ASSISTANT_ROLE = "assistant"
-MESSAGE_HASHES_FIELD = "message_hashes"
 # Stands in for an assistant message's content in the simulated key: its place
 # in the conversation counts, its words do not.
 ANSWER_PLACEHOLDER = "assistant-message"
@@ -69,8 +71,15 @@ MS_PER_SECOND = 1000.0
 SKIP_NOT_JSON = "not_json"
 SKIP_OTHER_EVENT = "other_event"
 SKIP_UNTAGGED = "untagged"
+# The proxy's analysis failed for a request: the line carries `error` only.
+SKIP_ERROR = "error"
 SKIP_NO_FINGERPRINT = "no_fingerprint"
-SKIP_REASONS = (SKIP_NOT_JSON, SKIP_OTHER_EVENT, SKIP_UNTAGGED, SKIP_NO_FINGERPRINT)
+SKIP_REASONS = (SKIP_NOT_JSON, SKIP_OTHER_EVENT, SKIP_UNTAGGED, SKIP_ERROR, SKIP_NO_FINGERPRINT)
+# Labels in Miss.first_difference_role besides a message role.
+DIFF_UNHASHED = "unhashed"
+DIFF_SETTINGS = "settings"
+DIFF_NONE = "none"
+DIFF_UNKNOWN_ROLE = "unknown"
 
 
 @dataclass
@@ -86,32 +95,40 @@ class Record:
     fingerprint: str
     settings_hash: str
     message_hashes: Optional[List[str]]
+    diag_message_hashes: Optional[List[str]]
     roles: List[str]
     prompt_tokens: int
     completion_tokens: int
     latency_ms: int
-    storable: bool
+    unstorable: List[str]
+
+    @property
+    def storable(self) -> bool:
+        return not self.unstorable
 
     @classmethod
     def from_line(cls, entry: Dict[str, Any]) -> "Record":
-        job = entry.get("job") or {}
-        hashes = entry.get(MESSAGE_HASHES_FIELD)
+        job = entry.get(F.JOB) or {}
+        hashes = entry.get(F.MESSAGE_HASHES)
+        diag = entry.get(F.DIAG_MESSAGE_HASHES)
         return cls(
-            request_id=str(entry.get("request_id", "")),
-            ts=float(entry["ts"]),
-            kind=str(job.get("kind") or ""),
-            project=str(job.get("project") or ""),
-            build=str(job.get("build") or ""),
-            pr=str(job.get("pr") or ""),
-            fingerprint=str(entry["fingerprint"]),
-            settings_hash=str(entry.get("settings_hash") or ""),
-            # Absent when the proxy could not scrub the request.
+            request_id=str(entry.get(F.REQUEST_ID, "")),
+            ts=float(entry[F.TS]),
+            kind=str(job.get(F.JOB_KIND) or ""),
+            project=str(job.get(F.JOB_PROJECT) or ""),
+            build=str(job.get(F.JOB_BUILD) or ""),
+            pr=str(job.get(F.JOB_PR) or ""),
+            fingerprint=str(entry[F.FINGERPRINT]),
+            settings_hash=str(entry.get(F.SETTINGS_HASH) or ""),
+            # The proxy always writes message_hashes; a hand-made or truncated
+            # line may lack them.
             message_hashes=list(hashes) if isinstance(hashes, list) else None,
-            roles=list(entry.get("roles") or []),
-            prompt_tokens=int(entry.get("prompt_tokens") or 0),
-            completion_tokens=int(entry.get("completion_tokens") or 0),
-            latency_ms=int(entry.get("latency_ms") or 0),
-            storable=not entry.get("unstorable"),
+            diag_message_hashes=list(diag) if isinstance(diag, list) else None,
+            roles=list(entry.get(F.ROLES) or []),
+            prompt_tokens=int(entry.get(F.PROMPT_TOKENS) or 0),
+            completion_tokens=int(entry.get(F.COMPLETION_TOKENS) or 0),
+            latency_ms=int(entry.get(F.LATENCY_MS) or 0),
+            unstorable=[str(r) for r in entry.get(F.UNSTORABLE) or []],
         )
 
     @property
@@ -123,11 +140,16 @@ class Record:
     def build_key(self) -> Tuple[str, str, str]:
         return (self.kind, self.pr, self.build)
 
-    def chain(self, skip_answers: bool = False) -> List[str]:
+    @property
+    def search_hashes(self) -> Optional[List[str]]:
+        """The per-message hashes the closest-request search walks: diagnosis hashes when logged."""
+        return self.diag_message_hashes if self.diag_message_hashes is not None else self.message_hashes
+
+    def chain(self, skip_answers: bool = False, hashes: Optional[List[str]] = None) -> List[str]:
         """Prefix hashes: element k identifies the settings plus the first k+1 messages."""
         out = []
         current = self.settings_hash
-        for index, message_hash in enumerate(self.message_hashes or []):
+        for index, message_hash in enumerate((self.message_hashes if hashes is None else hashes) or []):
             role = self.roles[index] if index < len(self.roles) else ""
             part = ANSWER_PLACEHOLDER if skip_answers and role == ASSISTANT_ROLE else message_hash
             current = hashlib.sha256(f"{current}|{part}".encode()).hexdigest()
@@ -157,11 +179,13 @@ class Miss:
 
     @property
     def first_difference_role(self) -> str:
-        if self.request.message_hashes is None:
-            return "unhashed"
+        if self.request.search_hashes is None:
+            return DIFF_UNHASHED
+        if self.closest is None:
+            return DIFF_SETTINGS
         if self.matched_messages < len(self.request.roles):
-            return self.request.roles[self.matched_messages] or "unknown"
-        return "settings" if self.closest is None else "none"
+            return self.request.roles[self.matched_messages] or DIFF_UNKNOWN_ROLE
+        return DIFF_NONE
 
 
 class Sources:
@@ -242,18 +266,18 @@ class PrefixSources(Sources):
     """Every prefix of every request, for the closest-earlier-request search."""
 
     def keys_of(self, record: Record) -> List[str]:
-        if record.message_hashes is None:
+        if record.search_hashes is None:
             return []
-        return [record.settings_hash] + record.chain()
+        return [record.settings_hash] + record.chain(hashes=record.search_hashes)
 
     def closest(self, request: Record) -> Tuple[Optional[Record], int]:
-        if request.message_hashes is None:
+        if request.search_hashes is None:
             return None, 0
         best = self.find(request.settings_hash, request, nightly_only=False)
         if best is None:
             return None, 0
         matched = 0
-        for prefix in request.chain():
+        for prefix in request.chain(hashes=request.search_hashes):
             found = self.find(prefix, request, nightly_only=False)
             if found is None:
                 break
@@ -276,13 +300,16 @@ def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
                 except ValueError:
                     skipped[SKIP_NOT_JSON] += 1
                     continue
-                if not isinstance(entry, dict) or entry.get("event") != LOG_EVENT:
+                if not isinstance(entry, dict) or entry.get(F.EVENT) != F.REQUEST_EVENT:
                     skipped[SKIP_OTHER_EVENT] += 1
                     continue
-                if not entry.get("fingerprint"):
+                if entry.get(F.ERROR):
+                    skipped[SKIP_ERROR] += 1
+                    continue
+                if not entry.get(F.FINGERPRINT):
                     skipped[SKIP_NO_FINGERPRINT] += 1
                     continue
-                if (entry.get("job") or {}).get("kind") not in JOB_KINDS:
+                if (entry.get(F.JOB) or {}).get(F.JOB_KIND) not in JOB_KINDS:
                     skipped[SKIP_UNTAGGED] += 1
                     continue
                 records.append(Record.from_line(entry))
@@ -326,9 +353,31 @@ def percent(part: float, whole: float) -> float:
     return round(PERCENT * part / whole, PERCENT_DECIMALS) if whole else 0.0
 
 
+def health(records: List[Record], skipped: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+    """Counts that show a broken setup: check these after the first day."""
+    skipped = skipped or {}
+    by_reason: Dict[str, int] = {}
+    for record in records:
+        for reason in record.unstorable:
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+    return {
+        "lines_by_kind": {kind: sum(1 for r in records if r.kind == kind) for kind in JOB_KINDS},
+        "error_lines": skipped.get(SKIP_ERROR, 0),
+        "lines_without_fingerprint": skipped.get(SKIP_NO_FINGERPRINT, 0),
+        "untagged_lines": skipped.get(SKIP_UNTAGGED, 0),
+        "unstorable_percent_by_reason": {
+            reason: percent(count, len(records)) for reason, count in sorted(by_reason.items(), key=lambda kv: -kv[1])
+        },
+        "presubmit_without_pr": sum(1 for r in records if r.kind == PRESUBMIT and not r.pr),
+        "without_message_hashes": sum(1 for r in records if r.message_hashes is None),
+        "upstream_incomplete": by_reason.get(F.UNSTORABLE_UPSTREAM_INCOMPLETE, 0),
+        "observe_failed": by_reason.get(F.UNSTORABLE_OBSERVE_FAILED, 0),
+    }
+
+
 def summarize(
     records: List[Record], require_storable: bool = True, top: int = DEFAULT_TOP_MISSES,
-    merged: Optional[Dict[str, float]] = None,
+    merged: Optional[Dict[str, float]] = None, skipped: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     presubmit = [r for r in records if r.kind == PRESUBMIT]
     total_tokens = sum(r.prompt_tokens for r in presubmit)
@@ -342,6 +391,7 @@ def summarize(
         # REPLAY_JOB_PR unset: these never match an earlier build of their PR.
         "presubmit_without_pr": sum(1 for r in presubmit if not r.pr),
         "merge_times_given": len(merged or {}),
+        "health": health(records, skipped),
         "estimates": {},
     }
     for estimate in ESTIMATES:
@@ -388,6 +438,11 @@ def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
         f" presubmit requests without a pull request: {report['presubmit_without_pr']};"
         f" merge times given: {report['merge_times_given']}",
         "",
+        "health (check after the first day):",
+    ]
+    lines += [f"  {name}: {value}" for name, value in report["health"].items()]
+    lines += [
+        "",
         "estimate    hits   token-weighted   cross-project   saved prompt / completion tokens   saved model time",
     ]
     for name, e in report["estimates"].items():
@@ -422,7 +477,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--ignore-storable", action="store_true", help="count sightings replay would not have saved")
     args = parser.parse_args(argv)
     records, skipped = load(args.logs)
-    report = summarize(records, require_storable=not args.ignore_storable, top=args.top, merged=load_merged(args.merged))
+    report = summarize(
+        records, require_storable=not args.ignore_storable, top=args.top, merged=load_merged(args.merged), skipped=skipped
+    )
     if args.json:
         report["skipped_lines"] = skipped
         print(json.dumps(report, indent=2, sort_keys=True))
