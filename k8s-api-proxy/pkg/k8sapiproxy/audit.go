@@ -19,6 +19,9 @@ const (
 	OutcomeForwarded Outcome = "forwarded"
 	// OutcomeUnauthenticated is a request whose caller was not authenticated.
 	OutcomeUnauthenticated Outcome = "unauthenticated"
+	// OutcomeAuthUnavailable is a request answered 503 because the TokenReview that would
+	// authenticate its caller failed; Err says why.
+	OutcomeAuthUnavailable Outcome = "auth_unavailable"
 	// OutcomeRefused is a request the route or the policy refused; Reason says why.
 	OutcomeRefused Outcome = "refused"
 	// OutcomeUpstreamError is a request the upstream transport failed to answer.
@@ -156,7 +159,7 @@ func auditLevel(e AuditEvent) slog.Level {
 	switch e.Outcome {
 	case OutcomeUnauthenticated, OutcomeRefused:
 		return slog.LevelWarn
-	case OutcomeUpstreamError, OutcomeAborted:
+	case OutcomeAuthUnavailable, OutcomeUpstreamError, OutcomeAborted:
 		return slog.LevelError
 	case OutcomeCanceled:
 		return slog.LevelInfo
