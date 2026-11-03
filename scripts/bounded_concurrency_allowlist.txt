@@ -1,0 +1,17 @@
+# Functions that started an unbounded thread or goroutine per request when
+# scripts/check_bounded_concurrency.py arrived, pinned at the count they had
+# that day. One entry per line: `<file> <function> <count>`, the file relative
+# to the repository root, the function as the check names it (`Class.method`
+# for a method), the count above zero, and the issue that owns the fix in a
+# comment above it.
+#
+# The list only shrinks. The check fails when a function has more unbounded
+# spawns than its entry (a rise), when it has fewer (lower the count, or remove
+# the entry once the function is bounded), when an entry names a function or a
+# file the check no longer sees a finding in, and when a line is not an entry.
+# A function with no entry is held at zero, so a new per-request spawn anywhere
+# the check reads is a failure, never a new line here.
+
+# #4331: the fix-pull-request lookup starts one daemon thread per forge call so
+# the call can be abandoned at its deadline; the inject route reaches it.
+agents/platform/scripts/session_kv_server.py _proposal_state 1
