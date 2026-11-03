@@ -341,6 +341,11 @@ const (
 	backendA2A       = "a2a"
 	backendA2AGoogle = "a2a-google"
 	backendInject    = "inject"
+
+	// originPlatformGooglechat is gchat's origin platform in the chat metrics
+	// label vocabulary (agents/chat/defaults/plugins/chat_metrics/metrics.py
+	// HERMES_PLATFORM_LABELS), the one every origin writer uses.
+	originPlatformGooglechat = "googlechat"
 )
 
 // errOriginExists is a session that already has its origin record.
@@ -354,9 +359,9 @@ type sessionOrigin struct {
 
 // backendOrigins maps the gateway door a task came through
 // (authority.requester.backend) to the session's origin. A chat door's
-// platform is the door's own name.
+// platform is its chat metrics label.
 var backendOrigins = map[string]sessionOrigin{
-	backendGchat:     {Origin: originChat, Platform: backendGchat},
+	backendGchat:     {Origin: originChat, Platform: originPlatformGooglechat},
 	backendSlack:     {Origin: originChat, Platform: backendSlack},
 	backendDiscord:   {Origin: originChat, Platform: backendDiscord},
 	backendConsole:   {Origin: originConsole},

@@ -31,7 +31,8 @@ DEFAULT_RETENTION_DAYS = 7
 # The session's origin (docs/designs/proposal-origin.md §2.1), the keys the
 # Session KV server reads (agents/platform/scripts/session_kv_server.py
 # ORIGIN_KEY, ORIGIN_PLATFORM_KEY). A session this plugin records is a chat
-# session unless another writer recorded its origin first.
+# session unless another writer recorded its origin first. The origin platform
+# is a chat metrics label (HERMES_PLATFORM_LABELS), as the hermes-bridge writes it.
 ORIGIN_KEY = "origin"
 ORIGIN_PLATFORM_KEY = "origin_platform"
 ORIGIN_CHAT = "chat"

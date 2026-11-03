@@ -486,13 +486,13 @@ func TestRecordRoute_AConsoleRouteForAnotherTurnIsNotTheSame(t *testing.T) {
 }
 
 // Before the first turn, the bridge records the session's origin from the
-// door the task came through: a chat door is "chat" with the door as its
-// platform, the console is "console", and the A2A and inject doors are "api".
+// door the task came through: a chat door is "chat" with its chat metrics
+// label as its platform, the console is "console", and the A2A and inject doors are "api".
 func TestRecordOriginBeforeTheFirstTurnPerBackend(t *testing.T) {
 	cases := []struct {
 		backend, conversation, origin, platform string
 	}{
-		{"gchat", "gchat:spaces/S1", "chat", "gchat"},
+		{"gchat", "gchat:spaces/S1", "chat", "googlechat"},
 		{"slack", "slack:dm/D1", "chat", "slack"},
 		{"discord", "discord:C1", "chat", "discord"},
 		{"console", "console:tok-1", "console", ""},
