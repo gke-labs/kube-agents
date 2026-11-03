@@ -673,7 +673,7 @@ class NpmCacheTest(unittest.TestCase):
         err = self.share(process_home, self.tmp, reclaim=True)
 
         self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
-        self.assertRegex(err, rf"reclaimed the per-profile npm cache {process_home}/\.npm\.reclaim\.\w+ \(10 bytes\)")
+        self.assertRegex(err, rf"reclaimed the per-profile npm cache {process_home}/\.npm\.reclaim\.[0-9a-f]{{32}} \(10 bytes\)")
         self.assertEqual(self.reclaim_dirs(process_home), [])
 
     def test_a_failed_delete_still_leaves_the_link(self):
@@ -776,7 +776,7 @@ class NpmCacheTest(unittest.TestCase):
 
     def test_the_sweep_deletes_a_leftover_with_a_unique_name(self):
         process_home = self.scaffold(self.tmp)
-        leftover = process_home / f"{ps.NPM_RECLAIM_PREFIX}.abc12_xy"  # mkdtemp's shape
+        leftover = process_home / f"{ps.NPM_RECLAIM_STEM}{'0123456789abcdef' * 2}"  # the sweep's own shape
         (leftover / "_cacache").mkdir(parents=True)
         (leftover / "_cacache" / "index").write_bytes(b"x" * 5)
 
@@ -832,9 +832,12 @@ class NpmCacheTest(unittest.TestCase):
                 self.assertEqual(self.share(process_home, self.tmp), "")
 
     def test_a_user_directory_under_the_prefix_is_not_swept(self):
-        """Only the bare prefix and mkdtemp's own names are the sweep's; a name a person chose is not."""
+        """Only the bare prefix and the sweep's UUID names are its own; a name a person chose is not."""
         process_home = self.scaffold(self.tmp)
-        mine = [process_home / f"{ps.NPM_RECLAIM_PREFIX}{rest}" for rest in ("ed", ".bak", ".2026-11-03", ".backup-old")]
+        rests = ("ed", ".bak", ".2026-11-03", ".backup-old",
+                 # Eight characters from [a-z0-9_], which a narrower guess at mkdtemp's shape still took.
+                 ".20261103", ".previous", ".old_copy", ".livetest")
+        mine = [process_home / f"{ps.NPM_RECLAIM_PREFIX}{rest}" for rest in rests]
         for path in mine:
             path.mkdir()
 

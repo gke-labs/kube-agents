@@ -22,9 +22,9 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -51,16 +51,15 @@ DEFAULT_HERMES_HOME = "/opt/data"
 PROCESS_HOME = "home"
 NPM_HOME_CACHE = ".npm"
 NPM_SHARED_CACHE = Path(".cache", "npm")
-# The start-up sweep moves an old per-profile cache to a new directory named this
-# prefix, a dot and mkdtemp's suffix, before it deletes it, and deletes every such
-# directory an earlier start-up left, and the bare prefix, the fixed name an older
-# image used. NPM_RECLAIM_GLOB finds the candidates; _is_reclaim_dir keeps only those
-# two shapes, so a directory a person named under the prefix, such as
-# ~/.npm.reclaimed or ~/.npm.reclaim.bak, is never deleted.
+# The start-up sweep moves an old per-profile cache to a directory it names itself,
+# this stem and a random UUID's 32 hex digits, before it deletes it. It deletes every
+# such directory an earlier start-up left, and the bare prefix, the fixed name an
+# older image used, and nothing else under the prefix: a name a person picks, such as
+# ~/.npm.reclaimed or ~/.npm.reclaim.previous, does not have that shape.
 NPM_RECLAIM_PREFIX = ".npm.reclaim"
+NPM_RECLAIM_STEM = NPM_RECLAIM_PREFIX + "."
 NPM_RECLAIM_GLOB = NPM_RECLAIM_PREFIX + "*"
-# mkdtemp's suffix: eight characters from tempfile's alphabet (a-z, 0-9 and _).
-NPM_RECLAIM_MOVED_RE = re.compile(re.escape(NPM_RECLAIM_PREFIX + ".") + r"[a-z0-9_]{8}")
+NPM_RECLAIM_MOVED_RE = re.compile(re.escape(NPM_RECLAIM_STEM) + r"[0-9a-f]{32}")
 
 _jobs_lock_state = threading.local()
 
@@ -258,8 +257,8 @@ def share_npm_cache(process_home: Path, hermes_home: Path, reclaim: bool = False
     over ~/.npm. A real ~/.npm directory is the old per-profile cache. With `reclaim`,
     it is moved aside, the link takes its place, and then the moved copy is deleted,
     so a delete that fails leaves an orphan directory, never a home with no link.
-    Each move goes to a new directory (tempfile.mkdtemp with NPM_RECLAIM_PREFIX), so
-    an orphan, or a file something else put at that name, never sits where the next
+    Each move goes to a new name (NPM_RECLAIM_STEM and a random UUID), so an orphan,
+    or a file something else put at the old fixed name, never sits where the next
     move lands. The next run with `reclaim` deletes every orphan directory with the
     prefix, before anything else. One that another start-up is still moving into is
     deleted too, which is harmless: that copy is deleted anyway, and a rename onto
@@ -296,14 +295,8 @@ def share_npm_cache(process_home: Path, hermes_home: Path, reclaim: bool = False
                 if reclaim:
                     log(f"WARN: left npm in {process_home} as it is: ~/.npm is not a directory, so it is not replaced by the shared cache {shared}")
                 return
-            aside = Path(tempfile.mkdtemp(prefix=NPM_RECLAIM_PREFIX + ".", dir=process_home))
-            try:
-                # rename(2) replaces the empty directory mkdtemp made.
-                link.rename(aside)
-            except OSError:
-                with contextlib.suppress(OSError):
-                    aside.rmdir()
-                raise
+            aside = process_home / f"{NPM_RECLAIM_STEM}{uuid.uuid4().hex}"
+            link.rename(aside)
             link.symlink_to(os.path.relpath(shared.resolve(), process_home.resolve()), target_is_directory=True)
             log(f"pointed npm in {process_home} at the shared cache {shared}")
             _delete_reclaimed_npm_cache(aside)
@@ -341,7 +334,7 @@ def _symlink_shape(link: Path) -> str:
 
 
 def _is_reclaim_dir(path: Path) -> bool:
-    """Whether `path` is a directory the sweep made or an older image's fixed name."""
+    """Whether `path` is a directory the sweep named, or an older image's fixed name."""
     name = path.name
     if name != NPM_RECLAIM_PREFIX and not NPM_RECLAIM_MOVED_RE.fullmatch(name):
         return False
