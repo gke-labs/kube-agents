@@ -310,8 +310,8 @@ const (
 )
 
 // connectWithRetry calls dial until it succeeds, the bus refuses the
-// credential or certificate (connectRefused, which no retry fixes), or ctx is
-// done, logging each failure with the wait before the next attempt.
+// certificate (connectRefused, which no retry fixes), or ctx is done,
+// logging each failure with the wait before the next attempt.
 func connectWithRetry[C any](ctx context.Context, log *slog.Logger, backoff time.Duration, dial func(context.Context) (C, error)) (C, error) {
 	for {
 		c, err := dial(ctx)
@@ -320,9 +320,13 @@ func connectWithRetry[C any](ctx context.Context, log *slog.Logger, backoff time
 		}
 		if connectRefused(err) {
 			var zero C
-			return zero, fmt.Errorf("the bus refused the connection (check the dispatcher's bus token and the bus CA): %w", err)
+			return zero, fmt.Errorf("the bus refused the connection (check the bus CA): %w", err)
 		}
-		log.Warn("the bus is not reachable yet; retrying", "in", backoff, "err", err)
+		msg := "the bus is not reachable yet; retrying"
+		if authorizationViolation(err) {
+			msg = "the bus refused the connection: a bad bus token, or the auth callout not answering yet; retrying"
+		}
+		log.Warn(msg, "in", backoff, "err", err)
 		select {
 		case <-ctx.Done():
 			var zero C
@@ -333,13 +337,20 @@ func connectWithRetry[C any](ctx context.Context, log *slog.Logger, backoff time
 	}
 }
 
-// connectRefused reports a connect failure no retry fixes: a refused
-// credential or an untrusted certificate.
+// connectRefused reports a connect failure no retry fixes: an untrusted
+// certificate. An authorization violation is not one: the bus gives the
+// same text for a refused token as for an auth callout that is down, not
+// yet subscribed, or still filling its identity map, and those pass.
 func connectRefused(err error) bool {
 	var unknownCA x509.UnknownAuthorityError
 	var wrongName x509.HostnameError
 	var unverified *tls.CertificateVerificationError
+	return errors.As(err, &unknownCA) || errors.As(err, &wrongName) || errors.As(err, &unverified)
+}
+
+// authorizationViolation reports the bus's refusal at connect, whatever its
+// cause.
+func authorizationViolation(err error) bool {
 	return errors.Is(err, nats.ErrAuthorization) ||
-		strings.Contains(strings.ToLower(err.Error()), "authorization violation") ||
-		errors.As(err, &unknownCA) || errors.As(err, &wrongName) || errors.As(err, &unverified)
+		strings.Contains(strings.ToLower(err.Error()), "authorization violation")
 }

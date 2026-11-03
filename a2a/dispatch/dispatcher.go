@@ -396,7 +396,8 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 
 // regrant reconnects so the bus connection carries grants for the durables
 // and profiles the config added, then binds the durables. A bind still refused (the callout's
-// watch lagging the config) gets another reconnect, with backoff, up to
+// watch lagging the config; not a missing durable or one whose stored config
+// the held bind refuses) gets another reconnect, with backoff, up to
 // RegrantAttempts; then it is logged as an error and left for the next
 // refresh. Held work is untouched throughout (lib.Client.Reconnect).
 func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durables map[string]lib.DispatchDurable, added, addedProfiles []string) {
@@ -429,9 +430,11 @@ func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durabl
 			err := d.bindNow(ctx, want[name], durables[name])
 			switch {
 			case err == nil:
-			case errors.Is(err, jetstream.ErrConsumerNotFound):
+			case errors.Is(err, jetstream.ErrConsumerNotFound), errors.Is(err, lib.ErrHeldBindRefused):
 				// The bus answered, so the grant is there: the durable
-				// just isn't yet, and the bind retries pick it up.
+				// just isn't yet, or its stored config is refused (the
+				// server's record, which no reconnect changes). The bind
+				// retries pick it up, with backoff, as bind's would.
 				d.noteBindFailure(name, err)
 			default:
 				refused = append(refused, name)
@@ -616,9 +619,12 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		_ = del.Nak(d.cfg.RetryDelay)
 		return
 	}
-	d.clearWaiting(taskID)
+	d.offeringWaiting(taskID)
 
 	rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
+	if err == nil && key != "" {
+		d.clearWaiting(taskID)
+	}
 	if err != nil || key == "" {
 		d.release(h, false)
 		if err != nil {
@@ -1443,7 +1449,8 @@ func (d *Dispatcher) prune() {
 //   - a running lease expired for longer than SweepAfter, held by no hold
 //     here, in a (profile, tier) whose durables are all bound (so a
 //     submission still on the stream would have come back and been
-//     re-adopted long since).
+//     re-adopted long since). An unreadable record counts as running and
+//     waits SweepAfter from its own write.
 func (d *Dispatcher) sweep(ctx context.Context) {
 	kctx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 	defer cancel()
@@ -1495,7 +1502,14 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 			d.log.Info("swept a tombstone past the submit stream's retention", "key", k, "finishedAt", rec.FinishedAt)
 			continue
 		}
-		if !bound || (readable && !rec.Expired(now, d.cfg.SweepAfter)) {
+		if !bound {
+			continue
+		}
+		// An unreadable record still says its task started (findLease), so
+		// it gets the same wait, counted from the entry's own write: no
+		// renewal can rewrite it, so that is its last sign of life.
+		if readable && !rec.Expired(now, d.cfg.SweepAfter) ||
+			!readable && now.Sub(entry.Created()) <= d.cfg.SweepAfter {
 			continue
 		}
 		if err := kv.Delete(kctx, k, jetstream.LastRevision(entry.Revision())); err != nil {
