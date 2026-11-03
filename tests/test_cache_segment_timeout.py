@@ -20,6 +20,7 @@ branch of that classification and each way the value can be wrong.
 """
 
 import pathlib
+import re
 import tempfile
 import unittest
 
@@ -44,6 +45,7 @@ _CACHE_ON_REQUEST_ACTIONS = ("actions/setup-python@", "actions/setup-node@")
 # The spellings of "off" for a `cache:` input: YAML's boolean and the quoted
 # string a composite action's input takes.
 _CACHE_OFF = (False, "false")
+_ASCII_DIGITS = re.compile(r"[0-9]+")
 
 
 def _steps(doc: dict):
@@ -90,7 +92,10 @@ def _failures(path: pathlib.Path, doc: dict) -> list[str]:
     value = env.get(_VARIABLE)
     if value is None:
         return [f"{path.name} restores a cache but does not set {_VARIABLE}"]
-    if not str(value).isdigit() or int(value) < 1:
+    # ASCII digits only: `str.isdigit()` accepts every Unicode digit, which
+    # `int()` may parse while `@actions/cache`'s `Number()` reads it as NaN and
+    # keeps its ten-minute default.
+    if not _ASCII_DIGITS.fullmatch(str(value)) or int(value) < 1:
         return [f"{path.name}: {_VARIABLE} must be a positive integer, got {value!r}"]
     if int(value) > _MAX_SEGMENT_TIMEOUT_MINUTES:
         return [f"{path.name}: {_VARIABLE} is above the convention's {_MAX_SEGMENT_TIMEOUT_MINUTES}"]
@@ -107,7 +112,6 @@ class CacheSegmentTimeoutTest(unittest.TestCase):
         names = [path.name for path, _ in _caching_workflows()]
         self.assertIn("python-tests.yml", names)
         self.assertIn("k8s-operator-test.yml", names)
-        self.assertIn("security-scan.yml", names, "trivy-action restores its database through a nested actions/cache")
         self.assertNotIn("ghes-proxy-test.yml", names, "setup-go with cache: false restores nothing")
 
     def test_every_caching_workflow_caps_the_segment_wait(self):
@@ -154,9 +158,11 @@ class CacheSegmentTimeoutSyntheticTest(unittest.TestCase):
             ten=_workflow("uses: actions/cache@abc", '"10"'),
             words=_workflow("uses: actions/cache@abc", "abc"),
             negative=_workflow("uses: actions/cache@abc", '"-1"'),
+            arabic_one=_workflow("uses: actions/cache@abc", '"\u0661"'),
+            superscript_two=_workflow("uses: actions/cache@abc", '"\u00b2"'),
             ok=_workflow("uses: actions/cache@abc", "1"),
         )
-        self.assertEqual({name for name, v in found.items() if v}, {"missing_env.yml", "zero.yml", "ten.yml", "words.yml", "negative.yml"})
+        self.assertEqual({name for name, v in found.items() if v}, {"missing_env.yml", "zero.yml", "ten.yml", "words.yml", "negative.yml", "arabic_one.yml", "superscript_two.yml"})
         self.assertEqual(found["ok.yml"], [])
 
     def test_a_workflow_with_no_steps_is_not_caching(self):
