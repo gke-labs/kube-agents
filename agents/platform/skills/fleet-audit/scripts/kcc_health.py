@@ -61,15 +61,21 @@ Stdlib only, and importable by every collector in this directory.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
-import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, NamedTuple
+
+# The shared subprocess call, as every collector binds it. Every collector
+# that imports this module puts collector_run's directory on `sys.path`
+# first, so the plain import resolves; this module cannot import collect.py
+# (collect.py imports it).
+import collector_run
 
 # The category Config Connector registers across every CRD it installs.
 # `read_objects` keeps the kinds in it and lists each in parallel, because
@@ -193,7 +199,7 @@ BUDGET_SPENT_REASON = (
     "so whether Config Connector applies its objects here is not known."
 )
 # What `default_run` returns for a command it killed, as `timeout(1)` does.
-TIMEOUT_RC = 124
+TIMEOUT_RC = collector_run.TIMEOUT_RC
 # How much of stderr goes into a `kcc_unread` reason.
 MAX_ERROR_CHARS = 300
 # The manifest outcome of a cluster the collector read.
@@ -273,15 +279,11 @@ KubeconfigFn = Callable[[dict], "Path | None"]
 ClockFn = Callable[[], float]
 
 
-def default_run(argv: list[str], *, env: dict | None = None, timeout: int = READ_TIMEOUT_S) -> Result:
-    """Run `argv`; a timeout is `TIMEOUT_RC`, never an exception."""
-    try:
-        done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        return Result(TIMEOUT_RC, "", f"killed after {timeout}s")
-    except OSError as exc:
-        return Result(-1, "", str(exc))
-    return Result(done.returncode, done.stdout, done.stderr)
+# The shared call (`collector_run.default_run`), with the read's timeout as the
+# default. A step passes its own timeout, cut to the time left. Its `Run` has
+# the `rc`, `stdout` and `stderr` that this module reads off a `Result`, and a
+# timeout is `TIMEOUT_RC`, never an exception.
+default_run = functools.partial(collector_run.default_run, timeout=READ_TIMEOUT_S)
 
 
 def ready_condition(item: dict) -> dict | None:
