@@ -12,9 +12,13 @@ Python (`PYTHON_TARGETS`), by AST. The entry points are request handlers: every
 method of a class whose base name ends in `RequestHandler`, and every function
 carrying a FastAPI route decorator (`@app.get(...)`, `@router.post(...)`). A
 call graph is built per module from direct calls: a bare `name(...)`, a class
-instantiation (an edge to its `__init__`), and `self.name(...)` or
-`cls.name(...)` to the same class's method. A call through any other receiver (a
-module-level singleton, a stored callback, a thread's `target=`) is not
+instantiation (an edge to its `__init__`), `self.name(...)` or `cls.name(...)`
+to the same class's method, and a function handed on as a value where the
+handing is itself how a request's work continues: the first argument of
+`.add_task(...)` (Starlette's `BackgroundTasks`) or `.submit(...)` (an executor
+or a queue), and the callable a spawn is given (`target=`, a `Timer`'s function,
+`start_new_thread`'s). A call through any other receiver (a module-level
+singleton, a callback stored in one call and invoked in another) is not
 followed; that is the check's blind spot, named here so a reviewer knows it. A
 spawn is a call that starts one or more threads inside the function: a
 `threading.Thread(...)` or `threading.Timer(...)`, `_thread.start_new_thread(...)`,
@@ -24,13 +28,16 @@ any function and is the bounded pool the rule asks for), and an instance of a
 class in the module that subclasses `Thread` or `Timer`. A spawn in a function a
 handler reaches is a finding unless its shape is bounded:
 
-* a fixed-size pool: the spawn sits in a loop or comprehension over `range(n)`
-  where `n` is a literal or a module-level name, so its count is fixed when the
-  module loads, not by the request;
 * a singleton guard: the spawn sits inside an `if` whose test reads a thread's
   `.is_alive()`, or follows one whose body returns, so at most one such thread
   runs at a time;
 * startup: the function is `main`.
+
+A loop over `range(n)` is not a bound, whatever `n` is: a handler that starts a
+constant number of threads per request still starts a number that grows with
+the callers, the same shape as a `ThreadPoolExecutor` built per request. A
+module-level pool built once by a function no handler reaches is not flagged,
+since only reachability flags a spawn.
 
 Go (`GO_TARGET_DIRS`), by text, since the callout has no request-handler marker
 to anchor a graph on: every `go func(...)` or `go name(...)` statement in a
@@ -40,8 +47,16 @@ channel whose name carries `sem`, or a `semaphore` `Acquire(...)`). The startup
 functions are `main` and, transitively, every function a startup function
 calls by name, across all the scanned files; a name shared by a startup function
 and a per-request one is read as startup, which is the text scan's blind spot.
-An `errgroup` with `SetLimit(...)` bounds its own `Go(...)` calls, which are not
-`go` statements and are not read; it does not bound a `go` statement near it.
+A startup function's bound stops at a function literal: a `go` statement inside
+a closure the function builds (`mux.HandleFunc(path, func(w, r) { go ... })`, a
+subscription callback) is not startup, since the closure runs when its caller
+decides, which for a handler is once per request. The literal is found by brace
+nesting, so a goroutine a startup function starts inside another of its own
+closures (`go func() { go work() }()`) is read the same way and is pinned
+rather than bounded. Comments and string literals are stripped before the call
+names and the braces are read. An `errgroup` with `SetLimit(...)` bounds its
+own `Go(...)` calls, which are not `go` statements and are not read; it does not
+bound a `go` statement near it.
 
 ``scripts/bounded_concurrency_allowlist.txt``: one line per function that
 carried a finding when the check arrived, `<file> <function> <count>`, with the
@@ -101,12 +116,19 @@ ROUTE_DECORATOR_ATTRS = frozenset({"get", "post", "put", "patch", "delete", "hea
 # spawn too when instantiated.
 THREAD_SPAWN_CALLEES = frozenset({"Thread", "Timer", "start_new_thread", "ThreadPoolExecutor"})
 THREAD_BASES = frozenset({"Thread", "Timer"})
+# Calls that hand a function on as a value and run it as the request's work:
+# the callee name, and the position of the function among the positional
+# arguments. `add_task` is Starlette's `BackgroundTasks`, `submit` an executor
+# or a queue, `Timer(interval, function)` and `start_new_thread(function, args)`
+# the spawns' own callables.
+CALLBACK_POSITIONS: dict[str, int] = {"add_task": 0, "submit": 0, "start_new_thread": 0, "Timer": 1}
+# Keywords that hand a function on the same way: `Thread(target=...)`,
+# `Timer(function=...)`.
+CALLBACK_KEYWORDS = frozenset({"target", "function"})
 # The bounded shapes, and the words the report uses for them.
 SINGLETON_GUARD_ATTR = "is_alive"
-FIXED_SIZE_ITERATOR = "range"
 STARTUP_FUNCTION = "main"
 SELF_RECEIVERS = frozenset({"self", "cls"})
-BOUND_FIXED_SIZE = "fixed-size pool (a loop over range of a constant)"
 BOUND_SINGLETON = "singleton guard (is_alive)"
 BOUND_STARTUP = "startup (main)"
 BOUND_GO_STARTUP = "startup (reached from main)"
@@ -122,6 +144,17 @@ GO_FUNC_RE = re.compile(r"^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)")
 GO_FUNC_END = "}"
 GO_SEMAPHORE_RE = re.compile(r"\b\w*[sS]em\w*\s*<-|\.Acquire\(")
 GO_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\(")
+# A function literal opens where `func(` is followed by `{`; its body is the
+# brace pair that `{` starts. Read on lines with comments and strings removed.
+GO_FUNC_LITERAL = "func("
+GO_LINE_COMMENT = "//"
+GO_BLOCK_COMMENT_OPEN = "/*"
+GO_BLOCK_COMMENT_CLOSE = "*/"
+GO_RAW_QUOTE = "`"
+GO_STRING_QUOTES = frozenset({'"', "'", GO_RAW_QUOTE})
+GO_ESCAPE = "\\"
+GO_BRACE_OPEN = "{"
+GO_BRACE_CLOSE = "}"
 GO_NO_GRAPH = "(every function; Go has no call graph here)"
 GO_NO_FUNCTION = "(outside any function)"
 KIND_THREAD = "thread"
@@ -197,8 +230,6 @@ class _Unit:
 class _ModuleFacts:
     """What a unit's classification needs from the module around it."""
 
-    # Names assigned at module level; `range(NAME)` over one is a fixed size.
-    constants: frozenset[str]
     # Classes of the module that subclass Thread or Timer; instantiating one is a spawn.
     thread_classes: frozenset[str]
 
@@ -234,19 +265,14 @@ def _is_request_handler_class(node: ast.ClassDef) -> bool:
     return any(name.endswith(REQUEST_HANDLER_BASE_SUFFIX) for name in _base_names(node))
 
 
-def _is_fixed_size_loop(node: ast.AST, constants: frozenset[str]) -> bool:
-    """A `for` or comprehension over `range(n)`, `n` a literal or a module-level name."""
-    iterators: list[ast.expr] = []
-    if isinstance(node, (ast.For, ast.AsyncFor)):
-        iterators.append(node.iter)
-    elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
-        iterators.extend(gen.iter for gen in node.generators)
-    for it in iterators:
-        if not (isinstance(it, ast.Call) and _callee_name(it) == FIXED_SIZE_ITERATOR):
-            continue
-        if all(isinstance(arg, ast.Constant) or (isinstance(arg, ast.Name) and arg.id in constants) for arg in it.args):
-            return True
-    return False
+def _handed_on(call: ast.Call, callee: str) -> list[ast.expr]:
+    """The function values a call hands on to run as the request's work."""
+    values: list[ast.expr] = []
+    position = CALLBACK_POSITIONS.get(callee)
+    if position is not None and len(call.args) > position:
+        values.append(call.args[position])
+    values.extend(kw.value for kw in call.keywords if kw.arg in CALLBACK_KEYWORDS)
+    return values
 
 
 def _reads_liveness(test: ast.expr) -> bool:
@@ -265,18 +291,13 @@ def _read_unit(node: ast.AST, name: str, class_name: str | None, entry_point: bo
     # Iterative walk carrying the depth, so a spawn knows what encloses it: a
     # node's descendants are the ones visited at a deeper depth before the walk
     # returns to its own depth or shallower.
-    fixed_depths: list[int] = []
     guard_depths: list[int] = []
     early_exit_seen = False
     pending: list[tuple[ast.AST, int]] = [(node, 0)]
     while pending:
         current, depth = pending.pop()
-        while fixed_depths and fixed_depths[-1] >= depth:
-            fixed_depths.pop()
         while guard_depths and guard_depths[-1] >= depth:
             guard_depths.pop()
-        if _is_fixed_size_loop(current, facts.constants):
-            fixed_depths.append(depth)
         if isinstance(current, ast.If) and _reads_liveness(current.test):
             guard_depths.append(depth)
             if _returns(current.body):
@@ -286,8 +307,6 @@ def _read_unit(node: ast.AST, name: str, class_name: str | None, entry_point: bo
             if callee in spawn_callees:
                 if simple == STARTUP_FUNCTION:
                     bound: str | None = BOUND_STARTUP
-                elif fixed_depths:
-                    bound = BOUND_FIXED_SIZE
                 elif guard_depths or early_exit_seen:
                     bound = BOUND_SINGLETON
                 else:
@@ -299,6 +318,18 @@ def _read_unit(node: ast.AST, name: str, class_name: str | None, entry_point: bo
                     unit.calls.add(callee)
                 elif isinstance(receiver, ast.Name) and receiver.id in SELF_RECEIVERS:
                     unit.self_calls.add(callee)
+            if callee is not None:
+                # The function a spawn runs, or one handed to add_task/submit,
+                # is the request's work too: an edge as if it were called.
+                for value in _handed_on(current, callee):
+                    if isinstance(value, ast.Name):
+                        unit.calls.add(value.id)
+                    elif (
+                        isinstance(value, ast.Attribute)
+                        and isinstance(value.value, ast.Name)
+                        and value.value.id in SELF_RECEIVERS
+                    ):
+                        unit.self_calls.add(value.attr)
         # Reversed so the walk visits children in source order with a stack.
         for child in reversed(list(ast.iter_child_nodes(current))):
             pending.append((child, depth + 1))
@@ -306,16 +337,11 @@ def _read_unit(node: ast.AST, name: str, class_name: str | None, entry_point: bo
 
 
 def _module_facts(module: ast.Module) -> _ModuleFacts:
-    constants: set[str] = set()
     thread_classes: set[str] = set()
     for node in module.body:
-        if isinstance(node, ast.Assign):
-            constants.update(t.id for t in node.targets if isinstance(t, ast.Name))
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            constants.add(node.target.id)
-        elif isinstance(node, ast.ClassDef) and any(b in THREAD_BASES for b in _base_names(node)):
+        if isinstance(node, ast.ClassDef) and any(b in THREAD_BASES for b in _base_names(node)):
             thread_classes.add(node.name)
-    return _ModuleFacts(frozenset(constants), frozenset(thread_classes))
+    return _ModuleFacts(frozenset(thread_classes))
 
 
 def _units_of(module: ast.Module) -> list[_Unit]:
@@ -411,9 +437,67 @@ def _go_functions(shown: str, lines: list[str]) -> list[_GoFunction]:
     return functions
 
 
+def _go_code(text: str) -> str:
+    """One line with its comments and its string and rune literals removed."""
+    kept: list[str] = []
+    index = 0
+    while index < len(text):
+        if text.startswith(GO_LINE_COMMENT, index):
+            break
+        if text.startswith(GO_BLOCK_COMMENT_OPEN, index):
+            close = text.find(GO_BLOCK_COMMENT_CLOSE, index + len(GO_BLOCK_COMMENT_OPEN))
+            if close < 0:
+                break
+            index = close + len(GO_BLOCK_COMMENT_CLOSE)
+            continue
+        char = text[index]
+        if char in GO_STRING_QUOTES:
+            index += 1
+            while index < len(text) and text[index] != char:
+                index += 2 if text[index] == GO_ESCAPE and char != GO_RAW_QUOTE else 1
+            index += 1
+            continue
+        kept.append(char)
+        index += 1
+    return "".join(kept)
+
+
 def _go_body(function: _GoFunction, upto: int | None = None) -> str:
     end = function.end if upto is None else upto
-    return "\n".join(function.lines[function.start - 1 : end])
+    return "\n".join(_go_code(line) for line in function.lines[function.start - 1 : end])
+
+
+def _go_in_literal(function: _GoFunction, number: int) -> bool:
+    """Whether line `number` of the function sits inside a function literal opened above it.
+
+    The function's own declaration line is skipped, and so is the line itself: a
+    `go func() {` statement is not inside the literal it starts. A `func(` is a
+    literal when the next `{` after it opens its body; the literal is open until
+    that brace's pair closes.
+    """
+    depth = 0
+    literal_pending = False
+    open_depths: list[int] = []
+    for text in function.lines[function.start : number - 1]:
+        code = _go_code(text)
+        index = 0
+        while index < len(code):
+            if code.startswith(GO_FUNC_LITERAL, index):
+                literal_pending = True
+                index += len(GO_FUNC_LITERAL)
+                continue
+            char = code[index]
+            if char == GO_BRACE_OPEN:
+                if literal_pending:
+                    open_depths.append(depth)
+                    literal_pending = False
+                depth += 1
+            elif char == GO_BRACE_CLOSE:
+                depth -= 1
+                if open_depths and open_depths[-1] == depth:
+                    open_depths.pop()
+            index += 1
+    return bool(open_depths)
 
 
 def _go_startup_names(functions: list[_GoFunction]) -> set[str]:
@@ -453,9 +537,10 @@ def scan_go(paths: Iterable[Path], root: Path) -> list[Spawn]:
             if enclosing is None:
                 spawns.append(Spawn(shown, number, GO_NO_FUNCTION, KIND_GOROUTINE, (GO_NO_GRAPH,), None))
                 continue
-            if enclosing.name == STARTUP_FUNCTION:
+            in_literal = _go_in_literal(enclosing, number)
+            if enclosing.name == STARTUP_FUNCTION and not in_literal:
                 bound: str | None = BOUND_STARTUP
-            elif enclosing.name in startup:
+            elif enclosing.name in startup and not in_literal:
                 bound = BOUND_GO_STARTUP
             elif GO_SEMAPHORE_RE.search(_go_body(enclosing, number)):
                 bound = BOUND_GO_SEMAPHORE

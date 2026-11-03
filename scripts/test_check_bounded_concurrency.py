@@ -16,7 +16,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.check_bounded_concurrency import (  # noqa: E402
     ALLOWLIST,
-    BOUND_FIXED_SIZE,
     BOUND_GO_SEMAPHORE,
     BOUND_GO_STARTUP,
     BOUND_SINGLETON,
@@ -97,6 +96,43 @@ PYTHON_FIXTURE = textwrap.dedent(
         for _ in range(len(payload["targets"])):
             threading.Thread(target=_work, daemon=True).start()
         return {}
+
+
+    @app.post("/fixed-fanout")
+    def post_fixed_fanout(payload):
+        for _ in range(POOL_SIZE):
+            threading.Thread(target=_work, daemon=True).start()
+        return {}
+
+
+    @app.post("/deferred")
+    def post_deferred(payload, background_tasks):
+        background_tasks.add_task(_deferred, payload)
+        return {}
+
+
+    def _deferred(payload):
+        threading.Thread(target=_work, args=(payload,), daemon=True).start()
+
+
+    @app.post("/submitted")
+    def post_submitted(payload):
+        _POOL.submit(_submitted, payload)
+        return {}
+
+
+    def _submitted(payload):
+        threading.Timer(30, _work).start()
+
+
+    @app.post("/chained")
+    def post_chained(payload):
+        threading.Thread(target=_chained, daemon=True).start()
+        return {}
+
+
+    def _chained():
+        threading.Thread(target=_work, daemon=True).start()
 
 
     @app.post("/timer")
@@ -224,12 +260,23 @@ GO_FIXTURE = textwrap.dedent(
     }
 
     func run() error {
+    \t// Handle(msg) is named here and in the string below, and neither is a call.
+    \tlog("Handle(")
     \tgo func() {}()
     \t_ = New()
+    \tstatusHandler()
     \treturn nil
     }
 
     func serve() {}
+
+    func log(s string) {}
+
+    func statusHandler() {
+    \tmux.HandleFunc("/readyz", func(w, r) {
+    \t\tgo func() { _ = w }()
+    \t})
+    }
     """
 )
 
@@ -275,15 +322,25 @@ ALLOWLIST_NAME = "allow.txt"
 FLAGGED_PYTHON = (
     "Door._proxy",
     "_SizedWorkers.__init__",
+    "_chained",
+    "_deferred",
     "_lookup",
+    "_submitted",
     "post_alive_elsewhere",
+    "post_chained",
     "post_fanout",
+    "post_fixed_fanout",
     "post_pool_per_request",
     "post_subclass",
     "post_timer",
     "post_unbounded",
 )
-FLAGGED_GO = (("callout.go", "handle"), ("callout.go", "limitElsewhere"), ("service.go", "Handle"))
+FLAGGED_GO = (
+    ("callout.go", "handle"),
+    ("callout.go", "limitElsewhere"),
+    ("callout.go", "statusHandler"),
+    ("service.go", "Handle"),
+)
 FULL_ALLOWLIST = "# fixture\n" + "".join(f"{PYTHON_TARGET} {name} 1\n" for name in FLAGGED_PYTHON) + "".join(
     f"{GO_DIR}/{file} {name} 1\n" for file, name in FLAGGED_GO
 )
@@ -356,14 +413,27 @@ class FixtureTest(unittest.TestCase):
         self.assertIsNone(elsewhere.bounded_by)
         self.assertTrue(elsewhere.flagged)
 
-    def test_a_fixed_size_pool_is_bounded_only_over_a_constant(self):
-        spawn = self._python("_Workers.__init__")
-        self.assertEqual(BOUND_FIXED_SIZE, spawn.bounded_by)
-        self.assertFalse(spawn.flagged)
+    def test_a_loop_over_range_is_not_a_bound_whatever_it_ranges_over(self):
+        # A pool main builds once is not flagged because nothing a handler reaches builds it.
+        startup_pool = self._python("_Workers.__init__")
+        self.assertIsNone(startup_pool.bounded_by)
+        self.assertEqual((), startup_pool.reachable_from)
+        self.assertFalse(startup_pool.flagged)
+        # The same loop in a route starts POOL_SIZE threads per request.
+        fixed = self._python("post_fixed_fanout")
+        self.assertIsNone(fixed.bounded_by)
+        self.assertTrue(fixed.flagged)
         self.assertTrue(self._python("post_fanout").flagged)
         sized = self._python("_SizedWorkers.__init__")
         self.assertEqual(("post_sized_pool_per_request",), sized.reachable_from)
         self.assertTrue(sized.flagged)
+
+    def test_a_function_handed_to_add_task_submit_or_a_spawn_is_followed(self):
+        for function, route in (("_deferred", "post_deferred"), ("_submitted", "post_submitted"), ("_chained", "post_chained")):
+            with self.subTest(function=function):
+                spawn = self._python(function)
+                self.assertEqual((route,), spawn.reachable_from)
+                self.assertTrue(spawn.flagged)
 
     def test_main_and_unreached_functions_are_not_flagged(self):
         by_function = {s.function: s for s in scan_python(self.py, self.root)}
@@ -388,11 +458,19 @@ class FixtureTest(unittest.TestCase):
     def test_the_startup_set_crosses_files_and_stops_at_what_main_reaches(self):
         by_function = self._go()
         self.assertEqual(BOUND_GO_STARTUP, by_function["New"].bounded_by)
+        # `Handle(` appears in run's comment and string; neither puts Handle on the startup path.
         self.assertTrue(by_function["Handle"].flagged)
         self.assertEqual(
             sorted(name for _, name in FLAGGED_GO),
             sorted(s.function for s in by_function.values() if s.flagged),
         )
+
+    def test_a_closure_built_on_the_startup_path_is_not_startup(self):
+        by_function = self._go()
+        self.assertEqual(BOUND_GO_STARTUP, by_function["run"].bounded_by)
+        closure = by_function["statusHandler"]
+        self.assertIsNone(closure.bounded_by)
+        self.assertTrue(closure.flagged)
 
     def test_go_test_files_are_not_read(self):
         code, _, err = _run(self.root, "")
@@ -415,7 +493,7 @@ class FixtureTest(unittest.TestCase):
         self.py.write_text(PYTHON_FIXTURE.replace(spawn, spawn + spawn), encoding="utf-8")
         code, _, err = _run(self.root, FULL_ALLOWLIST)
         self.assertEqual(EXIT_FAIL, code)
-        self.assertIn("post_unbounded has 2 unbounded per-request spawn(s), the entry at allow.txt:10 allows 1", err)
+        self.assertIn("post_unbounded has 2 unbounded per-request spawn(s), the entry at allow.txt:15 allows 1", err)
 
     def test_a_drop_below_the_entry_fails_until_lowered(self):
         code, _, err = _run(self.root, FULL_ALLOWLIST.replace("post_unbounded 1", "post_unbounded 2"))
@@ -425,12 +503,12 @@ class FixtureTest(unittest.TestCase):
     def test_a_stale_entry_fails(self):
         code, _, err = _run(self.root, FULL_ALLOWLIST + f"{PYTHON_TARGET} post_pooled 1\n")
         self.assertEqual(EXIT_FAIL, code)
-        self.assertIn("allow.txt:14: svc/server.py post_pooled has no unbounded per-request spawn left; remove the entry", err)
+        self.assertIn("allow.txt:20: svc/server.py post_pooled has no unbounded per-request spawn left; remove the entry", err)
 
     def test_an_entry_for_an_unread_file_fails(self):
         code, _, err = _run(self.root, FULL_ALLOWLIST + "svc/other.py anything 1\n")
         self.assertEqual(EXIT_FAIL, code)
-        self.assertIn("allow.txt:14: svc/other.py is not a file this check reads; remove the entry", err)
+        self.assertIn("allow.txt:20: svc/other.py is not a file this check reads; remove the entry", err)
 
     def test_a_malformed_or_duplicate_line_fails(self):
         code, _, err = _run(
@@ -438,9 +516,9 @@ class FixtureTest(unittest.TestCase):
             FULL_ALLOWLIST + f"{PYTHON_TARGET} post_unbounded\n{PYTHON_TARGET} _lookup 0\n{PYTHON_TARGET} _lookup 1\n",
         )
         self.assertEqual(EXIT_FAIL, code)
-        self.assertIn("allow.txt:14: expected `<file> <function> <count>` with a count above zero", err)
-        self.assertIn("allow.txt:15: expected `<file> <function> <count>` with a count above zero", err)
-        self.assertIn("allow.txt:16: svc/server.py _lookup already has an entry at line 4", err)
+        self.assertIn("allow.txt:20: expected `<file> <function> <count>` with a count above zero", err)
+        self.assertIn("allow.txt:21: expected `<file> <function> <count>` with a count above zero", err)
+        self.assertIn("allow.txt:22: svc/server.py _lookup already has an entry at line 6", err)
 
     def test_a_missing_allowlist_holds_every_function_at_zero(self):
         code, _, err = _run(self.root)

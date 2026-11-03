@@ -23,6 +23,24 @@ agents/platform/scripts/session_kv_server.py _fetch_ledger_issue 1
 # #4331 owns the KV server's per-request threads.
 agents/platform/scripts/session_kv_server.py stop_session_cards 1
 
+# One daemon Timer per alert, armed for TRIAGE_WATCHDOG_SECONDS before the
+# gateway is contacted, on the triage path every inject route hands to
+# BackgroundTasks; per alert, so the count grows with callers. #4331 owns the
+# KV server's per-request threads.
+agents/platform/scripts/session_kv_server.py _schedule_triage_watchdog 1
+
+# TRIAGE_START_WORKERS daemon threads for the process, built once on first use
+# under _TRIAGE_START_POOL_LOCK by _triage_start_pool, which the triage path
+# reaches. Bounded by that `is None` guard, which the check does not read.
+agents/platform/scripts/session_kv_server.py _TriageStartPool.__init__ 1
+
+# One thread per late drift row the digest cards, started on the digest thread
+# that _arm_drift_backlog_digest holds to one; each start first claims the
+# daily drift-alert quota, which caps the count per day. Neither the singleton
+# upstream nor the quota is a shape the check reads. #4331 owns the KV server's
+# per-request threads.
+agents/platform/scripts/session_kv_server.py _card_drift_backlog_minorities 1
+
 # One deadline timer per metrics connection, cancelled when the connection
 # ends. Bounded by MetricsServer, which admits at most METRICS_MAX_CONNECTIONS
 # live connections; that cap is a server attribute the check does not read.
