@@ -164,6 +164,13 @@ KUBECTL_NOT_FOUND_MARKER = "Error from server (NotFound)"
 # An empty list in `-o json`/`-o yaml` is a few hundred bytes; anything longer
 # has items and is not parsed at all.
 KUBECTL_EMPTY_LIST_PROBE_BYTES = 4096
+# Bounded prefix scanned before falling back to a full-string strip on large
+# outputs: twice the empty-list probe limit tolerates leading whitespace while
+# keeping the fast-path slice small.
+KUBECTL_EMPTY_LIST_PREFIX_MULTIPLIER = 2
+KUBECTL_EMPTY_LIST_PREFIX_WINDOW_BYTES = (
+    KUBECTL_EMPTY_LIST_PREFIX_MULTIPLIER * KUBECTL_EMPTY_LIST_PROBE_BYTES
+)
 # Only kubectl's own list wrapper counts: `kubectl get <type>` prints
 # `apiVersion: v1, kind: List` for every resource type, built-in or custom. A
 # found object is never that pair -- the core group has no `List` resource, and
@@ -9483,6 +9490,15 @@ def _kubectl_output_is_empty(argv: list[str], stdout: str) -> bool:
     bare `[]`, and `-o custom-columns` its header row alone. Anything longer
     than an empty list can be is not parsed.
     """
+    if len(stdout) > KUBECTL_EMPTY_LIST_PREFIX_WINDOW_BYTES:
+        # Strip only a bounded prefix: if more than the probe limit lies
+        # between its first and last non-whitespace characters, the stripped
+        # whole is at least that long.
+        if (
+            len(stdout[:KUBECTL_EMPTY_LIST_PREFIX_WINDOW_BYTES].strip())
+            > KUBECTL_EMPTY_LIST_PROBE_BYTES
+        ):
+            return False
     text = stdout.strip()
     if not text:
         return True
