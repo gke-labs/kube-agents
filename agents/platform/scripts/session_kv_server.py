@@ -65,6 +65,41 @@ _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST",)
 # into, so the mirror must not fill the key the container env lacks.
 _PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
 
+# The origin of a unit of work (docs/designs/proposal-origin.md §2.1): one value
+# per session, written once under ORIGIN_KEY in its metadata, with the chat
+# platform beside it under ORIGIN_PLATFORM_KEY (`platform` is already a key the
+# alert path overwrites). ORIGIN_OTHER is what an unresolved unit reads as.
+ORIGIN_KEY = "origin"
+ORIGIN_PLATFORM_KEY = "origin_platform"
+ORIGINS = ("chat", "console", "api", "event", "drift", "audit", "scheduled", "issue", "other")
+ORIGIN_OTHER = "other"
+ORIGIN_EVENT = "event"
+ORIGIN_DRIFT = "drift"
+# The sessions this server opens for the event watcher (`create_session`); only
+# those take their origin from the first inject.
+WATCHER_SESSION_PREFIX = "k8s-evt-"
+# Bounds on what the origin and ledger routes store.
+ORIGIN_PLATFORM_MAX_CHARS = 64
+ORIGIN_JOB_ID_MAX_CHARS = 256
+ORIGIN_TASK_ID_MAX_CHARS = 64
+PROPOSAL_URL_MAX_CHARS = 2048
+PROPOSAL_OPENED_AT_MAX_CHARS = 64
+# The upward compression walk `_session_origin` takes, as
+# deploy/docker/patches/kanban_event_routing.py `_compression_ancestors` takes it.
+ORIGIN_COMPRESSION_END_REASON = "compression"
+ORIGIN_COMPRESSION_WALK_MAX = 32
+ORIGIN_DB_TIMEOUT_SECONDS = 5.0
+# The board's origin stamp (`PUT /v1/board/tasks/{id}/origin`), a side table in
+# the kanban database that the first stamp wins.
+KANBAN_TASK_ORIGINS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS kanban_task_origins (
+        task_id TEXT PRIMARY KEY,
+        origin TEXT,
+        origin_platform TEXT,
+        stamped_at TEXT
+    )
+"""
+
 
 def _load_dotenv_ignoring_operator_switches(path: str) -> None:
     """Load ``path`` with python-dotenv's grammar, minus the operator-only switches.
@@ -1562,6 +1597,31 @@ def init_db() -> None:
                 )
                 """
             )
+            # The origin each cron job id was created or last changed under,
+            # written from trusted context by the `cronjob` tool's handler
+            # (docs/designs/proposal-origin.md §2.1), and the ledger of
+            # proposals the agent verified it opened, one row per url (§2.2).
+            # Neither is idle-session state: `cleanup_old_records` leaves both.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cron_job_origins (
+                    job_id          TEXT PRIMARY KEY,
+                    origin          TEXT,
+                    origin_platform TEXT,
+                    recorded_at     TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS proposals_opened (
+                    url             TEXT PRIMARY KEY,
+                    origin          TEXT,
+                    origin_platform TEXT,
+                    opened_at       TEXT
+                )
+                """
+            )
             # A fold anchor is written as an intent, before its background task
             # runs, so a process that died in between (OOM, SIGKILL, a crash)
             # leaves a row anchoring its workload with no triage behind it and
@@ -1579,6 +1639,8 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
     # `findings` and `queue_publications` are deliberately absent: a backlog
     # with a TTL is not a backlog, and a `dismissed` row that ages out is one
     # the next sweep re-offers. Their lifecycle is `state`, not age.
+    # `cron_job_origins` and `proposals_opened` are absent too: a job's origin
+    # holds for as long as the job exists, and the ledger is a durable count.
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
@@ -2137,7 +2199,7 @@ def healthz() -> Dict[str, Any]:
 @app.post("/sessions", status_code=201, dependencies=[Depends(verify_api_key)])
 def create_session() -> Dict[str, str]:
     """Create a new session ID for the incoming incident."""
-    session_id = f"k8s-evt-{uuid.uuid4().hex[:8]}"
+    session_id = f"{WATCHER_SESSION_PREFIX}{uuid.uuid4().hex[:8]}"
     
     # Save the session to the local metadata DB
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -6700,6 +6762,8 @@ def inject_message(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="inner payload must be a JSON object")
 
+    _stamp_watcher_session_origin(session_id, payload.get("kind"))
+
     if payload.get("kind") == INJECT_KIND_DRIFT:
         return _inject_drift(session_id, payload, background_tasks)
     if payload.get("kind") == INJECT_KIND_STALL:
@@ -7233,6 +7297,232 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
             conn.execute("ROLLBACK")
             raise
     return {"status": "recorded"}
+
+
+# --------------------------------------------------------------------------
+# The origin record, the per-job origin table and the proposals ledger:
+# docs/designs/proposal-origin.md §2.1-§2.2.
+# --------------------------------------------------------------------------
+
+
+def _origin_fields(request_data: Dict[str, Any]) -> tuple[str, str]:
+    """The `(origin, platform)` a request names, or a 400 for a value outside ORIGINS."""
+    origin = request_data.get("origin")
+    if not isinstance(origin, str) or origin not in ORIGINS:
+        raise HTTPException(status_code=400, detail=f"origin must be one of {list(ORIGINS)}")
+    platform = request_data.get("platform") or ""
+    if not isinstance(platform, str) or len(platform) > ORIGIN_PLATFORM_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"platform must be a string of at most {ORIGIN_PLATFORM_MAX_CHARS} characters"
+        )
+    return origin, platform.strip()
+
+
+def _set_session_origin(session_id: str, origin: str, platform: str = "") -> bool:
+    """Write the session's origin record if it has none; False when one exists.
+
+    Read and written in one `BEGIN IMMEDIATE` transaction, keeping every other
+    key on the row, so two first writers cannot both win. A session with no row
+    yet gets one carrying the record alone.
+    """
+    if origin not in ORIGINS:
+        raise ValueError(f"origin {origin!r} is not one of {ORIGINS}")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)).fetchone()
+            meta: Dict[str, Any] = {}
+            if row:
+                try:
+                    loaded = json.loads(row[0])
+                    meta = loaded if isinstance(loaded, dict) else {}
+                except ValueError:
+                    meta = {}
+            if meta.get(ORIGIN_KEY):
+                conn.execute("ROLLBACK")
+                return False
+            meta[ORIGIN_KEY] = origin
+            meta[ORIGIN_PLATFORM_KEY] = platform
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET metadata = excluded.metadata, updated_at = CURRENT_TIMESTAMP",
+                (session_id, json.dumps(meta)),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return True
+
+
+def _session_compression_ancestors(session_id: str) -> list[str]:
+    """The sessions `session_id` continues through compression, nearest first.
+
+    The walk `_compression_ancestors` in deploy/docker/patches/kanban_event_routing.py
+    takes over Hermes' `state.db`, replicated here because this server does not
+    load that patch. Fails open to none.
+    """
+    state_db = _card_stop_state_db()
+    if not state_db or not os.path.isfile(state_db):
+        return []
+    found: list[str] = []
+    try:
+        with closing(_read_only(state_db)) as conn:
+            current = session_id
+            for _ in range(ORIGIN_COMPRESSION_WALK_MAX):
+                row = conn.execute(
+                    "SELECT s.parent_session_id FROM sessions s JOIN sessions p ON p.id = s.parent_session_id "
+                    "WHERE s.id = ? AND p.end_reason = ?",
+                    (current, ORIGIN_COMPRESSION_END_REASON),
+                ).fetchone()
+                if not row or not row[0] or row[0] in found or row[0] == session_id:
+                    break
+                current = row[0]
+                found.append(current)
+    except sqlite3.Error as exc:
+        logger.warning("origin: the compression lineage of %s is unreadable: %s", session_id, exc)
+    return found
+
+
+def _session_origin(session_id: str) -> tuple[str, str]:
+    """The session's `(origin, platform)`, inherited through compression; `("other", "")` when none."""
+    for candidate in (session_id, *_session_compression_ancestors(session_id)):
+        meta = _session_metadata(candidate)
+        origin = meta.get(ORIGIN_KEY)
+        if isinstance(origin, str) and origin in ORIGINS:
+            platform = meta.get(ORIGIN_PLATFORM_KEY)
+            return origin, platform if isinstance(platform, str) else ""
+    return ORIGIN_OTHER, ""
+
+
+def _stamp_watcher_session_origin(session_id: str, kind: Any) -> None:
+    """Stamp a watcher session this server opened with its first inject's origin.
+
+    `drift` for INJECT_KIND_DRIFT, `event` for every other kind. The create call
+    carries no body, so the first inject is the first moment the producer is
+    known; the write-if-absent makes that one win. A session this server never
+    created (a watcher in shared mode) has no row and gets no record. A failed
+    write does not fail the inject.
+    """
+    if not session_id.startswith(WATCHER_SESSION_PREFIX):
+        return
+    meta = _session_metadata(session_id)
+    if not meta or meta.get(ORIGIN_KEY):
+        return
+    origin = ORIGIN_DRIFT if kind == INJECT_KIND_DRIFT else ORIGIN_EVENT
+    try:
+        _set_session_origin(session_id, origin)
+    except Exception as exc:  # noqa: BLE001 - telemetry, never the inject's failure
+        logger.warning("origin: could not record %s for %s: %s", origin, session_id, exc)
+
+
+@app.put("/v1/sessions/{session_id}/origin", dependencies=[Depends(verify_api_key)])
+def put_session_origin(session_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Record a session's origin once; 409 when it already has one."""
+    origin, platform = _origin_fields(request_data)
+    if not _set_session_origin(session_id, origin, platform):
+        raise HTTPException(status_code=409, detail="the session already has an origin record")
+    return {"origin": origin, "platform": platform}
+
+
+def _cron_job_origin(job_id: str) -> Optional[tuple[str, str]]:
+    """The `(origin, platform)` recorded for a cron job id, or None."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        row = conn.execute(
+            "SELECT origin, origin_platform FROM cron_job_origins WHERE job_id = ?", (job_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return str(row[0] or ORIGIN_OTHER), str(row[1] or "")
+
+
+@app.put("/v1/cron/jobs/{job_id}/origin", dependencies=[Depends(verify_api_key)])
+def put_cron_job_origin(job_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Record the origin a cron job was created or last changed under (an upsert)."""
+    if not job_id or len(job_id) > ORIGIN_JOB_ID_MAX_CHARS:
+        raise HTTPException(status_code=400, detail=f"job_id must be 1 to {ORIGIN_JOB_ID_MAX_CHARS} characters")
+    origin, platform = _origin_fields(request_data)
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        with conn:
+            conn.execute(
+                "INSERT INTO cron_job_origins (job_id, origin, origin_platform, recorded_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(job_id) DO UPDATE SET origin = excluded.origin, "
+                "origin_platform = excluded.origin_platform, recorded_at = excluded.recorded_at",
+                (job_id, origin, platform, datetime.now(timezone.utc).isoformat()),
+            )
+    return {"origin": origin, "platform": platform}
+
+
+@app.post("/v1/proposals/opened", dependencies=[Depends(verify_api_key)])
+def post_proposal_opened(request_data: Dict[str, Any]) -> Dict[str, bool]:
+    """Record one verified proposal in the ledger; the first record of a url stands.
+
+    200 either way, so a hook that retries after a lost answer is not told it failed.
+    """
+    url = request_data.get("url")
+    if not isinstance(url, str) or not url.strip() or len(url) > PROPOSAL_URL_MAX_CHARS:
+        raise HTTPException(status_code=400, detail=f"url must be 1 to {PROPOSAL_URL_MAX_CHARS} characters")
+    origin, platform = _origin_fields(request_data)
+    opened_at = request_data.get("opened_at") or datetime.now(timezone.utc).isoformat()
+    if not isinstance(opened_at, str) or len(opened_at) > PROPOSAL_OPENED_AT_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"opened_at must be a string of at most {PROPOSAL_OPENED_AT_MAX_CHARS} characters"
+        )
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        with conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO proposals_opened (url, origin, origin_platform, opened_at) VALUES (?, ?, ?, ?)",
+                (url.strip(), origin, platform, opened_at),
+            )
+    return {"recorded": cursor.rowcount > 0}
+
+
+@app.get("/v1/proposals/opened/counts", dependencies=[Depends(verify_api_key)])
+def get_proposals_opened_counts() -> Dict[str, Dict[str, int]]:
+    """`{origin: {platform: n}}` for every origin in ORIGINS, an origin with no row as `{"": 0}`."""
+    counts: Dict[str, Dict[str, int]] = {origin: {} for origin in ORIGINS}
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        rows = conn.execute(
+            "SELECT origin, COALESCE(origin_platform, ''), COUNT(*) FROM proposals_opened GROUP BY 1, 2"
+        ).fetchall()
+    for origin, platform, n in rows:
+        bucket = counts[origin if origin in ORIGINS else ORIGIN_OTHER]
+        bucket[platform] = bucket.get(platform, 0) + n
+    for origin in ORIGINS:
+        if not counts[origin]:
+            counts[origin][""] = 0
+    return counts
+
+
+@app.put("/v1/board/tasks/{task_id}/origin", dependencies=[Depends(verify_api_key)])
+def put_board_task_origin(task_id: str, request_data: Dict[str, Any]) -> Dict[str, bool]:
+    """Stamp a card's origin in the board's side table; the first stamp wins.
+
+    For the trusted writers that know better than their own context (the issue
+    gate, the drift backlog, the chat bootstrap), after a create that reported a
+    fresh insert. `stamped` is False when the card already carried a stamp.
+    """
+    if not task_id or len(task_id) > ORIGIN_TASK_ID_MAX_CHARS:
+        raise HTTPException(status_code=400, detail=f"task_id must be 1 to {ORIGIN_TASK_ID_MAX_CHARS} characters")
+    origin, platform = _origin_fields(request_data)
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        raise HTTPException(status_code=404, detail="the kanban board does not exist")
+    try:
+        _, connect_tracked = _hermes_kanban()
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"Hermes' kanban module is not importable: {exc}") from None
+    try:
+        with closing(_card_stop_connect(connect_tracked, board)) as conn:
+            conn.execute(KANBAN_TASK_ORIGINS_SCHEMA)
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO kanban_task_origins (task_id, origin, origin_platform, stamped_at) VALUES (?, ?, ?, ?)",
+                (task_id, origin, platform, datetime.now(timezone.utc).isoformat()),
+            )
+            stamped = cursor.rowcount > 0
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=503, detail=f"the kanban board could not be written: {exc}") from None
+    return {"stamped": stamped}
 
 
 @app.get("/v1/sessions/{session_id}/metadata", dependencies=[Depends(verify_api_key)])
