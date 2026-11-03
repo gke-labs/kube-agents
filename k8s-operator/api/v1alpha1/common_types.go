@@ -582,6 +582,39 @@ type ShellSandboxSpec struct {
 	// taint toleration itself, so nothing else has to be set here.
 	// +optional
 	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
+
+	// Resources overrides the shell container's requests and limits. Each key
+	// set here replaces the operator's default for that key and the rest keep
+	// their defaults, as spec.deployment.credentialProxy.resources and
+	// spec.deployment.agentAPIAuth.resources do and unlike
+	// spec.deployment.resources, which replaces the agent container's block
+	// wholesale: a CR that sets only requests.memory keeps the default 200m CPU
+	// request, 2 CPU limit and 2Gi memory limit. The shell is where every
+	// model-authored command runs, so a fleet sweep that fans out many kubectl
+	// calls at once is bounded by this container's memory; on GKE Autopilot
+	// without bursting the limits are set equal to the requests, so there
+	// requests.memory is the figure to raise when the shell pod is OOM-killed,
+	// with limits.memory to match. Only cpu, memory and ephemeral-storage are
+	// accepted: the container declares cpu and memory, and an
+	// ephemeral-storage limit set alone becomes its request by the API
+	// server's defaulting. The operator refuses a
+	// request above its limit, a negative quantity, a zero limit, an
+	// unrepresentable byte or CPU count and claims, because the sandbox pod
+	// declares no resourceClaims. A refused override, including an edit of one
+	// that was valid, renders the shell at the operator's defaults until it is
+	// corrected, and the operator reports Degraded with reason
+	// InvalidShellSandboxResources when no higher-ranked Degraded cause is
+	// present, the agent staying Ready, whether or not the validating webhook
+	// is enabled. Where the webhook is on, it refuses the edit at apply. The
+	// webhook warns when memory per CPU on the requests pair leaves the band
+	// GKE Autopilot admits unchanged, and when a cpu or memory limit is set
+	// without the same key under requests, for the reasons the credential-proxy
+	// field documents. A change rolls the shell pod, as an image change does.
+	// The image-trees init container, and the gateway pod's sandbox-ssh-key
+	// init container and sandbox-credential-cleanup sidecar, keep their own
+	// fixed figures.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // EventWatcherSpec configures the k8s-event-watcher, which runs as a peer service
@@ -1210,10 +1243,16 @@ type CredentialProxySpec struct {
 	// Resources overrides the credential-proxy container's requests and limits.
 	// Each key set here replaces the operator's default for that key and the
 	// rest keep their defaults, unlike spec.deployment.resources, which replaces
-	// the agent container's block wholesale: a CR that sets only limits.memory
-	// keeps the default 500m CPU request, 1 CPU limit and 8Gi ephemeral-storage
-	// limit. The broker sizes how many commands it admits at once from the
-	// memory limit, so raising the limit is the one knob for an install whose
+	// the agent container's block wholesale: a CR that sets only limits.memory,
+	// at or above the default memory request, keeps the default requests (500m
+	// CPU and 1Gi, or 2 CPU and 2Gi on GKE Autopilot, where Autopilot without
+	// bursting clamps the limits to the requests), the 2 CPU limit and the 8Gi
+	// ephemeral-storage limit. A cpu or memory limit set without its request,
+	// below the default request, lowers that request to the limit. On
+	// Autopilot a CPU request the CR does not set is held to at most one CPU
+	// per GiB of the memory request. The broker sizes how many commands it
+	// admits at once from the memory limit, so raising the limit is the one
+	// knob for an install whose
 	// fleet outgrows the default; the ephemeral-storage limit bounds the content
 	// workspace the broker clones into; the proxy's state emptyDir (sizeLimit
 	// 5Gi) grows by whatever the limit is raised above the 8Gi default, and
@@ -1229,8 +1268,7 @@ type CredentialProxySpec struct {
 	// memory high-water series give the figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
-	// refuses a memory limit below what admits two commands at once, a limits
-	// entry set alone below the default request it would cross, a request
+	// refuses a memory limit below what admits two commands at once, a request
 	// above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
 	// pod declares no resourceClaims. A refused override, including an edit of
 	// one that was valid, renders the proxy Deployment at the operator's
@@ -1757,14 +1795,19 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 // same-named repository on this one. See
 // docs/designs/version-control-support.md §6.
 //
-// A gitlab or gitea forge's credentialsRef (and a gitea forge's host) are
-// required by the API server too, so they hold with the webhook off -- the
-// chart ships it off.
-// +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.host) || size(self.host) == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com', 'ssh.github.com']",message="a forge at a host other than github.com names its provider: github for a GitHub Enterprise Server, gitlab for a GitLab instance, gitea for a Gitea instance"
+// A gitlab, gitea or bitbucket forge's credentialsRef is required by the API
+// server too, so it holds with the webhook off -- the chart ships it off. So
+// are a gitea or bitbucket-datacenter forge's host, the hostname-only rule for
+// host, and the providers that read identity.
+// +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.host) || size(self.host) == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com', 'ssh.github.com']",message="a forge at a host other than github.com names its provider: github for a GitHub Enterprise Server, gitlab for a GitLab instance, gitea for a Gitea instance, bitbucket-datacenter for a Bitbucket Data Center instance"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitea' || has(self.credentialsRef)",message="a gitea forge needs credentialsRef.name: the Secret holding its access token under the key token"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitea' || (has(self.host) && size(self.host) > 0)",message="a gitea forge has no default host; host is required"
-// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com', 'github.com', 'www.github.com', 'ssh.github.com']))",message="caBundleRef is for a self-managed host: gitlab.com and github.com present a certificate the public CAs sign, and a private CA must never vouch for it"
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || !(self.provider in ['bitbucket', 'bitbucket-datacenter']) || has(self.credentialsRef)",message="a bitbucket or bitbucket-datacenter forge needs credentialsRef.name: the Secret holding its access token under the key token"
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'bitbucket-datacenter' || (has(self.host) && size(self.host) > 0)",message="a bitbucket-datacenter forge needs host: the hostname of the Bitbucket Data Center instance"
+// +kubebuilder:validation:XValidation:rule="!has(self.host) || !(self.host.contains(':') || self.host.contains('/'))",message="host is the hostname alone, with no port and no path: a provider that supports another port takes it in port, and an instance at a context path is not supported"
+// +kubebuilder:validation:XValidation:rule="!has(self.identity) || size(self.identity) == 0 || (has(self.provider) && self.provider in ['bitbucket', 'bitbucket-datacenter'])",message="identity is for a bitbucket or bitbucket-datacenter forge: GitHub, GitLab and Gitea name the account their credential acts as"
+// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com', 'github.com', 'www.github.com', 'ssh.github.com', 'bitbucket.org', 'www.bitbucket.org']))",message="caBundleRef is for a self-managed host: gitlab.com, github.com and bitbucket.org present a certificate the public CAs sign, and a private CA must never vouch for it"
 // +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || !has(self.scheme) || self.scheme != 'http'",message="caBundleRef cannot be set when scheme is http"
 // +kubebuilder:validation:XValidation:rule="!has(self.scheme) || self.scheme != 'http' || (has(self.provider) && self.provider == 'gitea')",message="scheme http is only supported for provider gitea"
 // +kubebuilder:validation:XValidation:rule="!has(self.scheme) || self.scheme != 'http' || (has(self.host) && (self.host.lowerAscii().endsWith('.svc') || self.host.lowerAscii().endsWith('.svc.cluster.local')))",message="scheme http sends the forge token unencrypted and is only allowed for an in-cluster service host (*.svc or *.svc.cluster.local)"
@@ -1782,27 +1825,34 @@ type ForgeSpec struct {
 	// the agent reads which forge was declared rather than guessing from the
 	// URL's text.
 	//
-	// "github", "gitlab", and "gitea" are registered; the enum grows with each
+	// "github", "gitlab", "gitea", "bitbucket" (Bitbucket Cloud, at
+	// bitbucket.org) and "bitbucket-datacenter" (a Bitbucket Data Center
+	// instance at the declared host) are registered; the enum grows with each
 	// agent-side provider. Omitted, it is "github".
 	//
 	// A forge at a host other than a spelling of github.com must name it, so
 	// a forge written for another instance is never read as a GitHub
 	// Enterprise Server by default.
-	// +kubebuilder:validation:Enum=github;gitlab;gitea
+	// +kubebuilder:validation:Enum=github;gitlab;gitea;bitbucket;bitbucket-datacenter
 	// +optional
 	Provider string `json:"provider,omitempty"`
 
 	// Host is the forge hostname. Omit it for the provider's default
-	// ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
+	// ("github.com" for GitHub, "gitlab.com" for GitLab, "bitbucket.org" for
+	// Bitbucket Cloud); a bitbucket-datacenter forge has no default and must
+	// set it. It is the hostname alone: a port or a path is refused here; a
+	// provider that supports another port takes it in `port`, and an instance
+	// at a context path is not supported. A host the declared
 	// provider does not serve is rejected, and an alternative spelling of one
 	// it does serve resolves to the provider's canonical host. It may also be a
-	// self-managed instance's hostname: a GitLab instance, a Gitea instance, or
-	// a GitHub Enterprise Server instance. Every repository on the forge must
-	// then name that host or leave it implied. A self-managed provider such as
-	// "gitea" has no default, so the host is required there. A host another
-	// provider serves is rejected, and so is a host under a domain where the
-	// provider runs its own services (for GitHub: github.com,
-	// githubusercontent.com, ghe.com and others).
+	// self-managed instance's hostname: a GitLab instance, a Gitea instance, a
+	// GitHub Enterprise Server instance, or a Bitbucket Data Center instance.
+	// Every repository on the forge must then name that host or leave it
+	// implied. A self-managed provider such as "gitea" or
+	// "bitbucket-datacenter" has no default, so the host is required there. A
+	// host another provider serves is rejected, and so is a host under a
+	// domain where the provider runs its own services (for GitHub:
+	// github.com, githubusercontent.com, ghe.com and others).
 	//
 	// An install serves one GitHub host: github.com, or one GitHub Enterprise
 	// Server instance. A second GitHub forge at another host is rejected, and
@@ -1828,7 +1878,9 @@ type ForgeSpec struct {
 	// agent's credentials to; a repository in another organisation is not
 	// given a token. On GitLab it, with the group of every repository declared
 	// on the forge, is the set of groups the credential broker serves, so a
-	// token that reaches further is still refused there.
+	// token that reaches further is still refused there. On Bitbucket it is
+	// the same set: workspaces on Bitbucket Cloud, project keys on Bitbucket
+	// Data Center.
 	//
 	// The schema pattern is every forge's grammar at once, not GitHub's: the
 	// tight rule depends on Provider and a CRD pattern cannot dispatch on a
@@ -1869,10 +1921,19 @@ type ForgeSpec struct {
 	// account's personal access token where the tier offers neither; on Gitea
 	// a dedicated account's access token. It is mounted into the credential
 	// broker's pod only, never the agent's or the sandbox's, and read on every
-	// call, so rotating the token is updating the Secret. A GitLab Secret may
-	// also hold a read-only token under the key `read-token`; the broker
-	// presents it only to clone the forge's context repositories, never on a
-	// write.
+	// call, so rotating the token is updating the Secret. A GitLab or
+	// Bitbucket Secret may also hold a read-only token under the key
+	// `read-token`; the broker presents it only to clone the forge's context
+	// repositories, never on a write.
+	//
+	// For Bitbucket the Secret has the same keys. On Bitbucket Cloud the token
+	// is a workspace access token, or the API token of an account that exists
+	// only for this install; a repository access token reaches one repository,
+	// so it serves an install with one repository only, because the broker
+	// holds one credential per host. On Bitbucket Data Center it is a project
+	// HTTP access token. The broker sends it as `Authorization: Bearer`. Git
+	// gets it with the username `x-token-auth` on Cloud, and as a bearer on
+	// Data Center.
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
 
@@ -1883,9 +1944,9 @@ type ForgeSpec struct {
 	// its API client and in git. On a GitHub Enterprise Server forge, the
 	// chart also gives them to the token minter, which trusts them for all of
 	// its outbound calls. It is
-	// for a forge at a self-managed host, GitLab or GitHub Enterprise Server: it
-	// is refused when host is empty, gitlab.com or github.com, whose
-	// certificates the public CAs sign.
+	// for a forge at a self-managed host, GitLab, GitHub Enterprise Server or
+	// Bitbucket Data Center: it is refused when host is empty, gitlab.com,
+	// github.com or bitbucket.org, whose certificates the public CAs sign.
 	//
 	// The operator mounts the one key into the credential broker's pod only.
 	// The mount is optional: a missing Secret does not stop the broker, and
@@ -1894,6 +1955,26 @@ type ForgeSpec struct {
 	// restart.
 	// +optional
 	CABundleRef *ForgeCABundleRef `json:"caBundleRef,omitempty"`
+
+	// Identity is the login this forge's credential acts as, for a token
+	// that cannot name its own account through the forge's API. The broker
+	// compares it with the authors of proposals and comments, to tell this
+	// install's own from another person's. Without it, and with a token that
+	// the forge's current-user call refuses, every such check is refused with
+	// FORGE_IDENTITY_UNKNOWN.
+	//
+	// It is for bitbucket and bitbucket-datacenter forges only. On Bitbucket
+	// Cloud it is the account UUID, such as `{0f3b2c1d-...}`, with or without
+	// its braces, and any other value is refused: an access token has a bot
+	// account, which the current-user call refuses. On Bitbucket Data Center it
+	// is the username of the account the token acts as; a project or repository
+	// token needs none, because the instance names its user in every answer.
+	// GitHub, GitLab and Gitea name the account through their own API, so they
+	// refuse the field.
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9._@+{}-]+$`
+	// +optional
+	Identity string `json:"identity,omitempty"`
 }
 
 // ForgeCABundleRef names the Secret key that holds a forge's CA certificates.
@@ -2198,6 +2279,18 @@ type StorageStatus struct {
 	// Bound indicates if the primary PVC has been successfully provisioned.
 	// +optional
 	Bound bool `json:"bound,omitempty"`
+
+	// CapacityBytes is the size of the filesystem on the agent's data volume,
+	// as the gateway pod's event watcher last read it. Absent when the watcher
+	// is disabled or the operator has no current reading from it.
+	// +optional
+	CapacityBytes *int64 `json:"capacityBytes,omitempty"`
+
+	// FreeBytes is the space left on the agent's data volume for the agent's
+	// own non-root user, read with CapacityBytes. The DataVolumeNearlyFull
+	// condition is computed from the two.
+	// +optional
+	FreeBytes *int64 `json:"freeBytes,omitempty"`
 }
 
 // TelemetryStatus reports the telemetry wiring the operator resolved for this agent.
@@ -2296,7 +2389,7 @@ type AgentStatus struct {
 	// +optional
 	ServiceStatus ServiceStatus `json:"serviceStatus,omitempty"`
 
-	// StorageStatus tracks PVC binding state.
+	// StorageStatus tracks PVC binding state and the data volume's usage.
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 
@@ -2573,15 +2666,17 @@ type AgentUsageStatus struct {
 	// +optional
 	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
 
-	// ClustersRegistered is the number of clusters the event watcher built a
-	// client for at its last start: the management cluster and the Cluster
-	// Agent profiles the GKE API would describe, the management cluster
-	// counted once even where a profile also covers it. Read every five
-	// minutes as the number of k8s_event_watcher_cluster_up series the watcher
-	// exports, the largest reading across gateway replicas. The watcher
-	// discovers its fleet once per process, so a cluster that joins or leaves
-	// is counted after the gateway pod restarts, not before. A gauge, not a
-	// counter: it falls after such a restart. Absent when the operator has no
+	// ClustersRegistered is the number of clusters the event watcher has
+	// built a client for: the management cluster and the Cluster Agent
+	// profiles the GKE API would describe, the management cluster counted
+	// once even where a profile also covers it. Read every five minutes as
+	// the number of k8s_event_watcher_cluster_up series the watcher exports,
+	// the largest reading across gateway replicas. The watcher re-reads its
+	// profiles directory every minute, so a cluster that joins is counted
+	// within about two minutes and one whose profile is removed drops out on
+	// the next read; a restart rebuilds the count from the directory as it
+	// stands. A gauge, not a counter: it falls on a removal or after such a
+	// restart. Absent when the operator has no
 	// current reading: before the first poll, while the event watcher is
 	// disabled, and after two polls in a row in which no gateway replica
 	// could be read, whether its listener failed, its pod was not running, or

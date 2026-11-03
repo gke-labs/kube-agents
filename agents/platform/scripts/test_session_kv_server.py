@@ -1204,6 +1204,13 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert", "s1")])
         session_kv_server._record_alert_title.assert_not_called()
 
+    def test_under_next_a_google_chat_thread_gets_the_title(self):
+        # The title heads the plan the cards draw, which the gateway lays out on
+        # Google Chat under next.
+        with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat"}):
+            self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
+        session_kv_server._record_alert_title.assert_called_once()
+
 
 class TestAlertTitleRecord(unittest.TestCase):
     def setUp(self):
@@ -1266,6 +1273,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/sessions", None),
         ("GET", "/v1/sessions/sess-1/metadata", None),
         ("POST", "/v1/incidents", {"chat_id": "c", "thread_id": "t", "report": "r"}),
+        ("POST", "/v1/incidents/apply", {"chat_id": "c", "thread_id": "t"}),
         ("GET", "/v1/incidents/by-thread?chat_id=c&thread_id=t", None),
         ("GET", "/v1/incidents/recent?chat_id=c", None),
         ("GET", "/v1/alert-quota", None),
@@ -2319,19 +2327,32 @@ class TestWorkloadIncidentFold(unittest.TestCase):
 
     FIX_URL = "https://github.com/acme/fleet/pull/7"
 
-    def _board(self, cards=(), subs=()):
-        """A kanban board with `cards` (task_id, session_id, pr_url or None) and `subs` (task_id, chat_id, thread_id)."""
+    def _board(self, cards=(), subs=(), legacy=False):
+        """A kanban board with `cards` and `subs` (task_id, chat_id, thread_id).
+
+        A card is (task_id, session_id, pr_url or None), optionally followed by
+        its assignee and created_at (epoch seconds). `legacy` builds a tasks
+        table with neither column, as an older board has.
+        """
         import sqlite3
         board = os.path.join(tempfile.mkdtemp(), "kanban.db")
         with sqlite3.connect(board) as conn:
-            conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT)")
+            if legacy:
+                conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT)")
+            else:
+                conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT, assignee TEXT, created_at REAL)")
             conn.execute(
                 "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, "
                 "payload TEXT, created_at INTEGER)"
             )
             conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT)")
-            for task_id, session_id, url in cards:
-                conn.execute("INSERT INTO tasks VALUES (?, ?)", (task_id, session_id))
+            for card in cards:
+                task_id, session_id, url = card[:3]
+                if legacy:
+                    conn.execute("INSERT INTO tasks VALUES (?, ?)", (task_id, session_id))
+                else:
+                    assignee, created_at = (card[3], card[4]) if len(card) > 3 else ("", 0)
+                    conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?)", (task_id, session_id, assignee, created_at))
                 if url:
                     conn.execute(
                         "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'pr_opened', ?, 1)",
@@ -2383,6 +2404,99 @@ class TestWorkloadIncidentFold(unittest.TestCase):
                 )
             self._board(cards=[("t-label", "a2a-elsewhere", self.FIX_URL)], subs=[("t-label", "C1", "1700.1")])
             self.assertEqual(self._inject("threadfix-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def _apply_in_thread(self, session, thread_id):
+        """Route `session` to Slack thread C1/`thread_id`, store its report and an `apply` there; returns the apply's time."""
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                (session, json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": thread_id})),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO incidents (chat_id, thread_id, report) VALUES ('C1', ?, 'report')", (thread_id,)
+            )
+        self.assertEqual(
+            self.client.post("/v1/incidents/apply", json={"chat_id": "C1", "thread_id": thread_id}).json(),
+            {"status": "recorded"},
+        )
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT MAX(applied_at) FROM incident_applies WHERE chat_id = 'C1' AND thread_id = ?", (thread_id,)
+            ).fetchone()[0]
+
+    def test_the_card_an_apply_in_the_thread_files_holds(self):
+        # The front door files the `apply`'s fix card in its own session, so
+        # only the apply mark ties it to the incident.
+        assignee = session_kv_server.INCIDENT_PR_ASSIGNEE
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request") as remind:
+            anchor_id, session = self._first_incident("applyfix-api-6cfdb6b98b-aaaaa")
+            applied_at = self._apply_in_thread(session, "1700.2")
+            self._board(
+                cards=[("t-apply", "a2a-front-door", self.FIX_URL, assignee, applied_at + 60)],
+                subs=[("t-apply", "C1", "1700.2")],
+            )
+            reply = self._inject("applyfix-api-6cfdb6b98b-bbbbb")
+        self.assertEqual(reply, {"status": "folded", "duplicate_of": str(anchor_id), "pull_request": self.FIX_URL})
+        remind.assert_called_once_with(session, "applyfix-api", "BackOff", self.FIX_URL)
+
+    def test_only_the_first_fix_card_after_an_apply_counts(self):
+        # A later card in the thread is something else asked there.
+        assignee = session_kv_server.INCIDENT_PR_ASSIGNEE
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"):
+            _anchor, session = self._first_incident("firstcard-api-6cfdb6b98b-aaaaa")
+            applied_at = self._apply_in_thread(session, "1700.3")
+            self._board(
+                cards=[
+                    ("t-fix", "a2a-front-door", None, assignee, applied_at + 30),
+                    ("t-later", "a2a-front-door", self.FIX_URL, assignee, applied_at + 90),
+                ],
+                subs=[("t-fix", "C1", "1700.3"), ("t-later", "C1", "1700.3")],
+            )
+            self.assertEqual(self._inject("firstcard-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_thread_card_that_is_not_an_applys_fix_card_does_not_hold(self):
+        assignee = session_kv_server.INCIDENT_PR_ASSIGNEE
+        window = session_kv_server.INCIDENT_APPLY_CARD_WINDOW_S
+        # (name, assignee, seconds after the apply, thread the card is subscribed to or None for the apply's)
+        cases = (
+            ("before", assignee, -10, None),
+            ("past", assignee, window + 10, None),
+            ("other", "chat", 30, None),
+            ("elsewhere", assignee, 30, "1700.not-the-incident"),
+        )
+        for name, card_assignee, offset, card_thread in cases:
+            with self.subTest(name), \
+                    patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                    patch.object(session_kv_server, "_proposal_state", return_value="open"):
+                _anchor, session = self._first_incident(f"{name}apply-api-6cfdb6b98b-aaaaa")
+                thread = f"1700.{name}"
+                applied_at = self._apply_in_thread(session, thread)
+                self._board(
+                    cards=[("t-card", "a2a-front-door", self.FIX_URL, card_assignee, applied_at + offset)],
+                    subs=[("t-card", "C1", card_thread or thread)],
+                )
+                self.assertEqual(self._inject(f"{name}apply-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_board_the_apply_read_cannot_use_still_finds_the_incident_sessions_fix(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"):
+            anchor_id, session = self._first_incident("legacyboard-api-6cfdb6b98b-aaaaa")
+            self._apply_in_thread(session, "1700.4")
+            self._board(cards=[("t-pr", session, self.FIX_URL)], legacy=True)
+            reply = self._inject("legacyboard-api-6cfdb6b98b-bbbbb")
+        self.assertEqual(reply, {"status": "folded", "duplicate_of": str(anchor_id), "pull_request": self.FIX_URL})
+
+    def test_an_apply_is_recorded_only_in_an_incidents_thread(self):
+        self.assertEqual(
+            self.client.post("/v1/incidents/apply", json={"chat_id": "C1", "thread_id": "no-incident-here"}).status_code,
+            404,
+        )
+        self.assertEqual(self.client.post("/v1/incidents/apply", json={"chat_id": "C1"}).status_code, 400)
 
     def test_a_merged_or_closed_fix_or_none_starts_a_new_incident(self):
         for state, prefix in (("merged", "mergedfix"), ("closed", "closedfix"), (None, "nofix")):
@@ -5488,6 +5602,21 @@ class TestBoardHealthCardRelay(unittest.TestCase):
         ])
         self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.REPORT)])
 
+    def test_under_next_the_card_goes_to_the_gateway_on_google_chat_too(self):
+        # The gateway lays the card out on Google Chat under next; under today the
+        # report goes as text there (test_flag_off_another_job_or_google_chat_posts_the_report).
+        os.environ["A2A_NOTIFY_PLATFORM"] = "google_chat"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("spaces/H/threads/T")
+        ) as via:
+            response, calls = self._post(platforms=("google_chat",))
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "google_chat")
+        chat, text = via.call_args.args[3:5]
+        self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
+        self.assertEqual(text, self.REPORT)
+
     def test_under_next_the_card_goes_to_the_gateway_with_its_rows_actions(self):
         os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
         with patch.object(
@@ -5496,7 +5625,7 @@ class TestBoardHealthCardRelay(unittest.TestCase):
             response, calls = self._post()
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(calls, [])
-        chat, text = via.call_args.args[2:4]
+        chat, text = via.call_args.args[3:5]
         self.assertEqual(chat["rows"][0]["tasks"], ["t_1"])
         self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
         self.assertEqual(text, self.REPORT)
@@ -5766,7 +5895,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
             response, calls = self._post(composed=self.FAILED, job_id="reliability")
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(calls, [])
-        chat, text = via.call_args.args[2:4]
+        chat, text = via.call_args.args[3:5]
         self.assertEqual(chat["detail"], self.FAILED_LINE)
         self.assertEqual(chat["fold"], {"title": "why", "text": self.FAILED.strip()})
         self.assertEqual(text, self.FAILED.strip())
@@ -5857,11 +5986,43 @@ class TestSlackAuditHeadline(unittest.TestCase):
             self.assertIsNone(session_kv_server._fetch_ledger_issue(ref))
 
     def test_flag_on_leaves_google_chat_alone(self):
+        # Under today Google Chat is Hermes's own adapter, which takes text.
         os.environ["KAGE_SLACK_UX"] = "1"
         os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
         _, calls = self._post(platforms=("google_chat", "slack"))
         gchat = [c.args for c in calls if c.args[0] == "google_chat"]
         self.assertEqual(gchat, [("google_chat", self.COMPOSED, "", "")])
+
+    def test_under_next_a_slack_leg_with_no_home_channel_or_thread_still_sends_the_card(self):
+        # The gateway holds the home channel for the platform it routes, so a routed
+        # Slack leg needs neither a thread nor SLACK_HOME_CHANNEL to send the card;
+        # before, it fell back to text without one.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        os.environ.pop("SLACK_HOME_CHANNEL", None)
+        with patch.object(session_kv_server, "_slack_home_channel", return_value=""), patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("7.7")
+        ) as via:
+            response, calls = self._post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "slack")
+
+    def test_under_next_the_headline_card_goes_to_the_gateway_on_google_chat(self):
+        # The gateway lays the card out on Google Chat under next, as on Slack, and
+        # posts into its home space itself, so no home channel env is needed here.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "google_chat"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("spaces/H/threads/T")
+        ) as via:
+            response, calls = self._post(platforms=("google_chat",))
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "google_chat")
+        chat, text = via.call_args.args[3:5]
+        self.assertEqual(chat["schema"], "kube-agents.chat/v1")
+        self.assertTrue(text)
 
     def test_flag_on_a_report_that_is_not_an_audit_is_unchanged(self):
         os.environ["KAGE_SLACK_UX"] = "1"
@@ -5924,7 +6085,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
             response, calls = self._post(composed=self.SUMMARY)
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(calls, [])
-        chat, text = via.call_args.args[2:4]
+        chat, text = via.call_args.args[3:5]
         self.assertEqual(chat["rows"], [{"text": "seeded-a: control plane is public", "severity": "critical"}])
         self.assertEqual(text, session_kv_server.slack_audit_report.headline_from_summary(self.SUMMARY))
 
@@ -12122,6 +12283,118 @@ class TestTriageStartBurst(unittest.TestCase):
         self.assertEqual(len(started), self.BURST, f"{self.BURST - len(started)} triage starts were lost")
         self.assertEqual(len(self.turns), len(started), "a session got a second /chat turn")
         self.assertEqual(len(probe_timeouts), 0, "the readiness request timed out during the burst")
+
+
+class TestDataVolumeWarning(unittest.TestCase):
+    """The home-channel warning when the data volume fills: once per crossing
+    of DATA_VOLUME_WARN_PERCENT, re-armed below DATA_VOLUME_REARM_PERCENT."""
+
+    TOTAL = 10 * (1 << 30)
+
+    def setUp(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM data_volume_warning")
+        self.used_percent = 0
+        usage = patch.object(
+            session_kv_server,
+            "_data_volume_usage",
+            side_effect=lambda path: (self.TOTAL, self.TOTAL * (100 - self.used_percent) // 100),
+        )
+        usage.start()
+        self.addCleanup(usage.stop)
+        self.post = patch.object(session_kv_server, "_post_initial_alert", return_value="thread-1").start()
+        self.addCleanup(patch.stopall)
+        patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]).start()
+
+    def _check_at(self, percent):
+        self.used_percent = percent
+        session_kv_server.check_data_volume()
+
+    def test_posts_once_per_crossing_and_rearms_below_the_lower_line(self):
+        for percent in (50, 89):
+            self._check_at(percent)
+        self.post.assert_not_called()
+
+        self._check_at(90)
+        self.post.assert_called_once()
+        platform, message = self.post.call_args.args
+        self.assertEqual(platform, "slack")
+        self.assertEqual(
+            message,
+            "The agent's data volume is 90% full (9.0 of 10.0 GiB). "
+            "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent.",
+        )
+
+        # Above the lower line it stays quiet, however long it sits there.
+        for percent in (95, 100, 87, 85, 92):
+            self._check_at(percent)
+        self.assertEqual(self.post.call_count, 1)
+
+        # Below it, the warning is re-armed and the next crossing posts again.
+        self._check_at(84)
+        self._check_at(89)
+        self.assertEqual(self.post.call_count, 1)
+        self._check_at(91)
+        self.assertEqual(self.post.call_count, 2)
+
+    def test_a_restart_above_the_line_does_not_post_again(self):
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 1)
+        # The warned flag is on the session database, not in this process.
+        self.assertTrue(session_kv_server._data_volume_warned())
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 1)
+
+    def test_a_refused_post_is_tried_again_at_the_next_check(self):
+        self.post.return_value = None
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._check_at(95)
+        self.assertTrue(any("not accepted by any enabled chat platform" in line for line in logs.output))
+        self.assertFalse(session_kv_server._data_volume_warned())
+        self.post.return_value = "thread-2"
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 2)
+        self.assertTrue(session_kv_server._data_volume_warned())
+
+    def test_a_post_cut_off_before_it_returns_does_not_silence_the_crossing(self):
+        # A pod roll can kill the process during the send. An exception out of
+        # the send leaves the same state: nothing posted.
+        self.post.side_effect = RuntimeError("killed during the send")
+        with self.assertRaises(RuntimeError):
+            self._check_at(95)
+        self.assertFalse(session_kv_server._data_volume_warned())
+        self.post.side_effect = None
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 2)
+        self.assertTrue(session_kv_server._data_volume_warned())
+
+    def test_no_chat_platform_logs_the_warning_and_stops(self):
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=[session_kv_server.DEFAULT_CHAT_PLATFORM]), \
+                patch.object(session_kv_server, "_chat_platforms_disabled", return_value=True), \
+                self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._check_at(95)
+            self._check_at(96)
+        self.post.assert_not_called()
+        self.assertEqual(sum("data volume is 95% full" in line for line in logs.output), 1)
+        self.assertTrue(any("in this log and nowhere else" in line for line in logs.output))
+
+    def test_an_unreadable_volume_does_nothing(self):
+        with patch.object(session_kv_server, "_data_volume_usage", return_value=None):
+            session_kv_server.check_data_volume()
+        self.post.assert_not_called()
+        self.assertFalse(session_kv_server._data_volume_warned())
+
+    def test_reads_a_real_filesystem(self):
+        patch.stopall()
+        usage = session_kv_server._data_volume_usage(tempfile.gettempdir())
+        self.assertIsNotNone(usage)
+        total, free = usage
+        self.assertGreater(total, 0)
+        self.assertLessEqual(free, total)
+        self.assertIsNone(session_kv_server._data_volume_usage("/nonexistent/data-volume"))
 
 
 if __name__ == "__main__":

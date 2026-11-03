@@ -1,0 +1,86 @@
+# cluster - the generic cluster agent (#3658), and a pinned variant of it.
+#
+# The first profile serves every cluster in the install's scope. Each task names
+# its target with the project, location and cluster parameters, and the
+# credential broker holds the task's kubectl and gcloud calls to it. The chart
+# renders this one with profiles.cluster.enabled.
+#
+# The second is a pinned variant, for a cluster that needs a different persona
+# or tier. Its clusterRef names the one cluster it takes.
+#
+# Routing is the gateway's, and it isn't on main yet. The design
+# (docs/designs/spec-profiles-dispatch.md, "How tasks are routed") checks a
+# task's target against spec.scope and sends a pinned cluster's tasks to its
+# pinned profile, not the generic one. The gateway change that does it (#4127)
+# also refuses a target that two pinned profiles claim.
+#
+# Both run the same persona, so both declare its parameters, in its order: the
+# design has the worker refuse a task when the CR's list and the persona's
+# differ (docs/designs/spec-subagent-profiles.md). Neither runs a pod until the
+# profile dispatcher, worker and pool land and the operator runs them.
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentProfile
+metadata:
+  name: cluster
+spec:
+  description: >-
+    Read-only SRE for one GKE cluster, named per task: live runtime state and
+    workload debugging. Returns a grounded root cause analysis and a proposed
+    manifest patch; never mutates cluster state and never opens pull requests.
+  persona:
+    image: <registry>/kube-agents/persona-cluster:<tag>
+  harness:
+    image: <registry>/kube-agents/a2a-worker:<tag>
+    model: model-default
+    maxTurns: 90
+  identity: {}
+  allowedTiers: [read]
+  parameters:
+    - name: project
+      required: true
+    - name: cluster
+      required: true
+    - name: location
+      required: true
+  lifecycle:
+    activeDeadlineSeconds: 1800
+    ttlSecondsAfterFinished: 600
+  concurrency: 2
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 2Gi }
+---
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentProfile
+metadata:
+  name: cluster-prod-eu
+spec:
+  description: >-
+    Read-only SRE for the prod-eu cluster: live runtime state and workload
+    debugging there, and nowhere else.
+  persona:
+    image: <registry>/kube-agents/persona-cluster:<tag>
+  harness:
+    image: <registry>/kube-agents/a2a-worker:<tag>
+    model: model-default
+    maxTurns: 90
+  identity: {}
+  clusterRef:
+    projectId: my-prod-project
+    location: europe-west1
+    cluster: prod-eu
+  allowedTiers: [read]
+  parameters:
+    - name: project
+      required: true
+    - name: cluster
+      required: true
+    - name: location
+      required: true
+  lifecycle:
+    activeDeadlineSeconds: 1800
+    ttlSecondsAfterFinished: 600
+  concurrency: 1
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 2Gi }

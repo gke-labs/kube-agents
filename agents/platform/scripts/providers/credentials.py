@@ -339,6 +339,10 @@ class MintedWriteCredential:
 # the value is composed from this literal and two arguments that are checked
 # against _HELPER_ARGUMENT_RE first; nothing a caller sent reaches it.
 TOKEN_FILE_HELPER = "/opt/defaults/scripts/git_credential_token_file.py"
+#: The username that makes the token-file helper answer with the token as a
+#: bearer (`authtype=Bearer`, git 2.46 and later), for a forge whose git
+#: endpoint refuses the token as a Basic password.
+BEARER_GIT_USERNAME = "authtype-bearer"
 _HELPER_ARGUMENT_RE = re.compile(r"[A-Za-z0-9._/-]+")
 _HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?")
 

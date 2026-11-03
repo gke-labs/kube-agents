@@ -7,8 +7,31 @@ with credentials the sandbox never holds. So far it has the policy (`pkg/k8sapip
 and the HTTP handler around it (`handler.go`), which authenticates through a pluggable
 `CallerAuthenticator`, removes the caller's credentials (including a bearer token in
 `Sec-WebSocket-Protocol`), impersonation, `Audit-ID` and `Connection`-named headers, and forwards
-through a pluggable `UpstreamTransport`. Neither interface has an
-implementation yet, and nothing serves or deploys the handler.
+through a pluggable `UpstreamTransport`. `pkg/upstream` implements the transport, and nothing
+implements the authenticator yet or serves or deploys the handler.
+
+`pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
+`gke_` ID, to the API server through the pod's service account. Any other `gke_` cluster is reached
+with the proxy's Application Default Credentials: it describes the cluster through the Container
+API and picks its endpoint by rules 1, 2 and 4 of
+[`private-endpoint-selection.md`](../docs/designs/private-endpoint-selection.md) (the private
+endpoint of rule 3 is not chosen yet). A resolved endpoint is reused for ten minutes and a failed
+resolution for ten seconds; an endpoint that cannot be dialled is described again after ten
+seconds. An IP endpoint is verified against the cluster's own CA and never the system roots, an
+`http://` endpoint and a redirect are refused, and a `kind-` cluster has no upstream.
+
+The handler hands one `AuditEvent` per request to an `AuditSink` (`audit.go`) when the request
+ends, so a watch or an `exec` session is recorded when it closes. The event holds the caller, the
+cluster, the API server's classification of the request, the outcome (`forwarded`,
+`unauthenticated`, `refused` with its reason, `upstream_error`, `canceled` when the caller gives
+up, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be written),
+the status and the duration. An upgraded session that breaks off after its 101 is recorded as
+`forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
+puts no body, query or credential in it, but an authentication or transport error is recorded as
+returned. The caller never sees that error, because it can name the upstream. A Secret response
+the handler refuses to pass on because it cannot redact it stays `forwarded`, with the cause as
+the error and the handler's 502 as the status (on a watch, the stream's 200). The default sink
+writes each event as one `slog` record, and the reverse proxy's own errors go to the same logger.
 
 The policy has three modes. `read-only` permits `get`, `list` and `watch` and the discovery
 paths. `read-only-dry-run`, the default and the mode kube-agents will run, also permits `create`,

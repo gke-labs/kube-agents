@@ -24,7 +24,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from _seams import SCRIPTS_DIR, fake_executable, free_port
+from _seams import SCRIPTS_DIR, fake_executable
 
 try:
     from mcp import ClientSession, StdioServerParameters

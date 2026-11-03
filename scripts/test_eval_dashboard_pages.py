@@ -2206,7 +2206,7 @@ class ScenariosPageTest(unittest.TestCase):
         app = dom_text(self.page, fragment="#view=scenarios")
         self.assertIn("<h1>What kube-agents can do</h1>", app)
         self.assertNotIn("How reliable is each test?", app)
-        self.assertIn('<nav class="subnav"><a href="cases.html#view=reliability">How reliable is each test</a><a href="cases.html#view=scenarios" class="on">What kube-agents can do</a></nav><div class="sec head"><h1>What kube-agents can do</h1>', app)
+        self.assertIn('<nav class="subnav"><a href="cases.html#view=reliability">How reliable is each test</a><a href="cases.html#view=scenarios" class="on">What kube-agents can do</a><a href="cases.html#view=domains">Domain coverage</a></nav><div class="sec head"><h1>What kube-agents can do</h1>', app)
         self.assertIn("<li><b>Proven</b>: 90% or better over the scenario's repetitions in the last 7 days at the current build, at least 6 of them. 90% is the same bar that lets a scenario guard every pull request.</li>", app)
         self.assertIn("<li><b>Proving</b>: fewer than 6 repetitions at the current build in the window, or 70% to 90% over them.", app)
         self.assertIn("3 scenarios in 2 domains · <b>1</b> proven · <b>1</b> proving · <b>1</b> in development.", app)
@@ -2247,7 +2247,7 @@ class ScenariosPageTest(unittest.TestCase):
     def test_view_switch_domain_filter_and_empty_checkout(self):
         table = dom_text(self.page)
         self.assertIn("<h1>How reliable is each test?</h1>", table, "the table is the page's default view")
-        self.assertIn('<nav class="subnav"><a href="cases.html#view=reliability" class="on">How reliable is each test</a><a href="cases.html#view=scenarios">What kube-agents can do</a></nav><div class="sec head"><h1>How reliable is each test?</h1>', table)
+        self.assertIn('<nav class="subnav"><a href="cases.html#view=reliability" class="on">How reliable is each test</a><a href="cases.html#view=scenarios">What kube-agents can do</a><a href="cases.html#view=domains">Domain coverage</a></nav><div class="sec head"><h1>How reliable is each test?</h1>', table)
         self.assertNotIn('<details class="card"', table)
         self.assertIn("<h1>How reliable is each test?</h1>", dom_text(self.page, fragment="#view=nonesuch"), "an unknown view is the table")
         titled = dom_html(self.page, fragment="#view=scenarios")
@@ -2283,6 +2283,76 @@ class ScenariosPageTest(unittest.TestCase):
         index = dom_text(self.out / "index.html")
         self.assertIn('What kube-agents can do: <a href="cases.html#view=scenarios">scenarios</a>', index)
         self.assertNotIn('class="scn"', index)
+
+
+def scorecard_doc():
+    """understudies.py's scorecard: a covered domain with a ready understudy,
+    an uncovered one past its exception with none ready, and one whose
+    store and issues were not read."""
+    def study(case, passed, graded, state, held_out=False):
+        return {"case": case, "passed": passed, "graded": graded, "nights": 7, "rate": passed / graded, "meets_bar": passed / graded >= 0.9 and graded >= 20,
+                "held_out": held_out, "store": {"state": state, "runs": graded, "passes": passed}}
+    return {"schema_version": 1, "generated_at": "2026-09-08T14:00:00Z", "bar": {"rate": 0.9, "min_runs": 20, "nights": 14},
+            "store_read": True, "nightly_red_read": True, "domains": [
+                {"slug": "cost", "name": "Cost", "owner": "alice", "backup": "bob", "seats": ["proven-case"], "uncovered_since": None, "days_uncovered": None,
+                 "allowlist_issue": None, "held_out": None, "expired_days": None, "nightly_red": {"open": 2, "oldest_days": 5},
+                 "understudies": [study("proving-case", 21, 21, "would-admit")], "candidates": 1, "understudy_ready": True},
+                {"slug": "reliability", "name": "Reliability", "owner": "<b>carol</b>", "backup": None, "seats": [], "uncovered_since": "2026-08-30", "days_uncovered": 9,
+                 "allowlist_issue": 3120, "held_out": "demoted-case", "expired_days": 2, "nightly_red": {"open": 0, "oldest_days": None},
+                 "understudies": [study("demoted-case", 18, 21, "collecting", held_out=True), study("historical-case", 3, 3, "none")], "candidates": 2, "understudy_ready": False},
+                {"slug": "upgrades", "name": "Upgrades", "owner": None, "backup": None, "seats": [], "uncovered_since": None, "days_uncovered": None,
+                 "allowlist_issue": None, "held_out": None, "expired_days": None, "nightly_red": None, "understudies": [], "candidates": 0, "understudy_ready": None},
+            ]}
+
+
+@unittest.skipUnless(chrome(), "headless Chrome not found")
+class DomainsPageTest(unittest.TestCase):
+    """The Cases page's domain view (#3968 6d) from understudies.py's scorecard."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(cls.tmp.name)
+        scenario_checkout(root)
+        (root / "scorecard.json").write_text(json.dumps(scorecard_doc()))
+        with unittest.mock.patch.object(render, "recent_merges", return_value=MERGES):
+            cls.out = render_to(root, scenario_data(), health=health_doc("GREEN"), extra_args=["--scorecard", str(root / "scorecard.json")])
+            cls.bare = render_to(root / "bare", scenario_data(), health=health_doc("GREEN"), extra_args=["--repo-root", str(root)])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_brief_carries_the_scorecard_only_when_given(self):
+        self.assertEqual(json.loads((self.out / "brief.json").read_text())["scorecard"], scorecard_doc())
+        self.assertIsNone(json.loads((self.bare / "brief.json").read_text())["scorecard"])
+
+    def test_one_row_per_domain(self):
+        app = dom_text(self.out / "cases.html", fragment="#view=domains")
+        self.assertIn('<a href="cases.html#view=domains" class="on">Domain coverage</a></nav><div class="sec head"><h1>Domain coverage</h1>', app)
+        self.assertIn("<b>1</b> of 3 domains have a presubmit seat · <b>1</b> have an understudy ready.", app)
+        self.assertIn('<tr><td class="nm">cost</td><td>@alice <span class="mut">backup @bob</span></td><td><span class="pill p-pass">yes</span> <span class="mut"><a href="cases.html#proven-case">proven-case</a></span></td><td class="num">—</td><td class="num">2 <span class="mut">oldest 5 days</span></td><td><span class="pill p-pass">yes</span></td><td><div><a href="cases.html#proving-case">proving-case</a> <span class="mut hint"', app)
+        self.assertIn(">21/21 over 7 nights · store would-admit, 21/21</span></div>", app)
+        self.assertIn('<td class="num">9 days · <a href="https://github.com/gke-labs/kube-agents/issues/3120">#3120</a> <span class="pill p-fail">exception expired 2 days ago</span></td><td class="num">0</td><td><span class="pill p-partial">no</span></td>', app)
+        self.assertIn("held out: demoted-case", app)
+        self.assertIn(">3/3 over 7 nights · no store record at the current key</span></div>", app, "a read store with no record at the key says so in words")
+        # Hover notes: marked as such, and inside a table the stylesheet's tooltip rule reaches.
+        self.assertIn('<span class="mut hint" data-tip="nightly record over the last 14 nights; the bar is 90% over at least 20 graded runs, met">21/21 over 7 nights', app)
+        self.assertIn('<span class="mut hint" data-tip="still runs on the presubmit as a held-out seat', app)
+        self.assertIn('<table class="rel domains">', app)
+        css = render.PAGE_TEMPLATE.read_text()
+        self.assertIn("table.domains [data-tip]:hover::after", css)
+        self.assertIn("table.rel.domains { overflow:visible; }", css, "the table's rounded clip would cut a note off")
+        self.assertIn("@&lt;b&gt;carol&lt;/b&gt;", app, "an owner is escaped")
+        self.assertIn('<td class="nm">upgrades</td><td><span class="mut">none on record</span></td>', app)
+        self.assertIn('<td class="num"><span class="mut">start not recorded</span></td><td class="num"><span class="mut">not read</span></td><td><span class="mut">store not read</span></td><td><span class="mut">none on the nightly matrix</span></td>', app)
+        self.assertIn("<title>kube-agents · domain coverage</title>", dom_html(self.out / "cases.html", fragment="#view=domains"))
+
+    def test_without_a_scorecard_the_view_says_so(self):
+        app = dom_text(self.bare / "cases.html", fragment="#view=domains")
+        self.assertIn("<h1>Domain coverage</h1>", app)
+        self.assertIn("The scorecard was not computed for this refresh", app)
+        self.assertNotIn("<table", app.split("<h1>Domain coverage</h1>")[1].split('<div class="foot">')[0])
 
 
 if __name__ == "__main__":

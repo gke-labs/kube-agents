@@ -1,9 +1,13 @@
 package dispatch
 
 import (
+	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -82,5 +86,53 @@ func TestAdmissionRefusalsAreVisibleAndTerminal(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("verifier calls %v, want one for namespace/kube-agents", v.callList())
+	}
+}
+
+// unreachableVerifier answers nothing for its first n checks, then permits.
+type unreachableVerifier struct {
+	mu    sync.Mutex
+	n     int
+	calls int
+}
+
+func (v *unreachableVerifier) CheckProfileRun(context.Context, capability.Ref, string, capability.Tier, capability.Scope) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.calls++
+	if v.calls <= v.n {
+		return fmt.Errorf("%w: %w", ErrVerifierUnreachable, &capability.Refusal{Rule: "the verifier could not be reached"})
+	}
+	return nil
+}
+
+func (v *unreachableVerifier) callCount() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.calls
+}
+
+// A verifier nobody can reach is not a verdict: the submission stays queued
+// and is asked about again, and runs once the verifier answers. It is never
+// rejected for the outage.
+func TestAnUnreachableVerifierHoldsTheSubmission(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, 200*time.Millisecond)
+	v := &unreachableVerifier{n: 2}
+	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0"), v)
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	ts := b.waitTerminal("task-1", 15*time.Second)
+	if ts.state != lib.StateCompleted || ts.from != "tse-0" {
+		t.Errorf("terminal %+v, want the worker's completed once the verifier answered", ts)
+	}
+	if n := v.callCount(); n != 3 {
+		t.Errorf("the verifier was asked %d times, want 3 (two unanswered, then the verdict)", n)
+	}
+	if n := w.offerCount(); n != 1 {
+		t.Errorf("offered %d times, want 1", n)
+	}
+	if tomb := b.tombstones()[lib.ProfileLeaseKey("tse", "read", lib.ProfileLeaseRefusedPod, "task-1")]; tomb.Finished() {
+		t.Errorf("the outage left a refusal's tombstone: %+v", tomb)
 	}
 }

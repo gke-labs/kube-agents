@@ -405,9 +405,9 @@ What the operator renders per profile, as built (amended 10/6):
     `--name=value` token, then positionals), and its executor reads the parse for the
     kubeconfig, isolation and `get-credentials`, never parsing the argv again. The shim honours no
     `KUBECONFIG` or `CLOUDSDK_*` override for a task, and says so. Profile calls hold at most
-    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped to the pool
-    less the session share and one (never below one), so the platform agent's shell keeps a
-    slot given a pool larger than the session share plus one.
+    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped to the
+    background share: profile work is background, which holds at most the admitted count less two,
+    so on a pod that admits three or more, interactive work keeps two admissions ([`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §4.2).
   - Nothing may change what a later bare command targets. `gcloud config set`, `unset` and
     `configurations`, and every `kubectl config` write (`use-context`, `set-context`,
     `set-cluster`, `set-credentials` and the rest) are refused with or without a credential.

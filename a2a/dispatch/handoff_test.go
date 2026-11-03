@@ -372,3 +372,26 @@ func TestADroppedProfileIsUnbound(t *testing.T) {
 		t.Errorf("%d submissions queued, want task-2", num)
 	}
 }
+
+// The operator deletes a dropped profile's durables on the same change, so a
+// task held from one can no longer be acked. The tombstone already answers
+// any redelivery, so the task's slot and its pod are freed when the task
+// ends all the same, not held until the dispatcher restarts.
+func TestADeletedDurablesHeldTaskFreesItsSlot(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, 2*time.Second)
+	ti := oneProfile("tse", 2, "tse-0")
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "task-1 started", func() bool { return w.startedCount() == 1 })
+	ti.update(func(c *lib.DispatchConfig) { c.Profiles = nil })
+	for _, kind := range submitKinds {
+		if err := b.js.DeleteConsumer(b.ctx, lib.ProfileSubmitStream, lib.ProfileDurableName("tse", "read", kind)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")
+	waitFor(t, 10*time.Second, "the task's tombstone", func() bool { return b.tombstones()[key].Finished() })
+	waitFor(t, 5*time.Second, "the slot freed", func() bool { return d.Health().Running["tse"] == 0 })
+}
