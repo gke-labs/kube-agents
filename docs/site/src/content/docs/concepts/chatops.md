@@ -17,7 +17,7 @@ The reports of the cards a triage files reach the alert's thread the same way, a
 
 ## Google Chat
 
-Google Chat is the reference channel. Setup is automated by the install: the [`chat-pubsub` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) provisions the backend when Google Chat is enabled (the installer's `--enable-google-chat`, or `enable_google_chat = true` in `terraform.tfvars`).
+Google Chat is the reference channel. Setup is automated by the install: the [`chat-pubsub` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) provisions the backend when Google Chat is enabled (the installer's `--enable-google-chat`, or `enable_google_chat = true` in `terraform.tfvars`). Under `spec.mode: next`, each question you send the app in a DM is answered in its own thread, and a reply in that thread continues it, as on Slack.
 
 ### How it's wired
 
