@@ -3370,6 +3370,42 @@ class TestWorkloadFoldQueryPlans(unittest.TestCase):
         self.assertEqual(scans, [], plan)
         self.assertTrue(any("idx_intercepted_events_fold_anchor" in line for line in plan), plan)
 
+    def test_the_indexes_hold_only_rows_that_can_answer(self):
+        # The terms beyond the key: a refused sighting (notified 0, no
+        # delivery error) and a folded row are in neither index, so a miss
+        # walks nothing a workload's refused storm wrote.
+        with self.real_connect(temp_db_path) as conn:
+            sql = dict(conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'intercepted_events'"
+            ).fetchall())
+        self.assertIn(session_kv_server.FOLD_ANCHOR_INDEX_TERM, sql["idx_intercepted_events_fold_anchor"])
+        self.assertIn(
+            session_kv_server.WORKLOAD_INCIDENT_INDEX_TERM, sql["idx_intercepted_events_workload_incident"])
+
+    def test_an_index_built_on_the_key_alone_is_replaced_on_start(self):
+        # An earlier build of the daemon created both indexes on the key
+        # alone; CREATE INDEX IF NOT EXISTS would keep those, terms and all.
+        with self.real_connect(temp_db_path) as conn, conn:
+            conn.execute("DROP INDEX idx_intercepted_events_fold_anchor")
+            conn.execute(
+                "CREATE INDEX idx_intercepted_events_fold_anchor "
+                "ON intercepted_events (cluster, namespace, object_kind, fold_key, id DESC) WHERE fold_key != ''"
+            )
+        session_kv_server.init_db()
+        with self.real_connect(temp_db_path) as conn:
+            (sql,) = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'idx_intercepted_events_fold_anchor'"
+            ).fetchone()
+        self.assertIn(session_kv_server.FOLD_ANCHOR_INDEX_TERM, sql)
+        # And a second start leaves the right one alone.
+        _RecordingConnection.statements = []
+        session_kv_server.init_db()
+        self.assertFalse(any(
+            sql.lstrip().startswith("DROP INDEX idx_intercepted_events_fold_anchor")
+            or sql.lstrip().startswith("DROP INDEX idx_intercepted_events_workload_incident")
+            for sql, _ in _RecordingConnection.statements
+        ))
+
 
 # The ledger sizes the benchmark compares: a quiet install and the row cap a
 # busy fleet reaches in days (LEDGER_MAX_ROWS).
@@ -3381,9 +3417,10 @@ _BENCH_SESSIONS = 5
 # The cost measured is SQLite virtual-machine steps (a progress handler called
 # once per step), not wall time: the machine's load cannot move it, and a
 # scan's growth with the table cannot hide in it. Measured: indexed, the
-# anchor lookup takes 337 steps at both sizes and the open-fix lookup 443 and
-# 880 (the EXISTS runs once per candidate incident); unindexed, 5,149 and
-# 8,180 steps at a thousand rows become 971,930 and 16,772,056 at the cap.
+# anchor lookup takes 281 steps at both sizes and the open-fix lookup 293 and
+# 654 (the EXISTS runs once per candidate incident), and on the refused storm
+# below 270 and 274 at both sizes; unindexed, 5,149 and 8,180 steps at a
+# thousand rows become 971,930 and 16,772,056 at the cap.
 # A lookup at the cap may cost this many times its cost at a thousand rows,
 # and never more than the ceiling, which an unindexed read at the cap passes
 # by two orders of magnitude.
@@ -3391,6 +3428,8 @@ _BENCH_GROWTH_LIMIT = 4
 _BENCH_STEP_CEILING = 10_000
 # How many distinct workloads the rows spread over, per cluster and namespace.
 _BENCH_WORKLOADS = 500
+# The one workload a refused storm's rows all belong to.
+_BENCH_STORM_WORKLOAD = "storm"
 
 
 class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
@@ -3410,33 +3449,49 @@ class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
     def tearDownClass(cls):
         os.environ.pop("SESSION_KV_API_KEY", None)
 
-    def _ledger(self, rows):
+    def _ledger(self, rows, refused_storm=False):
+        """A ledger of `rows` admitted incidents spread over the workloads.
+
+        With `refused_storm`, every row is instead one workload's sighting that
+        its severity's ceiling refused (`notified` 0, no delivery error, no
+        session): the shape a Deployment that keeps failing after the day's
+        budget is spent writes for the rest of the day, and one on which both
+        lookups miss.
+        """
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         self.addCleanup(lambda: [os.path.exists(p) and os.remove(p) for p in (path, path + "-wal", path + "-shm")])
         with patch.object(session_kv_server, "SESSION_KV_DB_PATH", path):
             session_kv_server.init_db()
+        if refused_storm:
+            rows_to_insert = (
+                ("c1", "ns1", _BENCH_STORM_WORKLOAD, f"uid-{i}", "Pod", "BackOff", "m", "Warning", 0, "",
+                 _BENCH_STORM_WORKLOAD, _BENCH_STORM_WORKLOAD)
+                for i in range(rows)
+            )
+        else:
+            rows_to_insert = (
+                (
+                    f"c{i % 3}", f"ns{i % 7}", f"w{i % _BENCH_WORKLOADS}", f"uid-{i}", "Pod",
+                    "BackOff" if i % 2 else "Unhealthy", "m", "Warning", 1, f"sess-{i}",
+                    f"w{i % _BENCH_WORKLOADS}", f"w{i % _BENCH_WORKLOADS}",
+                )
+                for i in range(rows)
+            )
         with sqlite3.connect(path) as conn, conn:
             conn.executemany(
                 "INSERT INTO intercepted_events (cluster, namespace, workload, object_uid, object_kind, reason, "
                 "message, severity, occurrences, notified, session_id, duplicate_of, fold_key, workload_key) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, NULL, ?, ?)",
-                (
-                    (
-                        f"c{i % 3}", f"ns{i % 7}", f"w{i % _BENCH_WORKLOADS}", f"uid-{i}", "Pod",
-                        "BackOff" if i % 2 else "Unhealthy", "m", "Warning", f"sess-{i}",
-                        f"w{i % _BENCH_WORKLOADS}", f"w{i % _BENCH_WORKLOADS}",
-                    )
-                    for i in range(rows)
-                ),
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)",
+                rows_to_insert,
             )
         return path
 
-    def _measure(self, rows):
+    def _measure(self, rows, refused_storm=False):
         """The most SQLite steps one call of each kind took on a ledger of `rows`."""
         from fastapi.testclient import TestClient
 
-        path = self._ledger(rows)
+        path = self._ledger(rows, refused_storm)
         client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
         steps = {"n": 0}
         real_connect = sqlite3.connect
@@ -3463,7 +3518,7 @@ class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
                 patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 3600), \
                 patch.object(session_kv_server, "_incident_pull_request_urls", return_value=[]), \
                 patch.object(session_kv_server.sqlite3, "connect", side_effect=counting_connect):
-            key = lambda i: f"w{(i * 37) % _BENCH_WORKLOADS}"  # noqa: E731
+            key = lambda i: _BENCH_STORM_WORKLOAD if refused_storm else f"w{(i * 37) % _BENCH_WORKLOADS}"  # noqa: E731
             return {
                 "anchor": worst_of(_BENCH_LOOKUPS, lambda i: session_kv_server._workload_incident_anchor(
                     "c1", "ns1", "Pod", key(i), "Warning")),
@@ -3473,14 +3528,26 @@ class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
                     client.post("/sessions").status_code, 201)),
             }
 
-    def test_the_work_stays_bounded_from_a_thousand_rows_to_the_cap(self):
-        small = self._measure(_BENCH_SMALL_ROWS)
-        large = self._measure(_BENCH_LARGE_ROWS)
+    def _assert_bounded(self, small, large):
         for name in ("anchor", "open_fix", "sessions"):
             with self.subTest(lookup=name):
                 detail = f"{name}: {small[name]} steps at {_BENCH_SMALL_ROWS} rows, {large[name]} at {_BENCH_LARGE_ROWS}"
                 self.assertLessEqual(large[name], _BENCH_GROWTH_LIMIT * small[name], detail)
                 self.assertLess(large[name], _BENCH_STEP_CEILING, detail)
+
+    def test_the_work_stays_bounded_from_a_thousand_rows_to_the_cap(self):
+        self._assert_bounded(self._measure(_BENCH_SMALL_ROWS), self._measure(_BENCH_LARGE_ROWS))
+
+    def test_a_miss_against_one_workloads_refused_storm_stays_bounded(self):
+        # The hit path stops at the first index row; a miss walks every row
+        # the index holds for the workload. With the indexes on the key alone
+        # the anchor lookup took 1,600,122 steps and the open-fix lookup
+        # 2,000,156 on a 200,000-row storm, against 111 and 136 with the
+        # admission terms in the index.
+        self._assert_bounded(
+            self._measure(_BENCH_SMALL_ROWS, refused_storm=True),
+            self._measure(_BENCH_LARGE_ROWS, refused_storm=True),
+        )
 
 
 class TestSessionKvServerQueryBuilding(unittest.TestCase):

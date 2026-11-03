@@ -1007,6 +1007,12 @@ INCIDENT_FOLD_DB_TIMEOUT_S = 5.0
 # arriving together cannot both find no anchor and both open a triage. The
 # route is a sync def served on a threadpool, so they can.
 _WORKLOAD_FOLD_LOCK = threading.Lock()
+# The WHERE terms of the fold's two partial indexes (init_db). The anchor and
+# open-fix lookups spell them verbatim beside their bound parameters, since
+# SQLite matches a partial index against the query's text; init_db replaces an
+# index of the same name whose SQL lacks the term.
+FOLD_ANCHOR_INDEX_TERM = "fold_key != '' AND (notified != 0 OR delivery_error != '')"
+WORKLOAD_INCIDENT_INDEX_TERM = "workload_key != '' AND duplicate_of IS NULL AND session_id != ''"
 # A workload that breaks again while the fix for its last incident waits for
 # review (_open_fix_pull_request): the event is recorded against that incident
 # with the pull request's URL instead of opening a second investigation. A pull
@@ -1668,24 +1674,45 @@ def init_db() -> None:
             # window's rows through idx_intercepted_events_created_at and
             # sorted them, growing with the hour's event rate; the route's
             # latency grew with the table until the watcher's inject timed out.
-            # Partial, so each holds only the rows that can answer: an anchor
-            # has a fold_key (the start-up clear below empties the first index
-            # again), an incident with a fix has a workload_key, and only a
-            # folded row has a duplicate_of. The queries spell the WHERE term
-            # as a literal (`fold_key != ''`, `workload_key != ''`,
-            # `duplicate_of > 0`) next to their bound parameters, because SQLite
-            # matches a partial index's WHERE against the query's text. `id DESC`
-            # serves the `ORDER BY id DESC LIMIT` without a sort.
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_fold_anchor "
-                "ON intercepted_events (cluster, namespace, object_kind, fold_key, id DESC) "
-                "WHERE fold_key != ''"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_workload_incident "
-                "ON intercepted_events (cluster, namespace, object_kind, workload_key, id DESC) "
-                "WHERE workload_key != ''"
-            )
+            # Partial, so each holds only the rows that can answer, and nothing
+            # else is walked on a miss: an anchor has a fold_key and was
+            # admitted (`notified` non-zero or a `delivery_error`; the start-up
+            # clear below empties the first index again), an incident with a
+            # fix has a workload_key, is no duplicate and has a session, and
+            # only a folded row has a duplicate_of. The admission terms matter
+            # because every forwarded event writes a row with both keys set
+            # whatever became of it: a workload refused all day by its
+            # severity's ceiling writes one row per sighting, none of which
+            # answers either lookup, and an index on the key alone would make
+            # each later sighting walk all of them, newest first, before
+            # concluding there is no anchor. The queries spell the WHERE
+            # terms as literals (`fold_key != ''`, `(notified != 0 OR
+            # delivery_error != '')`, `workload_key != ''`, `duplicate_of IS
+            # NULL`, `session_id != ''`, `duplicate_of > 0`) next to their
+            # bound parameters, because SQLite matches a partial index's WHERE
+            # against the query's text. `id DESC` serves the `ORDER BY id DESC
+            # LIMIT` without a sort.
+            # An index of either name that an earlier build created on the
+            # key alone is dropped first, since CREATE INDEX IF NOT EXISTS
+            # would keep it, terms and all.
+            for name, columns, term in (
+                (
+                    "idx_intercepted_events_fold_anchor",
+                    "(cluster, namespace, object_kind, fold_key, id DESC)",
+                    FOLD_ANCHOR_INDEX_TERM,
+                ),
+                (
+                    "idx_intercepted_events_workload_incident",
+                    "(cluster, namespace, object_kind, workload_key, id DESC)",
+                    WORKLOAD_INCIDENT_INDEX_TERM,
+                ),
+            ):
+                existing = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (name,)
+                ).fetchone()
+                if existing and term not in (existing[0] or ""):
+                    conn.execute(f"DROP INDEX {name}")
+                conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON intercepted_events {columns} WHERE {term}")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_intercepted_events_duplicate_reason "
                 "ON intercepted_events (duplicate_of, reason) WHERE duplicate_of > 0"
@@ -1820,8 +1847,13 @@ def init_db() -> None:
             # Critical) for a sibling that arrives after
             # the restart, and is noise rather than silence. The WHERE is the
             # fold-anchor index's own term, so the clear walks that index and
-            # not the table.
-            conn.execute("UPDATE intercepted_events SET fold_key = '' WHERE fold_key != ''")
+            # not the table; a row the index leaves out (refused, or folded)
+            # keeps its fold_key, and never anchors because it was never
+            # admitted, which is the same term.
+            conn.execute(
+                "UPDATE intercepted_events SET fold_key = '' "
+                "WHERE fold_key != '' AND (notified != 0 OR delivery_error != '')"
+            )
             findings_queue.init_findings_schema(conn)
             _purge_plaintext_identities(conn)
 
@@ -2321,8 +2353,9 @@ def _open_fix_pull_request(
         return None
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
-            # `workload_key != ''` and `duplicate_of > 0` are the partial
-            # indexes' terms (init_db); the correlated EXISTS reads the
+            # `workload_key != ''`, `duplicate_of IS NULL` and `session_id != ''`
+            # are the workload-incident index's terms and `duplicate_of > 0`
+            # the duplicate index's (init_db); the correlated EXISTS reads the
             # duplicate index once per candidate incident rather than
             # materialising every folded row's anchor.
             incidents = conn.execute(
@@ -2472,7 +2505,8 @@ def _workload_incident_anchor(
         return None
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
-            # `fold_key != ''` is the fold-anchor index's term (init_db).
+            # `fold_key != ''` and `(notified != 0 OR delivery_error != '')`
+            # are the fold-anchor index's terms (init_db).
             row = conn.execute(
                 "SELECT id FROM intercepted_events "
                 "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND fold_key = ? AND fold_key != '' "
