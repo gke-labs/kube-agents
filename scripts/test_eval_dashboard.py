@@ -661,7 +661,7 @@ class CaseNotesTest(unittest.TestCase):
         notes = render.load_notes(REPO_NOTES)
         for name in ("agent-kanban-smoke", "capacity-pinned-pool-probe", "compliance-rbac-overgrant", "gpu-stress-test-diagnosis"):
             self.assertIn(name, notes)
-        self.assertEqual(notes["compliance-rbac-overgrant"]["issues"], ["#998", "#985", "#1171", "#2013"])
+        self.assertEqual(notes["compliance-rbac-overgrant"]["issues"], ["#998", "#985", "#1171", "#2013", "#4094"])
         self.assertEqual(notes["pdb-remediation-pr"]["issues"], ["#2016", "#3120"])
         self.assertEqual(notes["consistency-authorized-networks-probe"]["issues"], ["#3598"])
         self.assertEqual(notes["capacity-pinned-pool-probe"]["issues"], ["#1840", "#1874"])

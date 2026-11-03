@@ -2324,6 +2324,43 @@ class IdleReclaimTest(unittest.TestCase):
         # The full handle is never logged.
         self.assertNotIn(dead.handle, line)
 
+    def test_reclaim_idle_drops_the_idle_workspaces_now_and_says_how_many(self):
+        self.limits(cap=4, idle=100)
+        store = self.store()
+        dead = store.open("acme/fleet", caller="t_dead")
+        live = store.open("acme/fleet", caller="t_live")
+        self.now += 99
+        store.get(live.handle)
+        self.now += 1
+        self.assertEqual(1, store.reclaim_idle())
+        self.assertEqual({live.handle}, set(store._workspaces))
+        self.assertFalse((store.tree_root / dead.handle).exists())
+        self.assertEqual(0, store.reclaim_idle())
+
+    def test_reclaim_idle_answers_zero_while_a_verb_holds_the_lock(self):
+        self.limits(cap=4, idle=100)
+        store = self.store()
+        dead = store.open("acme/fleet", caller="t_dead")
+        self.now += 100
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with store._lock:
+                held.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        self.assertTrue(held.wait(5))
+        try:
+            self.assertEqual(0, store.reclaim_idle())
+            self.assertIn(dead.handle, store._workspaces)
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertEqual(1, store.reclaim_idle())
+
     def test_a_verb_queued_behind_the_lock_is_not_idle(self):
         """The lock is held across clones and pushes for minutes; a verb waiting
         its turn cannot stamp `last_used`, and must not lose its workspace to a

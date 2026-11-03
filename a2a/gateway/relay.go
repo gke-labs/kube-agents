@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -444,6 +445,20 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	}
 
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+		if errors.Is(err, ErrFenced) {
+			// A newer gateway term owns the record: this gateway has been
+			// deposed. Acked, the events would reach neither gateway's
+			// record; given back, the new leader renders them, which can
+			// repeat what this one posted (the design's overlap residue).
+			g.log.Warn("relay: record write fenced by a newer term; batch given back", "session", rec.Key, "err", err)
+			for _, item := range fresh {
+				g.giveBackLater(item)
+			}
+			for _, item := range dupes {
+				g.giveBackLater(item)
+			}
+			return
+		}
 		g.log.Error("relay: session record write failed", "session", rec.Key, "err", err)
 	}
 	// Rendered, so acked whatever the write did: the posts are out, and a
@@ -1211,8 +1226,8 @@ func (g *Gateway) retireTaskRoute(ctx context.Context, taskID string) {
 func withRetry(n int, f func() error) error {
 	var err error
 	for i := 0; i < n; i++ {
-		if err = f(); err == nil {
-			return nil
+		if err = f(); err == nil || errors.Is(err, ErrFenced) {
+			return err
 		}
 		time.Sleep(time.Duration(i+1) * kvRetryPause)
 	}

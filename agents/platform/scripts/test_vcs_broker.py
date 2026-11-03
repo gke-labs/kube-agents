@@ -679,6 +679,44 @@ class RepositoryVerbTest(unittest.TestCase):
         self.broker.clone({"repository": "local.test/acme/infra"})
         self.assertEqual(sorted(p.name for p in self.scratch.iterdir()), [])
 
+    def test_the_bundle_lives_inside_the_scratch_tree_so_its_removal_takes_it(self):
+        # A broker killed between writing the bundle and unlinking it leaves
+        # it behind. Inside the scratch tree, the start sweep and the
+        # reclaimer remove it with the tree; a sibling under the root matches
+        # neither's listing and would hold the state volume's quota for good.
+        seen: dict[str, tuple[Path, Path]] = {}
+
+        def recording_git(argv, cwd, check=True, config=()):
+            if argv[1] == "bundle" and argv[2] in ("create", "list-heads"):
+                seen[argv[2]] = (Path(argv[3]), cwd)
+            return git_runner(argv, cwd, check, config)
+
+        broker = VcsBroker(self.scratch / "bundles", git_runner=recording_git)
+        broker.registry.hosts["local.test"] = self.forge
+        answer = broker.clone({"repository": "local.test/acme/infra"})
+        work = Path(self.tmp.name) / "bundled"
+        bundle = Path(self.tmp.name) / "bundled.bundle"
+        bundle.write_bytes(base64.b64decode(answer["bundleBase64"]))
+        git(self.tmp.name, "clone", "--quiet", "--branch", answer["branch"], str(bundle), str(work))
+        git(work, "checkout", "--quiet", "-b", "fix/inside")
+        self.commit_in(work, "README.md", "inside\n", "change it")
+        broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": "fix/inside",
+                "target": "main",
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(work, "fix/inside", answer["revision"]),
+            }
+        )
+        self.assertEqual({"create", "list-heads"}, set(seen))
+        for verb, (path, cwd) in seen.items():
+            self.assertEqual(cwd, path.parent, verb)
+            self.assertEqual(broker.scratch_root, cwd.parent, verb)
+            self.assertTrue(vcs_broker.SCRATCH_NAME_RE.match(cwd.name), cwd.name)
+            self.assertEqual(f"{cwd.name}.bundle", path.name, verb)
+        self.assertEqual([], sorted(broker.scratch_root.iterdir()))
+
     def test_clone_makes_the_credential_current_before_it_spends(self):
         self.broker.clone({"repository": "local.test/acme/infra"})
         self.assertEqual(self.refreshed, ["acme/infra"])
@@ -3353,7 +3391,9 @@ class ForgeWithoutLabelsTest(unittest.TestCase):
         self.assertIs(self.broker.capabilities({"repository": "acme/infra"})["labels"], True)
         for forge in providers.AVAILABLE:
             with self.subTest(forge=forge.name):
-                self.assertIs(forge.labels, True)
+                # Bitbucket Cloud and Data Center have no labels; every other
+                # forge does.
+                self.assertIs(forge.labels, not forge.name.startswith("bitbucket"))
 
     def test_every_label_field_is_refused_before_the_forge_is_called(self):
         cases = (
@@ -3468,7 +3508,10 @@ class IdentityWithoutCurrentUserRouteTest(unittest.TestCase):
     def test_github_and_gitlab_do_not_require_an_identity(self):
         for forge in providers.AVAILABLE:
             with self.subTest(forge=forge.name):
-                self.assertFalse(forge.identity_required)
+                # A Bitbucket token always acts as an account, so an unknown
+                # login there is a fault; GitHub and GitLab keep "" as "do not
+                # compare".
+                self.assertIs(forge.identity_required, forge.name.startswith("bitbucket"))
                 self.assertEqual("", forge.identity)
 
 

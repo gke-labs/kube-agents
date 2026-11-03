@@ -1138,9 +1138,18 @@ forget_unmanaged_cluster_kms() {
 # exactly the wedge above, so refuse. PERMISSION_DENIED or a transient API error
 # means the guard could not ask, which is not evidence that the key is missing:
 # warn and proceed rather than blocking an apply on the guard's own blind spot.
+#
+# A key with no ENABLED version is refused either way, but there are two causes
+# with different fixes. A key never imported needs the GitHub App private key.
+# A key whose versions are DESTROY_SCHEDULED -- what any destroy of the key
+# leaves, a raw `terraform destroy` or an apply with enable_github_minter =
+# false -- needs only a restore. The guard runs before adopt_kms so a refused
+# apply changes no state, so it names that restore rather than a re-import:
+# adopt-kms for a key out of state (it restores what it imports), and the
+# gcloud restore for a key still in state, which adopt_kms leaves alone.
 guard_minter_key() {
   [[ "$(tfvar enable_github_minter)" == "true" ]] || return 0
-  local project location keyring key versions list_err err_file reason="" list_rc=0
+  local project location keyring key versions list_err err_file reason="" list_rc=0 scheduled=""
   project=$(tfvar project_id)
   location=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
   keyring=$(tfvar github_minter_kms_keyring)
@@ -1165,14 +1174,32 @@ guard_minter_key() {
     reason="does not exist yet"
   elif [[ -z "$(head -1 <<<"$versions")" ]]; then
     reason="has no ENABLED version"
+    # A failed query leaves scheduled empty, and the import advice below stands.
+    scheduled=$(gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+      --location "$location" --project "$project" \
+      --filter='state=DESTROY_SCHEDULED' --format='value(name)' 2>/dev/null) || scheduled=""
   else
     return 0
   fi
 
   warn "enable_github_minter is true, but KMS signing key '$location/$keyring/$key' $reason."
   warn "Applying now would deploy the minter and wedge waiting on its readiness probe."
-  warn "Import the GitHub App private key before applying (see https://github.com/abcxyz/github-token-minter),"
-  warn "or set enable_github_minter = false in terraform.tfvars."
+  if [[ -n "$(head -1 <<<"$scheduled")" ]]; then
+    warn "Its versions are scheduled for destruction, as a destroy of the key leaves them."
+    warn "Restore them rather than re-importing the key; a restore works only until their destruction time."
+    load_state
+    if in_state "$MINTER_KMS_KEY_ADDRESS"; then
+      warn "The key is still in Terraform state, so restore each version with gcloud, then apply again:"
+      warn "  gcloud kms keys versions restore <version> --key $key --keyring $keyring --location $location --project $project"
+      warn "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
+    else
+      warn "Run './lifecycle.sh adopt-kms' in terraform/examples/full-install, which imports the key"
+      warn "back and restores and re-enables those versions, then apply again."
+    fi
+  else
+    warn "Import the GitHub App private key before applying (see https://github.com/abcxyz/github-token-minter),"
+    warn "or set enable_github_minter = false in terraform.tfvars."
+  fi
   exit 1
 }
 

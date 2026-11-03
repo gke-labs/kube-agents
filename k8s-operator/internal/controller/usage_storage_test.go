@@ -215,10 +215,11 @@ func assertNoDataVolume(t *testing.T, agent *agentv1alpha1.PlatformAgent, when s
 
 // A served CRD from before this release prunes the byte fields. The poller
 // records it from the patch's echo and probes again only after the reprobe
-// interval, as it does for the newer status.usage fields, while
-// the condition, which every schema carries, keeps landing.
+// interval, as it does for the newer status.usage fields, while the
+// condition, which every schema carries, keeps landing inside the interval.
 func TestDataVolume_APruningCRDIsProbedNotRewrittenEveryPoll(t *testing.T) {
-	h := dataVolumeHarness(t, usageTestAgent(usageClock(0).Add(-time.Hour)))
+	agent := usageTestAgent(usageClock(0).Add(-time.Hour))
+	h := dataVolumeHarness(t, agent)
 	h.pruningStorage = true
 	h.stub.setDataVolume(gatewayAddr(), testVolume, freeAt(50))
 	h.poll(5)
@@ -226,14 +227,31 @@ func TestDataVolume_APruningCRDIsProbedNotRewrittenEveryPoll(t *testing.T) {
 	if c := meta.FindStatusCondition(h.agent().Status.Conditions, dataVolumeNearlyFullCondition); c == nil || c.Status != metav1.ConditionFalse {
 		t.Fatalf("the condition did not land under a pruning CRD: %+v", c)
 	}
-	// Inside the reprobe interval nothing is written; past it, one probe.
-	h.poll(7)
+	// Inside the reprobe interval an unchanged reading does not rewrite the
+	// pruned byte fields.
+	h.poll(6)
 	if h.patches != after {
-		t.Fatalf("the pruned byte fields were rewritten inside the reprobe interval: %d patches, want %d", h.patches, after)
+		t.Fatalf("rewritten inside the reprobe interval: %d patches, want %d", h.patches, after)
 	}
+	// Still inside the interval the volume crosses 95%: one patch carries the
+	// condition.
 	h.stub.setDataVolume(gatewayAddr(), testVolume, freeAt(95))
-	h.poll(15)
-	if !meta.IsStatusConditionTrue(h.agent().Status.Conditions, dataVolumeNearlyFullCondition) {
+	h.poll(7)
+	got := h.agent()
+	if h.patches != after+1 {
+		t.Fatalf("%d patches after crossing 95%% inside the reprobe interval, want %d", h.patches, after+1)
+	}
+	if !meta.IsStatusConditionTrue(got.Status.Conditions, dataVolumeNearlyFullCondition) {
 		t.Fatal("the condition stopped landing while the byte fields were pruned")
+	}
+	if s := got.Status.StorageStatus; s.CapacityBytes != nil || s.FreeBytes != nil {
+		t.Fatalf("storageStatus %+v inside the reprobe interval, want the pruned byte fields left unwritten", s)
+	}
+	// Past the interval, with the CRD now serving the fields, one probe lands them.
+	h.p.expireNewerFieldsRecordForTest(agent)
+	h.pruningStorage = false
+	h.poll(9)
+	if s := h.agent().Status.StorageStatus; s.CapacityBytes == nil || *s.CapacityBytes != testVolume || s.FreeBytes == nil || *s.FreeBytes != freeAt(95) {
+		t.Fatalf("after the record expired: storageStatus %+v, want capacity %d and free %d", s, testVolume, freeAt(95))
 	}
 }
