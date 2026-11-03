@@ -62,6 +62,9 @@ STATED = {
     "the heading two lines above the claim": "### `seeded-b`\n\nThe cluster is blocked by an active maintenance exclusion.\n\n- Exclusion: `hold-the-minor-lag`, scope `NO_MINOR_UPGRADES`.",
     "running until": "While there are no PDB blockers, the cluster has an active maintenance exclusion (`hold-the-minor-lag`) running until 2026-12-29 with the scope `NO_MINOR_UPGRADES`.",
     "pauses automatic minor upgrades": "- `seeded-b`: the `hold-the-minor-lag` exclusion (`NO_MINOR_UPGRADES`) pauses automatic minor upgrades until 2027-01-03.",
+    "the upgrade as subject, passive": "- `seeded-b`: the minor upgrade is excluded by the `hold-the-minor-lag` exclusion (`NO_MINOR_UPGRADES`).",
+    "the upgrade as subject, no agent": "- `seeded-b` (`hold-the-minor-lag`, `NO_MINOR_UPGRADES`): minor upgrades are excluded until 2027-01-03.",
+    "bare in effect": "- `seeded-b`: the exclusion `hold-the-minor-lag` (`NO_MINOR_UPGRADES`) is currently in effect.",
     "excludes minor upgrades, bold split": "- `seeded-b`: the `hold-the-minor-lag` exclusion **excludes** minor upgrades and defers **automatic** upgrades only.",
 }
 
@@ -71,12 +74,6 @@ NOT_STATED = {
     "another cluster's negation, in its own section": "## seeded-a\n\nReady. No exclusions block the upgrade.\n\nNode pools match the control plane.\n\n## seeded-c\n\nReady.\n\n## seeded-b\n\nLagging one minor; `hold-the-minor-lag` (`NO_MINOR_UPGRADES`) is on the record.",
     "the subject three lines away on both sides": "## seeded-b\n- version: 1.35.8\n- channel: REGULAR\n- window: daily 03:00\n- note: an active maintenance exclusion blocks minor upgrades on another member.\n- skew: none\n- pdb: none\n- record: `hold-the-minor-lag` (`NO_MINOR_UPGRADES`).",
     "a status row with drain blockers and a target": "| seeded-b | blocked | exclusion: hold-the-minor-lag (NO_MINOR_UPGRADES); drain blockers: pinned-batch-runner; upgrade target 1.36.4 |",
-    "negated: no exclusion blocks": "No exclusion blocks seeded-b's upgrade; `hold-the-minor-lag` (`NO_MINOR_UPGRADES`) has lapsed.",
-    "negated: no longer blocks": "- seeded-b: the hold-the-minor-lag exclusion no longer blocks the minor upgrade (scope NO_MINOR_UPGRADES).",
-    "negated: not active now": "- seeded-b: the exclusion hold-the-minor-lag is not active now; the upgrade will proceed. Scope was NO_MINOR_UPGRADES.",
-    "negated: not blocked by any exclusion": "seeded-b is not blocked by any maintenance exclusion; `hold-the-minor-lag` (`NO_MINOR_UPGRADES`) ended.",
-    "negated: does not prevent": "- seeded-b: the hold-the-minor-lag exclusion does not prevent the minor upgrade (`NO_MINOR_UPGRADES` covers nodes only).",
-    "negated: no exclusion in place until": "- seeded-b: no maintenance exclusion is in place until further notice; `hold-the-minor-lag` (`NO_MINOR_UPGRADES`) was removed.",
     "bound: a pipe between the exclusion and the verb": "| seeded-b | exclusion `hold-the-minor-lag` (`NO_MINOR_UPGRADES`) | the PDB blocks the node pool upgrade |",
     "bound: a period between the exclusion and the verb": "seeded-b carries the exclusion `hold-the-minor-lag` (`NO_MINOR_UPGRADES`). The PDB blocks the upgrade of the pool.",
     "bound: the verb more than 80 characters from the exclusion": "- seeded-b: the exclusion `hold-the-minor-lag` (`NO_MINOR_UPGRADES`) was set by the platform team last quarter for the batch window and the capacity review and it blocks the minor upgrade",
