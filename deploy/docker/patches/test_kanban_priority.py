@@ -172,6 +172,22 @@ class StampTest(unittest.TestCase):
                 mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "process-wide-stale"}):
             self.assertEqual(GATEWAY_SESSION, contextvars.copy_context().run(turn))
 
+    def test_a_fresh_session_context_wins_over_a_stale_binding(self):
+        # An internal event skips pre_gateway_dispatch, so it inherits the
+        # previous turn's binding; its own session context names the right id.
+        turn_context = self._turn_context()
+        session_context = SimpleNamespace(
+            get_session_env=lambda name, default="": GATEWAY_SESSION if name == "HERMES_SESSION_ID" else default
+        )
+        gateway = SimpleNamespace(session_context=session_context)
+
+        def internal_turn():
+            turn_context.bind_session("20261008_090000_stale000")
+            return kp.trusted_origin_session()
+
+        with mock.patch.dict(sys.modules, {"gateway": gateway, "gateway.session_context": session_context}):
+            self.assertEqual(GATEWAY_SESSION, contextvars.copy_context().run(internal_turn))
+
     def test_no_binding_and_no_session_env_is_no_session(self):
         turn_context = self._turn_context()
 

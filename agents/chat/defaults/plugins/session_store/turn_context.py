@@ -2,9 +2,10 @@
 
 On a gateway platform turn (Google Chat, Slack, ...) Hermes binds the chat id,
 not the session id, in the context a tool reads, so the session_store plugin
-binds the session id here at `pre_gateway_dispatch` and the kanban patches
-read it back (deploy/docker/patches/kanban_priority.py
-`trusted_origin_session`). A ContextVar, so the value is the turn's own.
+binds the session id here at `pre_gateway_dispatch`. The kanban patches read it
+back (deploy/docker/patches/kanban_priority.py `trusted_origin_session`) as the
+fallback for a turn whose Hermes session context lacks `HERMES_SESSION_ID`.
+A ContextVar, so the value is the turn's own.
 
 The binding is not reset when the hook returns, because the turn runs after it
 returns, in the same task, from a copy of that task's context. In the pinned
@@ -17,8 +18,10 @@ Hermes (0.21.3): each inbound message gets its own task,
 `asyncio.ensure_future(self._run_in_executor_with_context(...))`
 (gateway/run_turn.py:3242-3243), whose `copy_context()` (gateway/run.py:4152)
 carries the binding into the worker thread. The hook instead clears the binding
-at the start of every dispatch, so a message task that inherited another
-message's context (create_task copies its spawner's) never reads that id.
+at the start of every gateway dispatch, so a user message task that inherited
+another message's context (create_task copies its spawner's) never reads that
+id. An internal event returns before the hook (run_inbound.py:180-181) and keeps
+the binding it inherited, which is why the reader prefers the session context.
 
 Hermes loads this plugin as `hermes_plugins.session_store`, the tests load it as
 a top-level module, and a reader cannot know which name it got. So the first
