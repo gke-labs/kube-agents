@@ -165,6 +165,11 @@ _AA_OVERRIDE_CPU_REQUEST_MILLIS = 500
 _AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _AA_VALUE = "platformAgent.deployment.agentAPIAuth.resources"
 _SIZING_VALUE = "platformAgent.deployment.sizingProfile"
+# The shell container's override, and its default memory request (shellSandboxMemoryRequest in
+# shell_sandbox_manifests.go, restated in footprint.yaml); its default limit is 2Gi and the
+# fleet row raises the limit to 4Gi.
+_SHELL_VALUE = "platformAgent.harness.experimental.shellSandbox.resources"
+_SHELL_MEMORY_REQUEST_BYTES = 512 * 1024**2
 # The operator's own resources block, which the preflight sums and holds to its memory floor.
 _OPERATOR_VALUE = "operator.resources"
 # What releases up to 0.16.0 shipped for the manager's memory limit, under the 512Mi floor.
@@ -464,6 +469,47 @@ class PreflightDecisionTest(unittest.TestCase):
         refused = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_AA_VALUE}.requests.memory=9Gi"])
         fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
         self.assertEqual(refused, fleet)
+
+    def test_sizing_profile_shell_override_is_refused_against_the_row(self) -> None:
+        """The shell's refusal rule reads the row the profile picks, not the small
+        defaults: a 3Gi memory request is refused on small (its 2Gi limit) and counted at
+        the defaults, admitted on fleet (its 4Gi limit) and counted as written, and a 5Gi
+        request on fleet is refused and counted at the row. Pins the footprint loop's order,
+        the row first and the refusal rule after it; reversed, the 3Gi case under fleet
+        would count the row alone and pass a quota the pod then cannot fit."""
+        base = self._requirements()
+        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
+        self.assertEqual(self._requirements([f"{_SHELL_VALUE}.requests.memory=3Gi"]), base)
+        admitted = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_SHELL_VALUE}.requests.memory=3Gi"])
+        self.assertEqual(admitted["requestsMemory"] - base["requestsMemory"],
+                         7 * 1024**3 + 3 * 1024**3 - _SHELL_MEMORY_REQUEST_BYTES)
+        self.assertEqual(admitted["limitsMemory"], fleet["limitsMemory"])
+        self.assertEqual(self._requirements([f"{_SIZING_VALUE}=fleet", f"{_SHELL_VALUE}.requests.memory=5Gi"]), fleet)
+
+    def test_sizing_profile_on_autopilot_counts_the_rows_autopilot_requests(self) -> None:
+        """On GKE Autopilot the proxy's requests are the row's Autopilot pair, not the
+        small one: medium requests 2 CPU and 4Gi (the Standard medium row requests 1 CPU),
+        fleet 4 CPU and 8Gi. The limits are the row's, as on Standard."""
+        autopilot = ["--api-versions", _AUTOPILOT_API]
+        base = self._requirements()
+        small_on = self._requirements(extra_args=autopilot)
+        medium = self._requirements([f"{_SIZING_VALUE}=medium"])
+        medium_on = self._requirements([f"{_SIZING_VALUE}=medium"], extra_args=autopilot)
+        self.assertEqual(medium_on["requestsCpu"] - base["requestsCpu"], 2000 - 500)
+        self.assertEqual(medium_on["requestsCpu"] - medium["requestsCpu"], 2000 - 1000)
+        self.assertEqual(medium_on["requestsMemory"] - base["requestsMemory"], 3 * 1024**3)
+        self.assertEqual(medium_on["requestsMemory"] - small_on["requestsMemory"], 2 * 1024**3)
+        self.assertEqual(medium_on["limitsCpu"], medium["limitsCpu"])
+        self.assertEqual(medium_on["limitsMemory"], medium["limitsMemory"])
+        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
+        fleet_on = self._requirements([f"{_SIZING_VALUE}=fleet"], extra_args=autopilot)
+        self.assertEqual(fleet_on["requestsCpu"] - base["requestsCpu"], 4000 - 500)
+        self.assertEqual(fleet_on["requestsMemory"] - base["requestsMemory"], 7 * 1024**3)
+        self.assertEqual(fleet_on["limitsCpu"], fleet["limitsCpu"])
+        self.assertEqual(fleet_on["limitsMemory"], fleet["limitsMemory"])
+        for got in (medium_on, fleet_on):
+            for key in ("pods", "requestsEphemeral", "limitsEphemeral"):
+                self.assertEqual(got[key], base[key], key)
 
     def test_agent_api_auth_memory_limit_override_moves_only_that_total(self) -> None:
         """The field's use case (#2648): raising the sidecar's memory limit is counted,
