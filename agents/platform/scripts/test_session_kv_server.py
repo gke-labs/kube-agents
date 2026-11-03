@@ -2947,6 +2947,38 @@ class TestWorkloadIncidentFold(unittest.TestCase):
                 self.assertLess(time.monotonic() - before, 1)
                 release.set()
 
+    def test_a_queued_lookup_nobody_waits_for_is_dropped_once_stale(self):
+        # A forge brownout leaves the queue full of lookups whose callers have
+        # all given up; when the forge comes back the workers must not spend a
+        # round trip on each before a fresh caller gets its read.
+        release = threading.Event()
+        self.addCleanup(release.set)
+        started = threading.Event()
+        forge = MagicMock()
+
+        def blocked(*a, **k):
+            started.set()
+            release.wait(5)
+            return {"proposal": {"state": "open"}}
+
+        forge.call.side_effect = blocked
+        pool = session_kv_server._FixPullRequestLookupPool(workers=1, queue_max=4, ttl_s=60)
+        stale_url, fresh_url = self._lookup_url("stale-q"), self._lookup_url("fresh-q")
+        with patch.dict(sys.modules, {"forge": forge}), patch.object(session_kv_server, "_FIX_PR_LOOKUP_POOL", pool):
+            threading.Thread(target=session_kv_server._proposal_state, args=(self._lookup_url("busy"), 5)).start()
+            self.assertTrue(started.wait(5))
+            self.assertIsNone(session_kv_server._proposal_state(stale_url, 0.05))
+            with pool._lock:
+                queued = pool._in_flight[stale_url]
+                self.assertEqual(queued.waiters, 0)
+                queued.queued_at -= session_kv_server.FIX_PR_LOOKUP_TIMEOUT_S + 1
+            release.set()
+            self.assertEqual(session_kv_server._proposal_state(fresh_url, 5), "open")
+        urls_read = [call.args[2] for call in forge.call.call_args_list]
+        self.assertNotIn(stale_url.rsplit("/pull/", 1)[0], urls_read)
+        self.assertIn(fresh_url.rsplit("/pull/", 1)[0], urls_read)
+        self.assertNotIn(stale_url, pool._in_flight)
+
     def test_the_pull_request_constants_match_the_plugin_that_writes_them(self):
         plugin_path = Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
         spec = importlib.util.spec_from_file_location("pr_opened_constants", plugin_path)
@@ -3343,35 +3375,31 @@ class TestWorkloadFoldQueryPlans(unittest.TestCase):
 # busy fleet reaches in days (LEDGER_MAX_ROWS).
 _BENCH_SMALL_ROWS = 1_000
 _BENCH_LARGE_ROWS = 200_000
-# Lookups timed per size; p99 over them is the next-to-slowest sample.
-_BENCH_LOOKUPS = 100
-_BENCH_SESSIONS = 30
-# The bound at the cap is the larger of a floor and a multiple of the same
-# measurement on the small ledger, so a loaded runner that slows both alike
-# still passes and a scan that slows only the large one still fails. Measured
-# on a laptop: indexed p99 1.6 ms and 15 ms at the cap against 0.9 ms and
-# 1.2 ms at a thousand rows; unindexed, 67 ms and 681 ms at the cap.
-_BENCH_LOOKUP_P99_FLOOR_S = 0.05
-# POST /sessions commits a row and runs the ledger cleanup, so its floor is an
-# fsync, which a CI disk can take a tenth of a second over; the bound is on
-# growth with the ledger, not the disk.
-_BENCH_SESSION_P99_FLOOR_S = 0.5
-_BENCH_GROWTH_LIMIT = 5
+# Calls counted per size; the count is deterministic, so a few suffice.
+_BENCH_LOOKUPS = 20
+_BENCH_SESSIONS = 5
+# The cost measured is SQLite virtual-machine steps (a progress handler called
+# once per step), not wall time: the machine's load cannot move it, and a
+# scan's growth with the table cannot hide in it. Measured: indexed, the
+# anchor lookup takes 337 steps at both sizes and the open-fix lookup 443 and
+# 880 (the EXISTS runs once per candidate incident); unindexed, 5,149 and
+# 8,180 steps at a thousand rows become 971,930 and 16,772,056 at the cap.
+# A lookup at the cap may cost this many times its cost at a thousand rows,
+# and never more than the ceiling, which an unindexed read at the cap passes
+# by two orders of magnitude.
+_BENCH_GROWTH_LIMIT = 4
+_BENCH_STEP_CEILING = 10_000
 # How many distinct workloads the rows spread over, per cluster and namespace.
 _BENCH_WORKLOADS = 500
 
 
-def _p99(samples):
-    ordered = sorted(samples)
-    return ordered[min(len(ordered) - 1, int(len(ordered) * 0.99))]
-
-
 class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
-    """The fold's lookups and POST /sessions stay fast as the ledger grows to its cap.
+    """The fold's lookups and POST /sessions do not grow with the ledger up to its cap.
 
     Ties the index change to the symptom the fleet saw (inject latency growing
-    with the ledger): each lookup's p99 on a 200,000-row ledger stays under a
-    budget a full scan cannot meet.
+    with the ledger): the work each lookup does on a 200,000-row ledger is
+    bounded by a multiple of its work on a 1,000-row one, counted in SQLite
+    steps rather than seconds so a loaded runner reads the same as an idle one.
     """
 
     @classmethod
@@ -3405,38 +3433,54 @@ class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
         return path
 
     def _measure(self, rows):
+        """The most SQLite steps one call of each kind took on a ledger of `rows`."""
         from fastapi.testclient import TestClient
 
         path = self._ledger(rows)
         client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
-        timings = {"anchor": [], "open_fix": [], "sessions": []}
+        steps = {"n": 0}
+        real_connect = sqlite3.connect
+
+        def counting_connect(db_path, *args, **kwargs):
+            conn = real_connect(db_path, *args, **kwargs)
+
+            def tick():
+                steps["n"] += 1
+                return 0
+
+            conn.set_progress_handler(tick, 1)
+            return conn
+
+        def worst_of(count, call):
+            most = 0
+            for i in range(count):
+                steps["n"] = 0
+                call(i)
+                most = max(most, steps["n"])
+            return most
+
         with patch.object(session_kv_server, "SESSION_KV_DB_PATH", path), \
                 patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 3600), \
-                patch.object(session_kv_server, "_incident_pull_request_urls", return_value=[]):
-            for i in range(_BENCH_LOOKUPS):
-                key = f"w{(i * 37) % _BENCH_WORKLOADS}"
-                start = time.perf_counter()
-                session_kv_server._workload_incident_anchor("c1", "ns1", "Pod", key, "Warning")
-                timings["anchor"].append(time.perf_counter() - start)
-                start = time.perf_counter()
-                session_kv_server._open_fix_pull_request("c1", "ns1", "Pod", key, "BackOff", "Warning")
-                timings["open_fix"].append(time.perf_counter() - start)
-            for _ in range(_BENCH_SESSIONS):
-                start = time.perf_counter()
-                self.assertEqual(client.post("/sessions").status_code, 201)
-                timings["sessions"].append(time.perf_counter() - start)
-        return {name: _p99(samples) for name, samples in timings.items()}
+                patch.object(session_kv_server, "_incident_pull_request_urls", return_value=[]), \
+                patch.object(session_kv_server.sqlite3, "connect", side_effect=counting_connect):
+            key = lambda i: f"w{(i * 37) % _BENCH_WORKLOADS}"  # noqa: E731
+            return {
+                "anchor": worst_of(_BENCH_LOOKUPS, lambda i: session_kv_server._workload_incident_anchor(
+                    "c1", "ns1", "Pod", key(i), "Warning")),
+                "open_fix": worst_of(_BENCH_LOOKUPS, lambda i: session_kv_server._open_fix_pull_request(
+                    "c1", "ns1", "Pod", key(i), "BackOff", "Warning")),
+                "sessions": worst_of(_BENCH_SESSIONS, lambda i: self.assertEqual(
+                    client.post("/sessions").status_code, 201)),
+            }
 
-    def test_p99_stays_bounded_from_a_thousand_rows_to_the_cap(self):
+    def test_the_work_stays_bounded_from_a_thousand_rows_to_the_cap(self):
         small = self._measure(_BENCH_SMALL_ROWS)
         large = self._measure(_BENCH_LARGE_ROWS)
-        floors = {"anchor": _BENCH_LOOKUP_P99_FLOOR_S, "open_fix": _BENCH_LOOKUP_P99_FLOOR_S,
-                  "sessions": _BENCH_SESSION_P99_FLOOR_S}
-        for name, floor in floors.items():
+        for name in ("anchor", "open_fix", "sessions"):
             with self.subTest(lookup=name):
-                self.assertLess(large[name], max(floor, _BENCH_GROWTH_LIMIT * small[name]),
-                                f"p99 {name}: {small[name]:.6f}s at {_BENCH_SMALL_ROWS} rows, "
-                                f"{large[name]:.6f}s at {_BENCH_LARGE_ROWS}")
+                detail = f"{name}: {small[name]} steps at {_BENCH_SMALL_ROWS} rows, {large[name]} at {_BENCH_LARGE_ROWS}"
+                self.assertLessEqual(large[name], _BENCH_GROWTH_LIMIT * small[name], detail)
+                self.assertLess(large[name], _BENCH_STEP_CEILING, detail)
 
 
 class TestSessionKvServerQueryBuilding(unittest.TestCase):

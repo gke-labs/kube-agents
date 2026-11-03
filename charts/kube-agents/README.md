@@ -979,10 +979,11 @@ gives each setting's meaning and default.
 `platformAgent.deployment.incidentWorkloadDedupSeconds` is the window in which a broken workload's
 later events fold into its open incident, rendered as the `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry
 in `spec.deployment.env`. It defaults to `3600`, so a default render carries that entry; `0` turns
-folding off, the most is `86400`, and `null` renders no entry and leaves the agent image's own
-default, the same hour. The same precedence rules as the ceilings apply: an entry of that name in
-`platformAgent.deployment.env` wins, and a `valueFrom` entry for it fails the render while the key
-is set. The
+folding off, the most is `86400`, and `null` renders no entry and leaves the default the operator
+renders into the agent container, the same hour. The same precedence rules as the ceilings apply:
+an entry of that name in `platformAgent.deployment.env` wins, and a `valueFrom` entry for it fails
+the render while the key is set. A re-tag to a chart that does not declare the key, after it was
+set, needs `upgrade.sh --drop-undeclared-values`. The
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#one-incident-per-workload)
 has the fold rules.
 

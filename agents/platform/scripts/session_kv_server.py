@@ -388,8 +388,9 @@ TRIAGE_NOTICE_BY_SOURCE = {
 # The opt-in that has an event triage open the pull request for its recommended
 # fix instead of waiting for a human `apply`. An install opts in with a
 # `spec.deployment.env` entry (chart: `platformAgent.deployment.env`), which the
-# operator's allowlist (`safeSandboxEnvOverrides`) passes to this container, the
-# same path INCIDENT_WORKLOAD_DEDUP_SECONDS takes; an install that never sets it
+# operator's allowlist (`safeSandboxEnvOverrides`) passes to this container, as
+# it passes INCIDENT_WORKLOAD_DEDUP_SECONDS; unlike that window, which the
+# operator renders at its default on every pod, an install that never sets this
 # renders the same pod as before. Read per call rather than at import, so a
 # test can flip it.
 INCIDENT_TRIAGE_OPEN_PR_ENV = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
@@ -1661,8 +1662,11 @@ def init_db() -> None:
                 "ON intercepted_events (session_id)"
             )
             # The workload fold's lookups, both on the inject route and the
-            # first under _WORKLOAD_FOLD_LOCK, so every event waited on them:
-            # without these each is a scan of the whole ledger, and the route's
+            # first under _WORKLOAD_FOLD_LOCK, so every event waited on them.
+            # Without these the open-fix lookup and the start-up clear below
+            # scanned the whole ledger, and the anchor lookup ranged over the
+            # window's rows through idx_intercepted_events_created_at and
+            # sorted them, growing with the hour's event rate; the route's
             # latency grew with the table until the watcher's inject timed out.
             # Partial, so each holds only the rows that can answer: an anchor
             # has a fold_key (the start-up clear below empties the first index
@@ -2147,11 +2151,19 @@ def _incident_pull_request_urls(session_id: str) -> list[str]:
 
 
 class _FixPullRequestLookup:
-    """One pull request's state read in flight: whoever asks for the URL waits on it."""
+    """One pull request's state read in flight: whoever asks for the URL waits on it.
+
+    `waiters` and `queued_at` are guarded by the pool's lock: a lookup still
+    queued when its last waiter has given up and FIX_PR_LOOKUP_TIMEOUT_S has
+    passed is dropped unread, so a forge brownout does not leave the workers
+    draining stale reads ahead of fresh callers.
+    """
 
     def __init__(self) -> None:
         self.done = threading.Event()
         self.state: Optional[str] = None
+        self.waiters = 0
+        self.queued_at = time.monotonic()
 
 
 class _FixPullRequestLookupPool:
@@ -2167,7 +2179,9 @@ class _FixPullRequestLookupPool:
     within the window is answered from the cache, and callers that arrive while
     a read is in flight wait on that read rather than starting their own. Only
     a state the forge gave is cached; a failed or abandoned read leaves nothing
-    behind, so the next caller asks again.
+    behind, so the next caller asks again. A read that has started when its
+    callers give up still lands in the cache; one still queued once every
+    caller has gone and the search budget has passed is dropped unread.
     """
 
     def __init__(self, workers: int, queue_max: int, ttl_s: float):
@@ -2199,7 +2213,13 @@ class _FixPullRequestLookupPool:
                     logger.warning(f"Could not read the state of {url}: {self._queue.maxsize} lookups already waiting")
                     return None
                 self._in_flight[url] = lookup
-        if not lookup.done.wait(timeout):
+            lookup.waiters += 1
+        try:
+            answered = lookup.done.wait(timeout)
+        finally:
+            with self._lock:
+                lookup.waiters -= 1
+        if not answered:
             logger.warning(f"Could not read the state of {url} within {timeout:.1f}s")
             return None
         return lookup.state
@@ -2212,6 +2232,13 @@ class _FixPullRequestLookupPool:
     def _work(self) -> None:
         while True:
             url, lookup = self._queue.get()
+            with self._lock:
+                stale = lookup.waiters == 0 and time.monotonic() - lookup.queued_at > FIX_PR_LOOKUP_TIMEOUT_S
+                if stale and self._in_flight.get(url) is lookup:
+                    del self._in_flight[url]
+            if stale:
+                lookup.done.set()
+                continue
             state = None
             try:
                 state = _read_proposal_state(url)

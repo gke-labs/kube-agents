@@ -74,7 +74,8 @@ class SchemaDeclaresTheKeyTest(unittest.TestCase):
 
     def test_the_operator_and_daemon_carry_the_same_default(self):
         manifests = (_REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go").read_text()
-        self.assertIn(f'incidentWorkloadDedupDefaultSeconds = "{_DEFAULT_SECONDS}"', manifests)
+        # gofmt may re-pad the `=` column, so the spacing is not pinned.
+        self.assertRegex(manifests, rf'incidentWorkloadDedupDefaultSeconds\s*=\s*"{_DEFAULT_SECONDS}"')
         daemon = (_REPO_ROOT / "agents" / "platform" / "scripts" / "session_kv_server.py").read_text()
         self.assertIn(f"INCIDENT_WORKLOAD_DEDUP_DEFAULT_SECONDS = {_DEFAULT_SECONDS}\n", daemon)
         self.assertIn(f"INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS = {_MAX_SECONDS}\n", daemon)

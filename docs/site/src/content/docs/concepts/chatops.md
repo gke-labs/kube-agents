@@ -656,7 +656,7 @@ The same workload means the same cluster, namespace and kind, and either the sam
 
 A Critical event after a Warning alert is announced, so a workload that gets worse is announced again. A restart of the agent pod ends every open window, so the first event after one is announced again, unless its fix is waiting for review (below). The feed `GET /v1/intercepted-events` lists a folded event with the status `folded`. The value is a whole number of seconds; `0` turns folding off, a larger value than `86400` counts as `86400`, a negative value counts as `0`, and a value that is not a number counts as the default.
 
-Change it with the chart value `platformAgent.deployment.incidentWorkloadDedupSeconds`, which renders the entry into the CR's `spec.deployment.env`, or set that entry yourself on an install that no chart manages. `0` turns folding off:
+Change it with the chart value `platformAgent.deployment.incidentWorkloadDedupSeconds`, which renders the entry into the CR's `spec.deployment.env`, or set that entry yourself on an install that no chart manages. On an install made with `install.sh`, put the value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={deployment={incidentWorkloadDedupSeconds=0}}}'`. `0` turns folding off:
 
 ```yaml
 platformAgent:
@@ -664,13 +664,13 @@ platformAgent:
     incidentWorkloadDedupSeconds: 0
 ```
 
-An entry named `INCIDENT_WORKLOAD_DEDUP_SECONDS` in `platformAgent.deployment.env` wins over the key. The daemon keeps three indexes on its event ledger for the fold's lookups, so the window costs the inject route the same at an empty ledger as at its row cap.
+An entry named `INCIDENT_WORKLOAD_DEDUP_SECONDS` in `platformAgent.deployment.env` wins over the key. A change to the window restarts the agent pod and the credential-proxy pod, and the first apply that renders the entry replaces entries added to the CR's `spec.deployment.env` by hand, as the ceilings paragraph above describes.
 
 With folding on, a workload that breaks again after the window, while the pull request the agent opened automatically to fix one of its recent incidents (`INCIDENT_TRIAGE_OPEN_PULL_REQUEST`) is still open for review, also starts no new triage turn. This covers any object that comes back under the same workload: a Deployment's new pods, and a StatefulSet pod, bare pod or other object that comes back under the same name. A pull request a person opened by hand, or one opened for anything else asked in the incident's thread, does not count.
 
 A fix opened by replying `apply` or clicking an option button in the incident's own thread holds a recurrence the same way. The hold counts the first card for the Platform Agent filed from that thread within 30 minutes of the reply. A later card in the thread does not count, and neither does an `apply` typed in the main space or the first reply in a Google Chat direct message, which is answered at top level. Under `spec.mode: next`, an `apply` on the platform the A2A gateway holds is not recorded and does not hold.
 
-With folding on by default, an install that opens fix pull requests runs this lookup for every new incident. At most four forge reads run at a time, and each pull request's state is reused for a minute. The whole search gets eight seconds, after which the event is announced as a new incident.
+With folding on by default, an install that opens fix pull requests runs this lookup for every new incident. The search is bounded, and a forge that does not answer in time announces the event as a new incident.
 
 The hold covers the same fault only: the event's reason must be one the incident showed, its own or one folded into it, so a workload waiting on a fix for `BackOff` that starts failing `Unhealthy` gets a new incident. For the same fault, the incident's chat thread gets one short reminder per window instead, naming the pull request: the fault is already diagnosed and its fix is waiting on a person. Once that pull request is merged or closed, the next new failure is a new incident again. The feed `GET /v1/intercepted-events` lists such an event as `folded`, with the pull request in its `pull_request` field.
 
@@ -682,7 +682,7 @@ By default, a triage report proposes GitOps fixes and stops. A human replies `ap
 
 Once the report is complete, the second card opens only the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`, changing only the files that option calls for and leaving alternative options and unrelated definitions untouched. Any other value, or no value, keeps the default.
 
-Set it the same way as `INCIDENT_WORKLOAD_DEDUP_SECONDS`, as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+Set it as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
 
 ```yaml
 platformAgent:
