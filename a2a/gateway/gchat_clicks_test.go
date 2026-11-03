@@ -406,9 +406,9 @@ func TestGchatTypedReplyAnswersAndEditsClose(t *testing.T) {
 		t.Errorf("a click after a typed answer: %q", reason)
 	}
 
-	// Asked again on the side thread: a click's event names the top-level
-	// DM (the bot's message is no thread reply to Chat), but the question
-	// binds its click to the conversation it was posted in.
+	// Asked again in the DM thread: a click's event surface names the
+	// message's thread, and the click binds to the conversation the
+	// remembered question was posted in.
 	if err := a.EditMessage(side, "spaces/_c2fixtureAA/messages/BOT1.BOT1", OutMessage{Text: "fallback", Chat: question}); err != nil {
 		t.Fatal(err)
 	}

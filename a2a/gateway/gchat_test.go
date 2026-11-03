@@ -29,7 +29,7 @@ func TestGchatConversationIDRoundTrip(t *testing.T) {
 		wantSpace, wantThread string
 	}{
 		{"top-level dm binds the space", "spaces/AAA", "", "dm", "gchat:dm/spaces/AAA", "spaces/AAA", ""},
-		{"dm side thread binds the thread", "spaces/AAA", "spaces/AAA/threads/BBB", "dm", "gchat:dm/spaces/AAA/threads/BBB", "spaces/AAA", "spaces/AAA/threads/BBB"},
+		{"dm thread binds the thread", "spaces/AAA", "spaces/AAA/threads/BBB", "dm", "gchat:dm/spaces/AAA/threads/BBB", "spaces/AAA", "spaces/AAA/threads/BBB"},
 		{"threaded space binds the thread", "spaces/AAA", "spaces/AAA/threads/BBB", "group", "gchat:spaces/AAA/threads/BBB", "spaces/AAA", "spaces/AAA/threads/BBB"},
 		{"unthreaded space binds the space", "spaces/CCC", "", "group", "gchat:space/spaces/CCC", "spaces/CCC", ""},
 	}
@@ -164,12 +164,14 @@ func TestGchatDMTopLevelMark(t *testing.T) {
 	space := gchatMsg("spaces/S1", "SPACE", "THREADED_MESSAGES", "spaces/S1/threads/T9", "spaces/S1/messages/M3", "@Kage x", " x", "u2@example.com", "HUMAN")
 	legacy := gchatMsg("spaces/D2", "", "", "", "spaces/D2/messages/M4", "hi", "", "u1@example.com", "HUMAN")
 	legacy.Space.Type = "DM"
+	unthreaded := gchatMsg("spaces/D3", "DIRECT_MESSAGE", "UNTHREADED_MESSAGES", "spaces/D3/threads/T3", "spaces/D3/messages/M5", "hi", "", "u1@example.com", "HUMAN")
 	for _, tc := range []struct {
 		name string
 		ev   *gchatEvent
 		want bool
 	}{
-		{"top-level DM", top, true}, {"thread reply", reply, false}, {"space message", space, false}, {"legacy DM with no thread", legacy, true},
+		{"top-level DM", top, true}, {"thread reply", reply, false}, {"space message", space, false}, {"legacy DM with no thread", legacy, false},
+		{"unthreaded DM space", unthreaded, false},
 	} {
 		msg, reason := a.classify(tc.ev)
 		if reason != "" || msg.TopLevel != tc.want {
@@ -399,7 +401,7 @@ func TestGchatPostThreadsAndTranslates(t *testing.T) {
 	side := f.call(2)
 	if side.arguments["parent"] != "spaces/D1" || side.arguments["body"].(map[string]any)["thread"].(map[string]any)["name"] != "spaces/D1/threads/T2" ||
 		side.arguments["messageReplyOption"] != gchatReplyOption {
-		t.Errorf("a DM side-thread post must reply in its thread: %+v", side.arguments)
+		t.Errorf("a thread reply in a DM must post in its thread: %+v", side.arguments)
 	}
 
 	if _, err := a.Post("discord:1/2", "x"); err == nil {

@@ -58,8 +58,9 @@ type InboundMessage struct {
 	TaskID string
 	// TopLevel marks a message that roots a conversation of its own in a
 	// space whose questions each get their own thread, rather than one
-	// typed inside a thread: a top-level Slack or Google Chat DM, which the
-	// adapter keys on its own message id or thread. Such a conversation
+	// typed inside a thread: a top-level Slack DM, or a top-level Google
+	// Chat DM whose message has a thread of its own, which the adapter keys
+	// on its own message id or thread. Such a conversation
 	// has nothing running in it, so a stop or a status question there gets
 	// a reply saying where to send it instead of being read as an ask.
 	// False is every other message, and every other backend's case.
