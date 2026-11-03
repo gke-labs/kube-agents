@@ -241,6 +241,21 @@ class AgentAPIProxyTest(unittest.TestCase):
             connection.request("GET", "/health", headers={"Authorization": "Bearer external-secret"})
             self.assertEqual(200, connection.getresponse().status)
 
+    def test_an_idle_door_connection_is_a_debug_line_not_an_access_log_line(self):
+        # The stdlib reports the idle timeout through log_error, which on
+        # the door went to log_message: an INFO line shaped like an access
+        # log entry for every peer that connected and sent nothing.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                with socket.create_connection(("127.0.0.1", self.proxy.server_port), timeout=_CLOSE_WAIT_SECONDS) as silent:
+                    self.assertEqual(b"", silent.recv(1), "the silent connection was not closed")
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+        self.assertFalse(
+            any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output
+        )
+        self.assertFalse(any(line.startswith("INFO:") for line in logs.output), logs.output)
+        self.assertTrue(any(line.startswith("DEBUG:") and "closed idle" in line for line in logs.output), logs.output)
+
     def _seed_state_db_sessions(self, rows, profile=None):
         import sqlite3
 
@@ -15652,6 +15667,11 @@ _REFUSAL_BURST = 3
 # The small cap the saturation test builds its server with.
 _SMALL_THREAD_CAP = 4
 _KEEPALIVE_REQUESTS = 5
+# A _json body a caller that never reads cannot be written in full: wider than
+# a Unix socket's buffers, so the write blocks and the deadline ends it.
+_UNREAD_RESPONSE_BYTES = 8 << 20
+# How much of an announced body the stalled-request test sends before stopping.
+_STALLED_BODY_LENGTH = 100
 # A refusal drain made longer than the close wait: a test that reads a
 # second refusal inside the close wait while a first drain is parked for this
 # long shows the accept loop was not the thread doing the waiting.
@@ -15853,6 +15873,51 @@ class KeepAliveTest(_CredentialedUnixServer):
             any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output
         )
         self.assertTrue(any(line.startswith("DEBUG:") and "closed idle" in line for line in logs.output), logs.output)
+
+    def test_a_request_that_stalls_mid_body_is_logged_as_stalled_not_idle(self):
+        # The same socket timeout ends the idle wait and a body that stops
+        # arriving; the stdlib reports both the same way. A request that
+        # arrived and went unanswered is a warning naming it, never the
+        # idle close's debug line.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            sock = self.connect()
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                self.send(sock, "POST", "/v1/exec", self.SHELL, [f"Content-Length: {_STALLED_BODY_LENGTH}"], b'{"argv":')
+                self.assertTrue(self.closed_by_server(sock))
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+        stalled = [line for line in logs.output if "request stalled" in line]
+        self.assertEqual(1, len(stalled), logs.output)
+        self.assertTrue(stalled[0].startswith("WARNING:"), stalled[0])
+        self.assertIn("POST /v1/exec HTTP/1.1", stalled[0])
+        self.assertFalse(any("closed idle" in line for line in logs.output), logs.output)
+        self.assertFalse(
+            any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output
+        )
+
+    def test_a_caller_that_stops_reading_a_response_has_its_connection_closed(self):
+        # _json gives the write up at RESPONSE_WRITE_TIMEOUT_SECONDS. The
+        # response is then incomplete on the wire, so the connection cannot
+        # carry another request: it must close, not loop into the idle wait
+        # holding its thread and slot with a truncated response on it.
+        payload = {"status": "ok", "padding": "a" * _UNREAD_RESPONSE_BYTES}
+        with (
+            mock.patch.object(credential_proxy, "HEALTHZ_PAYLOAD", payload),
+            mock.patch.object(credential_proxy, "RESPONSE_WRITE_TIMEOUT_SECONDS", _SHORT_IDLE_SECONDS),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            sock = self.connect()
+            self.send(sock, "GET", "/healthz")
+            deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+            while not any("response not delivered" in line for line in logs.output):
+                self.assertLess(time.monotonic(), deadline, "the write to a caller that never reads was not given up on")
+                time.sleep(0.1)
+        # What was written is drained; EOF follows it on a closed connection,
+        # and the recv times out on one kept open for its next request.
+        try:
+            while sock.recv(1 << 16):
+                pass
+        except TimeoutError:
+            self.fail("the connection was kept open after the response write was given up on")
 
     def test_the_idle_timeout_is_under_envoys(self):
         # Envoy, the only client, must close an idle connection first, or it

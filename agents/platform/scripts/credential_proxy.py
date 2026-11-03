@@ -869,9 +869,9 @@ LISTEN_BACKLOG = 4096
 # connection is never the side that just closed it; this is the backstop for
 # a peer that does not, and the door's peers are under no such discipline.
 KEEPALIVE_IDLE_SECONDS = 60
-# How the stdlib's handle_one_request reports the socket timeout to
-# log_error ("Request timed out: %r"); the handler's log_error recognises an
-# idle close by it.
+# How the stdlib's handle_one_request reports every socket timeout on the
+# connection to log_error ("Request timed out: %r"); _log_socket_timeout
+# reads which it was off raw_requestline.
 IDLE_CLOSE_LOG_PREFIX = "Request timed out"
 # The most connections the credentialed listeners (the Unix socket or TCP
 # port behind Envoy, and the agent API door) hold a thread for at once. The
@@ -4527,7 +4527,10 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         # the peer kept it open. The stdlib reports the timeout through
         # log_error and closes; every served response here says
         # `Connection: close`, so a kept-open connection is only ever one
-        # that has not sent a request.
+        # that has not sent a request. raw_requestline is emptied first so
+        # that log_error can tell that idle close from a request that
+        # stalled (_log_socket_timeout).
+        self.raw_requestline = b""
         with contextlib.suppress(OSError):
             self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
         try:
@@ -4535,6 +4538,14 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         except OSError as exc:
             self.close_connection = True
             LOGGER.debug("api request not answered type=%s", type(exc).__name__)
+
+    def log_error(self, message: str, *args: Any) -> None:
+        # The stdlib reports the socket timeout through log_error, which
+        # without this override reaches log_message: an access-log-shaped
+        # INFO line per idle connection closed at KEEPALIVE_IDLE_SECONDS.
+        if _log_socket_timeout(self, message, args):
+            return
+        super().log_error(message, *args)
 
     def do_GET(self) -> None:  # noqa: N802
         self._proxy()
@@ -11549,6 +11560,37 @@ def _sanitized_log_args(args: tuple[Any, ...], max_length: int = 512) -> tuple[A
     )
 
 
+def _log_socket_timeout(handler: BaseHTTPRequestHandler, message: str, args: tuple[Any, ...]) -> bool:
+    """Log the stdlib's report of a socket timeout for what it was; False for any other message.
+
+    The stdlib's handle_one_request catches every TimeoutError raised under
+    it, the wait for a request line and a body read or a direct write inside
+    a route alike, and reports each through log_error as
+    IDLE_CLOSE_LOG_PREFIX. Which it was is read off raw_requestline: the
+    credentialed handler and the agent API door empty it before each request
+    line is read and the stdlib assigns it as its first statement, so it is
+    still empty only when the timeout hit while waiting for a request line.
+    That is the idle close at KEEPALIVE_IDLE_SECONDS, a connection ending as
+    a peer's EOF does, and a debug line rather than an access-log-shaped INFO
+    line per idle connection. Otherwise a request arrived and stalled before
+    its response was on the wire; it went unanswered, and is a warning naming
+    it. requestline is the stdlib's copy of the request line, caller text,
+    sanitised as log_message sanitises it.
+    """
+    if not message.startswith(IDLE_CLOSE_LOG_PREFIX):
+        return False
+    kind = type(args[0]).__name__ if args else ""
+    if getattr(handler, "raw_requestline", b""):
+        LOGGER.warning(
+            "request stalled before its response requestline=%s type=%s",
+            *_sanitized_log_args((getattr(handler, "requestline", ""),)),
+            kind,
+        )
+    else:
+        LOGGER.debug("connection closed idle type=%s", kind)
+    return True
+
+
 def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | None:
     """The blocked-response body for `argv`, or None if it may run.
 
@@ -15126,8 +15168,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # path is cleared here too: the stdlib's parse_request resets the
         # command and never the path, so on a kept-open connection a request
         # line it rejects (a 400, a 414, a 431) would otherwise be counted
-        # by log_request under the previous request's route.
+        # by log_request under the previous request's route. raw_requestline
+        # is emptied for log_error, which reads it to tell the idle close from
+        # a request that stalled (_log_socket_timeout).
         self.path = ""
+        self.raw_requestline = b""
         with contextlib.suppress(OSError):
             self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
         try:
@@ -15263,14 +15308,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
     def log_error(self, message: str, *args: Any) -> None:
         # The stdlib's handle_one_request catches the socket timeout itself
-        # and reports it here: on a kept-open connection that is the idle
-        # close at KEEPALIVE_IDLE_SECONDS, a connection ending as a peer's
-        # EOF does, not a request that went unanswered, so it is the same
-        # debug line and never an access-log-shaped INFO line per idle
-        # connection. Everything else log_error carries (send_error's code
-        # and message) goes on to log_message as before.
-        if message.startswith(IDLE_CLOSE_LOG_PREFIX):
-            LOGGER.debug("connection closed idle type=%s", type(args[0]).__name__ if args else "")
+        # and reports it here, the idle close at KEEPALIVE_IDLE_SECONDS and a
+        # request that stalled mid-body or mid-write alike;
+        # _log_socket_timeout tells them apart and logs each for what it is.
+        # Everything else log_error carries (send_error's code and message)
+        # goes on to log_message as before.
+        if _log_socket_timeout(self, message, args):
             return
         super().log_error(message, *args)
 
@@ -15314,6 +15357,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 len(body),
                 type(exc).__name__,
             )
+            # The response is incomplete on the wire, so nothing further can
+            # be framed on this connection: it closes rather than parking in
+            # the idle wait with a thread, a slot and a truncated response.
+            self.close_connection = True
 
     def _session_slot(self, role: str) -> contextlib.AbstractContextManager:
         """The session, profile or scope role's bounded share, or nothing for every other role."""

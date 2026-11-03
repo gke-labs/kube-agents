@@ -8,6 +8,7 @@ only the connections are pointed at the fakes and the token is fixed.
 
 import http.client
 import json
+import socket
 import threading
 import time
 import unittest
@@ -278,6 +279,27 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         body = response.read()
         self.assertEqual(["e1", "e2"], [json.loads(line)["object"]["metadata"]["name"] for line in body.splitlines()])
         connection.close()
+
+    def test_a_get_carrying_a_body_on_the_cloud_passthrough_announces_its_close(self):
+        # The Cloud API passthrough writes its response without _json, and a
+        # GET reads no body, so a GET that announces one leaves it unread:
+        # the response must say `Connection: close` and the connection close
+        # after it, or the body is read as the next request line.
+        path = "/v1/watcher/gcp/container.googleapis.com/v1/projects/kagents-dev/locations/us-east4/clusters/fleet-a?alt=json&prettyPrint=false"
+        body = b'{"unread":true}'
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            sock.sendall(
+                f"GET {path} HTTP/1.1\r\nHost: broker\r\nAuthorization: Bearer watcher-token\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+            )
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            relayed = response.read()
+            self.assertEqual(200, response.status, relayed)
+            self.assertEqual("close", (response.getheader("Connection") or "").lower(), response.getheaders())
+            self.assertEqual(b"", sock.recv(1), "the connection stayed open")
+        [(method, upstream_path, _, _)] = self.google_requests
+        self.assertEqual((method, upstream_path), ("GET", "/v1/projects/kagents-dev/locations/us-east4/clusters/fleet-a?alt=json&prettyPrint=false"))
 
     def test_secrets_writes_and_other_lists_never_reach_the_api_server(self):
         for method, path in (
