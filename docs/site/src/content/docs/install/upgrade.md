@@ -312,6 +312,10 @@ The operator moves before the harness because the operator owns the resources th
 Every mode needs the `kube-agents` Helm release to exist in the target namespace; an install
 without one predates the Terraform and Helm engine, and has to be re-installed to adopt it.
 
+A `helm upgrade` run by hand, for example with the
+[fleet example values file](/kube-agents/deploy/fleet-sizing/#applying-it), applies no CRDs
+either: apply `crds/` with `kubectl` first, as the operator mode does.
+
 ## Choosing what the run targets
 
 A release copy of the script carries the version it upgrades to, which is what makes the one-liner
