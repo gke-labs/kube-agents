@@ -313,7 +313,9 @@ class C1IsolationIsStructural(unittest.TestCase):
         ):
             decision = policy.evaluate_k8s("GET", target + path, one, metadata)
             self.assertFalse(decision.allowed, f"GET {path}?limit=1 is relayed as a count list")
-        for query in ({}, {"limit": ["2"]}, {"limit": ["1"], "labelSelector": ["app=web"]}, {"limit": ["1"], "watch": ["true"]}):
+        for query in (
+            {}, {"limit": ["0"]}, {"limit": ["2"]}, {"limit": ["1"], "labelSelector": ["app=web"]}, {"limit": ["1"], "watch": ["true"]},
+        ):
             decision = policy.evaluate_k8s("GET", target + "api/v1/pods", query, metadata)
             self.assertEqual(decision.rule_id, policy.RULE_K8S_QUERY, f"GET api/v1/pods with {query} is relayed")
         # The API server keeps the last duplicate parameter, so a second `as`

@@ -282,8 +282,14 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(headers["Accept"], metadata)
         # The policy reads the Accept the broker forwards, so an Accept the
         # forwarding shape drops (too long) is evaluated as absent: refused,
-        # not relayed as a list whose one item comes back whole.
-        for accept in (None, "application/json", metadata + ",application/json", metadata + ";" + "x" * 300):
+        # not relayed as a list whose one item comes back whole. The over-long
+        # one is metadata-only on every range, so the policy on its own admits
+        # it; only the coupling to the forwarded value refuses it, which is
+        # what a policy reading the raw header would get wrong.
+        overlong = ",".join([metadata] * 5)
+        self.assertTrue(watcher_policy.accepts_metadata_only(overlong))
+        self.assertFalse(credential_proxy.WATCHER_K8S_ACCEPT_SHAPE.match(overlong))
+        for accept in (None, "application/json", metadata + ",application/json", overlong):
             with self.subTest(accept=accept):
                 status, body = self._request(
                     "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/apis/apps/v1/deployments?limit=1",

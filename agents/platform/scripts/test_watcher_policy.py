@@ -330,8 +330,15 @@ class K8sTest(unittest.TestCase):
                 self.assertEqual(self.count("api/v1/pods", accept=accept).rule_id, w.RULE_K8S_ACCEPT)
 
     def test_a_count_list_carries_exactly_limit_one(self):
+        # The query is compared whole, so a limit below one (0, blank, -1: a
+        # "limit at most 1" would take them, and the server reads 0 and blank
+        # as no limit) and a spelling of one that is not "1" are refused too.
         for query in (
             {},
+            {"limit": ["0"]},
+            {"limit": [""]},
+            {"limit": ["-1"]},
+            {"limit": ["01"]},
             {"limit": ["2"]},
             {"limit": ["500"]},
             {"limit": ["1", "1"]},
