@@ -227,10 +227,7 @@ func TestRenderedDispatcherFixtures(t *testing.T) {
 	tse := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}
 	})
-	cm, _, err := buildA2AAuthMapConfigMap(agent, []agentv1alpha1.AgentProfile{tse})
-	if err != nil {
-		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
-	}
+	cm, _ := singleA2AAuthMapShard(t, agent, []agentv1alpha1.AgentProfile{tse})
 	checkFixture(t, dispatcherMapFixturePath, cm.Data[a2aAuthMapKey])
 	cfgMap, err := buildA2ADispatchConfigMap(agent, []agentv1alpha1.AgentProfile{tse})
 	if err != nil {
@@ -431,7 +428,7 @@ func TestATaskDeadlinePastTheCapIsClampedAndWarned(t *testing.T) {
 		}
 	}
 	env := map[string]string{}
-	for _, e := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0].Env {
+	for _, e := range buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers[0].Env {
 		env[e.Name] = e.Value
 	}
 	if env["A2A_TASK_CREDENTIAL_MAX_LIFETIME"] != "6h0m0s" {
@@ -442,7 +439,7 @@ func TestATaskDeadlinePastTheCapIsClampedAndWarned(t *testing.T) {
 	lowered.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{Profiles: &agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(900)}}}
 	cfg, _ = desiredDispatchConfig(lowered, []agentv1alpha1.AgentProfile{short})
 	env = map[string]string{}
-	for _, e := range buildA2ACalloutDeployment(lowered, "").Spec.Template.Spec.Containers[0].Env {
+	for _, e := range buildA2ACalloutDeployment(lowered, "", 1).Spec.Template.Spec.Containers[0].Env {
 		env[e.Name] = e.Value
 	}
 	lifetime, err := time.ParseDuration(env["A2A_TASK_CREDENTIAL_MAX_LIFETIME"])

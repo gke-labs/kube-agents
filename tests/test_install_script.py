@@ -5824,6 +5824,26 @@ class ServiceAccountOwnershipIsCheckedOnEveryApplyDoorTest(unittest.TestCase):
         self.assertLess(check, apply)
 
 
+class FootprintSummaryIsPrintedInTheStepElevenSummaryTest(unittest.TestCase):
+    """The footprint and modeled-cost block is part of the step 11 summary: after the
+    generator wrote the tfvars it reads, inside the summary, and before the dry-run exit
+    and the confirmation, so the dry run and the real run both show it."""
+
+    def setUp(self):
+        self.source = _INSTALL_SH.read_text()
+
+    def test_the_block_sits_between_the_summary_heading_and_the_dry_run_exit(self):
+        generator = self.source.index('write_tfvars_from_state "$tfvars_file" "$image_tag"')
+        summary = self.source.index('print_step "11. Pre-Flight Configuration Summary"', generator)
+        call = self.source.index('print_footprint_summary "$repo_dir" "$tfvars_file"', summary)
+        dry_run = self.source.index('if [ "$PARAM_DRY_RUN" = "true" ]; then', summary)
+        confirm = self.source.index("Proceed with automated GKE cluster & Platform Agent provisioning?", summary)
+        self.assertLess(summary, call)
+        self.assertLess(call, dry_run)
+        self.assertLess(dry_run, confirm)
+        self.assertEqual(self.source.count("print_footprint_summary "), 1)
+
+
 class FailedInitialReleaseIsClearedBeforeTheApplyTest(unittest.TestCase):
     """A retry after an apply that died inside the kube-agents release.
 
