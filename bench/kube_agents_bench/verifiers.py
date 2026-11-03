@@ -429,6 +429,16 @@ def _fold_line_decoration(line: str) -> str:
     return _VALUE_WRAP.sub(r"\1", trailed)
 
 
+def _fold_value(text: str) -> str:
+    """Normalize a value under decoration/argument folding.
+
+    Invisible format characters are stripped, inner underscores between word
+    characters are rewritten to hyphens, Markdown emphasis and backticks are
+    removed, whitespace runs are collapsed, and the result is lowercased.
+    """
+    return _normalize(_INNER_UNDERSCORE.sub("-", _INVISIBLE.sub("", text)))
+
+
 def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
     """``_normalize`` applied per line, newlines kept; with ``fold_decoration``
     each line's decoration is folded as well.
@@ -445,7 +455,7 @@ def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
     # boundary before its cluster name, while `_word_` emphasis, whose
     # underscores sit at a token's edges, is still deleted.
     lines = (
-        _normalize(_INNER_UNDERSCORE.sub("-", _INVISIBLE.sub("", line)) if fold_decoration else line)
+        _fold_value(line) if fold_decoration else _normalize(line)
         for line in text.splitlines()
     )
     if fold_decoration:
@@ -1769,6 +1779,20 @@ def _args_withheld(entry: dict[str, Any]) -> bool:
     return args == worker_trajectory.WITHHELD
 
 
+def _has_unescaped_ascii_uppercase(pattern: str) -> bool:
+    i = 0
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "\\":
+            i += 2
+            continue
+        if "A" <= c <= "Z":
+            return True
+        i += 1
+    return False
+
+
 @VERIFIERS.register("tool_called")
 class ToolCalledVerifier(BaseVerifier):
     """Count trajectory entries whose tool name is in ``tool_names``.
@@ -1836,16 +1860,18 @@ class ToolCalledVerifier(BaseVerifier):
 
     ``fold_arguments``: optional boolean, default False. When True, each
     argument value is normalized before matching against its pattern:
-    inner underscores between word characters are rewritten to hyphens (identical
-    to ``_INNER_UNDERSCORE`` in ``fold_decoration``) so tokens like
-    ``NO_REGISTERED_REPO`` match as ``no-registered-repo``, Markdown noise
-    (emphasis markers `*`, `_`, and backticks) is stripped, whitespace runs
-    are collapsed to a single space across the entire value (newlines become
-    spaces), boundary whitespace is stripped, and the result is lowercased.
-    Matching remains whole-value ``re.fullmatch``: unlike ``report_contains``
-    (which evaluates unanchored ``re.search`` across preserved line breaks),
-    patterns here match the full folded argument value and must use
-    wildcards (e.g. ``(?is).*...*``) if matching a substring phrase.
+    invisible format characters are stripped, inner underscores between word
+    characters are rewritten to hyphens (identical to ``_fold_value``) so
+    tokens like ``NO_REGISTERED_REPO`` match as ``no-registered-repo``,
+    Markdown noise (emphasis markers `*`, `_`, and backticks) is stripped,
+    whitespace runs are collapsed to a single space across the entire value
+    (newlines become spaces), boundary whitespace is stripped, and the result
+    is lowercased. Patterns carrying a literal ``_`` or ``` ` ```, or uppercase
+    letters without ``re.IGNORECASE``, are refused at spec load because the fold
+    makes them impossible to match. Matching remains whole-value ``re.fullmatch``:
+    unlike ``report_contains`` (which evaluates unanchored ``re.search`` across
+    preserved line breaks), patterns here match the full folded argument value
+    and must use wildcards (e.g. ``(?is).*...*``) if matching a substring phrase.
 
     ``result``: optional Python regular expression. When set, a call counts
     only if its recorded result, as a string, matches under ``re.search``: what
@@ -1942,7 +1968,7 @@ class ToolCalledVerifier(BaseVerifier):
             if name in args:
                 val = str(args[name])
                 if self.fold_arguments:
-                    val = _normalize(_INNER_UNDERSCORE.sub("-", val)).strip()
+                    val = _fold_value(val).strip()
                 if re.fullmatch(pattern, val) is None:
                     return False
                 continue
@@ -1975,6 +2001,19 @@ class ToolCalledVerifier(BaseVerifier):
             )
         if self.fold_arguments and self.arguments is None:
             raise ValueError("fold_arguments cannot be used without arguments")
+        if self.fold_arguments and self.arguments is not None:
+            for pattern in self.arguments.values():
+                if "_" in pattern or "`" in pattern:
+                    raise ValueError(
+                        f"arguments pattern {pattern!r} carries '_' or '`', which fold_arguments "
+                        "normalizes to '-' or strips; as written it can never match"
+                    )
+                compiled = re.compile(pattern)
+                if not (compiled.flags & re.IGNORECASE) and _has_unescaped_ascii_uppercase(pattern):
+                    raise ValueError(
+                        f"arguments pattern {pattern!r} carries uppercase characters without re.IGNORECASE; "
+                        "fold_arguments lowercases argument values, so as written it can never match"
+                    )
         return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:

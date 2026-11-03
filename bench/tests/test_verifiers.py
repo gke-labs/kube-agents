@@ -3105,6 +3105,75 @@ def test_tool_called_fold_arguments_strips_boundary_whitespace():
     assert check.verify(5.0).status == "pass"
 
 
+def test_tool_called_fold_arguments_strips_invisible_characters():
+    # Value contains zero-width space (\u200b) inside matched phrase
+    raw_reason = "No registered\u200b repository declares seeded-a."
+    transcript.set(
+        "done",
+        [
+            {
+                "name": "kanban_block",
+                "args": {"reason": raw_reason},
+                "status": "completed",
+                "agent": "platform",
+            }
+        ],
+    )
+    pattern = r"no registered repository declares seeded-a\."
+    check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+        fold_arguments=True,
+    )
+    assert check.verify(5.0).status == "pass"
+
+
+def test_tool_called_fold_arguments_refuses_patterns_with_underscores_or_backticks():
+    with pytest.raises(ValueError, match="carries '_' or '`'"):
+        ToolCalledVerifier(
+            type="tool_called",
+            tool_names=["kanban_block"],
+            arguments={"reason": r"(?is).*NO_REGISTERED_REPO.*"},
+            fold_arguments=True,
+        )
+    with pytest.raises(ValueError, match="carries '_' or '`'"):
+        ToolCalledVerifier(
+            type="tool_called",
+            tool_names=["kanban_block"],
+            arguments={"reason": r"`seeded-a`"},
+            fold_arguments=True,
+        )
+
+
+def test_tool_called_fold_arguments_refuses_uppercase_without_ignorecase():
+    with pytest.raises(ValueError, match="carries uppercase characters without re.IGNORECASE"):
+        ToolCalledVerifier(
+            type="tool_called",
+            tool_names=["kanban_block"],
+            arguments={"reason": r"No-registered-repo"},
+            fold_arguments=True,
+        )
+    # Permitted when re.IGNORECASE is present (e.g. (?i) or (?is))
+    check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        arguments={"reason": r"(?i)No-registered-repo"},
+        fold_arguments=True,
+    )
+    assert check.fold_arguments is True
+    # Escapes like \S are permitted without (?i)
+    check_escape = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        arguments={"reason": r"\bno-repo\s+\S+"},
+        fold_arguments=True,
+    )
+    assert check_escape.fold_arguments is True
+
+
 def test_tool_called_result_counts_only_the_calls_that_answered_so():
     spilled = "<persisted-output>\nThis tool result was too large (109,963 characters, 107.4 KB)."
     transcript.set(
