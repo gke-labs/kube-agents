@@ -73,6 +73,7 @@ from cluster_agent_profile import (
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
     create_profile,
     delete_profile,
+    delete_profiles,
     profile_name,
     kubeconfig_landed,
     list_profiles,
@@ -2195,6 +2196,9 @@ def reconcile(dry_run: bool = False) -> dict:
             consequence="inconclusive; the profile is kept",
         ))
     described.update({name: (True, "") for name in listed_alive})
+    # Pruned names, deleted together once the loop has judged every profile: their
+    # sandbox homes go in one mirror call rather than one each (#4574).
+    prune_queue: list[str] = []
     for name in profiles:
         identity = identities[name]
         if identity is None:
@@ -2221,7 +2225,7 @@ def reconcile(dry_run: bool = False) -> dict:
                 log(f"{name}: {identity['cluster']} is in {why} — WOULD prune (dry-run).")
             else:
                 log(f"{name}: {identity['cluster']} is in {why} — pruning.")
-                delete_profile(name)
+                prune_queue.append(name)
             report["pruned"].append(name)
             continue
 
@@ -2234,7 +2238,7 @@ def reconcile(dry_run: bool = False) -> dict:
                     log(f"{name}: project {project} left the scope — WOULD prune (dry-run).")
                 else:
                     log(f"{name}: project {project} left the scope — pruning.")
-                    delete_profile(name)
+                    prune_queue.append(name)
                 report["pruned"].append(name)
                 continue
             if management_changed and management_listed and project == previous_management:
@@ -2297,8 +2301,17 @@ def reconcile(dry_run: bool = False) -> dict:
         else:
             log(f"{name}: cluster {identity['cluster']} ({identity['project']}/{identity['location']}) "
                 f"is gone — pruning.")
-            delete_profile(name)
+            prune_queue.append(name)
         report["pruned"].append(name)
+
+    # Before anything below reads which homes are left. A name the batch skipped
+    # (its lock held) or could not delete stays in "pruned"; remaining_profiles
+    # counts it while its home is on disk, so its project stays retiring.
+    if prune_queue:
+        outcomes = delete_profiles(prune_queue)
+        undone = {name: outcome for name, outcome in outcomes.items() if outcome != "deleted"}
+        log(f"pruned {len(prune_queue) - len(undone)} of {len(prune_queue)} profile(s) here and in the sandbox"
+            + (f"; not fully: {', '.join(f'{n} ({o})' for n, o in sorted(undone.items()))}" if undone else ""))
 
     # A project absent from the resolved set whose only profiles were unreadable this run
     # was judged by nothing above; it is judged here by attribution, the same way a
