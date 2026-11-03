@@ -79,7 +79,7 @@ logger = logging.getLogger(__name__)
 #: path. ``test_pr_opened.py`` fails when the two drift.
 PROPOSAL_OPENED_KEY = "kube-agents.event"
 PROPOSAL_OPENED_EVENT = "proposal-opened"
-PROPOSAL_OPENED_FIELDS = ("url", "number", "title")
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title", "claim")
 
 #: ``kanban_progress_lines.PR_OPENED_KIND``: the event kind the notifier claims for it.
 PR_OPENED_KIND = "pr_opened"
