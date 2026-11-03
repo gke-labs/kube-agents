@@ -400,6 +400,10 @@ class TestClone(InspectRepositoryTestCase):
             "..copy.backup": False,
             "..copy.abc12345": False,
             "..copy.abc12345.def67890.bak": False,
+            # Eight characters, but not from mkdtemp's alphabet.
+            ".copy.cfg.data": False,
+            ".copy.ABCDEFGH": False,
+            "..copy.abc12345.ab-12345": False,
         }
         for name in names:
             (self.tmp / name).mkdir()
@@ -415,6 +419,18 @@ class TestClone(InspectRepositoryTestCase):
         self.assertTrue((self.tmp / ".copy.link1234").is_symlink())
         self.assertEqual((outside / "keep.txt").read_text(), "not staging\n")
         self.assertTrue((into / "README.md").is_file())
+
+    def test_a_destination_name_is_matched_as_text_not_as_a_pattern(self):
+        """`.` and `[` in --into's name are themselves: no wrong sibling, no refused clone."""
+        names = {".x.y.abc12345": True, ".xAy.abc12345": False}
+        for name in names:
+            (self.tmp / name).mkdir()
+            self.age(self.tmp / name)
+        self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "x.y")])
+        for name, removed in names.items():
+            self.assertEqual((self.tmp / name).exists(), not removed, name)
+        result = self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "repo[1")])
+        self.assertEqual(result["written"], 3)
 
     def test_a_leftover_that_cannot_be_removed_does_not_stop_the_clone(self):
         locked = self.tmp / ".copy.abc12345" / "locked"
