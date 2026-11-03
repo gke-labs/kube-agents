@@ -85,15 +85,18 @@ ADMISSION_BOUND_BACKGROUND = "background"
 RETRYABLE_BUSY_BOUNDS = frozenset(
     {"slot", "budget", ADMISSION_BOUND_BACKGROUND, ADMISSION_BOUND_DRAINING, "profile"}
 )
-# What `execute` prints on stderr, and exits with, when the broker answers
-# busy (a 429 or 503; the shim makes one request). A kanban worker's terminal result
-# reads the two back out of the command's result as a pressure signal to the
-# dispatcher (deploy/docker/patches/kanban_aimd.py, BUSY_LINE_PREFIX and
+# What `execute` prints on stderr, and exits with, when the broker's own busy
+# answer (BUSY_STATUS with BUSY_CODE in its JSON body, the pair `_busy_reply`
+# reads) is the one it ends on, after the one retry where one applies. A
+# kanban worker's terminal result reads the two back out of the command's
+# result as a pressure signal to the dispatcher
+# (deploy/docker/patches/kanban_aimd.py, BUSY_LINE_PREFIX and
 # BROKER_BUSY_EXIT; test_kanban_aimd pins the spellings), so both are a
 # contract, not a courtesy. The status is sysexits.h's EX_TEMPFAIL, "try again
 # later", which is what a busy broker means; the line and the status together
-# are the signal, so a log line a worker happens to read cannot forge it.
-BROKER_BUSY_STATUSES = (429, 503)
+# are the signal, so a log line a worker happens to read cannot forge it. A
+# 503 that is not the broker's busy JSON (Envoy's HTML while the sidecar
+# restarts) is the broker not answering, not busy: no line, exit 1 as before.
 BROKER_BUSY_LINE = "credential proxy busy (HTTP {code})"
 BROKER_BUSY_EXIT_FALLBACK = 75
 EXIT_BROKER_BUSY = getattr(os, "EX_TEMPFAIL", BROKER_BUSY_EXIT_FALLBACK)
@@ -1011,10 +1014,12 @@ def _busy_reply(exc: urllib.error.HTTPError) -> dict | None:
 def _exec_refused(exc: urllib.error.HTTPError, busy: dict | None) -> int:
     """Print a refusal from `/v1/exec` the way the agent reads it, and its exit code."""
     payload = busy if busy is not None else getattr(exc, "shim_payload", None)
-    # A busy broker is named first, in the one line the dispatcher's pressure
-    # signal reads, whatever the body turns out to be, and the exit status
-    # below says the same.
-    broker_busy = exc.code in BROKER_BUSY_STATUSES
+    # The broker's own busy answer, the admission refusal the retry above
+    # keys on (BUSY_STATUS with BUSY_CODE in the body), is named first, in the
+    # one line the dispatcher's pressure signal reads, and the exit status
+    # below says the same. Decided on the pair, not the status alone: a 503
+    # from a restarting sidecar is the broker unreachable, the plain failure.
+    broker_busy = busy is not None and exc.code == BUSY_STATUS
     failure = EXIT_BROKER_BUSY if broker_busy else 1
     if broker_busy:
         print(BROKER_BUSY_LINE.format(code=exc.code), file=sys.stderr)

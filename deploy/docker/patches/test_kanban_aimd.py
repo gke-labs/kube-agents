@@ -698,7 +698,8 @@ class SharedNamesTest(unittest.TestCase):
             self.skipTest("credential_proxy_client.py not in this checkout")
         constants = _module_constants(CREDENTIAL_PROXY_CLIENT)
         self.assertEqual(constants["BROKER_BUSY_LINE"].format(code=503), f"{ka.BUSY_LINE_PREFIX}503)")
-        self.assertEqual(tuple(constants["BROKER_BUSY_STATUSES"]), (429, 503))
+        self.assertNotIn("BROKER_BUSY_STATUSES", constants)  # the body's code decides, not the status
+        self.assertEqual(constants["BUSY_CODE"], "CREDENTIAL_PROXY_BUSY")
         self.assertEqual(constants["BROKER_BUSY_EXIT_FALLBACK"], ka.BROKER_BUSY_EXIT)
         self.assertEqual(getattr(os, "EX_TEMPFAIL", ka.BROKER_BUSY_EXIT), ka.BROKER_BUSY_EXIT)
 

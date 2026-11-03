@@ -1623,12 +1623,14 @@ class TestExecutePolicyBlocked(unittest.TestCase):
 
 
 class TestExecuteBusyBroker(unittest.TestCase):
-    """A 429 or 503 from the broker prints the busy line first and exits EX_TEMPFAIL.
+    """The broker's busy answer prints the busy line first and exits EX_TEMPFAIL.
 
     The line and the status together are the kanban worker's pressure signal
-    to the dispatcher, read back out of the command's result, so both happen
-    whatever the body is: the broker's JSON, or Envoy's HTML from a sidecar
-    restarting mid-request.
+    to the dispatcher, read back out of the command's result. The signal is
+    the broker's own JSON busy answer, code CREDENTIAL_PROXY_BUSY: a 503 with
+    any other body is whatever sits between shim and broker (Envoy's HTML
+    while the sidecar restarts) saying the broker is not there, and that stays
+    the plain exit 1, so a sidecar roll does not step the dispatcher down.
     """
 
     def setUp(self):
@@ -1658,20 +1660,39 @@ class TestExecuteBusyBroker(unittest.TestCase):
                     exit_code = credential_proxy_client.execute("http://proxy", ["kubectl", "get", "pods"])
         return exit_code, stderr.getvalue()
 
-    def test_a_503_with_an_html_body_prints_the_busy_line_then_the_error(self):
-        exit_code, err = self._execute(503, b"<html>upstream connect error</html>")
+    @staticmethod
+    def _busy_body(error="slot limit reached", bound="slot"):
+        return json.dumps(
+            {"status": "busy", "code": credential_proxy_client.BUSY_CODE, "error": error, "bound": bound}
+        ).encode()
+
+    def test_the_brokers_busy_answer_prints_the_busy_line_then_its_error(self):
+        exit_code, err = self._execute(credential_proxy_client.BUSY_STATUS, self._busy_body())
         self.assertEqual(exit_code, 75)
         self.assertEqual(exit_code, credential_proxy_client.EXIT_BROKER_BUSY)
         lines = err.splitlines()
         self.assertEqual(lines[0], "credential proxy busy (HTTP 503)")
-        self.assertIn("credential proxy error (HTTP 503): non-JSON response", lines[1])
-
-    def test_a_429_with_the_brokers_json_prints_the_busy_line_then_its_error(self):
-        exit_code, err = self._execute(429, json.dumps({"error": "slot limit reached", "bound": "slot"}).encode())
-        self.assertEqual(exit_code, 75)
-        lines = err.splitlines()
-        self.assertEqual(lines[0], "credential proxy busy (HTTP 429)")
         self.assertEqual(lines[1], "slot limit reached")
+
+    def test_a_busy_body_on_another_status_is_not_the_signal(self):
+        # The broker's admission refusal is the pair, BUSY_STATUS with BUSY_CODE,
+        # the same pair the retry keys on; a 429 is nothing the broker sends.
+        exit_code, err = self._execute(429, self._busy_body(error="budget", bound="budget"))
+        self.assertEqual(exit_code, 1)
+        self.assertNotIn("credential proxy busy", err)
+        self.assertEqual(err.splitlines()[0], "budget")
+
+    def test_a_503_with_an_html_body_is_the_old_failure_not_a_busy_signal(self):
+        exit_code, err = self._execute(503, b"<html>upstream connect error</html>")
+        self.assertEqual(exit_code, 1)
+        self.assertNotIn("credential proxy busy", err)
+        self.assertEqual(err.splitlines()[0], "credential proxy error (HTTP 503): non-JSON response")
+
+    def test_a_503_whose_json_carries_no_busy_code_is_not_a_busy_signal(self):
+        exit_code, err = self._execute(503, json.dumps({"error": "upstream unavailable"}).encode())
+        self.assertEqual(exit_code, 1)
+        self.assertNotIn("credential proxy busy", err)
+        self.assertEqual(err.splitlines()[0], "upstream unavailable")
 
     def test_other_statuses_print_no_busy_line_and_exit_1(self):
         for code in (400, 403, 500, 502):
@@ -1950,7 +1971,7 @@ class TestExecTierRouting(unittest.TestCase):
         for bound in ("session", "refresh-lock", "other", "scope", None, ["slot"], {"slot": 1}):
             with self.subTest(bound=bound):
                 code, calls, stderr = self.run_shim([busy_error(bound)])
-                self.assertEqual(1, code)
+                self.assertEqual(credential_proxy_client.EXIT_BROKER_BUSY, code)
                 self.assertEqual(1, len(calls))
                 self.assertIn(f"busy at {bound}", stderr)
 
@@ -1958,8 +1979,11 @@ class TestExecTierRouting(unittest.TestCase):
         """With no exec tier, or a named endpoint, the one stateful pod would
         refuse again: the command path stays as it was."""
         code, calls, stderr = self.run_shim([busy_error("slot")], endpoint=self.STATEFUL, fallback=None)
-        self.assertEqual(1, code)
+        # A busy refusal the shim ends on is the kanban pressure signal: the
+        # busy line first, then the broker's error, and EX_TEMPFAIL.
+        self.assertEqual(credential_proxy_client.EXIT_BROKER_BUSY, code)
         self.assertEqual(1, len(calls))
+        self.assertEqual("credential proxy busy (HTTP 503)", stderr.splitlines()[0])
         self.assertIn("busy at slot", stderr)
 
     def test_a_drop_while_the_refusal_is_read_is_reported_not_raised(self):
@@ -1978,8 +2002,9 @@ class TestExecTierRouting(unittest.TestCase):
 
     def test_a_second_refusal_is_printed_not_retried(self):
         code, calls, stderr = self.run_shim([busy_error("slot"), busy_error("slot")])
-        self.assertEqual(1, code)
+        self.assertEqual(credential_proxy_client.EXIT_BROKER_BUSY, code)
         self.assertEqual(2, len(calls))
+        self.assertEqual(1, stderr.count("credential proxy busy"), "the retried refusal is not named")
         self.assertIn("busy at slot", stderr)
 
     def test_a_fallback_is_not_a_retry_and_one_retry_is_the_most(self):
@@ -1993,7 +2018,7 @@ class TestExecTierRouting(unittest.TestCase):
         self.assertEqual(0, code, "the retry may still fall back: nothing ran")
         self.assertEqual(3, len(calls))
         code, calls, stderr = self.run_shim([unreachable(), busy_error("budget"), busy_error("budget")])
-        self.assertEqual(1, code)
+        self.assertEqual(credential_proxy_client.EXIT_BROKER_BUSY, code)
         self.assertEqual(3, len(calls))
         self.assertIn("busy at budget", stderr)
 
@@ -2027,6 +2052,7 @@ class TestExecTierRouting(unittest.TestCase):
         )
         code, calls, stderr = self.run_shim([odd])
         self.assertEqual(1, code)
+        self.assertNotIn("credential proxy busy", stderr, "nor is it the kanban pressure signal")
         self.assertEqual(1, len(calls))
         self.assertIn("odd", stderr)
 

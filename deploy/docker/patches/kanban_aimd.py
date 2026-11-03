@@ -10,7 +10,7 @@ Why
 ---
 The dispatcher runs every card under one host-wide cap, ``kanban.max_in_progress``
 (the operator pins 6). The cap is static: when the credential proxy answers a
-worker ``429`` or ``503``, when a worker's sandbox command dies as a mux client
+worker's command busy, when a worker's sandbox command dies as a mux client
 whose ssh master went away (exit 255, no cwd marker), or when the sandbox shell
 is close to its memory limit, the dispatcher keeps filling every slot, and each
 new worker adds to the pressure that is failing the ones already running.
@@ -35,9 +35,17 @@ Three sources feed it, read once per dispatch tick by
    255 and no cwd marker, or a command that exited with the credential proxy
    shim's busy status (:data:`BROKER_BUSY_EXIT`) and printed its busy line
    (:data:`BUSY_LINE_PREFIX`; ``agents/platform/scripts/credential_proxy_client.py``
-   does both on a 429 or 503; the shim makes one request). The status and
-   the line together are the signal: text alone would let any file or log a
-   worker reads steer the dispatcher. The dispatcher already reads this table,
+   does both when the broker's own busy answer, a 503 whose JSON carries the
+   code ``CREDENTIAL_PROXY_BUSY``, is the one the shim ends on; a sidecar's
+   bare 503 while it restarts is a plain failure, not this signal). The
+   status and the line together are the signal: text alone would let any
+   file or log a worker reads steer the dispatcher. The worker reads both
+   from its command's own result, so the signal carries only when the shim's
+   exit status is the command's and its stderr reached the result: a shim
+   piped into another command, or with its stderr redirected, exits and
+   prints into the pipe or the file, and the dispatcher never sees that busy
+   answer (the blind spot ``permission_refusal_stop.py`` documents for the
+   shim's refusal lines). The dispatcher already reads this table,
    and it survives a gateway restart, which an in-memory channel would not.
    Only a worker (:data:`WORKER_TASK_ENV` set) records; the front door's own
    turns do not. One card steps the cap down once between clean steps: its
@@ -161,8 +169,8 @@ SSH_BACKEND = "ssh"
 WORKER_TASK_ENV = "HERMES_KANBAN_TASK"
 WORKER_RUN_ENV = "HERMES_KANBAN_RUN_ID"
 
-#: The line the credential proxy shim prints on a 429 or 503, followed by the
-#: status and a closing parenthesis, and the status it then exits with
+#: The line the credential proxy shim prints on the broker's busy answer,
+#: followed by the HTTP status and a closing parenthesis, and the status it then exits with
 #: (``EX_TEMPFAIL``). The shim spells both; ``test_kanban_aimd`` pins the two
 #: files against each other.
 BUSY_LINE_PREFIX = "credential proxy busy (HTTP "
@@ -595,7 +603,7 @@ def worker_pressure_reason(env_type: str, returncode: int, output: str, cwd_obse
     master went away, or a connection that never opened (the shape
     ``ssh_shared_master`` hints on). A command that exited with the shim's
     busy status and whose output has the busy line at the start of a line is
-    a 429 or 503 from the broker. The line alone is not enough:
+    the broker's busy answer. The line alone is not enough:
     a log, a file or a README the worker reads could carry it.
     """
     if env_type == SSH_BACKEND and returncode == SSH_MUX_EXIT and not cwd_observed:

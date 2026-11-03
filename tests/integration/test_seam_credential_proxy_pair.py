@@ -6,9 +6,10 @@ until this file the pair had never met: nothing proved the bytes the client
 sends are the bytes the server's parser accepts, or that the server's refusals
 come back as exit codes an agent can read. The third test pins the case that
 sits between them — an error body written by neither (Envoy answering 503 with
-HTML during a sidecar restart), which used to crash the shim with a traceback;
-a 503 is also a busy broker to the shim, so it exits EX_TEMPFAIL and prints the
-busy line the kanban dispatcher's pressure signal reads, before the message.
+HTML during a sidecar restart), which used to crash the shim with a traceback.
+That 503 is the broker not answering, not the broker's busy JSON, so the shim
+exits 1 with a readable line and prints no busy line: the kanban dispatcher's
+pressure signal (the busy line and EX_TEMPFAIL together) is the broker's own.
 """
 
 from __future__ import annotations
@@ -110,9 +111,11 @@ class CredentialProxyPairTest(unittest.TestCase):
     def test_a_non_json_error_body_is_a_message_not_a_traceback(self):
         # Envoy restarting mid-request: 503, text/html, written by neither
         # side of this seam. The shim must degrade to a readable line rather
-        # than crash on json.load, and a 503 is a busy broker: the busy line
-        # comes first and the exit status is EX_TEMPFAIL (75), the pair a
-        # kanban worker's terminal result reads as a pressure signal.
+        # than crash on json.load. It is not the broker's busy answer (503
+        # with the CREDENTIAL_PROXY_BUSY code), so the busy line and exit 75
+        # a kanban worker's terminal result reads as a pressure signal must
+        # not appear: a sidecar roll is not pressure the dispatcher should
+        # step down for.
         class HtmlErrorHandler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
                 body = b"<html><body>upstream connect error</body></html>"
@@ -135,12 +138,12 @@ class CredentialProxyPairTest(unittest.TestCase):
             code = credential_proxy_client.execute(
                 f"http://127.0.0.1:{envoy.server_port}", ["kubectl", "get", "pods"]
             )
-        self.assertEqual(credential_proxy_client.EXIT_BROKER_BUSY, code)
-        self.assertEqual(75, code)
+        self.assertEqual(1, code)
+        self.assertNotEqual(credential_proxy_client.EXIT_BROKER_BUSY, code)
         lines = stderr.getvalue().splitlines()
-        self.assertEqual("credential proxy busy (HTTP 503)", lines[0])
-        self.assertIn("HTTP 503", lines[1])
-        self.assertIn("non-JSON response", lines[1])
+        self.assertIn("HTTP 503", lines[0])
+        self.assertIn("non-JSON response", lines[0])
+        self.assertNotIn("credential proxy busy", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
 
