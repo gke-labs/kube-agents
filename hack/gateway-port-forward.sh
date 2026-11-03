@@ -6,10 +6,12 @@
 # port-forward is the only way in. With more than one gateway replica only the
 # holder of the gateway's Lease serves them, and a standby answers every request
 # with 503 (docs/designs/gateway-replicas.md, "Reaching the active replica over
-# HTTP"). This forwards to the holder's pod and, when the port-forward drops (a
-# handover, a rollout, the pod deleted), reads the Lease again and forwards to
-# whoever holds it now. With no Lease, an unelected gateway, it forwards the
-# door's Service as before.
+# HTTP"). This forwards to the holder's pod, reads the Lease every few seconds
+# while it runs, and restarts the port-forward on the new holder when the lease
+# moves or the port-forward drops. With no Lease, an unelected gateway, it
+# forwards the door's Service as before. The holder is used only if it is one
+# of the pods the door's Service selects: the door's token travels over the
+# tunnel, and a Lease's holder is a string anyone who can write the Lease sets.
 #
 # Usage: hack/gateway-port-forward.sh [door-port] [local-port]
 #   door-port   the door's port in the pod (default 8099, the inject door)
@@ -19,7 +21,8 @@
 #   NAMESPACE     the install's namespace (default kubeagents-system)
 #   CR_NAME       the PlatformAgent's name (default platform-agent)
 #   KUBE_CONTEXT  a kubectl context to pin (default: the current one)
-#   DOOR_SERVICE  the Service used with no Lease (default <CR_NAME>-a2a-inject)
+#   DOOR_SERVICE  the door's Service (default <CR_NAME>-a2a-inject); set it for
+#                 the A2A door, whose Service has another name
 #
 # Ctrl-C stops it.
 set -euo pipefail
@@ -32,6 +35,13 @@ readonly DOOR_SERVICE_SUFFIX="-a2a-inject"
 # A pause between a dropped port-forward and the next, about the election's
 # retry period: a released lease is taken within it.
 readonly RESPAWN_DELAY_SECONDS=2
+# How often the Lease is read while a port-forward runs. A handover where the
+# old leader's pod survives (its container restarts as a standby) leaves the
+# port-forward up, so only a read notices.
+readonly HOLDER_POLL_SECONDS=5
+# A Service's selector as a label selector, with a trailing comma to trim.
+# shellcheck disable=SC2016 # a go-template, not a shell expansion
+readonly SELECTOR_TEMPLATE='{{range $k, $v := .spec.selector}}{{$k}}={{$v}},{{end}}'
 
 readonly NAMESPACE="${NAMESPACE:-${DEFAULT_NAMESPACE}}"
 readonly CR_NAME="${CR_NAME:-${DEFAULT_CR_NAME}}"
@@ -48,23 +58,47 @@ k() {
   fi
 }
 
-# The pod holding the gateway's Lease, or the door's Service when no Lease
-# names one.
+# The pod holding the gateway's Lease, if the door's Service selects it, or
+# the Service.
 door_target() {
-  local holder
+  local holder selector
   holder="$(k get lease "${LEASE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
   if [ -n "${holder}" ]; then
-    echo "pod/${holder}"
-  else
-    echo "svc/${DOOR_SERVICE}"
+    selector="$(k get svc "${DOOR_SERVICE}" -o "go-template=${SELECTOR_TEMPLATE}" 2>/dev/null || true)"
+    selector="${selector%,}"
+    if [ -n "${selector}" ] && k get pods -l "${selector}" -o name 2>/dev/null | grep -qxF "pod/${holder}"; then
+      echo "pod/${holder}"
+      return 0
+    fi
+    echo "lease ${LEASE} names ${holder}, which is not a pod svc/${DOOR_SERVICE} selects; using the service" >&2
   fi
+  echo "svc/${DOOR_SERVICE}"
 }
 
-trap 'exit 0' INT TERM
+pf_pid=""
+trap '[ -z "${pf_pid}" ] || kill "${pf_pid}" 2>/dev/null; exit 0' INT TERM
 while true; do
   target="$(door_target)"
   echo "forwarding 127.0.0.1:${LOCAL_PORT} to ${target}:${DOOR_PORT} in ${NAMESPACE}" >&2
-  k port-forward "${target}" "${LOCAL_PORT}:${DOOR_PORT}" || true
-  echo "the port-forward to ${target} ended; reading the lease again" >&2
+  # kubectl itself is the background job, not the k function: $! must be
+  # the process holding the port, or a kill leaves the forward running.
+  pf=(kubectl)
+  if [ -n "${KUBE_CONTEXT:-}" ]; then
+    pf+=(--context "${KUBE_CONTEXT}")
+  fi
+  pf+=(-n "${NAMESPACE}" port-forward "${target}" "${LOCAL_PORT}:${DOOR_PORT}")
+  "${pf[@]}" &
+  pf_pid=$!
+  while kill -0 "${pf_pid}" 2>/dev/null; do
+    sleep "${HOLDER_POLL_SECONDS}"
+    now="$(door_target)"
+    if [ "${now}" != "${target}" ]; then
+      echo "the lease moved to ${now}; restarting the port-forward" >&2
+      kill "${pf_pid}" 2>/dev/null || true
+      break
+    fi
+  done
+  wait "${pf_pid}" 2>/dev/null || true
+  pf_pid=""
   sleep "${RESPAWN_DELAY_SECONDS}"
 done

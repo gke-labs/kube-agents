@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,13 +22,14 @@ const (
 	// StandbyHolderHeader carries the lease holder's pod name on a
 	// standby's 503, so a client can re-target without parsing the body.
 	StandbyHolderHeader = "X-A2A-Gateway-Holder"
-	// standbyRetryAfter is the 503's Retry-After, in seconds: the election's
-	// retry period, about how long a released lease takes to be taken.
-	standbyRetryAfter = "2"
 	// standbyReadHeaderTimeout bounds a request's headers, as the doors'
 	// own servers do.
 	standbyReadHeaderTimeout = 10 * time.Second
 )
+
+// standbyRetryAfter is the 503's Retry-After, in seconds: the election's
+// retry period, about how long a released lease takes to be taken.
+var standbyRetryAfter = strconv.Itoa(int(electionRetryPeriod / time.Second))
 
 // LeaseView is the lease holder the election last read: every standby
 // retry reads the Lease, so it is at most a retry period old.
@@ -42,10 +44,16 @@ func (v *LeaseView) set(holder string) {
 // Holder is the holder's pod name, or "" when no replica holds the lease or
 // it hasn't been read yet.
 func (v *LeaseView) Holder() string {
+	h, _ := v.read()
+	return h
+}
+
+// read is the holder, and whether the lease has been read at all.
+func (v *LeaseView) read() (string, bool) {
 	if h := v.holder.Load(); h != nil {
-		return *h
+		return *h, true
 	}
-	return ""
+	return "", false
 }
 
 // StandbyDoors serve the 503 on the doors' addresses until Stop.
@@ -110,7 +118,13 @@ func (s *StandbyDoors) Stop() {
 func standbyHandler(namespace, port string, view *LeaseView) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", standbyRetryAfter)
-		holder := view.Holder()
+		holder, seen := view.read()
+		if !seen {
+			writeJSON(w, http.StatusServiceUnavailable, standbyAnswer{
+				Error: "this gateway replica is the standby and hasn't read the lease yet; retry in a few seconds",
+			})
+			return
+		}
 		if holder == "" {
 			writeJSON(w, http.StatusServiceUnavailable, standbyAnswer{
 				Error: "this gateway replica is the standby, and no replica holds the lease right now; retry in a few seconds",

@@ -466,6 +466,18 @@ FAKE_KUBECTL = textwrap.dedent(
             if kind == "platformagent":
                 obj = s["cr"]
                 out = json.dumps(obj) if fmt == "json" else jsonpath(obj, fmt[len("jsonpath="):])
+            elif kind == "pods" and "-l" in rest:
+                # The pods a label selector picks, by name: the selector's
+                # pairs must all be on the pod.
+                want = dict(pair.split("=", 1) for pair in rest[rest.index("-l") + 1].split(","))
+                out = "".join("pod/%s\n" % p["name"] for p in s["scenario"].get("labelled_pods", [])
+                              if all(p["labels"].get(k) == v for k, v in want.items()))
+            elif kind == "svc" and fmt.startswith("go-template="):
+                obj = s["objects"].get("svc/%s" % name)
+                if obj is None:
+                    sys.stderr.write('Error from server (NotFound): services "%s" not found\n' % name); rc = 1
+                else:
+                    out = "".join("%s=%s," % kv for kv in sorted(obj["spec"]["selector"].items()))
             elif kind == "pods":
                 out = json.dumps({"items": s["pods"]})
                 late_unschedulable(s)
@@ -1064,8 +1076,10 @@ class PortForwardTest(RoundTripTest):
         # standby answers 503), so the bus task's tunnel targets its pod; the
         # agent's own tunnel stays on its Service. With no Lease, as on the
         # healthy state the other tests run, it's the door's Service.
-        state = healthy_next_state()
+        gateway_pods = [{"name": "platform-agent-a2a-gateway-7d9f-abcde", "labels": {"app": "platform-agent-a2a-gateway"}}]
+        state = healthy_next_state(labelled_pods=gateway_pods)
         state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "platform-agent-a2a-gateway-7d9f-abcde"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
         result, after, _ = self.run_sim(state, **self.tunnel_env())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
@@ -1076,6 +1090,19 @@ class PortForwardTest(RoundTripTest):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
         self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+
+    def test_a_lease_holder_outside_the_inject_service_is_not_trusted(self) -> None:
+        # The tunnel carries the door's token: a Lease naming a pod the inject
+        # Service doesn't select (written by something else) is ignored.
+        state = healthy_next_state(labelled_pods=[{"name": "some-other-pod", "labels": {"app": "something-else"}}])
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "some-other-pod"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertNotIn("pod/some-other-pod", targets)
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("not a pod svc/platform-agent-a2a-inject selects", result.stderr)
 
     def test_a_dead_first_tunnel_is_replaced_by_a_fresh_one(self) -> None:
         # The first port-forward (the pre bus task's) accepts and drops every

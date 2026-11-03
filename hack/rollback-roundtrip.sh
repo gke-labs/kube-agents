@@ -76,6 +76,10 @@ readonly NATS_ORDINAL_SUFFIX="-0"
 readonly CALLOUT_NAME_SUFFIX="-a2a-callout"
 readonly CALLOUT_KEYS_SUFFIX="-keys"
 readonly A2A_GATEWAY_SUFFIX="-a2a-gateway"
+# A Service's selector as a label selector, with a trailing comma to trim.
+# shellcheck disable=SC2016 # a go-template, not a shell expansion
+readonly SELECTOR_TEMPLATE='{{range $k, $v := .spec.selector}}{{$k}}={{$v}},{{end}}'
+
 readonly A2A_VERIFIER_SUFFIX="-a2a-verifier"
 readonly INJECT_NAME_SUFFIX="-a2a-inject"
 readonly AGENT_DEPLOYMENT_SUFFIX="-gateway"
@@ -831,14 +835,24 @@ start_port_forward() {
 # one (a standby answers 503), or the door's Service when no Lease names one.
 # Read again on every attempt, so a retry after a handover finds the new
 # holder.
+#
+# The holder is taken only if it is one of the pods the inject Service
+# selects: the tunnel carries the door's token, and a Lease's holder is a
+# string anyone who can write the Lease sets.
 inject_target() {
-  local holder
+  local holder selector
   holder="$(k get lease "${A2A_GATEWAY_NAME}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
   if [ -n "${holder}" ]; then
-    echo "pod/${holder}"
-  else
-    echo "svc/${INJECT_NAME}"
+    selector="$(k get svc "${INJECT_NAME}" -o "go-template=${SELECTOR_TEMPLATE}" 2>/dev/null || true)"
+    selector="${selector%,}"
+    if [ -n "${selector}" ] && k get pods -l "${selector}" -o name 2>/dev/null | grep -qxF "pod/${holder}"; then
+      echo "pod/${holder}"
+      return 0
+    fi
+    # stderr: stdout is the target this function returns.
+    note "lease ${A2A_GATEWAY_NAME} names ${holder}, which is not a pod svc/${INJECT_NAME} selects; forwarding to the service" >&2
   fi
+  echo "svc/${INJECT_NAME}"
 }
 
 stop_port_forward() {

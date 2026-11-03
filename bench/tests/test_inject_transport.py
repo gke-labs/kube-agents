@@ -1354,55 +1354,104 @@ def test_a_respawn_after_a_standbys_503_forwards_to_the_new_holder(
     assert not infra(result)
 
 
-class _LeaseRead:
-    """A stand-in for ``subprocess.run`` reading the gateway's Lease."""
+class _KubectlReads:
+    """A stand-in for ``subprocess.run`` answering the three reads the door
+    target takes: the Lease's holder, the door Service's selector, and the
+    pods it selects."""
 
-    def __init__(self, stdout: str = "", returncode: int = 0, raises: BaseException | None = None) -> None:
-        self.stdout, self.returncode, self.raises = stdout, returncode, raises
+    def __init__(
+        self,
+        holder: str = "platform-agent-a2a-gateway-7d9f-abcde",
+        lease_rc: int = 0,
+        lease_stderr: str = "",
+        raises: BaseException | None = None,
+        selector: str = '{"app.kubernetes.io/component":"a2a-gateway","app.kubernetes.io/instance":"platform-agent"}',
+        pods: str = "platform-agent-a2a-gateway-7d9f-abcde platform-agent-a2a-gateway-7d9f-fghij",
+    ) -> None:
+        self.holder, self.lease_rc, self.lease_stderr, self.raises = holder, lease_rc, lease_stderr, raises
+        self.selector, self.pods = selector, pods
         self.commands: list[list[str]] = []
 
     def __call__(self, cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
         self.commands.append(cmd)
         if self.raises is not None:
             raise self.raises
-        return subprocess.CompletedProcess(cmd, self.returncode, stdout=self.stdout, stderr="")
+        if cmd[1:3] == ["get", "lease"]:
+            return subprocess.CompletedProcess(cmd, self.lease_rc, stdout=self.holder if self.lease_rc == 0 else "", stderr=self.lease_stderr)
+        if cmd[1:3] == ["get", "svc"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=self.selector, stderr="")
+        if cmd[1:3] == ["get", "pods"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=self.pods, stderr="")
+        raise AssertionError(f"unexpected kubectl {cmd}")
+
+
+_SERVICE = "platform-agent-a2a-inject"
+_HOLDER_POD = "pod/platform-agent-a2a-gateway-7d9f-abcde"
 
 
 @pytest.mark.parametrize(
-    ("read", "want"),
+    ("reads", "want"),
     [
-        (_LeaseRead(stdout="platform-agent-a2a-gateway-7d9f-abcde\n"), "pod/platform-agent-a2a-gateway-7d9f-abcde"),
+        (_KubectlReads(), _HOLDER_POD),
         # Released, or between leaders: nobody to point at.
-        (_LeaseRead(stdout=""), "svc/platform-agent-a2a-inject"),
+        (_KubectlReads(holder=""), f"svc/{_SERVICE}"),
         # No Lease: an unelected gateway, every install before the operator renders one.
-        (_LeaseRead(returncode=1), "svc/platform-agent-a2a-inject"),
-        (_LeaseRead(raises=OSError("kubectl not found")), "svc/platform-agent-a2a-inject"),
-        (_LeaseRead(raises=subprocess.TimeoutExpired(["kubectl"], 15)), "svc/platform-agent-a2a-inject"),
+        (_KubectlReads(lease_rc=1, lease_stderr='Error from server (NotFound): leases.coordination.k8s.io "x" not found'), f"svc/{_SERVICE}"),
+        (_KubectlReads(raises=OSError("kubectl not found")), f"svc/{_SERVICE}"),
+        (_KubectlReads(raises=subprocess.TimeoutExpired(["kubectl"], 15)), f"svc/{_SERVICE}"),
+        # The tunnel carries the door's token: a holder that isn't one of the
+        # gateway's own pods (a Lease written by something else) is not
+        # trusted with it.
+        (_KubectlReads(holder="some-other-pod"), f"svc/{_SERVICE}"),
+        (_KubectlReads(selector=""), f"svc/{_SERVICE}"),
+        (_KubectlReads(selector="not json"), f"svc/{_SERVICE}"),
+        (_KubectlReads(pods=""), f"svc/{_SERVICE}"),
     ],
 )
-def test_the_door_target_is_the_lease_holder_or_the_service(
-    monkeypatch: pytest.MonkeyPatch, read: _LeaseRead, want: str
+def test_the_door_target_is_a_gateway_pod_holding_the_lease_or_the_service(
+    monkeypatch: pytest.MonkeyPatch, reads: _KubectlReads, want: str
 ) -> None:
     monkeypatch.delenv("AGENT_GATEWAY_LEASE", raising=False)
     monkeypatch.setenv("AGENT_NAMESPACE", "kubeagents-system")
     monkeypatch.setenv("AGENT_CLUSTER_CONTEXT", "ctx-1")
-    monkeypatch.setattr(harness.subprocess, "run", read)
+    monkeypatch.setattr(harness.subprocess, "run", reads)
 
-    assert harness._gateway_door_target("platform-agent", "platform-agent-a2a-inject") == want
-    assert read.commands == [
-        [
-            "kubectl",
-            "get",
-            "lease",
-            "platform-agent-a2a-gateway",
-            "-n",
-            "kubeagents-system",
-            "-o",
-            "jsonpath={.spec.holderIdentity}",
-            "--context",
-            "ctx-1",
-        ]
+    assert harness._gateway_door_target("platform-agent", _SERVICE) == want
+    assert reads.commands[0] == [
+        "kubectl",
+        "get",
+        "lease",
+        "platform-agent-a2a-gateway",
+        "-o",
+        "jsonpath={.spec.holderIdentity}",
+        "-n",
+        "kubeagents-system",
+        "--context",
+        "ctx-1",
     ]
+    if want == _HOLDER_POD:
+        # The holder is checked against the pods the door's own Service selects.
+        assert reads.commands[2][1:5] == [
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/component=a2a-gateway,app.kubernetes.io/instance=platform-agent",
+        ]
+
+
+def test_a_lease_read_that_fails_for_another_reason_is_said(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A forbidden read falls back to the Service like a missing Lease, but
+    says so: at two replicas the Service can land on the standby every time."""
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        _KubectlReads(lease_rc=1, lease_stderr='Error from server (Forbidden): leases.coordination.k8s.io "x" is forbidden'),
+    )
+    with caplog.at_level(logging.WARNING, logger=harness._log.name):
+        assert harness._gateway_door_target("platform-agent", _SERVICE) == f"svc/{_SERVICE}"
+    assert "Forbidden" in caplog.text
 
 
 def test_a_resolved_target_is_forwarded_as_given(monkeypatch: pytest.MonkeyPatch) -> None:

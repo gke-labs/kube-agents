@@ -81,13 +81,19 @@ func TestAStandbyDoorNamesTheHolderAndThePortForward(t *testing.T) {
 // to point at, so the answer says to retry and names nobody.
 func TestAStandbyDoorWithNoHolderSaysToRetry(t *testing.T) {
 	addr := freeLoopback(t)
-	doors, err := StartStandbyDoors([]string{addr}, "kubeagents-system", &LeaseView{}, slog.Default())
+	view := &LeaseView{}
+	doors, err := StartStandbyDoors([]string{addr}, "kubeagents-system", view, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer doors.Stop()
+	// Before the first read: nothing to say about the holder.
+	if _, ans := standbyGet(t, addr); !strings.Contains(ans.Error, "hasn't read the lease yet") {
+		t.Fatalf("answer before the first read %+v", ans)
+	}
+	view.set("")
 	resp, ans := standbyGet(t, addr)
-	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get(StandbyHolderHeader) != "" || ans.Command != "" || !strings.Contains(ans.Error, "retry") {
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get(StandbyHolderHeader) != "" || ans.Command != "" || !strings.Contains(ans.Error, "no replica holds the lease") {
 		t.Fatalf("status %d, header %q, answer %+v", resp.StatusCode, resp.Header.Get(StandbyHolderHeader), ans)
 	}
 }
