@@ -2597,17 +2597,7 @@ collector on the pod network. `A2A_METRICS_PORT` names the port; unset means no 
 value that is not a port, or is either door's port, refuses the boot. A port that will not bind
 costs the gateway its metrics and its readiness, and logs an `ALERT` line; conversations carry on,
 though the pod never reads Ready, so the CR stays `Provisioning` naming the Deployment and
-`kubectl rollout status` does not finish until a restart binds the port.
-
-`/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
-once the gateway has bound its event relay and 503 until then, with the reason as the body
-(`waiting for stream TASKS: ...`). The relay binds before the adapters and doors start, and on an install
-whose provision Job has not created TASKS yet (a three-server bus can take longer to form than
-lib's 45-second bind window) the relay waits for the stream rather than exiting
-(`SubscribeConfig.WaitForStream`, set on the relay alone, and only a missing stream waits). It logs
-the wait every 30 seconds and warns every 10 minutes. So a gateway waiting on provisioning reads
-not Ready, and the CR `Provisioning` naming it, instead of crash-looping. The Deployment is
-Recreate, so the probe opens no gap in a roll; it shows the one Recreate already has. The operator
+`kubectl rollout status` does not succeed until a restart binds the port. The operator
 renders `A2A_METRICS_PORT=9096` and declares container port `a2a-metrics` on 9096 from one
 constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitoring`
 `PodMonitoring` scrapes 9096 every 30 seconds behind the `platformAgent.podMonitoring` switch. The
@@ -2621,6 +2611,19 @@ name, and the doors' ports admit no pod. The gateway's fence used to render only
 left the metrics port, bound on every interface, reachable from the whole pod network on an install
 with neither door armed; it renders on every `next` install now so that it is not (decided
 10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
+
+`/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
+once the gateway has bound its event relay and 503 until then, with the reason as the body
+(`waiting for stream TASKS: ...`). The relay binds before the adapters and doors start, and on an install
+whose provision Job has not created TASKS yet (a three-server bus can take longer to form than
+lib's 45-second bind window) the relay waits for the stream rather than exiting
+(`SubscribeConfig.WaitForStream`, set on the relay alone, and only a missing stream waits). It logs
+the wait every 30 seconds and warns every 10 minutes. So a gateway waiting on provisioning reads
+not Ready, and the CR `Provisioning` naming it, instead of crash-looping. The Deployment is
+Recreate, so the probe opens no gap in a roll; it shows the one Recreate already has. Its progress
+deadline is 1800 seconds rather than Kubernetes' 600, so a wait on a slow provision Job does not
+read `ProgressDeadlineExceeded` and end a `kubectl rollout status` early; past 1800 seconds it does,
+while the gateway keeps waiting and the CR keeps reading `Provisioning`.
 
 The site's [Observability page](../site/src/content/docs/concepts/observability.md) is
 canonical for what an operator reads off these series; this section is the design. Every label

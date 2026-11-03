@@ -413,6 +413,15 @@ func (c *Client) resubscribe(subs []*durableSub, js jetstream.JetStream, nc *nat
 			if s.stopped.Load() {
 				continue
 			}
+			// A durable whose first bind has not returned is its own
+			// startWithRetry's to bind: that loop reads the new connection
+			// on its next attempt. Binding it here too would retry a
+			// stream that does not exist yet for as long as a
+			// WaitForStream wait lasts, holding the rebuild open the whole
+			// time.
+			if !s.bound.Load() {
+				continue
+			}
 			if err := s.start(context.Background(), js); err != nil {
 				c.log.Error("nats rebuild re-subscribe failed; will retry", "durable", s.cfg.Durable, "err", err)
 				failed = append(failed, s)
@@ -428,6 +437,14 @@ func (c *Client) resubscribe(subs []*durableSub, js jetstream.JetStream, nc *nat
 		time.Sleep(fullJitterBackoff(attempt))
 	}
 	return !nc.IsClosed()
+}
+
+// currentJS is the client's JetStream context as it stands, which a rebuild
+// replaces.
+func (c *Client) currentJS() jetstream.JetStream {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.js
 }
 
 // Close shuts the client down deliberately; no rebuild follows.
@@ -691,9 +708,16 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // window restarts from the first attempt that finds it. The wait logs its
 // first attempt and then at most once per streamWaitLogInterval, and warns
 // once per streamWaitWarnEvery, so a stream that never comes is loud, not
-// silent; the caller reports itself not ready meanwhile. Each attempt of the
-// wait reads the client's current JetStream context, because a rebuild during
-// an open-ended wait replaces the one this bind started with.
+// silent; the caller reports itself not ready meanwhile.
+//
+// Until it returns, this loop is the durable's only binder: a rebuild skips a
+// durable that is not yet bound (resubscribe). So each attempt reads the
+// client's current JetStream context, and a bind counts only if it landed on
+// the connection that is still current, checked under the lock a rebuild
+// swaps the connection and snapshots the durables under. A bind on a
+// connection a rebuild has just replaced is tried again on the new one;
+// otherwise the durable would read bound, be skipped, and consume from a
+// dead connection.
 func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream) error {
 	deadline := time.Now().Add(subscribeBindWindow)
 	var waitStart, lastLog time.Time
@@ -701,6 +725,16 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 	for attempt := 1; ; attempt++ {
 		err := s.start(ctx, js)
 		if err == nil {
+			s.c.mu.RLock()
+			current := s.c.js
+			if current == js {
+				s.bound.Store(true)
+			}
+			s.c.mu.RUnlock()
+			if current != js {
+				js = current
+				continue
+			}
 			if attempt > 1 {
 				s.c.log.Info("durable bound after retry", "durable", s.cfg.Durable, "attempts", attempt)
 			}
@@ -733,9 +767,7 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 				return err
 			case <-time.After(bindBackoff(attempt)):
 			}
-			s.c.mu.RLock()
-			js = s.c.js
-			s.c.mu.RUnlock()
+			js = s.c.currentJS()
 			continue
 		}
 		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
@@ -748,6 +780,7 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 			return err
 		case <-time.After(bindBackoff(attempt)):
 		}
+		js = s.c.currentJS()
 	}
 }
 
@@ -757,6 +790,9 @@ type durableSub struct {
 	handler func(subject string, env *Envelope)
 	seen    *dedupSet
 	stopped atomic.Bool
+	// bound is set once the first bind has landed on the current connection
+	// (startWithRetry); a rebuild re-binds only bound durables.
+	bound atomic.Bool
 	// held is the held-delivery mode (held.go); nil for auto-ack.
 	held *heldState
 	// deferred is the deferred-ack mode (deferred.go); nil for the others.

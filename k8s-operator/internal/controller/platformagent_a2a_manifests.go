@@ -1152,6 +1152,18 @@ const (
 	a2aGatewayReadyzPath = "/readyz"
 )
 
+// a2aGatewayProgressDeadlineSeconds is the gateway Deployment's progress
+// deadline. With the readiness probe, a gateway waiting for TASKS holds its
+// rollout at zero available replicas, and past the deadline the Deployment
+// reads ProgressDeadlineExceeded and `kubectl rollout status` returns an error
+// however long it was asked to wait. Kubernetes' 600s default is shorter than
+// a slow provision Job (a three-server bus forming, the Job's backoff). 1800s
+// matches the Hermes gateway's gatewayProgressDeadlineSeconds and clears
+// upgrade.sh's 1500s deploy gate. The deadline stops nothing: the gateway
+// keeps waiting and binds when TASKS appears, and the CR reads Provisioning
+// throughout.
+const a2aGatewayProgressDeadlineSeconds int32 = 1800
+
 func a2aNATSImage() string {
 	if override := os.Getenv(a2aNATSImageEnvVar); override != "" {
 		return override
@@ -5045,8 +5057,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// overlapping during a roll is the wrong shape. Recreate stops
 			// the old one before the new one starts; the gap is the one
 			// the single-backend rule already implies.
-			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
-			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Strategy:                appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
+			ProgressDeadlineSeconds: ptr.To(a2aGatewayProgressDeadlineSeconds),
+			Selector:                &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{

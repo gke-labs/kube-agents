@@ -179,6 +179,11 @@ func TestTheA2AGatewayIsReadyOnlyOnceItsRelayBinds(t *testing.T) {
 	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
 		t.Errorf("strategy %s: the probe was argued safe under Recreate", dep.Spec.Strategy.Type)
 	}
+	// A wait for TASKS past the 600s default would read ProgressDeadlineExceeded
+	// and end every `kubectl rollout status` early.
+	if pd := dep.Spec.ProgressDeadlineSeconds; pd == nil || *pd < 1800 {
+		t.Errorf("progressDeadlineSeconds %v: a gateway waiting on a slow provision Job outlives the 600s default", pd)
+	}
 }
 
 // TestTheA2AGatewayFenceMirrorsTheBrokersCollectorRule: the gateway's one
