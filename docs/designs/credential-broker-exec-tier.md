@@ -98,6 +98,16 @@ and each caller routes to the right one.**
 - Admission is one queue with a 60 s timeout, then `503 CREDENTIAL_PROXY_BUSY` (`_admit`).
   Inside it the classes of §4.2 apply: the profile and `scope` roles are background, and every
   other role is interactive.
+- Since #4333, in front of that queue: the resource watermark gate (`ResourceWatermarkGate`).
+  From the soft watermark of live cgroup memory or scratch disk the queue admits one command at
+  a time; from the hard watermark a background caller is answered at once with
+  `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and `Retry-After: 5..30`, and the session role keeps
+  one slot up to a ceiling. The gate reads its own class from the role, narrower than §4.2's: the
+  session role alone is interactive to it, because the shell role still carries its sweeps until
+  the turn token (§4.1) can tell them from chat turns. Under the clamp §4.2's class caps hold
+  for everything but the session's reserve, which stands above the interactive cap: the shell's
+  sweep can hold that cap when the clamp arrives, and the admission it keeps for background
+  work holds nothing while the clamp admits background work one at a time.
 - **No priority inside the shell role.** A caller authenticates with a projected ServiceAccount token. The broker
   learns the workload and a role (shell, chat, a2a-chat, session, watcher, mcp) from it. The
   `caller` field of `Principal` is always `None` (`credential_proxy.py:2182`). Background work
@@ -458,8 +468,9 @@ caller presents, and nothing the caller can set alone changes it.
   and the fleet audits, the watches and the reconcile need nothing from their callers. Until then
   the shell role counts as interactive (the next bullets).
 - A request is `interactive` only with a claim minted outside the sandbox: a session pod's own
-  token (the session role), or a short-lived turn token that the agent's gateway mints for a chat
-  turn. The sandbox session receives the turn token at its start, the way it receives
+  token (the session role; on `main` since #4333 as `INTERACTIVE_ROLES` in the watermark gate,
+  which reserves one slot for it under the hard watermark), or a short-lived turn token that the
+  agent's gateway mints for a chat turn. The sandbox session receives the turn token at its start, the way it receives
   `HERMES_PROFILE_HOME`, so it needs an `AcceptEnv` entry and the session-command path. #3889's
   per-task credentials have the same shape, and the turn token can be one of them.
 - A profile-role request (#4257) is `background` by default, like the shell role once the turn
@@ -519,7 +530,10 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
   69/51 over two pods]. So each replica gets about 1/N of each class.
 - New: while exec routing is on (§12, "Shim retry"), the shim retries a
   `503 CREDENTIAL_PROXY_BUSY` once. Without exec routing there is one stateful pod, which would
-  refuse again. The retry is a new connection, so it
+  refuse again. It would wait out a `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` for its
+  `Retry-After` before that retry, since the broker drew the interval to spread a sweep's workers
+  and a retry at once undoes it; today the shim prints the refusal, whose text names the interval,
+  and retries nothing on it. The retry is a new connection, so it
   reaches another replica with probability (N−1)/N: half the time at 2 replicas. It does not
   retry a dropped connection (`BrokerDisconnected`), because the command may have run.
   `CREDENTIAL_PROXY_BUSY` is raised only at admission, before the command starts, so a retry

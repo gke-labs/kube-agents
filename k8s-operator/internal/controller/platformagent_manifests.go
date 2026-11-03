@@ -4558,6 +4558,10 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		{Name: "GITOPS_STATE_PATH", Value: path.Join(gitopsStateDir, "managed_repos")},
 		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 	}
+	// The scratch volumes' caps, for the broker's resource watermark gate. See
+	// credentialProxyStateLimitEnv for why they are values and why reserved;
+	// in the managed set, so the merge below reserves both names.
+	envVars = append(envVars, credentialProxyVolumeLimitEnv(agent)...)
 	// Set in both directions, deliberately. The broker's own default is off, so
 	// the "0" changes nothing on its own — what it buys is that the credential
 	// mode an install is in can be read off the Deployment rather than inferred
