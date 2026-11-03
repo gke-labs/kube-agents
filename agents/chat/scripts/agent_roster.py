@@ -614,16 +614,21 @@ def _format_scope(base: Path | None = None) -> str:
 # beside the previous text: (key, the unstamped profiles' own stamps, the
 # agents discovered, the text rendered).
 _cache: tuple | None = None
-# Set by any fallback path while a discovery runs (a profile skipped, a
+# Counted up by any fallback path while a discovery runs (a profile skipped, a
 # description or identity lost to an OSError, a scope that could not be read):
 # a roster that degraded is rendered for this call and never cached, as before
-# the cache every turn re-read it.
-_degraded = False
+# the cache every turn re-read it. A count that only grows, never a flag reset
+# per call: the gateway runs each session's turn on its own thread, so two
+# discoveries overlap after one invalidation, and a flag the second reset
+# would let the first cache the roster that lost a profile. A discovery
+# compares the count before and after its walk; a fault another caller noted
+# in that window costs it one skipped store, never a cached degraded roster.
+_faults = 0
 
 
 def _note_degraded() -> None:
-    global _degraded
-    _degraded = True
+    global _faults
+    _faults += 1
 
 
 def _mtime_ns(path: Path) -> int | None:
@@ -694,7 +699,7 @@ def _profile_stamps(root: Path, names: list[str]) -> tuple | None:
 
 def _discover_and_render(base: Path | None) -> tuple[list[dict[str, str]] | None, str | None]:
     """The agents and the rendered roster, from the cache when nothing changed."""
-    global _cache, _degraded
+    global _cache
     root = PROFILES_BASE if base is None else base
     key = _cache_key_for(root)
     cached = _cache
@@ -705,7 +710,7 @@ def _discover_and_render(base: Path | None) -> tuple[list[dict[str, str]] | None
         and _profile_stamps(root, [name for name, *_ in cached[1]]) == cached[1]
     ):
         return cached[2], cached[3]
-    _degraded = False
+    faults_before = _faults
     agents = discover(root)
     roster = format_roster(agents)
     if roster is None:
@@ -713,7 +718,7 @@ def _discover_and_render(base: Path | None) -> tuple[list[dict[str, str]] | None
     else:
         extra = [b for b in (_format_host(read_host_identity(agents, root)), _format_scope(root)) if b]
         text = "\n\n".join([roster, *extra])
-    if key is not None and agents is not None and not _degraded:
+    if key is not None and agents is not None and _faults == faults_before:
         unstamped = _profile_stamps(root, _unstamped(agents))
         if unstamped is not None:
             _cache = (key, unstamped, agents, text)
