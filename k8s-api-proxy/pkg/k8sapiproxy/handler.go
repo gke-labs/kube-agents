@@ -166,6 +166,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent) 
 	caller, err := h.authenticator.AuthenticateRequest(r)
 	if errors.Is(err, errAuthenticationUnavailable) {
 		// The cause can name the host API server; it is not the caller's to read.
+		ev.Outcome, ev.Err = OutcomeAuthUnavailable, err
 		writeStatus(w, http.StatusServiceUnavailable, metav1.StatusReasonServiceUnavailable, authUnavailableMessage)
 		return
 	}
