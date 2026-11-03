@@ -686,7 +686,7 @@ grade. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off ne
 nor the transport: on both lanes they are appended to a scratch copy of every remaining task
 file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
 `BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
-request, and the stopped asks, run in a second phase after every first-phase unit (a case that
+request, the stopped asks and the cases that declare `writes_alone: true`, run in a second phase after every first-phase unit (a case that
 declares `scope_exclude:` runs after them, in a phase of its own), one at a time and each after a settle, so no repetition that requests nothing shares the repository with one that
 writes by design and no window reaches back into the unit before; and after the fan-out the
 script lists in the job log what the run left on that repository, closing nothing. With the flag
@@ -714,8 +714,7 @@ they come from.
 Where the flag is set is the Prow job's choice, not a script default, and since `next` became the
 mode a new install gets, the merge-blocking presubmit sets it: every pull request is graded on
 `next` through the door. `today` stays supported as the rollback, so a second lane proves that
-path. The today lane (`pull-kube-agents-smoke-test-today` on demand, and
-the six-hourly periodic `ci-kube-agents-eval-today` on `main`) sets the flag together with
+path. The today lane (`pull-kube-agents-smoke-test-today`, on pull requests that touch the round trip, or on demand) sets the flag together with
 `EVAL_ROLLBACK_LANE=1`: the deploy is the flagged one, and `hack/ci-eval-pr.sh` then runs
 `hack/rollback-roundtrip.sh` with `ROLLBACK_END_MODE=today` before the matrix, which adds a third
 leg (`next` to `today` again, with the first leg's checks) and leaves the install rolled back. The
@@ -726,7 +725,7 @@ refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
 The flag admits those jobs by name and nothing else without a pull request: section 2b of the
 deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
 listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
-its Tide batch runs, the today lane's periodic, the main nightly's three parts
+its Tide batch runs, the main nightly's three parts
 `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
 `ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
 under next, and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
@@ -738,8 +737,8 @@ inject lane compares only with next-mode history at its own key (agent model inc
 nightly and the presubmit run the same one). The today lane is the rollback check, and it stays
 out of the recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`,
 but it grades a rolled-back install. No job appends today's window now. The dashboard's Trend page
-keeps a series per mode, drawing today's from the lines the store already holds until they age
-out of its window; its Nightly page
+keeps a series per mode: it draws `next` by default, and today's stays selectable from the lines
+the store already holds until they age out of its window; its Nightly page
 reads the main nightly's runs, so it shows `next`.
 
 ## Open questions

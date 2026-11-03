@@ -551,7 +551,16 @@ class ReadingsSweep:
             return self._logins[repo]
         bound = self._bound[repo]
         try:
-            login = (bound.transport.whoami() or "").strip()
+            # The forge answers first, as `Binding.whoami` asks it: a configured
+            # identity, or a lookup of its own for a token that cannot call the
+            # current-user route (Bitbucket). It makes no call through the
+            # write credential, since `api` is the sweep's own. None means the
+            # transport's route.
+            ask = getattr(bound.forge, "whoami", None)
+            login = ask(bound.api) if callable(ask) else None
+            if login is None:
+                login = bound.transport.whoami()
+            login = (login or "").strip()
         except (IdentityUnknown, ForgeUnsupported):
             login = ""
         if login and bound.forge.whoami_route and not bound.forge.whoami_graphql:

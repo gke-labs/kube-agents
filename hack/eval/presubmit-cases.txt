@@ -82,9 +82,10 @@
 # The full audit kept here as the machinery canary
 # (compliance-rbac-overgrant, under the fleet-audits domain) ran on every
 # pull request from 2026-08-25 until 2026-09-22 without ever being admitted,
-# was a nightly case 2026-09-22 to 2026-09-29 and is seated held out below
-# since (#2013); fleet-audits stays on the docs/designs/domains.yaml
-# allowlist until its roster line lands. The comment above EVAL_REPETITIONS
+# was a nightly case 2026-09-22 to 2026-09-29, sat held out below from
+# 2026-09-29 (#2013) and took its roster line on 2026-11-02 (#2013 step 4),
+# which took fleet-audits off the docs/designs/domains.yaml allowlist. The
+# comment above EVAL_REPETITIONS
 # in the script carries the measured history of that budget.
 
 # ── The domain probes ────────────────────────────────────────────────────────
@@ -223,10 +224,35 @@
 # docs/designs/domains.yaml allowlist.
 ./tasks/vcs-spent-branch-reuse/task.yaml
 
+# The audit-machinery canary (fleet-audits), on the roster since 2026-11-02
+# (#2013 step 4, #4094) on the record it built in the held-out section
+# below from 2026-09-29: 36/36 graded repetitions on the twelve main
+# nightlies that graded it 2026-10-20 to 11-02, every night 3/3 (30/30 on the
+# ten with a job verdict); 15/15 at the gemini-4-argon next-mode key (10-29
+# to 11-02, the store at `collecting`, five short of a window); on the
+# presubmit itself, 10-27 to 11-02, 1068 of 1117 graded repetitions (95.6 %)
+# over 399 builds and no build with every graded repetition failed (the last
+# such build was 2026-10-22, before the audits' own turn budget, #3602, and
+# the model change; 678 builds since, no collapse). Demoted from the
+# roster 2026-09-02 (#1171, closed 2026-09-08; the bar then lived on #2013
+# step 3), nightly 2026-09-22 to 2026-09-29, held out here 2026-09-29 to
+# 2026-11-02. One of the presubmit cases that write to GitHub, with
+# pdb-remediation-pr and vcs-spent-branch-reuse above, and one of the two
+# that write a ledger, with consistency-drift-outlier above: the minted
+# token, the cloned *-infra workspace, the ledger write; it requests no pull
+# request, so it runs in the first phase, its three repetitions one after
+# another on its task lock. 732s median / 1450s p90 over the 1068 passing
+# presubmit repetitions of 10-27 to 11-02 (1002s / 2074s over 903 in
+# 2026-09-04 to 09-15), the 3000s delegation ceiling, priced at 1000 in
+# unit_cost_hint. The residual miss class is #2856 (the worker publishes no
+# ledger), 31 of those 49 misses. This line took fleet-audits off the
+# docs/designs/domains.yaml allowlist.
+./tasks/compliance-rbac-overgrant/task.yaml
+
 # ── Held out: seated here without a roster line ──────────────────────────────
 # The documented exception to the 2026-09-22 rule above, one case per
-# coverage tracker (today #2013, fleet-audits; #2016's seat became a
-# roster line 2026-10-14). A case
+# coverage tracker (today none: #2013's seat, the compliance canary, became
+# a roster line 2026-11-02 and #2016's on 2026-10-14). A case
 # in this section runs on every pull request and, under the default
 # EVAL_ADMISSION_MODE=roster, CANNOT red one on a graded failure: it is not
 # in blocking-roster.txt, so rung 4 (collapse) and rung 6 (judged
@@ -246,18 +272,10 @@
 # added or withdrawn here edits only its own entry; SLOW_MIN_TASKS in
 # scripts/eval_dashboard/health.py reads this file.
 
-# The audit-machinery canary (fleet-audits), #2013 step 2, seated 2026-09-29.
-# Demoted from the roster 2026-09-02 (#1171, closed 2026-09-08; the bar now
-# lives on #2013 step 3), nightly 2026-09-22 to 2026-09-29. One of the
-# presubmit cases that write to GitHub, with pdb-remediation-pr and
-# vcs-spent-branch-reuse above, and one of the two that write a ledger,
-# with consistency-drift-outlier above since 2026-10-26: the minted token,
-# the cloned *-infra workspace, the ledger write.
-# 1002s median / 2074s p90 over 903 presubmit
-# repetitions 2026-09-04 to 09-15, the 3000s delegation ceiling, priced in
-# unit_cost_hint. Roster line when #2013 step 3's three clean days hold;
-# fleet-audits stays on the docs/designs/domains.yaml allowlist until then.
-./tasks/compliance-rbac-overgrant/task.yaml
+# The section is empty since 2026-11-02. Its two seats so far:
+# pdb-remediation-pr (#2016 step 2, 2026-09-28 to 2026-10-14) and the
+# compliance canary (#2013 step 2, 2026-09-29 to 2026-11-02), each moved
+# up into the list above on its record.
 
 # Moved out to nightly-cases.txt, for the record:
 #   the seven held-out cases this file ran without blocking, on 2026-09-22
@@ -265,7 +283,8 @@
 #   security-overgrant-remediation-proposal, obtainability-pdb-semantics,
 #   obtainability-fleet-exposure-sweep, obtainability-healthy-namespace-silence,
 #   rca-remediation-pr, compliance-rbac-overgrant (back here held out
-#   2026-09-29, #2013) and cluster-agent-healthy-workload-no-finding, each
+#   2026-09-29, #2013; on the roster above since 2026-11-02) and
+#   cluster-agent-healthy-workload-no-finding, each
 #   with its hold-out reason as the # line above it there;
 #   gpu-stress-test-diagnosis and
 #   autoops-warning-event-triage, 2026-09-03 (tofu wall clock, #1218/#1202);
