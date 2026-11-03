@@ -339,7 +339,7 @@ pools in place, it cost:
 | About 13,100 GB pd-balanced boot disks             | $1.80        |
 | Total                                              | About $16.10 |
 
-## Token cost against fleet size (in progress)
+## Token cost against fleet size
 
 `real-install-scaling.yaml` measures each fleet size the same way. 42 clusters is measured by the
 12-hour soak ($16.6 per hour, $398 per day).
@@ -357,6 +357,28 @@ the test project's quota of 575.
 Prediction, made before the run: the cost grows less than linearly. Triage grows with incidents,
 but Stall Watch reaches only a few clusters per run and the alert ceiling suppresses most event
 alerts, and neither of those grows with the fleet.
+
+### Results so far (M)
+
+| Window                         | Clusters | Nodes | Pods   | Input tokens (cached) | Token cost | Per hour | Agent peak | Waiting cards at the end |
+| ------------------------------ | -------- | ----- | ------ | --------------------- | ---------- | -------- | ---------- | ------------------------ |
+| 12-hour soak (no backlog)      | 40       | 254   | 17,439 | 482.3 M (83%)         | $198.7     | $16.6    | 2.57 GB    | none                     |
+| 80-cluster steady, 3 h         | 80       | 482   | 34,529 | 526.2 M (84%)         | $204.0     | $68.0    | 3.43 GB    | 96                       |
+| 80-cluster daily audits, 1.5 h | 80       | 482   | 34,529 | 189.2 M (84%)         | $87.2      | $58.0    | 4.67 GB    | 303                      |
+
+The 80-cluster daily audits did not all finish in their window: 5 of 7 completed, and the
+compliance, stockout and GCE audits were still running at its end.
+
+The first 20-cluster windows are not valid. At their end, 345 of the 405 waiting cards belonged to
+clusters the runner had already deleted (`scale-21` to `scale-80`), left from the 80-cluster level,
+so the windows measured that backlog: $69.5 per hour steady, and an agent peak of 5.29 GB. The
+20-cluster level is being measured again after the deleted clusters' cards were archived.
+
+What the data shows so far: the steady token cost follows how busy the 6 worker slots are. With a
+backlog that keeps the slots full, it was about $68–70 per hour at both fleet sizes; without one, at
+42 clusters, it was $16.6 per hour. The backlog formed at 80 clusters (96 cards waiting after the
+steady window) and not in the 42-cluster soak. The agent's peak passed the 4.3 GB the six-worker
+estimate gives, which agrees with #3937 (memory kept after worker bursts).
 
 ## What the install runs and what grows
 
