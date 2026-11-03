@@ -1012,7 +1012,9 @@ _WORKLOAD_FOLD_LOCK = threading.Lock()
 # SQLite matches a partial index against the query's text; init_db replaces an
 # index of the same name whose SQL lacks the term.
 FOLD_ANCHOR_INDEX_TERM = "fold_key != '' AND (notified != 0 OR delivery_error != '')"
-WORKLOAD_INCIDENT_INDEX_TERM = "workload_key != '' AND duplicate_of IS NULL AND session_id != ''"
+WORKLOAD_INCIDENT_INDEX_TERM = (
+    "workload_key != '' AND duplicate_of IS NULL AND session_id != '' AND (notified != 0 OR delivery_error != '')"
+)
 # A workload that breaks again while the fix for its last incident waits for
 # review (_open_fix_pull_request): the event is recorded against that incident
 # with the pull request's URL instead of opening a second investigation. A pull
@@ -1678,14 +1680,15 @@ def init_db() -> None:
             # else is walked on a miss: an anchor has a fold_key and was
             # admitted (`notified` non-zero or a `delivery_error`; the start-up
             # clear below empties the first index again), an incident with a
-            # fix has a workload_key, is no duplicate and has a session, and
-            # only a folded row has a duplicate_of. The admission terms matter
-            # because every forwarded event writes a row with both keys set
-            # whatever became of it: a workload refused all day by its
-            # severity's ceiling writes one row per sighting, none of which
-            # answers either lookup, and an index on the key alone would make
-            # each later sighting walk all of them, newest first, before
-            # concluding there is no anchor. The queries spell the WHERE
+            # fix has a workload_key, is no duplicate, has a session and was
+            # admitted, and only a folded row has a duplicate_of. The admission
+            # term is in both because every forwarded event writes a row with
+            # both keys and the inject's session set whatever became of it: a
+            # workload refused all day by its severity's ceiling writes one
+            # row per sighting, none of which answers either lookup, and an
+            # index without the term would make each later sighting walk all
+            # of them, newest first, before concluding there is no anchor and
+            # no incident. The queries spell the WHERE
             # terms as literals (`fold_key != ''`, `(notified != 0 OR
             # delivery_error != '')`, `workload_key != ''`, `duplicate_of IS
             # NULL`, `session_id != ''`, `duplicate_of > 0`) next to their
@@ -2353,9 +2356,10 @@ def _open_fix_pull_request(
         return None
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
-            # `workload_key != ''`, `duplicate_of IS NULL` and `session_id != ''`
-            # are the workload-incident index's terms and `duplicate_of > 0`
-            # the duplicate index's (init_db); the correlated EXISTS reads the
+            # `workload_key != ''`, `duplicate_of IS NULL`, `session_id != ''`
+            # and `(notified != 0 OR delivery_error != '')` are the
+            # workload-incident index's terms and `duplicate_of > 0` the
+            # duplicate index's (init_db); the correlated EXISTS reads the
             # duplicate index once per candidate incident rather than
             # materialising every folded row's anchor.
             incidents = conn.execute(

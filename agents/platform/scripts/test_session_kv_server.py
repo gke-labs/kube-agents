@@ -3384,19 +3384,28 @@ class TestWorkloadFoldQueryPlans(unittest.TestCase):
 
     def test_an_index_built_on_the_key_alone_is_replaced_on_start(self):
         # An earlier build of the daemon created both indexes on the key
-        # alone; CREATE INDEX IF NOT EXISTS would keep those, terms and all.
+        # alone, and a later one the incident index without the admission
+        # term; CREATE INDEX IF NOT EXISTS would keep those, terms and all.
         with self.real_connect(temp_db_path) as conn, conn:
             conn.execute("DROP INDEX idx_intercepted_events_fold_anchor")
             conn.execute(
                 "CREATE INDEX idx_intercepted_events_fold_anchor "
                 "ON intercepted_events (cluster, namespace, object_kind, fold_key, id DESC) WHERE fold_key != ''"
             )
+            conn.execute("DROP INDEX idx_intercepted_events_workload_incident")
+            conn.execute(
+                "CREATE INDEX idx_intercepted_events_workload_incident "
+                "ON intercepted_events (cluster, namespace, object_kind, workload_key, id DESC) "
+                "WHERE workload_key != '' AND duplicate_of IS NULL AND session_id != ''"
+            )
         session_kv_server.init_db()
         with self.real_connect(temp_db_path) as conn:
-            (sql,) = conn.execute(
-                "SELECT sql FROM sqlite_master WHERE name = 'idx_intercepted_events_fold_anchor'"
-            ).fetchone()
-        self.assertIn(session_kv_server.FOLD_ANCHOR_INDEX_TERM, sql)
+            sql = dict(conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'intercepted_events'"
+            ).fetchall())
+        self.assertIn(session_kv_server.FOLD_ANCHOR_INDEX_TERM, sql["idx_intercepted_events_fold_anchor"])
+        self.assertIn(
+            session_kv_server.WORKLOAD_INCIDENT_INDEX_TERM, sql["idx_intercepted_events_workload_incident"])
         # And a second start leaves the right one alone.
         _RecordingConnection.statements = []
         session_kv_server.init_db()
@@ -3419,7 +3428,7 @@ _BENCH_SESSIONS = 5
 # scan's growth with the table cannot hide in it. Measured: indexed, the
 # anchor lookup takes 281 steps at both sizes and the open-fix lookup 293 and
 # 654 (the EXISTS runs once per candidate incident), and on the refused storm
-# below 270 and 274 at both sizes; unindexed, 5,149 and 8,180 steps at a
+# below 270 and 273 at both sizes; unindexed, 5,149 and 8,180 steps at a
 # thousand rows become 971,930 and 16,772,056 at the cap.
 # A lookup at the cap may cost this many times its cost at a thousand rows,
 # and never more than the ceiling, which an unindexed read at the cap passes
@@ -3453,10 +3462,11 @@ class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
         """A ledger of `rows` admitted incidents spread over the workloads.
 
         With `refused_storm`, every row is instead one workload's sighting that
-        its severity's ceiling refused (`notified` 0, no delivery error, no
-        session): the shape a Deployment that keeps failing after the day's
-        budget is spent writes for the rest of the day, and one on which both
-        lookups miss.
+        its severity's ceiling refused (`notified` 0, no delivery error, and the
+        session the inject arrived on, which record_intercepted_event stamps on
+        every row whatever became of it): the shape a Deployment that keeps
+        failing after the day's budget is spent writes for the rest of the day,
+        and one on which both lookups miss.
         """
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -3465,7 +3475,7 @@ class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
             session_kv_server.init_db()
         if refused_storm:
             rows_to_insert = (
-                ("c1", "ns1", _BENCH_STORM_WORKLOAD, f"uid-{i}", "Pod", "BackOff", "m", "Warning", 0, "",
+                ("c1", "ns1", _BENCH_STORM_WORKLOAD, f"uid-{i}", "Pod", "BackOff", "m", "Warning", 0, f"sess-{i}",
                  _BENCH_STORM_WORKLOAD, _BENCH_STORM_WORKLOAD)
                 for i in range(rows)
             )
@@ -3542,8 +3552,10 @@ class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
         # The hit path stops at the first index row; a miss walks every row
         # the index holds for the workload. With the indexes on the key alone
         # the anchor lookup took 1,600,122 steps and the open-fix lookup
-        # 2,000,156 on a 200,000-row storm, against 111 and 136 with the
-        # admission terms in the index.
+        # 2,000,156 on a 200,000-row storm, and with the incident index on the
+        # key and the session but not the admission term the open-fix lookup
+        # still took 1,600,273, since the route stamps the inject's session on
+        # a refused row too; 270 and 273 with the admission term in both.
         self._assert_bounded(
             self._measure(_BENCH_SMALL_ROWS, refused_storm=True),
             self._measure(_BENCH_LARGE_ROWS, refused_storm=True),
