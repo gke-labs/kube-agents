@@ -782,8 +782,8 @@ METRICS_CONNECTION_DEADLINE_SECONDS = 10
 # command slots. Envoy's per-cluster connection ceiling for the credentialed
 # route (max_connections in deploy/shared/envoy-credential-proxy.yaml) is the
 # most it can hold open to the broker at once, so a queue of that size leaves
-# Envoy's own breaker, never this queue, as what refuses first; the test pins
-# this constant to that number. listen() clamps it to net.core.somaxconn: 4096
+# Envoy's own breaker, never this queue, as what refuses first; the test holds
+# this constant at or above that number. listen() clamps it to net.core.somaxconn: 4096
 # on a recent Linux kernel, 1024 inside a gVisor sandbox, so the queue is at
 # most this size and never less.
 LISTEN_BACKLOG = 4096

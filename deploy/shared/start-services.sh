@@ -107,8 +107,9 @@ readonly KV_DAEMON_URL="http://${KV_DAEMON_HOST}:${KV_DAEMON_PORT}"
 readonly AGENT_GATEWAY_URL="http://127.0.0.1:8642"
 
 # The address every listener in the baked Envoy config binds, which start_envoy
-# rebinds to the Pod IP. Named so the rewrite and the check that it reached
-# every listener read the same literal.
+# rebinds to the address the operator passes (0.0.0.0 in the broker Pod, so the
+# Pod IP answers). Named so the rewrite and the check that it reached every
+# listener read the same literal.
 readonly ENVOY_LOOPBACK_ADDRESS=127.0.0.1
 
 # How long to wait for that daemon to start listening before launching the

@@ -460,11 +460,11 @@ class EventWatcherMetricsPortContractTest(unittest.TestCase):
 
 
 class EnvoyListenerRewriteContractTest(unittest.TestCase):
-    """Every Envoy listener moves to the Pod IP, or Envoy does not start.
+    """Every Envoy listener moves off loopback, or Envoy does not start.
 
     The baked config binds loopback; in a Pod of its own the broker's listeners
-    have to accept the Pod IP, so start-services.sh rewrites every loopback
-    listener address before launching Envoy. There are two listeners now, the
+    have to accept the Pod IP (the operator passes 0.0.0.0), so start-services.sh
+    rewrites every loopback listener address before launching Envoy. There are two listeners now, the
     credentialed one and the readiness probe's, and a render that moved one
     and not the other starts an Envoy whose callers, or whose probe, reach a
     port bound to loopback: a hang, or a pod that is never Ready, with nothing

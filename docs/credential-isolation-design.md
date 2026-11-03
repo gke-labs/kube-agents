@@ -261,8 +261,9 @@ refuses first. The health listener routes `/healthz` alone to a `credential_heal
 on the same Unix socket, behind a breaker of 64, so ready still means the broker answers and
 no watch can mark the Pod unready; any other path on it is a 404. The Service and the
 NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
-`start-services.sh` rebinds both listeners from loopback to the Pod IP together and refuses
-to start Envoy if a render leaves one behind. There is no `livenessProbe`: the start script
+`start-services.sh` rebinds both listeners off loopback together, to the address the operator
+passes (`0.0.0.0`, so the Pod IP answers), and refuses to start Envoy if a render leaves one
+behind. There is no `livenessProbe`: the start script
 supervises both processes and restarts the runtime in place, and a probe-driven restart
 would drop every open watch and the broker's workspace state. Envoy's admin interface stays
 on its Unix socket, where nothing on the Pod network reaches it.

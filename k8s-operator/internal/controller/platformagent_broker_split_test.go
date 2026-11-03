@@ -1056,7 +1056,7 @@ func TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker(t *testing.T) {
 			t.Fatalf("listener %s is not a socket listener", listener.Name)
 		}
 		if listener.Address.SocketAddress.Address != envoyLoopbackAddress {
-			t.Fatalf("listener %s binds %s; start-services.sh rebinds %s to the Pod IP and nothing else, and 0.0.0.0 in the image would open the port before the rewrite had a say", listener.Name, listener.Address.SocketAddress.Address, envoyLoopbackAddress)
+			t.Fatalf("listener %s binds %s in the image; start-services.sh rebinds %s to the address the operator passes and nothing else, so a listener baked on any other address stays where it is in every Pod, the sidecar arrangement's loopback-only one included", listener.Name, listener.Address.SocketAddress.Address, envoyLoopbackAddress)
 		}
 		listeners[listener.Name] = listener.Address.SocketAddress.PortValue
 	}
