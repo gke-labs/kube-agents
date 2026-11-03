@@ -11420,6 +11420,35 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertEqual(drift["sent"], 0)
         self.trigger.assert_not_called()
 
+    def test_the_backlog_card_is_stamped_drift_by_the_override_never_an_argument(self):
+        import subprocess as sp
+        import time as _time
+
+        self._headless()
+        self._burst()
+        fresh = sp.CompletedProcess(
+            ["hermes"], 0, stdout=json.dumps({"id": "t_digest1", "created_at": int(_time.time())}), stderr=""
+        )
+        with patch.object(session_kv_server.subprocess, "run", return_value=fresh) as run, patch.object(
+            session_kv_server, "_stamp_board_task_origin", return_value=True
+        ) as stamp:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        self.assertEqual(run.call_args.kwargs["env"]["KUBE_AGENTS_CARD_ORIGIN"], "drift")
+        self.assertFalse([a for a in run.call_args.args[0] if "origin" in a.lower()], "no origin argument")
+        stamp.assert_called_once_with("t_digest1", "drift", "")
+
+    def test_a_dedupe_hit_on_the_backlog_key_is_not_restamped(self):
+        import subprocess as sp
+
+        self._headless()
+        self._burst()
+        old = sp.CompletedProcess(["hermes"], 0, stdout=json.dumps({"id": "t_digest1", "created_at": 1}), stderr="")
+        with patch.object(session_kv_server.subprocess, "run", return_value=old), patch.object(
+            session_kv_server, "_stamp_board_task_origin"
+        ) as stamp:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        stamp.assert_not_called()
+
     def test_a_next_install_whose_platform_has_no_home_channel_files_the_card(self):
         """The platform walk itself, not a patched answer: `spec.mode: next`,
         the gateway holding Slack with no home channel. The operator renders

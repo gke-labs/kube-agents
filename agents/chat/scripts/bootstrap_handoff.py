@@ -39,6 +39,11 @@ from pathlib import Path
 CLUSTER_KEY_PREFIX = "bootstrap-inventory-cluster-"
 PRIORITIZE_KEY = "bootstrap-inventory-prioritize"
 ASSIGNEE = "platform"
+# The board stamp the onboarding cards carry (docs/designs/proposal-origin.md
+# §2.1): the chat bootstrap is chat work. Passed to the board through the in-pod
+# override hermes_cli/kanban_origin.py reads on the CLI create path, never as an
+# argument of the create command.
+CARD_ORIGIN = "chat"
 RAW_PATH = "/opt/data/INVENTORY.raw.md"
 REPORT_PATH = "/opt/data/INVENTORY.md"
 # inventory_findings.py's DEFAULT_LIMITS_PATH, which its `select` reads;
@@ -831,19 +836,43 @@ def _create(parse_task_id, assignee: str, key: str, title: str, body: str) -> st
     except Exception as e:  # noqa: BLE001 - kanban unavailable; retry next tick
         _log(f"kanban API unavailable: {e}")
         return None
+    try:
+        from hermes_cli import kanban_origin
+    except Exception as e:  # noqa: BLE001 - file the card unstamped
+        _log(f"card origin unavailable: {e}")
+        kanban_origin = None
     cmd = (
         f"create --json --assignee {shlex.quote(assignee)} --idempotency-key {shlex.quote(key)} "
         f"--body {shlex.quote(body)} {shlex.quote(title)}"
     )
     try:
-        out = str(run_slash(cmd)).strip()
+        if kanban_origin is not None:
+            # The board's CLI create path stamps CARD_ORIGIN at insert.
+            with kanban_origin.writer_origin(CARD_ORIGIN):
+                out = str(run_slash(cmd)).strip()
+        else:
+            out = str(run_slash(cmd)).strip()
     except Exception as e:  # noqa: BLE001 - never fail the cron run
         _log(f"could not file {key}: {e}")
         return None
     task_id = parse_task_id(out)
     if not task_id:
         _log(f"could not read a task id from the board response for {key}: {out}")
+    elif kanban_origin is not None and kanban_origin.created_just_now(_created_at(out)):
+        # Applies only where the card has no stamp; a dedupe hit keeps the first card's.
+        kanban_origin.put_card_origin(task_id, CARD_ORIGIN)
     return task_id
+
+
+def _created_at(out: str) -> object:
+    """The ``created_at`` of the card a ``create --json`` response names, or None."""
+    start, end = out.find("{"), out.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(out[start : end + 1]).get("created_at")
+    except (ValueError, AttributeError):
+        return None
 
 
 def _archive(task_id: str) -> bool:

@@ -1274,6 +1274,14 @@ DRIFT_BACKLOG_CARD_TITLE = "Drift backlog: {count} {noun} reached drift detectio
 DRIFT_BACKLOG_CARD_KEY_PREFIX = "drift-backlog-"
 DRIFT_BACKLOG_CARD_CREATED_BY = "drift-detector"
 DRIFT_BACKLOG_CARD_STATUS = "blocked"
+# The card's board stamp is `drift` (docs/designs/proposal-origin.md §2.1): the
+# in-pod override the board's CLI create path reads (deploy/docker/patches/
+# kanban_origin.py CARD_ORIGIN_ENV), set in the subprocess's environment and
+# never passed as an argument. A card the create just inserted (its created_at
+# within the window kanban_origin.CREATED_JUST_NOW_SECONDS names) is then stamped
+# here too, which applies only where no stamp exists.
+DRIFT_BACKLOG_CARD_ORIGIN_ENV = "KUBE_AGENTS_CARD_ORIGIN"
+DRIFT_BACKLOG_CARD_CREATED_JUST_NOW_SECONDS = 60
 # The CLI timeout is the send timeout, so the lease (sized from it) outlives
 # the call. A timeout counts as no card, unlike the chat send, because the rows
 # must not be marked without a task id; a create that committed before the kill
@@ -6447,7 +6455,10 @@ def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
-            env=_run_env({"HERMES_KANBAN_BUSY_TIMEOUT_MS": DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS}),
+            env=_run_env({
+                "HERMES_KANBAN_BUSY_TIMEOUT_MS": DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS,
+                DRIFT_BACKLOG_CARD_ORIGIN_ENV: ORIGIN_DRIFT,
+            }),
             timeout=DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
@@ -6467,14 +6478,31 @@ def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
     out = proc.stdout or ""
     start, end = out.find("{"), out.rfind("}")
     task_id = ""
+    created_at: Any = None
     if start != -1 and end > start:
         try:
-            task_id = str((json.loads(out[start:end + 1]) or {}).get("id") or "")
-        except ValueError:
+            card = json.loads(out[start:end + 1]) or {}
+            task_id = str(card.get("id") or "")
+            created_at = card.get("created_at")
+        except (ValueError, AttributeError):
             task_id = ""
     if not task_id:
         logger.error(f"Drift backlog card: no task id in the board's answer: {out.strip()[:LEDGER_MESSAGE_MAX_CHARS]}")
+    elif _created_just_now(created_at):
+        try:
+            _stamp_board_task_origin(task_id, ORIGIN_DRIFT, "")
+        except Exception as exc:  # noqa: BLE001 - the card is filed; the stamp is telemetry
+            logger.warning(f"Drift backlog card: could not stamp {task_id} as {ORIGIN_DRIFT}: {exc}")
     return task_id
+
+
+def _created_just_now(created_at: Any) -> bool:
+    """Whether a card's `created_at` (epoch seconds) says the create just inserted it."""
+    try:
+        age = time.time() - float(created_at)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age <= DRIFT_BACKLOG_CARD_CREATED_JUST_NOW_SECONDS
 
 
 def _refund_alert_quota(severity: str) -> None:
@@ -7519,24 +7547,34 @@ def put_board_task_origin(task_id: str, request_data: Dict[str, Any]) -> Dict[st
     if not task_id or len(task_id) > ORIGIN_TASK_ID_MAX_CHARS:
         raise HTTPException(status_code=400, detail=f"task_id must be 1 to {ORIGIN_TASK_ID_MAX_CHARS} characters")
     origin, platform = _origin_fields(request_data)
-    board = _kanban_db_path()
-    if not os.path.isfile(board):
-        raise HTTPException(status_code=404, detail="the kanban board does not exist")
     try:
-        _, connect_tracked = _hermes_kanban()
+        stamped = _stamp_board_task_origin(task_id, origin, platform)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="the kanban board does not exist") from None
     except ImportError as exc:
         raise HTTPException(status_code=503, detail=f"Hermes' kanban module is not importable: {exc}") from None
-    try:
-        with closing(_card_stop_connect(connect_tracked, board)) as conn:
-            conn.execute(KANBAN_TASK_ORIGINS_SCHEMA)
-            cursor = conn.execute(
-                "INSERT OR IGNORE INTO kanban_task_origins (task_id, origin, origin_platform, stamped_at) VALUES (?, ?, ?, ?)",
-                (task_id, origin, platform, datetime.now(timezone.utc).isoformat()),
-            )
-            stamped = cursor.rowcount > 0
     except sqlite3.Error as exc:
         raise HTTPException(status_code=503, detail=f"the kanban board could not be written: {exc}") from None
     return {"stamped": stamped}
+
+
+def _stamp_board_task_origin(task_id: str, origin: str, platform: str) -> bool:
+    """Stamp a card in the board's side table if it has no stamp; True when this call wrote it.
+
+    Raises FileNotFoundError without a board, ImportError without Hermes'
+    kanban module, and sqlite3.Error when the board cannot be written.
+    """
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        raise FileNotFoundError(board)
+    _, connect_tracked = _hermes_kanban()
+    with closing(_card_stop_connect(connect_tracked, board)) as conn:
+        conn.execute(KANBAN_TASK_ORIGINS_SCHEMA)
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO kanban_task_origins (task_id, origin, origin_platform, stamped_at) VALUES (?, ?, ?, ?)",
+            (task_id, origin, platform, datetime.now(timezone.utc).isoformat()),
+        )
+        return cursor.rowcount > 0
 
 
 @app.get("/v1/sessions/{session_id}/metadata", dependencies=[Depends(verify_api_key)])

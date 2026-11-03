@@ -89,6 +89,12 @@ SWEEPS_ENV = "GITHUB_WATCHER_SWEEPS"
 # Every card this job files goes to the privileged specialist: the Chat Agent's
 # toolsets are stripped to `mcp-router` + `kanban`, so it could not act on one.
 ASSIGNEE = "platform"
+# The origin each card is stamped with on the board (docs/designs/proposal-origin.md
+# §2.1): an issue card is `issue`, a pull-request follow-up card `scheduled`.
+# Passed to the board through the in-pod override hermes_cli/kanban_origin.py
+# reads on the CLI create path, never as an argument of the create command.
+CARD_ORIGIN_ISSUE = "issue"
+CARD_ORIGIN_SCHEDULED = "scheduled"
 
 RESOLVER_REL = "skills/github-issue-resolver/scripts/resolver.py"
 PLATFORM_PROFILE_DIR = "profiles/platform"
@@ -198,6 +204,8 @@ class Card:
     title: str
     body: str
     idempotency_key: str
+    # The board stamp this card files with, "" for none.
+    origin: str = ""
 
 
 @dataclass
@@ -452,6 +460,7 @@ def _issue_card(payload: dict, now: datetime | None = None) -> Card:
         # rather than trust the card, so the second worker finds the issue
         # claimed or gone and stops.
         idempotency_key=f"issue-resolve-{_slug(repo)}-{number}-{bucket}",
+        origin=CARD_ORIGIN_ISSUE,
     )
 
 
@@ -641,6 +650,7 @@ def _pr_card(pr, triggers: list, repo: str, now: datetime | None = None) -> Card
         idempotency_key=(
             f"pr-conv-{_slug(repo)}-{pr.number}-{_key_part(refs[0])}-{bucket}"
         ),
+        origin=CARD_ORIGIN_SCHEDULED,
     )
 
 
@@ -968,6 +978,18 @@ def _parse_task_id(out: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _parse_created_at(out: str) -> object:
+    """The ``created_at`` of the card a ``create --json`` response names, or None."""
+    start = out.find("{")
+    end = out.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(out[start : end + 1]).get("created_at")
+    except Exception:  # noqa: BLE001 - no timestamp, no re-stamp
+        return None
+
+
 def file_card(card: Card) -> str | None:
     """File one card, returning its id.
 
@@ -975,12 +997,24 @@ def file_card(card: Card) -> str | None:
     not something to page the room about — the next tick re-files, because the
     issue is still unclaimed and the poll will find it again. Only a *sweep*
     failing is loud, because that is what makes the watcher blind.
+
+    The card's ``origin`` reaches the board through
+    ``hermes_cli/kanban_origin.py``: the create runs under ``writer_origin``,
+    which the board's CLI create path stamps at insert, and a card the create
+    just inserted is then re-stamped through the Session KV server, which
+    applies only where no stamp exists. A dedupe hit on a key someone else
+    filed first keeps that card's stamp.
     """
     try:
         from hermes_cli.kanban import run_slash
     except Exception as e:  # noqa: BLE001 - kanban unavailable; retry next tick
         sys.stderr.write(f"github_scan_gate: kanban API unavailable: {e}\n")
         return None
+    try:
+        from hermes_cli import kanban_origin
+    except Exception as e:  # noqa: BLE001 - file the card unstamped
+        sys.stderr.write(f"github_scan_gate: card origin unavailable: {e}\n")
+        kanban_origin = None
 
     cmd = (
         f"create --json --assignee {shlex.quote(ASSIGNEE)} "
@@ -988,8 +1022,13 @@ def file_card(card: Card) -> str | None:
         f"--body {shlex.quote(card.body)} "
         f"{shlex.quote(card.title)}"
     )
+    stamped = card.origin and kanban_origin is not None
     try:
-        out = str(run_slash(cmd)).strip()
+        if stamped:
+            with kanban_origin.writer_origin(card.origin):
+                out = str(run_slash(cmd)).strip()
+        else:
+            out = str(run_slash(cmd)).strip()
     except Exception as e:  # noqa: BLE001 - never fail the cron run
         sys.stderr.write(f"github_scan_gate: could not file card: {e}\n")
         return None
@@ -1000,6 +1039,8 @@ def file_card(card: Card) -> str | None:
             f"github_scan_gate: could not read a task id from the board response: {out}\n"
         )
         return None
+    if stamped and kanban_origin.created_just_now(_parse_created_at(out)):
+        kanban_origin.put_card_origin(task_id, card.origin)
     sys.stderr.write(f"github_scan_gate: filed card {task_id} ({card.idempotency_key})\n")
     return task_id
 
