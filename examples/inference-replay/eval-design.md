@@ -123,6 +123,13 @@ The rules that keep this safe:
   signature. The prototype did exactly this before it was fixed.
 - **Answers are rewritten by whole token only, and never for bare numbers.** An unrelated `99`
   in an answer must not become this run's row id.
+- **An answer that repeats a number we swapped isn't saved.** Some values are swapped in the
+  request but can't safely be put back in an answer: bare numbers like a `pid`, a row `id`,
+  `resourceVersion` or `generation`, and the epoch timestamps that all become one fixed token. If
+  the model's answer repeats one of those values (say it answers `kill 4821` after reading
+  `pid 4821`), a later run would get the old number back. So the proxy checks each answer before
+  saving it, and if it repeats any of those values, it doesn't save it. That request just goes to
+  the model next time, which is always safe.
 - **Hermes' recent-work digest is dropped from the key.** Every card view ends with
   `## Recent work by @<assignee>`, the assignee's last five runs on other cards, so the first
   card read differs between otherwise identical runs. The same block leaks earlier repetitions'
@@ -241,9 +248,10 @@ installs or customer installs, because the saved answers contain details about o
 **The proxy has to remove secrets itself.** It sees every request before anything is cleaned up.
 LiteLLM does have a redaction plugin, but it's off by default and CI doesn't turn it on. So before
 the proxy stores anything, it runs the same cleanup that `worker_trajectory.py` already uses (the
-install's `AuditRedactor`, then the rules in `worker_transcript.py`). That cleanup has only been
-tested on short snippets (2,000 characters), so we need to check it on full tool output, like a
-Secret dump or a token, before storing any request text.
+install's `AuditRedactor`, then the rules in `worker_transcript.py`). That cleanup already runs on the
+full tool output in today's eval records, but only the first 2,000 characters of each result are
+kept, so nobody has looked at what it leaves in the rest. We need to check it on full-length output,
+like a Secret dump or a token, before storing any request text.
 
 ### Who can write to the cache
 
@@ -266,8 +274,12 @@ shared cache:
 - **The nightly.** It runs `main`'s code as `eval-baseline-recorder` and uploads answers from runs
   that passed.
 - **A copy job that runs when a pull request merges.** It runs as a trusted account and copies the
-  merged pull request's answers, from its last passing presubmit, into the shared cache. That's safe
-  because by then the code that made those answers has been reviewed, approved and merged. It only
+  merged pull request's answers into the shared cache, but only from a presubmit that ran the full
+  eval matrix on the exact code that merged. That's safe because by then that code has been
+  reviewed, approved and merged. If the merged version only went green through an admin
+  `/override`, or by reusing an earlier version's result (the presubmit then logs `REVALIDATED` and
+  writes `step0_reused_override` in `finished.json`), no run of the merged code exists, so nothing
+  is copied and the nightly fills those cases in. It only
   copies files and doesn't run any evals, so it doesn't have the cost problem that made the scorer
   design turn down running evals after every merge (`docs/designs/eval-scorer.md`, "Why nightly and
   not per-merge"). It also keeps the cache fresh: right after a prompt change merges, that pull
@@ -284,10 +296,13 @@ pull request's folder, and the merge copy would then carry those answers into th
 Only a pull request's own builds should be able to write its answers. Two ways we could do that,
 which need checking before we build:
 
-- Keep them in that build's own Prow artifacts folder, encrypted with a Cloud KMS key that
-  presubmits can only encrypt with and only the copy job can decrypt. This only works if Prow's
-  uploader is the only thing that can write into a build's folder, and we haven't checked whether a
-  job's own code can write there too.
+- Keep them in that build's own Prow artifacts folder, encrypted with a Cloud KMS key. The
+  encryption is only there to keep the public out, since anyone can read Prow artifacts through the
+  Prow website. Presubmits can both encrypt and decrypt, so a re-run can still read its own earlier
+  answers. Another pull request being able to read them doesn't expose anything new, because every
+  presubmit already runs as the same account with admin on the same eval clusters. What stops
+  tampering is where the files live: this only works if Prow's uploader is the only thing that can
+  write into a build's folder, and we haven't checked whether a job's own code can write there too.
 - A staging bucket where builds can add files but not overwrite them, with each build also saving a
   list of what it wrote for the copy job to check.
 
@@ -311,7 +326,9 @@ flowchart LR
     own -. "re-runs of the same PR" .-> pre
 ```
 
-**What goes into the cache key.** Agents don't ask for a specific model. They send the name
+### What goes into the cache key
+
+Agents don't ask for a specific model. They send the name
 `model-default`, and LiteLLM decides which model that means and how hard it thinks. LiteLLM also
 edits requests with a few plugins (for example, one that strips old thinking text). So a pull
 request that changes any of that sends exactly the same requests as before, and without extra care
@@ -326,6 +343,46 @@ the same either way. But LiteLLM adds headers to each reply saying what happened
 it fell back (see [the gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)).
 The proxy only saves an answer when it came from the main setup with no fallback. Our prototype
 didn't check these headers, so this part hasn't been tested yet.
+
+### How a pull request run finds an answer
+
+For every model request, a pull request run (including a `/retest` or a new push) does this:
+
+1. **Check the shared cache.** If the fingerprint is there, replay that answer.
+2. **If not, check that pull request's own saved answers.** If the fingerprint is there, replay it.
+3. **If not, ask the model.** Save the new answer into the pull request's own storage, never the
+   shared cache.
+
+The order of 1 and 2 doesn't really matter. Both use the same fingerprint of the full normalized
+request, so a match in either is an answer to exactly the same input.
+
+**Answers saved during a build are never used by that same build.** The three runs of a case happen
+at the same time. If run 1 saved an answer and runs 2 and 3 replayed it moments later, a case the
+pull request changed would get one sample counted three times. So step 2 only looks at answers from
+earlier builds of the pull request, once those builds have finished and their runs are known.
+
+**A pull request's own answers only count if they came from a passing run.** People usually type
+`/retest` because a run failed by bad luck. If the retest replayed that run's answers, it would
+just repeat the same failure. So before a re-run uses the pull request's own answers, they're
+matched to their runs (by card and task ID, as in "Telling the runs in a build apart" below), and
+an answer is only used if at least one passing run produced that same fingerprint. Early steps,
+like reading the card and delegating, are often the same in a passing and a failing run, so those
+still get reused; only the steps that belong to the failed run go back to the model.
+
+```mermaid
+flowchart TD
+    req["Model request from a pull request run"]
+    shared{"In the shared cache?"}
+    own{"In this PR's own answers,<br/>from a passing run?"}
+    replay["Replay the saved answer"]
+    model["Ask the model"]
+    save["Save the answer in this PR's<br/>own storage (never the shared cache)"]
+    req --> shared
+    shared -- "yes" --> replay
+    shared -- "no" --> own
+    own -- "yes" --> replay
+    own -- "no" --> model --> save
+```
 
 ### Only save answers from runs that passed
 
