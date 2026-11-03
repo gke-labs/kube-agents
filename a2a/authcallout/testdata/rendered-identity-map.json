@@ -1,5 +1,7 @@
 {
   "version": "34fd90c062691d43",
+  "shard": 0,
+  "shards": 1,
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",

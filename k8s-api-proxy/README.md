@@ -1,22 +1,21 @@
 # k8s-api-proxy
 
-The Kubernetes API proxy for the agent sandbox (`kube-proxy` sidecar in the `platform-agent` pod).
-The sandbox's `kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...`), and
-the proxy authenticates the caller (`pkg/k8sapiproxy/auth.go`), applies a per-request policy
-(`pkg/k8sapiproxy/policy.go`), redacts Secret values (`pkg/k8sapiproxy/secrets.go`), strips the
+The Kubernetes API proxy for the agent sandbox (`<agent>-kube-proxy` deployment). The sandbox's
+`kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...`), and the proxy
+authenticates the caller (`pkg/k8sapiproxy/auth.go`), applies a per-request policy
+(`pkg/k8sapiproxy/policy.go`), redacts Secret values (`pkg/k8sapiproxy/secrets.go`), removes the
 caller's credentials (including a bearer token in `Sec-WebSocket-Protocol`), impersonation,
 `Audit-ID` and `Connection`-named headers (`pkg/k8sapiproxy/headers.go`), forwards the request to
 the cluster's API server through `pkg/upstream` with credentials the sandbox never holds, and emits
-structured JSON audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
+structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 (`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
 `cmd/k8s-api-proxy` builds the production server binary.
 
-`NewTokenReviewAuthenticator` reads the caller's bearer token from `Authorization` or a WebSocket
-subprotocol, verifies it with the cluster's `authentication.k8s.io/v1` `TokenReview` API against
-the proxy's audience, and checks that the authenticated `UserInfo.Username` is in the caller
-allowlist. A verified token is cached for up to 30 seconds (or until five seconds before its JWT
-`exp`, if sooner); an unauthenticated or unauthorized token is never cached, and the caller gets
-the same 401 whether the token was missing, expired, or belonged to another service account.
+`NewTokenReviewAuthenticator` (`auth.go`) is the `CallerAuthenticator`: it accepts a bearer token
+that a TokenReview on the host cluster finds valid for the configured audience, from a username on
+an allowlist, and caches each acceptance or refusal for ten seconds by default. The audience should
+be one the API server does not accept, so a token sent to the proxy cannot be used against the API
+server directly; the operator picks it. A review that fails is a 503 rather than a 401.
 
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
 `gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other
@@ -32,9 +31,9 @@ seconds. An IP endpoint is verified against the cluster's own CA and never the s
 The handler hands one `AuditEvent` per request to an `AuditSink` (`audit.go`) when the request
 ends, so a watch or an `exec` session is recorded when it closes. The event holds the caller, the
 cluster, the API server's classification of the request, the outcome (`forwarded`,
-`unauthenticated`, `refused` with its reason, `upstream_error`, `canceled` when the caller gives
-up, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be written),
-the status and the duration. An upgraded session that breaks off after its 101 is recorded as
+`unauthenticated`, `auth_unavailable` when the TokenReview fails, `refused` with its reason,
+`upstream_error`, `canceled` when the caller gives up, or `aborted` when a response fails
+mid-copy otherwise or an upgrade's 101 cannot be written), the status and the duration. An upgraded session that breaks off after its 101 is recorded as
 `forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
 puts no body, query or credential in it, but an authentication or transport error is recorded as
 returned. The caller never sees that error, because it can name the upstream. A Secret response
@@ -58,12 +57,6 @@ metadata and is absent unless the caller asked for a `Table`. The handler never 
 it cannot tell an empty one from a set one: `kubectl describe secret` prints every key as 8 bytes,
 the placeholder's size, and an empty key looks the same as a populated one. A response the handler
 cannot redact becomes a 502, or on a watch ends the stream with an `ERROR` event.
-
-When a request finishes, the handler records one `AuditEvent` through its `AuditSink`
-(`NewJSONAuditSink` writes one JSON line per event). Its `Outcome` is `allowed`, `denied`,
-`unauthenticated`, `upstream_error`, or `redaction_error`; on a watch or stream upgrade the event
-is recorded when the stream closes, and if a Secret watch ends because an event could not be
-redacted after the `200 OK` header was sent, the outcome is `redaction_error`.
 
 It is a self-contained Go module. Run its checks from this directory:
 

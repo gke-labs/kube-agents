@@ -93,7 +93,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	credentialProxyWithPlugins := buildCredentialProxyDeploymentForPlugins(agent, "p", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, false)
 	kubeProxy := buildKubeProxyDeployment(agent, "", true, "t")
 	a2aGateway := buildA2AGatewayDeployment(agent)
-	a2aCallout := buildA2ACalloutDeployment(agent, "")
+	a2aCallout := buildA2ACalloutDeployment(agent, "", 1)
 	a2aVerifier := buildA2AVerifierDeployment(agent)
 	a2aDispatcher := buildA2ADispatcherDeployment(agent)
 	a2aConsole := buildA2AConsoleDeployment(agent)

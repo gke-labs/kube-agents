@@ -223,7 +223,12 @@ the slots and bytes in use are gauges beside their caps, with the budget gauge a
 budget is off (the site's observability page names the series).
 On the exec and vcs routes the exception is raised where a slot refusal is raised, before any
 command has run and, on the vcs route, before the body is read, so each route's existing handler
-and the vcs route's body drain apply unchanged and answer `503 CREDENTIAL_PROXY_BUSY`. The
+and the vcs route's body drain apply unchanged and answer `503 CREDENTIAL_PROXY_BUSY`. Since
+#4333 the same arm also answers the resource watermark gate's refusal: `ResourcePressure`, a
+`CommandSlotUnavailable` raised before the queue when live cgroup memory or a scratch volume is
+at its hard watermark, answered `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` with `Retry-After` and
+counted under `bound="pressure"`; the session role is the interactive class that keeps one slot
+(`docs/credential-isolation-design.md` has the thresholds and the routes). The
 forge refresh route takes no slot, and has its own busy handler answering the same 503, so a
 refusal does not reach its generic branch and read as a `FORGE_TOKEN_REFRESH_FAILED` 502; it
 also has the hang-up handler §2.1 names. The content-workspace route reserves nothing (§2.1) and
@@ -397,7 +402,14 @@ does not move with the limit.
 counts reclaimable page cache, eight threads can pass the check before any child has grown, and
 the behaviour cannot be asserted in a unit test. The reservation model is deterministic and
 testable; a live reading could be layered on later as a second check if the constants prove
-wrong. Since #4315 the broker exports the live reading without admitting on it: the cgroup's
+wrong. Since #4315 the broker exports the live reading, and since #4333 it admits on it beside
+this budget, as a watermark gate rather than a per-spawn check: one working-set read per
+admission (`memory.current` less `memory.stat`'s `inactive_file`, so the page cache the first
+sentence names is not counted), the scratch volumes summed against the operator-passed caps on
+the sampler's tick, a concurrency clamp from the soft watermark and an immediate 429 for
+background callers from the hard one. The budget's static
+reservation stays what it was; the gate is the backstop for the cases above where the estimate
+is wrong. Before that: the cgroup's
 `memory.current`, `memory.peak`, `memory.max`, `memory.stat` and `memory.events`, its own and
 Envoy's `VmRSS`/`VmHWM`, and the children's `ru_maxrss` after each reap, as series
 (`kubeagents_credential_proxy_cgroup_memory_bytes`, `…_cgroup_memory_events_total`,
