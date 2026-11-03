@@ -280,8 +280,14 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 		warnings = append(warnings, policy.MissingSubjects(meta.Config)...)
 		warnings = append(warnings, fresh.OutsidePolicyDrift(meta.Config)...)
 		open := func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, SnapshotDataFile)) }
+		// What a restored stream is held to: the render's limits going
+		// forward, the snapshot's own on the way back (RestoreAsItWas).
+		built := policy
+		if replicas <= 1 {
+			built.MaxBytes, built.MaxAge = meta.Config.MaxBytes, meta.Config.MaxAge
+		}
 		for attempt := 1; ; attempt++ {
-			if alreadyRestored(ctx, nc, policy, meta.State) {
+			if alreadyRestored(ctx, nc, built, meta.State) {
 				// Built by an earlier attempt (a finish that timed out
 				// after the server built the stream, or this pod run
 				// again): the server builds a stream only on the final
@@ -289,8 +295,15 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 				err = nil
 				break
 			}
-			err = RestoreVerified(ctx, nc, meta.Config, meta.State, open, want.Data, policy)
-			if err == nil || errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrOutsidePolicy) || attempt == restoreRetries {
+			// Into three servers, the forward restore: the rendered limits,
+			// and a snapshot that does not fit them refused. Into one, the
+			// way back: the stream as it was.
+			if replicas > 1 {
+				err = RestoreVerified(ctx, nc, meta.Config, meta.State, open, want.Data, policy)
+			} else {
+				err = RestoreAsItWas(ctx, nc, meta.Config, meta.State, open, want.Data, policy)
+			}
+			if err == nil || errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrOutsidePolicy) || errors.Is(err, ErrOverRenderedLimits) || attempt == restoreRetries {
 				break
 			}
 			select {

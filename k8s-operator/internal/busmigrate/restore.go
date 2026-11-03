@@ -118,6 +118,34 @@ var ErrDigestMismatch = errors.New("snapshot digest does not match the operator'
 // not pass the operator's policy for that stream.
 var ErrOutsidePolicy = errors.New("config is outside the operator's policy")
 
+// ErrOverRenderedLimits is a snapshot that does not fit the limits the
+// operator renders for its stream: more bytes than the rendered max_bytes, or
+// an oldest message older than the rendered max_age. The restore refuses it
+// rather than let the server trim the stream to fit, and the run turns back.
+var ErrOverRenderedLimits = errors.New("snapshot does not fit the operator's rendered limits")
+
+// withRenderedLimits is cfg with the limits the operator renders, which the
+// restore sends in place of the snapshot's own: a stream comes back with the
+// caps the install renders now, whatever an earlier render gave it.
+func withRenderedLimits(cfg nats.StreamConfig, policy StreamPolicy) nats.StreamConfig {
+	cfg.MaxBytes = policy.MaxBytes
+	cfg.MaxAge = policy.MaxAge
+	return cfg
+}
+
+// fitsRenderedLimits refuses a snapshot whose state, as its pinned metadata
+// records it, does not fit the rendered limits at now. A limit of zero or
+// less is no limit.
+func fitsRenderedLimits(name string, state nats.StreamState, policy StreamPolicy, now time.Time) error {
+	if policy.MaxBytes > 0 && state.Bytes > uint64(policy.MaxBytes) {
+		return fmt.Errorf("stream %s: %w: the snapshot holds %d bytes, over the rendered max_bytes of %d", name, ErrOverRenderedLimits, state.Bytes, policy.MaxBytes)
+	}
+	if policy.MaxAge > 0 && state.Msgs > 0 && !state.FirstTime.IsZero() && now.Sub(state.FirstTime) > policy.MaxAge {
+		return fmt.Errorf("stream %s: %w: its oldest message, from %s, is older than the rendered max_age of %s", name, ErrOverRenderedLimits, state.FirstTime.UTC().Format(time.RFC3339), policy.MaxAge)
+	}
+	return nil
+}
+
 // Opener opens a snapshot's data for one read from the start. The restore pod
 // reads the staging volume read-only, and it is the only pod holding that
 // volume (ReadWriteOncePod), so nothing writes it between two opens.
@@ -125,9 +153,13 @@ type Opener func() (io.ReadCloser, error)
 
 // RestoreVerified restores one stream from its staged snapshot, sending
 // cfg, the snapshot's own config, pinned by the operator's digest of its
-// metadata. policy gates it twice, the same table both times: cfg must pass
-// policy.Check before anything is sent, and the restored stream's config is
-// read back and must pass it again, or the stream is deleted.
+// metadata, with the operator's rendered max_bytes and max_age in place of
+// its own (withRenderedLimits). A snapshot that does not fit those limits,
+// by its bytes or by the age of its oldest message, is refused before
+// anything is sent (ErrOverRenderedLimits). policy gates it twice, the same
+// table both times: cfg must pass policy.Check before anything is sent, and
+// the restored stream's config is read back and must pass it again, or the
+// stream is deleted.
 //
 // It hashes the data first and sends nothing when it is not the snapshot the
 // operator hashed (wantDigest), so a mismatch holds no name. It then
@@ -137,9 +169,36 @@ type Opener func() (io.ReadCloser, error)
 // the name, which a clustered server keeps reserved after a stalled restore.
 // state is the snapshot's, which the server uses only to size the restore.
 func RestoreVerified(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, open Opener, wantDigest string, policy StreamPolicy) error {
+	cfg = withRenderedLimits(cfg, policy)
 	if d := policy.Check(cfg); len(d) != 0 {
 		return fmt.Errorf("stream %s: %w: %s", cfg.Name, ErrOutsidePolicy, strings.Join(d, "; "))
 	}
+	if err := fitsRenderedLimits(cfg.Name, state, policy, time.Now()); err != nil {
+		return err
+	}
+	return restoreChecked(ctx, nc, cfg, state, open, wantDigest, policy)
+}
+
+// RestoreAsItWas is the way back's restore: it puts the stream back into one
+// server as the snapshot recorded it, limits included, so that a run turned
+// back by a snapshot that does not fit the rendered limits (or by anything
+// else) can always return the bus to where it was. It differs from
+// RestoreVerified only in the limits: max_bytes and max_age are the
+// snapshot's own, which its metadata digest pins, and policy holds the stream
+// to those, on the way in and on read-back; every other field is held to the
+// operator's policy as before, and there is no fit check.
+func RestoreAsItWas(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, open Opener, wantDigest string, policy StreamPolicy) error {
+	policy.MaxBytes, policy.MaxAge = cfg.MaxBytes, cfg.MaxAge
+	if d := policy.Check(cfg); len(d) != 0 {
+		return fmt.Errorf("stream %s: %w: %s", cfg.Name, ErrOutsidePolicy, strings.Join(d, "; "))
+	}
+	return restoreChecked(ctx, nc, cfg, state, open, wantDigest, policy)
+}
+
+// restoreChecked is both restores' common path once the config has passed
+// policy: the digest before anything is sent, the restore hashing what it
+// sends, and the read-back against policy.
+func restoreChecked(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, open Opener, wantDigest string, policy StreamPolicy) error {
 	pre, err := digestOf(open)
 	if err != nil {
 		return fmt.Errorf("stream %s: hashing the snapshot: %w", cfg.Name, err)
