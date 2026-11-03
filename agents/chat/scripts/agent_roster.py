@@ -98,9 +98,10 @@ FILTER_NONE = (
 # never cached: a second change inside the same tick would be invisible.
 CACHE_RACY_SECONDS = 2
 CACHE_RACY_NS = CACHE_RACY_SECONDS * 1_000_000_000
-# A Cluster Agent profile is cached only once its identity is stamped: the
-# scaffold creates the directory first and rewrites config.yaml in place
-# afterwards (cluster_agent_profile.py), which changes no directory mtime.
+# A Cluster Agent profile whose identity is not yet stamped is keyed on its
+# own directory's and config.yaml's mtimes as well: the scaffold creates the
+# directory first and rewrites config.yaml in place afterwards
+# (cluster_agent_profile.py), which moves no mtime of the profiles directory.
 CLUSTER_PROFILE_PREFIX = "cluster-"
 
 # The cluster_identity block a Cluster Agent's config.yaml carries
@@ -196,6 +197,7 @@ def _summarize_soul(home: Path) -> str:
             return ""
         lines = soul.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
+        _note_degraded()
         return ""
     for line in lines:
         s = line.strip()
@@ -216,6 +218,7 @@ def _responsibilities(home: Path) -> str:
     try:
         text = cap.read_text(encoding="utf-8", errors="replace").strip() if cap.is_file() else ""
     except OSError:
+        _note_degraded()
         text = ""
     if text:
         return text
@@ -240,6 +243,7 @@ def _cluster_identity(home: Path) -> dict[str, str]:
             return {}
         lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
+        _note_degraded()
         return {}
     identity: dict[str, str] = {}
     inside = False
@@ -287,6 +291,7 @@ def discover(base: Path | None = None) -> list[dict[str, str]] | None:
             agents.append(agent)
         except OSError as e:
             log(f"skipping unreadable profile {p.name}: {e}")
+            _note_degraded()
     return agents
 
 
@@ -461,6 +466,7 @@ def _management_project_id(base: Path | None = None) -> str:
         return fn(root.parent) or ""
     except Exception as e:
         log(f"cannot read the management project: {e}")
+        _note_degraded()
         return ""
 
 
@@ -563,6 +569,7 @@ def _format_scope(base: Path | None = None) -> str:
         targets = reader.declared_scope_targets(root.parent)
     except Exception as e:  # ScopeRenderUnreadable, or a fault on the shared PVC
         log(f"cannot read the declared scope: {e}")
+        _note_degraded()
         return f"{SCOPE_HEADING}\n{SCOPE_UNREADABLE}"
     if targets is None:
         return f"{SCOPE_HEADING}\n{SCOPE_UNDECLARED}"
@@ -603,10 +610,20 @@ def _format_scope(base: Path | None = None) -> str:
     return f"{SCOPE_HEADING}\n{SCOPE_LINE.format(count=total, projects=projects)}"
 
 
-# The one cached roster: its key, the agents discovered and the text rendered.
-_cache_key: tuple | None = None
-_cache_agents: list[dict[str, str]] | None = None
-_cache_text: str | None = None
+# The one cached roster, a single binding so a reader never sees a new key
+# beside the previous text: (key, the unstamped profiles' own stamps, the
+# agents discovered, the text rendered).
+_cache: tuple | None = None
+# Set by any fallback path while a discovery runs (a profile skipped, a
+# description or identity lost to an OSError, a scope that could not be read):
+# a roster that degraded is rendered for this call and never cached, as before
+# the cache every turn re-read it.
+_degraded = False
+
+
+def _note_degraded() -> None:
+    global _degraded
+    _degraded = True
 
 
 def _mtime_ns(path: Path) -> int | None:
@@ -614,6 +631,12 @@ def _mtime_ns(path: Path) -> int | None:
         return path.stat().st_mtime_ns
     except OSError:
         return None
+
+
+def _racy(stamps) -> bool:
+    """Whether any stamp is within CACHE_RACY_SECONDS of now, or in its future."""
+    now = time.time_ns()
+    return any(s is not None and abs(now - s) < CACHE_RACY_NS for s in stamps)
 
 
 def _cache_key_for(root: Path) -> tuple | None:
@@ -638,30 +661,51 @@ def _cache_key_for(root: Path) -> tuple | None:
         render_path = os.environ.get(reader.SCOPE_FILE_ENV, "")
         if render_path and not render_path.startswith(UNEXPANDED_PLACEHOLDER_PREFIX):
             stamps.append(_mtime_ns(Path(render_path)))
-    now = time.time_ns()
-    if any(s is not None and abs(now - s) < CACHE_RACY_NS for s in stamps):
+    if _racy(stamps):
         return None
     return (str(root), *stamps, summary_threshold())
 
 
-def _cacheable(agents: list[dict[str, str]] | None) -> bool:
-    """False while discovery failed or a Cluster Agent profile is not yet stamped."""
-    if agents is None:
-        return False
-    return not any(
-        a["name"].startswith(CLUSTER_PROFILE_PREFIX)
-        and not a.get(IDENTITY_FIELD_PREFIX + IDENTITY_NAME_KEY)
+def _unstamped(agents: list[dict[str, str]]) -> list[str]:
+    """The cluster- profiles whose identity the scaffold has not stamped yet."""
+    return [
+        a["name"]
         for a in agents
-    )
+        if a["name"].startswith(CLUSTER_PROFILE_PREFIX)
+        and not a.get(IDENTITY_FIELD_PREFIX + IDENTITY_NAME_KEY)
+    ]
+
+
+def _profile_stamps(root: Path, names: list[str]) -> tuple | None:
+    """(name, directory mtime, config.yaml mtime) per profile, or ``None`` when one is racy or gone.
+
+    The stamp rewrites config.yaml in place (its mtime moves) and an overlay
+    creates it (the directory's moves), so either change misses the cache.
+    """
+    out = []
+    for name in names:
+        home = root / name
+        stamps = (_mtime_ns(home), _mtime_ns(home / PROFILE_CONFIG))
+        if stamps[0] is None or _racy(stamps):
+            return None
+        out.append((name, *stamps))
+    return tuple(out)
 
 
 def _discover_and_render(base: Path | None) -> tuple[list[dict[str, str]] | None, str | None]:
     """The agents and the rendered roster, from the cache when nothing changed."""
-    global _cache_key, _cache_agents, _cache_text
+    global _cache, _degraded
     root = PROFILES_BASE if base is None else base
     key = _cache_key_for(root)
-    if key is not None and key == _cache_key:
-        return _cache_agents, _cache_text
+    cached = _cache
+    if (
+        key is not None
+        and cached is not None
+        and cached[0] == key
+        and _profile_stamps(root, [name for name, *_ in cached[1]]) == cached[1]
+    ):
+        return cached[2], cached[3]
+    _degraded = False
     agents = discover(root)
     roster = format_roster(agents)
     if roster is None:
@@ -669,8 +713,10 @@ def _discover_and_render(base: Path | None) -> tuple[list[dict[str, str]] | None
     else:
         extra = [b for b in (_format_host(read_host_identity(agents, root)), _format_scope(root)) if b]
         text = "\n\n".join([roster, *extra])
-    if key is not None and _cacheable(agents):
-        _cache_key, _cache_agents, _cache_text = key, agents, text
+    if key is not None and agents is not None and not _degraded:
+        unstamped = _profile_stamps(root, _unstamped(agents))
+        if unstamped is not None:
+            _cache = (key, unstamped, agents, text)
     return agents, text
 
 

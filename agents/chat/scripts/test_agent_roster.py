@@ -87,7 +87,8 @@ def _age(path: Path) -> None:
 
 def _forget() -> None:
     """Drop the module's cached roster, so a test starts from a miss."""
-    agent_roster._cache_key = agent_roster._cache_agents = agent_roster._cache_text = None
+    agent_roster._cache = None
+    agent_roster._degraded = False
 
 
 @contextmanager
@@ -820,16 +821,22 @@ class TestFleetScaleRoster(unittest.TestCase):
 
     def test_a_second_render_at_fleet_scale_reads_nothing(self):
         # The other half of the acceptance: pre_llm_call reads no files when
-        # nothing changed. The first render pays 3N reads; the second, the
-        # same tree, pays stats and no reads and no listing.
+        # nothing changed. The first render reads two files per profile
+        # (CAPABILITIES.md and config.yaml; SOUL.md only when the first is
+        # missing) plus the scope snapshot; the second, the same tree, pays
+        # stats and no reads and no listing.
         _forget()
         with TemporaryDirectory() as tmp:
             base = self._fleet(tmp)
             _age(base)
-            first = self._render(base)
+            with _counting_reads() as cold:
+                first = self._render(base)
             with _counting_reads() as counts:
                 second = self._render(base)
         self.assertEqual(first, second)
+        profiles = FLEET_SCALE_PROFILES + 1  # plus platform
+        self.assertGreaterEqual(cold["reads"].call_count, 2 * profiles)
+        self.assertLessEqual(cold["reads"].call_count, 2 * profiles + 2)
         self.assertEqual(counts["reads"].call_count, 0, "a cache hit read a file")
         self.assertEqual(counts["lists"].call_count, 0, "a cache hit listed a directory")
 
@@ -931,6 +938,78 @@ class TestRosterCache(unittest.TestCase):
         )
         # A rewrite in place moves the file's mtime, not the directory's.
         self.assertIn("GCP projects in scope (2): p, q", self._render())
+
+    def test_a_description_lost_to_a_read_fault_is_not_cached(self):
+        # Before the cache a fault cost one turn; it must not now cost every
+        # turn until the next scaffold moves the directory's mtime.
+        from unittest import mock
+
+        real = Path.read_text
+
+        def flaky(path, *args, **kwargs):
+            if path.name == "CAPABILITIES.md" and path.parent.name == "platform":
+                raise OSError(5, "EIO")
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=flaky):
+            out = self._render()
+        self.assertIn(f"- platform: {agent_roster.NO_DESCRIPTION}", out)
+        out, reads = self._reads_on_render()
+        self.assertGreater(reads, 0)
+        self.assertIn("- platform: Fleet work.", out)
+
+    def test_a_skipped_profile_is_not_cached(self):
+        from unittest import mock
+
+        real = Path.is_dir
+
+        def flaky(path):
+            if path.name == "platform":
+                raise OSError(13, "EACCES")
+            return real(path)
+
+        with mock.patch.object(Path, "is_dir", autospec=True, side_effect=flaky):
+            self.assertNotIn("platform", self._render())
+        self.assertIn("- platform: Fleet work.", self._render())
+
+    def test_an_unreadable_scope_is_not_cached(self):
+        missing = self.base.parent / "render.json"
+        self.assertIn(agent_roster.SCOPE_UNREADABLE, self._render({"KUBEAGENTS_SCOPE_FILE": str(missing)}))
+        missing.write_text('{"present": true, "projects": ["q"]}\n')
+        _age(missing)
+        self.assertIn("q (unresolved)", self._render({"KUBEAGENTS_SCOPE_FILE": str(missing)}))
+
+    def test_a_scope_render_rewrite_invalidates(self):
+        # No snapshot: the scope section comes from the operator's render, a
+        # mounted ConfigMap whose file gets a new mtime on update.
+        render = self.base.parent / "render.json"
+        render.write_text('{"present": true, "projects": ["p"]}\n')
+        _age(render)
+        env = {"KUBEAGENTS_SCOPE_FILE": str(render)}
+        out = self._render(env)
+        self.assertIn("p (unresolved)", out)
+        self.assertNotIn("q (unresolved)", out)
+        self._render(env)
+        _, reads = self._reads_on_render(env)
+        self.assertEqual(reads, 0)
+        render.write_text('{"present": true, "projects": ["p", "q"]}\n')
+        self.assertIn("q (unresolved)", self._render(env))
+
+    def test_an_unstamped_cluster_profile_is_cached_on_its_own_stamps(self):
+        # One directory that never gets stamped (a dead scaffold, a plugin
+        # mount point) must not turn the cache off for the whole fleet; it is
+        # keyed on its own mtimes instead, so the in-place stamp still misses.
+        home = self.base / "cluster-p-c-us"
+        home.mkdir()
+        (home / "CAPABILITIES.md").write_text(CLUSTER_ROLE)
+        (home / "config.yaml").write_text("model: x\n")
+        for path in (self.base, home, home / "config.yaml"):
+            _age(path)
+        self.assertIn("  - cluster-p-c-us\n", self._render())
+        _, reads = self._reads_on_render()
+        self.assertEqual(reads, 0, "an aged unstamped profile is cached")
+        (home / "config.yaml").write_text("model: x\ncluster_identity:\n  cluster: c\n  location: us\n  project: p\n")
+        self.assertIn("cluster-p-c-us (the c cluster agent", self._render())
 
     def test_an_unstamped_cluster_profile_is_re_read_until_stamped(self):
         # The scaffold creates the directory, then rewrites config.yaml in
