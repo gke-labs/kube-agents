@@ -16249,21 +16249,187 @@ class ThreadCapTest(_CredentialedUnixServer):
         self.assertIn(b"\r\nContent-Length: 0\r\n", refusal)
         self.assertIn(b"\r\nConnection: close\r\n", refusal)
 
-    def test_both_credentialed_server_classes_carry_the_cap_and_its_default(self):
+    def test_both_credentialed_server_classes_carry_the_cap_and_its_fallback(self):
         for server_class in (credential_proxy.ThreadingUnixHTTPServer, credential_proxy.ThreadingTCPHTTPServer):
             self.assertTrue(issubclass(server_class, credential_proxy.ThreadCap), server_class)
-        self.assertEqual(1024, credential_proxy.DEFAULT_MAX_THREADS)
-        self.assertEqual(credential_proxy.LISTEN_BACKLOG, credential_proxy.DEFAULT_MAX_THREADS)
+        # With no Envoy config readable, the cap is Envoy's own default for
+        # the one cluster the shipped config has.
+        self.assertEqual(1024, credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS)
+        self.assertEqual(credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS, credential_proxy.FALLBACK_MAX_THREADS)
         self.assertEqual(_SMALL_THREAD_CAP, self.server.connection_cap)
 
     def test_the_cap_comes_from_the_environment_and_a_bad_value_keeps_the_default(self):
+        # The default is stood in for here; ThreadCapDefaultTest derives it.
         cases = {None: 1024, "": 1024, "4": 4, "0": 1024, "-3": 1024, "many": 1024}
         for value, expected in cases.items():
-            with self.subTest(value=value), mock.patch.dict(os.environ):
+            with self.subTest(value=value), mock.patch.dict(os.environ), \
+                    mock.patch.object(credential_proxy, "default_max_threads", return_value=1024):
                 os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
                 if value is not None:
                     os.environ[credential_proxy.MAX_THREADS_ENV] = value
                 self.assertEqual(expected, credential_proxy.thread_cap_from_env())
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_ENVOY_CONFIG = _REPO_ROOT / "deploy" / "shared" / "envoy-credential-proxy.yaml"
+_DOCKERFILE = _REPO_ROOT / "deploy" / "docker" / "Dockerfile"
+# A config of #4652's shape: a runtime cluster at 4096 and a health cluster at
+# 64, both to the broker's socket, and a cluster elsewhere that must not
+# count. The cap it derives leaves the health route 64 slots when the runtime
+# cluster holds every connection its breaker allows.
+_TWO_CLUSTER_ENVOY_CONFIG = """
+static_resources:
+  clusters:
+    - name: credential_runtime
+      type: STATIC
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 4096
+          - priority: HIGH
+            max_connections: 4096
+      load_assignment:
+        cluster_name: credential_runtime
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe:
+                      path: /var/run/credential-proxy/backend.sock
+    - name: credential_health
+      type: STATIC
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 64
+          - priority: HIGH
+            max_connections: 64
+      load_assignment:
+        cluster_name: credential_health
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe:
+                      path: /var/run/credential-proxy/backend.sock
+    - name: metadata_server
+      type: STATIC
+      circuit_breakers:
+        thresholds:
+          - max_connections: 7
+      load_assignment:
+        cluster_name: metadata_server
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 169.254.169.254
+                      port_value: 80
+"""
+_TWO_CLUSTER_CEILING = 4096 + 64
+
+
+def _ceiling_summed_by_hand(config):
+    """The rule the broker derives its cap by, written out: per cluster to the
+    broker's socket, the largest max_connections across its thresholds, 1024
+    for a cluster or a threshold that sets none; summed."""
+    total = 0
+    for cluster in config["static_resources"]["clusters"]:
+        paths = [
+            endpoint["endpoint"]["address"].get("pipe", {}).get("path")
+            for locality in cluster["load_assignment"]["endpoints"]
+            for endpoint in locality["lb_endpoints"]
+        ]
+        if "/var/run/credential-proxy/backend.sock" not in paths:
+            continue
+        thresholds = cluster.get("circuit_breakers", {}).get("thresholds") or [{}]
+        total += max(threshold.get("max_connections", 1024) for threshold in thresholds)
+    return total
+
+
+class ThreadCapDefaultTest(unittest.TestCase):
+    """With CREDENTIAL_PROXY_MAX_THREADS unset, the cap is the sum of Envoy's
+    connection ceilings to the broker's socket, read from Envoy's config, so
+    the breaker refuses before the cap and a second cluster to the socket
+    keeps slots of its own."""
+
+    def _derived(self, text):
+        import yaml
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "envoy.yaml"
+        path.write_text(text, encoding="utf-8")
+        try:
+            config = yaml.safe_load(text)
+        except yaml.YAMLError:
+            config = None
+        return path, credential_proxy.default_max_threads(paths=(path,)), config
+
+    def test_the_default_is_the_sum_of_envoys_ceilings_in_the_shipped_config(self):
+        import yaml
+        config = yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8"))
+        # The shipped config names a cluster to the socket the broker serves:
+        # otherwise the derivation and the sum below would both fall back to
+        # 1024 and agree about nothing.
+        self.assertIsNotNone(credential_proxy.envoy_broker_connection_ceiling(config))
+        expected = _ceiling_summed_by_hand(config)
+        self.assertEqual(expected, credential_proxy.default_max_threads(paths=(_ENVOY_CONFIG,)))
+        # serve()'s reader takes the same path when the environment names no cap.
+        with mock.patch.dict(os.environ), mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (_ENVOY_CONFIG,)):
+            os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+            self.assertEqual(expected, credential_proxy.thread_cap_from_env())
+        # A cluster without circuit_breakers is at Envoy's default ceiling, so
+        # the derived cap is never under the breaker, whatever the config sets.
+        self.assertGreaterEqual(expected, credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS)
+
+    def test_a_runtime_and_a_health_cluster_to_the_socket_sum_and_a_cluster_elsewhere_does_not(self):
+        path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG)
+        self.assertEqual(_TWO_CLUSTER_CEILING, derived)
+        self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        # Per cluster the priorities are not summed: one route runs at one
+        # priority, and the shipped routes set none.
+        self.assertEqual(4096 + 64, credential_proxy.envoy_broker_connection_ceiling(config))
+
+    def test_a_threshold_or_a_cluster_that_sets_no_ceiling_counts_envoys_default(self):
+        text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", "")
+        path, derived, config = self._derived(text)
+        self.assertEqual(1024 + 64, derived)
+        health_breaker = (
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n"
+            "            max_connections: 64\n          - priority: HIGH\n            max_connections: 64\n"
+        )
+        self.assertIn(health_breaker, text)
+        path, derived, config = self._derived(text.replace(health_breaker, ""))
+        self.assertEqual(1024 + 1024, derived)
+
+    def test_no_readable_config_falls_back_to_envoys_default_with_a_warning(self):
+        missing = Path(tempfile.gettempdir()) / "no-such-envoy-config.yaml"
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.default_max_threads(paths=(missing,)))
+        self.assertTrue(any("thread cap default is 1024" in line for line in logs.output), logs.output)
+        # A config that does not parse, or names no cluster to the socket, is
+        # passed over for the next path, and the fallback stands when none is left.
+        for text in ("static_resources: [\n", "static_resources:\n  clusters: []\n", "clusters:\n  - name: x\n"):
+            with self.subTest(text=text), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                _, derived, _ = self._derived(text)
+                self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, derived)
+                self.assertTrue(any("not read for the thread cap" in line for line in logs.output), logs.output)
+        import yaml
+        passed_over = Path(tempfile.mkdtemp()) / "no-broker-cluster.yaml"
+        passed_over.write_text("static_resources:\n  clusters: []\n", encoding="utf-8")
+        self.assertEqual(
+            _ceiling_summed_by_hand(yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8"))),
+            credential_proxy.default_max_threads(paths=(passed_over, _ENVOY_CONFIG)),
+        )
+
+    def test_the_images_copy_of_the_config_is_read_first_and_the_dockerfile_puts_it_there(self):
+        self.assertEqual(credential_proxy.ENVOY_CONFIG_PATH, credential_proxy.ENVOY_CONFIG_PATHS[0])
+        self.assertEqual(_ENVOY_CONFIG, credential_proxy.ENVOY_CONFIG_PATHS[1])
+        self.assertIn(
+            f"deploy/shared/envoy-credential-proxy.yaml {credential_proxy.ENVOY_CONFIG_PATH}",
+            _DOCKERFILE.read_text(encoding="utf-8"),
+        )
 
 
 class HealthListenerTest(unittest.TestCase):
@@ -16297,8 +16463,10 @@ class HealthListenerTest(unittest.TestCase):
         self.assertEqual(3, server.connection_cap)
         self.assertEqual(credential_proxy.METRICS_CONNECTION_DEADLINE_SECONDS, credential_proxy.HealthHandler.timeout)
 
-    def test_the_port_defaults_to_8767_and_zero_or_a_bad_value_opens_none(self):
-        cases = {None: 8767, "": 8767, "0": 0, "8770": 8770, "none": 0}
+    def test_the_port_is_opt_in_and_zero_or_a_bad_value_opens_none(self):
+        # Opt-in, as the metrics port: the operator's readiness probe reads
+        # /healthz through Envoy, so an unset port opens nothing.
+        cases = {None: 0, "": 0, "0": 0, "8770": 8770, "none": 0}
         for value, expected in cases.items():
             with self.subTest(value=value), mock.patch.dict(os.environ), mock.patch.object(sys, "argv", ["credential_proxy.py"]):
                 os.environ.pop(credential_proxy.HEALTH_PORT_ENV, None)
@@ -16311,7 +16479,7 @@ class HealthListenerTest(unittest.TestCase):
                 else:
                     parsed = credential_proxy.parse_args().health_port
                 self.assertEqual(expected, parsed)
-        self.assertEqual(8767, credential_proxy.DEFAULT_HEALTH_PORT)
+        self.assertEqual(0, credential_proxy.DEFAULT_HEALTH_PORT)
 
     def test_the_other_listeners_ports_and_a_non_port_are_refused_by_name(self):
         args = types.SimpleNamespace(port=8765, unix_socket="/run/backend.sock")

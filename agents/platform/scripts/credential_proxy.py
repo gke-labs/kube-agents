@@ -881,12 +881,42 @@ IDLE_CLOSE_LOG_PREFIX = "Request timed out"
 # port behind Envoy, and the agent API door) hold a thread for at once. The
 # stdlib server starts one OS thread per accepted connection with no cap; one
 # past this is answered THREAD_CAP_REFUSAL on the accept loop's thread and
-# closed, with no thread spent. The default equals Envoy's per-cluster
-# connection ceiling and the listen backlog, so the cap backstops the
-# admission the broker already does through its command, session, profile
-# and scope slots rather than refusing ahead of them.
+# closed, with no thread spent. Unless MAX_THREADS_ENV names a cap, it is
+# derived from Envoy's config (default_max_threads): the sum, over the static
+# clusters that forward to the broker's socket, of each cluster's
+# circuit-breaker max_connections, Envoy's own default of
+# ENVOY_DEFAULT_MAX_CONNECTIONS for a cluster that sets none. Derived rather
+# than pinned so that Envoy's breaker refuses before the cap does whatever a
+# config raises it to, and so that a second cluster to the socket (a health
+# route's, say) keeps thread slots of its own when the first holds every
+# connection its breaker allows; the cap then backstops the admission the
+# broker already does through its command, session, profile and scope slots
+# rather than refusing ahead of them. The config is read from the copy the
+# credential-proxy image carries beside the broker, or the repository's when
+# running from source; with neither readable, the fallback is Envoy's default
+# for the one cluster the shipped config has.
 MAX_THREADS_ENV = "CREDENTIAL_PROXY_MAX_THREADS"
-DEFAULT_MAX_THREADS = 1024
+ENVOY_CONFIG_PATH = Path("/etc/envoy/envoy-credential-proxy.yaml")
+# This file sits three directories under the repository root
+# (agents/platform/scripts), where the image's copy of the config comes from.
+ENVOY_CONFIG_SOURCE_DEPTH = 3
+ENVOY_CONFIG_SOURCE_RELATIVE = Path("deploy") / "shared" / "envoy-credential-proxy.yaml"
+_THIS_FILE_PARENTS = Path(__file__).resolve().parents
+ENVOY_CONFIG_SOURCE_PATH = (
+    _THIS_FILE_PARENTS[ENVOY_CONFIG_SOURCE_DEPTH] / ENVOY_CONFIG_SOURCE_RELATIVE
+    if len(_THIS_FILE_PARENTS) > ENVOY_CONFIG_SOURCE_DEPTH
+    else None
+)
+ENVOY_CONFIG_PATHS: tuple[Path, ...] = tuple(
+    path for path in (ENVOY_CONFIG_PATH, ENVOY_CONFIG_SOURCE_PATH) if path is not None
+)
+# The Unix socket the broker serves behind Envoy, as the config's clusters
+# name it; a cluster to any other address is not a client of the broker.
+ENVOY_BROKER_SOCKET_PATH = "/var/run/credential-proxy/backend.sock"
+# Envoy's per-cluster connection ceiling when a cluster's circuit_breakers
+# set none.
+ENVOY_DEFAULT_MAX_CONNECTIONS = 1024
+FALLBACK_MAX_THREADS = ENVOY_DEFAULT_MAX_CONNECTIONS
 # The 503 a connection past the thread cap is written before it is closed: a
 # whole HTTP/1.1 response with an empty body, so a client that already sent
 # its request reads an answer that says when to retry rather than a reset.
@@ -921,9 +951,13 @@ THREAD_CAP_LOG_INTERVAL_SECONDS = 60
 # even while every thread the credentialed listener may spend is spent. Bound
 # on the same host as the metrics listener, which is the pod IP in the
 # operator's layout, so a kubelet probe can reach it; /healthz stays on the
-# credentialed listener too. Unset means the default; 0 means no listener.
+# credentialed listener too. Opt-in, as the metrics port is: unset or 0 opens
+# none. The operator's readiness probe reads /healthz through Envoy, whose
+# config can give that route a cluster of its own to the broker's socket,
+# with thread slots the cap above then keeps for it; a port here is for a
+# probe an operator points at the broker directly.
 HEALTH_PORT_ENV = "CREDENTIAL_PROXY_HEALTH_PORT"
-DEFAULT_HEALTH_PORT = 8767
+DEFAULT_HEALTH_PORT = 0
 HEALTH_SERVER_HEADER = "credential-proxy-health"
 # What /healthz answers, on both listeners.
 HEALTHZ_PAYLOAD = {"status": "ok"}
@@ -1376,8 +1410,9 @@ class ThreadCap(ConnectionCap):
     """
 
     # The cap every credentialed listener is built with unless told otherwise;
-    # serve() sets it from MAX_THREADS_ENV before building any.
-    max_threads: int = DEFAULT_MAX_THREADS
+    # serve() sets it from MAX_THREADS_ENV, or Envoy's config, before building
+    # any (thread_cap_from_env).
+    max_threads: int = FALLBACK_MAX_THREADS
 
     def __init__(self, *args: Any, max_threads: int | None = None, **kwargs: Any) -> None:
         # Refusals since the last line, when that line was written (None
@@ -1466,12 +1501,112 @@ class ThreadCap(ConnectionCap):
 
 
 def thread_cap_from_env() -> int:
-    """MAX_THREADS_ENV as a positive integer, or the default with a WARNING.
+    """MAX_THREADS_ENV as a positive integer, or default_max_threads() with a WARNING.
 
     The same grammar as every other positive-integer knob the broker reads
-    (session_slot_limit_from_env), so the two cannot drift.
+    (session_slot_limit_from_env), so the two cannot drift; the default is
+    derived from Envoy's config rather than pinned beside it.
     """
-    return session_slot_limit_from_env(MAX_THREADS_ENV, DEFAULT_MAX_THREADS)
+    return session_slot_limit_from_env(MAX_THREADS_ENV, default_max_threads())
+
+
+def default_max_threads(paths: Sequence[Path] | None = None) -> int:
+    """The thread cap when MAX_THREADS_ENV is unset.
+
+    Derived from the first Envoy config in ``paths`` (ENVOY_CONFIG_PATHS by
+    default: the image's copy, then the repository's) that is readable and
+    names a cluster to the broker's socket (envoy_broker_connection_ceiling);
+    FALLBACK_MAX_THREADS, with a WARNING, when none is. Nothing a caller sends
+    reaches this: the config is the image's own file.
+    """
+    candidates = tuple(ENVOY_CONFIG_PATHS if paths is None else paths)
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        ceiling = _envoy_ceiling_from_text(text, path)
+        if ceiling is not None:
+            LOGGER.info("thread cap default %d derived from %s", ceiling, path)
+            return ceiling
+    LOGGER.warning(
+        "no Envoy config naming a cluster to %s is readable at %s; thread cap default is %d",
+        ENVOY_BROKER_SOCKET_PATH, ", ".join(str(path) for path in candidates) or "(no path)",
+        FALLBACK_MAX_THREADS,
+    )
+    return FALLBACK_MAX_THREADS
+
+
+def _envoy_ceiling_from_text(text: str, path: Path) -> int | None:
+    """envoy_broker_connection_ceiling over a config's text; None, with a WARNING, when it cannot be read."""
+    try:
+        import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
+    except ImportError:
+        LOGGER.warning("pyyaml is not importable; %s is not read for the thread cap", path)
+        return None
+    try:
+        config = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        LOGGER.warning("%s does not parse as YAML (%s); not read for the thread cap", path, exc)
+        return None
+    ceiling = envoy_broker_connection_ceiling(config)
+    if ceiling is None:
+        LOGGER.warning(
+            "%s names no cluster to %s; not read for the thread cap", path, ENVOY_BROKER_SOCKET_PATH
+        )
+    return ceiling
+
+
+def envoy_broker_connection_ceiling(config: Any) -> int | None:
+    """Envoy's ceiling on connections to the broker, from a parsed Envoy config.
+
+    The sum, over the clusters in ``static_resources.clusters`` whose endpoint
+    is the pipe at ENVOY_BROKER_SOCKET_PATH, of each cluster's
+    max_connections: the largest across its ``circuit_breakers.thresholds``
+    (one per priority; the shipped routes set none, so DEFAULT is the one in
+    use), and ENVOY_DEFAULT_MAX_CONNECTIONS for a cluster, or a threshold,
+    that sets none. None when no cluster forwards to the socket, or the sum
+    is zero, so the caller can say so rather than cap at nothing.
+    """
+    clusters = _mapping(_mapping(config).get("static_resources")).get("clusters")
+    total = 0
+    found = False
+    for cluster in clusters if isinstance(clusters, list) else ():
+        cluster = _mapping(cluster)
+        if not _cluster_forwards_to_broker(cluster):
+            continue
+        found = True
+        thresholds = _mapping(cluster.get("circuit_breakers")).get("thresholds")
+        ceilings = [
+            _connection_count(_mapping(threshold).get("max_connections"))
+            for threshold in (thresholds if isinstance(thresholds, list) else ())
+        ]
+        total += max(ceilings) if ceilings else ENVOY_DEFAULT_MAX_CONNECTIONS
+    return total if found and total > 0 else None
+
+
+def _cluster_forwards_to_broker(cluster: Mapping[str, Any]) -> bool:
+    """Whether any endpoint of a parsed Envoy cluster is the broker's socket."""
+    endpoints = _mapping(cluster.get("load_assignment")).get("endpoints")
+    for locality in endpoints if isinstance(endpoints, list) else ():
+        lb_endpoints = _mapping(locality).get("lb_endpoints")
+        for lb_endpoint in lb_endpoints if isinstance(lb_endpoints, list) else ():
+            address = _mapping(_mapping(_mapping(lb_endpoint).get("endpoint")).get("address"))
+            if _mapping(address.get("pipe")).get("path") == ENVOY_BROKER_SOCKET_PATH:
+                return True
+    return False
+
+
+def _connection_count(value: Any) -> int:
+    """A threshold's max_connections, or Envoy's default when it is unset or not a count."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return ENVOY_DEFAULT_MAX_CONNECTIONS
+    return value
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    """``value`` when it is a mapping, else an empty one: a parsed config's absent keys read as absent."""
+    return value if isinstance(value, Mapping) else {}
 
 
 class ThreadingUnixHTTPServer(HandlerErrorsToLog, ThreadCap, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -16230,13 +16365,10 @@ def _health_port_refusal(health_port: int, args: argparse.Namespace, metrics_por
 
 
 def _health_port_default() -> int:
-    """HEALTH_PORT_ENV as an integer, DEFAULT_HEALTH_PORT when unset, or 0 with an ALERT.
+    """HEALTH_PORT_ENV as an integer, DEFAULT_HEALTH_PORT (none) when unset, or 0 with an ALERT.
 
-    Unlike the metrics port, unset means the default rather than no listener:
-    the port serves one unauthenticated route that reveals nothing, and a
-    probe that an operator points at it should find it on an install whose
-    environment never named it. 0 turns it off; a value that is no integer
-    costs the listener alone, as a bad metrics port does.
+    As the metrics port: unset opens no listener, a port opens one, and a
+    value that is no integer costs the listener alone.
     """
     raw = os.getenv(HEALTH_PORT_ENV, "").strip()
     if not raw:
@@ -16298,10 +16430,7 @@ def parse_args() -> argparse.Namespace:
         "--health-port",
         type=int,
         default=_health_port_default(),
-        help=(
-            f"Port of the health-only listener (GET {HEALTHZ_PATH}); unset opens it on "
-            f"{DEFAULT_HEALTH_PORT}, 0 opens none"
-        ),
+        help=f"Port of the health-only listener (GET {HEALTHZ_PATH}); 0 or unset opens none",
     )
     parser.add_argument(
         "--timeout-seconds",

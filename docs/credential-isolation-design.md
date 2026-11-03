@@ -218,15 +218,16 @@ credential-proxy Pod
 
 Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
-caller can bypass Envoy by reaching the runtime directly. The runtime opens two
-TCP listeners of its own. The health-only one on port 8767
-(`CREDENTIAL_PROXY_HEALTH_PORT`; open by default, 0 closes it) answers
+caller can bypass Envoy by reaching the runtime directly. The runtime opens up
+to two TCP listeners of its own. The health-only one, closed unless
+`CREDENTIAL_PROXY_HEALTH_PORT` names a port, answers
 `GET /healthz` and nothing else, unauthenticated like `/healthz` on 8765, with
 a fixed `{"status":"ok"}` body, under the same sixteen-connection cap and
-ten-second deadline as the metrics listener, so that a probe reads the broker
-as alive while the credentialed listener is at its thread cap; the broker's
-NetworkPolicy opens it to no pod, so only a kubelet probe reaches it. The
-metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
+ten-second deadline as the metrics listener, so that a probe an operator
+points at the broker directly reads it as alive while the credentialed
+listener is at its thread cap; the operator's readiness probe reads `/healthz`
+through Envoy instead, and the broker's NetworkPolicy opens the port to no
+pod, so only a kubelet probe reaches it. The metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
 set by the operator) serves Prometheus series whose label values are
 static enums and closed vocabularies, holds no route, credential or policy,
 answers at most sixteen connections at a time and cuts each off ten seconds
@@ -726,8 +727,10 @@ the right follow-up; neither alone does.
 
 Separately, the content routes raise the request-body cap to twice the
 total-payload limit, and the listener is threaded with one connection per
-thread up to `CREDENTIAL_PROXY_MAX_THREADS` (1024 by default; a connection past
-it is answered `503` with `Retry-After` and closed), a bound on connections that
+thread up to `CREDENTIAL_PROXY_MAX_THREADS` (by default the sum of Envoy's
+connection ceilings to the broker's socket, read from the Envoy config shipped
+beside the broker, 1024 for a cluster that sets none; a connection past it is
+answered `503` with `Retry-After` and closed), a bound on connections that
 is no bound on heap in practice, so peak heap on those routes is roughly
 concurrency times that figure: the bodies
 are read before any command runs, so the broker's command cap does not bound
