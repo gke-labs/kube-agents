@@ -1389,6 +1389,37 @@ class TestFilter(unittest.TestCase):
         self.assertIn("cluster-p-c049-us", out)
         self.assertNotIn("cluster-p-c050-us", out)
 
+    def test_an_exact_match_ranks_ahead_of_the_cap(self):
+        # `prod` among `prod-01` ... `prod-60`: the siblings sort first by name
+        # (`0` before `u` at the first differing byte of the assignee id), so
+        # discovery order alone would put the one exact match past the cap,
+        # and the needle is already the whole cluster name.
+        def agent(cluster):
+            return {"name": agent_roster._profile_name("p", cluster, "us-central1"),
+                    "responsibilities": CLUSTER_ROLE, "cluster_cluster": cluster,
+                    "cluster_project": "p", "cluster_location": "us-central1"}
+
+        agents = sorted(
+            [agent(f"prod-{i:02d}") for i in range(1, 61)] + [agent("prod")],
+            key=lambda a: a["name"],
+        )
+        self.assertEqual(agents[-1]["cluster_cluster"], "prod")
+        out = agent_roster.format_matches(agents, "prod")
+        self.assertIn("(50 of 61 matched, 61 on the roster)", out)
+        self.assertIn("  - cluster-p-prod-us-central1 (the prod cluster agent", out)
+        self.assertNotIn("cluster-p-prod-50-us-central1", out)
+        self.assertTrue(out.endswith("... and 11 more; narrow the filter."))
+        # The rest keep their discovery order after the exact match.
+        lines = [l for l in out.splitlines() if l.startswith("  - cluster-p-prod")]
+        self.assertEqual(lines[0].split(" (")[0], "  - cluster-p-prod-us-central1")
+        self.assertEqual(lines[1].split(" (")[0], "  - cluster-p-prod-01-us-central1")
+        self.assertEqual(lines[-1].split(" (")[0], "  - cluster-p-prod-49-us-central1")
+        # A whole project is equally exact for every member, so the discovery
+        # order stands there: the first fifty by name, `prod` not among them.
+        by_project = agent_roster.format_matches(agents, "p")
+        self.assertIn("(50 of 61 matched", by_project)
+        self.assertNotIn("cluster-p-prod-us-central1 ", by_project)
+
     def test_unknown_in_unknown_out(self):
         self.assertIsNone(agent_roster.format_matches(None, "x"))
 

@@ -78,7 +78,10 @@ SUMMARY_HINT = (
 
 # list_agents' filter: a case-insensitive substring match on the assignee id
 # and the three identity fields, capped so a filter that matches a whole
-# project cannot bring the full list back.
+# project cannot bring the full list back. An agent one of whose fields is
+# the whole needle sorts ahead of the substring matches, so the cap never
+# hides `prod` behind `prod-01` ... `prod-60`: the needle is already the
+# whole cluster name there, and nothing narrower exists.
 FILTER_MATCH_LIMIT = 50
 FILTER_HEADING = (
     'Agents matching "{query}" ({shown} of {matched} matched, {total} on the roster):'
@@ -405,10 +408,19 @@ def _summarize_group(members: list[dict[str, str]], desc: str) -> str:
     return "\n".join(lines)
 
 
+def _match_fields(agent: dict[str, str]) -> tuple[str, ...]:
+    """The assignee id and the identity fields a filter is matched against."""
+    return (agent["name"], *(agent.get(IDENTITY_FIELD_PREFIX + k, "") for k in IDENTITY_KEYS))
+
+
 def _matches(agent: dict[str, str], query: str) -> bool:
     """Whether the assignee id or an identity field contains ``query`` (already lowercased)."""
-    fields = (agent["name"], *(agent.get(IDENTITY_FIELD_PREFIX + k, "") for k in IDENTITY_KEYS))
-    return any(query in f.lower() for f in fields if f)
+    return any(query in f.lower() for f in _match_fields(agent) if f)
+
+
+def _matches_exactly(agent: dict[str, str], query: str) -> bool:
+    """Whether the assignee id or an identity field *is* ``query`` (already lowercased)."""
+    return any(query == f.lower() for f in _match_fields(agent) if f)
 
 
 def format_matches(
@@ -417,9 +429,12 @@ def format_matches(
     """The agents matching ``query``, rendered as format_roster renders them, or ``None``.
 
     Never summarized, whatever the threshold: the filter exists to hand back
-    the names a counted block withheld. Capped at FILTER_MATCH_LIMIT names.
-    ``degraded`` says the walk that produced ``agents`` skipped or half-read a
-    profile; a no-match from such a walk is reported as unread, not as absent.
+    the names a counted block withheld. Capped at FILTER_MATCH_LIMIT names,
+    the exact matches first (a cluster named ``prod`` among ``prod-01`` ...
+    ``prod-60`` is otherwise the one the cap drops), the rest in discovery
+    order. ``degraded`` says the walk that produced ``agents`` skipped or
+    half-read a profile; a no-match from such a walk is reported as unread,
+    not as absent.
     """
     if agents is None:
         return None
@@ -428,6 +443,8 @@ def format_matches(
     if not matched:
         none = FILTER_UNREAD if degraded else FILTER_NONE
         return none.format(query=query.strip(), total=len(agents))
+    # sort() is stable, so the substring matches keep their discovery order.
+    matched.sort(key=lambda a: not _matches_exactly(a, needle))
     shown = matched[:FILTER_MATCH_LIMIT]
     heading = FILTER_HEADING.format(
         query=query.strip(), shown=len(shown), matched=len(matched), total=len(agents)
