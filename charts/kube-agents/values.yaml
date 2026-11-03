@@ -610,6 +610,12 @@ litellm:
   # . or .. component, no doubled or trailing slash (the gateway container runs
   # with readOnlyRootFilesystem: true and only /tmp is writable).
   traceLogPath: "/tmp/litellm_traces.jsonl"
+  # Logs one "cache probe:" line per successful model call to the gateway's
+  # pod log: short hashes of the tool list and the system prompt (whole, and
+  # per 16 KiB slice), the message and tool counts, and the cache usage the
+  # provider returned. Hashes and counts only, never prompt text. A diagnostic
+  # for prompt-cache re-writes; the eval installs turn it on.
+  cacheProbeEnabled: false
 
 # The Hindsight memory store: the API the agents call for long-term memory,
 # the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for

@@ -323,6 +323,16 @@ I/O failures log a once-per-path warning to stderr so inference never fails. Off
 default, and the rendered default ConfigMap and rollout checksum are unchanged while
 it is off.
 
+`litellm.cacheProbeEnabled=true` adds `litellm_cache_probe_callback.py` to the
+ConfigMap, mounts it at `/app/litellm_cache_probe_callback.py` and registers
+`litellm_cache_probe_callback.proxy_handler_instance` under
+`litellm_settings.callbacks`. Each successful model call then writes one
+`cache probe: {...}` JSON line to the gateway's pod log: short hashes of the tool
+list and of the system prompt (whole, and per 16 KiB slice), the message and tool
+counts, and the token and cache usage LiteLLM reports. It logs hashes and counts,
+never prompt text. It is a diagnostic for prompt-cache re-writes that the eval
+installs turn on; off by default, with the default render unchanged.
+
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 
 Vertex AI has no API key by default. The gateway calls
