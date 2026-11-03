@@ -253,6 +253,11 @@ import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
 # The Config Connector read that the collectors share: this file's `gcp` read
 # gives the compliance stream's entries their `kcc_unready` keys through it.
+# It sits beside this file, which a caller can load by path with this
+# directory not on `sys.path` (a test of another skill does), so the
+# directory is added first.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parent))
 import kcc_health  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
