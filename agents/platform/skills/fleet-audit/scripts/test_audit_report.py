@@ -19986,18 +19986,20 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
         scan.assert_not_called()
 
-    def test_a_tree_still_over_the_ceiling_ends_finish_as_fatal(self):
-        # Not a document to fix: `finish` exits 1 with FATAL, names the
-        # ceiling, publishes nothing, and releases the run.
+    def test_a_tree_still_over_the_ceiling_still_publishes_the_report(self):
+        # A narrow snapshot still over the ceiling does not stop `finish`: the
+        # ledger publishes.
         self.start()
         path = "clusters/prod-us-east/payments-netpol.yaml"
         self.write_manifest(path, "kind: NetworkPolicy\n")
-        self.harness.replies = {"issue-list": {"issues": []}}
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
         use_large_repository(self, {}, too_large={"clusters/prod-us-east", path})
-        self.assertEqual(self.run_finish(make_doc()), 1)
-        self.assertIn("FATAL:", self.err)
-        self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", self.err)
-        self.assertFalse(self.harness.forge_calls("proposal-create"))
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertNotIn("FATAL", self.err)
+        self.assertTrue(self.harness.forge_calls("issue-create"))
 
     def test_the_kcc_scan_is_skipped_on_a_repository_over_the_ceiling(self):
         self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
@@ -21966,22 +21968,25 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
 
     def test_a_cluster_tree_over_the_ceiling_falls_back_to_the_file_alone(self):
         # The file checks fall back to a snapshot of the file alone; the name
-        # search needs the whole cluster tree, so a generated fix then stops.
+        # search needs the whole cluster tree, so the generated fix is then
+        # declined as unchecked, naming the ceiling.
         self.in_cluster_tree()
         calls = []
         use_large_repository(self, {}, too_large={"clusters/c1"}, calls=calls)
         self.patch_attr("content_mode", lambda: True)
-        with self.assertRaises(audit_report.ProbeLimit):
-            self.generate()
+        self.assertEqual(self.generate()[0], [])
         self.assertIn(["clusters/c1/web/a-pdb.yaml"], calls)
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", self.generate_err)
 
-    def test_a_path_still_over_the_ceiling_stops_the_command(self):
+    def test_a_path_still_over_the_ceiling_declines_the_fix_naming_the_limit(self):
         self.in_cluster_tree()
         use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/web/a-pdb.yaml"})
         self.patch_attr("content_mode", lambda: True)
-        with self.assertRaises(audit_report.ProbeLimit) as raised:
-            self.generate()
-        self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", str(raised.exception))
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("too large for one snapshot", self.generate_err)
+        self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", self.generate_err)
 
     def test_past_the_cap_a_check_is_skipped_with_the_reason(self):
         # The cap stops snapshots, not the run: the fix is declined as
@@ -21994,16 +21999,16 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertIn("could not be checked", self.generate_err)
         self.assertIn("PROBE_NARROW_SNAPSHOT_CAP", self.generate_err)
 
-    def test_a_too_large_read_or_search_is_not_swallowed(self):
+    def test_a_too_large_read_or_search_is_unanswered_naming_the_limit(self):
         use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/kustomization.yaml"})
         self.patch_attr("content_mode", lambda: True)
         probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertIsNone(probe.broker())
-            with self.assertRaises(audit_report.ProbeLimit):
-                probe.read_committed("clusters/c1/kustomization.yaml")
-            with self.assertRaises(audit_report.ProbeLimit):
-                probe.mentions("a-pdb", "clusters/c1/")
+            self.assertIsNone(probe.read_committed("clusters/c1/kustomization.yaml"))
+            self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", probe.take_unanswered())
+            self.assertTrue(probe.mentions("a-pdb", "clusters/c1/"))
+            self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", probe.take_unanswered())
         probe.close()
 
     def test_a_snapshot_that_failed_is_named_not_called_a_collision(self):

@@ -2584,16 +2584,6 @@ class NoGitOpsRepo(RuntimeError):
         self.message = message
 
 
-class ProbeLimit(RuntimeError):
-    """A narrow snapshot is still over the broker's snapshot ceiling.
-
-    Raised in narrow mode (`_RepositoryProbe._take_narrow`). It is not a
-    document the worker can fix, so it is not a `ValidationError`: `main`
-    reports it as `FATAL`, exit 1, and the run's note is released. Only an
-    operator can raise the ceiling.
-    """
-
-
 class _NarrowTooLarge(Exception):
     """A narrow snapshot of a directory is over the ceiling; the file alone is tried next."""
 
@@ -17137,8 +17127,6 @@ class _RepositoryProbe:
         if snap is None and self.narrow:
             try:
                 narrowed = self._narrow_snapshot_for(path)
-            except ProbeLimit:
-                raise
             except Exception as exc:  # noqa: BLE001 -- an unanswered check cannot rule the path out
                 self.unanswered = f"a snapshot of {path}: {type(exc).__name__}: {exc}"
                 self.note_outage(exc)
@@ -17181,10 +17169,11 @@ class _RepositoryProbe:
     def _take_narrow(self, key: str, *, last: bool) -> "RepositorySnapshot | None":
         """A snapshot of only `key`, kept for the run; None when the revision does not hold it.
 
-        Past `PROBE_NARROW_SNAPSHOT_CAP` it takes none and raises, which the
-        question reads as unanswered: the check is skipped with that reason, as
-        when no snapshot could be taken at all. A snapshot over the ceiling
-        stops the command (`ProbeLimit`) when it is the last thing to try.
+        Past `PROBE_NARROW_SNAPSHOT_CAP` it takes none and raises, and a
+        snapshot over the ceiling with nothing narrower to try raises too; the
+        question reads either as unanswered, so the check is skipped and the
+        fix declined with that reason, as when no snapshot could be taken at
+        all. The run goes on and the report publishes.
         """
         import vcs_client
 
@@ -17202,10 +17191,9 @@ class _RepositoryProbe:
             elif exc.code == vcs_client.SNAPSHOT_TOO_LARGE and not last:
                 raise _NarrowTooLarge(key) from exc
             elif exc.code == vcs_client.SNAPSHOT_TOO_LARGE:
-                raise ProbeLimit(
-                    f"{key} in {self.repo} is too large for one snapshot ({exc}), so the "
-                    "repository checks `finish` makes cannot run. An operator must raise the "
-                    "broker's CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES."
+                raise RuntimeError(
+                    f"{key} in {self.repo} is too large for one snapshot ({exc}); an operator "
+                    "can raise the broker's CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
                 ) from exc
             else:
                 raise
@@ -17288,8 +17276,6 @@ class _RepositoryProbe:
                 self.unanswered = self.unavailable or "the snapshot could not be taken"
                 return None
             return snap.read_bytes(path).decode("utf-8")
-        except ProbeLimit:
-            raise
         except Exception as exc:  # noqa: BLE001 -- an unread file cannot show the entry
             self.unanswered = f"reading {path}: {type(exc).__name__}: {exc}"
             return None
@@ -17336,8 +17322,6 @@ class _RepositoryProbe:
             if snap is None:
                 return True
             found = snap.grep(expression, prefix=tree or None, regex=True)
-        except ProbeLimit:
-            raise
         except Exception as exc:  # noqa: BLE001 -- an unanswered search cannot rule it out
             self.unanswered = f"searching for {name}: {type(exc).__name__}: {exc}"
             return True
