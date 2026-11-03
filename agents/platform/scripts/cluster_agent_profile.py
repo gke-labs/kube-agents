@@ -494,6 +494,10 @@ def _remove_sandbox_layouts(names: list[str]) -> dict[str, str]:
         done = subprocess.run(argv, check=False, capture_output=True, text=True,
                               timeout=SANDBOX_MIRROR_TIMEOUT_SECONDS)
         lines = [line for line in done.stdout.splitlines() if line.startswith(MIRROR_REMOVE_RESULT_PREFIX)]
+        if not lines and done.returncode == 0:
+            # The mirror's "no sandbox to mirror" exits (no ssh terminal backend, no
+            # agent home): zero, before it reads the names. Nothing to remove there.
+            return {name: "removed" for name in names}
         if not lines:
             raise ValueError(f"no result line (exit {done.returncode})")
         result = json.loads(lines[-1][len(MIRROR_REMOVE_RESULT_PREFIX):])
@@ -520,9 +524,15 @@ def delete_profiles(names: list[str]) -> dict[str, str]:
     name alone is skipped, and the next run tries it again.
 
     Outcomes: "deleted" (here and in the sandbox), "locked" (skipped: its lock was
-    held or could not be opened), "home-remains" (its home here survived the delete,
-    so its sandbox home was not touched), and "sandbox-left", "sandbox-refused" or
-    "sandbox-unreached" (gone here; the sandbox home stays, as the mirror said).
+    held), "home-remains" (its home here survived the delete, so its sandbox home
+    was not touched), "sandbox-unlocked" (its lock could not be opened: deleted
+    here, as delete_profile does, and its sandbox home left), and "sandbox-left",
+    "sandbox-refused" or "sandbox-unreached" (gone here; the sandbox home stays, as
+    the mirror said).
+
+    A held lock is a scaffold or delete that a blocking create of the same name
+    may queue behind; while a chunk holds its locks, such a create waits for that
+    chunk's deletes and its one mirror call, not one delete's.
     """
     outcomes: dict[str, str] = {}
     ordered = sorted(set(names))
@@ -534,10 +544,17 @@ def delete_profiles(names: list[str]) -> dict[str, str]:
                 if held.enter_context(profile_lock(profile_lock_root(), name, blocking=False,
                                                    on_error=lambda e, errs=errors: errs.append(str(e)))):
                     mine.append(name)
+                elif errors:
+                    # As delete_profile does without its lock: delete here, keep the
+                    # sandbox home. Skipping the name outright would keep its
+                    # project retiring for as long as the lock directory is broken.
+                    _delete_profile(name)
+                    outcomes[name] = "sandbox-unlocked"
+                    log(f"{name}: its profile lock could not be opened ({errors[0]}); "
+                        "deleted here, its sandbox home stays")
                 else:
                     outcomes[name] = "locked"
-                    why = f"its profile lock could not be opened ({errors[0]})" if errors else "its profile lock is held"
-                    log(f"{name}: not deleted this run, {why}")
+                    log(f"{name}: not deleted this run, its profile lock is held")
             for name in mine:
                 _delete_profile(name)
             gone = [name for name in mine if not os.path.lexists(profile_home(name))]

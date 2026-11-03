@@ -6,6 +6,7 @@ profile_name is a pure, deterministic function; the module imports without pyyam
 (that import is lazy, only on the scaffold path).
 """
 
+import contextlib
 import io
 import json
 import os
@@ -424,6 +425,24 @@ class DeleteProfilesTest(unittest.TestCase):
         self.assertEqual(outcomes, {"cluster-a": "deleted", "cluster-stays": "home-remains"})
         self.assertEqual(self.calls[0][0], ["cluster-a"])
 
+    def test_an_unopenable_lock_deletes_here_and_keeps_the_sandbox_home(self):
+        # As delete_profile without its lock; skipping outright would keep the
+        # project retiring for as long as the lock directory stays broken.
+        names = self.profiles("cluster-a", "cluster-b")
+        real = profile_scaffold.profile_lock
+
+        def lock(root, name, blocking=True, on_error=None):
+            if name == "cluster-b":
+                on_error(OSError(30, "Read-only file system"))
+                return contextlib.nullcontext(False)
+            return real(root, name, blocking=blocking, on_error=on_error)
+
+        with mock.patch.object(cap, "profile_lock", side_effect=lock):
+            outcomes = self.delete(names)
+        self.assertEqual(outcomes, {"cluster-a": "deleted", "cluster-b": "sandbox-unlocked"})
+        self.assertFalse(cap.profile_home("cluster-b").exists())
+        self.assertEqual(self.calls[0][0], ["cluster-a"])
+
     def test_the_mirror_s_answer_is_reported_per_name(self):
         names = self.profiles("cluster-a", "cluster-b", "cluster-c", "cluster-d")
         self.answer = lambda ns: {"cluster-a": "removed", "cluster-b": "left",
@@ -460,6 +479,11 @@ class RemoveSandboxLayoutsTest(unittest.TestCase):
         self.assertEqual([argv[i + 1] for i, a in enumerate(argv) if a == "--remove-profile"],
                          ["cluster-a", "cluster-b", "cluster-c"])
         self.assertEqual(run.call_args.kwargs["timeout"], cap.SANDBOX_MIRROR_TIMEOUT_SECONDS)
+
+    def test_an_install_with_no_sandbox_has_nothing_to_remove(self):
+        # The mirror exits 0 before reading the names when there is no sandbox.
+        outcomes, _ = self.run_with("sandbox-mirror: no ssh terminal backend in the managed config; no sandbox to mirror\n")
+        self.assertEqual(set(outcomes.values()), {"removed"})
 
     def test_no_result_line_is_every_name_unreached(self):
         for out in ("", "sandbox-mirror: the sandbox did not answer\n", cap.MIRROR_REMOVE_RESULT_PREFIX + "not json\n"):
