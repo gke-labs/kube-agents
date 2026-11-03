@@ -49,7 +49,8 @@ def list_agents(filter: str = "") -> str:
     instead of named; pass `filter` (a cluster name, assignee id, project or location; a
     case-insensitive substring) to get the matching agents by name, capped at a count the
     answer's heading reports, so you can copy the one `assignee` you need. With no match the answer says so; route a named cluster that
-    has no agent to `platform`. Without `filter` the tool renders what the injected block
+    has no agent to `platform`. When the roster could not be fully read, a no-match says that
+    instead and asks you to call again. Without `filter` the tool renders what the injected block
     renders.
     """
     # A tool has to answer with a string, so an unreadable roster (render() -> None)

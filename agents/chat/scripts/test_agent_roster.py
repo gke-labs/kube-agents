@@ -47,6 +47,11 @@ CACHE_AGED_SECONDS = 60
 # dated here is past the racy window, so only a key that carries its mtime
 # makes the next render re-read it.
 CACHE_REAGED_SECONDS = 30
+# CACHE_LONG_WALK_SECONDS is how long a fleet-scale walk is made to appear
+# (through a fake clock) so a stamp that lands during it sits past the racy
+# window by the time the stamps are read: only the walk-start rule explains
+# the next render's re-read.
+CACHE_LONG_WALK_SECONDS = 10
 # One fixture profile: the name as cluster_agent_profile.profile_name derives
 # it, and the identity block the scaffold stamps into config.yaml.
 FLEET_SCALE_PROJECT = "fleet-project"
@@ -1002,6 +1007,43 @@ class TestRosterCache(unittest.TestCase):
         _, reads = self._reads_on_render()
         self.assertGreater(reads, 0)
 
+    def test_a_stamp_landing_during_the_walk_is_not_cached_with_the_content_read_before_it(self):
+        # At fleet scale the walk is seconds long. An unstamped profile whose
+        # config.yaml is stamped after the walk read it, but before the stamps
+        # are taken, must not be stored: the stamp would vouch for content
+        # that has no identity. The clock is faked so the walk appears long
+        # and the stamp sits past the racy-by-now window when read; the same
+        # clock holds for the next render, so nothing but the walk-start rule
+        # can explain its re-read.
+        from types import SimpleNamespace
+        from unittest import mock
+
+        home = self.base / "cluster-p-c-us"
+        home.mkdir()
+        (home / "CAPABILITIES.md").write_text(CLUSTER_ROLE)
+        (home / "config.yaml").write_text("model: x\n")
+        for path in (self.base, home, home / "config.yaml"):
+            _age(path)
+        offset = [0]
+        clock = SimpleNamespace(time_ns=lambda: time.time_ns() + offset[0])
+        real = agent_roster.discover
+
+        def stamped_during_the_walk(root):
+            agents = real(root)
+            (home / "config.yaml").write_text(
+                "model: x\ncluster_identity:\n  cluster: c\n  location: us\n  project: p\n"
+            )
+            offset[0] = CACHE_LONG_WALK_SECONDS * 1_000_000_000
+            return agents
+
+        with mock.patch.object(agent_roster, "time", clock), \
+                mock.patch.object(agent_roster, "discover", side_effect=stamped_during_the_walk):
+            self.assertIn("  - cluster-p-c-us\n", self._render())
+        with mock.patch.object(agent_roster, "time", clock):
+            out, reads = self._reads_on_render()
+        self.assertGreater(reads, 0, "the pre-stamp content was cached under the post-stamp mtime")
+        self.assertIn("cluster-p-c-us (the c cluster agent", out)
+
     def test_a_tree_changed_within_the_racy_window_is_not_cached(self):
         # Filesystem timestamps are coarse: two writes inside one tick share
         # an mtime, so a tree touched just now is re-read until it is quiet.
@@ -1325,6 +1367,39 @@ class TestFilter(unittest.TestCase):
 
     def test_unknown_in_unknown_out(self):
         self.assertIsNone(agent_roster.format_matches(None, "x"))
+
+    def test_a_no_match_from_a_degraded_walk_is_unread_not_absent(self):
+        out = agent_roster.format_matches(self.agents, "nope", degraded=True)
+        self.assertEqual(out, agent_roster.FILTER_UNREAD.format(query="nope", total=4))
+        self.assertNotIn("has no cluster agent yet", out)
+        # A match is a match whatever the walk skipped elsewhere.
+        self.assertIn("1 of 1 matched", agent_roster.format_matches(self.agents, "seeded-a", degraded=True))
+
+    def test_render_filtered_reports_a_skipped_profile_as_unread(self):
+        # The one profile the filter is looking for is the one the walk could
+        # not read: the answer must not state that the cluster has no agent.
+        from unittest import mock
+
+        _forget()
+        real = Path.is_dir
+
+        def flaky(path):
+            if path.name == "cluster-p-b-us":
+                raise OSError(13, "EACCES")
+            return real(path)
+
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp) / "profiles"
+            base.mkdir()
+            _write_cluster_profile(base, "cluster-p-a-us", "p", "a", "us")
+            _write_cluster_profile(base, "cluster-p-b-us", "p", "b", "us")
+            _age(base)
+            with mock.patch.object(Path, "is_dir", autospec=True, side_effect=flaky):
+                degraded = agent_roster.render_filtered("b", base)
+            clean = agent_roster.render_filtered("b", base)
+        _forget()
+        self.assertEqual(degraded, agent_roster.FILTER_UNREAD.format(query="b", total=1))
+        self.assertIn("cluster-p-b-us (the b cluster agent", clean)
 
     def test_render_filtered_reads_the_cached_tree(self):
         _forget()

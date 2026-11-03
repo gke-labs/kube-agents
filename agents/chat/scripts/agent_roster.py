@@ -89,13 +89,25 @@ FILTER_NONE = (
     "cluster with no match has no cluster agent yet: route the request to "
     "`platform`, which owns cluster-agent lifecycle."
 )
+# A no-match from a walk that could not read every profile. Deliberately not
+# FILTER_NONE, for the reason UNKNOWN_ROSTER is not EMPTY_ROSTER: the profile
+# the filter was looking for may be the one the walk skipped.
+FILTER_UNREAD = (
+    'No specialist agent matches "{query}", but the roster could not be fully '
+    "read ({total} profiles read). Do not conclude that the cluster has no "
+    "agent: call `list_agents` again with the same `filter`, and say so plainly "
+    "if it keeps failing."
+)
 
 # render() keeps the last roster per process, keyed on the mtimes of the
 # profiles directory (an add, remove, rename or archive changes it) and of the
 # scope snapshot and render it reads, never on time: a TTL goes stale in the
 # window that matters, right after a scaffold. Filesystem timestamps are
 # coarse (a jiffy on Linux), so a tree changed within this many seconds is
-# never cached: a second change inside the same tick would be invisible.
+# never cached: a second change inside the same tick would be invisible. A
+# stamp read after a walk is held to the walk's start as well: a write that
+# landed while the walk was open may postdate the read, so the content on
+# hand is not the one the stamp vouches for.
 CACHE_RACY_SECONDS = 2
 CACHE_RACY_NS = CACHE_RACY_SECONDS * 1_000_000_000
 # A Cluster Agent profile whose identity is not yet stamped is keyed on its
@@ -399,18 +411,23 @@ def _matches(agent: dict[str, str], query: str) -> bool:
     return any(query in f.lower() for f in fields if f)
 
 
-def format_matches(agents: list[dict[str, str]] | None, query: str) -> str | None:
+def format_matches(
+    agents: list[dict[str, str]] | None, query: str, degraded: bool = False
+) -> str | None:
     """The agents matching ``query``, rendered as format_roster renders them, or ``None``.
 
     Never summarized, whatever the threshold: the filter exists to hand back
     the names a counted block withheld. Capped at FILTER_MATCH_LIMIT names.
+    ``degraded`` says the walk that produced ``agents`` skipped or half-read a
+    profile; a no-match from such a walk is reported as unread, not as absent.
     """
     if agents is None:
         return None
     needle = query.strip().lower()
     matched = [a for a in agents if _matches(a, needle)]
     if not matched:
-        return FILTER_NONE.format(query=query.strip(), total=len(agents))
+        none = FILTER_UNREAD if degraded else FILTER_NONE
+        return none.format(query=query.strip(), total=len(agents))
     shown = matched[:FILTER_MATCH_LIMIT]
     heading = FILTER_HEADING.format(
         query=query.strip(), shown=len(shown), matched=len(matched), total=len(agents)
@@ -638,10 +655,19 @@ def _mtime_ns(path: Path) -> int | None:
         return None
 
 
-def _racy(stamps) -> bool:
-    """Whether any stamp is within CACHE_RACY_SECONDS of now, or in its future."""
+def _racy(stamps, read_at: int | None = None) -> bool:
+    """Whether any stamp is within CACHE_RACY_SECONDS of now, or in its future.
+
+    ``read_at`` is when the content the stamps vouch for was read (the start
+    of the walk); a stamp newer than CACHE_RACY_SECONDS before it is racy too,
+    since the write may have landed after the read.
+    """
     now = time.time_ns()
-    return any(s is not None and abs(now - s) < CACHE_RACY_NS for s in stamps)
+    floor = None if read_at is None else read_at - CACHE_RACY_NS
+    return any(
+        s is not None and (abs(now - s) < CACHE_RACY_NS or (floor is not None and s > floor))
+        for s in stamps
+    )
 
 
 def _cache_key_for(root: Path) -> tuple | None:
@@ -681,24 +707,34 @@ def _unstamped(agents: list[dict[str, str]]) -> list[str]:
     ]
 
 
-def _profile_stamps(root: Path, names: list[str]) -> tuple | None:
+def _profile_stamps(root: Path, names: list[str], read_at: int | None = None) -> tuple | None:
     """(name, directory mtime, config.yaml mtime) per profile, or ``None`` when one is racy or gone.
 
     The stamp rewrites config.yaml in place (its mtime moves) and an overlay
     creates it (the directory's moves), so either change misses the cache.
+    ``read_at`` (see ``_racy``) is the walk's start when the stamps are taken
+    after it, so a stamp that landed during the walk is never stored.
     """
     out = []
     for name in names:
         home = root / name
         stamps = (_mtime_ns(home), _mtime_ns(home / PROFILE_CONFIG))
-        if stamps[0] is None or _racy(stamps):
+        if stamps[0] is None or _racy(stamps, read_at):
             return None
         out.append((name, *stamps))
     return tuple(out)
 
 
-def _discover_and_render(base: Path | None) -> tuple[list[dict[str, str]] | None, str | None]:
-    """The agents and the rendered roster, from the cache when nothing changed."""
+def _discover_and_render(
+    base: Path | None,
+) -> tuple[list[dict[str, str]] | None, str | None, bool]:
+    """The agents, the rendered roster, and whether the walk degraded.
+
+    From the cache when nothing changed; a hit is clean by construction. The
+    cache key is read before the walk and the unstamped profiles' own stamps
+    after it, held to the walk's start, so neither can vouch for content a
+    write during the walk replaced.
+    """
     global _cache
     root = PROFILES_BASE if base is None else base
     key = _cache_key_for(root)
@@ -709,8 +745,9 @@ def _discover_and_render(base: Path | None) -> tuple[list[dict[str, str]] | None
         and cached[0] == key
         and _profile_stamps(root, [name for name, *_ in cached[1]]) == cached[1]
     ):
-        return cached[2], cached[3]
+        return cached[2], cached[3], False
     faults_before = _faults
+    started = time.time_ns()
     agents = discover(root)
     roster = format_roster(agents)
     if roster is None:
@@ -718,11 +755,12 @@ def _discover_and_render(base: Path | None) -> tuple[list[dict[str, str]] | None
     else:
         extra = [b for b in (_format_host(read_host_identity(agents, root)), _format_scope(root)) if b]
         text = "\n\n".join([roster, *extra])
-    if key is not None and agents is not None and _faults == faults_before:
-        unstamped = _profile_stamps(root, _unstamped(agents))
+    degraded = _faults != faults_before
+    if key is not None and agents is not None and not degraded:
+        unstamped = _profile_stamps(root, _unstamped(agents), read_at=started)
         if unstamped is not None:
             _cache = (key, unstamped, agents, text)
-    return agents, text
+    return agents, text, degraded
 
 
 def render(base: Path | None = None) -> str | None:
@@ -737,6 +775,10 @@ def render(base: Path | None = None) -> str | None:
 
 
 def render_filtered(query: str, base: Path | None = None) -> str | None:
-    """The agents matching ``query`` (``format_matches``), from the same cache as render."""
-    agents, _ = _discover_and_render(base)
-    return format_matches(agents, query)
+    """The agents matching ``query`` (``format_matches``), from the same cache as render.
+
+    A no-match from a walk that degraded is reported as unread (FILTER_UNREAD),
+    never as "no such agent": the skipped profile may be the one asked for.
+    """
+    agents, _, degraded = _discover_and_render(base)
+    return format_matches(agents, query, degraded=degraded)
