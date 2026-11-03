@@ -235,6 +235,13 @@ PUSH_REMOVAL_WINDOW = timedelta(minutes=2)
 CHECK_SUITES_READ = 10
 #: Queue removals read per pull request: enough to count the `failed_checks` ones since the push.
 REMOVALS_READ = 10
+#: Open pull requests read per page of the sweep's query. Each node carries labels, the queue
+#: entry, the head's check suites and its whole status rollup, so GitHub answers one page as a
+#: heavy request; at 50 the query began timing out with HTTP 504 at the repository's open-PR count,
+#: failing the scheduled sweep so approved pull requests were not enqueued. A smaller page keeps
+#: each request inside GitHub's gateway timeout; the retry in github_api does not help a request
+#: that is too heavy to answer at all, only one that fails in transit.
+PULLS_PAGE_SIZE = 20
 #: How many times per head commit the sweep puts a pull request back after `failed_checks`
 #: removals. `LEFT_OUT_HEADLINES` and the sweep's log line say "one retry"; change them with it.
 FAILED_CHECKS_RETRIES = 1
@@ -243,7 +250,7 @@ FAILED_CHECKS_RETRIES = 1
 PULLS_QUERY = """
 query($owner: String!, $name: String!, $base: String!, $after: String) {
   repository(owner: $owner, name: $name) {
-    pullRequests(states: OPEN, baseRefName: $base, first: 50, after: $after) {
+    pullRequests(states: OPEN, baseRefName: $base, first: %(page)d, after: $after) {
       pageInfo { hasNextPage endCursor }
       nodes {
         id number isDraft headRefOid
@@ -627,7 +634,7 @@ def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
     pulls = []
     after = None
     while True:
-        page = api.graphql(PULLS_QUERY % {"removals": REMOVALS_READ, "suites": CHECK_SUITES_READ}, {"owner": owner, "name": name, "base": base, "after": after})
+        page = api.graphql(PULLS_QUERY % {"removals": REMOVALS_READ, "suites": CHECK_SUITES_READ, "page": PULLS_PAGE_SIZE}, {"owner": owner, "name": name, "base": base, "after": after})
         page = page["repository"]["pullRequests"]
         for node in page["nodes"]:
             commits = node["commits"]["nodes"]
