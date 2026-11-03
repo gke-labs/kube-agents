@@ -196,7 +196,8 @@ readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
 # The round trip after the suite verdict is for a next-mode run on main: a
 # pull request's next-mode run (the merge-blocking presubmit's, or a batch's
 # that Tide ran) skips it, since nobody reads a report-only result there and the
-# today lane below proves the same path on demand on a pull request.
+# today lane below proves the same path on pull requests that touch the round
+# trip, or on demand.
 readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"
 # The today lane, EVAL_ROLLBACK_LANE=1 beside EVAL_MODE_NEXT=1
 # (run_rollback_lane, in section 3): the deploy brings the install up under
@@ -5054,10 +5055,10 @@ profile_begin "record + final gate"
 # record once written. The candidate would then be measured for non-inferiority
 # against a window it had just moved.
 #
-# EVAL_ROLLBACK_LANE=1 is the fourth. A today-lane run with no PULL_NUMBER
-# would carry EVAL_MODE_NEXT=1 for its deploy and
-# grades the install after rolling it back to today, over the api transport,
-# so its key reads today; but a rolled-back install is not the fresh today
+# EVAL_ROLLBACK_LANE=1 is the fourth. No today-lane job runs on main now, but
+# one with no PULL_NUMBER would carry EVAL_MODE_NEXT=1 for its deploy and
+# grade the install after rolling it back to today, over the api transport,
+# so its key would read today; but a rolled-back install is not the fresh today
 # install today's window measures. `bench-gate record` refuses it too.
 #
 # A next-mode run on main does record. The main nightly
@@ -5236,7 +5237,7 @@ run_rollback_roundtrip() {
   local skip_type
   for skip_type in ${EVAL_ROLLBACK_SKIP_JOB_TYPES}; do
     if [ "${skip_type}" = "${JOB_TYPE:-}" ]; then
-      echo "Rollback round trip skipped: a pull request's run (JOB_TYPE=${JOB_TYPE}); the today lane proves the rollback path on main and on demand"
+      echo "Rollback round trip skipped: a pull request's run (JOB_TYPE=${JOB_TYPE}); the today presubmit (pull-kube-agents-smoke-test-today) proves the rollback path on pull requests that touch the round trip, or on demand"
       return 0
     fi
   done

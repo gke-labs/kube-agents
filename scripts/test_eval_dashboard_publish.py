@@ -207,10 +207,10 @@ class PublishHookFailSafeTest(unittest.TestCase):
             self.assertEqual(list(dash.glob("*.ran")), [])
 
     def test_a_today_lane_run_never_publishes(self):
-        """A today-lane periodic is also a periodic with no PULL_NUMBER and
-        no RC_COMMIT_SHA, flagged EVAL_MODE_NEXT=1 for its deploy. It grades
-        an install rolled back from next, which is not main's history.
-        Mirrors the baseline recorder's fourth condition."""
+        """A today-lane run on main, if one ran, would be a periodic with no
+        PULL_NUMBER and no RC_COMMIT_SHA, flagged EVAL_MODE_NEXT=1 for its
+        deploy. It would grade an install rolled back from next, which is not
+        main's history. Mirrors the baseline recorder's fourth condition."""
         marker = (
             "import pathlib, sys\n"
             "pathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"

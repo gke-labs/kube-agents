@@ -714,7 +714,7 @@ they come from.
 Where the flag is set is the Prow job's choice, not a script default, and since `next` became the
 mode a new install gets, the merge-blocking presubmit sets it: every pull request is graded on
 `next` through the door. `today` stays supported as the rollback, so a second lane proves that
-path. The today lane (`pull-kube-agents-smoke-test-today`, on demand) sets the flag together with
+path. The today lane (`pull-kube-agents-smoke-test-today`, on pull requests that touch the round trip, or on demand) sets the flag together with
 `EVAL_ROLLBACK_LANE=1`: the deploy is the flagged one, and `hack/ci-eval-pr.sh` then runs
 `hack/rollback-roundtrip.sh` with `ROLLBACK_END_MODE=today` before the matrix, which adds a third
 leg (`next` to `today` again, with the first leg's checks) and leaves the install rolled back. The

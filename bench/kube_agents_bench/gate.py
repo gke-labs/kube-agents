@@ -1031,9 +1031,10 @@ def _cmd_record(args: argparse.Namespace) -> int:
 
     if os.environ.get(ROLLBACK_LANE_ENV) == "1" and not args.force:
         # Third way in, mirrored from hack/ci-eval-pr.sh's recorder decision:
-        # a today-lane periodic on main has no PULL_NUMBER and grades an
-        # install rolled back from next over the api transport. Its key reads
-        # today, and today's window measures a fresh today install.
+        # a today-lane run on main (none runs today) would have no PULL_NUMBER
+        # and grade an install rolled back from next over the api transport.
+        # Its key would read today, and today's window measures a fresh today
+        # install.
         print(
             f"::error::refusing to record a baseline with {ROLLBACK_LANE_ENV}=1: "
             "the today lane grades a rolled-back install, which is not what "
