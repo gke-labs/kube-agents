@@ -298,9 +298,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lin
 # Hotfix: make a dispatched cron run report back, and stop it closing the
 # kanban card of the caller that dispatched it. Upstream discards the run's
 # final response and lets the run inherit HERMES_KANBAN_TASK, which is how
-# three fleet-audit streams published wrong ledgers on 2026-08-04. Sixteen edits
-# across four files, so the surgery lives in an applier script rather than
-# inline; it fails the build on any anchor that no longer matches. Since
+# three fleet-audit streams published wrong ledgers on 2026-08-04. The same
+# applier also carries the work's origin: it wraps the scheduler tick's run in
+# cron_tick_origin_scope, and makes the cronjob tool record a job's origin on
+# create and update (deploy/docker/patches/cron_job_template.py). Nineteen
+# edits across four files, so the surgery lives in an applier script rather
+# than inline; it fails the build on any anchor that no longer matches. Since
 # v2026.9.14 split the run body, the saved output path rides back on
 # upstream's _RunDelivery record before the out-param is filled in.
 # verify_cron_run_scope.py then exercises the patched code. The applier only
@@ -1827,8 +1830,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # own transaction by rebinding upstream's inherit_creator_origin, which both
 # create_task and the auto-decompose inserter call there; a worker's child and
 # a decomposed child inherit their creator's stamp. No create argument sets
-# it: in-pod writers that know better pass a one-time stamp ticket minted on
-# the Session KV server, which the insert redeems. Runs after kanban_priority, and before
+# it: the bootstrap hand-off and the GitHub scan gate pass a one-time stamp
+# ticket minted on the Session KV server, which the insert redeems; the drift
+# backlog stamps the side table directly from the Session KV server after its
+# create returns. The build checks three swaps: inherit_creator_origin in
+# kanban_db_graph.py, create_task in kanban_db.py, and the CLI's
+# _HANDLERS["create"] in kanban.py. Runs after kanban_priority, and before
 # credential_redaction, whose create_task prologue lands inside the def this
 # wraps. hermes_cli/ is the destination no chmod loop walks, hence install -m.
 # See the module docstring in deploy/docker/patches/kanban_origin.py.

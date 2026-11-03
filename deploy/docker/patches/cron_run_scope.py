@@ -4,6 +4,12 @@ Installed into the image at ``/opt/hermes/tools/cron_run_scope.py`` and wired
 into ``cron/scheduler.py``, ``tools/cronjob_tools.py``, and
 ``tools/kanban_tools.py`` by ``deploy/docker/Dockerfile``.
 
+The same applier wires the origin of the work into the scheduler and the
+cronjob tool: the scheduler tick runs each job inside
+:func:`cron_tick_origin_scope`, and ``cronjob_manage`` records a job's origin
+on ``create`` and ``update``. ``cron_job_template.py`` holds how that origin
+is resolved and recorded.
+
 Two upstream defects combine badly when an orchestrator profile dispatches a
 cron job with ``cronjob(action='run')``. Both were observed in production on
 2026-08-04, when three of the five fleet-audit streams published wrong results
