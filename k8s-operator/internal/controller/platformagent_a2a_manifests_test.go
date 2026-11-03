@@ -8186,7 +8186,8 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 	}
 
 	// natscli's create spellings, aliases included, and the edits that can raise a cap.
-	creates := regexp.MustCompile(`\b(stream (?:add|create|new)|kv (?:add|new|create))\s+(\S+)(.*)$`)
+	// Not `kv create`: that puts a key if it is new, and reserves nothing.
+	creates := regexp.MustCompile(`\b(stream (?:add|create|new)|kv (?:add|new))\s+(\S+)(.*)$`)
 	// Every edit or update, stream or bucket: one this test can't read fails rather
 	// than raising a cap it never sees.
 	edits := regexp.MustCompile(`\b((?:stream|kv) (?:edit|update))\b\s*(\S*)(.*)$`)
