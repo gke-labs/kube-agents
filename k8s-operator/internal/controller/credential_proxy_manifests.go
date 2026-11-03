@@ -130,7 +130,8 @@ const (
 	//   - On GKE Autopilot without bursting the limit is clamped to the
 	//     request, so only the request buys CPU, and the broker requests 2 CPU
 	//     there (credentialProxyAutopilotCPURequest). The operator learns the
-	//     cluster type from discovery (isGKEAutopilot).
+	//     cluster type from discovery (isGKEAutopilot), and from the running
+	//     proxy while discovery cannot say (liveCredentialProxyAutopilot).
 	//
 	// Memory. Nothing here holds cluster state. What the container holds is
 	// Envoy (53 to 66Mi resident on a live install), the broker process (104Mi
@@ -185,7 +186,8 @@ const (
 	// (TestCredentialProxyBudgetArithmeticAtTheDefaults). The Standard 1Gi
 	// request stays above the budget's 672Mi floor
 	// (credentialProxyMinimumMemoryLimitBytes) for a cluster discovery could
-	// not classify, which the operator renders as Standard.
+	// not classify and no running proxy shows as Autopilot, which the operator
+	// renders as Standard (liveCredentialProxyAutopilot).
 	//
 	// A CR that sets a cpu or memory limit without the same request, below
 	// the default request, gets that request lowered to its limit
@@ -507,8 +509,10 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 // with none. So does the profile role's configuration (credential_proxy_profiles.go):
 // the AgentProfile identities and the task-signing public key.
 //
-// autopilot is the cluster type discovery reported (isGKEAutopilot), which
-// picks the container's default requests (resolveCredentialProxyResourcesFor).
+// autopilot is the cluster type discovery reported (isGKEAutopilot) or, while
+// discovery cannot say, the one the running proxy's requests show
+// (liveCredentialProxyAutopilot). It picks the container's default requests
+// (resolveCredentialProxyResourcesFor).
 func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, owned brokerCallerOwnership, profiles credentialProxyProfileConfig, autopilot bool) *appsv1.Deployment {
 	saName := agent.Name
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {

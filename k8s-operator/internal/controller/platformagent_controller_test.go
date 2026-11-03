@@ -7778,3 +7778,75 @@ func TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode(t *testing.
 		})
 	}
 }
+
+// TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails: when
+// discovery cannot say whether the cluster is Autopilot, Reconcile renders the
+// proxy at the cluster type whose requests the running proxy already carries,
+// so a failed check after an operator restart does not restart the proxy. With
+// no proxy yet it renders the Standard requests.
+func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) {
+	tests := []struct {
+		name      string
+		resources *corev1.ResourceRequirements
+		running   *bool
+		wantCPU   string
+		wantMem   string
+	}{
+		{name: "running at the Autopilot requests", running: ptr.To(true), wantCPU: "2", wantMem: "2Gi"},
+		{name: "running at the Standard requests", running: ptr.To(false), wantCPU: "500m", wantMem: "1Gi"},
+		{name: "no proxy yet", running: nil, wantCPU: "500m", wantMem: "1Gi"},
+		// requests.cpu 2 on Standard runs at 2 / 1Gi: the CPU matches the
+		// Autopilot render (2 / 2Gi) and the memory does not, so it is Standard.
+		{
+			name:      "only the CPU matches the Autopilot render",
+			resources: &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}},
+			running:   ptr.To(false), wantCPU: "2", wantMem: "1Gi",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-mode", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+				},
+			}
+			if tt.resources != nil {
+				agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: tt.resources}}
+			}
+			objs := []client.Object{agent, shellSandboxKeysSecret(agent)}
+			if tt.running != nil {
+				objs = append(objs, buildCredentialProxyDeploymentForPlugins(agent, "policy-hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, *tt.running))
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			failing := &mockAutopilotDiscovery{serverGroupsErr: fmt.Errorf("503 Service Unavailable")}
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64), DiscoveryClient: failing}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+			ctx := context.Background()
+			for i := range 2 {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("Reconcile %d failed: %v", i+1, err)
+				}
+			}
+			if r.autopilotResolved {
+				t.Fatal("an undetermined discovery answer was cached")
+			}
+			dep := &appsv1.Deployment{}
+			if err := cl.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, dep); err != nil {
+				t.Fatalf("get the proxy Deployment: %v", err)
+			}
+			proxy, found := findContainer(dep.Spec.Template.Spec, credentialProxyContainerName)
+			if !found {
+				t.Fatalf("no %s container in the proxy Deployment", credentialProxyContainerName)
+			}
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceCPU, tt.wantCPU)
+			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceMemory, tt.wantMem)
+		})
+	}
+}

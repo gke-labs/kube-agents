@@ -543,7 +543,8 @@ type PlatformAgentReconciler struct {
 	// credential proxy's default requests (resolveCredentialProxyResourcesFor).
 	// The cluster type cannot change under a running operator, so only an
 	// authoritative probe sets autopilotResolved; a failed one is retried, and
-	// renders the Standard requests meanwhile.
+	// meanwhile the proxy keeps the cluster type its running requests show,
+	// else Standard (liveCredentialProxyAutopilot).
 	autopilotMu       sync.Mutex
 	autopilotResolved bool
 	autopilot         bool
@@ -3142,7 +3143,13 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles, r.clusterAutopilot())
+	autopilot, determined := r.clusterAutopilot()
+	if !determined {
+		if autopilot, err = r.liveCredentialProxyAutopilot(ctx, agent, rendered); err != nil {
+			return err
+		}
+	}
+	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles, autopilot)
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
@@ -6082,24 +6089,57 @@ func (r *PlatformAgentReconciler) imageVolumeSupported(agent *agentv1alpha1.Plat
 
 // clusterAutopilot reports whether the cluster is GKE Autopilot, from
 // discovery (isGKEAutopilot), and reuses an authoritative answer. An answer
-// discovery could not give is false, the Standard requests, and is asked again
-// on the next reconcile: a smaller request than Autopilot wants delays the
-// broker's CPU, where a larger one than a Standard node can fit leaves it
-// Pending.
-func (r *PlatformAgentReconciler) clusterAutopilot() bool {
+// discovery could not give is (false, false) and is asked again on the next
+// reconcile; the caller decides what to render meanwhile
+// (liveCredentialProxyAutopilot).
+func (r *PlatformAgentReconciler) clusterAutopilot() (autopilot bool, determined bool) {
 	r.autopilotMu.Lock()
 	defer r.autopilotMu.Unlock()
 	if r.autopilotResolved {
-		return r.autopilot
+		return r.autopilot, true
 	}
-	autopilot, determined := isGKEAutopilot(r.DiscoveryClient)
+	autopilot, determined = isGKEAutopilot(r.DiscoveryClient)
 	if !determined {
-		logf.Log.WithName("platformagent-controller").Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; rendering the credential proxy at the Standard requests until discovery answers.")
-		return false
+		logf.Log.WithName("platformagent-controller").Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; rendering the credential proxy for the cluster type its running requests show, else Standard, until discovery answers.")
+		return false, false
 	}
 	r.autopilot = autopilot
 	r.autopilotResolved = true
-	return autopilot
+	return autopilot, true
+}
+
+// liveCredentialProxyAutopilot picks the cluster type to render the proxy at
+// while discovery cannot say: the one whose requests, for this CR, the running
+// proxy already carries. Rendering the Standard requests over a proxy running
+// at the Autopilot ones would restart it (its Deployment is Recreate), and
+// again once discovery answers. The requests are still computed from the
+// current CR, so an edit made meanwhile is applied. With no proxy yet, or one
+// matching neither render, it is Standard: a smaller request than Autopilot
+// wants delays the broker's CPU, where a larger one than a Standard node can
+// fit leaves it Pending.
+func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Context, agent, rendered *agentv1alpha1.PlatformAgent) (bool, error) {
+	live := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, live); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to read the credential proxy Deployment: %w", err)
+	}
+	for _, c := range live.Spec.Template.Spec.Containers {
+		if c.Name != credentialProxyContainerName {
+			continue
+		}
+		want := resolveCredentialProxyResourcesFor(rendered.Spec.Deployment, true).Requests
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			have, ok := c.Resources.Requests[name]
+			wantQ := want[name]
+			if !ok || have.Cmp(wantQ) != 0 {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 type pluginFailure struct {
