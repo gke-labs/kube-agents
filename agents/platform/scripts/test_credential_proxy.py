@@ -241,6 +241,43 @@ class AgentAPIProxyTest(unittest.TestCase):
             connection.request("GET", "/health", headers={"Authorization": "Bearer external-secret"})
             self.assertEqual(200, connection.getresponse().status)
 
+    def test_a_peer_that_drips_its_request_head_is_closed_at_the_window_and_frees_its_slot(self):
+        # The window bounds the whole request head, not each read of it: a
+        # peer that sends one byte of its request line inside every per-read
+        # timeout would otherwise hold its thread, and its slot under the
+        # cap, for as long as it kept dripping, and enough of them lock the
+        # door for every other pod in the namespace.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _DOOR_IDLE_SECONDS):
+            door = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), AgentAPIProxyHandler, max_threads=1)
+            threading.Thread(target=door.serve_forever, daemon=True).start()
+            self.addCleanup(door.server_close)
+            self.addCleanup(door.shutdown)
+            dripping = socket.create_connection(("127.0.0.1", door.server_port), timeout=_CLOSE_WAIT_SECONDS)
+            self.addCleanup(dripping.close)
+            stop = threading.Event()
+            self.addCleanup(stop.set)
+            _drip(dripping, b"GET /" + b"a" * _DRIPPED_HEAD_BYTES, stop)
+            time.sleep(_RESET_SETTLE_SECONDS)
+            # Inside the window the one slot is held: the next connection is refused.
+            with socket.create_connection(("127.0.0.1", door.server_port), timeout=_CLOSE_WAIT_SECONDS) as refused:
+                response = http.client.HTTPResponse(refused)
+                response.begin()
+                self.assertEqual(503, response.status)
+            # At the window the dripping connection is closed, still dripping
+            # (EOF, or a reset for the bytes the close left unread), and the
+            # slot is back.
+            started = time.monotonic()
+            try:
+                self.assertEqual(b"", dripping.recv(1), "the dripping connection was not closed")
+            except ConnectionResetError:
+                pass
+            self.assertLess(time.monotonic() - started, _CLOSE_WAIT_SECONDS)
+            time.sleep(_RESET_SETTLE_SECONDS)
+            connection = http.client.HTTPConnection("127.0.0.1", door.server_port, timeout=_CLOSE_WAIT_SECONDS)
+            self.addCleanup(connection.close)
+            connection.request("GET", "/health", headers={"Authorization": "Bearer external-secret"})
+            self.assertEqual(200, connection.getresponse().status)
+
     def test_an_idle_door_connection_is_a_debug_line_not_an_access_log_line(self):
         # The stdlib reports the idle timeout through log_error, which on
         # the door went to log_message: an INFO line shaped like an access
@@ -15676,6 +15713,31 @@ _STALLED_BODY_LENGTH = 100
 # second refusal inside the close wait while a first drain is parked for this
 # long shows the accept loop was not the thread doing the waiting.
 _LONG_REFUSAL_DRAIN_SECONDS = 2 * _CLOSE_WAIT_SECONDS
+# How often a dripping peer sends its next byte: well inside every per-read
+# timeout the tests arm, so a handler that bounded each read rather than the
+# whole request head would never close on it.
+_DRIP_INTERVAL_SECONDS = _SHORT_IDLE_SECONDS / 5
+# A request line, header or body long enough that, dripped at that interval,
+# it is still incomplete when every window the tests arm has passed.
+_DRIPPED_HEAD_BYTES = 400
+
+
+def _drip(sock, data, stop):
+    """Send `data` to `sock` a byte at a time, every _DRIP_INTERVAL_SECONDS, on a thread until `stop` is set or the send fails."""
+
+    def dripper():
+        for byte in data:
+            if stop.is_set():
+                return
+            try:
+                sock.send(bytes([byte]))
+            except OSError:
+                return
+            time.sleep(_DRIP_INTERVAL_SECONDS)
+
+    thread = threading.Thread(target=dripper, daemon=True)
+    thread.start()
+    return thread
 
 
 class _CredentialedUnixServer(unittest.TestCase):
@@ -15894,6 +15956,44 @@ class KeepAliveTest(_CredentialedUnixServer):
             any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output
         )
 
+    def test_a_peer_that_drips_its_request_head_is_closed_at_the_window_and_logged_as_stalled(self):
+        # One deadline for the request line, the headers and the body
+        # together, so a peer that sends a byte inside every per-read timeout
+        # is closed at the window all the same, and logged as a request that
+        # stalled (with the bytes of it that arrived), never as the idle
+        # close: an idle connection sent nothing, this one did.
+        exec_head = (
+            f"POST /v1/exec HTTP/1.1\r\nHost: broker\r\nAuthorization: Bearer {self.SHELL}\r\n"
+            f"Content-Length: {_DRIPPED_HEAD_BYTES}\r\n\r\n"
+        ).encode("ascii")
+        shapes = (
+            ("request line", b"", b"GET /" + b"a" * _DRIPPED_HEAD_BYTES, "requestline= "),
+            ("headers", b"GET /healthz HTTP/1.1\r\n", b"Host: broker\r\nX-Padding: " + b"a" * _DRIPPED_HEAD_BYTES, "requestline=GET /healthz HTTP/1.1 "),
+            ("body", exec_head, b'{"argv": "' + b"a" * _DRIPPED_HEAD_BYTES, "requestline=POST /v1/exec HTTP/1.1 "),
+        )
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            for shape, sent_whole, dripped, named in shapes:
+                with self.subTest(shape=shape):
+                    sock = self.connect()
+                    stop = threading.Event()
+                    self.addCleanup(stop.set)
+                    with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                        if sent_whole:
+                            sock.sendall(sent_whole)
+                        _drip(sock, dripped, stop)
+                        started = time.monotonic()
+                        self.assertTrue(self.closed_by_server(sock), "the dripping connection was not closed")
+                        self.assertLess(time.monotonic() - started, _CLOSE_WAIT_SECONDS)
+                        stop.set()
+                        time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+                    stalled = [line for line in logs.output if "request stalled" in line]
+                    self.assertEqual(1, len(stalled), logs.output)
+                    self.assertTrue(stalled[0].startswith("WARNING:"), stalled[0])
+                    self.assertIn(named, stalled[0])
+                    received = int(re.search(r"received_bytes=(\d+)", stalled[0]).group(1))
+                    self.assertGreater(received, len(sent_whole), stalled[0])
+                    self.assertFalse(any("closed idle" in line for line in logs.output), logs.output)
+
     def test_a_caller_that_stops_reading_a_response_has_its_connection_closed(self):
         # _json gives the write up at RESPONSE_WRITE_TIMEOUT_SECONDS. The
         # response is then incomplete on the wire, so the connection cannot
@@ -16024,6 +16124,35 @@ class ThreadCapTest(_CredentialedUnixServer):
             parked[0].close()
             time.sleep(_RESET_SETTLE_SECONDS)
             self.assertEqual(503, self._refused()[0])
+
+    def test_a_slot_is_given_back_when_the_handler_thread_fails_to_start(self):
+        # The slot is taken on the accept loop before the handler thread is
+        # started; a start that fails (RuntimeError: can't start new thread)
+        # must give it back, or every such failure shrinks the cap by one for
+        # the life of the process.
+        real_start = threading.Thread.start
+        failed = threading.Event()
+        server = self.server
+
+        def failing_start(thread):
+            if thread._target == server.process_request_thread and not failed.is_set():
+                failed.set()
+                raise RuntimeError("can't start new thread")
+            return real_start(thread)
+
+        with mock.patch.object(threading.Thread, "start", failing_start):
+            with self.assertLogs(credential_proxy.LOGGER, level="ERROR") as logs:
+                dropped = self.connect()
+                self.assertTrue(failed.wait(_CLOSE_WAIT_SECONDS), "the handler thread's start was not reached")
+                self.assertTrue(self.closed_by_server(dropped))
+        self.assertTrue(any("request handler failed" in line and "RuntimeError" in line for line in logs.output), logs.output)
+        # Every slot is still there: a full cap of holders is admitted, and
+        # the last of them is served rather than refused.
+        holders = [self.connect() for _ in range(_SMALL_THREAD_CAP)]
+        time.sleep(_RESET_SETTLE_SECONDS)
+        self.send(holders[-1], "GET", "/healthz")
+        self.assertEqual(200, self.response(holders[-1])[0])
+        self.assertEqual(503, self._refused()[0])
 
     def test_the_refusal_is_one_complete_response(self):
         refusal = credential_proxy.THREAD_CAP_REFUSAL

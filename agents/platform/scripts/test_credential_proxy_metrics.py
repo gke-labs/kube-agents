@@ -54,6 +54,10 @@ _STATUS_CODE_LABEL = re.compile(r"^[0-9]{3}$")
 _SERIES = re.compile(r"^(?P<name>[a-z_]+)(?:\{(?P<labels>[^}]*)\})? (?P<value>-?[0-9.]+(?:e[+-]?[0-9]+)?)$")
 _LABEL_PAIR = re.compile(r'([a-z_]+)="((?:[^"\\]|\\.)*)"')
 _STUB_FAILING_EXIT = 3
+# The host serve() is handed for the metrics and health listeners: not the
+# loopback address, so an assertion that the listener bound on it cannot be
+# satisfied by a hard-coded loopback bind.
+_PROBE_HOST = "10.96.0.9"
 
 
 def _parse(exposition):
@@ -1902,14 +1906,14 @@ class ServeWiringTest(unittest.TestCase):
     class _Stop(Exception):
         pass
 
-    def _serve(self, metrics_port, env_value=None, started=None, unix_server=None, health_port=0, health_started=None):
+    def _serve(self, metrics_port, env_value=None, started=None, unix_server=None, health_port=0, health_started=None, host="127.0.0.1"):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         policy_path = Path(tmp.name) / "policy.json"
         policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
         args = types.SimpleNamespace(
             policy=str(policy_path),
-            host="127.0.0.1",
+            host=host,
             port=0,
             unix_socket=str(Path(tmp.name) / "backend.sock"),
             timeout_seconds=5,
@@ -1961,8 +1965,8 @@ class ServeWiringTest(unittest.TestCase):
         return started, logs.output
 
     def test_the_parsed_port_reaches_the_listener(self):
-        started, _ = self._serve(8766)
-        started.assert_called_once_with("127.0.0.1", 8766)
+        started, _ = self._serve(8766, host=_PROBE_HOST)
+        started.assert_called_once_with(_PROBE_HOST, 8766)
 
     def test_a_value_that_is_no_port_is_refused_by_name_and_never_bound(self):
         started, logs = self._serve(70000)
@@ -2017,8 +2021,12 @@ class ServeWiringTest(unittest.TestCase):
                 order.append("credentialed")
 
         health_started = mock.MagicMock(side_effect=lambda *args: order.append("health"))
-        self._serve(8766, unix_server=_Recording, health_port=8767, health_started=health_started)
-        health_started.assert_called_once_with("127.0.0.1", 8767)
+        # A host that is not loopback: the listener binds on the metrics
+        # host, the pod IP in the operator's layout, which is what a kubelet
+        # probe reaches; a regression to a hard-coded loopback bind would
+        # pass an assertion made with the loopback address.
+        self._serve(8766, unix_server=_Recording, health_port=8767, health_started=health_started, host=_PROBE_HOST)
+        health_started.assert_called_once_with(_PROBE_HOST, 8767)
         self.assertEqual(["credentialed", "health"], order)
 
     def test_a_health_port_the_other_listeners_hold_is_refused_by_name_and_never_bound(self):

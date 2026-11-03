@@ -863,8 +863,12 @@ LISTEN_BACKLOG = 4096
 # How long the credentialed handler and the agent API door hold an idle
 # keep-alive connection open for its next request before closing it, and so
 # the longest a connection that sends nothing holds a thread under the cap
-# below. Envoy, the credentialed listener's only client, closes an idle
-# upstream connection at the shorter timeout in
+# below. Also the window a request has to arrive in full once its first
+# byte is in, request line, headers and body together, rather than a
+# timeout on each read (_RequestReadDeadline): a peer that sends a byte
+# inside every per-read timeout would otherwise hold its thread, and its
+# slot, for as long as it kept dripping. Envoy, the credentialed listener's
+# only client, closes an idle upstream connection at the shorter timeout in
 # deploy/shared/envoy-credential-proxy.yaml, so the side that sends on a
 # connection is never the side that just closed it; this is the backstop for
 # a peer that does not, and the door's peers are under no such discipline.
@@ -4504,7 +4508,104 @@ AGENT_API_STATE_DB_BUSY_TIMEOUT_SECONDS = 2.0
 AGENT_API_SESSION_PARENT_WALK_LIMIT = 256
 
 
-class AgentAPIProxyHandler(BaseHTTPRequestHandler):
+class _DeadlineSocketIO(socket.SocketIO):
+    """The raw request stream under a handler's rfile, holding every read to one deadline while one is armed.
+
+    A socket timeout bounds one recv. The stdlib reads a request line and its
+    headers through a buffered reader that recvs as often as it needs to, and
+    a route reads its body the same way, so a peer that sends a byte inside
+    every timeout never trips it. While armed, each recv is given what is
+    left of the deadline (or the socket's own timeout, when a route set a
+    shorter one), and one past the deadline raises TimeoutError before the
+    recv, which the stdlib's handle_one_request reports and closes on as it
+    does any socket timeout; the socket's timeout is put back after each
+    recv, so a write that follows runs under the one its route set. The
+    window is counted from the first byte: a connection may wait idle for
+    one window before its request starts, and the request then has one
+    window to arrive in full. ``received`` counts the bytes read while
+    armed, so the log can tell a request that never began from one that
+    stalled part-way.
+    """
+
+    def __init__(self, sock: socket.socket) -> None:
+        super().__init__(sock, "r")
+        self.deadline: float | None = None
+        self.window = 0.0
+        self.received = 0
+
+    def arm(self, window: float) -> None:
+        self.window = window
+        self.deadline = time.monotonic() + window
+        self.received = 0
+
+    def disarm(self) -> None:
+        self.deadline = None
+
+    def readinto(self, b: Any) -> int | None:
+        deadline = self.deadline
+        if deadline is None:
+            return super().readinto(b)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("the request did not arrive in time")
+        previous = self._sock.gettimeout()
+        self._sock.settimeout(left if previous is None else min(left, previous))
+        try:
+            count = super().readinto(b)
+        finally:
+            with contextlib.suppress(OSError):
+                self._sock.settimeout(previous)
+        if count:
+            if not self.received:
+                self.deadline = time.monotonic() + self.window
+            self.received += count
+        return count
+
+
+class _RequestReadDeadline:
+    """Mixed in ahead of BaseHTTPRequestHandler: one deadline for every read of a request.
+
+    ``_arm_request_read_deadline`` runs before each request line is read and
+    gives the connection KEEPALIVE_IDLE_SECONDS to start a request and the
+    request that long again to arrive in full, request line, headers and
+    the body a route reads; ``_disarm_request_read_deadline`` lifts it, and
+    the handler's handle_one_request does so once the route has returned.
+    A route that bounds a late body read by a deadline of its own
+    (_read_json_body_within, measured from admission) disarms this one
+    first. A handler built without a socket (the route tests' stand-ins
+    assign their own rfile) has no stream to arm, and both calls do nothing.
+    """
+
+    _request_stream: _DeadlineSocketIO | None = None
+
+    def setup(self) -> None:
+        super().setup()
+        # socketserver's rfile is a buffered reader over the socket's own raw
+        # stream; before a byte is read it is swapped for one over the
+        # deadline-keeping stream, buffered the same way (rbufsize is -1,
+        # the default buffer, on both handlers).
+        self.rfile.close()
+        self._request_stream = _DeadlineSocketIO(self.connection)
+        self.rfile = io.BufferedReader(
+            self._request_stream, self.rbufsize if self.rbufsize > 0 else io.DEFAULT_BUFFER_SIZE
+        )
+
+    def _arm_request_read_deadline(self) -> None:
+        if self._request_stream is None:
+            return
+        with contextlib.suppress(OSError):
+            self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
+        self._request_stream.arm(KEEPALIVE_IDLE_SECONDS)
+
+    def _disarm_request_read_deadline(self) -> None:
+        if self._request_stream is None:
+            return
+        self._request_stream.disarm()
+        with contextlib.suppress(OSError):
+            self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
+
+
+class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     """Authenticate the external PlatformAgent API without sharing its key."""
 
     external_key: str
@@ -4519,25 +4620,26 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         # The guard the credentialed and metrics handlers carry: a peer that
         # resets while its request line is read, or while a 401 is on its
         # way, is a debug line and a closed connection, not a handler fault
-        # for the server's error hook to log with a traceback. The idle
-        # timeout is armed before the request line is read, as the
-        # credentialed handler arms it: the door's peers are every pod in
-        # the namespace, and a connection that sends nothing would otherwise
-        # hold its thread, and its slot under the thread cap, for as long as
-        # the peer kept it open. The stdlib reports the timeout through
-        # log_error and closes; every served response here says
-        # `Connection: close`, so a kept-open connection is only ever one
-        # that has not sent a request. raw_requestline is emptied first so
-        # that log_error can tell that idle close from a request that
-        # stalled (_log_socket_timeout).
+        # for the server's error hook to log with a traceback. The request
+        # read deadline is armed before the request line is read, as the
+        # credentialed handler arms it, and lifted once the route returns:
+        # the door's peers are every pod in the namespace, and a connection
+        # that sends nothing, or a byte at a time, would otherwise hold its
+        # thread, and its slot under the thread cap, for as long as the peer
+        # kept it open. The stdlib reports the timeout through log_error and
+        # closes; every served response here says `Connection: close`, so a
+        # kept-open connection is only ever one that has not sent a request.
+        # raw_requestline is emptied first so that log_error can tell that
+        # idle close from a request that stalled (_log_socket_timeout).
         self.raw_requestline = b""
-        with contextlib.suppress(OSError):
-            self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
+        self._arm_request_read_deadline()
         try:
             super().handle_one_request()
         except OSError as exc:
             self.close_connection = True
             LOGGER.debug("api request not answered type=%s", type(exc).__name__)
+        finally:
+            self._disarm_request_read_deadline()
 
     def log_error(self, message: str, *args: Any) -> None:
         # The stdlib reports the socket timeout through log_error, which
@@ -11566,24 +11668,30 @@ def _log_socket_timeout(handler: BaseHTTPRequestHandler, message: str, args: tup
     The stdlib's handle_one_request catches every TimeoutError raised under
     it, the wait for a request line and a body read or a direct write inside
     a route alike, and reports each through log_error as
-    IDLE_CLOSE_LOG_PREFIX. Which it was is read off raw_requestline: the
-    credentialed handler and the agent API door empty it before each request
-    line is read and the stdlib assigns it as its first statement, so it is
-    still empty only when the timeout hit while waiting for a request line.
-    That is the idle close at KEEPALIVE_IDLE_SECONDS, a connection ending as
-    a peer's EOF does, and a debug line rather than an access-log-shaped INFO
-    line per idle connection. Otherwise a request arrived and stalled before
-    its response was on the wire; it went unanswered, and is a warning naming
-    it. requestline is the stdlib's copy of the request line, caller text,
-    sanitised as log_message sanitises it.
+    IDLE_CLOSE_LOG_PREFIX. Which it was is read off raw_requestline and the
+    request stream's count: the credentialed handler and the agent API door
+    empty raw_requestline before each request line is read and the stdlib
+    assigns it as its first statement, and _DeadlineSocketIO counts the bytes
+    read while the request's deadline is armed. Both still empty, the timeout
+    hit while waiting for a request that never began: the idle close at
+    KEEPALIVE_IDLE_SECONDS, a connection ending as a peer's EOF does, and a
+    debug line rather than an access-log-shaped INFO line per idle
+    connection. Otherwise a request, or part of one, arrived and stalled
+    before its response was on the wire; it went unanswered, and is a warning
+    naming it, with the bytes of it that arrived. requestline is the stdlib's
+    copy of the request line, caller text, sanitised as log_message sanitises
+    it, and empty when the stall came inside the line.
     """
     if not message.startswith(IDLE_CLOSE_LOG_PREFIX):
         return False
     kind = type(args[0]).__name__ if args else ""
-    if getattr(handler, "raw_requestline", b""):
+    stream = getattr(handler, "_request_stream", None)
+    received = stream.received if stream is not None else 0
+    if getattr(handler, "raw_requestline", b"") or received:
         LOGGER.warning(
-            "request stalled before its response requestline=%s type=%s",
+            "request stalled before its response requestline=%s received_bytes=%d type=%s",
             *_sanitized_log_args((getattr(handler, "requestline", ""),)),
+            received,
             kind,
         )
     else:
@@ -12505,7 +12613,7 @@ class _CountingReader:
         return getattr(self._raw, name)
 
 
-class CredentialProxyHandler(BaseHTTPRequestHandler):
+class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     # HTTP/1.1, so Envoy reuses one upstream connection for request after
     # request instead of opening one per brokered command, event pull and
     # probe. Every response is then framed: _json and the relays' direct
@@ -14945,6 +15053,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0"))
         if content_length <= 0 or content_length > max_bytes:
             raise ValueError("request exceeds configured size limit")
+        # This read's deadline runs from admission, which the request may
+        # have waited for; the connection's own, counted from the request's
+        # first byte, is lifted so it cannot end the read first.
+        self._disarm_request_read_deadline()
         deadline = time.monotonic() + seconds
         chunks: list[bytes] = []
         remaining = content_length
@@ -15161,20 +15273,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # connection, as on the metrics listener; the exception would
         # otherwise leave the handler and reach the server's error hook. No
         # audit record is lost: every site logs before its response is
-        # written, and _json guards its own writes. The idle timeout is armed
-        # here, before the request line is read, so the same bound holds for
-        # the first request and for every one a kept-open connection carries
-        # after it; a route that changed the timeout has it put back. The
-        # path is cleared here too: the stdlib's parse_request resets the
-        # command and never the path, so on a kept-open connection a request
-        # line it rejects (a 400, a 414, a 431) would otherwise be counted
-        # by log_request under the previous request's route. raw_requestline
-        # is emptied for log_error, which reads it to tell the idle close from
-        # a request that stalled (_log_socket_timeout).
+        # written, and _json guards its own writes. The request read
+        # deadline is armed here, before the request line is read, and
+        # lifted once the route returns, so the same bound holds for the
+        # first request and for every one a kept-open connection carries
+        # after it, and for the whole request rather than each read of it;
+        # a route that changed the socket's timeout has it put back. The
+        # path is cleared here too: the stdlib's
+        # parse_request resets the command and never the path, so on a
+        # kept-open connection a request line it rejects (a 400, a 414, a
+        # 431) would otherwise be counted by log_request under the previous
+        # request's route. raw_requestline is emptied for log_error, which
+        # reads it to tell the idle close from a request that stalled
+        # (_log_socket_timeout).
         self.path = ""
         self.raw_requestline = b""
-        with contextlib.suppress(OSError):
-            self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
+        self._arm_request_read_deadline()
         try:
             super().handle_one_request()
         except OSError as exc:
@@ -15182,6 +15296,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             LOGGER.debug("request not answered type=%s", type(exc).__name__)
             return
         finally:
+            self._disarm_request_read_deadline()
             self._leave_in_flight()
         if not self.close_connection and self._body_unread():
             # The last resort for a response written over a body no route
