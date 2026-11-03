@@ -105,6 +105,9 @@ func (e Election) Run(ctx context.Context, leader Leader, lead func(context.Cont
 	defer stopElecting()
 
 	var result error
+	// ledAt is when this replica started leading; written before led closes
+	// and read after.
+	var ledAt time.Time
 	led := make(chan struct{})
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 		Lock:          lock,
@@ -118,6 +121,7 @@ func (e Election) Run(ctx context.Context, leader Leader, lead func(context.Cont
 		ReleaseOnCancel: false,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(leaseCtx context.Context) {
+				ledAt = time.Now()
 				defer close(led)
 				defer stopElecting()
 				result = e.lead(ctx, leaseCtx, lock.afterCrash(), leader, lead, log)
@@ -147,6 +151,13 @@ func (e Election) Run(ctx context.Context, leader Leader, lead func(context.Cont
 	// still stopping; on the other paths the work has returned and stopped
 	// the elector. Either way nothing renews from here on.
 	<-led
+	if lock.afterCrash() && time.Since(ledAt) < relayAckWait {
+		// The lease is the crash marker: the dead holder's events may still
+		// be pending on the relay durable, and a release would tell the next
+		// taker nobody holds any. Left to expire, it still names a holder.
+		log.Warn("gateway election: lease not released: this term followed a crash and ended inside the relay's AckWait; a standby takes it once it expires", "lease", e.Lease)
+		return result
+	}
 	e.release(lock, log)
 	return result
 }

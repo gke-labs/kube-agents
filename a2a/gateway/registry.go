@@ -812,7 +812,14 @@ func (r *Registry) fencedRecord(ctx context.Context, kv jetstream.KeyValue, sess
 			// term that began in between. Read the counter again: only a
 			// record above the counter as it stands now means the counter
 			// went backwards, by hand.
-			if now, _, rerr := readTerm(ctx, kv); rerr == nil && stored.Epoch > now {
+			now, _, rerr := readTerm(ctx, kv)
+			if rerr != nil {
+				// Unsettled: a new term or a reset. Not a step-down, since a
+				// reset would hand the same refusal to the next replica.
+				return 0, fmt.Errorf("session %s carries term %d, above the term counter %s read a moment ago at %d, and reading the counter again failed (%v): %w",
+					sessionKey, stored.Epoch, termKey, term, rerr, ErrFenced)
+			}
+			if stored.Epoch > now {
 				// Not a newer term, so not a step-down: every replica would
 				// start a term under this record, be refused, and step down
 				// in turn. The write fails, naming the counter to fix.

@@ -820,12 +820,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// rather than as a guess about timing.
 	defer g.observeTurnFinished(msg.Conversation)
 
-	if g.runCtx.Err() != nil {
-		// Stopping (SIGTERM or a lost lease): ingress has closed, and a turn
-		// taken but not started is dropped, not run on a context that has
-		// already ended. Its backend acked it, so this is a loss, bounded by
-		// what was queued.
-		g.log.Warn("turn dropped: the gateway is stopping", "conversation", msg.Conversation, "messageId", msg.MessageID)
+	if g.droppedAtStop(msg) {
 		return
 	}
 
@@ -868,9 +863,25 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	l := g.lockSession(msg.Conversation)
 	l.Lock()
 	defer l.Unlock()
+	// The stop may have begun while this turn waited for the lock.
+	if g.droppedAtStop(msg) {
+		return
+	}
 	ctx, cancel := context.WithTimeout(g.runCtx, g.turnBudget)
 	defer cancel()
 	g.routeTurn(ctx, msg, backend, principal)
+}
+
+// droppedAtStop drops a turn the gateway took but hasn't started once it is
+// stopping (SIGTERM or a lost lease): ingress has closed, and the turn would
+// otherwise run on a context that has already ended. Its backend acked it,
+// so this is a loss, bounded by what was queued.
+func (g *Gateway) droppedAtStop(msg InboundMessage) bool {
+	if g.runCtx.Err() == nil {
+		return false
+	}
+	g.log.Warn("turn dropped: the gateway is stopping", "conversation", msg.Conversation, "messageId", msg.MessageID)
+	return true
 }
 
 // runTurn is a door turn under a clock already running: take the session
@@ -882,6 +893,9 @@ func (g *Gateway) runTurn(ctx context.Context, msg InboundMessage, backend, prin
 	l := g.lockSession(msg.Conversation)
 	l.Lock()
 	defer l.Unlock()
+	if g.droppedAtStop(msg) {
+		return
+	}
 	if err := ctx.Err(); err != nil {
 		// The whole turn went on waiting for the lock. Every call below
 		// would fail on the expired context anyway; said once, and plainly,

@@ -514,6 +514,55 @@ func TestARecordAboveTheCounterSaysTheCounterWasReset(t *testing.T) {
 	}
 }
 
+// secondTermReadFails is a bucket whose second read of the term counter
+// fails, as a KV timeout would between fencedRecord's two reads.
+type secondTermReadFails struct {
+	jetstream.KeyValue
+	termReads int
+}
+
+func (k *secondTermReadFails) Get(ctx context.Context, key string) (jetstream.KeyValueEntry, error) {
+	if key == termKey {
+		k.termReads++
+		if k.termReads == 2 {
+			return nil, errors.New("nats: timeout")
+		}
+	}
+	return k.KeyValue.Get(ctx, key)
+}
+
+// TestAnUnsettledResetDoesntStepTheGatewayDown: a record above the counter,
+// and the counter can't be read again to tell a new term from a reset. The
+// write is refused, but the gateway doesn't step down over a question it
+// couldn't settle.
+func TestAnUnsettledResetDoesntStepTheGatewayDown(t *testing.T) {
+	ctx := context.Background()
+	r := startRig(t)
+	high := NewRegistry(r.client)
+	high.setEpoch(3)
+	key := "slack:T1/C1/unsettled"
+	if err := high.Put(ctx, &SessionRecord{Key: key, Addressee: "platform"}); err != nil {
+		t.Fatal(err)
+	}
+	kv, err := r.client.KV(ctx, lib.SessionStateBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, termKey, []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	low := NewRegistry(r.client)
+	stepped := false
+	low.SetOnFenced(func() { stepped = true })
+	_, err = low.fencedRecord(ctx, &secondTermReadFails{KeyValue: kv}, key, 1)
+	if !errors.Is(err, ErrFenced) || !strings.Contains(err.Error(), "reading the counter again failed") {
+		t.Fatalf("fenced read with the re-read failing = %v, want ErrFenced naming the failed re-read", err)
+	}
+	if stepped {
+		t.Fatal("an unsettled reset stepped the gateway down")
+	}
+}
+
 // historyFails is a bucket whose counter Get says missing and whose History
 // read fails, as a watch can during a bus leader election.
 type historyFails struct {

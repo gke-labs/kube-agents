@@ -167,11 +167,11 @@ func never[T any](t *testing.T, ch <-chan T, during time.Duration, what string) 
 // still holds the lease, then releases it, and the standby starts at once,
 // with no hold on its relay since the lease was given up cleanly.
 func TestOneGatewayLeadsAndTheLeaseMovesOnSIGTERM(t *testing.T) {
-	cs := fake.NewClientset()
+	cs := fake.NewClientset(heldLease("", 1))
 	a := runCampaign(t, cs, "pod-a")
 	opts := receive(t, a.leading, 5*time.Second, "pod-a leading")
-	if opts.RelayBindDelay != relayAckWait {
-		t.Fatalf("first leader's relay delay = %s, want %s: with no lease to read, a crash can't be ruled out", opts.RelayBindDelay, relayAckWait)
+	if opts.RelayBindDelay != 0 {
+		t.Fatalf("relay delay after a released lease = %s, want none", opts.RelayBindDelay)
 	}
 	if a.leader.started() != 1 {
 		t.Fatalf("pod-a started %d terms before its work, want 1", a.leader.started())
@@ -239,6 +239,40 @@ func TestARestartInItsOwnPodRetakesTheLeaseAtOnce(t *testing.T) {
 	}
 }
 
+// TestNoLeaseYetHoldsTheRelayBack: with no Lease to read, nothing shows
+// the last gateway released its events, so the first leader holds its
+// relay as after a crash.
+func TestNoLeaseYetHoldsTheRelayBack(t *testing.T) {
+	a := runCampaign(t, fake.NewClientset(), "pod-a")
+	if opts := receive(t, a.leading, 5*time.Second, "pod-a leading"); opts.RelayBindDelay != relayAckWait {
+		t.Fatalf("relay delay with no lease = %s, want %s", opts.RelayBindDelay, relayAckWait)
+	}
+}
+
+// TestACutShortCrashTakeoverKeepsTheMarker: a term that followed a crash and
+// ended inside the relay's AckWait (SIGTERM, a failed term, a fenced write)
+// doesn't release the lease: the dead holder's events may still be pending,
+// and a release would tell the next taker nobody holds any. Left to expire,
+// it still names a holder, and the next taker holds its relay too.
+func TestACutShortCrashTakeoverKeepsTheMarker(t *testing.T) {
+	cs := fake.NewClientset(heldLease("pod-dead", int32(testLeaseDuration/time.Second)))
+	b := runCampaign(t, cs, "pod-b")
+	if opts := receive(t, b.leading, 3*testLeaseDuration, "pod-b taking the expired lease"); opts.RelayBindDelay != relayAckWait {
+		t.Fatalf("relay delay after a crash = %s, want %s", opts.RelayBindDelay, relayAckWait)
+	}
+	b.cancel()
+	if err := receive(t, b.done, 5*time.Second, "pod-b's Run to return"); err != nil {
+		t.Fatalf("Run after SIGTERM = %v", err)
+	}
+	if h := leaseHolder(t, cs); h != "pod-b" {
+		t.Fatalf("lease holder after a cut-short crash takeover = %q, want pod-b left to expire", h)
+	}
+	c := runCampaign(t, cs, "pod-c")
+	if opts := receive(t, c.leading, 3*testLeaseDuration, "pod-c taking over"); opts.RelayBindDelay != relayAckWait {
+		t.Fatalf("next taker's relay delay = %s, want %s", opts.RelayBindDelay, relayAckWait)
+	}
+}
+
 // TestAReleasedLeaseStartsWithoutTheHoldBack: a lease its last holder gave
 // up holds nobody's events, so the relay binds at once.
 func TestAReleasedLeaseStartsWithoutTheHoldBack(t *testing.T) {
@@ -255,7 +289,7 @@ func TestAReleasedLeaseStartsWithoutTheHoldBack(t *testing.T) {
 // the lease is given up, and Run reports the lost leadership the process
 // exits on.
 func TestAFencedWriteStepsTheGatewayDown(t *testing.T) {
-	cs := fake.NewClientset()
+	cs := fake.NewClientset(heldLease("", 1))
 	a := runCampaign(t, cs, "pod-a")
 	receive(t, a.leading, 5*time.Second, "pod-a leading")
 	a.leader.fence()
@@ -296,7 +330,7 @@ func failRenewalsOf(cs *fake.Clientset, identity string) *atomic.Bool {
 // still named the holder while it stops, gives the lease up only once its
 // work has stopped, and reports the lost leadership.
 func TestLosingTheLeaseStepsDownWithTheShortDrain(t *testing.T) {
-	cs := fake.NewClientset()
+	cs := fake.NewClientset(heldLease("", 1))
 	failing := failRenewalsOf(cs, "pod-a")
 	a := runCampaign(t, cs, "pod-a")
 	receive(t, a.leading, 5*time.Second, "pod-a leading")
@@ -363,7 +397,7 @@ func TestAStandbyStopsAtOnceOnSIGTERM(t *testing.T) {
 // would write under an old one, so it doesn't start its work at all, gives
 // the lease up, and fails.
 func TestATermThatWontStartLeadsNothing(t *testing.T) {
-	cs := fake.NewClientset()
+	cs := fake.NewClientset(heldLease("", 1))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	leader := &fakeLeader{termErr: errors.New("the session-state bucket is unreachable")}
@@ -504,6 +538,30 @@ func TestATurnTakenAtTheStopIsDropped(t *testing.T) {
 	}
 	if envs := inSubjectEnvelopes(t, r.url, targetPlatform); len(envs) != 0 {
 		t.Fatalf("a dropped turn submitted %d envelope(s)", len(envs))
+	}
+}
+
+// TestATurnWaitingOnTheLockWhenTheStopBeginsIsDropped: a turn that passed
+// the first check while the gateway ran, then waited on its conversation's
+// lock (held by a relay render, a reap or a sweep), is dropped once it gets
+// the lock after the stop began.
+func TestATurnWaitingOnTheLockWhenTheStopBeginsIsDropped(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	waitRunning(t, r)
+	conv := "discord:g1/t-lock-wait"
+	l := r.g.lockSession(conv)
+	l.Lock()
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-lock-wait", Text: "how is the fleet?"}
+	waitFor(t, "the turn taken off the backend", func() bool { return len(r.adapter.inbox) == 0 })
+	time.Sleep(200 * time.Millisecond)
+	r.stop()
+	<-r.ran
+	l.Unlock()
+	waitFor(t, "the drop logged", func() bool {
+		return strings.Contains(r.logs.String(), "turn dropped: the gateway is stopping") && strings.Contains(r.logs.String(), conv)
+	})
+	if envs := inSubjectEnvelopes(t, r.url, targetPlatform); len(envs) != 0 {
+		t.Fatalf("a turn dropped at the stop submitted %d envelope(s)", len(envs))
 	}
 }
 
