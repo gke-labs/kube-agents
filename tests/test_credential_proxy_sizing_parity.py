@@ -119,6 +119,8 @@ def operator_floor_bytes() -> int:
 DEFAULTS = (
     ("requests", "cpu", "credentialProxyCPURequest"),
     ("requests", "memory", "credentialProxyMemoryRequest"),
+    ("autopilotRequests", "cpu", "credentialProxyAutopilotCPURequest"),
+    ("autopilotRequests", "memory", "credentialProxyAutopilotMemoryRequest"),
     ("limits", "cpu", "credentialProxyCPULimit"),
     ("limits", "memory", "credentialProxyMemoryLimit"),
     ("limits", "ephemeral-storage", "credentialProxyEphemeralStorageLimit"),
@@ -142,7 +144,7 @@ def chart_defaults() -> dict[tuple[str, str], str]:
     if block is None:
         raise AssertionError("_helpers.tpl declares no kube-agents.credentialProxyDefaults")
     defaults = {}
-    for side in ("requests", "limits"):
+    for side in ("requests", "autopilotRequests", "limits"):
         found = re.search(rf'"{side}" \(dict ([^)]*)\)', block.group(1))
         if found is None:
             raise AssertionError(f"kube-agents.credentialProxyDefaults carries no {side}")

@@ -237,10 +237,15 @@ metric status, the audit record and the site's troubleshooting entry see the sam
 slot refusal, with a different sentence in it. A wait of a second or more logs, as a slot wait does:
 `request waited %dms for memory budget (… MiB in use of … MiB: … MiB reserved for children, … MiB of output allowance for … requests)`, the figure the admission check compares.
 
-The queue keeps arrival order with one exception. A slot-less reserver that fits the budget is
-admitted past the tickets ahead of it when every one of them takes a slot and the slots are full:
-those wait on the slot cap, not the budget, and the reserver competes with them for nothing, so
-eight `kubectl logs -f` holding every slot and a ninth exec queued behind them do not keep a forge
+The queue keeps arrival order inside each admission class: interactive requests go ahead of queued
+background ones, and each class is held to its share
+([`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §4.2). A slot-less reserver
+is interactive work, so it goes ahead of queued background tickets too. Among the rest there is one
+exception. A slot-less reserver that fits the budget is
+admitted past the tickets ahead of it when every one of them takes a slot and is held by a slot cap
+(the full slot cap, or its own class's full cap while it would fit the budget): those wait for a
+slot, not the budget, and the reserver competes with them for nothing, so
+`kubectl logs -f` commands holding every slot their caps allow and an exec queued behind them do not keep a forge
 refresh waiting out the bound. Behind a ticket the budget holds, order is kept, because a reserver
 admitted ahead of it would take the budget that ticket is waiting for and could starve it. A
 request that fits but is still queued at the bound is refused naming the queue rather than the
@@ -260,10 +265,11 @@ requests' cost), and admits by slot alone. The case is real. GKE Autopilot witho
 container's limits equal to its requests, so the proxy's limit there is its memory request. At
 the 512Mi the operator first declared, the budget would admit one request and serialise every
 brokered command; a listing phase that cannot run two at once costs more than the out-of-memory
-exposure the budget prevents. The operator now declares the request at 1Gi, above the floor, so
-that the budget engages on Autopilot without bursting as well, admitting four there; the floor
-still applies to a CR override whose `requests.memory` is smaller, and a `limits.memory` set
-alone under 1Gi is refused as crossing the default request. The operator's sizing test
+exposure the budget prevents. The operator now declares the request at 2Gi on Autopilot (and 1Gi
+on Standard, where the 2Gi limit stands), above the floor, so that the budget engages on Autopilot
+without bursting as well, admitting nine there, held to eight by the slot cap; the floor still
+applies to a CR override whose `requests.memory` is smaller, and a `limits.memory` set alone below
+the default request lowers that request to it. The operator's sizing test
 holds its own limit to the same floor (`credentialProxyMinimumAdmittedRequests`) and its request
 to it too (`TestCredentialProxyBudgetArithmeticAtTheDefaults`).
 
@@ -303,9 +309,10 @@ env list, as it does the two caps: a CR that could set it would detach the budge
 ### 2.5 The sizing test's child term
 
 `TestCredentialProxyOutputCapClearsTheLargestFleetDump` asserts
-`request + output_burst(all slots) <= limit`, with the container's 1Gi memory request as the
-resting term, upstream's statement of what the pod holds with nothing in flight. It also makes a second assertion in the broker's own terms, with the broker's fixed reserves as the
-resting term, because those are the numbers the broker subtracts and so the budget the children
+`resting + output_burst(all slots) <= limit`, with the broker's two fixed reserves as the
+resting term (the memory request no longer models it: on Autopilot it is 2Gi, equal to the limit,
+to sit on the band). It also makes a second assertion in the broker's own terms, with the same
+fixed reserves as the resting term, because those are the numbers the broker subtracts and so the budget the children
 see. A slot in use is a request holding a reservation, so the slot count and the reservation
 count are one variable, not two, and the assertion is the admission rule itself at a floor:
 the budget admits at least two requests at once, each with its output allowance, so a listing
@@ -339,7 +346,8 @@ requests at once the eight-wide burst of both listing pools coinciding waits one
 retry is added here. (Those are the 1Gi figures; at the 2Gi default the budget admits nine and
 the slot cap of eight binds.) The proxy container's requests and limits, and so the
 chart's generated footprint and quota preflight (the request has since moved to 1Gi so that
-the budget runs on Autopilot without bursting, §2.3; the footprint moved with it). No
+the budget runs on Autopilot without bursting, §2.3, and later to 2 CPU and 2Gi on Autopilot,
+where the quota preflight counts that pair; the footprint moved with it). No
 agent-visible behaviour: no eval case.
 
 The reconciler's and the stall watch's listing pools are the caller settings the change moved.
@@ -414,8 +422,8 @@ hold, which the second check would need to know first.
 Unit, in `agents/platform/scripts/test_credential_proxy.py`: the budget is derived from the
 variable, from the cgroup file, and disabled when neither is readable or the file says `max`; a
 request waits when the sum would exceed the budget and is admitted when a reservation is
-released; the wait is in arrival order, except that a slot-less reservation that fits passes slot takers
-the full slot cap holds and keeps its place behind one the budget holds, and drops a caller that
+released; the wait is in arrival order inside a class, except that a slot-less reservation that fits passes slot takers
+only a slot cap holds and keeps its place behind one the budget holds, and drops a caller that
 hangs up while queued; a request
 still waiting at the bound raises `CommandSlotUnavailable` naming the budget, and the exec, vcs
 and forge refresh routes each answer it with the existing 503 body, the vcs route before reading

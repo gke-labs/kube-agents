@@ -112,7 +112,7 @@ the presubmit exports nothing new until it chooses to. The exchange:
    failing to publish it, infrastructure. The prompt is routed like any text, the gateway's
    literal affordances included, `Delegate` among them; the harness sends none as a prompt, and a
    case whose prompt opens with one is the case's defect. The one it sends itself is the `stop`
-   after a stopped ask's opening turn (`bench/kube_agents_bench/stop_hook.py`). The adapter dedupes on the backend message id,
+   during or after a stopped ask's opening turn (`bench/kube_agents_bench/stop_hook.py`). The adapter dedupes on the backend message id,
    bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an id it has
    already accepted gets the answer the first one got, the record's task id or the same refusal,
    and starts nothing. Because the id
@@ -686,7 +686,7 @@ grade. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off ne
 nor the transport: on both lanes they are appended to a scratch copy of every remaining task
 file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
 `BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
-request, and the stopped asks, run in a second phase after every first-phase unit (a case that
+request, the stopped asks and the cases that declare `writes_alone: true`, run in a second phase after every first-phase unit (a case that
 declares `scope_exclude:` runs after them, in a phase of its own), one at a time and each after a settle, so no repetition that requests nothing shares the repository with one that
 writes by design and no window reaches back into the unit before; and after the fan-out the
 script lists in the job log what the run left on that repository, closing nothing. With the flag
@@ -738,8 +738,8 @@ inject lane compares only with next-mode history at its own key (agent model inc
 nightly and the presubmit run the same one). The today lane is the rollback check, and it stays
 out of the recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`,
 but it grades a rolled-back install. No job appends today's window now. The dashboard's Trend page
-keeps a series per mode, drawing today's from the lines the store already holds until they age
-out of its window; its Nightly page
+keeps a series per mode: it draws `next` by default, and today's stays selectable from the lines
+the store already holds until they age out of its window; its Nightly page
 reads the main nightly's runs, so it shows `next`.
 
 ## Open questions

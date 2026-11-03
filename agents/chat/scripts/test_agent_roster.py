@@ -9,6 +9,7 @@ checks that the tool still delegates here.
 
 import os
 import sys
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,6 +23,56 @@ if "agent_roster" in sys.modules and getattr(sys.modules["agent_roster"], "__fil
     del sys.modules["agent_roster"]
 
 import agent_roster  # noqa: E402
+
+# The fleet-scale roster gate (#4440): the injected roster measured at the fleet
+# the gate names, against the budget it names.
+# FLEET_SCALE_PROFILES is N, the Cluster Agent profile count the roster is
+# rendered at.
+FLEET_SCALE_PROFILES = 2500
+# ROSTER_TOKEN_BUDGET is the most the injected text may cost every turn.
+ROSTER_TOKEN_BUDGET = 2000
+# CHARS_PER_TOKEN is the approximation the gate allows: this module is
+# stdlib-only, so there is no tokenizer to count with.
+CHARS_PER_TOKEN = 4
+# ROSTER_RENDER_SECONDS bounds one render at N; the gate as a whole has two
+# minutes, and the Go half of it takes about one second.
+ROSTER_RENDER_SECONDS = 60
+# ROSTER_FIX_ISSUE owns the change that brings the roster under budget.
+ROSTER_FIX_ISSUE = "#4432"
+# One fixture profile: the name as cluster_agent_profile.profile_name derives
+# it, and the identity block the scaffold stamps into config.yaml.
+FLEET_SCALE_PROJECT = "fleet-project"
+FLEET_SCALE_LOCATION = "us-central1"
+FLEET_SCALE_CLUSTER_FORMAT = "cluster-{index:04d}"
+
+# Every environment variable render() reads, cleared before a render so the
+# host and scope sections come from the test's own env and nothing else.
+ROSTER_ENV_NAMES = (
+    "GKE_CLUSTER_NAME", "GKE_PROJECT_ID", "GKE_LOCATION", "GCP_PROJECT_ID",
+    "KUBEAGENTS_SCOPE_FILE", "PLATFORM_AGENT_HOME",
+)
+# The one description every scaffolded Cluster Agent shares.
+CLUSTER_ROLE = "One cluster's runtime state.\n"
+
+
+def _render_roster(base: Path, env: dict[str, str]) -> str | None:
+    """render(base) with ROSTER_ENV_NAMES cleared and env applied on top."""
+    from unittest import mock
+
+    clean = {k: v for k, v in os.environ.items() if k not in ROSTER_ENV_NAMES}
+    clean.update(env)
+    with mock.patch.dict(os.environ, clean, clear=True):
+        return agent_roster.render(base)
+
+
+def _write_cluster_profile(base: Path, name: str, project: str, cluster: str, location: str) -> None:
+    """One scaffolded Cluster Agent profile: the shared role and its identity block."""
+    (base / name).mkdir()
+    (base / name / "CAPABILITIES.md").write_text(CLUSTER_ROLE)
+    (base / name / "config.yaml").write_text(
+        "cluster_identity:\n"
+        f"  cluster: {cluster}\n  location: {location}\n  project: {project}\n"
+    )
 
 
 class TestDiscovery(unittest.TestCase):
@@ -260,11 +311,6 @@ class TestHostAndScopeSections(unittest.TestCase):
         "GKE_PROJECT_ID": "kube-agents-demo",
         "GKE_LOCATION": "us-central1",
     }
-    ENV_NAMES = (
-        "GKE_CLUSTER_NAME", "GKE_PROJECT_ID", "GKE_LOCATION", "GCP_PROJECT_ID",
-        "KUBEAGENTS_SCOPE_FILE", "PLATFORM_AGENT_HOME",
-    )
-
     def _fleet(self, tmp: str) -> Path:
         base = Path(tmp) / "profiles"
         (base / "platform").mkdir(parents=True)
@@ -276,21 +322,11 @@ class TestHostAndScopeSections(unittest.TestCase):
                 "gca-gke-2025", "kcc-gitops-hub", "us-east1-c"),
         }
         for name, (project, cluster, location) in clusters.items():
-            (base / name).mkdir()
-            (base / name / "CAPABILITIES.md").write_text("One cluster's runtime state.\n")
-            (base / name / "config.yaml").write_text(
-                "cluster_identity:\n"
-                f"  cluster: {cluster}\n  location: {location}\n  project: {project}\n"
-            )
+            _write_cluster_profile(base, name, project, cluster, location)
         return base
 
     def _render(self, base: Path, env: dict[str, str]) -> str:
-        from unittest import mock
-
-        clean = {k: v for k, v in os.environ.items() if k not in self.ENV_NAMES}
-        clean.update(env)
-        with mock.patch.dict(os.environ, clean, clear=True):
-            return agent_roster.render(base)
+        return _render_roster(base, env)
 
     def _snapshot(self, tmp: str, payload: dict) -> None:
         import json
@@ -315,7 +351,7 @@ class TestHostAndScopeSections(unittest.TestCase):
 
     def test_an_unexpanded_placeholder_is_unset(self):
         # Hermes hands the router MCP child "${VAR}" for an unset variable (a kind install).
-        placeholders = {k: "${" + k + "}" for k in self.ENV_NAMES}
+        placeholders = {k: "${" + k + "}" for k in ROSTER_ENV_NAMES}
         with TemporaryDirectory() as tmp:
             out = self._render(self._fleet(tmp), placeholders)
         self.assertNotIn("Host Cluster Identity", out)
@@ -351,7 +387,7 @@ class TestHostAndScopeSections(unittest.TestCase):
             base = self._fleet(tmp)
             colliding = base / "cluster-a-b-c-us-central1"
             colliding.mkdir()
-            (colliding / "CAPABILITIES.md").write_text("One cluster's runtime state.\n")
+            (colliding / "CAPABILITIES.md").write_text(CLUSTER_ROLE)
             (colliding / "config.yaml").write_text(
                 "cluster_identity:\n  cluster: b-c\n  location: us-central1\n  project: a\n"
             )
@@ -397,7 +433,7 @@ class TestHostAndScopeSections(unittest.TestCase):
             base = self._fleet(tmp)
             other = base / "cluster-team-a-prod-us-central1"
             other.mkdir()
-            (other / "CAPABILITIES.md").write_text("One cluster's runtime state.\n")
+            (other / "CAPABILITIES.md").write_text(CLUSTER_ROLE)
             (other / "config.yaml").write_text(
                 "cluster_identity:\n  cluster: prod\n  location: us-central1\n  project: team-a\n"
             )
@@ -447,7 +483,7 @@ class TestHostAndScopeSections(unittest.TestCase):
             for proj in ("proj-a", "proj-b"):
                 name = f"cluster-{proj}-shared-cluster-us-central1"
                 (base / name).mkdir()
-                (base / name / "CAPABILITIES.md").write_text("One cluster's runtime state.\n")
+                (base / name / "CAPABILITIES.md").write_text(CLUSTER_ROLE)
                 (base / name / "config.yaml").write_text(
                     "cluster_identity:\n"
                     f"  cluster: shared-cluster\n  location: us-central1\n  project: {proj}\n"
@@ -700,6 +736,75 @@ class TestHostAndScopeSections(unittest.TestCase):
             out = agent_roster.format_roster(agent_roster.discover(base))
         self.assertNotIn("Host Cluster Identity", out)
         self.assertIn("(the kcc-gitops-hub cluster agent; project gca-gke-2025, location us-east1-c)", out)
+
+
+class TestFleetScaleRoster(unittest.TestCase):
+    """The injected roster at N=2,500 Cluster Agents, against its token budget (#4440).
+
+    Every Cluster Agent is scaffolded from one template, so the fixture shares
+    one description across the fleet and format_roster groups them under it;
+    what remains is one line per agent, its assignee id and its cluster note,
+    which is what grows with N.
+    """
+
+    def _fleet(self, tmp: str) -> Path:
+        base = Path(tmp) / "profiles"
+        (base / "platform").mkdir(parents=True)
+        (base / "platform" / "CAPABILITIES.md").write_text("Fleet work.\n")
+        for index in range(1, FLEET_SCALE_PROFILES + 1):
+            cluster = FLEET_SCALE_CLUSTER_FORMAT.format(index=index)
+            name = agent_roster._profile_name(FLEET_SCALE_PROJECT, cluster, FLEET_SCALE_LOCATION)
+            _write_cluster_profile(base, name, FLEET_SCALE_PROJECT, cluster, FLEET_SCALE_LOCATION)
+        return base
+
+    def _render(self, base: Path) -> str:
+        # The host and scope sections are constant in N; render without a
+        # host so the measurement is the roster the fleet grows.
+        out = _render_roster(base, {})
+        self.assertIsNotNone(out)
+        return out
+
+    @unittest.expectedFailure
+    def test_the_injected_roster_fits_the_token_budget(self):
+        """DESIRED, not current, behaviour: the budget the fix issue brings the roster under.
+
+        Today format_roster names every one of the N agents with its cluster
+        note, about 130 characters a line at the scaffold's name length, so
+        the injected block costs tens of thousands of tokens on every turn. This flips from expectedFailure to
+        green in the pull request that closes ROSTER_FIX_ISSUE; a run that
+        passes before then is that fix landing without the flip, and unittest
+        reports it as an unexpected success.
+        """
+        with TemporaryDirectory() as tmp:
+            out = self._render(self._fleet(tmp))
+        tokens = len(out) // CHARS_PER_TOKEN
+        self.assertLess(
+            tokens,
+            ROSTER_TOKEN_BUDGET,
+            f"the roster at N={FLEET_SCALE_PROFILES} is about {tokens} tokens "
+            f"({len(out)} characters at {CHARS_PER_TOKEN} per token), over the "
+            f"{ROSTER_TOKEN_BUDGET}-token budget; {ROSTER_FIX_ISSUE} owns the fix",
+        )
+
+    def test_the_fixture_is_the_fleet_the_gate_measures(self):
+        # Checked on discovery, the renderer's input, not on the rendered
+        # text: a check that pinned today's one-line-per-agent shape would
+        # go red in the pull request that closes ROSTER_FIX_ISSUE, in a test
+        # not marked expectedFailure, while the pinned test flipped green.
+        with TemporaryDirectory() as tmp:
+            agents = agent_roster.discover(self._fleet(tmp))
+        self.assertIsNotNone(agents)
+        clusters = [a for a in agents if a.get(agent_roster.IDENTITY_FIELD_PREFIX + agent_roster.IDENTITY_NAME_KEY)]
+        self.assertEqual(len(clusters), FLEET_SCALE_PROFILES)
+        self.assertEqual(len({a["responsibilities"] for a in clusters}), 1, "every Cluster Agent shares one role")
+
+    def test_the_roster_renders_within_the_gate_budget(self):
+        with TemporaryDirectory() as tmp:
+            base = self._fleet(tmp)
+            started = time.monotonic()
+            self._render(base)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, ROSTER_RENDER_SECONDS, f"rendering N={FLEET_SCALE_PROFILES} took {elapsed:.1f}s")
 
 
 class TestRouterEnvCarriesTheRosterInputs(unittest.TestCase):

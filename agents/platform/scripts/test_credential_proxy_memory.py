@@ -832,6 +832,67 @@ class ResourceWatermarkGateTest(unittest.TestCase):
         for thread in threads:
             thread.join(5)
 
+    def test_a_session_under_the_clamp_is_seated_above_the_interactive_class_cap(self):
+        # The class caps (§4.2) and the clamp together. The shell's sweep is
+        # interactive to the class caps, so it can hold the whole interactive
+        # cap when the clamp arrives: here three of four admissions, the cap
+        # with one kept for background work. The session's reserve stands
+        # above that cap under the clamp, because the clamp admits background
+        # work one at a time whatever the kept admission says; a profile
+        # request is still held by the clamp, and once the clamp lifts the
+        # interactive cap holds a shell request until the count drains.
+        gate = self.gate(memory_percent=50)
+        gate.tick()
+        executor = CommandExecutor(timeout_seconds=5, max_output_bytes=4096, state_dir=str(self.root / "exec"), scoped_pool=None, max_concurrent_commands=4)
+        executor.watermark_gate = gate
+        self.assertEqual(3, executor.class_cap(credential_proxy.CLASS_INTERACTIVE))
+        held = [threading.Event() for _ in range(3)]
+        release = [threading.Event() for _ in range(3)]
+
+        def hold(index):
+            with executor.request_slot(klass=credential_proxy.CLASS_INTERACTIVE):
+                held[index].set()
+                release[index].wait(5)
+
+        threads = [threading.Thread(target=hold, args=(index,), daemon=True) for index in range(3)]
+        for thread in threads:
+            thread.start()
+        for event in held:
+            self.assertTrue(event.wait(5))
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            # Before the clamp the interactive cap holds a fourth interactive
+            # request, and says so.
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as before:
+                with executor.request_slot(klass=credential_proxy.CLASS_INTERACTIVE, interactive=True):
+                    self.fail("a fourth interactive request ran past the interactive cap")
+            self.assertIn("keeps one of its 4 admissions for background work", str(before.exception))
+            self.set_memory(gate, 76)
+            self.assertEqual("soft", gate.tick())
+            # Under the clamp the session is seated at once above the three.
+            with executor.request_slot(klass=credential_proxy.CLASS_INTERACTIVE, interactive=True):
+                self.assertEqual(4, executor.slots_in_use)
+                self.assertEqual(4, executor._slots_by_class[credential_proxy.CLASS_INTERACTIVE])
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable) as profile:
+                    with executor.request_slot(klass=credential_proxy.CLASS_BACKGROUND):
+                        self.fail("a profile command ran under the clamp")
+                self.assertIn("limit of 1 concurrent commands (clamped under resource pressure)", str(profile.exception))
+                self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, profile.exception.bound)
+            # The clamp lifts with three still held: the interactive cap is
+            # back in force for a shell request, and a profile request has
+            # the admission the cap kept for it.
+            self.set_memory(gate, 50)
+            gate.tick()
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as after:
+                with executor.request_slot(klass=credential_proxy.CLASS_INTERACTIVE):
+                    self.fail("a shell request ran past the interactive cap once the clamp lifted")
+            self.assertIn("keeps one of its 4 admissions for background work", str(after.exception))
+            with executor.request_slot(klass=credential_proxy.CLASS_BACKGROUND):
+                self.assertEqual(4, executor.slots_in_use)
+        for event in release:
+            event.set()
+        for thread in threads:
+            thread.join(5)
+
     def test_the_sampler_ticks_the_gate(self):
         gate = self.gate(memory_percent=76)
         stop = threading.Event()
@@ -885,12 +946,14 @@ class ResourceWatermarkGateTest(unittest.TestCase):
         gate.tick()
         metrics = ProxyMetrics()
         metrics.set_watermark_reader(gate.snapshot)
-        metrics.record_refusal("pressure")
+        metrics.record_refusal("pressure", credential_proxy.CLASS_BACKGROUND)
         families = _families(metrics.render())
         self.assertAlmostEqual(0.86, _series(families, "kubeagents_credential_proxy_resource_watermark_ratio", resource="memory"), places=3)
         self.assertAlmostEqual(0.25, _series(families, "kubeagents_credential_proxy_resource_watermark_ratio", resource="tmp"), places=3)
         self.assertEqual(0.0, _series(families, "kubeagents_credential_proxy_resource_watermark_ratio", resource="state"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="pressure"))
+        self.assertEqual(
+            1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="pressure", **{"class": "background"})
+        )
         self.assertIn("pressure", credential_proxy.ADMISSION_BOUNDS)
         self.assertNotIn("kubeagents_credential_proxy_resource_watermark_ratio", ProxyMetrics().render())
 

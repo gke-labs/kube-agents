@@ -62,7 +62,24 @@ verification_spec:
       required_phrases: ["checkout-gateway", "seeded-a"]
       # The count only a live read of seeded-a produces, so an answer that
       # names seeded-a as unchecked doesn't pass on the cluster name alone.
+      # Phrases and patterns are one pool: any one of them is the count.
+      # The 2 is the fixture's spec.replicas (bench/tf/fleet/defects-a.tf),
+      # which the safeguard below pins. The patterns are the two spellings
+      # the recorded answers use beside the phrases, read on the lowercased
+      # text with emphasis dropped and line breaks kept: the kubectl columns
+      # read out from the desired count ("2 desired, 2 ready and 2 available
+      # replicas") and the READY column with its word ("2/2 ready", "ready
+      # 2/2"). A field with its value ("spec.replicas is 2") is not read on
+      # its own: every such answer on record also carries one of the forms
+      # above, and a value pattern cannot tell the desired count from a
+      # status count. A bare "2/2" is not read: it could count the cards.
+      # Nothing is excluded; the forbidden pattern below still refuses an
+      # answer that left seeded-a unchecked.
       any_of_phrases: ["2 replicas", "replica count of 2"]
+      any_of_patterns:
+        - '\b2 desired\b[^\n]{0,60}?\breplicas?\b'
+        - '\b2/2[ \t]+ready\b'
+        - '\bready[ \t]*:?[ \t]*2/2\b'
       forbidden_patterns:
         - 'seeded-a[^\n]*(unchecked|not (been )?checked|did not finish)'
   - name: the-seeded-b-card-completed
