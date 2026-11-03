@@ -12,13 +12,16 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -363,5 +366,99 @@ func TestTheBusWaitIsBoundedByWhatCanStillAnswer(t *testing.T) {
 	}
 	if holds("a stalled callout rollout") {
 		t.Error("a callout rollout past its progress deadline held the bus; its config could be carrying a credential repair")
+	}
+
+	// The same condition on a copy the controller has not observed yet
+	// describes the rollout before this one, and does not release it.
+	dep = getCallout(t, ctx, cl, agent)
+	dep.Status.ObservedGeneration = dep.Generation - 1
+	if err := cl.Status().Update(ctx, dep); err != nil {
+		t.Fatalf("report the callout spec unobserved: %v", err)
+	}
+	if !holds("a stall reported before the current spec was observed") {
+		t.Error("a stall from before the current spec was observed released the bus")
+	}
+}
+
+// A stalled callout rollout is not waited on, and is not passed quietly
+// either: the release records a Warning event naming the rollout, and the
+// PlatformAgent carries a2aCalloutStalledConditionType while the rollout
+// stays past its deadline, removed once it recovers.
+func TestAStalledCalloutRolloutReleasesTheBusAndSaysSo(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	recorder := record.NewFakeRecorder(64)
+	r.Recorder = recorder
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		busGatePass(t, ctx, r, req, "install")
+	}
+	theCalloutIsRolledOut(t, ctx, cl, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	busGatePass(t, ctx, r, req, "settled")
+	rendered := busConfigHash(t, ctx, cl, agent)
+	putTheBusOnAPreviousConfig(t, ctx, cl, agent)
+
+	stall := func(stalled bool) {
+		t.Helper()
+		dep := getCallout(t, ctx, cl, agent)
+		dep.Status.UpdatedReplicas = 1
+		dep.Status.Conditions = []appsv1.DeploymentCondition{{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "ReplicaSetUpdated"}}
+		if stalled {
+			dep.Status.Conditions[0].Status, dep.Status.Conditions[0].Reason = corev1.ConditionFalse, a2aProgressDeadlineExceeded
+		}
+		if err := cl.Status().Update(ctx, dep); err != nil {
+			t.Fatalf("report the callout rollout (stalled=%v): %v", stalled, err)
+		}
+	}
+	condition := func() *metav1.Condition {
+		t.Helper()
+		fresh := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+			t.Fatalf("get agent: %v", err)
+		}
+		return meta.FindStatusCondition(fresh.Status.Conditions, a2aCalloutStalledConditionType)
+	}
+
+	stall(false)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	busGatePass(t, ctx, r, req, "callout mid-roll, progressing")
+	if got := busConfigHash(t, ctx, cl, agent); got != "previous" {
+		t.Fatalf("the bus moved to %q on a callout still progressing; the rig does not hold to begin with", got)
+	}
+	if c := condition(); c != nil {
+		t.Errorf("the stalled-rollout condition is set on a rollout still progressing: %+v", c)
+	}
+
+	stall(true)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	busGatePass(t, ctx, r, req, "callout rollout stalled")
+	if got := busConfigHash(t, ctx, cl, agent); got != rendered {
+		t.Errorf("the bus config hash = %q with the callout rollout past its progress deadline, want the rendered %q", got, rendered)
+	}
+	var warned bool
+	for len(recorder.Events) > 0 {
+		e := <-recorder.Events
+		if strings.HasPrefix(e, corev1.EventTypeWarning+" "+a2aCalloutStalledReason+" ") && strings.Contains(e, a2aCalloutName(agent)) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Error("the bus moved past a stalled callout rollout with no Warning event naming it")
+	}
+	if c := condition(); c == nil || c.Status != metav1.ConditionTrue || !strings.Contains(c.Message, a2aCalloutName(agent)) {
+		t.Errorf("%s = %+v with the callout rollout stalled, want True naming the Deployment", a2aCalloutStalledConditionType, c)
+	}
+
+	reportCalloutServing(t, ctx, cl, agent)
+	stallClear := getCallout(t, ctx, cl, agent)
+	stallClear.Status.Conditions = nil
+	if err := cl.Status().Update(ctx, stallClear); err != nil {
+		t.Fatalf("report the callout recovered: %v", err)
+	}
+	completeTheProvisionJob(t, ctx, cl, agent)
+	busGatePass(t, ctx, r, req, "callout recovered")
+	if c := condition(); c != nil {
+		t.Errorf("%s stayed after the callout rollout recovered: %+v", a2aCalloutStalledConditionType, c)
 	}
 }

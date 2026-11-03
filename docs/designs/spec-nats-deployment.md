@@ -906,7 +906,9 @@ once every callout replica is on the current spec and no pod of an older Replica
 reconciled ahead of both. A fresh install is not held, since there is no running bus. The
 wait is bounded. A rollout the Deployment controller has given up on (its progress deadline,
 600s by default) does not hold the bus, because the config can carry a credential repair or a
-key change. Only pods an older ReplicaSet of the callout controls are counted, and a
+key change. The release records a Warning event, and the `A2ACalloutRolloutStalled` condition
+stays on the PlatformAgent while the rollout is past its deadline. A stall counts only once the
+Deployment controller has observed the current spec. Only pods an older ReplicaSet of the callout controls are counted, and a
 terminating one only until its deletion deadline.
 While the bus waits, a reconnect is placed by the current map, which can name an account the
 running config does not have yet. That connection is refused until the bus moves, which

@@ -58,6 +58,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -5277,6 +5278,12 @@ type a2aProvisionState struct {
 	// holds, and it shares the reconcile's requeue with gatewayHeld. It is
 	// the upgrade path only: this operator never darkens a gateway.
 	gatewayWaking bool
+	// calloutStalled is the callout Deployment's name while the Deployment
+	// controller reports its rollout past the progress deadline
+	// (a2aCalloutRolloutStalled), "" otherwise. The bus does not wait on
+	// such a rollout, and the status writers carry it as
+	// a2aCalloutStalledConditionType so the wedged rollout is visible.
+	calloutStalled string
 	// busHeld reports that a running bus was left on its current config
 	// this pass because a callout replica is not yet on the current spec
 	// (a2aBusWaitsForCallout). It shares the reconcile's requeue with
@@ -5534,6 +5541,10 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// reconnects. The config Secret is held with the StatefulSet, so a bus
 	// pod restarted for any other reason meanwhile comes back on the config
 	// it was running.
+	if stalled := (&appsv1.Deployment{}); r.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, stalled) == nil &&
+		a2aCalloutRolloutStalled(stalled, calloutGeneration) {
+		state.calloutStalled = stalled.Name
+	}
 	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
@@ -6372,11 +6383,16 @@ const a2aTerminatingCalloutSlack = 10 * time.Second
 var a2aBusGateNow = time.Now
 
 // a2aCalloutRolloutStalled reports whether the Deployment controller has given
-// up on the callout's rollout (Progressing False, ProgressDeadlineExceeded).
-// The bus does not wait on a rollout that has stopped: its config can carry a
-// credential repair or a key change, and those should not wait on a callout
-// that will not finish.
-func a2aCalloutRolloutStalled(dep *appsv1.Deployment) bool {
+// up on the callout's current rollout (Progressing False,
+// ProgressDeadlineExceeded). The bus does not wait on a rollout that has
+// stopped: its config can carry a credential repair or a key change, and those
+// should not wait on a callout that will not finish. The condition counts only
+// once the controller has observed the spec this pass applied, so a stall left
+// from an earlier rollout does not release the wait on this one.
+func a2aCalloutRolloutStalled(dep *appsv1.Deployment, appliedGeneration int64) bool {
+	if dep.Generation < appliedGeneration || dep.Status.ObservedGeneration < dep.Generation {
+		return false
+	}
 	for _, c := range dep.Status.Conditions {
 		if c.Type == appsv1.DeploymentProgressing && c.Status == corev1.ConditionFalse && c.Reason == a2aProgressDeadlineExceeded {
 			return true
@@ -6388,6 +6404,49 @@ func a2aCalloutRolloutStalled(dep *appsv1.Deployment) bool {
 // a2aProgressDeadlineExceeded is the Deployment controller's reason on a
 // rollout that passed its progressDeadlineSeconds.
 const a2aProgressDeadlineExceeded = "ProgressDeadlineExceeded"
+
+const (
+	// a2aCalloutStalledConditionType is present, True, while the callout's
+	// rollout is past its progress deadline, and absent otherwise.
+	a2aCalloutStalledConditionType = "A2ACalloutRolloutStalled"
+	a2aCalloutStalledReason        = "ProgressDeadlineExceeded"
+)
+
+func a2aCalloutStalledMessage(callout string) string {
+	return fmt.Sprintf("the auth callout Deployment %s passed its progress deadline; the bus does not wait for it, so a bus config change applies before every callout replica is on the current identity map", callout)
+}
+
+func a2aCalloutStalledEventMessage(callout string) string {
+	return fmt.Sprintf("the bus moved to its new config without waiting for the auth callout Deployment %s, whose rollout passed its progress deadline; connections may be placed by the previous identity map until it finishes", callout)
+}
+
+// a2aCalloutStalledConditionCurrent and setA2ACalloutStalledCondition carry
+// a2aCalloutStalledConditionType on the same pattern as the MCP server's:
+// present while a2aProvisionState.calloutStalled names the Deployment, and
+// written by both status writers.
+func a2aCalloutStalledConditionCurrent(agent *agentv1alpha1.PlatformAgent, callout string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aCalloutStalledConditionType)
+	if callout == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == a2aCalloutStalledReason && existing.Message == a2aCalloutStalledMessage(callout)
+}
+
+func setA2ACalloutStalledCondition(agent *agentv1alpha1.PlatformAgent, callout string, now metav1.Time) {
+	if callout == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aCalloutStalledConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aCalloutStalledConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             a2aCalloutStalledReason,
+		Message:            a2aCalloutStalledMessage(callout),
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
 
 // a2aDeploymentRevisionAnnotation is the Deployment controller's revision
 // stamp on each ReplicaSet it creates.
@@ -6429,9 +6488,10 @@ func (r *PlatformAgentReconciler) a2aBusWaitsForCallout(ctx context.Context, age
 		}
 		return false, err
 	}
-	if a2aCalloutRolloutStalled(callout) {
+	if a2aCalloutRolloutStalled(callout, calloutGeneration) {
 		logf.FromContext(ctx).Info("not holding the A2A bus for the auth callout: its rollout passed its progress deadline",
 			"callout", callout.Name)
+		r.recordEvent(agent, corev1.EventTypeWarning, a2aCalloutStalledReason, a2aCalloutStalledEventMessage(callout.Name))
 		return false, nil
 	}
 	if !a2aCalloutFullyRolledOut(callout, calloutGeneration) {
