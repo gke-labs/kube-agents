@@ -114,6 +114,11 @@ FLOOR = 1
 #: recovery steps. The issue pins 60 seconds; the variable overrides it.
 COOLDOWN_ENV = "KANBAN_AIMD_COOLDOWN_SECONDS"
 DEFAULT_COOLDOWN_SECONDS = 60
+#: The most the override may ask for: a day, the bound its neighbour
+#: ``INCIDENT_WORKLOAD_DEDUP_SECONDS`` carries. A finite value past it (an
+#: exponent slip, a value in milliseconds) would hold the floor for as long as
+#: it says with nothing to notice it by, since every tick reads it as valid.
+MAX_COOLDOWN_SECONDS = 86400
 
 #: The ``task_events`` kind a worker writes for a pressure signal.
 PRESSURE_KIND = "pressure"
@@ -194,12 +199,16 @@ def cooldown_seconds() -> float:
     except ValueError:
         logger.warning("kanban aimd: %s=%r is not a number; using %ss", COOLDOWN_ENV, raw, DEFAULT_COOLDOWN_SECONDS)
         return float(DEFAULT_COOLDOWN_SECONDS)
-    if not math.isfinite(value) or value <= 0:
+    if not math.isfinite(value) or value <= 0 or value > MAX_COOLDOWN_SECONDS:
         # ``float`` parses "inf", "nan" and an overflow such as "1e999"; a
         # deadline of now + inf never lapses, and now + nan is stored as NULL
-        # and re-armed every tick, so either pins the cap at the floor.
+        # and re-armed every tick, so either pins the cap at the floor. A
+        # finite "1e300" does the same by arithmetic, so the ceiling is the
+        # same refusal rather than a clamp: a value that far off is a mistake
+        # to warn about, not a day-long hold to grant.
         logger.warning(
-            "kanban aimd: %s=%r is not a finite positive number; using %ss", COOLDOWN_ENV, raw, DEFAULT_COOLDOWN_SECONDS,
+            "kanban aimd: %s=%r is not a finite positive number of at most %ss; using %ss",
+            COOLDOWN_ENV, raw, MAX_COOLDOWN_SECONDS, DEFAULT_COOLDOWN_SECONDS,
         )
         return float(DEFAULT_COOLDOWN_SECONDS)
     return value

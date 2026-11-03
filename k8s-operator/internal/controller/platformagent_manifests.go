@@ -5125,8 +5125,9 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// after a pressure signal, and between the steps that climb it back
 		// (KANBAN_AIMD_COOLDOWN_SECONDS in hermes_cli/kanban_aimd.py, the
 		// dispatcher patch). Parsed as a number, and a value that is not finite
-		// and positive falls back to the 60 s default with a warning, so it
-		// bounds how long a step-down lasts and reaches nothing else.
+		// and positive, or is above a day, falls back to the 60 s default with
+		// a warning, so it bounds how long a step-down lasts and reaches
+		// nothing else.
 		"KANBAN_AIMD_COOLDOWN_SECONDS": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the

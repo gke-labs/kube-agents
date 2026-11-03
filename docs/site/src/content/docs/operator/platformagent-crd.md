@@ -400,8 +400,8 @@ memory that reclaim cannot free.
 The cap holds at one worker for one interval. It then rises by one slot for every clean interval
 until it is back at `maxInProgress`. A card that keeps signalling does not restart the interval on
 its own. The interval is 60 seconds. `KANBAN_AIMD_COOLDOWN_SECONDS` in the chart value
-`platformAgent.deployment.env` (the CR's `spec.deployment.env`) sets another, in seconds; a value
-that is not a finite positive number keeps the default. Under the lowered cap each class of card
+`platformAgent.deployment.env` (the CR's `spec.deployment.env`) sets another, in seconds, up to a
+day (`86400`); a value that is not a finite positive number, or is above that, keeps the default. Under the lowered cap each class of card
 still keeps its one guaranteed slot. The gateway log names each step in lines that start with
 `kanban aimd:`.
 

@@ -168,10 +168,15 @@ class LimiterTest(unittest.TestCase):
             self.assertEqual(ka.cooldown_seconds(), 15.0)
             self.assertEqual(ka.AimdConcurrencyLimiter(4, clock=Clock(0)).cooldown, 15.0)
         # "inf" would arm a deadline that never lapses, "nan" one that SQLite
-        # stores as NULL and the next tick arms again; both pin the cap at the floor.
-        for bad in ("", "  ", "soon", "0", "-5", "inf", "-inf", "Infinity", "1e999", "nan"):
+        # stores as NULL and the next tick arms again; both pin the cap at the
+        # floor, and so does a finite value past the ceiling ("1e300", or an
+        # hour written in milliseconds): the deadline is valid and never lapses
+        # in practice.
+        for bad in ("", "  ", "soon", "0", "-5", "inf", "-inf", "Infinity", "1e999", "nan", "1e300", "3600000", "86400.5"):
             with self.subTest(value=bad), mock.patch.dict(os.environ, {ka.COOLDOWN_ENV: bad}):
                 self.assertEqual(ka.cooldown_seconds(), float(ka.DEFAULT_COOLDOWN_SECONDS))
+        with mock.patch.dict(os.environ, {ka.COOLDOWN_ENV: str(ka.MAX_COOLDOWN_SECONDS)}):
+            self.assertEqual(ka.cooldown_seconds(), float(ka.MAX_COOLDOWN_SECONDS))
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(ka.cooldown_seconds(), 60.0)
 
