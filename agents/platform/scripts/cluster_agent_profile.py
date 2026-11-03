@@ -437,7 +437,8 @@ def _remove_sandbox_layout(name: str) -> None:
     SSH hop: the mirror's ``--remove-profile`` mode, which refuses a name that
     still has anything under this pod's profiles/. delete_profile calls it under
     the profile's lock, after the home here is gone, so no scaffold of the same
-    name can be between those two steps.
+    name can be between those two steps. A prune's batch uses
+    _remove_sandbox_layouts instead: one call for many names (#4574).
 
     Never fatal, for the reason the push is not: a sandbox that is down leaves a
     stale skeleton, which costs disk and nothing else.

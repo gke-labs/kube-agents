@@ -1126,7 +1126,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.remove_profile:
         # Its own mode: a removal that also pushed or migrated would be two
         # decisions in one call. EXIT_RETRY on every refusal, as for --profile:
-        # only delete_profile passes this, and it reads non-zero as "not removed".
+        # delete_profile passes one name and reads non-zero as "not removed";
+        # delete_profiles passes a prune's batch and reads the remove-result line.
         if args.profile or not args.skeleton_only:
             log("--remove-profile needs --skeleton-only and no --profile; refusing")
             return EXIT_RETRY

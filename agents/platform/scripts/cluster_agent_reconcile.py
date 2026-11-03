@@ -1571,9 +1571,10 @@ def _previous_management(previous: dict | None) -> str | None:
 def remaining_profiles(project: str, identities: dict, pruned: list[str]) -> int:
     """Profiles of a project still on the volume after this run's deletes.
 
-    A pruned name still counts while its home is on disk: `delete_profile` swallows
-    its own errors, and a project whose delete failed must stay `retiring` so the
-    next run tries again instead of reading the survivor as never in scope.
+    A pruned name still counts while its home is on disk: `delete_profiles` swallows
+    its own errors and skips a name whose lock is held, and a project whose delete
+    failed or was skipped must stay `retiring` so the next run tries again instead
+    of reading the survivor as never in scope.
     """
     pruned_set = set(pruned)
     return sum(
@@ -1675,10 +1676,11 @@ def _exclusive_run():
     apart. Overlapping runs would call `create_profile` and `delete_profile` against
     the same profile home: interleaved read-modify-writes of `config.yaml` and
     `.env`, or an rmtree under a scaffold in progress. The lock lives here rather
-    than in either caller because it has to cover both. create_profile and
-    delete_profile also hold a per-profile lock of their own, which is what keeps a
+    than in either caller because it has to cover both. create_profile and the
+    deletes also hold a per-profile lock of their own, which is what keeps a
     `create` run outside the reconcile (by hand in the agent pod, or bench seeding)
-    apart from this run's PRUNE of the same name (#4389).
+    apart from this run's PRUNE of the same name (#4389). PRUNE's batch
+    (delete_profiles) takes those locks without blocking and skips a held one (#4574).
     """
     path = _hermes_home() / RECONCILE_LOCK
     try:
