@@ -667,9 +667,11 @@ func TestGchatSettlingAnUnrememberedQuestionForgetsItsPendingClick(t *testing.T)
 	}
 }
 
-// Every click in a DM binds to its card's thread, a home card's included,
-// remembered or posted before a restart. The home mark stays on a home card's buttons, because
-// cards already posted carry it.
+// A click in a DM binds to the remembered question's conversation, else to
+// its card's thread. A home card's question is remembered under no
+// conversation, so its click binds to the card's thread before and after a
+// restart. The home mark stays on a home card's buttons, because cards
+// already posted carry it.
 func TestGchatClickOnAHomeCardInADMBindsToItsThread(t *testing.T) {
 	f := newFakeChatRelay(t)
 	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1", "thread": map[string]any{"name": "spaces/_c2fixtureAA/threads/BOT1"}}

@@ -154,8 +154,9 @@ func TestGchatInboundNormalization(t *testing.T) {
 }
 
 // A top-level DM ask is marked TopLevel, as a top-level Slack DM is; a reply
-// typed in a DM thread and a space message are not. A legacy DM with no
-// thread is still a top-level ask.
+// typed in a DM thread and a space message are not. A DM whose thread the
+// adapter cleared (a legacy event with no thread name, an unthreaded space)
+// keys the shared space, where tasks run, so it is not marked either.
 func TestGchatDMTopLevelMark(t *testing.T) {
 	a := newTestGchatAdapter(t)
 	top := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "spaces/D1/threads/T1", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN")
