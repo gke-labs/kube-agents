@@ -17839,6 +17839,11 @@ class ScopeExecRouteTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = True
         CredentialProxyHandler.scope_window = credential_proxy.scope_policy.MemberWindow()
         self.addCleanup(setattr, CredentialProxyHandler, "scope_window", credential_proxy.scope_policy.MemberWindow())
+        # Unbounded, whatever an earlier `serve` test left: at the default
+        # share of one, a command sent as the last one's response arrives can
+        # find its slot not yet released (the response is written inside it).
+        # The share has its own tests below.
+        CredentialProxyHandler.scope_slots = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
