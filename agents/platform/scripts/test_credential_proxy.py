@@ -2635,10 +2635,11 @@ class ResourcePressureRouteTest(unittest.TestCase):
         )
         stub_dir = root / "bin"
         stub_dir.mkdir()
-        stub = stub_dir / "kubectl"
-        stub.write_text("#!/bin/bash\necho pods\n", encoding="utf-8")
-        stub.chmod(0o755)
-        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+        for exe in ("kubectl", "gcloud"):
+            stub = stub_dir / exe
+            stub.write_text("#!/bin/bash\necho pods\n", encoding="utf-8")
+            stub.chmod(0o755)
+            CredentialProxyHandler.executor.executables[exe] = str(stub)
         CredentialProxyHandler.max_request_bytes = 65536
         self.cgroup = root / "cgroup"
         self.cgroup.mkdir()
@@ -2690,7 +2691,7 @@ class ResourcePressureRouteTest(unittest.TestCase):
     def test_a_shell_caller_at_the_hard_watermark_is_answered_429_with_retry_after(self):
         self.as_role(credential_proxy.CALLER_ROLE_SHELL)
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-            status, headers, body = self.post({"argv": ["kubectl", "get", "pods"]})
+            status, headers, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
         self.assertEqual(429, status)
         self.assertEqual("11", headers["Retry-After"])
         self.assertEqual(
@@ -2715,7 +2716,7 @@ class ResourcePressureRouteTest(unittest.TestCase):
         self.assertNotIn("Retry-After", headers)
         self.set_memory_percent(50)
         self.as_role(credential_proxy.CALLER_ROLE_SHELL)
-        status, _, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        status, _, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
         self.assertEqual(200, status, body)
 
     def test_a_vcs_verb_at_the_hard_watermark_is_answered_429_before_its_body_is_read(self):
