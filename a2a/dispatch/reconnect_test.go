@@ -7,6 +7,7 @@ import (
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -245,4 +246,36 @@ func TestAnAddedTierReconnects(t *testing.T) {
 	}
 	withTiers("v4", "read", "unattended")
 	waitFor(t, 15*time.Second, "the second reconnect", func() bool { return d.Reconnects() == 2 })
+}
+
+// A durable that exists but whose stored config the held bind refuses
+// (lib.ErrHeldBindRefused) is not a grant problem: the server's record of
+// the consumer is the verdict, and no reconnect changes it. Added with a
+// tier, it costs the one reconnect the tier does and no more; the durable is
+// left to the bind retries' backoff.
+func TestARefusedHeldConfigDoesNotReconnectAgain(t *testing.T) {
+	b := newBus(t)
+	b.ensure("tse", 2, 0, "read", "unattended")
+	// The operator never made this one: a plain consumer with no held marker.
+	bad := lib.ProfileDurableName("tse", "unattended", lib.SubmitKindTop)
+	if err := b.js.DeleteConsumer(b.ctx, lib.ProfileSubmitStream, bad); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.js.CreateConsumer(b.ctx, lib.ProfileSubmitStream, jetstream.ConsumerConfig{Durable: bad,
+		FilterSubject: lib.ProfileDurableFilter("tse", "unattended", lib.SubmitKindTop),
+		AckPolicy:     jetstream.AckExplicitPolicy, MaxAckPending: 2, AckWait: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	ti := oneProfile("tse", 2)
+	d, _ := b.runDispatcher(fastRegrant(), ti, &fakeVerifier{})
+	time.Sleep(500 * time.Millisecond)
+	ti.update(func(c *lib.DispatchConfig) {
+		c.Version = "v2"
+		c.Profiles[0] = testProfile("tse", 2, "read", "unattended")
+	})
+	waitFor(t, 15*time.Second, "the reconnect", func() bool { return d.Reconnects() == 1 })
+	time.Sleep(4 * time.Second) // past several regrant backoffs and refreshes
+	if n := d.Reconnects(); n != 1 {
+		t.Errorf("%d reconnects for a durable whose stored config is refused, want 1", n)
+	}
 }

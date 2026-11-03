@@ -318,3 +318,49 @@ func TestARetryNamingAnotherTargetOrCapabilityIsCheckedAgain(t *testing.T) {
 		t.Fatalf("verifier calls %v; want each new target and capability checked", calls)
 	}
 }
+
+// putUnreadable writes a lease record nobody can unmarshal.
+func (b *bus) putUnreadable(profile, tier, pod, taskID string) string {
+	b.t.Helper()
+	kv, err := b.js.KeyValue(b.ctx, lib.ProfileLeaseBucket)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	key := lib.ProfileLeaseKey(profile, tier, pod, taskID)
+	if _, err := kv.Put(b.ctx, key, []byte("{not a lease record")); err != nil {
+		b.t.Fatal(err)
+	}
+	return key
+}
+
+// An unreadable record still says its task started, so the sweep gives it
+// the same SweepAfter wait as a readable one, counted from the entry's own
+// write time: a submission redelivered inside that wait must still find it.
+// Past the wait it goes like any other record nothing holds.
+func TestTheSweepWaitsOutAnUnreadableRecord(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	young := b.putUnreadable("tse", "read", "tse-0", "task-young")
+	cfg := testConfig()
+	cfg.SweepAfter = 2 * time.Hour
+	b.runDispatcher(cfg, oneProfile("tse", 2, "tse-0"), &fakeVerifier{})
+	time.Sleep(1500 * time.Millisecond) // several sweeps
+	if _, ok := b.records()[young]; !ok {
+		t.Fatalf("the sweep removed an unreadable record inside SweepAfter")
+	}
+}
+
+// Past SweepAfter from its write, an unreadable record nothing holds is
+// swept.
+func TestTheSweepRemovesAnOldUnreadableRecord(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	old := b.putUnreadable("tse", "read", "tse-0", "task-old")
+	cfg := testConfig()
+	cfg.SweepAfter = time.Second
+	b.runDispatcher(cfg, oneProfile("tse", 2, "tse-0"), &fakeVerifier{})
+	waitFor(t, 10*time.Second, "the old unreadable record swept", func() bool {
+		_, ok := b.records()[old]
+		return !ok
+	})
+}
