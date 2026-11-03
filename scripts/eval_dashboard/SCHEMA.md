@@ -790,7 +790,7 @@ the question imports it.
 `grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
 `cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`, or `cases.html#view=scenarios[&domain=<domain slug>]`, or `cases.html#view=domains`
 `nightly.html[#build=<prow build id>&cases=a,b]` (either key may be left out)
-`trend.html#cases=a,b`, or `trend.html#domain=<domain>`, each `[&metric=<judged metric>][&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]]`
+`trend.html#cases=a,b`, or `trend.html#domain=<domain>`, each `[&metric=<judged metric>][&mode=next|today][&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]]`
 
 Every parameter travels in the URL fragment as `key=value` pairs joined
 by `&`. `storage.cloud.google.com` answers an unauthenticated request with
@@ -842,8 +842,10 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
 - On the Trend page `cases` scopes to those cases (the case-id grammar
   above), `domain` to a domain slug (same grammar), `metric` to a judged
   metric (`[A-Za-z][A-Za-z0-9_]{0,39}`, and one the store carries, else the
-  default); `since` and `until` draw the incident's start and end as
-  markers. No parameter is the overview of every domain.
+  default), `mode` to a series (`next` or `today`, and one the store holds
+  records for, else the default, `next` when it holds any); `since` and
+  `until` draw the incident's start and end as markers. No parameter is the
+  overview of every domain.
 - On the Cases page `view=scenarios` opens the scenarios view (any other
   value is the reliability table); there `domain=<slug>` (the case-id
   grammar) shows that domain's section alone, and a slug no section has
@@ -1145,7 +1147,9 @@ Everything above is the today-mode series: records whose key has no `mode`,
 or `mode: today`. `next` is the same `{records, metrics, default_metric,
 keys{}, nights[], cases{}, domains{}}` built from the records whose key has
 `mode: next` (the main nightly's), or `null` when the store holds none;
-a key in any other mode is in neither. The page draws the today series.
+a key in any other mode is in neither. The page draws the next series, and
+the today series when its link carries `mode=today` or the store holds no
+next-mode record; it offers a chip for each when both hold records.
 
 `latency{}` is the one part of the block not read from the store, which
 carries no timing: it is from `data.json`'s nightly runs inside the same
@@ -1161,7 +1165,7 @@ target (p95, nothing gates on it) and `pct` each series' slow percentile
 (`turn1` 95, the target's `TURN1_TARGET_PCT`; `agent` 90, `SLOW_PCT`), as
 `nightly.py` has them; `nights[]` is `{id, at, build}`
 oldest first, `id` the same `build:<main part's build>` as the store's
-`nights[].id`, `at` that night's `at` when the store holds it, else the
+`nights[].id`, `at` that night's `at` when the store holds it in either series, else the
 newest finish (or start) of its parts. Each scope (`all[]` every case,
 `domains{}` a domain's cases, `cases{}` one case) has one point per night
 it recorded a repetition, oldest first: `{night, at, n_turn1, turn1_p50_s,
