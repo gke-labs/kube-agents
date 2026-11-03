@@ -464,7 +464,9 @@ def keys(failed_jobs):
     That is a join over its legs, such as `Run Python Unit Tests` over its
     `(shard k/3)` shards, failing because a shard did; its log names no test,
     and filing it would open an issue per failed join step on every flake. A
-    join that fails alone still files under its steps, and so does a matrix leg
+    failure of the join's own, such as a coverage download, in the same
+    attempt as a shard that names tests drops out with it: the tracker does
+    not read the join's steps. A join that fails alone still files under its steps, and so does a matrix leg
     that names no test beside one that does. When one attempt names more
     containers than MAX_CONTAINERS_PER_ATTEMPT the failure is the jobs', not
     the tests', and every job files under its name with the ids it named.
