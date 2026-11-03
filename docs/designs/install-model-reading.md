@@ -47,10 +47,16 @@ resource reference is a name that, after the provider, starts with `projects/` (
 endpoint, `vertex_ai/projects/<id>/locations/<region>/endpoints/<n>`, whose id is the segment after
 its last `/`) or has a `/`-separated segment that starts with `arn:` (a Bedrock model or inference
 profile, `bedrock/arn:aws:bedrock:<region>:<account>:inference-profile/<id>`, and LiteLLM's routed
-forms `bedrock/converse/arn:…` and `bedrock/invoke/arn:…`). An ARN's resource id is the text after
-its last `/`, or, for the colon-only form the grammar also admits
-(`arn:aws:bedrock:<region>:<account>:provisioned-model:<id>`), the text after its last `:`; in
-both forms the region and the account id are dropped. So a project id, a region or an account id
+forms `bedrock/converse/arn:…` and `bedrock/invoke/arn:…`). A resource reference must have its full shape, or the
+name is malformed (both fields absent): a `projects/` path needs at least
+`projects/<p>/locations/<l>/<kind>/<id>`, six segments with `projects` and `locations` first and
+third and a non-empty id; an ARN needs at least six `:` fields
+(`arn:partition:service:region:account:resource`) with a non-empty resource part. A truncated
+reference such as `vertex_ai/projects/acme-prod` or `bedrock/arn:aws:bedrock:us-east-1:123456789012`
+would otherwise leave a project id, a region or an account id as its last part. An ARN's resource
+id is the text after the resource part's last `/`, or, for the colon-only form the grammar also
+admits (`arn:aws:bedrock:<region>:<account>:provisioned-model:<id>`), the text after its last
+`:`; in both forms the region and the account id are dropped. So a project id, a region or an account id
 never reaches the status, the gauge or the summary. Every other name keeps everything after the
 provider: `hosted_vllm/meta-llama/Llama-3.1-8B-Instruct` reads as provider `hosted_vllm`, model
 `meta-llama/Llama-3.1-8B-Instruct`, because on a self-hosted install the organisation prefix is
@@ -76,9 +82,11 @@ entry whose model has an empty provider or an empty name after the split, or no 
 entry and no provider-qualified `litellm_params.model`. The pair is written whole or not at all. A read that fails (a timed-out or rate-limited API call) is not a
 negative: the operator keeps the last-written pair, as the telemetry discovery keeps its last
 known endpoint on an inconclusive probe, so a transient error never blanks the status or drops
-the install from the headcount. Never an empty string standing in for "unknown". `AgentStatus` gains `Inference InferenceStatus` with
-that struct (the block itself serialises as `{}` like its sibling structs; "absent" is said of the
-two fields); the served CRD skew rule the other newer fields follow applies (an older served CRD
+the install from the headcount. Never an empty string standing in for "unknown". `AgentStatus` gains `Inference *InferenceStatus` with
+that struct. The pointer keeps the key absent until `updateStatusReady` reads the config, so the
+Degraded and A2A-condition writers, which never read it, leave no key behind. A found read writes
+the pair, a negative read writes an empty object (`inference: {}`, the operator's definite
+negative), and a failed read keeps whatever is there, an absent key included. The served CRD skew rule the other newer fields follow applies (an older served CRD
 prunes the fields, the operator notices from the echo and lands them once the CRD is applied).
 
 The operator serves the pair as an info gauge on its metrics port, beside the usage gauges:
@@ -121,8 +129,10 @@ write them inline.
 
 The operator reads the ConfigMap LiteLLM mounts, through the manager cache, which already holds
 ConfigMaps (the controller owns some, so the informer runs). It takes the `litellm` Deployment
-from the cache, reads the ConfigMap name from its `config.yaml` volume, and gets that one
-ConfigMap by name; only when the Deployment is absent does it fall back to the summary script's
+from the cache and, among its ConfigMap volumes whose names pass the `litellm-config` /
+`litellm-config-*` filter, gets each by name in volume order and reads the first whose data
+carries `config.yaml`. When none does, the read is a negative, with no list fallback while the
+Deployment exists; only when the Deployment is absent does it fall back to the summary script's
 rule (`_litellm_config`: every `litellm-config` or `litellm-config-*` ConfigMap in the namespace
 whose data carries `config.yaml`, the newest by creation time). It parses the YAML and applies the
 entry rule, the split and the resource-reference rule of section 2.1. The read happens where the
@@ -174,8 +184,8 @@ and states the rule.
 ## 3. What changes, by component
 
 - **Operator** (`common_types.go`, `platformagent_controller.go`, a new `inference_status.go`
-  beside the usage files holding the reader, the parser and the gauge, `usage_gauges.go` for the
-  `forget` call, the CRD copies): `InferenceStatus`, the ConfigMap selection and the YAML parse
+  beside the usage files holding the reader, the parser and the gauge, the `forget` call in
+  `Reconcile` in `platformagent_controller.go`, the CRD copies): `InferenceStatus`, the ConfigMap selection and the YAML parse
   with the `model-default` lookup and the first-line fallback, the split and the
   resource-reference rule, the write in `updateStatusReady` with its unchanged-check term and its
   keep-on-error rule, the name-filtered `Watches` on ConfigMaps, the

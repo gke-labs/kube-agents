@@ -1246,11 +1246,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 // usageStatusRequeue is how soon the steady-state requeue has to fire for the
-// pruned-status probe: the interval while a record is held for this CR. With no
+// pruned-status probe: the interval while a record is held for this CR, the
+// whole usage block's or status.inference's. With no
 // record it returns the secret re-read's interval, the ceiling the caller
 // already applies, so the min it feeds leaves the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) {
+	if r.usageStatusPruned(agent) || r.inferencePruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -4594,11 +4595,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	newInference := agent.Status.Inference
 	switch model, read := r.readInferenceModel(ctx, agent); read {
 	case inferenceReadFound:
-		newInference = agentv1alpha1.InferenceStatus{Provider: model.Provider, Model: model.Model}
+		newInference = &agentv1alpha1.InferenceStatus{Provider: model.Provider, Model: model.Model}
 	case inferenceReadNegative:
-		newInference = agentv1alpha1.InferenceStatus{}
+		newInference = &agentv1alpha1.InferenceStatus{}
 	}
-	inferenceUnchanged := r.inferencePruned(agent) || agent.Status.Inference == newInference
+	inferenceUnchanged := r.inferencePruned(agent) || inferenceStatusEqual(agent.Status.Inference, newInference)
 
 	// Check if anything actually changed. The generation is in the list so that
 	// a spec edit which changes nothing derived here still gets one write:
@@ -4711,11 +4712,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
+	// Copied before the write: decoding the response may reuse the pointer's target.
+	var wroteInference inferenceModel
+	if newInference != nil {
+		wroteInference = inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
+	}
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, err
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
-	r.noteInferenceEcho(ctx, agent, inferenceModel{Provider: newInference.Provider, Model: newInference.Model})
+	r.noteInferenceEcho(ctx, agent, wroteInference)
 	return newPhase, nil
 }
 

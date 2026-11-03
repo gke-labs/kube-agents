@@ -42,6 +42,16 @@ const (
 	inferenceARNPrefix = "arn:"
 	// inferenceARNFieldSeparator separates an ARN's fields; the colon-only form ends in its id.
 	inferenceARNFieldSeparator = ":"
+	// inferenceResourcePathMinSegments is the shortest full Vertex AI resource path:
+	// projects/<p>/locations/<l>/<kind>/<id>.
+	inferenceResourcePathMinSegments = 6
+	// inferenceResourcePathLocationsIndex is where a full path's "locations" segment sits.
+	inferenceResourcePathLocationsIndex = 2
+	// inferenceResourcePathLocations is the segment a full path carries at that index.
+	inferenceResourcePathLocations = "locations"
+	// inferenceARNFields is the field count of a full ARN:
+	// arn:partition:service:region:account:resource.
+	inferenceARNFields = 6
 	// inferenceNewerField names status.inference's pruning record in prunedNewerFields.
 	inferenceNewerField = "status.inference"
 )
@@ -139,23 +149,37 @@ func validInferenceProvider(provider string) bool {
 }
 
 // trimInferenceModelName applies the resource-reference rule to the name after the
-// provider. A Vertex AI endpoint path keeps the text after its last separator. A name
-// with a segment that starts with an ARN keeps the text after its last separator, or,
-// when the ARN segment is the last one, the text after the ARN's last field separator.
-// Every other name is kept as typed.
+// provider. A reference must have its full shape, or the name is malformed and "" comes
+// back. A Vertex AI path needs projects/<p>/locations/<l>/<kind>/<id> at least and keeps
+// the text after its last separator. A name with a segment that starts with an ARN needs
+// six colon fields from there (arn:partition:service:region:account:resource) with a
+// non-empty resource part, and keeps the text after the resource part's last separator,
+// or, without one, the text after its last field separator. Every other name is kept as
+// typed.
 func trimInferenceModelName(name string) string {
 	if strings.HasPrefix(name, inferenceResourcePathPrefix) {
-		return afterLast(name, inferenceProviderSeparator)
+		segments := strings.Split(name, inferenceProviderSeparator)
+		if len(segments) < inferenceResourcePathMinSegments ||
+			segments[inferenceResourcePathLocationsIndex] != inferenceResourcePathLocations {
+			return ""
+		}
+		return segments[len(segments)-1]
 	}
 	segments := strings.Split(name, inferenceProviderSeparator)
 	for i, segment := range segments {
 		if !strings.HasPrefix(segment, inferenceARNPrefix) {
 			continue
 		}
-		if i < len(segments)-1 {
-			return afterLast(name, inferenceProviderSeparator)
+		arn := strings.Join(segments[i:], inferenceProviderSeparator)
+		fields := strings.SplitN(arn, inferenceARNFieldSeparator, inferenceARNFields)
+		if len(fields) < inferenceARNFields || fields[inferenceARNFields-1] == "" {
+			return ""
 		}
-		return afterLast(segment, inferenceARNFieldSeparator)
+		resource := fields[inferenceARNFields-1]
+		if strings.Contains(resource, inferenceProviderSeparator) {
+			return afterLast(resource, inferenceProviderSeparator)
+		}
+		return afterLast(resource, inferenceARNFieldSeparator)
 	}
 	return name
 }
@@ -187,69 +211,67 @@ func liteLLMConfigMapRequests(ctx context.Context, obj client.Object, enqueue fu
 }
 
 // readInferenceModel reads the default model out of the install's LiteLLM config. The
-// litellm Deployment's config volume names the ConfigMap; only when the Deployment is
-// missing does the newest candidate in the namespace that carries litellmConfigKey
-// answer (ties by name). A Deployment that mounts no LiteLLM config ConfigMap, a missing
-// ConfigMap or key, or a config that states no default model, is a negative; any other
-// API error is a failed read.
+// litellm Deployment's config volumes name the ConfigMap: the first, in volume order,
+// whose data carries litellmConfigKey. Only when the Deployment is missing does the
+// newest candidate in the namespace that carries litellmConfigKey answer (ties by
+// name). A Deployment none of whose mounted LiteLLM config ConfigMaps carries the key,
+// or a config that states no default model, is a negative; any other API error is a
+// failed read.
 func (r *PlatformAgentReconciler) readInferenceModel(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (inferenceModel, inferenceRead) {
 	log := logf.FromContext(ctx)
-	var cm *corev1.ConfigMap
-	name, deployed, err := r.mountedLiteLLMConfigMapName(ctx, agent.Namespace)
-	switch {
-	case err != nil:
-		log.Info("could not read the LiteLLM Deployment for status.inference; keeping the last written pair", "error", err)
+	cm, deployed, err := r.mountedLiteLLMConfigMap(ctx, agent.Namespace)
+	if err != nil {
+		log.Info("could not read the LiteLLM Deployment or its config ConfigMap for status.inference; keeping the last written pair", "error", err)
 		return inferenceModel{}, inferenceReadFailed
-	case deployed && name == "":
-		// A leftover ConfigMap is not what LiteLLM serves.
-		return inferenceModel{}, inferenceReadNegative
-	case deployed:
-		cm = &corev1.ConfigMap{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: name}, cm); err != nil {
-			if errors.IsNotFound(err) {
-				return inferenceModel{}, inferenceReadNegative
-			}
-			log.Info("could not read the LiteLLM config ConfigMap for status.inference; keeping the last written pair", "error", err)
-			return inferenceModel{}, inferenceReadFailed
-		}
-	default:
+	}
+	if !deployed {
 		cm, err = r.newestLiteLLMConfigMap(ctx, agent.Namespace)
 		if err != nil {
 			log.Info("could not list the LiteLLM config ConfigMaps for status.inference; keeping the last written pair", "error", err)
 			return inferenceModel{}, inferenceReadFailed
 		}
-		if cm == nil {
-			return inferenceModel{}, inferenceReadNegative
-		}
 	}
-	config, ok := cm.Data[litellmConfigKey]
-	if !ok {
+	// With the Deployment present, a leftover ConfigMap it does not mount is not what
+	// LiteLLM serves, so a nil here is a negative with no list fallback.
+	if cm == nil {
 		return inferenceModel{}, inferenceReadNegative
 	}
-	model, ok := parseLiteLLMDefaultModel(config)
+	model, ok := parseLiteLLMDefaultModel(cm.Data[litellmConfigKey])
 	if !ok {
 		return inferenceModel{}, inferenceReadNegative
 	}
 	return model, inferenceReadFound
 }
 
-// mountedLiteLLMConfigMapName returns the LiteLLM config ConfigMap the litellm
-// Deployment mounts. deployed is false when there is no Deployment; a Deployment that
-// mounts none returns "" with deployed true.
-func (r *PlatformAgentReconciler) mountedLiteLLMConfigMapName(ctx context.Context, namespace string) (name string, deployed bool, err error) {
+// mountedLiteLLMConfigMap returns the first LiteLLM config ConfigMap, in volume order,
+// that the litellm Deployment mounts and whose data carries litellmConfigKey. A mounted
+// ConfigMap that is missing or lacks the key is passed over. deployed is false when
+// there is no Deployment; a Deployment with no such ConfigMap returns nil with deployed
+// true.
+func (r *PlatformAgentReconciler) mountedLiteLLMConfigMap(ctx context.Context, namespace string) (cm *corev1.ConfigMap, deployed bool, err error) {
 	dep := &appsv1.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: litellmDeploymentName}, dep); err != nil {
 		if errors.IsNotFound(err) {
-			return "", false, nil
+			return nil, false, nil
 		}
-		return "", false, err
+		return nil, false, err
 	}
 	for _, v := range dep.Spec.Template.Spec.Volumes {
-		if v.ConfigMap != nil && isLiteLLMConfigMapName(v.ConfigMap.Name) {
-			return v.ConfigMap.Name, true, nil
+		if v.ConfigMap == nil || !isLiteLLMConfigMapName(v.ConfigMap.Name) {
+			continue
+		}
+		mounted := &corev1.ConfigMap{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: v.ConfigMap.Name}, mounted); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return nil, true, err
+		}
+		if _, ok := mounted.Data[litellmConfigKey]; ok {
+			return mounted, true, nil
 		}
 	}
-	return "", true, nil
+	return nil, true, nil
 }
 
 // newestLiteLLMConfigMap returns the newest LiteLLM config ConfigMap in the namespace
@@ -290,8 +312,8 @@ func (r *PlatformAgentReconciler) inferencePruned(agent *agentv1alpha1.PlatformA
 }
 
 // noteInferenceEcho reads status.inference back after the Ready writer's write. A
-// non-empty pair written that comes back with both fields empty is the served CRD
-// pruning it: recorded, and logged once per record. An echo that carries the pair
+// non-empty pair written that comes back absent or with both fields empty is the served
+// CRD pruning it: recorded, and logged once per record. An echo that carries the pair
 // clears the record. An empty pair written says nothing either way.
 func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, wrote inferenceModel) {
 	if wrote == (inferenceModel{}) {
@@ -301,11 +323,11 @@ func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *
 	key := usagePollKey(agent)
 	r.prunedNewerFieldsMu.Lock()
 	defer r.prunedNewerFieldsMu.Unlock()
-	if echoed.Provider == wrote.Provider && echoed.Model == wrote.Model {
+	if echoed != nil && echoed.Provider == wrote.Provider && echoed.Model == wrote.Model {
 		delete(r.prunedNewerFields[key], inferenceNewerField)
 		return
 	}
-	if echoed != (agentv1alpha1.InferenceStatus{}) {
+	if echoed != nil && *echoed != (agentv1alpha1.InferenceStatus{}) {
 		return
 	}
 	if r.prunedNewerFields == nil {
@@ -321,6 +343,15 @@ func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *
 		logf.FromContext(ctx).Info("the served CRD does not serve a status field this operator writes; apply this release's CRD to get it, which is probed again after the interval",
 			"platformagent", key, "field", inferenceNewerField, "reprobeAfter", usageStatusReprobeInterval.String())
 	}
+}
+
+// inferenceStatusEqual reports whether two status.inference values serialise the same:
+// both absent, or both present with the same pair.
+func inferenceStatusEqual(a, b *agentv1alpha1.InferenceStatus) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // inferenceGauges serves status.inference as an info gauge.
@@ -349,7 +380,7 @@ func (g *inferenceGauges) publish(agent *agentv1alpha1.PlatformAgent) {
 	defer g.mu.Unlock()
 	g.deleteAgent(agent.Namespace, agent.Name)
 	inference := agent.Status.Inference
-	if inference.Provider == "" || inference.Model == "" {
+	if inference == nil || inference.Provider == "" || inference.Model == "" {
 		return
 	}
 	g.model.WithLabelValues(agent.Namespace, agent.Name, inference.Provider, inference.Model).Set(inferenceGaugeValue)

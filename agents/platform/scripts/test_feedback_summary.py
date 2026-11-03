@@ -340,6 +340,19 @@ class ParsingTest(unittest.TestCase):
             self.assertNotIn("123456789012", got)
             self.assertNotIn("us-east-1", got)
 
+    def test_a_truncated_resource_reference_is_malformed(self):
+        for model in (
+            "vertex_ai/projects/acme-prod",
+            "vertex_ai/projects/acme/locations/us-central1",
+            "vertex_ai/projects/acme/regions/us-central1/endpoints/987",
+            "bedrock/arn:aws:bedrock:us-east-1:123456789012",
+            "bedrock/arn:aws:bedrock:us-east-1:123456789012:",
+        ):
+            self.assertIsNone(fs.split_model(model), model)
+        self.assertEqual(fs.split_model("vertex_ai/projects/acme-prod-123/locations/us-central1/endpoints/987"), "vertex_ai/987")
+        self.assertEqual(fs.split_model("bedrock/arn:aws:bedrock:us-east-1:123456789012:provisioned-model:abc"), "bedrock/abc")
+        self.assertEqual(fs.split_model("bedrock/converse/arn:aws:bedrock:us-east-1:123456789012:inference-profile/p1"), "bedrock/p1")
+
     def test_the_model_default_entry_answers_over_an_earlier_entry(self):
         config = (
             "model_list:\n"

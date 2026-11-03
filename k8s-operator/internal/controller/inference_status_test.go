@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -38,6 +39,11 @@ func TestParseLiteLLMDefaultModel(t *testing.T) {
 		{"bedrock arn slash form", cfg("model-default", "bedrock/arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3"), "bedrock", "us.anthropic.claude-3", true},
 		{"bedrock arn colon form", cfg("model-default", "bedrock/arn:aws:bedrock:us-east-1:123456789012:provisioned-model:abc"), "bedrock", "abc", true},
 		{"bedrock routed form", cfg("model-default", "bedrock/converse/arn:aws:bedrock:us-east-1:123456789012:inference-profile/p1"), "bedrock", "p1", true},
+		{"truncated projects path to the project", cfg("model-default", "vertex_ai/projects/acme-prod"), "", "", false},
+		{"truncated projects path to the region", cfg("model-default", "vertex_ai/projects/acme/locations/us-central1"), "", "", false},
+		{"projects path without locations", cfg("model-default", "vertex_ai/projects/acme/regions/us-central1/endpoints/987"), "", "", false},
+		{"truncated arn to the account", cfg("model-default", "bedrock/arn:aws:bedrock:us-east-1:123456789012"), "", "", false},
+		{"arn with an empty resource part", cfg("model-default", "bedrock/arn:aws:bedrock:us-east-1:123456789012:"), "", "", false},
 		{"unqualified default beside a qualified entry", cfg("model-default", "gpt-4o") + cfg("other", "anthropic/claude-opus-5"), "", "", false},
 		{"empty name", cfg("model-default", "gemini/"), "", "", false},
 		{"empty provider", cfg("model-default", "/gpt-4o"), "", "", false},
@@ -208,7 +214,7 @@ func TestUpdateStatusReadyWritesAndClearsTheModel(t *testing.T) {
 
 	settleReady(t, r, agent)
 	stored := readBack(t, r, agent)
-	if stored.Status.Inference != (agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "gemini-3.5-flash"}) {
+	if !inferenceStatusEqual(stored.Status.Inference, &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "gemini-3.5-flash"}) {
 		t.Fatalf("status.inference = %+v, want gemini/gemini-3.5-flash", stored.Status.Inference)
 	}
 
@@ -218,7 +224,7 @@ func TestUpdateStatusReadyWritesAndClearsTheModel(t *testing.T) {
 	}
 	settleReady(t, r, stored)
 	stored = readBack(t, r, agent)
-	if stored.Status.Inference != (agentv1alpha1.InferenceStatus{Provider: "anthropic", Model: "claude-opus-5"}) {
+	if !inferenceStatusEqual(stored.Status.Inference, &agentv1alpha1.InferenceStatus{Provider: "anthropic", Model: "claude-opus-5"}) {
 		t.Fatalf("status.inference = %+v after the edit, want anthropic/claude-opus-5", stored.Status.Inference)
 	}
 
@@ -227,8 +233,8 @@ func TestUpdateStatusReadyWritesAndClearsTheModel(t *testing.T) {
 	}
 	settleReady(t, r, stored)
 	stored = readBack(t, r, agent)
-	if stored.Status.Inference != (agentv1alpha1.InferenceStatus{}) {
-		t.Errorf("status.inference = %+v after the ConfigMap was deleted, want both fields empty", stored.Status.Inference)
+	if !inferenceStatusEqual(stored.Status.Inference, &agentv1alpha1.InferenceStatus{}) {
+		t.Errorf("status.inference = %+v after the ConfigMap was deleted, want an empty object, the definite negative", stored.Status.Inference)
 	}
 }
 
@@ -248,7 +254,7 @@ func TestUpdateStatusReadyKeepsTheModelOnAReadError(t *testing.T) {
 
 	settleReady(t, r, agent)
 	stored := readBack(t, r, agent)
-	if stored.Status.Inference.Model != "gemini-3.5-flash" {
+	if stored.Status.Inference == nil || stored.Status.Inference.Model != "gemini-3.5-flash" {
 		t.Fatalf("status.inference = %+v, want gemini/gemini-3.5-flash", stored.Status.Inference)
 	}
 	writes := counter.writes
@@ -263,7 +269,7 @@ func TestUpdateStatusReadyKeepsTheModelOnAReadError(t *testing.T) {
 		t.Fatalf("%d status writes after a generation bump, want %d: the other fields must still be written", counter.writes, writes+1)
 	}
 	stored = readBack(t, r, agent)
-	if stored.Status.Inference != (agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "gemini-3.5-flash"}) {
+	if !inferenceStatusEqual(stored.Status.Inference, &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "gemini-3.5-flash"}) {
 		t.Errorf("status.inference = %+v after a failed read, want the last written pair kept", stored.Status.Inference)
 	}
 	if readyConditionGeneration(t, stored) != stored.Generation {
@@ -279,14 +285,14 @@ func TestUpdateStatusReadyRecordsAPrunedInferenceBlock(t *testing.T) {
 	pruning := true
 	funcs.SubResourceUpdate = func(ctx context.Context, cl client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 		if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok && pruning {
-			pa.Status.Inference = agentv1alpha1.InferenceStatus{}
+			pa.Status.Inference = nil
 		}
 		return persist(ctx, cl, subResourceName, obj, opts...)
 	}
 	r := inferenceReconciler(t, &funcs, agent, litellmConfigMap("litellm-config", time.Now(), "gemini/gemini-3.5-flash"))
 
 	settleReady(t, r, agent)
-	if agent.Status.Inference != (agentv1alpha1.InferenceStatus{}) {
+	if agent.Status.Inference != nil {
 		t.Fatalf("the fixture did not prune status.inference (got %+v)", agent.Status.Inference)
 	}
 	if !r.inferencePruned(agent) {
@@ -318,7 +324,7 @@ func TestUpdateStatusReadyRecordsAPrunedInferenceBlock(t *testing.T) {
 	pruning = false
 	age()
 	settleReady(t, r, agent)
-	if counter.writes != 3 || agent.Status.Inference != (agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "gemini-3.5-flash"}) {
+	if counter.writes != 3 || !inferenceStatusEqual(agent.Status.Inference, &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "gemini-3.5-flash"}) {
 		t.Fatalf("after the CRD was applied: %d writes, status.inference=%+v; want 3 and gemini/gemini-3.5-flash", counter.writes, agent.Status.Inference)
 	}
 	if r.inferencePruned(agent) {
@@ -355,10 +361,10 @@ func TestInferenceGaugePublishesOneSampleAndSwapsOnAChange(t *testing.T) {
 	g := newInferenceGauges(prometheus.NewRegistry())
 	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "ns"}}
 	other := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: "ns"}}
-	other.Status.Inference = agentv1alpha1.InferenceStatus{Provider: "openai", Model: "gpt-5.4"}
+	other.Status.Inference = &agentv1alpha1.InferenceStatus{Provider: "openai", Model: "gpt-5.4"}
 	g.publish(other)
 
-	agent.Status.Inference = agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "a"}
+	agent.Status.Inference = &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "a"}
 	g.publish(agent)
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 2 {
 		t.Fatalf("%d samples after two agents published, want 2", n)
@@ -379,18 +385,18 @@ func TestInferenceGaugePublishesOneSampleAndSwapsOnAChange(t *testing.T) {
 		t.Errorf("model b sample = %v, want 1", v)
 	}
 
-	agent.Status.Inference = agentv1alpha1.InferenceStatus{}
+	agent.Status.Inference = &agentv1alpha1.InferenceStatus{}
 	g.publish(agent)
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 1 {
 		t.Errorf("%d samples after the pair cleared, want 1 (the other agent's)", n)
 	}
-	agent.Status.Inference = agentv1alpha1.InferenceStatus{Provider: "gemini"}
+	agent.Status.Inference = &agentv1alpha1.InferenceStatus{Provider: "gemini"}
 	g.publish(agent)
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 1 {
 		t.Errorf("%d samples with only a provider, want 1: one field alone is no sample", n)
 	}
 
-	agent.Status.Inference = agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "c"}
+	agent.Status.Inference = &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "c"}
 	g.publish(agent)
 	g.forget("ns", "pa")
 	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 1 {
@@ -450,5 +456,76 @@ func TestLiteLLMConfigMapRequests_EnqueueTheNamespacesAgentsForALiteLLMConfigNam
 		if len(asked) != 0 {
 			t.Errorf("%s asked for namespaces %v, want none", name, asked)
 		}
+	}
+}
+
+// A fresh status.inference record schedules the five-minute probe like the usage
+// block's does; a stale one leaves the caller's ceiling.
+func TestUsageStatusRequeueFollowsTheInferenceRecord(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	r := observedGenerationReconciler(agent, &statusWriteCounter{})
+	key := usagePollKey(agent)
+
+	r.prunedNewerFields = map[string]map[string]time.Time{key: {inferenceNewerField: time.Now()}}
+	if got := r.usageStatusRequeue(agent); got != usageStatusReprobeInterval {
+		t.Errorf("requeue with a fresh inference record = %s, want %s", got, usageStatusReprobeInterval)
+	}
+	r.prunedNewerFields[key][inferenceNewerField] = time.Now().Add(-2 * usageStatusReprobeInterval)
+	if got := r.usageStatusRequeue(agent); got != secretEnvReprobeInterval {
+		t.Errorf("requeue with a stale inference record = %s, want the caller's ceiling %s", got, secretEnvReprobeInterval)
+	}
+}
+
+// A sibling litellm-config-* volume mounted ahead of the config is passed over: the
+// ConfigMap read is the first mounted one that carries config.yaml.
+func TestReadInferenceModelSkipsAMountedConfigMapWithoutTheKey(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	dep := litellmDeploymentMounting("litellm-config")
+	dep.Spec.Template.Spec.Volumes = append([]corev1.Volume{
+		{Name: "callbacks", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "litellm-config-callbacks"}}}},
+	}, dep.Spec.Template.Spec.Volumes...)
+	callbacks := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "litellm-config-callbacks", Namespace: "test-ns"},
+		Data:       map[string]string{"callbacks.py": "x = 1\n"},
+	}
+	r := inferenceReconciler(t, nil, agent, dep, callbacks,
+		litellmConfigMap("litellm-config", time.Now(), "gemini/gemini-3.5-flash"))
+	got, read := r.readInferenceModel(context.Background(), agent)
+	if read != inferenceReadFound || got != (inferenceModel{Provider: "gemini", Model: "gemini-3.5-flash"}) {
+		t.Errorf("readInferenceModel() = (%+v, %v), want the second volume's gemini/gemini-3.5-flash, found", got, read)
+	}
+}
+
+// The key is absent until the Ready writer reads the config, so a status written by any
+// other writer carries no inference key; a negative read is an empty object.
+func TestInferenceStatusKeyIsAbsentUntilRead(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		inference *agentv1alpha1.InferenceStatus
+		want      string
+	}{
+		{"never read", nil, ""},
+		{"negative", &agentv1alpha1.InferenceStatus{}, `"inference":{}`},
+		{"found", &agentv1alpha1.InferenceStatus{Provider: "gemini", Model: "flash"}, `"inference":{"provider":"gemini","model":"flash"}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			raw, err := json.Marshal(agentv1alpha1.AgentStatus{Inference: c.inference})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := string(raw)
+			if c.want == "" && strings.Contains(got, `"inference"`) {
+				t.Errorf("status = %s, want no inference key", got)
+			}
+			if c.want != "" && !strings.Contains(got, c.want) {
+				t.Errorf("status = %s, want it to carry %s", got, c.want)
+			}
+		})
+	}
+	g := newInferenceGauges(prometheus.NewRegistry())
+	g.publish(&agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "ns"}})
+	if n := testutil.CollectAndCount(g.model, inferenceGaugeName); n != 0 {
+		t.Errorf("%d samples for an agent with no inference key, want 0", n)
 	}
 }

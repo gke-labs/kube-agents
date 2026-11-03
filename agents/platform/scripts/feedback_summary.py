@@ -217,9 +217,16 @@ MODEL_SEGMENT_SEPARATOR = "/"
 #: A name that starts with this is a Vertex AI endpoint path
 #: (``projects/<id>/locations/<region>/endpoints/<n>``): only its last segment is kept.
 MODEL_RESOURCE_PATH_PREFIX = "projects/"
+#: The shortest full path, ``projects/<p>/locations/<l>/<kind>/<id>``, in segments.
+MODEL_RESOURCE_PATH_MIN_SEGMENTS = 6
+#: Where a full path carries its ``locations`` segment.
+MODEL_RESOURCE_PATH_LOCATIONS_INDEX = 2
+MODEL_RESOURCE_PATH_LOCATIONS = "locations"
 #: A name segment that starts with this is a Bedrock ARN: only its resource id is kept.
 MODEL_ARN_PREFIX = "arn:"
 MODEL_ARN_FIELD_SEPARATOR = ":"
+#: A full ARN's field count: ``arn:partition:service:region:account:resource``.
+MODEL_ARN_FIELDS = 6
 FEEDBACK_TEMPLATE: Tuple[str, ...] = (
     "feedback:",
     "  Rating: [ 👍 / 👎 / 😐 ]",
@@ -377,20 +384,34 @@ def histogram_quantiles(samples: Iterable[Sample], family: str, quantiles: Seque
 def trim_model_name(name: str) -> str:
     """The name after the provider, with a resource reference cut to its resource id.
 
-    A Vertex AI endpoint path keeps the text after its last ``/``. A name with a
-    segment that starts with ``arn:`` keeps the text after its last ``/``, or,
-    when the ARN is the last segment, the text after its last ``:``. So no
-    project id, region or account id is printed. Every other name is kept as typed.
+    A reference must have its full shape, or the name is malformed and ``""``
+    comes back. A Vertex AI path needs ``projects/<p>/locations/<l>/<kind>/<id>``
+    at least and keeps the text after its last ``/``. A name with a segment that
+    starts with ``arn:`` needs six ``:`` fields from there
+    (``arn:partition:service:region:account:resource``) with a non-empty resource
+    part, and keeps the text after the resource part's last ``/``, or, without
+    one, the text after its last ``:``. So no project id, region or account id is
+    printed. Every other name is kept as typed.
     """
-    if name.startswith(MODEL_RESOURCE_PATH_PREFIX):
-        return name.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]
     segments = name.split(MODEL_SEGMENT_SEPARATOR)
+    if name.startswith(MODEL_RESOURCE_PATH_PREFIX):
+        if (
+            len(segments) < MODEL_RESOURCE_PATH_MIN_SEGMENTS
+            or segments[MODEL_RESOURCE_PATH_LOCATIONS_INDEX] != MODEL_RESOURCE_PATH_LOCATIONS
+        ):
+            return ""
+        return segments[-1]
     for index, segment in enumerate(segments):
         if not segment.startswith(MODEL_ARN_PREFIX):
             continue
-        if index < len(segments) - 1:
-            return name.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]
-        return segment.rsplit(MODEL_ARN_FIELD_SEPARATOR, 1)[-1]
+        arn = MODEL_SEGMENT_SEPARATOR.join(segments[index:])
+        fields = arn.split(MODEL_ARN_FIELD_SEPARATOR, MODEL_ARN_FIELDS - 1)
+        if len(fields) < MODEL_ARN_FIELDS or not fields[-1]:
+            return ""
+        resource = fields[-1]
+        if MODEL_SEGMENT_SEPARATOR in resource:
+            return resource.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]
+        return resource.rsplit(MODEL_ARN_FIELD_SEPARATOR, 1)[-1]
     return name
 
 

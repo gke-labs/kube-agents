@@ -11853,9 +11853,9 @@ spec:
                 inference:
                   description: |-
                     Inference reports the Platform Agent's default model, as the install's LiteLLM
-                    config states it. Both fields are absent until the operator reads the config; a
-                    read that fails keeps the last pair; both are absent while the served CRD
-                    predates them.
+                    config states it. The key is absent until the operator reads the config; an
+                    empty object means the config states no default model; a read that fails keeps
+                    what is there; the key is absent while the served CRD predates it.
                   properties:
                     model:
                       description: |-

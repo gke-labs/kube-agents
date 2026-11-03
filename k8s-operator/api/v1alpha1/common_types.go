@@ -2328,8 +2328,7 @@ type TelemetryStatus struct {
 //
 // A resource reference, a Vertex AI endpoint path or a Bedrock ARN, keeps its resource id
 // only, so a project id, a region or an account id never appears here. Both fields are
-// absent until the operator reads the config; a read that fails keeps the last pair; both
-// are absent while the served CRD predates them.
+// absent when the config states no default model.
 type InferenceStatus struct {
 	// Provider is the LiteLLM provider slug, the text before the first "/" of the
 	// default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
@@ -2455,18 +2454,12 @@ type AgentStatus struct {
 	// +optional
 	Usage AgentUsageStatus `json:"usage,omitempty"`
 
-	// Note, deliberately not a doc comment — the blank line below keeps it out of the
-	// CRD description that `kubectl explain` prints. As on the structs above, omitempty
-	// does nothing on a struct field, so this key is always serialised, as `{}` before
-	// the first reconcile; its own fields carry omitempty, so a pair nothing has read
-	// is absent rather than empty strings.
-
 	// Inference reports the Platform Agent's default model, as the install's LiteLLM
-	// config states it. Both fields are absent until the operator reads the config; a
-	// read that fails keeps the last pair; both are absent while the served CRD
-	// predates them.
+	// config states it. The key is absent until the operator reads the config; an
+	// empty object means the config states no default model; a read that fails keeps
+	// what is there; the key is absent while the served CRD predates it.
 	// +optional
-	Inference InferenceStatus `json:"inference,omitempty"`
+	Inference *InferenceStatus `json:"inference,omitempty"`
 }
 
 // AgentUsageStatus is the non-sensitive activity summary of an agent. Static
