@@ -89,9 +89,29 @@ MUTATIONS: list[Mutation] = [
         "agents/platform/scripts/credential_proxy.py",
         ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
          '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
-        "test_A3_the_profile_role_reaches_the_exec_route_alone",
+        "test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone",
         "let a profile worker read a proposal the way the MCP pod does -- a "
         "forge read no task target confines",
+    ),
+    Mutation(
+        "A3-profile-reaches-gke-mcp",
+        "agents/platform/scripts/mcp_policy.py",
+        ('    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n}',
+         '    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n'
+         '    "gke": GKE_READ_TOOLS,\n}'),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "let a profile worker call the gke MCP server, whose tools name any "
+        "project and cluster in their arguments, so a task confined to one "
+        "cluster could read every other",
+    ),
+    Mutation(
+        "A3-profile-mcp-without-task",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if profile and principal.task is None:\n",
+         "        if False:\n"),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "let a warm profile pod between tasks read through the MCP relay "
+        "with no task credential",
     ),
     Mutation(
         "A3-inject-auth",
@@ -526,8 +546,8 @@ Mutation(
     Mutation(
         "B1-mcp-relay-opened-to-the-sandbox",
         "agents/platform/scripts/credential_proxy.py",
-        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),\n",
-         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),\n",
+         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE, CALLER_ROLE_SHELL)),\n"),
         "test_B1_only_the_gateway_reaches_the_mcp_relay",
         "let the shell sandbox call MCP tools too, for a skill script -- every "
         "model-authored command then has a GKE read path it never had",

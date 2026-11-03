@@ -469,10 +469,27 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                     h.task_confinement.confine(argv, None, None)
         self.assertTrue(h.task_confinement.confine(["kubectl", "version", "--client"], None, None).isolated)
 
-    def test_A3_the_profile_role_reaches_the_exec_route_alone(self) -> None:
+    def test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone(self) -> None:
         profile = h.credential_proxy.CALLER_ROLE_PROFILE
-        reached = [prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles]
-        self.assertEqual(["/v1/exec"], reached)
+        reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
+        self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
+
+    def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
+        # The relay has no per-task target check, so a profile worker reaches
+        # only the servers whose tools name no cluster: Developer Knowledge's
+        # document reads. The gke server, whose tools take a project and
+        # cluster as arguments, stays out, and so does every write.
+        self.assertEqual(
+            {"developer_knowledge": frozenset({"get_documents", "search_documents"})},
+            h.mcp_policy.PROFILE_SERVER_TOOLS,
+        )
+        call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_k8s_resource"}}
+        self.assertFalse(h.mcp_policy.evaluate_for_profile("gke", call).allowed)
+        source = h.text("credential_proxy")
+        handler = source[source.index("def _handle_mcp_relay"):]
+        handler = handler[: handler.index("\n    def ", 1)]
+        self.assertIn("mcp_policy.evaluate_for_profile(server_name, message)", handler)
+        self.assertIn("principal.task is None", handler)
 
 
 class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):

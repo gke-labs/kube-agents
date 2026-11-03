@@ -571,11 +571,15 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         self.assertGreaterEqual(checked, 5, "the scan matched fewer remote servers than ship")
 
     def test_B1_only_the_gateway_reaches_the_mcp_relay(self) -> None:
-        """The relay is the gateway's: the sandbox and session pods get no new read path."""
+        """The relay is the gateway's: the sandbox and session pods get no new read path.
+
+        Profile workers are the one other role, narrowed in the handler to the
+        servers whose tools name no cluster (A3, PROFILE_SERVER_TOOLS, #3658).
+        """
         prefix = h.mcp_policy.MCP_RELAY_PREFIX
         self.assertEqual(
             h.credential_proxy.required_roles(prefix + "gke"),
-            (h.credential_proxy.CALLER_ROLE_CHAT,),
+            (h.credential_proxy.CALLER_ROLE_CHAT, h.credential_proxy.CALLER_ROLE_PROFILE),
         )
 
     def test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route(self) -> None:

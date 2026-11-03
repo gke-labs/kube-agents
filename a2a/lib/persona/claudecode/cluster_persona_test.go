@@ -59,10 +59,13 @@ func TestTheClusterPersonaRendersWhole(t *testing.T) {
 	if err := json.Unmarshal([]byte(flagValueRaw(t, out.Args, MCPConfigFlag)), &cfg); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"gke", "developer_knowledge"} {
-		if _, ok := cfg.MCPServers[name]; !ok {
-			t.Errorf("--mcp-config lacks %s", name)
-		}
+	if _, ok := cfg.MCPServers["developer_knowledge"]; !ok {
+		t.Error("--mcp-config lacks developer_knowledge")
+	}
+	// No gke server: its tools name any cluster, and the broker refuses it to
+	// profile workers (mcp_policy.PROFILE_SERVER_TOOLS).
+	if _, ok := cfg.MCPServers["gke"]; ok {
+		t.Error("--mcp-config carries gke, which the broker refuses to a profile worker")
 	}
 	if slices.Contains(out.Allowed, "mcp__developer_knowledge__answer_query") {
 		t.Error("answer_query is granted; the persona's include list leaves it out")
@@ -110,7 +113,7 @@ func TestTheClusterPersonaStatesItsRedLines(t *testing.T) {
 	text := load(t, clusterPersonaDir).Instructions
 	for what, phrase := range map[string]string{
 		"target cluster only":        "**The target cluster only.**",
-		"never wildcard the project": "`projects/-` is refused",
+		"never wildcard the project": "Every `gcloud` call names the task's `project`, always",
 		"read-only":                  "Never mutate cluster state",
 		"a denial is terminal":       "**A denial is terminal.**",
 		"a refused read is a gap":    "re-run it with a spelling the policy allows, or report it as a gap",

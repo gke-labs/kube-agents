@@ -37,10 +37,11 @@ same test checks both. The skills run their scripts by skill-relative paths
 What it holds:
 
 - [`persona.yaml`](persona.yaml): the manifest, with the three parameters and
-  the tools it grants (`read_file`, `shell`, `web_search` and the two servers);
+  the tools it grants (`read_file`, `shell`, `web_search` and `developer_knowledge`);
 - [`instructions.md`](instructions.md): the instructions;
-- [`mcp.yaml`](mcp.yaml): the `gke` and `developer_knowledge` servers on the
-  broker's relay, each limited to its read tools;
+- [`mcp.yaml`](mcp.yaml): the `developer_knowledge` server on the broker's
+  relay, limited to its two document reads. There is no `gke` server, because
+  its tools name any cluster; `kubectl` and `gcloud` reach the task's target;
 - the skills:
   [`gke-load-bearing-change`](skills/gke-load-bearing-change/SKILL.md),
   [`gke-observability`](skills/gke-observability/SKILL.md),
