@@ -9863,6 +9863,54 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
                 self.assertTrue(kubeconfig.endswith(".yaml"), command)
                 self.assertEqual(collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), command)
 
+    def test_the_two_reads_are_paged_raw_reads_one_kind_at_a_time(self):
+        """The real paging, not the module's adapter: the workload dump and
+        the Service dump each go out as `kubectl get --raw` collection pages,
+        one kind at a time, and each record names that paged read under the
+        cluster's kubeconfig. A `_collect_ai_security` that went back to a
+        one-shot `kubectl get <kinds> -A -o json` for either passes every
+        other test in this class, because the adapter answers that argv;
+        here it fails."""
+        issued = []
+        # One AI workload on the deployments page, as a raw list carries it
+        # (no `kind`), so the workload checks have something to examine.
+        workload = {k: v for k, v in ai_workload().items() if k not in ("kind", "apiVersion")}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                items = [workload] if argv[3].startswith("/apis/apps/v1/deployments?") else []
+                return Run(argv, 0, json.dumps({"metadata": {}, "items": items}), "", 0.01)
+            if argv[:2] == ["kubectl", "get"] and argv[2] in (collect.COMPLIANCE_DUMP_KINDS, collect.SERVICE_DUMP_KINDS):
+                raise AssertionError(f"a one-shot dump was issued: {argv}")
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump):
+            result = collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(
+            [
+                "/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/statefulsets?limit=500",
+                "/apis/apps/v1/daemonsets?limit=500", "/apis/batch/v1/cronjobs?limit=500", "/api/v1/pods?limit=500",
+                "/api/v1/services?limit=500",
+            ],
+            raw,
+        )
+        commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
+        kubeconfig = re.search(r"KUBECONFIG=([^\s;]+)", commands_by_slug["inference-endpoint-public"]).group(1)
+        self.assertTrue(kubeconfig.startswith(tmp), kubeconfig)
+        self.assertEqual(
+            collect.paged_command_text(collect.SERVICE_DUMP_KINDS.split(","), kubeconfig=kubeconfig),
+            commands_by_slug["inference-endpoint-public"],
+        )
+        workload_slugs = [slug for slug in commands_by_slug if slug != "inference-endpoint-public"]
+        self.assertTrue(workload_slugs, commands_by_slug)
+        for slug in workload_slugs:
+            self.assertEqual(collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), commands_by_slug[slug], slug)
+
 
 class TestEvidenceCommandsArePasteable(unittest.TestCase):
     """Every published command is an offer: run this and see what we saw.
