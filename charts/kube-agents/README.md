@@ -976,6 +976,16 @@ entry included. A change rolls the agent pod and the credential-proxy pod. The
 [watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
 gives each setting's meaning and default.
 
+`platformAgent.deployment.incidentWorkloadDedupSeconds` is the window in which a broken workload's
+later events fold into its open incident, rendered as the `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry
+in `spec.deployment.env`. It defaults to `3600`, so a default render carries that entry; `0` turns
+folding off, the most is `86400`, and `null` renders no entry and leaves the agent image's own
+default, the same hour. The same precedence rules as the ceilings apply: an entry of that name in
+`platformAgent.deployment.env` wins, and a `valueFrom` entry for it fails the render while the key
+is set. The
+[chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#one-incident-per-workload)
+has the fold rules.
+
 #### PlatformAgent annotations
 
 `platformAgent.annotations` is copied onto the CR's `metadata.annotations`, and

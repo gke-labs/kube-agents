@@ -467,8 +467,8 @@ FIXTURE_NOT_READY = {
         "both paths, so no CI tier can run it; run it by hand against such an install"
     ),
     "incident-triage-open-pr-reminder": (
-        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true and "
-        "INCIDENT_WORKLOAD_DEDUP_SECONDS above 0 in spec.deployment.env and a GitOps repository "
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env "
+        "(INCIDENT_WORKLOAD_DEDUP_SECONDS on, which is its default) and a GitOps repository "
         "declaring eval-pr-reminder-workload; every CI eval install leaves "
         "INCIDENT_TRIAGE_OPEN_PULL_REQUEST off and no pool *-infra repository declares it, so no CI "
         "tier can run it; run it by hand against such an install"

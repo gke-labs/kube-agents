@@ -67,6 +67,14 @@ const (
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
+	// incidentWorkloadDedupDefaultSeconds is the default INCIDENT_WORKLOAD_DEDUP_SECONDS:
+	// the seconds an admitted event folds its workload's later events into
+	// one incident (session_kv_server.py). Rendered into the platform
+	// container so the window is on for every install and visible on the
+	// Deployment; the daemon's own fallback is the same hour. A
+	// spec.deployment.env entry replaces it (mergeEnvVars), and "0" turns
+	// folding off.
+	incidentWorkloadDedupDefaultSeconds = "3600"
 	// credentialProxyMaxOutputBytes caps each stream a brokered command returns,
 	// and what the broker keeps of it while the command runs;
 	// credentialProxyMaxConcurrentCommands caps how many commands run at once.
@@ -2929,6 +2937,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Name:  "GITOPS_STATE_PATH",
 			Value: path.Join(gitopsStateDir, "managed_repos"),
 		},
+		{
+			Name:  "INCIDENT_WORKLOAD_DEDUP_SECONDS",
+			Value: incidentWorkloadDedupDefaultSeconds,
+		},
 	}
 
 	// Two of the three exceptions to "no credentials in the sandbox", and the
@@ -5183,9 +5195,12 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 
 		// Seconds a workload's admitted event folds its later events into
 		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in
-		// session_kv_server.py). Parsed as a whole number and capped at a
-		// day, and a value that does not parse means off, so it bounds a
-		// count of chat messages and triage turns and reaches nothing else.
+		// session_kv_server.py). The container carries the default
+		// (incidentWorkloadDedupDefaultSeconds); an entry here replaces it,
+		// and "0" turns folding off. Parsed as a whole number and capped at a
+		// day, and a value that does not parse means the default, so it
+		// bounds a count of chat messages and triage turns and reaches
+		// nothing else.
 		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
 
 		// "true" has an event triage also file a card that opens the

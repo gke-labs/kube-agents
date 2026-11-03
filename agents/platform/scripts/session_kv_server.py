@@ -959,12 +959,17 @@ ALERT_DAILY_LIMITS = {
 # every replacement pod and every reason in a cascade opens a triage of its own.
 # The window runs from the anchor, not from the latest duplicate, so a new pod
 # or reason from a workload that keeps failing is announced again once the
-# window has passed. 0, the default, turns
-# folding off; a negative or unparseable value reads as the default, the same
-# parse the daily ceilings use. Capped at a day, the watcher's own dedup window.
+# window has passed. On by default at an hour, which the operator also renders
+# into the container's env (platformagent_manifests.go) and the chart exposes
+# as platformAgent.deployment.incidentWorkloadDedupSeconds; 0 turns folding
+# off. A negative value reads as 0 and an unparseable one as the default, the
+# same parse the daily ceilings use. Capped at a day, the watcher's own dedup
+# window.
+INCIDENT_WORKLOAD_DEDUP_DEFAULT_SECONDS = 3600
 INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS = 86400
 INCIDENT_WORKLOAD_DEDUP_SECONDS = min(
-    _alert_daily_limit("INCIDENT_WORKLOAD_DEDUP_SECONDS", 0), INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS
+    _alert_daily_limit("INCIDENT_WORKLOAD_DEDUP_SECONDS", INCIDENT_WORKLOAD_DEDUP_DEFAULT_SECONDS),
+    INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS,
 )
 # A pod named like a Deployment's for display: 8-10 hex characters, then the
 # pod's own suffix (`checkout-6cfdb6b98b-zwv24` -> `checkout`). clean_workload_name
@@ -1019,6 +1024,20 @@ FIX_PR_INCIDENTS_SCANNED = 5
 # The forge lookup's budget for the whole search; past it the event is
 # announced as a new incident, the same answer as no fix at all.
 FIX_PR_LOOKUP_TIMEOUT_S = 8.0
+# The forge calls run on this many daemon workers (_FixPullRequestLookupPool)
+# rather than on a thread per call: a burst of events for workloads with a
+# fix in review would otherwise start one thread each, every one of them held
+# on the forge for up to FIX_PR_LOOKUP_TIMEOUT_S.
+FIX_PR_LOOKUP_WORKERS = 4
+# How many lookups may wait for a worker. A call that finds the queue full
+# answers None, which announces the event: the same fail-open answer as a
+# forge that is slow.
+FIX_PR_LOOKUP_QUEUE_MAX = 64
+# How long a pull request's state is reused for. Every replica of a workload
+# whose fix is in review asks about the same URL within seconds of each
+# other, so one forge call answers the burst; the cost is that a pull request
+# merged within the last minute can still hold one recurrence.
+FIX_PR_STATE_CACHE_TTL_S = 60.0
 # session_metadata key on the held incident's session: when its thread was last
 # reminded that the fix is waiting, so it is reminded at most once per window.
 FIX_PR_REMINDED_AT_KEY = "fix_pr_reminded_at"
@@ -1641,6 +1660,32 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_intercepted_events_session_id "
                 "ON intercepted_events (session_id)"
             )
+            # The workload fold's lookups, both on the inject route and the
+            # first under _WORKLOAD_FOLD_LOCK, so every event waited on them:
+            # without these each is a scan of the whole ledger, and the route's
+            # latency grew with the table until the watcher's inject timed out.
+            # Partial, so each holds only the rows that can answer: an anchor
+            # has a fold_key (the start-up clear below empties the first index
+            # again), an incident with a fix has a workload_key, and only a
+            # folded row has a duplicate_of. The queries spell the WHERE term
+            # as a literal (`fold_key != ''`, `workload_key != ''`,
+            # `duplicate_of > 0`) next to their bound parameters, because SQLite
+            # matches a partial index's WHERE against the query's text. `id DESC`
+            # serves the `ORDER BY id DESC LIMIT` without a sort.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_fold_anchor "
+                "ON intercepted_events (cluster, namespace, object_kind, fold_key, id DESC) "
+                "WHERE fold_key != ''"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_workload_incident "
+                "ON intercepted_events (cluster, namespace, object_kind, workload_key, id DESC) "
+                "WHERE workload_key != ''"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_duplicate_reason "
+                "ON intercepted_events (duplicate_of, reason) WHERE duplicate_of > 0"
+            )
             # Today's alert budget per severity. In the database rather than in
             # memory because this table's whole job is to survive a restart:
             # the session server goes down with its container, and an in-memory
@@ -1769,7 +1814,9 @@ def init_db() -> None:
             # all: a workload whose triage did start loses its window, which
             # costs one more triage (per severity: a Critical folds only into a
             # Critical) for a sibling that arrives after
-            # the restart, and is noise rather than silence.
+            # the restart, and is noise rather than silence. The WHERE is the
+            # fold-anchor index's own term, so the clear walks that index and
+            # not the table.
             conn.execute("UPDATE intercepted_events SET fold_key = '' WHERE fold_key != ''")
             findings_queue.init_findings_schema(conn)
             _purge_plaintext_identities(conn)
@@ -2099,37 +2146,128 @@ def _incident_pull_request_urls(session_id: str) -> list[str]:
     return urls
 
 
-def _proposal_state(url: str, timeout: float) -> Optional[str]:
-    """The forge's state for the pull request at `url`, or None when it cannot say in time."""
+class _FixPullRequestLookup:
+    """One pull request's state read in flight: whoever asks for the URL waits on it."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.state: Optional[str] = None
+
+
+class _FixPullRequestLookupPool:
+    """`FIX_PR_LOOKUP_WORKERS` daemon threads reading pull request states, with a per-URL cache.
+
+    Daemon threads, not a ThreadPoolExecutor: a forge call that outlives a
+    caller's budget is abandoned by that caller, and an executor's worker would
+    hold a restart until it ends (forge's own hop allows FORWARD_TIMEOUT_S an
+    attempt). The queue is bounded (FIX_PR_LOOKUP_QUEUE_MAX), so a forge that
+    stops answering cannot pile up lookups behind the four workers.
+
+    A URL is asked of the forge once per FIX_PR_STATE_CACHE_TTL_S: a state read
+    within the window is answered from the cache, and callers that arrive while
+    a read is in flight wait on that read rather than starting their own. Only
+    a state the forge gave is cached; a failed or abandoned read leaves nothing
+    behind, so the next caller asks again.
+    """
+
+    def __init__(self, workers: int, queue_max: int, ttl_s: float):
+        self._queue: "queue.Queue[tuple[str, _FixPullRequestLookup]]" = queue.Queue(maxsize=queue_max)
+        self._ttl_s = ttl_s
+        self._lock = threading.Lock()
+        # url -> (monotonic expiry, state)
+        self._cache: Dict[str, tuple[float, str]] = {}
+        self._in_flight: Dict[str, _FixPullRequestLookup] = {}
+        self.threads = [
+            threading.Thread(target=self._work, name=f"fix-pr-lookup-{i}", daemon=True) for i in range(workers)
+        ]
+        for thread in self.threads:
+            thread.start()
+
+    def state(self, url: str, timeout: float) -> Optional[str]:
+        """The cached or freshly read state of `url`, or None when it is not known within `timeout`."""
+        now = time.monotonic()
+        with self._lock:
+            cached = self._cache.get(url)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            lookup = self._in_flight.get(url)
+            if lookup is None:
+                lookup = _FixPullRequestLookup()
+                try:
+                    self._queue.put_nowait((url, lookup))
+                except queue.Full:
+                    logger.warning(f"Could not read the state of {url}: {self._queue.maxsize} lookups already waiting")
+                    return None
+                self._in_flight[url] = lookup
+        if not lookup.done.wait(timeout):
+            logger.warning(f"Could not read the state of {url} within {timeout:.1f}s")
+            return None
+        return lookup.state
+
+    def forget(self) -> None:
+        """Drop every cached state (tests, between cases)."""
+        with self._lock:
+            self._cache.clear()
+
+    def _work(self) -> None:
+        while True:
+            url, lookup = self._queue.get()
+            state = None
+            try:
+                state = _read_proposal_state(url)
+            except Exception:
+                logger.exception(f"Pull request lookup worker raised on {url}")
+            with self._lock:
+                if state is not None:
+                    self._cache[url] = (time.monotonic() + self._ttl_s, state)
+                if self._in_flight.get(url) is lookup:
+                    del self._in_flight[url]
+            lookup.state = state
+            lookup.done.set()
+
+
+_FIX_PR_LOOKUP_POOL: Optional[_FixPullRequestLookupPool] = None
+_FIX_PR_LOOKUP_POOL_LOCK = threading.Lock()
+
+
+def _fix_pr_lookup_pool() -> _FixPullRequestLookupPool:
+    global _FIX_PR_LOOKUP_POOL
+    with _FIX_PR_LOOKUP_POOL_LOCK:
+        if _FIX_PR_LOOKUP_POOL is None:
+            _FIX_PR_LOOKUP_POOL = _FixPullRequestLookupPool(
+                FIX_PR_LOOKUP_WORKERS, FIX_PR_LOOKUP_QUEUE_MAX, FIX_PR_STATE_CACHE_TTL_S
+            )
+        return _FIX_PR_LOOKUP_POOL
+
+
+def _read_proposal_state(url: str) -> Optional[str]:
+    """Ask the forge for the state of the pull request at `url`; None when it has none to give."""
     match = PROPOSAL_URL_RE.match(url)
-    if match is None or timeout <= 0:
+    if match is None:
         return None
-    # A daemon thread, not a ThreadPoolExecutor: a forge call that outlives the
-    # budget is abandoned, and an executor's worker would hold a restart until
-    # it ends (forge's own hop allows FORWARD_TIMEOUT_S an attempt).
-    answer: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def _view() -> None:
-        try:
-            import forge
-
-            view = forge.call("proposal-view", {"number": int(match.group(2))}, match.group(1), retry_transient=True)
-            answer.put((True, view))
-        except Exception as exc:
-            answer.put((False, exc))
-
-    threading.Thread(target=_view, name="fix-pr-lookup", daemon=True).start()
     try:
-        ok, result = answer.get(timeout=timeout)
-    except queue.Empty:
-        logger.warning(f"Could not read the state of {url} within {timeout:.1f}s")
+        import forge
+
+        view = forge.call("proposal-view", {"number": int(match.group(2))}, match.group(1), retry_transient=True)
+    except Exception as exc:
+        logger.warning(f"Could not read the state of {url}: {exc!r}")
         return None
-    if not ok:
-        logger.warning(f"Could not read the state of {url}: {result!r}")
-        return None
-    proposal = (result.get("proposal") if isinstance(result, dict) else None) or {}
+    proposal = (view.get("proposal") if isinstance(view, dict) else None) or {}
     state = proposal.get("state") if isinstance(proposal, dict) else None
     return state if isinstance(state, str) else None
+
+
+def _proposal_state(url: str, timeout: float) -> Optional[str]:
+    """The forge's state for the pull request at `url`, or None when it cannot say in time.
+
+    Read through _FixPullRequestLookupPool: at most FIX_PR_LOOKUP_WORKERS forge
+    calls at once, one per URL per FIX_PR_STATE_CACHE_TTL_S. The caller waits
+    only its own `timeout`; a read that outlives it still lands in the cache
+    for the next caller.
+    """
+    if PROPOSAL_URL_RE.match(url) is None or timeout <= 0:
+        return None
+    return _fix_pr_lookup_pool().state(url, timeout)
 
 
 def _open_fix_pull_request(
@@ -2156,13 +2294,19 @@ def _open_fix_pull_request(
         return None
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            # `workload_key != ''` and `duplicate_of > 0` are the partial
+            # indexes' terms (init_db); the correlated EXISTS reads the
+            # duplicate index once per candidate incident rather than
+            # materialising every folded row's anchor.
             incidents = conn.execute(
-                "SELECT id, session_id FROM intercepted_events "
-                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND workload_key = ? "
-                "AND (reason = ? OR id IN (SELECT duplicate_of FROM intercepted_events WHERE reason = ? AND duplicate_of > 0)) "
-                "AND (? != ? OR severity = ?) "
-                "AND duplicate_of IS NULL AND (notified != 0 OR delivery_error != '') AND session_id != '' "
-                "ORDER BY id DESC LIMIT ?",
+                "SELECT e.id, e.session_id FROM intercepted_events AS e "
+                "WHERE e.cluster = ? AND e.namespace = ? AND e.object_kind = ? "
+                "AND e.workload_key = ? AND e.workload_key != '' "
+                "AND (e.reason = ? OR EXISTS (SELECT 1 FROM intercepted_events AS d "
+                "WHERE d.duplicate_of = e.id AND d.duplicate_of > 0 AND d.reason = ?)) "
+                "AND (? != ? OR e.severity = ?) "
+                "AND e.duplicate_of IS NULL AND (e.notified != 0 OR e.delivery_error != '') AND e.session_id != '' "
+                "ORDER BY e.id DESC LIMIT ?",
                 (
                     cluster,
                     namespace,
@@ -2301,9 +2445,10 @@ def _workload_incident_anchor(
         return None
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            # `fold_key != ''` is the fold-anchor index's term (init_db).
             row = conn.execute(
                 "SELECT id FROM intercepted_events "
-                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND fold_key = ? "
+                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND fold_key = ? AND fold_key != '' "
                 "AND (? != ? OR severity = ?) "
                 "AND (notified != 0 OR delivery_error != '') "
                 "AND created_at >= datetime('now', ?) "

@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -2341,6 +2342,9 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
         self.trigger = trigger.start()
         self.addCleanup(trigger.stop)
+        # The pull request lookup pool caches a state for a minute; a test
+        # that asks the forge must not be answered by the last one's reading.
+        session_kv_server._fix_pr_lookup_pool().forget()
 
     def tearDown(self):
         os.environ.pop("SESSION_KV_API_KEY", None)
@@ -2604,7 +2608,8 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         self.assertEqual(reply["duplicate_of"], str(anchor_id))
 
     def test_with_folding_off_nothing_is_held_or_looked_up(self):
-        with patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 0), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
             self.assertEqual(self._inject("offfix-api-6cfdb6b98b-aaaaa")["status"], "injected")
             self.assertEqual(self._inject("offfix-api-6cfdb6b98b-bbbbb")["status"], "injected")
         state.assert_not_called()
@@ -2663,6 +2668,10 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.assertEqual(self._inject("deadline-api-6cfdb6b98b-ccccc")["status"], "injected")
         self.assertEqual(state.call_count, 1)
 
+    def _lookup_url(self, tag):
+        """A pull request URL no other test asks about, so the pool's cache cannot answer for it."""
+        return f"https://github.com/acme/fleet-{tag}/pull/{abs(hash(tag)) % 9000 + 1}"
+
     def test_the_forge_is_asked_for_the_pull_request_and_its_state_read(self):
         forge = MagicMock()
         forge.call.return_value = {"proposal": {"state": "open"}}
@@ -2677,12 +2686,14 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.assertEqual(forge.call.call_args.args[1:], ({"number": 12}, "https://gitlab.example.com/acme/fleet"))
 
     def test_a_forge_that_fails_or_overruns_reads_as_no_state(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
         forge = MagicMock()
         with patch.dict(sys.modules, {"forge": forge}):
             forge.call.side_effect = RuntimeError("forge down")
-            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 5))
-            forge.call.side_effect = lambda *a, **k: time.sleep(0.5) or {"proposal": {"state": "open"}}
-            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 0.05))
+            self.assertIsNone(session_kv_server._proposal_state(self._lookup_url("down"), 5))
+            forge.call.side_effect = lambda *a, **k: release.wait(5) and {"proposal": {"state": "open"}}
+            self.assertIsNone(session_kv_server._proposal_state(self._lookup_url("slow"), 0.05))
             forge.call.reset_mock()
             self.assertIsNone(session_kv_server._proposal_state("https://github.com/acme/fleet/issues/7", 5))
             forge.call.assert_not_called()
@@ -2805,16 +2816,136 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             with self.subTest(url=not_a_proposal):
                 self.assertIsNone(session_kv_server.PROPOSAL_URL_RE.match(not_a_proposal))
 
+    def test_a_failed_read_is_not_cached(self):
+        url = self._lookup_url("retry")
+        forge = MagicMock()
+        forge.call.side_effect = [RuntimeError("forge down"), {"proposal": {"state": "open"}}]
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertIsNone(session_kv_server._proposal_state(url, 5))
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+        self.assertEqual(forge.call.call_count, 2)
+
     def test_an_abandoned_forge_call_cannot_hold_a_restart(self):
         release = threading.Event()
         forge = MagicMock()
         forge.call.side_effect = lambda *a, **k: release.wait(5) and {}
         self.addCleanup(release.set)
         with patch.dict(sys.modules, {"forge": forge}):
-            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 0.05))
-        workers = [t for t in threading.enumerate() if t.name == "fix-pr-lookup"]
-        self.assertTrue(workers, "the overrunning call has no thread left to inspect")
+            self.assertIsNone(session_kv_server._proposal_state(self._lookup_url("held"), 0.05))
+        workers = session_kv_server._fix_pr_lookup_pool().threads
+        self.assertEqual(len(workers), session_kv_server.FIX_PR_LOOKUP_WORKERS)
         self.assertTrue(all(t.daemon for t in workers), "a non-daemon worker is joined at interpreter exit")
+        self.assertTrue(all(t.is_alive() for t in workers), "an abandoned call must not end its worker")
+
+    def test_a_cached_state_makes_no_forge_call(self):
+        url = self._lookup_url("cached")
+        forge = MagicMock()
+        forge.call.return_value = {"proposal": {"state": "open"}}
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+        forge.call.assert_called_once()
+
+    def test_a_stale_cache_entry_is_read_again(self):
+        url = self._lookup_url("stale")
+        pool = session_kv_server._fix_pr_lookup_pool()
+        forge = MagicMock()
+        forge.call.side_effect = [{"proposal": {"state": "open"}}, {"proposal": {"state": "merged"}}]
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+            with pool._lock:
+                expires_at, state = pool._cache[url]
+                self.assertEqual(state, "open")
+                self.assertAlmostEqual(
+                    expires_at - time.monotonic(), session_kv_server.FIX_PR_STATE_CACHE_TTL_S, delta=5
+                )
+                pool._cache[url] = (time.monotonic() - 1, state)
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "merged")
+        self.assertEqual(forge.call.call_count, 2)
+
+    def test_callers_waiting_on_the_same_url_share_one_forge_call(self):
+        url = self._lookup_url("shared")
+        release = threading.Event()
+        self.addCleanup(release.set)
+        forge = MagicMock()
+        forge.call.side_effect = lambda *a, **k: release.wait(5) and {"proposal": {"state": "open"}}
+        answers = []
+        with patch.dict(sys.modules, {"forge": forge}):
+            callers = [
+                threading.Thread(target=lambda: answers.append(session_kv_server._proposal_state(url, 5)))
+                for _ in range(3)
+            ]
+            for caller in callers:
+                caller.start()
+            deadline = time.monotonic() + 5
+            while forge.call.call_count < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            release.set()
+            for caller in callers:
+                caller.join(5)
+        self.assertEqual(answers, ["open"] * 3)
+        forge.call.assert_called_once()
+
+    def test_at_most_four_forge_calls_run_at_once(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        started = threading.Semaphore(0)
+        forge = MagicMock()
+
+        def blocked(*a, **k):
+            started.release()
+            release.wait(5)
+            return {"proposal": {"state": "open"}}
+
+        forge.call.side_effect = blocked
+        urls = [self._lookup_url(f"burst-{i}") for i in range(8)]
+        with patch.dict(sys.modules, {"forge": forge}):
+            callers = [
+                threading.Thread(target=session_kv_server._proposal_state, args=(url, 5)) for url in urls
+            ]
+            for caller in callers:
+                caller.start()
+            for _ in range(session_kv_server.FIX_PR_LOOKUP_WORKERS):
+                self.assertTrue(started.acquire(timeout=5))
+            time.sleep(0.1)
+            in_flight = forge.call.call_count
+            release.set()
+            for caller in callers:
+                caller.join(5)
+        self.assertEqual(in_flight, session_kv_server.FIX_PR_LOOKUP_WORKERS)
+        self.assertEqual(forge.call.call_count, len(urls))
+        self.assertEqual(session_kv_server.FIX_PR_LOOKUP_WORKERS, 4)
+
+    def test_a_full_queue_fails_open(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        started = threading.Event()
+        forge = MagicMock()
+
+        def blocked(*a, **k):
+            started.set()
+            release.wait(5)
+            return {"proposal": {"state": "open"}}
+
+        forge.call.side_effect = blocked
+        pool = session_kv_server._FixPullRequestLookupPool(workers=1, queue_max=1, ttl_s=60)
+        with patch.dict(sys.modules, {"forge": forge}):
+            with patch.object(session_kv_server, "_FIX_PR_LOOKUP_POOL", pool):
+                # The worker takes the first, the queue holds the second, and the
+                # third has nowhere to wait: None at once, not after its budget.
+                threading.Thread(target=session_kv_server._proposal_state, args=(self._lookup_url("q1"), 5)).start()
+                self.assertTrue(started.wait(5))
+                threading.Thread(target=session_kv_server._proposal_state, args=(self._lookup_url("q2"), 5)).start()
+                deadline = time.monotonic() + 5
+                while not pool._queue.full() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(pool._queue.full(), "the second lookup never reached the queue")
+                before = time.monotonic()
+                self.assertIsNone(session_kv_server._proposal_state(self._lookup_url("q3"), 5))
+                self.assertLess(time.monotonic() - before, 1)
+                release.set()
 
     def test_the_pull_request_constants_match_the_plugin_that_writes_them(self):
         plugin_path = Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
@@ -2829,10 +2960,28 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         self.assertEqual(session_kv_server.PROPOSAL_OPEN_STATE, vcs_broker.OPEN_PROPOSAL_STATE)
         self.assertEqual(session_kv_server.PROPOSAL_URL_RE.pattern, plugin.PROPOSAL_URL.pattern)
 
-    def test_off_by_default(self):
-        self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS, 0)
-        for pod in ("off-api-6cfdb6b98b-aaaaa", "off-api-6cfdb6b98b-bbbbb"):
-            self.assertEqual(self._inject(pod)["status"], "injected")
+    def test_on_by_default_at_an_hour(self):
+        # The daemon's own fallback, which the operator's rendered default and the
+        # chart's key repeat (platformagent_manifests.go, values.yaml).
+        self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_DEFAULT_SECONDS, 3600)
+        self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS, 3600)
+        with patch.dict(os.environ, {"INCIDENT_WORKLOAD_DEDUP_SECONDS": ""}):
+            self.assertEqual(
+                session_kv_server._alert_daily_limit(
+                    "INCIDENT_WORKLOAD_DEDUP_SECONDS", session_kv_server.INCIDENT_WORKLOAD_DEDUP_DEFAULT_SECONDS
+                ),
+                3600,
+            )
+        self.assertEqual(self._inject("default-api-6cfdb6b98b-aaaaa")["status"], "injected")
+        self.assertEqual(self._inject("default-api-6cfdb6b98b-bbbbb")["status"], "folded")
+        self.assertEqual(self.trigger.call_count, 1)
+        rows = self._rows("default-api")
+        self.assertEqual([r[3] for r in rows], [None, rows[0][0]])
+
+    def test_zero_turns_folding_off(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 0):
+            for pod in ("off-api-6cfdb6b98b-aaaaa", "off-api-6cfdb6b98b-bbbbb"):
+                self.assertEqual(self._inject(pod)["status"], "injected")
         self.assertEqual(self.trigger.call_count, 2)
         self.assertEqual([r[3] for r in self._rows("off-api")], [None, None])
 
@@ -3102,6 +3251,192 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         ]
         self.assertEqual([e["status"] for e in events], ["folded", "injected"])
         self.assertEqual([e["duplicate_of"] for e in events], [events[1]["id"], None])
+
+
+class _RecordingConnection(sqlite3.Connection):
+    """A connection that keeps every statement it ran, for EXPLAIN QUERY PLAN."""
+
+    statements: list = []
+
+    def execute(self, sql, parameters=(), /):
+        type(self).statements.append((sql, tuple(parameters)))
+        return super().execute(sql, parameters)
+
+
+def _table_scans(conn, sql, params):
+    """The EXPLAIN QUERY PLAN lines that walk the ledger itself rather than an index."""
+    plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()]
+    return [line for line in plan if line.startswith("SCAN") and "USING" not in line], plan
+
+
+class TestWorkloadFoldQueryPlans(unittest.TestCase):
+    """The fold's lookups read the ledger through the partial indexes init_db creates.
+
+    Each ran as a scan of the whole table, on the inject route and under
+    _WORKLOAD_FOLD_LOCK, so the route's latency grew with the ledger until the
+    watcher's inject timed out. The plan is read for the statement the code
+    actually runs, recorded off a connection subclass, so a reworded query
+    that loses the index's literal term fails here.
+    """
+
+    def setUp(self):
+        _RecordingConnection.statements = []
+        self.real_connect = sqlite3.connect
+
+        def recording_connect(path, *args, **kwargs):
+            kwargs["factory"] = _RecordingConnection
+            return self.real_connect(path, *args, **kwargs)
+
+        patcher = patch.object(session_kv_server.sqlite3, "connect", side_effect=recording_connect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _recorded(self, verb, fragment):
+        for sql, params in _RecordingConnection.statements:
+            if sql.lstrip().upper().startswith(verb) and fragment in sql:
+                return sql, params
+        self.fail(f"no {verb} statement containing {fragment!r} was run: {_RecordingConnection.statements}")
+
+    def test_the_three_indexes_exist(self):
+        with self.real_connect(temp_db_path) as conn:
+            names = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'intercepted_events'"
+            )}
+        self.assertLessEqual({
+            "idx_intercepted_events_fold_anchor",
+            "idx_intercepted_events_workload_incident",
+            "idx_intercepted_events_duplicate_reason",
+        }, names)
+
+    def test_the_anchor_lookup_searches_the_fold_index(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 900):
+            session_kv_server._workload_incident_anchor("c1", "ns", "Pod", "api", "Warning")
+        sql, params = self._recorded("SELECT", "fold_key = ?")
+        with self.real_connect(temp_db_path) as conn:
+            scans, plan = _table_scans(conn, sql, params)
+        self.assertEqual(scans, [], plan)
+        self.assertTrue(any("idx_intercepted_events_fold_anchor" in line for line in plan), plan)
+
+    def test_the_open_fix_lookup_searches_the_workload_and_duplicate_indexes(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 900), \
+                patch.object(session_kv_server, "_incident_pull_request_urls", return_value=[]):
+            session_kv_server._open_fix_pull_request("c1", "ns", "Pod", "api", "BackOff", "Warning")
+        sql, params = self._recorded("SELECT", "workload_key = ?")
+        self.assertNotIn(" IN (SELECT", sql)
+        self.assertIn("EXISTS", sql)
+        with self.real_connect(temp_db_path) as conn:
+            scans, plan = _table_scans(conn, sql, params)
+        self.assertEqual(scans, [], plan)
+        self.assertTrue(any("idx_intercepted_events_workload_incident" in line for line in plan), plan)
+        self.assertTrue(any("idx_intercepted_events_duplicate_reason" in line for line in plan), plan)
+
+    def test_the_startup_clear_walks_the_fold_index(self):
+        session_kv_server.init_db()
+        sql, params = self._recorded("UPDATE", "SET fold_key = ''")
+        with self.real_connect(temp_db_path) as conn:
+            scans, plan = _table_scans(conn, sql, params)
+        self.assertEqual(scans, [], plan)
+        self.assertTrue(any("idx_intercepted_events_fold_anchor" in line for line in plan), plan)
+
+
+# The ledger sizes the benchmark compares: a quiet install and the row cap a
+# busy fleet reaches in days (LEDGER_MAX_ROWS).
+_BENCH_SMALL_ROWS = 1_000
+_BENCH_LARGE_ROWS = 200_000
+# Lookups timed per size; p99 over them is the next-to-slowest sample.
+_BENCH_LOOKUPS = 100
+_BENCH_SESSIONS = 30
+# The bound at the cap is the larger of a floor and a multiple of the same
+# measurement on the small ledger, so a loaded runner that slows both alike
+# still passes and a scan that slows only the large one still fails. Measured
+# on a laptop: indexed p99 1.6 ms and 15 ms at the cap against 0.9 ms and
+# 1.2 ms at a thousand rows; unindexed, 67 ms and 681 ms at the cap.
+_BENCH_LOOKUP_P99_FLOOR_S = 0.05
+# POST /sessions commits a row and runs the ledger cleanup, so its floor is an
+# fsync, which a CI disk can take a tenth of a second over; the bound is on
+# growth with the ledger, not the disk.
+_BENCH_SESSION_P99_FLOOR_S = 0.5
+_BENCH_GROWTH_LIMIT = 5
+# How many distinct workloads the rows spread over, per cluster and namespace.
+_BENCH_WORKLOADS = 500
+
+
+def _p99(samples):
+    ordered = sorted(samples)
+    return ordered[min(len(ordered) - 1, int(len(ordered) * 0.99))]
+
+
+class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
+    """The fold's lookups and POST /sessions stay fast as the ledger grows to its cap.
+
+    Ties the index change to the symptom the fleet saw (inject latency growing
+    with the ledger): each lookup's p99 on a 200,000-row ledger stays under a
+    budget a full scan cannot meet.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def _ledger(self, rows):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(lambda: [os.path.exists(p) and os.remove(p) for p in (path, path + "-wal", path + "-shm")])
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", path):
+            session_kv_server.init_db()
+        with sqlite3.connect(path) as conn, conn:
+            conn.executemany(
+                "INSERT INTO intercepted_events (cluster, namespace, workload, object_uid, object_kind, reason, "
+                "message, severity, occurrences, notified, session_id, duplicate_of, fold_key, workload_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, NULL, ?, ?)",
+                (
+                    (
+                        f"c{i % 3}", f"ns{i % 7}", f"w{i % _BENCH_WORKLOADS}", f"uid-{i}", "Pod",
+                        "BackOff" if i % 2 else "Unhealthy", "m", "Warning", f"sess-{i}",
+                        f"w{i % _BENCH_WORKLOADS}", f"w{i % _BENCH_WORKLOADS}",
+                    )
+                    for i in range(rows)
+                ),
+            )
+        return path
+
+    def _measure(self, rows):
+        from fastapi.testclient import TestClient
+
+        path = self._ledger(rows)
+        client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        timings = {"anchor": [], "open_fix": [], "sessions": []}
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", path), \
+                patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 3600), \
+                patch.object(session_kv_server, "_incident_pull_request_urls", return_value=[]):
+            for i in range(_BENCH_LOOKUPS):
+                key = f"w{(i * 37) % _BENCH_WORKLOADS}"
+                start = time.perf_counter()
+                session_kv_server._workload_incident_anchor("c1", "ns1", "Pod", key, "Warning")
+                timings["anchor"].append(time.perf_counter() - start)
+                start = time.perf_counter()
+                session_kv_server._open_fix_pull_request("c1", "ns1", "Pod", key, "BackOff", "Warning")
+                timings["open_fix"].append(time.perf_counter() - start)
+            for _ in range(_BENCH_SESSIONS):
+                start = time.perf_counter()
+                self.assertEqual(client.post("/sessions").status_code, 201)
+                timings["sessions"].append(time.perf_counter() - start)
+        return {name: _p99(samples) for name, samples in timings.items()}
+
+    def test_p99_stays_bounded_from_a_thousand_rows_to_the_cap(self):
+        small = self._measure(_BENCH_SMALL_ROWS)
+        large = self._measure(_BENCH_LARGE_ROWS)
+        floors = {"anchor": _BENCH_LOOKUP_P99_FLOOR_S, "open_fix": _BENCH_LOOKUP_P99_FLOOR_S,
+                  "sessions": _BENCH_SESSION_P99_FLOOR_S}
+        for name, floor in floors.items():
+            with self.subTest(lookup=name):
+                self.assertLess(large[name], max(floor, _BENCH_GROWTH_LIMIT * small[name]),
+                                f"p99 {name}: {small[name]:.6f}s at {_BENCH_SMALL_ROWS} rows, "
+                                f"{large[name]:.6f}s at {_BENCH_LARGE_ROWS}")
 
 
 class TestSessionKvServerQueryBuilding(unittest.TestCase):
