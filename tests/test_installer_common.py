@@ -5888,8 +5888,8 @@ class GchatHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
 class NextHomeChannelUnsetWarningTest(unittest.TestCase):
     """warn_next_home_channel_unset (#3320). Under spec.mode next the A2A
     gateway makes the proactive posts and arms them only on a home channel,
-    so a chat backend the gateway holds with none drops every alert while
-    conversations keep working. The front doors warn, never refuse, and the
+    so a chat backend the gateway holds with none refuses and keeps every
+    alert for a digest while conversations keep working. The front doors warn, never refuse, and the
     closing summary says it again. The backend follows the operator's
     a2aChatArmed / a2aSlackArmed: Chat holds the gateway when enabled."""
 

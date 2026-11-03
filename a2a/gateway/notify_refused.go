@@ -154,10 +154,12 @@ func (s *kvRefusedStore) Keep(ctx context.Context, post refusedPost) (refusedMet
 	}
 	meta, err := s.readMeta(ctx, kv)
 	if err != nil {
+		s.unkeep(kv, post)
 		return refusedMeta{}, err
 	}
 	meta = metaWith(meta, post)
 	if err := s.writeMeta(ctx, kv, meta); err != nil {
+		s.unkeep(kv, post)
 		return refusedMeta{}, err
 	}
 	if err := s.prune(ctx, kv); err != nil {
@@ -188,6 +190,15 @@ func (s *kvRefusedStore) Clear(ctx context.Context, digested int) (refusedMeta, 
 		return refusedMeta{}, err
 	}
 	return left, nil
+}
+
+// unkeep takes a post back out when its count could not be written, so
+// "not kept" stays true and a re-send does not stack uncounted copies. Best
+// effort, on its own clock: the keep's context may be what failed.
+func (s *kvRefusedStore) unkeep(kv jetstream.KeyValue, post refusedPost) {
+	ctx, cancel := context.WithTimeout(context.Background(), refusedStoreTimeout)
+	defer cancel()
+	_ = kv.Purge(ctx, s.postKey(post.At))
 }
 
 // metaWith is meta with one more refusal counted. Keeps run one at a time
@@ -364,10 +375,12 @@ func (n *Notifier) Backend() string {
 }
 
 // keepJob is one refused home post on its way to the store, with the
-// requester's answer: Kept goes back only once the store has it.
+// requester's answer (Kept goes back only once the store has it) and the
+// requester's deadline, as notifyJob carries it.
 type keepJob struct {
-	post   refusedPost
-	answer func(lib.NotifyReply)
+	post     refusedPost
+	answer   func(lib.NotifyReply)
+	deadline time.Time
 }
 
 // startKeeper arms the keep queue and its one goroutine, before the route
@@ -386,19 +399,38 @@ func (n *Notifier) startKeeper() {
 
 // keepWork keeps the queued posts one at a time and answers each requester:
 // Kept once the store has the post, the plain no-home refusal when it does
-// not. A prune that fails after the post and the count were written is
-// logged and not a failed keep. Each kept post marks a digest owed. The
+// not, and the stopping refusal, without a store call, for what is still
+// queued when Stop closes the queue, so nobody is left in silence. A prune
+// that fails after the post and the count were written is logged and not a
+// failed keep. Each kept post marks a digest owed. A requester that stopped
+// waiting before its keep ran has recorded the post as possibly posted, so
+// that is logged as the loss it is (as reply does), kept or not. The
 // channels come as arguments: Stop lets go of the queue field once it has
 // closed it, and the keeper must not read the field after that.
 func (n *Notifier) keepWork(keeps <-chan keepJob, done chan<- struct{}) {
 	defer close(done)
 	for job := range keeps {
-		n.keptMu.Lock()
+		if n.isStopping() {
+			job.answer(n.refuse(notifyStoppingRefusal))
+			continue
+		}
+		n.storeMu.Lock()
 		ctx, cancel := context.WithTimeout(context.Background(), refusedStoreTimeout)
 		meta, err := n.kept.Keep(ctx, job.post)
 		cancel()
-		if err != nil && meta.Count == 0 {
+		kept := err == nil || meta.Count > 0
+		if kept {
+			n.keptMu.Lock()
+			n.keptPending = true
 			n.keptMu.Unlock()
+		}
+		n.storeMu.Unlock()
+		late := !job.deadline.IsZero() && time.Now().After(job.deadline)
+		if late {
+			n.log.Error("notify answered after its requester stopped waiting, which records it as possibly posted",
+				"backend", n.backend, "kept", kept, "text", firstLine(job.post.Text, notifyLostLineMax))
+		}
+		if !kept {
 			n.log.Error("notify refused and not kept", "backend", n.backend, "subject", job.post.Subject, "err", err)
 			job.answer(n.refuse(notifyNoHome))
 			continue
@@ -406,8 +438,6 @@ func (n *Notifier) keepWork(keeps <-chan keepJob, done chan<- struct{}) {
 		if err != nil {
 			n.log.Warn("kept posts not pruned; the next keep prunes again", "backend", n.backend, "err", err)
 		}
-		n.keptPending = true
-		n.keptMu.Unlock()
 		n.log.Warn("notify refused and kept: no home channel", "backend", n.backend, "subject", job.post.Subject, "refused", meta.Count)
 		job.answer(lib.NotifyReply{Error: notifyNoHomeKept, Kept: true})
 	}
@@ -419,6 +449,10 @@ func (n *Notifier) keepWork(keeps <-chan keepJob, done chan<- struct{}) {
 // Kept never names a post the store does not hold.
 func (n *Notifier) keepRefused(req lib.NotifyRequest, answer func(lib.NotifyReply)) {
 	post := refusedPost{At: time.Now(), Backend: n.backend, Subject: firstLine(req.Text, refusedSubjectMax), Text: req.Text, Blocks: req.Blocks}
+	job := keepJob{post: post, answer: answer}
+	if req.WaitMillis > 0 {
+		job.deadline = time.Now().Add(time.Duration(req.WaitMillis) * time.Millisecond)
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.keeps == nil || n.stopping {
@@ -426,7 +460,7 @@ func (n *Notifier) keepRefused(req lib.NotifyRequest, answer func(lib.NotifyRepl
 		return
 	}
 	select {
-	case n.keeps <- keepJob{post: post, answer: answer}:
+	case n.keeps <- job:
 	default:
 		n.log.Error("notify refused and not kept: the keep queue is full", "backend", n.backend, "subject", post.Subject, "depth", notifyQueueDepth)
 		answer(n.refuse(notifyNoHome))
@@ -473,84 +507,110 @@ func (n *Notifier) primeKept() {
 }
 
 // digestKept posts the digest of refused posts into home when one is owed,
-// and clears the count when the post lands. Nothing is posted when keeping
-// is off, when the count was never read (primeKept runs instead), when no
-// digest is owed, or before Start.
+// and takes what it named off the count when the post lands. Nothing is
+// posted when keeping is off, when the count was never read (primeKept runs
+// instead), when no digest is owed, when one is already on its way, or
+// before Start. Called on the delivery goroutine: it reads the flags and
+// returns; the store is read, and the count cleared, on goroutines of their
+// own, so no post waits on the bucket.
 func (n *Notifier) digestKept(home string) {
 	if n.kept == nil || home == "" {
 		return
 	}
 	n.keptMu.Lock()
-	primed, pending := n.keptPrimed, n.keptPending
+	primed := n.keptPrimed
+	launch := primed && n.keptPending && !n.keptDigesting
+	if launch {
+		n.keptDigesting = true
+	}
 	n.keptMu.Unlock()
 	if !primed {
 		n.primeKept()
 		return
 	}
-	if !pending {
+	if !launch {
 		return
+	}
+	// settle ends this digest's flight: owed again, or not.
+	settle := func(owed bool) {
+		n.keptMu.Lock()
+		n.keptDigesting = false
+		n.keptPending = owed
+		n.keptMu.Unlock()
 	}
 	n.keptWG.Add(1)
 	go func() {
 		defer n.keptWG.Done()
-		n.keptMu.Lock()
-		defer n.keptMu.Unlock()
-		if !n.keptPending {
-			return // another request's digest took it
-		}
+		n.storeMu.Lock()
 		ctx, cancel := context.WithTimeout(context.Background(), refusedStoreTimeout)
-		defer cancel()
 		meta, err := n.kept.Meta(ctx)
+		var kept int
+		if err == nil && meta.Count > 0 {
+			var kerr error
+			if kept, kerr = n.kept.Kept(ctx, meta.Since); kerr != nil {
+				n.log.Warn("refused-post digest: the kept count could not be read", "backend", n.backend, "err", kerr)
+			}
+		}
+		cancel()
+		n.storeMu.Unlock()
 		if err != nil {
 			n.log.Error("refused-post digest not posted: the meta could not be read", "backend", n.backend, "err", err)
+			settle(true)
 			return
 		}
 		if meta.Count == 0 {
-			n.keptPending = false
+			settle(false)
 			return
 		}
-		kept, err := n.kept.Kept(ctx, meta.Since)
-		if err != nil {
-			n.log.Warn("refused-post digest: the kept count could not be read", "backend", n.backend, "err", err)
-		}
 		text := refusedDigest(meta, kept)
+		// The answer's work (settle, or the clear) is counted on keptWG from
+		// here, while this goroutine still holds its own count, so Stop's
+		// wait never sees the count reach zero between the two.
+		n.keptWG.Add(1)
 		job := notifyJob{req: lib.NotifyRequest{Text: text}, home: home, answer: func(r lib.NotifyReply) {
 			if r.Error != "" {
 				// Owed again: the next home request posts it, not only the
 				// next restart or the next refusal.
 				n.log.Error("refused-post digest not posted; the count stands", "backend", n.backend, "refused", meta.Count, "err", r.Error)
-				n.keptMu.Lock()
-				n.keptPending = true
-				n.keptMu.Unlock()
+				settle(true)
+				n.keptWG.Done()
 				return
 			}
-			// Only what this digest named comes off the count: a refusal
-			// kept while the post was in flight stays owed to the next one.
-			n.keptMu.Lock()
-			defer n.keptMu.Unlock()
-			ctx, cancel := context.WithTimeout(context.Background(), refusedStoreTimeout)
-			defer cancel()
-			left, err := n.kept.Clear(ctx, meta.Count)
-			if err != nil {
-				n.log.Error("refused-post digest posted but the count was not cleared", "backend", n.backend, "err", err)
-				return
-			}
-			n.keptPending = left.Count > 0
-			n.log.Info("refused-post digest posted", "backend", n.backend, "refused", meta.Count, "home", home, "message", r.MessageID, "still_owed", left.Count)
+			// Off the posting worker: the clear is store I/O. Only what this
+			// digest named comes off the count; a refusal kept while the post
+			// was in flight stays owed to the next one. Under storeMu with
+			// the flag, so a keep landing after the clear is not overwritten.
+			go func() {
+				defer n.keptWG.Done()
+				n.storeMu.Lock()
+				defer n.storeMu.Unlock()
+				ctx, cancel := context.WithTimeout(context.Background(), refusedStoreTimeout)
+				defer cancel()
+				left, err := n.kept.Clear(ctx, meta.Count)
+				if err != nil {
+					n.log.Error("refused-post digest posted but the count was not cleared", "backend", n.backend, "err", err)
+					settle(true)
+					return
+				}
+				settle(left.Count > 0)
+				n.log.Info("refused-post digest posted", "backend", n.backend, "refused", meta.Count, "home", home, "message", r.MessageID, "still_owed", left.Count)
+			}()
 		}}
 		// Under mu, as handle enqueues: Stop closes jobs under it, so a send
-		// here never meets a closed channel. keptPending stays set until the
-		// post lands, and the next request skips while it is in the queue.
+		// here never meets a closed channel.
 		n.mu.Lock()
 		defer n.mu.Unlock()
 		if n.stopping || n.jobs == nil {
+			settle(true)
+			n.keptWG.Done()
 			return
 		}
 		select {
 		case n.jobs <- job:
-			n.keptPending = false
 		default:
 			n.log.Error("refused-post digest not queued: the route's queue is full; the count stands", "backend", n.backend, "refused", meta.Count)
+			settle(true)
+			n.keptWG.Done()
 		}
 	}()
 }

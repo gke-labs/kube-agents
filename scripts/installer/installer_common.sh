@@ -1514,7 +1514,13 @@ next_home_channel_unset_key() {
 
 # The warning for that key ($1), one line.
 next_home_channel_unset_message() {
-  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set it refuses them and keeps them for one digest (or, with Slack enabled too, they go to Slack); replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+  local meanwhile="it refuses them and keeps them for one digest"
+  # Only the Chat key can have Slack beside it: Slack holds the gateway only
+  # with Chat off, so with the Slack key the posts are kept, never sent on.
+  if [ "${1:-}" = GOOGLE_CHAT_HOME_CHANNEL ]; then
+    meanwhile="${meanwhile} (or, with Slack enabled too, they go to Slack)"
+  fi
+  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set ${meanwhile}; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
 }
 
 # What to set for that key ($1); $2 is "flags" when install.sh's flags can

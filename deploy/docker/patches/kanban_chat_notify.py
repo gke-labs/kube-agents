@@ -131,6 +131,10 @@ A2A_CLI = "a2a"
 # and the route is not there right now (nothing posted).
 NOTIFY_OUTCOME_UNKNOWN = 3
 NOTIFY_ROUTE_UNAVAILABLE = 4
+# The gateway refused a home post for want of a home channel and kept it for
+# the digest it posts once one is set: nothing posted now, nothing lost, so
+# the send is not retried and spends no failure budget.
+NOTIFY_KEPT = 5
 # How long `a2a notify` waits for the gateway's answer, passed explicitly so
 # the send timeout below can be derived from it.
 NOTIFY_WAIT_SECONDS = 60
@@ -926,6 +930,9 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"a2a notify: {exc}")
         if proc.returncode == NOTIFY_OUTCOME_UNKNOWN:
             logger.warning("chat.notify: no answer in time for %s; treating as sent", chat_id)
+            return SendResult(success=True)
+        if proc.returncode == NOTIFY_KEPT:
+            logger.warning("chat.notify: kept by the gateway for its digest (no home channel) for %s; treating as sent", chat_id)
             return SendResult(success=True)
         if proc.returncode == NOTIFY_ROUTE_UNAVAILABLE:
             self.mark_route_down()

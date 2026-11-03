@@ -1531,8 +1531,9 @@ count, the span, the last subjects, how many of those texts it still holds) and 
 named off the count; the texts stay until pruned. The arrival is seen where the home channel is
 read: at a start that has one (the CR's, or on Slack the projected file's), or at the first
 home request that finds the projected file naming one (Slack, with the learn armed). The
-requester's answer is the same refusal, worded to say the post is kept, and the relay and the
-alert path record it as they did. For the posts to reach the route at all the agent has to be
+requester's answer is the same refusal, worded to say the post is kept and carrying `kept`;
+the relay records its own undelivered line as before, and the alert path records the alert as
+kept. For the posts to reach the route at all the agent has to be
 routed with no home channel: the operator names the route (`A2A_NOTIFY_PLATFORM`, below)
 whenever the gateway's backend is the install's only chat platform, home channel or not
 (`a2aGchatHomeRouted`, `a2aSlackHomeRouted`); on a Chat-and-Slack install with no Chat home

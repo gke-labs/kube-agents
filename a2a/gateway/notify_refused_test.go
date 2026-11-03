@@ -12,15 +12,15 @@ import (
 
 // memRefusedStore is refusedStore in memory, for the notifier's tests.
 type memRefusedStore struct {
-	mu       sync.Mutex
-	posts    []refusedPost
-	meta     refusedMeta
+	mu        sync.Mutex
+	posts     []refusedPost
+	meta      refusedMeta
 	fail      bool
 	pruneFail bool // Keep stores, then errors as a failed prune would
 	metaFail  int  // Meta errors this many times, then answers
-	metaWait time.Duration
-	metaRead int // Meta calls so far
-	keepWait time.Duration
+	metaWait  time.Duration
+	metaRead  int // Meta calls so far
+	keepWait  time.Duration
 }
 
 func (m *memRefusedStore) Keep(_ context.Context, post refusedPost) (refusedMeta, error) {
@@ -477,11 +477,68 @@ func TestNotify_StopWaitsForAKeepInFlight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Queued, not awaited: Stop has to drain it.
+	// Queued, not awaited, and in flight by the time Stop runs: Stop has to
+	// wait it out rather than refuse it.
 	n.keepRefused(lib.NotifyRequest{Text: "an alert"}, func(lib.NotifyReply) {})
+	time.Sleep(50 * time.Millisecond)
 	sub.Stop()
 	if posts, _ := store.snapshot(); len(posts) != 1 {
 		t.Fatalf("Stop returned before the keep landed: kept %d", len(posts))
+	}
+}
+
+// Stop answers what is still queued for the keeper: the keep in flight
+// finishes, the rest get the stopping refusal without a store call, and no
+// requester is left in silence to record its post as possibly posted.
+func TestNotify_StopAnswersQueuedKeeps(t *testing.T) {
+	s := startServer(t)
+	provision(t, s.ClientURL())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("notify-stop-queue-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	poster := &fakeNotifyPoster{}
+	n, err := NewSlackNotifier(poster, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &memRefusedStore{keepWait: 300 * time.Millisecond}
+	n.SetKept(store)
+	sub, err := n.Start(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const queued = 4
+	answers := make(chan lib.NotifyReply, queued)
+	for i := 0; i < queued; i++ {
+		n.keepRefused(lib.NotifyRequest{Text: "an alert"}, func(r lib.NotifyReply) { answers <- r })
+	}
+	time.Sleep(50 * time.Millisecond) // the first keep is in flight
+	sub.Stop()
+	kept, stopping := 0, 0
+	for i := 0; i < queued; i++ {
+		select {
+		case r := <-answers:
+			switch r.Error {
+			case notifyNoHomeKept:
+				kept++
+			case notifyStoppingRefusal:
+				stopping++
+			default:
+				t.Fatalf("answer %+v", r)
+			}
+		default:
+			t.Fatalf("only %d of %d answered by the time Stop returned", i, queued)
+		}
+	}
+	if kept != 1 || stopping != queued-1 {
+		t.Fatalf("kept %d stopping %d, want the one in flight kept and the rest refused", kept, stopping)
+	}
+	if posts, _ := store.snapshot(); len(posts) != 1 {
+		t.Fatalf("store holds %d posts after Stop, want the one in flight", len(posts))
 	}
 }
 
@@ -511,8 +568,10 @@ func TestNotify_ARefusalDuringTheDigestStaysCounted(t *testing.T) {
 		}
 		once.Do(func() {
 			projected.set("")
+			// Kept by the time it answers (the keeper answers after the
+			// store); no keptWG.Wait here, on the worker: the digest's own
+			// slot on it is released only once this post has landed.
 			serveJSON(t, n, lib.NotifyRequest{Text: "fourth alert, during the digest"})
-			n.keptWG.Wait()
 		})
 	}
 	projected.set("C0HOME")

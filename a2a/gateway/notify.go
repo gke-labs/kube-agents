@@ -73,10 +73,10 @@ const (
 	// home channel: the route then serves conversation requests only.
 	notifyNoHome = "no home channel is configured; only a request naming a conversation is posted"
 	// notifyNoHomeKept is the same refusal on a route that keeps refused
-	// home posts (notify_refused.go); the reply also carries Kept, which the
-	// a2a CLI turns into its own exit status so a sender that re-sends on
-	// failure (the drift digest, the data-volume warning) treats the post as
-	// handled. The keep itself runs just after this answer, best effort.
+	// home posts (notify_refused.go), answered by the keeper once the store
+	// has the post; the reply also carries Kept, which the a2a CLI turns
+	// into its own exit status so a sender that re-sends on failure (the
+	// drift digest, the data-volume warning) treats the post as handled.
 	notifyNoHomeKept = "no home channel is configured; the gateway keeps the post for one digest once a home channel is set; only a request naming a conversation is posted now"
 	// notifyHomeRefused answers a home post whose channel Slack refuses now
 	// (homeVerify): the word is one the operator matches.
@@ -245,17 +245,23 @@ type Notifier struct {
 	marksOnce sync.Once
 
 	// kept keeps the home posts refused for want of a home channel
-	// (notify_refused.go); keptMu orders the keeps, the reads and the
-	// digest so the count is exact, and keptWG counts them for Stop.
-	// keptPrimed, under keptMu, says the count left by an earlier process
-	// has been read, keptPriming that the read is in flight; keptPending
-	// that a digest is owed to the next home channel this route sees.
-	kept        refusedStore
-	keptMu      sync.Mutex
-	keptWG      sync.WaitGroup
-	keptPrimed  bool
-	keptPriming bool
-	keptPending bool
+	// (notify_refused.go). storeMu orders the store's read-modify-writes
+	// (a keep against the digest's clear) and is held across store I/O, so
+	// only the keeper and the digest goroutines take it; keptMu guards the
+	// flags alone and is never held across I/O, so the delivery goroutine
+	// reads them without waiting on the store (lock order storeMu, then
+	// keptMu). keptWG counts the goroutines for Stop. keptPrimed says the
+	// count left by an earlier process has been read, keptPriming that the
+	// read is in flight; keptPending that a digest is owed to the next home
+	// channel this route sees, keptDigesting that one is on its way.
+	kept          refusedStore
+	storeMu       sync.Mutex
+	keptMu        sync.Mutex
+	keptWG        sync.WaitGroup
+	keptPrimed    bool
+	keptPriming   bool
+	keptPending   bool
+	keptDigesting bool
 	// keeps queues the refused home posts for the one keeper goroutine
 	// (keepWork), bounded like jobs; keepDone closes when it has drained.
 	keeps    chan keepJob
@@ -382,11 +388,11 @@ func (n *Notifier) homeState() (home, source string) {
 func (n *Notifier) Start(client *lib.Client) (lib.Subscription, error) {
 	n.jobs = make(chan notifyJob, notifyQueueDepth)
 	n.done = make(chan struct{})
+	n.startKeeper()
 	sub, err := client.SubscribeCore(n.subject, n.handle)
 	if err != nil {
 		return nil, fmt.Errorf("notify: %w", err)
 	}
-	n.startKeeper()
 	go n.work()
 	home, source := n.homeState()
 	n.log.Info("chat.notify route armed", "subject", n.subject, "home", home, "homeSource", source, "conversations", n.ServesConversations())
