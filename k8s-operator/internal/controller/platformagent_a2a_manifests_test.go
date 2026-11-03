@@ -4029,6 +4029,8 @@ func TestA2AConfigHashRollsOnCredentialRepair(t *testing.T) {
 	if before == "" {
 		t.Fatal("pod template carries no config hash")
 	}
+	// A changed config moves a running bus only behind a rolled-out callout.
+	theCalloutIsRolledOut(t, ctx, cl, agent)
 
 	// A reconcile that changes nothing must not roll the bus.
 	if _, err := r.Reconcile(ctx, req); err != nil {

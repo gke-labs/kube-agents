@@ -2504,6 +2504,9 @@ func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secr
 // controller stamps out is "<this>-<sts>-0", which handleDeletion reaps by name --
 // so a rename here that is not matched there turns the reap into a silent no-op
 // and leaks the PV on every CR deletion. One spelling, both sites.
+// a2aConfigHashAnnotation carries the bus's config hash on its pod template.
+const a2aConfigHashAnnotation = "kubeagents.x-k8s.io/a2a-config-hash"
+
 const (
 	a2aNATSDataClaim = "data"
 	// a2aNATSStartupScript migrates an existing single-node (R1) JetStream store
@@ -2564,7 +2567,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      podLabels,
-					Annotations: map[string]string{"kubeagents.x-k8s.io/a2a-config-hash": confHash},
+					Annotations: map[string]string{a2aConfigHashAnnotation: confHash},
 				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken: ptr.To(false),
@@ -5274,6 +5277,11 @@ type a2aProvisionState struct {
 	// holds, and it shares the reconcile's requeue with gatewayHeld. It is
 	// the upgrade path only: this operator never darkens a gateway.
 	gatewayWaking bool
+	// busHeld reports that a running bus was left on its current config
+	// this pass because a callout replica is not yet on the current spec
+	// (a2aBusWaitsForCallout). It shares the reconcile's requeue with
+	// gatewayHeld.
+	busHeld bool
 	// jobName is the provisioning Job this pass rendered, by its digest
 	// name. The status writer names it when it is what Ready waits on,
 	// and carrying it saves re-rendering the JobSpec to hash it again.
@@ -5507,20 +5515,48 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	state.AuthMapVersion = authMapVersion
 
-	config := buildA2ANATSConfigSecret(agent, creds, calloutKeys)
-	if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
+	// The auth callout, before the bus's config and before anything that
+	// dials the bus. nats.conf names it as the authority for every
+	// non-exempt connection, so a bus standing up without it accepts only
+	// the static users and refuses everything else — and refuses it as an
+	// Authorization Violation, which reads exactly like a credential
+	// problem. Ahead of the config for the hold below.
+	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public, len(authMaps))
+	if err != nil {
 		return state, err
-	}
-	if err := r.applyManaged(ctx, agent, config); err != nil {
-		return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
 	}
 
+	// A running bus moves to a new config only once every callout replica
+	// is on the current spec (a2aBusWaitsForCallout). Every client
+	// reconnects when the bus restarts, and the callout that answers a
+	// reconnect decides the account it lands in, so a replica still on the
+	// previous identity map would place it by that map until it next
+	// reconnects. The config Secret is held with the StatefulSet, so a bus
+	// pod restarted for any other reason meanwhile comes back on the config
+	// it was running.
 	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
-	if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
+	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
+	if err != nil {
 		return state, err
 	}
-	if err := r.applyManaged(ctx, agent, sts); err != nil {
-		return state, fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
+	if busHeld {
+		state.busHeld = true
+		logf.FromContext(ctx).Info("holding the A2A bus on its current config until every auth callout replica is on the current spec",
+			"statefulset", sts.Name, "callout", a2aCalloutName(agent))
+	} else {
+		config := buildA2ANATSConfigSecret(agent, creds, calloutKeys)
+		if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, config); err != nil {
+			return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
+		}
+		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, sts); err != nil {
+			return state, fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
+		}
 	}
 
 	svc := buildA2ANATSService(agent)
@@ -5529,16 +5565,6 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	if err := r.applyManaged(ctx, agent, svc); err != nil {
 		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
-	}
-
-	// The auth callout, before the fence and before anything that dials the
-	// bus. nats.conf now names it as the authority for every non-exempt
-	// connection, so a bus standing up without it accepts only the static
-	// users and refuses everything else — and refuses it as an Authorization
-	// Violation, which reads exactly like a credential problem.
-	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public, len(authMaps))
-	if err != nil {
-		return state, err
 	}
 
 	// The capability verifier. It binds the `cap` bucket at boot, and when it
@@ -5673,11 +5699,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		// above went through a2aReader, so a stale NotFound cannot
 		// re-create a Job that exists. A held Job is a pass with
 		// done=false, which is already the requeue.
+		// A held bus is still on its previous config, which a Job of
+		// this one's would provision against; it waits with the bus.
 		if hold, err := r.a2aProvisionJobWaitsForCallout(ctx, agent); err != nil {
 			return state, err
-		} else if hold {
+		} else if hold || state.busHeld {
 			state.jobHeld = true
-			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready",
+			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready and the bus is on its current config",
 				"job", job.Name, "callout", a2aCalloutName(agent))
 		} else if err := r.Create(ctx, job); err != nil {
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
@@ -6249,6 +6277,115 @@ func (r *PlatformAgentReconciler) a2aProvisionJobWaitsForCallout(ctx context.Con
 		return true, nil
 	}
 	return !a2aCalloutServesAnyReplica(callout), nil
+}
+
+// a2aCalloutFullyRolledOut reports whether every replica of the callout
+// Deployment is on its current spec and ready: the copy is at least the
+// Generation this pass applied, the Deployment controller has observed it,
+// and the replica, updated and ready counts all equal the desired count.
+// a2aCalloutCanServeANewGateway asks for one such replica; the bus asks for
+// all of them, because the replicas form one queue group and any of them may
+// answer a reconnect. Status.Replicas leaves out a pod already terminating,
+// which a2aCalloutHasOlderPods covers.
+func a2aCalloutFullyRolledOut(dep *appsv1.Deployment, appliedGeneration int64) bool {
+	if dep.Generation < appliedGeneration || dep.Status.ObservedGeneration < dep.Generation {
+		return false
+	}
+	want := int32(1)
+	if dep.Spec.Replicas != nil {
+		want = *dep.Spec.Replicas
+	}
+	st := dep.Status
+	return st.Replicas == want && st.UpdatedReplicas == want && st.ReadyReplicas == want
+}
+
+// a2aCalloutHasOlderPods reports whether any pod of the callout, terminating
+// ones included, is not on the Deployment's current ReplicaSet. A terminating
+// pod keeps its subscription until it exits, so it can still answer an
+// authorization request from the previous identity map. Read live through
+// a2aReader: neither kind is cached, and the question is only asked on a pass
+// that would move the bus to a new config.
+func (r *PlatformAgentReconciler) a2aCalloutHasOlderPods(ctx context.Context, dep *appsv1.Deployment) (bool, error) {
+	selector, err := metav1.LabelSelectorAsSelector(dep.Spec.Selector)
+	if err != nil {
+		return false, err
+	}
+	inNamespace := []client.ListOption{client.InNamespace(dep.Namespace), client.MatchingLabelsSelector{Selector: selector}}
+	sets := &appsv1.ReplicaSetList{}
+	if err := r.a2aReader().List(ctx, sets, inNamespace...); err != nil {
+		return false, err
+	}
+	// The current ReplicaSet is the newest one: a2aCalloutFullyRolledOut
+	// has already required the Deployment controller to have observed the
+	// current spec, and it stamps each new ReplicaSet with the next revision.
+	current, newest := "", int64(0)
+	for i := range sets.Items {
+		rs := &sets.Items[i]
+		if !metav1.IsControlledBy(rs, dep) {
+			continue
+		}
+		revision, err := strconv.ParseInt(rs.Annotations[a2aDeploymentRevisionAnnotation], 10, 64)
+		if err == nil && revision > newest {
+			current, newest = rs.Labels[appsv1.DefaultDeploymentUniqueLabelKey], revision
+		}
+	}
+	if current == "" {
+		return true, nil
+	}
+	pods := &corev1.PodList{}
+	if err := r.a2aReader().List(ctx, pods, inNamespace...); err != nil {
+		return false, err
+	}
+	for _, pod := range pods.Items {
+		if pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey] != current {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// a2aDeploymentRevisionAnnotation is the Deployment controller's revision
+// stamp on each ReplicaSet it creates.
+const a2aDeploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
+
+// a2aBusWaitsForCallout reports whether the bus must stay on its current
+// config this pass. Only a running bus whose config would change waits: a
+// fresh install has no bus to hold, and one whose config is unchanged has
+// nothing to apply that matters here. It waits until every callout replica
+// is on the current spec and no pod of an older one is left. While it waits,
+// a principal that reconnects is placed by the current identity map, which
+// may name an account the running config does not have yet; that refusal
+// lasts until the bus moves, and is the direction this gate prefers to a
+// connection placed by the previous map that would stay there until it next
+// reconnects.
+func (r *PlatformAgentReconciler) a2aBusWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, calloutGeneration int64) (bool, error) {
+	live := &appsv1.StatefulSet{}
+	err := r.Get(ctx, client.ObjectKeyFromObject(sts), live)
+	if errors.IsNotFound(err) {
+		// Confirmed live, as the gateway gate does: a stale NotFound would
+		// apply the new config under a callout still rolling.
+		err = r.a2aReader().Get(ctx, client.ObjectKeyFromObject(sts), live)
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+	}
+	if err != nil {
+		return false, err
+	}
+	if live.Spec.Template.Annotations[a2aConfigHashAnnotation] == sts.Spec.Template.Annotations[a2aConfigHashAnnotation] {
+		return false, nil
+	}
+	callout := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, callout); err != nil {
+		if errors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if !a2aCalloutFullyRolledOut(callout, calloutGeneration) {
+		return true, nil
+	}
+	return r.a2aCalloutHasOlderPods(ctx, callout)
 }
 
 // a2aGatewayWaitsForCallout reports whether the gateway Deployment must be

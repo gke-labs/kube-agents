@@ -897,6 +897,17 @@ exposes. Rolling the callout pods on every map change would close the gap and wa
 rejected: the callout is on the connection path, so a rolling restart is a window in
 which new connections fail, which is the thing the informer exists to avoid.
 
+**Amended 11/3:** the bus has an ordering of its own with the callout. When the bus restarts
+on a new config, every client reconnects, and whichever callout replica answers a reconnect
+places it by the map that replica holds. A connection placed by the previous map stays in
+that map's account until it next reconnects. So a running bus moves to a new config only
+once every callout replica is on the current spec and no pod of an older ReplicaSet is left
+(`a2aBusWaitsForCallout`). The config Secret waits with the StatefulSet, and the callout is
+reconciled ahead of both. A fresh install is not held, since there is no running bus.
+While the bus waits, a reconnect is placed by the current map, which can name an account the
+running config does not have yet. That connection is refused until the bus moves, which
+fails closed.
+
 Three numbers in the render are load-bearing and none of them is a preference.
 
 **`max_control_line: 65536`.** A ServiceAccount token travels inside the client's CONNECT

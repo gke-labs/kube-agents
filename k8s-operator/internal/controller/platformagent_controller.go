@@ -1195,7 +1195,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// that darkened its gateway, the A2AGateway condition is kept until the
 	// scaled-up replica is ready, and the pass that clears it should not
 	// depend on the Deployment's status event alone.
-	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayWaking) {
+	// busHeld shares it for the gateway's reason: the bus waits on the
+	// callout's rollout, and the pass that sees it finish has to happen.
+	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayWaking || a2aState.busHeld) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
