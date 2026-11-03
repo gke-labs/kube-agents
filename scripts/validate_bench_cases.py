@@ -414,6 +414,12 @@ FIXTURE_NOT_READY = {
         "not, so the case fails with the branch absent, which is broken rather "
         "than red"
     ),
+    "inspect-repository-unmanaged-and-context-read": (
+        "#4243: needs kubernetes-sigs/kind at v0.24.0 registered in each pool "
+        "install's context_repos, as the case's header gives; no pool install "
+        "registers it, so the context check fails with the repository absent, "
+        "which is broken rather than red"
+    ),
     "gce-startup-script-failure": (
         "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
         "(fleet re-apply); no pool project runs a VM whose startup script fails"

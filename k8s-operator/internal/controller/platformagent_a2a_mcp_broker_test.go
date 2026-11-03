@@ -358,7 +358,7 @@ func TestAnUnownedMCPServiceAccountRemovesTheServerAndReportsIt(t *testing.T) {
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("precondition: the stack with the MCP door on renders: %v", err)
 	}
 	mcpKey := types.NamespacedName{Name: a2aMCPName(agent), Namespace: agent.Namespace}
@@ -382,7 +382,7 @@ func TestAnUnownedMCPServiceAccountRemovesTheServerAndReportsIt(t *testing.T) {
 	}
 
 	fenceKey := types.NamespacedName{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("an unowned MCP ServiceAccount stopped the next reconcile: %v", err)
 	}
@@ -405,7 +405,7 @@ func TestAnUnownedMCPServiceAccountRemovesTheServerAndReportsIt(t *testing.T) {
 		if err := cl.Get(ctx, tokenKey, kept); err != nil || string(kept.Data[a2aMCPAccessKey]) != string(minted.Data[a2aMCPAccessKey]) {
 			t.Fatalf("pass %d: the MCP token was removed or rotated behind an unowned account: err=%v", pass, err)
 		}
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatalf("pass %d: %v", pass, err)
 		}
 	}
@@ -425,7 +425,7 @@ func TestAnUnownedMCPServiceAccountRemovesTheServerAndReportsIt(t *testing.T) {
 	if err := cl.Delete(ctx, sa); err != nil {
 		t.Fatal(err)
 	}
-	state, err = r.reconcileA2A(ctx, agent)
+	state, err = r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("reconcileA2A after the account was removed: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestAnUnownedMCPTokenSecretRemovesTheServerAndReportsIt(t *testing.T) {
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("precondition: the stack with the MCP door on renders: %v", err)
 	}
 	mcpKey := types.NamespacedName{Name: a2aMCPName(agent), Namespace: agent.Namespace}
@@ -474,7 +474,7 @@ func TestAnUnownedMCPTokenSecretRemovesTheServerAndReportsIt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("an unowned MCP token Secret stopped the next reconcile: %v", err)
 	}
@@ -582,7 +582,7 @@ func TestTheBrokerAdmitsTheMCPAccountOnlyWhenOwned(t *testing.T) {
 	if env := a2aMCPBrokerEnv(agent, false); len(env) != 0 {
 		t.Errorf("the MCP audience binding is rendered while somebody else owns the account: %+v", env)
 	}
-	unowned := buildCredentialProxyDeploymentForPlugins(agent, "policy-hash", nil, brokerCallerOwnership{scope: true}, credentialProxyProfileConfig{}).Spec.Template.Spec.Containers[0]
+	unowned := buildCredentialProxyDeploymentForPlugins(agent, "policy-hash", nil, brokerCallerOwnership{scope: true}, credentialProxyProfileConfig{}, false).Spec.Template.Spec.Containers[0]
 	if _, found := brokerEnvValue(unowned.Env, "CREDENTIAL_PROXY_MCP_CALLERS"); found {
 		t.Error("CREDENTIAL_PROXY_MCP_CALLERS is rendered while somebody else owns the account")
 	}
