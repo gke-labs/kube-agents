@@ -3503,11 +3503,6 @@ _EVIDENCE_HEADING = "**Evidence for verified claims**"
 _VERIFIED_LABEL_RE = re.compile(r"\bverified\b", re.I)
 # ``worker_trajectory.clip``'s marker on a result cut in the pod.
 _CLIPPED_RESULT_RE = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
-# The start of the note hermes appends to a tool result after the JSON (a
-# refused call: ``permission_denied``; a repeated failure:
-# ``same_tool_failure_warning``). What follows it is advice to the model, not
-# the command's output.
-_TOOL_LOOP_WARNING_SEP = "\n\n[Tool loop warning:"
 # The head of a terminal result as the pod stores it: ``{"output": "``.
 _OUTPUT_HEAD_RE = re.compile(r'^\{\s*"output":\s*"')
 # The longest escape a cut can split (``\uXXXX``), trimmed one character at a
@@ -3597,22 +3592,22 @@ def _same_command(stored: str, cited: str) -> bool:
 def _terminal_output(result: str) -> tuple[str, bool]:
     """The ``output`` of a terminal result as the trajectory stores it, and whether the pod clipped it.
 
-    The result is the JSON text of ``{"output": ..., "exit_code": ...}``,
-    which hermes may follow with a tool-loop warning; the warning is cut off
-    before the parse, since the output ends where it starts. A clipped
-    result no longer parses; its surviving head is decoded as a JSON string,
-    less any escape the cut split. A clip that landed inside the warning
-    leaves the JSON whole, so the cut is applied first.
+    The result is the JSON text of ``{"output": ..., "exit_code": ...}``.
+    Hermes may append a note after it (a tool-loop warning or hard stop, a
+    repeated-call notice), which is advice to the model and not output, so
+    the leading JSON object is decoded and whatever follows it is left
+    alone; that also reads a result whose clip landed inside the note. A
+    result whose JSON itself was cut no longer parses; its surviving head
+    is decoded as a JSON string, less any escape the cut split.
     """
-    result = result.split(_TOOL_LOOP_WARNING_SEP, 1)[0]
+    try:
+        parsed, _ = json.JSONDecoder().raw_decode(result)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+        return parsed["output"], False
     clipped = _CLIPPED_RESULT_RE.search(result)
     if not clipped:
-        try:
-            parsed = json.loads(result)
-        except ValueError:
-            return result, False
-        if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
-            return parsed["output"], False
         return result, False
     head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])
     for cut in range(_MAX_SPLIT_ESCAPE + 1):

@@ -9032,6 +9032,29 @@ def test_verified_claims_backed_a_clip_inside_the_warning_leaves_the_output_whol
     assert res.status == "pass" and "not checked" not in res.reason, res
 
 
+@pytest.mark.parametrize(
+    "note",
+    [
+        "\n\n[Tool loop hard stop: permission_refusal_halt; count=3; Stop.]",
+        "\n\n[hermes note: this is the 3rd consecutive identical call to terminal with the same arguments.]",
+        "\n\n[Tool loop warning: same_tool_failure_warning; count=3; terminal has failed 3 times this turn.]"
+        "\n\n[hermes note: this is the 3rd consecutive identical call to terminal.]",
+    ],
+)
+def test_verified_claims_backed_reads_the_output_before_any_appended_note(note):
+    stored = json.dumps({"output": _LOGS_ERROR, "exit_code": 1, "error": None}) + note
+    res = _grade_claims(_block(_LOGS_CMD, _LOGS_ERROR[:60]), [_terminal(_LOGS_CMD, result=stored)])
+    assert res.status == "pass" and "not checked" not in res.reason, res
+
+
+def test_verified_claims_backed_a_clip_inside_the_notes_opening_leaves_the_output_whole():
+    body = json.dumps({"output": _LOGS_ERROR, "exit_code": 1, "error": None})
+    for cut in range(0, 21):
+        clipped = body + _LOGS_WARNING[:cut] + " ...[clipped 40 chars]"
+        res = _grade_claims(_block(_LOGS_CMD, _LOGS_ERROR[:60]), [_terminal(_LOGS_CMD, result=clipped)])
+        assert res.status == "pass" and "not checked" not in res.reason, (cut, res)
+
+
 def test_verified_claims_backed_an_invented_excerpt_fails_despite_the_warning():
     res = _grade_claims(_block(_LOGS_CMD, "OOMKilled exit code 137 in the previous container"), [_terminal(_LOGS_CMD, result=_LOGS_OUT)])
     assert res.status == "fail" and "is not in the output of" in res.reason, res
