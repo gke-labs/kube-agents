@@ -1,0 +1,43 @@
+{
+  "payload": {
+    "number": 10,
+    "body": "Rebased onto the new base image. <!-- agent:ack -->"
+  },
+  "responses": [
+    {
+      "properties": {
+        "repositoryId": 1
+      },
+      "id": 3,
+      "version": 0,
+      "text": "Rebased onto the new base image. <!-- agent:ack -->",
+      "author": {
+        "name": "access-token-user/1/1",
+        "active": true,
+        "displayName": "Access Token User - acme",
+        "emailAddress": null,
+        "id": 4,
+        "slug": "access-token-user_1_1",
+        "type": "SERVICE",
+        "links": {
+          "self": [
+            {
+              "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+            }
+          ]
+        }
+      },
+      "createdDate": 1793644409739,
+      "updatedDate": 1793644409739,
+      "comments": [],
+      "threadResolved": false,
+      "severity": "NORMAL",
+      "state": "OPEN",
+      "permittedOperations": {
+        "editable": true,
+        "transitionable": true,
+        "deletable": true
+      }
+    }
+  ]
+}

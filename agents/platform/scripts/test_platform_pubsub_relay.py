@@ -155,28 +155,53 @@ class PlatformPubsubRelayOverTheSocketTest(unittest.TestCase):
                     status, answer = self._request(method, path, body=body)
                     self.assertEqual(status, 200, answer)
 
-    def test_a_pull_answer_over_the_relays_default_cap_is_still_relayed_to_the_adapter(self):
+    def test_a_pull_answer_over_the_relays_default_cap_is_still_relayed_on_both_families(self):
         """A pull is a lease: Pub/Sub has delivered the batch and started its ack
         deadline by the time the broker reads the answer, and the ack ids are
         in the body. A refused answer would leave the batch undeliverable until
-        the deadline, forever for a message that is always over the cap. The
-        platform family carries a cap no legal Pub/Sub message can exceed; the
-        read-only watcher family keeps the relay's own."""
+        the deadline, forever for a batch that is always over the cap. Both
+        families carry the Pub/Sub cap: the platform adapter pulls one message
+        at a time and no legal message exceeds it, and the drift-detector's
+        batch pull shrinks on a 502 until its answer fits under it."""
         self.pull_padding = 4000
+        watcher_pull = f"{watcher_policy.WATCHER_GCP_PREFIX}pubsub.googleapis.com/v1/{DRIFT}:pull"
         with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", 1024), \
-                mock.patch.object(credential_proxy, "PLATFORM_PUBSUB_MAX_RESPONSE_BYTES", 16384):
+                mock.patch.object(credential_proxy, "PUBSUB_RELAY_MAX_RESPONSE_BYTES", 16384):
             status, body = self._request("POST", PULL, body=b'{"maxMessages":1}')
             self.assertEqual(status, 200, body)
             self.assertEqual(json.loads(body)["receivedMessages"][0]["ackId"], "ack-1")
-            watcher_pull = f"{watcher_policy.WATCHER_GCP_PREFIX}pubsub.googleapis.com/v1/{DRIFT}:pull"
             status, body = self._request("POST", watcher_pull, token="watcher-token", body=b'{"maxMessages":1}')
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["receivedMessages"][0]["ackId"], "ack-1")
+
+    def test_a_pull_answer_over_the_pubsub_cap_is_refused_on_both_families(self):
+        """The Pub/Sub cap is a cap: an answer over it is a 502 the detector
+        reads as its signal to halve the batch, not a bigger relay."""
+        self.pull_padding = 20000
+        watcher_pull = f"{watcher_policy.WATCHER_GCP_PREFIX}pubsub.googleapis.com/v1/{DRIFT}:pull"
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", 1024), \
+                mock.patch.object(credential_proxy, "PUBSUB_RELAY_MAX_RESPONSE_BYTES", 16384):
+            for path, token in ((PULL, "chat-token"), (watcher_pull, "watcher-token")):
+                with self.subTest(path=path):
+                    status, body = self._request("POST", path, token=token, body=b'{"maxMessages":1}')
+                    self.assertEqual(status, 502, body)
+                    self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNRELAYABLE")
+
+    def test_the_gke_read_on_the_watcher_relay_keeps_the_relays_own_cap(self):
+        """The Pub/Sub cap is the host's, not the family's: a cluster read on
+        the watcher relay is bounded by API_RELAY_MAX_RESPONSE_BYTES as before."""
+        cluster = f"{watcher_policy.WATCHER_GCP_PREFIX}container.googleapis.com/v1/projects/kagents-dev/locations/us-central1-a/clusters/seeded-a"
+        with mock.patch.object(credential_proxy, "API_RELAY_MAX_RESPONSE_BYTES", 16), \
+                mock.patch.object(credential_proxy, "PUBSUB_RELAY_MAX_RESPONSE_BYTES", 16384):
+            status, body = self._request("GET", cluster, token="watcher-token")
             self.assertEqual(status, 502, body)
             self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNRELAYABLE")
+            self.assertEqual(self.upstream_hosts, ["container.googleapis.com"])
 
-    def test_the_platform_cap_covers_one_largest_pubsub_message(self):
+    def test_the_pubsub_cap_covers_one_largest_pubsub_message(self):
         """10 MiB of payload is 13.4 MiB once base64-encoded, plus the envelope."""
         self.assertGreaterEqual(
-            credential_proxy.PLATFORM_PUBSUB_MAX_RESPONSE_BYTES,
+            credential_proxy.PUBSUB_RELAY_MAX_RESPONSE_BYTES,
             credential_proxy.PUBSUB_MAX_MESSAGE_BYTES * 4 // 3 + 64 * 1024,
         )
 

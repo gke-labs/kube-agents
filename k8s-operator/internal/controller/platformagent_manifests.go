@@ -294,6 +294,45 @@ const (
 	// the inference gateway. Decoupled from the backing implementation (LiteLLM,
 	// vLLM, a custom proxy) so swapping the backend does not touch agent configs.
 	inferenceGatewayServiceName = "inference-gateway"
+
+	// The gateway container's startup and readiness probes run one command
+	// (agentAPIProbe) and differ only in these timings.
+	//
+	// The startup probe covers a cold boot that scaffolds every profile onto a
+	// fresh PVC: 5 + 10×90 = 905s, the budget gatewayProgressDeadlineSeconds is
+	// sized to outlast. Readiness afterwards withdraws the pod after 3 missed
+	// checks 15s apart — 45s of a gateway that accepts connections and answers
+	// nobody, the stall the agent-api-auth sidecar's upstream timeout otherwise
+	// turns into a 502 for every caller.
+	//
+	// Each TimeoutSeconds sits under its probe's period, so a slow check never
+	// pushes the next one: kubelet runs probes on a fixed ticker, so a longer
+	// timeout costs at most one timeout of detection latency and buys that much
+	// tolerance for an answer that is slow but true. The readiness answer is
+	// slow by construction before it is slow by load: Hermes' list_sessions_rich
+	// first calls flush_token_counts(timeout=5.0), waiting up to 5s for the
+	// token-accounting writer to drain, and on a sandboxed install (the chart
+	// default) the operator pins SQLite to the DELETE journal mode, where the
+	// read that follows takes the writer's lock (hermes_state.py _read_ctx)
+	// behind any turn persisting its transcript. Up to 5s can therefore pass before a
+	// byte is read; 10s under the 15s period covers the flush with as much
+	// again for the locked read and the exec spawn. The startup probe keeps 5s
+	// under its 10s period: at boot the answer is absent rather than slow, and
+	// the 90 retries are its tolerance.
+	//
+	// agentAPIProbeCurlMarginSeconds is how far curl's own --max-time sits under
+	// TimeoutSeconds, so a hung listener is curl's 28 to report, with its
+	// stderr in the probe event, rather than kubelet's to kill with "command
+	// timed out". 2s leaves the exec spawn and sh's exit inside kubelet's budget,
+	// as the dashboard probe's --max-time 3 under 5s already does.
+	agentAPIProbeInitialDelaySeconds       int32 = 5
+	agentAPIStartupProbePeriodSeconds      int32 = 10
+	agentAPIStartupProbeFailureThreshold   int32 = 90
+	agentAPIStartupProbeTimeoutSeconds     int32 = 5
+	agentAPIReadinessProbePeriodSeconds    int32 = 15
+	agentAPIReadinessProbeFailureThreshold int32 = 3
+	agentAPIReadinessProbeTimeoutSeconds   int32 = 10
+	agentAPIProbeCurlMarginSeconds         int32 = 2
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -1014,7 +1053,8 @@ const (
 	// moves the config hash and rolls the pod (docs/designs/multi-project-scope.md §5).
 	scopeConfigKey = "scope.json"
 
-	// scopeVolumeName projects scopeConfigKey into scopeDir for the agent container. The
+	// scopeVolumeName projects scopeConfigKey into scopeDir for the agent container (and,
+	// under mode next, for the scope publisher, and into brokerScopeDir for the broker). The
 	// volume is marked optional so a ConfigMap written by an older operator, which has no
 	// such key, still mounts (as an empty directory) instead of holding the pod in
 	// ContainerCreating during a roll; the reader treats the missing file as "no render",
@@ -3363,7 +3403,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
 		// Slack's half of the same rule: the Hermes slack platform is off
 		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
-		// the single-backend gateway, so at most one platform is routed.
+		// the single-backend gateway, so at most one platform is routed. Only
+		// the CR's channel travels as env; a channel the gateway learned
+		// reaches the agent through the projection file mounted below
+		// (platformagent_home_channel_record.go), which the agent's readers
+		// take after a non-empty env, so a learn replaces no pod.
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
 		// The agent's own idea of the Slack home channel, as under today: the
 		// audit relay gates its report card on knowing a channel and records
@@ -3552,6 +3596,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
 	volumes = append(volumes, buildWatcherTokenVolume())
+	if a2aAgentSurface(agent) && a2aSlackArmed(agent) {
+		// The home-channel projection (platformagent_home_channel_record.go):
+		// Optional and out of the pod-template hashes, so its content rolls
+		// no pod; the agent's readers follow the file within a kubelet sync.
+		volumes = append(volumes, homeChannelProjectionVolume(agent))
+	}
 	if a2aAgentSurface(agent) {
 		volumes = append(volumes, a2aBusTokenVolumeSource())
 		// Optional here and only here: a2aAgentSurface also holds on the skew
@@ -3661,7 +3711,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 // Past the deadline the Deployment reports ProgressDeadlineExceeded and any
 // caller's wait returns early however long it asked for, so a gate raised above
 // this number buys nothing. Kubernetes defaults it to 600s, which is *below*
-// the 905s cold boot agentAPIProbe(10, 90) already sanctions — the kubelet is
+// the 905s cold boot the startup probe already sanctions (the agentAPIStartupProbe*
+// constants at the top of this file) — the kubelet is
 // told to tolerate a boot the Deployment gives up on. 1800s clears the 1500s
 // deploy gate in upgrade.sh. hindsight-api
 // carries an explicit 900 for the same reason; see tests/test_hindsight_probes.py.
@@ -4415,7 +4466,7 @@ func harnessOnKind(harness *agentv1alpha1.HarnessSpec) bool {
 // buildCredentialProxyEnv is buildCredentialProxyEnvForPlugins with no plugins:
 // every variable but the platform Pub/Sub relay's subscription set.
 func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
-	return buildCredentialProxyEnvForPlugins(agent, nil, true, credentialProxyProfileConfig{})
+	return buildCredentialProxyEnvForPlugins(agent, nil, allBrokerCallersOwned, credentialProxyProfileConfig{})
 }
 
 // buildCredentialProxyEnvForPlugins renders the broker's environment for an
@@ -4423,7 +4474,7 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 // variable: the subscriptions the Pub/Sub platform relay may reach. profiles
 // is the profile role's configuration (credentialProxyProfileEnv); its zero
 // value renders no profile role.
-func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool, profiles credentialProxyProfileConfig) []corev1.EnvVar {
+func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, owned brokerCallerOwnership, profiles credentialProxyProfileConfig) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
 		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
@@ -4507,6 +4558,10 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		{Name: "GITOPS_STATE_PATH", Value: path.Join(gitopsStateDir, "managed_repos")},
 		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 	}
+	// The scratch volumes' caps, for the broker's resource watermark gate. See
+	// credentialProxyStateLimitEnv for why they are values and why reserved;
+	// in the managed set, so the merge below reserves both names.
+	envVars = append(envVars, credentialProxyVolumeLimitEnv(agent)...)
 	// Set in both directions, deliberately. The broker's own default is off, so
 	// the "0" changes nothing on its own — what it buys is that the credential
 	// mode an install is in can be read off the Deployment rather than inferred
@@ -4553,7 +4608,7 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		// The profile workers' ServiceAccounts join the list only with a
 		// profile caller to confer the role on; the broker holds each to the
 		// profile audience by the identity map rendered below.
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: strings.Join(append([]string{allowedBrokerCallers(agent, mcpIdentityOwned)}, profiles.callers()...), ",")},
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: strings.Join(append([]string{allowedBrokerCallers(agent, owned)}, profiles.callers()...), ",")},
 		// The watchers' audience, in both modes: agent-api-auth always runs
 		// them.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_WATCHER_AUDIENCE", Value: credentialProxyWatcherAudience},
@@ -4575,7 +4630,8 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	}
 	// The MCP server's audience, under its flag on a mode-next install only
 	// (a2aMCPBrokerEnabled), so an install without it confers no mcp role.
-	envVars = append(envVars, a2aMCPBrokerEnv(agent, mcpIdentityOwned)...)
+	envVars = append(envVars, a2aMCPBrokerEnv(agent, owned.mcp)...)
+	envVars = append(envVars, scopeBrokerEnv(agent, owned.scope)...)
 	// The profile workers' audience, identity map and the task-signing public
 	// key, with a profile caller only (credential_proxy_profiles.go).
 	envVars = append(envVars, credentialProxyProfileEnv(profiles)...)
@@ -4765,6 +4821,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// And one that could set the MCP callers could unbind the MCP
 		// ServiceAccount from its audience, or bind another to it.
 		credentialProxyMCPCallersEnvVar,
+		// The scope role's three: one that could set the audience or the
+		// callers would decide who holds the scope role, and one that could
+		// set the file would choose the declaration that bounds its
+		// arguments.
+		credentialProxyScopeAudienceEnvVar,
+		credentialProxyScopeCallersEnvVar,
+		credentialProxyScopeFileEnvVar,
 		a2aMCPBrokerURLEnvVar,
 		a2aMCPBrokerTokenFileEnvVar,
 		// The profile role's four, by name because each is rendered only
@@ -5206,15 +5269,27 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 }
 
 // agentAPIProbe returns a probe that asks the Hermes API on loopback for one
-// session. Callers supply periodSeconds and failureThreshold, which is the only
-// difference between the gateway's startup and readiness probes: the startup
-// one has to cover a cold boot that scaffolds every profile onto a fresh PVC,
-// while readiness afterwards should withdraw the pod quickly.
+// session. Callers supply the period, failure threshold and timeout, which is
+// the only difference between the gateway's startup and readiness probes: the
+// startup one has to cover a cold boot that scaffolds every profile onto a
+// fresh PVC, while readiness afterwards should withdraw the pod quickly. The
+// values, and why each is what it is, are the agentAPI*Probe* constants at the
+// top of this file.
 //
 // /api/sessions is the endpoint the agent's own callers use — see the pubsub
 // adapter and admin_console — and the Authorization: Bearer form is theirs too.
-// Every timing is explicit, per the gke-reliability skill's rule 3; kubelet's
-// 1-second default timeout is far too tight for a container this busy at boot.
+// It stays the probe's target although Hermes also serves an unauthenticated,
+// constant GET /health: that route proves the listener and nothing else, while
+// this one proves the bearer key the entrypoint handed the container matches
+// the one the API server loaded (a disagreement holds the pod out of Ready
+// instead of 401ing every in-pod caller quietly; docker-entrypoint.sh checks
+// the same agreement before exec and names this probe in its warning) and
+// that the session store the callers write to answers. Every timing is
+// explicit, per the gke-reliability skill's
+// rule 3; kubelet's 1-second default timeout is far too tight for a container
+// this busy at boot. curl's --max-time sits agentAPIProbeCurlMarginSeconds
+// under TimeoutSeconds, so a listener that accepts and then hangs is curl's
+// exit 28 rather than kubelet's exec kill.
 //
 // The exit-7 branch is what makes this probe safe above one replica. At
 // replicas > 1 the container runs leader_elect.py, and a pod that does not hold
@@ -5232,13 +5307,13 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 // which still fail. Detecting the standby by looking for the process instead
 // would not work: `hermes` is a shim that execs `s6-suid hermes $REAL "$@"`, so
 // the string "hermes gateway run" never appears in any command line to match.
-func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
+func agentAPIProbe(periodSeconds, failureThreshold, timeoutSeconds int32) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			Exec: &corev1.ExecAction{
 				Command: []string{
 					"sh", "-c",
-					`curl --fail --silent --show-error -o /dev/null ` +
+					fmt.Sprintf(`curl --fail --silent --show-error --max-time %d -o /dev/null `, timeoutSeconds-agentAPIProbeCurlMarginSeconds) +
 						`-H "Authorization: Bearer $API_SERVER_KEY" ` +
 						`http://127.0.0.1:8642/api/sessions?limit=1; rc=$?; ` +
 						`[ "$rc" -eq 0 ] && exit 0; ` +
@@ -5247,9 +5322,9 @@ func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
 				},
 			},
 		},
-		InitialDelaySeconds: 5,
+		InitialDelaySeconds: agentAPIProbeInitialDelaySeconds,
 		PeriodSeconds:       periodSeconds,
-		TimeoutSeconds:      5,
+		TimeoutSeconds:      timeoutSeconds,
 		FailureThreshold:    failureThreshold,
 	}
 }
@@ -5312,6 +5387,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// the container that opens the connection has no reason to see the Secret mount
 	// the init container read from.
 	volumeMounts = append(volumeMounts, buildShellSandboxClientKeyMount())
+	if a2aAgentSurface(agent) && a2aSlackArmed(agent) {
+		volumeMounts = append(volumeMounts, homeChannelProjectionMount(agentChatHomeDir))
+	}
 
 	// Args, never Command. Command replaces the image ENTRYPOINT
 	// (/usr/local/bin/agent-entrypoint), and that script is what makes $HERMES_HOME
@@ -5453,8 +5531,8 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			// The bearer key is the non-secret loopback sentinel already in this
 			// container's env, and API_SERVER_ENABLED is unconditionally true above,
 			// so the probe is valid in every configuration.
-			StartupProbe:    agentAPIProbe(10, 90),
-			ReadinessProbe:  agentAPIProbe(15, 3),
+			StartupProbe:    agentAPIProbe(agentAPIStartupProbePeriodSeconds, agentAPIStartupProbeFailureThreshold, agentAPIStartupProbeTimeoutSeconds),
+			ReadinessProbe:  agentAPIProbe(agentAPIReadinessProbePeriodSeconds, agentAPIReadinessProbeFailureThreshold, agentAPIReadinessProbeTimeoutSeconds),
 			SecurityContext: hardenedSecurityContext(),
 		},
 	}

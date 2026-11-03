@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -150,5 +151,91 @@ func TestAFinishBetweenHoldersIsSettledNotFailed(t *testing.T) {
 	time.Sleep(time.Second)
 	if ts := b.terminalsOf("task-1"); len(ts) != 1 || ts[0].state != lib.StateCompleted {
 		t.Errorf("terminals %+v, want only the worker's completed", ts)
+	}
+}
+
+// A lease record nobody can read still says the task started, so it is
+// re-adopted, not offered. It names neither a deadline nor a confirm time,
+// so the limit counts from the re-adoption, and the restart grace covers it
+// like any other: a worker still renewing keeps it, and its final renewal
+// settles it with no failure terminal.
+func TestAnUnreadableRecordIsReadoptedWithTheRestartGrace(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	kv, err := b.js.KeyValue(b.ctx, lib.ProfileLeaseBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")
+	if _, err := kv.Put(b.ctx, key, []byte("{not a lease record")); err != nil {
+		t.Fatal(err)
+	}
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	renewing := make(chan struct{})
+	renewed := make(chan struct{})
+	go func() {
+		defer close(renewed)
+		tick := time.NewTicker(500 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-renewing:
+				return
+			case <-tick.C:
+				w.publish(lib.DispatchLeaseSubject("tse", "read", "tse-0"), lib.LeaseRenewal{TaskID: "task-1"})
+			}
+		}
+	}()
+	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0"), &fakeVerifier{})
+	time.Sleep(4 * time.Second) // past the 2s grace and the 3s lease
+	close(renewing)
+	<-renewed
+	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+		t.Fatalf("a re-adopted task its worker still renews was ended: %+v", ts)
+	}
+	w.publish(lib.DispatchLeaseSubject("tse", "read", "tse-0"), lib.LeaseRenewal{TaskID: "task-1", Final: true})
+	waitFor(t, 5*time.Second, "the task settled", func() bool { return b.tombstones()[key].Finished() })
+	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+		t.Errorf("a settled task got a terminal from the dispatcher: %+v", ts)
+	}
+	if n := w.offerCount(); n != 0 {
+		t.Errorf("a task its record says started was offered %d times", n)
+	}
+}
+
+// A final renewal for a task not held here is looked up off onRenewal's
+// lock, and the task's submission can come back and be re-adopted in
+// between. The final then belongs to that hold: delivered to it, not left
+// in released for an adoption that has already happened (the hold would
+// wait out the grace and the lease and fail a task that completed).
+func TestAFinalRacingAReadoptionReachesTheHold(t *testing.T) {
+	b := newBus(t, "tse-0")
+	ti := oneProfile("tse", 2, "tse-0")
+	d, err := New(testConfig(), b.connect("dispatcher"), ti.src, ti.pool, &fakeVerifier{}, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")
+	now := time.Now()
+	rec, _ := json.Marshal(lib.LeaseRecord{TaskID: "task-1", Pod: "tse-0", Kind: lib.SubmitKindTop,
+		ConfirmedAt: now, RenewedAt: now, ExpiresAt: now.Add(time.Hour)})
+	if _, err := b.js.Publish(b.ctx, "$KV."+lib.ProfileLeaseBucket+"."+key, rec); err != nil {
+		t.Fatal(err)
+	}
+	// onRenewal found no hold; adopt registers one before the lookup ends.
+	h := &holding{profile: "tse", tier: "read", kind: lib.SubmitKindTop, taskID: "task-1", pod: "tse-0", confirmed: true,
+		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
+	d.mu.Lock()
+	d.active[h.key()] = h
+	d.mu.Unlock()
+	d.renewOrphan("tse", "read", "tse-0", key, lib.LeaseRenewal{TaskID: "task-1", Final: true}, true)
+	select {
+	case r := <-h.renewals:
+		if !r.final || r.pod != "tse-0" {
+			t.Errorf("the hold got %+v, want tse-0's final", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Errorf("the final never reached the hold that re-adopted the task (released: %v)", d.released)
 	}
 }

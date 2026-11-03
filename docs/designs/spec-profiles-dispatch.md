@@ -286,7 +286,9 @@ paths:
   permits running the resolved profile at tier T for the target in scope, checks the tier
   against the profile's allowed tiers, and checks the message's age against
   `spec.queueTimeoutSeconds` (default 3600; the stream's own age limit is stream-wide). It
-  fails a task that fails any check with a visible notice.
+  fails a task that fails any check with a visible notice. A verifier nobody answers gives no
+  verdict: the submission stays queued and is asked about again, until a verdict or its queue
+  timeout ends it.
 - It then **holds the message unacknowledged for the task's whole life**, with periodic
   in-progress acks, and hands the task to an executor: a warm worker for interactive tiers, a
   Job for the unattended tier. Workers get tasks only from the dispatcher; they have no fetch
@@ -345,15 +347,17 @@ leave open:
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
   has published the task's terminal it sends a renewal with `final` set (`LeaseRenewal.Final`).
   The dispatcher has no read on `.events`, so that renewal is how it learns the task ended:
-  it turns the record into a tombstone, acks the submission, waits for the server to confirm
-  the ack, then frees the slot. An expired lease or a passed deadline also tells the worker
-  to abandon the task.
+  it turns the record into a tombstone and frees the slot, then acks the submission and waits
+  for the server to confirm the ack (an ack that never lands, as on a durable the operator
+  deleted, leaves the tombstone to answer the redelivery). An expired lease or a passed
+  deadline also tells the worker to abandon the task.
 - **Tombstones.** `PROFILE_SUBMITS` keeps acked submissions for its 72h max age (limits
   retention), so a durable re-created with DeliverAll replays every task it ever held. Every
   outcome the dispatcher sees or writes is final: a `final` renewal, a `lease-expired` or
   `deadline-exceeded` failure, a refusal at admission. On each it writes a tombstone before
   it acks: the lease record under the same key with `finishedAt` set
-  (`LeaseRecord.FinishedAt`); a refusal, which no pod held, under the pod token `_refused`.
+  (`LeaseRecord.FinishedAt`); a refusal, which no pod held, under the pod token `_refused`,
+  and before its `rejected` terminal, so a restart never re-admits a refusal already reported.
   A submission that finds a tombstone is acked and nothing else: it is never offered,
   adopted or given a second terminal, so a grant given since never runs a task once refused.
   A tombstone keeps no pod busy and is never renewed or re-adopted; it is told from a
@@ -378,7 +382,8 @@ leave open:
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
-  the gateway's relay already reads `.supervisor` beside `.events`. The codes are
+  the gateway's relay reads `.supervisor` beside `.events`, under an agreement policy that
+  names the dispatcher (`lib.DispatcherSession`) as a supervisor beside the gateway. The codes are
   `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
   admission, and `lease-expired` and `deadline-exceeded` while it holds.
 - **Breaker (#3655 PR 6).** A run of `breakerThreshold` lease expiries in a row on one

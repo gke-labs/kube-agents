@@ -380,6 +380,9 @@ type usageScrapedPod struct {
 	// largest of each field across the brokers read (usageReadingsForPoll).
 	Readings        map[string]int64
 	ReadingsPresent map[usageReadingKind]bool
+	// DataVolume is the watcher's data volume reading, nil for any pod but a
+	// gateway's and for a watcher body that carried none. Not folded either.
+	DataVolume *usageDataVolume
 }
 
 // usageSeed is what a poll that finds no usable document starts from: the

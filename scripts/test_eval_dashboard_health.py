@@ -324,6 +324,53 @@ class SharedBreak(unittest.TestCase):
         self.assertEqual(result["state"], "GREEN")
         self.assertIn("PR-caused: agent-kanban-smoke failing on 2 runs of #11 (passing on 2 other PRs)", result["evidence"])
 
+    def test_a_thin_record_is_not_pr_caused(self):
+        # One graded fail beside two infra reps (a throttled run) is not a
+        # collapse the PR owns, same base or not; two graded fails are.
+        passing = [task(name, "ppp") for name in sorted(ADMITTED - {"agent-kanban-smoke"})]
+        thin = run(1, 11, T0 - timedelta(hours=2), tasks=[task("agent-kanban-smoke", "ifi")] + passing, result="FAILURE", base_sha="aaaaaaa")
+        other = run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()), base_sha="aaaaaaa")
+        self.assertFalse([line for line in assess(data(thin, other), T0)["evidence"] if line.startswith("PR-caused")])
+        self.assertEqual(adjudicate(data(thin, other), T0)["metrics"]["pr_caused_reds"], 0)
+        solid = run(1, 11, T0 - timedelta(hours=2), tasks=[task("agent-kanban-smoke", "iff")] + passing, result="FAILURE", base_sha="aaaaaaa")
+        self.assertIn("PR-caused: agent-kanban-smoke failing only on #11 (passing on 1 other PRs built on the same main commit)", assess(data(solid, other), T0)["evidence"])
+        # A retest pair where one run is thin is one solid run, not two.
+        thin_retest = run(2, 11, T0 - timedelta(hours=3), tasks=[task("agent-kanban-smoke", "ifi")] + passing, result="FAILURE")
+        solid_alone = run(1, 11, T0 - timedelta(hours=2), tasks=[task("agent-kanban-smoke", "iff")] + passing, result="FAILURE")
+        self.assertFalse([line for line in assess(data(thin_retest, solid_alone, run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()))), T0)["evidence"] if line.startswith("PR-caused")])
+        # Two solid runs beside a thin one: the line counts the solid two, and
+        # the digest counts the solid runs only, the thin one on the gate's side.
+        second = run(4, 11, T0 - timedelta(hours=4), tasks=[task("agent-kanban-smoke", "fff")] + passing, result="FAILURE")
+        passer = run(3, 12, T0 - timedelta(hours=1), tasks=broken_tasks(set()))
+        self.assertIn("PR-caused: agent-kanban-smoke failing on 2 runs of #11 (passing on 1 other PRs)", assess(data(thin_retest, solid_alone, second, passer), T0)["evidence"])
+        metrics = adjudicate(data(thin_retest, solid_alone, second, passer), T0)["metrics"]
+        self.assertEqual((metrics["pr_caused_reds"], metrics["infra_reds"]), (2, 1))
+        self.assertEqual(adjudicate(data(thin, solid, other), T0)["metrics"]["pr_caused_reds"], 1, "a thin run beside a same-base solid one is the gate's")
+
+    def test_nothing_is_pr_caused_while_a_storm_fires(self):
+        # A solid same-base collapse on #11 beside a storm's reps: the storm
+        # owns the window, confirmed by a reading or not.
+        stormy = [run(100 + i, pr, T0 - timedelta(minutes=20 * i), result="SUCCESS", tasks=[task(f"case-{k}", "eee") for k in range(2)] + [task(name, "ppp") for name in sorted(ADMITTED)]) for i, pr in enumerate((1, 2, 3))]
+        collapse = run(1, 11, T0 - timedelta(hours=1), tasks=broken_tasks({"agent-kanban-smoke"}), base_sha="aaaaaaa")
+        other = run(3, 12, T0 - timedelta(minutes=50), tasks=broken_tasks(set()), base_sha="aaaaaaa")
+        line = "PR-caused: agent-kanban-smoke failing only on #11 (passing on 1 other PRs built on the same main commit)"
+        self.assertIn(line, assess(data(collapse, other), T0)["evidence"])
+        with_storm = assess(data(*stormy, collapse, other), T0)
+        self.assertEqual(with_storm["condition"], "storm")
+        self.assertFalse([l for l in with_storm["evidence"] if l.startswith("PR-caused")])
+        # The reading denying the storm (infra deaths) still leaves the thin window alone.
+        reading = {"schema_version": 1, "read_at": health.iso(T0), "window_start": health.iso(T0 - timedelta(hours=6)), "window_end": health.iso(T0), "read": ["p"], "errors": {}, "bucket_seconds": 600, "buckets": [{"end": health.iso(T0 - timedelta(minutes=10 * i)), "requests": 100, "429": 1} for i in range(36)]}
+        denied = health.assess(health.load_runs(data(*stormy, collapse, other)), T0, health.Roster.fixed(ADMITTED), vertex_429=reading)
+        self.assertEqual(denied["condition"], None)
+        self.assertFalse([l for l in denied["evidence"] if l.startswith("PR-caused")])
+        # A collapse that finished before the storm's reach (its first hit run
+        # finished 40 minutes ago, calls up to three hours before) is named.
+        early = run(1, 11, T0 - timedelta(hours=5), tasks=broken_tasks({"agent-kanban-smoke"}), base_sha="aaaaaaa")
+        early_other = run(3, 12, T0 - timedelta(hours=4, minutes=50), tasks=broken_tasks(set()), base_sha="aaaaaaa")
+        self.assertIn(line, assess(data(*stormy, early, early_other), T0)["evidence"])
+        # The digest's count keeps the floor only: a storm does not blank a day.
+        self.assertEqual(adjudicate(data(*stormy, collapse, other), T0)["metrics"]["pr_caused_reds"], 1)
+
     def test_one_red_run_is_pr_caused_only_against_a_pass_on_the_same_base(self):
         # One red run of #11 and passes elsewhere on other main commits: a
         # flake or a moving main, so nothing is said.

@@ -28,7 +28,8 @@ func TestALostAcceptIsAbandonedBeforeTheReoffer(t *testing.T) {
 		t.Fatalf("terminal %+v, want tse-1's completed", ts)
 	}
 	if lost.offerCount() != 1 || lost.abandonCount() != 1 {
-		t.Errorf("tse-0: %d offers, %d abandons; want its timed-out offer abandoned once", lost.offerCount(), lost.abandonCount())
+		// Fatal: the reason check below indexes the first abandon.
+		t.Fatalf("tse-0: %d offers, %d abandons; want its timed-out offer abandoned once", lost.offerCount(), lost.abandonCount())
 	}
 	if lost.confirmCount() != 0 || lost.startedCount() != 0 {
 		t.Errorf("tse-0 was confirmed (%d) or started (%d) after its accept was lost", lost.confirmCount(), lost.startedCount())
@@ -134,6 +135,16 @@ func TestARestartMidOfferDispatchesAfresh(t *testing.T) {
 	stop1()
 	if l := b.leases(); len(l) != 0 {
 		t.Fatalf("a dispatcher stopped mid-offer left a lease: %v", l)
+	}
+	// The stop waited for the hand-off to return, and the abandon was sent
+	// before it did: the pod drops the offer now, not when its own accept
+	// window lapses.
+	waitFor(t, 2*time.Second, "the stopping dispatcher's abandon", func() bool { return first.abandonCount() == 1 })
+	first.mu.Lock()
+	abandon := first.abandons[0]
+	first.mu.Unlock()
+	if abandon.TaskID != "task-1" || abandon.Reason != abandonStopping {
+		t.Errorf("the first pod's abandon %+v, want task-1's %q", abandon, abandonStopping)
 	}
 
 	second := b.worker("tse", "read", "tse-1", answerAccept, 500*time.Millisecond)

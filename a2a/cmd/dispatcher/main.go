@@ -64,7 +64,9 @@ const (
 // connection, and the dispatcher replaces its connection when its grants
 // change (lib.Client.Reconnect), so one is built per check: it is only the
 // connection and a subject, and the check's reply subscription ends with
-// the check. Any error, an unreachable verifier included, is a refusal.
+// the check. A verifier nobody answers (or no connection at all) is
+// dispatch.ErrVerifierUnreachable, which holds the submission; any other
+// error is a refusal.
 type busVerifier struct {
 	conn func() *nats.Conn
 	log  *slog.Logger
@@ -73,14 +75,18 @@ type busVerifier struct {
 func (v busVerifier) CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error {
 	nc := v.conn()
 	if nc == nil {
-		return &capability.Refusal{Rule: "the dispatcher is not connected to the bus"}
+		return fmt.Errorf("%w: the dispatcher is not connected to the bus", dispatch.ErrVerifierUnreachable)
 	}
 	c, err := capability.NewClient(nc, natsUser)
 	if err != nil {
 		return err
 	}
 	c.Log = v.log
-	return c.CheckProfileRun(ctx, ref, profile, tier, target)
+	err = c.CheckProfileRun(ctx, ref, profile, tier, target)
+	if capability.IsUnreachable(err) {
+		return fmt.Errorf("%w: %w", dispatch.ErrVerifierUnreachable, err)
+	}
+	return err
 }
 
 // errProfileNamespaceMoved ends the process when the config's profile

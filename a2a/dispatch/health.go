@@ -16,14 +16,19 @@ const waitingForgetAfter = 3
 type Health struct {
 	// Running is every held task, by profile.
 	Running map[string]int
-	// Waiting is the submissions over a cap, by durable.
+	// Waiting is the submissions waiting, over a cap or for a free worker,
+	// by durable.
 	Waiting map[string]int
+	// NoWorker is the part of Waiting that no free worker took (the pool
+	// had no free pod, or none accepted), by durable.
+	NoWorker map[string]int
 	// OldestWait is the longest a waiting submission has been queued, by
 	// durable.
 	OldestWait map[string]time.Duration
 	// Stalled are the durables with a submission waiting longer than
 	// StallAfter and no admission from them in that time: what a
-	// cross-chain admission cycle looks like until the deadlines end it.
+	// cross-chain admission cycle looks like until the deadlines end it, or
+	// a pool with no ready worker (every wait in NoWorker).
 	Stalled []string
 	// DroppedAnswers counts worker answers for tasks they don't hold that
 	// were dropped over a pod's budget, since start.
@@ -65,8 +70,8 @@ func (d *Dispatcher) Health() Health {
 	now := d.now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	h := Health{Running: map[string]int{}, Waiting: map[string]int{}, OldestWait: map[string]time.Duration{},
-		DroppedAnswers: d.droppedAnswers.Load()}
+	h := Health{Running: map[string]int{}, Waiting: map[string]int{}, NoWorker: map[string]int{},
+		OldestWait: map[string]time.Duration{}, DroppedAnswers: d.droppedAnswers.Load()}
 	for _, a := range d.active {
 		h.Running[a.profile]++
 	}
@@ -77,6 +82,9 @@ func (d *Dispatcher) Health() Health {
 			continue
 		}
 		h.Waiting[w.durable]++
+		if w.why == ReasonNoWorker {
+			h.NoWorker[w.durable]++
+		}
 		if age := now.Sub(w.queued); age > h.OldestWait[w.durable] {
 			h.OldestWait[w.durable] = age
 		}
@@ -95,20 +103,32 @@ func (d *Dispatcher) Health() Health {
 
 func (d *Dispatcher) logHealth() {
 	h := d.Health()
-	d.log.Info("dispatcher health", "running", h.Running, "waiting", h.Waiting, "oldestWait", h.OldestWait,
-		"droppedAnswers", h.DroppedAnswers)
+	d.log.Info("dispatcher health", "running", h.Running, "waiting", h.Waiting, "noWorker", h.NoWorker,
+		"oldestWait", h.OldestWait, "droppedAnswers", h.DroppedAnswers)
 	if h.JobAdmission != "" {
 		d.log.Warn(jobRefusedHint, "err", h.JobAdmission)
 	}
 	if h.StopStream != "" {
 		d.log.Warn("the stop stream can't be read; a stop counts only if heard live", "err", h.StopStream)
 	}
-	if len(h.Stalled) > 0 {
+	var overCap, noWorker []string
+	for _, durable := range h.Stalled {
+		if h.NoWorker[durable] == h.Waiting[durable] {
+			noWorker = append(noWorker, durable)
+		} else {
+			overCap = append(overCap, durable)
+		}
+	}
+	if len(overCap) > 0 {
 		d.log.Warn("admission stalled: submissions waiting over a cap with no admission; a cross-chain cycle holds until the parents' deadlines",
-			"durables", h.Stalled, "stallAfter", d.cfg.StallAfter)
+			"durables", overCap, "stallAfter", d.cfg.StallAfter)
+	}
+	if len(noWorker) > 0 {
+		d.log.Warn("admission stalled: no ready worker took a submission; check the pool's pods",
+			"durables", noWorker, "stallAfter", d.cfg.StallAfter)
 	}
 	if len(h.OpenBreakers) > 0 {
-		d.log.Warn("breakers open: refusing new submissions where tasks kept losing their workers", "open", h.OpenBreakers)
+		d.log.Warn("breakers open: holding new submissions queued where tasks kept losing their workers", "open", h.OpenBreakers)
 	}
 }
 
