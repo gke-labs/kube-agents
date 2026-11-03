@@ -32,6 +32,10 @@ import gke_endpoint  # noqa: E402
 
 POD_RANGE = "10.92.0.0/14"
 ADMIT_REMEDY = gke_endpoint.REMEDY_ADMIT_POD_RANGE.format(pod_cidr=POD_RANGE)
+# The shim's one line per retry (credential_proxy_client.report_retry): printed
+# before the next attempt, whose kubectl may write after it.
+BUSY_RETRY_LINE = ("credential proxy busy (HTTP 503): the credential proxy is at its limit of 8 concurrent "
+                   "commands and this request waited 60s without reaching a free slot; retrying in 1.7s (attempt 2)")
 
 
 def a_decision(**overrides):
@@ -715,14 +719,42 @@ class CreateProfileTest(unittest.TestCase):
     def test_the_shim_exclusion_matches_the_shims_prefixes_and_not_a_mention(self):
         # The shim's own messages start "credential proxy:" or "credential proxy
         # unavailable"; preflight's cap text merely mentions "the credential
-        # proxy's admission wait" and is a real timeout.
+        # proxy's admission wait" and is a real timeout. The shim's busy line is
+        # not terminal: the retried attempt's kubectl writes after it, so it
+        # must not decide the whole stderr.
         for shim in ("credential proxy unavailable: [Errno 111] Connection refused",
                      "credential proxy: kubeconfig is unreadable: /x: [Errno 13] Permission denied",
                      "credential proxy token unavailable: no token file",
-                     "credential proxy error (HTTP 502): non-JSON response"):
+                     "credential proxy error (HTTP 502): non-JSON response",
+                     "credential proxy throttled: gave up after 2 attempts (HTTP 503): the credential proxy is at "
+                     "its child memory budget (704 MiB in use of 704 MiB) and this request timed out waiting"):
             self.assertTrue(cap.NOT_A_CONNECTION_FAILURE_RE.search(shim), shim)
-        self.assertFalse(cap.NOT_A_CONNECTION_FAILURE_RE.search(
-            "timed out after 95s, the preflight's cap on one brokered call (the credential proxy's 60s admission wait plus 30s)"))
+        for not_shim in ("timed out after 95s, the preflight's cap on one brokered call (the credential proxy's 60s admission wait plus 30s)",
+                         BUSY_RETRY_LINE):
+            self.assertFalse(cap.NOT_A_CONNECTION_FAILURE_RE.search(not_shim), not_shim)
+
+    def test_a_probe_refused_busy_once_and_then_unreachable_still_earns_the_remedy(self):
+        # The shim printed its busy line, waited, was admitted, and the kubectl
+        # it then ran never reached the endpoint: the case the remedy is for.
+        self.decision = a_blocked_decision()
+        self.probe_exit = 1
+        self.probe_stderr = BUSY_RETRY_LINE + "\nUnable to connect to the server: dial tcp 203.0.113.10:443: i/o timeout\n"
+        self.create()
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
+        self.assertIn(ADMIT_REMEDY, self.stderr)
+        self.assertIn("kubectl: Unable to connect to the server", self.stderr)
+
+    def test_a_probe_the_shim_gave_up_on_names_no_remedy(self):
+        # Busy, retried, then throttled: the shim exited without asking the
+        # cluster, so the list is not what stood in the way.
+        self.decision = a_blocked_decision()
+        self.probe_exit = 1
+        self.probe_stderr = (BUSY_RETRY_LINE + "\ncredential proxy throttled: gave up after 2 attempts (HTTP 503): "
+                             "the credential proxy is at its limit of 8 concurrent commands and this request waited "
+                             "60s without reaching a free slot; retry shortly\n")
+        self.create()
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
+        self.assertNotIn(ADMIT_REMEDY, self.stderr)
 
     def test_a_passing_probe_logs_nothing_about_the_endpoint(self):
         self.decision = a_decision()

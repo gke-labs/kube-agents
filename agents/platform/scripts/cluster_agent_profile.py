@@ -112,13 +112,17 @@ CONNECTIVITY_FAILURE_RE = re.compile(
 # ... Connection refused", "credential proxy: kubeconfig is unreadable") are
 # the shim or the broker, not the cluster's list. Matched on the shim's
 # prefixes, not the words: preflight's cap text mentions "the credential
-# proxy's admission wait" and is a real timeout.
+# proxy's admission wait" and is a real timeout. Only the shim's terminal
+# lines are here, the ones after which it exits without running kubectl: its
+# "credential proxy busy ... retrying" line is followed by the admitted
+# attempt's own stderr, so a command refused once and then failing to reach
+# the endpoint still earns the remedy.
 # "Error from server" fronts every answer the API server gave, a degraded
 # etcd's "request timed out" included: the server was reached, so the list is
 # not what stands in the way whatever words follow.
 NOT_A_CONNECTION_FAILURE_RE = re.compile(
     r"credential proxy( token)? unavailable|credential proxy error|credential proxy:|"
-    r"Error from server",
+    r"credential proxy throttled|Error from server",
     re.IGNORECASE,
 )
 

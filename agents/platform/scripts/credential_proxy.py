@@ -3345,10 +3345,13 @@ class SessionSlots:
 
     Only ``role`` is counted; every other role passes through to the pool
     unchanged. A caller at the bound is refused immediately with
-    CommandSlotUnavailable, which the exec route already answers as busy, so
-    the shim prints why and the model reports it rather than retrying. The
-    profile and scope roles have instances of their own (``profile_slots``,
-    ``scope_slots``).
+    CommandSlotUnavailable, which the exec route already answers as busy with
+    this instance's ``bound`` in the reply. The shim retries a busy reply only
+    under the pool's bounds (``RETRYABLE_BUSY_BOUNDS``), never ``session`` or
+    ``scope``, so a caller at its own cap prints why and the model reports it
+    rather than retrying; ``profile`` is a share of the pool, which another
+    replica can admit, so that one is retried. The profile and scope roles
+    have instances of their own (``profile_slots``, ``scope_slots``).
     """
 
     def __init__(
@@ -14828,9 +14831,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         either bound is the one that would take the container over its memory limit.
         `error` is the key the shim prints, so the agent reads why rather than
         a bare exit 1, and `code` lets a caller tell "busy, retry" from a
-        failure. A queue refusal is the 503 it has always been; the gate's is
-        a 429 with Retry-After in the header and the body, under its own code,
-        so a caller can back off for the interval rather than retry at once.
+        failure. A queue refusal is the 503 it has always been, and `bound`
+        names what held the request, so the shim retries a pool bound (another
+        replica, or a moment later, can admit it) and reports a caller's own
+        cap (`session`, `scope`) instead. The gate's refusal is a 429 with
+        Retry-After in the header and the body, under its own code, so a
+        caller can back off for the interval rather than retry at once.
         Counted here, once per route that answers it, under the bound the
         exception carries.
         """
