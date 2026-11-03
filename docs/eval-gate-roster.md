@@ -883,8 +883,8 @@ a pull request.
 
 ## The GHES lane
 
-The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand, `ci-kube-agents-eval-nightly-ghes`
-and, under `spec.mode: next`, `ci-kube-agents-eval-nightly-ghes-next`; `EVAL_FORGE=ghes`,
+The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand and `ci-kube-agents-eval-nightly-ghes-next`
+nightly, both under `spec.mode: next`; `EVAL_FORGE=ghes`,
 [#3684](https://github.com/gke-labs/kube-agents/issues/3684)) deploy the agent against a GitHub
 Enterprise Server at a private host with a private CA: the forwarding proxy in `hack/ghes-proxy`,
 on a VM the job stands up per run in front of the leased project's github.com repository
