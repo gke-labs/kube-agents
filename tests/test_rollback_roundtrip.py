@@ -376,6 +376,8 @@ FAKE_KUBECTL = textwrap.dedent(
             return obj["spec"].get("mode", "")
         if path == "{.metadata.generation}":
             return str(obj["metadata"]["generation"])
+        if path == "{.spec.holderIdentity}":
+            return obj["spec"].get("holderIdentity", "")
         if path == "{.spec.volumes[*].persistentVolumeClaim.claimName}":
             return " ".join(v["persistentVolumeClaim"]["claimName"] for v in obj["spec"]["volumes"])
         sys.exit("fake kubectl: unsupported jsonpath " + path)
@@ -1056,6 +1058,24 @@ class PortForwardTest(RoundTripTest):
         pids = [int(line) for line in sim.pf_pids.read_text().split()]
         time.sleep(0.5)
         self.assertEqual([pid for pid in pids if alive(pid)], [])
+
+    def test_the_inject_tunnel_goes_to_the_gateway_lease_holder(self) -> None:
+        # Behind an elected gateway only the Lease holder serves the door (a
+        # standby answers 503), so the bus task's tunnel targets its pod; the
+        # agent's own tunnel stays on its Service. With no Lease, as on the
+        # healthy state the other tests run, it's the door's Service.
+        state = healthy_next_state()
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "platform-agent-a2a-gateway-7d9f-abcde"}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("pod/platform-agent-a2a-gateway-7d9f-abcde"), 2, targets)
+        self.assertEqual(targets.count("svc/platform-agent"), 1, targets)
+
+        result, after, _ = self.run_sim(healthy_next_state(), **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
 
     def test_a_dead_first_tunnel_is_replaced_by_a_fresh_one(self) -> None:
         # The first port-forward (the pre bus task's) accepts and drops every

@@ -85,6 +85,11 @@ Environment:
         ``28099``). The remote side is always the Service's 8099.
     AGENT_INJECT_URL: A gateway base URL to use instead of spawning a
         port-forward.
+    AGENT_GATEWAY_LEASE: The gateway's Lease (default
+        ``<AGENT_SERVICE_NAME>-a2a-gateway``). When it names a holder, the
+        tunnel forwards to that pod rather than the Service, and finds the
+        holder again on every respawn, so a standby's 503 is retried against
+        the replica serving the door.
     AGENT_INJECT_TOKEN: The door's bearer token, required. The operator
         renders it into the ``<agent>-a2a-inject`` Secret under its eval
         flag, and this is read the way the presubmit reads the agent's own
@@ -270,6 +275,13 @@ _MAX_CARD_MESSAGE_LOG_CHARS = 200
 # forwarding cannot be mistaken for this tunnel.
 _INJECT_SERVICE_SUFFIX = "-a2a-inject"
 _INJECT_REMOTE_PORT = 8099
+# The A2A gateway's Lease, whose holder is the one replica serving the doors
+# once the gateway runs more than one (docs/designs/gateway-replicas.md). The
+# tunnel forwards to that pod, read again on every respawn; a standby answers
+# 503 and a respawn finds the new holder. With no Lease, or none readable,
+# the install runs one unelected gateway and the door's Service reaches it.
+_GATEWAY_LEASE_SUFFIX = "-a2a-gateway"
+_LEASE_READ_TIMEOUT = 15
 _INJECT_DEFAULT_LOCAL_PORT = 28099
 # The Secret the operator renders the door's bearer token into, named in the
 # message a run without the token fails with. Suffix and key, so the message
@@ -563,8 +575,10 @@ def _kubectl_target(service: str | None = None) -> list[str]:
     passes the gateway's inject Service, which lives in the same namespace and
     the same context.
     """
+    target = service or os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
     cmd = [
-        f"svc/{service or os.environ.get('AGENT_SERVICE_NAME', 'platform-agent')}",
+        # A resolved target (``pod/<name>``, ``svc/<name>``) is used as given.
+        target if "/" in target else f"svc/{target}",
         "-n",
         os.environ.get("AGENT_NAMESPACE", "kubeagents-system"),
     ]
@@ -572,6 +586,43 @@ def _kubectl_target(service: str | None = None) -> list[str]:
     if context:
         cmd.extend(["--context", context])
     return cmd
+
+
+def _gateway_door_target(agent_service: str, service: str) -> str:
+    """The port-forward target for a gateway door: the Lease holder's pod, or
+    the door's Service when no Lease names one.
+
+    ``AGENT_GATEWAY_LEASE`` overrides the Lease's name (default
+    ``<AGENT_SERVICE_NAME>-a2a-gateway``). Best effort: a Lease that is
+    missing, unreadable or held by nobody leaves the Service, which is what
+    every install that renders no Lease serves the door through.
+    """
+    lease = os.environ.get("AGENT_GATEWAY_LEASE") or agent_service + _GATEWAY_LEASE_SUFFIX
+    cmd = [
+        "kubectl",
+        "get",
+        "lease",
+        lease,
+        "-n",
+        os.environ.get("AGENT_NAMESPACE", _DEFAULT_AGENT_NAMESPACE),
+        "-o",
+        "jsonpath={.spec.holderIdentity}",
+    ]
+    context = os.environ.get("AGENT_CLUSTER_CONTEXT")
+    if context:
+        cmd.extend(["--context", context])
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=_LEASE_READ_TIMEOUT, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.debug("reading lease %s failed: %s", lease, exc)
+        return f"svc/{service}"
+    holder = proc.stdout.strip() if proc.returncode == 0 else ""
+    if not holder:
+        return f"svc/{service}"
+    _log.info("gateway lease %s is held by %s; forwarding to that pod", lease, holder)
+    return f"pod/{holder}"
 
 
 def _port_forward_command(
@@ -2648,7 +2699,10 @@ class KubeAgentsHarness(AgentHarness):
             if not own_tunnel:
                 return
             forward = _reset_port_forward if reset else _ensure_port_forward
-            forward(local_port, service=service, remote_port=_INJECT_REMOTE_PORT)
+            # Resolved on every spawn: after a 503 from a standby or a tunnel
+            # dropped with its pod, the lease names where the door is now.
+            target = _gateway_door_target(agent_service, service)
+            forward(local_port, service=target, remote_port=_INJECT_REMOTE_PORT)
 
         # Same establishment retry as the api path's, for the same reason: a
         # tunnel that cannot come up is the run class, not an answer.

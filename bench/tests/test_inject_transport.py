@@ -37,6 +37,7 @@ import json
 import logging
 import socket
 import sqlite3
+import subprocess
 import threading
 import time
 from collections.abc import Generator, Sequence
@@ -1292,6 +1293,15 @@ def test_an_own_tunnel_forwards_the_inject_service_and_respawns_it_on_a_drop(
 
     monkeypatch.setattr(harness, "_ensure_port_forward", _ensure)
     monkeypatch.setattr(harness, "_reset_port_forward", _reset)
+    # No Lease on this install: the door's Service, as every unelected
+    # gateway serves it.
+    asked: list[tuple[str, str]] = []
+
+    def _no_lease(agent_service: str, service: str) -> str:
+        asked.append((agent_service, service))
+        return f"svc/{service}"
+
+    monkeypatch.setattr(harness, "_gateway_door_target", _no_lease)
     stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
     stub_gateway.poll_status = 503
     stub_gateway.poll_failures = 1
@@ -1300,13 +1310,108 @@ def test_an_own_tunnel_forwards_the_inject_service_and_respawns_it_on_a_drop(
 
     result = KubeAgentsHarness().run("take your time")
 
-    door = (local_port, "platform-agent-a2a-inject", harness._INJECT_REMOTE_PORT)
+    door = (local_port, "svc/platform-agent-a2a-inject", harness._INJECT_REMOTE_PORT)
     assert established == [door]
     assert respawned == [door]
+    assert asked == [("platform-agent", "platform-agent-a2a-inject")] * 2
     assert stub_gateway.failed_polls == 1
     assert len(stub_gateway.submissions) == 1
     assert result.output == "partial findings"
     assert not infra(result)
+
+
+def test_a_respawn_after_a_standbys_503_forwards_to_the_new_holder(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behind an elected gateway the tunnel goes to the Lease holder's pod,
+    and the holder is read again on each respawn: a 503 from a standby (the
+    lease moved, or the first read was stale) is retried against the replica
+    that holds it now, not the same pod or the Service."""
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    local_port = stub_gateway.server_address[1]
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(local_port))
+    targets: list[str | None] = []
+
+    def _forward(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        targets.append(service)
+
+    monkeypatch.setattr(harness, "_ensure_port_forward", _forward)
+    monkeypatch.setattr(harness, "_reset_port_forward", _forward)
+    holders = iter(["pod/platform-agent-a2a-gateway-a", "pod/platform-agent-a2a-gateway-b"])
+    monkeypatch.setattr(harness, "_gateway_door_target", lambda agent_service, service: next(holders))
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.poll_status = 503
+    stub_gateway.poll_failures = 1
+    stub_gateway.poll_fail_after_seconds = 0.5
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert targets == ["pod/platform-agent-a2a-gateway-a", "pod/platform-agent-a2a-gateway-b"]
+    assert result.output == "partial findings"
+    assert not infra(result)
+
+
+class _LeaseRead:
+    """A stand-in for ``subprocess.run`` reading the gateway's Lease."""
+
+    def __init__(self, stdout: str = "", returncode: int = 0, raises: BaseException | None = None) -> None:
+        self.stdout, self.returncode, self.raises = stdout, returncode, raises
+        self.commands: list[list[str]] = []
+
+    def __call__(self, cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        self.commands.append(cmd)
+        if self.raises is not None:
+            raise self.raises
+        return subprocess.CompletedProcess(cmd, self.returncode, stdout=self.stdout, stderr="")
+
+
+@pytest.mark.parametrize(
+    ("read", "want"),
+    [
+        (_LeaseRead(stdout="platform-agent-a2a-gateway-7d9f-abcde\n"), "pod/platform-agent-a2a-gateway-7d9f-abcde"),
+        # Released, or between leaders: nobody to point at.
+        (_LeaseRead(stdout=""), "svc/platform-agent-a2a-inject"),
+        # No Lease: an unelected gateway, every install before the operator renders one.
+        (_LeaseRead(returncode=1), "svc/platform-agent-a2a-inject"),
+        (_LeaseRead(raises=OSError("kubectl not found")), "svc/platform-agent-a2a-inject"),
+        (_LeaseRead(raises=subprocess.TimeoutExpired(["kubectl"], 15)), "svc/platform-agent-a2a-inject"),
+    ],
+)
+def test_the_door_target_is_the_lease_holder_or_the_service(
+    monkeypatch: pytest.MonkeyPatch, read: _LeaseRead, want: str
+) -> None:
+    monkeypatch.delenv("AGENT_GATEWAY_LEASE", raising=False)
+    monkeypatch.setenv("AGENT_NAMESPACE", "kubeagents-system")
+    monkeypatch.setenv("AGENT_CLUSTER_CONTEXT", "ctx-1")
+    monkeypatch.setattr(harness.subprocess, "run", read)
+
+    assert harness._gateway_door_target("platform-agent", "platform-agent-a2a-inject") == want
+    assert read.commands == [
+        [
+            "kubectl",
+            "get",
+            "lease",
+            "platform-agent-a2a-gateway",
+            "-n",
+            "kubeagents-system",
+            "-o",
+            "jsonpath={.spec.holderIdentity}",
+            "--context",
+            "ctx-1",
+        ]
+    ]
+
+
+def test_a_resolved_target_is_forwarded_as_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pod target from the lease reaches kubectl unchanged, not as a
+    Service named ``svc/pod/...``."""
+    monkeypatch.delenv("AGENT_CLUSTER_CONTEXT", raising=False)
+    monkeypatch.setenv("AGENT_NAMESPACE", "kubeagents-system")
+    cmd = harness._port_forward_command(28099, "pod/platform-agent-a2a-gateway-7d9f-abcde", harness._INJECT_REMOTE_PORT)
+    assert cmd[2:4] == ["pod/platform-agent-a2a-gateway-7d9f-abcde", "28099:8099"]
 
 
 def test_a_status_outside_the_retry_set_is_not_retried(stub_gateway: _StubGatewayServer) -> None:

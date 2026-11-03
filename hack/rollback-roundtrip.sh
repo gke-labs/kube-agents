@@ -805,14 +805,14 @@ print(json.dumps({"spec": {"deployment": {"sidecars": ((cr.get("spec") or {}).ge
 # a wrapper and leaves the tunnel bound, and every later attempt's probe is
 # answered by the first, possibly dead, tunnel.
 start_port_forward() {
-  local service="$1" local_port="$2" remote_port="$3" waited=0
+  local target="$1" local_port="$2" remote_port="$3" waited=0
   local -a pf=(kubectl)
   stop_port_forward
   [ -n "${PF_LOG}" ] || PF_LOG="$(mktemp)"
   if [ -n "${ROLLBACK_KUBE_CONTEXT:-}" ]; then
     pf+=(--context "${ROLLBACK_KUBE_CONTEXT}")
   fi
-  pf+=(-n "${NAMESPACE}" port-forward "svc/${service}" "${local_port}:${remote_port}")
+  pf+=(-n "${NAMESPACE}" port-forward "${target}" "${local_port}:${remote_port}")
   "${pf[@]}" >>"${PF_LOG}" 2>&1 &
   PF_PID=$!
   while [ "${waited}" -lt "${PORT_FORWARD_WAIT}" ]; do
@@ -822,8 +822,23 @@ start_port_forward() {
     sleep 1
     waited=$((waited + 1))
   done
-  note "port-forward to svc/${service} did not listen on ${local_port}; its log: $(tail -n "${PF_LOG_TAIL_LINES}" "${PF_LOG}" 2>/dev/null | tr '\n' ' ')"
+  note "port-forward to ${target} did not listen on ${local_port}; its log: $(tail -n "${PF_LOG_TAIL_LINES}" "${PF_LOG}" 2>/dev/null | tr '\n' ' ')"
   return 1
+}
+
+# The inject door's port-forward target: the pod holding the gateway's Lease,
+# which is the one replica serving the door once the gateway runs more than
+# one (a standby answers 503), or the door's Service when no Lease names one.
+# Read again on every attempt, so a retry after a handover finds the new
+# holder.
+inject_target() {
+  local holder
+  holder="$(k get lease "${A2A_GATEWAY_NAME}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+  if [ -n "${holder}" ]; then
+    echo "pod/${holder}"
+  else
+    echo "svc/${INJECT_NAME}"
+  fi
 }
 
 stop_port_forward() {
@@ -842,7 +857,7 @@ assert_today_turn() {
   for ((attempt = 1; attempt <= TURN_ATTEMPTS; attempt++)); do
     url="${AGENT_URL}"
     if [ -z "${url}" ]; then
-      if ! start_port_forward "${CR_NAME}" "${AGENT_LOCAL_PORT}" "${AGENT_API_PORT}"; then
+      if ! start_port_forward "svc/${CR_NAME}" "${AGENT_LOCAL_PORT}" "${AGENT_API_PORT}"; then
         detail="the port-forward to svc/${CR_NAME} did not listen within ${PORT_FORWARD_WAIT}s"
         continue
       fi
@@ -912,7 +927,7 @@ done = exchange.outcome in (it.OUTCOME_TERMINAL, it.OUTCOME_STREAM_TERMINAL) and
 sys.exit(0 if done else 1)
 '
 assert_bus_task() {
-  local name="$1" token attempt url line rc conversation err
+  local name="$1" token attempt url line rc conversation err target
   token="$(secret_value "${INJECT_NAME}" "${INJECT_TOKEN_FIELD}")" || fail "${name}" "secret/${INJECT_NAME} could not be read"
   [ -n "${token}" ] || fail "${name}" "secret/${INJECT_NAME} has no ${INJECT_TOKEN_FIELD}: the install has no inject door (A2A_INJECT_BACKEND=true on the operator)"
   conversation="${BUS_TASK_CONVERSATION_PREFIX}/${name}/$(date -u +%s)"
@@ -920,8 +935,9 @@ assert_bus_task() {
   for ((attempt = 1; attempt <= BUS_TASK_ATTEMPTS; attempt++)); do
     url="${INJECT_URL}"
     if [ -z "${url}" ]; then
-      if ! start_port_forward "${INJECT_NAME}" "${INJECT_LOCAL_PORT}" "${INJECT_PORT}"; then
-        line="the port-forward to svc/${INJECT_NAME} did not listen within ${PORT_FORWARD_WAIT}s"
+      target="$(inject_target)"
+      if ! start_port_forward "${target}" "${INJECT_LOCAL_PORT}" "${INJECT_PORT}"; then
+        line="the port-forward to ${target} did not listen within ${PORT_FORWARD_WAIT}s"
         continue
       fi
       url="http://127.0.0.1:${INJECT_LOCAL_PORT}"
