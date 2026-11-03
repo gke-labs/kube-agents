@@ -13,23 +13,48 @@
 # investigate `gke-system-balloon-pod` pods through `kubectl` queries,
 # `mcp-developer_knowledge` searches, and `web_search` loops, or flag them as
 # idle waste. The route checks verify that work was delegated through kanban,
-# no worker command targets `balloon` pods directly, and no worker invokes
-# `mcp-developer_knowledge` or `web_search` to look them up; the report check
+# no worker command inspects `balloon` pods, and no worker invokes
+# `mcp-developer_knowledge` or `web_search` on this card; the report check
 # verifies that `gke-system-balloon-pod` is explained as GKE Autopilot headroom
 # rather than proposed for deletion or rightsizing.
 #
-# Why `no-deep-inspection-commands-target-balloon-pods` pairs `worker_commands`
-# with `tool_called(terminal, scope: workers)`: on a front-filed card,
-# `worker_commands` grades Hermes's one-line card-log rendering
-# (`summarize_shell_command`), which collapses `;`, `&&`, or `||` chains to the
-# first command plus ` + N command(s)`, hiding a chained `kubectl ... balloon`
-# behind `cluster_preflight.sh`. Pairing it with `none -> tool_called(terminal)`
-# grades each worker `terminal` call's `command` argument as typed while keeping
-# `worker_commands` for any card-log line whose trajectory entry was not
-# captured (a command run inside `execute_code` on a front-filed card with a
-# shell log line remains outside both). Inverted `grep` filters (`-v`, `-vi`,
-# `-Ev`, `--invert-match`) are exempt in both halves so excluding `balloon` pods
-# from a `kubectl get pods -A` listing passes.
+# Command-guard scope (`no-deep-inspection-commands-target-balloon-pods`):
+# `kubectl` (`get`, `describe`, `logs`, `top`), `jq`, `awk` (`awk`/`gawk`/`mawk`
+# /`nawk`), and `sed` (`sed`/`gsed`) are graded as parsed shell argvs via
+# `forbidden_runs` both on card-log / child-card commands and on typed worker
+# `terminal` / `execute_code` calls (`after_result_pattern: "(?!)"`), so `;`,
+# `&&`, `||`, and `|` pipelines collapsed by Hermes's one-line card-log summary
+# are still read as per-segment argvs. Negative exclusions pass: `kubectl`
+# selectors using `!=`, `notin (...)`, or `!<key>`; `jq` filters negating the
+# balloon match via `!= "...balloon..."`, `...balloon... | not`, `== false`,
+# `not(...)`, or `del(...)`; `awk` `!/.../`, `!~`, or `/.../ {next}`; and `sed`
+# `/.../d` or `/.../!p`. Because `WorkerRun` checks `word_patterns` per word and
+# cannot test the absence of a separate `-v` flag word on `grep`, non-inverted
+# `grep`/`egrep`/`fgrep`/`rg` segments are graded via `forbidden_patterns` paired
+# with `none -> tool_called(terminal, scope: workers)` (`-v`, `-vi`, `-iv`,
+# `-Ev`, `-vE`, `--invert-match` exempt). Arbitrary inline Python filter logic
+# (`python3 -c` / `execute_code`) that does not invoke those binaries is not
+# graded.
+#
+# Lookup-guard scope (`no-doc-or-web-search-rabbit-hole`): worker MCP calls
+# arrive wrapped inside Hermes's `tool_call` (`calls: [{name, arguments}]`), and
+# `tool_called` does not inspect wrapped arguments one level down, so this check
+# forbids any worker `web_search` or `developer_knowledge` call on the card
+# rather than only balloon-worded queries. On the standing dev Autopilot
+# cluster, non-system namespaces carry no user workloads needing GKE sizing-rule
+# lookups; a legitimate user-workload sizing lookup on a fuller cluster is a
+# known over-reach of this deterministic check.
+#
+# Report-guard scope (`report-identifies-balloon-pods-as-autopilot-headroom`):
+# `forbidden_patterns` deterministically grades line-opening imperative removal
+# actions (`delete`, `kubectl delete`/`scale`, `remove`, `evict`, `scale down`,
+# `scale ... to 0/zero`, `set ... replicas to 0/zero`, `right-size`) and
+# line-opening affirmative recommendation leads (`recommend`, `recommendation`,
+# `suggest`, `propose`, `consider`, `you/we should`, `action`, `remediation`) in
+# any verb inflection (`-e`, `-ing`, `removal of`), where nothing earlier on the
+# line can negate the verb. Recommendations embedded mid-sentence or phrased as
+# bare gerund/noun subjects are left to `expected_output` (`OutcomeValidity`) so
+# negated prose explanations never false-fail.
 #
 # Works whether the host cluster routes to its dedicated Cluster Agent profile
 # or falls back to `platform` when the host profile has not yet been scaffolded
@@ -50,9 +75,12 @@ expected_output: >-
   cluster is meant. The worker explains directly from the GKE Autopilot
   Headroom Invariant that gke-system-balloon-pod pods are normal GKE Autopilot
   spare scheduling headroom (preempted automatically when user pods need
-  capacity) rather than idle waste or rightsizing candidates, runs no per-pod
-  kubectl queries or documentation/web searches on gke-system-balloon-pod, and
-  scopes its live workload inspection strictly to non-system user namespaces.
+  capacity) rather than idle waste or rightsizing candidates, does not
+  recommend deleting, removing, evicting, scaling down, or rightsizing
+  gke-system-balloon-pod anywhere in the report, runs no per-pod kubectl or
+  filter queries targeting balloon pods, makes no documentation or web-search
+  calls on this card, and scopes its live workload inspection strictly to
+  non-system user namespaces.
 infrastructure:
   deployer: noop
 validated: false
@@ -78,15 +106,69 @@ verification_spec:
       type: all
       checks:
         - type: worker_commands
+          forbidden_runs:
+            - script: kubectl
+              word_patterns:
+                - "^(?:get|describe|logs|top)$"
+                - '(?i)(?:^|,(?![^()]*\)))\s*(?:--(?:field-)?selector=)?\s*(?!!)(?![^,()]*!=)(?![^,()]*\bnotin\b)(?:[^,()]|\([^)]*\))*(?:balloon|\([^)]*balloon)'
+            - script: jq
+              word_patterns:
+                - '(?is)\A(?:(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|!=\s*["''][^"'']*["''])|(?!(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|!=\s*["''][^"'']*["''])).)*?balloon(?![\s"'')]*?(?:\|\s*not\b|==\s*false\b))'
+            - script: awk
+              word_patterns:
+                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+            - script: gawk
+              word_patterns:
+                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+            - script: mawk
+              word_patterns:
+                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+            - script: nawk
+              word_patterns:
+                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+            - script: sed
+              word_patterns:
+                - '(?is)/[^/\n]*balloon[^/\n]*/[iI]?(?!d\b|!p\b)'
+            - script: gsed
+              word_patterns:
+                - '(?is)/[^/\n]*balloon[^/\n]*/[iI]?(?!d\b|!p\b)'
           forbidden_patterns:
-            - '(?i)\bkubectl\b[^;\n|&]*\b(?:get|describe|logs|top)\b[^;\n|&]*balloon|(?:^|[|;&\n])\s*(?:grep|egrep|fgrep)\b(?![^;\n|&]*\s(?:-[a-z]*v[a-z]*|--invert-match)\b)[^;\n|&]*balloon'
+            - '(?i)(?:^|[|;&\n])\s*(?:grep|egrep|fgrep|rg)\b(?!(?:[^;\n|&''"\\]|\\.|''[^'']*''|"(?:[^"\\]|\\.)*")*\s(?:-[a-z]*v[a-z]*|--invert-match)\b)(?:[^;\n|&''"\\]|\\.|''[^'']*''|"(?:[^"\\]|\\.)*")*balloon'
+        - type: worker_commands
+          after_result_pattern: "(?!)"
+          forbidden_runs:
+            - script: kubectl
+              word_patterns:
+                - "^(?:get|describe|logs|top)$"
+                - '(?i)(?:^|,(?![^()]*\)))\s*(?:--(?:field-)?selector=)?\s*(?!!)(?![^,()]*!=)(?![^,()]*\bnotin\b)(?:[^,()]|\([^)]*\))*(?:balloon|\([^)]*balloon)'
+            - script: jq
+              word_patterns:
+                - '(?is)\A(?:(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|!=\s*["''][^"'']*["''])|(?!(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|!=\s*["''][^"'']*["''])).)*?balloon(?![\s"'')]*?(?:\|\s*not\b|==\s*false\b))'
+            - script: awk
+              word_patterns:
+                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+            - script: gawk
+              word_patterns:
+                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+            - script: mawk
+              word_patterns:
+                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+            - script: nawk
+              word_patterns:
+                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+            - script: sed
+              word_patterns:
+                - '(?is)/[^/\n]*balloon[^/\n]*/[iI]?(?!d\b|!p\b)'
+            - script: gsed
+              word_patterns:
+                - '(?is)/[^/\n]*balloon[^/\n]*/[iI]?(?!d\b|!p\b)'
         - type: none
           checks:
             - type: tool_called
               tool_names: ["terminal"]
               scope: workers
               arguments:
-                command: '(?is).*(?:\bkubectl\b[^;\n|&]*\b(?:get|describe|logs|top)\b[^;\n|&]*balloon|(?:^|[|;&\n])\s*(?:grep|egrep|fgrep)\b(?![^;\n|&]*\s(?:-[a-z]*v[a-z]*|--invert-match)\b)[^;\n|&]*balloon).*'
+                command: '(?is)(?:[\s\S]*[|;&\n])?\s*(?:grep|egrep|fgrep|rg)\b(?!(?:[^;\n|&''"\\]|\\.|''[^'']*''|"(?:[^"\\]|\\.)*")*\s(?:-[a-z]*v[a-z]*|--invert-match)\b)(?:[^;\n|&''"\\]|\\.|''[^'']*''|"(?:[^"\\]|\\.)*")*balloon[\s\S]*'
   - name: no-doc-or-web-search-rabbit-hole
     role: objective
     mode: assert
@@ -113,4 +195,4 @@ verification_spec:
         - '(?i)\bautopilot\b'
         - '(?i)\b(?:headroom|spare capacity|capacity reservation|overprovision(?:ed|ing)|placeholder|preempt(?:s|ed|ing|ible|ion)?)\b'
       forbidden_patterns:
-        - '(?im)^(?:\b(?:do not|does not|did not|should not|must not|can not|cannot|could not|would not|will not|may not|don''t|doesn''t|didn''t|shouldn''t|mustn''t|can''t|couldn''t|wouldn''t|won''t|never|neither|nor|avoid|refrain(?:\s+from)?|instead of|rather than|without|no need to|not(?:\s+a\s+candidate)?\s+to|not|if\s+(?:you|we|an?\s+\w+|anyone))(?:\s+(?:attempt(?:ing)?\s+to|try(?:ing)?\s+(?:to|and)|need\s+to|have\s+to|seek\s+to|proceed\s+to|choose\s+to|recommend|propose|suggest|advise|run\s+kubectl|kubectl|ever|manually|directly|forcibly|force|automatically|blindly|arbitrarily)|\s+(?:delete|deleting|remove|removing|scale\s+down|scaling\s+down|right-?size|right-?sizing|touch|modify|edit|alter|cordon|drain|evict)(?:\s*,(?:\s+(?:or|nor|and))?(?=\s)|\s+(?:or|nor|and)(?=\s))){0,4}\s+(?:delete|remove|scale down|right-?size)\s+(?:(?:pod|pods|deployment|replicaset)\s+)?(?:(?:the|all|these|those|any)\s+)?(?:kube-system/)?gke-system-balloon-pod|(?!\b(?:do not|does not|did not|should not|must not|can not|cannot|could not|would not|will not|may not|don''t|doesn''t|didn''t|shouldn''t|mustn''t|can''t|couldn''t|wouldn''t|won''t|never|neither|nor|avoid|refrain(?:\s+from)?|instead of|rather than|without|no need to|not(?:\s+a\s+candidate)?\s+to|not|if\s+(?:you|we|an?\s+\w+|anyone))(?:\s+(?:attempt(?:ing)?\s+to|try(?:ing)?\s+(?:to|and)|need\s+to|have\s+to|seek\s+to|proceed\s+to|choose\s+to|recommend|propose|suggest|advise|run\s+kubectl|kubectl|ever|manually|directly|forcibly|force|automatically|blindly|arbitrarily)|\s+(?:delete|deleting|remove|removing|scale\s+down|scaling\s+down|right-?size|right-?sizing|touch|modify|edit|alter|cordon|drain|evict)(?:\s*,(?:\s+(?:or|nor|and))?(?=\s)|\s+(?:or|nor|and)(?=\s))){0,4}\s+(?:delete|remove|scale down|right-?size)\s+(?:(?:pod|pods|deployment|replicaset)\s+)?(?:(?:the|all|these|those|any)\s+)?(?:kube-system/)?gke-system-balloon-pod)[^\n])*?\b(?:delete|remove|scale down|right-?size)\s+(?:(?:pod|pods|deployment|replicaset)\s+)?(?:(?:the|all|these|those|any)\s+)?(?:kube-system/)?gke-system-balloon-pod'
+        - '(?im)^[\s\-*\d.)>#]*(?:(?:(?:kubectl\s+)?(?:delete|scale)|remove|evict|right-?size)\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|scale\s+(?:down\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n]*?\bto\s+(?:0|zero)\b)|set\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n]*?\breplicas\s+to\s+(?:0|zero)\b|(?:(?:(?:i|we)\s+)?(?:recommend(?:ed|ation)?|suggest(?:ed|ion)?|propose|consider):?\s+(?:to\s+|that\s+(?:you|we)\s+)?|(?:you|we)\s+should\s+|action:?\s+|remediation:?\s+)(?:(?:(?:kubectl\s+)?(?:delet(?:e|ing)|scal(?:e|ing))|remov(?:e|ing|al\s+of)|evict(?:ing|ion\s+of)?|right-?siz(?:e|ing))\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|scal(?:e|ing)\s+(?:down\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n]*?\bto\s+(?:0|zero)\b)|set(?:ting)?\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n]*?\breplicas\s+to\s+(?:0|zero)\b))'
