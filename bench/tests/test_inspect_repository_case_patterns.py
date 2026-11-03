@@ -6,7 +6,8 @@ These run the case's own check through `WorkerCommandsVerifier` on worker log
 lines as hermes renders them: the snapshot route passes, with or without a
 direct download beside it, a leading `cd`, a chain the clone starts, a quoted
 path and a continued line do not hide it, a mention of a route is no run, and
-the red's workspace route fails.
+the red's workspace route fails, whether a workspace verb, curl, wget, a python
+program or an assignment carries it.
 """
 
 from __future__ import annotations
@@ -76,11 +77,16 @@ def test_a_quoted_path_or_a_continued_line_is_still_the_clone_run():
 
 
 def test_a_mention_is_no_run():
-    # A grep or an echo names the route as a quoted word; it does not run it.
+    # A grep or an echo names the route as a quoted word, and a cat reads a
+    # file that names it; none of them runs it.
     assert _passes('grep "inspect_repository.py open" SKILL.md', CLONE_PUBLIC)
     assert _passes('grep -rn "/v1/workspace" /opt/data/profiles/platform/skills', CLONE_PUBLIC)
     assert _passes("cat /opt/data/profiles/platform/skills/inspect-repository/SKILL.md", CLONE_PUBLIC)
     assert not _passes(f'echo "note: run python3 {SCRIPT} clone --repo gke-labs/kube-agents"')
+    # The assignment and heredoc patterns read the start of a row only.
+    assert _passes("grep -rn 'URL=http://127.0.0.1:8080/v1/workspace/open' SKILL.md", CLONE_PUBLIC)
+    assert _passes("echo URL=http://127.0.0.1:8080/v1/workspace/open", CLONE_PUBLIC)
+    assert _passes("grep -n 'python3 - <<EOF /v1/workspace' SKILL.md", CLONE_PUBLIC)
 
 
 def test_the_workspace_route_through_curl_wget_or_python_fails():
@@ -88,6 +94,14 @@ def test_the_workspace_route_through_curl_wget_or_python_fails():
     assert not _passes("wget -qO- http://127.0.0.1:8080/v1/workspace/list", CLONE_PUBLIC)
     assert not _passes(
         "python3 -c \" import urllib.request urllib.request.urlopen('http://127.0.0.1:8080/v1/workspace/open') \"",
+        CLONE_PUBLIC,
+    )
+    assert not _passes(
+        "python -c \" import urllib.request urllib.request.urlopen('http://127.0.0.1:8080/v1/workspace/open') \"",
+        CLONE_PUBLIC,
+    )
+    assert not _passes(
+        "python3.14 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/v1/workspace/open')\"",
         CLONE_PUBLIC,
     )
     # The base URL in a variable is not resolved, but the word still carries the route.
@@ -100,3 +114,56 @@ def test_a_refused_run_still_counts():
     # is the known limit #4363 owns.
     assert _passes(f"python3 {SCRIPT} clone --repo gke-labs/kube-agents --into /opt/data/scratch/not-empty")
     assert not _passes(f"python3 {SCRIPT} open --rpo gke-labs/kube-agents", CLONE_PUBLIC)
+
+
+def test_the_workspace_route_through_python_standard_input_fails():
+    # hermes joins the heredoc into one row. A body with no `(` keeps the
+    # route on the python3 segment, so the `-` run sees it; a `(` cuts the
+    # segment, so the heredoc pattern sees it.
+    assert not _passes(
+        "python3 - <<'EOF' import urllib.request as u url = 'http://127.0.0.1:8080/v1/workspace/open' EOF + 1 command",
+        CLONE_PUBLIC,
+    )
+    assert not _passes(
+        "timeout 30 python3 - <<'EOF' url = 'http://127.0.0.1:8080/v1/workspace/open' EOF",
+        CLONE_PUBLIC,
+    )
+    assert not _passes(
+        "python3 - <<'EOF' import urllib.request urllib.request.urlopen('http://127.0.0.1:8080/v1/workspace/open') EOF",
+        CLONE_PUBLIC,
+    )
+
+
+def test_an_assignment_that_holds_the_route_fails():
+    # hermes keeps the assignment as the chain's first segment.
+    assert not _passes("URL=http://127.0.0.1:8080/v1/workspace/open + 1 command", CLONE_PUBLIC)
+
+
+def test_a_python3_run_without_the_code_or_input_flag_is_no_workspace_run():
+    # The python3 runs need -c or -: a script file that names the route is not seen.
+    assert _passes("python3 /tmp/x.py --note /v1/workspace", CLONE_PUBLIC)
+
+
+def test_the_verb_words_are_whole_words():
+    # The anchors: `openssl` is no `open`, and `./clone` is no `clone`.
+    assert _passes(f"python3 {SCRIPT} clone --repo openssl/openssl --prefix crypto --into ./src")
+    assert not _passes(f"python3 {SCRIPT} --into ./clone")
+
+
+def test_each_workspace_verb_fails():
+    for verb in ("list", "grep", "fetch", "close"):
+        assert not _passes(f"python3 {SCRIPT} {verb} --repo gke-labs/kube-agents", CLONE_PUBLIC), verb
+
+
+def test_a_verb_as_an_option_value_counts_as_the_verb():
+    # A run cannot name a word position, so `--into list` reads as the verb
+    # `list`. This is a known limit that the case header records.
+    assert not _passes(f"python3 {SCRIPT} clone --repo gke-labs/kube-agents --into list")
+
+
+def test_a_versioned_interpreter_or_a_continued_code_flag_is_not_seen():
+    # Known limits that the case header records: a run matches the exact
+    # basename, and hermes leaves a continued `-c` as the word ` -c`.
+    url = "http://127.0.0.1:8080/v1/workspace/open"
+    assert _passes(f"python3.11 -c \"import urllib.request; urllib.request.urlopen('{url}')\"", CLONE_PUBLIC)
+    assert _passes(f"python3 \\ -c \"import urllib.request; urllib.request.urlopen('{url}')\"", CLONE_PUBLIC)
