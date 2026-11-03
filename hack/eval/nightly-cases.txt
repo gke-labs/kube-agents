@@ -952,6 +952,15 @@
 # inject lane only (api-lane-exclusions.txt).
 ./tasks/chat-reply-under-pushed-report/task.yaml
 
+# A question naming one seeded cluster reaches that cluster's Cluster Agent
+# when the roster block counts the Cluster Agents instead of naming them
+# (#4432): the front door finds the assignee through list_agents' filter.
+# On an install below the threshold it grades the named route, so it is a
+# regression guard for both forms. deployer: noop, read-only, reads seeded-a
+# through its own agent, one front-door turn plus the card round trip:
+# +3 units.
+./tasks/chat-routing-named-cluster-under-summarized-roster/task.yaml
+
 # The front door routes "which namespaces exist in this cluster?" to the host
 # cluster's agent (or platform) without asking which cluster (#3286).
 # deployer: noop, read-only, one front-door turn plus the card round trip:

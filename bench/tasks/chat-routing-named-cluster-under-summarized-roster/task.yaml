@@ -1,0 +1,76 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. Above KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD Cluster
+# Agents (20 unless set) the injected roster block counts the shared-role
+# group by project and location instead of naming each agent
+# (agents/chat/scripts/agent_roster.py), and agents/chat/SOUL.md §1 and §3
+# tell the front door to find a named cluster's assignee through
+# `list_agents(filter=<cluster>)` and route the card to it, or to `platform`
+# when it returns none. This case grades that a question naming one seeded
+# cluster still reaches that cluster's Cluster Agent under the counted block.
+#
+# The counted block is reached on the eval install by setting the threshold
+# below its Cluster Agent count (`KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD: "1"` in
+# spec.deployment.env). On an install at the default the block names every
+# agent and the case grades the named route, which is also correct: it is a
+# regression guard for both forms, and it cannot go red on an install that
+# never counts.
+#
+# What it grades: a successful kanban_create; the seeded-a Cluster Agent
+# among the workers (worker_agents, set aside on the inject lane where the
+# workers are not read); the cluster's namespaces in the answer, including
+# the crashloop-workload fixture's seeded-debug, which only a read of
+# seeded-a can name; and no "which cluster" question. seeded-a is read
+# through its own Cluster Agent, so the fixture declared is the one on that
+# slot; this case asserts nothing about the fixture's state.
+#
+# Planted defect required: none. Isolation class: read-only. deployer: noop,
+# one front-door turn plus the card round trip.
+id: chat-routing-named-cluster-under-summarized-roster
+name: A named cluster reaches its own Cluster Agent under a counted roster
+prompt: >-
+  Which namespaces exist in the seeded-a cluster?
+expected_output: >-
+  The front door files a card for seeded-a's Cluster Agent without asking
+  which cluster is meant, and the answer lists seeded-a's namespaces,
+  including kube-system and seeded-debug.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the front door's routing journey.
+domain: chat-and-routing
+
+# seeded-a's crashloop-workload namespace is one of the phrases graded below;
+# the role is declared so the fleet owner replacing that slot finds this case.
+fixtures:
+  - crashloop-workload
+
+verification_spec:
+  # assert, not the converge default: the transcript is immutable once the
+  # run ends, so polling a failed check would only wait out the timeout.
+  - name: work-was-delegated-through-kanban
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  # Profile names are `cluster-<project>-<cluster>-<location>`
+  # (cluster_agent_profile.profile_name); the project and location are the
+  # install's.
+  - name: seeded-a-cluster-agent-did-the-work
+    role: objective
+    mode: assert
+    check:
+      type: worker_agents
+      required_agents: ["cluster-.+-seeded-a-.+"]
+  - name: the-answer-names-the-clusters-namespaces-without-asking
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["kube-system", "seeded-debug"]
+      forbidden_patterns:
+        - '(?i)\bwhich cluster\b'
