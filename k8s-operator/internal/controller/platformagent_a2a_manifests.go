@@ -177,10 +177,15 @@ const (
 	// gets the most: JetStream keeps stream indexes in memory and the TASKS
 	// stream is sized at 20GiB on disk. Named constants so the next
 	// measurement changes one line.
-	a2aNATSCPURequest    = "250m"
-	a2aNATSMemoryRequest = "512Mi"
-	a2aNATSCPULimit      = "1"
-	a2aNATSMemoryLimit   = "1Gi"
+	a2aNATSCPURequest = "250m"
+	// The one-server bus's init step (a2aNATSStaleMetaContainer): a shell,
+	// one du and one rm. Requests equal limits, under the server's own, so
+	// it never raises the pod's effective request.
+	a2aNATSStaleMetaCPU    = "50m"
+	a2aNATSStaleMetaMemory = "64Mi"
+	a2aNATSMemoryRequest   = "512Mi"
+	a2aNATSCPULimit        = "1"
+	a2aNATSMemoryLimit     = "1Gi"
 
 	a2aGatewayCPURequest    = "50m"
 	a2aGatewayMemoryRequest = "64Mi"
@@ -2224,7 +2229,7 @@ websocket {
 }
 
 jetstream {
-  store_dir: /data
+  store_dir: ` + a2aNATSStoreDir + `
   # Under the 40Gi PV; the stream max_bytes caps (20+5+1+1 GiB) plus KV live
   # inside this.
   max_file_store: 34359738368
@@ -2266,7 +2271,7 @@ accounts {
 ` + renderA2AStaticUsers(agent, pw, a2aAccountSys) + `    ]
   }
 }
-system_account: SYS
+system_account: ` + a2aAccountSys + `
 
 # The auth callout: who a connection is, decided against the cluster that
 # issued its identity rather than against a password this file rendered.
@@ -2477,6 +2482,88 @@ func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secr
 // deletion. One spelling, both sites.
 const a2aNATSDataClaim = "data"
 
+// a2aNATSStoreDir is where the bus's claim is mounted and JetStream keeps its
+// store (nats.conf's store_dir).
+const a2aNATSStoreDir = "/data"
+
+// a2aNATSStaleMetaContainer is the init container a one-server bus starts
+// with. A server that ran in a three-server cluster keeps the cluster's
+// metadata (the meta group and its raft groups) under
+// <store_dir>/jetstream/<system_account>/_js_, and goes on keeping it while
+// it runs alone. Clustered again later, it brings that metadata back and with
+// it streams that no longer exist, which then outvote the ones a restore has
+// just put back. Reproduced on nats-server 2.10, 2.12, 2.14 and 2.15. A
+// server running alone never reads that directory, so removing it is safe,
+// and the step removes exactly that directory and nothing else:
+//
+//   - rendered only on a one-server bus (a three-server one needs it);
+//   - only on ordinal 0, the expected pod name compared exactly;
+//   - the path is built from the store_dir and system_account nats.conf
+//     renders, with globbing off (set -f), and a symbolic link anywhere on it is refused
+//     (nats-server never writes one there), failing the pod rather than
+//     following it;
+//   - it logs the path and size it removes;
+//   - it mounts only the claim, carries no credential and makes no network
+//     call, and runs as the server does with a read-only root.
+const a2aNATSStaleMetaContainer = "stale-cluster-meta"
+
+// a2aNATSStaleMetaScript is the step's script. Its arguments are the store
+// directory, the system account and the one pod name it acts on.
+const a2aNATSStaleMetaScript = `set -euf
+store="$1"
+account="$2"
+only="$3"
+target="$store/jetstream/$account/_js_"
+if [ "${POD_NAME:-}" != "$only" ]; then
+  echo "stale-cluster-meta: ${POD_NAME:-this pod} is not $only; leaving $target alone"
+  exit 0
+fi
+for p in "$store" "$store/jetstream" "$store/jetstream/$account" "$target"; do
+  if [ -L "$p" ]; then
+    echo "stale-cluster-meta: $p is a symbolic link, which nats-server never writes; refusing to touch the store" >&2
+    exit 1
+  fi
+done
+if [ ! -e "$target" ]; then
+  echo "stale-cluster-meta: $target is absent; nothing to remove"
+  exit 0
+fi
+if [ ! -d "$target" ]; then
+  echo "stale-cluster-meta: $target is not a directory; refusing to touch the store" >&2
+  exit 1
+fi
+size="$(du -sk "$target" | cut -f1)"
+echo "stale-cluster-meta: removing $target (${size} KiB), the cluster metadata this server kept from a three-server bus"
+rm -rf -- "$target"
+echo "stale-cluster-meta: removed $target"
+`
+
+// a2aNATSInitContainers is the bus pods' init step: the stale-metadata
+// removal on a one-server bus, nothing on a three-server one.
+func a2aNATSInitContainers(statefulSet string, replicas int) []corev1.Container {
+	if replicas != 1 {
+		return nil
+	}
+	return []corev1.Container{buildA2ANATSStaleMetaContainer(statefulSet)}
+}
+
+// buildA2ANATSStaleMetaContainer renders the step for the StatefulSet's
+// ordinal-0 pod.
+func buildA2ANATSStaleMetaContainer(statefulSet string) corev1.Container {
+	return corev1.Container{
+		Name:    a2aNATSStaleMetaContainer,
+		Image:   a2aNATSImage(),
+		Command: []string{"sh", "-c", a2aNATSStaleMetaScript, a2aNATSStaleMetaContainer, a2aNATSStoreDir, a2aAccountSys, statefulSet + "-0"},
+		Env: []corev1.EnvVar{{
+			Name:      "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
+		}},
+		VolumeMounts:    []corev1.VolumeMount{{Name: a2aNATSDataClaim, MountPath: a2aNATSStoreDir}},
+		SecurityContext: hardenedSecurityContext(),
+		Resources:       a2aResources(a2aNATSStaleMetaCPU, a2aNATSStaleMetaMemory, a2aNATSStaleMetaCPU, a2aNATSStaleMetaMemory),
+	}
+}
+
 // a2aNATSMaxReplicas is the most servers the bus can run (the busReplicas
 // enum's top value), and so the ordinals handleDeletion reaps claims for.
 const a2aNATSMaxReplicas = 3
@@ -2569,6 +2656,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 					// preStop signal to land first.
 					TerminationGracePeriodSeconds: ptr.To(int64(a2aNATSTerminationGraceSeconds)),
 					TopologySpreadConstraints:     a2aNATSTopologySpread(selector, replicas),
+					InitContainers:                a2aNATSInitContainers(name, replicas),
 					Containers: []corev1.Container{{
 						Name:  "nats",
 						Image: a2aNATSImage(),
@@ -2595,7 +2683,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
 							{Name: a2aNATSTLSVolume, MountPath: a2aNATSTLSMountDir, ReadOnly: true},
-							{Name: a2aNATSDataClaim, MountPath: "/data"},
+							{Name: a2aNATSDataClaim, MountPath: a2aNATSStoreDir},
 						},
 						SecurityContext: hardenedSecurityContext(),
 						Resources:       a2aResources(a2aNATSCPURequest, a2aNATSMemoryRequest, a2aNATSCPULimit, a2aNATSMemoryLimit),

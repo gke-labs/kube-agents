@@ -67,6 +67,8 @@ The operator runs the migration's work in pods of its own image, so it needs `OP
 
 **Three servers to one** happens in place. A Job of the operator's moves each stream's leader to server 0 and scales the stream to one replica while the bus is still a cluster; then the bus renders one server. Writes keep flowing, with brief stalls as leaders move and while server 0 restarts on its own.
 
+A one-server bus starts its server with a `stale-cluster-meta` init step. A server that ran in a cluster keeps the cluster's metadata (`/data/jetstream/SYS/_js_`) while it runs alone, and a later move back to three servers would bring back, from it, streams that no longer exist. The step removes exactly that directory, and only on `<agent>-a2a-nats-0`, logging the path and size. It refuses a symbolic link on that path, failing the pod rather than following it: `kubectl logs <agent>-a2a-nats-0 -c stale-cluster-meta` says what it did.
+
 **One server to three** copies the streams, behind a write freeze:
 
 1. **The freeze.** The callout is rolled so that every replica authenticates only the migration. Then the bus restarts without its static application users. From then on, until the freeze lifts, connections drop and are refused: the console and web logins fail, the gateway and the bridge cannot publish, and tasks wait.
