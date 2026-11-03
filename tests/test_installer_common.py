@@ -6341,24 +6341,26 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
-        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console:
-        # the settings the tfvars carry reached the render.
-        self.assertIn("Persistent storage:  410 GiB over 5 claims", proc.stdout)
-        self.assertIn("Pods:                12", proc.stdout)
+        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console,
+        # and, since the tfvars say next, the NATS bus's 40Gi JetStream claim and the
+        # next-mode pods the preflight now sums: the settings the tfvars carry reached
+        # the render.
+        self.assertIn("Persistent storage:  450 GiB over 6 claims", proc.stdout)
+        self.assertIn("Pods:                20", proc.stdout)
         # The tfvars say autopilot, so the credential proxy is counted at the operator's
         # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
         # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
-        self.assertIn("CPU requests:        4.400 cores", proc.stdout)
-        self.assertIn("Memory requests:     10.59 GiB", proc.stdout)
+        self.assertIn("CPU requests:        5.100 cores", proc.stdout)
+        self.assertIn("Memory requests:     11.78 GiB", proc.stdout)
         standard = self._run(
             f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
             tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
         )
         self.assertIn("rc=0", standard.stdout, standard.stderr)
-        self.assertIn("CPU requests:        2.900 cores", standard.stdout)
-        self.assertIn("Memory requests:     9.59 GiB", standard.stdout)
+        self.assertIn("CPU requests:        3.600 cores", standard.stdout)
+        self.assertIn("Memory requests:     10.78 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
-        self.assertIn("Not counted: the spec.mode next workloads", proc.stdout)
+        self.assertIn("Not counted: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
         # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
         with tempfile.TemporaryDirectory() as tmp:

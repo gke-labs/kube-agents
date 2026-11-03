@@ -3112,7 +3112,7 @@ Modeled monthly cost on GKE Autopilot (modeled from {{ include "kube-agents.foot
   Disk:     {{ printf "%.0f" $diskGiB }} GiB x ${{ include "kube-agents.footprintPriceBalancedDiskPerGiBMonth" . }}/GiB-month = ${{ printf "%.2f" $diskCost }}
   Total:    ${{ printf "%.2f" $total }}/month, plus the ${{ printf "%.2f" $clusterFee }}/month GKE cluster fee (per cluster, noted separately)
 {{- if eq (toString .Values.platformAgent.mode) "next" }}
-  Not counted: the spec.mode next workloads (the NATS bus and its 40 GiB JetStream claim, the A2A gateway and its callouts) and the session pods; the install prerequisites page lists them.
+  Not counted: the session pods (one per delegation or /session conversation, up to maxSessions at once); the install prerequisites page sizes them. The spec.mode next workloads, the NATS bus and its 40 GiB JetStream claim among them, are in the figures above.
 {{- end }}
 {{- end }}
 
