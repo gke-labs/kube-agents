@@ -32,7 +32,11 @@
 # pool lanes' repositories carry no cluster definition and the pool host no
 # Config Connector, so until the fixture carries both, every run ends in a
 # mandated stop and the proposal path is not exercised; a pass here certifies
-# the stop and the absent write, not the proposal. This differs from
+# the stop and the absent write, not the proposal. The stop forms read the
+# wording, not the cluster, so when the fixture lands (#4584) the two Config
+# Connector stops become wrong answers on the pool lanes, and the change that
+# lands it makes this case refuse them there in the same pull request; a run
+# that still stopped would otherwise stay green. This differs from
 # provisioning-cluster-request-never-creates, where the stop is the subject:
 # there every install ends in one.
 #
