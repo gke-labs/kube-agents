@@ -86,10 +86,12 @@ These are the regressions #2765 fixed, and the design must not bring them back:
   already keys a DM message with a thread as `gchat:dm/<thread>` and posts into a thread when the
   key has one. The `UNTHREADED_MESSAGES` and `GROUP_CHAT` clearing stays.
 - **Call 1: the top-level mark is set for Google Chat too.** `classify` sets the inbound message's
-  top-level mark when the space is a DM and `threadReply` is false, which is what Slack does with
-  an empty `thread_ts`. The notices and the card-stop suppression that key on the mark then apply
-  on both backends; the session-on acknowledgement's Slack-only wording branch becomes a DM
-  branch. The `threadReply` flag therefore still decides one thing, the mark, and nothing about
+  top-level mark when the space is a DM, `threadReply` is false, and the adapter kept the
+  message's thread, which is what Slack does with an empty `thread_ts`. A message in an
+  `UNTHREADED_MESSAGES` space, or an event with no thread name, keys the shared space conversation
+  and is not marked. The notices and the card-stop suppression that key on the mark then apply
+  on both backends; the session-on acknowledgement's Slack-only wording branch becomes a branch
+  for a DM record keyed by its thread, and a thread-less DM record gets the generic wording. The `threadReply` flag therefore still decides one thing, the mark, and nothing about
   the key. The spec sentence that says the mark is set only for a top-level Slack DM changes to say
   both backends.
 - **Call 2: the pushed-report splice applies to DM asks, as it does on Slack.** The hermes
