@@ -483,6 +483,19 @@ class CollectTest(unittest.TestCase):
                 fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW))
         self.assertIn("platformagent", str(ctx.exception))
 
+    def test_the_configmap_is_listed_only_when_the_status_has_no_inference_key(self):
+        """The ConfigMap is the fallback for an older operator or CRD; with the key
+        present the namespace listing would be fetched and discarded."""
+        with_key = json.loads(json.dumps(CR))
+        with_key.setdefault("status", {})["inference"] = {"provider": "vertex_ai", "model": "claude-opus-5"}
+        without_key = json.loads(json.dumps(CR))
+        without_key.get("status", {}).pop("inference", None)
+        for cr, expected_calls in ((with_key, 0), (without_key, 1)):
+            run, _ = self.fake_run({"get platformagent": json.dumps(cr)})
+            with mock.patch.object(fs.subprocess, "run", run), mock.patch.object(fs, "_litellm_config", return_value=None) as listing:
+                fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW))
+            self.assertEqual(listing.call_count, expected_calls, cr.get("status", {}).keys())
+
     def test_optional_sources_failing_leave_unavailable_lines(self):
         run, _ = self.fake_run({
             "get platformagent": json.dumps(CR),
@@ -536,8 +549,11 @@ class CollectTest(unittest.TestCase):
         self.assertIn("tasks (14 days): unavailable", fs.render(snapshot))
 
     def test_a_stale_hashed_config_map_loses_to_the_mounted_one(self):
+        # The ConfigMap is read only for a status with no ``inference`` key.
+        legacy_cr = json.loads(json.dumps(CR))
+        legacy_cr.get("status", {}).pop("inference", None)
         run, _ = self.fake_run({
-            "get platformagent": json.dumps(CR),
+            "get platformagent": json.dumps(legacy_cr),
             "get configmap": json.dumps({"items": [
                 {"metadata": {"name": "litellm-config-a1b2stale", "creationTimestamp": "2026-10-11T00:00:00Z"}, "data": {"config.yaml": "model: vertex_ai/old-model\n"}},
                 {"metadata": {"name": "litellm-config-k4b9ht22c7", "creationTimestamp": "2026-10-10T00:00:00Z"}, "data": {"config.yaml": LITELLM_CONFIG_YAML}},

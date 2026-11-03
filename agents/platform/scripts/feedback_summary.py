@@ -791,7 +791,11 @@ def collect(options: Options) -> Snapshot:
             server_version = json.loads(raw_version)
         except ValueError:
             server_version = None
-    litellm_config = _litellm_config(options)
+    # The ConfigMap is the fallback for a status with no ``inference`` key (an
+    # operator or a served CRD from before the field); with the key present the
+    # listing would be fetched and thrown away, so it is not made.
+    status = cr.get("status") if isinstance(cr.get("status"), Mapping) else {}
+    litellm_config = None if INFERENCE_STATUS_KEY in status else _litellm_config(options)
     tasks: Optional[Sequence[Mapping[str, Any]]] = None
     truncated = False
     metrics: Optional[str] = None
