@@ -901,8 +901,9 @@ which new connections fail, which is the thing the informer exists to avoid.
 on a new config, every client reconnects, and whichever callout replica answers a reconnect
 places it by the map that replica holds. A connection placed by the previous map stays in
 that map's account until it next reconnects. So a running bus moves to a new config only
-once every callout replica is on the current spec and no pod of an older ReplicaSet is left
-(`a2aBusWaitsForCallout`). The config Secret waits with the StatefulSet, and the callout is
+once the callout's current spec is observed and no pod of an older ReplicaSet can still answer
+(`a2aBusWaitsForCallout`). Readiness does not hold it: a current replica that is not ready places
+nobody, and a callout cannot be ready while the bus it connects to is down. The config Secret waits with the StatefulSet, and the callout is
 reconciled ahead of both. A fresh install is not held, since there is no running bus. The
 wait is bounded. A rollout the Deployment controller has given up on (its progress deadline,
 600s by default) does not hold the bus, because the config can carry a credential repair or a

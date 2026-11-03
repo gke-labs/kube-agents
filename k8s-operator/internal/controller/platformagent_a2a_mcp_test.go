@@ -151,12 +151,13 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 	}
 }
 
-// The creds Secret holds every static user's password. The MCP pod gets the
-// console's and nothing else, and its only other Secret is its own token.
+// The creds Secret holds every static user's password. The MCP pod gets its
+// own, console-mcp's, and nothing else, and its only other Secret is its own
+// token.
 // With broker access on (A2A_MCP_DOOR=true on a next install) it also holds
 // exactly one projected token, for the broker's mcp audience and nothing else;
 // with it off, none.
-func TestTheMCPPodHoldsTheConsolePasswordAndItsOwnTokenOnly(t *testing.T) {
+func TestTheMCPPodHoldsItsBusPasswordAndItsOwnTokenOnly(t *testing.T) {
 	for _, brokerOn := range []bool{false, true} {
 		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
 			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])

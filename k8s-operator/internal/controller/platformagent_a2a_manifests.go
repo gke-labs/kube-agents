@@ -5533,8 +5533,8 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, err
 	}
 
-	// A running bus moves to a new config only once every callout replica
-	// is on the current spec (a2aBusWaitsForCallout). Every client
+	// A running bus moves to a new config only once no callout pod of an
+	// older spec can answer (a2aBusWaitsForCallout). Every client
 	// reconnects when the bus restarts, and the callout that answers a
 	// reconnect decides the account it lands in, so a replica still on the
 	// previous identity map would place it by that map until it next
@@ -5552,7 +5552,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	if busHeld {
 		state.busHeld = true
-		logf.FromContext(ctx).Info("holding the A2A bus on its current config until every auth callout replica is on the current spec",
+		logf.FromContext(ctx).Info("holding the A2A bus on its current config until no auth callout pod of an older spec is left",
 			"statefulset", sts.Name, "callout", a2aCalloutName(agent))
 	} else {
 		config := buildA2ANATSConfigSecret(agent, creds, calloutKeys)
@@ -6290,24 +6290,17 @@ func (r *PlatformAgentReconciler) a2aProvisionJobWaitsForCallout(ctx context.Con
 	return !a2aCalloutServesAnyReplica(callout), nil
 }
 
-// a2aCalloutFullyRolledOut reports whether every replica of the callout
-// Deployment is on its current spec and ready: the copy is at least the
-// Generation this pass applied, the Deployment controller has observed it,
-// and the replica, updated and ready counts all equal the desired count.
-// a2aCalloutCanServeANewGateway asks for one such replica; the bus asks for
-// all of them, because the replicas form one queue group and any of them may
-// answer a reconnect. Status.Replicas leaves out a pod already terminating,
-// which a2aCalloutHasOlderPods covers.
-func a2aCalloutFullyRolledOut(dep *appsv1.Deployment, appliedGeneration int64) bool {
-	if dep.Generation < appliedGeneration || dep.Status.ObservedGeneration < dep.Generation {
-		return false
-	}
-	want := int32(1)
-	if dep.Spec.Replicas != nil {
-		want = *dep.Spec.Replicas
-	}
-	st := dep.Status
-	return st.Replicas == want && st.UpdatedReplicas == want && st.ReadyReplicas == want
+// a2aCalloutSpecObserved reports whether the copy is at least the Generation
+// this pass applied and the Deployment controller has observed it, so its
+// newest ReplicaSet is the current spec's. The bus asks nothing about
+// readiness: a current replica that is not ready places nobody, and a hold
+// on it would have no bound (a pod that turns NotReady in place after a
+// rollout never trips the progress deadline, and a callout cannot be ready
+// while the bus it connects to is down). What places a connection by the
+// previous map is a pod of an older ReplicaSet, which a2aCalloutHasOlderPods
+// counts.
+func a2aCalloutSpecObserved(dep *appsv1.Deployment, appliedGeneration int64) bool {
+	return dep.Generation >= appliedGeneration && dep.Status.ObservedGeneration >= dep.Generation
 }
 
 // a2aCalloutHasOlderPods reports whether any pod of the callout, terminating
@@ -6326,7 +6319,7 @@ func (r *PlatformAgentReconciler) a2aCalloutHasOlderPods(ctx context.Context, de
 	if err := r.a2aReader().List(ctx, sets, inNamespace...); err != nil {
 		return false, err
 	}
-	// The current ReplicaSet is the newest one: a2aCalloutFullyRolledOut
+	// The current ReplicaSet is the newest one: a2aCalloutSpecObserved
 	// has already required the Deployment controller to have observed the
 	// current spec, and it stamps each new ReplicaSet with the next revision.
 	var current *appsv1.ReplicaSet
@@ -6455,8 +6448,9 @@ const a2aDeploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
 // a2aBusWaitsForCallout reports whether the bus must stay on its current
 // config this pass. Only a running bus whose config would change waits: a
 // fresh install has no bus to hold, and one whose config is unchanged has
-// nothing to apply that matters here. It waits until every callout replica
-// is on the current spec and no pod of an older one is left. While it waits,
+// nothing to apply that matters here. It waits until the Deployment
+// controller has observed the callout's current spec and no pod of an older
+// ReplicaSet can still answer. While it waits,
 // a principal that reconnects is placed by the current identity map, which
 // may name an account the running config does not have yet; that refusal
 // lasts until the bus moves, and is the direction this gate prefers to a
@@ -6494,7 +6488,7 @@ func (r *PlatformAgentReconciler) a2aBusWaitsForCallout(ctx context.Context, age
 		r.recordEvent(agent, corev1.EventTypeWarning, a2aCalloutStalledReason, a2aCalloutStalledEventMessage(callout.Name))
 		return false, nil
 	}
-	if !a2aCalloutFullyRolledOut(callout, calloutGeneration) {
+	if !a2aCalloutSpecObserved(callout, calloutGeneration) {
 		return true, nil
 	}
 	return r.a2aCalloutHasOlderPods(ctx, callout)

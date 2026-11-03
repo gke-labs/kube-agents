@@ -2,9 +2,9 @@ package controller
 
 // The bus's config gate, from the side that waits on it.
 //
-// A running bus moves to a new config only once every auth callout replica is
-// on the current spec and no pod of an older one is left
-// (a2aBusWaitsForCallout). Every client reconnects when the bus restarts, and
+// A running bus moves to a new config only once the callout's current spec is
+// observed and no pod of an older ReplicaSet can still answer
+// (a2aBusWaitsForCallout). Readiness is not part of it. Every client reconnects when the bus restarts, and
 // whichever callout replica answers a reconnect places it by the identity map
 // that replica holds, so a replica still on the previous map would place it by
 // that map until it next reconnects. A fresh install has no bus to hold.
@@ -183,10 +183,10 @@ func TestAFreshInstallRendersTheBusWithoutWaitingForTheCallout(t *testing.T) {
 }
 
 // The upgrade: a bus on a previous config, a callout rolling to a new spec.
-// The bus keeps its config while the roll is short of every replica, and
-// while a pod of the previous ReplicaSet is still terminating, and moves on
-// the pass after the last one goes.
-func TestAChangedBusConfigWaitsForTheWholeCalloutRollout(t *testing.T) {
+// The bus keeps its config while pods of the previous ReplicaSet are serving,
+// and while one is still terminating, and moves on the pass after the last
+// one goes.
+func TestAChangedBusConfigWaitsUntilNoPreviousCalloutPodCanAnswer(t *testing.T) {
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconciler(t, agent)
 	ctx := context.Background()
@@ -209,12 +209,15 @@ func TestAChangedBusConfigWaitsForTheWholeCalloutRollout(t *testing.T) {
 
 	putTheBusOnAPreviousConfig(t, ctx, cl, agent)
 
-	// Mid-roll: one replica on the new spec.
-	reportCalloutStatus(t, ctx, cl, agent, replicas, replicas, 1)
+	// Mid-roll: the new ReplicaSet has its first pod, and both pods of
+	// the previous one are still serving.
+	reportCalloutStatus(t, ctx, cl, agent, replicas+1, replicas+1, 1)
+	newRS := calloutReplicaSet(t, ctx, cl, getCallout(t, ctx, cl, agent), "new", "2")
+	calloutPod(t, ctx, cl, dep, newRS, "callout-new-0", "", false)
 	completeTheProvisionJob(t, ctx, cl, agent)
 	res := busGatePass(t, ctx, r, req, "callout mid-roll")
 	if got := busConfigHash(t, ctx, cl, agent); got != "previous" {
-		t.Errorf("the bus moved to config %q while one of %d callout replicas was on the current spec", got, replicas)
+		t.Errorf("the bus moved to config %q while pods of the previous callout ReplicaSet were serving", got)
 	}
 	if busConfigText(t, ctx, cl, agent) != "previous" {
 		t.Error("the bus config Secret moved while the StatefulSet was held; a bus pod restarted meanwhile would start on it")
@@ -227,7 +230,6 @@ func TestAChangedBusConfigWaitsForTheWholeCalloutRollout(t *testing.T) {
 	// ReplicaSet is still terminating, and still subscribed.
 	reportCalloutServing(t, ctx, cl, agent)
 	dep = getCallout(t, ctx, cl, agent)
-	newRS := calloutReplicaSet(t, ctx, cl, dep, "new", "2")
 	if err := cl.Delete(ctx, old1); err != nil {
 		t.Fatalf("delete callout-old-1: %v", err)
 	}
@@ -238,7 +240,6 @@ func TestAChangedBusConfigWaitsForTheWholeCalloutRollout(t *testing.T) {
 	if err := cl.Delete(ctx, old0); err != nil {
 		t.Fatalf("delete callout-old-0: %v", err)
 	}
-	calloutPod(t, ctx, cl, dep, newRS, "callout-new-0", "", false)
 	calloutPod(t, ctx, cl, dep, newRS, "callout-new-1", "", false)
 	// A pod that only carries the callout's labels, on an old hash, does
 	// not count.
@@ -268,12 +269,11 @@ func TestAChangedBusConfigWaitsForTheWholeCalloutRollout(t *testing.T) {
 	}
 }
 
-func TestACalloutIsFullyRolledOutOnlyWithEveryReplicaOnTheCurrentSpec(t *testing.T) {
-	dep := func(gen, observed int64, desired *int32, replicas, ready, updated int32) *appsv1.Deployment {
+func TestTheCalloutSpecIsObservedOnlyAtTheAppliedGeneration(t *testing.T) {
+	dep := func(gen, observed int64) *appsv1.Deployment {
 		return &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{Generation: gen},
-			Spec:       appsv1.DeploymentSpec{Replicas: desired},
-			Status:     appsv1.DeploymentStatus{ObservedGeneration: observed, Replicas: replicas, ReadyReplicas: ready, UpdatedReplicas: updated},
+			Status:     appsv1.DeploymentStatus{ObservedGeneration: observed},
 		}
 	}
 	for _, tc := range []struct {
@@ -282,16 +282,12 @@ func TestACalloutIsFullyRolledOutOnlyWithEveryReplicaOnTheCurrentSpec(t *testing
 		applied int64
 		want    bool
 	}{
-		{"every replica ready and updated", dep(3, 3, ptr.To(int32(2)), 2, 2, 2), 3, true},
-		{"desired unset means one", dep(3, 3, nil, 1, 1, 1), 3, true},
-		{"one replica still on the previous spec", dep(3, 3, ptr.To(int32(2)), 2, 2, 1), 3, false},
-		{"a surge pod beside the desired count", dep(3, 3, ptr.To(int32(2)), 3, 3, 2), 3, false},
-		{"one replica not ready", dep(3, 3, ptr.To(int32(2)), 2, 1, 2), 3, false},
-		{"the controller has not observed the spec", dep(3, 2, ptr.To(int32(2)), 2, 2, 2), 3, false},
-		{"a copy older than this pass's apply", dep(2, 2, ptr.To(int32(2)), 2, 2, 2), 3, false},
+		{"observed at the applied generation", dep(3, 3), 3, true},
+		{"the controller has not observed the spec", dep(3, 2), 3, false},
+		{"a copy older than this pass's apply", dep(2, 2), 3, false},
 	} {
-		if got := a2aCalloutFullyRolledOut(tc.dep, tc.applied); got != tc.want {
-			t.Errorf("%s: a2aCalloutFullyRolledOut = %v, want %v", tc.name, got, tc.want)
+		if got := a2aCalloutSpecObserved(tc.dep, tc.applied); got != tc.want {
+			t.Errorf("%s: a2aCalloutSpecObserved = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
@@ -399,6 +395,11 @@ func TestAStalledCalloutRolloutReleasesTheBusAndSaysSo(t *testing.T) {
 	rendered := busConfigHash(t, ctx, cl, agent)
 	putTheBusOnAPreviousConfig(t, ctx, cl, agent)
 
+	// A rollout under way: a newer ReplicaSet with one pod, beside the
+	// steady pods of the previous one.
+	nextRS := calloutReplicaSet(t, ctx, cl, getCallout(t, ctx, cl, agent), "next", "2")
+	calloutPod(t, ctx, cl, getCallout(t, ctx, cl, agent), nextRS, "callout-next-0", "", false)
+
 	stall := func(stalled bool) {
 		t.Helper()
 		dep := getCallout(t, ctx, cl, agent)
@@ -460,5 +461,34 @@ func TestAStalledCalloutRolloutReleasesTheBusAndSaysSo(t *testing.T) {
 	busGatePass(t, ctx, r, req, "callout recovered")
 	if c := condition(); c != nil {
 		t.Errorf("%s stayed after the callout rollout recovered: %+v", a2aCalloutStalledConditionType, c)
+	}
+}
+
+// Readiness is not what the bus waits on. With every pod on the current spec,
+// a callout that is not ready (one pod NotReady in place, or none ready at
+// all because the bus they connect to is down) does not hold a pending bus
+// config: a pod that is not ready places nobody, and a bus that needs its new
+// config to come back must not wait on a callout that needs the bus.
+func TestANotReadyCalloutOnTheCurrentSpecDoesNotHoldTheBus(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		busGatePass(t, ctx, r, req, "install")
+	}
+	theCalloutIsRolledOut(t, ctx, cl, agent)
+	completeTheProvisionJob(t, ctx, cl, agent)
+	busGatePass(t, ctx, r, req, "settled")
+	rendered := busConfigHash(t, ctx, cl, agent)
+	replicas := ptr.Deref(getCallout(t, ctx, cl, agent).Spec.Replicas, 1)
+
+	for _, ready := range []int32{replicas - 1, 0} {
+		putTheBusOnAPreviousConfig(t, ctx, cl, agent)
+		reportCalloutStatus(t, ctx, cl, agent, replicas, ready, replicas)
+		completeTheProvisionJob(t, ctx, cl, agent)
+		busGatePass(t, ctx, r, req, fmt.Sprintf("%d of %d callout replicas ready", ready, replicas))
+		if got := busConfigHash(t, ctx, cl, agent); got != rendered {
+			t.Errorf("with %d of %d callout replicas ready, all on the current spec, the bus stayed on config %q; want the rendered %q", ready, replicas, got, rendered)
+		}
 	}
 }
