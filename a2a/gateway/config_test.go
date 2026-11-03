@@ -1159,3 +1159,32 @@ func TestConfigHomeLearnArmed(t *testing.T) {
 		})
 	}
 }
+
+// TestFromEnvGatewayLease: no Lease runs the gateway unelected; a Lease needs
+// the pod's name, the election's identity.
+func TestFromEnvGatewayLease(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("A2A_GATEWAY_LEASE", "")
+	t.Setenv("POD_NAME", "platform-agent-a2a-gateway-7d9f-abcde")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Elected() {
+		t.Fatal("elected with no Lease named")
+	}
+
+	t.Setenv("A2A_GATEWAY_LEASE", "platform-agent-a2a-gateway")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Elected() || cfg.GatewayLease != "platform-agent-a2a-gateway" || cfg.PodName != "platform-agent-a2a-gateway-7d9f-abcde" {
+		t.Fatalf("lease %q, identity %q, elected %v", cfg.GatewayLease, cfg.PodName, cfg.Elected())
+	}
+
+	t.Setenv("POD_NAME", "")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "POD_NAME") {
+		t.Fatalf("a Lease with no pod name = %v, want it refused naming POD_NAME", err)
+	}
+}

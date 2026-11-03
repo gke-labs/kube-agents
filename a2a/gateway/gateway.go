@@ -588,10 +588,94 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // Run subscribes the event relay, starts the reap and sweep loops, and runs
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
+	return g.RunWith(ctx, RunOptions{})
+}
+
+// RunOptions are what an elected gateway changes about Run (election.go).
+// The zero value is Run.
+type RunOptions struct {
+	// RelayBindDelay holds the relay's bind back this long while ingress
+	// and the loops start at once. After a start that follows a crash, the
+	// dead process's held events come back only when their AckWait runs
+	// out, and they have to render before newer ones.
+	RelayBindDelay time.Duration
+	// StopDrain is read once the stop begins and bounds the wait for the
+	// relay batches still rendering; nil means relayStopDrainTimeout. A
+	// lost lease has less time than SIGTERM.
+	StopDrain func() time.Duration
+}
+
+// RunWith is Run with the elected gateway's options.
+func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
+	// A relay bind that fails after the delay ends the run, as one that
+	// fails before ingress starts does.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	g.runCtx = ctx
 	// Its first try before the relay starts, so on an install with the
 	// bucket every answer the relay posts is marked alike.
 	g.startFeedback(ctx)
+
+	var sub lib.Subscription
+	bound := make(chan struct{})
+	if o.RelayBindDelay <= 0 {
+		var err error
+		if sub, err = g.bindRelay(ctx); err != nil {
+			return err
+		}
+		close(bound)
+	} else {
+		g.log.Info("relay bind held back: this start follows a crash, so the dead process's held events render first", "delay", o.RelayBindDelay.String())
+		go func() {
+			defer close(bound)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(o.RelayBindDelay):
+			}
+			s, err := g.bindRelay(ctx)
+			if err != nil {
+				cancel(err)
+				return
+			}
+			sub = s
+		}()
+	}
+	// The batches already rendering finish first, then the subscription's
+	// stop gives every event not yet rendered back to the stream.
+	// Only then do the adapters close their connections: ingress stopped
+	// when ctx ended, but a batch rendering past its stop check posts
+	// through them.
+	defer func() {
+		<-bound
+		drain := relayStopDrainTimeout
+		if o.StopDrain != nil {
+			drain = o.StopDrain()
+		}
+		g.relayInFlight.drain(drain)
+		if sub != nil {
+			sub.Stop()
+		}
+		closeAdapter(g.adapter)
+	}()
+
+	go g.reapLoop(ctx)
+	if g.spawner != nil {
+		go g.sweepLoop(ctx)
+	}
+
+	// The adapter's delivery goroutines only enqueue (or refuse a console
+	// turn whose queue is full); per-conversation order is the queue's job,
+	// not the backend's.
+	err := g.adapter.Run(ctx, g.enqueueInbound)
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	return err
+}
+
+// bindRelay subscribes the event relay.
+func (g *Gateway) bindRelay(ctx context.Context) (lib.Subscription, error) {
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to
 	// the requester and retires the task on exactly like an executor's own.
@@ -618,28 +702,22 @@ func (g *Gateway) Run(ctx context.Context) error {
 		MaxAckPending: relayMaxAckPending,
 	}, func(d lib.DeferredDelivery) { g.relayDelivery(ctx, d) })
 	if err != nil {
-		return fmt.Errorf("event relay subscription: %w", err)
+		return nil, fmt.Errorf("event relay subscription: %w", err)
 	}
-	// The batches already rendering finish first, then the subscription's
-	// stop gives every event not yet rendered back to the stream.
-	// Only then do the adapters close their connections: ingress stopped
-	// when ctx ended, but a batch rendering past its stop check posts
-	// through them.
-	defer func() {
-		g.relayInFlight.drain(relayStopDrainTimeout)
-		sub.Stop()
-		closeAdapter(g.adapter)
-	}()
+	return sub, nil
+}
 
-	go g.reapLoop(ctx)
-	if g.spawner != nil {
-		go g.sweepLoop(ctx)
-	}
+// BeginTerm starts a new gateway term on the registry every write goes
+// through (Registry.BeginTerm). The election calls it on acquiring the
+// lease, before Run.
+func (g *Gateway) BeginTerm(ctx context.Context) (uint64, error) {
+	return g.reg.BeginTerm(ctx)
+}
 
-	// The adapter's delivery goroutines only enqueue (or refuse a console
-	// turn whose queue is full); per-conversation order is the queue's job,
-	// not the backend's.
-	return g.adapter.Run(ctx, g.enqueueInbound)
+// OnFenced sets what runs when a registry write is refused because a newer
+// term has started (Registry.SetOnFenced).
+func (g *Gateway) OnFenced(f func()) {
+	g.reg.SetOnFenced(f)
 }
 
 // enqueueInbound queues a turn for its conversation. Console turns are
@@ -734,6 +812,15 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// a program say "the gateway answered without starting a task" as a fact
 	// rather than as a guess about timing.
 	defer g.observeTurnFinished(msg.Conversation)
+
+	if g.runCtx.Err() != nil {
+		// Stopping (SIGTERM or a lost lease): ingress has closed, and a turn
+		// taken but not started is dropped, not run on a context that has
+		// already ended. Its backend acked it, so this is a loss, bounded by
+		// what was queued.
+		g.log.Warn("turn dropped: the gateway is stopping", "conversation", msg.Conversation, "messageId", msg.MessageID)
+		return
+	}
 
 	// Counted before the sender is verified, as the chat_metrics plugin
 	// counts the Hermes-side ingress before its allowlist, so the two halves
