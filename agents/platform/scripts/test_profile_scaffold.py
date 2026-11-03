@@ -776,7 +776,7 @@ class NpmCacheTest(unittest.TestCase):
 
     def test_the_sweep_deletes_a_leftover_with_a_unique_name(self):
         process_home = self.scaffold(self.tmp)
-        leftover = process_home / f"{ps.NPM_RECLAIM_PREFIX}.abc123"
+        leftover = process_home / f"{ps.NPM_RECLAIM_PREFIX}.abc12_xy"  # mkdtemp's shape
         (leftover / "_cacache").mkdir(parents=True)
         (leftover / "_cacache" / "index").write_bytes(b"x" * 5)
 
@@ -831,14 +831,16 @@ class NpmCacheTest(unittest.TestCase):
                 # Profile create is quiet about the same home.
                 self.assertEqual(self.share(process_home, self.tmp), "")
 
-    def test_a_user_directory_with_a_longer_name_is_not_swept(self):
-        """Only the bare prefix and prefix-dot-suffix are the sweep's; ~/.npm.reclaimed is not."""
+    def test_a_user_directory_under_the_prefix_is_not_swept(self):
+        """Only the bare prefix and mkdtemp's own names are the sweep's; a name a person chose is not."""
         process_home = self.scaffold(self.tmp)
-        mine = process_home / f"{ps.NPM_RECLAIM_PREFIX}ed"
-        mine.mkdir()
+        mine = [process_home / f"{ps.NPM_RECLAIM_PREFIX}{rest}" for rest in ("ed", ".bak", ".2026-11-03", ".backup-old")]
+        for path in mine:
+            path.mkdir()
 
         self.assertEqual(self.share(process_home, self.tmp, reclaim=True), "")
-        self.assertTrue(mine.is_dir())
+        for path in mine:
+            self.assertTrue(path.is_dir(), path)
 
     def test_the_sweep_is_quiet_after_the_agent_home_moves(self):
         """The relative link resolves to the new shared cache, so nothing is reported."""

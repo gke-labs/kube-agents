@@ -18,6 +18,7 @@ import contextlib
 import errno
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -54,9 +55,12 @@ NPM_SHARED_CACHE = Path(".cache", "npm")
 # prefix, a dot and mkdtemp's suffix, before it deletes it, and deletes every such
 # directory an earlier start-up left, and the bare prefix, the fixed name an older
 # image used. NPM_RECLAIM_GLOB finds the candidates; _is_reclaim_dir keeps only those
-# two shapes, so a user directory such as ~/.npm.reclaimed is never deleted.
+# two shapes, so a directory a person named under the prefix, such as
+# ~/.npm.reclaimed or ~/.npm.reclaim.bak, is never deleted.
 NPM_RECLAIM_PREFIX = ".npm.reclaim"
 NPM_RECLAIM_GLOB = NPM_RECLAIM_PREFIX + "*"
+# mkdtemp's suffix: eight characters from tempfile's alphabet (a-z, 0-9 and _).
+NPM_RECLAIM_MOVED_RE = re.compile(re.escape(NPM_RECLAIM_PREFIX + ".") + r"[a-z0-9_]{8}")
 
 _jobs_lock_state = threading.local()
 
@@ -339,7 +343,7 @@ def _symlink_shape(link: Path) -> str:
 def _is_reclaim_dir(path: Path) -> bool:
     """Whether `path` is a directory the sweep made or an older image's fixed name."""
     name = path.name
-    if name != NPM_RECLAIM_PREFIX and not name.startswith(NPM_RECLAIM_PREFIX + "."):
+    if name != NPM_RECLAIM_PREFIX and not NPM_RECLAIM_MOVED_RE.fullmatch(name):
         return False
     return path.is_dir() and not path.is_symlink()
 
