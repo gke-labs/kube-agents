@@ -13,7 +13,8 @@ so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
 file for the nightly one that day) and the held-out seats a coverage tracker
 puts back in the presubmit file without a roster line (HELD_OUT_IN_PRESUBMIT,
-the documented exception: #2013; #2016's seat took its roster line 2026-10-14) and the
+the documented exception: #2016's seat took its roster line 2026-10-14 and
+#2013's on 2026-11-02, RESEATED_FROM_HELD_OUT) and the
 cases demoted since (DEMOTED_AFTER_THE_SPLIT) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
 out, which the same decision moved into the nightly (#1546, #1564), plus
@@ -242,6 +243,8 @@ ADMITTED_AFTER_THE_SPLIT = [
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),
     # 2026-10-26: 33/34 on the twelve graded main nightlies 10-13 to 10-26 (14/14 since the claude-opus-5-5 key of 10-19, 5/5 under spec.mode next), the store at collecting.
     ("consistency-drift-outlier", "cost-idle-pool-probe"),
+    # 2026-11-02 (#2013 step 4, #4094): 36/36 on the twelve graded main nightlies 10-20 to 11-02, 15/15 at the gemini-4-argon next key (the store at collecting), 1068/1117 graded presubmit repetitions 10-27 to 11-02 with no all-reps collapse.
+    ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
 # (case, the presubmit line it follows); the same case leaves the nightly
@@ -265,7 +268,7 @@ HELD_OUT_TO_NIGHTLY = [
     "obtainability-fleet-exposure-sweep",  # #1049, never admitted
     "obtainability-healthy-namespace-silence",  # #1049, never admitted
     "rca-remediation-pr",  # demoted 2026-09-02, #1189
-    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171; seated back in the presubmit 2026-09-29 (HELD_OUT_IN_PRESUBMIT)
+    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171; seated back in the presubmit 2026-09-29, its roster line 2026-11-02 (RESEATED_FROM_HELD_OUT)
     "cluster-agent-healthy-workload-no-finding",  # held out on #1010
 ]
 
@@ -280,9 +283,23 @@ HELD_OUT_TO_NIGHTLY = [
 # roster-line step deletes the entry here and adds the name to
 # blocking-roster.txt. roster <= presubmit holds; presubmit == roster holds
 # less exactly this list.
-HELD_OUT_IN_PRESUBMIT = [
-    ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),  # #2013 step 2, seated 2026-09-29 after agent-kanban-smoke; the roster line is step 4
+HELD_OUT_IN_PRESUBMIT: list[tuple[str, str]] = []
+# A held-out seat that took its roster line without ever leaving the
+# presubmit file, as (case, the presubmit line it follows): its line moved
+# up out of the held-out section and its name joined blocking-roster.txt in
+# one edit. It is in the presubmit and on the roster like a promoted case,
+# but it is pinned here rather than in PROMOTED_AFTER_THE_SPLIT because its
+# split-time presubmit line is also in HELD_OUT_TO_NIGHTLY, so the
+# presubmit expectation drops that line and re-inserts this one, and the
+# nightly expectation leaves it out. pdb-remediation-pr's seat could take
+# the PROMOTED_AFTER_THE_SPLIT route on 2026-10-14 because its split-time
+# line was not in HELD_OUT_TO_NIGHTLY. A later demotion of a case here is
+# the ordinary one: the entry stays, DEMOTED_AFTER_THE_SPLIT records it
+# with None, and the DEMOTED filter removes it from every expectation.
+RESEATED_FROM_HELD_OUT = [
+    ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),  # #2013 step 2 seated it 2026-09-29; step 4, the roster line, 2026-11-02 (#4094)
 ]
+RESEATED = {case for case, _ in RESEATED_FROM_HELD_OUT}
 
 
 # Demoted after the split under docs/eval-gate-roster.md "Demoting a flaky
@@ -468,9 +485,13 @@ class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
         expected = [
             c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT)
-            if c not in HELD_OUT_TO_NIGHTLY and c not in DEMOTED
+            if c not in HELD_OUT_TO_NIGHTLY
         ]
-        self.assertEqual(eval_rosters.presubmit_cases(), with_insertions(expected, HELD_OUT_IN_PRESUBMIT))
+        # The DEMOTED filter runs last, after the reseated and held-out
+        # insertions, so a demotion of any of them is the ordinary edit.
+        self.assertEqual(
+            eval_rosters.presubmit_cases(),
+            [c for c in with_insertions(expected, RESEATED_FROM_HELD_OUT + HELD_OUT_IN_PRESUBMIT) if c not in DEMOTED])
 
     def test_the_presubmit_runs_the_blocking_roster_plus_the_held_out_seats_and_nothing_else(self):
         # Decided 2026-09-22 (#1023): a case that cannot red a pull request
@@ -494,12 +515,26 @@ class SplitLostNothingTest(unittest.TestCase):
                 # A seat for a case registered after the freeze came from the
                 # sorted section, which pins no history; its seat cites its record.
         for case in HELD_OUT_TO_NIGHTLY:
-            if case in seated:
+            if case in seated or case in RESEATED:
                 continue
             with self.subTest(case=case):
                 self.assertNotIn(case, eval_rosters.presubmit_cases())
                 self.assertNotIn(case, eval_rosters.blocking_roster())
                 self.assertIn(case, eval_rosters.nightly_cases())
+
+    def test_a_reseated_case_sits_after_its_line_and_is_pinned_once(self):
+        # A seat that took its roster line in place (RESEATED_FROM_HELD_OUT):
+        # its membership is held with the promoted cases below; what is new
+        # here is its place in the presubmit file and the cross-list pins.
+        for case, follows in RESEATED_FROM_HELD_OUT:
+            if case in DEMOTED:
+                continue  # demoted since; test_a_demoted_case_is_in_the_nightly_only holds it
+            with self.subTest(case=case):
+                presubmit = eval_rosters.presubmit_cases()
+                self.assertEqual(presubmit.index(case), presubmit.index(follows) + 1)
+                self.assertIn(case, HELD_OUT_TO_NIGHTLY, "a reseated case is one that left for the nightly on 2026-09-22 and came back held out")
+                self.assertNotIn(case, {c for c, _ in HELD_OUT_IN_PRESUBMIT})
+                self.assertIn(case, {c for c, _ in ADMITTED_AFTER_THE_SPLIT})
 
     def test_the_blocking_roster_is_bootstrap_admitted_at_the_split_plus_the_admitted(self):
         self.assertEqual(
@@ -523,7 +558,7 @@ class SplitLostNothingTest(unittest.TestCase):
             [
                 c
                 for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
-                if c not in seated and c not in PARKED_AFTER_THE_MOVE
+                if c not in seated and c not in RESEATED and c not in PARKED_AFTER_THE_MOVE
             ],
             DEMOTED_AFTER_THE_SPLIT,
         )
@@ -552,7 +587,7 @@ class SplitLostNothingTest(unittest.TestCase):
                 self.assertNotIn(case, eval_rosters.blocking_roster())
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
-        for case, _ in PROMOTED_AFTER_THE_SPLIT:
+        for case, _ in PROMOTED_AFTER_THE_SPLIT + RESEATED_FROM_HELD_OUT:
             if case in DEMOTED:
                 continue  # demoted since its promotion; test_a_demoted_case_is_in_the_nightly_only holds it
             with self.subTest(case=case):
