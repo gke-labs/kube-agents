@@ -995,8 +995,8 @@ class RevalidationTest(unittest.TestCase):
         self.assertEqual(proc.stdout.count("Step 0: full run:"), 1)
 
     def test_an_override_behind_days_of_re_pins_is_still_found(self):
-        """The sticky re-pin posts a copy on this head after every merge to
-        main, newest first, so the one Prow-bot event is soon past the first
+        """The retired sticky re-pin posted a copy on this head after every
+        merge to main, newest first, so the one Prow-bot event is soon past the first
         hundred; the read follows GitHub's next-page link until it finds it."""
         pins = [
             self._override_event(creator="github-actions[bot]", when=f"2026-10-{7 + i // 24:02d}T{i % 24:02d}:00:00Z")

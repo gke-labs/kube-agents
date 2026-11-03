@@ -707,8 +707,6 @@ statuses on the head when an input changes — a push, a label, a new smoke stat
 green, so a gate missing from the head has not passed yet. Its `merge_group` jobs decide the same
 two again on the queue commit, and the enqueue sweep re-posts the head statuses of approved pull
 requests on its schedule. `scripts/merge_gate.py` is the reference for what each one reads.
-[`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) still re-pins a green's
-`BaseSHA:` suffix to the new head of `main`, which only Tide read.
 
 A push starts a fresh smoke run.
 [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0, makes some runs cheap: before

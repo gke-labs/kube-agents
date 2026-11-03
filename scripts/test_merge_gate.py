@@ -23,7 +23,6 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import merge_gate as gate
-import pin_smoke_status
 
 REPO = "gke-labs/kube-agents"
 SHA = "a" * 40
@@ -249,7 +248,7 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(skipped[gate.SMOKE_GATE][0], gate.SUCCESS)
 
     def test_a_re_pin_copy_counts_from_the_builds_first_report(self):
-        """A re-pin after the cutoff is a fresh copy of a green from before it."""
+        """A re-pin after the cutoff was a fresh copy of a green from before it."""
         api = FakeAPI(all_statuses=[smoke_status("2026-10-23T19:00:00Z"), smoke_status("2026-10-23T12:00:00Z")])
         self.assertEqual(gate.smoke_first_reported(api, SHA), datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc))
 
@@ -264,7 +263,7 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(gate.smoke_first_reported(api, SHA), datetime(2026, 10, 23, 19, 0, tzinfo=timezone.utc))
 
     def test_a_status_with_no_build_link_counts_from_the_earliest_with_none(self):
-        """A re-pin copies a link-less green with a new time; the copy must not pass for a new verdict."""
+        """A re-pin copied a link-less green with a new time; the copy must not pass for a new verdict."""
         api = FakeAPI(
             all_statuses=[
                 smoke_status("2026-10-23T19:00:00Z", target_url=""),
@@ -284,7 +283,7 @@ class CutoffTest(unittest.TestCase):
             with self.subTest(statuses=statuses):
                 self.assertIsNone(gate.smoke_first_reported(FakeAPI(all_statuses=statuses), SHA))
 
-    def test_the_variable_is_read_as_pin_smoke_status_reads_it(self):
+    def test_the_variable_is_read_as_a_utc_time(self):
         for raw, want in (("", None), ("  ", None), ("2026-10-23T18:00:00Z", CUTOFF), ("2026-10-23T14:00:00-04:00", CUTOFF)):
             with self.subTest(raw=raw):
                 self.assertEqual(gate.not_before_from_env({gate.NOT_BEFORE_ENV: raw}), want)
@@ -306,7 +305,7 @@ class CutoffTest(unittest.TestCase):
             self.assertEqual(gate.main(["--repo", REPO, "group", "--ref", "x", "--gate", gate.LABELS_GATE]), 0)
         self.assertIsNone(group.call_args.kwargs["not_before"])
 
-    def test_a_green_pin_smoke_status_expired_waits_with_or_without_the_variable(self):
+    def test_an_expired_green_waits_with_or_without_the_variable(self):
         def unread():
             raise AssertionError("the status history was read for an expired green")
 
@@ -316,9 +315,9 @@ class CutoffTest(unittest.TestCase):
                 results = gate.verdicts(pull(statuses=expired), no_files, not_before, unread)
                 self.assertEqual(results[gate.SMOKE_GATE], (gate.PENDING, gate.SMOKE_PREDATES))
 
-    def test_the_expired_note_is_the_one_pin_smoke_status_writes(self):
-        self.assertEqual(gate.SMOKE_EXPIRED_NOTE, pin_smoke_status.EXPIRED_NOTE)
-        self.assertIn(gate.SMOKE_EXPIRED_NOTE, pin_smoke_status.expired_description("x" * 200))
+    def test_the_expired_note_is_the_one_on_existing_statuses(self):
+        # The retired pin_smoke_status.py wrote this note; greens that carry it stay on old heads.
+        self.assertEqual(gate.SMOKE_EXPIRED_NOTE, "(predates SMOKE_PIN_NOT_BEFORE: retest)")
 
     def test_the_queue_refuses_a_green_from_before_the_cutoff(self):
         raw = {"number": 42, "head": {"sha": SHA}, "base": {"ref": "main"}, "labels": []}
