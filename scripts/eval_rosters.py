@@ -298,18 +298,24 @@ def parse_lane_requesting(text: str) -> dict[str, int]:
     return out
 
 
-# The first prompt line that makes a case a stopped ask
-# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE). hack/ci-eval-pr.sh's
-# unit_phase runs a stopped ask in the serial second phase beside the
-# requesting cases; scripts/test_eval_rosters.py holds this text read to
+# The first prompt lines that make a case a stopped ask
+# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE and
+# MID_TURN_DIRECTIVE). hack/ci-eval-pr.sh's unit_phase runs a stopped ask in
+# the serial second phase beside the requesting cases;
+# scripts/test_eval_rosters.py holds this text read to
 # stop_hook.is_stopped_ask.
 STOP_DIRECTIVE = "[bench:stop-after-first-card]"
+MID_TURN_DIRECTIVE = "[bench:stop-mid-turn]"
 
 
 def is_stopped_ask(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
-    """Whether the case's task.yaml carries the stop directive outside a comment."""
+    """Whether the case's task.yaml carries a stop directive outside a comment."""
     text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
-    return any(STOP_DIRECTIVE in line.split("#", 1)[0] for line in text.splitlines())
+    return any(
+        directive in line.split("#", 1)[0]
+        for line in text.splitlines()
+        for directive in (STOP_DIRECTIVE, MID_TURN_DIRECTIVE)
+    )
 
 
 def requests_a_pull_request(case: str, lane_requesting: dict[str, int], tasks_dir: pathlib.Path = TASKS_DIR) -> bool:

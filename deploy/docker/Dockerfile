@@ -1743,6 +1743,19 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # turn can still answer.
 # See the module docstring in deploy/docker/patches/kanban_wake_guard.py.
 #
+# api_session_stop: a Stop ends the turn running in Hermes, not only the
+# bridge's wait for it. The bridge POSTs each turn without streaming, and
+# upstream interrupts an agent only when a streaming client disconnects, so a
+# turn the person stopped ran on and could still file a card after the card
+# stop had looked for one (#3263). The chat-completions handler records each
+# turn under its session id, _run_agent carries the record onto the turn's
+# thread and binds the agent to it, and a new route,
+# POST /v1/kube-agents/sessions/{id}/stop, gives every turn running in the
+# session upstream's hard interrupt and process reap and waits for it to end.
+# kanban_create refuses on a stopped turn. Applied AFTER kanban_wake_guard,
+# whose rewritten lines are two of its anchors. See the module docstring in
+# deploy/docker/patches/api_session_stop.py.
+#
 # kanban_link_running_guard: kanban_link refuses to gate a card that has
 # already started. A link makes its child wait for the parent, so a worker that
 # linked its own running fan-out child stranded that run: its completes were
@@ -1761,6 +1774,16 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # enforce_max_runtime, which is anchored on upstream's line, after the
 # kanban-scheduling stage's edits to the same file.
 # See the module docstring in deploy/docker/patches/kanban_fanout_reaper.py.
+#
+# kanban_worker_toolsets: the dispatcher resolves each worker's toolset pin in a
+# short-lived child process instead of inside the gateway. Done in the gateway,
+# each profile got a plugin manager the process kept forever, with that profile's
+# plugins registered there (hermes_otel's span and metric threads among them):
+# about 2.9 MiB and two threads per profile ever dispatched to (#3937). The
+# result is cached per profile while its config, .env, plugins and the managed
+# scope are unchanged. Its verifier needs a real profile layout, so it runs in
+# the hermes-otel step below, against a copy of /opt/defaults.
+# See the module docstring in deploy/docker/patches/kanban_worker_toolsets.py.
 #
 # kanban_priority: user cards ahead of background
 # triage. The dispatcher half (one slot held for user cards, the saturation
@@ -1849,12 +1872,18 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_wake_guard.py \
      deploy/docker/patches/apply_kanban_wake_guard.py \
      deploy/docker/patches/verify_kanban_wake_guard.py \
+     deploy/docker/patches/api_session_stop.py \
+     deploy/docker/patches/apply_api_session_stop.py \
+     deploy/docker/patches/verify_api_session_stop.py \
      deploy/docker/patches/kanban_link_running_guard.py \
      deploy/docker/patches/apply_kanban_link_running_guard.py \
      deploy/docker/patches/verify_kanban_link_running_guard.py \
      deploy/docker/patches/kanban_fanout_reaper.py \
      deploy/docker/patches/apply_kanban_fanout_reaper.py \
      deploy/docker/patches/verify_kanban_fanout_reaper.py \
+     deploy/docker/patches/kanban_worker_toolsets.py \
+     deploy/docker/patches/apply_kanban_worker_toolsets.py \
+     deploy/docker/patches/verify_kanban_worker_toolsets.py \
      deploy/docker/patches/kanban_chat_notify.py \
      deploy/docker/patches/apply_kanban_chat_notify.py \
      deploy/docker/patches/verify_kanban_chat_notify.py \
@@ -1934,7 +1963,11 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF '_kanban_refuse_unblock_on_wake()' /opt/hermes/tools/kanban_tools.py && \
     grep -qF 'headers[_KANBAN_WAKE_HEADER]' /opt/hermes/gateway/wake.py && \
     grep -qF '_kanban_wake_marked(OpenAICompatRoutesMixin._handle_chat_completions)' /opt/hermes/gateway/platforms/api_server.py && \
-    grep -qF 'run_in_executor(None, _kanban_wake_carry(_run))' /opt/hermes/gateway/platforms/api_server.py && \
+    cp /tmp/latency-patches/api_session_stop.py /opt/hermes/tools/api_session_stop.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_api_session_stop.py /opt/hermes && \
+    grep -qF 'run_in_executor(None, _kanban_wake_carry(_kube_session_stop.carry(self, _run)))' /opt/hermes/gateway/platforms/api_server.py && \
+    grep -qF '_kube_session_stop.track(OpenAICompatRoutesMixin._handle_chat_completions)' /opt/hermes/gateway/platforms/api_server.py && \
+    grep -qF '_stop_err = _kube_refuse_create_on_stop()' /opt/hermes/tools/kanban_tools.py && \
     cp /tmp/latency-patches/kanban_link_running_guard.py /opt/hermes/tools/kanban_link_running_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_link_running_guard.py /opt/hermes && \
     grep -qF '_link_err = _kanban_refuse_started_child_link(kb, conn, parent_id, child_id)' /opt/hermes/tools/kanban_tools.py && \
@@ -1942,6 +1975,10 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     cp /tmp/latency-patches/kanban_fanout_reaper.py /opt/hermes/tools/kanban_fanout_reaper.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_fanout_reaper.py /opt/hermes && \
     grep -qF '_kanban_reap_overdue_fanout(conn)' /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    cp /tmp/latency-patches/kanban_worker_toolsets.py /opt/hermes/tools/kanban_worker_toolsets.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_worker_toolsets.py /opt/hermes && \
+    grep -qF '_kanban_worker_toolsets.resolve_worker_toolsets(hermes_home)' /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    cp /tmp/latency-patches/verify_kanban_worker_toolsets.py /tmp/verify_kanban_worker_toolsets.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_priority.py /opt/hermes && \
     grep -qF 'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task, self_tid),' /opt/hermes/tools/kanban_tools.py && \
     grep -qF '**_kanban_queue_fields(conn, new_tid, args.get("board")),' /opt/hermes/tools/kanban_tools.py && \
@@ -1986,6 +2023,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_audit_ledger.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_guard.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_api_session_stop.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_link_running_guard.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_fanout_reaper.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
@@ -2064,7 +2102,9 @@ ARG HERMES_OTEL_ROOT_SPAN_TTL_MS=14400000
 RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install --ref "${HERMES_OTEL_REF}" briancaffey/hermes-otel/hermes_otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; c['root_span_ttl_ms'] = int('${HERMES_OTEL_ROOT_SPAN_TTL_MS}'); p.write_text(yaml.safe_dump(c))" && \
-    grep -q "^root_span_ttl_ms: ${HERMES_OTEL_ROOT_SPAN_TTL_MS}$" /opt/defaults/plugins/hermes_otel/config.yaml
+    grep -q "^root_span_ttl_ms: ${HERMES_OTEL_ROOT_SPAN_TTL_MS}$" /opt/defaults/plugins/hermes_otel/config.yaml && \
+    /opt/hermes/.venv/bin/python3 /tmp/verify_kanban_worker_toolsets.py /opt/defaults && \
+    rm -f /tmp/verify_kanban_worker_toolsets.py
 
 # The two files that name the speaking profile to the shell sandbox on every
 # connection Hermes' backend opens: the ssh client drop-in, and the wrapper that

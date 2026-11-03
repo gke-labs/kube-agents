@@ -390,17 +390,18 @@ already written.
   `--target-version` defaults to the file's `target_version` when the report was run with one.
 - Without `--repo` the script scans every repository under `managed_repos`, on every forge, the
   same list the GitOps skills write to; `--repo` is repeatable and, when given, is the whole scope.
-  A repository on another forge than GitHub is named `host/path`, as the list names it, and is read
-  through the content workspace only: on a broker not armed for content-passing it is listed under
-  errors, because the leased checkout reaches GitHub alone.
+  A repository on another forge than GitHub is named `host/path`, as the list names it. A `--repo`
+  can also name a `context_repos` entry or a public repository: the broker reads each with the
+  credential its role allows.
   `--manifests-dir` scans a local tree instead of, or as well as, repositories.
-- It reads each repository the way `inspect-repository` does: through the credential broker's
-  content workspaces as a shallow read-only clone, or, on an install whose broker is not armed
-  for content-passing, through a leased checkout on the shared volume. That checkout is under
-  a lease of the scan's own (`--lease` overrides it), so positioning it on the base branch
-  never resets a checkout another skill is working in -- `fleet-audit`'s remediation clone is
-  leased on its audit id on the same volume. It runs no `gcloud` and writes to no repository. A repository the broker or git cannot
-  serve is listed under errors and sets exit code 1; the other repositories are still reported.
+- It reads one revision of each repository through the credential broker, with no history, into a
+  temporary directory of its own, and deletes it, so it never touches a copy another skill is
+  working in. The broker reads the whole tree, and refuses a repository whose tree is over its
+  snapshot ceiling: that repository is listed under errors, not as partial. When
+  `CREDENTIAL_PROXY_URL` is not set (a run outside the pod), the script reads a leased checkout of
+  its own instead, for GitHub repositories only; `--lease` names that lease. It runs no `gcloud`
+  and writes to no repository. A repository the broker or git cannot serve is listed under errors
+  and sets exit code 1; the other repositories are still reported.
 - Removal data is `removed_apis.json` beside the script: Kubernetes 1.16 through 1.32, from the
   upstream Deprecated API Migration Guide, whose URL and `as_of` version the report prints. The
   script cannot call MCP tools, so when the target is newer than the table (the report says so)

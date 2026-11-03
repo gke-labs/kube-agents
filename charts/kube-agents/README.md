@@ -1217,7 +1217,7 @@ bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets 
 the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
 rendered manifest. A cluster with bursting admits the manifest as rendered.
 
-### Optional AgentProfiles (`profiles.tse`)
+### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`)
 
 `profiles.tse.enabled` (default `false`) renders the optional `AgentProfile/tse`
 (GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
@@ -1226,6 +1226,18 @@ rendered manifest. A cluster with bursting admits the manifest as rendered.
 controlling its `AgentProfile` spec. When bound, the operator passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
 scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+
+`profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
+generic cluster agent: one profile for every cluster in scope, with the
+target named per task by the `project`, `location` and `cluster` parameters.
+Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
+and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
+control its spec. The parameters are fixed, in the persona's order, because
+the design has the worker refuse a task when they differ from the persona's.
+No pod runs it until the profile dispatcher, worker and pool land and the
+operator runs them, though enabling it already gets the profile its
+ServiceAccounts, bus identity and agent card. A cluster that needs its own
+persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
 
 ## Uninstalling
 
