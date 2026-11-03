@@ -429,11 +429,6 @@ FIXTURE_NOT_READY = {
         "(fleet re-apply), as gce-startup-script-failure does; until then it runs by "
         "hand on a dev install with the VM planted"
     ),
-    "obtainability-major-pdb-auto-pr": (
-        "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
-        "each pool project's *-infra repository, so 3.3's fix is a manifest "
-        "rather than manual"
-    ),
     "obtainability-pdb-kustomize-overlay": (
         "#2686: needs checkout-gateway declared in a Kustomize root under "
         "clusters/seeded-a/seeded-reliability/ in each pool project's *-infra "
