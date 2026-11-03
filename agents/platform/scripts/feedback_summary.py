@@ -212,6 +212,10 @@ LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
     r"[ \t]+model:[ \t]*(?P<mq>['\"]?)(?P<model>[^'\"\s#]*)(?P=mq)",
     re.MULTILINE,
 )
+#: A CRLF line end, normalised to LF before the LiteLLM regexes run: MULTILINE ``$``
+#: and the ``\n`` the entry pattern spells match only before LF.
+CRLF_LINE_END = "\r\n"
+LF_LINE_END = "\n"
 #: A LiteLLM model is ``<provider>/<name>``, split at the first separator.
 MODEL_SEGMENT_SEPARATOR = "/"
 #: A name that starts with this is a Vertex AI endpoint path
@@ -452,15 +456,14 @@ def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
     """
     if not config_yaml:
         return None
+    config_yaml = config_yaml.replace(CRLF_LINE_END, LF_LINE_END)
     if LITELLM_DEFAULT_NAME_LINE.search(config_yaml):
         entry = LITELLM_DEFAULT_ENTRY_MODEL.search(config_yaml)
         return split_model(entry.group("model")) if entry else None
     # The scan reads every ``model:`` line, while the operator's parser reads only
     # ``model_list[].litellm_params.model``: a ``model:`` key elsewhere in the
-    # config can answer here and not in the operator. CRLF line endings defeat
-    # LITELLM_DEFAULT_NAME_LINE (``$`` does not match before ``\r``), so a
-    # malformed ``model-default`` entry then falls to this scan instead of a
-    # negative.
+    # config can answer here and not in the operator. A CRLF config reads the
+    # same as LF: the line ends are normalised above.
     for match in LITELLM_MODEL_LINE.finditer(config_yaml):
         model = split_model(match.group("model"))
         if model:

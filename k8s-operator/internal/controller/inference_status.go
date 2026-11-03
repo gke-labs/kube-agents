@@ -311,12 +311,14 @@ func (r *PlatformAgentReconciler) inferencePruned(agent *agentv1alpha1.PlatformA
 	return ok && time.Since(recorded) < usageStatusReprobeInterval
 }
 
-// noteInferenceEcho reads status.inference back after the Ready writer's write. A
-// non-empty pair written that comes back absent or with both fields empty is the served
-// CRD pruning it: recorded, and logged once per record. An echo that carries the pair
-// clears the record. An empty pair written says nothing either way.
-func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, wrote inferenceModel) {
-	if wrote == (inferenceModel{}) {
+// noteInferenceEcho reads status.inference back after the Ready writer's write. wrote
+// is nil when the write carried no block. A block written that comes back absent is
+// the served CRD pruning it, the empty pair (a definite negative) included: a CRD that
+// serves the field round-trips {} as a present empty object. A non-empty pair that
+// comes back with both fields empty is pruning too. Either is recorded, and logged
+// once per record. An echo that carries the written pair clears the record.
+func (r *PlatformAgentReconciler) noteInferenceEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, wrote *inferenceModel) {
+	if wrote == nil {
 		return
 	}
 	echoed := agent.Status.Inference

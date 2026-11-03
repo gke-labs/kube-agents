@@ -361,6 +361,16 @@ class ParsingTest(unittest.TestCase):
         )
         self.assertEqual(fs.model_from_litellm_config(config), "anthropic/claude-opus-5")
 
+    def test_a_crlf_config_reads_its_model_default_entry(self):
+        config = (
+            "model_list:\r\n"
+            "  - model_name: fast\r\n    litellm_params:\r\n      model: openai/gpt-4o-mini\r\n"
+            "  - model_name: model-default\r\n    litellm_params:\r\n      model: vertex_ai/gemini-4-argon\r\n"
+        )
+        self.assertEqual(fs.model_from_litellm_config(config), "vertex_ai/gemini-4-argon")
+        malformed = config.replace("vertex_ai/gemini-4-argon", "gpt-4o")
+        self.assertIsNone(fs.model_from_litellm_config(malformed))
+
     def test_a_malformed_model_default_entry_is_a_negative_with_no_fallback(self):
         for model in ("gpt-4o", "gemini/", "/claude", '""', "projects/acme/locations/x/endpoints/9",
                       "arn:aws:bedrock:us-east-1:1:x/y", "vertex_ai/projects/acme/locations/x/endpoints/"):

@@ -457,7 +457,10 @@ type PlatformAgentReconciler struct {
 	// gauges' publish reads them on every reconcile, at any age, to hold the
 	// pruned fields' samples back (heldUsageFields). Cleared per field by an
 	// echo that carries it, per CR by the poller's sweep of departed CRs and
-	// when the CR is deleted. Under prunedNewerFieldsMu.
+	// when the CR is deleted. updateStatusReady also records status.inference
+	// here (inferenceNewerField, through noteInferenceEcho) when the Ready
+	// write's echo drops the block, reads it through inferencePruned, and
+	// clears it when an echo carries the pair. Under prunedNewerFieldsMu.
 	prunedNewerFieldsMu sync.Mutex
 	prunedNewerFields   map[string]map[string]time.Time
 
@@ -4713,9 +4716,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
 	// Copied before the write: decoding the response may reuse the pointer's target.
-	var wroteInference inferenceModel
+	var wroteInference *inferenceModel
 	if newInference != nil {
-		wroteInference = inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
+		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
 	}
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, err

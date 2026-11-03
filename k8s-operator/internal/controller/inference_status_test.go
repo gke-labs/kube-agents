@@ -357,6 +357,73 @@ func TestUpdateStatusReadyRecordsAPrunedInferenceBlock(t *testing.T) {
 	}
 }
 
+// A definite negative (no LiteLLM ConfigMap) writes the empty pair. A served CRD that
+// prunes status.inference echoes it back absent, which is recorded like a pruned found
+// pair, so the gate holds until the record ages rather than writing on every pass.
+func TestUpdateStatusReadyRecordsAPrunedNegativeInferenceBlock(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	counter := &statusWriteCounter{}
+	funcs := counter.interceptors()
+	persist := funcs.SubResourceUpdate
+	funcs.SubResourceUpdate = func(ctx context.Context, cl client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+		if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+			pa.Status.Inference = nil
+		}
+		return persist(ctx, cl, subResourceName, obj, opts...)
+	}
+	r := inferenceReconciler(t, &funcs, agent)
+
+	settleReady(t, r, agent)
+	if counter.writes != 1 {
+		t.Fatalf("%d status writes on the first pass, want 1", counter.writes)
+	}
+	if agent.Status.Inference != nil {
+		t.Fatalf("the fixture did not prune status.inference (got %+v)", agent.Status.Inference)
+	}
+	if !r.inferencePruned(agent) {
+		t.Fatal("the echo dropped the empty status.inference and no record was kept")
+	}
+	settleReady(t, r, agent)
+	if counter.writes != 1 {
+		t.Errorf("%d status writes after a second negative pass under a pruning CRD, want 1", counter.writes)
+	}
+
+	r.prunedNewerFieldsMu.Lock()
+	r.prunedNewerFields[usagePollKey(agent)][inferenceNewerField] = time.Now().Add(-2 * usageStatusReprobeInterval)
+	r.prunedNewerFieldsMu.Unlock()
+	settleReady(t, r, agent)
+	if counter.writes != 2 {
+		t.Errorf("%d status writes after the record aged, want 2: the probe must write", counter.writes)
+	}
+	if !r.inferencePruned(agent) {
+		t.Error("the probe's pruning echo was not recorded again")
+	}
+}
+
+// On a CRD that keeps status.inference, a fresh CR's first negative writes the empty
+// object once; the echo carries {}, so the next pass is unchanged and nothing is recorded.
+func TestUpdateStatusReadyWritesANegativeOnceOnAKeepingCRD(t *testing.T) {
+	agent := observedGenerationAgent(1)
+	counter := &statusWriteCounter{}
+	funcs := counter.interceptors()
+	r := inferenceReconciler(t, &funcs, agent)
+
+	settleReady(t, r, agent)
+	if counter.writes != 1 {
+		t.Fatalf("%d status writes on the first pass, want 1", counter.writes)
+	}
+	if !inferenceStatusEqual(agent.Status.Inference, &agentv1alpha1.InferenceStatus{}) {
+		t.Fatalf("status.inference = %+v, want an empty object", agent.Status.Inference)
+	}
+	if r.inferencePruned(agent) {
+		t.Error("an echo that carried the empty pair was recorded as pruned")
+	}
+	settleReady(t, r, agent)
+	if counter.writes != 1 {
+		t.Errorf("%d status writes after an unchanged negative pass, want 1", counter.writes)
+	}
+}
+
 func TestInferenceGaugePublishesOneSampleAndSwapsOnAChange(t *testing.T) {
 	g := newInferenceGauges(prometheus.NewRegistry())
 	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "ns"}}
