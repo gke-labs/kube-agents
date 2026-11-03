@@ -12515,6 +12515,36 @@ class TestProposalOrigin(unittest.TestCase):
             self.assertEqual(child.json(), {"origin": "chat", "platform": "slack"})
             self.assertEqual(self.client.get("/v1/sessions/a2a-route-root/origin").json(), {"origin": "chat", "platform": "slack"})
 
+    def test_session_origin_walks_the_gateway_profiles_store_on_a_front_door_install(self):
+        # With HERMES_GATEWAY_PROFILE=platform the gateway's sessions are in
+        # profiles/platform/state.db; this server's own store does not know them.
+        own = self.tmp / "state.db"
+        with closing_state(own) as conn:
+            conn.executescript("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);")
+        profile_db = self.tmp / "profiles" / "platform" / "state.db"
+        profile_db.parent.mkdir(parents=True)
+        with closing_state(profile_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('fd-origin-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('fd-origin-child', 'fd-origin-root', NULL);
+                """
+            )
+        session_kv_server._set_session_origin("fd-origin-root", "chat", "slack")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(own)), \
+                patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.tmp / "kanban.db")):
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: "platform"}):
+                self.assertEqual(session_kv_server._session_origin("fd-origin-child"), ("chat", "slack"))
+                child = self.client.get("/v1/sessions/fd-origin-child/origin")
+                self.assertEqual(child.json(), {"origin": "chat", "platform": "slack"})
+            # Without the front door the profile's store is not read.
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: ""}):
+                self.assertEqual(session_kv_server._session_origin("fd-origin-child"), ("other", ""))
+            # A profile name that leaves the profiles directory names no store.
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: "../platform"}):
+                self.assertEqual(session_kv_server._origin_state_dbs(), [str(own)])
+
     def test_get_origin_route_is_404_without_a_record_and_401_without_the_key(self):
         from fastapi.testclient import TestClient
 

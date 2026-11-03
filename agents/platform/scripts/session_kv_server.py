@@ -87,6 +87,10 @@ PROPOSAL_OPENED_AT_MAX_CHARS = 64
 # deploy/docker/patches/kanban_event_routing.py `_compression_ancestors` takes it.
 ORIGIN_COMPRESSION_END_REASON = "compression"
 ORIGIN_COMPRESSION_WALK_MAX = 32
+# The profile the gateway runs as, as the operator sets it for this container
+# (empty for the default profile). On a platform front-door install the gateway's
+# sessions are in that profile's `state.db`, not in this server's own.
+GATEWAY_PROFILE_ENV = "HERMES_GATEWAY_PROFILE"
 ORIGIN_DB_TIMEOUT_SECONDS = 5.0
 # The board's origin stamp (`_stamp_board_task_origin`, the drift backlog's
 # writer), a side table in the kanban database that the first stamp wins.
@@ -7406,16 +7410,49 @@ def _set_session_origin(session_id: str, origin: str, platform: str = "") -> boo
     return True
 
 
+def _origin_state_dbs() -> list[str]:
+    """The Hermes session stores the compression walk reads, in order.
+
+    `kanban_event_routing.state_db_path` resolves the store from inside the
+    gateway, whose `HERMES_HOME` is its profile's home. This server runs with
+    the root home, so it reads its own store (`_card_stop_state_db`) and then,
+    when `HERMES_GATEWAY_PROFILE` names a profile, that profile's store under
+    the data root, the way the feed readers find a profile's `state.db`
+    (`_profile_state_db`).
+    """
+    stores: list[str] = []
+    own = _card_stop_state_db()
+    if own and os.path.isfile(own):
+        stores.append(own)
+    profile = os.environ.get(GATEWAY_PROFILE_ENV, "").strip()
+    if profile and profile != DEFAULT_PROFILE:
+        try:
+            gateway = _profile_state_db(_feed_data_root(), profile)
+        except Exception as exc:  # noqa: BLE001 - no data root here: the walk fails open
+            logger.warning("origin: the gateway profile's session store is unresolvable: %s", exc)
+            gateway = None
+        if gateway is not None and str(gateway) not in stores:
+            stores.append(str(gateway))
+    return stores
+
+
 def _session_compression_ancestors(session_id: str) -> list[str]:
     """The sessions `session_id` continues through compression, nearest first.
 
     The walk `_compression_ancestors` in deploy/docker/patches/kanban_event_routing.py
     takes over Hermes' `state.db`, replicated here because this server does not
-    load that patch. Fails open to none.
+    load that patch. A session lives in one store, so the first store
+    (`_origin_state_dbs`) that knows a parent answers. Fails open to none.
     """
-    state_db = _card_stop_state_db()
-    if not state_db or not os.path.isfile(state_db):
-        return []
+    for state_db in _origin_state_dbs():
+        found = _compression_ancestors_in(session_id, state_db)
+        if found:
+            return found
+    return []
+
+
+def _compression_ancestors_in(session_id: str, state_db: str) -> list[str]:
+    """`_session_compression_ancestors` over one session store."""
     found: list[str] = []
     try:
         with closing(_read_only(state_db)) as conn:
