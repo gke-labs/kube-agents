@@ -202,8 +202,12 @@ def gitlab_document(data: dict, now: datetime.datetime | None = None) -> dict:
 
 
 def _night_label(lane: dict, job: str) -> str:
-    """A nightly's short name in the digest: the lane's noun and its mode."""
+    """A nightly's short name in the digest: the lane's noun and its mode for
+    a job in its table, the job's own name for any other (a rename or an
+    extra prefix), so two jobs of one mode never read alike."""
     noun = lane["title"].removesuffix(" lane")
+    if job not in lane["nightly_jobs"]:
+        return f"{noun} {job}"
     return f"{noun} {'next' if job.endswith(NEXT_JOB_SUFFIX) else 'today'}"
 
 

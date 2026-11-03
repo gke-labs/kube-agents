@@ -129,6 +129,14 @@ class LaneDocumentTest(unittest.TestCase):
         ]}
         line = forge_lane.digest_line(old, now)
         self.assertIn("GHES next no night last night", line)
+        # A job outside the lane's table is named, so it never reads like the table's job of its mode.
+        extra = {"runs": [
+            dict(run("30", job="ci-kube-agents-eval-nightly-gitlab", pr=None), started="2026-11-03T06:30:00+00:00"),
+            dict(run("31", job="ci-kube-agents-eval-nightly-gitlab-v2", pr=None, result="FAILURE"), started="2026-11-03T07:30:00+00:00"),
+        ]}
+        named = forge_lane.digest_line(extra, now)
+        self.assertIn("GitLab today green", named)
+        self.assertIn("GitLab ci-kube-agents-eval-nightly-gitlab-v2 red", named)
         self.assertIn("GitLab CE next no result", line)
         self.assertNotIn("oss-test-infra#2755", line)
 
