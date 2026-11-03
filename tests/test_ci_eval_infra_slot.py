@@ -99,12 +99,13 @@ RUN_SECONDS=(1.0 1.0 1.0 0.6 0.6 0.6 0.6 0.6 0.6 3.0 0.4 0.3 0.3 0)
 # INFRA_LOCK_DEADLINE).
 TRY_SECONDS=0.05
 GIVEUP_TRIES="${GIVEUP_TRIES:-200}"
-# stack-dies holds for at most half that deadline (the tries stretch under
-# load, the one sleep does not), derived from it so the two stay in step:
-# long enough that the waiter launched when it ends is still waiting when the
-# first waiter gives up, short enough that the first waiter is still waiting
-# when it launches.
-RUN_SECONDS[13]="$(awk "BEGIN { print ${GIVEUP_TRIES} * ${TRY_SECONDS} / 2 }")"
+# stack-dies holds for half that deadline, counted in the waiters' own tries
+# (one mkdir and one sleep per try, the same two spawns) rather than slept as
+# one duration, so the hold stretches under load as the deadlines do: long
+# enough that the waiter launched when it ends is still waiting when the first
+# waiter gives up, short enough that the first waiter is still waiting when it
+# launches.
+HOLD_TRIES=$((GIVEUP_TRIES / 2))
 # The unit that must hold its locks before any other lock taker contends for
 # lock-infra; empty for no such order. A gated unit waits GIVEUP_TRIES tries
 # at most, then contends anyway.
@@ -154,7 +155,16 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse> <has-stack> <seq> <stre
   # Logged first, then marked: the marker's mkdir is a spawn, and a unit gated
   # on HELD_FIRST_BY waits for the marker, not the log line. Never removed.
   mkdir -p "${STATE_DIR}/held-${name}"
-  /bin/sleep "${RUN_SECONDS[i]}"
+  if [ "${name}" = "stack-dies" ]; then
+    # Each iteration is one waiter try: a failing mkdir on the lock it holds
+    # and one sleep.
+    tries=0
+    while [ "${tries}" -lt "${HOLD_TRIES}" ]; do
+      mkdir "${LOCK}" 2>/dev/null || true; /bin/sleep "${TRY_SECONDS}"; tries=$((tries + 1))
+    done
+  else
+    /bin/sleep "${RUN_SECONDS[i]}"
+  fi
   if [ -n "$5" ] && [ "${name}" != "stack-dies" ]; then event "${name}" release; rmdir "${LOCK}"; fi
   if [ -n "${state}" ]; then rmdir "${STATE_DIR}/lock-state-${state}"; fi
   event "${name}" end
@@ -326,8 +336,9 @@ class InfraSlotTest(unittest.TestCase):
             self.assertLess(stack_a_start, _at(events, bootstrap, END), "the tofu chain waited for oobe's state lock")
 
     def test_a_dead_holder_costs_one_deadline_per_pair_of_waiters(self):
-        # stack-dies takes lock-infra, holds it for half the deadline and
-        # exits without releasing it. The three units behind it wait two at a
+        # stack-dies takes lock-infra, holds it for half the deadline (counted
+        # in the waiters' tries, so load stretches both alike) and exits
+        # without releasing it. The three units behind it wait two at a
         # time: stack-a launches with stack-dies, stack-b once stack-dies' job
         # ends, and each gives up at the deadline (60 tries). When the first gives
         # up the other is the one unit parked, and the third launches then,
