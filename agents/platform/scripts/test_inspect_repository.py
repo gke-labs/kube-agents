@@ -485,6 +485,16 @@ class TestClone(InspectRepositoryTestCase):
             result = self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "copy")])
         self.assertEqual(result["written"], 3)
 
+    def test_a_destination_in_the_staging_folder_is_refused(self):
+        root = inspect_repository.staging_root()
+        for into in (root, root / "mine", root / "a" / "b"):
+            with self.subTest(into=str(into)):
+                with self.assertRaises(SystemExit) as refused:
+                    inspect_repository.dispatch(["clone", "--repo", "acme/public", "--into", str(into)])
+                self.assertIn("holds only clone staging", str(refused.exception))
+                self.assertFalse((into / "README.md").exists())
+        self.assertEqual(self.calls, [])
+
     def test_a_byte_bound_refuses_the_whole_copy(self):
         into = self.tmp / "copy"
         with self.assertRaises(vcs_client.VcsError) as caught:

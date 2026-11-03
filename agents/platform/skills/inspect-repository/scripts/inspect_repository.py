@@ -207,9 +207,16 @@ def clone_content(args) -> int:
     `staging_root()` too.
     """
     remove_stale_staging()
-    into = prepare_destination(
-        Path(args.into) if args.into else default_into(args.repo), args.force
-    )
+    target = Path(args.into).expanduser() if args.into else default_into(args.repo)
+    # The sweep removes what sits in staging_root(), so a copy there would be
+    # removed an hour later.
+    resolved, root_resolved = target.resolve(), staging_root().resolve()
+    if resolved == root_resolved or root_resolved in resolved.parents:
+        raise SystemExit(
+            f"{target} is in {staging_root()}, which holds only clone staging. "
+            "Name a directory outside it with --into."
+        )
+    into = prepare_destination(target, args.force)
     paths = [args.prefix] if args.prefix else None
     root = staging_root()
     root.mkdir(parents=True, exist_ok=True)
