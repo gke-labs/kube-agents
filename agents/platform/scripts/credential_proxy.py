@@ -972,6 +972,17 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 VCS_PROVIDER_LABEL = "provider"
 VCS_PROVIDER_NONE = "none"
+# The one-time claim token minted with each `proposal-create` answer, under
+# CLAIM_TOKEN_FIELD, and burned by the first `proposal-claim` that presents it
+# (`ClaimTokens`). It lives CLAIM_TOKEN_TTL_SECONDS, the window
+# `vcs_broker.CLAIM_WINDOW_SECONDS` holds the proposal's creation time to, and
+# is CLAIM_TOKEN_BYTES of os.urandom, spelled in hex.
+PROPOSAL_CREATE_VERB = "proposal-create"
+PROPOSAL_CLAIM_VERB = "proposal-claim"
+CLAIM_TOKEN_FIELD = "claim"
+CLAIM_URL_FIELD = "url"
+CLAIM_TOKEN_TTL_SECONDS = vcs_broker.CLAIM_WINDOW_SECONDS
+CLAIM_TOKEN_BYTES = 32
 # The provider label's closed set: the names of the forge classes this image
 # ships (providers.AVAILABLE), which is also the set the registry admits a
 # configured forge from, so a configured forge's name is always in it.
@@ -3564,6 +3575,65 @@ class NullAuthenticator:
 class _CacheEntry:
     expires_at: float
     principal: Principal
+
+
+@dataclass(frozen=True)
+class _ClaimEntry:
+    expires_at: float
+    url: str
+    repository: Any
+    number: int
+
+
+class ClaimTokens:
+    """The claim tokens `proposal-create` answers have minted and no claim has burned.
+
+    Keyed by the token's SHA-256, as the authenticator's cache is, so the
+    process holds no token it could leak. Each keeps the proposal's url and
+    number and the repository the create resolved, for the claim to check in
+    place of anything its caller sends. Expiry is on the monotonic clock;
+    expired entries are pruned on every mint and never served.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = CLAIM_TOKEN_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._entries: dict[str, _ClaimEntry] = {}
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    @staticmethod
+    def _key(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def mint(self, url: str, repository: Any, number: int) -> str:
+        """A new token for the proposal at ``url``, kept for ``ttl_seconds``."""
+        token = os.urandom(CLAIM_TOKEN_BYTES).hex()
+        now = self._clock()
+        with self._lock:
+            self._entries = {
+                key: entry for key, entry in self._entries.items() if entry.expires_at > now
+            }
+            self._entries[self._key(token)] = _ClaimEntry(now + self.ttl_seconds, url, repository, number)
+        return token
+
+    def burn(self, token: Any) -> _ClaimEntry | None:
+        """Spend ``token``: its entry if it was live, None if unknown, burned or expired."""
+        if not isinstance(token, str) or not token:
+            return None
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.pop(self._key(token), None)
+        if entry is None or entry.expires_at <= now:
+            return None
+        return entry
 
 
 class ServiceAccountAuthenticator:
@@ -12167,6 +12237,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # the sandbox reaches a repository at all. It is None on an exec pod, which
     # answers /v1/vcs/* with 404 (exec_pod_serves), and on no other broker.
     vcs: vcs_broker.VcsBroker | None = None
+    # The claim tokens `proposal-create` answers carry and `proposal-claim`
+    # burns. One store per process, shared by every handler thread.
+    claim_tokens: ClaimTokens = ClaimTokens()
     # Set by _repository_is_permitted on a refusal: the status it answered.
     repository_refusal_status: HTTPStatus | None = None
     # Replaced by serve(). The default keeps the sidecar deployment, where the
@@ -14297,6 +14370,21 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         status = self._dispatch_vcs_post(verb)
         self.metrics.record_vcs(_vcs_verb_label(verb), status, self.vcs_provider)
 
+    def _mint_claim(self, result: Any, repository: Any) -> None:
+        """Add a one-time claim token to a `proposal-create` answer that names its proposal.
+
+        Kept with the proposal's url and number and the repository the
+        request resolved, for `proposal-claim` to check. An answer with no url
+        or number gets none: there is nothing a claim could be checked against.
+        """
+        proposal = result.get("proposal") if isinstance(result, dict) else None
+        if not isinstance(proposal, dict):
+            return
+        url, number = proposal.get("url"), proposal.get("number")
+        if not isinstance(url, str) or not url or isinstance(number, bool) or not isinstance(number, int):
+            return
+        result[CLAIM_TOKEN_FIELD] = self.claim_tokens.mint(url, repository, number)
+
     def _dispatch_vcs_post(self, verb: str) -> str:
         """Answer one version-control request and return its outcome label.
 
@@ -14402,6 +14490,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 # verb will read it (`snapshot_bare_name_fallback`): lifted
                 # onto the install's GitHub forge, or, when it is read from a
                 # host outside the table with no credential, not at all.
+                if verb == PROPOSAL_CLAIM_VERB:
+                    # Burned before anything else is asked, so a claim whose
+                    # forge check fails below has spent its token too. What
+                    # the broker checks is what the create kept with the
+                    # token, never the caller's repository or number.
+                    entry = self.claim_tokens.burn(payload.get(CLAIM_TOKEN_FIELD))
+                    if entry is None or entry.url != payload.get(CLAIM_URL_FIELD):
+                        self._json(
+                            HTTPStatus.NOT_FOUND,
+                            {
+                                "error": "no live claim for that proposal: unknown, already claimed, or expired",
+                                "code": "CLAIM_UNKNOWN",
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
+                    payload = {"repository": entry.repository, "url": entry.url, "number": entry.number}
                 role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS
                 named, outside = payload.get("repository"), None
                 if role_selected:
@@ -14427,6 +14531,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                             return TOOL_STATUS_ERROR
                         return TOOL_STATUS_BLOCKED
                 result = route(payload)
+                if verb == PROPOSAL_CREATE_VERB:
+                    self._mint_claim(result, payload.get("repository"))
                 self._json(HTTPStatus.OK, result)
                 return TOOL_STATUS_SUCCESS
         except CallerHungUp as exc:
