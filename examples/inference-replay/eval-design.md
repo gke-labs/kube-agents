@@ -127,9 +127,9 @@ The rules that keep this safe:
   a month). So timestamps, both dates and epoch seconds, become a token for roughly how far from now
   they are ("minutes ago", "days ago", "in the future", and so on), and an expired certificate never
   matches a valid one. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
-  `timestamp`); any other 10-digit number, like `memory: 1717986918`, stays as it is. IP addresses
-  stay as they are whenever the request mentions a network range (like `10.0.0.0/16`), because then
-  which range an IP falls in can matter.
+  `timestamp`); any other 10-digit number, like `memory: 1717986918`, isn't read as a time. IP
+  addresses stay as they are whenever the request mentions a network range (like `10.0.0.0/16`),
+  because then which range an IP falls in can matter.
 - **Opaque fields are never edited.** Fields named for signatures, `provider_specific_fields`,
   and the `id`/`tool_call_id` of tool calls: LiteLLM embeds Gemini's thought signature in
   tool-call ids (`call_…__thought__<base64>`), and rewriting a digit inside it corrupts the
@@ -144,9 +144,9 @@ The rules that keep this safe:
   in an answer must not become this run's row id.
 - **An answer that repeats a number we swapped isn't saved.** Some values are swapped in the
   request but can't safely be put back in an answer: bare numbers like a `pid`, a row `id`,
-  `resourceVersion` or `generation`, and the epoch timestamps that all become one fixed token. If
-  the model's answer repeats one of those values (say it answers `kill 4821` after reading
-  `pid 4821`), a later run would get the old number back. So the proxy checks each answer before
+  `resourceVersion` or `generation`, and epoch timestamps, which become an unnumbered
+  how-far-from-now time token. If the model's answer repeats one of those values (say it answers
+  `kill 4821` after reading `pid 4821`), a later run would get the old number back. So the proxy checks each answer before
   saving it, and if it repeats any of those values, it doesn't save it. That request just goes to
   the model next time, which is always safe.
 - **Hermes' recent-work digest is dropped from the key.** Every card view ends with
@@ -157,12 +157,12 @@ The rules that keep this safe:
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
-`resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages. Epoch seconds are
-replaced by a fixed token, because two events in one second would otherwise shift every later
-number. Known gaps from the measurements: `ls -l` dates (`Nov  2 04:13`) and Hermes'
-terminal-output cache file suffixes (`…-89b0.log`). The rules above change two of these classes:
-timestamps get a how-far-from-now token, and IPs stay as they are when a network range is in the
-request.
+`resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages. Epoch seconds
+become an unnumbered how-far-from-now time token rather than a numbered placeholder, because two
+events in one second would otherwise shift every later number. Known gaps from the measurements:
+`ls -l` dates (`Nov  2 04:13`) and Hermes' terminal-output cache file suffixes (`…-89b0.log`). The
+rules above change two of these classes: timestamps get a how-far-from-now token, and IPs stay as
+they are when a network range is in the request.
 
 ## Measurements
 
@@ -500,17 +500,18 @@ before stage 2 of the rollout:
 1. **Shadow mode (logs only, no cache).** The proxy runs in the presubmit and the nightly but still
    calls the model for every request, so no pass or fail changes. For each request it logs a
    fingerprint (a hash of the normalized request), the prompt tokens and how long the model took.
-   Fingerprints don't contain anything sensitive, so they go in the job's normal Prow artifacts. The
-   cleaned-up request text goes to a private, eval-only bucket instead, because anyone can read Prow
-   artifacts through the public Prow website. Both are copied out while the job runs, not at the end,
-   because the last two nightlies ran into Prow's 14-hour timeout and by the time the end-of-run step
-   ran, LiteLLM was already gone. After a week, a script goes through all the logs in time order and
-   checks, for each request, whether the same fingerprint showed up earlier. Matches against nightly
-   fingerprints give us a low estimate (those can be a day old), and matches against pull request
-   fingerprints a high one. How many matches came from a different project tells us whether one
-   shared cache makes sense. For normalizer fixes, the script compares each miss with the closest
-   earlier request, and since we kept the cleaned-up text, we can test a new normalizer rule on the
-   same week of data without redeploying anything.
+   The fingerprint log and the cleaned-up request text both go to a private, eval-only bucket, never
+   to Prow artifacts, which anyone can read through the public Prow website: the log holds no text,
+   but a hash of request content can be guessed against. Both are copied out while the job runs, not
+   at the end, because the last two nightlies ran into Prow's 14-hour timeout and by the time the
+   end-of-run step ran, LiteLLM was already gone. After a week, a script goes through all the logs
+   in time order and checks, for each request, whether the same fingerprint showed up earlier.
+   Matches against nightly fingerprints give us a low estimate (those can be a day old). Adding
+   matches against the same pull request's earlier finished builds, and against a merged pull
+   request's last build once it merged, gives a high one. How many matches came from a different
+   project tells us whether one shared cache makes sense. For normalizer fixes, the script compares
+   each miss with the closest earlier request, and since we kept the cleaned-up text, we can test a
+   new normalizer rule on the same week of data without redeploying anything.
 
    Exact matches will undercount. In shadow mode every model answer is a fresh live answer, so two
    runs rarely match exactly after the model's first reply, while under replay those replies would

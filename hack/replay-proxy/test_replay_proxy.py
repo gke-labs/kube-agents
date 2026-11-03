@@ -34,7 +34,9 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
     fallbacks = "0"
     # "normal", "stall_reset" (one chunk, a pause, then a TCP reset),
     # "early_close" (two chunks, then the connection closes without the last
-    # chunk), or "slow" (many chunks, slowly; `aborted` is set when a write fails).
+    # chunk), "short_body" (a non-streamed answer cut short of its
+    # Content-Length), or "slow" (many chunks, slowly; `aborted` is set when a
+    # write fails).
     mode = "normal"
     aborted = threading.Event()
     lock = threading.Lock()
@@ -77,6 +79,12 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
             for key, value in headers.items():
                 self.send_header(key, value)
             self.end_headers()
+            if self.mode == "short_body":
+                self.wfile.write(data[: len(data) // 2])
+                self.wfile.flush()
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.close_connection = True
+                return
             self.wfile.write(data)
             return
         self.send_response(200)
@@ -282,6 +290,16 @@ class UpstreamFailureTest(ProxyTestCase):
         self.assert_incomplete_line()
 
 
+    def test_body_cut_short_of_its_content_length(self):
+        FakeLiteLLM.mode = "short_body"
+        started = time.monotonic()
+        status, _, payload = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.assertEqual(status, 200)
+        self.assertLess(time.monotonic() - started, LOG_WAIT_SECONDS, "the client is not left waiting")
+        self.assertNotIn(b"usage", payload)
+        self.assert_incomplete_line()
+
+
 class UpstreamTimeoutTest(ProxyTestCase):
     upstream_timeout = STALL_SECONDS / 3
 
@@ -382,21 +400,22 @@ class LogLineTest(ProxyTestCase):
         for text in (TOKEN, "t_11111111", "web-7d4b9c8f6d", "platform agent", "answer 1"):
             self.assertNotIn(text, log)
 
-    def test_message_and_answer_hashes_are_of_scrubbed_text(self):
-        other = "ghp_" + "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2"
-        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
-        body = chat("t_11111111", stream=False)
-        body["messages"][-1]["content"] = body["messages"][-1]["content"].replace(TOKEN, other)
-        self.request("POST", "/v1/chat/completions", body)
-        a, b = self.lines(2)
-        # Different secrets, same scrubbed text: the hashes cannot tell them apart.
-        self.assertNotEqual(a["fingerprint"], b["fingerprint"])
-        self.assertEqual(a["message_hashes"], b["message_hashes"])
+    def test_message_hashes_are_of_unscrubbed_content(self):
+        # The scrubber blanks the rest of a line after a secret; the hashes
+        # must still tell replicas=3 from replicas=7.
+        a, b = chat("t_11111111", stream=False), chat("t_11111111", stream=False)
+        a["messages"][-1]["content"] = "DB_PASSWORD=hunter2 replicas=3"
+        b["messages"][-1]["content"] = "DB_PASSWORD=hunter2 replicas=7"
+        self.request("POST", "/v1/chat/completions", a)
+        self.request("POST", "/v1/chat/completions", b)
+        first, second = self.lines(2)
+        self.assertNotEqual(first["message_hashes"][-1], second["message_hashes"][-1])
+        self.assertEqual(first["message_hashes"][0], second["message_hashes"][0])
 
-    def test_scrubbed_message_hashes_are_prefix_stable(self):
+    def test_message_hashes_are_prefix_stable(self):
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
-        extra = ({"role": "user", "content": f"earlier turn t_99999999 with {TOKEN}"},)
-        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False, extra_messages=extra))
+        extra = ({"role": "user", "content": "earlier turn t_99999999"},)
+        self.request("POST", "/v1/chat/completions", chat("t_22222222", stream=False, extra_messages=extra))
         a, b = self.lines(2)
         self.assertEqual(a["message_hashes"][:1], b["message_hashes"][:1])
         self.assertEqual(len(b["message_hashes"]), 3)
@@ -431,8 +450,9 @@ class FailClosedProxyTest(ProxyTestCase):
         self.assertEqual(os.listdir(self.store), [])
         self.assertIn("replay_shadow_scrubbers_loaded 0", self.request("GET", "/metrics")[2].decode())
         self.assertIn("scrubbers_unavailable", line["unstorable"])
-        self.assertNotIn("message_hashes", line)
-        self.assertNotIn("answer_hash", line)
+        # Hashes do not depend on the scrubbers; only the stored text does.
+        self.assertEqual(len(line["message_hashes"]), 2)
+        self.assertTrue(line["answer_hash"])
 
 
 class ConfigTest(unittest.TestCase):

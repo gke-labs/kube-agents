@@ -8,10 +8,10 @@ answer" and Rollout step 1):
 
 - low estimate: the same fingerprint from a nightly;
 - high estimate: also from an earlier, finished build of the same pull
-  request (never the same build, never another pull request), and, with
-  `--merged`, from another pull request once it merged (the merge copy);
-- simulated: as high, but with the assistant messages in the history left out
-  of the comparison. In shadow mode every answer is a fresh sample, so a later
+  request (never the same build), and, with `--merged`, from another pull
+  request's last build before it merged, once it merged (the merge copy);
+- simulated: high, plus the requests that match when the assistant messages
+  in the history are left out of the comparison. In shadow mode every answer is a fresh sample, so a later
   request matches exactly only when the model repeated every earlier answer;
   under replay those answers would have been the recorded ones. It assumes the
   recorded answer's tool calls would have returned the results this run saw.
@@ -20,6 +20,13 @@ A sighting is available from when its answer finished (`ts + latency_ms`),
 and counts only when replay would have saved it (the line's `unstorable` list
 is empty, so a cut-short upstream answer never counts); `--ignore-storable`
 drops that rule. A build counts as finished once its last answer has.
+
+Until run verdicts are joined, high is an upper bound: it counts every earlier
+finished build of the same pull request and the merged pull request's last
+build whatever their verdicts, and a nightly answer counts as soon as it was
+written, before its run passed or failed. A presubmit line without `pr`
+(REPLAY_JOB_PR unset) never matches its own pull request's earlier builds; the
+report counts those lines.
 
 Also reported: the share of hits first seen in another project, the tokens and
 model time hits would save, and for misses the closest earlier request by
@@ -128,10 +135,8 @@ class Record:
         return out
 
     def key(self, estimate: str) -> Optional[str]:
-        if estimate != SIMULATED:
+        if estimate != SIMULATED or self.message_hashes is None:
             return self.fingerprint
-        if self.message_hashes is None:
-            return None
         chain = self.chain(skip_answers=True)
         return chain[-1] if chain else self.settings_hash
 
@@ -168,6 +173,17 @@ class Sources:
         for record in records:
             end = self.build_end.get(record.build_key, record.available_at)
             self.build_end[record.build_key] = max(end, record.available_at)
+        # The merge copy takes the merged pull request's last build that
+        # finished before the merge, not every build it ever ran.
+        self.merge_build: Dict[str, Tuple[str, str, str]] = {}
+        for build_key, end in self.build_end.items():
+            kind, pr, _ = build_key
+            merged_at = merged.get(pr)
+            if kind != PRESUBMIT or merged_at is None or end > merged_at:
+                continue
+            current = self.merge_build.get(pr)
+            if current is None or end > self.build_end[current]:
+                self.merge_build[pr] = build_key
         self.nightly: Dict[str, Record] = {}
         self.merge_copy: Dict[str, Tuple[float, Record]] = {}
         self.by_pr: Dict[str, Dict[str, List[Record]]] = {}
@@ -187,7 +203,7 @@ class Sources:
                 self.nightly[key] = record
             return
         merged_at = self.merged.get(record.pr)
-        if merged_at is not None and record.available_at <= merged_at:
+        if merged_at is not None and self.merge_build.get(record.pr) == record.build_key:
             best_copy = self.merge_copy.get(key)
             if best_copy is None or merged_at < best_copy[0]:
                 self.merge_copy[key] = (merged_at, record)
@@ -219,7 +235,7 @@ class KeySources(Sources):
 
     def keys_of(self, record: Record) -> List[str]:
         key = record.key(self.estimate)
-        return [key] if key is not None else []
+        return [key]
 
 
 class PrefixSources(Sources):
@@ -283,9 +299,13 @@ def iter_hits(
     the recording it would have been served from.
     """
     sources = KeySources(records, merged or {}, require_storable, estimate)
+    # Simulated is high plus the matches it adds, never fewer.
+    exact = KeySources(records, merged or {}, require_storable, HIGH) if estimate == SIMULATED else None
     for record in records:
         if record.kind == PRESUBMIT:
             recording = sources.find(record.key(estimate), record, nightly_only=estimate == LOW)
+            if recording is None and exact is not None:
+                recording = exact.find(record.fingerprint, record, nightly_only=False)
             yield record, (Hit(record, recording) if recording is not None else None)
 
 
@@ -319,6 +339,8 @@ def summarize(
         "presubmit_prompt_tokens": total_tokens,
         "unstorable_sightings": sum(1 for r in records if not r.storable),
         "unhashed_requests": sum(1 for r in records if r.message_hashes is None),
+        # REPLAY_JOB_PR unset: these never match an earlier build of their PR.
+        "presubmit_without_pr": sum(1 for r in presubmit if not r.pr),
         "merge_times_given": len(merged or {}),
         "estimates": {},
     }
@@ -362,7 +384,9 @@ def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
         f"requests: {report['requests']} ({report['presubmit_requests']} presubmit, {report['nightly_requests']} nightly);"
         f" presubmit prompt tokens: {report['presubmit_prompt_tokens']}",
         f"skipped lines: {skipped}; sightings replay would not have saved: {report['unstorable_sightings']};"
-        f" requests without message hashes: {report['unhashed_requests']}; merge times given: {report['merge_times_given']}",
+        f" requests without message hashes: {report['unhashed_requests']};"
+        f" presubmit requests without a pull request: {report['presubmit_without_pr']};"
+        f" merge times given: {report['merge_times_given']}",
         "",
         "estimate    hits   token-weighted   cross-project   saved prompt / completion tokens   saved model time",
     ]

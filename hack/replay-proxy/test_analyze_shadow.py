@@ -83,6 +83,36 @@ class EstimateTest(unittest.TestCase):
         self.assertEqual(rep["estimates"]["low"]["hits"], 0)
         self.assertEqual(hits(lines, merged={"10": 10.0}, top=0), 1)
 
+    def test_merge_copy_takes_only_the_last_build_before_the_merge(self):
+        lines = [
+            presubmit("p1", 1, "10", "b1", "OLD", ["o"]),  # PR 10's first build
+            presubmit("p2", 3, "10", "b2", "NEW", ["n"]),  # its last build before merging at 10
+            presubmit("p3", 20, "12", "b3", "OLD", ["o"]),
+            presubmit("p4", 21, "12", "b3", "NEW", ["n"]),
+        ]
+        rep, _ = report(lines, merged={"10": 10.0})
+        self.assertEqual(rep["estimates"]["high"]["hits"], 1)
+        hit_ids = [h.request.request_id for _, h in analyze_shadow.iter_hits(
+            analyze_shadow.load([write(lines)])[0], "high", merged={"10": 10.0}) if h]
+        self.assertEqual(hit_ids, ["p4"])
+
+    def test_a_build_finishing_after_the_merge_is_not_copied(self):
+        lines = [
+            presubmit("p1", 1, "10", "b1", "A", ["a"]),
+            presubmit("p2", 8, "10", "b2", "B", ["b"]),
+            presubmit("p3", 12, "10", "b2", "Z", ["z"]),  # b2 ends after the merge at 10
+            presubmit("p4", 20, "12", "b3", "A", ["a"]),
+            presubmit("p5", 21, "12", "b3", "B", ["b"]),
+        ]
+        hit_ids = [h.request.request_id for _, h in analyze_shadow.iter_hits(
+            analyze_shadow.load([write(lines)])[0], "high", merged={"10": 10.0}) if h]
+        self.assertEqual(hit_ids, ["p4"])
+
+    def test_presubmit_lines_without_a_pr_are_counted(self):
+        rep, _ = report([presubmit("p1", 1, "", "b1", "A", ["a"]), presubmit("p2", 2, "10", "b2", "A", ["a"]),
+                         line("n1", 3, "nightly", "n", "A", ["a"])])
+        self.assertEqual(rep["presubmit_without_pr"], 1)
+
     def test_a_sighting_after_the_merge_is_not_copied(self):
         lines = [
             presubmit("p1", 15, "10", "b1", "A", ["a"]),
@@ -172,9 +202,17 @@ class EstimateTest(unittest.TestCase):
         ]
         self.assertEqual(hits(lines, "simulated"), 0)
 
-    def test_requests_without_message_hashes_never_match_in_the_simulated_estimate(self):
-        lines = [line("n1", 1, "nightly", "n", "A", None), presubmit("p1", 2, "10", "b1", "B", None)]
-        self.assertEqual(hits(lines, "simulated"), 0)
+    def test_simulated_falls_back_to_the_fingerprint_without_message_hashes(self):
+        lines = [line("n1", 1, "nightly", "n", "A", None), presubmit("p1", 2, "10", "b1", "A", None),
+                 presubmit("p2", 3, "10", "b1", "B", None)]
+        self.assertEqual(hits(lines, "simulated"), 1)
+
+    def test_simulated_is_never_below_high(self):
+        # Same fingerprint, but message hashes that differ (lines from before a
+        # hashing change): high hits, so simulated must too.
+        lines = [line("n1", 1, "nightly", "n", "A", ["x"]), presubmit("p1", 2, "10", "b1", "A", ["y"])]
+        self.assertEqual(hits(lines, "high"), 1)
+        self.assertEqual(hits(lines, "simulated"), 1)
 
 
 class MissTest(unittest.TestCase):

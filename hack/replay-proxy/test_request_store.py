@@ -86,13 +86,6 @@ class ScrubberTest(unittest.TestCase):
         r1 = json.loads(Path(self.root, request_store.REQUESTS_DIR, "r1.json").read_text())
         self.assertEqual(r1["messages"], r2["messages"][:2])
 
-    def test_answer_is_scrubbed_for_hashing(self):
-        answer = {"content": f"use {TOKEN}", "tool_calls": [{"id": "c", "function": {
-            "name": "terminal", "arguments": json.dumps({"command": f"curl -H 'Authorization: Bearer {TOKEN}' x"})}}]}
-        scrubbed = self.scrubber.answer(answer)
-        self.assertNotIn(TOKEN, json.dumps(scrubbed))
-        self.assertIn(TOKEN, answer["content"], "the answer passed in is not modified")
-
     def test_answer_change_detection(self):
         self.assertFalse(self.scrubber.answer_changes({"content": "the pod is healthy"}))
         self.assertTrue(self.scrubber.answer_changes({"content": f"use {TOKEN}"}))

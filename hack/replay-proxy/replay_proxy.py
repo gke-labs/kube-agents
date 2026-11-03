@@ -9,7 +9,8 @@ client, the proxy:
 - normalizes the request and computes its fingerprint (normalizer.py);
 - writes one JSON line to stdout: the fingerprint, per-message hashes, token
   usage, model latency, a hash of the answer and LiteLLM's fallback headers.
-  Nothing in the line is request text;
+  Nothing in the line is request text, but its hashes can be guessed
+  against, so the log is private, like the stored text;
 - scrubs the request text and keeps it under the store directory
   (request_store.py), or keeps nothing if the scrubbers cannot load.
 
@@ -395,21 +396,15 @@ class ShadowProxy:
                 client_disconnected=upstream["client_disconnected"],
             ),
         )
-        scrubbed, skipped = self.store.scrub(body)
-        if scrubbed is not None:
-            # The per-message and answer hashes are of scrubbed text, so a
-            # short secret cannot be recovered from the public log by guessing.
-            # The scrubbed messages are normalized on their own, in order, so
-            # a shared prefix still has the same hashes.
-            scrubbed_body = dict(body)
-            scrubbed_body[request_store.MESSAGES_KEY] = scrubbed[0]
-            hashed = normalizer.normalize_request(scrubbed_body, received)
-            entry["message_hashes"] = hashed.message_hashes
-            try:
-                entry["answer_hash"] = answer_hash(self.scrubber.answer(upstream["message"]), hashed.mapping)
-            except Exception:  # an answer that cannot be scrubbed is not hashed
-                entry["answer_hash"] = None
-            skipped = self.store.write(request_id, fingerprint, scrubbed)
+        # The per-message and answer hashes are of the normalized, unscrubbed
+        # content, as the fingerprint is: the scrubber blanks the rest of a
+        # line after a secret, so hashes of scrubbed text would hide real
+        # state. That makes this log as private as the stored text: a hash of
+        # request content can be guessed against, so both go to the private,
+        # eval-only bucket, never to Prow artifacts.
+        entry["message_hashes"] = normalized.message_hashes
+        entry["answer_hash"] = answer_hash(upstream["message"], normalized.mapping)
+        skipped = self.store.store(request_id, fingerprint, body)
         entry["stored"] = skipped is None
         entry["store_skipped"] = skipped
         self.metrics.add("stored" if skipped is None else "store_skipped")
@@ -541,6 +536,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.close_connection = True
                     break
                 if not data:
+                    if not chunked and length is not None and resp.length:
+                        # The upstream closed before the Content-Length it
+                        # promised. Closing the client's connection is what
+                        # tells it the body is short; otherwise it waits.
+                        result["upstream_incomplete"] = True
+                        self.proxy.metrics.add("upstream_errors")
+                        self.close_connection = True
                     break
                 if observer is not None:
                     observer.feed(data)

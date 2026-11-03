@@ -150,6 +150,18 @@ class TimeTest(unittest.TestCase):
         )
         self.assertEqual(norm("created_at: 1793440000, \"ts\": 1793440000123"), "created_at: ⟦TIME_past_days⟧, \"ts\": ⟦TIME_past_days⟧")
 
+    def test_epoch_under_a_camel_case_time_key(self):
+        out = normalizer.Normalizer(NOW, False).walk(
+            {"startTime": 1793440000, "creationTimestamp": "1793440000", "expiryDate": int(NOW) + 3 * 3600}
+        )
+        self.assertEqual(
+            out,
+            {"creationTimestamp": "⟦TIME_past_days⟧", "expiryDate": "⟦TIME_future_hours⟧", "startTime": "⟦TIME_past_days⟧"},
+        )
+        self.assertEqual(norm("startTime: 1793440000"), "startTime: ⟦TIME_past_days⟧")
+        # Not a camelCase time key: the word itself, capitalised.
+        self.assertEqual(normalizer.Normalizer(NOW, False).walk({"Uptime": 1793440000}), {"Uptime": 1793440000})
+
     def test_free_text_epoch_shaped_number_stays_literal(self):
         self.assertEqual(norm("memory: 1717986918 bytes"), "memory: 1717986918 bytes")
         self.assertEqual(norm("at 1793440000"), "at 1793440000")

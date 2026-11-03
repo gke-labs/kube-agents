@@ -198,23 +198,6 @@ class Scrubber:
         scrubbed_settings = json.loads(self.text(KIND_TOOL_RESULT, settings))
         return scrubbed, scrubbed_tools, scrubbed_settings
 
-    def answer(self, answer: Dict[str, Any]) -> Dict[str, Any]:
-        """An answer's text and tool-call arguments, scrubbed."""
-        out = dict(answer)
-        if isinstance(answer.get(CONTENT_KEY), str):
-            out[CONTENT_KEY] = self.text(KIND_REPLY, answer[CONTENT_KEY])
-        calls = []
-        for call in answer.get(TOOL_CALLS_KEY) or []:
-            call = dict(call) if isinstance(call, dict) else {}
-            function = dict(call.get(FUNCTION_KEY) or {})
-            if function.get(ARGUMENTS_KEY):
-                function[ARGUMENTS_KEY] = self.text(KIND_TOOL_CALL, function[ARGUMENTS_KEY])
-            call[FUNCTION_KEY] = function
-            calls.append(call)
-        if calls:
-            out[TOOL_CALLS_KEY] = calls
-        return out
-
     def answer_changes(self, answer: Dict[str, Any]) -> bool:
         """Whether scrubbing would change an answer (such an answer is never saved)."""
         if not self.available:

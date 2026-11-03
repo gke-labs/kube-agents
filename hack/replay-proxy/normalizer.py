@@ -133,7 +133,10 @@ LS_DATE_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) {1,2}(?:(\d{2}):
 # key that names a time: a free-text 10-digit number (`memory: 1717986918
 # bytes`) stays literal.
 EPOCH_FULL_RE = re.compile(r"^(1[6-9]\d{8})(\d{3})?(?:\.\d+)?$")
-TIME_KEY_PATTERN = r"(?:[A-Za-z0-9_]*_at|[A-Za-z0-9]*[a-z]At|time|timestamp|ts|date|[A-Za-z0-9_]*_(?:time|timestamp|ts|date))"
+TIME_KEY_PATTERN = (
+    r"(?:[A-Za-z0-9_]*_at|[A-Za-z0-9]*[a-z](?:At|Time|Timestamp|Date)|time|timestamp|ts|date"
+    r"|[A-Za-z0-9_]*_(?:time|timestamp|ts|date))"
+)
 TIME_KEY_RE = re.compile(r"^" + TIME_KEY_PATTERN + r"$")
 KEYED_EPOCH_TEXT_RE = re.compile(
     r"(?<![A-Za-z0-9_])(" + TIME_KEY_PATTERN + r")(\\?[\"']?\s*[:=]\s*\\?[\"']?)(1[6-9]\d{8}(?:\d{3})?(?:\.\d+)?)(?![\w.])"
@@ -210,7 +213,8 @@ class Mapping:
     to_value: Dict[str, str] = field(default_factory=dict)
     counts: Dict[str, int] = field(default_factory=dict)
     # Values swapped that can never be put back in an answer: bare numbers
-    # (keyed numbers) and epoch timestamps, which share one fixed token.
+    # (keyed numbers) and epoch timestamps, which become an unnumbered
+    # how-far-from-now time token.
     bare_numbers: set = field(default_factory=set)
 
     def placeholder(self, cls: str, value: str) -> str:
