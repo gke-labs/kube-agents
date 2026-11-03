@@ -161,9 +161,12 @@ class Forge:
     def ref(pull):
         return pull[2] if len(pull) > 2 else plant.stack_branch(DECLARATION)
 
-    def __init__(self, files=None, pulls=None):
+    def __init__(self, files=None, pulls=None, label_status=200):
         self.files = dict(files or {})
         self.pulls = pulls or []
+        # `label_status`: what GitHub answers a label write with.
+        self.label_status = label_status
+        self.labelled = []
         self.closed = []
         self.calls = []
 
@@ -192,6 +195,10 @@ class Forge:
         if method == "GET" and route.endswith("/files"):
             number = int(route.split("/")[-2])
             return 200, [{"filename": f} for pull in self.pulls if pull[0] == number for f in pull[1]]
+        if method == "POST" and route.startswith("/repos/acme/fleet/issues/") and route.endswith("/labels"):
+            if self.label_status == 200:
+                self.labelled.append((int(route.split("/")[-2]), body["labels"]))
+            return self.label_status, {}
         if method == "PATCH" and route.startswith("/repos/acme/fleet/pulls/"):
             self.closed.append(int(route.rsplit("/", 1)[1]))
             return 200, {}
@@ -306,6 +313,24 @@ def test_the_teardown_closes_the_runs_pull_request_and_removes_only_its_own_file
 
 def ours():
     return plant.declaration_text(plant.node_pool_manifest(settings(), plant.Target("acme-seeded-a", "z")))
+
+
+def test_the_close_labels_the_pull_request_stale_closed_first():
+    """Review finding: the teardown closed the audit's pull request with no
+    `audit:stale-closed` label, and the audit reads an unlabelled close as a
+    person's refusal, so a later repetition might not open its pull request.
+    The label goes on before the close; a label that does not stick leaves
+    the pull request open."""
+    assert plant.STALE_CLOSED_LABEL == audit_report.STALE_CLOSED_LABEL
+    declared = {DECLARATION: plant.declaration_text(plant.node_pool_manifest(settings(), plant.Target("acme-seeded-a", "z")))}
+    forge = Forge(files=declared, pulls=[(5, [DECLARATION])])
+    assert new_plant(Cluster(namespace_owner="kube-agents-bench"), forge).teardown()
+    assert forge.labelled == [(5, [plant.STALE_CLOSED_LABEL])]
+    calls = [call[0] + " " + call[1] for call in forge.calls]
+    assert calls.index("POST /repos/acme/fleet/issues/5/labels") < calls.index("PATCH /repos/acme/fleet/pulls/5")
+    refused = Forge(files=declared, pulls=[(5, [DECLARATION])], label_status=403)
+    assert not new_plant(Cluster(namespace_owner="kube-agents-bench"), refused).teardown()
+    assert refused.closed == []
 
 
 def test_the_stack_branch_is_the_branch_the_audit_opens_for_the_declaration():

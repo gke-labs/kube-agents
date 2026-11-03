@@ -164,6 +164,13 @@ RESOURCE_TYPE_ABSENT_MARKER = "doesn't have a resource type"
 NOT_FOUND_MARKERS = ("NotFound", "not found", RESOURCE_TYPE_ABSENT_MARKER)
 GITHUB_API = "https://api.github.com"
 GITHUB_PAGE = 100
+# The label the audit reads as "closed by a sweep, not refused by a person"
+# (`audit_report.STALE_CLOSED_LABEL`, which a stack test holds equal). A
+# remediation pull request closed without it reads as a human refusal, and
+# the audit then does not open that fix again on the same path.
+STALE_CLOSED_LABEL = "audit:stale-closed"
+# The statuses GitHub answers a label write with.
+LABEL_OK_STATUSES = (200, 201)
 HTTP_NOT_FOUND = 404
 HTTP_TIMEOUT_S = 30
 # The pool as the seeded fleet declares it (bench/tf/fleet/main.tf,
@@ -566,6 +573,12 @@ class Plant:
             if status != 200 or not isinstance(files, list):
                 raise RuntimeError(f"cannot list the files of pull request {number} (HTTP {status})")
             if any(f.get("filename") == path for f in files):
+                # The label goes on before the close, never after, as
+                # hack/ci_reset_agent_pulls.py does: a label that does not
+                # stick leaves the pull request open.
+                status, _ = self.http("POST", f"/repos/{repo}/issues/{number}/labels", {"labels": [STALE_CLOSED_LABEL]})
+                if status not in LABEL_OK_STATUSES:
+                    raise RuntimeError(f"cannot label pull request {number} {STALE_CLOSED_LABEL} (HTTP {status}); it stays open")
                 status, _ = self.http("PATCH", f"/repos/{repo}/pulls/{number}", {"state": "closed"})
                 if status != 200:
                     raise RuntimeError(f"cannot close pull request {number} (HTTP {status})")
