@@ -5350,6 +5350,76 @@ class CommandExecutorTest(unittest.TestCase):
             "the sleep the command started outlived the command",
         )
 
+    def test_the_drain_ends_a_running_command_and_still_answers_it(self):
+        # The broker is stopping, not the caller: the caller stays connected and
+        # gets an exit code and a line saying why, where a hang-up gets nothing.
+        pid_file = Path(self.temp_dir.name) / "drained.pid"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30),
+            body=f'sleep 30 & echo $! > "{pid_file}"; wait',
+        )
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+
+        def end_commands():
+            time.sleep(0.5)
+            executor.end_commands.set()
+
+        threading.Thread(target=end_commands, daemon=True).start()
+        started = time.monotonic()
+        result = executor.execute(["kubectl", "wait", "--for=condition=Ready", "pod/api"], caller=ours)
+
+        self.assertFalse(result.abandoned)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(credential_proxy.DRAINED_COMMAND_EXIT_CODE, result.exit_code)
+        self.assertTrue(result.stderr.endswith(credential_proxy.DRAINED_COMMAND_NOTE))
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertFalse(
+            self.process_is_live(int(pid_file.read_text().strip())),
+            "the sleep the command started outlived the drain",
+        )
+
+    def test_a_callers_own_stop_is_not_taken_for_the_drain(self):
+        # The snapshot clone's ceiling stops its git through the same check; with
+        # no drain under way that is the caller's abandonment, not a drained answer.
+        executor = self.executor(timeout_seconds=30)
+        started = time.monotonic()
+        result = executor._execute(["/bin/sh", "-c", "sleep 30"], stop=lambda: True)
+        self.assertTrue(result.abandoned)
+        self.assertNotEqual(credential_proxy.DRAINED_COMMAND_EXIT_CODE, result.exit_code)
+        self.assertNotIn(credential_proxy.DRAINED_COMMAND_NOTE, result.stderr)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_no_command_starts_after_the_drain_ended_the_commands(self):
+        executor = self.fake_kubectl(self.executor(), body="echo ran")
+        executor.end_commands.set()
+        with mock.patch.object(credential_proxy.subprocess, "Popen") as popen:
+            result = executor.execute(["kubectl", "get", "pods"])
+        popen.assert_not_called()
+        self.assertEqual(credential_proxy.DRAINED_COMMAND_EXIT_CODE, result.exit_code)
+        self.assertFalse(result.abandoned)
+        # Its own line: nothing ran, so the caller can resend it.
+        self.assertEqual(credential_proxy.DRAINED_NOT_STARTED_NOTE, result.stderr)
+        self.assertNotIn(credential_proxy.DRAINED_COMMAND_NOTE.strip(), result.stderr)
+
+    def test_a_hang_up_during_no_drain_is_still_abandoned(self):
+        # end_commands is what tells the two apart: without it, a killed command
+        # whose caller left stays abandoned, with no answer.
+        executor = self.fake_kubectl(self.executor(timeout_seconds=30), body="sleep 30")
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+
+        def hang_up():
+            time.sleep(0.5)
+            theirs.close()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        result = executor.execute(["kubectl", "wait", "--for=condition=Ready", "pod/api"], caller=ours)
+
+        self.assertTrue(result.abandoned)
+        self.assertNotIn(credential_proxy.DRAINED_COMMAND_NOTE, result.stderr)
+
     def test_a_caller_that_stays_connected_does_not_end_the_command(self):
         executor = self.fake_kubectl(self.executor(), body="sleep 0.5; echo done")
         ours, theirs = socket.socketpair()
@@ -9482,6 +9552,337 @@ class GracefulShutdownTest(unittest.TestCase):
         self.assertIs(before, credential_proxy.signal.getsignal(credential_proxy.signal.SIGTERM))
 
 
+class GracefulDrainTest(unittest.TestCase):
+    """In the broker role SIGTERM drains: new requests are refused with the
+    `draining` bound, those in flight get SHUTDOWN_DRAIN_SECONDS, and the
+    commands still running then are ended and answered (credential-broker-
+    exec-tier.md §9 step 0)."""
+
+    def setUp(self):
+        self.addCleanup(CredentialProxyHandler.shutting_down.clear)
+        self.addCleanup(CredentialProxyHandler.draining.clear)
+        patcher = mock.patch.object(CredentialProxyHandler, "in_flight", credential_proxy.InFlight())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        slack = mock.patch.object(CredentialProxyHandler, "slack_relay", None)
+        slack.start()
+        self.addCleanup(slack.stop)
+
+    def _handler(self, path):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = path
+        handler.metrics = mock.Mock()
+        handler.max_request_bytes = 1024
+        handler._authenticated = lambda: object()
+        handler._counted_in_flight = False
+        captured = {}
+        handler._json = lambda status, payload: captured.update(status=status, payload=payload)
+        return handler, captured
+
+    def test_a_new_request_is_refused_with_the_draining_bound(self):
+        CredentialProxyHandler.draining.set()
+        requests = (
+            ("POST", "/v1/exec"),
+            ("POST", "/v1/vcs/status"),
+            ("POST", "/v1/workspace/open"),
+            ("POST", "/v1/chat/teams/events"),
+            ("POST", "/v1/forge/refresh"),
+            ("GET", credential_proxy.API_RELAY_PREFIX + "compute/v1/projects/p/zones"),
+            ("GET", credential_proxy.watcher_policy.WATCHER_K8S_PREFIX + "c/api/v1/pods?watch=1"),
+        )
+        for method, path in requests:
+            with self.subTest(method=method, path=path):
+                handler, captured = self._handler(path)
+                with mock.patch.object(credential_proxy, "drain_request_body") as drained:
+                    getattr(handler, f"do_{method}")()
+                self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, captured["status"])
+                self.assertEqual(
+                    {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY",
+                     "error": credential_proxy.SHUTDOWN_DRAINING_ERROR, "bound": "draining"},
+                    captured["payload"],
+                )
+                handler.metrics.record_refusal.assert_called_once_with(
+                    credential_proxy.ADMISSION_BOUND_DRAINING, credential_proxy.CLASS_INTERACTIVE)
+                # A POST body is read before the refusal, or it is lost to a reset.
+                self.assertEqual(method == "POST", drained.called)
+
+    def test_the_draining_bound_is_counted_under_its_own_label(self):
+        self.assertIn(credential_proxy.ADMISSION_BOUND_DRAINING, credential_proxy.ADMISSION_BOUNDS)
+
+    def test_the_open_routes_still_serve_while_draining(self):
+        CredentialProxyHandler.draining.set()
+        for method, path in sorted(credential_proxy.DRAIN_OPEN_ROUTES | credential_proxy.DRAIN_OPEN_REPLY_ROUTES):
+            with self.subTest(method=method, path=path):
+                handler, captured = self._handler(path)
+                self.assertFalse(handler._refused_while_draining(method))
+                self.assertEqual({}, captured)
+
+    def test_a_pull_with_a_query_is_still_an_open_route(self):
+        CredentialProxyHandler.draining.set()
+        handler, _ = self._handler("/v1/chat/slack/events?timeout=20")
+        self.assertFalse(handler._refused_while_draining("GET"))
+
+    def test_relayed_pubsub_settles_stay_open_and_new_pulls_are_refused(self):
+        CredentialProxyHandler.draining.set()
+        for prefix in (credential_proxy.watcher_policy.PLATFORM_PUBSUB_PREFIX,
+                       credential_proxy.watcher_policy.WATCHER_GCP_PREFIX):
+            for verb, refused in ((":acknowledge", False), (":modifyAckDeadline", False), (":pull", True)):
+                with self.subTest(prefix=prefix, verb=verb):
+                    handler, captured = self._handler(prefix + self.PUBSUB + verb)
+                    with mock.patch.object(credential_proxy, "drain_request_body"):
+                        self.assertEqual(refused, handler._refused_while_draining("POST"))
+                    self.assertEqual(refused, captured.get("status") == HTTPStatus.SERVICE_UNAVAILABLE)
+
+    def test_nothing_is_refused_without_the_drain(self):
+        handler, captured = self._handler("/v1/exec")
+        self.assertFalse(handler._refused_while_draining("POST"))
+        self.assertEqual({}, captured)
+
+    PUBSUB = "pubsub.googleapis.com/v1/projects/p/subscriptions/s"
+
+    def test_open_routes_and_long_polls_leave_the_in_flight_count(self):
+        in_flight = CredentialProxyHandler.in_flight
+        k8s = credential_proxy.watcher_policy.WATCHER_K8S_PREFIX
+        for method, path, counted in (
+            ("GET", "/v1/chat/slack/events", False),
+            ("POST", "/v1/chat/a2a/events/ack", False),
+            ("GET", k8s + "c/api/v1/pods?watch=1", False),
+            ("GET", k8s + "c/api/v1/pods?watch=", False),
+            # A list or a get is bounded like any relay call, and the drain waits for it.
+            ("GET", k8s + "c/api/v1/pods", True),
+            ("POST", credential_proxy.watcher_policy.PLATFORM_PUBSUB_PREFIX + self.PUBSUB + ":pull", False),
+            ("POST", credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + self.PUBSUB + ":pull", False),
+            ("POST", "/v1/exec", True),
+            # A Chat reply stays open, and the drain waits for it.
+            ("POST", "/v1/chat/api", True),
+            ("POST", "/v1/chat/slack/api", True),
+            ("POST", "/v1/chat/teams/api", True),
+        ):
+            with self.subTest(method=method, path=path):
+                handler, _ = self._handler(path)
+                in_flight.enter()
+                handler._counted_in_flight = True
+                handler._refused_while_draining(method)
+                self.assertEqual(1 if counted else 0, in_flight.wait_idle(time.monotonic()))
+                handler._leave_in_flight()  # what handle_one_request does once answered
+                self.assertEqual(0, in_flight.wait_idle(time.monotonic()))
+
+    def test_a_request_is_in_flight_until_it_is_answered(self):
+        in_flight = CredentialProxyHandler.in_flight
+        seen = []
+        handler, _ = self._handler("/v1/exec")
+        for raised in (None, OSError("reset")):
+            with self.subTest(raised=raised):
+                def answer(_self, raised=raised):
+                    seen.append(in_flight.wait_idle(time.monotonic()))
+                    if raised:
+                        raise raised
+
+                with mock.patch.object(credential_proxy.BaseHTTPRequestHandler, "handle_one_request", answer):
+                    handler.handle_one_request()
+                self.assertEqual(1, seen[-1])
+                self.assertEqual(0, in_flight.wait_idle(time.monotonic()))
+
+    def test_in_flight_wakes_the_waiter_when_the_last_request_leaves(self):
+        in_flight = credential_proxy.InFlight()
+        in_flight.enter()
+        threading.Timer(0.2, in_flight.leave).start()
+        started = time.monotonic()
+        self.assertEqual(0, in_flight.wait_idle(started + 10))
+        self.assertLess(time.monotonic() - started, 5)
+        in_flight.enter()
+        self.assertEqual(1, in_flight.wait_idle(time.monotonic() + 0.1))
+
+    # ---- The drain itself -----------------------------------------------------
+
+    def _install(self, server, relays, executor, drain_seconds, end_wait_seconds=0.2):
+        installed = {}
+        with mock.patch.object(
+            credential_proxy.signal, "signal",
+            lambda signum, handler: installed.update(signum=signum, handler=handler),
+        ):
+            credential_proxy.install_shutdown_handler(
+                server, relays, settle_seconds=0, executor=executor,
+                drain_seconds=drain_seconds, end_wait_seconds=end_wait_seconds,
+            )
+        return installed["handler"]
+
+    @staticmethod
+    def _drain_thread():
+        for thread in threading.enumerate():
+            if thread.name == credential_proxy.SHUTDOWN_THREAD_NAME:
+                thread.join(10)
+
+    def _parts(self):
+        events = []
+        server = mock.Mock()
+        server.shutdown.side_effect = lambda: events.append("shutdown")
+        relay = mock.Mock()
+        relay.release_unsettled.side_effect = lambda: events.append("release") or 0
+        executor = types.SimpleNamespace(end_commands=threading.Event())
+        return events, server, relay, executor
+
+    def test_an_idle_broker_drains_at_once_and_ends_nothing(self):
+        events, server, relay, executor = self._parts()
+        handler = self._install(server, [relay], executor, drain_seconds=30)
+        started = time.monotonic()
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            handler(credential_proxy.signal.SIGTERM, None)
+            self.assertTrue(CredentialProxyHandler.draining.is_set())
+            self._drain_thread()
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(["release", "shutdown"], events)
+        self.assertFalse(executor.end_commands.is_set())
+        self.assertIn("refusing new requests", "\n".join(logs.output))
+
+    def test_a_request_that_finishes_inside_the_drain_is_waited_for(self):
+        events, server, relay, executor = self._parts()
+        in_flight = CredentialProxyHandler.in_flight
+        in_flight.enter()
+
+        def finish():
+            time.sleep(0.3)
+            events.append("answered")
+            in_flight.leave()
+
+        handler = self._install(server, [relay], executor, drain_seconds=10)
+        with self.assertLogs("credential-proxy", level="INFO"):
+            handler(credential_proxy.signal.SIGTERM, None)
+            threading.Thread(target=finish, daemon=True).start()
+            self._drain_thread()
+        self.assertEqual(["answered", "release", "shutdown"], events)
+        self.assertFalse(executor.end_commands.is_set())
+
+    def test_the_commands_still_running_at_the_drain_end_are_ended_then_waited_for(self):
+        events, server, relay, executor = self._parts()
+        in_flight = CredentialProxyHandler.in_flight
+        in_flight.enter()
+
+        def ended():
+            executor.end_commands.wait(10)
+            events.append("ended")
+            in_flight.leave()
+
+        threading.Thread(target=ended, daemon=True).start()
+        handler = self._install(server, [relay], executor, drain_seconds=0.2, end_wait_seconds=5)
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            handler(credential_proxy.signal.SIGTERM, None)
+            self._drain_thread()
+        self.assertEqual(["ended", "release", "shutdown"], events)
+        self.assertIn("1 request(s) still in flight", "\n".join(logs.output))
+
+    def test_a_request_that_outlives_the_end_wait_does_not_hold_the_stop(self):
+        events, server, relay, executor = self._parts()
+        CredentialProxyHandler.in_flight.enter()  # never leaves
+        handler = self._install(server, [relay], executor, drain_seconds=0.1, end_wait_seconds=0.1)
+        started = time.monotonic()
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            handler(credential_proxy.signal.SIGTERM, None)
+            self._drain_thread()
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(["release", "shutdown"], events)
+        self.assertIn("still open; they end with the process", "\n".join(logs.output))
+
+    def test_slack_intake_stops_and_the_events_left_are_counted(self):
+        events, server, relay, executor = self._parts()
+        slack = mock.Mock()
+        slack.stop_intake.side_effect = lambda: events.append("stop_intake")
+        slack.undelivered.return_value = 3
+        CredentialProxyHandler.slack_relay = slack
+        handler = self._install(server, [relay], executor, drain_seconds=10)
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            handler(credential_proxy.signal.SIGTERM, None)
+            self._drain_thread()
+        self.assertEqual(["stop_intake", "release", "shutdown"], events)
+        self.assertIn("3 Slack event(s)", "\n".join(logs.output))
+
+    def test_without_a_drain_the_short_stop_is_unchanged(self):
+        # The sidecar roles: no `draining`, no wait, nothing ended.
+        events, server, relay, executor = self._parts()
+        CredentialProxyHandler.in_flight.enter()
+        handler = self._install(server, [relay], executor, drain_seconds=0)
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            handler(credential_proxy.signal.SIGTERM, None)
+            self.assertFalse(CredentialProxyHandler.draining.is_set())
+            self._drain_thread()
+        self.assertEqual(["release", "shutdown"], events)
+        self.assertFalse(executor.end_commands.is_set())
+        self.assertIn("refusing new Chat event pulls; settling receipts", "\n".join(logs.output))
+
+    def test_a_stop_check_after_the_child_exited_keeps_its_peak(self):
+        # The child has exited and is not reaped yet: the stop check reaps it
+        # through `_reap`, so the peak the reap returns is kept.
+        process = subprocess.Popen(
+            ["sh", "-c", "echo done; exit 3"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except OSError:
+                break
+            if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                break
+            time.sleep(0.05)
+        captured = credential_proxy._capture_output(process, None, 1 << 16, 30, stop=lambda: True)
+        self.assertFalse(captured.stopped)
+        self.assertEqual(3, process.returncode)
+        self.assertIsNotNone(captured.peak_rss_bytes)
+
+    def test_a_stop_check_after_the_command_exited_leaves_its_own_exit_code(self):
+        # The command finished; ending it as drained would make a retry run it twice.
+        process = subprocess.Popen(
+            ["sh", "-c", "echo done; exit 3"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        process.wait()
+        captured = credential_proxy._capture_output(process, None, 1 << 16, 30, stop=lambda: True)
+        self.assertFalse(captured.stopped)
+        self.assertEqual(3, process.returncode)
+        self.assertEqual(b"done\n", captured.stdout)
+
+    def test_a_late_slack_relay_is_closed_by_the_drain_or_by_itself(self):
+        events, server, relay, executor = self._parts()
+        slack = mock.Mock()
+        slack.undelivered.return_value = 2
+
+        def connect_late():
+            CredentialProxyHandler.draining.wait(5)
+            CredentialProxyHandler.slack_relay = slack
+            if CredentialProxyHandler.draining.is_set():
+                slack.stop_intake()
+
+        CredentialProxyHandler.in_flight.enter()
+        threading.Timer(0.3, CredentialProxyHandler.in_flight.leave).start()
+        threading.Thread(target=connect_late, daemon=True).start()
+        handler = self._install(server, [relay], executor, drain_seconds=10)
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            handler(credential_proxy.signal.SIGTERM, None)
+            self._drain_thread()
+        slack.stop_intake.assert_called()
+        self.assertIn("2 Slack event(s)", "\n".join(logs.output))
+
+    def test_a_stop_check_marks_the_capture_stopped(self):
+        process = subprocess.Popen(
+            ["sleep", "30"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+        )
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        asked = threading.Event()
+
+        def stop():
+            asked.set()
+            return True
+
+        started = time.monotonic()
+        captured = credential_proxy._capture_output(process, None, 1 << 16, 30, stop=stop)
+        self.assertTrue(asked.is_set())
+        self.assertTrue(captured.abandoned)
+        self.assertTrue(captured.stopped)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIsNotNone(process.returncode)
+
+
 class SlackRelayTest(unittest.TestCase):
     class FakeResponse:
         """Stands in for slack_sdk's SlackResponse.
@@ -10031,6 +10432,15 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         server, relays = self.installed_shutdown.args
         self.assertIsInstance(server, credential_proxy.ThreadingUnixHTTPServer)
         self.assertEqual([], relays)
+
+    def test_serve_drains_on_sigterm_only_in_the_broker_role(self):
+        # The broker pod's grace period holds the drain; the sidecar roles'
+        # pods keep the short stop.
+        for role, drain_seconds in (("broker", credential_proxy.SHUTDOWN_DRAIN_SECONDS), ("combined", 0)):
+            with self.subTest(role=role):
+                self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
+                self.assertEqual(drain_seconds, self.installed_shutdown.kwargs["drain_seconds"])
+                self.assertIs(CredentialProxyHandler.executor, self.installed_shutdown.kwargs["executor"])
 
     def test_serve_arms_the_gate_by_default(self):
         CredentialProxyHandler.enforce_read_only = False
