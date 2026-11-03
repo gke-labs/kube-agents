@@ -7733,13 +7733,14 @@ func TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode(t *testing.
 		}},
 	}
 	tests := []struct {
-		name    string
-		dc      discovery.DiscoveryInterface
-		wantCPU string
-		wantMem string
+		name     string
+		dc       discovery.DiscoveryInterface
+		wantCPU  string
+		wantMem  string
+		wantType string
 	}{
-		{name: "standard", dc: &mockAutopilotDiscovery{}, wantCPU: "500m", wantMem: "1Gi"},
-		{name: "autopilot", dc: autopilot, wantCPU: "2", wantMem: "2Gi"},
+		{name: "standard", dc: &mockAutopilotDiscovery{}, wantCPU: "500m", wantMem: "1Gi", wantType: credentialProxyClusterTypeStandard},
+		{name: "autopilot", dc: autopilot, wantCPU: "2", wantMem: "2Gi", wantType: credentialProxyClusterTypeAutopilot},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -7775,33 +7776,60 @@ func TestReconcileRendersTheCredentialProxyRequestsForTheClusterMode(t *testing.
 			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceCPU, tt.wantCPU)
 			assertQuantity(t, proxy.Resources.Requests, corev1.ResourceMemory, tt.wantMem)
 			assertQuantity(t, proxy.Resources.Limits, corev1.ResourceCPU, "2")
+			if got := dep.Annotations[credentialProxyClusterTypeAnnotation]; got != tt.wantType {
+				t.Errorf("%s = %q, want %q", credentialProxyClusterTypeAnnotation, got, tt.wantType)
+			}
+			if _, onPod := dep.Spec.Template.Annotations[credentialProxyClusterTypeAnnotation]; onPod {
+				t.Errorf("%s is on the pod template, where a change restarts the proxy", credentialProxyClusterTypeAnnotation)
+			}
 		})
 	}
 }
 
 // TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails: when
 // discovery cannot say whether the cluster is Autopilot, Reconcile renders the
-// proxy at the cluster type whose requests the running proxy already carries,
-// so a failed check after an operator restart does not restart the proxy. With
-// no proxy yet it renders the Standard requests.
+// proxy at the cluster type the running proxy was rendered for: the one its
+// cluster-type annotation records, or, on a Deployment without one, the one
+// whose requests it carries. So a failed check after an operator restart does
+// not restart the proxy. With no proxy yet it renders the Standard requests.
 func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) {
+	lowerMemory := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")}}
+	cpuOnly := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}}
+	cpuHalf := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m")}}
+	memory2Gi := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")}}
 	tests := []struct {
 		name      string
 		resources *corev1.ResourceRequirements
 		running   *bool
-		wantCPU   string
-		wantMem   string
+		// editedMeanwhile renders the running proxy without the CR's override,
+		// as before a CR edit made while discovery fails; runningResources, when
+		// set, is the override the running proxy was rendered from instead.
+		editedMeanwhile  bool
+		runningResources *corev1.ResourceRequirements
+		unannotated      bool
+		wantCPU          string
+		wantMem          string
 	}{
 		{name: "running at the Autopilot requests", running: ptr.To(true), wantCPU: "2", wantMem: "2Gi"},
 		{name: "running at the Standard requests", running: ptr.To(false), wantCPU: "500m", wantMem: "1Gi"},
 		{name: "no proxy yet", running: nil, wantCPU: "500m", wantMem: "1Gi"},
+		// The annotation holds across a CR edit that moves the requests, which
+		// the request comparison cannot follow.
+		{name: "Autopilot, the CR edited meanwhile", resources: lowerMemory, running: ptr.To(true), editedMeanwhile: true, wantCPU: "1500m", wantMem: "1536Mi"},
+		// A Standard proxy at 500m / 2Gi (requests.memory 2Gi), whose CR now
+		// sets only requests.cpu 500m: the new CR's Autopilot render is also
+		// 500m / 2Gi, so only the annotation keeps it Standard.
+		{
+			name: "Standard, the CR edited meanwhile", resources: cpuHalf, running: ptr.To(false), editedMeanwhile: true,
+			runningResources: memory2Gi, wantCPU: "500m", wantMem: "1Gi",
+		},
+		// A Deployment an older operator wrote has no annotation, so its
+		// requests decide.
+		{name: "unannotated, at the Autopilot requests", running: ptr.To(true), unannotated: true, wantCPU: "2", wantMem: "2Gi"},
+		{name: "unannotated, at the Standard requests", running: ptr.To(false), unannotated: true, wantCPU: "500m", wantMem: "1Gi"},
 		// requests.cpu 2 on Standard runs at 2 / 1Gi: the CPU matches the
 		// Autopilot render (2 / 2Gi) and the memory does not, so it is Standard.
-		{
-			name:      "only the CPU matches the Autopilot render",
-			resources: &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}},
-			running:   ptr.To(false), wantCPU: "2", wantMem: "1Gi",
-		},
+		{name: "unannotated, only the CPU matches the Autopilot render", resources: cpuOnly, running: ptr.To(false), unannotated: true, wantCPU: "2", wantMem: "1Gi"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -7817,7 +7845,18 @@ func TestReconcileKeepsTheRunningProxyRequestsWhileDiscoveryFails(t *testing.T) 
 			}
 			objs := []client.Object{agent, shellSandboxKeysSecret(agent)}
 			if tt.running != nil {
-				objs = append(objs, buildCredentialProxyDeploymentForPlugins(agent, "policy-hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, *tt.running))
+				source := agent.DeepCopy()
+				if tt.editedMeanwhile {
+					source.Spec.Deployment = nil
+					if tt.runningResources != nil {
+						source.Spec.Deployment = &agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: tt.runningResources}}
+					}
+				}
+				live := buildCredentialProxyDeploymentForPlugins(source, "policy-hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, *tt.running)
+				if tt.unannotated {
+					delete(live.Annotations, credentialProxyClusterTypeAnnotation)
+				}
+				objs = append(objs, live)
 			}
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).

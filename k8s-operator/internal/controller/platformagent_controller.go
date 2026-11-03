@@ -543,8 +543,9 @@ type PlatformAgentReconciler struct {
 	// credential proxy's default requests (resolveCredentialProxyResourcesFor).
 	// The cluster type cannot change under a running operator, so only an
 	// authoritative probe sets autopilotResolved; a failed one is retried, and
-	// meanwhile the proxy keeps the cluster type its running requests show,
-	// else Standard (liveCredentialProxyAutopilot).
+	// meanwhile the proxy keeps the cluster type it was rendered for, from its
+	// cluster-type annotation or, without one, its requests; else Standard
+	// (liveCredentialProxyAutopilot).
 	autopilotMu       sync.Mutex
 	autopilotResolved bool
 	autopilot         bool
@@ -6100,7 +6101,7 @@ func (r *PlatformAgentReconciler) clusterAutopilot() (autopilot bool, determined
 	}
 	autopilot, determined = isGKEAutopilot(r.DiscoveryClient)
 	if !determined {
-		logf.Log.WithName("platformagent-controller").Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; rendering the credential proxy for the cluster type its running requests show, else Standard, until discovery answers.")
+		logf.Log.WithName("platformagent-controller").Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; rendering the credential proxy for the cluster type it was last rendered for, else Standard, until discovery answers.")
 		return false, false
 	}
 	r.autopilot = autopilot
@@ -6109,14 +6110,17 @@ func (r *PlatformAgentReconciler) clusterAutopilot() (autopilot bool, determined
 }
 
 // liveCredentialProxyAutopilot picks the cluster type to render the proxy at
-// while discovery cannot say: the one whose requests, for this CR, the running
-// proxy already carries. Rendering the Standard requests over a proxy running
-// at the Autopilot ones would restart it (its Deployment is Recreate), and
-// again once discovery answers. The requests are still computed from the
-// current CR, so an edit made meanwhile is applied. With no proxy yet, or one
-// matching neither render, it is Standard: a smaller request than Autopilot
-// wants delays the broker's CPU, where a larger one than a Standard node can
-// fit leaves it Pending.
+// while discovery cannot say: the one the running proxy was last rendered for.
+// Rendering the Standard requests over a proxy running at the Autopilot ones
+// would restart it (its Deployment is Recreate), and again once discovery
+// answers. The type is read from credentialProxyClusterTypeAnnotation, which
+// holds across a CR edit and an operator upgrade that moves the defaults. A
+// Deployment an older operator wrote has no annotation, so the type is then
+// the one whose requests, for this CR, the proxy already carries. The requests
+// are still computed from the current CR, so an edit made meanwhile is
+// applied. With no proxy yet, or one matching neither render, it is Standard:
+// a smaller request than Autopilot wants delays the broker's CPU, where a
+// larger one than a Standard node can fit leaves it Pending.
 func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Context, agent, rendered *agentv1alpha1.PlatformAgent) (bool, error) {
 	live := &appsv1.Deployment{}
 	if err := r.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, live); err != nil {
@@ -6124,6 +6128,12 @@ func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Conte
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to read the credential proxy Deployment: %w", err)
+	}
+	switch live.Annotations[credentialProxyClusterTypeAnnotation] {
+	case credentialProxyClusterTypeAutopilot:
+		return true, nil
+	case credentialProxyClusterTypeStandard:
+		return false, nil
 	}
 	for _, c := range live.Spec.Template.Spec.Containers {
 		if c.Name != credentialProxyContainerName {

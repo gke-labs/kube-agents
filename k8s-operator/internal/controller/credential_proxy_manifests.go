@@ -63,6 +63,19 @@ import (
 // reference that hands the broker its memory limit names it too.
 const credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- Container name, not a credential.
 
+// credentialProxyClusterTypeAnnotation records, on the proxy Deployment's own
+// metadata, the cluster type its requests were rendered for, so a reconcile
+// whose Autopilot check fails can keep it (liveCredentialProxyAutopilot). It
+// is on the Deployment and not the pod template, so writing it restarts
+// nothing. The operator owns it: its apply puts back a hand edit once
+// discovery answers, but while discovery fails a hand edit is read as the
+// cluster type and can restart the proxy at the other type's requests.
+const (
+	credentialProxyClusterTypeAnnotation = "kubeagents.x-k8s.io/credential-proxy-cluster-type"
+	credentialProxyClusterTypeAutopilot  = "autopilot"
+	credentialProxyClusterTypeStandard   = "standard"
+)
+
 // credentialProxyPDBMaxUnavailable is the budget's one field, on one replica.
 //
 // What it does: nothing to any drain. With one pod, desiredHealthy is 1 - 1 =
@@ -510,9 +523,10 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 // the AgentProfile identities and the task-signing public key.
 //
 // autopilot is the cluster type discovery reported (isGKEAutopilot) or, while
-// discovery cannot say, the one the running proxy's requests show
+// discovery cannot say, the one the running proxy was rendered for
 // (liveCredentialProxyAutopilot). It picks the container's default requests
-// (resolveCredentialProxyResourcesFor).
+// (resolveCredentialProxyResourcesFor) and the value of
+// credentialProxyClusterTypeAnnotation.
 func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, owned brokerCallerOwnership, profiles credentialProxyProfileConfig, autopilot bool) *appsv1.Deployment {
 	saName := agent.Name
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
@@ -536,9 +550,17 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 		tolerations = agent.Spec.Deployment.Availability.Tolerations
 	}
 
+	clusterType := credentialProxyClusterTypeStandard
+	if autopilot {
+		clusterType = credentialProxyClusterTypeAutopilot
+	}
 	dep := &appsv1.Deployment{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
-		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
+		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        credentialProxyName(agent),
+			Namespace:   agent.Namespace,
+			Annotations: map[string]string{credentialProxyClusterTypeAnnotation: clusterType},
+		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptr.To(int32(1)),
 			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
