@@ -383,6 +383,23 @@ class KccFleetAuditTest(unittest.TestCase):
         self.assertIn(kcc.BUDGET_EXHAUSTED_ERROR, out)
         self.assertIn("CLEAN_AUDIT_STOP: NO", out)
 
+    def test_subprocess_timeout_reports_clean_message_without_argv_truncation(self) -> None:
+        def fake_timeout(cmd: list[str], **kwargs):
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs["timeout"])
+
+        with mock.patch("subprocess.run", side_effect=fake_timeout):
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                rc = kcc.audit_kcc()
+            code, payload = kcc.run_kubectl_json(["get", "sqlinstances.sql.cnrm.cloud.google.com"], {}, timeout=70.0)
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("kubectl timed out after 125s", out)
+        self.assertNotIn("Command '[", out)
+        self.assertIn("CLEAN_AUDIT_STOP: NO", out)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload, {"error": "kubectl timed out after 70s"})
+
 
 if __name__ == "__main__":
     unittest.main()

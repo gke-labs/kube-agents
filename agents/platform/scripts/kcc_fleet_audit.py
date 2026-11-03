@@ -147,6 +147,8 @@ def run_cmd(
                 return 1, stderr_msg
             return 0, res.stdout.strip()
         return res.returncode, res.stderr.strip() or f"kubectl exit {res.returncode} with no output"
+    except subprocess.TimeoutExpired:
+        return 1, f"kubectl timed out after {timeout:.0f}s"
     except Exception as exc:
         return 1, str(exc)
 
@@ -184,6 +186,8 @@ def run_kubectl_json(
         return res.returncode or 1, {
             "stderr": res.stderr.strip() or f"kubectl exit {res.returncode} with no output"
         }
+    except subprocess.TimeoutExpired:
+        return 1, {"error": f"kubectl timed out after {timeout:.0f}s"}
     except Exception as exc:
         return 1, {"error": str(exc)}
 
