@@ -25,10 +25,14 @@ its token. The gateway's notifier claims the event kind and, with
 ``KAGE_SLACK_UX`` on, posts the PR as its own message in the thread the card
 reports to (``gateway/kanban_progress_lines.py``, ``gateway/slack_ux_moments.py``).
 
-At most :data:`RECORDS_CHECKED_MAX` distinct urls in one output are claimed.
-Every record line the hook does not claim (past the cap, a repeated url, a
-refused claim, a broker hop that is down) keeps its text but loses its ``claim``
-field, so no live token reaches what the model reads. The claim is one broker
+At most :data:`RECORDS_CHECKED_MAX` distinct urls in one output are claimed,
+and none once :data:`CLAIMS_BUDGET_SECONDS` have passed since the hook began on
+that output: Hermes skips a ``transform_terminal_output`` hook that runs past
+its 30 s callback timeout and hands the model the original output, tokens
+included. Every record line the hook does not claim (past the cap or the
+budget, a repeated url, a refused claim, a broker hop that is down) keeps its
+text but loses its ``claim`` field, so no live token reaches what the model
+reads, unless one claim alone outlasts Hermes' timeout. The claim is one broker
 call through the sandbox (``forge.call``), made in line rather than on a thread
 because a worker leaves through ``os._exit``, which would drop a thread still
 waiting on the broker. A claim or a write that fails is logged: the PR is open
@@ -65,6 +69,7 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.request
 
 logger = logging.getLogger(__name__)
@@ -157,6 +162,12 @@ HOP_DOWN_REASONS = frozenset({"SANDBOX_UNREACHABLE", "BROKER_UNREACHABLE"})
 #: ``proposal create`` prints one record; a fleet audit prints one per group
 #: it opened, and a group past this count is missed.
 RECORDS_CHECKED_MAX = 5
+
+#: No claim starts once this long has passed since the hook began on one
+#: output. Hermes skips the hook at 30 s (``hook_callback_timeout``) and hands
+#: the model the raw output, so the budget leaves room for the ledger writes,
+#: the card record and the strip that follow the last claim.
+CLAIMS_BUDGET_SECONDS = 20
 
 #: Where Hermes installs ``deploy/docker/patches/kanban_origin.py``, and the name
 #: a test loads it under.
@@ -381,7 +392,8 @@ def on_terminal_output(command="", output="", **_):
     """Claim each proposal record in ``output``, count it in the ledger, and strip every token.
 
     At most :data:`RECORDS_CHECKED_MAX` distinct urls carrying a token are
-    claimed. A claimed proposal goes to the ledger under :func:`resolve_origin`;
+    claimed, and no claim starts once :data:`CLAIMS_BUDGET_SECONDS` have passed.
+    A claimed proposal goes to the ledger under :func:`resolve_origin`;
     in a kanban worker it also goes on the card and its line, with every line
     repeating its url, leaves the output. Every other line naming a record stays
     without its token. The first claim the broker does not answer ends the
@@ -404,6 +416,7 @@ def _claim_output(output):
     """:func:`on_terminal_output`'s work, for an output that names a record. May raise."""
     task_id = os.environ.get(TASK_ENV, "").strip()
     asked, removed, kept, unanswered, origin, changed = set(), set(), [], False, None, False
+    deadline = time.monotonic() + CLAIMS_BUDGET_SECONDS
     for line in output.splitlines(keepends=True):
         proposal = opened(line)
         if proposal is not None and proposal["url"] in removed:
@@ -416,6 +429,7 @@ def _claim_output(output):
             and proposal["url"] not in asked
             and len(asked) < RECORDS_CHECKED_MAX
             and not unanswered
+            and time.monotonic() < deadline
         ):
             asked.add(proposal["url"])
             try:

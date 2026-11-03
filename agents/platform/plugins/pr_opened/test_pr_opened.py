@@ -209,6 +209,43 @@ class PrOpenedTest(unittest.TestCase):
                     self.assertEqual(kanban.events, [])
                     self.assertEqual(kept, [issue] + [urls[0]] * 3 + urls[1:], "outside a worker every line stays")
 
+    def test_no_claim_starts_once_the_budget_is_spent_and_no_token_survives(self):
+        # Hermes skips the hook at 30 s and hands the model the raw output, so a
+        # slow broker must not take the claims past the budget.
+        clock = [1000.0]
+        urls = [f"{REPOSITORY}/pull/{n}" for n in (1, 2, 3)]
+        for task in (TASK, ""):
+            kanban, broker = _Kanban(), _Broker()
+            forge = broker.module()
+            claim = forge.call
+
+            def slow(verb, payload, repo, *, retry_transient=False):
+                clock[0] += plugin.CLAIMS_BUDGET_SECONDS + 1  # the broker sleeps past the budget
+                return claim(verb, payload, repo, retry_transient=retry_transient)
+
+            forge.call = slow
+            output = "".join(broker.line(url=url, number=n) for n, url in zip((1, 2, 3), urls))
+            with self.subTest(worker=bool(task)), \
+                    mock.patch.object(plugin, "_forge", lambda: forge), \
+                    mock.patch.object(plugin.time, "monotonic", lambda: clock[0]):
+                out = self.run_hook(output, kanban, task=task, broker=broker)
+                self.assertEqual([payload["url"] for _, _, payload, _ in broker.asked], urls[:1])
+                self.assertEqual([payload["url"] for _, payload in self.ledger], urls[:1])
+                self.assertEqual(_tokens(out), [], "no token survives, claimed or not")
+                kept = [plugin.opened(line)["url"] for line in out.splitlines()]
+                self.assertEqual(kept, urls[1:] if task else urls)
+            self.ledger.clear()
+
+    def test_claims_inside_the_budget_are_all_made(self):
+        clock = [1000.0]
+        kanban, broker = _Kanban(), _Broker()
+        urls = [f"{REPOSITORY}/pull/{n}" for n in (1, 2, 3)]
+        output = "".join(broker.line(url=url, number=n) for n, url in zip((1, 2, 3), urls))
+        with mock.patch.object(plugin.time, "monotonic", lambda: clock[0]):
+            out = self.run_hook(output, kanban, task="", broker=broker)
+        self.assertEqual([payload["url"] for _, _, payload, _ in broker.asked], urls)
+        self.assertEqual(_tokens(out), [])
+
     def test_a_repeat_of_a_url_whose_claim_failed_stays_without_its_token(self):
         kanban, broker = _Kanban(), _Broker(refuse="CLAIM_NOT_CONFIRMED")
         with self.assertLogs(plugin.logger, "WARNING"):
