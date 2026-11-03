@@ -66,6 +66,7 @@ import json
 import os
 import re
 import threading
+import urllib.parse
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -152,6 +153,10 @@ PARTIAL_DISCOVERY_MARKER = "unable to retrieve the complete list of server APIs"
 # cut to the time left.
 DISCOVERY_TIMEOUT_S = 60
 KIND_READ_TIMEOUT_S = 60
+# How many objects one list request of a kind returns. A kind with more
+# continues on the next page (`metadata.continue`), each page one request
+# with its own proxy slot, so no reply holds a whole large kind.
+KIND_PAGE_LIMIT = 500
 # How many Config Connector requests run at once in this process, across all
 # clusters (`proxy_slots`): the sweep width the credential broker admits, as
 # every pool in this directory reads it (`broker_admission.sweep_width`), and
@@ -471,9 +476,13 @@ def discovery_argv() -> list[str]:
     return list(DISCOVERY_ARGV)
 
 
-def kind_argv(kind: KccKind) -> list[str]:
-    """One kind's cluster-wide list, with no discovery."""
-    return ["kubectl", "get", "--raw", f"/apis/{kind.group}/{kind.version}/{kind.plural}"]
+def kind_argv(kind: KccKind, after: str = "") -> list[str]:
+    """One page of a kind's cluster-wide list, with no discovery: at most
+    `KIND_PAGE_LIMIT` objects, from the `continue` token `after` when given."""
+    url = f"/apis/{kind.group}/{kind.version}/{kind.plural}?limit={KIND_PAGE_LIMIT}"
+    if after:
+        url += "&continue=" + urllib.parse.quote(after, safe="")
+    return ["kubectl", "get", "--raw", url]
 
 
 def kcc_kinds(discovery: str) -> list[KccKind]:
@@ -574,24 +583,35 @@ def read_objects(
         return KccRead(READ_ABSENT, [], "", 0, timeout_s)
 
     def one(kind: KccKind) -> tuple[str, list, str]:
-        result = _with_proxy_slot(run, kind_argv(kind), kubeconfig, KIND_READ_TIMEOUT_S, deadline, clock)
-        if result is None:
-            return READ_TIMED_OUT, [], f"{kind.plural}.{kind.group}: {NO_SLOT_DETAIL}"
-        if result.rc == TIMEOUT_RC:
-            return READ_TIMED_OUT, [], f"{kind.plural}.{kind.group}: the list did not finish"
-        if result.rc != 0:
-            if any(marker in result.stderr for marker in KIND_GONE_MARKERS):
-                return READ_LISTED, [], ""
-            return READ_FAILED, [], f"{kind.plural}.{kind.group}: the list exited {result.rc} ({_excerpt(result.stderr)})"
-        try:
-            parsed = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            parsed = None
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
-            return READ_UNREADABLE, [], f"{kind.plural}.{kind.group}: the list is not a list of objects"
-        # A list item can leave out its kind; the CRD names it.
-        items = [{"kind": kind.kind, **item} if isinstance(item, dict) and not item.get("kind") else item for item in parsed["items"]]
-        return READ_LISTED, items, ""
+        items: list = []
+        after = ""
+        while True:
+            result = _with_proxy_slot(run, kind_argv(kind, after), kubeconfig, KIND_READ_TIMEOUT_S, deadline, clock)
+            if result is None:
+                return READ_TIMED_OUT, [], f"{kind.plural}.{kind.group}: {NO_SLOT_DETAIL}"
+            if result.rc == TIMEOUT_RC:
+                return READ_TIMED_OUT, [], f"{kind.plural}.{kind.group}: the list did not finish"
+            if result.rc != 0:
+                if any(marker in result.stderr for marker in KIND_GONE_MARKERS):
+                    return READ_LISTED, [], ""
+                return READ_FAILED, [], f"{kind.plural}.{kind.group}: the list exited {result.rc} ({_excerpt(result.stderr)})"
+            try:
+                parsed = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                parsed = None
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
+                return READ_UNREADABLE, [], f"{kind.plural}.{kind.group}: the list is not a list of objects"
+            # A list item can leave out its kind; the CRD names it.
+            items += [{"kind": kind.kind, **item} if isinstance(item, dict) and not item.get("kind") else item for item in parsed["items"]]
+            meta = parsed.get("metadata") if isinstance(parsed.get("metadata"), dict) else {}
+            token = str(meta.get("continue") or "")
+            # A server that returns the same token again would loop: stop
+            # with the read unknown rather than spin until the deadline.
+            if token and token == after:
+                return READ_UNREADABLE, [], f"{kind.plural}.{kind.group}: the list repeated its continue token"
+            if not token:
+                return READ_LISTED, items, ""
+            after = token
 
     workers = workers or proxy_slots()
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(kinds)))) as pool:

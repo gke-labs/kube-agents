@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -76,7 +77,7 @@ def serve_kcc(argv, answer):
     if argv[:3] == ["kubectl", "get", "--raw"]:
         if answer.rc != 0 or not answer.stdout.startswith("{"):
             return answer
-        plural = argv[3].rsplit("/", 1)[1]
+        plural = argv[3].partition("?")[0].rsplit("/", 1)[1]
         return listing(*(item for item in items if f"{item['kind'].lower()}s" == plural))
     raise AssertionError(f"unexpected Config Connector command {argv}")
 
@@ -244,8 +245,45 @@ class ReadObjectsTest(unittest.TestCase):
         )
         self.assertEqual(
             kcc_health.kind_argv(kcc_health.KccKind("pubsub.cnrm.cloud.google.com", "v1beta1", "pubsubtopics", "PubSubTopic")),
-            ["kubectl", "get", "--raw", "/apis/pubsub.cnrm.cloud.google.com/v1beta1/pubsubtopics"],
+            ["kubectl", "get", "--raw", f"/apis/pubsub.cnrm.cloud.google.com/v1beta1/pubsubtopics?limit={kcc_health.KIND_PAGE_LIMIT}"],
         )
+
+    def test_a_large_kind_is_read_in_pages(self):
+        """Each list request carries `limit=`, so no reply holds a whole
+        large kind across every namespace, and the read follows
+        `metadata.continue` to the end."""
+        kind = kcc_health.KccKind("pubsub.cnrm.cloud.google.com", "v1beta1", "pubsubtopics", "PubSubTopic")
+        self.assertEqual(
+            kcc_health.kind_argv(kind, "a b/c")[-1],
+            f"/apis/pubsub.cnrm.cloud.google.com/v1beta1/pubsubtopics?limit={kcc_health.KIND_PAGE_LIMIT}&continue=a%20b%2Fc",
+        )
+        pages = {"": ("t1", ["one"]), "t1": ("t2", ["two"]), "t2": ("", ["three"])}
+        urls = []
+
+        def run(argv, *, env=None, timeout=None):
+            if is_discovery(argv):
+                return kcc_health.Result(0, crd_line("PubSubTopic", group="pubsub.cnrm.cloud.google.com") + "\n", "")
+            urls.append(argv[3])
+            query = urllib.parse.parse_qs(argv[3].partition("?")[2])
+            after = query.get("continue", [""])[0]
+            token, names = pages[after]
+            items = [{"kind": "PubSubTopic", "metadata": {"name": name}} for name in names]
+            return kcc_health.Result(0, json.dumps({"items": items, "metadata": {"continue": token}}), "")
+
+        read = kcc_health.read_objects(Path("k"), run=run, deadline=time.monotonic() + 60, workers=1)
+        self.assertEqual(read.status, kcc_health.READ_LISTED)
+        self.assertEqual([item["metadata"]["name"] for item in read.items], ["one", "two", "three"])
+        self.assertEqual(len(urls), 3)
+        self.assertTrue(all(f"limit={kcc_health.KIND_PAGE_LIMIT}" in url for url in urls))
+
+    def test_a_repeated_continue_token_makes_the_read_unknown(self):
+        def run(argv, *, env=None, timeout=None):
+            if is_discovery(argv):
+                return kcc_health.Result(0, crd_line("PubSubTopic", group="pubsub.cnrm.cloud.google.com") + "\n", "")
+            return kcc_health.Result(0, json.dumps({"items": [], "metadata": {"continue": "same"}}), "")
+
+        read = kcc_health.read_objects(Path("k"), run=run, deadline=time.monotonic() + 60, workers=1)
+        self.assertEqual(read.status, kcc_health.READ_UNREADABLE)
 
     def test_the_lists_of_every_kind_are_merged(self):
         calls = []
@@ -304,7 +342,7 @@ class ReadObjectsTest(unittest.TestCase):
                 def run(argv, *, env=None, timeout=None):
                     if is_discovery(argv):
                         return kcc_health.Result(0, crd_line("PubSubTopic") + "\n" + crd_line("ComputeFirewall") + "\n", "")
-                    if argv[3].endswith("pubsubtopics"):
+                    if argv[3].partition("?")[0].endswith("pubsubtopics"):
                         return answer
                     return listing(kcc_object("ComputeFirewall", "fw", status="False", reason="UpdateFailed"))
 
@@ -399,7 +437,7 @@ class ReadObjectsTest(unittest.TestCase):
         read = self.read(run, kinds=kcc_health.CONTAINER_KINDS)
         self.assertEqual(read.status, kcc_health.READ_LISTED)
         self.assertEqual(read.kinds, 2)
-        listed = sorted(argv[3] for argv in calls if argv[:3] == ["kubectl", "get", "--raw"])
+        listed = sorted(argv[3].partition("?")[0] for argv in calls if argv[:3] == ["kubectl", "get", "--raw"])
         self.assertEqual(listed, [
             "/apis/container.cnrm.cloud.google.com/v1beta1/containerclusters",
             "/apis/container.cnrm.cloud.google.com/v1beta1/containernodepools",
