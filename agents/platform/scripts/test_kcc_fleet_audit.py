@@ -54,7 +54,16 @@ class KccFleetAuditTest(unittest.TestCase):
     def test_validate_namespace_rejects_empty_whitespace_and_flag_injection(self) -> None:
         self.assertIsNone(kcc.validate_namespace(None))
         self.assertEqual(kcc.validate_namespace("prod-1"), "prod-1")
-        for bad_ns in ("", "   ", "-A", "--all-namespaces", "Prod_Upper", "../kube-system"):
+        for bad_ns in (
+            "",
+            "   ",
+            "prod\n",
+            "\nprod",
+            "-A",
+            "--all-namespaces",
+            "Prod_Upper",
+            "../kube-system",
+        ):
             with self.subTest(bad_ns=bad_ns):
                 with self.assertRaises(ValueError):
                     kcc.validate_namespace(bad_ns)
@@ -318,25 +327,51 @@ class KccFleetAuditTest(unittest.TestCase):
         self.assertIn("(+5 Ready resources omitted", out)
 
     def test_worker_computes_remaining_timeout_at_execution_start(self) -> None:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor as RealPool
+
         observed_timeouts: list[float] = []
-        # Deadline = 170.0; when worker executes, monotonic_fn() returns 150.0 -> 20.0s remaining!
-        ticks = iter([150.0])
+        clock = [0.0]
+        all_submitted = threading.Event()
+        submit_count = [0]
+        orig_submit = RealPool.submit
+
+        def tracked_submit(pool_self, *args, **kwargs):
+            fut = orig_submit(pool_self, *args, **kwargs)
+            submit_count[0] += 1
+            if submit_count[0] >= 2:
+                all_submitted.set()
+            return fut
 
         def fake_run(_cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
             observed_timeouts.append(kwargs["timeout"])
+            self.assertTrue(all_submitted.wait(timeout=5.0))
+            clock[0] += 100.0
             return _completed(0, stdout='{"kind": "List", "items": []}')
 
-        with mock.patch("subprocess.run", side_effect=fake_run):
+        # Two single-CRD batches serialized on 1 worker against deadline=170.0:
+        # batch 1 starts at t=0.0 -> min(125.0, 170.0) = 125.0, then advances clock to 100.0
+        # AFTER batch 2 has already been submit()ted; batch 2 starts at t=100.0 -> 70.0
+        # (whereas submit-time computation would yield [125.0, 125.0]).
+        with (
+            mock.patch.object(kcc, "MAX_PARALLEL_WORKERS", 1),
+            mock.patch.object(RealPool, "submit", tracked_submit),
+            mock.patch("subprocess.run", side_effect=fake_run),
+        ):
             items, unread = kcc.collect_kcc_objects(
-                {"sqlinstances.sql.cnrm.cloud.google.com": "Namespaced"},
+                {
+                    "a.sql.cnrm.cloud.google.com": "Namespaced",
+                    "b.sql.cnrm.cloud.google.com": "Namespaced",
+                },
                 {},
                 namespace=None,
                 deadline=170.0,
-                monotonic_fn=lambda: next(ticks),
+                monotonic_fn=lambda: clock[0],
+                chunk_size=1,
             )
         self.assertEqual(items, [])
         self.assertEqual(unread, {})
-        self.assertEqual(observed_timeouts, [20.0])
+        self.assertEqual(observed_timeouts, [125.0, 70.0])
 
     def test_budget_exhaustion_fails_closed(self) -> None:
         ticks = iter([0.0, 200.0, 200.0])

@@ -91,7 +91,7 @@ TABLE_DIVIDER_WIDTH = 115
 
 REDACTED_STOP_MARKER = "[REDACTED_STOP_MARKER]"
 STOP_MARKER_RE = re.compile(r"clean[\W_]*audit[\W_]*stop", re.IGNORECASE)
-RFC1123_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+RFC1123_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 UNREAD_COUNT_TEXT = "unread (listing failed; see the verdict below)"
 
 
@@ -107,7 +107,7 @@ def validate_namespace(namespace: str | None) -> str | None:
     """Validate optional `--namespace` against RFC 1123 DNS label syntax."""
     if namespace is None:
         return None
-    if not RFC1123_DNS_LABEL_RE.match(namespace):
+    if not RFC1123_DNS_LABEL_RE.fullmatch(namespace):
         raise ValueError(
             f"invalid Kubernetes namespace {namespace!r}: expected an RFC 1123 DNS label"
         )
