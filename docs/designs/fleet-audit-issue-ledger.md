@@ -843,7 +843,9 @@ A ready object is not in the list, so with more than one possible host the same 
 on one host and not ready on another. Then the `project` must also be known, for a `Cluster/` or
 `NodePool/` finding. A `kcc-object-wedged` finding's object is on the finding's own cluster, so the
 number of hosts does not apply to it. In the fix's file, a known `project` that differs from the
-file's still blocks the match; outside it, a declaration for another project is not named. A possible host is an
+file's still blocks the match. Outside it, the files that declare the object in the stall's
+namespace, the fix's file included, are the evidence: when each of them gives a known project or
+location that differs from the stall's, the match is not certain. A possible host is an
 entry that carries `kcc_unready` (also empty) or `kcc_unread`, or, when any entry carries either key,
 a cluster entry the collector never read (`unreachable` or `gate-failed`), or a project whose
 cluster list failed (a `gate-failed` `project/<id>` entry). An entry
@@ -865,19 +867,20 @@ counts the rest.
 A `manifest` fix whose file declares the object gets the paragraph above. Any other fix (`manual`,
 `gcloud`, a fix degraded to `manual` because the worker did not write its file, or a `manifest` fix
 to another file) gets a paragraph that names the object's declaration. `finish` looks it up in the
-Config Connector declaration index the `gcloud` check reads: the clone, or
-`kcc_declarations_via_broker` in content mode, with its own search for an `apiVersion` line in any
-Config Connector group (`KCC_DECLARATION_GREP`), so every kind is indexed. Both read `.yaml`, `.yml`
-and `.json` files. `finish` builds this index only when a finding needs it (`kcc_index_needed`): a
+Config Connector declaration index the `gcloud` check reads: the clone, or in content mode
+`kcc_declarations_via_broker` over the probe's snapshot of the repository, with its own read of the
+files that name any Config Connector group (`every_kind`), so every kind is indexed. Both read
+`.yaml`, `.yml` and `.json` files. `finish` and `remediate` build this index the same way
+(`kcc_paragraph_index`), and only when a finding needs it (`kcc_index_needed`): a
 `Cluster/` or `NodePool/` finding whose own object matches a stall, or a `kcc-object-wedged` finding
 with a stall of its kind and name on its cluster. When exactly one file declares the object, the
 paragraph keeps the first sentence "**Config Connector is not applying this file.**" and names that
 file. Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and
 says that more than one file declares the object, or only that the audit names no declaration file
 for it. It never says that no file declares the object: the index skips a file it cannot parse (a
-template, for example), so no search proves an absence. A paragraph search that stops short or does
-not run is a warning in the `finish` log. The index keys each declaration by its namespace and its
-project annotation as well, so two objects of one name in two namespaces, or for two projects, are
+template, for example), so no search proves an absence. A snapshot that cannot be taken is a
+warning in the log. The index keys each declaration by its namespace and its
+project (the annotation, else that of a Namespace the same file declares) as well, so two objects of one name in two namespaces, or for two projects, are
 two declarations. It keeps each other file that declares the same object, whole, in
 `KccDeclaration.also`, and matches each file on its own fields, so two files of one object read as
 ambiguous. A `gcloud` fix's note is its command, so
@@ -909,7 +912,9 @@ as `uncut_note`, so no later pass brings back a paragraph from an earlier ledger
 also removes an earlier copy from every remediation, and the carry removes it too, so a note never
 shows a stall that this run's manifest does not. A cluster whose read failed
 (`kcc_unread`) records no objects, so no note names an object there, and the log has a warning. The
-absence of the note never says that Config Connector applies a file.
+absence of the note never says that Config Connector applies a file. `remediate` given
+`--manifest-file` runs the same pass before its dry-run preview and before it opens a pull request,
+because `finish` does not revisit a finding whose pull request is open.
 
 The same match makes the `pr-merged-persists` row and the comment on the merged pull request state
 the stall in place of "the remediation was incomplete, or something outside this repository
