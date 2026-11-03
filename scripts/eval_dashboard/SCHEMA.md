@@ -788,7 +788,7 @@ the question imports it.
 `index.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b&view=gate|agent`
 `run.html#build=<prow build id>`
 `grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
-`cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`, or `cases.html#view=scenarios[&domain=<domain slug>]`
+`cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`, or `cases.html#view=scenarios[&domain=<domain slug>]`, or `cases.html#view=domains`
 `nightly.html[#build=<prow build id>&cases=a,b]` (either key may be left out)
 `trend.html#cases=a,b`, or `trend.html#domain=<domain>`, each `[&metric=<judged metric>][&mode=next|today][&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]]`
 
@@ -858,7 +858,7 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
 
 `{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
 strip_runs, admitted[], health, history, merges, catches, domains[],
-confidence_bar{}, cases{}, runs[], pending[], releases[], nightly{}, gitlab{},
+scorecard, confidence_bar{}, cases{}, runs[], pending[], releases[], nightly{}, gitlab{},
 trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
@@ -949,7 +949,16 @@ case passed every graded repetition, as the Nightly report links it
 rows in file order as `{slug, meaning}` (empty when the file cannot be read),
 and `confidence_bar` is `{rate, min_runs, window_days, proving_min_rate}`,
 the thresholds `confidence` was computed with, so the view prints the rule
-it applied.
+it applied. `scorecard` is the domain view's (`cases.html#view=domains`):
+`understudies.py`'s document as written, `{schema_version, generated_at,
+bar{rate, min_runs, nights}, store_read, nightly_red_read, domains[]}`, each
+domain `{slug, name, owner, backup, seats[], uncovered_since,
+days_uncovered, allowlist_issue, held_out, expired_days, nightly_red{open,
+oldest_days}, understudies[], candidates, understudy_ready}` (an
+understudy is `{case, passed, graded, nights, rate, meets_bar, held_out,
+store{state, runs, passes}}`; `nightly_red`, `understudies` and
+`understudy_ready` are `null` when not read), or `null` when the render was
+given none ([`docs/ci-health.md`](../../docs/ci-health.md#the-domain-scorecard)).
 
 `pending[]` is `pending_builds` as `{build, first_seen}`, the Grid's "still
 running" columns — the presubmit's entries only (a night in flight,

@@ -955,7 +955,8 @@ tick keeps an issue open for the domain's owner with the domain's best nightly c
 [`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md) is what a contributor signs up to.
 
 A demotion that leaves a domain with no case on the roster must, in the same pull request, do one
-of three things: seat a stand-in case from that domain on the roster; keep the demoted case on the
+of three things: seat a stand-in case from that domain on the roster (the dashboard's [domain
+scorecard](ci-health.md#the-domain-scorecard) lists each domain's best two); keep the demoted case on the
 presubmit as a held-out seat (its line in the last section of `hack/eval/presubmit-cases.txt` and
 its `HELD_OUT_IN_PRESUBMIT` entry), which keeps the domain exercised but does not cover it; or add
 a record to the `allowlist` in [`docs/designs/domains.yaml`](designs/domains.yaml) with `since`,
