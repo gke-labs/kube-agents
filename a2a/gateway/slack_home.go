@@ -165,7 +165,10 @@ type slackHome struct {
 	// projected file lags it; picks is each member's last pick outcome
 	// (slack_home_pick.go).
 	pending *slackHomePending
-	picks   map[string]slackHomePickStatus
+	// moves counts Home tab moves; a move's wait for the projected file is
+	// superseded once the count has moved past its own.
+	moves uint64
+	picks map[string]slackHomePickStatus
 }
 
 var _ HomeSink = (*SlackAdapter)(nil)

@@ -230,6 +230,7 @@ func TestSlackHomePickRefusals(t *testing.T) {
 		wantInfoCalls int
 	}{
 		{"a foreign team id with a listed id (E1)", "U1", "T9", "C0NEW2", nil, slackHomePickGuest, true, 0},
+		{"a foreign team id the list no longer names", "U2", "T9", "C0NEW2", nil, slackHomeDenied, true, 0},
 		{"a member not admitted", "U2", "T1", "C0NEW2", nil, slackHomeDenied, true, 0},
 		{"admission undecided (E5)", "UX", "T1", "C0NEW2", func(a *SlackAdapter, api *fakeSlackAPI) { delete(api.users, "UX") }, "", false, 0},
 		{"the recorded channel (E4)", "U1", "T1", "C0OLD1", nil, "already the home channel", true, 1},
@@ -490,5 +491,105 @@ func TestSlackHomePickBusyPublishEndsBeforeTheClose(t *testing.T) {
 	a.homeLearn.wg.Wait()
 	if final := viewsFor(api, "U1"); closedAt != final || final != before+1 {
 		t.Errorf("views at the close %d, after it %d, before the pick %d: a publish ran after closeHomeLearn's wait returned", closedAt, final, before)
+	}
+}
+
+// TestSlackHomePickRetriesWhenOnlyASiblingKeyChanged (round 2): a 409 from a
+// writer of another key (a post-time refusal) costs one retry, and the move
+// lands; only a changed home key names a mover.
+func TestSlackHomePickRetriesWhenOnlyASiblingKeyChanged(t *testing.T) {
+	a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeySetAt: "2026-01-01T00:00:00Z", homeRecordKeyWriter: homeTestImage})
+	writeHomeFile(t, dir, "C0NEW2\n")
+	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+	var once sync.Once
+	cs.PrependReactor("patch", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		conflicted := false
+		once.Do(func() {
+			conflicted = true
+			cm, _ := cs.Tracker().Get(configMapsGVR, homeTestNamespace, homeTestRecord)
+			obj := cm.(*corev1.ConfigMap)
+			obj.Data[homeRecordKeyRefused] = homeRefusedArchived
+			obj.ResourceVersion = "9"
+			_ = cs.Tracker().Update(configMapsGVR, obj, homeTestNamespace)
+		})
+		if conflicted {
+			return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, homeTestRecord, errors.New("changed"))
+		}
+		return false, nil, nil
+	})
+	pick(t, a, "U1", "T1", "C0NEW2", "216.1")
+	data := homeRecordData(t, cs)
+	if data[homeRecordKeySlack] != "C0NEW2" || data[homeRecordKeyRefused] != "" || homePatches(cs) != 2 {
+		t.Fatalf("record %v after %d patches; want the move landed on the retry", data, homePatches(cs))
+	}
+	if text := lastView(t, api, "U1"); !strings.Contains(text, "Recorded <#C0NEW2>") || strings.Contains(text, "Moved to") {
+		t.Errorf("a sibling-key 409 was reported as a move:\n%s", text)
+	}
+}
+
+// TestSlackHomePickCloseEndsTheFollowUpAtOnce (round 2): closing the learner
+// ends a move's wait for the projected file now, not at the next poll. The
+// pick runs off the test goroutine: sessions are inline in this fixture.
+func TestSlackHomePickCloseEndsTheFollowUpAtOnce(t *testing.T) {
+	a, api, cs, dir := newHomePickAdapter(t, nil)
+	a.homeLearn.followUp = time.Hour
+	writeHomeFile(t, dir, "")
+	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+	go a.interactive(homePickPayload(t, "U1", "T1", "C0NEW2", "217.1"))
+	waitFor(t, "the move to land", func() bool { return homeRecordData(t, cs)[homeRecordKeySlack] == "C0NEW2" })
+	start := time.Now()
+	a.closeHomeLearn()
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("closeHomeLearn waited %s on the follow-up poll", took)
+	}
+}
+
+// TestSlackHomePickNotAppliedSurvivesARedraw (round 2): a view published
+// after the pending TTL clears the pending move; the follow-up still reports
+// a move the operator did not apply. A move superseded by a later one that
+// the file then follows reports nothing.
+func TestSlackHomePickNotAppliedSurvivesARedraw(t *testing.T) {
+	a, api, cs, dir := newHomePickAdapter(t, nil)
+	a.homeLearn.followUp = 400 * time.Millisecond
+	writeHomeFile(t, dir, "")
+	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+	api.conversations["C0NEW3"] = homeChannelInfo("C0NEW3", nil)
+	go a.interactive(homePickPayload(t, "U1", "T1", "C0NEW2", "218.1"))
+	waitFor(t, "the move to land", func() bool { return homeRecordData(t, cs)[homeRecordKeySlack] == "C0NEW2" })
+	a.home.mu.Lock()
+	if a.home.pending != nil {
+		a.home.pending.at = time.Now().Add(-2 * slackHomePickPendingTTL)
+	}
+	a.home.mu.Unlock()
+	a.publishHome("U1", true) // clears the expired pending move
+	a.homeLearn.wg.Wait()
+	if text := lastView(t, api, "U1"); !strings.Contains(text, slackHomePickNotApplied) {
+		t.Errorf("the redraw suppressed the not-applied status:\n%s", text)
+	}
+	// Two moves; the file follows the second, and a publish clears pending.
+	a.homeLearn.followUp = time.Second
+	go a.interactive(homePickPayload(t, "U1", "T1", "C0NEW3", "218.2"))
+	waitFor(t, "the second move to land", func() bool { return homeRecordData(t, cs)[homeRecordKeySlack] == "C0NEW3" })
+	go a.interactive(homePickPayload(t, "U1", "T1", "C0NEW2", "218.3"))
+	waitFor(t, "the third move to land", func() bool { return homeRecordData(t, cs)[homeRecordKeySlack] == "C0NEW2" })
+	writeHomeFile(t, dir, "C0NEW2\n")
+	a.publishHome("U1", true)
+	a.homeLearn.wg.Wait()
+	if text := lastView(t, api, "U1"); strings.Contains(text, slackHomePickNotApplied) || !strings.Contains(text, "Home channel: <#C0NEW2>") {
+		t.Errorf("a superseded move the file then followed was reported:\n%s", text)
+	}
+}
+
+// TestSlackHomeCheckNamesADirectMessageByItsOwnWord (round 2): a well-formed
+// id that is a DM or a group DM is refused as direct-message, a word the
+// operator does not confuse with a malformed id.
+func TestSlackHomeCheckNamesADirectMessageByItsOwnWord(t *testing.T) {
+	a, api, _, _ := newHomePickAdapter(t, nil)
+	api.conversations["G0MPIM"] = homeChannelInfo("G0MPIM", func(c *slack.Channel) { c.IsMpIM = true })
+	if refused, err := a.checkHomeChannel(context.Background(), "G0MPIM"); err != nil || refused != homeRefusedDirectMessage {
+		t.Errorf("group DM: refused %q err %v, want %q", refused, err, homeRefusedDirectMessage)
+	}
+	if refused, err := a.checkHomeChannel(context.Background(), "D0DM1"); err != nil || refused != homeRefusedMalformed {
+		t.Errorf("DM id: refused %q err %v, want %q", refused, err, homeRefusedMalformed)
 	}
 }

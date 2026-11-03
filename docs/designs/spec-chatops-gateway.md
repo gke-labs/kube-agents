@@ -1627,7 +1627,9 @@ Slack Connect, not archived, the app a member) and written once (`slack`, `slack
 `slack.setAt`, `writer`; `slack.refused` cleared), and one line in the learning thread names the
 channel; the gateway's own home posts follow within one kubelet sync, about a minute, during which a
 home post is refused as having no home. A candidate the check refuses is written to `slack.refused`
-as one of the four words the operator matches, `shared`, `archived`, `not-member` or `malformed`,
+as one of the words the operator matches, `shared`, `archived`, `not-member` or `malformed` (the
+post-time check also writes `direct-message` for a hand-edited group DM id, which an operator without
+that word renders as a reason it does not know),
 while the record names no channel and does not name that reason already (a write that fails is tried
 again at the next refusal; while a channel is recorded, a refusal beside it is the post-time check's
 or an older gateway's, and a learn that adopts or replaces the channel clears it) and the next

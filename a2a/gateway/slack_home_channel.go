@@ -53,6 +53,9 @@ const (
 	homeRefusedArchived  = "archived"
 	homeRefusedNotMember = "not-member"
 	homeRefusedMalformed = "malformed"
+	// A well-formed id that names a DM or a group DM, not a channel; an
+	// operator without the word renders it as a reason it does not know.
+	homeRefusedDirectMessage = "direct-message"
 
 	// homeRecordIDMax bounds a recorded id: the grammar alone has no upper
 	// bound, and a channel id is about eleven characters.
@@ -131,6 +134,9 @@ type slackHomeLearn struct {
 	// follow before it says the operator has not applied it
 	// (slack_home_pick.go); tests shorten it.
 	followUp time.Duration
+	// done closes in closeHomeLearn, so a Home tab move's wait for the
+	// projected file ends at once at shutdown.
+	done chan struct{}
 }
 
 // SetHomeLearner hands the adapter what a learn needs: the record, the image
@@ -141,6 +147,7 @@ func (s *SlackAdapter) SetHomeLearner(client kubernetes.Interface, namespace, na
 	s.homeLearn.image = image
 	s.homeLearn.file = homeFile{dir: fileDir}
 	s.homeLearn.followUp = slackHomePickPendingTTL
+	s.homeLearn.done = make(chan struct{})
 }
 
 // LearnedHome is the home channel the operator's projection names, and
@@ -180,7 +187,12 @@ func (s *SlackAdapter) homeCandidate(conversation, channelType, member string) {
 func (s *SlackAdapter) closeHomeLearn() {
 	l := &s.homeLearn
 	l.mu.Lock()
-	l.closed = true
+	if !l.closed {
+		l.closed = true
+		if l.done != nil {
+			close(l.done)
+		}
+	}
 	l.mu.Unlock()
 	l.wg.Wait()
 }
@@ -280,7 +292,7 @@ func (s *SlackAdapter) checkHomeChannel(ctx context.Context, id string) (refused
 	case info.IsIM || info.IsMpIM:
 		// A direct or group direct message: a Home tab pick carries no
 		// channel_type, so the answer itself says what the id is.
-		return homeRefusedMalformed, nil
+		return homeRefusedDirectMessage, nil
 	case info.IsExtShared || info.IsPendingExtShared:
 		return homeRefusedShared, nil
 	case info.IsArchived:
