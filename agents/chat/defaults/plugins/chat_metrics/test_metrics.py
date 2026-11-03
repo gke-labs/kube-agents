@@ -7,11 +7,13 @@ import os
 import re
 import sqlite3
 import sys
+import json
 import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -71,6 +73,7 @@ class RegistryTest(unittest.TestCase):
         text = self.registry.render()
         self.assertIn("# TYPE kubeagents_chat_messages_inbound_total counter", text)
         self.assertIn("# TYPE kubeagents_chat_sessions_total counter", text)
+        self.assertIn("# TYPE kubeagents_proposals_opened gauge", text)
         self.assertEqual(1, text.count("# TYPE process_start_time_seconds gauge"))
         self.assertRegex(text, r"(?m)^process_start_time_seconds \d+\.\d+$")
         self.assertEqual(text, self.registry.render(), "two renders of an idle registry differ")
@@ -226,6 +229,147 @@ class KanbanGaveUpTest(unittest.TestCase):
     def test_the_board_path_is_the_agent_homes_board_outside_the_gateway_venv(self):
         with mock.patch.dict(os.environ, {"PLATFORM_AGENT_HOME": self.temp.name}, clear=False):
             self.assertEqual(self.db, metrics.board_path())
+
+
+_PROPOSALS_LINE = re.compile(r'^kubeagents_proposals_opened\{origin="([a-z]*)",platform="([a-z]*)"\} (\d+)$', re.M)
+_SESSION_KV_KEY = "test-session-kv-key"
+
+
+class _Ledger:
+    """A fake Session KV server: answers GET /v1/proposals/opened/counts with
+    `body` (a dict serialised as JSON, or bytes as is) and `status`, and
+    records the Authorization header of each request."""
+
+    def __init__(self):
+        self.body = {}
+        self.status = 200
+        self.auth = []
+        ledger = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                ledger.auth.append(self.headers.get("Authorization"))
+                body = ledger.body if isinstance(ledger.body, bytes) else json.dumps(ledger.body).encode()
+                self.send_response(ledger.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/v1/proposals/opened/counts"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _served(origins=None, **rows):
+    """The server's answer: every origin, those not in `rows` as {"": 0}."""
+    answer = {origin: {"": 0} for origin in (origins or metrics.ORIGINS)}
+    answer.update(rows)
+    return answer
+
+
+class ProposalsOpenedTest(unittest.TestCase):
+    """The proposals ledger, read over loopback from Session KV at scrape time
+    and served as kubeagents_proposals_opened{origin,platform}: one series per
+    origin at least, the last counts kept on a read error, no state of its own."""
+
+    def setUp(self):
+        self.ledger = _Ledger()
+        self.addCleanup(self.ledger.close)
+        env = mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": _SESSION_KV_KEY})
+        env.start()
+        self.addCleanup(env.stop)
+        self.gauge = metrics.ProposalsOpenedGauge(url=self.ledger.url)
+
+    def series(self, gauge=None):
+        registry = metrics.ChatMetrics(proposals=gauge or self.gauge)
+        return {(o, p): int(n) for o, p, n in _PROPOSALS_LINE.findall(registry.render())}
+
+    def test_every_origin_is_served_zero_filled(self):
+        # Before any successful read, and when the ledger is empty, every
+        # origin has a series at 0 under platform="".
+        self.ledger.body = _served(chat={"slack": 3})
+        with mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": ""}), self.assertLogs("hermes.plugin.chat_metrics", level="WARNING"):
+            self.assertEqual({(o, ""): 0 for o in metrics.ORIGINS}, self.series())
+        self.assertEqual([], self.ledger.auth, "no request without the key")
+        self.ledger.body = _served()
+        self.assertEqual({(o, ""): 0 for o in metrics.ORIGINS}, self.series())
+        self.assertEqual([f"Bearer {_SESSION_KV_KEY}"], self.ledger.auth)
+        # An answer that omits an origin still serves it, zero-filled.
+        self.ledger.body = {"audit": {"": 2}}
+        got = self.series()
+        self.assertEqual(2, got[("audit", "")])
+        self.assertEqual({o for o in metrics.ORIGINS}, {o for o, _ in got})
+        self.assertEqual(0, got[("drift", "")])
+
+    def test_chat_rows_carry_the_platform(self):
+        self.ledger.body = _served(chat={"slack": 3, "googlechat": 1}, audit={"": 2})
+        exposition = metrics.ChatMetrics(proposals=self.gauge).render()
+        self.assertIn("# TYPE kubeagents_proposals_opened gauge", exposition)
+        self.assertIn('kubeagents_proposals_opened{origin="chat",platform="slack"} 3\n', exposition)
+        self.assertIn('kubeagents_proposals_opened{origin="chat",platform="googlechat"} 1\n', exposition)
+        self.assertIn('kubeagents_proposals_opened{origin="audit",platform=""} 2\n', exposition)
+        self.assertNotIn(("chat", ""), self.gauge.counts(), "a chat origin with rows has no empty-platform series")
+        lines = [l for l in exposition.splitlines() if l.startswith("kubeagents_proposals_opened{")]
+        self.assertEqual(sorted(lines), lines, "series render in sorted (origin, platform) order")
+        self.assertEqual(len(metrics.ORIGINS) + 1, len(lines))
+        # A later answer replaces the earlier one; nothing accumulates.
+        self.ledger.body = _served(chat={"slack": 4})
+        got = self.series()
+        self.assertEqual(4, got[("chat", "slack")])
+        self.assertNotIn(("chat", "googlechat"), got)
+        self.assertEqual(0, got[("audit", "")])
+
+    def test_a_read_error_keeps_the_last_count(self):
+        self.ledger.body = _served(chat={"slack": 3}, issue={"": 1})
+        last = self.gauge.counts()
+        self.assertEqual(3, last[("chat", "slack")])
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING") as logs:
+            self.ledger.status = 500
+            self.assertEqual(last, self.gauge.counts())
+            self.ledger.status = 200
+            for body in (b"not json", b"[]", json.dumps({"chat": {"slack": "3"}}).encode(), json.dumps({"chat": [1]}).encode()):
+                self.ledger.body = body
+                self.assertEqual(last, self.gauge.counts())
+            with mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": ""}):
+                self.assertEqual(last, self.gauge.counts())
+            closed = metrics.ProposalsOpenedGauge(url="http://127.0.0.1:1/v1/proposals/opened/counts")
+            self.assertEqual({(o, ""): 0 for o in metrics.ORIGINS}, closed.counts())
+        # One line per failure streak per gauge, naming the exception type and
+        # never the key.
+        self.assertEqual(2, len(logs.output), logs.output)
+        self.assertNotIn(_SESSION_KV_KEY, "\n".join(logs.output))
+        # A good read ends the streak; the next failure logs again.
+        self.ledger.body = _served(chat={"slack": 5})
+        self.assertEqual(5, self.gauge.counts()[("chat", "slack")])
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING") as again:
+            self.ledger.status = 503
+            self.assertEqual(5, self.gauge.counts()[("chat", "slack")])
+        self.assertEqual(1, len(again.output))
+
+    def test_a_restart_of_the_process_serves_the_ledger_unchanged(self):
+        # The ledger is durable on the pod's volume; the gauge holds nothing of
+        # its own, so a fresh gauge against the same server answers the same.
+        self.ledger.body = _served(chat={"slack": 3}, drift={"": 7})
+        before = self.series()
+        restarted = metrics.ProposalsOpenedGauge(url=self.ledger.url)
+        self.assertEqual(before, self.series(restarted))
+        self.assertEqual(7, before[("drift", "")])
+
+    def test_the_origins_are_the_session_kv_servers(self):
+        # session_kv_server imports FastAPI, which this plugin's tests do not
+        # carry, so the pin reads its source text.
+        server = Path(__file__).resolve().parents[4] / "platform" / "scripts" / "session_kv_server.py"
+        match = re.search(r"^ORIGINS = \(([^)]*)\)$", server.read_text(), re.M)
+        self.assertIsNotNone(match, "session_kv_server's ORIGINS moved; update this reader")
+        self.assertEqual(tuple(re.findall(r'"([a-z]+)"', match.group(1))), metrics.ORIGINS)
 
 
 class HookTest(unittest.TestCase):
