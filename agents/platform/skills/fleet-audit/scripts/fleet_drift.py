@@ -2130,8 +2130,8 @@ def main(argv: list[str] | None = None) -> int:
     manifest[kcc_health.READ_STAMP_FIELD] = reason
     if reason:
         # After the sweep, in a new pool of the sweep's size: a credential fetch
-        # and one Config Connector read per collected cluster (discovery, then one
-        # list request per container kind, `kcc_health.CONTAINER_KINDS`,
+        # and one Config Connector read per collected cluster (discovery, then paged
+        # list requests per container kind, `kcc_health.CONTAINER_KINDS`,
         # `kcc_health.read_objects`), as `kcc_unready` or
         # `kcc_unread` on its entry. The reads end inside the collector's time
         # budget (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.

@@ -2669,7 +2669,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest[kcc_health.READ_STAMP_FIELD] = reason
     if reason:
         # After the sweep, in a new pool of the sweep's size: one Config Connector
-        # read (discovery, then one list request per container kind,
+        # read (discovery, then paged list requests per container kind,
         # `kcc_health.CONTAINER_KINDS`, `kcc_health.read_objects`) per collected
         # cluster, as `kcc_unready` or `kcc_unread` on its entry, with the
         # kubeconfig the sweep fetched for that cluster (`fetch_credentials`).

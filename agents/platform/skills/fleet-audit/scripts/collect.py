@@ -8368,7 +8368,7 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # Config Connector has not cleared anything.
     # `kcc_health.read_objects`, the one Config Connector read the collectors
     # share: discovery (`kubectl api-resources`, no RBAC needed) finds the
-    # Config Connector kinds, then one list request per kind runs in parallel,
+    # Config Connector kinds, then each kind is listed in pages, in parallel,
     # with no more than `kcc_health.proxy_slots()` (the broker's sweep width)
     # in flight in the process. `kubectl get gcp -A` does the same requests one
     # after another, and through the credential proxy they took longer than

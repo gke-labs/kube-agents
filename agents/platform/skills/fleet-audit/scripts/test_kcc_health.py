@@ -219,7 +219,7 @@ class UnreadyObjectsTest(unittest.TestCase):
 
 
 class ReadObjectsTest(unittest.TestCase):
-    """`read_objects`: discovery, then one list request per Config Connector
+    """`read_objects`: discovery, then paged list requests per Config Connector
     kind (every kind for the compliance collector, `CONTAINER_KINDS` for the
     others), with no more than `proxy_slots()` requests in flight."""
 

@@ -13,8 +13,8 @@ the collectors do the reading. This module is the one read they share
 (`read_objects`). On each cluster a collector swept, it reads the API
 server's discovery once (`kubectl api-resources`, which needs no RBAC grant) to
 find the Config Connector kinds (a group that ends in `.cnrm.cloud.google.com`,
-in the `gcp` category), then makes one list request per kind (`kubectl get
---raw /apis/<group>/<version>/<plural>`), with no more requests in flight in
+in the `gcp` category), then lists each kind in pages (`kubectl get --raw
+/apis/<group>/<version>/<plural>?limit=500`, `KIND_PAGE_LIMIT`), with no more requests in flight in
 the process than the credential broker admits (`proxy_slots`), and puts
 the result on that cluster's manifest entry. `kubectl get gcp -A` does the same work one kind after another, and
 through the credential proxy its 230 requests took longer than the read's
