@@ -396,7 +396,8 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 
 // regrant reconnects so the bus connection carries grants for the durables
 // and profiles the config added, then binds the durables. A bind still refused (the callout's
-// watch lagging the config) gets another reconnect, with backoff, up to
+// watch lagging the config; not a missing durable or one whose stored config
+// the held bind refuses) gets another reconnect, with backoff, up to
 // RegrantAttempts; then it is logged as an error and left for the next
 // refresh. Held work is untouched throughout (lib.Client.Reconnect).
 func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durables map[string]lib.DispatchDurable, added, addedProfiles []string) {
@@ -429,9 +430,11 @@ func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durabl
 			err := d.bindNow(ctx, want[name], durables[name])
 			switch {
 			case err == nil:
-			case errors.Is(err, jetstream.ErrConsumerNotFound):
+			case errors.Is(err, jetstream.ErrConsumerNotFound), errors.Is(err, lib.ErrHeldBindRefused):
 				// The bus answered, so the grant is there: the durable
-				// just isn't yet, and the bind retries pick it up.
+				// just isn't yet, or its stored config is refused (the
+				// server's record, which no reconnect changes). The bind
+				// retries pick it up, with backoff, as bind's would.
 				d.noteBindFailure(name, err)
 			default:
 				refused = append(refused, name)
