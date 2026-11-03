@@ -955,8 +955,10 @@
 # A question naming one seeded cluster reaches that cluster's Cluster Agent
 # when the roster block counts the Cluster Agents instead of naming them
 # (#4432): the front door finds the assignee through list_agents' filter.
-# On an install below the threshold it grades the named route, so it is a
-# regression guard for both forms. deployer: noop, read-only, reads seeded-a
+# The counted block needs KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD set below the
+# install's Cluster Agent count, which no CI install does yet, so here the
+# case grades the named route; it guards the lookup route only once an eval
+# install sets the threshold. deployer: noop, read-only, reads seeded-a
 # through its own agent, one front-door turn plus the card round trip:
 # +3 units.
 ./tasks/chat-routing-named-cluster-under-summarized-roster/task.yaml

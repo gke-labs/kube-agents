@@ -10,12 +10,16 @@
 # when it returns none. This case grades that a question naming one seeded
 # cluster still reaches that cluster's Cluster Agent under the counted block.
 #
-# The counted block is reached on the eval install by setting the threshold
-# below its Cluster Agent count (`KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD: "1"` in
-# spec.deployment.env). On an install at the default the block names every
-# agent and the case grades the named route, which is also correct: it is a
-# regression guard for both forms, and it cannot go red on an install that
-# never counts.
+# Which form the case grades is the install's, not the case's: the counted
+# block is reached only on an install whose threshold is set below its
+# Cluster Agent count (`KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD: "1"` in
+# spec.deployment.env). No CI install sets it, so the nightly grades the
+# named route, where the block names every agent and the lookup is never
+# called; that is also correct, and the case cannot go red on an install
+# that never counts. The lookup route (`list_agents(filter=...)`, then the
+# card to the assignee it returned) is graded only where the threshold is
+# set, as the pull request that added this case did on its own install;
+# admitting it to a CI lane is the eval install's setting to make.
 #
 # What it grades: a successful kanban_create; the seeded-a Cluster Agent
 # among the workers (worker_agents, set aside on the inject lane where the
