@@ -511,7 +511,7 @@ declarable check and the list does not cover every slug in the record — or the
 record — every finding whose check is declarable is withheld and the run goes partial (§7.4).
 `remediate` applies the same withhold and refuses a withheld id by name. The sha comes from the
 reads: `list`, `grep` and `fetch` print the broker's tree sha, and in content mode
-`inspect_repository.py clone` and `open` print it for a context copy (#1477).
+`inspect_repository.py clone` prints it for a context copy (#1477).
 
 `start` also performs the search itself: it reads each repository in that set for `declares:`
 frontmatter within the paths its `.kube-agents/intent.yaml` names — in content mode copying the

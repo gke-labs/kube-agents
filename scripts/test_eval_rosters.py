@@ -790,6 +790,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 # inject door can carry. An edit to the file edits this set.
 API_LANE_EXCLUDED = [
     "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
+    "chat-stop-mid-turn-files-no-card",  # #3263: the same, while the opening turn runs
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
     "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
 ]
@@ -1307,29 +1308,41 @@ class PresubmitWallTimeTest(unittest.TestCase):
         self.assertEqual([int(n) for n in out], [hints.get(c, default) for c in cases])
 
     def test_the_text_read_of_a_stopped_ask_agrees_with_stop_hook(self):
-        """A stopped ask runs in the serial phase too (unit_phase reads
-        STOPPED_ASK_CASES); hold the stdlib read to stop_hook's on every
-        registered case, and price one in phase two."""
+        """A stopped ask and a writes_alone case run in the serial phase too
+        (unit_phase reads STOPPED_ASK_CASES); hold the stdlib reads to
+        stop_hook's and lane.runs_alone on every registered case, and price
+        one of each in phase two."""
         import yaml
         from unittest import mock
 
         sys.path.insert(0, str(REPO_ROOT / "bench"))
-        from kube_agents_bench import stop_hook
+        from kube_agents_bench import lane, stop_hook
 
         self.assertEqual(eval_rosters.STOP_DIRECTIVE, stop_hook.STOP_DIRECTIVE)
+        self.assertEqual(eval_rosters.MID_TURN_DIRECTIVE, stop_hook.MID_TURN_DIRECTIVE)
         stopped = []
+        alone = []
         for case in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases():
             with self.subTest(case=case):
                 doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
                 self.assertEqual(eval_rosters.is_stopped_ask(case), stop_hook.is_stopped_ask(str(doc.get("prompt") or "")))
+                self.assertEqual(eval_rosters.runs_alone(case), lane.runs_alone(doc))
                 if eval_rosters.is_stopped_ask(case):
                     stopped.append(case)
+                if eval_rosters.declares_writes_alone(case):
+                    alone.append(case)
         self.assertTrue(stopped, "no registered stopped ask left to price")
         base = eval_rosters.presubmit_wall_estimate()
         with mock.patch.object(eval_rosters, "presubmit_cases", return_value=eval_rosters.presubmit_cases() + stopped[:1]):
             grown = eval_rosters.presubmit_wall_estimate()
         self.assertEqual(grown["phase one"], base["phase one"])
         self.assertIn(stopped[0], grown["requesting"])
+        # A writes_alone case is priced in phase two the same way.
+        self.assertTrue(alone, "no registered writes_alone case left to price")
+        with mock.patch.object(eval_rosters, "presubmit_cases", return_value=eval_rosters.presubmit_cases() + alone[:1]):
+            grown = eval_rosters.presubmit_wall_estimate()
+        self.assertEqual(grown["phase one"], base["phase one"])
+        self.assertIn(alone[0], grown["requesting"])
 
     def test_a_requesting_case_adds_its_serial_chain_and_settles(self):
         from unittest import mock

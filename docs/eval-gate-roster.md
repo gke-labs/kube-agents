@@ -401,8 +401,8 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   The GitLab nightly passed it 21 of 21 on the seven nights that graded it, 2026-10-19 to 10-26.
   What it costs: like vcs-spent-branch-reuse it requests a pull request, so its three repetitions
   join that case's in the fan-out's second phase, one at a time after every other unit, each after
-  the repository reset and on the inject lane the 120-second GitHub-write settle ([The inject
-  lane](#the-inject-lane)): about 15 minutes more serial tail at the measured median (3 × (120 s +
+  the repository reset and on the inject lane the 30-second GitHub-write settle ([The inject
+  lane](#the-inject-lane)): about 10 minutes more serial tail at the measured median (3 × (30 s +
   172 s)), plus three more resets. The two cases' units alternate there, so a late write from one
   would be charged to the other by the lane's write safeguard; the writers nightly has run them
   interleaved that way on the inject lane, with six other requesting cases, on all three next-mode
@@ -428,9 +428,9 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   demoted the upgrades and consistency probes. What it costs: it was the presubmit's one case
   that requests a pull request (until pdb-remediation-pr's return on 2026-10-26), so its three
   repetitions run in the fan-out's second phase, one at a time after every other unit, each
-  after the repository reset and on the inject lane the 120-second GitHub-write settle
-  ([The inject lane](#the-inject-lane)): about 15 minutes of serial tail at the measured median
-  (3 × (120 s + 173 s)), plus the resets and the drain at the phase boundary. Its seat took
+  after the repository reset and on the inject lane the 30-second GitHub-write settle
+  ([The inject lane](#the-inject-lane)): about 10 minutes of serial tail at the measured median
+  (3 × (30 s + 173 s)), plus the resets and the drain at the phase boundary. Its seat took
   `source-control` off the `docs/designs/domains.yaml` allowlist.
 - **upgrades-lagging-master-probe**, 2026-10-23
   ([#3269](https://github.com/gke-labs/kube-agents/issues/3269)), back from its demotion of
@@ -575,8 +575,8 @@ with "Not a roster admission."
   presubmit wall time, priced from `unit_cost_hint` in `hack/ci-eval-pr.sh`. Phase one runs the
   cases that request nothing, four lanes at a time (`EVAL_TASK_PARALLELISM`), and one case's
   repetitions run one after another on its task lock. Phase two runs the cases that request a
-  pull request, and the stopped asks, one unit at a time, after phase one is done, each after
-  the 120 s write settle, so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
+  pull request, the stopped asks and the cases that declare `writes_alone`, one unit at a time, after phase one is done, each after
+  the 30 s write settle, so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
   Held-out seats count, because they run. Locks shared between cases are not counted, so a
   seat with its own Terraform stack would cost more than the estimate says. The test fails
   when the estimate passes
@@ -677,10 +677,9 @@ Nothing in this repository changes for the flip, and the same line removed disar
 periodic does not get the line: it records `main` and grades itself against a window that already
 holds its own night, so its aggregate is a report, never a gate. Revisit the margin when `main`'s
 window rate passes 0.96 (at that point 0.10 starts redding five failed repetitions, which the
-sample contains); the eval dashboard's Trend page draws today's window from the same store, per case
-and per domain, and since no job appends that window now, the view empties as its lines age out of
-the page's window. It does not draw the `next` series yet, which is the window the presubmit is compared
-with since the nightly grades `next`; the `next` block of the published `trend.json` holds it.
+sample contains); the eval dashboard's Trend page draws the `next` window from the same store, per
+case and per domain, which is the window the presubmit is compared with since the nightly grades
+`next`. Today's window stays selectable on the page until its lines age out: no job appends it now.
 
 **What an author sees when it fires.** No case is marked blocking; the failures are spread. The
 job's final log line is the ordinary `PR Smoke Test Evaluation Failed -- see .../eval-verdict.md`,
@@ -773,7 +772,7 @@ The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it change
 pull request runs.
 
 Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject lane can carry:
-the stopped asks (a `stop` sent on the conversation after the opening turn,
+the stopped asks (a `stop` sent on the conversation during or after the opening turn,
 [`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and a case
 graded on the question a delegated card paused on, which only the inject lane's board read folds
 into the reply, and the reply-under-pushed-report replays (a report stored for the conversation
@@ -781,7 +780,8 @@ after the opening turn, then the reply sent as a second message on it,
 [`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)).
 `hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
 needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
-the cases that request a pull request, with its window marked exclusive like theirs, so a stop
+the cases that request a pull request, as does a case that declares `writes_alone: true` on
+either lane, with its window marked exclusive like theirs, so a stop
 that fails and lets its card write reds that case whether or not it names the write, and only
 that case.
 
@@ -805,8 +805,8 @@ included, and on GitHub without `EVAL_LEDGER_APP_KEY_FILE` it refuses unless
 learned on the first repetition, whose check errors naming the repository and the missing permission.
 The task files under `bench/tasks/` are untouched. A case that
 requests a pull request (a `pull_request_opened` or `pull_request_diff_contains` check of its
-own) is allowed the ones its reply names, and the script runs those cases in a second phase
-after every other unit has finished, one at a time and each after a settle as long as the
+own) is allowed the ones its reply names, and the script runs those cases, the stopped asks and
+the cases that declare `writes_alone: true` in a second phase after every other unit has finished, one at a time and each after a settle as long as the
 check's clock-skew tolerance, so a repetition that requests nothing never shares the repository
 with one that writes by design and no window reaches back into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and

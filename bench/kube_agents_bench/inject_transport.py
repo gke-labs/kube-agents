@@ -58,6 +58,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from typing import Any
 
 __all__ = [
@@ -1547,17 +1548,29 @@ class InjectTask:
         self.task_id = probe.task_id
         return self.task_id
 
-    def await_terminal(self, task_id: str, *, deadline: float) -> Exchange:
+    def await_terminal(
+        self,
+        task_id: str,
+        *,
+        deadline: float,
+        on_poll: Callable[[Fold], float | None] | None = None,
+    ) -> Exchange:
         """Await the terminal of ``task_id`` (:meth:`_await_terminal`), then,
         for a task that ended, read the front door's usage once
         (:meth:`_read_usage`).
         """
-        exchange = self._await_terminal(task_id, deadline=deadline)
+        exchange = self._await_terminal(task_id, deadline=deadline, on_poll=on_poll)
         if exchange.outcome in (OUTCOME_TERMINAL, OUTCOME_STREAM_TERMINAL):
             self._read_usage(exchange.fold, task_id, deadline)
         return exchange
 
-    def _await_terminal(self, task_id: str, *, deadline: float) -> Exchange:
+    def _await_terminal(
+        self,
+        task_id: str,
+        *,
+        deadline: float,
+        on_poll: Callable[[Fold], float | None] | None = None,
+    ) -> Exchange:
         """Await the terminal of ``task_id``, folding what the relay posts.
 
         A function of a task id rather than of "the task I submitted", so the
@@ -1580,6 +1593,12 @@ class InjectTask:
             deadline: ``time.monotonic()`` instant after which the wait ends
                 on the read route's answer. The budget behind it clears the
                 floor (:func:`check_budget`).
+            on_poll: Called with the fold before the first read and after
+                each read that did not end the wait; what it returns caps
+                how long the next read may block, in seconds (``None``: the
+                usual long poll). The harness's mid-turn stop sends from
+                here, and caps the reads so its delay is kept to a second or
+                so rather than a long poll's 30 (:mod:`stop_hook`).
 
         Raises:
             InjectUnavailable: The gateway could not be reached or was lost.
@@ -1587,13 +1606,14 @@ class InjectTask:
         fold = Fold(task_id)
         after = 0
         probe: Probe | None = None
+        poll_cap = on_poll(fold) if on_poll is not None else None
         while True:
             if fold.final:
                 return self._ended(fold, task_id, probe)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return self._classify(fold, task_id, after)
-            body = self._poll(task_id, after, remaining)
+            body = self._poll(task_id, after, remaining if poll_cap is None else min(remaining, poll_cap))
             after, fresh = self._absorb(fold, body, after)
             answered = Probe.from_body(body)
             adopted = False
@@ -1611,6 +1631,8 @@ class InjectTask:
                         return self._finish(fold, task_id, after, answered)
                     if answered.executor_state == "" and answered.past_grace:
                         return self._never_started(fold, task_id, answered)
+            if on_poll is not None:
+                poll_cap = on_poll(fold)
             if fold.final and not adopted:
                 # The relay's terminal arrived in this read and its probe
                 # carried no trace to adopt: whatever trace the fold holds

@@ -184,7 +184,9 @@ x509 and auth-plugin failures the list cannot fix) rather than an answer the ser
 (anything kubectl fronts with `Error from server`, a degraded etcd's "request timed out"
 included) or a message the credential-proxy shim itself produced (its `credential proxy:`,
 `credential proxy unavailable`, `credential proxy token unavailable` and `credential proxy
-error` prefixes). When the probe itself does not finish inside its outer bound,
+error` prefixes; a connection that drops after the request was sent is reported under the last).
+The shim's exec-tier fallback line names no cause and carries none of these prefixes, so a cluster
+failure that follows it is still classified. When the probe itself does not finish inside its outer bound,
 or cannot run, the log says that and nothing about the endpoint. The scaffold still returns
 normally: a cluster that is unreachable now may be reachable after the operator acts, and a
 scaffold that failed would only be retried on the next reconcile tick with the same result.

@@ -107,7 +107,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse> <has-stack> <seq> <stre
 class InfraSlotTest(unittest.TestCase):
     maxDiff = None
 
-    def _run(self, queue_indexes, parallelism, giveup_tries=200):
+    def _run(self, queue_indexes, parallelism, giveup_tries=200, reps=None):
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = pathlib.Path(tmp)
             log = tmpdir / "units.log"
@@ -124,7 +124,7 @@ class InfraSlotTest(unittest.TestCase):
                 _function("unit_counts_toward_infra_limit"),
                 _extract_line(r"^INFRA_IN_FLIGHT_MAX=\d+$"),
                 _function("launch_units"),
-                "QUEUE=\"$(printf '1 0 %s\\n' " + " ".join(str(i) for i in queue_indexes) + ")\"",
+                "QUEUE=\"$(printf '%s 0 %s\\n' " + " ".join(f"{r} {i}" for r, i in zip(reps or [1] * len(queue_indexes), queue_indexes)) + ")\"",
                 f'launch_units "${{QUEUE}}" {parallelism} 0 > /dev/null',
                 "wait",
             ])
@@ -184,6 +184,19 @@ class InfraSlotTest(unittest.TestCase):
         rows = self._run([10, 0, 3], parallelism=4)
         got = {name: g for name, _, g, _ in rows}
         self.assertLess(got["stack-a"], got["stack-stalls"], "the chain waited behind a holder that was not on lock-infra")
+
+    def test_a_tasks_next_repetition_waits_for_its_last_and_lends_the_lane(self):
+        # The queue is case by case (#3939): plain-1's three repetitions, then
+        # plain-2. Launched together, plain-1's later repetitions would sleep
+        # on its task lock in two lanes; held back, plain-2 takes a lane at
+        # once and plain-1's repetitions never overlap.
+        rows = self._run([3, 3, 3, 4], parallelism=4, reps=[1, 2, 3, 1])
+        plain1 = sorted((start, end) for name, start, _, end in rows if name == "plain-1")
+        self.assertEqual(len(plain1), 3)
+        for (_, end), (start, _) in zip(plain1, plain1[1:]):
+            self.assertGreaterEqual(start, end - 0.05, "two repetitions of one task were in flight at once")
+        start = {name: s for name, s, _, _ in rows}
+        self.assertLess(start["plain-2"] - plain1[0][0], 0.3, "plain-2 waited behind plain-1's repetitions")
 
     def test_parallelism_is_still_the_ceiling(self):
         rows = self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=3)
