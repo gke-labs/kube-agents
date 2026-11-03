@@ -137,8 +137,10 @@ SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS = 5
 # A probe or a project-number lookup refused as not declared means the broker's member window
 # no longer holds a member an earlier lookup returned: its scope.json, and the digest the window
 # is tied to, changed after the sources resolved (an edit that adds no source, a mount that
-# caught up late). The run then resolves every source again and probes again, once, if the
-# budget still leaves one lookup and one probe their minimum attempt.
+# caught up late). A source lookup given up as not declared may be answered once the mount
+# catches up. Either way the run resolves every source again and probes again, once, after its
+# probes, if the budget still leaves one lookup and one probe their minimum attempt. That pass
+# starts no wait of its own: a source still not declared then is answered at once.
 SCOPE_RECOVERY_MIN_SECONDS = 2 * SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS
 # The broker's argv flag the log leaves out: it names no source, only the output columns.
 FORMAT_FLAG_PREFIX = "--format="
@@ -180,16 +182,19 @@ def log(msg: str) -> None:
 
 
 class _ScopeArgumentWait:
-    """One run's wait for the broker's scope.json to name a new source (broker_run).
+    """One run's wait for the broker's scope.json to name a new source, and what the run saw
+    of a scope.json change (broker_run).
 
     `until` is the run's retry window, set at its first `caller.scope-argument` refusal of
     a source lookup. `caught_up` is set when a source lookup that had been refused then
     answered: the broker's scope.json changed during the run, and with it the digest its
     member window is tied to, so the members recorded before the change are gone from it.
     `probe_refused` is set when a probe or a project-number lookup is refused as not
-    declared: the same change, seen after the sources resolved. build_document resets all
-    three at the start of a run, resolves the sources again when `caught_up` is set, and
-    resolves and probes again once when `probe_refused` is set.
+    declared: the same change, seen after the sources resolved. `gave_up` is set when a
+    source lookup is still refused as not declared when its wait ends. build_document resets
+    all four at the start of a run, resolves the sources again when `caught_up` is set, and
+    resolves and probes again once when `probe_refused` or `gave_up` is set and the budget
+    still leaves SCOPE_RECOVERY_MIN_SECONDS.
     """
 
     def __init__(self) -> None:
@@ -199,6 +204,7 @@ class _ScopeArgumentWait:
         self.until: float | None = None
         self.caught_up = False
         self.probe_refused = False
+        self.gave_up = False
 
 
 _scope_argument_wait = _ScopeArgumentWait()
@@ -234,7 +240,9 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
     variables (CREDENTIAL_PROXY_URL, CREDENTIAL_PROXY_TOKEN_FILE). A source lookup the broker
     refuses because its scope.json does not name the argument yet is retried while it
     catches up (SCOPE_ARGUMENT_REFUSAL_LINE, SCOPE_ARGUMENT_UNDECLARED_PREFIX), inside the
-    same timeout.
+    same timeout; one still refused when the wait ends sets `gave_up`. A probe or a
+    project-number lookup refused the same way is not retried; it sets `probe_refused`. Both
+    are for build_document.
     """
     env = {k: v for k, v in os.environ.items() if k not in CLIENT_DROPPED_ENV}
     deadline = time.monotonic() + timeout
@@ -276,6 +284,8 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
         time.sleep(SCOPE_ARGUMENT_RETRY_SECONDS)
         # A retry gets what is left of the lookup's timeout, never more.
         attempt_timeout = max(deadline - time.monotonic(), 0)
+    if undeclared and source_lookup:
+        _scope_argument_wait.gave_up = True
     if waited and not undeclared:
         # Any end of a wait but another "not declared" refusal: the broker's answer, or a
         # failure that may hide one. A spurious second resolve costs time, not an admit.
@@ -475,7 +485,9 @@ def build_document(declared: dict, management: str | None, previous: dict | None
     `clusters list`; `ok` stamps `confirmedAt` with this run's time, any other answer is the
     row's outcome and keeps the time it had. A member carried from a failed source keeps
     its previous row's outcome and `confirmedAt`: the source did not list it, so nothing
-    this run can confirm it.
+    this run can confirm it. When the broker's scope.json changes during the run, the sources
+    resolve again, and a probe refused as not declared resolves and probes once more, inside
+    the budget; a later pass keeps a source's earlier answer when its own lookup gives none.
     """
     present = declared.get(rec.SCOPE_PRESENT_KEY) is True
     scope = rec._normalize_scope(declared) if present else rec._empty_scope()
@@ -514,23 +526,28 @@ def build_document(declared: dict, management: str | None, previous: dict | None
     groups = rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget)
     if _scope_argument_wait.caught_up:
         # The broker's scope.json changed while the sources resolved, and the member
-        # window went with its old digest: resolve them all again, so every member the
-        # probes name is recorded under the new one.
+        # window went with its old digest: resolve them all again, so the members of every
+        # source that answers again are recorded under the new one.
         log("the broker's scope.json changed during the run; resolving every source again")
         groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget))
     searches, selector_reports, selections, members, carried = place(groups)
     probes = probe(members)
-    if (_scope_argument_wait.probe_refused
+    if ((_scope_argument_wait.probe_refused or _scope_argument_wait.gave_up)
             and deadline - time.monotonic() >= SCOPE_RECOVERY_MIN_SECONDS):
-        # The window lost members the sources had returned: the broker's scope.json changed
-        # after they resolved. Resolve them again under the new digest, then probe again what
-        # did not read `ok`. Once: a second change in the same run is left to the next run.
-        log("the broker refused a probe as not declared: its scope.json changed after the sources "
-            "resolved; resolving every source again and probing again")
+        # The window lost members the sources had returned, or a source gave up before the
+        # mount caught up: the broker's scope.json changed, or may have, after the sources
+        # resolved. Resolve them again under its digest now, then probe again what a refusal
+        # left `unreachable` and what was not probed. Once: a second change in the same run is
+        # left to the next run.
+        reason = ("the broker refused a probe as not declared" if _scope_argument_wait.probe_refused
+                  else "a source's wait for the broker's scope.json ran out")
+        log(f"{reason}; resolving every source again and probing again")
+        if _scope_argument_wait.until is None:
+            _scope_argument_wait.until = time.monotonic()
         groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget))
         searches, selector_reports, selections, members, carried = place(groups)
-        probes.update(probe([e for e in members
-                             if probes.get(e[ROW_ID], (None, None))[1] != rec.OUTCOME_OK]))
+        probes.update(probe([e for e in members if probes.get(e[ROW_ID], (None, rec.OUTCOME_UNREACHABLE))[1]
+                             == rec.OUTCOME_UNREACHABLE]))
     rows_before = {row[ROW_ID]: row for row in (previous or {}).get(DOC_PROJECTS, [])
                    if isinstance(row, dict) and isinstance(row.get(ROW_ID), str)}
     resolved_at = _now()
