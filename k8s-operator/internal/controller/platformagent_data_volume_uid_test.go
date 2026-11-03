@@ -90,7 +90,7 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	// The plugin-aware render the reconciler calls; the wrapper above is
 	// the same Deployment with no plugins. Both are pod-bearing builders,
 	// so both pods reach the assertion.
-	credentialProxyWithPlugins := buildCredentialProxyDeploymentForPlugins(agent, "p", nil, allBrokerCallersOwned, credentialProxyProfileConfig{})
+	credentialProxyWithPlugins := buildCredentialProxyDeploymentForPlugins(agent, "p", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, false)
 	credentialProxyExecTier := buildCredentialProxyExecTierDeployment(agent, credentialProxy)
 	a2aGateway := buildA2AGatewayDeployment(agent)
 	a2aCallout := buildA2ACalloutDeployment(agent, "")

@@ -127,44 +127,49 @@ func rewriteSecretRequest(h http.Header, info *request.RequestInfo) *secretRedac
 }
 
 // redactSecretResponse redacts resp in place. Anything it cannot redact, it replaces with a
-// 502 Status, or on a watch ends the stream with an ERROR event: a body that is not JSON, an encoding other than gzip, an object of an
-// unexpected kind, or a body over maxSecretResponseBytes.
-func redactSecretResponse(resp *http.Response, plan *secretRedaction) {
+// 502 Status, or on a watch ends the stream with an ERROR event: a body that is not JSON, an
+// encoding other than gzip, an object of an unexpected kind, or a body over
+// maxSecretResponseBytes. It passes the cause of each such refusal to onRefuse, which on a watch
+// runs when the stream ends.
+func redactSecretResponse(resp *http.Response, plan *secretRedaction, onRefuse func(error)) {
+	if err := redactSecretBody(resp, plan, onRefuse); err != nil {
+		onRefuse(err)
+		replaceWithStatus(resp, err)
+	}
+}
+
+func redactSecretBody(resp *http.Response, plan *secretRedaction, onRefuse func(error)) error {
 	body, err := decodedBody(resp)
 	if err != nil {
-		replaceWithStatus(resp, err)
-		return
+		return err
 	}
 	if mt, _, err := mime.ParseMediaType(resp.Header.Get(headerContentType)); err != nil || mt != contentTypeJSON {
 		_ = body.Close()
-		replaceWithStatus(resp, fmt.Errorf("content type %q is not JSON", resp.Header.Get(headerContentType)))
-		return
+		return fmt.Errorf("content type %q is not JSON", resp.Header.Get(headerContentType))
 	}
 
 	if plan.verb == verbWatch && resp.StatusCode == http.StatusOK {
 		resp.Header.Set(headerContentType, contentTypeJSON)
 		resp.Header.Del(headerContentLength)
 		resp.ContentLength = -1
-		resp.Body = newWatchRedactor(body, plan.view)
-		return
+		resp.Body = newWatchRedactor(body, plan.view, onRefuse)
+		return nil
 	}
 
 	defer body.Close()
 	raw, err := io.ReadAll(io.LimitReader(body, maxSecretResponseBytes+1))
 	if err != nil {
-		replaceWithStatus(resp, fmt.Errorf("reading the body: %w", err))
-		return
+		return fmt.Errorf("reading the body: %w", err)
 	}
 	if len(raw) > maxSecretResponseBytes {
-		replaceWithStatus(resp, fmt.Errorf("the body exceeds %d bytes", maxSecretResponseBytes))
-		return
+		return fmt.Errorf("the body exceeds %d bytes", maxSecretResponseBytes)
 	}
 	out, err := redactSecretJSON(raw, plan.view)
 	if err != nil {
-		replaceWithStatus(resp, err)
-		return
+		return err
 	}
 	setBody(resp, out)
+	return nil
 }
 
 // decodedBody returns resp's body without its content encoding.
@@ -445,17 +450,18 @@ func secretDataKeys(obj map[string]any) []string {
 // maxWatchEventBytes, ends the stream with an ERROR event carrying a Status, as the API server
 // ends a failed watch.
 type watchRedactor struct {
-	src     io.ReadCloser
-	scanner *bufio.Scanner
-	view    secretView
-	buf     bytes.Buffer
-	err     error
+	src      io.ReadCloser
+	scanner  *bufio.Scanner
+	view     secretView
+	onRefuse func(error)
+	buf      bytes.Buffer
+	err      error
 }
 
-func newWatchRedactor(src io.ReadCloser, view secretView) io.ReadCloser {
+func newWatchRedactor(src io.ReadCloser, view secretView, onRefuse func(error)) io.ReadCloser {
 	scanner := bufio.NewScanner(src)
 	scanner.Buffer(nil, maxWatchEventBytes)
-	return &watchRedactor{src: src, scanner: scanner, view: view}
+	return &watchRedactor{src: src, scanner: scanner, view: view, onRefuse: onRefuse}
 }
 
 func (w *watchRedactor) Read(p []byte) (int, error) {
@@ -503,6 +509,7 @@ func (w *watchRedactor) next() {
 }
 
 func (w *watchRedactor) fail(cause error) {
+	w.onRefuse(cause)
 	_, status := statusBody(http.StatusBadGateway, metav1.StatusReasonInternalError, fmt.Sprintf(redactionFailed, cause))
 	w.write(map[string]any{fieldType: watchEventError, fieldObject: json.RawMessage(status)})
 	w.err = io.EOF

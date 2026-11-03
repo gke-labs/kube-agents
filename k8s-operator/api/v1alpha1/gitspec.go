@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -79,6 +80,9 @@ type ResolvedForge struct {
 	Scheme string
 	// Port is the declared port, zero when none was declared.
 	Port int32
+	// Identity is the declared login the forge's credential acts as, or
+	// empty.
+	Identity string
 }
 
 // ResolvedRepository is one declared repository.
@@ -171,6 +175,7 @@ func resolveLists(forges []ForgeSpec, repositories []RepositorySpec) *ResolvedIn
 			Namespace:        strings.TrimSpace(f.Namespace),
 			Scheme:           strings.ToLower(strings.TrimSpace(f.Scheme)),
 			Port:             f.Port,
+			Identity:         strings.TrimSpace(f.Identity),
 		}
 		if f.CredentialsRef != nil {
 			forge.CredentialsSecret = strings.TrimSpace(f.CredentialsRef.Name)
@@ -258,6 +263,9 @@ func (f *ResolvedForge) problems() []forgeProblem {
 	if err := f.caBundleProblem(provider); err != nil {
 		out = append(out, forgeProblem{gitCABundleField, f.CABundleSecret, err})
 	}
+	if err := f.identityProblem(provider); err != nil {
+		out = append(out, forgeProblem{gitIdentityField, f.Identity, err})
+	}
 	return out
 }
 
@@ -279,7 +287,7 @@ func (f *ResolvedForge) providerProblem() error {
 	if gitProviders[GitProviderGitHub].ValidateHost(host) != nil {
 		return nil
 	}
-	return fmt.Errorf("the forge at host %q names no provider; name it: github for a GitHub Enterprise Server, gitlab for a GitLab instance", f.Host)
+	return fmt.Errorf("the forge at host %q names no provider; name it: github for a GitHub Enterprise Server, gitlab for a GitLab instance, bitbucket-datacenter for a Bitbucket Data Center instance", f.Host)
 }
 
 // usable reports whether a forge can be served: its own fields are valid, and
@@ -500,6 +508,37 @@ func (f *ResolvedForge) RepoURL(ref RepoRef) string {
 	}
 	return f.EffectiveScheme() + schemeSeparator + authority + pathSeparator + ref.Path
 }
+
+// identityProblem is why a forge's identity cannot be used, or nil.
+//
+// A provider whose broker does not read the field refuses it, as
+// caBundleProblem refuses a CA bundle nothing reads: GitHub and GitLab name
+// the token's account through their own API, and a declared login there
+// would look like a setting that the ownership checks use. The value is held
+// to the broker's rule (providers/registry.py): one login, with no space.
+func (f *ResolvedForge) identityProblem(provider *GitProvider) error {
+	if f.Identity == "" {
+		return nil
+	}
+	if !provider.AcceptsIdentity {
+		return fmt.Errorf("provider %s does not read identity: its API names the account the credential acts as", provider.Name)
+	}
+	if !forgeIdentityRegex.MatchString(f.Identity) {
+		return fmt.Errorf("identity %q is not one login: letters, digits and . _ @ + - { }, with no space, at most %d characters", f.Identity, MaxForgeIdentityLength)
+	}
+	if provider.IdentityPattern != nil && !provider.IdentityPattern.MatchString(f.Identity) {
+		return fmt.Errorf("identity %q is not an account UUID; a %s forge compares authors by the UUID of the account, such as {0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}", f.Identity, provider.Name)
+	}
+	return nil
+}
+
+// MaxForgeIdentityLength bounds a forge's identity, as the broker does.
+const MaxForgeIdentityLength = 255
+
+// forgeIdentityRegex is the broker's rule for a login (providers/registry.py
+// `_IDENTITY_RE`): a Bitbucket Cloud account UUID keeps its braces, and a
+// Data Center username may hold `@`.
+var forgeIdentityRegex = regexp.MustCompile(`^[A-Za-z0-9._@+{}-]{1,255}$`)
 
 // credentialsProblem is why a forge whose provider needs an administrator's
 // credential cannot be served, or nil. Without the Secret the broker has no
@@ -796,6 +835,7 @@ const (
 	gitCABundleField      = "caBundleRef"
 	gitSchemeField        = "scheme"
 	gitPortField          = "port"
+	gitIdentityField      = "identity"
 	gitRepositoryField    = "repository"
 	gitRepoForgeField     = "forge"
 	gitRepoRoleField      = "role"
@@ -1224,6 +1264,9 @@ type BrokerForge struct {
 	// AllowedPaths is never empty on an entry BrokerForges makes for a
 	// credentialed forge, and absent on GitHub's, whose minter scopes it.
 	AllowedPaths []string `json:"allowedPaths,omitempty"`
+	// Identity is the login the forge's credential acts as, when the forge
+	// declares one. The broker answers it for `identity` with no call.
+	Identity string `json:"identity,omitempty"`
 }
 
 // BrokerForges is the forge configuration this declaration hands the
@@ -1280,6 +1323,7 @@ func (ri *ResolvedIntegration) BrokerForges(tokenDir, caDir string) []BrokerForg
 			TokenPath:         tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsTokenKey,
 			ReadTokenPath:     tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsReadTokenKey,
 			AllowedPaths:      allowed,
+			Identity:          f.Identity,
 		}
 		if f.Scheme != "" && f.Scheme != DefaultForgeScheme {
 			entry.Scheme = f.Scheme
