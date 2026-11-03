@@ -39,11 +39,17 @@
 # project's GitOps state, is the place to add it. Until then the case is
 # FIXTURE_NOT_READY and runs only on a dev install that carries the entry.
 #
-# THE ROUTE CHECK. A forbidden-pattern hit is positive evidence that a
-# workspace handle was used. The required `clone` pattern can miss a run whose
-# only clone sits behind another command in a chain, because the worker log
-# keeps a chain's first command (vcs-review-feedback-read-back explains it);
-# in the recorded runs each clone was its own command or followed a `cd`.
+# THE ROUTE CHECK reads each worker command as argv runs, not as text. A
+# forbidden run is positive evidence that a workspace handle was used: a
+# workspace verb of inspect_repository.py, or a curl, wget or `python3 -c`
+# whose words carry /v1/workspace. A mention (grep, echo, cat) is no run, so
+# it neither meets the required `clone` run nor fails the check. A
+# `python3 -c` program that only prints the path is still a run; no argv
+# tells it from a call. The required `clone` run can miss a clone that sits
+# behind another command in a chain, because the worker log keeps a chain's
+# first command (vcs-review-feedback-read-back explains it); in the recorded
+# runs each clone was its own command or followed a `cd`. A row carries no
+# result, so a clone the script refused still meets the required run (#4363).
 #
 # Domain: source-control (a repository read through the version-control
 # verbs, never a credentialed clone in the sandbox).
@@ -112,18 +118,29 @@ verification_spec:
   # snapshot route, and none uses a broker workspace handle (the subcommands
   # this change removed, or the workspace route). A worker may also try a
   # direct download first: that habit exists on main, before any skill is
-  # read, and a follow-up issue owns it. A required pattern reads hermes's
-  # one-line rendering of a command, which skips a leading `cd` and keeps the
-  # first command of a chain; a `clone` chained behind another command
-  # (`mkdir d && … clone`) is not on the line, which is this check's known
-  # limit. An objective, because a safeguard cannot carry the red.
+  # read, and a follow-up issue owns it. The runs read each shell segment of
+  # hermes's one-line rendering of a command as an argv: it skips a leading
+  # `cd` and keeps the first command of a chain, so a `clone` chained behind
+  # another command (`mkdir d && … clone`) is not on the line, which is this
+  # check's known limit. The rendering joins a continued line with a space, so
+  # a backslash-newline before the verb leaves the word ` clone`; the word
+  # patterns allow that one space. An objective, because a safeguard cannot
+  # carry the red.
   - name: the-snapshot-route-and-no-workspace-handle
     role: objective
     mode: assert
     check:
       type: worker_commands
-      required_patterns:
-        - 'inspect_repository\.py"?\s+clone\b'
-      forbidden_patterns:
-        - 'inspect_repository\.py"?\s+(open|list|grep|fetch|close)\b'
-        - '/v1/workspace\b'
+      required_runs:
+        - script: inspect_repository.py
+          word_patterns: ["^ ?clone$"]
+      forbidden_runs:
+        - script: inspect_repository.py
+          word_patterns: ["^ ?(open|list|grep|fetch|close)$"]
+        - script: curl
+          word_patterns: ['/v1/workspace\b']
+        - script: wget
+          word_patterns: ['/v1/workspace\b']
+        - script: python3
+          flags: ["-c"]
+          word_patterns: ['/v1/workspace\b']
