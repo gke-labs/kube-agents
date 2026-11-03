@@ -903,7 +903,11 @@ places it by the map that replica holds. A connection placed by the previous map
 that map's account until it next reconnects. So a running bus moves to a new config only
 once every callout replica is on the current spec and no pod of an older ReplicaSet is left
 (`a2aBusWaitsForCallout`). The config Secret waits with the StatefulSet, and the callout is
-reconciled ahead of both. A fresh install is not held, since there is no running bus.
+reconciled ahead of both. A fresh install is not held, since there is no running bus. The
+wait is bounded. A rollout the Deployment controller has given up on (its progress deadline,
+600s by default) does not hold the bus, because the config can carry a credential repair or a
+key change. Only pods an older ReplicaSet of the callout controls are counted, and a
+terminating one only until its deletion deadline.
 While the bus waits, a reconnect is placed by the current map, which can name an account the
 running config does not have yet. That connection is refused until the bus moves, which
 fails closed.

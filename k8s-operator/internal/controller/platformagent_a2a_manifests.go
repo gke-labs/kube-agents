@@ -6318,31 +6318,76 @@ func (r *PlatformAgentReconciler) a2aCalloutHasOlderPods(ctx context.Context, de
 	// The current ReplicaSet is the newest one: a2aCalloutFullyRolledOut
 	// has already required the Deployment controller to have observed the
 	// current spec, and it stamps each new ReplicaSet with the next revision.
-	current, newest := "", int64(0)
+	var current *appsv1.ReplicaSet
+	owned := map[types.UID]bool{}
+	newest := int64(0)
 	for i := range sets.Items {
 		rs := &sets.Items[i]
 		if !metav1.IsControlledBy(rs, dep) {
 			continue
 		}
+		owned[rs.UID] = true
 		revision, err := strconv.ParseInt(rs.Annotations[a2aDeploymentRevisionAnnotation], 10, 64)
 		if err == nil && revision > newest {
-			current, newest = rs.Labels[appsv1.DefaultDeploymentUniqueLabelKey], revision
+			current, newest = rs, revision
 		}
 	}
-	if current == "" {
+	if current == nil {
 		return true, nil
 	}
 	pods := &corev1.PodList{}
 	if err := r.a2aReader().List(ctx, pods, inNamespace...); err != nil {
 		return false, err
 	}
-	for _, pod := range pods.Items {
-		if pod.Labels[appsv1.DefaultDeploymentUniqueLabelKey] != current {
-			return true, nil
+	now := a2aBusGateNow()
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		// Only the callout's own pods count: one an older ReplicaSet of
+		// this Deployment controls. A pod that merely carries the labels
+		// cannot hold the bus.
+		ref := metav1.GetControllerOf(pod)
+		if ref == nil || !owned[ref.UID] || ref.UID == current.UID {
+			continue
 		}
+		// A finished pod answers nothing. A terminating one answers until
+		// the kubelet kills it, which is its deletion timestamp; past that
+		// (with a little slack for the kill) it is not counted, so a pod
+		// stuck on a finalizer cannot hold the bus.
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if pod.DeletionTimestamp != nil && now.After(pod.DeletionTimestamp.Add(a2aTerminatingCalloutSlack)) {
+			continue
+		}
+		return true, nil
 	}
 	return false, nil
 }
+
+// a2aTerminatingCalloutSlack is how long past its deletion timestamp a
+// terminating callout pod is still taken to be answering.
+const a2aTerminatingCalloutSlack = 10 * time.Second
+
+// a2aBusGateNow is the clock a2aCalloutHasOlderPods reads; tests set it.
+var a2aBusGateNow = time.Now
+
+// a2aCalloutRolloutStalled reports whether the Deployment controller has given
+// up on the callout's rollout (Progressing False, ProgressDeadlineExceeded).
+// The bus does not wait on a rollout that has stopped: its config can carry a
+// credential repair or a key change, and those should not wait on a callout
+// that will not finish.
+func a2aCalloutRolloutStalled(dep *appsv1.Deployment) bool {
+	for _, c := range dep.Status.Conditions {
+		if c.Type == appsv1.DeploymentProgressing && c.Status == corev1.ConditionFalse && c.Reason == a2aProgressDeadlineExceeded {
+			return true
+		}
+	}
+	return false
+}
+
+// a2aProgressDeadlineExceeded is the Deployment controller's reason on a
+// rollout that passed its progressDeadlineSeconds.
+const a2aProgressDeadlineExceeded = "ProgressDeadlineExceeded"
 
 // a2aDeploymentRevisionAnnotation is the Deployment controller's revision
 // stamp on each ReplicaSet it creates.
@@ -6357,7 +6402,9 @@ const a2aDeploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
 // may name an account the running config does not have yet; that refusal
 // lasts until the bus moves, and is the direction this gate prefers to a
 // connection placed by the previous map that would stay there until it next
-// reconnects.
+// reconnects. A rollout the Deployment controller has given up on
+// (a2aCalloutRolloutStalled) does not hold it, so the wait is bounded by the
+// callout's progress deadline.
 func (r *PlatformAgentReconciler) a2aBusWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, calloutGeneration int64) (bool, error) {
 	live := &appsv1.StatefulSet{}
 	err := r.Get(ctx, client.ObjectKeyFromObject(sts), live)
@@ -6381,6 +6428,11 @@ func (r *PlatformAgentReconciler) a2aBusWaitsForCallout(ctx context.Context, age
 			return true, nil
 		}
 		return false, err
+	}
+	if a2aCalloutRolloutStalled(callout) {
+		logf.FromContext(ctx).Info("not holding the A2A bus for the auth callout: its rollout passed its progress deadline",
+			"callout", callout.Name)
+		return false, nil
 	}
 	if !a2aCalloutFullyRolledOut(callout, calloutGeneration) {
 		return true, nil

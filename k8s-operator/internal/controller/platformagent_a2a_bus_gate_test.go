@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -29,7 +30,7 @@ import (
 // calloutReplicaSet is a ReplicaSet the Deployment controller would have made
 // for the callout: controlled by it, carrying its selector and the given
 // template hash and revision.
-func calloutReplicaSet(t *testing.T, ctx context.Context, cl client.Client, dep *appsv1.Deployment, hash, revision string) {
+func calloutReplicaSet(t *testing.T, ctx context.Context, cl client.Client, dep *appsv1.Deployment, hash, revision string) *appsv1.ReplicaSet {
 	t.Helper()
 	labels := map[string]string{appsv1.DefaultDeploymentUniqueLabelKey: hash}
 	for k, v := range dep.Spec.Selector.MatchLabels {
@@ -48,13 +49,18 @@ func calloutReplicaSet(t *testing.T, ctx context.Context, cl client.Client, dep 
 	if err := cl.Create(ctx, rs); err != nil {
 		t.Fatalf("create callout ReplicaSet %s: %v", rs.Name, err)
 	}
+	return rs
 }
 
-// calloutPod is a callout pod on the template with the given hash. A pod
+// calloutPod is a callout pod controlled by rs, on its template hash; a nil rs
+// is a pod that only carries the labels, with hash as its template hash. A pod
 // created with a finalizer and then deleted stays listed, terminating, the way
 // a real one does through its grace period.
-func calloutPod(t *testing.T, ctx context.Context, cl client.Client, dep *appsv1.Deployment, name, hash string, terminating bool) *corev1.Pod {
+func calloutPod(t *testing.T, ctx context.Context, cl client.Client, dep *appsv1.Deployment, rs *appsv1.ReplicaSet, name, hash string, terminating bool) *corev1.Pod {
 	t.Helper()
+	if rs != nil {
+		hash = rs.Labels[appsv1.DefaultDeploymentUniqueLabelKey]
+	}
 	labels := map[string]string{appsv1.DefaultDeploymentUniqueLabelKey: hash}
 	for k, v := range dep.Spec.Selector.MatchLabels {
 		labels[k] = v
@@ -62,6 +68,9 @@ func calloutPod(t *testing.T, ctx context.Context, cl client.Client, dep *appsv1
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: dep.Namespace, Labels: labels},
 		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "callout", Image: "callout"}}},
+	}
+	if rs != nil {
+		pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(rs, appsv1.SchemeGroupVersion.WithKind("ReplicaSet"))}
 	}
 	if terminating {
 		pod.Finalizers = []string{"test.kubeagents.x-k8s.io/terminating"}
@@ -86,9 +95,9 @@ func theCalloutIsRolledOut(t *testing.T, ctx context.Context, cl client.Client, 
 	t.Helper()
 	reportCalloutServing(t, ctx, cl, agent)
 	dep := getCallout(t, ctx, cl, agent)
-	calloutReplicaSet(t, ctx, cl, dep, "steady", "1")
+	rs := calloutReplicaSet(t, ctx, cl, dep, "steady", "1")
 	for i := int32(0); i < ptr.Deref(dep.Spec.Replicas, 1); i++ {
-		calloutPod(t, ctx, cl, dep, fmt.Sprintf("callout-steady-%d", i), "steady", false)
+		calloutPod(t, ctx, cl, dep, rs, fmt.Sprintf("callout-steady-%d", i), "", false)
 	}
 }
 
@@ -187,9 +196,9 @@ func TestAChangedBusConfigWaitsForTheWholeCalloutRollout(t *testing.T) {
 	if replicas < 2 {
 		t.Fatalf("the callout renders at %d replicas; the mid-roll states below need two", replicas)
 	}
-	calloutReplicaSet(t, ctx, cl, dep, "old", "1")
-	calloutPod(t, ctx, cl, dep, "callout-old-0", "old", false)
-	old1 := calloutPod(t, ctx, cl, dep, "callout-old-1", "old", false)
+	oldRS := calloutReplicaSet(t, ctx, cl, dep, "old", "1")
+	calloutPod(t, ctx, cl, dep, oldRS, "callout-old-0", "", false)
+	old1 := calloutPod(t, ctx, cl, dep, oldRS, "callout-old-1", "", false)
 	completeTheProvisionJob(t, ctx, cl, agent)
 	settled := busGatePass(t, ctx, r, req, "settled")
 	rendered := busConfigHash(t, ctx, cl, agent)
@@ -215,7 +224,7 @@ func TestAChangedBusConfigWaitsForTheWholeCalloutRollout(t *testing.T) {
 	// ReplicaSet is still terminating, and still subscribed.
 	reportCalloutServing(t, ctx, cl, agent)
 	dep = getCallout(t, ctx, cl, agent)
-	calloutReplicaSet(t, ctx, cl, dep, "new", "2")
+	newRS := calloutReplicaSet(t, ctx, cl, dep, "new", "2")
 	if err := cl.Delete(ctx, old1); err != nil {
 		t.Fatalf("delete callout-old-1: %v", err)
 	}
@@ -226,9 +235,12 @@ func TestAChangedBusConfigWaitsForTheWholeCalloutRollout(t *testing.T) {
 	if err := cl.Delete(ctx, old0); err != nil {
 		t.Fatalf("delete callout-old-0: %v", err)
 	}
-	calloutPod(t, ctx, cl, dep, "callout-new-0", "new", false)
-	calloutPod(t, ctx, cl, dep, "callout-new-1", "new", false)
-	stale := calloutPod(t, ctx, cl, dep, "callout-old-2", "old", true)
+	calloutPod(t, ctx, cl, dep, newRS, "callout-new-0", "", false)
+	calloutPod(t, ctx, cl, dep, newRS, "callout-new-1", "", false)
+	// A pod that only carries the callout's labels, on an old hash, does
+	// not count.
+	calloutPod(t, ctx, cl, dep, nil, "lookalike", "old", false)
+	stale := calloutPod(t, ctx, cl, dep, oldRS, "callout-old-2", "", true)
 	completeTheProvisionJob(t, ctx, cl, agent)
 	busGatePass(t, ctx, r, req, "an old pod terminating")
 	if got := busConfigHash(t, ctx, cl, agent); got != "previous" {
@@ -278,5 +290,78 @@ func TestACalloutIsFullyRolledOutOnlyWithEveryReplicaOnTheCurrentSpec(t *testing
 		if got := a2aCalloutFullyRolledOut(tc.dep, tc.applied); got != tc.want {
 			t.Errorf("%s: a2aCalloutFullyRolledOut = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// The bounds on the wait. Older pods that answer nothing do not hold the bus:
+// one stuck terminating past its deletion deadline, one finished, one that is
+// only labelled like the callout. A rollout the Deployment controller has
+// given up on does not hold it either, so a credential repair or a key change
+// in the bus's config waits at most the callout's progress deadline.
+func TestTheBusWaitIsBoundedByWhatCanStillAnswer(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		busGatePass(t, ctx, r, req, "install")
+	}
+	reportCalloutServing(t, ctx, cl, agent)
+	dep := getCallout(t, ctx, cl, agent)
+	oldRS := calloutReplicaSet(t, ctx, cl, dep, "old", "1")
+	newRS := calloutReplicaSet(t, ctx, cl, dep, "new", "2")
+	for i := int32(0); i < ptr.Deref(dep.Spec.Replicas, 1); i++ {
+		calloutPod(t, ctx, cl, dep, newRS, fmt.Sprintf("callout-new-%d", i), "", false)
+	}
+	stuck := calloutPod(t, ctx, cl, dep, oldRS, "callout-old-stuck", "", true)
+	sts := buildA2ANATSStatefulSet(agent, "next")
+
+	holds := func(what string) bool {
+		t.Helper()
+		held, err := r.a2aBusWaitsForCallout(ctx, agent, sts, 0)
+		if err != nil {
+			t.Fatalf("a2aBusWaitsForCallout (%s): %v", what, err)
+		}
+		return held
+	}
+	if !holds("a pod of the old ReplicaSet terminating, inside its deadline") {
+		t.Fatal("the rig does not hold to begin with; the cases below would pass on nothing")
+	}
+
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(stuck), stuck); err != nil {
+		t.Fatalf("get the stuck pod: %v", err)
+	}
+	past := stuck.DeletionTimestamp.Add(a2aTerminatingCalloutSlack + time.Second)
+	defer func(was func() time.Time) { a2aBusGateNow = was }(a2aBusGateNow)
+	a2aBusGateNow = func() time.Time { return past }
+	if holds("the old pod past its deletion deadline") {
+		t.Error("a pod past its deletion deadline held the bus; a finalizer could pin it")
+	}
+	a2aBusGateNow = time.Now
+
+	stuck.Finalizers = nil
+	if err := cl.Update(ctx, stuck); err != nil {
+		t.Fatalf("finish the stuck pod: %v", err)
+	}
+	done := calloutPod(t, ctx, cl, dep, oldRS, "callout-old-done", "", false)
+	done.Status.Phase = corev1.PodFailed
+	if err := cl.Status().Update(ctx, done); err != nil {
+		t.Fatalf("mark callout-old-done failed: %v", err)
+	}
+	calloutPod(t, ctx, cl, dep, nil, "lookalike", "old", false)
+	if holds("a failed old pod and a look-alike") {
+		t.Error("a finished pod or a pod that only carries the callout's labels held the bus")
+	}
+
+	live := calloutPod(t, ctx, cl, dep, oldRS, "callout-old-live", "", false)
+	if !holds("a running pod of the old ReplicaSet") {
+		t.Fatalf("a running pod of the old ReplicaSet (%s) did not hold the bus", live.Name)
+	}
+	dep = getCallout(t, ctx, cl, agent)
+	dep.Status.Conditions = []appsv1.DeploymentCondition{{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionFalse, Reason: a2aProgressDeadlineExceeded}}
+	if err := cl.Status().Update(ctx, dep); err != nil {
+		t.Fatalf("report the callout rollout stalled: %v", err)
+	}
+	if holds("a stalled callout rollout") {
+		t.Error("a callout rollout past its progress deadline held the bus; its config could be carrying a credential repair")
 	}
 }
