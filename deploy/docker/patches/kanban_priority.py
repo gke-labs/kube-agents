@@ -103,10 +103,16 @@ BACKGROUND_SESSION_PREFIXES = ("k8s-evt-", "cron-")
 
 #: Where the chat session_store plugin publishes the Hermes session id it binds
 #: for a gateway turn (agents/chat/defaults/plugins/session_store/turn_context.py
-#: TURN_CONTEXT_MODULE), the fallback when the turn's session context lacks
-#: GATEWAY_SESSION_ENV.
+#: TURN_CONTEXT_MODULE), the fallback when the turn's session context has no
+#: session id.
 TURN_CONTEXT_MODULE = "kube_agents_turn_context"
-GATEWAY_SESSION_ENV = "HERMES_SESSION_ID"
+#: Hermes' per-turn session context (pinned ``gateway/session_context.py``): the
+#: ``HERMES_SESSION_ID`` ContextVar, and the sentinel it holds when nothing in
+#: this task bound it. Read directly, because ``get_session_env`` falls back to
+#: ``os.environ``, which Hermes writes process-wide for every root agent.
+SESSION_CONTEXT_MODULE = "gateway.session_context"
+SESSION_ID_VAR_ATTR = "_SESSION_ID"
+SESSION_UNSET_ATTR = "_UNSET"
 
 
 def is_background_session(session_id: object) -> bool:
@@ -134,12 +140,14 @@ def trusted_origin_session() -> str:
     request-scoped ``HERMES_SESSION_CHAT_ID`` of an ``api_server`` turn, which
     is where event triage (``k8s-evt-...``) and cron relays (``cron-...``) run.
     It reads the gateway's ContextVars, not anything the model passed. On a
-    gateway platform turn that id is empty, so the turn's ``HERMES_SESSION_ID``
-    from Hermes' per-turn session context is read next. The Hermes session id
-    the session_store plugin bound at dispatch is the fallback for a turn whose
-    session context lacks it, and the process env is the last resort. The
-    session context goes first because an internal event returns before
-    ``pre_gateway_dispatch`` and so carries the previous turn's binding.
+    gateway platform turn that id is empty, so the turn's session id from
+    Hermes' per-turn session context is read next. The Hermes session id the
+    session_store plugin bound at dispatch is the fallback for a turn whose
+    session context lacks it; with none of these, ``""``. The session context
+    goes first because an internal event returns before
+    ``pre_gateway_dispatch`` and so carries the previous turn's binding. The
+    process env's ``HERMES_SESSION_ID`` is never read: Hermes writes it for
+    every root agent in the gateway, so it names the last turn, not this one.
     """
     try:
         from tools.async_delegation import _current_origin_session_id
@@ -149,7 +157,7 @@ def trusted_origin_session() -> str:
         api_session = ""
     if api_session:
         return api_session
-    session_context_id = _session_context_env(GATEWAY_SESSION_ENV)
+    session_context_id = _session_context_id()
     if session_context_id:
         return session_context_id
     turn_context = sys.modules.get(TURN_CONTEXT_MODULE)
@@ -160,17 +168,25 @@ def trusted_origin_session() -> str:
             bound = ""
         if bound:
             return bound
-    return os.environ.get(GATEWAY_SESSION_ENV, "")
+    return ""
 
 
-def _session_context_env(name: str) -> str:
-    """A ``HERMES_SESSION_*`` value from Hermes' per-turn session context, or ``""`` outside Hermes."""
+def _session_context_id() -> str:
+    """The session id bound in Hermes' per-turn session context, or ``""``.
+
+    ``""`` when this task never bound it, outside Hermes (tests), or on a Hermes
+    without the ContextVar.
+    """
     try:
-        from gateway.session_context import get_session_env
+        import importlib
 
-        return get_session_env(name, "") or ""
+        session_context = importlib.import_module(SESSION_CONTEXT_MODULE)
+        value = getattr(session_context, SESSION_ID_VAR_ATTR).get()
     except Exception:  # noqa: BLE001 — not inside Hermes (tests), or a Hermes without it
         return ""
+    if value is getattr(session_context, SESSION_UNSET_ATTR, None) or not isinstance(value, str):
+        return ""
+    return value
 
 
 def stamp_priority(

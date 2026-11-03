@@ -146,10 +146,29 @@ class StampTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"tools": SimpleNamespace(async_delegation=api), "tools.async_delegation": api}):
             self.assertEqual(EVENT_SESSION, contextvars.copy_context().run(gateway_turn))
 
-        # No plugin loaded in this process: the gateway's session env.
+        # No plugin loaded and no session context bound: no session, whatever
+        # the process env holds.
         with mock.patch.dict(sys.modules), mock.patch.dict(os.environ, {"HERMES_SESSION_ID": GATEWAY_SESSION}):
             sys.modules.pop(turn_context.TURN_CONTEXT_MODULE, None)
-            self.assertEqual(GATEWAY_SESSION, kp.trusted_origin_session())
+            self.assertEqual("", kp.trusted_origin_session())
+
+    def _session_context(self, bound=None):
+        """A stand-in for Hermes' ``gateway.session_context``: its ContextVar and sentinel.
+
+        ``get_session_env`` answers the stale process env, as Hermes' does when the
+        ContextVar is unset, so a reader that calls it fails these tests.
+        """
+        unset = object()
+        var = contextvars.ContextVar("HERMES_SESSION_ID", default=unset)
+        if bound is not None:
+            var.set(bound)
+        session_context = SimpleNamespace(
+            _SESSION_ID=var,
+            _UNSET=unset,
+            get_session_env=lambda name, default="": os.environ.get(name, default),
+        )
+        gateway = SimpleNamespace(session_context=session_context)
+        return mock.patch.dict(sys.modules, {"gateway": gateway, "gateway.session_context": session_context})
 
     def _turn_context(self):
         spec = importlib.util.spec_from_file_location("turn_context_under_test", TURN_CONTEXT)
@@ -159,16 +178,12 @@ class StampTest(unittest.TestCase):
 
     def test_an_empty_binding_falls_to_the_turns_session_context(self):
         turn_context = self._turn_context()
-        session_context = SimpleNamespace(
-            get_session_env=lambda name, default="": GATEWAY_SESSION if name == "HERMES_SESSION_ID" else default
-        )
-        gateway = SimpleNamespace(session_context=session_context)
 
         def turn():
             turn_context.bind_session("")
             return kp.trusted_origin_session()
 
-        with mock.patch.dict(sys.modules, {"gateway": gateway, "gateway.session_context": session_context}), \
+        with self._session_context(bound=GATEWAY_SESSION), \
                 mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "process-wide-stale"}):
             self.assertEqual(GATEWAY_SESSION, contextvars.copy_context().run(turn))
 
@@ -176,19 +191,15 @@ class StampTest(unittest.TestCase):
         # An internal event skips pre_gateway_dispatch, so it inherits the
         # previous turn's binding; its own session context names the right id.
         turn_context = self._turn_context()
-        session_context = SimpleNamespace(
-            get_session_env=lambda name, default="": GATEWAY_SESSION if name == "HERMES_SESSION_ID" else default
-        )
-        gateway = SimpleNamespace(session_context=session_context)
 
         def internal_turn():
             turn_context.bind_session("20261008_090000_stale000")
             return kp.trusted_origin_session()
 
-        with mock.patch.dict(sys.modules, {"gateway": gateway, "gateway.session_context": session_context}):
+        with self._session_context(bound=GATEWAY_SESSION):
             self.assertEqual(GATEWAY_SESSION, contextvars.copy_context().run(internal_turn))
 
-    def test_no_binding_and_no_session_env_is_no_session(self):
+    def test_no_binding_and_no_session_context_is_no_session(self):
         turn_context = self._turn_context()
 
         def turn():
@@ -196,8 +207,24 @@ class StampTest(unittest.TestCase):
             return kp.trusted_origin_session()
 
         env = {k: v for k, v in os.environ.items() if k != "HERMES_SESSION_ID"}
-        with mock.patch.dict(os.environ, env, clear=True):
+        with mock.patch.dict(os.environ, env, clear=True), self._session_context():
             self.assertEqual("", contextvars.copy_context().run(turn))
+
+    def test_a_stale_process_env_session_id_is_ignored(self):
+        # Hermes writes os.environ["HERMES_SESSION_ID"] for every root agent in
+        # the gateway, so outside a bound turn it names the last turn's session.
+        turn_context = self._turn_context()
+
+        def unbound():
+            turn_context.bind_session("")
+            return kp.trusted_origin_session()
+
+        with mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "20261103_090000_lastturn"}):
+            with self._session_context():
+                self.assertEqual("", contextvars.copy_context().run(unbound), "unset ContextVar")
+            with self._session_context(bound=""):
+                self.assertEqual("", contextvars.copy_context().run(unbound), "cleared ContextVar")
+            self.assertEqual("", contextvars.copy_context().run(unbound), "no Hermes session context")
 
     def test_the_class_boundary_is_the_floor(self):
         self.assertTrue(kp.is_user_priority(kp.USER_PRIORITY))
