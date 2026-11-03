@@ -617,6 +617,8 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	g.startFeedback(ctx)
 
 	var sub lib.Subscription
+	// bindErr is a held-back bind's failure, which ends the run.
+	var bindErr error
 	bound := make(chan struct{})
 	if o.RelayBindDelay <= 0 {
 		var err error
@@ -635,6 +637,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 			}
 			s, err := g.bindRelay(ctx)
 			if err != nil {
+				bindErr = err
 				cancel(err)
 				return
 			}
@@ -668,8 +671,12 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	// turn whose queue is full); per-conversation order is the queue's job,
 	// not the backend's.
 	err := g.adapter.Run(ctx, g.enqueueInbound)
-	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
-		return cause
+	// Ingress has stopped, so a bind still held back won't happen; once the
+	// bind goroutine is done, bindErr is safe to read.
+	cancel(nil)
+	<-bound
+	if bindErr != nil {
+		return bindErr
 	}
 	return err
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,6 +101,9 @@ func runCampaign(t *testing.T, cs kubernetes.Interface, identity string) *campai
 		c.done <- e.Run(ctx, c.leader, func(ctx context.Context, o RunOptions) error {
 			c.leading <- o
 			<-ctx.Done()
+			// A stop takes a while (the relay's drain): long enough for a
+			// release that didn't wait for it to land.
+			time.Sleep(3 * testRetryPeriod)
 			c.holderAtStop <- leaseHolder(t, cs)
 			c.stopped <- o.StopDrain()
 			return nil
@@ -267,21 +271,75 @@ func TestAFencedWriteStepsTheGatewayDown(t *testing.T) {
 	}
 }
 
+// failRenewalsOf makes identity's own lease writes fail once the returned
+// switch is on, as an unreachable API server would; a release (no holder)
+// and another holder's write still go through. It's installed before the
+// campaign starts, since the fake's reactor chain isn't safe to change
+// under a running elector.
+func failRenewalsOf(cs *fake.Clientset, identity string) *atomic.Bool {
+	var failing atomic.Bool
+	cs.PrependReactor("update", "leases", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if !failing.Load() {
+			return false, nil, nil
+		}
+		lease, ok := a.(k8stesting.UpdateAction).GetObject().(*coordinationv1.Lease)
+		if ok && lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity == identity {
+			return true, nil, errors.New("the API server is unreachable")
+		}
+		return false, nil, nil
+	})
+	return &failing
+}
+
 // TestLosingTheLeaseStepsDownWithTheShortDrain: a leader that can't renew
-// stops its work on the drain that fits before a standby can take over, and
-// Run reports the lost leadership.
+// stops its work on the drain that fits before a standby can take over,
+// still named the holder while it stops, gives the lease up only once its
+// work has stopped, and reports the lost leadership.
 func TestLosingTheLeaseStepsDownWithTheShortDrain(t *testing.T) {
 	cs := fake.NewClientset()
+	failing := failRenewalsOf(cs, "pod-a")
 	a := runCampaign(t, cs, "pod-a")
 	receive(t, a.leading, 5*time.Second, "pod-a leading")
-	cs.PrependReactor("update", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
-		return true, nil, errors.New("the API server is unreachable")
-	})
-	if d := receive(t, a.stopped, 3*testLeaseDuration, "pod-a stopping"); d != lostLeaseRelayDrain {
+	failing.Store(true)
+	if h := receive(t, a.holderAtStop, 3*testLeaseDuration, "pod-a stopping"); h != "pod-a" {
+		t.Fatalf("lease holder while pod-a stopped = %q, want pod-a: a release before the work stops lets a standby overlap it", h)
+	}
+	if d := receive(t, a.stopped, time.Second, "pod-a's drain"); d != lostLeaseRelayDrain {
 		t.Fatalf("drain after losing the lease = %s, want %s", d, lostLeaseRelayDrain)
 	}
 	if err := receive(t, a.done, 5*time.Second, "Run to return"); !errors.Is(err, ErrLeadershipLost) {
 		t.Fatalf("Run after losing the lease = %v, want ErrLeadershipLost", err)
+	}
+	if h := leaseHolder(t, cs); h != "" {
+		t.Fatalf("lease holder after pod-a stopped = %q, want it released", h)
+	}
+}
+
+// TestAFencedGatewayLeavesTheNewLeadersLeaseAlone: a deposed replica that
+// learns of the new term from a fenced write, before its stale view of the
+// lease catches up, must not clear the new leader's hold when it stops.
+func TestAFencedGatewayLeavesTheNewLeadersLeaseAlone(t *testing.T) {
+	cs := fake.NewClientset()
+	failing := failRenewalsOf(cs, "pod-a")
+	a := runCampaign(t, cs, "pod-a")
+	receive(t, a.leading, 5*time.Second, "pod-a leading")
+	// pod-a pauses; pod-b takes the lease meanwhile.
+	failing.Store(true)
+	lease, err := cs.CoordinationV1().Leases(testNamespace).Get(context.Background(), testLease, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := "pod-b"
+	lease.Spec.HolderIdentity = &holder
+	if _, err := cs.CoordinationV1().Leases(testNamespace).Update(context.Background(), lease, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	a.leader.fence()
+	if err := receive(t, a.done, 5*time.Second, "Run to return"); !errors.Is(err, ErrLeadershipLost) {
+		t.Fatalf("Run after a fenced write = %v, want ErrLeadershipLost", err)
+	}
+	if h := leaseHolder(t, cs); h != "pod-b" {
+		t.Fatalf("lease holder after the deposed replica stopped = %q, want pod-b's hold left alone", h)
 	}
 }
 

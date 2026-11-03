@@ -501,9 +501,16 @@ func TestARecordAboveTheCounterSaysTheCounterWasReset(t *testing.T) {
 	}
 	low := NewRegistry(r.client)
 	low.setEpoch(1)
+	stepped := false
+	low.SetOnFenced(func() { stepped = true })
 	err = low.Put(ctx, &SessionRecord{Key: key, Addressee: "after-reset"})
 	if !errors.Is(err, ErrFenced) || !strings.Contains(err.Error(), termKey) || !strings.Contains(err.Error(), "reset") {
 		t.Fatalf("Put under a reset counter = %v, want ErrFenced naming %s and the reset", err, termKey)
+	}
+	// No newer term exists, so the gateway doesn't step down over it: the
+	// next replica would be refused the same way.
+	if stepped {
+		t.Fatal("a reset counter stepped the gateway down")
 	}
 }
 
@@ -555,9 +562,14 @@ func TestANewTermBetweenTheReadsIsNotCalledAReset(t *testing.T) {
 			t.Errorf("new leader's Put: %v", err)
 		}
 	}
+	stepped := false
+	old.SetOnFenced(func() { stepped = true })
 	err := old.Put(ctx, &SessionRecord{Key: key, Addressee: "deposed"})
 	if !errors.Is(err, ErrFenced) || strings.Contains(err.Error(), "reset") {
 		t.Fatalf("deposed Put across a new term = %v, want ErrFenced without a reset", err)
+	}
+	if !stepped {
+		t.Fatal("a write fenced by a newer term didn't step the gateway down")
 	}
 }
 

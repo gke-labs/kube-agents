@@ -665,10 +665,12 @@ type Registry struct {
 	onFenced atomic.Pointer[func()]
 }
 
-// SetOnFenced sets what runs each time a write is refused with ErrFenced,
-// before the error goes back to the writer. The election steps down there:
-// a refused write means a newer term has started, so this gateway has been
-// deposed whether or not it has noticed the lease move yet.
+// SetOnFenced sets what runs each time a write is refused because a newer
+// term has started, before the error goes back to the writer. The election
+// steps down there: this gateway has been deposed, whether or not it has
+// noticed the lease move yet. A write refused by a counter reset below the
+// records (by hand) doesn't run it: no newer term exists, and stepping down
+// would only hand the same refusal to the next replica.
 func (r *Registry) SetOnFenced(f func()) {
 	r.onFenced.Store(&f)
 }
@@ -811,8 +813,11 @@ func (r *Registry) fencedRecord(ctx context.Context, kv jetstream.KeyValue, sess
 			// record above the counter as it stands now means the counter
 			// went backwards, by hand.
 			if now, _, rerr := readTerm(ctx, kv); rerr == nil && stored.Epoch > now {
-				return 0, r.fenced(fmt.Errorf("session %s carries term %d, above the term counter %s at %d (the counter was reset): %w",
-					sessionKey, stored.Epoch, termKey, now, ErrFenced))
+				// Not a newer term, so not a step-down: every replica would
+				// start a term under this record, be refused, and step down
+				// in turn. The write fails, naming the counter to fix.
+				return 0, fmt.Errorf("session %s carries term %d, above the term counter %s at %d (the counter was reset): %w",
+					sessionKey, stored.Epoch, termKey, now, ErrFenced)
 			}
 		}
 		return 0, r.fenced(fmt.Errorf("session %s: %w", sessionKey, ErrFenced))

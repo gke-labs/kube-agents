@@ -34,9 +34,14 @@ const (
 	// relayStopDrainTimeout, sized to the pod's grace period.
 	lostLeaseRelayDrain = 5 * time.Second
 
-	// relayAckWait is the relay durable's AckWait. The relay's subscription
-	// sets none, so it's the server's default.
+	// relayAckWait is the relay durable's AckWait. The relay creates or
+	// updates its durable with none on every bind, so it's always the
+	// server's default.
 	relayAckWait = 30 * time.Second
+
+	// releasedLeaseSeconds is the duration a released lease records, as
+	// client-go's own release writes it.
+	releasedLeaseSeconds = 1
 )
 
 // ErrLeadershipLost reports a gateway that stopped because it lost its
@@ -79,8 +84,8 @@ type Leader interface {
 // term and then calls lead, with the options an elected gateway runs with
 // (RunOptions), and a context that ends on SIGTERM (ctx), on losing the
 // lease, or on a write fenced by a newer term. The lease is released only
-// after lead returns, so a standby takes over from a gateway that has
-// stopped.
+// after lead returns and only if this replica still holds it, so a standby
+// takes over from a gateway that has stopped.
 //
 // Run returns nil when ctx ended, ErrLeadershipLost when the lease was lost
 // or a write was fenced, and otherwise the error that stopped lead.
@@ -102,12 +107,15 @@ func (e Election) Run(ctx context.Context, leader Leader, lead func(context.Cont
 	var result error
 	led := make(chan struct{})
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock:            lock,
-		Name:            e.Lease,
-		LeaseDuration:   orDefault(e.LeaseDuration, electionLeaseDuration),
-		RenewDeadline:   orDefault(e.RenewDeadline, electionRenewDeadline),
-		RetryPeriod:     orDefault(e.RetryPeriod, electionRetryPeriod),
-		ReleaseOnCancel: true,
+		Lock:          lock,
+		Name:          e.Lease,
+		LeaseDuration: orDefault(e.LeaseDuration, electionLeaseDuration),
+		RenewDeadline: orDefault(e.RenewDeadline, electionRenewDeadline),
+		RetryPeriod:   orDefault(e.RetryPeriod, electionRetryPeriod),
+		// Not client-go's release: it runs when renewing gives up, before the
+		// work has been told to stop, and on a stale view of who holds the
+		// lease. release below runs after both, on a fresh read.
+		ReleaseOnCancel: false,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(leaseCtx context.Context) {
 				defer close(led)
@@ -132,12 +140,49 @@ func (e Election) Run(ctx context.Context, leader Leader, lead func(context.Cont
 	}()
 	log.Info("gateway election: waiting for the lease", "lease", e.Lease, "identity", e.Identity)
 	elector.Run(electCtx)
-	// The elector returns as soon as a renewal fails, while the work is
-	// still stopping.
-	if lock.acquired() {
-		<-led
+	if !lock.acquired() {
+		return result
 	}
+	// The elector returns as soon as a renewal fails, while the work is
+	// still stopping; on the other paths the work has returned and stopped
+	// the elector. Either way nothing renews from here on.
+	<-led
+	e.release(lock, log)
 	return result
+}
+
+// release gives the lease up once the work has stopped, so a standby can
+// take it at once and knows nobody holds events. It writes only if a fresh
+// read still names this replica: after a lost lease or a fenced write
+// another replica usually holds it, and that holder must not be cleared.
+func (e Election) release(lock *observingLock, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), orDefault(e.RenewDeadline, electionRenewDeadline))
+	defer cancel()
+	rec, _, err := lock.Interface.Get(ctx)
+	if err != nil {
+		log.Warn("gateway election: lease not released: it couldn't be read; a standby takes it once it expires", "lease", e.Lease, "err", err)
+		return
+	}
+	if rec.HolderIdentity != e.Identity {
+		log.Info("gateway election: lease not released: another replica holds it", "lease", e.Lease, "holder", rec.HolderIdentity)
+		return
+	}
+	now := metav1.NewTime(time.Now())
+	// The record client-go's own release writes: no holder, and a duration
+	// of one second, so a standby that reads it takes the lease at once.
+	released := resourcelock.LeaderElectionRecord{
+		LeaderTransitions:    rec.LeaderTransitions,
+		LeaseDurationSeconds: releasedLeaseSeconds,
+		AcquireTime:          now,
+		RenewTime:            now,
+	}
+	// Update is conditional on the revision Get read, so a replica that
+	// took the lease in between isn't overwritten.
+	if err := lock.Interface.Update(ctx, released); err != nil {
+		log.Warn("gateway election: lease not released; a standby takes it once it expires", "lease", e.Lease, "err", err)
+		return
+	}
+	log.Info("gateway election: lease released", "lease", e.Lease)
 }
 
 // lead is one term: start it, run the work, and say why it ended.
