@@ -68,13 +68,15 @@ The trusted writers' stamp ticket
 Three in-pod writers know their card's origin better than their own context:
 the GitHub watcher gate (``issue`` on issue cards, ``scheduled`` on its
 pull-request follow-up cards), the drift backlog (``drift``) and the chat
-bootstrap (``chat``). None of them passes an origin value. Just before each
-create, the writer mints a one-time ticket for its origin with
-``POST /v1/board/stamp-tickets`` on the Session KV server (the pod's Session KV
-key; the drift backlog, which is that server, mints in-process) and hands the
-ticket to the create in :data:`STAMP_TICKET_ENV`: in the subprocess's
-environment for ``hermes kanban create``, in its own process's around
-``run_slash`` (:func:`writer_ticket`). Before the insert's transaction,
+bootstrap (``chat``). None of them passes an origin value. The drift backlog
+runs inside the Session KV server, so once its ``hermes kanban create``
+subprocess returns the id it stamps the card in the board directly, with the
+same ``INSERT OR IGNORE`` (the subprocess has no turn, so the insert left the
+card unstamped). The gate and the bootstrap run ``run_slash`` in their own
+process: just before each create they mint a one-time ticket for their origin
+with ``POST /v1/board/stamp-tickets`` on the Session KV server (the pod's
+Session KV key) and hand it to the create in :data:`STAMP_TICKET_ENV` around
+the call (:func:`writer_ticket`). Before the insert's transaction,
 :func:`wrap_create_task` redeems it over loopback
 (``POST /v1/board/stamp-tickets/{ticket}/redeem``, also with the pod's key) and
 the insert stamps the origin the server returns, exactly and in the insert's
@@ -237,10 +239,14 @@ def _cron_origin() -> Optional[tuple[str, str]]:
     current = getattr(scope, "current_cron_origin", None)
     if current is None:
         return None
-    found = current()
-    if not found:
+    try:
+        found = current()
+        if not found:
+            return None
+        origin, platform = found
+    except Exception as exc:  # noqa: BLE001 — an unreadable run context is no run
+        logger.warning("kanban origin: the cron run's origin is unreadable: %r", exc)
         return None
-    origin, platform = found
     return (origin, platform or "") if origin in ORIGINS else None
 
 
@@ -268,6 +274,9 @@ def _fetch_session_metadata(session_id: str) -> Optional[dict]:
         if exc.code != HTTP_NOT_FOUND:
             logger.warning("kanban origin: session %s record unreadable: HTTP %s", session_id, exc.code)
         return None
+    except (urllib.error.URLError, OSError, ValueError) as exc:  # down, timed out, or not JSON
+        logger.warning("kanban origin: session %s record unreadable: %r", session_id, exc)
+        return None
     return loaded if isinstance(loaded, dict) else None
 
 
@@ -287,22 +296,29 @@ def turn_origin() -> tuple[str, str]:
 
     The cron run's context; else the session record for the trusted session id;
     else ``console`` by the console id convention; else ``other``. Never raises.
+    Each step is guarded on its own, so a failure in one never skips the next.
     """
-    try:
-        cron = _cron_origin()
-        if cron:
-            return cron
-        session_id = _session_id()
-        if not session_id:
-            return NO_ORIGIN
-        record = _record_origin(session_id)
-        if record:
-            return record
-        if session_id.startswith(CONSOLE_SESSION_PREFIXES):
-            return ORIGIN_CONSOLE, ""
-    except Exception as exc:  # noqa: BLE001 — never fail a create
-        logger.warning("kanban origin: the turn's origin is unreadable: %r", exc)
+    cron = _step(_cron_origin, None, "the cron run's origin")
+    if cron:
+        return cron
+    session_id = _step(_session_id, "", "the turn's session id")
+    if not session_id:
+        return NO_ORIGIN
+    record = _step(lambda: _record_origin(session_id), None, "the session record")
+    if record:
+        return record
+    if session_id.startswith(CONSOLE_SESSION_PREFIXES):
+        return ORIGIN_CONSOLE, ""
     return NO_ORIGIN
+
+
+def _step(read: Callable[[], Any], default: Any, what: str) -> Any:
+    """``read()``, or ``default`` when it raises (logged as ``what``)."""
+    try:
+        return read()
+    except Exception as exc:  # noqa: BLE001 — never fail a create
+        logger.warning("kanban origin: %s is unreadable: %r", what, exc)
+        return default
 
 
 # ---------------------------------------------------------------------------

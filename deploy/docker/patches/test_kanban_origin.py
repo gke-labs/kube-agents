@@ -543,6 +543,32 @@ class SessionRecordTest(unittest.TestCase):
         self.assertEqual(request.full_url, "http://127.0.0.1:8699/v1/sessions/s%2F1/metadata")
         self.assertEqual(request.get_header("Authorization"), "Bearer k")
 
+    def test_a_timed_out_session_lookup_still_reaches_the_console_convention(self):
+        import socket
+        import urllib.error
+
+        session = "web-console-0123456789abcdef0123456789abcdef"
+        for failure in (socket.timeout("timed out"), urllib.error.URLError("refused")):
+            with self.subTest(failure=failure), mock.patch.object(
+                kanban_origin, "_session_id", return_value=session
+            ), mock.patch.object(kanban_origin, "_cron_origin", return_value=None), mock.patch.object(
+                kanban_origin.urllib.request, "urlopen", side_effect=failure
+            ):
+                self.assertIsNone(kanban_origin._fetch_session_metadata(session))
+                self.assertEqual(kanban_origin.turn_origin(), ("console", ""))
+
+    def test_a_failing_cron_scope_does_not_skip_the_session_lookup(self):
+        scope = SimpleNamespace(current_cron_origin=mock.Mock(side_effect=RuntimeError("broken")))
+        with mock.patch.object(kanban_origin, "_first_module", return_value=scope), mock.patch.object(
+            kanban_origin, "_session_id", return_value="s"
+        ), mock.patch.object(kanban_origin, "_fetch_session_metadata", return_value={"origin": "chat"}):
+            self.assertIsNone(kanban_origin._cron_origin())
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", ""))
+        with mock.patch.object(kanban_origin, "_cron_origin", side_effect=RuntimeError("worse")), mock.patch.object(
+            kanban_origin, "_session_id", return_value="portal_x"
+        ), mock.patch.object(kanban_origin, "_fetch_session_metadata", return_value=None):
+            self.assertEqual(kanban_origin.turn_origin(), ("console", ""))
+
     def test_no_record_and_an_other_record_are_unresolved(self):
         with self._answer(status=404):
             self.assertIsNone(kanban_origin._record_origin("s"))
@@ -592,12 +618,11 @@ class PinTest(unittest.TestCase):
             for node in tree.body
             if isinstance(node, ast.Assign) and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id in ("ORIGINS", "KANBAN_TASK_ORIGINS_SCHEMA", "DRIFT_BACKLOG_CARD_TICKET_ENV")
+            and node.targets[0].id in ("ORIGINS", "KANBAN_TASK_ORIGINS_SCHEMA")
         }
         self.assertEqual(values["ORIGINS"], kanban_origin.ORIGINS)
         squash = lambda sql: re.sub(r"\s+", " ", sql).replace("( ", "(").replace(" )", ")").strip()
         self.assertEqual(squash(values["KANBAN_TASK_ORIGINS_SCHEMA"]), squash(kanban_origin._TABLE_DDL))
-        self.assertEqual(values["DRIFT_BACKLOG_CARD_TICKET_ENV"], kanban_origin.STAMP_TICKET_ENV)
         source = SESSION_KV_SERVER.read_text()
         self.assertIn(f'@app.post("{kanban_origin.STAMP_TICKETS_PATH}"', source)
         self.assertIn(f'@app.post("{kanban_origin.STAMP_TICKET_REDEEM_PATH}"', source)

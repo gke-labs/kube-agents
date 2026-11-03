@@ -11423,28 +11423,33 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertEqual(drift["sent"], 0)
         self.trigger.assert_not_called()
 
-    def test_the_backlog_card_is_stamped_drift_by_a_ticket_never_an_argument(self):
-        self._headless()
-        self._burst()
-        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run, patch.object(
-            session_kv_server, "_stamp_board_task_origin"
-        ) as put:
-            self.assertTrue(session_kv_server._post_drift_backlog_digest())
-        ticket = run.call_args.kwargs["env"]["KUBE_AGENTS_CARD_STAMP_TICKET"]
-        self.assertNotIn("KUBE_AGENTS_CARD_ORIGIN", run.call_args.kwargs["env"])
-        self.assertFalse([a for a in run.call_args.args[0] if "origin" in a.lower()], "no origin argument")
-        self.assertEqual(session_kv_server._redeem_stamp_ticket(ticket), ("drift", ""))
-        self.assertIsNone(session_kv_server._redeem_stamp_ticket(ticket), "one card per ticket")
-        put.assert_not_called()
+    def test_the_backlog_card_is_stamped_drift_in_the_board_never_through_the_subprocess(self):
+        import sqlite3
 
-    def test_a_ticket_that_cannot_be_minted_still_files_the_card(self):
         self._headless()
         self._burst()
+        board = Path(tempfile.mkdtemp()) / "kanban.db"
+        sqlite3.connect(board).close()
         with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run, patch.object(
-            session_kv_server, "_mint_stamp_ticket", side_effect=__import__("sqlite3").OperationalError("locked")
-        ):
+            session_kv_server, "KANBAN_DB_PATH", str(board)
+        ), patch.object(session_kv_server, "_hermes_kanban", return_value=(None, None)):
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
-        self.assertNotIn("KUBE_AGENTS_CARD_STAMP_TICKET", run.call_args.kwargs["env"])
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("KUBE_AGENTS_CARD_STAMP_TICKET", env)
+        self.assertNotIn("KUBE_AGENTS_CARD_ORIGIN", env)
+        self.assertFalse([a for a in run.call_args.args[0] if "origin" in a.lower()], "no origin argument")
+        with closing_state(board) as conn:
+            rows = conn.execute("SELECT task_id, origin, origin_platform FROM kanban_task_origins").fetchall()
+        self.assertEqual(rows, [("t_digest1", "drift", "")])
+
+    def test_a_stamp_that_fails_still_files_the_card(self):
+        self._headless()
+        self._burst()
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()), patch.object(
+            session_kv_server, "_stamp_board_task_origin", side_effect=FileNotFoundError("no board")
+        ) as stamp:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        stamp.assert_called_once_with("t_digest1", "drift", "")
 
     def test_a_next_install_whose_platform_has_no_home_channel_files_the_card(self):
         """The platform walk itself, not a patched answer: `spec.mode: next`,
@@ -12587,7 +12592,7 @@ class TestProposalOrigin(unittest.TestCase):
         minted = self.client.post("/v1/board/stamp-tickets", json={"origin": "issue"})
         self.assertEqual(minted.status_code, 200, minted.text)
         ticket = minted.json()["ticket"]
-        self.assertRegex(ticket, rf"^[0-9a-f]{{{2 * session_kv_server.STAMP_TICKET_HEX_BYTES}}}$")
+        self.assertRegex(ticket, rf"^[0-9a-f]{{{2 * session_kv_server.STAMP_TICKET_BYTES}}}$")
         self.assertEqual(self.client.post("/v1/board/stamp-tickets", json={"origin": "eval"}).status_code, 400)
 
     def test_a_stamp_ticket_redeems_once_and_a_replay_is_404(self):

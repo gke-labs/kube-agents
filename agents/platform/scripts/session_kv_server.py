@@ -12,7 +12,6 @@ import hashlib
 import queue
 import random
 import re
-import secrets
 import signal
 import threading
 import sqlite3
@@ -106,9 +105,9 @@ KANBAN_TASK_ORIGINS_SCHEMA = """
 # (deploy/docker/patches/kanban_origin.py) redeems it once. The ticket is an
 # unguessable reference, not an origin, so a value planted in any environment
 # source is an unknown ticket.
-STAMP_TICKET_HEX_BYTES = 16  # secrets.token_hex(16): 32 hex characters
+STAMP_TICKET_BYTES = 16  # os.urandom(16).hex(): 32 hex characters
 STAMP_TICKET_TTL_SECONDS = 300
-STAMP_TICKET_MAX_CHARS = 2 * STAMP_TICKET_HEX_BYTES
+STAMP_TICKET_MAX_CHARS = 2 * STAMP_TICKET_BYTES
 
 
 def _load_dotenv_ignoring_operator_switches(path: str) -> None:
@@ -1284,11 +1283,13 @@ DRIFT_BACKLOG_CARD_TITLE = "Drift backlog: {count} {noun} reached drift detectio
 DRIFT_BACKLOG_CARD_KEY_PREFIX = "drift-backlog-"
 DRIFT_BACKLOG_CARD_CREATED_BY = "drift-detector"
 DRIFT_BACKLOG_CARD_STATUS = "blocked"
-# The card's board stamp is `drift` (docs/designs/proposal-origin.md §2.1): a
-# one-time stamp ticket minted here and passed in the subprocess's environment
-# under the name deploy/docker/patches/kanban_origin.py STAMP_TICKET_ENV reads,
-# never an origin argument.
-DRIFT_BACKLOG_CARD_TICKET_ENV = "KUBE_AGENTS_CARD_STAMP_TICKET"
+# The card's board stamp is `drift` (docs/designs/proposal-origin.md §2.1),
+# written here, in the board, once the create returns the id, through the same
+# `INSERT OR IGNORE` the board route uses. Not a ticket in the subprocess's
+# environment: Hermes reloads `$HERMES_HOME/.env` with override on, so a value
+# planted there would replace it. The subprocess has no turn, so its insert
+# leaves the card unstamped and this stamp lands; a dedupe hit on a card that
+# already carries a stamp keeps it.
 # The CLI timeout is the send timeout, so the lease (sized from it) outlives
 # the call. A timeout counts as no card, unlike the chat send, because the rows
 # must not be marked without a task id; a create that committed before the kill
@@ -6464,11 +6465,6 @@ def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
     card that exists back rather than a second one.
     """
     noun = "change" if len(rows) == 1 else "changes"
-    env_extra = {"HERMES_KANBAN_BUSY_TIMEOUT_MS": DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS}
-    try:
-        env_extra[DRIFT_BACKLOG_CARD_TICKET_ENV] = _mint_stamp_ticket(ORIGIN_DRIFT, "")
-    except Exception as exc:  # noqa: BLE001 - file the card unstamped rather than not at all
-        logger.warning(f"Drift backlog card: could not mint a stamp ticket: {exc}")
     cmd = [
         chat_notify.HERMES_CLI, "kanban", "create",
         DRIFT_BACKLOG_CARD_TITLE.format(count=len(rows), noun=noun),
@@ -6484,7 +6480,7 @@ def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
-            env=_run_env(env_extra),
+            env=_run_env({"HERMES_KANBAN_BUSY_TIMEOUT_MS": DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS}),
             timeout=DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
@@ -6511,6 +6507,11 @@ def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
             task_id = ""
     if not task_id:
         logger.error(f"Drift backlog card: no task id in the board's answer: {out.strip()[:LEDGER_MESSAGE_MAX_CHARS]}")
+        return task_id
+    try:
+        _stamp_board_task_origin(task_id, ORIGIN_DRIFT, "")
+    except Exception as exc:  # noqa: BLE001 - the card is filed; the stamp is telemetry
+        logger.warning(f"Drift backlog card: could not stamp {task_id} as {ORIGIN_DRIFT}: {exc}")
     return task_id
 
 
@@ -7547,10 +7548,11 @@ def get_proposals_opened_counts() -> Dict[str, Dict[str, int]]:
 def put_board_task_origin(task_id: str, request_data: Dict[str, Any]) -> Dict[str, bool]:
     """Stamp a card's origin in the board's side table; the first stamp wins.
 
-    No caller uses it today: the trusted writers (the issue gate, the drift
-    backlog, the chat bootstrap) pass their origin to the insert itself through
-    a one-time stamp ticket (`POST /v1/board/stamp-tickets`), which stamps in
-    the insert's transaction. It stays `INSERT OR IGNORE`, so it can never
+    No caller uses it today: the issue gate and the chat bootstrap pass their
+    origin to the insert itself through a one-time stamp ticket
+    (`POST /v1/board/stamp-tickets`), which stamps in the insert's transaction,
+    and the drift backlog, which runs in this server, calls the same write
+    (`_stamp_board_task_origin`) directly. It stays `INSERT OR IGNORE`, so it can never
     replace a stamp. `stamped` is False when the card already carried a stamp.
     It does not check that the card exists on the board, so a caller holding the
     API key can stamp an id no card has yet.
@@ -7592,7 +7594,7 @@ def _mint_stamp_ticket(origin: str, platform: str = "") -> str:
     """Issue a one-time stamp ticket for `origin`; returns the ticket."""
     if origin not in ORIGINS:
         raise ValueError(f"origin {origin!r} is not one of {ORIGINS}")
-    ticket = secrets.token_hex(STAMP_TICKET_HEX_BYTES)
+    ticket = os.urandom(STAMP_TICKET_BYTES).hex()
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
         with conn:
             conn.execute(
