@@ -873,7 +873,8 @@ files that name any Config Connector group (`every_kind`), so every kind is inde
 `.yaml`, `.yml` and `.json` files. `finish` and `remediate` build this index the same way
 (`kcc_paragraph_index`), and only when a finding needs it (`kcc_index_needed`): a
 `Cluster/` or `NodePool/` finding whose own object matches a stall, or a `kcc-object-wedged` finding
-with a stall of its kind and name on its cluster. When exactly one file declares the object, the
+with a stall of its kind and name on its cluster. When the `gcloud` check also runs, it takes this
+index, so the snapshot and each clone are read once. When exactly one file declares the object, the
 paragraph keeps the first sentence "**Config Connector is not applying this file.**" and names that
 file. Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and
 says that more than one file declares the object, or only that the audit names no declaration file
@@ -912,9 +913,10 @@ as `uncut_note`, so no later pass brings back a paragraph from an earlier ledger
 also removes an earlier copy from every remediation, and the carry removes it too, so a note never
 shows a stall that this run's manifest does not. A cluster whose read failed
 (`kcc_unread`) records no objects, so no note names an object there, and the log has a warning. The
-absence of the note never says that Config Connector applies a file. `remediate` given
-`--manifest-file` runs the same pass before its dry-run preview and before it opens a pull request,
-because `finish` does not revisit a finding whose pull request is open.
+absence of the note never says that Config Connector applies a file. `remediate` runs the same pass
+before its dry-run preview and before it opens a pull request, because `finish` does not revisit a
+finding whose pull request is open. With no `--manifest-file`, the pass only removes a paragraph
+that the worker copied, and claims no stall.
 
 The same match makes the `pr-merged-persists` row and the comment on the merged pull request state
 the stall in place of "the remediation was incomplete, or something outside this repository
