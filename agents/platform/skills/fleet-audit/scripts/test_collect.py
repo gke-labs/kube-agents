@@ -4904,7 +4904,7 @@ def serve_kcc(argv, kcc_items):
         return Run(argv, 0, "".join(kcc_crd_line(kind) + "\n" for kind in kinds), "", 0.05)
     if callable(kcc_items):
         return kcc_items(argv)
-    plural = argv[3].rsplit("/", 1)[1]
+    plural = argv[3].partition("?")[0].rsplit("/", 1)[1]
     return Run(argv, 0, json.dumps(dump_of(*(i for i in kcc_items or [] if f"{i['kind'].lower()}s" == plural))), "", 0.05)
 
 
