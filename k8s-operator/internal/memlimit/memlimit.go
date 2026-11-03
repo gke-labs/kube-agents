@@ -31,6 +31,10 @@ limitations under the License.
 // debug.SetMemoryLimit is the same knob GOMEMLIMIT turns. When GOMEMLIMIT is
 // set the runtime has already applied it before main runs, and it is an
 // explicit choice this package does not second-guess.
+//
+// A copy lives at a2a/lib/memlimit for the bus module's binaries, which
+// cannot import this internal package; tests/test_memlimit_copies_agree.py
+// holds the two bodies identical, so a change here is made there too.
 package memlimit
 
 import (
@@ -55,8 +59,8 @@ const (
 // bytes and true when the caller should apply it, or zero, false and the
 // reason when the runtime's own setting should stand: GOMEMLIMIT already set
 // (the runtime applied it and it wins), the container limit absent (running
-// outside the operator's manifests), or unparseable or non-positive (the
-// value is not a byte count, so nothing is derived from it).
+// outside a rendered manifest), or unparseable or non-positive (the value
+// is not a byte count, so nothing is derived from it).
 func Derive(envName, goMemLimit, containerLimit string, fraction float64) (int64, bool, string) {
 	if goMemLimit != "" {
 		return 0, false, fmt.Sprintf("%s=%s is set and takes precedence", GoMemLimitEnv, goMemLimit)

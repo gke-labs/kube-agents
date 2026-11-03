@@ -39,6 +39,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+from tests._autopilot import gib_per_vcpu_in_band
 from tests.testing.release import parse_required_release_images
 CHART_DIR = REPO_ROOT / "charts" / "kube-agents"
 TEMPLATE = CHART_DIR / "templates" / "web-console.yaml"
@@ -240,7 +241,7 @@ class WebConsoleChartTest(unittest.TestCase):
             },
         )
         gib_per_vcpu = (128 / 1024) / (100 / 1000)
-        self.assertTrue(1 <= gib_per_vcpu <= 6.5, gib_per_vcpu)
+        self.assertTrue(gib_per_vcpu_in_band(gib_per_vcpu), gib_per_vcpu)
         self.assertRegex(
             self.docs["Deployment"],
             r"(?m)^\s+- name: WEB_CONSOLE_MEMORY_LIMIT_BYTES\n\s+valueFrom:\n\s+resourceFieldRef:\n\s+resource: limits\.memory$",

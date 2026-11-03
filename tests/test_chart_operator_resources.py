@@ -14,10 +14,14 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 import yaml
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _autopilot import gib_per_vcpu_in_band  # noqa: E402
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
@@ -44,8 +48,6 @@ _LEGACY_REQUEST = "64Mi"
 # limits to them, inside the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged.
 _PINNED_REQUESTS = {"cpu": "100m", "memory": "256Mi"}
 _PINNED_LIMITS = {"cpu": "500m", "memory": "512Mi"}
-_AUTOPILOT_MIN_GIB_PER_VCPU = 1
-_AUTOPILOT_MAX_GIB_PER_VCPU = 6.5
 
 
 def _floor_bytes():
@@ -89,7 +91,7 @@ class RequestsAreLivableAsLimitsTest(unittest.TestCase):
         mib = int(requests["memory"][:-2])
         gib_per_vcpu = (mib / 1024) / (millis / 1000)
         self.assertTrue(
-            _AUTOPILOT_MIN_GIB_PER_VCPU <= gib_per_vcpu <= _AUTOPILOT_MAX_GIB_PER_VCPU,
+            gib_per_vcpu_in_band(gib_per_vcpu),
             f"the operator requests {gib_per_vcpu} GiB per vCPU, outside the band",
         )
 

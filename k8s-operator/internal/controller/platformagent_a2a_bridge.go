@@ -428,7 +428,9 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 // under 512Mi. The limit gives the same ten room twice over where bursting
 // is on, and the bridge sets its Go soft memory limit from whichever of the
 // two the cluster admitted (a2aBridgeMemoryLimitEnvVar). The pair sits in
-// the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged. The cli
+// the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged, so adding it
+// to the agent pod, whose total requests Autopilot evaluates, does not pull
+// the pod out of the band on its own. The cli
 // executor runs a one-shot hermes chat per task (about 430Mi each, up to
 // BRIDGE_CONCURRENCY of them) and doesn't fit these
 // (a2aRenderedBridgeResources).

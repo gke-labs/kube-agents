@@ -32,8 +32,9 @@ limitations under the License.
 // explicit choice this package does not second-guess.
 //
 // A copy of the operator's internal/memlimit: the two modules do not depend
-// on each other, and the package is internal to that one. Keep the two in
-// step.
+// on each other, and the package is internal to that one.
+// tests/test_memlimit_copies_agree.py holds the two bodies identical, so a
+// change here is made there too.
 package memlimit
 
 import (
@@ -58,7 +59,7 @@ const (
 // bytes and true when the caller should apply it, or zero, false and the
 // reason when the runtime's own setting should stand: GOMEMLIMIT already set
 // (the runtime applied it and it wins), the container limit absent (running
-// outside the rendered manifests), or unparseable or non-positive (the value
+// outside a rendered manifest), or unparseable or non-positive (the value
 // is not a byte count, so nothing is derived from it).
 func Derive(envName, goMemLimit, containerLimit string, fraction float64) (int64, bool, string) {
 	if goMemLimit != "" {

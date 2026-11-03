@@ -16,9 +16,13 @@ during recall.
 """
 
 import pathlib
+import sys
 import unittest
 
 import yaml
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _autopilot import AUTOPILOT_MAX_GIB_PER_VCPU, AUTOPILOT_MIN_GIB_PER_VCPU, gib_per_vcpu_in_band  # noqa: E402
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
@@ -35,9 +39,6 @@ _GI_SUFFIX = "Gi"
 _PINNED_REQUESTS = {"cpu": "500m", "memory": "2Gi"}
 _PINNED_LIMITS = {"cpu": "4", "memory": "4Gi"}
 _MIN_MEMORY_REQUEST_GI = 2
-# GKE Autopilot admits a requests pair unchanged between these, in GiB per vCPU.
-_AUTOPILOT_MIN_GIB_PER_VCPU = 1
-_AUTOPILOT_MAX_GIB_PER_VCPU = 6.5
 
 
 def _cpu_millis(quantity):
@@ -144,9 +145,9 @@ class HindsightApiResourcesTest(unittest.TestCase):
             _cpu_millis(self.chart["requests"]["cpu"]) / _MILLIS_PER_CORE
         )
         self.assertTrue(
-            _AUTOPILOT_MIN_GIB_PER_VCPU <= gib_per_vcpu <= _AUTOPILOT_MAX_GIB_PER_VCPU,
+            gib_per_vcpu_in_band(gib_per_vcpu),
             f"hindsight-api requests {gib_per_vcpu} GiB per vCPU, outside the "
-            f"{_AUTOPILOT_MIN_GIB_PER_VCPU} to {_AUTOPILOT_MAX_GIB_PER_VCPU} GiB per vCPU "
+            f"{AUTOPILOT_MIN_GIB_PER_VCPU} to {AUTOPILOT_MAX_GIB_PER_VCPU} GiB per vCPU "
             "GKE Autopilot admits unchanged",
         )
 

@@ -1613,8 +1613,20 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
 		}
 		run.mu.Unlock()
-		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
+		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String())+cliStdoutCutNote(stdout.Dropped()), nil)
 	}
+}
+
+// cliStdoutCutNote is what a failed run's reason adds when the child's
+// stdout went past cliStdoutCap by dropped bytes, or "". The stdout tail
+// the reason quotes is then the end of the kept prefix, not of the stream,
+// so the note says so: the child's own error, printed last, is among the
+// bytes dropped, and a reader diagnosing from the quote should know it.
+func cliStdoutCutNote(dropped int64) string {
+	if dropped <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("; stdout kept to the %d-byte cap (cliStdoutCap in bridge.go), %d bytes past it dropped, so the stdout tail above ends at the cap", cliStdoutCap, dropped)
 }
 
 // reapCutNote is the detail a killed run's reason adds when the reap after
