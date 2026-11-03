@@ -879,7 +879,7 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
 
 `{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
 strip_runs, admitted[], health, history, merges, catches, domains[],
-confidence_bar{}, cases{}, runs[], pending[], releases[], nightly{}, gitlab{},
+confidence_bar{}, cases{}, runs[], pending[], releases[], nightly{}, lanes[],
 trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus

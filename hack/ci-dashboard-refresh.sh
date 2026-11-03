@@ -245,7 +245,8 @@ command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
 # it as a first run and bounds the sweep itself. The nightly prefixes and the
-# GitLab glob ride only with the GCS source: the from-dir path is the offline one.
+# forge lanes' globs and prefixes ride only with the GCS source: the from-dir
+# path is the offline one.
 rc=0
 # shellcheck disable=SC2016
 ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
