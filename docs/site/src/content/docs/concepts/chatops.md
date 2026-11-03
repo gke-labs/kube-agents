@@ -709,7 +709,7 @@ The job fires every minute (`* * * * *`, see [Autonomous watchdogs](/kube-agents
 
 ## When no chat platform is enabled
 
-Both channels are opt-in and default to disabled, so an install that enabled neither has no chat to talk to. On a `spec.mode: next` install the A2A gateway still runs, on its console door alone, so the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console)'s chat pane reaches the Planning Agent with nothing to turn on: `kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080`, then `http://localhost:8080`. The [web console](/kube-agents/deploy/web-console/) is a browser alternative in either mode, turned on with `install.sh --enable-web-console`; its channels also show event triage and scheduled checks. The Hermes CLI above is another way in, and the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes:
+Both channels are opt-in and default to disabled, so an install that enabled neither has no chat to talk to. Under `spec.mode: next` it also carries the [`NoChatPlatform`](/kube-agents/operator/platformagent-crd/#status) condition, which says where its findings go. On a `spec.mode: next` install the A2A gateway still runs, on its console door alone, so the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console)'s chat pane reaches the Planning Agent with nothing to turn on: `kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080`, then `http://localhost:8080`. The [web console](/kube-agents/deploy/web-console/) is a browser alternative in either mode, turned on with `install.sh --enable-web-console`; its channels also show event triage and scheduled checks. The Hermes CLI above is another way in, and the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes:
 
 ```bash
 gcloud container clusters get-credentials <cluster> --location <region> --project <project> --dns-endpoint
@@ -722,7 +722,9 @@ This reaches the Platform Agent directly, bypassing the front door: a request ty
 
 The [admin console](/kube-agents/reference/admin-console/), started from a repository checkout on your own machine, is one more. Its Chat page reaches the Planning Agent through the front door, so a request typed there is planned and delegated the way a chat message would be. [User interfaces](/kube-agents/reference/user-interfaces/) compares the browser pages.
 
-Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And the onboarding delivery stage waits for a human to connect over chat before it posts the first-run inventory report, so that report stays at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume. Read it with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md` rather than waiting for it.
+Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither reaches a person as it happens. The audit reports stay in the report store on the data volume, the triage shows on the board, and other scheduled reports are not kept.
+
+The onboarding delivery stage waits for a human to connect over chat before it posts the first-run inventory report, so that report stays at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume. Read it with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md` rather than waiting for it.
 
 ## Where to go next
 
