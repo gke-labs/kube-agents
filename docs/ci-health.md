@@ -249,9 +249,11 @@ running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube
 `pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with its next-mode
 nightly (`ci-kube-agents-eval-nightly-ghes-next`, `ci-kube-agents-eval-nightly-gitlab-ce-next`). Each lane is listed in
 its own section of the Brief, its pull-request runs and then each nightly's nights, with its own counts and links, and in
-no gate number, case history or digest line. Each job is read from its own log prefix above its own watermark. The
-GHES and GitLab CE sources are wired for the jobs those lanes run (`GoogleCloudPlatform/oss-test-infra` adds them); a
-source lists nothing, as a note, until its job has run.
+no gate number or case history. The daily digest carries one line on them (`forge_lane.digest_line`): last night's
+result per forge nightly, green, red or none last night, and a nightly with no night on record at all as not enabled
+yet with its lane's reason (`forge_lane.LANES`' `not_enabled`). Nothing alerts on a forge night. Each job is read from
+its own log prefix above its own watermark. The GHES and GitLab CE sources are wired for the jobs those lanes run
+(`GoogleCloudPlatform/oss-test-infra` adds them); a source lists nothing, as a note, until its job has run.
 
 ## Hysteresis
 

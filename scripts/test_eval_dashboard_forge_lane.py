@@ -108,6 +108,20 @@ class LaneDocumentTest(unittest.TestCase):
         self.assertEqual([n["build"] for n in doc["nights"]], ["13", "12", "11", "10"], "all nights together, newest first")
         self.assertEqual(doc["night_counts"], {"on_record": 4, "green": 3, "red": 1})
 
+    def test_the_digest_line_says_last_nights_result_or_that_a_job_is_not_enabled(self):
+        now = datetime.datetime(2026, 11, 3, 15, 0, tzinfo=datetime.timezone.utc)
+        data = {"runs": [
+            dict(run("10", job="ci-kube-agents-eval-nightly-gitlab", pr=None), started="2026-11-03T06:30:00+00:00"),
+            dict(run("11", job="ci-kube-agents-eval-nightly-gitlab-next", pr=None), started="2026-10-30T08:30:00+00:00"),
+            dict(run("12", tier="ghes", job="ci-kube-agents-eval-nightly-ghes-next", pr=None, result="FAILURE"), started="2026-11-03T10:00:00+00:00"),
+        ]}
+        self.assertEqual(
+            forge_lane.digest_line(data, now),
+            "🦊 Forge nightlies: GitLab today green · GitLab next no night last night · GHES next red"
+            " · GitLab CE next not enabled yet (their Prow jobs are on hold in GoogleCloudPlatform/oss-test-infra#2755)",
+        )
+        self.assertIsNone(forge_lane.digest_line(None, now))
+
     def test_the_tier_filter_is_the_shared_one(self):
         self.assertTrue(tiers.is_gitlab({"tier": "gitlab"}))
         self.assertFalse(tiers.is_presubmit({"tier": "gitlab"}))
