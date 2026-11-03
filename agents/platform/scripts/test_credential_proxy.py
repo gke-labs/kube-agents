@@ -217,8 +217,10 @@ class AgentAPIProxyTest(unittest.TestCase):
         # The door shares the capped server classes: a peer that connects and
         # sends nothing must give its thread, and its slot under the cap,
         # back at KEEPALIVE_IDLE_SECONDS rather than hold them for as long as
-        # it keeps the connection open.
-        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+        # it keeps the connection open. The window is _DOOR_IDLE_SECONDS, not
+        # _SHORT_IDLE_SECONDS: the refused peer below connects after a settle,
+        # and must do so while the silent one is still inside its window.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _DOOR_IDLE_SECONDS):
             door = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), AgentAPIProxyHandler, max_threads=1)
             threading.Thread(target=door.serve_forever, daemon=True).start()
             self.addCleanup(door.server_close)
@@ -15634,6 +15636,12 @@ class ListenBacklogTest(unittest.TestCase):
 _CLOSE_WAIT_SECONDS = 5
 # The idle keep-alive timeout a test arms, short enough to observe.
 _SHORT_IDLE_SECONDS = 0.5
+# The idle timeout the door's slot test arms. That test connects a second peer
+# only after _RESET_SETTLE_SECONDS, so its window has to outlast the settle by
+# a wide margin: at an idle equal to the settle, the silent connection could be
+# closed first and the second peer admitted in its place, held for a request
+# it never sends, and closed unanswered, where the test expects the cap's 503.
+_DOOR_IDLE_SECONDS = 4 * _RESET_SETTLE_SECONDS
 # The bound on the health listener's answer under saturation. What the test
 # rules out is the answer waiting behind the four holders, parked for the idle
 # timeout (seconds); an order of magnitude under that, and not the issue's 50 ms,
