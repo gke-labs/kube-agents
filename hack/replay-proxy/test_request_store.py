@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,9 +37,16 @@ def read_all(root):
     return "\n".join(out)
 
 
-class ScrubberTest(unittest.TestCase):
+class TempDirTestCase(unittest.TestCase):
+    def tmpdir(self):
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        return path
+
+
+class ScrubberTest(TempDirTestCase):
     def setUp(self):
-        self.root = tempfile.mkdtemp()
+        self.root = self.tmpdir()
         self.scrubber = request_store.Scrubber(REDACTOR, RULES)
         self.store = request_store.RequestStore(self.root, self.scrubber)
 
@@ -120,9 +128,9 @@ class ScrubberTest(unittest.TestCase):
         self.assertIn("\\ud83d", read_all(self.root))
 
 
-class FailClosedTest(unittest.TestCase):
+class FailClosedTest(TempDirTestCase):
     def test_missing_redactor_stores_nothing(self):
-        root = tempfile.mkdtemp()
+        root = self.tmpdir()
         scrubber = request_store.Scrubber(os.path.join(root, "missing.py"), RULES)
         self.assertFalse(scrubber.available)
         self.assertIsNotNone(scrubber.error)
@@ -131,21 +139,21 @@ class FailClosedTest(unittest.TestCase):
         self.assertEqual(os.listdir(root), [])
 
     def test_missing_transcript_rules_stores_nothing(self):
-        root = tempfile.mkdtemp()
+        root = self.tmpdir()
         scrubber = request_store.Scrubber(REDACTOR, os.path.join(root, "missing.py"))
         self.assertFalse(scrubber.available)
         self.assertEqual(request_store.RequestStore(root, scrubber).store("r1", "fp", body()), "scrubbers_unavailable")
         self.assertEqual(os.listdir(root), [])
 
     def test_redactor_without_the_class_stores_nothing(self):
-        root = tempfile.mkdtemp()
+        root = self.tmpdir()
         broken = os.path.join(root, "redactor.py")
         Path(broken).write_text("x = 1\n")
         scrubber = request_store.Scrubber(broken, RULES)
         self.assertFalse(scrubber.available)
 
     def test_scrubber_that_raises_stores_nothing(self):
-        root = tempfile.mkdtemp()
+        root = self.tmpdir()
         scrubber = request_store.Scrubber(REDACTOR, RULES)
 
         class Exploding:
@@ -159,14 +167,14 @@ class FailClosedTest(unittest.TestCase):
         self.assertEqual(os.listdir(root), [])
 
     def test_write_failure_is_a_reason_not_an_exception(self):
-        handle, root = tempfile.mkstemp()  # a file: nothing can be written under it
-        os.close(handle)
+        root = os.path.join(self.tmpdir(), "a-file")  # a file: nothing can be written under it
+        Path(root).write_text("")
         store = request_store.RequestStore(root, request_store.Scrubber(REDACTOR, RULES))
         reason = store.store("r1", "fp", body())
         self.assertTrue(reason.startswith("write_failed"), reason)
 
     def test_failed_write_leaves_no_tmp_file(self):
-        root = tempfile.mkdtemp()
+        root = self.tmpdir()
         store = request_store.RequestStore(root, request_store.Scrubber(REDACTOR, RULES))
         target = os.path.join(root, "blob.json")
         original = os.replace

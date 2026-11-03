@@ -41,6 +41,16 @@ COMPLETIONS_PATH = "/v1/chat/completions"
 HEALTH_PATH = "/replay/healthz"
 METRICS_PATH = "/metrics"
 HTTP_BAD_REQUEST = 400
+HTTP_PAYLOAD_TOO_LARGE = 413
+# Memory bounds. A request body above MAX_REQUEST_BYTES is refused with 413
+# rather than read into memory. The observer stops reading a response (the
+# bytes still flow) once it has seen MAX_OBSERVED_BYTES of it, which bounds the
+# buffered SSE text, the merged answer and a non-streamed body together. A
+# tool_calls index must be below MAX_TOOL_CALLS, so a hostile or broken index
+# cannot make the merge allocate.
+MAX_REQUEST_BYTES = 64 * 1024 * 1024
+MAX_OBSERVED_BYTES = 8 * 1024 * 1024
+MAX_TOOL_CALLS = 256
 DEFAULT_BIND_HOST = "0.0.0.0"
 BODY_METHODS = ("POST", "PUT", "PATCH")
 HEAD_METHOD = "HEAD"
@@ -76,6 +86,10 @@ NO_FALLBACKS = "0"
 READ_CHUNK_BYTES = 65536
 SSE_DATA_PREFIX = "data:"
 SSE_DONE = "[DONE]"
+SSE_LINE_END = b"\n"
+SSE_CR = "\r"
+SSE_FIELD_SPACE = " "
+SSE_DATA_JOIN = "\n"
 JSON_CONTENT_TYPE = "application/json"
 METRICS_CONTENT_TYPE = "text/plain; version=0.0.4"
 HTTP_OK = 200
@@ -171,8 +185,28 @@ class Metrics:
         return "\n".join(lines) + "\n"
 
 
+class ObserveTooLarge(Exception):
+    """The observer has seen more of a response than it keeps."""
+
+
+class RequestTooLarge(Exception):
+    """A request body is larger than the proxy reads into memory."""
+
+
+def tool_call_index(call: Any, default: int) -> int:
+    """A streamed tool call's index: an int (not a bool) in [0, MAX_TOOL_CALLS), else ValueError."""
+    if not isinstance(call, dict):
+        raise TypeError("tool call delta is not an object")
+    index = call.get("index", default)
+    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < MAX_TOOL_CALLS:
+        raise ValueError("tool call index out of range")
+    return index
+
+
 def merge_delta(acc: Dict[str, Any], delta: Dict[str, Any]) -> Dict[str, Any]:
-    """Fold one streamed delta into the assembled message."""
+    """Fold one streamed delta into the assembled message; raises on a malformed one."""
+    if not isinstance(delta, dict):
+        raise TypeError("delta is not an object")
     for key, value in delta.items():
         if value is None:
             continue
@@ -181,11 +215,10 @@ def merge_delta(acc: Dict[str, Any], delta: Dict[str, Any]) -> Dict[str, Any]:
         elif key == "tool_calls" and isinstance(value, list):
             calls = acc.setdefault("tool_calls", [])
             for call in value:
-                index = call.get("index", len(calls)) if isinstance(call, dict) else len(calls)
+                index = tool_call_index(call, len(calls))
                 while len(calls) <= index:
                     calls.append({})
-                if isinstance(call, dict):
-                    merge_delta(calls[index], call)
+                merge_delta(calls[index], call)
         elif isinstance(value, dict):
             merge_delta(acc.setdefault(key, {}), value)
         elif key == "name" and isinstance(value, str) and acc.get(key) and acc[key] != value:
@@ -196,48 +229,66 @@ def merge_delta(acc: Dict[str, Any], delta: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class ResponseObserver:
-    """Reads the answer and usage out of response bytes as they stream past."""
+    """Reads the answer and usage out of response bytes as they stream past.
+
+    Raises on anything it cannot read (the caller then stops observing and
+    marks the line), and ObserveTooLarge past MAX_OBSERVED_BYTES.
+    """
 
     def __init__(self, streaming: bool):
         self.streaming = streaming
+        self.seen = 0
         self.buffer = b""
+        self.data_lines: List[str] = []
         self.body = bytearray()
         self.message: Dict[str, Any] = {}
         self.usage: Optional[Dict[str, Any]] = None
 
     def feed(self, data: bytes) -> None:
+        self.seen += len(data)
+        if self.seen > MAX_OBSERVED_BYTES:
+            raise ObserveTooLarge()
         if not self.streaming:
             self.body.extend(data)
             return
         self.buffer += data
-        while b"\n" in self.buffer:
-            line, self.buffer = self.buffer.split(b"\n", 1)
-            self._line(line)
+        while SSE_LINE_END in self.buffer:
+            line, self.buffer = self.buffer.split(SSE_LINE_END, 1)
+            self._line(line.decode("utf-8", "replace").rstrip(SSE_CR))
 
-    def _line(self, raw: bytes) -> None:
-        line = raw.decode("utf-8", "replace").strip()
-        if not line.startswith(SSE_DATA_PREFIX):
+    def _line(self, line: str) -> None:
+        """One SSE line: a blank line ends an event; `data:` lines of an event are joined."""
+        if not line:
+            self._dispatch()
+        elif line.startswith(SSE_DATA_PREFIX):
+            value = line[len(SSE_DATA_PREFIX):]
+            self.data_lines.append(value[1:] if value.startswith(SSE_FIELD_SPACE) else value)
+
+    def _dispatch(self) -> None:
+        if not self.data_lines:
             return
-        payload = line[len(SSE_DATA_PREFIX):].strip()
-        if payload == SSE_DONE:
+        payload = SSE_DATA_JOIN.join(self.data_lines)
+        self.data_lines = []
+        if payload.strip() == SSE_DONE:
             return
-        try:
-            chunk = json.loads(payload)
-        except ValueError:
-            return
+        chunk = json.loads(payload)  # ValueError (or RecursionError) on a payload that is not JSON
         if not isinstance(chunk, dict):
-            return
+            raise TypeError("event is not an object")
         if chunk.get("usage"):
             self.usage = chunk["usage"]
-        for choice in chunk.get("choices") or []:
+        choices = chunk.get("choices") or []
+        if not isinstance(choices, list):
+            raise TypeError("choices is not a list")
+        for choice in choices:
             if isinstance(choice, dict):
                 merge_delta(self.message, choice.get("delta") or {})
 
     def finish(self) -> None:
         if self.streaming:
             if self.buffer:
-                self._line(self.buffer)
+                self._line(self.buffer.decode("utf-8", "replace").rstrip(SSE_CR))
                 self.buffer = b""
+            self._dispatch()
             return
         try:
             out = json.loads(bytes(self.body))
@@ -290,12 +341,14 @@ def unstorable_reasons(
     body: Dict[str, Any], status: int, message: Dict[str, Any], headers: Dict[str, str],
     mapping: normalizer.Mapping, scrubber: request_store.Scrubber,
     upstream_incomplete: bool = False, client_disconnected: bool = False, observe_failed: bool = False,
+    observe_too_large: bool = False,
 ) -> List[str]:
     """Why replay would not have saved this answer (eval-design.md); empty when it would."""
     for flag, reason in (
-        (observe_failed, F.UNSTORABLE_OBSERVE_FAILED),
         (upstream_incomplete, F.UNSTORABLE_UPSTREAM_INCOMPLETE),
         (client_disconnected, F.UNSTORABLE_CLIENT_DISCONNECTED),
+        (observe_too_large, F.UNSTORABLE_OBSERVE_TOO_LARGE),
+        (observe_failed, F.UNSTORABLE_OBSERVE_FAILED),
     ):
         if flag:
             return [reason]
@@ -396,6 +449,7 @@ class ShadowProxy:
             upstream_incomplete=upstream["upstream_incomplete"],
             client_disconnected=upstream["client_disconnected"],
             observe_failed=upstream["observe_failed"],
+            observe_too_large=upstream["observe_too_large"],
         )
         # The per-message and answer hashes are of the normalized, unscrubbed
         # content, as the fingerprint is: the scrubber blanks the rest of a
@@ -434,6 +488,8 @@ class Handler(BaseHTTPRequestHandler):
                 size = int(self.rfile.readline().split(b";", 1)[0].strip() or b"0", HEX_BASE)
                 if size < 0:
                     raise ValueError("negative chunk size")
+                if len(data) + size > MAX_REQUEST_BYTES:
+                    raise RequestTooLarge()
                 if size == 0:
                     while self.rfile.readline() not in (CRLF, b"\n", b""):
                         pass
@@ -443,6 +499,8 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get(CONTENT_LENGTH_HEADER) or 0)
         if length < 0:
             raise ValueError("negative Content-Length")
+        if length > MAX_REQUEST_BYTES:
+            raise RequestTooLarge()
         return self.rfile.read(length) if length else b""
 
     def _send_local(self, status: int, payload: bytes, content_type: str) -> None:
@@ -474,6 +532,11 @@ class Handler(BaseHTTPRequestHandler):
             # The rest of the stream cannot be framed, so the connection ends here.
             self.close_connection = True
             self._send_local(HTTP_BAD_REQUEST, b'{"error": "replay proxy: malformed request framing"}', JSON_CONTENT_TYPE)
+            return
+        except RequestTooLarge:
+            # The body is left unread, so the connection ends here too.
+            self.close_connection = True
+            self._send_local(HTTP_PAYLOAD_TOO_LARGE, b'{"error": "replay proxy: request too large"}', JSON_CONTENT_TYPE)
             return
         if self._local():
             return
@@ -508,7 +571,7 @@ class Handler(BaseHTTPRequestHandler):
         headers[HOST_HEADER] = f"{config.upstream_host}:{config.upstream_port}"
         result: Dict[str, Any] = {"status": HTTP_BAD_GATEWAY, "headers": {}, "usage": None, "message": {},
                                   "latency_ms": None, "client_disconnected": False, "upstream_incomplete": False,
-                                  "observe_failed": False}
+                                  "observe_failed": False, "observe_too_large": False}
         started = time.monotonic()
         conn = http.client.HTTPConnection(config.upstream_host, config.upstream_port,
                                           timeout=config.upstream_timeout_seconds)
@@ -572,9 +635,11 @@ class Handler(BaseHTTPRequestHandler):
             # the rest, and the model may still be generating it.
             conn.close()
         result["latency_ms"] = int((time.monotonic() - started) * MS_PER_SECOND)
-        if observer is not None and resp.status == HTTP_OK:
+        cut_short = result["upstream_incomplete"] or result["client_disconnected"]
+        if observer is not None and resp.status == HTTP_OK and not cut_short:
+            # A cut-short response is not parsed to its end: its last event is partial.
             observer = self._observe(observer, result, None)
-        if observer is not None and resp.status == HTTP_OK:
+        if observer is not None and resp.status == HTTP_OK and not cut_short:
             result["usage"] = observer.usage if isinstance(observer.usage, dict) else None
             result["message"] = observer.message if isinstance(observer.message, dict) else {}
         return result
@@ -587,6 +652,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 observer.feed(data)
             return observer
+        except ObserveTooLarge:
+            result["observe_failed"] = True
+            result["observe_too_large"] = True
+            return None
         except Exception:  # an unusual chunk costs the line its usage and answer, not the client its bytes
             result["observe_failed"] = True
             self.proxy.metrics.add("analysis_errors")

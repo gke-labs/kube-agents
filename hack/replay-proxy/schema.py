@@ -55,6 +55,7 @@ JOB_PR = "pr"
 
 # Why replay would not have saved an answer, in `unstorable`.
 UNSTORABLE_OBSERVE_FAILED = "observe_failed"
+UNSTORABLE_OBSERVE_TOO_LARGE = "observe_too_large"
 UNSTORABLE_UPSTREAM_INCOMPLETE = "upstream_incomplete"
 UNSTORABLE_CLIENT_DISCONNECTED = "client_disconnected"
 UNSTORABLE_NO_ANSWER = "no_answer"

@@ -225,7 +225,8 @@ class OpaqueTest(unittest.TestCase):
         self.assertEqual(call["id"], "⟦OPAQUE_1⟧")
         self.assertEqual(normalized.messages[1]["tool_call_id"], "⟦OPAQUE_1⟧")
         self.assertEqual(call["provider_specific_fields"], "⟦OPAQUE_2⟧")
-        self.assertEqual(normalized.mapping.to_value["⟦OPAQUE_1⟧"], self.SIGNED_ID)
+        self.assertEqual(normalized.mapping.to_placeholder["OPAQUE" + normalizer.MAPPING_KEY_SEPARATOR + self.SIGNED_ID],
+                         "⟦OPAQUE_1⟧")
         # Classes never reach inside an opaque value.
         self.assertNotIn("⟦TASK", json.dumps(call["id"]))
         self.assertEqual(json.loads(call["function"]["arguments"]), {"task_id": "⟦TASK_1⟧"})
@@ -349,6 +350,13 @@ class AnswerMappingTest(unittest.TestCase):
         self.assertEqual(mapping.apply_to_answer("xt_11111111"), "xt_11111111")
         self.assertTrue(mapping.answer_repeats_bare_number("kill 99"))
         self.assertFalse(mapping.answer_repeats_bare_number("kill 990"))
+
+    def test_repeated_number_uses_token_boundaries(self):
+        mapping = normalizer.normalize_request(request("generation: 1"), NOW).mapping
+        for answer in ("upgrade to 1.31", "use gemini-2.5-pro", "pool node-pool-1", "api v2", "--replicas=-1"):
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+        for answer in ("kill 1", "generation is 1."):
+            self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
 
 
 if __name__ == "__main__":

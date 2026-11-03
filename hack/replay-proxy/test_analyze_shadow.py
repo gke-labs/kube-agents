@@ -3,7 +3,7 @@
 import contextlib
 import io
 import json
-import os
+import shutil
 import tempfile
 import unittest
 
@@ -34,8 +34,20 @@ def presubmit(request_id, ts, pr, build, fingerprint, messages, **kwargs):
     return line(request_id, ts, "presubmit", build, fingerprint, messages, pr=pr, **kwargs)
 
 
+TEMP_DIR = None
+
+
+def setUpModule():
+    global TEMP_DIR
+    TEMP_DIR = tempfile.mkdtemp()
+
+
+def tearDownModule():
+    shutil.rmtree(TEMP_DIR, ignore_errors=True)
+
+
 def write(lines):
-    handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+    handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=TEMP_DIR)
     with handle:
         for entry in lines:
             handle.write((entry if isinstance(entry, str) else json.dumps(entry)) + "\n")
@@ -111,7 +123,7 @@ class EstimateTest(unittest.TestCase):
     def test_presubmit_lines_without_a_pr_are_counted(self):
         rep, _ = report([presubmit("p1", 1, "", "b1", "A", ["a"]), presubmit("p2", 2, "10", "b2", "A", ["a"]),
                          line("n1", 3, "nightly", "n", "A", ["a"])])
-        self.assertEqual(rep["presubmit_without_pr"], 1)
+        self.assertEqual(rep["health"]["presubmit_without_pr"], 1)
 
     def test_a_sighting_after_the_merge_is_not_copied(self):
         lines = [
@@ -167,7 +179,7 @@ class EstimateTest(unittest.TestCase):
         ]
         rep, _ = report(lines)
         self.assertEqual(rep["estimates"]["low"]["hits"], 0)
-        self.assertEqual(rep["unstorable_sightings"], 1)
+        self.assertEqual(rep["health"]["unstorable_lines"], 1)
         self.assertEqual(hits(lines, "low", require_storable=False), 1)
 
     def test_a_cut_short_upstream_answer_is_never_a_recording(self):
@@ -272,17 +284,19 @@ class HealthTest(unittest.TestCase):
             presubmit("p1", 2, "", "b1", "A", None, unstorable=["upstream_incomplete"]),
             presubmit("p2", 3, "10", "b1", "B", ["b"], unstorable=["observe_failed"]),
             presubmit("p3", 4, "10", "b1", "C", ["c"], unstorable=["fallback_attempted", "repeats_swapped_number"]),
+            presubmit("p4", 4, "10", "b1", "D", ["d"], unstorable=["observe_too_large"]),
             {"event": "replay_shadow_request", "ts": 5, "error": "RuntimeError", "job": {"kind": "presubmit"}},
         ])])
         rep = analyze_shadow.summarize(records, skipped=skipped)
         h = rep["health"]
-        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "presubmit": 3})
+        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "presubmit": 4})
+        self.assertEqual(h["observe_too_large"], 1)
         self.assertEqual(h["error_lines"], 1)
         self.assertEqual(h["presubmit_without_pr"], 1)
         self.assertEqual(h["without_message_hashes"], 1)
         self.assertEqual(h["upstream_incomplete"], 1)
         self.assertEqual(h["observe_failed"], 1)
-        self.assertEqual(h["unstorable_percent_by_reason"]["fallback_attempted"], 25.0)
+        self.assertEqual(h["unstorable_percent_by_reason"]["fallback_attempted"], 20.0)
         self.assertIn("health (check after the first day)", analyze_shadow.render(rep, skipped))
 
 
@@ -316,8 +330,6 @@ class LoadTest(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 self.assertEqual(analyze_shadow.main(args), 0)
             self.assertIn("50.0", out.getvalue())
-        os.unlink(path)
-        os.unlink(merged)
 
 
 if __name__ == "__main__":

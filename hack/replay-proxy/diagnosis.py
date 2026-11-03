@@ -1,4 +1,4 @@
-"""Per-message hashes for diagnosing misses, frozen at each message's first sighting.
+"""Per-message hashes for diagnosing misses, stable across one conversation.
 
 The fingerprint and `message_hashes` normalize every message with the whole
 request's context: its time (timestamps become how-far-from-now tokens) and
@@ -7,11 +7,11 @@ message can hash differently in a later request of the same conversation, and
 the closest-earlier-request search would report a difference that is only
 drift. These hashes are for that search only; they never decide a match.
 
-Each message is normalized once, when this proxy first sees it after a given
-history, with that request's time and with IPs kept literal only if a CIDR
-appeared in that message or an earlier one. The result is reused for the same
-message after the same history (keyed by a hash of the raw history plus the
-message), from a bounded in-memory LRU.
+The proxy remembers when it first saw each raw message (one float per distinct
+message, oldest dropped past FIRST_SEEN_CAPACITY). A request's messages are
+normalized in order with a fresh mapping; each uses its own first-seen time as
+"now", and IPs stay literal only if a CIDR appeared in that message or an
+earlier one. This runs after the response has gone back, off the agent's path.
 """
 
 from __future__ import annotations
@@ -20,32 +20,14 @@ import hashlib
 import json
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
 from typing import Any, List
 
 import normalizer
 
-DEFAULT_CAPACITY = 65536
-CHAIN_ROOT = "diag"
+FIRST_SEEN_CAPACITY = 1_000_000
 TEXT_ENCODING = "utf-8"
 # A lone surrogate is valid in a JSON string but not in UTF-8.
 ENCODING_ERRORS = "surrogatepass"
-
-
-@dataclass(frozen=True)
-class _Entry:
-    hash: str
-    mapping: normalizer.Mapping
-    cidr_seen: bool
-
-
-def _copy_mapping(mapping: normalizer.Mapping) -> normalizer.Mapping:
-    return normalizer.Mapping(
-        to_placeholder=dict(mapping.to_placeholder),
-        to_value=dict(mapping.to_value),
-        counts=dict(mapping.counts),
-        bare_numbers=set(mapping.bare_numbers),
-    )
 
 
 def _digest(text: str) -> str:
@@ -53,32 +35,27 @@ def _digest(text: str) -> str:
 
 
 class DiagnosisHasher:
-    def __init__(self, capacity: int = DEFAULT_CAPACITY):
+    def __init__(self, capacity: int = FIRST_SEEN_CAPACITY):
         self.capacity = capacity
-        self._cache: "OrderedDict[str, _Entry]" = OrderedDict()
+        self.first_seen: "OrderedDict[str, float]" = OrderedDict()
         self._lock = threading.Lock()
 
+    def _first_seen(self, raw: str, now: float) -> float:
+        key = _digest(raw)
+        with self._lock:
+            seen = self.first_seen.get(key)
+            if seen is None:
+                self.first_seen[key] = seen = now
+                while len(self.first_seen) > self.capacity:
+                    self.first_seen.popitem(last=False)
+            return seen
+
     def hashes(self, messages: List[Any], now: float) -> List[str]:
+        norm = normalizer.Normalizer(now, keep_ips=False)
         out = []
-        chain = CHAIN_ROOT
-        previous = _Entry("", normalizer.Mapping(), False)
         for message in messages:
             raw = json.dumps(message, sort_keys=True, ensure_ascii=False)
-            chain = _digest(chain + "|" + _digest(raw))
-            with self._lock:
-                entry = self._cache.get(chain)
-                if entry is not None:
-                    self._cache.move_to_end(chain)
-            if entry is None:
-                cidr_seen = previous.cidr_seen or normalizer.CIDR_RE.search(raw) is not None
-                norm = normalizer.Normalizer(now, keep_ips=cidr_seen)
-                norm.mapping = _copy_mapping(previous.mapping)
-                digest = normalizer.stable_hash(norm.walk(message))[: normalizer.MESSAGE_HASH_HEX_CHARS]
-                entry = _Entry(digest, norm.mapping, cidr_seen)
-                with self._lock:
-                    self._cache[chain] = entry
-                    while len(self._cache) > self.capacity:
-                        self._cache.popitem(last=False)
-            out.append(entry.hash)
-            previous = entry
+            norm.now = self._first_seen(raw, now)
+            norm.keep_ips = norm.keep_ips or normalizer.CIDR_RE.search(raw) is not None
+            out.append(normalizer.stable_hash(norm.walk(message))[: normalizer.MESSAGE_HASH_HEX_CHARS])
         return out

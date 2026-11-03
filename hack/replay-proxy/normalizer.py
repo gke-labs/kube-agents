@@ -39,7 +39,6 @@ KEY_DROP_FIELDS = ("stream", "user", "metadata")
 MESSAGES_FIELD = "messages"
 
 OPEN, CLOSE = "⟦", "⟧"
-PLACEHOLDER_RE = re.compile(re.escape(OPEN) + r"[^" + re.escape(CLOSE) + r"]+" + re.escape(CLOSE))
 
 # Opaque fields. LiteLLM embeds Gemini's thought signature in tool-call ids
 # (`call_…__thought__<base64>`), so no rule ever edits inside one: the whole
@@ -191,8 +190,11 @@ ENCODING_ERRORS = "surrogatepass"
 # characters that may border a token are excluded on each side.
 TOKEN_BEFORE = r"(?<![A-Za-z0-9+/=_-])"
 TOKEN_AFTER = r"(?![A-Za-z0-9+/=_-])"
-NUMBER_BEFORE = r"(?<![\w.])"
-NUMBER_AFTER = r"(?![\w])"
+# A bare number is a token when no word character, `.` or `-` precedes it and
+# no word character or `.`+digit follows it: `1` in `1.31`, `node-pool-1` or
+# `--replicas=-1` is not the number 1, but in `generation is 1.` it is.
+NUMBER_BEFORE = r"(?<![\w.-])"
+NUMBER_AFTER = r"(?!\w|\.\d)"
 DIGIT_RE = re.compile(r"\d")
 # Joins a mapping key's class scope and its value.
 MAPPING_KEY_SEPARATOR = "\0"
@@ -221,7 +223,6 @@ class Mapping:
     """Value <-> placeholder, numbered per class by first appearance."""
 
     to_placeholder: Dict[str, str] = field(default_factory=dict)
-    to_value: Dict[str, str] = field(default_factory=dict)
     counts: Dict[str, int] = field(default_factory=dict)
     # Values swapped that can never be put back in an answer: bare numbers
     # (keyed numbers) and epoch timestamps, which become an unnumbered
@@ -235,7 +236,6 @@ class Mapping:
             self.counts[cls] = number
             token = f"{OPEN}{cls}_{number}{CLOSE}"
             self.to_placeholder[key] = token
-            self.to_value[token] = value
         if cls == NUMBER_CLASS:
             self.bare_numbers.add(value)
         return self.to_placeholder[key]

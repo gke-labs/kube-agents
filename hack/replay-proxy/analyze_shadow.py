@@ -365,13 +365,16 @@ def health(records: List[Record], skipped: Optional[Dict[str, int]] = None) -> D
         "error_lines": skipped.get(SKIP_ERROR, 0),
         "lines_without_fingerprint": skipped.get(SKIP_NO_FINGERPRINT, 0),
         "untagged_lines": skipped.get(SKIP_UNTAGGED, 0),
+        "unstorable_lines": sum(1 for r in records if not r.storable),
         "unstorable_percent_by_reason": {
             reason: percent(count, len(records)) for reason, count in sorted(by_reason.items(), key=lambda kv: -kv[1])
         },
+        # REPLAY_JOB_PR unset: these never match an earlier build of their PR.
         "presubmit_without_pr": sum(1 for r in records if r.kind == PRESUBMIT and not r.pr),
         "without_message_hashes": sum(1 for r in records if r.message_hashes is None),
         "upstream_incomplete": by_reason.get(F.UNSTORABLE_UPSTREAM_INCOMPLETE, 0),
         "observe_failed": by_reason.get(F.UNSTORABLE_OBSERVE_FAILED, 0),
+        "observe_too_large": by_reason.get(F.UNSTORABLE_OBSERVE_TOO_LARGE, 0),
     }
 
 
@@ -386,10 +389,6 @@ def summarize(
         "presubmit_requests": len(presubmit),
         "nightly_requests": len(records) - len(presubmit),
         "presubmit_prompt_tokens": total_tokens,
-        "unstorable_sightings": sum(1 for r in records if not r.storable),
-        "unhashed_requests": sum(1 for r in records if r.message_hashes is None),
-        # REPLAY_JOB_PR unset: these never match an earlier build of their PR.
-        "presubmit_without_pr": sum(1 for r in presubmit if not r.pr),
         "merge_times_given": len(merged or {}),
         "health": health(records, skipped),
         "estimates": {},
@@ -433,10 +432,7 @@ def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
     lines = [
         f"requests: {report['requests']} ({report['presubmit_requests']} presubmit, {report['nightly_requests']} nightly);"
         f" presubmit prompt tokens: {report['presubmit_prompt_tokens']}",
-        f"skipped lines: {skipped}; sightings replay would not have saved: {report['unstorable_sightings']};"
-        f" requests without message hashes: {report['unhashed_requests']};"
-        f" presubmit requests without a pull request: {report['presubmit_without_pr']};"
-        f" merge times given: {report['merge_times_given']}",
+        f"skipped lines: {skipped}; merge times given: {report['merge_times_given']}",
         "",
         "health (check after the first day):",
     ]

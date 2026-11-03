@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import shutil
 import socket
 import struct
 import tempfile
@@ -176,7 +177,7 @@ def chat(task, stream, model="model-default", extra_messages=()):
 class ProxyTestCase(unittest.TestCase):
     redactor_path = REDACTOR
     upstream_timeout = replay_proxy.DEFAULT_UPSTREAM_TIMEOUT_SECONDS
-    store_dir = None
+    store_is_file = False
 
     def setUp(self):
         FakeLiteLLM.calls = []
@@ -186,7 +187,13 @@ class ProxyTestCase(unittest.TestCase):
         FakeLiteLLM.aborted = threading.Event()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeLiteLLM)
         threading.Thread(target=self.upstream.serve_forever, args=(POLL_SECONDS,), daemon=True).start()
-        self.store = self.store_dir or tempfile.mkdtemp()
+        temp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp, ignore_errors=True)
+        self.store = temp
+        if self.store_is_file:
+            self.store = os.path.join(temp, "a-file")  # no directory can be made under a file
+            with open(self.store, "w"):
+                pass
         self.out = io.StringIO()
         config = replay_proxy.Config(
             listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
@@ -342,6 +349,9 @@ MALFORMED_STREAMS = {
     "tool_call index null": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": None, "id": "c"}]}}]})),
     "tool_call index string": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": "0", "id": "c"}]}}]})),
     "tool_call index negative": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": -1, "id": "c"}]}}]})),
+    "tool_call index a bool": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": True, "id": "c"}]}}]})),
+    "tool_call index at the cap": sse(json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 256, "id": "c"}]}}]})),
+    "data that is not JSON": sse("not json at all"),
     "delta not a dict": sse(json.dumps({"choices": [{"delta": ["x"]}]})),
     "choices a number": sse(json.dumps({"choices": 5})),
     "nested too deep": sse('{"choices": ' + "[" * DEEP_NESTING + "]" * DEEP_NESTING + "}"),
@@ -371,6 +381,76 @@ class ObserveFailureTest(ProxyTestCase):
 
     def test_malformed_non_streamed_body(self):
         self.check(json.dumps({"choices": 5}).encode(), stream=False)
+
+
+class MergeDeltaTest(unittest.TestCase):
+    def test_tool_call_index_must_be_a_small_int(self):
+        # 256 first: code without the bound accepts it and fails here, before
+        # reaching 10**12, which it would try to allocate.
+        for index in (256, 10**12, -1, True, "0", None, 1.0):
+            with self.assertRaises((TypeError, ValueError), msg=repr(index)):
+                replay_proxy.merge_delta({}, {"tool_calls": [{"index": index, "id": "c"}]})
+        merged = replay_proxy.merge_delta({}, {"tool_calls": [{"index": 1, "id": "c"}]})
+        self.assertEqual(merged["tool_calls"][1]["id"], "c")
+
+
+class SseGrammarTest(ProxyTestCase):
+    def test_multi_line_data_event_is_joined(self):
+        event = {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "joined answer"}}],
+                 "usage": {"prompt_tokens": 321, "completion_tokens": 4}}
+        text = json.dumps(event, indent=1)  # several lines
+        body = "".join(f"data: {line}\n" for line in text.split("\n")).encode() + b"\n" + b"data: [DONE]\n\n"
+        FakeLiteLLM.custom_body = body
+        status, _, payload = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=True))
+        self.assertEqual(payload, body)
+        line = self.lines(1)[0]
+        self.assertFalse(line["observe_failed"])
+        self.assertEqual(line["prompt_tokens"], 321)
+        self.assertTrue(line["answer_hash"])
+
+
+class ObserveCapTest(ProxyTestCase):
+    CAP = 4096
+
+    def setUp(self):
+        super().setUp()
+        original = getattr(replay_proxy, "MAX_OBSERVED_BYTES", None)
+        replay_proxy.MAX_OBSERVED_BYTES = self.CAP
+        self.addCleanup(setattr, replay_proxy, "MAX_OBSERVED_BYTES", original)
+
+    def check(self, body, stream):
+        FakeLiteLLM.custom_body = body
+        status, _, payload = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=stream))
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, body, "the client gets every byte")
+        line = self.lines(1)[0]
+        self.assertEqual(line["unstorable"], ["observe_too_large"])
+        self.assertTrue(line["observe_failed"])
+
+    def test_oversized_streamed_answer(self):
+        chunk = sse(json.dumps({"choices": [{"index": 0, "delta": {"content": "x" * 1000}}]}))
+        self.check(chunk * 10 + b"data: [DONE]\n\n", stream=True)
+
+    def test_oversized_non_streamed_body(self):
+        body = json.dumps({"choices": [{"index": 0, "message": {"role": "assistant", "content": "x" * 10_000}}]})
+        self.check(body.encode(), stream=False)
+
+
+class RequestCapTest(ProxyTestCase):
+    CAP = 4096
+
+    def setUp(self):
+        super().setUp()
+        original = getattr(replay_proxy, "MAX_REQUEST_BYTES", None)
+        replay_proxy.MAX_REQUEST_BYTES = self.CAP
+        self.addCleanup(setattr, replay_proxy, "MAX_REQUEST_BYTES", original)
+
+    def test_oversized_request_is_a_413_and_not_forwarded(self):
+        body = chat("t_11111111", stream=False)
+        body["messages"][-1]["content"] += " " + "y" * 10_000
+        status, _, _ = self.request("POST", "/v1/chat/completions", body)
+        self.assertEqual(status, 413)
+        self.assertEqual(FakeLiteLLM.calls, [])
 
 
 class FramingTest(ProxyTestCase):
@@ -428,7 +508,7 @@ class ClientDisconnectTest(ProxyTestCase):
 
 
 class StoreWriteFailureTest(ProxyTestCase):
-    store_dir = tempfile.mkstemp()[1]  # a file, so no directory can be made under it
+    store_is_file = True
 
     def test_write_failure_keeps_the_line(self):
         status, _, _ = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
