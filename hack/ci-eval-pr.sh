@@ -253,10 +253,17 @@ readonly EVAL_INSTALL_GONE_MARKER="install-gone"
 # fence_live_cards (beside wait_platform_runs, #4425): how many times
 # hack/ci_fence_cards.py reads the board again for a child a worker filed
 # before its own archive, as the harness's _DESCENDANT_PASSES, and the bound on
-# the one exec: each archive is bounded at 30s in the helper, and a few cards
-# are what an abandoned unit leaves.
+# the one exec. A later fence faces the few cards one abandoned unit leaves. The
+# first faces every card phase 1's parallel units left live, and each archive is
+# a hermes CLI start bounded at 30s in the helper, so it can run out of time.
+# The budget the helper gets is the bound less the margin: timeout(1) stops
+# kubectl, not the helper in the pod, so the helper must end by itself first or
+# a later pass could archive the card of the unit launched next. The margin
+# covers the exec's setup, the interpreter's start and the last board read; a
+# helper that runs out names the cards it did not reach, and the warning says so.
 readonly EVAL_FENCE_CARD_PASSES=3
 readonly EVAL_FENCE_TIMEOUT_SECONDS=180
+readonly EVAL_FENCE_BUDGET_MARGIN_SECONDS=30
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
@@ -1975,6 +1982,7 @@ fence_live_cards() { # <label>
   out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
     -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
     "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_FANOUT_STARTED_EPOCH}" "${EVAL_FENCE_CARD_PASSES}" \
+    "$((EVAL_FENCE_TIMEOUT_SECONDS - EVAL_FENCE_BUDGET_MARGIN_SECONDS))" \
     < "${SCRIPT_DIR}/ci_fence_cards.py" 2>&1)" || rc=$?
   if [ "${rc}" -eq 0 ]; then
     echo "Card fence (${label}): ${out}"

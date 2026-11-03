@@ -35,6 +35,9 @@ SCRIPT = REPO / "hack" / "ci_fence_cards.py"
 RUNNER = REPO / "hack" / "ci-eval-pr.sh"
 SINCE = 1_000
 PASSES = 3
+BUDGET = 60
+# The helper's floor for starting an archive, read from source so the test follows it.
+ARCHIVE_FLOOR = int(re.search(r"^ARCHIVE_FLOOR_SECONDS = (\d+)$", SCRIPT.read_text(), re.M).group(1))
 
 # The runner's own readonly lines fence_live_cards reads, lifted so a rename there fails here.
 RUNNER_CONSTANTS = (
@@ -44,6 +47,7 @@ RUNNER_CONSTANTS = (
     "EVAL_GATEWAY_HOME",
     "EVAL_FENCE_CARD_PASSES",
     "EVAL_FENCE_TIMEOUT_SECONDS",
+    "EVAL_FENCE_BUDGET_MARGIN_SECONDS",
 )
 
 
@@ -92,9 +96,9 @@ class FenceCardsTest(unittest.TestCase):
         )
         hermes.chmod(0o755)
 
-    def _fence(self, passes: int = PASSES) -> subprocess.CompletedProcess:
+    def _fence(self, passes: int = PASSES, budget: int = BUDGET) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["python3", "-", str(self.home), str(SINCE), str(passes)],
+            ["python3", "-", str(self.home), str(SINCE), str(passes), str(budget)],
             stdin=SCRIPT.open(), capture_output=True, text=True, check=False, timeout=60,
             env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}"},
         )
@@ -173,6 +177,26 @@ class FenceCardsTest(unittest.TestCase):
         done = self._fence()
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "nothing live"), done.stdout)
 
+    def test_a_budget_spent_mid_list_stops_and_names_the_cards_not_reached(self):
+        # The runner's timeout stops kubectl, not the helper in the pod; a helper that kept
+        # going could archive the card of the unit launched after it (#4702 review).
+        self._cards([("t_a", "running", SINCE + 1), ("t_b", "running", SINCE + 2), ("t_c", "todo", SINCE + 3)])
+        self._hermes(f"echo start >> \"{self.home}/starts\"; /bin/sleep 3")
+        done = self._fence(budget=ARCHIVE_FLOOR + 2)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertEqual(self.calls.read_text().split(), ["t_a"])
+        self.assertIn("not reached: t_b (running), t_c (todo)", done.stdout)
+        self.assertIn(f"budget of {ARCHIVE_FLOOR + 2}s", done.stdout)
+        self.assertEqual(self._status("t_b"), "running")
+
+    def test_a_budget_below_the_floor_archives_nothing(self):
+        self._cards([("t_a", "running", SINCE + 1)])
+        self._hermes()
+        done = self._fence(budget=ARCHIVE_FLOOR - 1)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertFalse(self.calls.exists())
+        self.assertIn("not reached: t_a (running)", done.stdout)
+
     def test_an_unreadable_board_exits_non_zero(self):
         self.board.write_text("not a database")
         self._hermes()
@@ -206,7 +230,10 @@ class FenceCardsTest(unittest.TestCase):
         self.assertIn("Card fence (pdb-remediation-pr rep 3): archived 1 card(s)", done.stdout, done.stderr)
         argv = (self.home / "argv").read_text()
         self.assertIn("--context gke_proj_us_c -n ns exec -i deployment/platform-agent-gateway -c platform-agent", argv)
-        self.assertRegex(argv, r" - /opt/data 1000 \d+\n?$")
+        constants = dict(line.split("=", 1) for line in runner_constants())
+        budget = int(constants["EVAL_FENCE_TIMEOUT_SECONDS"]) - int(constants["EVAL_FENCE_BUDGET_MARGIN_SECONDS"])
+        self.assertGreater(budget, 0)
+        self.assertRegex(argv, rf" - /opt/data 1000 {constants['EVAL_FENCE_CARD_PASSES']} {budget}\n?$")
 
     def test_a_failed_exec_warns_and_the_unit_goes_ahead(self):
         done = self._runner('echo "error: pod not running"; exit 1')
