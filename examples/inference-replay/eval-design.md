@@ -111,12 +111,12 @@ The rules that keep this safe:
 - **Identifiers only, never state.** Counts, statuses, restart numbers, versions, scores and
   zones stay literal; they are what the agent reasons about. A crashlooping pod's restart count
   rises between runs, so cases with a live defect replay less, and that is correct.
-- **Ages keep their unit, and only ages count as ages.** `5m` and `3d` get different placeholder
-  classes, because a pod's age in minutes against days can be the finding. A value is treated as an
-  age only where it is clearly one: an `AGE` column, an `age:` or `lastSeen` field, or "… ago".
-  Kubernetes writes CPU the same way (`120m` is 0.12 of a core), and CPU and memory amounts are
-  state that cases are graded on, so they always stay literal. The prototype matched any
-  `<digits>m`, which this rule replaces.
+- **Only real ages are treated as ages, and they keep their unit.** `5m` and `3d` get different
+  placeholders, because a pod being minutes old instead of days old can be the whole finding. And
+  something only counts as an age when it clearly is one: in an `AGE` column, an `age:` or
+  `lastSeen` field, or "… ago". Kubernetes writes CPU the same way (`120m` means 0.12 of a core),
+  and cases get graded on CPU and memory numbers, so those are never touched. (The prototype
+  swapped any number ending in `m`; this rule replaces that.)
 - **Opaque fields are never touched.** Fields named for signatures, `provider_specific_fields`,
   and the `id`/`tool_call_id` of tool calls: LiteLLM embeds Gemini's thought signature in
   tool-call ids (`call_…__thought__<base64>`), and rewriting a digit inside it corrupts the
@@ -193,10 +193,11 @@ to the `inference-gateway` Service.
 
 How traffic reaches it:
 
-- **Agents → proxy.** The worker pods' network policies (A2A sessions and Cluster Agents) only let
-  them talk to pods labelled `app: litellm` (the Platform Agent's own pod also allows the older
-  `app: standalone-replay`). So the proxy pod carries that label too, plus a second label, `replay: proxy`.
-  The `inference-gateway` Service is pointed at pods with both labels, which means only the proxy.
+- **Agents → proxy.** The worker pods (A2A sessions and Cluster Agents) are only allowed to talk to
+  pods labelled `app: litellm`. (The Platform Agent's own pod is also allowed to talk to the older
+  `app: standalone-replay` label.) So the proxy pod gets the `app: litellm` label too, plus a second
+  label, `replay: proxy`. The `inference-gateway` Service is pointed at pods with both labels, which
+  means only the proxy.
 - **Proxy → LiteLLM.** A second Service, `inference-gateway-upstream`, points at the real LiteLLM
   pods, and one extra network policy lets the proxy reach them.
 
@@ -237,64 +238,65 @@ to refill it once per project instead of once.
 The cache lives in a storage bucket that only the eval projects use. It's never shared with dev
 installs or customer installs, because the saved answers contain details about our test clusters.
 
-**Requests are scrubbed in the proxy.** The proxy sees every request before any redaction:
-LiteLLM's redaction plugin runs inside LiteLLM, is off by default, and CI doesn't turn it on. So
-before anything is stored, the proxy runs the same scrubbers `worker_trajectory.py` uses (the
-install's `AuditRedactor`, then the `worker_transcript.py` rules). Those have only been tested on
-2,000-character snippets, so full-length tool output (a Secret dump, a minted token) needs its own
-check before any request text is stored.
+**The proxy has to remove secrets itself.** It sees every request before anything is cleaned up.
+LiteLLM does have a redaction plugin, but it's off by default and CI doesn't turn it on. So before
+the proxy stores anything, it runs the same cleanup that `worker_trajectory.py` already uses (the
+install's `AuditRedactor`, then the rules in `worker_transcript.py`). That cleanup has only been
+tested on short snippets (2,000 characters), so we need to check it on full tool output, like a
+Secret dump or a token, before storing any request text.
 
 ### Who can write to the cache
 
-The eval run on a pull request (the presubmit) uses that pull request's code. If that run could
-write to the shared cache, a pull request could change its scripts to save made-up "passing"
-answers under `main`'s requests, and every pull request after it would be graded with them. The
-evidence store already has a rule against this in
+The eval run on a pull request (the presubmit) runs that pull request's code. If that run could
+write to the shared cache, someone could change the scripts in their pull request to save fake
+"passing" answers, and every pull request after it would be graded with them. We already have a
+rule against this for the evidence store, in
 [`testing-strategy.md`](../../docs/designs/testing-strategy.md) §4.2: a pull request must not be able
 to change what it's compared against.
 
-Permissions inside the eval cluster can't enforce that. The presubmit's own account
-(`prowjob-default-sa`) is an admin on every eval-pool project (storage, service accounts and IAM,
-per `docs/ci-pool-projects.md`), so anything a process in the cluster can write, a pull request can
-write too. The evidence store gets around this the only way that works: the trusted writer is a
-different account that runs outside the cluster. The nightly uploads as `eval-baseline-recorder`,
-and presubmits only get read access. The cache works the same way. The proxy keeps each run's
-answers inside the cluster, and the job copies them out as it runs. They only reach the shared
-cache through one of these writers:
+We can't fix this with permissions inside the eval cluster. The presubmit's account
+(`prowjob-default-sa`) is an admin on every eval-pool project, with control over storage, service
+accounts and permissions (see `docs/ci-pool-projects.md`). So anything that can write from inside
+the cluster, a pull request can write too. The evidence store solves this by having the trusted
+writer be a different account that runs outside the cluster: the nightly uploads as
+`eval-baseline-recorder`, and presubmits can only read. We do the same. The proxy keeps answers
+inside the cluster, the job copies them out while it runs, and only these two can put them in the
+shared cache:
 
-- **The nightly.** It runs `main`'s code as `eval-baseline-recorder`, and uploads the answers from
-  runs that passed.
-- **A copy job when a pull request merges.** A small job, triggered by the merge and running as a
-  trusted account, copies the merged pull request's answers from its last passing presubmit into
-  the shared cache. That's safe because the code that produced them has now been reviewed,
-  approved and merged. It's only a file copy, not an eval run, so the cost that made the scorer
-  design reject an after-merge eval run (`docs/designs/eval-scorer.md`, "Why nightly and not
-  per-merge") doesn't apply. It's also what keeps the cache fresh: right after a prompt change
-  merges, the merged pull request's own answers already match the new prompt.
+- **The nightly.** It runs `main`'s code as `eval-baseline-recorder` and uploads answers from runs
+  that passed.
+- **A copy job that runs when a pull request merges.** It runs as a trusted account and copies the
+  merged pull request's answers, from its last passing presubmit, into the shared cache. That's safe
+  because by then the code that made those answers has been reviewed, approved and merged. It only
+  copies files and doesn't run any evals, so it doesn't have the cost problem that made the scorer
+  design turn down running evals after every merge (`docs/designs/eval-scorer.md`, "Why nightly and
+  not per-merge"). It also keeps the cache fresh: right after a prompt change merges, that pull
+  request's answers already use the new prompt.
 
 A pull request can also **reuse its own answers** when it's re-run (a `/retest`, or a new push that
-doesn't touch a case). A lot of the 150–290 presubmit builds a weekday are re-runs of the same pull
+doesn't touch a case). Lots of the 150–290 presubmit builds a weekday are re-runs of the same pull
 request.
 
-**The hard part is keeping a pull request's answers safe until it merges.** Both the merge copy and
-a pull request's own re-runs read answers a presubmit saved. All presubmits run as the same account,
-so if they all wrote into one bucket, a bad pull request could write into another pull request's
-folder, and the merge copy would carry its answers into the shared cache. Only a pull request's own
-builds may be able to write its answers. Two candidates, to be checked before building:
+**The tricky part is keeping a pull request's answers safe until it merges.** The merge copy and a
+pull request's own re-runs both read answers that a presubmit saved. Every presubmit runs as the
+same account, so if they all saved into one bucket, a bad pull request could write into another
+pull request's folder, and the merge copy would then carry those answers into the shared cache.
+Only a pull request's own builds should be able to write its answers. Two ways we could do that,
+which need checking before we build:
 
-- Store them in the build's own Prow artifacts folder, encrypted with a Cloud KMS key that
-  presubmits can encrypt with but only the copy job can decrypt. That needs Prow's uploader to be
-  the only thing that can write into a build's folder; whether a job's own code can write there
-  isn't verified.
-- A staging bucket with create-only access (no overwrite), where each build writes a list of what
-  it saved and the copy job checks it.
+- Keep them in that build's own Prow artifacts folder, encrypted with a Cloud KMS key that
+  presubmits can only encrypt with and only the copy job can decrypt. This only works if Prow's
+  uploader is the only thing that can write into a build's folder, and we haven't checked whether a
+  job's own code can write there too.
+- A staging bucket where builds can add files but not overwrite them, with each build also saving a
+  list of what it wrote for the copy job to check.
 
-Pull requests read the shared cache through the runner's own read-only token, refreshed into the
-cluster, rather than through an account that lives in the cluster.
+Pull requests read the shared cache using the runner's own read-only token, passed into the cluster,
+not through an account that lives in the cluster.
 
 ```mermaid
 flowchart LR
-    subgraph trusted["Trusted writers (run outside the eval cluster)"]
+    subgraph trusted["Trusted writers (outside the eval cluster)"]
         nightly["Nightly run<br/>(saves passing runs, never replays)"]
         copy["Merge copy job<br/>(copies a merged PR's answers)"]
     end
@@ -334,11 +336,21 @@ doesn't touch a case replays a passing run, and a pull request that does touch i
 requests and runs live. The writers above apply that rule: the nightly uploads only passing runs,
 and the merge copy takes only the merged pull request's last passing presubmit.
 
-Each case runs three times on a pull request. Ideally each of those three would replay its own
-recording, so we still get three different samples instead of the same one three times. For that,
-the proxy needs to know which run a request belongs to, and today requests don't carry that (see
-open questions). Until then, all three runs of a case replay the same recording. That's also how
-our measurements were done: one recording, replayed three times.
+**Telling the runs in a build apart.** One presubmit build isn't one run. It's about 45 runs (around
+15 cases, three times each) going at the same time on the same install, and a build can pass while
+some of those runs fail. Requests don't say which run they belong to, but we can work it out after
+the run with data we already have. Every request names the kanban card it's working on (a worker's
+first message is "work kanban task t\_…"), or the A2A task ID for the front door. Each run's
+`results.json` already lists the cards and task IDs that run used, and whether it passed. So the
+copy job can match each saved answer to its card, the card to its run, and the run to pass or fail,
+and copy only the passing ones.
+
+Each case runs three times. Ideally each of the three would replay its own recording, so we still
+get three different samples instead of one sample three times. That needs the proxy to know the run
+while it's happening, not afterwards. It could follow the same chain live: the harness tells the
+proxy which case and run each front-door task ID is, and every card after that was created by an
+answer the proxy already saw. That's more work, so it comes later. Until then all three runs of a
+case replay the same recording, which is also how our measurements were done.
 
 ### Prompts change often
 
@@ -373,26 +385,27 @@ before stage 2 of the rollout:
   pull requests. The nightly still shows it.
 - **Token counts look like the model ran.** A replayed answer comes with the token counts from the
   original run. So the eval record's token numbers, and rung 3's check that the run really called a
-  model, both act as if the model was called. To count replayed tokens separately, the proxy has to
-  tell the eval record which answers were replayed, and that needs the same "which run is this"
-  information as above. Until then, we read the savings from the proxy's own log.
+  model, both act as if the model was called. To show real savings per run, we match the proxy's log
+  to runs the same way as above (card and task IDs) and add the replayed-token count to each run's
+  record afterwards.
 
 ## Rollout
 
-1. **Shadow mode (logs only, no cache).** The proxy runs in the presubmit and the nightly and
-   calls the model for every request, so nothing about pass or fail changes. For each request it
-   logs a fingerprint (the hash of the normalized request), the prompt tokens and the model time.
-   The fingerprints carry nothing sensitive, so they go into the job's normal Prow artifacts. The
-   scrubbed request text goes to a private, eval-only bucket instead, because Prow artifacts can be
-   read by anyone through the public Prow web UI. The job streams both out while it runs, not at the
-   end: the last two nightlies hit Prow's 14-hour timeout, and their end-of-run collection found
-   LiteLLM already deleted. After a week, an offline script goes through the logs in time order and,
-   for each request, asks whether the same fingerprint appeared earlier. Hits on nightly
-   fingerprints give a low estimate (up to a day old), hits on pull request fingerprints a high one,
-   and the share of hits from another project answers whether one shared cache is right. For
-   normalizer work, the script diffs each miss against the closest earlier request, and because the
-   scrubbed text is kept, a new normalizer rule can be re-run over the same week without redeploying.
-   No shared cache and no new in-cluster permissions are needed for this stage.
+1. **Shadow mode (logs only, no cache).** The proxy runs in the presubmit and the nightly but still
+   calls the model for every request, so no pass or fail changes. For each request it logs a
+   fingerprint (a hash of the normalized request), the prompt tokens and how long the model took.
+   Fingerprints don't contain anything sensitive, so they go in the job's normal Prow artifacts. The
+   cleaned-up request text goes to a private, eval-only bucket instead, because anyone can read Prow
+   artifacts through the public Prow website. Both are copied out while the job runs, not at the end,
+   because the last two nightlies ran into Prow's 14-hour timeout and by the time the end-of-run step
+   ran, LiteLLM was already gone. After a week, a script goes through all the logs in time order and
+   checks, for each request, whether the same fingerprint showed up earlier. Matches against nightly
+   fingerprints give us a low estimate (those can be a day old), and matches against pull request
+   fingerprints a high one. How many matches came from a different project tells us whether one
+   shared cache makes sense. For normalizer fixes, the script compares each miss with the closest
+   earlier request, and since we kept the cleaned-up text, we can test a new normalizer rule on the
+   same week of data without redeploying anything. This stage needs no shared cache and no new
+   permissions inside the cluster.
 2. **Turn on replay for pull requests**, once the eval crew has decided the three gate questions above
    and #1730 is fixed (or they're happy with stripping the recent-work section from the key).
 3. **Look at polling.** If shadow mode shows most of the remaining misses come from the `sleep 60`
@@ -400,15 +413,13 @@ before stage 2 of the rollout:
 
 ## Open questions
 
-- **How does the proxy know which run a request belongs to?** We need this to save only passing runs
-  and to give each of the three runs its own recording. Requests from many agents and many cases
-  arrive at the same time with nothing saying which run they're from. Two ideas: pass a run tag from
-  the eval harness through the gateway and Hermes into each request's `metadata`, or link requests
-  together by conversation (each worker's first request names its card, and the card's text came
-  from the parent's recorded answer).
+- **Following runs live, for one recording per run.** Working out which run an answer came from
+  after the fact is covered above. Doing it live, so each of the three runs gets its own recording,
+  means the harness telling the proxy which case and run each front-door task is, and the proxy
+  following the cards from there. Worth doing only if shadow mode shows replay is worth turning on.
 - **Should the judge be cached too?** When a whole run is replayed, the judge gets exactly the same
   input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
-- **How are a pull request's answers kept safe until it merges?** See "The hard part" above; one of
-  the two candidates has to be checked and picked before stage 2.
+- **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We
+  need to check the two options and pick one before stage 2.
 - **How big does the cache get, and when do entries expire?** Answers recorded for an old version of
   a prompt can never be hit again, so entries should expire by age.
