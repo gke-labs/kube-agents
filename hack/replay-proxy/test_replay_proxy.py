@@ -37,6 +37,7 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     calls = []
     fallbacks = "0"
+    model_group = "model-default"
     # "normal", "stall_reset" (one chunk, a pause, then a TCP reset),
     # "early_close" (two chunks, then the connection closes without the last
     # chunk), "short_body" (a non-streamed answer cut short of its
@@ -71,7 +72,9 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
         raw, number = self._record()
         body = json.loads(raw)
         task = body["messages"][-1]["content"].split()[-1]
-        headers = {"x-litellm-model-group": body["model"], "x-litellm-attempted-fallbacks": self.fallbacks}
+        # A fixed value, not the request's `model`: a response header is never
+        # built from request data, even in this fake.
+        headers = {"x-litellm-model-group": self.model_group, "x-litellm-attempted-fallbacks": self.fallbacks}
         if not body.get("stream") and self.custom_body is not None:
             data = self.custom_body
             self.send_response(200)
