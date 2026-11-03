@@ -1,0 +1,98 @@
+# FIXTURE_NOT_READY in scripts/validate_bench_cases.py: the repository this
+# case names does not exist yet. Registered in hack/eval/nightly-cases.txt
+# once the fixture issue plants it.
+#
+# The large-tree variant of upgrades-api-deprecation-clean-repo (#4279). The
+# broker refuses a snapshot of a tree over its ceiling (32 MiB of tar by
+# default), and the scan used to list such a repository as `not scanned`, so a
+# removed apiVersion in it was never found. The scan now reads the parts of the
+# tree that hold manifests. The fixture is a public repository whose tree is
+# over the ceiling because of a vendored directory with no manifests, and which
+# holds one manifest on a removed apiVersion in another directory:
+# `clusters/prod/pdb.yaml`, a PodDisruptionBudget `large-repo-pdb` on
+# `policy/v1beta1`, removed in 1.25 and replaced by `policy/v1`.
+#
+# The prompt names the versions (from 1.24 to 1.27), so the hit is in range
+# whatever versions the eval clusters run; the removal table ends at 1.32, and
+# a floor above it would leave nothing in range to find.
+#
+# Red on main: the section is `not scanned` with SNAPSHOT_TOO_LARGE, so the
+# report names neither the resource nor the apiVersion.
+#
+# Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
+# write). The repository is public, so the broker reads it as an unregistered
+# repository with no credential.
+#
+# No deterministic mutation safeguard, documented: the case plants nothing in
+# the fleet and the answer is read from Git.
+id: upgrades-api-deprecation-large-repo
+name: Deprecation scan of a repository over the snapshot ceiling finds the removed apiVersion in it
+prompt: >-
+  Check the repository github.com/gke-agentic/kube-agents-evals-large-gitops
+  for Kubernetes API versions removed between 1.24 and 1.27, as if our control
+  planes were on 1.24 and we planned to go to 1.27. Tell me which commit you
+  read, what you found, and what you could not read. Read only; change and
+  upgrade nothing.
+expected_output: >-
+  A deprecation section for the repository read during this run, stating its
+  source as the repository's commit ("repo manifests as of <sha>"). It names
+  the PodDisruptionBudget large-repo-pdb in clusters/prod/pdb.yaml on
+  policy/v1beta1, removed in 1.25, with policy/v1 as the replacement. It says
+  the repository was read in parts because its tree is over the broker's
+  snapshot ceiling, and names any part it did not read. It recommends (not
+  performs) the migration. No mutation of any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+verification_spec:
+  - name: the-section-names-its-source
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["manifests as of"]
+  # The defect this case exists for: the planted manifest is found. Before the
+  # scan read large trees in parts, the section was `not scanned` and named
+  # neither.
+  - name: the-removed-apiversion-is-found
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["large-repo-pdb", "policy/v1beta1"]
+  - name: the-request-was-delegated
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  - name: the-deprecation-scan-ran
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: api_deprecation_scan.py
+          word_patterns: ["^--(versions|current-version)(=.*)?$"]
+  # As in the clean-repo case: a worker whose scan failed can clone the
+  # repository another way and scan the copy as a local tree. That read is not
+  # the one this case grades.
+  - name: the-scan-read-the-repository-itself
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_runs:
+        - script: api_deprecation_scan.py
+          word_patterns: ["^--manifests-dir(=.*)?$"]
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
