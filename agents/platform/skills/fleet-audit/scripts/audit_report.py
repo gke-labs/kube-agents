@@ -19198,30 +19198,15 @@ def _remediation_file_index(finding: dict, root: Path) -> dict[KccKey, KccDeclar
     except OSError:
         return {}
     index: dict[KccKey, KccDeclaration] = {}
+    # `_index_kcc_text` gives a declaration with no project annotation the
+    # project of a Namespace that the same file declares.
     _index_kcc_text(index, yaml, text, "", relative)
-    # A declaration with no project annotation takes its namespace's, as
-    # Config Connector does, when the same file declares that Namespace.
-    namespace_projects = _namespace_projects(yaml, text)
-    return {
-        key: declaration._replace(project=namespace_projects.get(declaration.namespace, ""))
-        if not declaration.project and declaration.namespace in namespace_projects
-        else declaration
-        for key, declaration in index.items()
-    }
-
-
-def _namespace_projects(yaml: Any, text: str) -> dict[str, str]:
-    """The `cnrm.cloud.google.com/project-id` annotation of each Namespace a
-    file declares, by namespace name."""
-    try:
-        docs = list(yaml.safe_load_all(text))
-    except (yaml.YAMLError, ValueError, RecursionError):
-        return {}
-    return _namespace_projects_of(docs)
+    return index
 
 
 def _namespace_projects_of(docs: list) -> dict[str, str]:
-    """`_namespace_projects` of documents that are already parsed."""
+    """The `cnrm.cloud.google.com/project-id` annotation of each Namespace
+    that the parsed documents of one file declare, by namespace name."""
     projects: dict[str, str] = {}
     for doc in docs:
         if not isinstance(doc, dict) or doc.get("kind") != KCC_NAMESPACE_KIND:
