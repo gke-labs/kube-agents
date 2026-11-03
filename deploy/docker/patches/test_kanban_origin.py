@@ -22,7 +22,6 @@ import sqlite3
 import sys
 import tempfile
 import textwrap
-import time
 import unittest
 from contextlib import closing
 from datetime import datetime, timezone
@@ -237,12 +236,12 @@ class Hermes(unittest.TestCase):
         self.home.mkdir()
         env = {
             "KANBAN_TEST_BOARD": str(self.board),
-            kanban_origin.HERMES_HOME_ENV: str(self.home),
+            "HERMES_HOME": str(self.home),
         }
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name in (kanban_origin.CARD_ORIGIN_ENV, "HERMES_KANBAN_TASK", "HERMES_SESSION_ID"):
+        for name in (kanban_origin.STAMP_TICKET_ENV, "HERMES_KANBAN_TASK", "HERMES_SESSION_ID"):
             os.environ.pop(name, None)
         _purge_hermes_modules()
         sys.path.insert(0, str(self.root))
@@ -253,16 +252,32 @@ class Hermes(unittest.TestCase):
         self.kanban, self.kb, self.graph, self.ko = kanban, kanban_db, kanban_db_graph, ko
         self.records: dict = {}
         self.session = ""
+        # The Session KV server's ticket routes, in memory: a ticket redeems
+        # once; anything else is the server's 404.
+        self.tickets: dict = {}
+        self.minted: list = []
         for name, fake in (
             ("_session_id", lambda: self.session),
             ("_fetch_session_metadata", lambda sid: self.records.get(sid)),
             ("_cron_origin", lambda: None),
+            ("_session_kv", self._ticket_server),
         ):
             patcher = mock.patch.object(ko, name, side_effect=fake)
             patcher.start()
             self.addCleanup(patcher.stop)
 
     # -- helpers --------------------------------------------------------------
+
+    def _ticket_server(self, path, payload=None):
+        if path == kanban_origin.STAMP_TICKETS_PATH:
+            ticket = f"{len(self.minted):032x}"
+            self.minted.append(ticket)
+            self.tickets[ticket] = {"origin": payload["origin"], "platform": payload.get("platform", "")}
+            return {"ticket": ticket}
+        match = re.fullmatch(r"/v1/board/stamp-tickets/([^/]+)/redeem", path)
+        if match and match.group(1) in self.tickets:
+            return self.tickets.pop(match.group(1))
+        raise LookupError("HTTP 404: no live stamp ticket by that value")
 
     def conn(self):
         return closing(self.kb.connect(str(self.board)))
@@ -300,10 +315,6 @@ class Hermes(unittest.TestCase):
 
 
 class StampAtInsertTest(Hermes):
-    def setUp(self):
-        super().setUp()
-        self.route_results: list = []
-
     def test_a_fresh_insert_is_stamped_with_the_turns_origin(self):
         self.in_chat_turn("googlechat")
         tool_card = self.create()
@@ -345,11 +356,10 @@ class StampAtInsertTest(Hermes):
         first = self.slash(f"create --json --assignee platform --idempotency-key {key} squat")
         self.assertEqual(self.origin(first), ("chat", "slack"))
         self.session = ""  # the gate's tick has no turn
-        with mock.patch.object(self.ko, "put_card_origin", side_effect=self._route) as put:
-            got = gate.file_card(gate.Card(title="t", body="b", idempotency_key=key, origin="issue"))
+        got = gate.file_card(gate.Card(title="t", body="b", idempotency_key=key, origin="issue"))
         self.assertEqual(got, first)
+        self.assertEqual(len(self.minted), 1, "the gate minted its ticket")
         self.assertEqual(self.origin(first), ("chat", "slack"))
-        self.assertEqual(self.route_results, [False] * put.call_count, "the route stamps nothing over a stamp")
 
     def test_no_create_argument_can_set_the_origin(self):
         out = self.kanban.run_slash("create --json --origin issue --assignee platform x")
@@ -375,12 +385,13 @@ class StampAtInsertTest(Hermes):
         )
         follow_up = gate._pr_card(pr, [trigger], "example/fleet", now=now)
         self.assertEqual((issue.origin, follow_up.origin), ("issue", "scheduled"))
-        with mock.patch.object(self.ko, "put_card_origin", side_effect=self._route):
-            issue_id = gate.file_card(issue)
-            pr_id = gate.file_card(follow_up)
+        issue_id = gate.file_card(issue)
+        pr_id = gate.file_card(follow_up)
         self.assertEqual(self.origin(issue_id), ("issue", ""))
         self.assertEqual(self.origin(pr_id), ("scheduled", ""))
-        self.assertNotIn(kanban_origin.CARD_ORIGIN_ENV, os.environ, "the override does not outlive the call")
+        self.assertEqual(len(self.minted), 2, "one ticket per create")
+        self.assertEqual(self.tickets, {}, "each ticket was spent by its insert")
+        self.assertNotIn(kanban_origin.STAMP_TICKET_ENV, os.environ, "the ticket does not outlive the call")
 
     def test_the_console_convention_resolves_portal_and_web_console_ids(self):
         ko = self.ko
@@ -399,50 +410,47 @@ class StampAtInsertTest(Hermes):
         self.session = "portal_x"
         self.assertEqual(self.origin(self.create()), ("console", ""))
 
-    # -- the in-process stand-in for PUT /v1/board/tasks/{id}/origin -------------
-
-    def _route(self, task_id, origin, platform=""):
-        with self.conn() as conn:
-            result = self.ko.stamp(conn, task_id, origin, platform)
-        self.route_results.append(result)
-        return result
 
 
 # ---------------------------------------------------------------------------
-# The override, read on the CLI create path only
+# The trusted writers' stamp ticket
 # ---------------------------------------------------------------------------
 
 
-class OverrideTest(Hermes):
-    def setUp(self):
-        super().setUp()
-        os.environ[kanban_origin.CARD_ORIGIN_ENV] = "issue"
-
-    def test_the_cli_create_path_reads_the_override(self):
-        self.assertEqual(self.origin(self.slash("create --json --assignee platform gate")), ("issue", ""))
-
-    def test_no_other_create_path_reads_it(self):
-        self.assertFalse(self.stamped(self.create()), "the tool path ignores the variable")
-        self.assertFalse(self.stamped(self.create(created_by="platform")))
-        self.assertIsNone(self.ko.cli_override())
-
-    def test_the_turn_beats_the_override_so_a_chat_user_cannot_borrow_it(self):
+class TicketTest(Hermes):
+    def test_a_planted_ticket_value_is_ignored(self):
         self.in_chat_turn()
-        self.assertEqual(self.origin(self.slash("create --json --assignee platform mine")), ("chat", "slack"))
+        for planted in ("issue", "0" * 32, "drift:"):
+            with self.subTest(planted=planted):
+                os.environ[kanban_origin.STAMP_TICKET_ENV] = planted
+                self.assertEqual(self.origin(self.slash("create --json --assignee platform x")), ("chat", "slack"))
+                self.assertEqual(self.origin(self.create()), ("chat", "slack"))
+        self.session = ""
+        self.assertFalse(self.stamped(self.slash("create --json --assignee platform no-turn")))
 
-    def test_a_dotenv_naming_the_override_refuses_it(self):
-        for line in ("KUBE_AGENTS_CARD_ORIGIN=issue", "export KUBE_AGENTS_CARD_ORIGIN = drift"):
-            with self.subTest(line=line):
-                (self.home / ".env").write_text(f"OTHER=1\n{line}\n")
-                self.assertFalse(self.stamped(self.slash("create --json --assignee platform x")))
-        (self.home / ".env").write_text("OTHER=1\n# KUBE_AGENTS_CARD_ORIGIN is the writers'\n")
-        self.assertEqual(self.origin(self.slash("create --json --assignee platform y")), ("issue", ""))
+    def test_a_minted_ticket_stamps_once(self):
+        self.in_chat_turn()
+        os.environ[kanban_origin.STAMP_TICKET_ENV] = self.ko.mint_ticket("drift")
+        first = self.slash("create --json --assignee platform first")
+        second = self.slash("create --json --assignee platform second")
+        self.assertEqual(self.origin(first), ("drift", ""))
+        self.assertEqual(self.origin(second), ("chat", "slack"), "a spent ticket is the turn's origin")
 
-    def test_a_value_outside_the_vocabulary_is_ignored(self):
-        for value in ("eval", "other", "issue:slack"):
-            with self.subTest(value=value):
-                os.environ[kanban_origin.CARD_ORIGIN_ENV] = value
-                self.assertFalse(self.stamped(self.slash("create --json --assignee platform x")))
+    def test_writer_ticket_sets_and_restores_the_variable(self):
+        os.environ[kanban_origin.STAMP_TICKET_ENV] = "previous"
+        with self.ko.writer_ticket("issue") as ticket:
+            self.assertEqual(os.environ[kanban_origin.STAMP_TICKET_ENV], ticket)
+            card = self.slash("create --json --assignee platform gate")
+        self.assertEqual(os.environ[kanban_origin.STAMP_TICKET_ENV], "previous")
+        self.assertEqual(self.origin(card), ("issue", ""))
+
+    def test_a_ticket_that_cannot_be_minted_leaves_the_create_to_its_context(self):
+        with mock.patch.object(self.ko, "_session_kv", side_effect=OSError("refused")):
+            with self.ko.writer_ticket("issue") as ticket:
+                self.assertIsNone(ticket)
+                self.assertNotIn(kanban_origin.STAMP_TICKET_ENV, os.environ)
+                card = self.slash("create --json --assignee platform x")
+        self.assertFalse(self.stamped(card))
 
 
 # ---------------------------------------------------------------------------
@@ -547,15 +555,33 @@ class SessionRecordTest(unittest.TestCase):
         with mock.patch.object(kanban_origin, "_first_module", return_value=None):
             self.assertIsNone(kanban_origin._cron_origin())
 
-    def test_the_re_stamp_never_raises(self):
-        with mock.patch.object(kanban_origin.urllib.request, "urlopen", side_effect=OSError("refused")):
-            self.assertFalse(kanban_origin.put_card_origin("t_1", "issue"))
+    def test_a_ticket_is_redeemed_over_loopback_with_the_pods_key(self):
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k", kanban_origin.STAMP_TICKET_ENV: "ab"}), \
+                self._answer(body=b'{"origin": "issue", "platform": ""}') as urlopen:
+            self.assertEqual(kanban_origin.ticket_origin(), ("issue", ""))
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:8699/v1/board/stamp-tickets/ab/redeem")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Authorization"), "Bearer k")
 
-    def test_created_just_now(self):
-        now = time.time()
-        self.assertTrue(kanban_origin.created_just_now(int(now), now=now))
-        self.assertFalse(kanban_origin.created_just_now(int(now) - 3600, now=now))
-        self.assertFalse(kanban_origin.created_just_now(None, now=now))
+    def test_an_unredeemable_ticket_is_no_ticket(self):
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k", kanban_origin.STAMP_TICKET_ENV: "ab"}):
+            with self._answer(status=404):
+                self.assertIsNone(kanban_origin.ticket_origin())
+            with mock.patch.object(kanban_origin.urllib.request, "urlopen", side_effect=OSError("down")):
+                self.assertIsNone(kanban_origin.ticket_origin())
+            with self._answer(body=b'{"origin": "other"}'):
+                self.assertIsNone(kanban_origin.ticket_origin())
+        env = {kanban_origin.STAMP_TICKET_ENV: "ab"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
+            os.environ.pop(kanban_origin.SESSION_KV_KEY_ENV, None)
+            self.assertIsNone(kanban_origin.ticket_origin(), "no key, no redemption")
+        urlopen.assert_not_called()
+
+    def test_minting_never_raises(self):
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), \
+                mock.patch.object(kanban_origin.urllib.request, "urlopen", side_effect=OSError("refused")):
+            self.assertIsNone(kanban_origin.mint_ticket("issue"))
 
 
 class PinTest(unittest.TestCase):
@@ -566,16 +592,15 @@ class PinTest(unittest.TestCase):
             for node in tree.body
             if isinstance(node, ast.Assign) and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id in ("ORIGINS", "KANBAN_TASK_ORIGINS_SCHEMA", "DRIFT_BACKLOG_CARD_ORIGIN_ENV",
-                                       "DRIFT_BACKLOG_CARD_CREATED_JUST_NOW_SECONDS")
+            and node.targets[0].id in ("ORIGINS", "KANBAN_TASK_ORIGINS_SCHEMA", "DRIFT_BACKLOG_CARD_TICKET_ENV")
         }
         self.assertEqual(values["ORIGINS"], kanban_origin.ORIGINS)
         squash = lambda sql: re.sub(r"\s+", " ", sql).replace("( ", "(").replace(" )", ")").strip()
         self.assertEqual(squash(values["KANBAN_TASK_ORIGINS_SCHEMA"]), squash(kanban_origin._TABLE_DDL))
-        self.assertEqual(values["DRIFT_BACKLOG_CARD_ORIGIN_ENV"], kanban_origin.CARD_ORIGIN_ENV)
-        self.assertEqual(
-            values["DRIFT_BACKLOG_CARD_CREATED_JUST_NOW_SECONDS"], kanban_origin.CREATED_JUST_NOW_SECONDS
-        )
+        self.assertEqual(values["DRIFT_BACKLOG_CARD_TICKET_ENV"], kanban_origin.STAMP_TICKET_ENV)
+        source = SESSION_KV_SERVER.read_text()
+        self.assertIn(f'@app.post("{kanban_origin.STAMP_TICKETS_PATH}"', source)
+        self.assertIn(f'@app.post("{kanban_origin.STAMP_TICKET_REDEEM_PATH}"', source)
 
     def test_the_dockerfile_installs_applies_and_verifies_the_patch(self):
         text = DOCKERFILE.read_text()

@@ -569,8 +569,8 @@ class FileCardOriginTest(unittest.TestCase):
         import types
 
         kanban = types.ModuleType("hermes_cli.kanban")
-        kanban.run_slash = lambda cmd: sent.append((cmd, os.environ.get("KUBE_AGENTS_CARD_ORIGIN"))) or (
-            '{"id": "t_1", "created_at": 1}'
+        kanban.run_slash = lambda cmd: sent.append((cmd, os.environ.get("KUBE_AGENTS_CARD_STAMP_TICKET"))) or (
+            '{"id": "t_1"}'
         )
         pkg = types.ModuleType("hermes_cli")
         pkg.kanban = kanban
@@ -580,33 +580,31 @@ class FileCardOriginTest(unittest.TestCase):
             modules["hermes_cli.kanban_origin"] = origin_module
         return mock.patch.dict(sys.modules, modules)
 
-    def test_the_issue_card_files_under_its_origin_and_restamps_only_a_fresh_insert(self):
+    def test_each_card_files_under_a_freshly_minted_ticket_for_its_origin(self):
         import contextlib
         import types
 
-        sent, put = [], []
+        sent, minted = [], []
         origin = types.ModuleType("hermes_cli.kanban_origin")
 
         @contextlib.contextmanager
-        def writer_origin(value):
-            os.environ["KUBE_AGENTS_CARD_ORIGIN"] = value
+        def writer_ticket(value):
+            minted.append(value)
+            os.environ["KUBE_AGENTS_CARD_STAMP_TICKET"] = f"ticket-{len(minted)}"
             try:
-                yield
+                yield f"ticket-{len(minted)}"
             finally:
-                os.environ.pop("KUBE_AGENTS_CARD_ORIGIN", None)
+                os.environ.pop("KUBE_AGENTS_CARD_STAMP_TICKET", None)
 
-        origin.writer_origin = writer_origin
-        origin.put_card_origin = lambda task_id, value: put.append((task_id, value))
-        fresh = {"value": True}
-        origin.created_just_now = lambda created_at: fresh["value"]
+        origin.writer_ticket = writer_ticket
         card = gate._issue_card({"repository": "o/r", "issue_number": 1, "title_plain": "t"})
         with self._stub(sent, origin):
             self.assertEqual(gate.file_card(card), "t_1")
-            fresh["value"] = False
             self.assertEqual(gate.file_card(card), "t_1")
-        self.assertEqual([env for _, env in sent], ["issue", "issue"])
+        self.assertEqual(minted, ["issue", "issue"])
+        self.assertEqual([ticket for _, ticket in sent], ["ticket-1", "ticket-2"])
         self.assertNotIn("--origin", sent[0][0])
-        self.assertEqual(put, [("t_1", "issue")], "a dedupe hit is not re-stamped")
+        self.assertNotIn("KUBE_AGENTS_CARD_STAMP_TICKET", os.environ)
 
     def test_without_the_origin_module_the_card_still_files(self):
         sent = []

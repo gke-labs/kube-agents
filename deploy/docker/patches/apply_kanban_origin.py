@@ -25,9 +25,9 @@ held in memory and compiled before any is written:
 
     3. ``_cmd_create`` is rebound to ``wrap_cli_create`` and put back into
        ``_HANDLERS``, which ``kanban_command`` and so ``run_slash`` dispatch
-       through. That marks the CLI create path, the only one that reads the
-       trusted writers' ``KUBE_AGENTS_CARD_ORIGIN``. No argument is added: the
-       create parser rejects ``--origin``.
+       through. That marks the CLI create path, whose ``--created-by`` is an
+       argument and so never reads as the dashboard's. No argument is added:
+       the create parser rejects ``--origin``.
 
 Why is documented in the module docstring of
 ``deploy/docker/patches/kanban_origin.py``. Usage::
@@ -85,9 +85,8 @@ HANDLERS = "_HANDLERS"
 HANDLERS_ENTRY = '"create": _cmd_create'
 CLI_MARKER = "_kanban_origin_wrap_cli_create("
 CLI_TRAILER = (
-    "\n\n# kube-agents patch: mark the CLI create path, the one place a trusted\n"
-    "# in-pod writer's KUBE_AGENTS_CARD_ORIGIN is read. See\n"
-    "# hermes_cli/kanban_origin.py.\n"
+    "\n\n# kube-agents patch: mark the CLI create path, whose --created-by is an\n"
+    "# argument, not the dashboard. See hermes_cli/kanban_origin.py.\n"
     "from hermes_cli.kanban_origin import (  # noqa: E402\n"
     "    wrap_cli_create as _kanban_origin_wrap_cli_create,\n"
     ")\n"

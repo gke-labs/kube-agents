@@ -91,8 +91,8 @@ SWEEPS_ENV = "GITHUB_WATCHER_SWEEPS"
 ASSIGNEE = "platform"
 # The origin each card is stamped with on the board (docs/designs/proposal-origin.md
 # §2.1): an issue card is `issue`, a pull-request follow-up card `scheduled`.
-# Passed to the board through the in-pod override hermes_cli/kanban_origin.py
-# reads on the CLI create path, never as an argument of the create command.
+# Passed to the board as a one-time stamp ticket minted for the create
+# (hermes_cli/kanban_origin.py), never as an argument of the create command.
 CARD_ORIGIN_ISSUE = "issue"
 CARD_ORIGIN_SCHEDULED = "scheduled"
 
@@ -978,18 +978,6 @@ def _parse_task_id(out: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _parse_created_at(out: str) -> object:
-    """The ``created_at`` of the card a ``create --json`` response names, or None."""
-    start = out.find("{")
-    end = out.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        return json.loads(out[start : end + 1]).get("created_at")
-    except Exception:  # noqa: BLE001 - no timestamp, no re-stamp
-        return None
-
-
 def file_card(card: Card) -> str | None:
     """File one card, returning its id.
 
@@ -999,11 +987,11 @@ def file_card(card: Card) -> str | None:
     failing is loud, because that is what makes the watcher blind.
 
     The card's ``origin`` reaches the board through
-    ``hermes_cli/kanban_origin.py``: the create runs under ``writer_origin``,
-    which the board's CLI create path stamps at insert, and a card the create
-    just inserted is then re-stamped through the Session KV server, which
-    applies only where no stamp exists. A dedupe hit on a key someone else
-    filed first keeps that card's stamp.
+    ``hermes_cli/kanban_origin.py``: the create runs under ``writer_ticket``,
+    which mints a one-time stamp ticket for it on the Session KV server, and
+    the board redeems the ticket and stamps the card in the insert's own
+    transaction. A dedupe hit inserts nothing, so a key someone else filed
+    first keeps that card's stamp.
     """
     try:
         from hermes_cli.kanban import run_slash
@@ -1025,7 +1013,7 @@ def file_card(card: Card) -> str | None:
     stamped = card.origin and kanban_origin is not None
     try:
         if stamped:
-            with kanban_origin.writer_origin(card.origin):
+            with kanban_origin.writer_ticket(card.origin):
                 out = str(run_slash(cmd)).strip()
         else:
             out = str(run_slash(cmd)).strip()
@@ -1039,8 +1027,6 @@ def file_card(card: Card) -> str | None:
             f"github_scan_gate: could not read a task id from the board response: {out}\n"
         )
         return None
-    if stamped and kanban_origin.created_just_now(_parse_created_at(out)):
-        kanban_origin.put_card_origin(task_id, card.origin)
     sys.stderr.write(f"github_scan_gate: filed card {task_id} ({card.idempotency_key})\n")
     return task_id
 

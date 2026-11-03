@@ -1820,8 +1820,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # own transaction by rebinding upstream's inherit_creator_origin, which both
 # create_task and the auto-decompose inserter call there; a worker's child and
 # a decomposed child inherit their creator's stamp. No create argument sets
-# it: in-pod writers that know better set KUBE_AGENTS_CARD_ORIGIN, which only
-# the CLI create path reads. Runs after kanban_priority, and before
+# it: in-pod writers that know better pass a one-time stamp ticket minted on
+# the Session KV server, which the insert redeems. Runs after kanban_priority, and before
 # credential_redaction, whose create_task prologue lands inside the def this
 # wraps. hermes_cli/ is the destination no chmod loop walks, hence install -m.
 # See the module docstring in deploy/docker/patches/kanban_origin.py.

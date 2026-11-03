@@ -1301,6 +1301,8 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
         ("GET", "/v1/proposals/opened/counts", None),
         ("PUT", "/v1/board/tasks/t-1/origin", {"origin": "chat", "platform": "slack"}),
+        ("POST", "/v1/board/stamp-tickets", {"origin": "issue"}),
+        ("POST", "/v1/board/stamp-tickets/tk-1/redeem", None),
     )
 
     def setUp(self):
@@ -1351,6 +1353,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
                 .replace("f-1", "{finding_id}")
                 .replace("t-1", "{task_id}")
                 .replace("j-1", "{job_id}")
+                .replace("tk-1", "{ticket}")
                 .replace("publication/backlog", "publication/{publisher}"),
             )
             for method, path, _ in self.PROTECTED_ROUTES
@@ -11420,34 +11423,28 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertEqual(drift["sent"], 0)
         self.trigger.assert_not_called()
 
-    def test_the_backlog_card_is_stamped_drift_by_the_override_never_an_argument(self):
-        import subprocess as sp
-        import time as _time
-
+    def test_the_backlog_card_is_stamped_drift_by_a_ticket_never_an_argument(self):
         self._headless()
         self._burst()
-        fresh = sp.CompletedProcess(
-            ["hermes"], 0, stdout=json.dumps({"id": "t_digest1", "created_at": int(_time.time())}), stderr=""
-        )
-        with patch.object(session_kv_server.subprocess, "run", return_value=fresh) as run, patch.object(
-            session_kv_server, "_stamp_board_task_origin", return_value=True
-        ) as stamp:
-            self.assertTrue(session_kv_server._post_drift_backlog_digest())
-        self.assertEqual(run.call_args.kwargs["env"]["KUBE_AGENTS_CARD_ORIGIN"], "drift")
-        self.assertFalse([a for a in run.call_args.args[0] if "origin" in a.lower()], "no origin argument")
-        stamp.assert_called_once_with("t_digest1", "drift", "")
-
-    def test_a_dedupe_hit_on_the_backlog_key_is_not_restamped(self):
-        import subprocess as sp
-
-        self._headless()
-        self._burst()
-        old = sp.CompletedProcess(["hermes"], 0, stdout=json.dumps({"id": "t_digest1", "created_at": 1}), stderr="")
-        with patch.object(session_kv_server.subprocess, "run", return_value=old), patch.object(
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run, patch.object(
             session_kv_server, "_stamp_board_task_origin"
-        ) as stamp:
+        ) as put:
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
-        stamp.assert_not_called()
+        ticket = run.call_args.kwargs["env"]["KUBE_AGENTS_CARD_STAMP_TICKET"]
+        self.assertNotIn("KUBE_AGENTS_CARD_ORIGIN", run.call_args.kwargs["env"])
+        self.assertFalse([a for a in run.call_args.args[0] if "origin" in a.lower()], "no origin argument")
+        self.assertEqual(session_kv_server._redeem_stamp_ticket(ticket), ("drift", ""))
+        self.assertIsNone(session_kv_server._redeem_stamp_ticket(ticket), "one card per ticket")
+        put.assert_not_called()
+
+    def test_a_ticket_that_cannot_be_minted_still_files_the_card(self):
+        self._headless()
+        self._burst()
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run, patch.object(
+            session_kv_server, "_mint_stamp_ticket", side_effect=__import__("sqlite3").OperationalError("locked")
+        ):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        self.assertNotIn("KUBE_AGENTS_CARD_STAMP_TICKET", run.call_args.kwargs["env"])
 
     def test_a_next_install_whose_platform_has_no_home_channel_files_the_card(self):
         """The platform walk itself, not a patched answer: `spec.mode: next`,
@@ -12585,6 +12582,27 @@ class TestProposalOrigin(unittest.TestCase):
                 session_kv_server.cleanup_old_records(conn)
         self.assertEqual(self.client.get("/v1/proposals/opened/counts").json()["issue"], {"": 1})
         self.assertEqual(session_kv_server._cron_job_origin("job-old"), ("chat", "slack"))
+
+    def test_a_stamp_ticket_is_minted_with_the_named_length(self):
+        minted = self.client.post("/v1/board/stamp-tickets", json={"origin": "issue"})
+        self.assertEqual(minted.status_code, 200, minted.text)
+        ticket = minted.json()["ticket"]
+        self.assertRegex(ticket, rf"^[0-9a-f]{{{2 * session_kv_server.STAMP_TICKET_HEX_BYTES}}}$")
+        self.assertEqual(self.client.post("/v1/board/stamp-tickets", json={"origin": "eval"}).status_code, 400)
+
+    def test_a_stamp_ticket_redeems_once_and_a_replay_is_404(self):
+        ticket = self.client.post("/v1/board/stamp-tickets", json={"origin": "chat", "platform": "slack"}).json()["ticket"]
+        first = self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem")
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json(), {"origin": "chat", "platform": "slack"})
+        self.assertEqual(self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem").status_code, 404)
+        self.assertEqual(self.client.post("/v1/board/stamp-tickets/" + "0" * 32 + "/redeem").status_code, 404)
+
+    def test_an_expired_stamp_ticket_is_404(self):
+        ticket = self.client.post("/v1/board/stamp-tickets", json={"origin": "drift"}).json()["ticket"]
+        later = time.time() + session_kv_server.STAMP_TICKET_TTL_SECONDS + 1
+        with patch.object(session_kv_server.time, "time", return_value=later):
+            self.assertEqual(self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem").status_code, 404)
 
     def test_board_task_origin_first_stamp_wins(self):
         import sqlite3

@@ -12,6 +12,7 @@ import hashlib
 import queue
 import random
 import re
+import secrets
 import signal
 import threading
 import sqlite3
@@ -99,6 +100,15 @@ KANBAN_TASK_ORIGINS_SCHEMA = """
         stamped_at TEXT
     )
 """
+# One-time stamp tickets (`POST /v1/board/stamp-tickets`): an in-pod writer that
+# knows its card's origin mints one with the pod's key and hands it to its
+# create through KUBE_AGENTS_CARD_STAMP_TICKET; the board's insert-time stamp
+# (deploy/docker/patches/kanban_origin.py) redeems it once. The ticket is an
+# unguessable reference, not an origin, so a value planted in any environment
+# source is an unknown ticket.
+STAMP_TICKET_HEX_BYTES = 16  # secrets.token_hex(16): 32 hex characters
+STAMP_TICKET_TTL_SECONDS = 300
+STAMP_TICKET_MAX_CHARS = 2 * STAMP_TICKET_HEX_BYTES
 
 
 def _load_dotenv_ignoring_operator_switches(path: str) -> None:
@@ -1274,14 +1284,11 @@ DRIFT_BACKLOG_CARD_TITLE = "Drift backlog: {count} {noun} reached drift detectio
 DRIFT_BACKLOG_CARD_KEY_PREFIX = "drift-backlog-"
 DRIFT_BACKLOG_CARD_CREATED_BY = "drift-detector"
 DRIFT_BACKLOG_CARD_STATUS = "blocked"
-# The card's board stamp is `drift` (docs/designs/proposal-origin.md §2.1): the
-# in-pod override the board's CLI create path reads (deploy/docker/patches/
-# kanban_origin.py CARD_ORIGIN_ENV), set in the subprocess's environment and
-# never passed as an argument. A card the create just inserted (its created_at
-# within the window kanban_origin.CREATED_JUST_NOW_SECONDS names) is then stamped
-# here too, which applies only where no stamp exists.
-DRIFT_BACKLOG_CARD_ORIGIN_ENV = "KUBE_AGENTS_CARD_ORIGIN"
-DRIFT_BACKLOG_CARD_CREATED_JUST_NOW_SECONDS = 60
+# The card's board stamp is `drift` (docs/designs/proposal-origin.md §2.1): a
+# one-time stamp ticket minted here and passed in the subprocess's environment
+# under the name deploy/docker/patches/kanban_origin.py STAMP_TICKET_ENV reads,
+# never an origin argument.
+DRIFT_BACKLOG_CARD_TICKET_ENV = "KUBE_AGENTS_CARD_STAMP_TICKET"
 # The CLI timeout is the send timeout, so the lease (sized from it) outlives
 # the call. A timeout counts as no card, unlike the chat send, because the rows
 # must not be marked without a task id; a create that committed before the kill
@@ -1630,6 +1637,19 @@ def init_db() -> None:
                 )
                 """
             )
+            # One-time stamp tickets for a card's board origin; spent or
+            # expired rows are removed by `cleanup_old_records`.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kanban_stamp_tickets (
+                    ticket          TEXT PRIMARY KEY,
+                    origin          TEXT,
+                    origin_platform TEXT,
+                    issued_at       REAL,
+                    redeemed_at     REAL NULL
+                )
+                """
+            )
             # A fold anchor is written as an intent, before its background task
             # runs, so a process that died in between (OOM, SIGKILL, a crash)
             # leaves a row anchoring its workload with no triage behind it and
@@ -1692,6 +1712,10 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
         # is kept the same 14 days as everything else so an operator asked
         # "what did we drop last week" still has an answer.
         conn.execute("DELETE FROM alert_quota WHERE day < date('now', ?)", (param,))
+        # A ticket past its TTL can no longer be redeemed, spent or not.
+        conn.execute(
+            "DELETE FROM kanban_stamp_tickets WHERE issued_at < ?", (time.time() - STAMP_TICKET_TTL_SECONDS,)
+        )
     except Exception as exc:
         logger.error(f"Failed to clean up old DB records: {exc}")
 
@@ -6440,6 +6464,11 @@ def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
     card that exists back rather than a second one.
     """
     noun = "change" if len(rows) == 1 else "changes"
+    env_extra = {"HERMES_KANBAN_BUSY_TIMEOUT_MS": DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS}
+    try:
+        env_extra[DRIFT_BACKLOG_CARD_TICKET_ENV] = _mint_stamp_ticket(ORIGIN_DRIFT, "")
+    except Exception as exc:  # noqa: BLE001 - file the card unstamped rather than not at all
+        logger.warning(f"Drift backlog card: could not mint a stamp ticket: {exc}")
     cmd = [
         chat_notify.HERMES_CLI, "kanban", "create",
         DRIFT_BACKLOG_CARD_TITLE.format(count=len(rows), noun=noun),
@@ -6455,10 +6484,7 @@ def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
-            env=_run_env({
-                "HERMES_KANBAN_BUSY_TIMEOUT_MS": DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS,
-                DRIFT_BACKLOG_CARD_ORIGIN_ENV: ORIGIN_DRIFT,
-            }),
+            env=_run_env(env_extra),
             timeout=DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
@@ -6478,31 +6504,14 @@ def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
     out = proc.stdout or ""
     start, end = out.find("{"), out.rfind("}")
     task_id = ""
-    created_at: Any = None
     if start != -1 and end > start:
         try:
-            card = json.loads(out[start:end + 1]) or {}
-            task_id = str(card.get("id") or "")
-            created_at = card.get("created_at")
-        except (ValueError, AttributeError):
+            task_id = str((json.loads(out[start:end + 1]) or {}).get("id") or "")
+        except ValueError:
             task_id = ""
     if not task_id:
         logger.error(f"Drift backlog card: no task id in the board's answer: {out.strip()[:LEDGER_MESSAGE_MAX_CHARS]}")
-    elif _created_just_now(created_at):
-        try:
-            _stamp_board_task_origin(task_id, ORIGIN_DRIFT, "")
-        except Exception as exc:  # noqa: BLE001 - the card is filed; the stamp is telemetry
-            logger.warning(f"Drift backlog card: could not stamp {task_id} as {ORIGIN_DRIFT}: {exc}")
     return task_id
-
-
-def _created_just_now(created_at: Any) -> bool:
-    """Whether a card's `created_at` (epoch seconds) says the create just inserted it."""
-    try:
-        age = time.time() - float(created_at)
-    except (TypeError, ValueError):
-        return False
-    return 0 <= age <= DRIFT_BACKLOG_CARD_CREATED_JUST_NOW_SECONDS
 
 
 def _refund_alert_quota(severity: str) -> None:
@@ -7538,9 +7547,11 @@ def get_proposals_opened_counts() -> Dict[str, Dict[str, int]]:
 def put_board_task_origin(task_id: str, request_data: Dict[str, Any]) -> Dict[str, bool]:
     """Stamp a card's origin in the board's side table; the first stamp wins.
 
-    For the trusted writers that know better than their own context (the issue
-    gate, the drift backlog, the chat bootstrap), after a create that reported a
-    fresh insert. `stamped` is False when the card already carried a stamp.
+    No caller uses it today: the trusted writers (the issue gate, the drift
+    backlog, the chat bootstrap) pass their origin to the insert itself through
+    a one-time stamp ticket (`POST /v1/board/stamp-tickets`), which stamps in
+    the insert's transaction. It stays `INSERT OR IGNORE`, so it can never
+    replace a stamp. `stamped` is False when the card already carried a stamp.
     It does not check that the card exists on the board, so a caller holding the
     API key can stamp an id no card has yet.
     """
@@ -7575,6 +7586,63 @@ def _stamp_board_task_origin(task_id: str, origin: str, platform: str) -> bool:
             (task_id, origin, platform, datetime.now(timezone.utc).isoformat()),
         )
         return cursor.rowcount > 0
+
+
+def _mint_stamp_ticket(origin: str, platform: str = "") -> str:
+    """Issue a one-time stamp ticket for `origin`; returns the ticket."""
+    if origin not in ORIGINS:
+        raise ValueError(f"origin {origin!r} is not one of {ORIGINS}")
+    ticket = secrets.token_hex(STAMP_TICKET_HEX_BYTES)
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        with conn:
+            conn.execute(
+                "INSERT INTO kanban_stamp_tickets (ticket, origin, origin_platform, issued_at) VALUES (?, ?, ?, ?)",
+                (ticket, origin, platform, time.time()),
+            )
+    return ticket
+
+
+def _redeem_stamp_ticket(ticket: str) -> Optional[tuple[str, str]]:
+    """The `(origin, platform)` a live, unspent ticket carries, spending it; None otherwise."""
+    if not ticket or len(ticket) > STAMP_TICKET_MAX_CHARS:
+        return None
+    now = time.time()
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                "UPDATE kanban_stamp_tickets SET redeemed_at = ? "
+                "WHERE ticket = ? AND redeemed_at IS NULL AND issued_at >= ?",
+                (now, ticket, now - STAMP_TICKET_TTL_SECONDS),
+            )
+            row = None
+            if cursor.rowcount == 1:
+                row = conn.execute(
+                    "SELECT origin, origin_platform FROM kanban_stamp_tickets WHERE ticket = ?", (ticket,)
+                ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    if not row:
+        return None
+    return str(row[0]), str(row[1] or "")
+
+
+@app.post("/v1/board/stamp-tickets", dependencies=[Depends(verify_api_key)])
+def post_stamp_ticket(request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Mint a one-time ticket that stamps one new card with `origin` at insert."""
+    origin, platform = _origin_fields(request_data)
+    return {"ticket": _mint_stamp_ticket(origin, platform)}
+
+
+@app.post("/v1/board/stamp-tickets/{ticket}/redeem", dependencies=[Depends(verify_api_key)])
+def redeem_stamp_ticket(ticket: str) -> Dict[str, str]:
+    """Spend a ticket: its origin once; 404 when unknown, already spent, or past STAMP_TICKET_TTL_SECONDS."""
+    found = _redeem_stamp_ticket(ticket)
+    if not found:
+        raise HTTPException(status_code=404, detail="no live stamp ticket by that value")
+    return {"origin": found[0], "platform": found[1]}
 
 
 @app.get("/v1/sessions/{session_id}/metadata", dependencies=[Depends(verify_api_key)])

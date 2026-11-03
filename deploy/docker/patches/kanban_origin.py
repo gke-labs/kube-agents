@@ -38,25 +38,23 @@ In this order, the first that applies:
    ``kanban_create`` and ``hermes kanban create`` pass ``HERMES_KANBAN_TASK``,
    the card the worker runs, as ``creator_task_id``; an auto-decomposed child
    passes its root. The child gets that card's stamp, or none when it has none.
-2. **The creating turn's origin** (:func:`turn_origin`): a tick-started cron
+2. **A trusted writer's stamp ticket** (:data:`STAMP_TICKET_ENV`). See below.
+3. **The creating turn's origin** (:func:`turn_origin`): a tick-started cron
    run's context (``tools.cron_run_scope.current_cron_origin``, when that
    Hermes has it); else the session record of the turn's trusted session id
    (``kanban_priority.trusted_origin_session``), read from the Session KV
    server's ``GET /v1/sessions/{id}/metadata``; else ``console`` for a session
    id the web console (``web-console-``) or the admin console's chat page
    (``portal_``) minted; else nothing.
-3. **The Hermes dashboard's create route** (``created_by="dashboard"``, which
+4. **The Hermes dashboard's create route** (``created_by="dashboard"``, which
    the route sets itself) is ``console``. Only outside the CLI create path,
    where ``--created-by`` is an argument anyone can type.
-4. **A trusted writer's override, on the CLI create path only**
-   (:data:`CARD_ORIGIN_ENV`). See below.
 
 A card that resolves to none of these, ``other``, gets no stamp, and reads as
-``other`` (:func:`origin_of`). That leaves room for a trusted writer's
-``PUT /v1/board/tasks/{id}/origin`` on the Session KV server, which applies only
-where no stamp exists. The stamp is written with ``INSERT OR IGNORE``: the first
-stamp wins, and a dedupe hit (an ``idempotency_key`` that matches an existing
-card) inserts nothing and stamps nothing, so the first card's stamp stands.
+``other`` (:func:`origin_of`). The stamp is written with ``INSERT OR IGNORE``:
+the first stamp wins, and a dedupe hit (an ``idempotency_key`` that matches an
+existing card) inserts nothing and stamps nothing, so the first card's stamp
+stands.
 
 No argument sets the origin
 ---------------------------
@@ -65,29 +63,34 @@ chat users and in-pod scripts alike, so a ``--origin`` flag would let anyone who
 can chat stamp ``issue`` or ``drift``; the parser has none and rejects one. The
 ``kanban_create`` tool reads no such argument either.
 
-The trusted writers' override
------------------------------
+The trusted writers' stamp ticket
+---------------------------------
 Three in-pod writers know their card's origin better than their own context:
 the GitHub watcher gate (``issue`` on issue cards, ``scheduled`` on its
 pull-request follow-up cards), the drift backlog (``drift``) and the chat
-bootstrap (``chat``). They run ``hermes kanban create`` (the drift backlog, a
-subprocess of the Session KV server) or ``run_slash`` in their own process (the
-gate and the bootstrap, under :func:`writer_origin`) with
-:data:`CARD_ORIGIN_ENV` set in that process's environment to the value, then
-re-stamp a card the create just inserted (:func:`created_just_now`) through the
-Session KV server (:func:`put_card_origin`), which changes nothing where the
-insert already stamped. Only the CLI create path reads the variable
-(:func:`wrap_cli_create` marks the call), and only when steps 1 and 2 found
-nothing, so a chat user's ``/kanban create`` in the gateway stamps ``chat``
-whatever the environment holds. The value must be one of :data:`ORIGINS` other
-than ``other``.
+bootstrap (``chat``). None of them passes an origin value. Just before each
+create, the writer mints a one-time ticket for its origin with
+``POST /v1/board/stamp-tickets`` on the Session KV server (the pod's Session KV
+key; the drift backlog, which is that server, mints in-process) and hands the
+ticket to the create in :data:`STAMP_TICKET_ENV`: in the subprocess's
+environment for ``hermes kanban create``, in its own process's around
+``run_slash`` (:func:`writer_ticket`). Before the insert's transaction,
+:func:`wrap_create_task` redeems it over loopback
+(``POST /v1/board/stamp-tickets/{ticket}/redeem``, also with the pod's key) and
+the insert stamps the origin the server returns, exactly and in the insert's
+own transaction. A ticket redeems once and expires after the server's
+``STAMP_TICKET_TTL_SECONDS``.
 
-Only in-pod code sets that variable. The sandbox, where the agent's terminal
-runs, has its own environment and no route to the board. One way remains for
-the agent to put a key into a Hermes process's environment: Hermes loads
-``$HERMES_HOME/.env``, which an agent can write, with ``override=True``. So an
-override whose name appears in that file is refused, and the card falls back to
-no stamp.
+Why a ticket and not the origin itself: the variable's value is a random
+reference the server issued, not a claim. An environment variable is not a
+trusted channel here: Hermes loads ``$HERMES_HOME/.env``, which the agent can
+write, with ``override=True``, and other dotenv sources besides. A value
+planted in any of them is an unknown ticket; redeeming it fails, the variable
+is ignored, and the card takes the turn's origin as if it were absent. Minting
+a ticket that redeems needs the Session KV key, which the gateway and the
+in-pod scripts hold and the sandbox, where the agent's terminal runs, does not.
+Any failure to redeem (an unknown, spent or expired ticket, no key, the server
+down) falls back the same way.
 
 Nothing here may fail a create: every entry point logs and falls back to no
 stamp.
@@ -101,14 +104,11 @@ import functools
 import json
 import logging
 import os
-import re
 import sqlite3
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
@@ -147,23 +147,16 @@ CONSOLE_SESSION_PREFIXES = ("web-console-", "portal_")
 #: (``plugins/kanban/dashboard/plugin_api.py``) passes ``create_task``.
 DASHBOARD_CREATED_BY = "dashboard"
 
-#: The trusted writers' override, read only on the CLI create path.
-CARD_ORIGIN_ENV = "KUBE_AGENTS_CARD_ORIGIN"
-#: The agent-writable dotenv file Hermes loads with ``override=True``, under
-#: ``HERMES_HOME`` (default ``~/.hermes``).
-HERMES_HOME_ENV = "HERMES_HOME"
-DEFAULT_HERMES_HOME = "~/.hermes"
-DOTENV_NAME = ".env"
-_DOTENV_NAMES_OVERRIDE = re.compile(
-    rf"^\s*(?:export\s+)?{re.escape(CARD_ORIGIN_ENV)}\s*=", re.MULTILINE
-)
+#: Where a trusted writer hands its create a one-time stamp ticket.
+STAMP_TICKET_ENV = "KUBE_AGENTS_CARD_STAMP_TICKET"
 
 #: The Session KV server's loopback address and key, as ``kanban_notifier``
 #: spells them. The server binds 127.0.0.1 only.
 SESSION_KV_URL = "http://127.0.0.1:8699"
 SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
 SESSION_METADATA_PATH = "/v1/sessions/{session_id}/metadata"
-BOARD_ORIGIN_PATH = "/v1/board/tasks/{task_id}/origin"
+STAMP_TICKETS_PATH = "/v1/board/stamp-tickets"
+STAMP_TICKET_REDEEM_PATH = "/v1/board/stamp-tickets/{ticket}/redeem"
 #: Keys of the session record (``session_kv_server.ORIGIN_KEY`` and
 #: ``ORIGIN_PLATFORM_KEY``).
 ORIGIN_KEY = "origin"
@@ -172,13 +165,8 @@ ORIGIN_PLATFORM_KEY = "origin_platform"
 #: insert's transaction, on a loopback call.
 SESSION_LOOKUP_TIMEOUT_SECONDS = 2.0
 HTTP_NOT_FOUND = 404
-#: A trusted writer's re-stamp waits at most this long; it never fails the filing.
-BOARD_ORIGIN_TIMEOUT_SECONDS = 2.0
-#: How old a card a create returned may be and still be one that create
-#: inserted. The CLI's answer carries no "inserted" flag, and a dedupe hit
-#: returns the existing card, so its ``created_at`` is the signal. It only
-#: gates the re-stamp, which cannot replace a stamp anyway.
-CREATED_JUST_NOW_SECONDS = 60
+#: Minting and redeeming a ticket each wait at most this long, on loopback.
+STAMP_TICKET_TIMEOUT_SECONDS = 2.0
 
 #: Where Hermes installs the patched modules this one reads, and the name a
 #: test loads them under.
@@ -190,7 +178,7 @@ PRIORITY_MODULES = ("hermes_cli.kanban_priority", "kanban_priority")
 _pending_origin: contextvars.ContextVar[Optional[tuple[str, str]]] = contextvars.ContextVar(
     "kanban_origin_pending", default=None
 )
-#: Set while the CLI create command runs, the one path that reads the override.
+#: Set while the CLI create command runs, whose ``created_by`` is an argument.
 _cli_create: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "kanban_origin_cli_create", default=False
 )
@@ -318,107 +306,92 @@ def turn_origin() -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# The trusted writers' override
+# The trusted writers' stamp ticket
 # ---------------------------------------------------------------------------
 
 
-def _dotenv_names_override() -> bool:
-    """Whether ``$HERMES_HOME/.env`` names :data:`CARD_ORIGIN_ENV` (True when unreadable)."""
-    home = Path(os.environ.get(HERMES_HOME_ENV) or DEFAULT_HERMES_HOME).expanduser()
-    path = home / DOTENV_NAME
-    if not path.exists():
-        return False
+def _session_kv(path: str, payload: Optional[dict] = None) -> dict:
+    """POST ``payload`` to the Session KV server with the pod's key; the JSON answer. Raises on failure."""
+    token = (os.environ.get(SESSION_KV_KEY_ENV) or "").strip()
+    if not token:
+        raise PermissionError(f"no {SESSION_KV_KEY_ENV}")
+    request = urllib.request.Request(
+        SESSION_KV_URL + path,
+        data=json.dumps(payload or {}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=STAMP_TICKET_TIMEOUT_SECONDS) as response:
+        loaded = json.loads(response.read() or b"{}")
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def mint_ticket(origin: str, platform: str = "") -> Optional[str]:
+    """A one-time stamp ticket for ``origin`` from the Session KV server, or None. Never raises."""
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return True
-    return bool(_DOTENV_NAMES_OVERRIDE.search(text))
-
-
-def cli_override() -> Optional[tuple[str, str]]:
-    """The override a trusted writer set for this CLI create, or None.
-
-    Read only while :func:`wrap_cli_create` runs; refused when the value is not
-    an origin, is ``other``, or the agent-writable dotenv file names it.
-    """
-    if not _cli_create.get():
+        ticket = _session_kv(STAMP_TICKETS_PATH, {"origin": origin, "platform": platform}).get("ticket")
+    except Exception as exc:  # noqa: BLE001 — the card files unstamped rather than not at all
+        logger.warning("kanban origin: could not mint a stamp ticket for %s: %r", origin, exc)
         return None
-    value = (os.environ.get(CARD_ORIGIN_ENV) or "").strip()
-    if not value:
-        return None
-    if value not in ORIGINS or value == ORIGIN_OTHER:
-        logger.warning("kanban origin: ignoring %s=%r, not an origin", CARD_ORIGIN_ENV, value)
-        return None
-    if _dotenv_names_override():
-        logger.warning(
-            "kanban origin: ignoring %s, named in the agent-writable %s", CARD_ORIGIN_ENV, DOTENV_NAME
-        )
-        return None
-    return value, ""
-
-
-def creation_origin(created_by: object = None) -> tuple[str, str]:
-    """A top-level card's ``(origin, platform)``: the turn, then the dashboard, then the override."""
-    origin = turn_origin()
-    if origin != NO_ORIGIN:
-        return origin
-    try:
-        if _cli_create.get():
-            return cli_override() or NO_ORIGIN
-        if created_by == DASHBOARD_CREATED_BY:
-            return ORIGIN_CONSOLE, ""
-    except Exception as exc:  # noqa: BLE001 — never fail a create
-        logger.warning("kanban origin: the creator's origin is unreadable: %r", exc)
-    return NO_ORIGIN
+    return ticket if isinstance(ticket, str) and ticket else None
 
 
 @contextlib.contextmanager
-def writer_origin(origin: str) -> Iterator[None]:
-    """Set :data:`CARD_ORIGIN_ENV` for a trusted writer's in-process ``run_slash`` create.
+def writer_ticket(origin: str, platform: str = "") -> Iterator[Optional[str]]:
+    """Mint a ticket and set :data:`STAMP_TICKET_ENV` for a writer's in-process ``run_slash`` create.
 
-    Restores the variable afterwards. A writer that runs ``hermes kanban
-    create`` as a subprocess sets it in the child's environment instead.
+    Restores the variable afterwards. Yields the ticket, or None when none was
+    minted (the create then takes its own context's origin).
     """
-    previous = os.environ.get(CARD_ORIGIN_ENV)
-    os.environ[CARD_ORIGIN_ENV] = origin
+    ticket = mint_ticket(origin, platform)
+    previous = os.environ.get(STAMP_TICKET_ENV)
+    if ticket:
+        os.environ[STAMP_TICKET_ENV] = ticket
     try:
-        yield
+        yield ticket
     finally:
         if previous is None:
-            os.environ.pop(CARD_ORIGIN_ENV, None)
+            os.environ.pop(STAMP_TICKET_ENV, None)
         else:
-            os.environ[CARD_ORIGIN_ENV] = previous
+            os.environ[STAMP_TICKET_ENV] = previous
 
 
-def created_just_now(created_at: object, now: Optional[float] = None) -> bool:
-    """Whether a card's ``created_at`` (epoch seconds) says the create just inserted it."""
-    try:
-        age = (time.time() if now is None else now) - float(created_at)
-    except (TypeError, ValueError):
-        return False
-    return 0 <= age <= CREATED_JUST_NOW_SECONDS
+def ticket_origin() -> Optional[tuple[str, str]]:
+    """The origin the ticket in :data:`STAMP_TICKET_ENV` carries, redeeming it; None otherwise.
 
-
-def put_card_origin(task_id: str, origin: str, platform: str = "") -> bool:
-    """A trusted writer's ``PUT /v1/board/tasks/{id}/origin``; True when it stamped.
-
-    Applies only where the card has no stamp. Never raises.
+    An unknown, spent or expired ticket, a missing key or an unreachable
+    server is None, as if the variable were absent.
     """
-    token = (os.environ.get(SESSION_KV_KEY_ENV) or "").strip()
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    url = SESSION_KV_URL + BOARD_ORIGIN_PATH.format(task_id=urllib.parse.quote(task_id, safe=""))
-    body = json.dumps({"origin": origin, "platform": platform}).encode()
+    ticket = (os.environ.get(STAMP_TICKET_ENV) or "").strip()
+    if not ticket:
+        return None
     try:
-        with urllib.request.urlopen(
-            urllib.request.Request(url, data=body, headers=headers, method="PUT"),
-            timeout=BOARD_ORIGIN_TIMEOUT_SECONDS,
-        ) as response:
-            return bool(json.loads(response.read() or b"{}").get("stamped"))
-    except Exception as exc:  # noqa: BLE001 — the card is filed; the stamp is telemetry
-        logger.warning("kanban origin: could not re-stamp %s as %s: %r", task_id, origin, exc)
-        return False
+        answer = _session_kv(
+            STAMP_TICKET_REDEEM_PATH.format(ticket=urllib.parse.quote(ticket, safe=""))
+        )
+    except Exception as exc:  # noqa: BLE001 — a planted or stale ticket changes nothing
+        logger.warning("kanban origin: ignoring %s, it did not redeem: %r", STAMP_TICKET_ENV, exc)
+        return None
+    origin, platform = answer.get("origin"), answer.get("platform") or ""
+    if origin not in ORIGINS or origin == ORIGIN_OTHER or not isinstance(platform, str):
+        return None
+    return origin, platform
+
+
+def creation_origin(created_by: object = None) -> tuple[str, str]:
+    """A top-level card's ``(origin, platform)``: a ticket, then the turn, then the dashboard."""
+    try:
+        ticket = ticket_origin()
+        if ticket:
+            return ticket
+    except Exception as exc:  # noqa: BLE001 — never fail a create
+        logger.warning("kanban origin: the stamp ticket is unreadable: %r", exc)
+    origin = turn_origin()
+    if origin != NO_ORIGIN:
+        return origin
+    if created_by == DASHBOARD_CREATED_BY and not _cli_create.get():
+        return ORIGIN_CONSOLE, ""
+    return NO_ORIGIN
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +449,7 @@ def wrap_create_task(create_task: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def wrap_cli_create(command: Callable[..., Any]) -> Callable[..., Any]:
-    """``hermes_cli.kanban._cmd_create``, marked as the path that reads the override."""
+    """``hermes_cli.kanban._cmd_create``, marked so its ``--created-by`` is not the dashboard's."""
 
     @functools.wraps(command)
     def wrapper(*args, **kwargs):

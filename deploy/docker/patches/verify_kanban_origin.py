@@ -4,11 +4,11 @@
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after the applier. The
 applier proves its locators matched; this drives the real patched board on a
 throwaway ``HERMES_HOME``: ``create_task`` from a turn, a worker's child, an
-auto-decomposed child, the ``kanban_create`` tool, the CLI create path with
-and without a trusted writer's override, a dedupe hit, the dashboard's
-``created_by``, and a ``--origin`` argument. The turn's session record is
-stubbed (``_session_id``, ``_fetch_session_metadata``); nothing reaches the
-network. On an unpatched tree every stamp check fails, because nothing writes
+auto-decomposed child, the ``kanban_create`` tool, a trusted writer's stamp
+ticket (once, then spent) and a planted one, a dedupe hit, the dashboard's
+``created_by``, and a ``--origin`` argument. The turn's session record and the
+Session KV server's ticket routes are stubbed (``_session_id``,
+``_fetch_session_metadata``, ``_session_kv``); nothing reaches the network. On an unpatched tree every stamp check fails, because nothing writes
 ``kanban_task_origins``.
 
 Usage::
@@ -44,7 +44,7 @@ TMP = Path(tempfile.mkdtemp())
 os.environ["HERMES_HOME"] = str(TMP)
 os.environ["HERMES_KANBAN_DB"] = str(TMP / "kanban.db")
 os.environ["HERMES_PROFILE"] = "default"
-for name in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID", "KUBE_AGENTS_CARD_ORIGIN"):
+for name in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID", "KUBE_AGENTS_CARD_STAMP_TICKET"):
     os.environ.pop(name, None)
 
 from hermes_cli import kanban as KCLI  # noqa: E402
@@ -60,6 +60,23 @@ records = {
 }
 KO._session_id = lambda: turn["session"]
 KO._fetch_session_metadata = lambda session_id: records.get(session_id)
+tickets: dict = {}
+
+
+def ticket_server(path: str, payload: dict | None = None) -> dict:
+    """The Session KV server's mint and redeem routes, in memory: a ticket redeems once."""
+    if path == KO.STAMP_TICKETS_PATH:
+        ticket = f"{len(tickets) + 1:032x}"
+        tickets[ticket] = dict(payload or {})
+        return {"ticket": ticket}
+    for ticket, body in list(tickets.items()):
+        if path == KO.STAMP_TICKET_REDEEM_PATH.format(ticket=ticket) and body is not None:
+            tickets[ticket] = None
+            return body
+    raise LookupError("HTTP 404")
+
+
+KO._session_kv = ticket_server
 
 
 def origin(task_id: str) -> tuple:
@@ -121,21 +138,28 @@ for kid in kids:
 print("first stamp wins")
 squat = slash(f"create --json --assignee default --idempotency-key {DEDUPE_KEY} squat")
 turn["session"] = ""
-os.environ[KO.CARD_ORIGIN_ENV] = "issue"
-again = slash(f"create --json --assignee default --idempotency-key {DEDUPE_KEY} gate")
+with KO.writer_ticket("issue"):
+    again = slash(f"create --json --assignee default --idempotency-key {DEDUPE_KEY} gate")
 check("the dedupe hit returns the first card", again == squat, f"{again} != {squat}")
 check("the dedupe hit keeps the first stamp", origin(squat) == ("chat", "slack"), str(origin(squat)))
 
-print("the trusted writers' override")
-gate_card = slash("create --json --assignee default gate-card")
-check("the CLI create path reads the override", origin(gate_card) == ("issue", ""), str(origin(gate_card)))
-tool_path = create(title="not the CLI")
-check("create_task outside the CLI ignores it", origin(tool_path) == ("other", ""), str(origin(tool_path)))
-(TMP / ".env").write_text("KUBE_AGENTS_CARD_ORIGIN=issue\n")
-refused = slash("create --json --assignee default from-dotenv")
-check("an override the agent-writable .env names is refused", origin(refused) == ("other", ""), str(origin(refused)))
-(TMP / ".env").unlink()
-os.environ.pop(KO.CARD_ORIGIN_ENV)
+print("the trusted writers' stamp ticket")
+with KO.writer_ticket("issue"):
+    gate_card = slash("create --json --assignee default gate-card")
+    check("the ticket is in the create's environment", bool(os.environ.get(KO.STAMP_TICKET_ENV)))
+check("a minted ticket stamps its origin", origin(gate_card) == ("issue", ""), str(origin(gate_card)))
+check("the ticket does not outlive the call", KO.STAMP_TICKET_ENV not in os.environ)
+os.environ[KO.STAMP_TICKET_ENV] = KO.mint_ticket("drift")
+first = slash("create --json --assignee default first")
+turn["session"] = CHAT_SESSION
+second = create(title="second")
+check("the ticket stamps the first insert", origin(first) == ("drift", ""), str(origin(first)))
+check("a spent ticket is the turn's origin", origin(second) == ("chat", "slack"), str(origin(second)))
+os.environ[KO.STAMP_TICKET_ENV] = "issue"
+planted = slash("create --json --assignee default planted")
+check("a planted ticket value is the turn's origin", origin(planted) == ("chat", "slack"), str(origin(planted)))
+os.environ.pop(KO.STAMP_TICKET_ENV)
+turn["session"] = ""
 
 print("no argument sets the origin")
 with closing(KC.connect()) as conn:
