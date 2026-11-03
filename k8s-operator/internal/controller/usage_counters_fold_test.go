@@ -767,7 +767,8 @@ func TestFoldUsage_AnUnfoldedMaxCounterFirstReadOnTwoReplicasAddsTheLargerOnce(t
 // no sessions in the status both are unfolded and the first samples add whole;
 // with a status that carries sessions, from an operator that wrote the field
 // before a rollback, neither is: the triage half's share is in the chat
-// half's floor, so its first sample is a baseline, not an add.
+// half's floor, or under a split seed in its own, so its first sample is a
+// baseline, not an add.
 func TestMigrateUsageDocument_TheSessionsHalvesAreUnfoldedOnlyWithoutASessionsStatus(t *testing.T) {
 	first := foldClock(0)
 	created := first.Add(-time.Hour)
@@ -800,6 +801,27 @@ func TestMigrateUsageDocument_TheSessionsHalvesAreUnfoldedOnlyWithoutASessionsSt
 	})
 	if got := usageSessionsTotal(doc.Totals); got != 502 {
 		t.Fatalf("sessionsTotal after the return = %d, want 502", got)
+	}
+	// A split seed, from a status carrying chatSessionsTotal: each half's
+	// floor is its own, and neither is unfolded, since the field's floor is
+	// the pair's summed floors.
+	floors[usageCounterSessionsChat] = 300
+	floors[usageCounterSessionsTriage] = 200
+	for _, half := range usageSessionsCounters {
+		if got := usageFieldFloor(floors, half); got != 500 {
+			t.Fatalf("usageFieldFloor(%s) = %d, want 500: the halves' summed floors", half, got)
+		}
+	}
+	doc = predating()
+	migrateUsageDocument(doc, floors)
+	if usageUnfolded(doc, usageCounterSessionsTriage) || usageUnfolded(doc, usageCounterSessionsChat) {
+		t.Fatalf("with a split seed neither half is unfolded: %v", doc.Unfolded)
+	}
+	if doc.Totals[usageCounterSessionsChat] != 300 || doc.Totals[usageCounterSessionsTriage] != 200 {
+		t.Fatalf("totals after migration under a split seed: %v", doc.Totals)
+	}
+	if got := usageSessionsTotal(doc.Totals); got != 500 {
+		t.Fatalf("sessionsTotal under a split seed = %d, want 500", got)
 	}
 }
 

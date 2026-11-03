@@ -76,6 +76,11 @@ const (
 // slack.answerFeedback=false.
 const envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
 
+// envPeopleSeen turns the people bucket's records off when "false"
+// (people.go); the operator renders it only from
+// spec.telemetry.peopleSeen=false.
+const envPeopleSeen = "A2A_PEOPLE_SEEN"
+
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
 // lines rather than a directory of one file per id, because every key carries
@@ -221,6 +226,9 @@ type Config struct {
 	// rating controls are drawn and nothing is kept, whatever the feedback
 	// bucket holds.
 	AnswerFeedbackOff bool
+	// PeopleSeenOff is the install's spec.telemetry.peopleSeen=false: the
+	// gateway records no one it sees in the people bucket.
+	PeopleSeenOff bool
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -711,6 +719,7 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("%s is set but %s is empty: the election needs the pod's name as its identity", envGatewayLease, envPodName)
 	}
 	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false)
+	cfg.PeopleSeenOff = strings.TrimSpace(os.Getenv(envPeopleSeen)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
 	// Set is a list, even set empty: the operator renders the var empty for

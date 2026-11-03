@@ -1188,3 +1188,20 @@ func TestFromEnvGatewayLease(t *testing.T) {
 		t.Fatalf("a Lease with no pod name = %v, want it refused naming POD_NAME", err)
 	}
 }
+
+func TestPeopleSeenOffIsReadFromItsEnv(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		off   bool
+	}{{"", false}, {"true", false}, {"false", true}, {" false ", true}} {
+		setBaseEnv(t)
+		t.Setenv(envPeopleSeen, tc.value)
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.PeopleSeenOff != tc.off {
+			t.Errorf("%q: PeopleSeenOff=%v, want %v", tc.value, cfg.PeopleSeenOff, tc.off)
+		}
+	}
+}

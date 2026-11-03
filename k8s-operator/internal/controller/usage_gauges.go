@@ -96,6 +96,7 @@ func usageGaugeField(name string, get func(*agentv1alpha1.AgentUsageStatus) *int
 // struct.
 var usageExportFields = []usageExportField{
 	{name: "sessionsTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.SessionsTotal })},
+	{name: "chatSessionsTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ChatSessionsTotal })},
 	{name: "eventsIngestedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.EventsIngestedTotal })},
 	{name: "toolExecutionsTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ToolExecutionsTotal })},
 	{name: "remediationsProposedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.RemediationsProposedTotal })},

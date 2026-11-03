@@ -189,6 +189,16 @@ type Gateway struct {
 	// feedback is the answer-feedback recorder, set by Run once the
 	// feedback bucket is found (startFeedback); nil leaves answers unmarked.
 	feedback atomic.Pointer[feedbackDesk]
+	// peopleKeyer derives the people bucket's keys (people.go), and people
+	// is the people desk, set by Run once the people bucket is found
+	// (startPeople); nil notes nobody.
+	peopleKeyer *peopleKeyer
+	people      atomic.Pointer[peopleDesk]
+	// peoplePurgeRetry is how long purgePeople waits between two attempts,
+	// and peoplePurgeList lists the bucket's keys for one attempt
+	// (listPeopleKeys); tests replace both.
+	peoplePurgeRetry time.Duration
+	peoplePurgeList  func(ctx context.Context, kv jetstream.KeyValue) ([]string, error)
 	// consoleResults holds a console chain end's deliverable from
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
@@ -446,6 +456,10 @@ func New(o Options) (*Gateway, error) {
 		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
 	ps := NewPseudonymizer(o.Config.AttributionSalt)
+	peopleKeys, err := newPeopleKeyer(o.Config.AttributionSalt)
+	if err != nil {
+		return nil, fmt.Errorf("people keyer: %w", err)
+	}
 	targetAllowed := buildTargetAllowed(o.Config, ps)
 	for target, byBackend := range targetAllowed {
 		for b, set := range byBackend {
@@ -499,6 +513,9 @@ func New(o Options) (*Gateway, error) {
 		adapter:          o.Adapter,
 		pm:               pm,
 		ps:               ps,
+		peopleKeyer:      peopleKeys,
+		peoplePurgeRetry: peopleRetryInterval,
+		peoplePurgeList:  listPeopleKeys,
 		log:              log,
 		runCtx:           context.Background(),
 		sessionLocks:     map[string]*sessionLockEntry{},
@@ -615,6 +632,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	// Its first try before the relay starts, so on an install with the
 	// bucket every answer the relay posts is marked alike.
 	g.startFeedback(ctx)
+	g.startPeople(ctx)
 
 	var sub lib.Subscription
 	// bindErr is a held-back bind's failure, which ends the run.
@@ -838,6 +856,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	if !ok {
 		return
 	}
+	g.peopleNote(backend, principal)
 
 	// Where the turn's clock starts depends on who is waiting for the
 	// answer. The relay, the reap and the sweep each hold the conversation's
