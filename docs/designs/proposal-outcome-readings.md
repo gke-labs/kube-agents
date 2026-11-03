@@ -333,7 +333,8 @@ repository that is not a context repository, because a managed one "already has 
 credential and must keep riding it", so it gains a sweep caller that the role check admits and
 that names the sweep scope; and the helper scopes a minted token to one repository and returns
 no coverage list, so the sweep's reuse is per managed repository for the same thirty minutes the
-write token is reused, not per organization. On github.com the forge's transport is the
+write token is reused, not per organization (amended 11/2: the write token is now minted and
+reused per repository too, since each repository's minter policy lists that repository alone). On github.com the forge's transport is the
 `gh` CLI with the stored write credential, so the sweep cannot use it: it uses the in-process
 HTTP transport the GitHub Enterprise Server path already has, pointed at `api.github.com` with
 the read token, a construction the forge does not make today. On GitLab and Gitea, whose

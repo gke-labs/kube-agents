@@ -35,7 +35,10 @@ admissionPolicy:
 # fast with a diagnosis and patch command instead of stalling later during pod creation.
 #
 # With no cluster to query (`helm template` in CI) or no ResourceQuota in the namespace,
-# `lookup` returns nothing and the check passes.
+# `lookup` returns nothing and the check passes. The footprint summary NOTES.txt prints
+# under this switch sums the same workloads on every render, quota or not, so an input
+# the sum cannot size (an empty hindsight.postgresql.storage, a quantity it cannot parse)
+# is refused there even where the check passes; `quotaPreflight.enabled=false` skips both.
 #
 # It needs `get`/`list` on `resourcequotas` in the release namespace, though. Helm's
 # `lookup` swallows a NotFound and nothing else, so a 403 aborts the render rather than

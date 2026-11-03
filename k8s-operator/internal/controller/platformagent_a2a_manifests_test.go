@@ -1220,7 +1220,7 @@ func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	if workerEnv != mirror+"/a2a-worker:0.3.0" {
 		t.Errorf("A2A_WORKER_IMAGE %q does not follow the agent image's mirror (or is not rendered)", workerEnv)
 	}
-	callout := buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0]
+	callout := buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers[0]
 	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
 		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
 	}
@@ -1683,7 +1683,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent, "")
+	callout := buildA2ACalloutDeployment(agent, "", 1)
 	verifier := buildA2AVerifierDeployment(agent)
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
@@ -1770,7 +1770,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent, "")
+	callout := buildA2ACalloutDeployment(agent, "", 1)
 	verifier := buildA2AVerifierDeployment(agent)
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
@@ -2456,7 +2456,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	}
 
 	authMap := &corev1.ConfigMap{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(next), Namespace: next.Namespace}, authMap); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aAuthMapShardName(next, 0), Namespace: next.Namespace}, authMap); err != nil {
 		t.Fatalf("authMap was not created: %v", err)
 	}
 
@@ -2468,7 +2468,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,
 			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-				if _, isCM := obj.(*corev1.ConfigMap); isCM && obj.GetName() == a2aAuthMapName(next) && failAuthMap {
+				if _, isCM := obj.(*corev1.ConfigMap); isCM && obj.GetName() == a2aAuthMapShardName(next, 0) && failAuthMap {
 					return fmt.Errorf("injected: API server error deleting authmap")
 				}
 				return c.Delete(ctx, obj, opts...)
@@ -2479,7 +2479,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	for _, obj := range []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: next.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(next), Namespace: next.Namespace}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(next), Namespace: next.Namespace}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(next, 0), Namespace: next.Namespace}},
 	} {
 		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), obj); err == nil {
 			obj.SetResourceVersion("")
@@ -6016,7 +6016,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"gateway Deployment": buildA2AGatewayDeployment(agent).Spec.Template.Spec,
 		"NATS StatefulSet":   buildA2ANATSStatefulSet(agent, "conf-hash").Spec.Template.Spec,
 		"provision Job":      buildA2AProvisionJob(agent).Spec.Template.Spec,
-		"callout Deployment": buildA2ACalloutDeployment(agent, "").Spec.Template.Spec,
+		"callout Deployment": buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
 		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
 		"MCP Deployment":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
@@ -7301,7 +7301,7 @@ func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
 	}
 	// The callout too: it is the provision Job's authentication path, and a
 	// quota that refused it would leave the Job's creation held for good.
-	for _, c := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers {
+	for _, c := range buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers {
 		containers = append(containers, container{"callout Deployment", c})
 	}
 	// The verifier too, and it is the one with the sharpest consequence: an

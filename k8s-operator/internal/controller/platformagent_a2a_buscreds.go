@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -139,19 +140,37 @@ func (r *PlatformAgentReconciler) syncBusCredentialsReady(ctx context.Context, a
 	return r.setBusCredentialsReady(ctx, agent, dep, err != nil, mapVersion)
 }
 
-// renderedAuthMapVersion reads the version off the ConfigMap the callout
-// watches. Best effort: the caller only needs it for the condition's message,
-// and a message naming no version is better than a reconcile that fails
-// because it could not read one.
+// renderedAuthMapVersion reads the version off the identity map's shards on
+// the cluster. Shard 0, which every render has, carries the version and the
+// count, and every shard the count names must carry the same version: the
+// callout serves a version only once it holds every shard of it, so a set
+// that is incomplete or split across versions -- a pass that failed between
+// two shard applies, read back by a later pass that parked before rendering
+// -- is reported as unknown rather than as the version shard 0 happens to
+// carry while the callout still serves the one before it. Best effort: the
+// caller only needs it for the condition's message, and a message naming no
+// version is better than a reconcile that fails because it could not read one.
 func (r *PlatformAgentReconciler) renderedAuthMapVersion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
-	cm := &corev1.ConfigMap{}
-	if err := r.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}, cm); err != nil {
+	first := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aAuthMapShardName(agent, 0), Namespace: agent.Namespace}, first); err != nil {
 		return a2aAuthMapVersionUnknown
 	}
-	if v := cm.Annotations[a2aAuthMapVersionAnnotation]; v != "" {
-		return v
+	version := first.Annotations[a2aAuthMapVersionAnnotation]
+	count := first.Annotations[a2aAuthMapShardsAnnotation]
+	shards, err := strconv.Atoi(count)
+	if version == "" || err != nil || shards < 1 {
+		return a2aAuthMapVersionUnknown
 	}
-	return a2aAuthMapVersionUnknown
+	for i := 1; i < shards; i++ {
+		shard := &corev1.ConfigMap{}
+		if err := r.Get(ctx, types.NamespacedName{Name: a2aAuthMapShardName(agent, i), Namespace: agent.Namespace}, shard); err != nil {
+			return a2aAuthMapVersionUnknown
+		}
+		if shard.Annotations[a2aAuthMapVersionAnnotation] != version || shard.Annotations[a2aAuthMapShardsAnnotation] != count {
+			return a2aAuthMapVersionUnknown
+		}
+	}
+	return version
 }
 
 // setBusCredentialsReady writes the condition from the callout Deployment's

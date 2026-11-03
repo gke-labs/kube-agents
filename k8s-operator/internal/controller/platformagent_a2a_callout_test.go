@@ -78,7 +78,7 @@ func TestA2ACalloutIsGatedByMode(t *testing.T) {
 		t.Errorf("callout ServiceAccount not rendered under next: %v", err)
 	}
 	authMap := &corev1.ConfigMap{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-authmap", Namespace: "test-ns"}, authMap); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-authmap-0", Namespace: "test-ns"}, authMap); err != nil {
 		t.Errorf("identity map not rendered under next: %v", err)
 	}
 	crb := &rbacv1.ClusterRoleBinding{}
@@ -128,7 +128,7 @@ func TestA2ACalloutIsGatedByMode(t *testing.T) {
 			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-task-signing-key", Namespace: "test-ns"}, &corev1.Secret{})
 		}},
 		{"identity map", func() error {
-			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-authmap", Namespace: "test-ns"}, &corev1.ConfigMap{})
+			return cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-authmap-0", Namespace: "test-ns"}, &corev1.ConfigMap{})
 		}},
 		// The one nothing else would reclaim: cluster-scoped, so it carries
 		// no owner reference, and a security reviewer diffing a "normal"
@@ -175,7 +175,7 @@ var rbacBindingKinds = map[string]bool{
 // scope: they take the subject as an argument and have their own coverage.)
 func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T) {
 	agent := a2aTestAgent()
-	callout := buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.ServiceAccountName
+	callout := buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.ServiceAccountName
 	gateway := buildA2AGatewayDeployment(agent).Spec.Template.Spec.ServiceAccountName
 	dispatcher := buildA2ADispatcherDeployment(agent).Spec.Template.Spec.ServiceAccountName
 
@@ -612,7 +612,7 @@ func TestTheSessionIdentityIsRenderedUnderNextAndRemovedUnderToday(t *testing.T)
 
 	// And the callout's map is keyed on exactly that ServiceAccount.
 	authMap := &corev1.ConfigMap{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-authmap", Namespace: "test-ns"}, authMap); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-authmap-0", Namespace: "test-ns"}, authMap); err != nil {
 		t.Fatalf("identity map: %v", err)
 	}
 	wantKey := `"serviceAccount": "system:serviceaccount:test-ns:` + saName + `"`
