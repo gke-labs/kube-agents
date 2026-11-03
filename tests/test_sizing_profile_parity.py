@@ -53,13 +53,23 @@ ROWS = (
     ("fleet", "agentAPIAuth", "limits", "memory", "agentAPIAuthFleetMemoryLimit"),
     ("fleet", "shellSandbox", "limits", "memory", "shellSandboxFleetMemoryLimit"),
 )
-# Every medium or fleet constant sizing_profile.go declares for one of the three containers
-# the profile sizes. Held equal to the constants ROWS names, so a figure added on the
-# operator's side with no chart row behind it fails here rather than at the quota preflight
-# that would count the smaller row.
-OPERATOR_ROW_CONSTANT_RE = re.compile(
-    r'^\s*((?:credentialProxy|agentAPIAuth|shellSandbox)\w*(?:Medium|Fleet)\w*)\s*=\s*"', re.MULTILINE
+# Every medium or fleet constant sizing_profile.go declares, whichever container it sizes:
+# a row figure is a request or a limit, and no container prefix is assumed, so a fourth
+# sized container's constants are collected too. Held equal to the constants ROWS names, so
+# a figure added on the operator's side with no chart row behind it fails here rather than
+# at the quota preflight that would count the smaller row.
+OPERATOR_ROW_CONSTANT_RE = re.compile(r'^\s*(\w*(?:Medium|Fleet)\w*(?:Request|Limit))\s*=\s*"', re.MULTILINE)
+# A constants block in the operator's shape for a container the profile does not size
+# today, beside the names the collector must leave alone: the profile names (quoted, but
+# neither a request nor a limit) and the thresholds (not quoted).
+FOURTH_CONTAINER_CONSTANTS = '''
+const (
+	sizingProfileMedium = "medium"
+	sizingMediumClusterThreshold int64 = 10
+	dashboardMediumCPURequest = "500m"
+	dashboardFleetMemoryLimit = "2Gi"
 )
+'''
 PROBE_TEMPLATE = """
 apiVersion: v1
 kind: ConfigMap
@@ -138,6 +148,15 @@ class OperatorRowConstantsHaveAChartRow(unittest.TestCase):
         declared = set(OPERATOR_ROW_CONSTANT_RE.findall(OPERATOR.read_text(encoding="utf-8")))
         self.assertTrue(declared, f"{OPERATOR.relative_to(REPO_ROOT)} declares no medium or fleet constant")
         self.assertEqual(declared, {row[4] for row in ROWS})
+
+    def test_the_collector_reads_a_container_it_has_not_seen(self) -> None:
+        """The collector keys on the request-or-limit suffix, not on the containers sized
+        today, so a fourth container's constants reach the assertion above and the profile
+        names and thresholds do not."""
+        self.assertEqual(
+            set(OPERATOR_ROW_CONSTANT_RE.findall(FOURTH_CONTAINER_CONSTANTS)),
+            {"dashboardMediumCPURequest", "dashboardFleetMemoryLimit"},
+        )
 
 
 @unittest.skipUnless(HELM, "helm is not installed")
