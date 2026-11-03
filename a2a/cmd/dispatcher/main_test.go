@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -235,13 +238,37 @@ func TestTheFirstBusConnectIsRetried(t *testing.T) {
 	if err != nil || got != 7 || calls != 3 {
 		t.Fatalf("got %d, %v after %d calls; want 7 after 3", got, err, calls)
 	}
-	calls = 0
-	_, err = connectWithRetry(context.Background(), log, time.Millisecond, func(context.Context) (int, error) {
-		calls++
-		return 0, nats.ErrAuthorization
-	})
-	if err == nil || calls != 1 {
-		t.Fatalf("a refused credential: %v after %d calls; want an error after 1", err, calls)
+	// An authorization violation is retried: the bus gives the same text
+	// for a bad token as for an auth callout that is down or not yet
+	// subscribed, and the callout's outage passes.
+	for _, refusal := range []error{nats.ErrAuthorization, errors.New("nats connect: nats: Authorization Violation")} {
+		calls = 0
+		got, err = connectWithRetry(context.Background(), log, time.Millisecond, func(context.Context) (int, error) {
+			calls++
+			if calls < 3 {
+				return 0, refusal
+			}
+			return 7, nil
+		})
+		if err != nil || got != 7 || calls != 3 {
+			t.Fatalf("%v: got %d, %v after %d calls; want 7 after 3", refusal, got, err, calls)
+		}
+	}
+	// An untrusted certificate is not: no retry fixes it.
+	for _, untrusted := range []error{x509.UnknownAuthorityError{}, x509.HostnameError{Host: "nats"}, &tls.CertificateVerificationError{Err: errors.New("bad")}} {
+		calls = 0
+		ctx, cancel := context.WithCancel(context.Background())
+		_, err = connectWithRetry(ctx, log, time.Millisecond, func(context.Context) (int, error) {
+			calls++
+			if calls == 3 {
+				cancel() // retried: stop it rather than loop forever
+			}
+			return 0, fmt.Errorf("nats connect: %w", untrusted)
+		})
+		cancel()
+		if err == nil || calls != 1 {
+			t.Fatalf("an untrusted certificate (%T): %v after %d calls; want an error after 1", untrusted, err, calls)
+		}
 	}
 }
 

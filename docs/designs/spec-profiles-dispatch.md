@@ -340,7 +340,9 @@ leave open:
   the pod counts as busy in memory, and a dispatcher restarted mid-offer finds no record and
   dispatches the task afresh. With no free pod the submission waits over its cap and is
   redelivered. A record past its expiry doesn't keep its pod busy, and a sweep deletes records
-  long expired that no held submission has (its submission aged off the stream). Answers a pod
+  long expired that no held submission has (its submission aged off the stream). A record
+  nobody can read counts as a running one: its task is treated as started, and the sweep
+  waits as long from the record's last write. Answers a pod
   sends for tasks it doesn't hold are held to a small budget per pod.
 - **Task credentials.** With a task-signing key (a cluster seed, read from the file
   `A2A_TASK_SIGNING_SEED_FILE` names), the confirm carries two credentials the dispatcher
@@ -397,8 +399,9 @@ leave open:
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
   once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
-  the gateway's relay reads `.supervisor` beside `.events`, under an agreement policy that
-  names the dispatcher (`lib.DispatcherSession`) as a supervisor beside the gateway. The codes are
+  the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
+  under an agreement policy that names the dispatcher (`lib.DispatcherSession`) as a
+  supervisor beside the gateway. The codes are
   `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
   admission, and `lease-expired` and `deadline-exceeded` while it holds.
 
