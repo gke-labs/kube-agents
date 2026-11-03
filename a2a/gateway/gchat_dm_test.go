@@ -20,6 +20,11 @@ const (
 	gchatDMSecondThread = "gchat:dm/spaces/D1/threads/T2"
 	gchatDMThirdThread  = "gchat:dm/spaces/D1/threads/T3"
 	gchatDMCancelNotice = "cancel sent"
+	// gchatDMWholeSpace is the thread-less DM key a record from before the
+	// thread-per-ask rule, or a gateway-opened DM, carries.
+	gchatDMWholeSpace     = "gchat:dm/spaces/D1"
+	gchatDMSessionThread  = "reply in this thread"
+	gchatDMSessionNextMsg = "your next message opens a session pod"
 )
 
 // gchatDM sends one Google Chat DM message on conv.
@@ -100,5 +105,24 @@ func TestGchatDMTopLevelStatusPointsAtTheThread(t *testing.T) {
 	awaitSubmission(t, r, "platform", 1)
 	if slices.Contains(r.adapter.postTextsFor(gchatDMThirdThread), topLevelNothingRunningNotice) {
 		t.Errorf("a top-level question was redirected as a status poke")
+	}
+}
+
+// TestGchatDMSessionOnAckNamesTheThreadOnlyWhenTheRecordHasOne: a bare
+// `/session` in a Google Chat DM whose key names a thread points the user at
+// that thread; on a thread-less DM key it says the next message opens the
+// pod and names no thread.
+func TestGchatDMSessionOnAckNamesTheThreadOnlyWhenTheRecordHasOne(t *testing.T) {
+	r := startGchatRigWith(t, &fakeSpawner{}, []string{gchatDMUser}, false)
+
+	gchatDM(r, gchatDMQuestion, "spaces/D1/messages/M1", "/session", true)
+	awaitPostIn(t, r, "the ack in the command's thread", gchatDMQuestion, gchatDMSessionThread)
+
+	gchatDM(r, gchatDMWholeSpace, "spaces/D1/messages/M2", "/session", false)
+	awaitPostIn(t, r, "the ack on the thread-less DM", gchatDMWholeSpace, gchatDMSessionNextMsg)
+	if slices.ContainsFunc(r.adapter.postTextsFor(gchatDMWholeSpace), func(p string) bool {
+		return strings.Contains(p, gchatDMSessionThread)
+	}) {
+		t.Errorf("the ack on a thread-less DM key names a thread it does not have")
 	}
 }

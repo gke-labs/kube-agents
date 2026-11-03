@@ -996,6 +996,13 @@ func TestGchatRunDeliversAcksAndSwallowsPoison(t *testing.T) {
 // the Chat relay.
 func startGchatRig(t *testing.T, allowed []string, allowAll bool, opts ...func(*Config)) *rig {
 	t.Helper()
+	return startGchatRigWith(t, nil, allowed, allowAll, opts...)
+}
+
+// startGchatRigWith is startGchatRig with a session spawner; a non-nil spawn
+// arms sessions, so `/session` is answered rather than refused.
+func startGchatRigWith(t *testing.T, spawn spawner, allowed []string, allowAll bool, opts ...func(*Config)) *rig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -1026,7 +1033,7 @@ func startGchatRig(t *testing.T, allowed []string, allowAll bool, opts ...func(*
 	for _, o := range opts {
 		o(cfg)
 	}
-	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "gchat"})
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "gchat", Spawner: spawn})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
