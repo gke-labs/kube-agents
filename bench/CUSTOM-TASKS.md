@@ -588,7 +588,7 @@ repetitions inside one lease gradable: rep 2 pushing onto rep 1's branch moves t
 rep 2 quoting rep 1's URL does not. The job itself empties the leased repository of the agent's
 pull requests and branches at lease time and before every repetition of a case that requests a
 pull request (`hack/ci_reset_agent_pulls.py`, [`ci-pool-projects.md`](../docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it)), and a Prow periodic (`hack/ci_sweep_agent_pulls.py --pool`, run from
-`main` only) closes what a run killed hard left in free pool projects every ten minutes; a
+`main` only) closes what a run killed hard left in free pool projects hourly; a
 leftover branch would refuse an identical fix "nothing to commit", which is why both delete
 branches too. The head-commit check is what keeps anything inherited from grading.
 A pull request closed without being merged is rejected: closing moves `updated_at` too, and
