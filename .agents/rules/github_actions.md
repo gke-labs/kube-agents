@@ -4,7 +4,7 @@ paths:
   - ".github/workflows/**"
   - ".github/buildkitd.toml"
 trigger: model_decision
-description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, hardening pull_request_target workflows, collapsing superseded pull-request runs with a concurrency group, detecting changed files with git rather than the API, and pulling Docker Hub images through mirror.gcr.io."
+description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, hardening pull_request_target workflows, collapsing superseded pull-request runs with a concurrency group, detecting changed files with git rather than the API, pulling Docker Hub images through mirror.gcr.io, and capping the Actions cache segment download wait."
 ---
 
 # GitHub Actions rules
@@ -139,8 +139,10 @@ takes seconds. Re-check the value if the toolkit changes its segment size. The v
 restores only; saves read `CACHE_UPLOAD_CONCURRENCY` and `CACHE_UPLOAD_CHUNK_SIZE`. It reaches the
 `setup-python`, `setup-go` and `setup-node` actions and `actions/cache` alike, because all of them
 restore through the same package and read it from the process environment, and `setup-go` caches
-unless told `cache: false`. `tests/test_cache_segment_timeout.py` finds every workflow with a
-restoring step and holds the variable and its ceiling on each.
+unless told `cache: false`. A composite action that runs `actions/cache` as a nested step,
+`aquasecurity/trivy-action` and `github/codeql-action/init` here, restores the same way.
+`tests/test_cache_segment_timeout.py` finds every workflow with a step on that list and holds the
+variable and its ceiling on each; its synthetic cases hold the classification and each wrong value.
 
 ## Harden `pull_request_target` workflows
 
