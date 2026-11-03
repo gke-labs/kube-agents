@@ -21966,18 +21966,33 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertEqual(self.generate()[0], [])
         self.assertIn("already exists", self.generate_err)
 
-    def test_a_cluster_tree_over_the_ceiling_falls_back_to_the_file_alone(self):
-        # The file checks fall back to a snapshot of the file alone; the name
-        # search needs the whole cluster tree, so the generated fix is then
-        # declined as unchecked, naming the ceiling.
+    def test_a_generated_fix_in_a_tree_over_the_ceiling_costs_one_snapshot(self):
+        # The name search needs the whole cluster tree, so the planner asks for
+        # it first and declines the fix at once, naming the ceiling, without
+        # the per-file checks that would come before it.
         self.in_cluster_tree()
         calls = []
         use_large_repository(self, {}, too_large={"clusters/c1"}, calls=calls)
         self.patch_attr("content_mode", lambda: True)
         self.assertEqual(self.generate()[0], [])
-        self.assertIn(["clusters/c1/web/a-pdb.yaml"], calls)
+        self.assertEqual(calls, [None, ["clusters/c1"]])
         self.assertIn("could not be checked", self.generate_err)
         self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", self.generate_err)
+
+    def test_a_refused_path_is_not_asked_again(self):
+        # A tree or a file the broker refused as too large is answered from the
+        # refusal on every later question, a name search on the tree included.
+        calls = []
+        use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/kustomization.yaml"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(2):
+                probe.read_committed("clusters/c1/kustomization.yaml")
+                probe.mentions("a-pdb", "clusters/c1/")
+        self.assertEqual(calls.count(["clusters/c1"]), 1)
+        self.assertEqual(calls.count(["clusters/c1/kustomization.yaml"]), 1)
+        probe.close()
 
     def test_a_path_still_over_the_ceiling_declines_the_fix_naming_the_limit(self):
         self.in_cluster_tree()
@@ -22043,7 +22058,9 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 if target.exists():
                     target.unlink()
                 self.assertEqual(self.generate()[0], expected)
-                self.assertEqual(len(calls), 1)
+                # A failed snapshot gets its second attempt within the same fix:
+                # the narrow-mode check asks first, then the existence check.
+                self.assertEqual(len(calls), 2 if error else 1)
 
     def test_two_clusters_each_get_their_own_budget_of_one_name(self):
         """A PodDisruptionBudget's name is unique per namespace per cluster, and

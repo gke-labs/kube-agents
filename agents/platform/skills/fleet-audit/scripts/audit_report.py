@@ -17034,8 +17034,8 @@ class _RepositoryProbe:
         # snapshot, None for a path the revision does not hold.
         self.narrow = False
         self._narrow: dict[str, RepositorySnapshot | None] = {}
-        # Directories whose narrow snapshot was refused as too large, so a
-        # later path under one goes straight to the file alone.
+        # Paths whose narrow snapshot was refused as too large, a directory's or
+        # a file's, so neither is asked of the broker again this run.
         self._narrow_refused: set[str] = set()
         # The revision the first narrow answer was read at, a refusal's included.
         self._narrow_revision = ""
@@ -17136,6 +17136,28 @@ class _RepositoryProbe:
             return True
         return snap.has_file(path)
 
+    def narrow_unreadable(self, tree: str) -> str:
+        """In narrow mode, why the name search under `tree` cannot run; "" when it can.
+
+        "" outside narrow mode. The planner asks this before its other checks
+        of a generated fix, so a fix whose name search would fail anyway is
+        declined at once, without the per-file snapshots of the checks before it.
+        """
+        if not content_mode():
+            return ""
+        if self._snapshot is None and self._attempts == 0:
+            # The first question of the run: this is what finds narrow mode.
+            self.broker()
+        if not self.narrow:
+            return ""
+        if not tree:
+            return f"{self.repo} is too large to search whole for a name"
+        try:
+            self._narrow_snapshot_for(tree.rstrip("/"))
+        except Exception as exc:  # noqa: BLE001 -- the reason the fix is declined
+            return f"{type(exc).__name__}: {exc}"
+        return ""
+
     @staticmethod
     def _narrow_key(path: str) -> str:
         """What narrow mode snapshots to answer a question about `path`.
@@ -17159,11 +17181,11 @@ class _RepositoryProbe:
             if path == key or path.startswith(f"{key}/"):
                 return held
         key = self._narrow_key(path)
-        if key != path and key not in self._narrow_refused:
+        if key != path:
             try:
                 return self._take_narrow(key, last=False)
             except _NarrowTooLarge:
-                self._narrow_refused.add(key)
+                pass
         return self._take_narrow(path, last=True)
 
     def _take_narrow(self, key: str, *, last: bool) -> "RepositorySnapshot | None":
@@ -17182,19 +17204,26 @@ class _RepositoryProbe:
                 f"this run already took {PROBE_NARROW_SNAPSHOT_CAP} narrow snapshots of "
                 f"{self.repo} (PROBE_NARROW_SNAPSHOT_CAP), so {key} was not checked"
             )
+        too_large = (
+            f"{key} in {self.repo} is too large for one snapshot; an operator can raise "
+            "the broker's CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
+        )
+        if key in self._narrow_refused:
+            # Refused earlier this run: the broker's answer does not change.
+            if not last:
+                raise _NarrowTooLarge(key)
+            raise RuntimeError(too_large)
         try:
             snap: RepositorySnapshot | None = RepositorySnapshot(self.repo, paths=[key])
         except vcs_client.VcsError as exc:
             if exc.code == SNAPSHOT_PATH_NOT_FOUND:
                 snap = None
                 self._narrow_revision = self._narrow_revision or (exc.revision or "")
-            elif exc.code == vcs_client.SNAPSHOT_TOO_LARGE and not last:
-                raise _NarrowTooLarge(key) from exc
             elif exc.code == vcs_client.SNAPSHOT_TOO_LARGE:
-                raise RuntimeError(
-                    f"{key} in {self.repo} is too large for one snapshot ({exc}); an operator "
-                    "can raise the broker's CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
-                ) from exc
+                self._narrow_refused.add(key)
+                if not last:
+                    raise _NarrowTooLarge(key) from exc
+                raise RuntimeError(f"{too_large} ({exc})") from exc
             else:
                 raise
         if snap is not None:
@@ -17469,6 +17498,10 @@ def plan_generated_fixes(
             reason = f"the namespace already has a PodDisruptionBudget named {name}"
         elif not ours and target.exists():
             reason = f"{path} already exists"
+        elif not ours and (unreadable := probe.narrow_unreadable(scope)):
+            # Narrow mode: the name search below would fail, so the per-file
+            # checks before it would be spent for nothing.
+            reason = f"the repository could not be checked ({unreadable})"
         elif not ours and probe.has_path(path):
             reason = unchecked(f"{path} already exists")
         elif any(probe.has_path(str(parent / marker)) for parent in (directory, *directory.parents) for marker in KUSTOMIZATION_FILE_NAMES):
