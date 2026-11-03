@@ -1298,6 +1298,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/tasks/t-1", None),
         ("PUT", "/v1/sessions/sess-1/origin", {"origin": "chat", "platform": "slack"}),
         ("PUT", "/v1/cron/jobs/j-1/origin", {"origin": "chat", "platform": "slack"}),
+        ("GET", "/v1/cron/jobs/j-1/origin", None),
         ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
         ("GET", "/v1/proposals/opened/counts", None),
         ("PUT", "/v1/board/tasks/t-1/origin", {"origin": "chat", "platform": "slack"}),
@@ -12547,6 +12548,16 @@ class TestProposalOrigin(unittest.TestCase):
         self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "api"}).status_code, 200)
         self.assertEqual(session_kv_server._cron_job_origin("job-a"), ("api", ""))
         self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "nope"}).status_code, 400)
+
+    def test_cron_job_origin_get_route_reads_the_record_or_404(self):
+        from fastapi.testclient import TestClient
+
+        self.assertEqual(self.client.get("/v1/cron/jobs/job-r/origin").status_code, 404)
+        self.client.put("/v1/cron/jobs/job-r/origin", json={"origin": "chat", "platform": "slack"})
+        got = self.client.get("/v1/cron/jobs/job-r/origin")
+        self.assertEqual(got.status_code, 200, got.text)
+        self.assertEqual(got.json(), {"origin": "chat", "platform": "slack"})
+        self.assertEqual(TestClient(session_kv_server.app).get("/v1/cron/jobs/job-r/origin").status_code, 401)
 
     def test_proposals_opened_is_idempotent_on_url(self):
         url = "https://github.com/example/fleet/pull/7"

@@ -101,6 +101,24 @@ SCHEDULER_RUN_JOB_PATCHED = (
     "        except BaseException:\n"
 )
 
+# The tick's own path. ``_process_due_job`` is what the scheduler's tick
+# submits for a due job (the run ledger records it ``source='builtin'``); the
+# cronjob tool's direct run calls ``run_one_job`` without passing through it,
+# and so does the scoped ``run_job`` above, which both paths share. The run's
+# origin is therefore set here and nowhere else: ``audit`` or ``scheduled`` for
+# a job that matches the image's template, else the job's recorded origin.
+# See tools/cron_run_scope.py ``cron_tick_origin_scope`` and
+# tools/cron_job_template.py.
+SCHEDULER_TICK_RUN = "    return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)\n"
+
+SCHEDULER_TICK_RUN_PATCHED = (
+    "    # kube-agents patch: a tick-started run carries its origin.\n"
+    "    # See tools/cron_run_scope.py and tools/cron_job_template.py.\n"
+    "    from tools.cron_run_scope import cron_tick_origin_scope\n"
+    "    with cron_tick_origin_scope(claimed_job):\n"
+    "        return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)\n"
+)
+
 # save_job_output moved out of the body into _save_compose_deliver, which does
 # not see the out-param. The saved path travels back on the _RunDelivery record
 # that function already fills in for the bookkeeping tail, so the record gains a
@@ -259,6 +277,40 @@ CRONJOB_CREATE_CALL_PATCHED = (
     '            risk=a["risk"],\n'
 )
 
+# Record the origin a job was created or last changed under, for its
+# tick-started runs once it no longer matches the template. Written by this
+# in-pod handler from the turn's trusted context into the Session KV server,
+# never into the jobs file the agent writes. After the create's refusal path,
+# so a refused create records nothing; after ``update_job``, only for a job it
+# found. See tools/cron_job_template.py.
+_RECORD_ORIGIN = (
+    "{indent}# kube-agents patch: record this turn's origin for the job id.\n"
+    "{indent}# See tools/cron_job_template.py.\n"
+    "{indent}try:\n"
+    "{indent}    from tools.cron_job_template import record_job_origin\n"
+    "{indent}    record_job_origin({job_id})\n"
+    "{indent}except Exception as _origin_exc:\n"
+    '{indent}    logger.warning("cron origin: job %s not recorded: %r", {job_id}, _origin_exc)\n'
+)
+
+CRONJOB_CREATE_REFUSED_ANCHOR = (
+    "    except CronSchedulerRegistrationError as exc:\n"
+    "        _partial = exc.to_dict()\n"
+    '        return tool_error(_partial.pop("error"), success=False, **_partial)\n'
+)
+
+CRONJOB_CREATE_REFUSED_PATCHED = CRONJOB_CREATE_REFUSED_ANCHOR + _RECORD_ORIGIN.format(
+    indent="    ", job_id='job["id"]'
+)
+
+CRONJOB_UPDATE_ANCHOR = '    updated = update_job(job["id"], updates)\n'
+
+CRONJOB_UPDATE_PATCHED = (
+    CRONJOB_UPDATE_ANCHOR
+    + "    if updated:\n"
+    + _RECORD_ORIGIN.format(indent="        ", job_id='job["id"]')
+)
+
 # --- cron/jobs.py: stamp default risk on newly created jobs -----------------
 
 JOBS_DEF_ANCHOR = (
@@ -394,7 +446,10 @@ def apply(root: Path) -> None:
         SCHEDULER_SAVE_OUTPUT, SCHEDULER_SAVE_OUTPUT_PATCHED, label="saved output"
     )
     scheduler.substitute(SCHEDULER_TAIL, SCHEDULER_TAIL_PATCHED, label="run tail")
-    scheduler.commit("2 locators, 5 anchors")
+    scheduler.substitute(
+        SCHEDULER_TICK_RUN, SCHEDULER_TICK_RUN_PATCHED, label="tick run origin"
+    )
+    scheduler.commit("2 locators, 6 anchors")
 
     cronjob = patchlib.Patch(root, "tools/cronjob_tools.py", prefix=PREFIX)
     cronjob.substitute(
@@ -413,7 +468,15 @@ def apply(root: Path) -> None:
         CRONJOB_CREATE_CALL_PATCHED,
         label="create call",
     )
-    cronjob.commit("6 anchors")
+    cronjob.substitute(
+        CRONJOB_CREATE_REFUSED_ANCHOR,
+        CRONJOB_CREATE_REFUSED_PATCHED,
+        label="create records origin",
+    )
+    cronjob.substitute(
+        CRONJOB_UPDATE_ANCHOR, CRONJOB_UPDATE_PATCHED, label="update records origin"
+    )
+    cronjob.commit("8 anchors")
 
     jobs = patchlib.Patch(root, "cron/jobs.py", prefix=PREFIX)
     jobs.substitute(

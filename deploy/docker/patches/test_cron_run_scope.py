@@ -5,14 +5,21 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t dep
 
 import ast
 import concurrent.futures
+import contextlib
 import contextvars
+import json
 import os
+import sys
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import apply_cron_run_scope
+import cron_job_template
+import cron_run_scope as cron_run_scope_module
 from cron_run_scope import (
     CRON_RESPONSE_LIMIT,
     CRON_RISK_ENV,
@@ -22,6 +29,7 @@ from cron_run_scope import (
     cron_ownership_violation,
     cron_run_scope,
     current_cron_job,
+    current_cron_origin,
     current_cron_risk,
     missing_task_id_error,
 )
@@ -32,6 +40,8 @@ CALLER_CARD = "t_a1b2c3d4"
 JOB_ID = "fleet-wide-cost-analysis"
 DISPATCH_ENV = {WORKER_TASK_ENV: CALLER_CARD, CRON_RUN_ENV: JOB_ID}
 WORKER_ENV = {WORKER_TASK_ENV: CALLER_CARD}
+# A shipped fleet-audit job, as the template and the tick's claimed record carry it.
+TICK_JOB = {"prompt": "Run the fleet cost audit.", "skills": ["fleet-audit"]}
 
 
 class CronRunScopeTest(unittest.TestCase):
@@ -349,6 +359,19 @@ def _run_one_job_body(
     except Exception:
         finish_execution(execution_id, success=False)
         return False
+
+
+def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
+    """Run one due job via the shared ``run_one_job`` body."""
+    claimed = claim_job_for_fire(job["id"], return_job=True)
+    if not claimed:
+        finish_execution(
+            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+        return True
+    claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
+    claimed_job["execution_id"] = job["execution_id"]
+    claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 '''
 
 CRONJOB_STUB = '''import json
@@ -386,8 +409,17 @@ def _action_create(a):
             prompt=a["prompt"] or "",
             reasoning_effort=a["reasoning_effort"],
             failure_deliver=a["failure_deliver"])
-    except Exception:
-        pass
+    except CronSchedulerRegistrationError as exc:
+        _partial = exc.to_dict()
+        return tool_error(_partial.pop("error"), success=False, **_partial)
+    return _dumps({"success": True, "job_id": job["id"]})
+
+
+def _action_update(job, a):
+    updates = {"prompt": a["prompt"]}
+    updated = update_job(job["id"], updates)
+    _notify_provider_jobs_changed_safe()
+    return _dumps({"success": True, "job": updated})
 
 
 def _action_run(job, a):
@@ -614,6 +646,134 @@ class ApplierTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             apply_cron_run_scope.apply(root)
         self.assertIn("found 0", str(ctx.exception))
+
+    def _patched_namespace(self, root: Path, relative: str, **names) -> dict:
+        """Exec one patched stub with the ``tools`` package aliased to these modules."""
+        tools = types.ModuleType("tools")
+        tools.__path__ = []
+        modules = {
+            "tools": tools,
+            "tools.cron_run_scope": cron_run_scope_module,
+            "tools.cron_job_template": cron_job_template,
+        }
+        patcher = mock.patch.dict(sys.modules, modules)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        ns = {"__name__": f"patched_{relative.replace('/', '_')}", "logger": mock.Mock()}
+        ns.update(names)
+        exec(compile((root / relative).read_text(), relative, "exec"), ns)
+        return ns
+
+    def _scheduler(self, root: Path, seen: list) -> dict:
+        """The patched scheduler stub, whose ``run_job`` records the run's context."""
+
+        def run_job(job, **_kwargs):
+            seen.append((current_cron_job(), current_cron_origin()))
+            return True, "output", "final", None
+
+        return self._patched_namespace(
+            root,
+            "cron/scheduler.py",
+            run_job=run_job,
+            _run_with_fire_claim_heartbeat=lambda job, run: run(None),
+            claim_job_for_fire=lambda job_id, return_job=False: {"id": job_id, **TICK_JOB},
+            finish_execution=lambda *a, **k: None,
+            save_job_output=lambda job_id, output: Path("/tmp/out.md"),
+        )
+
+    def _template(self) -> None:
+        template = Path(tempfile.mkdtemp()) / "jobs.json"
+        template.write_text(json.dumps({"jobs": [{"id": JOB_ID, **TICK_JOB}]}))
+        for patcher in (
+            mock.patch.object(cron_job_template, "TEMPLATE_JOBS_PATH", str(template)),
+            mock.patch.object(cron_job_template, "SESSION_KV_URL", "http://127.0.0.1:9"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_tick_run_sets_the_run_origin_for_its_scope(self):
+        """The scheduler's tick (``_process_due_job``) sets the origin around the run, and only there."""
+        self._template()
+        seen: list = []
+        ns = self._scheduler(self._apply_all(), seen)
+        ns["_process_due_job"]({"id": JOB_ID, "execution_id": "e1"}, None, None, False)
+        self.assertEqual(seen, [(JOB_ID, ("audit", ""))])
+        self.assertIsNone(current_cron_origin())
+        # A job that no longer matches the template and has no record is other.
+        seen.clear()
+        ns["claim_job_for_fire"] = lambda job_id, return_job=False: {"id": job_id, **TICK_JOB, "prompt": "edited"}
+        ns["_process_due_job"]({"id": JOB_ID, "execution_id": "e2"}, None, None, False)
+        self.assertEqual(seen, [(JOB_ID, ("other", ""))])
+        self.assertIsNone(current_cron_origin())
+
+    def test_a_direct_run_sets_no_run_origin(self):
+        """``run_one_job`` called by the cronjob tool runs under the run scope, with no origin."""
+        self._template()
+        seen: list = []
+        root = self._apply_all()
+        scheduler = self._scheduler(root, seen)
+        scheduler["run_one_job"]({"id": JOB_ID, **TICK_JOB})
+        self.assertEqual(seen, [(JOB_ID, None)])
+        # Through the patched tool's own direct path too.
+        seen.clear()
+        fake_scheduler = types.ModuleType("cron.scheduler")
+        fake_scheduler.run_one_job = scheduler["run_one_job"]
+        fake_scheduler.release_running_job = lambda job_id: None
+        fake_scheduler.try_register_running_job = lambda job_id: True
+        cron_package = types.ModuleType("cron")
+        cron_package.__path__ = []
+        cron_package.scheduler = fake_scheduler
+        patcher = mock.patch.dict(sys.modules, {"cron": cron_package, "cron.scheduler": fake_scheduler})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        tool = self._patched_namespace(
+            root,
+            "tools/cronjob_tools.py",
+            _run_heartbeat=lambda name: contextlib.nullcontext(),
+            adapters=None,
+            gateway_loop=None,
+            get_job=lambda job_id: {"last_status": "ok"},
+        )
+        result = tool["_run_claimed_job"]({"id": JOB_ID, **TICK_JOB})
+        self.assertTrue(result["claimed"], result)
+        self.assertEqual(seen, [(JOB_ID, None)])
+
+    def test_cronjob_create_and_update_record_the_origin(self):
+        """``cronjob_manage`` create and update record the turn's origin for the job id."""
+
+        class CronSchedulerRegistrationError(Exception):
+            def to_dict(self):
+                return {"error": "refused"}
+
+        created = {"id": "j-new"}
+        updated = {"id": "j-new", "prompt": "changed"}
+        tool = self._patched_namespace(
+            self._apply_all(),
+            "tools/cronjob_tools.py",
+            CronSchedulerRegistrationError=CronSchedulerRegistrationError,
+            create_job_with_scheduler_registration=lambda **kw: created,
+            update_job=lambda job_id, updates: updated,
+            tool_error=lambda message, **kw: message,
+        )
+        args = {"prompt": "p", "reasoning_effort": None, "failure_deliver": None, "risk": None}
+        with mock.patch.object(cron_job_template, "record_job_origin", return_value=True) as record:
+            tool["_action_create"](args)
+            tool["_action_update"]({"id": "j-new"}, args)
+            self.assertEqual([c.args for c in record.call_args_list], [("j-new",), ("j-new",)])
+            record.reset_mock()
+            # A refused create, and an update of a job that is gone, record nothing.
+            def refuse(**kw):
+                raise CronSchedulerRegistrationError()
+
+            tool["create_job_with_scheduler_registration"] = refuse
+            tool["update_job"] = lambda job_id, updates: None
+            self.assertEqual(tool["_action_create"](args), "refused")
+            tool["_action_update"]({"id": "j-gone"}, args)
+            record.assert_not_called()
+        # A recorder that raises never fails the tool call.
+        tool["create_job_with_scheduler_registration"] = lambda **kw: created
+        with mock.patch.object(cron_job_template, "record_job_origin", side_effect=RuntimeError("boom")):
+            self.assertIn("j-new", tool["_action_create"](args))
 
     def test_applying_twice_is_refused(self):
         """Deliberately not idempotent: the out-param is inserted, not

@@ -95,6 +95,7 @@ and hand the card to a second worker.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import os
 from contextvars import ContextVar
 from typing import Iterator, Mapping, Optional
@@ -120,6 +121,18 @@ DEFAULT_CRON_RISK = "high"
 #: Declared risk tier of the cron job executing in this context (default "high").
 _CRON_RUN_RISK: ContextVar = ContextVar(CRON_RISK_ENV, default="")
 
+#: Name of the run-origin context variable.
+CRON_ORIGIN_VAR = "kube_agents_cron_run_origin"
+
+#: ``(origin, platform)`` of the tick-started run executing in this context, or
+#: None: outside a run, and in a direct run. See :func:`cron_tick_origin_scope`.
+_CRON_RUN_ORIGIN: ContextVar = ContextVar(CRON_ORIGIN_VAR, default=None)
+
+#: Where Hermes installs the template matcher, and the name a test loads it under.
+CRON_JOB_TEMPLATE_MODULES = ("tools.cron_job_template", "cron_job_template")
+#: A tick-started run's origin when the template matcher is not installed.
+UNRESOLVED_RUN_ORIGIN = ("other", "")
+
 
 @contextlib.contextmanager
 def cron_run_scope(job_id: str, risk: str = DEFAULT_CRON_RISK) -> Iterator[None]:
@@ -143,6 +156,46 @@ def cron_run_scope(job_id: str, risk: str = DEFAULT_CRON_RISK) -> Iterator[None]
     finally:
         _CRON_RUN_RISK.reset(risk_token)
         _CRON_RUN_JOB.reset(token)
+
+
+@contextlib.contextmanager
+def cron_tick_origin_scope(job: Mapping) -> Iterator[None]:
+    """Mark the current context as a tick-started run of ``job``, with its origin.
+
+    Entered by the scheduler's tick path only (``_process_due_job``, patched by
+    ``apply_cron_run_scope.py``), around ``run_one_job``. The cronjob tool's
+    direct run calls ``run_one_job`` without it, so a direct run carries no run
+    origin and resolves as the session that asked for it. The origin is
+    ``cron_job_template.run_origin(job)``: ``audit`` or ``scheduled`` for a job
+    that matches the image's template, else the job's Session KV record, else
+    ``other``. A ContextVar for the same reasons as :func:`cron_run_scope`:
+    ``run_job`` copies the context into the agent's worker thread.
+    """
+    origin = _resolve_run_origin(job)
+    token = _CRON_RUN_ORIGIN.set(origin)
+    try:
+        yield
+    finally:
+        _CRON_RUN_ORIGIN.reset(token)
+
+
+def _resolve_run_origin(job: Mapping) -> tuple:
+    for name in CRON_JOB_TEMPLATE_MODULES:
+        try:
+            template = importlib.import_module(name)
+        except ImportError:
+            continue
+        return template.run_origin(job)
+    return UNRESOLVED_RUN_ORIGIN
+
+
+def current_cron_origin() -> Optional[tuple]:
+    """``(origin, platform)`` of the tick-started run in this context, or None.
+
+    No environment fallback: the origin must come from the scheduler's own
+    context, never a variable a process could inherit or plant.
+    """
+    return _CRON_RUN_ORIGIN.get()
 
 
 def current_cron_risk(environ: Optional[Mapping[str, str]] = None) -> str:

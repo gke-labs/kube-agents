@@ -7506,6 +7506,20 @@ def put_cron_job_origin(job_id: str, request_data: Dict[str, Any]) -> Dict[str, 
     return {"origin": origin, "platform": platform}
 
 
+@app.get("/v1/cron/jobs/{job_id}/origin", dependencies=[Depends(verify_api_key)])
+def get_cron_job_origin(job_id: str) -> Dict[str, str]:
+    """The origin recorded for a cron job id; 404 when it has none.
+
+    Read by a tick-started run of a job that no longer matches the image's
+    template (`deploy/docker/patches/cron_job_template.py`).
+    """
+    recorded = _cron_job_origin(job_id)
+    if recorded is None:
+        raise HTTPException(status_code=404, detail="no origin recorded for this cron job")
+    origin, platform = recorded
+    return {"origin": origin, "platform": platform}
+
+
 @app.post("/v1/proposals/opened", dependencies=[Depends(verify_api_key)])
 def post_proposal_opened(request_data: Dict[str, Any]) -> Dict[str, bool]:
     """Record one verified proposal in the ledger; the first record of a url stands.

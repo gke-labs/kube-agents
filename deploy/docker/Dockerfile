@@ -309,7 +309,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lin
 # the run action json.dumps it, and the caller got a TypeError in place of the
 # report it had waited six minutes for.
 # See the module docstring in deploy/docker/patches/cron_run_scope.py.
-COPY --chmod=0644 deploy/docker/patches/cron_run_scope.py /opt/hermes/tools/cron_run_scope.py
+# cron_job_template.py rides the same COPY: the tick's run-origin scope and
+# the cronjob tool's per-job origin record import it from tools/.
+COPY --chmod=0644 deploy/docker/patches/cron_run_scope.py \
+     deploy/docker/patches/cron_job_template.py \
+     /opt/hermes/tools/
 # patchlib.py is the shared build-time helper every apply_*.py below imports:
 # the exact-once anchor check, the ast.parse gate, the write. It is staged
 # beside the appliers rather than installed -- Python puts the running script's
@@ -335,9 +339,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_run_scope.py /opt/hermes && \
     grep -q "cron_ownership_violation(tid)" /opt/hermes/tools/kanban_tools.py && \
     grep -q 'd.output_file = str(output_file)' /opt/hermes/cron/scheduler.py && \
     grep -q 'job\["risk"\] = _eff_risk' /opt/hermes/cron/jobs.py && \
+    grep -qF 'with cron_tick_origin_scope(claimed_job):' /opt/hermes/cron/scheduler.py && \
+    grep -c 'record_job_origin(job\["id"\])' /opt/hermes/tools/cronjob_tools.py | grep -qx 2 && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
 from gateway.kanban_handoff_clip import clip_handoff; \
-from tools.cron_run_scope import clip_cron_response, cron_run_scope; \
+from tools.cron_run_scope import clip_cron_response, cron_run_scope, cron_tick_origin_scope; \
+from tools.cron_job_template import record_job_origin, run_origin; \
 clipped = clip_cron_response(('word ' * 2000) + 'https://example.invalid/issues/27'); \
 exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None" && \
     /opt/hermes/.venv/bin/python3 /tmp/verify_cron_run_scope.py && \
