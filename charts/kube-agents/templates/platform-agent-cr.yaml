@@ -502,7 +502,11 @@ spec:
       shared with the agentAPIAuth and shellSandbox blocks.
     */}}
     {{- $proxyQuantities := include "kube-agents.resourcesOverrideQuantities" $proxyResources | fromJson }}
-    {{- $proxyDefaults := include "kube-agents.credentialProxyDefaults" . | fromJson }}
+    {{- /* The row the override merges over is the sizing profile's
+           (kube-agents.credentialProxyRow): the defaults under small, unset and
+           auto, so a pair valid on the chosen row is not refused against the
+           small one, as the operator admits it. */}}
+    {{- $proxyDefaults := include "kube-agents.credentialProxyRow" . | fromJson }}
     {{- $proxyFloor := include "kube-agents.credentialProxyMemoryFloorBytes" . | int64 }}
     {{- $proxyMerged := dict "requests" (dict) "limits" (dict) }}
     {{- range $side := list "requests" "limits" }}

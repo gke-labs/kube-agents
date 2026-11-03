@@ -921,17 +921,18 @@ the override, at the defaults when the operator would refuse it (it then renders
 the shell at them), and the same CRD guard fails the upgrade when the installed CRD
 predates the field.
 
-`platformAgent.deployment.sizingProfile` picks the preset the three containers
-above start from, forwarded to the CR's `spec.deployment.sizingProfile` when set:
-`small` (the operator's defaults, and what an unset value means), `medium`,
-`fleet`, or `auto`, which steps the tier up with the cluster count the operator
-polls and never down, holding a step the namespace's ResourceQuota has no room
-for. The
+`platformAgent.deployment.sizingProfile` picks the preset the credential proxy,
+the `agent-api-auth` sidecar and the shell container start from, forwarded to the
+CR's `spec.deployment.sizingProfile` when set: `small` (the operator's defaults,
+and what an unset value means), `medium`, `fleet`, or `auto`, which steps the
+tier up with the cluster count the operator polls and never down, holding a step
+the namespace's ResourceQuota has no room for. The
 [`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
-has each row's figures and the auto rules. The per-key overrides are applied over
-the preset, so an explicit key wins. The quota preflight sums the small row
-whatever the profile. The same CRD guard fails the upgrade when the installed CRD
-predates the field.
+has each row's figures and the auto rules. The three per-key overrides (the two
+above and `platformAgent.deployment.agentAPIAuth.resources`, the sidecar's) are
+applied over the preset, so an explicit key wins. The quota preflight counts
+`medium` and `fleet` at their rows and `auto` at the small row it starts from. The
+same CRD guard fails the upgrade when the installed CRD predates the field.
 
 `platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
 `critical`, `warning`, `info` and `drift`, and each key that is set becomes an
@@ -1186,7 +1187,10 @@ the API server defaults it to the limit. The shell sandbox is counted the same w
 `platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
 ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own; an
 override the operator refuses (a zero limit, a request above its limit) is counted at the defaults
-the operator renders in its place, because the chart does not fail the render on those. A
+the operator renders in its place, because the chart does not fail the render on those. Under
+`platformAgent.deployment.sizingProfile` `medium` or `fleet` the proxy, the sidecar and the shell
+are counted at that row, with each override merged over it; `auto` is counted at the small row it
+starts from, and the operator checks the quota itself before each later promotion. A
 `PlatformAgent` edited by hand after the install is outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as

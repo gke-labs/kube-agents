@@ -164,6 +164,7 @@ _AA_OVERRIDE_CPU_LIMIT_MILLIS = 2000
 _AA_OVERRIDE_CPU_REQUEST_MILLIS = 500
 _AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _AA_VALUE = "platformAgent.deployment.agentAPIAuth.resources"
+_SIZING_VALUE = "platformAgent.deployment.sizingProfile"
 # The operator's own resources block, which the preflight sums and holds to its memory floor.
 _OPERATOR_VALUE = "operator.resources"
 # What releases up to 0.16.0 shipped for the manager's memory limit, under the 512Mi floor.
@@ -421,6 +422,48 @@ class PreflightDecisionTest(unittest.TestCase):
         base = self._requirements()
         nulled = self._requirements([f"{_PROXY_VALUE}.limits.memory=null"])
         self.assertEqual(nulled, base)
+
+    def test_sizing_profile_rows_are_counted(self) -> None:
+        """platformAgent.deployment.sizingProfile medium and fleet are counted at their
+        rows, the difference from the small footprint across the three sized containers:
+        fleet raises the proxy to 4 CPU / 8Gi requests and 8 CPU / 8Gi limits, the
+        sidecar's memory limit to 8Gi and the shell's to 4Gi; medium raises the proxy to
+        1 CPU / 4Gi requests and a 4Gi memory limit and the sidecar's limit to 4Gi.
+        Ephemeral-storage and the pod count do not move. auto is the small row the
+        operator starts it at."""
+        base = self._requirements()
+        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
+        self.assertEqual(fleet["requestsCpu"] - base["requestsCpu"], 4000 - 500)
+        self.assertEqual(fleet["requestsMemory"] - base["requestsMemory"], 7 * 1024**3)
+        self.assertEqual(fleet["limitsCpu"] - base["limitsCpu"], 8000 - 2000)
+        self.assertEqual(fleet["limitsMemory"] - base["limitsMemory"], (6 + 6 + 2) * 1024**3)
+        medium = self._requirements([f"{_SIZING_VALUE}=medium"])
+        self.assertEqual(medium["requestsCpu"] - base["requestsCpu"], 1000 - 500)
+        self.assertEqual(medium["requestsMemory"] - base["requestsMemory"], 3 * 1024**3)
+        self.assertEqual(medium["limitsCpu"], base["limitsCpu"])
+        self.assertEqual(medium["limitsMemory"] - base["limitsMemory"], (2 + 2) * 1024**3)
+        for got in (fleet, medium):
+            for key in ("pods", "requestsEphemeral", "limitsEphemeral", "persistentVolumeClaims", "requestsStorage"):
+                self.assertEqual(got[key], base[key], key)
+        self.assertEqual(self._requirements([f"{_SIZING_VALUE}=auto"]), base)
+        self.assertEqual(self._requirements([f"{_SIZING_VALUE}=small"]), base)
+
+    def test_sizing_profile_override_merges_over_the_row(self) -> None:
+        """An override key replaces the row's figure and the rest of the row stands: under
+        fleet, a 3 CPU proxy request (valid on the fleet row, refused on small) counts 3
+        CPU, and a sidecar memory request alone above the small limit but under the
+        fleet one is counted rather than treated as refused."""
+        base = self._requirements()
+        proxy = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_PROXY_VALUE}.requests.cpu=3"])
+        self.assertEqual(proxy["requestsCpu"] - base["requestsCpu"], 3000 - 500)
+        self.assertEqual(proxy["requestsMemory"] - base["requestsMemory"], 7 * 1024**3)
+        sidecar = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_AA_VALUE}.requests.memory=3Gi"])
+        self.assertEqual(sidecar["requestsMemory"] - base["requestsMemory"], 7 * 1024**3 + 3 * 1024**3 - _AA_MEMORY_REQUEST_BYTES)
+        # A sidecar override the fleet row still refuses (a request above its 8Gi limit)
+        # is counted at the row, not at the small defaults.
+        refused = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_AA_VALUE}.requests.memory=9Gi"])
+        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
+        self.assertEqual(refused, fleet)
 
     def test_agent_api_auth_memory_limit_override_moves_only_that_total(self) -> None:
         """The field's use case (#2648): raising the sidecar's memory limit is counted,
