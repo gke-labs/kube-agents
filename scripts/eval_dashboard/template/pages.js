@@ -1008,10 +1008,10 @@ function releasesHtml() {
   return `<div class="sec" id="releases"><h2>Release candidates</h2>${body}</div>`;
 }
 
-/* ---- the GitLab lane (SCHEMA.md: brief.json's gitlab block) ---- */
-// The lane's runs are nobody's gate verdict: tier gitlab (tiers.py) keeps
-// them out of every count above, so this section is the only place they
-// show. Each row links the build where it lives (log_url for a night,
+/* ---- the forge lanes (SCHEMA.md: brief.json's lanes block) ---- */
+// A forge lane's runs are nobody's gate verdict: their tier (tiers.py,
+// FORGE_TIERS) keeps them out of every count above, so each lane's section
+// is the only place they show. Each row links the build where it lives (log_url for a night,
 // gcs_base for a run that records it), else Spyglass under the lane's own job name.
 const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
 function laneRow(run) {
@@ -1024,31 +1024,42 @@ function laneRow(run) {
   const when = run.started ? et(parseIso(run.started)) : "—";
   return `<tr><td>${build}</td><td>${pr}</td><td><span class="${run.green ? "p-pass" : "p-fail"}">${esc(run.result || "unknown")}</span></td><td>${verdict}</td><td>${esc(cases)}</td><td class="mut">${esc(when)}</td><td class="mut">${run.duration_s != null ? esc(minutesText(run.duration_s * 1000)) : "—"}</td></tr>`;
 }
-function gitlabLaneHtml() {
-  const lane = brief.gitlab && typeof brief.gitlab === "object" ? brief.gitlab : null;
-  const job = lane && lane.job || "pull-kube-agents-smoke-test-gitlab";
-  const runs = lane && Array.isArray(lane.runs) ? lane.runs.filter((r) => r && typeof r === "object" && r.build != null) : [];
-  const inFlight = lane && Array.isArray(lane.running) ? lane.running.length : 0;
+const laneTable = (rows) => `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${rows.map(laneRow).join("")}</tbody></table>`;
+const laneRows = (list) => (Array.isArray(list) ? list.filter((r) => r && typeof r === "object" && r.build != null) : []);
+function laneHtml(lane) {
+  const tier = String(lane.tier || "");
+  const title = lane.title || `${tier} lane`;
+  const noun = title.replace(/ lane$/, "");
+  const job = lane.job || "";
+  const runs = laneRows(lane.runs);
+  const inFlight = Array.isArray(lane.running) ? lane.running.length : 0;
   const flight = inFlight ? `<p class="mut small">${plural(inFlight, "build")} of the lane in flight, not yet recorded.</p>` : "";
   let body;
   if (!runs.length) {
-    body = `<p class="mut">No GitLab run on record. <code>${esc(job)}</code> runs the smoke matrix against a pool project's GitLab repository (<code>EVAL_FORGE=gitlab</code>), on demand with <code>/test ${esc(job)}</code>; its runs are listed here and counted nowhere else.</p>${flight}`;
+    body = `<p class="mut">No ${esc(noun)} run on record. <code>${esc(job)}</code> runs the lane's list (<code>EVAL_FORGE=${esc(tier)}</code>) on demand with <code>/test ${esc(job)}</code>; its runs are listed here and counted nowhere else.</p>${flight}`;
   } else {
     const c = lane.counts || {};
-    body = `<p class="mut small">${plural(c.on_record || runs.length, "run")} on record: ${c.green || 0} green, ${c.red || 0} not. These runs are the lane's own and sit outside the gate's numbers above.</p>` +
-      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${runs.map(laneRow).join("")}</tbody></table>${flight}`;
+    body = `<p class="mut small">${plural(c.on_record || runs.length, "run")} on record: ${c.green || 0} green, ${c.red || 0} not. These runs are the lane's own and sit outside the gate's numbers above.</p>${laneTable(runs)}${flight}`;
   }
-  const nightlyJob = lane && lane.nightly_job || "ci-kube-agents-eval-nightly-gitlab";
-  const nights = lane && Array.isArray(lane.nights) ? lane.nights.filter((r) => r && typeof r === "object" && r.build != null) : [];
+  const jobs = Array.isArray(lane.nightly_jobs) ? lane.nightly_jobs.filter((j) => j && typeof j === "object" && j.job) : [];
+  const anyNight = jobs.some((j) => laneRows(j.nights).length);
   let nightsHtml;
-  if (!nights.length) {
-    nightsHtml = `<p class="mut small">No GitLab night on record. <code>${esc(nightlyJob)}</code> runs the same list once a night on its own leased project.</p>`;
+  if (!anyNight) {
+    const names = jobs.map((j) => `<code>${esc(j.job)}</code>`).join(" and ");
+    nightsHtml = `<p class="mut small">No ${esc(noun)} night on record.${names ? ` ${names} ${jobs.length > 1 ? "run" : "runs"} the same list once a night on ${jobs.length > 1 ? "their own leased projects" : "its own leased project"}.` : ""}</p>`;
   } else {
-    const nc = lane.night_counts || {};
-    nightsHtml = `<h3>Nights</h3><p class="mut small">${plural(nc.on_record || nights.length, "night")} on record: ${nc.green || 0} green, ${nc.red || 0} not (<code>${esc(nightlyJob)}</code>).</p>` +
-      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${nights.map(laneRow).join("")}</tbody></table>`;
+    nightsHtml = `<h3>Nights</h3>` + jobs.map((j) => {
+      const nights = laneRows(j.nights);
+      if (!nights.length) return `<p class="mut small">No night of <code>${esc(j.job)}</code> on record yet.</p>`;
+      const nc = j.night_counts || {};
+      return `<p class="mut small">${plural(nc.on_record || nights.length, "night")} on record: ${nc.green || 0} green, ${nc.red || 0} not (<code>${esc(j.job)}</code>).</p>${laneTable(nights)}`;
+    }).join("");
   }
-  return `<div class="sec" id="gitlab"><h2>GitLab lane</h2>${body}${nightsHtml}</div>`;
+  return `<div class="sec" id="${esc(tier)}"><h2>${esc(title)}</h2>${body}${nightsHtml}</div>`;
+}
+function lanesHtml() {
+  const lanes = Array.isArray(brief.lanes) ? brief.lanes.filter((l) => l && typeof l === "object" && l.tier) : [];
+  return lanes.map(laneHtml).join("");
 }
 
 function briefHtml(link) {
@@ -1081,7 +1092,7 @@ function briefHtml(link) {
       `<div class="sec" id="agent"><h2>Last 24 hours</h2>${numbersHtml(sinceMs, null)}</div>` +
       (healthy || noVerdict ? `<div class="sec"><h2>Last incident</h2>${lastIncidentHtml()}</div>` : "") +
       runsListHtml(windowRuns(sinceMs, null), inc, "Runs in the last 24 hours") +
-      nightlyBriefHtml() + gitlabLaneHtml() + releasesHtml() + footHtml();
+      nightlyBriefHtml() + lanesHtml() + releasesHtml() + footHtml();
   }
   const inWindow = windowRuns(incidentStartMs(inc), inc.untilMs);
   if (!inWindow.some(measured) && !inWindow.some((r) => r.setup_death || r.cls === "deadline-kill")) {
@@ -1103,7 +1114,7 @@ function briefHtml(link) {
     changedBeforeHtml(inc, inWindow) +
     beingDoneHtml(inc) +
     runsListHtml(inWindow, inc, "Runs in this window") +
-    nightlyBriefHtml() + gitlabLaneHtml() + releasesHtml() + footHtml();
+    nightlyBriefHtml() + lanesHtml() + releasesHtml() + footHtml();
 }
 
 function footHtml() {

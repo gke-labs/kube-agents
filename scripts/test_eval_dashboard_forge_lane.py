@@ -1,6 +1,6 @@
-"""brief.json's ``gitlab`` block (forge_lane.py): the GitLab lane's runs,
+"""brief.json's ``lanes`` block (forge_lane.py): each forge lane's runs,
 newest first, with their counts, and the lane's builds in flight; a run of
-another tier never enters it."""
+another tier never enters a lane."""
 
 import datetime
 import pathlib
@@ -73,10 +73,49 @@ class LaneDocumentTest(unittest.TestCase):
         self.assertEqual(forge_lane.gitlab_document({"runs": data["runs"][1:2]})["job"], forge_lane.DEFAULT_JOB)
         self.assertEqual(forge_lane.gitlab_document({"runs": data["runs"][:1]})["nightly_job"], forge_lane.DEFAULT_NIGHTLY_JOB)
 
+    def test_there_is_one_lane_per_forge_tier_in_order_each_with_its_own_runs(self):
+        data = {"runs": [
+            run("100"),
+            run("200", tier="ghes", job="pull-kube-agents-smoke-test-ghes"),
+            run("300", tier="gitlab-ce", job="pull-kube-agents-smoke-test-gitlab-ce", result="FAILURE"),
+        ], "pending_builds": [{"build_id": "400", "first_seen": "2026-10-07T16:00:00+00:00", "tier": "ghes"}]}
+        lanes = forge_lane.lanes_document(data)
+        self.assertEqual([(l["tier"], l["title"]) for l in lanes], [("gitlab", "GitLab lane"), ("ghes", "GHES lane"), ("gitlab-ce", "GitLab CE lane")])
+        self.assertEqual([[r["build"] for r in l["runs"]] for l in lanes], [["100"], ["200"], ["300"]])
+        self.assertEqual([[e["build"] for e in l["running"]] for l in lanes], [[], ["400"], []])
+        self.assertEqual(lanes[2]["counts"], {"on_record": 1, "green": 0, "red": 1})
+        # With no run on record a lane's jobs are its table's defaults.
+        empty = forge_lane.lanes_document({"runs": []})
+        self.assertEqual([(l["job"], [j["job"] for j in l["nightly_jobs"]]) for l in empty], [
+            ("pull-kube-agents-smoke-test-gitlab", ["ci-kube-agents-eval-nightly-gitlab", "ci-kube-agents-eval-nightly-gitlab-next"]),
+            ("pull-kube-agents-smoke-test-ghes", ["ci-kube-agents-eval-nightly-ghes-next"]),
+            ("pull-kube-agents-smoke-test-gitlab-ce", ["ci-kube-agents-eval-nightly-gitlab-ce-next"]),
+        ])
+
+    def test_a_lanes_nights_are_grouped_by_job_the_tables_first(self):
+        data = {"runs": [
+            run("10", job="ci-kube-agents-eval-nightly-gitlab-next", pr=None),
+            run("11", job="ci-kube-agents-eval-nightly-gitlab", pr=None, result="FAILURE"),
+            run("12", job="ci-kube-agents-eval-nightly-gitlab-next", pr=None),
+            run("13", job="ci-kube-agents-eval-nightly-gitlab-v2", pr=None),
+        ]}
+        doc = forge_lane.gitlab_document(data)
+        self.assertEqual([(j["job"], [n["build"] for n in j["nights"]], j["night_counts"]["on_record"]) for j in doc["nightly_jobs"]], [
+            ("ci-kube-agents-eval-nightly-gitlab", ["11"], 1),
+            ("ci-kube-agents-eval-nightly-gitlab-next", ["12", "10"], 2),
+            ("ci-kube-agents-eval-nightly-gitlab-v2", ["13"], 1),
+        ])
+        self.assertEqual([n["build"] for n in doc["nights"]], ["13", "12", "11", "10"], "all nights together, newest first")
+        self.assertEqual(doc["night_counts"], {"on_record": 4, "green": 3, "red": 1})
+
     def test_the_tier_filter_is_the_shared_one(self):
         self.assertTrue(tiers.is_gitlab({"tier": "gitlab"}))
         self.assertFalse(tiers.is_presubmit({"tier": "gitlab"}))
         self.assertEqual(tiers.presubmit_runs([{"tier": "gitlab"}, {}]), [{}])
+        for tier in ("ghes", "gitlab-ce"):
+            self.assertTrue(tiers.is_forge({"tier": tier}))
+            self.assertFalse(tiers.is_presubmit({"tier": tier}))
+            self.assertNotIn(tier, tiers.CASE_TIERS, "a forge lane feeds no case rate")
 
 
 if __name__ == "__main__":

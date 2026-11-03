@@ -241,13 +241,15 @@ Only presubmit runs reach these rules and the digest's numbers. `data.json`
 also carries the nightly periodics' runs (`runs[].tier`, see
 `scripts/eval_dashboard/SCHEMA.md`); a nightly has no pull request to count
 towards a distinct-PR floor, and a nightly collapsing is a case's record on
-`main`, not a gate incident. It carries the GitLab lane's runs too
-(`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`): on a pull request the
-forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones; the GitLab
-nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
-section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
-lane" section with its own counts and links, and in no gate number, case
-history or digest line. The GHES lane (`pull-kube-agents-smoke-test-ghes`, its two nightlies; `docs/ci-pool-projects.md` 5.8) is not collected yet: its runs show in Prow only until the dashboard reads a lane per forge.
+`main`, not a gate incident. It carries the forge lanes' runs too, one tier
+each (`tiers.FORGE_TIERS`): the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`), on a pull request the
+forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones) against a pool project's
+GitLab repository, with its nightlies `ci-kube-agents-eval-nightly-gitlab` and `ci-kube-agents-eval-nightly-gitlab-next`
+running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
+`pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with its next-mode
+nightly (`ci-kube-agents-eval-nightly-ghes-next`, `ci-kube-agents-eval-nightly-gitlab-ce-next`). Each lane is listed in
+its own section of the Brief, its pull-request runs and then each nightly's nights, with its own counts and links, and in
+no gate number, case history or digest line. Each job is read from its own log prefix above its own watermark.
 
 ## Hysteresis
 

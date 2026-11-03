@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""The ``gitlab`` block of brief.json: the GitLab lane's last runs.
+"""The ``lanes`` block of brief.json: each forge lane's last runs.
+
+One document per forge lane (tiers.FORGE_TIERS): the GitLab lane, the GHES
+lane and the GitLab CE lane (kube-agents#3682), each its pull-request job and
+its nightlies. What follows says it of the GitLab lane; the other two are the
+same shape under their own tier and jobs.
 
 The lane (``pull-kube-agents-smoke-test-gitlab``, kube-agents#2394) is the
 forge-grading cases of the catalogue driven against a pool project's
@@ -32,23 +37,44 @@ RUNNING_MAX_AGE = datetime.timedelta(hours=8)
 DEFAULT_JOB = "pull-kube-agents-smoke-test-gitlab"
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 RESULT_SUCCESS = "SUCCESS"
+# Each forge lane as the Brief titles it, with its jobs: the pull-request
+# job, and the nightlies in the order the section lists them. A job the
+# lane's runs name and this table does not is listed after these.
+LANES = {
+    tiers.TIER_GITLAB: {
+        "title": "GitLab lane",
+        "job": DEFAULT_JOB,
+        "nightly_jobs": (DEFAULT_NIGHTLY_JOB, "ci-kube-agents-eval-nightly-gitlab-next"),
+    },
+    tiers.TIER_GHES: {
+        "title": "GHES lane",
+        "job": "pull-kube-agents-smoke-test-ghes",
+        "nightly_jobs": ("ci-kube-agents-eval-nightly-ghes-next",),
+    },
+    tiers.TIER_GITLAB_CE: {
+        "title": "GitLab CE lane",
+        "job": "pull-kube-agents-smoke-test-gitlab-ce",
+        "nightly_jobs": ("ci-kube-agents-eval-nightly-gitlab-ce-next",),
+    },
+}
 
 
 def is_night(run: dict) -> bool:
-    """A GitLab run with no pull request is the lane's nightly's."""
+    """A forge lane run with no pull request is one of the lane's nightlies'."""
     return run.get("pr") is None
 
 
-def lane_job(data: dict, nights: bool = False) -> str:
-    """The job name as the newest GitLab pull-request run (or night) carries
-    it, else the default."""
-    for run in reversed(tiers.gitlab_runs(data.get("runs"))):
+def lane_job(data: dict, nights: bool = False, tier: str = tiers.TIER_GITLAB) -> str:
+    """The job name as the lane's newest pull-request run (or night) carries
+    it, else the lane's default."""
+    for run in reversed(tiers.forge_runs(data.get("runs"), tier)):
         if not isinstance(run, dict) or is_night(run) != nights:
             continue
         job = run.get("job")
         if isinstance(job, str) and job:
             return job
-    return DEFAULT_NIGHTLY_JOB if nights else DEFAULT_JOB
+    lane = LANES[tier]
+    return lane["nightly_jobs"][0] if nights else lane["job"]
 
 
 def task_counts(run: dict) -> dict:
@@ -61,7 +87,7 @@ def task_counts(run: dict) -> dict:
 
 
 def lane_run(run: dict) -> dict:
-    """One run as the Brief's GitLab section lists it."""
+    """One run as the Brief's lane section lists it."""
     result = str(run.get("result") or "").upper() or None
     return {
         "build": str(run.get("build_id")),
@@ -91,13 +117,13 @@ def parse_iso(value) -> datetime.datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.timezone.utc)
 
 
-def running(data: dict, now: datetime.datetime | None = None) -> list[dict]:
+def running(data: dict, now: datetime.datetime | None = None, tier: str = tiers.TIER_GITLAB) -> list[dict]:
     """The lane's builds the collector listed but could not record yet,
     first seen inside RUNNING_MAX_AGE of ``now`` (without one the age is not
     judged); an entry with no readable first sighting is skipped."""
     out = []
     for entry in data.get("pending_builds") or []:
-        if not (isinstance(entry, dict) and tiers.is_gitlab(entry) and str(entry.get("build_id") or "").isdigit()):
+        if not (isinstance(entry, dict) and tiers.run_tier(entry) == tier and str(entry.get("build_id") or "").isdigit()):
             continue
         seen = parse_iso(entry.get("first_seen"))
         if seen is None or (now is not None and now - seen > RUNNING_MAX_AGE):
@@ -116,21 +142,49 @@ def _counts(runs: list[dict]) -> dict:
     }
 
 
-def gitlab_document(data: dict, now: datetime.datetime | None = None) -> dict:
-    """``{job, runs[], running[], counts, nightly_job, nights[], night_counts}``:
-    the lane's pull-request runs and its nights apart, each newest first and
-    capped at RUNS_LISTED, with counts over every one on record; running
-    judged against ``now``."""
-    every = [r for r in tiers.gitlab_runs(data.get("runs")) if isinstance(r, dict) and str(r.get("build_id") or "").isdigit()]
+def lane_document(data: dict, tier: str, now: datetime.datetime | None = None) -> dict:
+    """``{tier, title, job, runs[], running[], counts, nightly_jobs[],
+    nightly_job, nights[], night_counts}`` for one forge lane: its
+    pull-request runs and its nights apart, each newest first and capped at
+    RUNS_LISTED, with counts over every one on record; running judged
+    against ``now``. ``nightly_jobs`` holds one ``{job, nights[],
+    night_counts}`` per nightly, the table's jobs first (listed even with no
+    night yet), then any other job the lane's nights name; ``nights`` and
+    ``night_counts`` are over all of them, ``nightly_job`` the newest
+    night's job."""
+    every = [r for r in tiers.forge_runs(data.get("runs"), tier) if isinstance(r, dict) and str(r.get("build_id") or "").isdigit()]
     every.sort(key=lambda r: int(r["build_id"]), reverse=True)
     runs = [r for r in every if not is_night(r)]
     nights = [r for r in every if is_night(r)]
+    jobs = list(LANES[tier]["nightly_jobs"])
+    for night in nights:
+        job = night.get("job")
+        if isinstance(job, str) and job and job not in jobs:
+            jobs.append(job)
+    by_job = []
+    for job in jobs:
+        mine = [r for r in nights if r.get("job") == job]
+        by_job.append({"job": job, "nights": [lane_run(r) for r in mine[:RUNS_LISTED]], "night_counts": _counts(mine)})
     return {
-        "job": lane_job(data),
+        "tier": tier,
+        "title": LANES[tier]["title"],
+        "job": lane_job(data, tier=tier),
         "runs": [lane_run(r) for r in runs[:RUNS_LISTED]],
-        "running": running(data, now),
+        "running": running(data, now, tier),
         "counts": _counts(runs),
-        "nightly_job": lane_job(data, nights=True),
+        "nightly_jobs": by_job,
+        "nightly_job": lane_job(data, nights=True, tier=tier),
         "nights": [lane_run(r) for r in nights[:RUNS_LISTED]],
         "night_counts": _counts(nights),
     }
+
+
+def lanes_document(data: dict, now: datetime.datetime | None = None) -> list[dict]:
+    """brief.json's ``lanes``: one lane_document per forge lane, in
+    tiers.FORGE_TIERS order."""
+    return [lane_document(data, tier, now) for tier in tiers.FORGE_TIERS]
+
+
+def gitlab_document(data: dict, now: datetime.datetime | None = None) -> dict:
+    """The GitLab lane's lane_document."""
+    return lane_document(data, tiers.TIER_GITLAB, now)
