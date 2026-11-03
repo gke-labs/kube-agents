@@ -67,6 +67,16 @@ HELM_INVOCATION = re.compile(
     r"(?im)(?:^|[;&|(`]|-c\s+['\"]|\$|/|\b\w+=\S*\s|\b(?:sudo|env|timeout\s+\d+|xargs|exec|command|nohup)\s)\s*helm\s"
 )
 SHIPPED_SKILL_DIRS = sorted(Path(__file__).resolve().parents[2].glob("*/skills/*/"))
+# The bench seeds that onboard a per-run cluster prove the Cluster Agent's
+# path by running kubectl through the shim as the sandbox user under the
+# profile's kubeconfig, under `set -e`: a probe the policy refuses fails the
+# seed before the agent's turn. Each probe is a `KUBECONFIG=<path> kubectl …`
+# word run inside the seed's remote shell command, up to its redirect.
+PREBUILT_SEED_SCRIPTS = sorted(Path(__file__).resolve().parents[3].glob("bench/tf/prebuilt/*/scripts/*.sh"))
+SEED_SHIM_PROBE = re.compile(r"KUBECONFIG=\S+\s+kubectl\s+(?P<args>[^;>|&]*)")
+# Fewer probes than this means a seed reworded its probe lines and the test
+# would pass by finding nothing; the gitops-fix-cycle seed runs one per layout.
+MIN_SEED_SHIM_PROBES = 2
 MIN_HELM_CHART_FENCED_COMMANDS = 6
 
 
@@ -352,6 +362,23 @@ class KubectlRawPathTest(unittest.TestCase):
         self.assertEqual("--raw", decision.offending_flag)
         self.assertIn("Refused:", decision.message)
         return decision
+
+    def test_the_probes_the_bench_seeds_run_through_the_shim_are_admitted(self):
+        """The gitops-fix-cycle seed proves a Cluster Agent profile from the
+        shell sandbox with one kubectl through the shim under the pinned
+        kubeconfig; a probe this rule refuses fails the seed before the agent's
+        turn. Its `get --raw=/readyz` did once `--raw` was held to paged
+        collection reads and /metrics; the probe is `version` now."""
+        probes = []
+        for path in PREBUILT_SEED_SCRIPTS:
+            for match in SEED_SHIM_PROBE.finditer(path.read_text(encoding="utf-8")):
+                probes.append((path.parent.parent.name, shlex.split(match.group("args"))))
+        self.assertGreaterEqual(len(probes), MIN_SEED_SHIM_PROBES, probes)
+        for stack, args in probes:
+            argv = ["kubectl", *args]
+            with self.subTest(stack=stack, argv=argv):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, decision.message)
 
     def test_the_paged_reads_the_collectors_issue_are_allowed(self):
         for argv in (
