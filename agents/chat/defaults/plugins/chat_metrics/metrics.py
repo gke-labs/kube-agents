@@ -207,16 +207,18 @@ class ProposalsOpenedGauge:
     """The proposals ledger by (origin, platform), read from Session KV at scrape time.
 
     Each successful read replaces the previous counts, zero-filled so every
-    origin has a series; before one, every origin is 0. A read that fails (no
-    API key, a connection error, a non-200, an answer of the wrong shape)
-    keeps the last counts and logs the exception type once per failure streak.
-    The gauge holds nothing the ledger does not: a new process reads the same.
+    origin has a series. A read that fails (no API key, a connection error, a
+    non-200, an answer of the wrong shape) keeps the last counts and logs the
+    exception type once per failure streak. Before the first successful read
+    there are no counts: :meth:`counts` returns None and the family is not
+    rendered, so a scraper sees a miss rather than nine zero readings. The
+    gauge holds nothing the ledger does not: a new process reads the same.
     """
 
     def __init__(self, url: str = PROPOSALS_COUNTS_URL) -> None:
         self._url = url
         self._lock = threading.Lock()
-        self._counts: dict[tuple[str, str], int] = _zero_filled({})
+        self._counts: Optional[dict[tuple[str, str], int]] = None
         self._failing = False
 
     def _read(self) -> dict[tuple[str, str], int]:
@@ -240,7 +242,8 @@ class ProposalsOpenedGauge:
                 counts[(origin, platform)] = n
         return _zero_filled(counts)
 
-    def counts(self) -> dict[tuple[str, str], int]:
+    def counts(self) -> Optional[dict[tuple[str, str], int]]:
+        """The ledger's counts, the last ones on a failed read, or None before any read succeeded."""
         with self._lock:
             try:
                 counts = self._read()
@@ -248,7 +251,7 @@ class ProposalsOpenedGauge:
                 if not self._failing:
                     logger.warning("chat_metrics: the proposals ledger could not be read, keeping the last counts: %s", type(exc).__name__)
                     self._failing = True
-                return dict(self._counts)
+                return None if self._counts is None else dict(self._counts)
             self._failing = False
             self._counts = counts
             return dict(counts)
@@ -333,12 +336,14 @@ class ChatMetrics:
             f"# TYPE {KANBAN_GAVE_UP_METRIC} counter",
             f"{KANBAN_GAVE_UP_METRIC} {self._kanban.count()}",
         ]
-        lines += [
-            f"# HELP {PROPOSALS_OPENED_METRIC} Pull requests the agent opened, by the origin of the work and, for chat, its platform, read from the pod's proposals ledger at scrape time.",
-            f"# TYPE {PROPOSALS_OPENED_METRIC} gauge",
-        ]
-        for (origin, platform), count in sorted(self._proposals.counts().items()):
-            lines.append(f'{PROPOSALS_OPENED_METRIC}{{{ORIGIN_LABEL}="{_label_value(origin)}",{PLATFORM_LABEL}="{_label_value(platform)}"}} {count}')
+        proposals = self._proposals.counts()
+        if proposals is not None:
+            lines += [
+                f"# HELP {PROPOSALS_OPENED_METRIC} Pull requests the agent opened, by the origin of the work and, for chat, its platform, read from the pod's proposals ledger at scrape time.",
+                f"# TYPE {PROPOSALS_OPENED_METRIC} gauge",
+            ]
+            for (origin, platform), count in sorted(proposals.items()):
+                lines.append(f'{PROPOSALS_OPENED_METRIC}{{{ORIGIN_LABEL}="{_label_value(origin)}",{PLATFORM_LABEL}="{_label_value(platform)}"}} {count}')
         lines += [
             f"# HELP {CHAT_FEEDBACK_NEGATIVE_METRIC} Thumbs-down reactions a person put on one of the bot's messages, by platform, once per person and message.",
             f"# TYPE {CHAT_FEEDBACK_NEGATIVE_METRIC} counter",

@@ -87,7 +87,9 @@ class RegistryTest(unittest.TestCase):
         text = self.registry.render()
         self.assertIn("# TYPE kubeagents_chat_messages_inbound_total counter", text)
         self.assertIn("# TYPE kubeagents_chat_sessions_total counter", text)
-        self.assertIn("# TYPE kubeagents_proposals_opened gauge", text)
+        # No Session KV key in this suite: the ledger was never read, so the
+        # family is absent rather than nine zeros.
+        self.assertNotIn("kubeagents_proposals_opened", text)
         self.assertEqual(1, text.count("# TYPE process_start_time_seconds gauge"))
         self.assertRegex(text, r"(?m)^process_start_time_seconds \d+\.\d+$")
         self.assertEqual(text, self.registry.render(), "two renders of an idle registry differ")
@@ -307,21 +309,39 @@ class ProposalsOpenedTest(unittest.TestCase):
         return {(o, p): int(n) for o, p, n in _PROPOSALS_LINE.findall(registry.render())}
 
     def test_every_origin_is_served_zero_filled(self):
-        # Before any successful read, and when the ledger is empty, every
-        # origin has a series at 0 under platform="".
-        self.ledger.body = _served(chat={"slack": 3})
-        with mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": ""}), self.assertLogs("hermes.plugin.chat_metrics", level="WARNING"):
-            self.assertEqual({(o, ""): 0 for o in metrics.ORIGINS}, self.series())
-        self.assertEqual([], self.ledger.auth, "no request without the key")
-        self.ledger.body = _served()
+        # A successful read of an empty ledger serves every origin at 0 under
+        # platform="".
+        self.ledger.body = {}
         self.assertEqual({(o, ""): 0 for o in metrics.ORIGINS}, self.series())
         self.assertEqual([f"Bearer {_SESSION_KV_KEY}"], self.ledger.auth)
+        self.ledger.body = _served()
+        self.assertEqual({(o, ""): 0 for o in metrics.ORIGINS}, self.series())
         # An answer that omits an origin still serves it, zero-filled.
         self.ledger.body = {"audit": {"": 2}}
         got = self.series()
         self.assertEqual(2, got[("audit", "")])
         self.assertEqual({o for o in metrics.ORIGINS}, {o for o, _ in got})
         self.assertEqual(0, got[("drift", "")])
+
+    def test_no_family_is_served_before_the_first_successful_read(self):
+        # The operator reads nine resolved origins as a reading; before a
+        # successful read there is no count to serve, so the family is absent.
+        self.ledger.body = _served(chat={"slack": 3})
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING"):
+            with mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": ""}):
+                self.assertIsNone(self.gauge.counts())
+                self.assertNotIn("kubeagents_proposals_opened", metrics.ChatMetrics(proposals=self.gauge).render())
+            self.assertEqual([], self.ledger.auth, "no request without the key")
+            self.ledger.status = 503
+            self.assertNotIn("kubeagents_proposals_opened", metrics.ChatMetrics(proposals=self.gauge).render())
+            closed = metrics.ProposalsOpenedGauge(url="http://127.0.0.1:1/v1/proposals/opened/counts")
+            self.assertNotIn("kubeagents_proposals_opened", metrics.ChatMetrics(proposals=closed).render())
+        # The first good read serves the family, and a later failure keeps it.
+        self.ledger.status = 200
+        self.assertEqual(3, self.series()[("chat", "slack")])
+        self.ledger.status = 503
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING"):
+            self.assertEqual(3, self.series()[("chat", "slack")])
 
     def test_chat_rows_carry_the_platform(self):
         self.ledger.body = _served(chat={"slack": 3, "googlechat": 1}, audit={"": 2})
@@ -355,7 +375,7 @@ class ProposalsOpenedTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": ""}):
                 self.assertEqual(last, self.gauge.counts())
             closed = metrics.ProposalsOpenedGauge(url="http://127.0.0.1:1/v1/proposals/opened/counts")
-            self.assertEqual({(o, ""): 0 for o in metrics.ORIGINS}, closed.counts())
+            self.assertIsNone(closed.counts(), "a gauge that never read has no last count")
         # One line per failure streak per gauge, naming the exception type and
         # never the key.
         self.assertEqual(2, len(logs.output), logs.output)
@@ -375,6 +395,10 @@ class ProposalsOpenedTest(unittest.TestCase):
         before = self.series()
         restarted = metrics.ProposalsOpenedGauge(url=self.ledger.url)
         self.assertEqual(before, self.series(restarted))
+        # A restart while the ledger is unreachable serves no family, not zeros.
+        self.ledger.status = 503
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING"):
+            self.assertEqual({}, self.series(metrics.ProposalsOpenedGauge(url=self.ledger.url)))
         self.assertEqual(7, before[("drift", "")])
 
     def test_the_origins_are_the_session_kv_servers(self):
