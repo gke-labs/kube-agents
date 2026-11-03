@@ -16,30 +16,42 @@ instantiation (an edge to its `__init__`), and `self.name(...)` or
 `cls.name(...)` to the same class's method. A call through any other receiver (a
 module-level singleton, a stored callback, a thread's `target=`) is not
 followed; that is the check's blind spot, named here so a reviewer knows it. A
-spawn (`threading.Thread(...)`, `_thread.start_new_thread(...)`) in a function a
+spawn is a call that starts one or more threads inside the function: a
+`threading.Thread(...)` or `threading.Timer(...)`, `_thread.start_new_thread(...)`,
+a `ThreadPoolExecutor(...)` built inside the function (its workers are the
+request's, whatever `max_workers` says; one built at module level is not inside
+any function and is the bounded pool the rule asks for), and an instance of a
+class in the module that subclasses `Thread` or `Timer`. A spawn in a function a
 handler reaches is a finding unless its shape is bounded:
 
-* a fixed-size pool: the spawn sits in a loop or comprehension over `range(...)`,
-  so its count is fixed when the pool is built, not per request;
-* a singleton guard: the function checks `.is_alive()` before spawning, so at most
-  one such thread runs at a time;
+* a fixed-size pool: the spawn sits in a loop or comprehension over `range(n)`
+  where `n` is a literal or a module-level name, so its count is fixed when the
+  module loads, not by the request;
+* a singleton guard: the spawn sits inside an `if` whose test reads a thread's
+  `.is_alive()`, or follows one whose body returns, so at most one such thread
+  runs at a time;
 * startup: the function is `main`.
-
-A `ThreadPoolExecutor` is not a spawn, so a bounded executor needs no shape.
 
 Go (`GO_TARGET_DIRS`), by text, since the callout has no request-handler marker
 to anchor a graph on: every `go func(...)` or `go name(...)` statement in a
-non-test file is a finding unless it sits in `main`, in a function `main` calls
-directly (the process's startup path), or in a function that bounds it with an
-`errgroup` `SetLimit(...)`, a `semaphore` package call, or a send on a channel
-whose name carries `sem`.
+non-test file is a finding unless it sits in a startup function, or in a
+function that gates it with a semaphore before the statement (a send on a
+channel whose name carries `sem`, or a `semaphore` `Acquire(...)`). The startup
+functions are `main` and, transitively, every function a startup function
+calls by name, across all the scanned files; a name shared by a startup function
+and a per-request one is read as startup, which is the text scan's blind spot.
+An `errgroup` with `SetLimit(...)` bounds its own `Go(...)` calls, which are not
+`go` statements and are not read; it does not bound a `go` statement near it.
 
 ``scripts/bounded_concurrency_allowlist.txt``: one line per function that
 carried a finding when the check arrived, `<file> <function> <count>`, with the
-issue that owns the fix in a comment above it. The list only shrinks: a count
-above the entry fails (a rise), a count below fails until the entry is lowered
-or removed (a drop), an entry whose function has no finding left fails (stale),
-and a line that is not an entry fails. A function with no entry is held at zero.
+issue that owns the fix, or the bound the check cannot see, in a comment above
+it. The list only shrinks: a count above the entry fails (a rise), a count
+below fails until the entry is lowered or removed (a drop), an entry whose
+function has no finding left fails (stale), an entry naming a file the check
+does not read fails, and a line that is not an entry fails. A function with no
+entry is held at zero. A configured target that is missing is a failure too, so
+a moved file cannot turn the check green by leaving the scan.
 
 Exit 0 when every finding is pinned exactly; 1 otherwise. `--list` prints every
 spawn the scan saw with its classification, pinned or not.
@@ -54,7 +66,7 @@ import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, TextIO
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -82,19 +94,23 @@ COMMENT_PREFIX = "#"
 # is a route.
 REQUEST_HANDLER_BASE_SUFFIX = "RequestHandler"
 ROUTE_DECORATOR_ATTRS = frozenset({"get", "post", "put", "patch", "delete", "head", "options", "api_route", "websocket"})
-# The callee names that start a thread. `Thread` covers `threading.Thread(...)`
-# and a bare `Thread(...)` import; `start_new_thread` is the `_thread` primitive.
-THREAD_SPAWN_CALLEES = frozenset({"Thread", "start_new_thread"})
+# The callee names that start one or more threads. `Thread` and `Timer` cover
+# `threading.Thread(...)` and a bare import; `start_new_thread` is the `_thread`
+# primitive; a `ThreadPoolExecutor` built inside a function starts its workers
+# for that call. A class in the module whose base is one of THREAD_BASES is a
+# spawn too when instantiated.
+THREAD_SPAWN_CALLEES = frozenset({"Thread", "Timer", "start_new_thread", "ThreadPoolExecutor"})
+THREAD_BASES = frozenset({"Thread", "Timer"})
 # The bounded shapes, and the words the report uses for them.
 SINGLETON_GUARD_ATTR = "is_alive"
 FIXED_SIZE_ITERATOR = "range"
 STARTUP_FUNCTION = "main"
 SELF_RECEIVERS = frozenset({"self", "cls"})
-BOUND_FIXED_SIZE = "fixed-size pool (a loop over range)"
+BOUND_FIXED_SIZE = "fixed-size pool (a loop over range of a constant)"
 BOUND_SINGLETON = "singleton guard (is_alive)"
 BOUND_STARTUP = "startup (main)"
-BOUND_CALLED_FROM_MAIN = "startup (called from main)"
-BOUND_GO_LIMIT = "SetLimit or a semaphore"
+BOUND_GO_STARTUP = "startup (reached from main)"
+BOUND_GO_SEMAPHORE = "a semaphore before the statement"
 CONSTRUCTOR = "__init__"
 QUALIFIED_SEPARATOR = "."
 
@@ -104,15 +120,18 @@ QUALIFIED_SEPARATOR = "."
 GO_SPAWN_RE = re.compile(r"^\s*go\s+(?:func\b|[A-Za-z_][\w.]*\()")
 GO_FUNC_RE = re.compile(r"^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)")
 GO_FUNC_END = "}"
-GO_BOUNDED_RE = re.compile(r"\.SetLimit\(|\bsemaphore\.|\b\w*[sS]em\w*\s*<-")
+GO_SEMAPHORE_RE = re.compile(r"\b\w*[sS]em\w*\s*<-|\.Acquire\(")
 GO_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\(")
 GO_NO_GRAPH = "(every function; Go has no call graph here)"
+GO_NO_FUNCTION = "(outside any function)"
 KIND_THREAD = "thread"
 KIND_GOROUTINE = "goroutine"
 
 # How the report reads.
 FINDING_LINE = "{file}:{line}: {function} starts a {kind} per request, reachable from {handlers}; bound it or pin it in {allowlist}"
 LIST_LINE = "{file}:{line}: {function} {kind} reachable_from={handlers} bounded_by={bounded}"
+TARGET_MISSING_ERROR = "{target}: a configured target this check reads is missing; move the entry in {script} with the file"
+GO_DIR_EMPTY_ERROR = "{target}: a configured Go directory holds no non-test .go file; move the entry in {script} with the package"
 ALLOWLIST_MALFORMED_ERROR = "{allowlist}:{line}: expected `<file> <function> <count>` with a count above zero, got {text!r}"
 ALLOWLIST_DUPLICATE_ERROR = "{allowlist}:{line}: {file} {function} already has an entry at line {first}"
 ALLOWLIST_UNSCANNED_ERROR = "{allowlist}:{line}: {file} is not a file this check reads; remove the entry"
@@ -127,8 +146,9 @@ ALLOWLIST_DROP_ERROR = (
     "{file}: {function} has {found} unbounded per-request spawn(s), the entry at {allowlist}:{line} allows {allowed}; "
     "lower the entry to {found}"
 )
-SUMMARY_FAIL = "check_bounded_concurrency: {findings} finding(s) not pinned and {problems} allowlist problem(s)"
+SUMMARY_FAIL = "check_bounded_concurrency: {findings} finding(s) not pinned and {problems} problem(s)"
 SUMMARY_OK = "check_bounded_concurrency: {spawns} spawn(s) read across {files} file(s), none unbounded beyond the {entries} allowlist entr(y/ies)"
+SCRIPT_NAME = "scripts/check_bounded_concurrency.py"
 EXIT_OK = 0
 EXIT_FAIL = 1
 
@@ -173,6 +193,16 @@ class _Unit:
     spawns: list[tuple[int, str | None]]
 
 
+@dataclass(frozen=True)
+class _ModuleFacts:
+    """What a unit's classification needs from the module around it."""
+
+    # Names assigned at module level; `range(NAME)` over one is a fixed size.
+    constants: frozenset[str]
+    # Classes of the module that subclass Thread or Timer; instantiating one is a spawn.
+    thread_classes: frozenset[str]
+
+
 def _callee_name(call: ast.Call) -> str | None:
     func = call.func
     if isinstance(func, ast.Name):
@@ -180,6 +210,16 @@ def _callee_name(call: ast.Call) -> str | None:
     if isinstance(func, ast.Attribute):
         return func.attr
     return None
+
+
+def _base_names(node: ast.ClassDef) -> list[str]:
+    names = []
+    for base in node.bases:
+        if isinstance(base, ast.Name):
+            names.append(base.id)
+        elif isinstance(base, ast.Attribute):
+            names.append(base.attr)
+    return names
 
 
 def _is_route_decorator(decorator: ast.expr) -> bool:
@@ -191,81 +231,106 @@ def _is_route_decorator(decorator: ast.expr) -> bool:
 
 
 def _is_request_handler_class(node: ast.ClassDef) -> bool:
-    for base in node.bases:
-        name = base.id if isinstance(base, ast.Name) else base.attr if isinstance(base, ast.Attribute) else ""
-        if name.endswith(REQUEST_HANDLER_BASE_SUFFIX):
-            return True
-    return False
+    return any(name.endswith(REQUEST_HANDLER_BASE_SUFFIX) for name in _base_names(node))
 
 
-def _is_fixed_size_loop(node: ast.AST) -> bool:
-    """A `for` or comprehension whose iterator is `range(...)`."""
+def _is_fixed_size_loop(node: ast.AST, constants: frozenset[str]) -> bool:
+    """A `for` or comprehension over `range(n)`, `n` a literal or a module-level name."""
     iterators: list[ast.expr] = []
     if isinstance(node, (ast.For, ast.AsyncFor)):
         iterators.append(node.iter)
     elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
         iterators.extend(gen.iter for gen in node.generators)
-    return any(isinstance(it, ast.Call) and _callee_name(it) == FIXED_SIZE_ITERATOR for it in iterators)
+    for it in iterators:
+        if not (isinstance(it, ast.Call) and _callee_name(it) == FIXED_SIZE_ITERATOR):
+            continue
+        if all(isinstance(arg, ast.Constant) or (isinstance(arg, ast.Name) and arg.id in constants) for arg in it.args):
+            return True
+    return False
 
 
-def _read_unit(node: ast.AST, name: str, class_name: str | None, entry_point: bool) -> _Unit:
+def _reads_liveness(test: ast.expr) -> bool:
+    return any(isinstance(n, ast.Call) and _callee_name(n) == SINGLETON_GUARD_ATTR for n in ast.walk(test))
+
+
+def _returns(body: list[ast.stmt]) -> bool:
+    return any(isinstance(n, ast.Return) for stmt in body for n in ast.walk(stmt))
+
+
+def _read_unit(node: ast.AST, name: str, class_name: str | None, entry_point: bool, facts: _ModuleFacts) -> _Unit:
     """Collect the calls and spawns of one function body, nested defs included."""
     unit = _Unit(name=name, class_name=class_name, entry_point=entry_point, calls=set(), self_calls=set(), spawns=[])
-    guarded = False
+    simple = name.rsplit(QUALIFIED_SEPARATOR, 1)[-1]
+    spawn_callees = THREAD_SPAWN_CALLEES | facts.thread_classes
+    # Iterative walk carrying the depth, so a spawn knows what encloses it: a
+    # node's descendants are the ones visited at a deeper depth before the walk
+    # returns to its own depth or shallower.
     fixed_depths: list[int] = []
-    spawn_calls: list[tuple[ast.Call, bool]] = []
-    # Iterative walk carrying the depth, so a spawn knows whether a range loop
-    # encloses it: a loop's descendants are the nodes visited at a deeper depth
-    # before the walk returns to its own.
+    guard_depths: list[int] = []
+    early_exit_seen = False
     pending: list[tuple[ast.AST, int]] = [(node, 0)]
     while pending:
         current, depth = pending.pop()
         while fixed_depths and fixed_depths[-1] >= depth:
             fixed_depths.pop()
-        if _is_fixed_size_loop(current):
+        while guard_depths and guard_depths[-1] >= depth:
+            guard_depths.pop()
+        if _is_fixed_size_loop(current, facts.constants):
             fixed_depths.append(depth)
+        if isinstance(current, ast.If) and _reads_liveness(current.test):
+            guard_depths.append(depth)
+            if _returns(current.body):
+                early_exit_seen = True
         if isinstance(current, ast.Call):
             callee = _callee_name(current)
-            if callee in THREAD_SPAWN_CALLEES:
-                spawn_calls.append((current, bool(fixed_depths)))
+            if callee in spawn_callees:
+                if simple == STARTUP_FUNCTION:
+                    bound: str | None = BOUND_STARTUP
+                elif fixed_depths:
+                    bound = BOUND_FIXED_SIZE
+                elif guard_depths or early_exit_seen:
+                    bound = BOUND_SINGLETON
+                else:
+                    bound = None
+                unit.spawns.append((current.lineno, bound))
             elif callee is not None:
                 receiver = current.func.value if isinstance(current.func, ast.Attribute) else None
                 if receiver is None:
                     unit.calls.add(callee)
                 elif isinstance(receiver, ast.Name) and receiver.id in SELF_RECEIVERS:
                     unit.self_calls.add(callee)
-                if callee == SINGLETON_GUARD_ATTR:
-                    guarded = True
-        children = list(ast.iter_child_nodes(current))
         # Reversed so the walk visits children in source order with a stack.
-        for child in reversed(children):
+        for child in reversed(list(ast.iter_child_nodes(current))):
             pending.append((child, depth + 1))
-    simple = name.rsplit(QUALIFIED_SEPARATOR, 1)[-1]
-    for call, in_fixed_loop in spawn_calls:
-        if simple == STARTUP_FUNCTION:
-            bound: str | None = BOUND_STARTUP
-        elif in_fixed_loop:
-            bound = BOUND_FIXED_SIZE
-        elif guarded:
-            bound = BOUND_SINGLETON
-        else:
-            bound = None
-        unit.spawns.append((call.lineno, bound))
     return unit
 
 
+def _module_facts(module: ast.Module) -> _ModuleFacts:
+    constants: set[str] = set()
+    thread_classes: set[str] = set()
+    for node in module.body:
+        if isinstance(node, ast.Assign):
+            constants.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            constants.add(node.target.id)
+        elif isinstance(node, ast.ClassDef) and any(b in THREAD_BASES for b in _base_names(node)):
+            thread_classes.add(node.name)
+    return _ModuleFacts(frozenset(constants), frozenset(thread_classes))
+
+
 def _units_of(module: ast.Module) -> list[_Unit]:
+    facts = _module_facts(module)
     units: list[_Unit] = []
     for node in module.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             entry = any(_is_route_decorator(d) for d in node.decorator_list)
-            units.append(_read_unit(node, node.name, None, entry))
+            units.append(_read_unit(node, node.name, None, entry, facts))
         elif isinstance(node, ast.ClassDef):
             handler_class = _is_request_handler_class(node)
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     entry = handler_class or any(_is_route_decorator(d) for d in item.decorator_list)
-                    units.append(_read_unit(item, f"{node.name}{QUALIFIED_SEPARATOR}{item.name}", node.name, entry))
+                    units.append(_read_unit(item, f"{node.name}{QUALIFIED_SEPARATOR}{item.name}", node.name, entry, facts))
     return units
 
 
@@ -319,81 +384,120 @@ def scan_python(path: Path, root: Path) -> list[Spawn]:
     return spawns
 
 
-def _go_functions(lines: list[str]) -> list[tuple[str, int, int]]:
-    """(name, first line, last line) of every top-level function, 1-indexed and inclusive."""
-    functions: list[tuple[str, int, int]] = []
+@dataclass(frozen=True)
+class _GoFunction:
+    name: str
+    file: str
+    lines: list[str]
+    start: int  # 1-indexed, inclusive
+    end: int
+
+
+def _go_functions(shown: str, lines: list[str]) -> list[_GoFunction]:
+    """Every top-level function of one file, with its line span."""
+    functions: list[_GoFunction] = []
     current: tuple[str, int] | None = None
     for number, text in enumerate(lines, 1):
         match = GO_FUNC_RE.match(text)
         if match is not None:
             if current is not None:
-                functions.append((current[0], current[1], number - 1))
+                functions.append(_GoFunction(current[0], shown, lines, current[1], number - 1))
             current = (match.group(1), number)
         elif current is not None and text.rstrip("\r\n") == GO_FUNC_END:
-            functions.append((current[0], current[1], number))
+            functions.append(_GoFunction(current[0], shown, lines, current[1], number))
             current = None
     if current is not None:
-        functions.append((current[0], current[1], len(lines)))
+        functions.append(_GoFunction(current[0], shown, lines, current[1], len(lines)))
     return functions
 
 
-def scan_go(path: Path, root: Path) -> list[Spawn]:
-    """Every goroutine start in one Go file, with the bound it sits under if any."""
-    lines = path.read_text(encoding="utf-8").splitlines()
-    functions = _go_functions(lines)
-    shown = path.relative_to(root).as_posix()
-    called_from_main: set[str] = set()
-    for name, start, end in functions:
-        if name == STARTUP_FUNCTION:
-            body = "\n".join(lines[start - 1 : end])
-            called_from_main.update(GO_CALL_RE.findall(body))
+def _go_body(function: _GoFunction, upto: int | None = None) -> str:
+    end = function.end if upto is None else upto
+    return "\n".join(function.lines[function.start - 1 : end])
+
+
+def _go_startup_names(functions: list[_GoFunction]) -> set[str]:
+    """`main` and, transitively by name, every function a startup function calls."""
+    by_name: dict[str, list[_GoFunction]] = {}
+    for function in functions:
+        by_name.setdefault(function.name, []).append(function)
+    startup: set[str] = set()
+    queue: deque[str] = deque([STARTUP_FUNCTION])
+    while queue:
+        name = queue.popleft()
+        if name in startup or name not in by_name:
+            continue
+        startup.add(name)
+        for function in by_name[name]:
+            queue.extend(GO_CALL_RE.findall(_go_body(function)))
+    return startup
+
+
+def scan_go(paths: Iterable[Path], root: Path) -> list[Spawn]:
+    """Every goroutine start across the Go files, with the bound it sits under if any."""
+    files: list[tuple[str, list[str]]] = []
+    functions: list[_GoFunction] = []
+    for path in paths:
+        shown = path.relative_to(root).as_posix()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        files.append((shown, lines))
+        functions.extend(_go_functions(shown, lines))
+    startup = _go_startup_names(functions)
     spawns: list[Spawn] = []
-    for number, text in enumerate(lines, 1):
-        if not GO_SPAWN_RE.match(text):
-            continue
-        enclosing = next(((n, s) for n, s, e in functions if s <= number <= e), None)
-        if enclosing is None:
-            spawns.append(Spawn(shown, number, "", KIND_GOROUTINE, (GO_NO_GRAPH,), None))
-            continue
-        name, start = enclosing
-        before = "\n".join(lines[start - 1 : number])
-        if name == STARTUP_FUNCTION:
-            bound: str | None = BOUND_STARTUP
-        elif name in called_from_main:
-            bound = BOUND_CALLED_FROM_MAIN
-        elif GO_BOUNDED_RE.search(before):
-            bound = BOUND_GO_LIMIT
-        else:
-            bound = None
-        spawns.append(Spawn(shown, number, name, KIND_GOROUTINE, (GO_NO_GRAPH,), bound))
+    for shown, lines in files:
+        own = [f for f in functions if f.file == shown]
+        for number, text in enumerate(lines, 1):
+            if not GO_SPAWN_RE.match(text):
+                continue
+            enclosing = next((f for f in own if f.start <= number <= f.end), None)
+            if enclosing is None:
+                spawns.append(Spawn(shown, number, GO_NO_FUNCTION, KIND_GOROUTINE, (GO_NO_GRAPH,), None))
+                continue
+            if enclosing.name == STARTUP_FUNCTION:
+                bound: str | None = BOUND_STARTUP
+            elif enclosing.name in startup:
+                bound = BOUND_GO_STARTUP
+            elif GO_SEMAPHORE_RE.search(_go_body(enclosing, number)):
+                bound = BOUND_GO_SEMAPHORE
+            else:
+                bound = None
+            spawns.append(Spawn(shown, number, enclosing.name, KIND_GOROUTINE, (GO_NO_GRAPH,), bound))
     return spawns
 
 
-def go_files(root: Path, dirs: Iterable[str]) -> Iterator[Path]:
-    for rel in dirs:
-        base = root / rel
-        if not base.is_dir():
-            continue
-        for path in sorted(base.rglob(f"*{GO_SUFFIX}")):
-            if path.name.endswith(GO_TEST_SUFFIX) or GO_TESTDATA_DIR in path.relative_to(base).parts:
-                continue
-            yield path
+def go_files(base: Path) -> list[Path]:
+    """The non-test Go files under one directory, testdata trees excepted."""
+    if not base.is_dir():
+        return []
+    return [
+        path
+        for path in sorted(base.rglob(f"*{GO_SUFFIX}"))
+        if not path.name.endswith(GO_TEST_SUFFIX) and GO_TESTDATA_DIR not in path.relative_to(base).parts
+    ]
 
 
-def scan(root: Path, python_targets: Iterable[str], go_dirs: Iterable[str]) -> tuple[list[Spawn], list[str]]:
-    """Every spawn across the targets, and the files read (repository-relative)."""
+def scan(root: Path, python_targets: Iterable[str], go_dirs: Iterable[str]) -> tuple[list[Spawn], list[str], list[str]]:
+    """Every spawn across the targets, the files read (repository-relative), and the targets that were not there."""
     spawns: list[Spawn] = []
     files: list[str] = []
+    problems: list[str] = []
     for rel in python_targets:
         path = root / rel
         if not path.is_file():
+            problems.append(TARGET_MISSING_ERROR.format(target=rel, script=SCRIPT_NAME))
             continue
         files.append(path.relative_to(root).as_posix())
         spawns.extend(scan_python(path, root))
-    for path in go_files(root, go_dirs):
-        files.append(path.relative_to(root).as_posix())
-        spawns.extend(scan_go(path, root))
-    return spawns, files
+    go_paths: list[Path] = []
+    for rel in go_dirs:
+        found = go_files(root / rel)
+        if not found:
+            problems.append(GO_DIR_EMPTY_ERROR.format(target=rel, script=SCRIPT_NAME))
+            continue
+        go_paths.extend(found)
+    files.extend(path.relative_to(root).as_posix() for path in go_paths)
+    spawns.extend(scan_go(go_paths, root))
+    return spawns, files, problems
 
 
 def display_path(path: Path, root: Path) -> str:
@@ -467,14 +571,16 @@ def check(
     go_dirs: Iterable[str] = GO_TARGET_DIRS,
     allowlist: Path = ALLOWLIST,
     list_spawns: bool = False,
-    out=sys.stdout,
-    err=sys.stderr,
+    out: TextIO | None = None,
+    err: TextIO | None = None,
 ) -> int:
+    out = sys.stdout if out is None else out
+    err = sys.stderr if err is None else err
     shown = display_path(allowlist, root)
-    spawns, files = scan(root, python_targets, go_dirs)
+    spawns, files, missing = scan(root, python_targets, go_dirs)
     entries, malformed = load_allowlist(allowlist, shown)
     findings, problems = reconcile(spawns, files, entries, shown)
-    problems = malformed + problems
+    problems = missing + malformed + problems
     if list_spawns:
         for spawn in spawns:
             print(
@@ -509,7 +615,7 @@ def check(
     return EXIT_OK
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, out: TextIO | None = None, err: TextIO | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", type=Path, default=REPO_ROOT, help="repository root the targets are relative to")
     parser.add_argument(
@@ -525,7 +631,7 @@ def main(argv: list[str] | None = None) -> int:
     python_targets = tuple(args.python_target) if args.python_target is not None else PYTHON_TARGETS
     go_dirs = tuple(args.go_dir) if args.go_dir is not None else GO_TARGET_DIRS
     allowlist = args.allowlist if args.allowlist is not None else (ALLOWLIST if root == REPO_ROOT else root / ALLOWLIST.relative_to(REPO_ROOT))
-    return check(root, python_targets, go_dirs, allowlist, list_spawns=args.list)
+    return check(root, python_targets, go_dirs, allowlist, list_spawns=args.list, out=out, err=err)
 
 
 if __name__ == "__main__":

@@ -2,16 +2,28 @@
 # scripts/check_bounded_concurrency.py arrived, pinned at the count they had
 # that day. One entry per line: `<file> <function> <count>`, the file relative
 # to the repository root, the function as the check names it (`Class.method`
-# for a method), the count above zero, and the issue that owns the fix in a
-# comment above it.
-#
-# The list only shrinks. The check fails when a function has more unbounded
-# spawns than its entry (a rise), when it has fewer (lower the count, or remove
-# the entry once the function is bounded), when an entry names a function or a
-# file the check no longer sees a finding in, and when a line is not an entry.
-# A function with no entry is held at zero, so a new per-request spawn anywhere
-# the check reads is a failure, never a new line here.
+# for a method), the count above zero. The comment above an entry names the
+# issue that owns the fix, or the bound the check cannot see. The rules (the
+# list only shrinks: a rise, a drop, a stale entry, an entry for a file the
+# check does not read, and a line that is not an entry all fail) are in the
+# script's docstring; this file states only what is pinned and why.
 
 # #4331: the fix-pull-request lookup starts one daemon thread per forge call so
 # the call can be abandoned at its deadline; the inject route reaches it.
 agents/platform/scripts/session_kv_server.py _proposal_state 1
+
+# The same abandon-at-deadline shape as _proposal_state, as a one-worker
+# executor per call with shutdown(wait=False); the cron-report route reaches
+# it. #4331 owns the KV server's per-request threads, so the fix for the
+# lookup above is the pattern for this one.
+agents/platform/scripts/session_kv_server.py _fetch_ledger_issue 1
+
+# One executor of CARD_STOP_PARALLEL workers per stop request, left to finish
+# stragglers after the answer; per request, so the count grows with callers.
+# #4331 owns the KV server's per-request threads.
+agents/platform/scripts/session_kv_server.py stop_session_cards 1
+
+# One deadline timer per metrics connection, cancelled when the connection
+# ends. Bounded by MetricsServer, which admits at most METRICS_MAX_CONNECTIONS
+# live connections; that cap is a server attribute the check does not read.
+agents/platform/scripts/credential_proxy.py MetricsHandler.handle 1
