@@ -355,9 +355,9 @@ every REGULAR patch of its minor, the 2026-10-14 shape, as `version-laggard` dri
 (`not_ahead_of_channel` in `fixtures.json`): agents compared that patch with REGULAR's and
 read the cluster as current or ahead rather than behind.
 
-A case touching `version-laggard` may assert that branch (a) is absent, and
-`upgrades-master-behind-offered-elsewhere` does: slot `b` graded critical is the defect it
-catches.
+A case touching `version-laggard` may assert that branch (b) was graded, and
+`upgrades-master-behind-offered-elsewhere` does: it requires slot `b`'s major row, so slot `b`
+graded critical, the defect it catches, leaves no such row.
 
 ## When a fixture goes away
 
