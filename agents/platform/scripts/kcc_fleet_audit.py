@@ -79,10 +79,17 @@ PROXY_TRUNCATED_MARKER = "credential proxy output truncated"
 
 UNREAD_REASON_MAX_CHARS = 200
 MAX_CELL_CHARS = 200
+MAX_ID_CHARS = 80
+MAX_REASON_CHARS = 64
 MAX_SAMPLE_CRDS_IN_SUMMARY = 8
-# Cap healthy rows rendered in the object table so total stdout stays well below Hermes's
-# 50 KB terminal output cap (~105 bytes/row * 200 = ~21 KB); all unhealthy rows always print.
-MAX_RENDERED_READY_ROWS = 200
+# Bound each variable-length section so worst-case stdout stays well below Hermes's 50 KB
+# terminal output cap even on large or all-unhealthy KCC clusters (~5 KB CRD issues +
+# ~15 KB failure bullets + ~12 KB Ready object rows + ~2 KB summary < 50 KB). Unhealthy
+# objects are rendered once in `### Synchronization Failures & Error Messages` and are not
+# repeated in `### Config Connector Objects`.
+MAX_RENDERED_CRD_ISSUES = 15
+MAX_RENDERED_FAILURES = 50
+MAX_RENDERED_READY_ROWS = 100
 COL_NAMESPACE_WIDTH = 24
 COL_KIND_WIDTH = 30
 COL_NAME_WIDTH = 32
@@ -340,11 +347,11 @@ def collect_kcc_objects(
 
 def evaluate_kcc_item(item: dict) -> dict[str, object]:
     """Classify one KCC operator CR or managed resource CR into Ready/Healthy vs Unhealthy."""
-    kind = sanitize_cell(item.get("kind") or "Unknown")
+    kind = sanitize_cell(item.get("kind") or "Unknown", MAX_ID_CHARS)
     meta = item.get("metadata") or {}
     ns_raw = meta.get("namespace")
-    namespace = sanitize_cell(ns_raw) if ns_raw else "<cluster>"
-    name = sanitize_cell(meta.get("name") or "")
+    namespace = sanitize_cell(ns_raw, MAX_ID_CHARS) if ns_raw else "<cluster>"
+    name = sanitize_cell(meta.get("name") or "", MAX_ID_CHARS)
     generation = meta.get("generation")
 
     status = item.get("status") or {}
@@ -400,8 +407,8 @@ def evaluate_kcc_item(item: dict) -> dict[str, object]:
         "name": name,
         "is_operator_cr": is_operator_cr,
         "ready": is_ready,
-        "reason": sanitize_cell(reason),
-        "message": sanitize_cell(message),
+        "reason": sanitize_cell(reason, MAX_REASON_CHARS),
+        "message": sanitize_cell(message, MAX_CELL_CHARS),
     }
 
 
@@ -516,10 +523,17 @@ def audit_kcc(
         print(f"- **Active Resource Kinds:** {breakdown}")
     print("")
 
-    for crd_name in unserved_crds:
+    for crd_name in unserved_crds[:MAX_RENDERED_CRD_ISSUES]:
         print(f"- Unserved or unestablished KCC CRD `{sanitize_cell(crd_name)}`")
-    for crd_name, reason in sorted(unread_crds.items()):
+    if len(unserved_crds) > MAX_RENDERED_CRD_ISSUES:
+        print(
+            f"... (+{len(unserved_crds) - MAX_RENDERED_CRD_ISSUES} unserved/unestablished KCC CRDs omitted)"
+        )
+    sorted_unread = sorted(unread_crds.items())
+    for crd_name, reason in sorted_unread[:MAX_RENDERED_CRD_ISSUES]:
         print(f"- Could not read `{sanitize_cell(crd_name)}`: {reason}")
+    if len(sorted_unread) > MAX_RENDERED_CRD_ISSUES:
+        print(f"... (+{len(sorted_unread) - MAX_RENDERED_CRD_ISSUES} unread KCC CRDs omitted)")
 
     is_clean = not has_unread and not unhealthy_operator and not unhealthy_managed
     if is_clean:
@@ -549,40 +563,49 @@ def audit_kcc(
         )
         print("CLEAN_AUDIT_STOP: NO — Inspect failed Config Connector resources listed below.\n")
 
-    # Print synchronization failures BEFORE the object table so Hermes's 50 KB terminal
-    # output cap never truncates error details on large KCC clusters.
+    # Print bounded synchronization failures BEFORE the Ready-only object table so Hermes's
+    # 50 KB terminal output cap is never exceeded even on large or all-unhealthy KCC clusters.
     all_unhealthy = [*unhealthy_operator, *unhealthy_managed]
     if all_unhealthy:
         print("### Synchronization Failures & Error Messages")
-        for row in all_unhealthy:
-            detail = row["message"] or row["reason"]
+        for row in all_unhealthy[:MAX_RENDERED_FAILURES]:
+            reason = str(row["reason"])
+            msg = str(row["message"])
+            detail = f"{reason} — {msg}" if msg and reason and reason not in msg else (msg or reason)
             print(f"- `{row['namespace']}/{row['kind']}/{row['name']}`: {detail}")
+        omitted_failures = max(0, len(all_unhealthy) - MAX_RENDERED_FAILURES)
+        if omitted_failures > 0:
+            print(
+                f"... (+{omitted_failures} unhealthy resources omitted to stay within terminal output cap; "
+                "re-run with -n <namespace> to inspect a single namespace)"
+            )
         print("")
 
     if evaluated:
-        unhealthy_rows = [row for row in evaluated if not row["ready"]]
         ready_rows = [row for row in evaluated if row["ready"]]
-        rendered_rows = [*unhealthy_rows, *ready_rows[:MAX_RENDERED_READY_ROWS]]
+        rendered_rows = ready_rows[:MAX_RENDERED_READY_ROWS]
         omitted_ready = max(0, len(ready_rows) - MAX_RENDERED_READY_ROWS)
 
         print("### Config Connector Objects")
-        print(
-            f"{'NAMESPACE':<{COL_NAMESPACE_WIDTH}} {'KIND':<{COL_KIND_WIDTH}} "
-            f"{'NAME':<{COL_NAME_WIDTH}} {'READY':<{COL_READY_WIDTH}} {'REASON'}"
-        )
-        print("-" * TABLE_DIVIDER_WIDTH)
-        for row in rendered_rows:
-            ready_str = "True" if row["ready"] else "FALSE"
+        if rendered_rows:
             print(
-                f"{str(row['namespace']):<{COL_NAMESPACE_WIDTH}} "
-                f"{str(row['kind']):<{COL_KIND_WIDTH}} "
-                f"{str(row['name']):<{COL_NAME_WIDTH}} "
-                f"{ready_str:<{COL_READY_WIDTH}} {row['reason']}"
+                f"{'NAMESPACE':<{COL_NAMESPACE_WIDTH}} {'KIND':<{COL_KIND_WIDTH}} "
+                f"{'NAME':<{COL_NAME_WIDTH}} {'READY':<{COL_READY_WIDTH}} {'REASON'}"
             )
-        if omitted_ready > 0:
-            print(
-                f"... (+{omitted_ready} Ready resources omitted to stay within terminal output cap)"
-            )
+            print("-" * TABLE_DIVIDER_WIDTH)
+            for row in rendered_rows:
+                print(
+                    f"{str(row['namespace']):<{COL_NAMESPACE_WIDTH}} "
+                    f"{str(row['kind']):<{COL_KIND_WIDTH}} "
+                    f"{str(row['name']):<{COL_NAME_WIDTH}} "
+                    f"{'True':<{COL_READY_WIDTH}} {row['reason']}"
+                )
+            if omitted_ready > 0:
+                print(
+                    f"... (+{omitted_ready} Ready resources omitted to stay within terminal output cap)"
+                )
+        else:
+            print("(0 Ready resources; all unhealthy resources are listed above)")
         print("")
     elif not has_unread:
         print(f"No Config Connector custom resource instances declared across {scope_label}.\n")

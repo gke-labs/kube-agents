@@ -325,6 +325,55 @@ class KccFleetAuditTest(unittest.TestCase):
             out.index("### Config Connector Objects"),
         )
         self.assertIn("(+5 Ready resources omitted", out)
+        objects_section = out.split("### Config Connector Objects", 1)[1]
+        self.assertNotIn("failed-db", objects_section)
+        self.assertNotIn("stale-db", objects_section)
+
+    def test_many_unhealthy_resources_are_capped_below_50kb_and_not_duplicated(self) -> None:
+        crd_ok = "sqlinstances.sql.cnrm.cloud.google.com"
+        crd_table = f"{crd_ok} Namespaced true True\n"
+        long_err = (
+            "googleapi: Error 403: Caller does not have required IAM permission "
+            "cloudsql.instances.update on target project resource; verify Workload Identity "
+            "binding andIAMPolicyMember reconciliation before retrying request."
+        )
+        many_unhealthy_items = [
+            {
+                "kind": "SQLInstance",
+                "metadata": {"name": f"broken-sql-instance-{i:03d}", "namespace": "prod-data"},
+                "status": {
+                    "conditions": [
+                        {
+                            "type": "Ready",
+                            "status": "False",
+                            "reason": "UpdateFailed",
+                            "message": long_err,
+                        }
+                    ]
+                },
+            }
+            for i in range(200)
+        ]
+
+        def fake_run(cmd: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+            if cmd[:3] == ["kubectl", "get", "crd"]:
+                return _completed(0, stdout=crd_table)
+            return _completed(0, stdout=json.dumps({"kind": "List", "items": many_unhealthy_items}))
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                rc = kcc.audit_kcc()
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertLess(len(out.encode("utf-8")), 50_000)
+        self.assertIn("CLEAN_AUDIT_STOP: NO", out)
+        self.assertIn("UpdateFailed — googleapi: Error 403:", out)
+        omitted = 200 - kcc.MAX_RENDERED_FAILURES
+        self.assertIn(f"(+{omitted} unhealthy resources omitted", out)
+        self.assertIn("(0 Ready resources; all unhealthy resources are listed above)", out)
+        self.assertEqual(out.count("broken-sql-instance-000"), 1)
+        self.assertNotIn(f"broken-sql-instance-{kcc.MAX_RENDERED_FAILURES:03d}", out)
 
     def test_worker_computes_remaining_timeout_at_execution_start(self) -> None:
         import threading
