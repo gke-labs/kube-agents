@@ -7,7 +7,8 @@ into toolExecutionsBlockedTotal, and the event watcher's injected-event counter,
 reads process_start_time_seconds from all four, and counts the watcher's per-cluster
 up gauge into the two cluster gauges, and sums the broker's version-control
 counter under one verb and status into remediationsProposedTotal, and its
-merged-proposals counter whole into remediationsMergedTotal, and the chat plugin's inbound-message
+proposal readings (the gauges the readings sweep sets, vcs_readings.py) into the
+proposal fields of status.usage, and the chat plugin's inbound-message
 counter over its platform label into chatMessagesInboundTotal, and into sessionsTotal the watcher's
 triage-sessions counter, the chat plugin's sessions counter and the A2A gateway's. Each series name, the status label
 key the broker writes and the operator filters on, and each counted outcome
@@ -27,6 +28,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRAPE_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "usage_counters_scrape.go"
 _WATCHER_METRICS_GO = _REPO_ROOT / "k8s-operator" / "cmd" / "k8s-event-watcher" / "metrics.go"
 _BROKER_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "credential_proxy.py"
+_READINGS_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "vcs_readings.py"
 _CHAT_METRICS_PY = _REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "chat_metrics" / "metrics.py"
 _MANIFESTS_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
 _A2A_METRICS_GO = _REPO_ROOT / "a2a" / "gateway" / "metrics.go"
@@ -72,11 +74,38 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertIsNotNone(match, "VCS_VERBS not found")
         self.assertIn(verb, set(re.findall(r'"([^"]+)"', match.group(1))))
 
-    def test_the_brokers_merged_counter_is_the_one_the_poller_sums(self):
-        self.assertEqual(_py_const("VCS_MERGED_METRIC"), _go_const(_SCRAPE_GO, "vcsMergedSeries"))
+    def test_every_reading_series_the_poller_reads_is_the_brokers(self):
+        for python, go in (
+            ("VCS_PROPOSALS_METRIC", "vcsProposalsSeries"),
+            ("VCS_PROPOSALS_CLOSED_BY_METRIC", "vcsProposalsClosedBySeries"),
+            ("VCS_PROPOSAL_TOUCHES_METRIC", "vcsTouchesSeries"),
+            ("VCS_PROPOSAL_TOUCHES_PER_PROPOSAL_METRIC", "vcsTouchesPerProposalSeries"),
+            ("VCS_PROPOSALS_IGNORED_METRIC", "vcsProposalsIgnoredSeries"),
+            ("VCS_READINGS_AGE_METRIC", "vcsReadingsAgeSeries"),
+        ):
+            with self.subTest(series=python):
+                self.assertEqual(_py_const(python, _READINGS_PY), _go_const(_SCRAPE_GO, go))
 
-    def test_the_closed_unmerged_series_is_the_brokers(self):
-        self.assertEqual(_py_const("VCS_CLOSED_UNMERGED_METRIC"), _go_const(_SCRAPE_GO, "vcsClosedUnmergedSeries"))
+    def test_the_reading_labels_the_poller_filters_on_are_the_brokers(self):
+        """The fold selects samples by label key and value; a rename on either
+        side would drop a field from the readings with every suite green."""
+        for python, path, go in (
+            ("VCS_READINGS_STATE_LABEL", _BROKER_PY, "vcsReadingsStateLabel"),
+            ("VCS_READINGS_ACTOR_LABEL", _BROKER_PY, "vcsReadingsActorLabel"),
+            ("VCS_READINGS_OUTCOME_LABEL", _BROKER_PY, "vcsReadingsOutcomeLabel"),
+            ("VCS_READINGS_LE_LABEL", _BROKER_PY, "vcsReadingsLeLabel"),
+            ("VCS_READINGS_READING_LABEL", _BROKER_PY, "vcsReadingsReadingLabel"),
+            ("STATE_OPEN", _READINGS_PY, "vcsStateOpen"),
+            ("STATE_MERGED", _READINGS_PY, "vcsStateMerged"),
+            ("STATE_CLOSED", _READINGS_PY, "vcsStateClosed"),
+            ("ACTOR_HUMAN", _READINGS_PY, "vcsActorHuman"),
+            ("ACTOR_BOT", _READINGS_PY, "vcsActorBot"),
+            ("STATE_MERGED", _READINGS_PY, "vcsOutcomeMerged"),
+            ("READING_OUTCOMES", _READINGS_PY, "usageReadingOutcomes"),
+            ("READING_DETAILS", _READINGS_PY, "usageReadingDetails"),
+        ):
+            with self.subTest(label=go):
+                self.assertEqual(_py_const(python, path), _go_const(_SCRAPE_GO, go))
 
     def test_the_a2a_gateways_inbound_counter_is_the_chat_counters_other_family(self):
         """On a next-mode install the A2A gateway counts the chat messages it accepts;

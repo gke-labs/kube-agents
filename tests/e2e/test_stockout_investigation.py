@@ -58,7 +58,8 @@ _FIXTURE_BUDGET_SECONDS = 600
 # agentplugins/pubsub-platform/tests/dedup_e2e_test.py:125-131.
 _GENERATION_STABLE_SECONDS = 20
 # Not the 1500s cold-boot budget that upgrade.sh derives from
-# agentAPIProbe(10, 90) plus an image-pull allowance. That figure is for a
+# the 905s startup probe budget (agentAPIProbeInitialDelaySeconds plus the
+# agentAPIStartupProbe* constants in platformagent_manifests.go) plus an image-pull allowance. That figure is for a
 # gateway being started; by the time this suite runs, step 2 has already provisioned the
 # environment and `scripts/release/wait_for_gke_readiness.sh` has waited for the pod. What
 # is left for this wait is a re-template still in flight, so the ceiling is sized for a
@@ -80,12 +81,13 @@ _DEGRADED_PERSISTENCE_SECONDS = 120
 # has finished linking plugins.
 #
 # On the RC's single-replica gateway it does. platform-agent carries
-# ReadinessProbe: agentAPIProbe(15, 3) (platformagent_manifests.go:3701, added by #674), and
+# a readiness probe that curls /api/sessions on loopback every 15s (the agentAPIReadinessProbe*
+# constants in platformagent_manifests.go, added by #674), and
 # deploy/shared/profile_plugins.py runs at entrypoint step 2.65 before `exec "$@"`, so a pod
 # that answers the probe has already linked them.
 #
-# Under leader election it does not. replicas > 1 sets ENABLE_LEADER_ELECTION (:2178), and
-# agentAPIProbe then exits 0 on connection-refused (:3545) so a standby can report Ready
+# Under leader election it does not. replicas > 1 sets ENABLE_LEADER_ELECTION, and
+# agentAPIProbe then exits 0 on connection-refused (its exit-7 branch) so a standby can report Ready
 # without serving — which means Ready no longer implies the entrypoint reached `exec`. The
 # window is for that configuration.
 _SKILL_MOUNT_TIMEOUT_SECONDS = 120
@@ -565,11 +567,12 @@ def _verify_skill_mounted(
             else:
                 # Retried rather than failed on sight, because ABSENT is not always final.
                 # A single-replica gateway settles it: platform-agent carries
-                # ReadinessProbe agentAPIProbe(15, 3) (platformagent_manifests.go:2927) and
+                # a readiness probe that curls /api/sessions on loopback (the agentAPIReadinessProbe*
+                # constants in platformagent_manifests.go) and
                 # the entrypoint links plugins at step 2.65 before `exec "$@"`, so Ready
                 # implies the links exist. Under leader election it does not — replicas > 1
                 # sets ENABLE_LEADER_ELECTION, and agentAPIProbe then exits 0 on
-                # connection-refused (:2773), so a Ready pod there may not have reached
+                # connection-refused (the exit-7 branch of agentAPIProbe), so a Ready pod there may not have reached
                 # `exec` yet and ABSENT is transient. The window covers that case; what it
                 # buys on the RC's single replica is one retry's worth of nothing.
                 absent_in = pod

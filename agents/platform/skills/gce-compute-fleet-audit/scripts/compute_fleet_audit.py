@@ -127,16 +127,14 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 DEFAULT_TIMEOUT_S = 60
-# How many projects this audit reads at once. Each is a run of gcloud compute
-# reads through the credential proxy, which admits four requests at once under
-# its child memory budget at the operator's default 1Gi limit
-# (docs/designs/credential-proxy-child-memory-budget.md §2.2). A wider pool only
-# queues the rest at the proxy, where a read still waiting at its 60 s admission
-# bound is refused busy, or hits DEFAULT_TIMEOUT_S here first and reads its
-# project as gate-failed -- the SOP's cue to re-read it by hand through the same
-# proxy. So the pool is the admitted count, as the fleet-audit collectors and
-# stall_watch.py's and cluster_agent_reconcile.py's listing pools are.
-MAX_WORKERS = 4
+# How many projects this audit reads at once: broker_admission.sweep_width(),
+# resolved in collect_fleet. Each project is a run of gcloud compute reads
+# through the credential broker, and a pool wider than the broker admits only
+# queues the rest, where a read still waiting at its 60 s admission bound is
+# refused busy, or hits DEFAULT_TIMEOUT_S here first and reads its project as
+# gate-failed -- the SOP's cue to re-read it by hand through the same broker.
+# The fleet-audit collectors resolve the same width (collect.py has the
+# reasoning).
 # `audit_report.validate_check_command`'s ceiling, restated rather than
 # imported because this script ships standalone. An over-length `command` is
 # not a clipped field: `finish` refuses the whole document, so a project with
@@ -202,6 +200,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -1490,8 +1489,9 @@ def collect_fleet(
     project: str | None = None,
     *,
     run: RunFn = default_run,
-    max_workers: int = MAX_WORKERS,
+    max_workers: int | None = None,
 ) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     notes: list[str] = []
     projects = get_target_projects(project, notes, run=run)

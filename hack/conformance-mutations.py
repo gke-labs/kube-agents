@@ -65,6 +65,35 @@ class Mutation:
 MUTATIONS: list[Mutation] = [
     # ---- A. Authority ---------------------------------------------------
     Mutation(
+        "A3-profile-context-unchecked",
+        "agents/platform/scripts/task_confinement.py",
+        ("    for value in contexts:\n        if value != target.context_name:\n",
+         "    for value in contexts:\n        if False:\n"),
+        "test_A3_a_profile_call_outside_its_tasks_target_is_refused",
+        "trust a profile worker's --context, since the managed kubeconfig only "
+        "holds one context anyway -- until the broker regenerates the one it names",
+    ),
+    Mutation(
+        "A3-profile-no-credential-runs",
+        "agents/platform/scripts/task_confinement.py",
+        ("    if target is None:\n        if not local:\n            raise ConfinementRefusal(\n"
+         "                \"this profile task has no target cluster",
+         "    if target is None:\n        if False:\n            raise ConfinementRefusal(\n"
+         "                \"this profile task has no target cluster"),
+        "test_A3_a_profile_caller_without_a_task_credential_reaches_no_cluster",
+        "let a profile worker with no credential run as a session would, on "
+        "the host cluster, so a task the dispatcher gave no target still works",
+    ),
+    Mutation(
+        "A3-profile-reaches-vcs",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
+         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
+        "test_A3_the_profile_role_reaches_the_exec_route_alone",
+        "let a profile worker read a proposal the way the MCP pod does -- a "
+        "forge read no task target confines",
+    ),
+    Mutation(
         "A3-inject-auth",
         "agents/platform/scripts/session_kv_server.py",
         ('"/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])',
@@ -1284,6 +1313,15 @@ Mutation(
         ("  failurePolicy: Fail", "  failurePolicy: Ignore"),
         "test_C5_the_admission_policy_fails_closed",
         "the one-line edit B3 names: 'unblock apply during upgrade window'",
+    ),
+    Mutation(
+        "C5-gateway-pod-policy-any-account",
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ('    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == variables.sessionAccount"',
+         '    - expression: "has(object.spec.serviceAccountName)"'),
+        "test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account",
+        "widen the identity rule to any ServiceAccount, which reopens the "
+        "gateway's pod create to every identity in its namespace",
     ),
     Mutation(
         "C1-broker-colocation-flag-restored",

@@ -239,7 +239,10 @@ runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLE
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
 consumes Google Chat, and, under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, the session
 pods' (bound to the audience `kubeagents-credential-proxy-session`; see
-[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and does not vary on
+[spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next)), and, under `mode: next`
+with an `AgentProfile` bound, each profile tier's (bound to the audience
+`kubeagents-credential-proxy-profile`; see
+[spec-subagent-profiles.md](designs/spec-subagent-profiles.md)), and does not vary on
 which one presented the token — the audience and the route table it feeds do — so the
 allowlist itself keeps other workloads out rather than telling those callers apart. The token
 crosses the cluster network in cleartext;
@@ -743,7 +746,9 @@ get-credentials`, which already runs in the broker. The proxy reads exactly one
 string out of the caller's file — `current-context` — accepts it only if it is a
 well-formed `gke_<project>_<location>_<cluster>` name, and regenerates the
 kubeconfig itself into a directory backed by a broker-only `emptyDir`. That
-regenerated file is what every proxied command runs against. No field the
+regenerated file is what every proxied `kubectl` command runs against. A gcloud
+call gets an empty per-call file instead (get-credentials fetches into its own
+scratch file). No field the
 sandbox wrote is ever interpreted, and there is no check-then-open window,
 because the sandbox never had a handle on the document that is opened.
 
@@ -883,9 +888,9 @@ Consequences:
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
   sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
-  it prevents. The operator declares that request at 1Gi, above the floor, so that the
-  budget engages there too, admitting four; the floor remains for a CR override that
-  sets a smaller request.
+  it prevents. The operator declares that request at 2Gi on Autopilot (1Gi on Standard),
+  above the floor, so that the budget engages there too, admitting nine, held to eight by
+  the slot cap; the floor remains for a CR override that sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.
@@ -897,11 +902,16 @@ Consequences:
   `503 CREDENTIAL_PROXY_BUSY`, naming the slot cap
   (`the credential proxy is at its limit of 8 concurrent commands …`) or the budget
   (`the credential proxy is at its child memory budget (… MiB in use of … MiB: … MiB reserved for children, … MiB of output allowance for … requests) …`),
+  the background share (`the credential proxy keeps … of its … admissions for interactive work …`)
+  or the interactive cap (`the credential proxy keeps one of its … admissions for background work …`),
   whichever held it, or, when the request itself fits and only requests ahead of it that
   are waiting for the budget kept it queued, the queue
   (`the credential proxy's admission queue is held by requests waiting for its child memory budget (…) …`).
-  The queue is in arrival order, except that a forge refresh that fits the budget passes
-  requests the slot cap alone holds, since it takes no slot.
+  The queue is in arrival order inside each admission class, with interactive requests ahead
+  of queued background ones (`designs/credential-broker-exec-tier.md` §4.2), except that a
+  forge refresh that fits the budget passes requests only a slot cap holds (the full slot cap,
+  or their own class's full cap), since it takes
+  no slot.
   A long-running command holds its slot and reservation for as long as it runs,
   and a caller that stops reading its response is given up on after 60 seconds
   so that it cannot keep them.
@@ -911,8 +921,8 @@ Consequences:
   applies at the deadline. On the exec, vcs and forge refresh routes, a caller
   that disconnects while queued for admission (a slot, the child memory budget,
   or both) is dropped without anything being started; a vcs verb's own git commands, once started, run to completion
-  unwatched. Admission goes in arrival order, so the caller refused after the wait
-  is the one that waited longest. Disconnecting means the peer closed for good
+  unwatched. Admission goes in arrival order inside each class, so the caller refused
+  after the wait is the one of its class that waited longest. Disconnecting means the peer closed for good
   (`POLLHUP` on the broker's Unix socket); a peer that only shut its writing
   half is still answered, and a broker spoken to over TCP, where a closed peer
   and a half-closed one look alike, runs its commands unwatched.
@@ -939,7 +949,8 @@ host, method and path against the code allowlist in
 `agents/platform/scripts/api_policy.py`, forwards it on its own identity with
 only its own `Authorization` and `Accept` headers and the credential-substituting
 query keys removed, and returns the upstream status, `Content-Type` and body
-unchanged under a response cap and a deadline. The shell role alone may call it;
+unchanged under a response cap and a deadline (a route with a projection, the GKE
+cluster list and get, returns its 2xx body cut down to the fields it names). The shell role alone may call it;
 token-issuing hosts are refused before the table, redirects are not followed, and
 a refusal is a 403 naming a `gcp.api.*` rule. Widening the table is a pull request.
 [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md) is canonical.

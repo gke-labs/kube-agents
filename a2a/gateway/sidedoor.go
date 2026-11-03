@@ -95,6 +95,11 @@ func WithSideDoors(primary Adapter, doors []DoorSpec, log *slog.Logger) Adapter 
 	return &sideDoorAdapter{primary: primary, doors: doors, log: log}
 }
 
+// Close closes the chat adapters behind the doors (closeAdapter).
+func (s *sideDoorAdapter) Close() {
+	closeAdapter(s.primary)
+}
+
 // doorFor reports which door a conversation belongs to, or nil. The prefix
 // is the whole test, and it is why every door's keys are qualified: see
 // injectConversationKey and a2aConversationKey.

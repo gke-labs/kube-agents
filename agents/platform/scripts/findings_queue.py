@@ -89,11 +89,15 @@ RECURRENCE_STATES = ("resolved", "stale")
 # `surfaced`, which ends a snooze early (§3.2, §6.1).
 PATCHABLE_STATES = ("accepted", "dismissed", "snoozed", "surfaced")
 # The user's three decisions. One on any row of a gathered line covers the
-# line (§7.2): the rows of that item still waiting to be decided take it too.
+# line (§7.2): the rows of that item a message has named (`CASCADE_STATES`)
+# take it too.
 DECISION_STATES = ("accepted", "dismissed", "snoozed")
-# The states of a row still waiting to be decided, which a decision on another
-# row of its item reaches.
+# The states of a row still waiting to be decided.
 UNDECIDED_STATES = ("queued", "surfaced")
+# The rows of an item a decision reaches: the named ones. A `queued` row no
+# message has named yet (`mark_surfaced` moves every named row out of it), so
+# the user has not seen it; it stays open and is returned as left open (§7.2).
+CASCADE_STATES = ("surfaced",)
 
 VERIFY_OUTCOMES = ("still_failing", "resolved", "unverifiable")
 
@@ -940,11 +944,13 @@ def patch_finding(conn: sqlite3.Connection, finding_id: str, patch: Any) -> dict
     """The three human transitions, the early end of a snooze, and PR reconciliation.
 
     A decision (`DECISION_STATES`) on a row that is an item at all (not
-    `rolled_up`) covers its whole item: every other row with the same
-    `item_key` that `decided_with_item` accepts takes the same state and
-    `snoozed_until`. Their ids come
+    `rolled_up`) covers the named rows of its item: every other row with the
+    same `item_key` that `decided_with_item` accepts and that is in
+    `CASCADE_STATES` takes the same state and `snoozed_until`. Their ids come
     back as `item_rows_decided`. Without it, the nudge names one id for a
-    gathered line, the user decides it, and the line stays pending.
+    gathered line, the user decides it, and the line stays pending. A
+    `queued` row of the item, which no message has named, keeps its state:
+    its id comes back as `item_rows_left_open`.
     """
     if not isinstance(patch, dict):
         raise FindingError("patch must be an object")
@@ -1002,19 +1008,21 @@ def patch_finding(conn: sqlite3.Connection, finding_id: str, patch: Any) -> dict
         decided_assignments, decided_values = decision
         key = item_key(current)
         placeholders = ", ".join("?" * len(UNDECIDED_STATES))
-        siblings = [
-            sibling["id"]
+        undecided = [
+            sibling
             for sibling in map(
                 _row_to_finding,
                 conn.execute(f"{_SELECT} WHERE state IN ({placeholders}) AND id != ?", (*UNDECIDED_STATES, finding_id)),
             )
             if item_key(sibling) == key and decided_with_item(sibling)
         ]
+        siblings = [sibling["id"] for sibling in undecided if sibling["state"] in CASCADE_STATES]
         for sibling in siblings:
             conn.execute(
                 f"UPDATE findings SET {', '.join(decided_assignments)} WHERE id = ?", (*decided_values, sibling)
             )
         result["item_rows_decided"] = siblings
+        result["item_rows_left_open"] = [sibling["id"] for sibling in undecided if sibling["state"] not in CASCADE_STATES]
     return result
 
 
@@ -1170,7 +1178,9 @@ def rolled_up(finding: Mapping) -> bool:
 
 
 def decided_with_item(finding: Mapping) -> bool:
-    """Whether a decision on another row of this row's item applies to it too (§7.2)."""
+    """Whether this row is an undecided member of its item (§7.2): what the
+    nudge's count counts. A decision on another row reaches only those of them
+    in `CASCADE_STATES`; `patch_finding` returns the others as left open."""
     return finding.get("state") in UNDECIDED_STATES and not rolled_up(finding)
 
 
@@ -1244,9 +1254,10 @@ class Item:
     severity: str = SEVERITIES[-1]
     # The earliest showing among the pending members, None for a new item.
     first_shown: datetime | None = None
-    # How many rows a decision on any member's id applies to (`patch_finding`):
-    # the members, and any row of the line that is neither pending nor new
-    # but still undecided, such as a shown row the sweep stopped reporting.
+    # How many rows a decision on any member's id applies to once the nudge
+    # has marked the members it names (`patch_finding`, `CASCADE_STATES`): the
+    # members, and any row of the line that is neither pending nor new but
+    # still undecided, such as a shown row the sweep stopped reporting.
     covers: int = 0
 
     @property

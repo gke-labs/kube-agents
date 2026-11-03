@@ -209,6 +209,10 @@
             "numRetries": {
               "type": "integer",
               "minimum": 0
+            },
+            "retryAfterSeconds": {
+              "type": "integer",
+              "minimum": 0
             }
           }
         },
@@ -797,6 +801,17 @@
                 }
               }
             },
+            "retention": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sessionDays": {
+                  "type": ["integer", "null"],
+                  "minimum": 90,
+                  "maximum": 365
+                }
+              }
+            },
             "stallWatch": {
               "type": "object",
               "additionalProperties": false,
@@ -860,6 +875,9 @@
                     },
                     "runtimeClassName": {
                       "type": "string"
+                    },
+                    "resources": {
+                      "type": "object"
                     }
                   }
                 }
@@ -890,6 +908,36 @@
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 100
+                    },
+                    "childReserve": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 999
+                    },
+                    "leaseSeconds": {
+                      "type": "integer",
+                      "minimum": 15,
+                      "maximum": 3600
+                    },
+                    "renewSeconds": {
+                      "type": "integer",
+                      "minimum": 5,
+                      "maximum": 300
+                    },
+                    "restartGraceSeconds": {
+                      "type": "integer",
+                      "minimum": 10,
+                      "maximum": 3600
+                    },
+                    "acceptTimeoutSeconds": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 120
+                    },
+                    "maxTaskDeadlineSeconds": {
+                      "type": "integer",
+                      "minimum": 60,
+                      "maximum": 21600
                     }
                   }
                 },
@@ -1416,7 +1464,8 @@
                   "type": "string"
                 },
                 "serviceUrl": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Ignored. Accepted so existing values files still validate; the PlatformAgent CRD has no serviceUrl field, and the adapter takes the service URL from each inbound activity."
                 },
                 "adaptiveCards": {
                   "type": "boolean"
@@ -1684,6 +1733,112 @@
                   }
                 }
               }
+            },
+            "lifecycle": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "activeDeadlineSeconds": {
+                  "type": "integer"
+                },
+                "ttlSecondsAfterFinished": {
+                  "type": "integer"
+                }
+              }
+            },
+            "concurrency": {
+              "type": "integer"
+            },
+            "resources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "requests": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "type": ["string", "number"]
+                    },
+                    "memory": {
+                      "type": ["string", "number"]
+                    }
+                  }
+                },
+                "limits": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "type": ["string", "number"]
+                    },
+                    "memory": {
+                      "type": ["string", "number"]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "cluster": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "persona": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": ["string", "integer"]
+                    }
+                  }
+                }
+              }
+            },
+            "harness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": ["string", "integer"]
+                    }
+                  }
+                },
+                "model": {
+                  "type": "string"
+                },
+                "maxTurns": {
+                  "type": "integer"
+                }
+              }
+            },
+            "allowedTiers": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "items": { "type": "string", "enum": ["read", "unattended"] }
             },
             "lifecycle": {
               "type": "object",

@@ -245,8 +245,10 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	if notifier := chatNotifier(cfg, backendAdapter, gw.Conversations, log); notifier != nil {
+		// The home source is wired before the route starts: Start's boot
+		// line reads it, and nothing writes it after.
+		armHomeLearn(cfg, backendAdapter, notifier, log)
 		defer runNotifier(ctx, notifier, client)()
-		armHomeLearn(ctx, cfg, backendAdapter, notifier, log)
 	}
 	// The console's route runs whenever the console does: a card filed from
 	// a console turn reports back into its conversation as a notify frame.
@@ -320,10 +322,12 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 
 // armHomeLearn lets a Slack gateway learn its home channel from the first
 // admitted channel mention and record it (gateway/slack_home_channel.go), when
-// the operator armed it (Config.HomeLearnArmed). The record client is the
-// pod's own ServiceAccount, whose Role reaches that one ConfigMap; one that
-// cannot be built leaves the learn off and chat ingress untouched.
-func armHomeLearn(ctx context.Context, cfg *gateway.Config, backend gateway.Adapter, notifier *gateway.Notifier, log *slog.Logger) {
+// the operator armed it (Config.HomeLearnArmed), and points the notify route
+// at the home channel the operator projects into this pod as a file. The
+// record client is the pod's own ServiceAccount, whose Role reaches that one
+// ConfigMap; one that cannot be built leaves the learn off and chat ingress
+// untouched.
+func armHomeLearn(cfg *gateway.Config, backend gateway.Adapter, notifier *gateway.Notifier, log *slog.Logger) {
 	slack, ok := backend.(*gateway.SlackAdapter)
 	if !ok || !cfg.HomeLearnArmed() {
 		return
@@ -338,9 +342,12 @@ func armHomeLearn(ctx context.Context, cfg *gateway.Config, backend gateway.Adap
 		log.Error("home channel learn not armed: no Kubernetes client", "err", err)
 		return
 	}
-	slack.SetHomeLearner(notifier, cs, cfg.Namespace, cfg.HomeChannelRecord, cfg.SelfImage)
-	slack.AdoptHomeRecord(ctx)
-	log.Info("home channel learn armed", "record", cfg.HomeChannelRecord)
+	slack.SetHomeLearner(cs, cfg.Namespace, cfg.HomeChannelRecord, cfg.SelfImage, gateway.HomeFileDir)
+	if notifier != nil {
+		notifier.SetHomeSource(slack.LearnedHome)
+		notifier.SetHomeVerifier(slack.VerifyHomeForPost)
+	}
+	log.Info("home channel learn armed", "record", cfg.HomeChannelRecord, "file", gateway.HomeFileDir)
 }
 
 // runNotifier runs a chat.notify route until ctx ends, and returns the stop

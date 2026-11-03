@@ -63,7 +63,7 @@ line (hack/OWNERS). The issue names the move; a person makes it.
 Dry run is the default: reads happen, every write is printed. ``--live``
 writes; the workflow passes it under the switch the nightly bug filer uses
 (``NIGHTLY_BUGS_LIVE=true`` and ``CI_HEALTH_MUTE`` not ``true``).
-``digest_lines`` gives the 9 AM digest one line per uncovered domain
+``digest_lines`` gives the 11 AM digest one line per uncovered domain
 (``post_health.coverage_lines``); it reads no GitHub.
 """
 

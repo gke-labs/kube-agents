@@ -401,9 +401,10 @@ The GKE-events path is live end to end:
   `OOMKilled`, `FailedScheduling`. The same list admits two more, cluster-autoscaler's
   `TriggeredScaleUp` and `NotTriggerScaleUp`, which the watcher records against the pod and never
   forwards: a `FailedScheduling` is held while a scale-up for its pod is in progress, passed at any
-  count once the autoscaler has declined to help, and otherwise held until its fifth repeat, so a
-  pod waiting for a node the cluster is already adding opens no card and a pod nothing will place
-  opens one. On an Autopilot cluster the event is also held, at any count, when the message is
+  count once the autoscaler has declined to help, and otherwise held until its fifth repeat and
+  two minutes between its first and last sighting. A pod waiting for a node the cluster is
+  already adding opens no card, nor does the replacement for a pod a node scale-down evicted,
+  placed seconds later; a pod nothing will place opens one. On an Autopilot cluster the event is also held, at any count, when the message is
   `no nodes available to schedule pods` and the autoscaler has recorded no verdict on the pod — an
   Autopilot cluster with no user workloads scales to zero nodes and leaves GKE's own system pods
   `Pending` by design, which is not an incident. Whether the cluster is Autopilot comes from the

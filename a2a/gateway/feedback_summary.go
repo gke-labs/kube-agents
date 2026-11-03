@@ -84,12 +84,25 @@ const (
 	//: a2aGatewayName); the resource name is what precedes the suffix.
 	a2aGatewayNameSuffix = "-a2a-gateway"
 	platformAgentNameEnv = "PLATFORM_AGENT_NAME"
+	usageNoReading       = "no reading"
+	usageReadingSuffix   = " (as the forge reports)"
 )
 
-// : status.usage fields, in the order the block prints them; a missing one prints 0.
+// : status.usage fields, in the order the block prints them; a missing counter
+// : prints 0, a missing reading (usageSummaryReadings) prints usageNoReading.
+// : The script's USAGE_COUNTERS verbatim.
 var usageSummaryCounters = []string{
 	"clustersRegistered", "clustersMonitored", "chatMessagesInboundTotal", "sessionsTotal",
 	"toolExecutionsTotal", "eventsIngestedTotal", "remediationsProposedTotal", "remediationsMergedTotal",
+	"proposalsAuthored", "remediationsOpen", "remediationsClosedUnmergedTotal", "proposalHumanTouches",
+	"proposalsMergedUntouched",
+}
+
+// : The fields the broker reads off the forge rather than counts: absent means
+// : it has no reading yet, which is not 0. The script's USAGE_READINGS.
+var usageSummaryReadings = map[string]bool{
+	"remediationsMergedTotal": true, "proposalsAuthored": true, "remediationsOpen": true,
+	"remediationsClosedUnmergedTotal": true, "proposalHumanTouches": true, "proposalsMergedUntouched": true,
 }
 
 // : Spec subtrees whose string leaves name the install and must not reach the
@@ -353,7 +366,16 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 	}
 	lines = append(lines, "  interfaces: "+joined, "usage:")
 	for _, counter := range usageSummaryCounters {
-		lines = append(lines, fmt.Sprintf("  %s: %d", counter, asInt(usage[counter])))
+		value, present := usage[counter]
+		if !usageSummaryReadings[counter] {
+			lines = append(lines, fmt.Sprintf("  %s: %d", counter, asInt(value)))
+			continue
+		}
+		shown := usageNoReading
+		if present && value != nil {
+			shown = strconv.FormatInt(asInt(value), 10)
+		}
+		lines = append(lines, fmt.Sprintf("  %s: %s%s", counter, shown, usageReadingSuffix))
 	}
 	last := asString(usage["lastActiveTime"])
 	if last == "" {

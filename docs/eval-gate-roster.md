@@ -352,8 +352,8 @@ Admitted on the record since the split:
   The GitLab nightly passed it 21 of 21 on the seven nights that graded it, 2026-10-19 to 10-26.
   What it costs: like vcs-spent-branch-reuse it requests a pull request, so its three repetitions
   join that case's in the fan-out's second phase, one at a time after every other unit, each after
-  the repository reset and on the inject lane the 120-second GitHub-write settle ([The inject
-  lane](#the-inject-lane)): about 15 minutes more serial tail at the measured median (3 × (120 s +
+  the repository reset and on the inject lane the 30-second GitHub-write settle ([The inject
+  lane](#the-inject-lane)): about 10 minutes more serial tail at the measured median (3 × (30 s +
   172 s)), plus three more resets. The two cases' units alternate there, so a late write from one
   would be charged to the other by the lane's write safeguard; the writers nightly has run them
   interleaved that way on the inject lane, with six other requesting cases, on all three next-mode
@@ -379,9 +379,9 @@ Admitted on the record since the split:
   demoted the upgrades and consistency probes. What it costs: it was the presubmit's one case
   that requests a pull request (until pdb-remediation-pr's return on 2026-10-26), so its three
   repetitions run in the fan-out's second phase, one at a time after every other unit, each
-  after the repository reset and on the inject lane the 120-second GitHub-write settle
-  ([The inject lane](#the-inject-lane)): about 15 minutes of serial tail at the measured median
-  (3 × (120 s + 173 s)), plus the resets and the drain at the phase boundary. Its seat took
+  after the repository reset and on the inject lane the 30-second GitHub-write settle
+  ([The inject lane](#the-inject-lane)): about 10 minutes of serial tail at the measured median
+  (3 × (30 s + 173 s)), plus the resets and the drain at the phase boundary. Its seat took
   `source-control` off the `docs/designs/domains.yaml` allowlist.
 - **upgrades-lagging-master-probe**, 2026-10-23
   ([#3269](https://github.com/gke-labs/kube-agents/issues/3269)), back from its demotion of
@@ -526,8 +526,8 @@ with "Not a roster admission."
   presubmit wall time, priced from `unit_cost_hint` in `hack/ci-eval-pr.sh`. Phase one runs the
   cases that request nothing, four lanes at a time (`EVAL_TASK_PARALLELISM`), and one case's
   repetitions run one after another on its task lock. Phase two runs the cases that request a
-  pull request, and the stopped asks, one unit at a time, after phase one is done, each after
-  the 120 s write settle, so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
+  pull request, the stopped asks and the cases that declare `writes_alone`, one unit at a time, after phase one is done, each after
+  the 30 s write settle, so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
   Held-out seats count, because they run. Locks shared between cases are not counted, so a
   seat with its own Terraform stack would cost more than the estimate says. The test fails
   when the estimate passes
@@ -627,10 +627,9 @@ Nothing in this repository changes for the flip, and the same line removed disar
 periodic does not get the line: it records `main` and grades itself against a window that already
 holds its own night, so its aggregate is a report, never a gate. Revisit the margin when `main`'s
 window rate passes 0.96 (at that point 0.10 starts redding five failed repetitions, which the
-sample contains); the eval dashboard's Trend page draws today's window from the same store, per case
-and per domain, and since no job appends that window now, the view empties as its lines age out of
-the page's window. It does not draw the `next` series yet, which is the window the presubmit is compared
-with since the nightly grades `next`; the `next` block of the published `trend.json` holds it.
+sample contains); the eval dashboard's Trend page draws the `next` window from the same store, per
+case and per domain, which is the window the presubmit is compared with since the nightly grades
+`next`. Today's window stays selectable on the page until its lines age out: no job appends it now.
 
 **What an author sees when it fires.** No case is marked blocking; the failures are spread. The
 job's final log line is the ordinary `PR Smoke Test Evaluation Failed -- see .../eval-verdict.md`,
@@ -671,12 +670,11 @@ the api transport, and they are kept apart on purpose.
 
 `today`, the mode a rollback lands on, is graded over the api transport by the today lane: the
 optional `pull-kube-agents-smoke-test-today` (on demand with `/test`, and on its own when a pull
-request touches `hack/rollback-roundtrip.sh` or the operator's A2A reconciliation) and the
-six-hourly periodic `ci-kube-agents-eval-today` on `main`. Both run with `EVAL_ROLLBACK_LANE=1`:
+request touches `hack/rollback-roundtrip.sh` or the operator's A2A reconciliation). It runs with `EVAL_ROLLBACK_LANE=1`:
 the deploy brings the install up under `next`, `hack/rollback-roundtrip.sh` takes it to `today`,
 back to `next` and to `today` again before the matrix, and a rollback that fails reds the run.
 The matrix is the presubmit's, roster included, so a case graded only over the api transport is
-graded there, but neither job blocks a merge.
+graded there, but the job does not block a merge.
 
 A check the transport blinds is the scorer's business. The door's trace carries no card ids,
 no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod
@@ -702,7 +700,8 @@ posts into the conversation under `next`, and a card paused on a question as the
 asks, and those cases grade that outcome rather than the `kanban_create` behind it. The
 card-wake replays run on this lane as well, because under `next` a card's wake reaches the front
 door through the in-pod API server, not the gateway; the question cases grade the reply to the
-user's answer and the card, not the reply to the wake. What stays listed is the
+user's answer and the card, and a block replay grades the reply to the wake, which next posts
+nowhere but the same front door writes. What stays listed is the
 fresh-session question case, whose answer turn carries today's Slack thread context, a turn
 next's door never sends.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
@@ -711,8 +710,9 @@ block above it, naming the issue that decides when it goes, and `scripts/test_ev
 holds every entry to that, the way the validator's `FIXTURE_NOT_READY` holds a case with no
 fixture to an issue. The case keeps its seat in `presubmit-cases.txt` or `nightly-cases.txt` and
 on the blocking roster, but it stops running wherever the inject lane runs, the nightlies
-included. The only api-transport job on `main` is the today lane, which runs the presubmit
-matrix: a listed presubmit case still runs there, and a listed nightly case runs nowhere in CI.
+included. No job on `main` runs the presubmit matrix over the api transport now: a listed
+presubmit case runs only when the today presubmit (`pull-kube-agents-smoke-test-today`) runs on a
+pull request, and a listed nightly case runs nowhere in CI.
 An entry also leaves what can red a pull request, because the merge-blocking presubmit is on the inject lane: `hack/ci-eval-pr.sh` drops it
 from the matrix and from `BOOTSTRAP_ADMITTED` there. No roster case is listed, so the
 merge-blocking run grades delegation through the chat front door with `agent-kanban-smoke`.
@@ -722,12 +722,16 @@ The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it change
 pull request runs.
 
 Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject lane can carry:
-the stopped asks (a `stop` sent on the conversation after the opening turn,
+the stopped asks (a `stop` sent on the conversation during or after the opening turn,
 [`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and a case
 graded on the question a delegated card paused on, which only the inject lane's board read folds
-into the reply. `hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
+into the reply, and the reply-under-pushed-report replays (a report stored for the conversation
+after the opening turn, then the reply sent as a second message on it,
+[`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)).
+`hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
 needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
-the cases that request a pull request, with its window marked exclusive like theirs, so a stop
+the cases that request a pull request, as does a case that declares `writes_alone: true` on
+either lane, with its window marked exclusive like theirs, so a stop
 that fails and lets its card write reds that case whether or not it names the write, and only
 that case.
 
@@ -751,8 +755,8 @@ included, and on GitHub without `EVAL_LEDGER_APP_KEY_FILE` it refuses unless
 learned on the first repetition, whose check errors naming the repository and the missing permission.
 The task files under `bench/tasks/` are untouched. A case that
 requests a pull request (a `pull_request_opened` or `pull_request_diff_contains` check of its
-own) is allowed the ones its reply names, and the script runs those cases in a second phase
-after every other unit has finished, one at a time and each after a settle as long as the
+own) is allowed the ones its reply names, and the script runs those cases, the stopped asks and
+the cases that declare `writes_alone: true` in a second phase after every other unit has finished, one at a time and each after a settle as long as the
 check's clock-skew tolerance, so a repetition that requests nothing never shares the repository
 with one that writes by design and no window reaches back into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
@@ -794,8 +798,8 @@ issue), since a chat probe passes the same on either forge and the GitHub run al
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
 from the catalogue and registers nothing. The same list runs on a self-managed GitLab
 (`EVAL_FORGE=gitlab-ce`), since the cases grade the forge and not where it is; a GitHub Enterprise
-Server run (`EVAL_FORGE=ghes`) reads a GHES list of its own, named by `lane_cases_file()` in
-`hack/ci-eval-pr.sh` and refused while the checkout lacks it. `hack/ci-eval-pr.sh` refuses an entry in neither file,
+Server run (`EVAL_FORGE=ghes`) reads `hack/eval/ghes-cases.txt`, named by `lane_cases_file()` in
+`hack/ci-eval-pr.sh` (below). `hack/ci-eval-pr.sh` refuses an entry in neither file,
 and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
 (not negated, not one alternative under an `any`). Today that is three merge-request cases; no
 ledger case is in the lane (consistency-drift-outlier passes on the GitHub nightlies and holds a
@@ -826,6 +830,24 @@ own is the provider and the forge, which the nightly catches within a day and th
 checks for a pull request that touches the provider. The file needs the normal approvers, like
 `nightly-cases.txt`: it changes what one on-demand lane and the two nightlies run, not what can red
 a pull request.
+
+## The GHES lane
+
+The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand, `ci-kube-agents-eval-nightly-ghes`
+and, under `spec.mode: next`, `ci-kube-agents-eval-nightly-ghes-next`; `EVAL_FORGE=ghes`,
+[#3684](https://github.com/gke-labs/kube-agents/issues/3684)) deploy the agent against a GitHub
+Enterprise Server at a private host with a private CA: the forwarding proxy in `hack/ghes-proxy`,
+on a VM the job stands up per run in front of the leased project's github.com repository
+([`docs/ci-pool-projects.md`](ci-pool-projects.md) 5.8). They run `hack/eval/ghes-cases.txt`, the
+GitLab lane's three cases, under the GitLab lane's rules above: registered cases with a positive
+forge check, the roster intersected with the list, never a blocking presubmit, nothing appended to
+the evidence store, `scripts/test_eval_rosters.py` pinning the set. A pass proves the agent went
+through the host: `pull_request_opened` accepts only a pull request linked on the GHES host, which
+the proxy writes for a request it forwarded, and the grader reads it back from api.github.com. The
+GHES-only case `ghes-pdb-remediation-pr` (the same task with a writes safeguard the inject lane
+appends anyway) stays unregistered, since a nightly registration would run it on the github.com
+nightly as a second copy of `pdb-remediation-pr`; it joins the list when the registration rules
+grow a lane-only seat.
 
 ## Demoting a flaky case
 

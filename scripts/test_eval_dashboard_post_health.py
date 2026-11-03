@@ -3,8 +3,8 @@ day, renders the six approved message shapes, and never lets the token, the
 space or the webhook URL reach a log.
 
 Times in messages are Toronto time ("7:30 AM ET"); T0 is 12:00Z, which is
-8:00 AM EDT on 2026-09-04, and the digest hour is 9 AM Toronto (13:00Z that
-day), so the window is 12:40Z-13:20Z.
+8:00 AM EDT on 2026-09-04, and these tests pin the digest hour at 9 AM Toronto
+(13:00Z that day; the product's default is 11), so the window is 12:40Z-13:20Z.
 
 The HTTP layer is a recording fake handed in as `opener`; nothing here opens
 a socket or touches a bucket (the gs:// state path is exercised through a
@@ -32,7 +32,7 @@ URL = post_health.DASHBOARD_URL
 GH_ENV = {post_health.ghcli.TOKEN_ENV: "ghs_workflow_token"}
 
 T0 = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
-DIGEST_HOUR = 9  # Toronto; 13:00Z in September
+DIGEST_HOUR = 9  # Toronto; 13:00Z in September. The tests pin this hour; the product's default is 11 (post_health.DEFAULT_DIGEST_HOUR)
 DIGEST_UTC = 13
 
 TRIO = ["cluster-agent-crashloop-debug", "cluster-agent-crashloop-evidence-chain", "cluster-agent-crashloop-misleading-symptom"]
@@ -299,10 +299,10 @@ class RunHarness(unittest.TestCase):
         self.coverage = coverage.start()
         self.addCleanup(coverage.stop)
 
-    def tick(self, health_doc, now, environ=None, opener=None, dry_run=False, digest_hour=DIGEST_HOUR, digest_tz=None, gh=None, data=None):
+    def tick(self, health_doc, now, environ=None, opener=None, dry_run=False, digest_hour=DIGEST_HOUR, digest_tz=None, gh=None, data=None, extra=()):
         path = self.dir / "health.json"
         path.write_text(json.dumps(health_doc))
-        argv = ["--health", str(path), "--state", str(self.state), "--now", now.isoformat(), "--digest-hour", str(digest_hour)]
+        argv = ["--health", str(path), "--state", str(self.state), "--now", now.isoformat(), "--digest-hour", str(digest_hour)] + list(extra)
         if data is not None:
             data_path = self.dir / "data.json"
             data_path.write_text(data if isinstance(data, str) else json.dumps(data))
@@ -599,6 +599,38 @@ class Digest(RunHarness):
         self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
         self.assertEqual(len(self.opener.requests), 2, "the next day gets its own")
 
+    def test_the_digest_says_when_bug_filing_has_been_held_for_hours(self):
+        # The nightly bug filer's --state (#3769); no line on a non-digest tick.
+        bugs = self.dir / "nightly-bugs-state.json"
+        now = self.at(DIGEST_UTC, 5)
+        bugs.write_text(json.dumps({"held_ticks": 9, "held_since": "2026-09-04T10:30:00+00:00", "doubt": "the GraphQL cross-check could not be read", "updated_at": now.isoformat()}))
+        self.tick(health(), self.at(DIGEST_UTC - 2, 5), extra=["--bugs-state", str(bugs)])
+        self.assertEqual(self.opener.texts, [])
+        self.tick(health(), now, extra=["--bugs-state", str(bugs)])
+        self.assertIn("🚫 Nightly bug filing held since Fri 6:30 AM ET: the nightly-red issue listing is untrusted (the GraphQL cross-check could not be read)", self.opener.texts[-1])
+        # An unreadable state file costs the line, not the digest.
+        # A failed gs:// read costs the line with a warning, not the digest.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            failed = post_health.filing_lines("gs://b/s.json", now, lambda argv, **kw: GhResult(rc=1, stderr="HTTPError 503"))
+        self.assertEqual(failed, [])
+        self.assertIn("held bug-filing line skipped", err.getvalue())
+        bugs.write_text("not json")
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=5), extra=["--bugs-state", str(bugs)])
+        self.assertNotIn("bug filing held", self.opener.texts[-1])
+
+    def test_without_the_flag_the_digest_goes_out_at_the_default_hour(self):
+        # The workflow passes no --digest-hour, so DEFAULT_DIGEST_HOUR (11 AM
+        # Toronto) is the product's hour; the rest of this file pins 9.
+        path = self.dir / "health.json"
+        path.write_text(json.dumps(health()))
+        for hour_utc, sent in ((13, 0), (15, 1)):  # 9:05 AM EDT: not yet; 11:05 AM EDT: once
+            argv = ["--health", str(path), "--state", str(self.state), "--now", datetime(2026, 9, 4, hour_utc, 5, tzinfo=timezone.utc).isoformat()]
+            with contextlib.redirect_stderr(io.StringIO()):
+                post_health.main(argv, environ={post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN}, opener=self.opener, gh_runner=self.gh)
+            self.assertEqual(len(self.opener.requests), sent, f"{hour_utc}:05Z")
+        self.assertEqual(post_health.DEFAULT_DIGEST_HOUR, 11)
+
     def test_digest_hour_is_a_toronto_hour_and_the_zone_is_configurable(self):
         # 9 AM Toronto is 13:00Z in September and 14:00Z in January (DST).
         self.tick(health(), datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc))
@@ -684,7 +716,7 @@ class Digest(RunHarness):
         store.write_text("{}")
         path = self.dir / "health.json"
         path.write_text(json.dumps(health()))
-        argv = ["--health", str(path), "--state", str(self.state), "--now", self.at(DIGEST_UTC, 5).isoformat(), "--store", str(store)]
+        argv = ["--health", str(path), "--state", str(self.state), "--now", self.at(DIGEST_UTC, 5).isoformat(), "--digest-hour", str(DIGEST_HOUR), "--store", str(store)]
         with contextlib.redirect_stderr(io.StringIO()):
             post_health.main(argv, environ={post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN}, opener=self.opener, gh_runner=self.gh)
         [(args, _)] = self.coverage.call_args_list

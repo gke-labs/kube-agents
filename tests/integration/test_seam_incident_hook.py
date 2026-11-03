@@ -92,6 +92,22 @@ class IncidentHookSeamTest(unittest.TestCase):
         self.assertIn("[User reply in thread]: what are my options?", result["text"])
         self.assertIn("UNTRUSTED DATA", result["text"])
 
+    def test_an_apply_in_the_incidents_thread_is_recorded_by_the_real_server(self):
+        import sqlite3
+        thread = THREAD_ID + "-apply"
+        status, _ = http_json(
+            f"{self.kv.url}/v1/incidents",
+            payload={"chat_id": CHAT_ID, "thread_id": thread, "report": REPORT},
+        )
+        self.assertEqual(200, status)
+        self.hook.on_inbound(event=_Event("yes, apply Option B", source=_Source(thread_id=thread)))
+        self.hook.on_inbound(event=_Event("what are my options?", source=_Source(thread_id=thread)))
+        with sqlite3.connect(self.kv.db_path) as conn:
+            rows = conn.execute(
+                "SELECT COUNT(*) FROM incident_applies WHERE chat_id = ? AND thread_id = ?", (CHAT_ID, thread)
+            ).fetchone()[0]
+        self.assertEqual(1, rows, "one apply recorded, and the question not taken for one")
+
     def test_a_thread_with_no_incident_and_no_recent_reports_is_untouched(self):
         source = _Source(thread_id="spaces/BBB-other/threads/none", chat_id="spaces/BBB-other")
         self.assertIsNone(self.hook.on_inbound(event=_Event("hello", source=source)))

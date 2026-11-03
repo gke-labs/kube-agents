@@ -175,7 +175,7 @@ func TestTheSlackIntegrationRendersTheGateway(t *testing.T) {
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
 	dep := &appsv1.Deployment{}
@@ -418,9 +418,10 @@ func TestChatArmedDropsTheSlackReferences(t *testing.T) {
 // verb on Secrets - the a2a-slack-principal-map Secret is reachable by the
 // kubelet's mount alone. Every Role builder, next stack
 // and legacy, is rendered and read; a wildcard resource counts as reaching
-// them. What this does not bound is the gateway's `create` on pods, which can
-// mount a Secret into a pod it builds; buildA2AGatewayRole's comment records
-// that as the admission policy it owes.
+// them. What this does not bound is the gateway's `create` on pods, which RBAC
+// cannot keep from mounting a Secret into a pod it builds; the admission policy
+// kube-agents-a2a-gateway-pod does, where the chart installs it
+// (buildA2AGatewayRole's comment).
 func TestNoRenderedRoleReachesASecret(t *testing.T) {
 	agent := a2aTestAgent()
 	roles := map[string][]rbacv1.PolicyRule{
@@ -626,7 +627,7 @@ func TestAnUnarmedGatewayCarriesNoSlackAllowlist(t *testing.T) {
 // digest read off an absent Deployment is "" and would pass on absence.
 func gatewayDigestAfterPass(t *testing.T, ctx context.Context, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) string {
 	t.Helper()
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
 	dep := &appsv1.Deployment{}
@@ -822,7 +823,7 @@ func TestDisablingSlackLeavesTheGatewayRunning(t *testing.T) {
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
 
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("precondition: a Slack-armed gateway renders: %v", err)
 	}
 	armed := &appsv1.Deployment{}
@@ -831,7 +832,7 @@ func TestDisablingSlackLeavesTheGatewayRunning(t *testing.T) {
 	}
 
 	agent.Spec.Integration.Slack.Enabled = ptr.To(false)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A with Slack disabled: %v", err)
 	}
 	off := &appsv1.Deployment{}
@@ -853,7 +854,7 @@ func TestDisablingSlackLeavesTheGatewayRunning(t *testing.T) {
 	}
 
 	agent.Spec.Integration.Slack.Enabled = ptr.To(true)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("re-enabling Slack: %v", err)
 	}
 	back := &appsv1.Deployment{}

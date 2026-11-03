@@ -1,0 +1,154 @@
+{
+  "payload": {
+    "author": "project_1001_bot_3f2a9c",
+    "authorId": 50099001,
+    "page": 1,
+    "limit": 3
+  },
+  "responses": [
+    {
+      "__headers__": {
+        "x-total": "8",
+        "x-total-pages": "3",
+        "x-page": "1",
+        "x-per-page": "3",
+        "x-next-page": "",
+        "x-prev-page": "",
+        "content-type": "application/json"
+      },
+      "__body__": [
+        {
+          "id": 50044807,
+          "iid": 7,
+          "project_id": 1001,
+          "title": "ingest: change 7",
+          "description": "body text",
+          "state": "opened",
+          "created_at": "2026-10-03T09:00:00.000Z",
+          "updated_at": "2026-10-04T08:00:00.000Z",
+          "merged_at": null,
+          "closed_at": null,
+          "target_branch": "main",
+          "source_branch": "platform-agent/change-7",
+          "source_project_id": 1001,
+          "target_project_id": 1001,
+          "labels": [],
+          "draft": false,
+          "work_in_progress": false,
+          "author": {
+            "id": 50099001,
+            "username": "project_1001_bot_3f2a9c",
+            "name": "kube-agents",
+            "state": "active",
+            "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/50099001/avatar.png",
+            "web_url": "https://gitlab.com/project_1001_bot_3f2a9c"
+          },
+          "assignees": [],
+          "sha": "7d462311fd849dfae2341381a114157772bffd24",
+          "merge_commit_sha": null,
+          "web_url": "https://gitlab.com/acme/infra/-/merge_requests/7",
+          "references": {
+            "short": "!7",
+            "relative": "!7",
+            "full": "acme/infra!7"
+          },
+          "detailed_merge_status": "preparing",
+          "closed_by": null,
+          "merged_by": null
+        },
+        {
+          "id": 50044806,
+          "iid": 6,
+          "project_id": 1001,
+          "title": "ingest: change 6",
+          "description": "body text",
+          "state": "merged",
+          "created_at": "2026-10-02T09:00:00.000Z",
+          "updated_at": "2026-10-03T12:00:00.000Z",
+          "merged_at": "2026-10-03T12:00:00.000Z",
+          "closed_at": null,
+          "target_branch": "main",
+          "source_branch": "platform-agent/change-6",
+          "source_project_id": 1001,
+          "target_project_id": 1001,
+          "labels": [],
+          "draft": false,
+          "work_in_progress": false,
+          "author": {
+            "id": 50099001,
+            "username": "project_1001_bot_3f2a9c",
+            "name": "kube-agents",
+            "state": "active",
+            "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/50099001/avatar.png",
+            "web_url": "https://gitlab.com/project_1001_bot_3f2a9c"
+          },
+          "assignees": [],
+          "sha": "7d462311fd849dfae2341381a114157772bffd24",
+          "merge_commit_sha": null,
+          "web_url": "https://gitlab.com/acme/infra/-/merge_requests/6",
+          "references": {
+            "short": "!6",
+            "relative": "!6",
+            "full": "acme/infra!6"
+          },
+          "detailed_merge_status": "preparing",
+          "closed_by": null,
+          "merged_by": {
+            "id": 50031807,
+            "username": "example-maintainer",
+            "name": "Example Maintainer",
+            "state": "active",
+            "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/2001/avatar.png",
+            "web_url": "https://gitlab.com/example-maintainer"
+          }
+        },
+        {
+          "id": 50044805,
+          "iid": 5,
+          "project_id": 1001,
+          "title": "ingest: change 5",
+          "description": "body text",
+          "state": "closed",
+          "created_at": "2026-10-01T09:00:00.000Z",
+          "updated_at": "2026-10-02T15:00:00.000Z",
+          "merged_at": null,
+          "closed_at": "2026-10-02T15:00:00.000Z",
+          "target_branch": "main",
+          "source_branch": "platform-agent/change-5",
+          "source_project_id": 1001,
+          "target_project_id": 1001,
+          "labels": [],
+          "draft": false,
+          "work_in_progress": false,
+          "author": {
+            "id": 50099001,
+            "username": "project_1001_bot_3f2a9c",
+            "name": "kube-agents",
+            "state": "active",
+            "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/50099001/avatar.png",
+            "web_url": "https://gitlab.com/project_1001_bot_3f2a9c"
+          },
+          "assignees": [],
+          "sha": "7d462311fd849dfae2341381a114157772bffd24",
+          "merge_commit_sha": null,
+          "web_url": "https://gitlab.com/acme/infra/-/merge_requests/5",
+          "references": {
+            "short": "!5",
+            "relative": "!5",
+            "full": "acme/infra!5"
+          },
+          "detailed_merge_status": "preparing",
+          "closed_by": {
+            "id": 50031807,
+            "username": "example-maintainer",
+            "name": "Example Maintainer",
+            "state": "active",
+            "avatar_url": "https://gitlab.com/uploads/-/system/user/avatar/2001/avatar.png",
+            "web_url": "https://gitlab.com/example-maintainer"
+          },
+          "merged_by": null
+        }
+      ]
+    }
+  ]
+}

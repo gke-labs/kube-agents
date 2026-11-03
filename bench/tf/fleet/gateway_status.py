@@ -9,14 +9,15 @@ Programmed (NoResources), its listener programmed with one attached route,
 and the HTTPRoute Accepted and ResolvedRefs with no backend available
 (EndpointsNotFound).
 
-Reads the API server address and its CA from the environment, takes a fresh
-access token from `gcloud auth print-access-token` (the reconciler's own
-identity; the plan-time token the kubernetes provider holds can expire during
-a long apply), GETs each object for its generation, and merge-patches its
-status subresource. Standard library
-only: the reconcile image carries python3 and gcloud, and kubectl is not
-promised. Exits non-zero, with the API's answer, on any failure, so the apply
-fails rather than leaving a fixture that reads as a fresh Gateway.
+Reads the API server address and its CA from the environment and takes a
+fresh access token (the plan-time token the kubernetes provider holds can
+expire during a long apply): from Application Default Credentials, the
+provider's own identity, falling back to `gcloud auth print-access-token`.
+GETs each object for its generation and merge-patches its status
+subresource. Standard library only: the reconcile image carries python3 and
+gcloud, and kubectl is not promised. Exits non-zero, with the API's answer, on
+any failure, so the apply fails rather than leaving a fixture that reads as a
+fresh Gateway.
 """
 
 from __future__ import annotations
@@ -33,7 +34,15 @@ import urllib.request
 from datetime import datetime, timezone
 
 HOST_ENV = "K8S_HOST"
-TOKEN_COMMAND = ("gcloud", "auth", "print-access-token")
+# The access token, tried in order: Application Default Credentials first,
+# which the google provider also resolves when no credential variable is set,
+# then gcloud's own login.
+# Either is the reconciler's service account in CI. On a workstation the two
+# can differ, and gcloud's user token can be one the GKE API refuses (401).
+TOKEN_COMMANDS = (
+    ("gcloud", "auth", "application-default", "print-access-token"),
+    ("gcloud", "auth", "print-access-token"),
+)
 TOKEN_TIMEOUT_SECONDS = 60
 CA_ENV = "K8S_CA_BASE64"
 NAMESPACE_ENV = "FIXTURE_NAMESPACE"
@@ -102,13 +111,20 @@ def call(host: str, token: str, context: ssl.SSLContext, path: str, body: dict |
 
 
 def access_token() -> str:
-    try:
-        done = subprocess.run(list(TOKEN_COMMAND), capture_output=True, text=True, timeout=TOKEN_TIMEOUT_SECONDS, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SystemExit(f"gateway_status: {' '.join(TOKEN_COMMAND)} failed: {exc}")
-    if done.returncode != 0 or not done.stdout.strip():
-        raise SystemExit(f"gateway_status: {' '.join(TOKEN_COMMAND)} exited {done.returncode}: {done.stderr.strip()}")
-    return done.stdout.strip()
+    failures = []
+    for command in TOKEN_COMMANDS:
+        try:
+            done = subprocess.run(list(command), capture_output=True, text=True, timeout=TOKEN_TIMEOUT_SECONDS, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            failures.append(f"{' '.join(command)} failed: {exc}")
+            continue
+        if done.returncode == 0 and done.stdout.strip():
+            if failures:
+                # Say which token is in use: a later refusal then names it.
+                sys.stderr.write(f"gateway_status: token from {' '.join(command)} after {'; '.join(failures)}\n")
+            return done.stdout.strip()
+        failures.append(f"{' '.join(command)} exited {done.returncode}: {done.stderr.strip()}")
+    raise SystemExit("gateway_status: no access token; " + "; ".join(failures))
 
 
 def main() -> int:

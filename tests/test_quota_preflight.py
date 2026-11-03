@@ -17,6 +17,7 @@ first two directly, which is what lets them assert the arithmetic and the pass/f
 decision rather than only that the templates exist.
 """
 
+import contextlib
 import json
 import math
 import pathlib
@@ -66,17 +67,18 @@ data:
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here.
 _DEFAULT_PODS = 7
-_DEFAULT_REQUESTS_CPU_MILLIS = 2466
-_DEFAULT_LIMITS_CPU_MILLIS = 10200
+_DEFAULT_REQUESTS_CPU_MILLIS = 2506
+_DEFAULT_LIMITS_CPU_MILLIS = 11200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
 _DEFAULT_REQUESTS_MEMORY_BYTES = 8896 * 1024**2
 _DEFAULT_LIMITS_MEMORY_BYTES = 23424 * 1024**2
-# Ephemeral-storage requests: the footprint's 5Gi, LiteLLM's 1280Mi per replica (its tmp
-# emptyDir's sizeLimit plus logs) on two replicas, and the cleanup hook's 1088Mi.
+# Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
+# proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
+# replicas, and the cleanup hook's 1088Mi.
 _LITELLM_EPHEMERAL_REQUEST_BYTES = 1280 * 1024**2
-_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (5 * 1024 + 2 * 1280 + 1088) * 1024**2
+_DEFAULT_REQUESTS_EPHEMERAL_BYTES = (11 * 1024 + 2 * 1280 + 1088) * 1024**2
 # The same three additions, because each sets its limit equal to its request.
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = _DEFAULT_REQUESTS_EPHEMERAL_BYTES
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
@@ -100,8 +102,8 @@ _HA_REPLICAS = 2
 # The largest pod that rolls with a surge Pod at defaults: LiteLLM, at a 100m CPU request.
 # The agent pod is larger but rolls with Recreate at the default single replica.
 _LARGEST_SURGING_REQUEST_MILLIS = 100
-# The operator's own request.
-_OPERATOR_REQUEST_MILLIS = 10
+# The operator's own request: the smallest GKE Autopilot admits unchanged beside 128Mi.
+_OPERATOR_REQUEST_MILLIS = 50
 # Two operator-rendered claims plus two from the shell StatefulSet's volumeClaimTemplates.
 _OPERATOR_PVC_COUNT = 4
 _OPERATOR_STORAGE_BYTES = 102 * 1024**3
@@ -133,17 +135,24 @@ _MILLICORES_PER_CORE = 1000
 # entry per key, as the operator does, so only the overridden number moves.
 _PROXY_MEMORY_LIMIT_BYTES = 2 * 1024**3
 _PROXY_MEMORY_REQUEST_BYTES = 1024**3
-_PROXY_CPU_LIMIT_MILLIS = 1000
+_PROXY_CPU_LIMIT_MILLIS = 2000
 _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES = 3 * 1024**3
-_PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 2000
-_PROXY_FLOAT_CPU_LIMIT = 1.5
-_PROXY_FLOAT_CPU_LIMIT_MILLIS = 1500
+_PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 4000
+# A request between the 1Gi default and the 2Gi limit, so the override moves the total.
+_PROXY_OVERRIDE_MEMORY_REQUEST_BYTES = 1536 * 1024**2
+_PROXY_FLOAT_CPU_LIMIT = 2.5
+_PROXY_FLOAT_CPU_LIMIT_MILLIS = 2500
 # The operator renders no ephemeral-storage request on the proxy, so the API server sets it
-# to the limit: footprint.yaml's 2Gi request is that defaulting, and it follows an override
+# to the limit: footprint.yaml's 8Gi request is that defaulting, and it follows an override
 # of the limit alone.
-_PROXY_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
+_PROXY_EPHEMERAL_LIMIT_BYTES = 8 * 1024**3
 _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
+# The API kube-agents.gkeAutopilot reads: the resource the operator's isGKEAutopilot probes,
+# at any served version.
+_AUTOPILOT_API = "auto.gke.io/v1/AllowlistedWorkload"
+_AUTOPILOT_API_V1BETA1 = "auto.gke.io/v1beta1/AllowlistedWorkload"
+_AUTOPILOT_API_V2 = "auto.gke.io/v2/AllowlistedWorkload"
 
 # The agent-api-auth sidecar's defaults (agentAPIAuth* in platformagent_manifests.go);
 # it is one container of the agent pod, so these are already in agentPod.base and an
@@ -159,6 +168,10 @@ _AA_OVERRIDE_CPU_LIMIT_MILLIS = 2000
 _AA_OVERRIDE_CPU_REQUEST_MILLIS = 500
 _AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _AA_VALUE = "platformAgent.deployment.agentAPIAuth.resources"
+# The operator's own resources block, which the preflight sums and holds to its memory floor.
+_OPERATOR_VALUE = "operator.resources"
+# What releases up to 0.16.0 shipped for the manager's memory limit, under the 512Mi floor.
+_OPERATOR_LEGACY_MEMORY_LIMIT = "128Mi"
 
 
 def _parse_gib_or_mib(quantity: str) -> int:
@@ -223,8 +236,8 @@ class PreflightDecisionTest(unittest.TestCase):
         finally:
             pathlib.Path(values_path).unlink(missing_ok=True)
 
-    def _requirements(self, sets: list[str] | None = None, values: dict | None = None) -> dict:
-        res = self._render({"probe": {"emitRequirements": True}, **(values or {})}, sets)
+    def _requirements(self, sets: list[str] | None = None, values: dict | None = None, extra_args: list[str] | None = None) -> dict:
+        res = self._render({"probe": {"emitRequirements": True}, **(values or {})}, sets, extra_args)
         self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
         for doc in yaml.safe_load_all(res.stdout):
             if doc and doc.get("metadata", {}).get("name") == "probe-requirements":
@@ -281,15 +294,8 @@ class PreflightDecisionTest(unittest.TestCase):
         The CR template refuses a size above 64Ti first, so this renders a copy
         without it, to reach the preflight's own arithmetic.
         """
-        with tempfile.TemporaryDirectory() as tmp:
-            chart = pathlib.Path(tmp) / "kube-agents"
-            shutil.copytree(self.chart, chart)
-            (chart / "templates" / "platform-agent-cr.yaml").unlink()
-            original, self.chart = self.chart, chart
-            try:
-                req = self._requirements(["platformAgent.storage.size=9Ei"])
-            finally:
-                self.chart = original
+        with self._chart_without("platform-agent-cr.yaml"):
+            req = self._requirements(["platformAgent.storage.size=9Ei"])
         self.assertEqual(req["requestsStorage"], 2**63 - 1)
 
     def test_credential_proxy_memory_limit_override_moves_only_that_total(self) -> None:
@@ -313,12 +319,12 @@ class PreflightDecisionTest(unittest.TestCase):
     def test_credential_proxy_request_and_cpu_overrides_are_each_counted(self) -> None:
         base = self._requirements()
         raised = self._requirements([
-            f"{_PROXY_VALUE}.requests.memory={_PROXY_MEMORY_LIMIT_BYTES}",
+            f"{_PROXY_VALUE}.requests.memory={_PROXY_OVERRIDE_MEMORY_REQUEST_BYTES}",
             f"{_PROXY_VALUE}.limits.cpu={_PROXY_OVERRIDE_CPU_LIMIT_MILLIS}m",
         ])
         self.assertEqual(
             raised["requestsMemory"] - base["requestsMemory"],
-            _PROXY_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_REQUEST_BYTES,
+            _PROXY_OVERRIDE_MEMORY_REQUEST_BYTES - _PROXY_MEMORY_REQUEST_BYTES,
         )
         self.assertEqual(
             raised["limitsCpu"] - base["limitsCpu"],
@@ -327,6 +333,46 @@ class PreflightDecisionTest(unittest.TestCase):
         # A request the override does not name keeps the footprint's, not the new limit.
         self.assertEqual(raised["requestsCpu"], base["requestsCpu"])
         self.assertEqual(raised["limitsMemory"], base["limitsMemory"])
+
+    def test_a_credential_proxy_limit_alone_below_the_default_request_lowers_it(self) -> None:
+        # The operator lowers a cpu or memory request the override does not set to a
+        # limit set below it (resolveCredentialProxyResources); the preflight counts that.
+        base = self._requirements()
+        for sets, key, delta in (
+            ([f"{_PROXY_VALUE}.limits.cpu=200m"], "requestsCpu", 200 - 500),
+            ([f"{_PROXY_VALUE}.limits.memory=768Mi"], "requestsMemory", (768 - 1024) * 1024**2),
+            ([f"{_PROXY_VALUE}.limits.cpu=4"], "requestsCpu", 0),
+        ):
+            with self.subTest(sets=sets):
+                self.assertEqual(self._requirements(sets)[key] - base[key], delta)
+
+    def test_credential_proxy_on_autopilot_counts_the_autopilot_requests(self) -> None:
+        # On Autopilot the operator requests 2 CPU and 2Gi (credentialProxyAutopilot*), and a
+        # CPU request the override does not set stays at one CPU per GiB of memory or under.
+        autopilot = ["--api-versions", _AUTOPILOT_API]
+        base = self._requirements()
+        on = self._requirements(extra_args=autopilot)
+        self.assertEqual(on["requestsCpu"] - base["requestsCpu"], 2000 - 500)
+        self.assertEqual(on["requestsMemory"] - base["requestsMemory"], (2048 - 1024) * 1024**2)
+        self.assertEqual(on["limitsCpu"], base["limitsCpu"])
+        lowered = self._requirements([f"{_PROXY_VALUE}.limits.memory=1536Mi"], extra_args=autopilot)
+        self.assertEqual(lowered["requestsMemory"] - base["requestsMemory"], (1536 - 1024) * 1024**2)
+        self.assertEqual(lowered["requestsCpu"] - base["requestsCpu"], 1500 - 500)
+        # Standard does not hold the CPU request to the band.
+        small = self._requirements([f"{_PROXY_VALUE}.requests.memory=256Mi"])
+        self.assertEqual(small["requestsCpu"], base["requestsCpu"])
+        small_on = self._requirements([f"{_PROXY_VALUE}.requests.memory=256Mi"], extra_args=autopilot)
+        self.assertEqual(small_on["requestsCpu"] - base["requestsCpu"], 250 - 500)
+        # A cluster serving the resource at v1beta1 only is Autopilot to the operator too.
+        self.assertEqual(self._requirements(extra_args=["--api-versions", _AUTOPILOT_API_V1BETA1]), on)
+        self.assertEqual(self._requirements(extra_args=["--api-versions", _AUTOPILOT_API_V2]), on)
+        # Another resource in the group is not Autopilot: Standard serves auto.gke.io too.
+        self.assertEqual(self._requirements(extra_args=["--api-versions", "auto.gke.io/v1/WorkloadAllowlist"]), base)
+        # Just under 2Gi rounds the CPU request down to the 250m step, as the operator does.
+        under = self._requirements([f"{_PROXY_VALUE}.limits.memory=2147483647"], extra_args=autopilot)
+        self.assertEqual(under["requestsCpu"] - base["requestsCpu"], 1750 - 500)
+        at_floor = self._requirements([f"{_PROXY_VALUE}.limits.memory=672Mi"], extra_args=autopilot)
+        self.assertEqual(at_floor["requestsCpu"] - base["requestsCpu"], 500 - 500)
 
     def test_credential_proxy_cpu_written_as_a_float_is_counted(self) -> None:
         # A values file's `cpu: 1.5` arrives as a YAML float, not the string `--set` gives.
@@ -358,7 +404,7 @@ class PreflightDecisionTest(unittest.TestCase):
         """An override of limits.ephemeral-storage alone is counted as a request of the same size.
 
         The operator renders no ephemeral-storage request, so the API server defaults it to
-        the limit; counting the footprint's 2Gi against a 10Gi limit passes a quota with 2
+        the limit; counting the footprint's 8Gi against a 10Gi limit passes a quota with 8
         to 10Gi of request headroom that then refuses the pod.
         """
         base = self._requirements()
@@ -438,22 +484,69 @@ class PreflightDecisionTest(unittest.TestCase):
         # Helm renders quota-preflight.yaml before the CR template, so the preflight's own
         # read of the override is the first to see it. The CR template is removed from this
         # copy, so the message can only come from kube-agents.credentialProxyFootprint.
+        with self._chart_without("platform-agent-cr.yaml"):
+            for value in ("-1Gi", "abc", "2GB"):
+                res = self._render({"probe": {"emitRequirements": True}},
+                                   [f"{_PROXY_VALUE}.limits.memory={value}"])
+                self.assertNotEqual(res.returncode, 0, res.stdout)
+                self.assertIn(f"{_PROXY_VALUE}.limits.memory is", res.stderr)
+                self.assertNotIn("cannot parse quantity", res.stderr)
+            res = self._render({"probe": {"emitRequirements": True}}, [f"{_PROXY_VALUE}.limits=2Gi"])
+            self.assertIn(f"{_PROXY_VALUE}.limits is 2Gi, which is not a map", res.stderr)
+
+    @contextlib.contextmanager
+    def _chart_without(self, template: str):
+        """Point self.chart at a copy of the chart with one template removed, so a message
+        about a value that template also reads can only come from the preflight's own read."""
         with tempfile.TemporaryDirectory() as tmp:
             chart = pathlib.Path(tmp) / "kube-agents"
             shutil.copytree(self.chart, chart)
-            (chart / "templates" / "platform-agent-cr.yaml").unlink()
+            (chart / "templates" / template).unlink()
             original, self.chart = self.chart, chart
             try:
-                for value in ("-1Gi", "abc", "2GB"):
-                    res = self._render({"probe": {"emitRequirements": True}},
-                                       [f"{_PROXY_VALUE}.limits.memory={value}"])
-                    self.assertNotEqual(res.returncode, 0, res.stdout)
-                    self.assertIn(f"{_PROXY_VALUE}.limits.memory is", res.stderr)
-                    self.assertNotIn("cannot parse quantity", res.stderr)
-                res = self._render({"probe": {"emitRequirements": True}}, [f"{_PROXY_VALUE}.limits=2Gi"])
-                self.assertIn(f"{_PROXY_VALUE}.limits is 2Gi, which is not a map", res.stderr)
+                yield
             finally:
                 self.chart = original
+
+    def _render_without_operator_template(self, sets: list[str]):
+        """Render the probe with templates/operator-deployment.yaml removed, so a message
+        about operator.resources can only come from the preflight's own read of it."""
+        with self._chart_without("operator-deployment.yaml"):
+            return self._render({"probe": {"emitRequirements": True}}, sets)
+
+    def test_operator_memory_limit_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
+        # Helm renders quota-preflight.yaml before operator-deployment.yaml, so the
+        # preflight's read of operator.resources is the first to see it; without its own
+        # call to kube-agents.operatorResourcesCheck, parseBytes refuses a bad value with
+        # "please report it" and never names the key.
+        res = self._render_without_operator_template([f"{_OPERATOR_VALUE}.limits.memory=lots"])
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertIn(f'{_OPERATOR_VALUE}.limits.memory is "lots", which is not a Kubernetes quantity', res.stderr)
+        self.assertNotIn("cannot parse quantity", res.stderr)
+
+    def test_operator_memory_limit_under_the_floor_fails_in_the_preflight(self) -> None:
+        # The legacy limit parses, so parseBytes would have summed it quietly; the floor
+        # check in the preflight is what refuses it before the operator template could.
+        res = self._render_without_operator_template(
+            [f"{_OPERATOR_VALUE}.limits.memory={_OPERATOR_LEGACY_MEMORY_LIMIT}"]
+        )
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertIn(
+            f"{_OPERATOR_VALUE}.limits.memory is {_OPERATOR_LEGACY_MEMORY_LIMIT}, under the 512Mi floor",
+            res.stderr,
+        )
+
+    def test_operator_disabled_leaves_a_bad_operator_memory_limit_alone(self) -> None:
+        # No manager is rendered, so there is no limit to hold to the floor: a release that
+        # brings its own operator (operator.enabled=false) with a legacy block in its reused
+        # values renders, as the workload loop and the operator template skip it too.
+        req = self._requirements(
+            [
+                "operator.enabled=false",
+                f"{_OPERATOR_VALUE}.limits.memory={_OPERATOR_LEGACY_MEMORY_LIMIT}",
+            ]
+        )
+        self.assertEqual(req["pods"], _DEFAULT_PODS - 1)
 
     def test_agent_api_auth_refused_override_counts_defaults(self) -> None:
         """An override the operator refuses is rendered at defaults, Degraded, so the
@@ -523,21 +616,14 @@ class PreflightDecisionTest(unittest.TestCase):
         # The footprint path reads the override too; with the CR template removed, a bad
         # quantity or a non-map side can only be caught by kube-agents.agentAPIAuthResourcesCheck
         # in the preflight, naming the key rather than reaching parseBytes as garbage.
-        with tempfile.TemporaryDirectory() as tmp:
-            chart = pathlib.Path(tmp) / "kube-agents"
-            shutil.copytree(self.chart, chart)
-            (chart / "templates" / "platform-agent-cr.yaml").unlink()
-            original, self.chart = self.chart, chart
-            try:
-                for value in ("-1Gi", "abc", "2GB"):
-                    res = self._render({"probe": {"emitRequirements": True}},
-                                       [f"{_AA_VALUE}.limits.memory={value}"])
-                    self.assertNotEqual(res.returncode, 0, res.stdout)
-                    self.assertIn(f"{_AA_VALUE}.limits.memory is", res.stderr)
-                res = self._render({"probe": {"emitRequirements": True}}, [f"{_AA_VALUE}.limits=4Gi"])
-                self.assertIn(f"{_AA_VALUE}.limits is 4Gi, which is not a map", res.stderr)
-            finally:
-                self.chart = original
+        with self._chart_without("platform-agent-cr.yaml"):
+            for value in ("-1Gi", "abc", "2GB"):
+                res = self._render({"probe": {"emitRequirements": True}},
+                                   [f"{_AA_VALUE}.limits.memory={value}"])
+                self.assertNotEqual(res.returncode, 0, res.stdout)
+                self.assertIn(f"{_AA_VALUE}.limits.memory is", res.stderr)
+            res = self._render({"probe": {"emitRequirements": True}}, [f"{_AA_VALUE}.limits=4Gi"])
+            self.assertIn(f"{_AA_VALUE}.limits is 4Gi, which is not a map", res.stderr)
 
     def test_disabling_the_dashboard_drops_it_from_the_total(self) -> None:
         """The flag is harness.hermes.dashboardEnabled, one level deeper than harness.
@@ -1166,7 +1252,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.cpu quota must fail")
         self.assertIn("  - limits.cpu:", res.stderr)
-        self.assertIn('"limits.cpu":"10700m"', res.stderr)
+        self.assertIn('"limits.cpu":"11700m"', res.stderr)
 
     def test_limits_memory_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.memory must be refused and named in the patch."""
@@ -1186,8 +1272,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small limits.ephemeral-storage quota must fail"
         )
         self.assertIn("  - limits.ephemeral-storage:", res.stderr)
-        # The release's 8768Mi plus one LiteLLM surge Pod's 1280Mi.
-        self.assertIn('"limits.ephemeral-storage":"10048Mi"', res.stderr)
+        # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"limits.ephemeral-storage":"16192Mi"', res.stderr)
 
     def test_shorthand_cpu_spelling_is_enforced(self) -> None:
         """`cpu` is the shorthand spelling for `requests.cpu` and must be checked."""
@@ -1196,7 +1282,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        self.assertIn('"cpu":"2566m"', res.stderr)
+        # The release's 2506m plus one LiteLLM surge Pod's 100m.
+        self.assertIn('"cpu":"2606m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -1216,8 +1303,8 @@ class PreflightDecisionTest(unittest.TestCase):
             res.returncode, 0, "a too-small ephemeral-storage shorthand quota must fail"
         )
         self.assertIn("  - ephemeral-storage:", res.stderr)
-        # The release's 8768Mi plus one LiteLLM surge Pod's 1280Mi.
-        self.assertIn('"ephemeral-storage":"10048Mi"', res.stderr)
+        # The release's 14912Mi plus one LiteLLM surge Pod's 1280Mi.
+        self.assertIn('"ephemeral-storage":"16192Mi"', res.stderr)
 
     def test_shorthand_storage_spelling_is_enforced(self) -> None:
         """`storage` is the shorthand spelling for `requests.storage`."""
@@ -1267,16 +1354,16 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["base"]["cpuMillisLimit"], 4500)
         self.assertEqual(op["agentPod"]["dashboard"]["cpuMillisLimit"], 1000)
         self.assertEqual(op["shellSandbox"]["cpuMillisLimit"], 2000)
-        self.assertEqual(op["credentialProxy"]["cpuMillisLimit"], 1000)
+        self.assertEqual(op["credentialProxy"]["cpuMillisLimit"], 2000)
 
-        # Total operator limits on default install: 4500 + 1000 + 2000 + 1000 = 8500m (8.5 CPU)
+        # Total operator limits on default install: 4500 + 1000 + 2000 + 2000 = 9500m (9.5 CPU)
         total_op_cpu_limit = (
             op["agentPod"]["base"]["cpuMillisLimit"]
             + op["agentPod"]["dashboard"]["cpuMillisLimit"]
             + op["shellSandbox"]["cpuMillisLimit"]
             + op["credentialProxy"]["cpuMillisLimit"]
         )
-        self.assertEqual(total_op_cpu_limit, 8500)
+        self.assertEqual(total_op_cpu_limit, 9500)
 
         # Memory, in the same shape. A generator that stopped parsing memory would emit 0
         # here; `--check` alone would not catch that if the regenerated file were committed
@@ -1292,13 +1379,13 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["dashboard"]["ephemeralStorageBytesLimit"], 0)
         self.assertEqual(op["shellSandbox"]["ephemeralStorageBytesLimit"], 0)
         self.assertEqual(
-            op["credentialProxy"]["ephemeralStorageBytesLimit"], 2 * 1024**3
+            op["credentialProxy"]["ephemeralStorageBytesLimit"], 8 * 1024**3
         )
         self.assertEqual(op["agentPod"]["base"]["ephemeralStorageBytesRequest"], 3 * 1024**3)
         self.assertEqual(op["agentPod"]["dashboard"]["ephemeralStorageBytesRequest"], 0)
         self.assertEqual(op["shellSandbox"]["ephemeralStorageBytesRequest"], 0)
         self.assertEqual(
-            op["credentialProxy"]["ephemeralStorageBytesRequest"], 2 * 1024**3
+            op["credentialProxy"]["ephemeralStorageBytesRequest"], 8 * 1024**3
         )
 
         self.assertEqual(op["storage"]["persistentVolumeClaims"], _OPERATOR_PVC_COUNT)

@@ -35,7 +35,7 @@ LANE_ENTRY = "no-github-writes-the-case-did-not-request"
 # every run gets it unless the test says otherwise.
 READ_CREDENTIAL = {"BENCH_GITHUB_TOKEN": "test-read-token"}
 # What the shell running the tests may export that the step reads.
-STEP_INPUTS = ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO", "EVAL_FORGE", "EVAL_LEDGER_APP_KEY_FILE", "BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
+STEP_INPUTS = ("AGENT_TRANSPORT", "BENCH_GITOPS_REPO", "EVAL_GITOPS_REPO", "EVAL_FORGE", "EVAL_FORGE_KIND", "EVAL_LEDGER_APP_KEY_FILE", "BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
 # `uv run python -m ...` answered by python3 with bench/ on the path: the
 # real lane module, without the virtualenv the presubmit has. Anything else
@@ -254,7 +254,8 @@ class InjectLaneTest(unittest.TestCase):
         GITHUB_TOKEN, so on GitHub with no ledger key to mint one from the
         step refuses, as it does without a repository."""
         repo = {"EVAL_LEDGER_REPO_FOR_TEST": "gke-agentic/kube-agents-evals-21-infra"}
-        for forge in ({}, {"EVAL_FORGE": "github"}):
+        # A GitHub Enterprise row is the GitHub kind: it grades through the same reader and refuses the same way.
+        for forge in ({}, {"EVAL_FORGE": "github"}, {"EVAL_FORGE": "ghes", "EVAL_FORGE_KIND": "github"}):
             with self.subTest(forge=forge):
                 result = run_step(self.lane(**repo, **forge), credential={})
                 self.assertNotEqual(result.returncode, 0)
@@ -340,13 +341,14 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         """
     )
 
-    def run_fanout(self, requesting: str, stopped: str = "") -> list[str]:
+    def run_fanout(self, requesting: str, stopped: str = "", alone: str = "") -> list[str]:
         body = "\n".join(
             [
                 "set -euo pipefail",
                 self.STUBS,
                 f'INJECT_LANE_REQUESTING="{requesting}"',
                 f'STOPPED_ASK_CASES="{stopped}"',
+                f'WRITES_ALONE_CASES="{alone}"',
                 lifted_block(r"^# Two phases on both lanes.*?^fi$"),
                 'echo "TOTAL=$((UNIT_TOTAL + WRITER_TOTAL))"',
             ]
@@ -389,6 +391,17 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         self.assertEqual(len(v_starts), 2)
         self.assertLess(max(others_ended), min(v_starts))
         self.assertTrue(any("the stopped asks (v)" in line for line in lines))
+
+    def test_a_writes_alone_case_runs_in_the_second_phase_without_requesting(self):
+        """A case that declares writes_alone requests nothing, but its window
+        is exclusive, so it must run alone after every other unit."""
+        lines = self.run_fanout("", alone="v")
+        self.assertIn("TOTAL=8", lines)
+        v_starts = [i for i, line in enumerate(lines) if line.startswith("START v")]
+        others_ended = [i for i, line in enumerate(lines) if line.startswith("END ") and not line.startswith("END v")]
+        self.assertEqual(len(v_starts), 2)
+        self.assertLess(max(others_ended), min(v_starts))
+        self.assertTrue(any("the writes_alone cases (v)" in line for line in lines))
 
     def test_the_settle_equals_the_lane_safeguards_clock_skew(self):
         """The settle exists so a write in the last seconds of the unit before
@@ -450,6 +463,33 @@ class StoppedAsksTest(unittest.TestCase):
 
     def test_another_lane_names_none(self):
         self.assertEqual(self.run_block("api"), "STOPPED=")
+
+    ALONE_CASE = "./tasks/provisioning-cluster-request-never-creates/task.yaml"
+
+    def run_writes_alone_block(self, transport: str) -> str:
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                UV_STUB,
+                f'BENCH_DIR="{BENCH_DIR}"',
+                'EVAL_INJECT_TRANSPORT="inject"',
+                f'AGENT_TRANSPORT="{transport}"',
+                f'TASKS=("{self.STOP_CASE}" "{self.ALONE_CASE}" "{self.OTHER_CASE}")',
+                lifted_block(r'^WRITES_ALONE_CASES="".*?^fi$'),
+                'echo "ALONE=${WRITES_ALONE_CASES}"',
+            ]
+        )
+        result = subprocess.run(["bash", "-c", body], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return next(line for line in result.stdout.splitlines() if line.startswith("ALONE="))
+
+    def test_a_writes_alone_case_is_listed_on_every_transport_and_a_stopped_ask_is_not(self):
+        # The stopped ask's premise needs the inject door; a writes_alone case
+        # is placed in the second phase wherever it runs, since the lane marks
+        # its window exclusive.
+        for transport in ("inject", "api"):
+            with self.subTest(transport=transport):
+                self.assertEqual(self.run_writes_alone_block(transport), "ALONE=provisioning-cluster-request-never-creates")
 
     def test_the_unit_hands_the_bench_the_resolved_path(self):
         src = SCRIPT.read_text(encoding="utf-8")

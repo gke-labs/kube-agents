@@ -20,7 +20,7 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # already shows the verdict the message names.
 # The weekly health email renders after the bug filer and is
 # published beside data.json; its summary is posted to the same space once a
-# week, Monday from 9 AM Toronto (scripts/eval_dashboard/weekly_chat.py).
+# week, Monday from 11 AM Toronto (scripts/eval_dashboard/weekly_chat.py).
 #
 # Two identities, each least-privilege for its half, which is why the
 # refresh script is not invoked as one unit here: it couples collect and
@@ -118,11 +118,14 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # every tick in dry run -- it reads the open issues and prints what it would
 # file, comment and assign -- and writes only when the repository variable
 # NIGHTLY_BUGS_LIVE is `true` (a maintainer arms it after reading a few dry
-# runs) and CI_HEALTH_MUTE is not. It runs before the post, so the 9 AM
+# runs) and CI_HEALTH_MUTE is not. It runs before the post, so the 11 AM
 # digest's nightly section (scripts/eval_dashboard/nightly_digest.py) reads
-# the issues it filed that tick. The section turns owners' GitHub logins
-# into Chat mentions through the CI_HEALTH_CHAT_MENTIONS secret (a JSON
-# object, login -> Chat user id); without it the logins print as text.
+# the issues it filed that tick. Armed, it counts the ticks it held for an
+# untrusted issue listing in nightly-bugs-state.json beside health.json, and
+# the digest says so once the hold has lasted about two hours. The section
+# turns owners' GitHub logins into Chat mentions through the
+# CI_HEALTH_CHAT_MENTIONS secret (a JSON object, login -> Chat user id);
+# without it the logins print as text.
 # A fourth, scripts/eval_dashboard/coverage_gaps.py, keeps one
 # `presubmit-gate` issue open per domain with no blocking roster seat,
 # assigned to the domain owner, and closes it when the domain is covered
@@ -309,7 +312,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ".python-version"
 
@@ -724,7 +727,9 @@ jobs:
         run: |
           mode=--dry-run
           if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
-          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json "$mode"
+          # --state counts the live ticks held on an untrusted issue listing,
+          # for the digest's held-filing line (post step, --bugs-state).
+          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json --state "$DASHBOARD_BUCKET/nightly-bugs-state.json" "$mode"
 
       # One `presubmit-gate` issue per domain with no blocking roster seat,
       # assigned to the domain owner, kept current, closed when a roster case
@@ -768,7 +773,8 @@ jobs:
           # without one: every login is then printed as plain text.
           CI_HEALTH_CHAT_MENTIONS: ${{ secrets.CI_HEALTH_CHAT_MENTIONS || '' }}
         run: |
-          # --digest-hour is a Toronto hour (the poster's default zone).
+          # The digest hour is post_health.DEFAULT_DIGEST_HOUR (11, Toronto, the
+          # poster's default zone); --digest-hour would override it.
           # --data is the data.json this tick collected (or, after a failed
           # collect, the bucket's): the digest's nightly section reads last
           # night's run from it.
@@ -780,8 +786,8 @@ jobs:
             --health work/health.json \
             --data work/data.json \
             "${store_args[@]}" \
-            --state "$DASHBOARD_BUCKET/health-state.json" \
-            --digest-hour 9
+            --bugs-state "$DASHBOARD_BUCKET/nightly-bugs-state.json" \
+            --state "$DASHBOARD_BUCKET/health-state.json"
 
       # One comment per pull request whose smoke run went red, or lost its
       # build node, since the last tick (header). The script exits 0 on a
@@ -823,7 +829,7 @@ jobs:
           gcloud storage cp --cache-control=no-cache work/health-email.html "$DASHBOARD_BUCKET/health-email.html"
 
       # The weekly summary (docs/ci-health.md, "The weekly health email"):
-      # posted once a week, on the first tick from Monday 9 AM Toronto, for
+      # posted once a week, on the first tick from Monday 11 AM Toronto, for
       # the week the page just published covers; weekly-chat-state.json
       # records the week posted, so later ticks and re-runs stay silent. Only
       # after a render that passed and was uploaded, so the post never links
@@ -877,7 +883,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ".python-version"
 

@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -63,16 +64,22 @@ func assertQuantity(t *testing.T, list corev1.ResourceList, name corev1.Resource
 }
 
 // TestCredentialProxyResourcesDefaultToTheOperatorsValues pins the values the
-// goldens, footprint.yaml and the chart's quota preflight all carry: a nil CR
-// override renders exactly what the literals rendered before the field existed.
+// goldens, footprint.yaml and the chart's quota preflight all carry: 500m and
+// 1Gi requests on Standard, 2 CPU and 2Gi on Autopilot, and a 2 CPU limit on
+// both (#4106).
 func TestCredentialProxyResourcesDefaultToTheOperatorsValues(t *testing.T) {
 	for _, deployment := range []*agentv1alpha1.DeploymentSpec{nil, {}, {CredentialProxy: &agentv1alpha1.CredentialProxySpec{}}} {
+		autopilot := resolveCredentialProxyResourcesFor(deployment, true)
+		assertQuantity(t, autopilot.Requests, corev1.ResourceCPU, "2")
+		assertQuantity(t, autopilot.Requests, corev1.ResourceMemory, "2Gi")
+		assertQuantity(t, autopilot.Limits, corev1.ResourceCPU, "2")
+		assertQuantity(t, autopilot.Limits, corev1.ResourceMemory, "2Gi")
 		got := resolveCredentialProxyResources(deployment)
 		assertQuantity(t, got.Requests, corev1.ResourceCPU, "500m")
 		assertQuantity(t, got.Requests, corev1.ResourceMemory, "1Gi")
-		assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
+		assertQuantity(t, got.Limits, corev1.ResourceCPU, "2")
 		assertQuantity(t, got.Limits, corev1.ResourceMemory, "2Gi")
-		assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "2Gi")
+		assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "8Gi")
 		if len(got.Requests) != 2 || len(got.Limits) != 3 {
 			t.Errorf("default render carries %d requests and %d limits, want 2 and 3", len(got.Requests), len(got.Limits))
 		}
@@ -95,8 +102,108 @@ func TestCredentialProxyMemoryLimitOverrideKeepsTheOtherDefaults(t *testing.T) {
 	assertQuantity(t, got.Limits, corev1.ResourceMemory, "3Gi")
 	assertQuantity(t, got.Requests, corev1.ResourceCPU, "500m")
 	assertQuantity(t, got.Requests, corev1.ResourceMemory, "1Gi")
+	assertQuantity(t, got.Limits, corev1.ResourceCPU, "2")
+	assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "8Gi")
+}
+
+// TestCredentialProxyLimitSetAloneBelowTheDefaultRequestLowersTheRequest: a CR
+// that sets only a limit below the default request (limits.cpu 1 or
+// limits.memory 1536Mi against Autopilot's 2 CPU and 2Gi, limits.cpu 200m
+// against Standard's 500m) renders that limit as its request rather than a
+// crossed pair the API server and the validation refuse. A limit above the
+// default request, or a request the CR sets itself, is left as written.
+func TestCredentialProxyLimitSetAloneBelowTheDefaultRequestLowersTheRequest(t *testing.T) {
+	cpuAlone := proxyAgentWithResources(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+	}).Spec.Deployment
+	got := resolveCredentialProxyResourcesFor(cpuAlone, true)
+	assertQuantity(t, got.Requests, corev1.ResourceCPU, "1")
 	assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
-	assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "2Gi")
+	assertQuantity(t, got.Requests, corev1.ResourceMemory, "2Gi")
+
+	standard := resolveCredentialProxyResources(proxyAgentWithResources(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
+	}).Spec.Deployment)
+	assertQuantity(t, standard.Requests, corev1.ResourceCPU, "200m")
+	assertQuantity(t, standard.Requests, corev1.ResourceMemory, "1Gi")
+
+	raised := resolveCredentialProxyResourcesFor(proxyAgentWithResources(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+	}).Spec.Deployment, true)
+	assertQuantity(t, raised.Requests, corev1.ResourceCPU, "2")
+	assertQuantity(t, raised.Limits, corev1.ResourceCPU, "4")
+
+	explicit := resolveCredentialProxyResources(proxyAgentWithResources(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+	}).Spec.Deployment)
+	assertQuantity(t, explicit.Requests, corev1.ResourceCPU, "3")
+	if errs, _ := ValidateCredentialProxyResources(proxyAgentWithResources(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+	}).Spec.Deployment, credentialProxyResourcesPath); len(errs) == 0 {
+		t.Error("an explicit cpu request above its limit was admitted; want refused")
+	}
+	if errs, _ := ValidateCredentialProxyResources(proxyAgentWithResources(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")},
+	}).Spec.Deployment, credentialProxyResourcesPath); len(errs) != 0 {
+		t.Errorf("a memory limit set alone under the default request was refused: %v", errs)
+	}
+}
+
+// TestCredentialProxyAutopilotCPURequestStaysInTheBand: on Autopilot a memory
+// request lowered below 2Gi (here by a limit set alone) takes a CPU request the
+// CR did not set down to one CPU per GiB, so Autopilot's band does not raise
+// the memory back over the CR's limit. A CPU request the CR sets is kept, and
+// Standard is not touched.
+func TestCredentialProxyAutopilotCPURequestStaysInTheBand(t *testing.T) {
+	memoryAlone := proxyAgentWithResources(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")},
+	}).Spec.Deployment
+	got := resolveCredentialProxyResourcesFor(memoryAlone, true)
+	assertQuantity(t, got.Requests, corev1.ResourceMemory, "1536Mi")
+	assertQuantity(t, got.Requests, corev1.ResourceCPU, "1500m")
+	assertQuantity(t, got.Limits, corev1.ResourceCPU, "2")
+
+	explicit := resolveCredentialProxyResourcesFor(proxyAgentWithResources(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")},
+	}).Spec.Deployment, true)
+	assertQuantity(t, explicit.Requests, corev1.ResourceCPU, "2")
+
+	standard := resolveCredentialProxyResources(memoryAlone)
+	assertQuantity(t, standard.Requests, corev1.ResourceCPU, "500m")
+	assertQuantity(t, standard.Requests, corev1.ResourceMemory, "1Gi")
+	// 256Mi would cap the CPU request at 250m on Autopilot; Standard keeps 500m.
+	smallMemory := proxyAgentWithResources(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
+	}).Spec.Deployment
+	assertQuantity(t, resolveCredentialProxyResources(smallMemory).Requests, corev1.ResourceCPU, "500m")
+	assertQuantity(t, resolveCredentialProxyResourcesFor(smallMemory, true).Requests, corev1.ResourceCPU, "250m")
+
+	// A byte count just under 2Gi rounds the CPU request down to the 250m
+	// step below it, so the pair stays in the band and draws no band warning.
+	// 672Mi gives 656m before the step, which Autopilot would round up to
+	// 750m and then raise the memory to 768Mi, over the CR's limit.
+	justUnder := proxyAgentWithResources(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2147483647")},
+	}).Spec.Deployment
+	assertQuantity(t, resolveCredentialProxyResourcesFor(justUnder, true).Requests, corev1.ResourceCPU, "1750m")
+	atFloor := proxyAgentWithResources(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
+	}).Spec.Deployment
+	assertQuantity(t, resolveCredentialProxyResourcesFor(atFloor, true).Requests, corev1.ResourceCPU, "500m")
+	// Under 256Mi the step still leaves 250m, Autopilot's smallest request.
+	tiny := proxyAgentWithResources(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
+	}).Spec.Deployment
+	assertQuantity(t, resolveCredentialProxyResourcesFor(tiny, true).Requests, corev1.ResourceCPU, "250m")
+	_, warnings := ValidateCredentialProxyResources(justUnder, field.NewPath("spec"))
+	for _, w := range warnings {
+		if strings.Contains(w, "GiB per vCPU") {
+			t.Errorf("a band-held pair drew the band warning: %q", w)
+		}
+	}
 }
 
 // TestCredentialProxyFullOverrideReplacesEveryKey: a CR that states every key
@@ -118,6 +225,29 @@ func TestCredentialProxyFullOverrideReplacesEveryKey(t *testing.T) {
 	assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "8Gi")
 }
 
+// TestCredentialProxyEphemeralStorageLimitCoversItsEmptyDirs: the kubelet
+// sums the pod's disk-backed emptyDirs, writable layer and logs against the
+// container's ephemeral-storage limit, so a limit under the state and /tmp
+// sizeLimits together evicts the pod before either volume reaches its own cap
+// (three evictions on a hyperscale fleet at the old 2Gi, #4314). The limit
+// holds the two caps plus the declared headroom for the writable layer and
+// the container's logs, and stays inside the 10Gi GKE Autopilot admits per
+// pod, because Autopilot sets the ephemeral-storage limit equal to the request
+// and the operator declares no request, so the API server defaults the request
+// to this limit.
+func TestCredentialProxyEphemeralStorageLimitCoversItsEmptyDirs(t *testing.T) {
+	limit := resource.MustParse(credentialProxyEphemeralStorageLimit)
+	needed := resource.MustParse(credentialProxyStateSizeLimit)
+	needed.Add(resource.MustParse(credentialProxyTmpSizeLimit))
+	needed.Add(resource.MustParse(credentialProxyEphemeralStorageHeadroom))
+	if limit.Cmp(needed) < 0 {
+		t.Errorf("ephemeral-storage limit %s is under the state and /tmp sizeLimits plus the %s headroom (%s): the kubelet evicts the pod before the state volume can fill, or the writable layer and logs have no room", limit.String(), credentialProxyEphemeralStorageHeadroom, needed.String())
+	}
+	if autopilotCeiling := resource.MustParse("10Gi"); limit.Cmp(autopilotCeiling) > 0 {
+		t.Errorf("ephemeral-storage limit %s is above the %s Autopilot admits per pod, and the request defaults to the limit", limit.String(), autopilotCeiling.String())
+	}
+}
+
 func emptyDirSizeLimits(volumes []corev1.Volume) map[string]string {
 	sizes := map[string]string{}
 	for _, vol := range volumes {
@@ -130,17 +260,23 @@ func emptyDirSizeLimits(volumes []corev1.Volume) map[string]string {
 
 // TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit: the kubelet
 // evicts the pod when an emptyDir passes its sizeLimit, so a limit raised past
-// the /tmp (2Gi) and state (5Gi) defaults widens both, a limit under them moves
-// neither, and the gateway pod's /tmp, which shares the volume's definition but
-// not the broker's container, keeps its default.
+// the container's 8Gi default gives the excess to the state volume (5Gi) and
+// leaves /tmp at its 2Gi cap, so the two caps and the 1Gi headroom still add
+// up to the limit; a limit at or under the default moves neither, the default
+// render included, because the kubelet sums the two volumes against the
+// container's limit and each cap keeps a runaway in one volume out of the
+// other's share; and the gateway pod's /tmp, which shares the volume's
+// definition but not the broker's container, keeps its default.
 func TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit(t *testing.T) {
 	cases := []struct {
 		limit, tmp, state string
 	}{
 		{"", "2Gi", "5Gi"},
 		{"1Gi", "2Gi", "5Gi"},
-		{"3Gi", "3Gi", "5Gi"},
-		{"8Gi", "8Gi", "8Gi"},
+		{"6Gi", "2Gi", "5Gi"},
+		{"8Gi", "2Gi", "5Gi"},
+		{"10Gi", "2Gi", "7Gi"},
+		{"16Gi", "2Gi", "13Gi"},
 	}
 	for _, tc := range cases {
 		var override *corev1.ResourceRequirements
@@ -262,16 +398,21 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 		t.Errorf("floor = %d MiB, want 672", got/mib)
 	}
 	// GKE Autopilot without bursting sets a container's limits equal to its
-	// requests, so there the broker reads the request as its limit. The
-	// request therefore has to clear the floor on its own, or the budget is
-	// off exactly where a default install runs and the broker admits by slot
-	// alone, with the out-of-memory exposure the budget exists to remove.
+	// requests, so there the broker reads the request as its limit: the
+	// Autopilot request, or the Standard one on a cluster discovery could not
+	// classify. Each request therefore has to clear the floor on its own, or
+	// the budget is off and the broker admits by slot alone, with the
+	// out-of-memory exposure the budget exists to remove.
+	autopilotRequest := resource.MustParse(credentialProxyAutopilotMemoryRequest)
+	if got := credentialProxyAdmittedRequests(autopilotRequest.Value(), credentialProxyOutputCapBytes); got != 9 {
+		t.Errorf("at the Autopilot memory request the proxy admits %d requests, want 9: that is the figure on Autopilot without bursting", got)
+	}
 	defaultRequest := resource.MustParse(credentialProxyMemoryRequest)
 	if floor := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); defaultRequest.Value() < floor {
-		t.Errorf("the default memory request %s is under the budget's %d MiB floor, so on Autopilot without bursting the budget is off", defaultRequest.String(), floor/mib)
+		t.Errorf("the Standard memory request %s is under the budget's %d MiB floor, so on an unclassified Autopilot cluster the budget is off", defaultRequest.String(), floor/mib)
 	}
 	if got := credentialProxyAdmittedRequests(defaultRequest.Value(), credentialProxyOutputCapBytes); got < credentialProxyMinimumAdmittedRequests {
-		t.Errorf("at its request the proxy admits %d requests, want at least %d: that is the figure on Autopilot without bursting", got, credentialProxyMinimumAdmittedRequests)
+		t.Errorf("at the Standard request the proxy admits %d requests, want at least %d: that is the figure on an unclassified Autopilot cluster", got, credentialProxyMinimumAdmittedRequests)
 	}
 	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != credentialProxyMemoryFloorBytesAtDefaultCap {
 		t.Errorf("floor = %d bytes, but credentialProxyMemoryFloorBytesAtDefaultCap declares %d; the declared copy the chart and the broker are compared with has drifted from the function", got, credentialProxyMemoryFloorBytesAtDefaultCap)
@@ -323,4 +464,32 @@ func TestCredentialProxyRefusalKeepsTheCountWithinTheBudget(t *testing.T) {
 	if !strings.HasSuffix(refusal, credentialProxyRefusalEllipsis+" (and 1 more)") {
 		t.Errorf("refusal ends %q, want the ellipsis and the count", refusal[len(refusal)-40:])
 	}
+}
+
+// TestClusterAutopilotCachesOnlyAnAuthoritativeAnswer: the reconciler renders
+// the Autopilot requests on an Autopilot cluster, the Standard ones while
+// discovery cannot say, and asks again until it can.
+func TestClusterAutopilotCachesOnlyAnAuthoritativeAnswer(t *testing.T) {
+	autopilotGroups := &metav1.APIGroupList{Groups: []metav1.APIGroup{{
+		Name:     "auto.gke.io",
+		Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: "auto.gke.io/v1", Version: "v1"}},
+	}}}
+	dc := &mockAutopilotDiscovery{
+		serverGroupsList: autopilotGroups,
+		resourcesErr:     map[string]error{"auto.gke.io/v1": fmt.Errorf("503 Service Unavailable")},
+	}
+	r := &PlatformAgentReconciler{DiscoveryClient: dc}
+	if r.clusterAutopilot() || r.autopilotResolved {
+		t.Fatal("an undetermined probe was read as Autopilot or cached")
+	}
+	dc.resourcesErr = nil
+	dc.resourcesList = map[string]*metav1.APIResourceList{"auto.gke.io/v1": {
+		GroupVersion: "auto.gke.io/v1", APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+	}}
+	if !r.clusterAutopilot() || !r.autopilotResolved {
+		t.Fatal("an Autopilot cluster was not recognised once discovery answered")
+	}
+	container := buildCredentialProxyDeploymentForPlugins(proxyAgentWithResources(nil), "hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, r.clusterAutopilot()).Spec.Template.Spec.Containers[0]
+	assertQuantity(t, container.Resources.Requests, corev1.ResourceCPU, "2")
+	assertQuantity(t, container.Resources.Requests, corev1.ResourceMemory, "2Gi")
 }

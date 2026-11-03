@@ -63,8 +63,9 @@ jobs:
   # steps in the `test` job below are therefore continue-on-error -- a broken
   # report costs the comment, not the merge. What is left able to fail the
   # required check is the suite itself, coverage.py writing and joining its
-  # data, a shard that did not finish, and the bench harness job, which are
-  # the things that should.
+  # data, a shard that did not finish, a shard download that fails on both
+  # of its attempts (the two download steps below say why there are two),
+  # and the bench harness job, which are the things that should.
   #
   # The sweep runs as three shards on three runners (`test-shard`), and `test`
   # joins their coverage and carries the required check's name. On one runner
@@ -117,7 +118,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ".python-version"
           cache: "pip"
@@ -244,7 +245,7 @@ jobs:
       # No pip cache: the shards' cache holds the whole test set, and this job
       # installs two packages.
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ".python-version"
 
@@ -257,7 +258,45 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install coverage diff-cover
 
+      # Two attempts, because the action's own retries are not enough. On
+      # 2026-10-30 this step failed on two runs whose three shards had all
+      # uploaded before it started (the last one about 20 seconds before, the
+      # other two minutes before): the action listed the three artifacts with
+      # their sizes and digests, fetched one of them on one run and none on
+      # the other, wrote "Artifact download failed after 5 retries" 51 seconds
+      # in, and ended 3m47s after it started; the re-run of each commit
+      # passed. The log does not say why the fetches failed: the action logs
+      # each retry's reason at debug level only. Its retries wrap one request
+      # per artifact, so a fault that outlasts them reds the required check
+      # with every test green. When the first attempt fails, the step after
+      # it clears the partial extraction, so the join reads only what one
+      # attempt wrote, and waits a minute; the second attempt then starts
+      # about five minutes after the first began, inside the job's timeout
+      # even if it runs as long again. If it fails too the job fails as
+      # before: the first attempt is continue-on-error only so that the
+      # second can run, and `coverage-merge` still refuses a missing shard.
+      # The warning the clear step prints is the record of a rescued first
+      # attempt: the flaky-check tracker only sees a run that was re-run after
+      # a failed run attempt, and a rescued run has one green attempt and no
+      # re-run.
       - name: Download the shards' coverage
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: python-coverage-shard-*
+          path: .coverage-data
+
+      - name: Clear the failed download and wait before the second attempt
+        if: ${{ steps.download.outcome == 'failure' }}
+        run: |
+          wait_seconds=60
+          echo "::warning::The first download of the shards' coverage failed; a second attempt runs in ${wait_seconds} seconds."
+          rm -rf .coverage-data
+          sleep "${wait_seconds}"
+
+      - name: Download the shards' coverage, second attempt
+        if: ${{ steps.download.outcome == 'failure' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: python-coverage-shard-*
@@ -384,7 +423,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up the agent image's Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ".agent-python-version"
           cache: "pip"
@@ -435,7 +474,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: ".python-version"
 

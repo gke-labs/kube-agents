@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
-from contextlib import ExitStack, closing, nullcontext
+from contextlib import ExitStack, asynccontextmanager, closing, nullcontext
 from pathlib import Path
 
 import logging
@@ -59,6 +59,11 @@ logger = logging.getLogger("session_kv_server")
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
 _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST",)
+# The home channel a today-era `/sethome` or first chat mirrored into that
+# `.env` (Hermes' persist_home_channel). Under `next` with the operator's
+# projection mounted, the projected file is the channel the gateway posts
+# into, so the mirror must not fill the key the container env lacks.
+_PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
 
 
 def _load_dotenv_ignoring_operator_switches(path: str) -> None:
@@ -80,6 +85,9 @@ def _load_dotenv_ignoring_operator_switches(path: str) -> None:
         if key in _OPERATOR_ONLY_ENV_KEYS:
             logger.info(f"Ignoring operator-only switch {key} in {path}")
             continue
+        if key in _PROJECTED_HOME_ENV_KEYS and chat_notify.home_file()[1]:
+            logger.info(f"Ignoring {key} in {path}: the operator projects the home channel")
+            continue
         if key not in os.environ:
             os.environ[key] = val
 
@@ -89,10 +97,35 @@ _load_dotenv_ignoring_operator_switches(DOTENV_PATH)
 # The schema is not published: this server has exactly three known callers, all
 # of them inside this pod, and an interactive /docs page on a port that carries
 # chat identifiers is a browsable index of them.
-app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # The data volume check runs on its own thread for the life of the server;
+    # see check_data_volume.
+    threading.Thread(target=_data_volume_monitor, name="data-volume-monitor", daemon=True).start()
+    yield
+
+
+app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None, lifespan=_lifespan)
 
 SESSION_KV_DB_PATH = os.getenv("SESSION_KV_DB_PATH", "/var/lib/kube-agents/session/session_kv.db")
 CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
+
+# The data volume warning. A full volume fails every kanban and session write
+# with a bare `disk I/O error` and nothing in chat says why, so this server, the
+# one long-running process of the agent's that already posts to the home
+# channel, checks the volume and says so once per crossing: at
+# DATA_VOLUME_WARN_PERCENT used, and not again until usage has dropped below
+# DATA_VOLUME_REARM_PERCENT. The operator reports the same reading on the CR as
+# the DataVolumeNearlyFull condition; this is the half a chat user sees.
+DATA_VOLUME_PATH = os.getenv("PLATFORM_AGENT_HOME", "/opt/data")
+DATA_VOLUME_CHECK_INTERVAL_SECONDS = 300
+DATA_VOLUME_WARN_PERCENT = 90
+DATA_VOLUME_REARM_PERCENT = 85
+DATA_VOLUME_WARNING = (
+    "The agent's data volume is {percent}% full ({used:.1f} of {total:.1f} GiB). "
+    "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent."
+)
+BYTES_PER_GIB = 1 << 30
 
 # Bounds on the index `/v1/incidents/recent` returns. Both axes matter because
 # its caller prepends the result to messages that carry no report of their own,
@@ -876,6 +909,37 @@ INCIDENT_FOLD_DB_TIMEOUT_S = 5.0
 # arriving together cannot both find no anchor and both open a triage. The
 # route is a sync def served on a threadpool, so they can.
 _WORKLOAD_FOLD_LOCK = threading.Lock()
+# A workload that breaks again while the fix for its last incident waits for
+# review (_open_fix_pull_request): the event is recorded against that incident
+# with the pull request's URL instead of opening a second investigation. A pull
+# request a card opened is a `pr_opened` event on that card in kanban.db
+# (agents/platform/plugins/pr_opened). Same pattern as that plugin's
+# PROPOSAL_URL, copied because a plugin is loaded by file path: the repository
+# forge.call takes, then the number.
+PR_OPENED_EVENT_KIND = "pr_opened"
+PROPOSAL_URL_RE = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+PROPOSAL_OPEN_STATE = "open"
+# How many of the workload's most recent incidents are searched for a fix.
+FIX_PR_INCIDENTS_SCANNED = 5
+# The forge lookup's budget for the whole search; past it the event is
+# announced as a new incident, the same answer as no fix at all.
+FIX_PR_LOOKUP_TIMEOUT_S = 8.0
+# session_metadata key on the held incident's session: when its thread was last
+# reminded that the fix is waiting, so it is reminded at most once per window.
+FIX_PR_REMINDED_AT_KEY = "fix_pr_reminded_at"
+FIX_PR_REMINDER_SEND_TIMEOUT_S = 30.0
+# A human's `apply` (typed, or an option button's text) in an incident's thread,
+# recorded by agents/platform/plugins/incident_context (POST /v1/incidents/apply).
+# The fix it asks for is opened by a card the front door files from the thread,
+# in the front door's own session, so the incident-session read misses it, and
+# reading every card subscribed to the thread would count anything else asked
+# there. What counts instead is the first card assigned to INCIDENT_PR_ASSIGNEE
+# carrying the thread's subscription and created within this many seconds after
+# an `apply`: long enough for a front-door turn under gVisor, short enough that
+# an unrelated later card is not taken for the fix.
+INCIDENT_APPLY_CARD_WINDOW_S = 1800
+# How many of a thread's most recent `apply`s are read for their fix cards.
+INCIDENT_APPLIES_SCANNED = 5
 
 # The `kind` a drift record carries, set by the drift detector
 # (`injectKindDrift` in k8s-operator/cmd/drift-detector/inject.go). It is the
@@ -1052,6 +1116,9 @@ DRIFT_UNKNOWN_FIELD = "unknown"
 # misstate it. The title is stored on the session's routing row, where
 # gateway/slack_ux_incident.py reads it; Slack's rename refuses `·`, so " in ".
 SLACK_PLATFORM = "slack"
+# The platforms a cron report's card goes to: Slack, and Google Chat where the gateway
+# routes it (spec.mode: next) and lays the card out (kanban_notifier.CHAT_UX_PLATFORMS).
+CARD_PLATFORMS = (SLACK_PLATFORM, chat_notify.GCHAT_PLATFORM)
 CRASHLOOP_REASON = "CrashLoopBackOff"
 BACKOFF_REASON = "BackOff"
 IMAGE_PULL_MARKER = "pulling image"
@@ -1279,6 +1346,22 @@ def init_db() -> None:
                 )
                 """
             )
+            # One row per `apply` in an incident's thread (INCIDENT_APPLY_CARD_WINDOW_S).
+            # applied_at is epoch seconds, the unit kanban.db's tasks.created_at
+            # is compared in; created_at is what cleanup_old_records ages.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS incident_applies (
+                    chat_id    TEXT NOT NULL,
+                    thread_id  TEXT NOT NULL,
+                    applied_at REAL NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_incident_applies_thread ON incident_applies (chat_id, thread_id, applied_at)"
+            )
             # Every event the watcher forwards, whether or not it was announced
             # in chat. This is the only durable record of one: the watcher's
             # dedup snapshot is a rolling window of *active* incidents keyed by
@@ -1329,6 +1412,12 @@ def init_db() -> None:
                 # Deployment's pod, or a non-Pod object's own name. Empty on
                 # every row that can neither fold nor anchor.
                 ("fold_key", "fold_key TEXT NOT NULL DEFAULT ''"),
+                # The workload an incident's fix belongs to (_incident_branch_workload),
+                # which, unlike fold_key, nothing clears: the search for an open
+                # fix reaches back past restarts (_open_fix_pull_request).
+                ("workload_key", "workload_key TEXT NOT NULL DEFAULT ''"),
+                # The open pull request a row was held for; '' on every other row.
+                ("pull_request", "pull_request TEXT NOT NULL DEFAULT ''"),
                 # When the row's turn was dispatched: stamped by the dispatcher
                 # as it creates the gateway session, on every path, and by the
                 # carding of a drift-backlog row. created_at is the row's
@@ -1432,6 +1521,19 @@ def init_db() -> None:
                 )
                 """
             )
+            # One row: whether the data volume warning has been posted for the
+            # current crossing. On this database rather than in memory so that a
+            # restart while the volume is still full does not post it again, and
+            # on this database rather than the data volume, which is the one that
+            # is full.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS data_volume_warning (
+                    id     INTEGER PRIMARY KEY CHECK (id = 1),
+                    warned INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
             # The fleet-audit run whose report each audit job last posted, so a
             # run's report is posted once and a later run that never reached
             # `finish` gets the not-finished notice instead of it.
@@ -1490,6 +1592,7 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
         if undigested:
             logger.warning(f"Ledger cleanup is removing {undigested} drift backlog row(s) that were never digested")
         conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', ?)", (param,))
+        conn.execute("DELETE FROM incident_applies WHERE created_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM intercepted_events WHERE created_at < datetime('now', ?)", (param,))
         # A row cap beside the TTL, because a time bound alone does not bound
@@ -1537,6 +1640,8 @@ def record_intercepted_event(
     session_id: str = "",
     duplicate_of: Optional[int] = None,
     fold_key: str = "",
+    workload_key: str = "",
+    pull_request: str = "",
 ) -> Optional[int]:
     """Append one forwarded event to the ledger the daily recap reads.
 
@@ -1582,8 +1687,8 @@ def record_intercepted_event(
                 cursor = conn.execute(
                     "INSERT INTO intercepted_events "
                     "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
-                    "occurrences, notified, session_id, duplicate_of, fold_key) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "occurrences, notified, session_id, duplicate_of, fold_key, workload_key, pull_request) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cluster,
                         namespace,
@@ -1598,6 +1703,8 @@ def record_intercepted_event(
                         session_id,
                         duplicate_of,
                         fold_key,
+                        workload_key,
+                        pull_request,
                     ),
                 )
                 return cursor.lastrowid
@@ -1693,6 +1800,233 @@ def mark_triage_state(event_row_id: Optional[int], state: str) -> None:
                 )
     except Exception as exc:
         logger.error(f"Failed to record triage state {state} for ledger row {event_row_id}: {exc}")
+
+
+class FixPullRequest(NamedTuple):
+    """An incident whose fix is open for review: its ledger row, its session, and the pull request."""
+
+    anchor_id: int
+    session_id: str
+    url: str
+
+
+def _incident_apply_times(session_id: str) -> tuple[str, str, list[float]]:
+    """The incident's thread (chat_id, thread_id) and its most recent `apply` times, newest first.
+
+    Empty when the session has no thread or the thread no `apply`.
+    Best-effort, as _incident_pull_request_urls is.
+    """
+    _platform, chat_id, thread_id = _lookup_session_routing(session_id)
+    if not (chat_id and thread_id):
+        return chat_id, thread_id, []
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            rows = conn.execute(
+                "SELECT applied_at FROM incident_applies WHERE chat_id = ? AND thread_id = ? "
+                "ORDER BY applied_at DESC LIMIT ?",
+                (chat_id, thread_id, INCIDENT_APPLIES_SCANNED),
+            ).fetchall()
+    except Exception as exc:
+        logger.warning(f"Could not read session {session_id}'s applies: {exc!r}")
+        return chat_id, thread_id, []
+    return chat_id, thread_id, [float(applied_at) for (applied_at,) in rows]
+
+
+def _incident_pull_request_urls(session_id: str) -> list[str]:
+    """The pull requests an incident's fix cards opened, newest first.
+
+    Two cards open an incident's fix, and a card that opened one has a
+    `pr_opened` event (agents/platform/plugins/pr_opened):
+
+    - the card the front door files in the incident's own session
+      (INCIDENT_TRIAGE_OPEN_PULL_REQUEST; Hermes stamps the filing session on
+      `tasks.session_id`);
+    - the card it files for a human's `apply` in the incident's thread: the
+      first card assigned to INCIDENT_PR_ASSIGNEE that carries the thread's
+      subscription and was created within INCIDENT_APPLY_CARD_WINDOW_S after
+      an `apply` there (_incident_apply_times).
+
+    Not every card subscribed to the thread: anything asked for in the thread
+    files one, so a pull request found that way need not be the fix.
+    Best-effort: an unreadable board, or one without a table or column these
+    read, contributes nothing.
+    """
+    sql = (
+        "SELECT e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE e.kind = ? AND t.session_id = ? ORDER BY e.created_at DESC, e.id DESC"
+    )
+    apply_card_sql = (
+        "SELECT t.id FROM tasks t JOIN kanban_notify_subs s ON s.task_id = t.id "
+        "WHERE s.chat_id = ? AND s.thread_id = ? AND t.assignee = ? "
+        "AND t.created_at >= ? AND t.created_at <= ? ORDER BY t.created_at, t.id LIMIT 1"
+    )
+    card_sql = (
+        "SELECT payload FROM task_events WHERE kind = ? AND task_id = ? ORDER BY created_at DESC, id DESC"
+    )
+    chat_id, thread_id, applied = _incident_apply_times(session_id)
+    urls: list[str] = []
+    try:
+        with closing(_read_only(_kanban_db_path())) as conn:
+            payloads = [row[0] for row in conn.execute(sql, (PR_OPENED_EVENT_KIND, session_id)).fetchall()]
+            # Its own guard, so a board this read cannot use still answers
+            # with the incident session's cards above.
+            try:
+                for applied_at in applied:
+                    card = conn.execute(
+                        apply_card_sql,
+                        (chat_id, thread_id, INCIDENT_PR_ASSIGNEE, applied_at, applied_at + INCIDENT_APPLY_CARD_WINDOW_S),
+                    ).fetchone()
+                    if card:
+                        payloads += [row[0] for row in conn.execute(card_sql, (PR_OPENED_EVENT_KIND, card[0])).fetchall()]
+            except Exception as exc:
+                logger.warning(f"Could not read the board for session {session_id}'s apply card: {exc!r}")
+            for payload in payloads:
+                try:
+                    data = json.loads(payload) if isinstance(payload, str) else payload
+                except ValueError:
+                    continue
+                url = data.get("url") if isinstance(data, dict) else None
+                if isinstance(url, str) and PROPOSAL_URL_RE.match(url) and url not in urls:
+                    urls.append(url)
+    except Exception as exc:
+        logger.warning(f"Could not read the board for session {session_id}'s pull requests: {exc!r}")
+    return urls
+
+
+def _proposal_state(url: str, timeout: float) -> Optional[str]:
+    """The forge's state for the pull request at `url`, or None when it cannot say in time."""
+    match = PROPOSAL_URL_RE.match(url)
+    if match is None or timeout <= 0:
+        return None
+    # A daemon thread, not a ThreadPoolExecutor: a forge call that outlives the
+    # budget is abandoned, and an executor's worker would hold a restart until
+    # it ends (forge's own hop allows FORWARD_TIMEOUT_S an attempt).
+    answer: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def _view() -> None:
+        try:
+            import forge
+
+            view = forge.call("proposal-view", {"number": int(match.group(2))}, match.group(1), retry_transient=True)
+            answer.put((True, view))
+        except Exception as exc:
+            answer.put((False, exc))
+
+    threading.Thread(target=_view, name="fix-pr-lookup", daemon=True).start()
+    try:
+        ok, result = answer.get(timeout=timeout)
+    except queue.Empty:
+        logger.warning(f"Could not read the state of {url} within {timeout:.1f}s")
+        return None
+    if not ok:
+        logger.warning(f"Could not read the state of {url}: {result!r}")
+        return None
+    proposal = (result.get("proposal") if isinstance(result, dict) else None) or {}
+    state = proposal.get("state") if isinstance(proposal, dict) else None
+    return state if isinstance(state, str) else None
+
+
+def _open_fix_pull_request(
+    cluster: str, namespace: str, object_kind: str, workload_key: str, reason: str, severity: str
+) -> Optional[FixPullRequest]:
+    """The workload's latest incident whose fix pull request is still open, or None.
+
+    Searches the workload's most recent admitted incidents (same cluster,
+    namespace, kind, workload_key and reason), newest first, for a pull request a card
+    opened for it (_incident_pull_request_urls) that the forge still reports
+    open. A merged or closed one is not a fix in review: a merged fix that did
+    not hold, or a rejected one, is a new incident. A Critical event is held
+    only by a Critical incident, as the fold holds it (_workload_incident_anchor).
+    The event's reason has to be one the incident showed, its own or one folded
+    into it (a cascade such as `Failed` then `BackOff` is one fault): another
+    reason is another fault, which the open fix may not touch, so it is triaged
+    rather than reminded.
+
+    Fails open: an unreadable ledger or board, a forge that refuses or is slow
+    past FIX_PR_LOOKUP_TIMEOUT_S for the whole search, all answer None, and the
+    event is announced as a new incident.
+    """
+    if INCIDENT_WORKLOAD_DEDUP_SECONDS <= 0 or not workload_key:
+        return None
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            incidents = conn.execute(
+                "SELECT id, session_id FROM intercepted_events "
+                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND workload_key = ? "
+                "AND (reason = ? OR id IN (SELECT duplicate_of FROM intercepted_events WHERE reason = ? AND duplicate_of > 0)) "
+                "AND (? != ? OR severity = ?) "
+                "AND duplicate_of IS NULL AND (notified != 0 OR delivery_error != '') AND session_id != '' "
+                "ORDER BY id DESC LIMIT ?",
+                (
+                    cluster,
+                    namespace,
+                    object_kind,
+                    workload_key,
+                    reason,
+                    reason,
+                    severity,
+                    CRITICAL_SEVERITY,
+                    CRITICAL_SEVERITY,
+                    FIX_PR_INCIDENTS_SCANNED,
+                ),
+            ).fetchall()
+    except Exception as exc:
+        logger.error(f"Failed to look up {namespace}/{workload_key}'s incidents for an open fix: {exc}")
+        return None
+    deadline = time.monotonic() + FIX_PR_LOOKUP_TIMEOUT_S
+    for anchor_id, session_id in incidents:
+        for url in _incident_pull_request_urls(session_id):
+            if _proposal_state(url, deadline - time.monotonic()) == PROPOSAL_OPEN_STATE:
+                return FixPullRequest(int(anchor_id), session_id, url)
+            if time.monotonic() >= deadline:
+                return None
+    return None
+
+
+def _claim_fix_pull_request_reminder(session_id: str) -> bool:
+    """Whether the held incident's thread may be reminded now; records the reminder when it may.
+
+    At most once per INCIDENT_WORKLOAD_DEDUP_SECONDS per incident, so a workload
+    that keeps breaking while its fix waits reminds the thread once a window
+    rather than once an event. The check and the stamp share one transaction.
+    """
+    now = time.time()
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                return False
+            meta = json.loads(row[0] or "{}")
+            last = meta.get(FIX_PR_REMINDED_AT_KEY)
+            if isinstance(last, (int, float)) and now - last < INCIDENT_WORKLOAD_DEDUP_SECONDS:
+                conn.rollback()
+                return False
+            meta[FIX_PR_REMINDED_AT_KEY] = now
+            conn.execute(
+                "UPDATE session_metadata SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                (json.dumps(meta), session_id),
+            )
+            conn.commit()
+            return True
+    except Exception as exc:
+        logger.warning(f"Could not claim a fix reminder for session {session_id}: {exc!r}")
+        return False
+
+
+def _remind_fix_pull_request(session_id: str, workload: str, reason: str, url: str) -> None:
+    """Remind the held incident's thread that its fix is still waiting for review.
+
+    Background task. Nothing when the incident has no thread (an install with
+    no chat platform), or when the thread was reminded within the window.
+    """
+    platform, chat_id, thread_id = _lookup_session_routing(session_id)
+    if not (platform and thread_id) or not _claim_fix_pull_request_reminder(session_id):
+        return
+    message = f"`{workload}` is still failing ({reason}). The fix is waiting for review: {url}"
+    if _send_to_chat(platform, message, chat_id, thread_id, timeout=FIX_PR_REMINDER_SEND_TIMEOUT_S) is None:
+        logger.warning(f"Could not remind session {session_id}'s thread that {url} is waiting for review")
 
 
 def mark_triage_not_started(event_row_id: Optional[int]) -> None:
@@ -2010,11 +2344,19 @@ def _slack_home_channel() -> str:
 
     Environment first, so an install whose CR sets the channel resolves exactly
     as it did before; the files are consulted only when it is absent, which is
-    the case that was broken.
+    the case that was broken. Under `spec.mode: next` a channel the gateway
+    learned is never rendered into the pod: the operator projects it into a
+    file the kubelet refreshes in place (chat_notify.home_file). A mounted file
+    decides, empty or not, so this answer is the channel the gateway posts
+    into; the config files `/sethome` writes in today mode count only where no
+    file is mounted, since the data volume keeps them across a mode switch.
     """
     env = os.environ.get("SLACK_HOME_CHANNEL", "").strip()
     if env:
         return env
+    projected, mounted = chat_notify.home_file()
+    if mounted:
+        return projected
     for path in (MANAGED_CONFIG_PATH, CONFIG_PATH):
         value = _platform_setting_in(path, "slack", "home_channel")
         if value:
@@ -2047,8 +2389,9 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
-    One thing outranks all three: the platform the operator names in
-    ``A2A_NOTIFY_PLATFORM`` (chat_notify.py). Under ``spec.mode: next`` the
+    One thing outranks all three: the platform ``chat_notify.routed_platform()``
+    names, from ``A2A_NOTIFY_PLATFORM`` or the projected home-channel file. Under
+    ``spec.mode: next`` the
     managed scope says that platform's Hermes consumer is off because the A2A
     gateway holds the backend, and posts to it go through the gateway instead,
     so it is still a platform this install posts to. The operator renders the
@@ -2097,7 +2440,8 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
 
     Checks `chat_notify.routes(name)` first so `spec.mode: next` installs where
     the operator renders `platforms.<p>.enabled: false` into `/etc/hermes/config.yaml`
-    while routing notifications through `A2A_NOTIFY_PLATFORM` resolve that
+    while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM` or the
+    projected home-channel file) resolve that
     platform as enabled in both `enabled_chat_platforms` and `_chat_platforms_disabled`.
     """
     from_managed = _platforms_enabled_in(MANAGED_CONFIG_PATH)
@@ -2134,7 +2478,7 @@ def _chat_platforms_disabled() -> bool:
 
     On a chat-less install (`install.sh` chat choice "None", or a CR with
     `googleChat.enabled: false` and `slack.enabled: false` and no routed
-    `A2A_NOTIFY_PLATFORM`), `renderConfigYAML` emits `enabled: false` for both
+    platform), `renderConfigYAML` emits `enabled: false` for both
     platforms in `/etc/hermes/config.yaml`. `enabled_chat_platforms` falls back
     to `DEFAULT_CHAT_PLATFORM` when nothing resolves so legacy callers never
     address an empty string; this helper uses the same `_resolve_chat_platforms`
@@ -2320,6 +2664,87 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
     except Exception as exc:
         logger.error(f"Alert quota check failed for severity {severity} (allowing the alert through): {exc}")
         return True, 0
+
+
+def _data_volume_usage(path: str) -> Optional[tuple[int, int]]:
+    """The volume holding `path` as (total, free) bytes, free being what a
+    non-root writer can still use; None when it cannot be read."""
+    try:
+        st = os.statvfs(path)
+    except OSError as exc:
+        logger.debug(f"Cannot read the data volume at {path}: {exc}")
+        return None
+    total = st.f_blocks * st.f_frsize
+    if total <= 0:
+        return None
+    return total, st.f_bavail * st.f_frsize
+
+
+def _data_volume_warned() -> bool:
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
+        row = conn.execute("SELECT warned FROM data_volume_warning WHERE id = 1").fetchone()
+    return bool(row and row[0])
+
+
+def _set_data_volume_warned(warned: bool) -> None:
+    """Set the flag to `warned`."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
+        with conn:
+            conn.execute("INSERT OR IGNORE INTO data_volume_warning (id, warned) VALUES (1, 0)")
+            conn.execute("UPDATE data_volume_warning SET warned = ? WHERE id = 1", (int(warned),))
+
+
+def _post_data_volume_warning(message: str) -> bool:
+    """Post the warning to the home channel. True once it is delivered, or once
+    there is nowhere to deliver it, so the caller stops trying; False when every
+    enabled platform refused, so the next check tries again."""
+    platforms = enabled_chat_platforms()
+    if platforms == [DEFAULT_CHAT_PLATFORM] and _chat_platforms_disabled():
+        logger.warning("No chat platform is enabled, so the data volume warning is in this log and nowhere else")
+        return True
+    for candidate in platforms:
+        if _post_initial_alert(candidate, message):
+            return True
+    logger.warning(
+        "The data volume warning was not accepted by any enabled chat platform; "
+        "check the home channel setting. It is tried again at the next check"
+    )
+    return False
+
+
+def check_data_volume() -> None:
+    """Post the data volume warning if the volume has crossed the line, and
+    re-arm it once usage is back below the lower one."""
+    usage = _data_volume_usage(DATA_VOLUME_PATH)
+    if usage is None:
+        return
+    total, free = usage
+    percent = (total - free) * 100 // total
+    warned = _data_volume_warned()
+    if warned:
+        if percent < DATA_VOLUME_REARM_PERCENT:
+            _set_data_volume_warned(False)
+            logger.info(f"The data volume is back to {percent}% used; the full-volume warning is re-armed")
+        return
+    if percent < DATA_VOLUME_WARN_PERCENT:
+        return
+    message = DATA_VOLUME_WARNING.format(
+        percent=percent, used=(total - free) / BYTES_PER_GIB, total=total / BYTES_PER_GIB
+    )
+    logger.warning(message)
+    # Set only after the post is delivered. A process killed during the send
+    # (a pod roll) then posts at the next check instead of never.
+    if _post_data_volume_warning(message):
+        _set_data_volume_warned(True)
+
+
+def _data_volume_monitor() -> None:
+    while True:
+        try:
+            check_data_volume()
+        except Exception as exc:
+            logger.error(f"Data volume check failed: {exc}")
+        time.sleep(DATA_VOLUME_CHECK_INTERVAL_SECONDS)
 
 
 def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
@@ -3889,7 +4314,8 @@ def trigger_agent_troubleshooter(
     """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background.
 
     ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
-    ``alert_title`` is recorded only for a Slack thread.
+    ``alert_title`` is recorded for a thread on a card platform: Slack, or Google
+    Chat under ``spec.mode: next``.
 
     An exception releases the row's fold anchor before it propagates: the
     ledger row was written as admitted before this task was queued, and a task
@@ -3974,7 +4400,9 @@ def _trigger_agent_troubleshooter(
         if thread_id:
             _register_session_routing(session_id, active_platform, thread_id)
             notice = _TriageNotice(active_platform, thread_id, "")
-            if alert_title and active_platform == SLACK_PLATFORM:
+            if alert_title and active_platform in CARD_PLATFORMS and (active_platform == SLACK_PLATFORM or chat_notify.routes(active_platform)):
+                # The title heads the plan the cards draw: on Slack, and on the
+                # platform the gateway lays the plan out for under spec.mode: next.
                 _record_alert_title(session_id, alert_title)
             # Armed here, before the gateway is contacted: an alert whose turn
             # never starts (session creation refused, the turn's POST failing)
@@ -4407,14 +4835,27 @@ class AuditHeadline(NamedTuple):
     ref: slack_audit_report.LedgerRef
 
 
+def _card_platform(platform: str, chat_id: str) -> bool:
+    """Whether a cron report's card goes to ``platform``: with ``KAGE_SLACK_UX`` on, Slack
+    (Block Kit through the relay, or a chat message through the gateway under
+    ``spec.mode: next``), or Google Chat when the gateway routes it, where the gateway
+    lays the chat message out; and a destination, the thread's chat or the home
+    channel, which the gateway holds itself for the platform it routes."""
+    routed = chat_notify.routes(platform)
+    if not slack_presenter.enabled() or platform not in CARD_PLATFORMS or not (platform == SLACK_PLATFORM or routed):
+        return False
+    return bool(routed or chat_id or _slack_home_channel())
+
+
 def _slack_audit_headline(
     platform: str, message: str, chat_id: str, profile: str, job_id: str, deadline: float
 ) -> AuditHeadline | None:
-    """With ``KAGE_SLACK_UX`` on, the headline a fleet-audit report leads with in Slack.
+    """With ``KAGE_SLACK_UX`` on, the headline a fleet-audit report leads with on a
+    card platform: Slack, or Google Chat under ``spec.mode: next``.
 
     None, and the leg posts `message` as it always has, unless every condition
-    holds: the flag is on, the leg is Slack, a channel is known
-    (the leg's chat id or the Slack home channel), the job runs the fleet-audit
+    holds: the flag is on, the leg is a card platform with a channel known
+    (the leg's chat id or the gateway's home channel), the job runs the fleet-audit
     skill, and the message
     ends with an issue URL in a managed repository, which is where fleet-audit
     keeps its ledger, and at least `AUDIT_HEADLINE_MIN_LEFT_S` is left before
@@ -4424,9 +4865,7 @@ def _slack_audit_headline(
     link. The issue rides along
     for :func:`_post_audit_blocks`.
     """
-    if platform != "slack" or not slack_presenter.enabled():
-        return None
-    if not (chat_id or _slack_home_channel()):
+    if not _card_platform(platform, chat_id):
         return None
     if not _is_fleet_audit_job(profile, job_id):
         return None
@@ -4562,6 +5001,7 @@ def _fetch_ledger_issue(ref: slack_audit_report.LedgerRef) -> dict | None:
 
 
 def _post_audit_blocks(
+    platform: str,
     profile: str,
     job_id: str,
     headline: AuditHeadline,
@@ -4589,18 +5029,18 @@ def _post_audit_blocks(
     missing report. An ok answer with no ts posted:
     ``thread_id`` is then empty and the caller counts the leg as delivered.
     """
-    routed = chat_notify.routes(SLACK_PLATFORM)
+    routed = chat_notify.routes(platform)
     if headline.issue is None or not (routed or slack_blocks_post.configured()):
         return None
     if routed:
         built = slack_audit_report.chat_from_issue(headline.issue, headline.ref, message)
     else:
         built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
-    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+    return _post_audit_card(platform, profile, job_id, built, routed, chat_id, thread_id, deadline)
 
 
 def _post_summary_card(
-    profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
+    platform: str, profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
 ) -> AuditPost | None:
     """Post the card of a fleet-audit report with no ledger issue (:func:`slack_audit_report.summary_card`).
 
@@ -4609,17 +5049,18 @@ def _post_summary_card(
     through the gateway; None, and the caller posts text, when neither is
     there, the card cannot be built, or the post did not land.
     """
-    routed = chat_notify.routes(SLACK_PLATFORM)
+    routed = chat_notify.routes(platform)
     if not (routed or slack_blocks_post.configured()):
         return None
     if routed:
         built = slack_audit_report.chat_from_summary(report)
     else:
         built = slack_audit_report.blocks_from_summary(report)
-    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+    return _post_audit_card(platform, profile, job_id, built, routed, chat_id, thread_id, deadline)
 
 
 def _post_audit_card(
+    platform: str,
     profile: str,
     job_id: str,
     built: tuple[Any, str] | None,
@@ -4643,7 +5084,7 @@ def _post_audit_card(
         return None
     if routed:
         return _post_audit_chat_via_gateway(
-            profile, job_id, blocks, text, thread_id if threaded else "", min(AUDIT_BLOCKS_POST_TIMEOUT_S, left)
+            platform, profile, job_id, blocks, text, thread_id if threaded else "", min(AUDIT_BLOCKS_POST_TIMEOUT_S, left)
         )
     try:
         ts = slack_blocks_post.post(
@@ -4671,15 +5112,15 @@ GATEWAY_POST_TIMEOUT_MARGIN_S = 3
 
 
 def _post_audit_chat_via_gateway(
-    profile: str, job_id: str, chat: dict, text: str, thread_id: str, timeout: float
+    platform: str, profile: str, job_id: str, chat: dict, text: str, thread_id: str, timeout: float
 ) -> AuditPost | None:
-    """Post the audit report's card through the gateway's Slack chat.notify route.
+    """Post the audit report's card through the gateway's chat.notify route for ``platform``.
 
     The next-stack half of :func:`_post_audit_blocks`: under ``spec.mode: next``
-    the broker's Slack relay is gone and the gateway holds Slack, so the card
-    goes as a ``kube-agents.chat/v1`` message (``a2a notify --chat-file``,
-    chat_notify.py) into the home channel, and the gateway lays it out, its
-    buttons included. ``text`` is the message's fallback, which the gateway
+    the broker's Slack relay is gone and the gateway holds the chat platform,
+    Slack or Google Chat, so the card goes as a ``kube-agents.chat/v1`` message
+    (``a2a notify --chat-file``, chat_notify.py) into the home channel, and the
+    gateway lays it out, its buttons included. ``text`` is the message's fallback, which the gateway
     posts itself when it does not lay the message out. Same outcomes as the
     relay path: None, to post text instead, after a refusal, a failure to
     send, or a post that may have landed.
@@ -4691,7 +5132,7 @@ def _post_audit_chat_via_gateway(
             path = handle.name
         res = subprocess.run(
             chat_notify.chat_command(
-                SLACK_PLATFORM, thread_id, text, path, max(timeout - GATEWAY_POST_TIMEOUT_MARGIN_S, 1)
+                platform, thread_id, text, path, max(timeout - GATEWAY_POST_TIMEOUT_MARGIN_S, 1)
             ),
             capture_output=True,
             text=True,
@@ -4720,11 +5161,11 @@ def _post_audit_chat_via_gateway(
         resp = {}
     if thread_id:
         return AuditPost(thread_id)
-    return AuditPost(chat_notify.thread_from_response(SLACK_PLATFORM, resp if isinstance(resp, dict) else {}))
+    return AuditPost(chat_notify.thread_from_response(platform, resp if isinstance(resp, dict) else {}))
 
 
 def _post_failed_audit_via_gateway(
-    profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
+    platform: str, profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
 ) -> AuditPost | None:
     """Under ``spec.mode: next``, post a failed fleet-audit report as its one line with the report folded under it.
 
@@ -4740,7 +5181,7 @@ def _post_failed_audit_via_gateway(
         return None
     chat, text = built
     thread = thread_id if chat_id and thread_id else ""
-    return _post_audit_chat_via_gateway(profile, job_id, chat, text, thread, min(AUDIT_BLOCKS_POST_TIMEOUT_S, left))
+    return _post_audit_chat_via_gateway(platform, profile, job_id, chat, text, thread, min(AUDIT_BLOCKS_POST_TIMEOUT_S, left))
 
 
 def _slack_summary_text(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
@@ -4753,9 +5194,7 @@ def _slack_summary_text(platform: str, report: str, chat_id: str, profile: str, 
     skill. The card itself is :func:`_post_summary_card`'s; this text is what
     posts when the card does not.
     """
-    if platform != SLACK_PLATFORM or not slack_presenter.enabled():
-        return None
-    if not (chat_id or _slack_home_channel()):
+    if not _card_platform(platform, chat_id):
         return None
     text = slack_audit_report.headline_from_summary(report)
     if text is None or not _is_fleet_audit_job(profile, job_id):
@@ -4772,9 +5211,7 @@ def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) ->
     for this very report. Never raises: a card that cannot be read posts as
     text.
     """
-    if platform != SLACK_PLATFORM or job_id != kanban_board_health.JOB_ID or not slack_presenter.enabled():
-        return None
-    if not (chat_id or _slack_home_channel()):
+    if job_id != kanban_board_health.JOB_ID or not _card_platform(platform, chat_id):
         return None
     try:
         return board_health_card.load(kanban_board_health.agent_home(), report)
@@ -4784,18 +5221,18 @@ def _board_health_card(platform: str, report: str, chat_id: str, job_id: str) ->
 
 
 def _post_board_health_card(
-    profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
+    platform: str, profile: str, job_id: str, card: dict, chat_id: str, thread_id: str, deadline: float
 ) -> AuditPost | None:
     """Post the board-health card; where it landed, or None to post the report as text.
 
     Block Kit through the Slack relay, or under ``spec.mode: next`` a chat
     message through the gateway, with the outcomes of :func:`_post_audit_card`.
     """
-    routed = chat_notify.routes(SLACK_PLATFORM)
+    routed = chat_notify.routes(platform)
     if not (routed or slack_blocks_post.configured()):
         return None
     built = board_health_card.chat_from_card(card) if routed else board_health_card.blocks_from_card(card)
-    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+    return _post_audit_card(platform, profile, job_id, built, routed, chat_id, thread_id, deadline)
 
 
 def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
@@ -4810,9 +5247,7 @@ def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, j
     whole report for a reply in the thread, and under ``spec.mode: next`` the
     report folds under the line instead (:func:`_post_failed_audit_via_gateway`).
     """
-    if platform != SLACK_PLATFORM or not slack_presenter.enabled():
-        return None
-    if not (chat_id or _slack_home_channel()):
+    if not _card_platform(platform, chat_id):
         return None
     line = slack_audit_report.failed_line(report)
     if line is None or not _is_fleet_audit_job(profile, job_id):
@@ -5304,11 +5739,11 @@ def relay_cron_report(
             # The stuck tasks alone, as a card with Retry and Drop on each row;
             # where it does not post, the report goes out as written.
             posted = _post_board_health_card(
-                profile, job_id, board, leg_chat_id, leg_thread_id, blocks_deadline
+                platform, profile, job_id, board, leg_chat_id, leg_thread_id, blocks_deadline
             )
         elif headline and not truncation_notice:
             posted = _post_audit_blocks(
-                profile, job_id, headline, message, leg_chat_id, leg_thread_id, blocks_deadline
+                platform, profile, job_id, headline, message, leg_chat_id, leg_thread_id, blocks_deadline
             )
         elif not truncation_notice:
             try:
@@ -5317,7 +5752,7 @@ def relay_cron_report(
                 logger.warning(f"Relay for {profile}/{job_id}: audit summary card skipped: {exc!r}")
             if summary:
                 posted = _post_summary_card(
-                    profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
+                    platform, profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
                 )
             else:
                 try:
@@ -5326,13 +5761,14 @@ def relay_cron_report(
                     logger.warning(f"Relay for {profile}/{job_id}: failed-audit line skipped: {exc!r}")
                 if failed and chat_notify.routes(platform):
                     posted = _post_failed_audit_via_gateway(
-                        profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
+                        platform, profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
                     )
         if posted is not None:
             new_thread_id = posted.thread_id or None
         else:
-            # Under next a reply cannot bring the report back, so a failed audit
-            # whose folded card did not post goes out whole.
+            # A failed audit whose folded card did not post goes out whole: under
+            # next the hermes-bridge attaches the stored report to a reply, but
+            # the card was the one place the failure line was readable.
             if headline:
                 leg_message = truncation_notice + headline.text
             elif summary:
@@ -6324,13 +6760,31 @@ def inject_message(
     #
     # The workload fold comes between the two for the same reason: a duplicate
     # is never going to post, so it must not spend a budget either.
+    #
+    # Past the fold window, a workload whose last incident's fix pull request is
+    # still open for review is held against that incident too
+    # (_open_fix_pull_request): the fault is diagnosed and its fix waits on a
+    # human, so a second investigation would only repeat the first. The forge
+    # lookup is made before the lock, and only when no fold applies, because it
+    # can take seconds and a burst inside the window never needs it.
     quota_denied = False
     suppressed_today = 0
     anchor_id = None
+    held_for: Optional[FixPullRequest] = None
+    fold_key = _fold_key(object_kind, object_name)
+    workload_key = _incident_branch_workload(object_kind, object_name) if object_name else ""
+    fix: Optional[FixPullRequest] = None
+    if (
+        not suppressed
+        and INCIDENT_WORKLOAD_DEDUP_SECONDS > 0
+        and _workload_incident_anchor(event_cluster, namespace, object_kind, fold_key, severity_label) is None
+    ):
+        fix = _open_fix_pull_request(event_cluster, namespace, object_kind, workload_key, event_reason, severity_label)
     with _WORKLOAD_FOLD_LOCK if INCIDENT_WORKLOAD_DEDUP_SECONDS > 0 else nullcontext():
-        fold_key = _fold_key(object_kind, object_name)
         if not suppressed:
             anchor_id = _workload_incident_anchor(event_cluster, namespace, object_kind, fold_key, severity_label)
+            if anchor_id is None and fix is not None:
+                anchor_id, held_for = fix.anchor_id, fix
         if not suppressed and anchor_id is None:
             allowed, suppressed_today = _claim_alert_quota(severity_label)
             quota_denied = not allowed
@@ -6354,7 +6808,19 @@ def inject_message(
             session_id=session_id,
             duplicate_of=anchor_id,
             fold_key=fold_key,
+            workload_key=workload_key,
+            pull_request=held_for.url if held_for is not None else "",
         )
+
+    if held_for is not None:
+        # Answered "folded" for the reason the fold is: the watcher keeps its
+        # entry, so the pod is not re-offered while the fix waits.
+        logger.info(
+            f"Held {severity_label} event {event_reason} for {namespace}/{object_kind}/{object_name} against "
+            f"ledger row {anchor_id}, whose fix {held_for.url} is open for review (no new triage session)"
+        )
+        background_tasks.add_task(_remind_fix_pull_request, held_for.session_id, clean_name, event_reason, held_for.url)
+        return {"status": FEED_STATUS_FOLDED, "duplicate_of": str(anchor_id), "pull_request": held_for.url}
 
     if anchor_id is not None:
         # Neither "filtered" nor "suppressed", both of which reopen. The watcher
@@ -6607,11 +7073,10 @@ def _inject_followup(
     touching the board, for the retry the watcher sends when its client gave
     up on a slow board after the comment had landed.
 
-    A reply, not an edit of the alert: the gateway edits by update key only
-    inside a conversation request (a2a/gateway/notify.go, postConversation),
-    and the alert was a home-channel post whose key was never bound, so a
-    keyed send here would post anew at best and at worst overwrite whatever
-    message had taken that key since, the triage report included.
+    A reply, not an edit of the alert: the gateway keeps the alert's update
+    key on its thread (a2a/gateway/notify.go, postHome) and the triage edits
+    the alert through it, so a keyed send here would overwrite whatever
+    message holds the key by now, the triage report included.
     """
     platform, chat_id, thread_id = _lookup_session_routing(session_id)
     text = _followup_message(session_id, payload)
@@ -6836,6 +7301,29 @@ def store_incident(body: Dict[str, Any]) -> Dict[str, str]:
     return {"status": "stored"}
 
 
+@app.post("/v1/incidents/apply", dependencies=[Depends(verify_api_key)])
+def record_incident_apply(body: Dict[str, Any]) -> Dict[str, str]:
+    """Records a human's `apply` in an incident's thread (INCIDENT_APPLY_CARD_WINDOW_S).
+
+    404 when the thread has no incident: an `apply` anywhere else asks for
+    nothing the recurrence hold could count.
+    """
+    chat_id, thread_id = body.get("chat_id"), body.get("thread_id")
+    if not (chat_id and thread_id):
+        raise HTTPException(status_code=400, detail="chat_id, thread_id required")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+        with conn:
+            if not conn.execute(
+                "SELECT 1 FROM incidents WHERE chat_id = ? AND thread_id = ?", (chat_id, thread_id)
+            ).fetchone():
+                raise HTTPException(status_code=404, detail="no incident for thread")
+            conn.execute(
+                "INSERT INTO incident_applies (chat_id, thread_id, applied_at) VALUES (?, ?, ?)",
+                (chat_id, thread_id, time.time()),
+            )
+    return {"status": "recorded"}
+
+
 @app.get("/v1/incidents/by-thread", dependencies=[Depends(verify_api_key)])
 def get_incident(chat_id: str, thread_id: str) -> Dict[str, str]:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -7053,7 +7541,7 @@ def list_intercepted_events(
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
-        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state"
+        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state, pull_request"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
         if since_id is not None:
@@ -7083,6 +7571,7 @@ def list_intercepted_events(
             ),
             "message": row["message"],
             "duplicate_of": row["duplicate_of"],
+            "pull_request": row["pull_request"],
         }
         for row in rows[:limit]
     ]

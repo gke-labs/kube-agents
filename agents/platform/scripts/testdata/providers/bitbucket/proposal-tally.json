@@ -1,0 +1,508 @@
+{
+  "payload": {
+    "author": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}"
+  },
+  "responses": [
+    {
+      "values": [
+        {
+          "comment_count": 0,
+          "task_count": 0,
+          "type": "pullrequest",
+          "id": 4,
+          "title": "Open check acme-open-1793639646",
+          "description": "Left open by the live check.",
+          "state": "OPEN",
+          "draft": false,
+          "merge_commit": null,
+          "close_source_branch": false,
+          "closed_by": null,
+          "author": {
+            "type": "app_user",
+            "links": {
+              "avatar": {
+                "href": "https://bitbucket.org/account/example/avatar/"
+              }
+            },
+            "created_on": "2026-11-02T15:08:55.432081+00:00",
+            "display_name": "kube-agents",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "account_id": "712020:00000000-0000-0000-0000-000000000001",
+            "account_status": "active",
+            "kind": "repository_access_token"
+          },
+          "reason": "",
+          "created_on": "2026-11-02T17:14:23.553545+00:00",
+          "updated_on": "2026-11-02T17:49:34.393889+00:00",
+          "destination": {
+            "branch": {
+              "name": "main"
+            },
+            "commit": {
+              "hash": "d613b799d16e",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/d613b799d16e"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra/commits/d613b799d16e"
+                }
+              },
+              "type": "commit"
+            },
+            "repository": {
+              "type": "repository",
+              "full_name": "acme/infra",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra"
+                },
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                }
+              },
+              "name": "infra",
+              "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+            }
+          },
+          "source": {
+            "branch": {
+              "name": "acme-open-1793639646",
+              "links": {}
+            },
+            "commit": {
+              "hash": "cdc726073b0a",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/cdc726073b0a"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra/commits/cdc726073b0a"
+                }
+              },
+              "type": "commit"
+            },
+            "repository": {
+              "type": "repository",
+              "full_name": "acme/infra",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra"
+                },
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                }
+              },
+              "name": "infra",
+              "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+            }
+          },
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/4"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/pull-requests/4"
+            },
+            "commits": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/4/commits"
+            },
+            "approve": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/4/approve"
+            },
+            "request-changes": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/4/request-changes"
+            },
+            "diff": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diff/acme/infra:cdc726073b0a%0Dd613b799d16e?from_pullrequest_id=4&topic=true"
+            },
+            "diffstat": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diffstat/acme/infra:cdc726073b0a%0Dd613b799d16e?from_pullrequest_id=4&topic=true"
+            },
+            "comments": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/4/comments"
+            },
+            "activity": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/4/activity"
+            },
+            "merge": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/4/merge"
+            },
+            "decline": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/4/decline"
+            },
+            "statuses": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/4/statuses"
+            },
+            "mergeability_checks": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/4/mergeability/checks"
+            }
+          },
+          "summary": {
+            "type": "rendered",
+            "raw": "Left open by the live check.",
+            "markup": "markdown",
+            "html": "<p>Left open by the live check.</p>"
+          },
+          "queued": false
+        }
+      ],
+      "pagelen": 1,
+      "size": 2,
+      "page": 1,
+      "next": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests?q=author.uuid%3D%22%7B4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e%7D%22+AND+%28state%3D%22OPEN%22%29&sort=-updated_on&pagelen=1&page=2"
+    },
+    {
+      "values": [
+        {
+          "comment_count": 1,
+          "task_count": 0,
+          "type": "pullrequest",
+          "id": 6,
+          "title": "Data 2",
+          "description": "Readings data 2.",
+          "state": "MERGED",
+          "draft": false,
+          "merge_commit": {
+            "hash": "b7aec0d9a64b",
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/b7aec0d9a64b"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra/commits/b7aec0d9a64b"
+              }
+            },
+            "type": "commit"
+          },
+          "close_source_branch": true,
+          "closed_by": {
+            "type": "app_user",
+            "links": {
+              "avatar": {
+                "href": "https://bitbucket.org/account/example/avatar/"
+              }
+            },
+            "created_on": "2026-11-02T15:08:55.432081+00:00",
+            "display_name": "kube-agents",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "account_id": "712020:00000000-0000-0000-0000-000000000001",
+            "account_status": "active",
+            "kind": "repository_access_token"
+          },
+          "author": {
+            "type": "app_user",
+            "links": {
+              "avatar": {
+                "href": "https://bitbucket.org/account/example/avatar/"
+              }
+            },
+            "created_on": "2026-11-02T15:08:55.432081+00:00",
+            "display_name": "kube-agents",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "account_id": "712020:00000000-0000-0000-0000-000000000001",
+            "account_status": "active",
+            "kind": "repository_access_token"
+          },
+          "reason": "",
+          "created_on": "2026-11-02T17:29:37.708946+00:00",
+          "updated_on": "2026-11-02T17:49:35.119108+00:00",
+          "destination": {
+            "branch": {
+              "name": "main"
+            },
+            "commit": {
+              "hash": "8d739b1fb2cc",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/8d739b1fb2cc"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra/commits/8d739b1fb2cc"
+                }
+              },
+              "type": "commit"
+            },
+            "repository": {
+              "type": "repository",
+              "full_name": "acme/infra",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra"
+                },
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                }
+              },
+              "name": "infra",
+              "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+            }
+          },
+          "source": {
+            "branch": {
+              "name": "acme-data-2-1793640534",
+              "links": {}
+            },
+            "commit": {
+              "hash": "1a56c53c11a8",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/1a56c53c11a8"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra/commits/1a56c53c11a8"
+                }
+              },
+              "type": "commit"
+            },
+            "repository": {
+              "type": "repository",
+              "full_name": "acme/infra",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra"
+                },
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                }
+              },
+              "name": "infra",
+              "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+            }
+          },
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/6"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/pull-requests/6"
+            },
+            "commits": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/6/commits"
+            },
+            "approve": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/6/approve"
+            },
+            "request-changes": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/6/request-changes"
+            },
+            "diff": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diff/acme/infra:1a56c53c11a8%0D8d739b1fb2cc?from_pullrequest_id=6&topic=true"
+            },
+            "diffstat": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diffstat/acme/infra:1a56c53c11a8%0D8d739b1fb2cc?from_pullrequest_id=6&topic=true"
+            },
+            "comments": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/6/comments"
+            },
+            "activity": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/6/activity"
+            },
+            "merge": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/6/merge"
+            },
+            "decline": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/6/decline"
+            },
+            "statuses": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/6/statuses"
+            },
+            "mergeability_checks": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/6/mergeability/checks"
+            }
+          },
+          "summary": {
+            "type": "rendered",
+            "raw": "Readings data 2.",
+            "markup": "markdown",
+            "html": "<p>Readings data 2.</p>"
+          },
+          "queued": false
+        }
+      ],
+      "pagelen": 1,
+      "size": 5,
+      "page": 1,
+      "next": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests?q=author.uuid%3D%22%7B4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e%7D%22+AND+%28state%3D%22MERGED%22%29&sort=-updated_on&pagelen=1&page=2"
+    },
+    {
+      "values": [
+        {
+          "comment_count": 0,
+          "task_count": 0,
+          "type": "pullrequest",
+          "id": 3,
+          "title": "Decline check acme-decl-1793639625",
+          "description": "Declined by the live check.",
+          "state": "DECLINED",
+          "draft": false,
+          "merge_commit": null,
+          "close_source_branch": false,
+          "closed_by": {
+            "type": "app_user",
+            "links": {
+              "avatar": {
+                "href": "https://bitbucket.org/account/example/avatar/"
+              }
+            },
+            "created_on": "2026-11-02T15:08:55.432081+00:00",
+            "display_name": "kube-agents",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "account_id": "712020:00000000-0000-0000-0000-000000000001",
+            "account_status": "active",
+            "kind": "repository_access_token"
+          },
+          "author": {
+            "type": "app_user",
+            "links": {
+              "avatar": {
+                "href": "https://bitbucket.org/account/example/avatar/"
+              }
+            },
+            "created_on": "2026-11-02T15:08:55.432081+00:00",
+            "display_name": "kube-agents",
+            "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+            "account_id": "712020:00000000-0000-0000-0000-000000000001",
+            "account_status": "active",
+            "kind": "repository_access_token"
+          },
+          "reason": "",
+          "created_on": "2026-11-02T17:14:02.780455+00:00",
+          "updated_on": "2026-11-02T17:14:05.572578+00:00",
+          "destination": {
+            "branch": {
+              "name": "main"
+            },
+            "commit": {
+              "hash": "54f28412a790",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/54f28412a790"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra/commits/54f28412a790"
+                }
+              },
+              "type": "commit"
+            },
+            "repository": {
+              "type": "repository",
+              "full_name": "acme/infra",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra"
+                },
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                }
+              },
+              "name": "infra",
+              "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+            }
+          },
+          "source": {
+            "branch": {
+              "name": "acme-decl-1793639625",
+              "links": {}
+            },
+            "commit": {
+              "hash": "246cb9206dbb",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/246cb9206dbb"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra/commits/246cb9206dbb"
+                }
+              },
+              "type": "commit"
+            },
+            "repository": {
+              "type": "repository",
+              "full_name": "acme/infra",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra"
+                },
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                }
+              },
+              "name": "infra",
+              "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+            }
+          },
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/3"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/pull-requests/3"
+            },
+            "commits": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/3/commits"
+            },
+            "approve": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/3/approve"
+            },
+            "request-changes": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/3/request-changes"
+            },
+            "diff": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diff/acme/infra:246cb9206dbb%0D54f28412a790?from_pullrequest_id=3&topic=true"
+            },
+            "diffstat": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diffstat/acme/infra:246cb9206dbb%0D54f28412a790?from_pullrequest_id=3&topic=true"
+            },
+            "comments": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/3/comments"
+            },
+            "activity": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/3/activity"
+            },
+            "merge": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/3/merge"
+            },
+            "decline": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/3/decline"
+            },
+            "statuses": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/3/statuses"
+            },
+            "mergeability_checks": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/3/mergeability/checks"
+            }
+          },
+          "summary": {
+            "type": "rendered",
+            "raw": "Declined by the live check.",
+            "markup": "markdown",
+            "html": "<p>Declined by the live check.</p>"
+          },
+          "queued": false
+        }
+      ],
+      "pagelen": 1,
+      "size": 1,
+      "page": 1
+    }
+  ]
+}
