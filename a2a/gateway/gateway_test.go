@@ -2588,6 +2588,20 @@ func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
 	}
 }
 
+// TestSessionOnAckTellsThreadedDMsToReplyInThread: a Google Chat DM roots
+// each top-level message in a conversation of its own, as a Slack DM does,
+// so its ack carries Slack's DM wording. A Discord DM has no threads and
+// keeps the generic wording.
+func TestSessionOnAckTellsThreadedDMsToReplyInThread(t *testing.T) {
+	want := sessionOnAck(slackBackend, sessionKindDM, "bridge")
+	if got := sessionOnAck(gchatBackend, sessionKindDM, "bridge"); got != want {
+		t.Fatalf("gchat DM ack = %q, want Slack's DM wording %q", got, want)
+	}
+	if got := sessionOnAck(discordBackend, sessionKindDM, "bridge"); got == want {
+		t.Fatalf("discord DM ack = %q; a Discord DM has no threads", got)
+	}
+}
+
 // TestNewRefusesTheClusterViewWithoutABrokerURL: told the view is on but not
 // where the broker is, the gateway refuses to start rather than spawn pods
 // whose shim dials nothing.

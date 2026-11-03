@@ -1939,8 +1939,9 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	}
 	running := rec.ActiveTask != nil && !rec.ActiveTask.Detached
 	if off {
-		// A top-level message in a Slack DM roots a conversation of its own,
-		// so a top-level /session off cannot reach the thread the user routed.
+		// A top-level message in a Slack or Google Chat DM roots a
+		// conversation of its own, so a top-level /session off cannot reach
+		// the thread the user routed.
 		// Say where it goes instead of answering for the fresh conversation.
 		if msg.TopLevel && !rec.SessionRouted {
 			g.post(rec.Key, topLevelSessionOffNotice)
@@ -2014,20 +2015,20 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 }
 
 // topLevelSessionOffNotice answers a /session off typed at the top of a
-// Slack DM, where it roots a fresh conversation rather than reaching the
-// thread whose session the user means.
+// Slack or Google Chat DM, where it roots a fresh conversation rather than
+// reaching the thread whose session the user means.
 const topLevelSessionOffNotice = "ℹ️ `/session off` acts on the thread it's typed in — reply `/session off` in that question's thread"
 
 // sessionOnAck is the reply to a bare /session. It promises what the backend
 // will deliver: the Slack adapter forwards an unmentioned channel-thread
 // reply only once the gateway has started a task in that thread, and a
 // /session binding starts none, so in a Slack channel the next message needs
-// the mention. A Slack DM carries every message, but each top-level DM is a
-// conversation of its own, so the binding holds only for replies in the
-// thread the /session was typed in. The other backends route the next
-// message on their own rules.
+// the mention. A Slack or Google Chat DM carries every message, but each
+// top-level DM is a conversation of its own, so the binding holds only for
+// replies in the thread the /session was typed in. The other backends route
+// the next message on their own rules.
 func sessionOnAck(backend, kind, defaultAddressee string) string {
-	if backend == slackBackend && kind == sessionKindDM {
+	if (backend == slackBackend || backend == gchatBackend) && kind == sessionKindDM {
 		return "🧵 session route on — reply in this thread to open a session pod; `/session off` returns to `" + defaultAddressee + "`"
 	}
 	if backend == slackBackend {
