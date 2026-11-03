@@ -38,14 +38,17 @@ state on the agent's PVC, as the pod's KSA (model auth via Workload Identity for
 things are taken out. The agent's own values for the names the bridge sets for itself, and
 the agent's bus identity: `AGENT_SHARED_STATE_SETUP`, `NATS_URL`, `NATS_USER`,
 `NATS_PASSWORD`, `BRIDGE_CONCURRENCY`, `BRIDGE_EXECUTOR`, `A2A_ACTIVITY_SECRET`,
-`API_SERVER_KEY` and `A2A_BUS_USER`. And the `a2a-bus-token` mount, the `agent` principal's credential, which the
+`API_SERVER_KEY`, `BRIDGE_MEMORY_LIMIT_BYTES` and `A2A_BUS_USER`. And the `a2a-bus-token` mount, the `agent` principal's credential, which the
 bridge never holds ([Bus user and grants](#bus-user-and-grants)). Ports and probes are not
 copied. On top go the bridge's own: `AGENT_SHARED_STATE_SETUP=skip`, so the image's
 entrypoint runs its container-local init and execs the bridge as it does for the dashboard
 container; `NATS_URL` for the `<agent>-a2a-nats` Service; `NATS_USER=bridge` and
 `NATS_PASSWORD` from the `bridge-password` key of `<agent>-a2a-nats-creds`;
 `BRIDGE_CONCURRENCY`; and `A2A_ACTIVITY_SECRET` from the same Secret's `bridge-activity-key`,
-optional; and `API_SERVER_KEY`, the bearer the agent's API server accepts, which the `api`
+optional; `BRIDGE_MEMORY_LIMIT_BYTES`, the container's own `limits.memory` through the
+Downward API, which the bridge turns into its Go soft memory limit (nine tenths of it; an
+explicit `GOMEMLIMIT` wins), so the limit it paces to is the one the cluster admitted, an
+Autopilot clamp to the request included; and `API_SERVER_KEY`, the bearer the agent's API server accepts, which the `api`
 executor needs ([Executors](#executors)). It is set rather than inherited because the agent
 container's entry can come from an AgentPlugin's env, and a blank or unresolvable one would
 quietly switch the bridge to `cli`.
@@ -103,9 +106,12 @@ mode and again when the bridge arrives after the Job. The agent Deployment's str
 agent outage: the old pod stops before the new one starts. Once `BusProvisioned` has been
 `True` the bridge stays in the pod on later renders.
 
-**It has its own resources, sized for the `api` executor.** The rendered bridge requests 100m
-CPU and 256Mi, with limits of 1 CPU and 512Mi. The request is sized to live under on its
-own, since GKE Autopilot without Pod bursting sets every limit to its request. On `api`, the default, it's a Go relay that
+**It has its own resources, sized for the `api` executor.** The rendered bridge requests 250m
+CPU and 512Mi, with limits of 1 CPU and 1Gi. The request is sized to live under on its
+own, since GKE Autopilot without Pod bursting sets every limit to its request: one answer at
+the 8 MiB response cap takes about 80Mi to read, decode and publish, so the ten workers of
+the default concurrency at once sit under 512Mi, where the 256Mi it used to request held
+three. The pair sits in the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged. On `api`, the default, it's a Go relay that
 holds one HTTP request per task to the agent container's API server, and the turn itself
 runs in the agent container. Measured idle it uses about 1m CPU and 5Mi
 ([#2748](https://github.com/gke-labs/kube-agents/issues/2748)). It used to copy the agent
@@ -459,7 +465,11 @@ message: `reason: hermes-exited-nonzero - exit status N; session: <id>; stdout t
 tail: …`. Both tails are bounded (2 KiB each),
 and `session:` carries the id when `hermes chat -Q` printed its `session_id:` line on stderr (it
 is the last thing the CLI writes before exiting), so the transcript under the profile's session
-store can be found from the terminal alone. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
+store can be found from the terminal alone. The bridge keeps at most 8 MiB of the child's stdout
+(`cliStdoutCap` in `bridge.go`, the `api` executor's read cap) and counts the rest, so a child
+that prints without end cannot grow the bridge's heap with it; a clean exit whose stdout went
+past the cap ends `failed` with `reason: hermes-cli-oversize`, the limit named, refused rather
+than published cut. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
 gave up on the provider's rate limit or billing; it is named `reason: hermes-rate-limited` instead,
 which the eval harness classes as infrastructure rather than the persona's failure (the image patch
 `apply_quiet_rate_limit_exit.py` makes a plain `-Q` run exit 75 on that failure, as a kanban worker
@@ -640,6 +650,7 @@ failures name themselves in the status message:
 | `hermes-api-unreadable`         | a 2xx answer that is not a chat completion with at least one choice                                                                  | persona            |
 | `hermes-api-read-failed`        | the response body broke off mid-read                                                                                                 | persona            |
 | `hermes-api-oversize`           | a 2xx body over the 8 MiB read cap (`apiResponseCap` in `api.go`); refused rather than truncated, with the limit named               | persona            |
+| `hermes-cli-oversize`           | a `cli` child exited 0 with over 8 MiB on stdout (`cliStdoutCap`, `bridge.go`); refused rather than truncated, with the limit named  | persona            |
 | `hermes-unstructured-reasoning` | the answer opens with a `thought` or `thought:` line, the model's reasoning written as content (#3206); withheld, on either executor | persona            |
 | `request-encode-failed`         | the bridge could not encode the request; a bridge fault, not expected in practice                                                    | graded (unlisted)  |
 | `request-build-failed`          | the bridge could not build the request; the URL is checked at start, so likewise                                                     | graded (unlisted)  |
