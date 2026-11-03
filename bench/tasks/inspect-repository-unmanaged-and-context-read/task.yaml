@@ -39,32 +39,24 @@
 # project's GitOps state, is the place to add it. Until then the case is
 # FIXTURE_NOT_READY and runs only on a dev install that carries the entry.
 #
-# THE ROUTE CHECK reads each worker command as argv runs, not as text. A
-# forbidden run is positive evidence that a workspace handle was used: a
-# workspace verb of inspect_repository.py, or a run whose words carry
-# /v1/workspace through curl, wget, `python -c`, `python3 -c`,
-# `python3.14 -c` or `python3 -` (standard input). A mention (grep, echo,
-# cat) is no run, so it neither meets the required `clone` run nor fails the
-# check. A `python3 -c` program that only prints the path is still a run; no
-# argv tells it from a call. Two text patterns read the start of a row:
-#   - an assignment that holds the route (`URL=…/v1/workspace/open`), which
-#     hermes keeps as a chain's first segment;
-#   - `python3 - <<EOF … /v1/workspace … EOF`, because a `(` in the body
-#     cuts the python3 segment, so the run does not see a route inside
-#     `urlopen('…')`.
-# A grep or an echo row starts with its own command, so these patterns do
-# not match it. The check does not see these routes:
-#   - httpie, node, or another client that the runs do not name;
-#   - a script file that names the route (`python3 /tmp/call.py`);
-#   - a program that the execute_code tool runs, which has no curl, wget or
-#     python3 command word;
-#   - a route in a variable that `export` set, because hermes drops the
-#     `export` segment and the run does not resolve `$URL`;
-#   - a versioned interpreter other than python3.14, the sandbox image's
-#     Python: a run matches the exact basename, so `python3.11 -c` is no
-#     `python3` run;
-#   - a backslash-newline before `-c`: hermes leaves the word ` -c`, which is
-#     not the flag `-c`.
+# THE ROUTE CHECK reads the inspect_repository.py commands as argv runs,
+# not as text: the required run is the script with the word `clone`, and a
+# forbidden run is the script with a workspace verb. A mention of the script
+# (grep, echo, cat) is no run, so it neither meets the required run nor
+# fails the check. The workspace route itself is a text pattern, because a
+# run must name every client that could carry it (curl, wget, python in any
+# version and form, a heredoc, a wrapper such as timeout), and each one it
+# misses is a workspace call that passes. The pattern matches any row that
+# names /v1/workspace, except a row whose command is one that only reads or
+# prints (grep, rg, egrep, fgrep, cat, echo, printf, sed, head, tail, less,
+# find, ls), after an optional leading `cd <dir> &&` or `cd <dir>;`. So a
+# grep of the skill tree does not fail the check, and a python heredoc, a
+# `python3 -Ic` program or an assignment that holds the route does. The
+# check does not see a route that no row names: a script file that names it
+# (`python3 /tmp/call.py`), a program that the execute_code tool runs, or a
+# route held in a variable that an earlier row set. A row that reads first
+# and then calls the route in the same chain (`grep … && curl …/v1/workspace`)
+# is read as a mention.
 # A workspace verb matches as any word after the script, not only as the
 # subcommand. So an option value that is a bare open, list, grep, fetch or
 # close (`clone … --into list`) counts as the verb and fails the check; a
@@ -161,25 +153,7 @@ verification_spec:
       forbidden_runs:
         - script: inspect_repository.py
           word_patterns: ["^ ?(open|list|grep|fetch|close)$"]
-        - script: curl
-          word_patterns: ['/v1/workspace\b']
-        - script: wget
-          word_patterns: ['/v1/workspace\b']
-        - script: python
-          flags: ["-c"]
-          word_patterns: ['/v1/workspace\b']
-        - script: python3
-          flags: ["-c"]
-          word_patterns: ['/v1/workspace\b']
-        - script: python3.14
-          flags: ["-c"]
-          word_patterns: ['/v1/workspace\b']
-        - script: python3
-          flags: ["-"]
-          word_patterns: ['/v1/workspace\b']
-      # A route held in an assignment, and a route in a python3 heredoc
-      # body; the case header explains both. Each is anchored to the start
-      # of the row, so a grep or an echo that names the route does not match.
+      # Any row that names the workspace route, unless its command only
+      # reads or prints; the case header lists the commands and the limits.
       forbidden_patterns:
-        - '^[A-Za-z_]\w*=\S*/v1/workspace\b'
-        - '^\S*python[\d.]* - <<.*/v1/workspace\b'
+        - '(?s)^\s*(?:cd\s+\S+\s*(?:&&|;)\s*)?+(?!(?:grep|rg|egrep|fgrep|cat|echo|printf|sed|head|tail|less|find|ls)\b).*/v1/workspace\b'
