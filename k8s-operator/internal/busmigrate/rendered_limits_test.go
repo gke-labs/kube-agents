@@ -3,7 +3,10 @@ package busmigrate
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -184,5 +187,69 @@ func TestTheWayBackRestoresAStreamThatDoesNotFitTheRender(t *testing.T) {
 	widened.Subjects = []string{"a2a.>"}
 	if err := RestoreAsItWas(ctx, nc, widened, meta.State, opener(data), Digest(data), policy); !errors.Is(err, ErrOutsidePolicy) {
 		t.Errorf("way back with a widened subject: %v, want ErrOutsidePolicy", err)
+	}
+}
+
+// stageTasks writes TASKS's snapshot the way the snapshot pod stages it, and
+// the run file the operator writes for it under policy.
+func stageTasks(t *testing.T, meta *Metadata, data []byte, policy StreamPolicy) (string, RunFile) {
+	t.Helper()
+	dir := t.TempDir()
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "TASKS"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "TASKS", SnapshotMetaFile), metaBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "TASKS", SnapshotDataFile), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir, RunFile{
+		Digests:  map[string]StagedDigest{"TASKS": {Data: Digest(data), Meta: Digest(metaBytes)}},
+		Policies: []StreamPolicy{policy},
+	}
+}
+
+// The restore pod picks its restore by where it restores to: into three
+// servers a snapshot over the rendered cap is refused at once, not retried;
+// into one (the way back) it goes back as it was, and a pod run again finds
+// it already built rather than restoring onto an existing name.
+func TestTheRestorePodPicksItsRestoreByLeg(t *testing.T) {
+	meta, data := snapshotTasks(t)
+	policy := policyOf(meta.Config)
+	policy.MaxBytes = int64(meta.State.Bytes) - 1
+	dir, run := stageTasks(t, meta, data, policy)
+	dst := startServer(t, "a2a-nats-0", t.TempDir(), 0)
+	defer shutdown(dst)
+	nc, err := nats.Connect(dst.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	ctx := context.Background()
+
+	start := time.Now()
+	if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3); !errors.Is(err, ErrOverRenderedLimits) {
+		t.Fatalf("into three servers: %v, want ErrOverRenderedLimits", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("the refusal took %v; it was retried", took)
+	}
+	for i := 1; i <= 2; i++ {
+		if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 1); err != nil {
+			t.Fatalf("into one server, run %d: %v", i, err)
+		}
+	}
+	js, _ := nc.JetStream()
+	info, err := js.StreamInfo("TASKS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Config.MaxBytes != meta.Config.MaxBytes || info.State.Msgs != meta.State.Msgs {
+		t.Errorf("way back: max_bytes %d msgs %d, want the snapshot's %d and %d", info.Config.MaxBytes, info.State.Msgs, meta.Config.MaxBytes, meta.State.Msgs)
 	}
 }
