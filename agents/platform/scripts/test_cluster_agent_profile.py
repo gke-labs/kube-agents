@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "shared"))
 
 import cluster_agent_profile as cap  # noqa: E402
+import credential_proxy_client  # noqa: E402
 import terminal_env_pin  # noqa: E402
 import gke_endpoint  # noqa: E402
 
@@ -785,8 +786,10 @@ class CreateProfileTest(unittest.TestCase):
 
         self._patch(subprocess, "run", recording)
         self.assertEqual(self.create(), self.name)
-        client = cap.credential_proxy_client
-        self.assertEqual([str(cap.PROBE_SHIM_RETRY_DEADLINE_SECONDS)], [env[client.RETRY_DEADLINE_ENV] for env in probe_envs])
+        client = credential_proxy_client
+        # The name is spelled in the script, not imported (its constants comment says why).
+        self.assertEqual(client.RETRY_DEADLINE_ENV, cap.SHIM_RETRY_DEADLINE_ENV)
+        self.assertEqual([str(cap.PROBE_SHIM_RETRY_DEADLINE_SECONDS)], [env[cap.SHIM_RETRY_DEADLINE_ENV] for env in probe_envs])
         deadline = float(cap.PROBE_SHIM_RETRY_DEADLINE_SECONDS)
         self.assertEqual(max(0, cap.CONNECTIVITY_PROBE_TIMEOUT_SECONDS - cap.BROKER_KUBECTL_RUN_SECONDS), deadline)
         shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS

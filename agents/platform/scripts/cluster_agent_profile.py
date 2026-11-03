@@ -26,7 +26,6 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
-import credential_proxy_client
 import sandbox_exec
 from gke_endpoint import EndpointDecision, endpoint_decision
 from profile_scaffold import (
@@ -105,7 +104,12 @@ CONNECTIVITY_PROBE_TIMEOUT_SECONDS = 45
 # default), so a retry could only end in the probe's own kill, with the
 # refusal's text, the one line the probe exists to log, unread. The probe tells
 # the shim its bound less the run bound, under which no retry fits, and a
-# refused probe logs the refusal at once.
+# refused probe logs the refusal at once. The variable's name is spelled here
+# rather than imported from credential_proxy_client (test_cluster_agent_profile.py
+# holds the two equal): the image entrypoint's cluster loop runs this script at
+# gateway start-up, and tests/test_docker_entrypoint.py stages it with the three
+# modules it imports, so a new import here is a loop that silently stops stamping.
+SHIM_RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
 BROKER_KUBECTL_RUN_SECONDS = 60
 PROBE_SHIM_RETRY_DEADLINE_SECONDS = max(0, CONNECTIVITY_PROBE_TIMEOUT_SECONDS - BROKER_KUBECTL_RUN_SECONDS)
 # What kubectl prints when it never reached the API server, as opposed to an
@@ -531,7 +535,7 @@ def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision 
             argv,
             remote_env={
                 "KUBECONFIG": str(kubeconfig),
-                credential_proxy_client.RETRY_DEADLINE_ENV: str(PROBE_SHIM_RETRY_DEADLINE_SECONDS),
+                SHIM_RETRY_DEADLINE_ENV: str(PROBE_SHIM_RETRY_DEADLINE_SECONDS),
             },
             local_env=_run_env({"KUBECONFIG": str(kubeconfig)}),
             timeout=CONNECTIVITY_PROBE_TIMEOUT_SECONDS,
