@@ -348,6 +348,20 @@ class ScopeArgumentRetryTest(unittest.TestCase):
         self.assertIsInstance(error, subprocess.CalledProcessError)
         self.assertEqual((1, []), (len(calls), clock.slept))
         self.assertFalse(pub._scope_argument_wait.caught_up)
+        # It tells the run that the window lost a member, for one recovery pass.
+        self.assertTrue(pub._scope_argument_wait.probe_refused)
+
+    def test_a_refused_source_lookup_is_not_taken_for_a_refused_probe(self):
+        answered = subprocess.CompletedProcess([], 0, "[]", "")
+        self._run([self._refused(), answered])
+        self.assertFalse(pub._scope_argument_wait.probe_refused)
+
+    def test_another_refusal_of_a_probe_is_not_taken_for_a_lost_member(self):
+        probe = [t.format("team-project") for t in SHAPE_PROBE]
+        for stderr in (SCOPE_ARGV_STDERR, UNREADABLE_DECLARATION_STDERR):
+            pub._scope_argument_wait.reset()
+            self._run([self._refused(stderr)], argv=probe)
+            self.assertFalse(pub._scope_argument_wait.probe_refused, stderr)
 
     def test_the_window_is_the_runs_not_each_lookups(self):
         clock = FakeClock()
@@ -393,16 +407,40 @@ class FakeBrokerThroughClient:
     times, while the broker's scope.json does not name it yet; the first answer after that
     is its scope.json changing, which empties the member window as a new digest does. A
     probe or a project-number lookup of an argument outside the window gets the same rule.
+
+    `flip_on(argv)` changes the broker's scope.json, once, before the first call it is true
+    for: the window empties and every refusal left ends, with no source refused for it (an
+    edit that adds no source, or a mount that catches up after its lookup gave up). `script`
+    maps a source argument to the answers its calls get in turn, before the usual ones:
+    "refuse", "fail" (a client failure that reaches no policy check) or "flip" (the mount
+    catches up: the window empties, and the call is answered).
     """
 
-    def __init__(self, broker, refusals):
+    def __init__(self, broker, refusals, flip_on=None, script=None):
         self.broker, self.refusals = broker, dict(refusals)
+        self.flip_on, self.flipped = flip_on, False
+        self.script = {argument: list(answers) for argument, answers in (script or {}).items()}
+
+    def _flip(self):
+        self.broker.window.clear()
+        self.refusals = {argument: None for argument in self.refusals}
 
     def _refused(self, cmd):
         return subprocess.CompletedProcess(cmd, pub.EXIT_SECURITY_POLICY_BLOCKED, "", SCOPE_ARGUMENT_STDERR)
 
     def __call__(self, cmd, **kwargs):
         argv = cmd[2:]
+        if self.flip_on is not None and not self.flipped and self.flip_on(argv):
+            self.flipped = True
+            self._flip()
+        for argument, answers in self.script.items():
+            if answers and any(argument in token for token in argv):
+                action = answers.pop(0)
+                if action == "refuse":
+                    return self._refused(cmd)
+                if action == "fail":
+                    return subprocess.CompletedProcess(cmd, 1, "", "credential proxy unavailable: connection reset")
+                self.broker.window.clear()  # "flip"
         for argument, left in self.refusals.items():
             if left is not None and any(argument in token for token in argv):
                 if left:
@@ -823,11 +861,100 @@ class BuildDocumentTest(unittest.TestCase):
         self.assertEqual(document["projects"], [{"id": "mon-proj-a", "via": [FOLDER_A, "metricsScopes/scope-project"],
                                                  "outcome": "denied", "confirmedAt": PREVIOUS_TIME}])
 
-    def _build_through_client(self, broker, refusals, declared, previous=None):
+    def _build_through_client(self, broker, refusals, declared, previous=None, flip_on=None, script=None):
         clock = FakeClock()
         with mock.patch.object(rec, "COMMAND_RUNNER", pub.broker_run), clock.patch(), \
-                mock.patch.object(pub.subprocess, "run", FakeBrokerThroughClient(broker, refusals)):
+                mock.patch.object(pub.subprocess, "run", FakeBrokerThroughClient(broker, refusals, flip_on, script)):
             return pub.build_document(declared, MANAGEMENT, previous), clock
+
+    @staticmethod
+    def _is_probe(argv):
+        return list(argv[:4]) == list(SHAPE_PROBE[:4])
+
+    @staticmethod
+    def _recoveries(logged):
+        return sum("refused a probe as not declared" in str(c) for c in logged.call_args_list)
+
+    def test_an_edit_that_adds_no_source_is_recovered_from_its_refused_probes(self):
+        # The digest changes after the sources resolved, and no source lookup is refused
+        # for it: the first probe is, as not declared. One recovery pass resolves the
+        # sources under the new digest and probes again.
+        broker = FakeBroker(assets={FOLDER_A: ["team-a1", "team-a2"]})
+        with mock.patch.object(pub, "log") as logged:
+            document, _ = self._build_through_client(broker, {}, _scope(folders=["111111111111"]),
+                                                     flip_on=self._is_probe)
+        self.assertEqual({p: r["outcome"] for p, r in self._rows(document).items()},
+                         {"team-a1": "ok", "team-a2": "ok"})
+        self.assertEqual(1, self._recoveries(logged))
+
+    def test_a_source_whose_wait_ran_out_resolves_when_the_mount_catches_up_later(self):
+        # The new folder is refused past the retry window and is given up; the mount then
+        # catches up before the probes, which empties the window. The recovery pass
+        # resolves the new folder too.
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"], FOLDER_B: ["team-b"]})
+        with mock.patch.object(pub, "log") as logged:
+            document, clock = self._build_through_client(
+                broker, {FOLDER_B: 10_000}, _scope(folders=["111111111111", "222222222222"]),
+                flip_on=self._is_probe)
+        self.assertGreater(sum(clock.slept), pub.SCOPE_ARGUMENT_RETRY_WINDOW_SECONDS / 2)
+        self.assertEqual({p: r["outcome"] for p, r in self._rows(document).items()},
+                         {"team-a": "ok", "team-b": "ok"})
+        self.assertEqual(1, self._recoveries(logged))
+
+    def test_a_catch_up_during_the_second_resolve_is_recovered_from(self):
+        # A client failure after a wait sets caught_up before the real catch-up; that one
+        # lands inside the second resolve, after the existing folder resolved again under
+        # the old digest. Its members' probes are refused, and the recovery pass runs.
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"], FOLDER_B: ["team-b"]})
+        with mock.patch.object(pub, "log") as logged:
+            document, _ = self._build_through_client(
+                broker, {}, _scope(folders=["111111111111", "222222222222"]),
+                script={FOLDER_B: ["refuse", "fail", "refuse", "flip"]})
+        self.assertEqual({p: r["outcome"] for p, r in self._rows(document).items()},
+                         {"team-a": "ok", "team-b": "ok"})
+        self.assertEqual(1, self._recoveries(logged))
+
+    def test_a_second_resolve_that_gets_no_answer_keeps_the_first_passs(self):
+        # The only source answers after the mount catches up; the second resolve then gets
+        # no answer. Its first answer stands: the run publishes the member, not `error`.
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
+        document, _ = self._build_through_client(
+            broker, {}, _scope(folders=["111111111111"]),
+            script={FOLDER_A: ["refuse", "refuse", "flip", "fail"]})
+        self.assertEqual(document["state"], pub.STATE_OK)
+        self.assertEqual({p: r["outcome"] for p, r in self._rows(document).items()}, {"team-a": "ok"})
+
+    def test_the_recovery_pass_runs_once(self):
+        # A window that empties again before every probe: one recovery pass, then the rows
+        # read as the probes left them.
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
+        client = FakeBrokerThroughClient(broker, {})
+        original = client.__call__
+
+        def flip_every_probe(cmd, **kwargs):
+            if self._is_probe(cmd[2:]):
+                broker.window.clear()
+            return original(cmd, **kwargs)
+
+        clock = FakeClock()
+        with mock.patch.object(pub, "log") as logged, mock.patch.object(rec, "COMMAND_RUNNER", pub.broker_run), \
+                clock.patch(), mock.patch.object(pub.subprocess, "run", flip_every_probe):
+            document = pub.build_document(_scope(folders=["111111111111"]), MANAGEMENT, None)
+        self.assertEqual(1, self._recoveries(logged))
+        self.assertEqual(self._rows(document)["team-a"]["outcome"], "unreachable")
+
+    def test_no_recovery_pass_without_a_refused_probe_or_the_budget_for_one(self):
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
+        with mock.patch.object(pub, "log") as logged:
+            self._build_through_client(broker, {}, _scope(folders=["111111111111"]))
+        self.assertEqual(0, self._recoveries(logged))
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
+        with mock.patch.object(pub, "log") as logged, \
+                mock.patch.object(rec, "_list_budget_seconds", return_value=pub.SCOPE_RECOVERY_MIN_SECONDS - 1):
+            document, _ = self._build_through_client(broker, {}, _scope(folders=["111111111111"]),
+                                                     flip_on=self._is_probe)
+        self.assertEqual(0, self._recoveries(logged))
+        self.assertEqual(self._rows(document)["team-a"]["outcome"], "unreachable")
 
     def test_sources_resolved_before_the_mount_changed_are_resolved_again(self):
         # The existing folder sorts first and resolves under the old digest; the new one

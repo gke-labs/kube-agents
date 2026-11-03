@@ -134,6 +134,12 @@ SCOPE_ARGUMENT_SOURCE_SHAPES = frozenset(
 SCOPE_ARGUMENT_RETRY_SECONDS = 5
 SCOPE_ARGUMENT_RETRY_WINDOW_SECONDS = 120
 SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS = 5
+# A probe or a project-number lookup refused as not declared means the broker's member window
+# no longer holds a member an earlier lookup returned: its scope.json, and the digest the window
+# is tied to, changed after the sources resolved (an edit that adds no source, a mount that
+# caught up late). The run then resolves every source again and probes again, once, if the
+# budget still leaves one lookup and one probe their minimum attempt.
+SCOPE_RECOVERY_MIN_SECONDS = 2 * SCOPE_ARGUMENT_MIN_ATTEMPT_SECONDS
 # The broker's argv flag the log leaves out: it names no source, only the output columns.
 FORMAT_FLAG_PREFIX = "--format="
 # The Kubernetes API, from the pod: the in-cluster token and CA the operator projects at the
@@ -180,8 +186,10 @@ class _ScopeArgumentWait:
     a source lookup. `caught_up` is set when a source lookup that had been refused then
     answered: the broker's scope.json changed during the run, and with it the digest its
     member window is tied to, so the members recorded before the change are gone from it.
-    build_document resets both at the start of a run and resolves the sources again when
-    `caught_up` is set.
+    `probe_refused` is set when a probe or a project-number lookup is refused as not
+    declared: the same change, seen after the sources resolved. build_document resets all
+    three at the start of a run, resolves the sources again when `caught_up` is set, and
+    resolves and probes again once when `probe_refused` is set.
     """
 
     def __init__(self) -> None:
@@ -190,6 +198,7 @@ class _ScopeArgumentWait:
     def reset(self) -> None:
         self.until: float | None = None
         self.caught_up = False
+        self.probe_refused = False
 
 
 _scope_argument_wait = _ScopeArgumentWait()
@@ -250,6 +259,10 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
         undeclared = (result.returncode == EXIT_SECURITY_POLICY_BLOCKED
                       and SCOPE_ARGUMENT_REFUSAL_LINE in lines
                       and any(line.startswith(SCOPE_ARGUMENT_UNDECLARED_PREFIX) for line in lines))
+        if undeclared and not source_lookup:
+            # Not waited for: the window it was refused by does not refill by waiting. The
+            # run resolves the sources again after its probes instead.
+            _scope_argument_wait.probe_refused = True
         if not (undeclared and source_lookup):
             break
         if _scope_argument_wait.until is None:
@@ -442,6 +455,16 @@ def _excluded_members(searches: dict, selections: dict, previous: dict | None, p
                   and (rec._excluded_by(p, patterns) or ((n := number_of(p)) and rec._excluded_by(n, patterns))))
 
 
+def _merge_pass(earlier: dict, later: dict) -> dict:
+    """A later resolve pass over an earlier one: a source keeps its earlier answer when its
+    later lookup gave none (a pass on what is left of the budget can run out of it)."""
+    merged = dict(earlier)
+    for source, answer in later.items():
+        if answer[0] is not None or source not in merged:
+            merged[source] = answer
+    return merged
+
+
 def build_document(declared: dict, management: str | None, previous: dict | None) -> dict:
     """Resolve the declaration and probe its members into a document with `state: ok`, or
     `error` when every source lookup failed and no earlier run resolved.
@@ -461,35 +484,53 @@ def build_document(declared: dict, management: str | None, previous: dict | None
     budget = rec._list_budget_seconds(cap)
     deadline = time.monotonic() + budget
     patterns = scope[EXCLUDE_KEY][EXCLUDE_PROJECTS_KEY]
+    sources = rec._container_ids(scope) + rec._selector_ids(scope)
+
+    def place(groups: dict) -> tuple[dict, dict, dict, list, list]:
+        searches = {g: r for g, r in groups.items() if rec._is_container(g)}
+        selector_reports = {g: r for g, r in groups.items() if rec._is_selector(g)}
+        selections = rec._selector_members(selector_reports, looked_up, deadline, patterns, SCOPE_WORKERS, budget)
+        # With no management project named, its slot is still reserved: the cap passed on is
+        # one smaller, which is what `_resolve_projects` makes of a management project it counts.
+        entries, _, _, _ = rec._resolve_projects(management, scope, searches, looked_up, selections,
+                                                 cap if management else cap - 1)
+        counted = [e for e in entries if e[ROW_OUTCOME] != rec.OUTCOME_OVER_CAP]
+        members = [e for e in counted
+                   if not e[ROW_ID].isdigit() and not any(via in ROW_EXCLUDED_VIAS for via in e[ROW_VIA])]
+        # A source can carry a counted member only when the member's row names it.
+        member_ids = {e[ROW_ID] for e in members}
+        carried = [{ROW_ID: e[ROW_ID], ROW_VIA: e[ROW_VIA], ROW_OUTCOME: e[ROW_OUTCOME] or rec.OUTCOME_OK,
+                    **({ROW_NUMBER: e[ROW_NUMBER]} if e.get(ROW_NUMBER) else {})}
+                   for e in counted if e[ROW_ID] not in member_ids
+                   and any(rec._is_container(via) or rec._is_selector(via) for via in e[ROW_VIA])]
+        return searches, selector_reports, selections, members, carried
+
+    def probe(members: list) -> dict:
+        return rec._bounded_map(rec._list_project, [e[ROW_ID] for e in members if e[ROW_OUTCOME] in LISTED_OUTCOMES],
+                                deadline, "probing", SCOPE_WORKERS, budget,
+                                consequence="its row is not confirmed this run")
+
     _scope_argument_wait.reset()
-    groups = rec._resolve_groups(rec._container_ids(scope) + rec._selector_ids(scope), deadline,
-                                 SCOPE_WORKERS, budget)
+    groups = rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget)
     if _scope_argument_wait.caught_up:
         # The broker's scope.json changed while the sources resolved, and the member
         # window went with its old digest: resolve them all again, so every member the
         # probes name is recorded under the new one.
         log("the broker's scope.json changed during the run; resolving every source again")
-        groups = rec._resolve_groups(rec._container_ids(scope) + rec._selector_ids(scope), deadline,
-                                     SCOPE_WORKERS, budget)
-    searches = {g: r for g, r in groups.items() if rec._is_container(g)}
-    selector_reports = {g: r for g, r in groups.items() if rec._is_selector(g)}
-    selections = rec._selector_members(selector_reports, looked_up, deadline, patterns, SCOPE_WORKERS, budget)
-    # With no management project named, its slot is still reserved: the cap passed on is one
-    # smaller, which is what `_resolve_projects` makes of a management project it counts.
-    entries, _, _, _ = rec._resolve_projects(management, scope, searches, looked_up, selections,
-                                             cap if management else cap - 1)
-    counted = [e for e in entries if e[ROW_OUTCOME] != rec.OUTCOME_OVER_CAP]
-    members = [e for e in counted
-               if not e[ROW_ID].isdigit() and not any(via in ROW_EXCLUDED_VIAS for via in e[ROW_VIA])]
-    # A source can carry a counted member only when the member's row names it.
-    member_ids = {e[ROW_ID] for e in members}
-    carried = [{ROW_ID: e[ROW_ID], ROW_VIA: e[ROW_VIA], ROW_OUTCOME: e[ROW_OUTCOME] or rec.OUTCOME_OK,
-                **({ROW_NUMBER: e[ROW_NUMBER]} if e.get(ROW_NUMBER) else {})}
-               for e in counted if e[ROW_ID] not in member_ids
-               and any(rec._is_container(via) or rec._is_selector(via) for via in e[ROW_VIA])]
-    probes = rec._bounded_map(rec._list_project, [e[ROW_ID] for e in members if e[ROW_OUTCOME] in LISTED_OUTCOMES],
-                              deadline, "probing", SCOPE_WORKERS, budget,
-                              consequence="its row is not confirmed this run")
+        groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget))
+    searches, selector_reports, selections, members, carried = place(groups)
+    probes = probe(members)
+    if (_scope_argument_wait.probe_refused
+            and deadline - time.monotonic() >= SCOPE_RECOVERY_MIN_SECONDS):
+        # The window lost members the sources had returned: the broker's scope.json changed
+        # after they resolved. Resolve them again under the new digest, then probe again what
+        # did not read `ok`. Once: a second change in the same run is left to the next run.
+        log("the broker refused a probe as not declared: its scope.json changed after the sources "
+            "resolved; resolving every source again and probing again")
+        groups = _merge_pass(groups, rec._resolve_groups(sources, deadline, SCOPE_WORKERS, budget))
+        searches, selector_reports, selections, members, carried = place(groups)
+        probes.update(probe([e for e in members
+                             if probes.get(e[ROW_ID], (None, None))[1] != rec.OUTCOME_OK]))
     rows_before = {row[ROW_ID]: row for row in (previous or {}).get(DOC_PROJECTS, [])
                    if isinstance(row, dict) and isinstance(row.get(ROW_ID), str)}
     resolved_at = _now()
