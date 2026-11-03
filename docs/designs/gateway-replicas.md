@@ -68,7 +68,10 @@ On losing the lease, or on SIGTERM, it stops in this order:
    only after it renders, which the relay ack-after-render change (#4183) put on `main`.
 4. **The loops:** reap and sweep stop.
 
-Then it releases the lease.
+Then it releases the lease, if a fresh read still names it as the holder. A gateway whose term
+followed a crash and is ending inside the relay's AckWait leaves the lease to expire instead: the
+dead holder's events may still be pending, and a lease that still names a holder makes the next
+leader hold its relay too.
 
 ### Handover
 

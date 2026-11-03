@@ -660,8 +660,8 @@ type Registry struct {
 	// afterTermRead, when set, runs between a fenced write's counter read
 	// and its record read (tests).
 	afterTermRead func()
-	// onFenced, when set, runs each time a write is refused with ErrFenced
-	// (SetOnFenced).
+	// onFenced, when set, runs each time a write is refused because a newer
+	// term has started; SetOnFenced says which refusals don't run it.
 	onFenced atomic.Pointer[func()]
 }
 
