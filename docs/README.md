@@ -219,6 +219,7 @@ identifier appears, add its source here.
 | Kubernetes service-account names | `scripts/installer/common.sh` |
 | Seeded-fleet reconcile report keys and outcomes, fixture-state role states, the delete/replace allowlist | `hack/fleet_reconcile.py` (`OUTCOMES`, `write_report`), `scripts/eval_dashboard/fixture_state.py` (`ROLE_STATES`), `bench/tf/fleet/reconcile-allow.json` |
 | GCP service-account names an install creates, release namespace, GKE CMEK key ring and key | `install.defaults.env` |
+| The `spec.deployment.env` names the operator forwards to the agent container, as literal values | `safeSandboxEnvOverrides` in `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Defaults an install gets for saying nothing (region, cluster, permission set, registry prefix) | `install.defaults.env` |
 | The PlatformAgent data volume size default (`spec.storage.size` when absent) | `agentDataStorageSize` in `k8s-operator/internal/controller/platformagent_manifests.go`; `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE` in `install.defaults.env`, the `platform_agent_storage_size` default in `terraform/examples/full-install/variables.tf` and the `platform_agent_default_storage_size` local in its `main.tf` restate it, held equal by `tests/test_platform_agent_storage_size_defaults.py` |
 | Content-workspace ceilings and reclaim (`CREDENTIAL_PROXY_MAX_WORKSPACES`, `CREDENTIAL_PROXY_MAX_CLONE_BYTES`, `CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS`) | `DEFAULT_*` and `_limit` in `agents/platform/scripts/content_workspace.py` |
