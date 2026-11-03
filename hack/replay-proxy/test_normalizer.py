@@ -211,6 +211,22 @@ class OpaqueTest(unittest.TestCase):
         out = normalizer.Normalizer(NOW, False).walk({"thinking_blocks": [{"signature": "t_3c176184", "thinking": "t_3c176184"}]})
         self.assertEqual(out, {"thinking_blocks": [{"signature": "⟦OPAQUE_1⟧", "thinking": "⟦TASK_1⟧"}]})
 
+    def test_a_meaningful_string_id_is_not_hidden(self):
+        def tool_result(content):
+            body = self.body(self.SIGNED_ID, "s")
+            body["messages"][-1]["content"] = content
+            return fp(body)
+        self.assertNotEqual(
+            tool_result(json.dumps({"items": [{"id": "cluster-a", "status": "RUNNING"}]})),
+            tool_result(json.dumps({"items": [{"id": "cluster-b", "status": "RUNNING"}]})),
+        )
+
+    def test_a_kanban_card_id_field_still_maps_as_a_task(self):
+        normalized = normalizer.normalize_request(
+            {"messages": [{"role": "tool", "content": json.dumps({"task": {"id": "t_3c176184"}})}]}, NOW
+        )
+        self.assertIn("⟦TASK_1⟧", json.dumps(normalized.messages, ensure_ascii=False))
+
     def test_runs_differing_only_in_call_ids_match(self):
         self.assertEqual(fp(self.body("call_aaa__thought__x", "s1")), fp(self.body("call_bbb__thought__y", "s2")))
 

@@ -48,8 +48,13 @@ PLACEHOLDER_RE = re.compile(re.escape(OPEN) + r"[^" + re.escape(CLOSE) + r"]+" +
 # forwarded request is never modified; this is the key only.
 OPAQUE_KEY_RE = re.compile(r"signature|provider_specific_fields", re.I)
 OPAQUE_ALWAYS_KEYS = ("tool_call_id",)
-# `id` is opaque when it is a string id; a numeric `id` is a row id (below).
+# `id` is opaque only when it is a tool-call id (LiteLLM and OpenAI-style
+# clients prefix those with `call_`). Any other string `id` -- a kanban card,
+# a cluster, a resource -- goes through the normal rules, so a meaningful value
+# is never hidden behind a positional placeholder. A numeric `id` is a row id
+# (below).
 ID_KEY = "id"
+TOOL_CALL_ID_PREFIX = "call_"
 OPAQUE_CLASS = "OPAQUE"
 
 # Keys whose numeric value is a per-run counter or row id.
@@ -271,7 +276,7 @@ class Normalizer:
     def is_opaque(key: str, value: Any) -> bool:
         if OPAQUE_KEY_RE.search(key) or key in OPAQUE_ALWAYS_KEYS:
             return True
-        return key == ID_KEY and isinstance(value, str) and not DIGITS_RE.match(value)
+        return key == ID_KEY and isinstance(value, str) and value.startswith(TOOL_CALL_ID_PREFIX)
 
     @staticmethod
     def is_number(value: Any) -> bool:
