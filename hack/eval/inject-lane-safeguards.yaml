@@ -63,6 +63,9 @@
 # the script's EVAL_GITHUB_WRITE_SETTLE_SECONDS equals), so no window reaches back into
 # the unit before, whose branch name the next repetition of the same case
 # derives again; each is graded on the pull requests its own reply names.
+# Before that settle the script archives every kanban card an earlier unit
+# left live (fence_live_cards, #4425), so a card whose inject exchange was cut
+# cannot open its pull requests inside the next window.
 # scripts/test_eval_rosters.py pins the set of requesting cases.
 #
 # WHO APPROVES. The eval crew, as for inject-lane-exclusions.txt: an entry

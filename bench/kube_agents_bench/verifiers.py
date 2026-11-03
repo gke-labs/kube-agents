@@ -6554,9 +6554,10 @@ class GitHubWritesVerifier(BaseVerifier):
     requests its own reply names. That ordering holds while a unit's writes
     land before it ends: a write from a card the harness's delegation wait
     did not follow (a worker's fan-out child, a card at the delegation
-    ceiling) can land in the next unit's window, unattributed there in the
-    first phase and charged to it in the second, whose window is exclusive
-    (#2619).
+    ceiling, a card whose inject exchange was cut) can land in the next
+    unit's window, unattributed there in the first phase (#2619). Before
+    each second-phase unit, whose window is exclusive, the script archives
+    every card still live and then settles (``fence_live_cards``, #4425).
     A pull request that was only commented on, labelled or closed in the
     window is not a write: :func:`kube_agents_bench.github_writes.find_writes`
     reads the head commit before it counts an ``updated_at`` that moved.

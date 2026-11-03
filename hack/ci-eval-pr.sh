@@ -250,6 +250,13 @@ readonly EVAL_PLATFORM_RUN_POLL_SECONDS=30
 readonly EVAL_GATEWAY_NOT_FOUND_RE='deployments(\.apps)? "[^"]+" not found'
 readonly EVAL_GATEWAY_GONE_RC=76
 readonly EVAL_INSTALL_GONE_MARKER="install-gone"
+# fence_live_cards (beside wait_platform_runs, #4425): how many times
+# hack/ci_fence_cards.py reads the board again for a child a worker filed
+# before its own archive, as the harness's _DESCENDANT_PASSES, and the bound on
+# the one exec: each archive is bounded at 30s in the helper, and a few cards
+# are what an abandoned unit leaves.
+readonly EVAL_FENCE_CARD_PASSES=3
+readonly EVAL_FENCE_TIMEOUT_SECONDS=180
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
@@ -1931,6 +1938,50 @@ wait_platform_runs() { # <label> <space-separated audit ids>
     echo "WARNING: Platform runs (${label}): kubectl exec exited ${rc} (${out}); trying again in ${EVAL_PLATFORM_RUN_POLL_SECONDS}s" >&2
     sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
   done
+  return 0
+}
+
+# Before each unit of the fan-out's second phase, archive every kanban card
+# still live that was filed since the fan-out began (#4425). The phase runs
+# one unit at a time and the GitHub-write safeguard marks each window
+# exclusive, so a pull request from a card an earlier unit left running is
+# charged to the unit in flight. That card outlives its unit when the inject
+# exchange is cut and the harness cannot send the cancel over the failed
+# transport (pull-kube-agents-smoke-test 2116235582324609024 on #4323 and
+# 2117358437963665408 on #3846), at the delegation ceiling, and through a
+# worker's own fan-out. The exec goes to the gateway pod, not through the
+# port-forward the cut exchange used. hack/ci_fence_cards.py does the work and
+# says what it archived; the settle that follows in launch_units covers a push
+# already in flight when a worker stops. Pinned to AGENT_CLUSTER_CONTEXT and
+# refused for a context that does not name PROJECT_ID, as wait_platform_runs
+# is. Returns 0 whatever happens: a fence that fails is a warning, and the
+# unit runs as it did before the fence.
+fence_live_cards() { # <label>
+  local label="$1" ns ctx out rc=0
+  ns="${TARGET_NAMESPACE:-}"
+  ctx="${AGENT_CLUSTER_CONTEXT:-}"
+  if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || [ -z "${EVAL_FANOUT_STARTED_EPOCH:-}" ] || ! command -v kubectl >/dev/null 2>&1; then
+    echo "Card fence (${label}): skipped, PROJECT_ID, AGENT_CLUSTER_CONTEXT, TARGET_NAMESPACE, EVAL_FANOUT_STARTED_EPOCH or kubectl is missing"
+    return 0
+  fi
+  case "${ctx}" in
+    "gke_${PROJECT_ID}_"*) ;;
+    *)
+      echo "WARNING: Card fence (${label}): skipped, AGENT_CLUSTER_CONTEXT=${ctx} does not name PROJECT_ID=${PROJECT_ID}" >&2
+      return 0 ;;
+  esac
+  local bound=(timeout --foreground "${EVAL_FENCE_TIMEOUT_SECONDS}")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
+    -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+    "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_FANOUT_STARTED_EPOCH}" "${EVAL_FENCE_CARD_PASSES}" \
+    < "${SCRIPT_DIR}/ci_fence_cards.py" 2>&1)" || rc=$?
+  if [ "${rc}" -eq 0 ]; then
+    echo "Card fence (${label}): ${out}"
+    return 0
+  fi
+  [ "${rc}" -eq 124 ] && out="timed out after ${EVAL_FENCE_TIMEOUT_SECONDS}s${out:+; ${out}}"
+  echo "WARNING: Card fence (${label}): kubectl exec into ${ns}/${AGENT_SERVICE_NAME}-gateway exited ${rc} (${out}); a card an earlier unit left running may still open a pull request in this unit's window, where the GitHub-write safeguard charges it (#4425)" >&2
   return 0
 }
 
@@ -4802,11 +4853,13 @@ scheduled_audits pause "fan-out"
 # the cards the case filed are terminal, so their workers' pull requests
 # land in the unit's own window. A worker's own fan-out children, a card
 # still running at the delegation ceiling, and the wait's fallback paths
-# are not waited for, and a write from one of those can land in the next
-# unit's window (docs/designs/eval-next-transport.md, "What the lane
-# grades"): unattributed there in the first phase, and charged to the unit
-# in the second, whose window is exclusive (a requesting case's, a stopped
-# ask's and a writes_alone case's alike).
+# are not waited for, nor is a card whose inject exchange was cut before the
+# wait began, and a write from one of those can land in the next unit's
+# window (docs/designs/eval-next-transport.md, "What the lane grades"):
+# unattributed there in the first phase. The second phase, whose window is
+# exclusive (a requesting case's, a stopped ask's and a writes_alone case's
+# alike), would charge it to the unit, so each of its launches first archives
+# every card still live (fence_live_cards, #4425) and then settles.
 #
 # A case that excludes seeded slots from the install's scope (SCOPE_EXCLUDE_NAMES)
 # is phase 2, run after both and alone, each case between its own scope edit and
@@ -4886,8 +4939,14 @@ INFRA_IN_FLIGHT_MAX=2
 # unit whose task already has a repetition in flight is held back the same way
 # (#3939): it would only sleep on the task lock. Queue order is otherwise
 # unchanged.
-launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch>
-  local queue="$1" parallelism="$2" pause="$3"
+#
+# With `fence` as the fourth argument, each launch first archives the cards an
+# earlier unit left live (fence_live_cards, #4425), then waits the pause, so
+# the settle also covers a push already in flight when a fenced worker stops.
+# Only the second phase passes it: it runs one unit at a time, so every live
+# card is an earlier unit's.
+launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before each launch> [fence]
+  local queue="$1" parallelism="$2" pause="$3" fence="${4:-}"
   local pending=() line i pick running pid alive infra_pids="" counted task_jobs="" job
   # Each line carries whether its unit counts toward INFRA_IN_FLIGHT_MAX, worked
   # out once here rather than on every poll.
@@ -4944,6 +5003,7 @@ EOF_UNIT_QUEUE
     # A unit of a case marked for a drifted fixture makes no model call and no
     # write, so it skips the pause.
     if [ -z "${FIXTURE_DRIFT_DIR:-}" ] || [ ! -s "${FIXTURE_DRIFT_DIR}/${TASK_NAMES[IDX]}" ]; then
+      [ -z "${fence}" ] || fence_live_cards "${TASK_NAMES[IDX]} rep ${REP}"
       sleep "${pause}"
     fi
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
@@ -4966,11 +5026,15 @@ done <<<"${SCOPE_EXCLUDE_CASES:-}"
 SCOPE_TOTAL=$(( ${#SCOPE_EXCLUDE_LINES[@]} * EVAL_REPETITIONS ))
 
 profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
+# The cards fence_live_cards may archive are the ones filed from here on (the
+# board's created_at, which the gateway pod stamps); the install's own earlier
+# cards are left alone.
+EVAL_FANOUT_STARTED_EPOCH="$(date -u +%s)"
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) the stopped asks (${STOPPED_ASK_CASES:-none}) and the writes_alone cases (${WRITES_ALONE_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
-  launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
+  launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}" fence
   wait
 fi
 # A scope edit that does not take effect records the case's repetitions as
