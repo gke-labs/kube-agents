@@ -28,9 +28,10 @@ any function and is the bounded pool the rule asks for), and an instance of a
 class in the module that subclasses `Thread` or `Timer`. A spawn in a function a
 handler reaches is a finding unless its shape is bounded:
 
-* a singleton guard: the spawn sits inside an `if` whose test reads a thread's
-  `.is_alive()`, or follows one whose body returns, so at most one such thread
-  runs at a time;
+* a singleton guard: the spawn sits in the body of an `if` whose test reads a
+  thread's `.is_alive()` (its `else` branch is not covered), or is the first
+  spawn after such an `if` whose body returns, so at most one such thread runs
+  at a time; a second spawn after the early return is not under the guard;
 * startup: the function is `main`.
 
 A loop over `range(n)` is not a bound, whatever `n` is: a handler that starts a
@@ -40,23 +41,31 @@ module-level pool built once by a function no handler reaches is not flagged,
 since only reachability flags a spawn.
 
 Go (`GO_TARGET_DIRS`), by text, since the callout has no request-handler marker
-to anchor a graph on: every `go func(...)` or `go name(...)` statement in a
-non-test file is a finding unless it sits in a startup function, or in a
-function that gates it with a semaphore before the statement (a send on a
-channel whose name carries `sem`, or a `semaphore` `Acquire(...)`). The startup
-functions are `main` and, transitively, every function a startup function
-calls by name, across all the scanned files; a name shared by a startup function
-and a per-request one is read as startup, which is the text scan's blind spot.
-A startup function's bound stops at a function literal: a `go` statement inside
-a closure the function builds (`mux.HandleFunc(path, func(w, r) { go ... })`, a
-subscription callback) is not startup, since the closure runs when its caller
-decides, which for a handler is once per request. The literal is found by brace
-nesting, so a goroutine a startup function starts inside another of its own
-closures (`go func() { go work() }()`) is read the same way and is pinned
-rather than bounded. Comments and string literals are stripped before the call
-names and the braces are read. An `errgroup` with `SetLimit(...)` bounds its
-own `Go(...)` calls, which are not `go` statements and are not read; it does not
-bound a `go` statement near it.
+to anchor a graph on. Comments and string literals are stripped from the whole
+file first, a raw string or block comment spanning lines included, and the rest
+is read as code. Every `go func(...)` or `go name(...)` statement in a non-test
+file, at the start of a line or after a `{`, `;` or `:` on it, is a finding
+unless it sits in a startup function, or a semaphore gates it in the same block
+before the statement (a send on a channel whose name starts with `sem` or
+carries `Sem`, or an `Acquire(...)`, written between the `{` that opens the
+innermost block holding the statement and the statement itself, so a send
+above the loop the statement is in bounds nothing). The startup functions are
+`main` and, transitively, every function a startup function calls by name
+outside its function literals, across all the scanned files; a name shared by a
+startup function and a per-request one is read as startup, which is the text
+scan's blind spot. A startup function's bound stops at a function literal: a
+`go` statement inside a closure the function builds (`mux.HandleFunc(path,
+func(w, r) { go ... })`, a subscription callback), and whatever that closure
+calls, is not startup, since the closure runs when its caller decides, which
+for a handler is once per request. A `func(` opens a literal when the `{` that
+follows its parameter list comes before a `;` or the end of that line (so a
+function type, `var cb func()` or `map[string]func()`, opens none); the body is
+the brace pair that `{` starts, and the literal is found by brace nesting, so a
+goroutine a startup function starts inside another of its own closures
+(`go func() { go work() }()`) is read the same way and is pinned rather than
+bounded. An `errgroup` with `SetLimit(...)` bounds its own `Go(...)` calls,
+which are not `go` statements and are not read; it does not bound a `go`
+statement near it.
 
 ``scripts/bounded_concurrency_allowlist.txt``: one line per function that
 carried a finding when the check arrived, `<file> <function> <count>`, with the
@@ -132,26 +141,34 @@ SELF_RECEIVERS = frozenset({"self", "cls"})
 BOUND_SINGLETON = "singleton guard (is_alive)"
 BOUND_STARTUP = "startup (main)"
 BOUND_GO_STARTUP = "startup (reached from main)"
-BOUND_GO_SEMAPHORE = "a semaphore before the statement"
+BOUND_GO_SEMAPHORE = "a semaphore before the statement, in its block"
 CONSTRUCTOR = "__init__"
 QUALIFIED_SEPARATOR = "."
 
-# Go, by text. A spawn is a line that starts a goroutine; a function starts at
-# column 0 with `func`, optionally with a receiver, and ends at the first `}` at
-# column 0 (gofmt's shape, which `go vet` in CI holds).
-GO_SPAWN_RE = re.compile(r"^\s*go\s+(?:func\b|[A-Za-z_][\w.]*\()")
+# Go, by text, on lines with comments and strings removed. A spawn is a `go`
+# statement at the start of a line or after a `{`, `;` or `:` on it (group 1 is
+# the statement, so its column is known); a function starts at column 0 with
+# `func`, optionally with a receiver, and ends at the first `}` at column 0
+# (gofmt's shape, which `go vet` in CI holds).
+GO_SPAWN_RE = re.compile(r"(?:^|[{;:])\s*(go\s+(?:func\b|[A-Za-z_][\w.]*\())")
 GO_FUNC_RE = re.compile(r"^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)")
 GO_FUNC_END = "}"
-GO_SEMAPHORE_RE = re.compile(r"\b\w*[sS]em\w*\s*<-|\.Acquire\(")
+# A semaphore: a send on a channel named for one (`sem`, `semaphore`, `connSem`;
+# not `assembly` or `resemble`), or an `Acquire(` call.
+GO_SEMAPHORE_RE = re.compile(r"\b(?:sem\w*|\w*Sem\w*)\s*<-|\.Acquire\(")
 GO_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\(")
-# A function literal opens where `func(` is followed by `{`; its body is the
-# brace pair that `{` starts. Read on lines with comments and strings removed.
+# A function literal opens where the `{` after a `func(`'s parameter list comes
+# before a `;` or the end of that list's line; its body is the brace pair that
+# `{` starts.
 GO_FUNC_LITERAL = "func("
+GO_PAREN_OPEN = "("
+GO_PAREN_CLOSE = ")"
+GO_STATEMENT_END = ";"
 GO_LINE_COMMENT = "//"
 GO_BLOCK_COMMENT_OPEN = "/*"
 GO_BLOCK_COMMENT_CLOSE = "*/"
 GO_RAW_QUOTE = "`"
-GO_STRING_QUOTES = frozenset({'"', "'", GO_RAW_QUOTE})
+GO_QUOTES = frozenset({'"', "'"})
 GO_ESCAPE = "\\"
 GO_BRACE_OPEN = "{"
 GO_BRACE_CLOSE = "}"
@@ -302,13 +319,24 @@ def _read_unit(node: ast.AST, name: str, class_name: str | None, entry_point: bo
             guard_depths.append(depth)
             if _returns(current.body):
                 early_exit_seen = True
+            # The guard covers the `if`'s test and body. Its `orelse` runs when
+            # the test did not hold, so it is queued at the `if`'s own depth,
+            # where the walk closes the guard before reading it.
+            pending.extend((stmt, depth) for stmt in reversed(current.orelse))
+            pending.extend((child, depth + 1) for child in reversed([current.test, *current.body]))
+            continue
         if isinstance(current, ast.Call):
             callee = _callee_name(current)
             if callee in spawn_callees:
                 if simple == STARTUP_FUNCTION:
                     bound: str | None = BOUND_STARTUP
-                elif guard_depths or early_exit_seen:
+                elif guard_depths:
                     bound = BOUND_SINGLETON
+                elif early_exit_seen:
+                    # The early return bounds the one spawn that follows it,
+                    # not every later spawn in the function.
+                    bound = BOUND_SINGLETON
+                    early_exit_seen = False
                 else:
                     bound = None
                 unit.spawns.append((current.lineno, bound))
@@ -414,13 +442,77 @@ def scan_python(path: Path, root: Path) -> list[Spawn]:
 class _GoFunction:
     name: str
     file: str
+    # The file's lines with comments and strings stripped (`_go_strip`).
     lines: list[str]
     start: int  # 1-indexed, inclusive
     end: int
 
 
+@dataclass(frozen=True)
+class _GoPosition:
+    """What the brace walk of a function body knows at one point of it."""
+
+    # The body's code outside every function literal, up to the point.
+    outside_literals: str
+    # Whether the point sits inside a function literal opened before it.
+    in_literal: bool
+    # The code of the innermost block holding the point, from the `{` that
+    # opens it to the point, nested blocks left out.
+    block: str
+
+
+def _go_strip(lines: list[str]) -> list[str]:
+    """The file's lines with comments and string and rune literals removed.
+
+    One output line per input line, so line numbers hold; the inner lines of a
+    raw string or a block comment that spans lines come out empty.
+    """
+    stripped: list[str] = []
+    in_block_comment = False
+    in_raw_string = False
+    for text in lines:
+        kept: list[str] = []
+        index = 0
+        while index < len(text):
+            if in_block_comment:
+                close = text.find(GO_BLOCK_COMMENT_CLOSE, index)
+                if close < 0:
+                    break
+                in_block_comment = False
+                index = close + len(GO_BLOCK_COMMENT_CLOSE)
+                continue
+            if in_raw_string:
+                close = text.find(GO_RAW_QUOTE, index)
+                if close < 0:
+                    break
+                in_raw_string = False
+                index = close + 1
+                continue
+            if text.startswith(GO_LINE_COMMENT, index):
+                break
+            if text.startswith(GO_BLOCK_COMMENT_OPEN, index):
+                in_block_comment = True
+                index += len(GO_BLOCK_COMMENT_OPEN)
+                continue
+            char = text[index]
+            if char == GO_RAW_QUOTE:
+                in_raw_string = True
+                index += 1
+                continue
+            if char in GO_QUOTES:
+                index += 1
+                while index < len(text) and text[index] != char:
+                    index += 2 if text[index] == GO_ESCAPE else 1
+                index += 1
+                continue
+            kept.append(char)
+            index += 1
+        stripped.append("".join(kept))
+    return stripped
+
+
 def _go_functions(shown: str, lines: list[str]) -> list[_GoFunction]:
-    """Every top-level function of one file, with its line span."""
+    """Every top-level function of one stripped file, with its line span."""
     functions: list[_GoFunction] = []
     current: tuple[str, int] | None = None
     for number, text in enumerate(lines, 1):
@@ -429,7 +521,7 @@ def _go_functions(shown: str, lines: list[str]) -> list[_GoFunction]:
             if current is not None:
                 functions.append(_GoFunction(current[0], shown, lines, current[1], number - 1))
             current = (match.group(1), number)
-        elif current is not None and text.rstrip("\r\n") == GO_FUNC_END:
+        elif current is not None and text.rstrip() == GO_FUNC_END:
             functions.append(_GoFunction(current[0], shown, lines, current[1], number))
             current = None
     if current is not None:
@@ -437,71 +529,71 @@ def _go_functions(shown: str, lines: list[str]) -> list[_GoFunction]:
     return functions
 
 
-def _go_code(text: str) -> str:
-    """One line with its comments and its string and rune literals removed."""
-    kept: list[str] = []
-    index = 0
-    while index < len(text):
-        if text.startswith(GO_LINE_COMMENT, index):
-            break
-        if text.startswith(GO_BLOCK_COMMENT_OPEN, index):
-            close = text.find(GO_BLOCK_COMMENT_CLOSE, index + len(GO_BLOCK_COMMENT_OPEN))
-            if close < 0:
-                break
-            index = close + len(GO_BLOCK_COMMENT_CLOSE)
-            continue
-        char = text[index]
-        if char in GO_STRING_QUOTES:
-            index += 1
-            while index < len(text) and text[index] != char:
-                index += 2 if text[index] == GO_ESCAPE and char != GO_RAW_QUOTE else 1
-            index += 1
-            continue
-        kept.append(char)
-        index += 1
-    return "".join(kept)
+def _go_walk(function: _GoFunction, line: int | None = None, column: int = 0) -> _GoPosition:
+    """Walk the braces of a function body from the line after its declaration to a point.
 
-
-def _go_body(function: _GoFunction, upto: int | None = None) -> str:
-    end = function.end if upto is None else upto
-    return "\n".join(_go_code(line) for line in function.lines[function.start - 1 : end])
-
-
-def _go_in_literal(function: _GoFunction, number: int) -> bool:
-    """Whether line `number` of the function sits inside a function literal opened above it.
-
-    The function's own declaration line is skipped, and so is the line itself: a
-    `go func() {` statement is not inside the literal it starts. A `func(` is a
-    literal when the next `{` after it opens its body; the literal is open until
-    that brace's pair closes.
+    The point is `column` characters into `line`, or the end of the function
+    when `line` is None. The declaration line is skipped, so a function type in
+    the signature opens nothing. A `func(` opens a literal when the `{` after
+    its parameter list comes before a `;` or the end of that list's line; the
+    literal is open until that brace's pair closes.
     """
     depth = 0
+    # The parenthesis depth of a `func(` parameter list being read, or None.
+    params_open: int | None = None
     literal_pending = False
     open_depths: list[int] = []
-    for text in function.lines[function.start : number - 1]:
-        code = _go_code(text)
+    outside: list[str] = []
+    blocks: list[list[str]] = [[]]
+    stop = function.end if line is None else line
+    for number in range(function.start + 1, stop + 1):
+        code = function.lines[number - 1]
+        if line is not None and number == stop:
+            code = code[:column]
         index = 0
         while index < len(code):
-            if code.startswith(GO_FUNC_LITERAL, index):
-                literal_pending = True
-                index += len(GO_FUNC_LITERAL)
-                continue
             char = code[index]
-            if char == GO_BRACE_OPEN:
+            step = 1
+            if params_open is None and code.startswith(GO_FUNC_LITERAL, index):
+                params_open = 1
+                literal_pending = False
+                step = len(GO_FUNC_LITERAL)
+            elif params_open is not None:
+                if char == GO_PAREN_OPEN:
+                    params_open += 1
+                elif char == GO_PAREN_CLOSE:
+                    params_open -= 1
+                    if params_open == 0:
+                        params_open = None
+                        literal_pending = True
+            elif char == GO_STATEMENT_END:
+                literal_pending = False
+            elif char == GO_BRACE_OPEN:
                 if literal_pending:
                     open_depths.append(depth)
                     literal_pending = False
                 depth += 1
+                blocks.append([])
             elif char == GO_BRACE_CLOSE:
                 depth -= 1
                 if open_depths and open_depths[-1] == depth:
                     open_depths.pop()
-            index += 1
-    return bool(open_depths)
+                if len(blocks) > 1:
+                    blocks.pop()
+            chunk = code[index : index + step]
+            if not open_depths:
+                outside.append(chunk)
+            blocks[-1].append(chunk)
+            index += step
+        if params_open is None:
+            literal_pending = False
+        outside.append("\n")
+        blocks[-1].append("\n")
+    return _GoPosition("".join(outside), bool(open_depths), "".join(blocks[-1]))
 
 
 def _go_startup_names(functions: list[_GoFunction]) -> set[str]:
-    """`main` and, transitively by name, every function a startup function calls."""
+    """`main` and, transitively by name, every function a startup function calls outside its literals."""
     by_name: dict[str, list[_GoFunction]] = {}
     for function in functions:
         by_name.setdefault(function.name, []).append(function)
@@ -513,7 +605,7 @@ def _go_startup_names(functions: list[_GoFunction]) -> set[str]:
             continue
         startup.add(name)
         for function in by_name[name]:
-            queue.extend(GO_CALL_RE.findall(_go_body(function)))
+            queue.extend(GO_CALL_RE.findall(_go_walk(function).outside_literals))
     return startup
 
 
@@ -523,7 +615,7 @@ def scan_go(paths: Iterable[Path], root: Path) -> list[Spawn]:
     functions: list[_GoFunction] = []
     for path in paths:
         shown = path.relative_to(root).as_posix()
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = _go_strip(path.read_text(encoding="utf-8").splitlines())
         files.append((shown, lines))
         functions.extend(_go_functions(shown, lines))
     startup = _go_startup_names(functions)
@@ -531,18 +623,19 @@ def scan_go(paths: Iterable[Path], root: Path) -> list[Spawn]:
     for shown, lines in files:
         own = [f for f in functions if f.file == shown]
         for number, text in enumerate(lines, 1):
-            if not GO_SPAWN_RE.match(text):
+            match = GO_SPAWN_RE.search(text)
+            if match is None:
                 continue
             enclosing = next((f for f in own if f.start <= number <= f.end), None)
             if enclosing is None:
                 spawns.append(Spawn(shown, number, GO_NO_FUNCTION, KIND_GOROUTINE, (GO_NO_GRAPH,), None))
                 continue
-            in_literal = _go_in_literal(enclosing, number)
-            if enclosing.name == STARTUP_FUNCTION and not in_literal:
+            position = _go_walk(enclosing, number, match.start(1))
+            if enclosing.name == STARTUP_FUNCTION and not position.in_literal:
                 bound: str | None = BOUND_STARTUP
-            elif enclosing.name in startup and not in_literal:
+            elif enclosing.name in startup and not position.in_literal:
                 bound = BOUND_GO_STARTUP
-            elif GO_SEMAPHORE_RE.search(_go_body(enclosing, number)):
+            elif GO_SEMAPHORE_RE.search(position.block):
                 bound = BOUND_GO_SEMAPHORE
             else:
                 bound = None
