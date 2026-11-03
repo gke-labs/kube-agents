@@ -92,17 +92,19 @@ resource "null_resource" "stalled_declaration" {
     environment = local.settings
     command     = <<-EOT
       set -euo pipefail
-      if [ -z "${var.kcc_cluster_name}" ] || [ -z "${var.gitops_repo}" ]; then
-        echo "ERROR: kcc_cluster_name and gitops_repo are required: the cluster that runs Config Connector, and the GitOps repository the audit writes to." >&2
+      if [ -z "${var.kcc_cluster_name}" ] || [ -z "${var.kcc_cluster_location}" ] || [ -z "${var.gitops_repo}" ]; then
+        echo "ERROR: kcc_cluster_name, kcc_cluster_location and gitops_repo are required: the cluster that runs Config Connector, its location, and the GitOps repository the audit writes to." >&2
         exit 1
       fi
       python3 "${path.module}/plant.py" plant
     EOT
   }
 
+  # No on_failure = continue: a destroy that cannot remove the planted file,
+  # close the pull requests or delete the namespace fails the run, rather than
+  # leaving them behind while Terraform records the stack as removed.
   provisioner "local-exec" {
     when        = destroy
-    on_failure  = continue
     interpreter = ["/bin/bash", "-c"]
     environment = {
       KCC_EVAL_PROJECT           = self.triggers.KCC_EVAL_PROJECT

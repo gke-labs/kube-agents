@@ -28,6 +28,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -528,3 +529,24 @@ def test_a_context_delete_that_finishes_strips_nothing():
     assert new_plant(cluster, Forge()).teardown()
     assert cluster.patched == []
     assert not [c for c in cluster.calls if c[:3] == ["kubectl", "get", "gcp"]]
+
+
+MAIN_TF = Path(plant.__file__).with_name("main.tf")
+
+
+def test_a_failed_teardown_fails_the_destroy():
+    """Review finding: `on_failure = continue` let Terraform record a failed
+    teardown as destroyed. The stack follows the other GitOps-writing
+    stacks: the destroy fails."""
+    text = MAIN_TF.read_text(encoding="utf-8")
+    assert re.search(r"^\s*when\s*=\s*destroy", text, re.MULTILINE)
+    assert not re.search(r"^\s*on_failure\s*=", text, re.MULTILINE)
+
+
+def test_the_apply_refuses_an_empty_cluster_location():
+    """variables.tf says the apply refuses an empty value of each of the three."""
+    text = MAIN_TF.read_text(encoding="utf-8")
+    guard = text[text.index("set -euo pipefail"): text.index('plant.py" plant')]
+    for name in ("kcc_cluster_name", "kcc_cluster_location", "gitops_repo"):
+        assert f'[ -z "${{var.{name}}}" ]' in guard, name
+
