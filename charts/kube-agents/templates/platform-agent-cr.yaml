@@ -449,6 +449,21 @@ spec:
         {{- $_ := set (index $proxyMerged $side) $name $raw }}
       {{- end }}
     {{- end }}
+    {{- /* A cpu or memory limit set without its request, below the default request, takes the
+           request down with it, as resolveCredentialProxyResources does in the operator, so the
+           render admits what the operator admits rather than refusing a crossed pair. */}}
+    {{- range $name := list "cpu" "memory" }}
+      {{- $setLimit := hasKey ((index $proxyQuantities "limits") | default dict) $name }}
+      {{- $setRequest := hasKey ((index $proxyQuantities "requests") | default dict) $name }}
+      {{- if and $setLimit (not $setRequest) }}
+        {{- $isCpu := eq $name "cpu" }}
+        {{- $lim := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.limits $name) "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
+        {{- $req := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.requests $name) "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
+        {{- if and (gt $lim 0.0) (lt $lim $req) }}
+          {{- $_ := set $proxyMerged.requests $name (index $proxyMerged.limits $name) }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
     {{- if $proxyQuantities }}
     {{- $proxyParsed := dict "requests" (dict) "limits" (dict) }}
     {{- range $side, $set := $proxyMerged }}
@@ -484,10 +499,8 @@ spec:
       {{- $lim := index $proxyMerged.limits $name }}
       {{- if and $setRequest $setLimit }}
       {{- fail (printf "%s.requests.%s (%s) exceeds limits.%s (%s); a request above its limit is refused by the API server, and by the operator" $proxyPrefix $name $req $name $lim) }}
-      {{- else if $setRequest }}
-      {{- fail (printf "%s.requests.%s (%s) exceeds the operator's default limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
       {{- else }}
-      {{- fail (printf "%s.limits.%s (%s) is below the operator's default requests.%s (%s), which the override does not lower; set requests.%s as well" $proxyPrefix $name $lim $name $req $name) }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds the operator's default limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
       {{- end }}
       {{- end }}
       {{- end }}

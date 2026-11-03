@@ -1299,15 +1299,15 @@ resource "helm_release" "kube_agents" {
     # Bitbucket Cloud is bitbucket.org only, with the public CAs; a Data
     # Center instance names its host, which is never a hosted service's.
     precondition {
-      condition = var.gitops_forge != "bitbucket" || (var.gitops_host == "" && var.gitops_ca_secret_name == "")
+      condition     = var.gitops_forge != "bitbucket" || (var.gitops_host == "" && var.gitops_ca_secret_name == "")
       error_message = "gitops_forge = \"bitbucket\" is Bitbucket Cloud at bitbucket.org: leave gitops_host and gitops_ca_secret_name unset. For a Data Center instance, use gitops_forge = \"bitbucket-datacenter\"."
     }
     precondition {
-      condition = var.gitops_forge != "bitbucket-datacenter" || (var.gitops_host != "" && !can(regex("(^|\\.)(bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net|github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host)))
+      condition     = var.gitops_forge != "bitbucket-datacenter" || (var.gitops_host != "" && !can(regex("(^|\\.)(bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net|github\\.com|githubusercontent\\.com|githubassets\\.com|githubapp\\.com|github\\.io|github\\.dev|ghe\\.com|gitlab\\.com)$", var.gitops_host)))
       error_message = "gitops_forge = \"bitbucket-datacenter\" needs gitops_host: the instance's own hostname, not bitbucket.org or another hosted service's domain."
     }
     precondition {
-      condition = var.gitops_forge != "bitbucket" || var.gitops_identity == "" || can(regex("^(\\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\\}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$", var.gitops_identity))
+      condition     = var.gitops_forge != "bitbucket" || var.gitops_identity == "" || can(regex("^(\\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\\}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$", var.gitops_identity))
       error_message = "gitops_identity on Bitbucket Cloud is the account UUID the access token acts as, with or without braces."
     }
     # The CRD's grammar for identity, on both Bitbucket providers.
@@ -1317,7 +1317,7 @@ resource "helm_release" "kube_agents" {
     }
     # The Bitbucket inputs under another forge would be dropped silently.
     precondition {
-      condition = local.gitops_is_bitbucket || (var.gitops_repo_path == "" && var.gitops_token_secret_name == "" && var.gitops_ca_secret_name == "" && var.gitops_identity == "")
+      condition     = local.gitops_is_bitbucket || (var.gitops_repo_path == "" && var.gitops_token_secret_name == "" && var.gitops_ca_secret_name == "" && var.gitops_identity == "")
       error_message = "gitops_repo_path, gitops_token_secret_name, gitops_ca_secret_name and gitops_identity apply only with gitops_forge = \"bitbucket\" or \"bitbucket-datacenter\"; set it, or leave them unset."
     }
 

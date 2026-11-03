@@ -1179,10 +1179,16 @@ spec:
                             Resources overrides the credential-proxy container's requests and limits.
                             Each key set here replaces the operator's default for that key and the
                             rest keep their defaults, unlike spec.deployment.resources, which replaces
-                            the agent container's block wholesale: a CR that sets only limits.memory
-                            keeps the default 500m CPU request, 1 CPU limit and 8Gi ephemeral-storage
-                            limit. The broker sizes how many commands it admits at once from the
-                            memory limit, so raising the limit is the one knob for an install whose
+                            the agent container's block wholesale: a CR that sets only limits.memory,
+                            at or above the default memory request, keeps the default requests (500m
+                            CPU and 1Gi, or 2 CPU and 2Gi on GKE Autopilot, where Autopilot without
+                            bursting clamps the limits to the requests), the 2 CPU limit and the 8Gi
+                            ephemeral-storage limit. A cpu or memory limit set without its request,
+                            below the default request, lowers that request to the limit. On
+                            Autopilot a CPU request the CR does not set is held to at most one CPU
+                            per GiB of the memory request. The broker sizes how many commands it
+                            admits at once from the memory limit, so raising the limit is the one
+                            knob for an install whose
                             fleet outgrows the default; the ephemeral-storage limit bounds the content
                             workspace the broker clones into; the proxy's state emptyDir (sizeLimit
                             5Gi) grows by whatever the limit is raised above the 8Gi default, and
@@ -1198,8 +1204,7 @@ spec:
                             memory high-water series give the figure.
                             Only cpu, memory and ephemeral-storage
                             are accepted, the quantities the container declares. The operator
-                            refuses a memory limit below what admits two commands at once, a limits
-                            entry set alone below the default request it would cross, a request
+                            refuses a memory limit below what admits two commands at once, a request
                             above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
                             pod declares no resourceClaims. A refused override, including an edit of
                             one that was valid, renders the proxy Deployment at the operator's
@@ -10684,13 +10689,21 @@ spec:
                           type: string
                         homeChannelPolicy:
                           description: |-
-                            HomeChannelPolicy ("auto", also absent, or "manual") is accepted and
-                            recorded in this release but has no effect yet: the A2A gateway does not
-                            learn a home channel, so HomeChannel alone decides. It is rendered to
-                            the gateway as A2A_SLACK_HOME_POLICY for a gateway that learns the
-                            channel of the first admitted mention under "auto". No schema default:
-                            the API server would apply one to every stored object it reads, so
-                            absent is read as "auto" by the operator instead.
+                            HomeChannelPolicy ("auto", also absent, or "manual") says whether the
+                            A2A gateway may learn the Slack home channel under spec.mode next with
+                            Slack on the gateway (Google Chat not enabled) when HomeChannel is
+                            empty. Under "auto" the channel of the first top-level
+                            mention of the agent in a channel becomes the home channel: the gateway
+                            records it in the <agent>-home-channel ConfigMap, the operator projects
+                            it into the <agent>-chat-home ConfigMap it mounts as a directory in the
+                            agent pod and the gateway pod, both read the file within about a minute
+                            with no pod restarted, and HomeChannelUnset clears. An agent image
+                            older than this operator reads env only and never sees a learned
+                            channel: keep the agent image at the operator's release. Under
+                            "manual" HomeChannel alone decides. A set HomeChannel wins under
+                            either. No schema default: the API server would
+                            apply one to every stored object it reads, so absent is read as "auto"
+                            by the operator instead.
                           enum:
                             - auto
                             - manual

@@ -58,7 +58,7 @@ const notifyExitRouteUnavailable = 4
 var errNotifyRouteUnavailable = errors.New("route unavailable")
 
 // notifyUpdateMax bounds an --update key. The gateway keeps at most 16 per
-// conversation (spec-a2a-payloads, "Card work after the task ends"); the
+// conversation or home thread (spec-a2a-payloads, "Card work after the task ends"); the
 // senders pick short ones (plan-<card>-<serial>, question-<card>-<serial>,
 // alert-<event session>).
 const notifyUpdateMax = 128
@@ -72,7 +72,7 @@ gateway's conversation key, and the context id its tasks carry): the gateway
 posts only into a live conversation whose session record has that context.
 --chat-file names a kube-agents.chat/v1 object to lay the post out with, the
 text being its fallback; --update names the message: a later notify with the
-same key, in the same conversation, edits that message instead of posting.
+same key, in the same conversation or home thread, edits that message instead of posting.
 --answer-to, with --conversation, names the plan whose ask the post answers,
 by its update key: the gateway draws the rating controls on it.
 --reply-to names the gateway task whose turn filed the work the post reports

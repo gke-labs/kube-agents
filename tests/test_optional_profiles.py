@@ -366,5 +366,92 @@ class HelmProfilesTemplatingTest(unittest.TestCase):
         self.assertNotIn("%!s(", proc.stdout)
 
 
+_CLUSTER_PERSONA = _REPO_ROOT / "agents" / "cluster" / "persona" / "persona.yaml"
+_CHART_CLUSTER_SETS = [
+    "--set",
+    "platformAgent.harness.clusterName=ci-cluster",
+    "--set",
+    "platformAgent.harness.location=us-central1",
+    "--set",
+    "platformAgent.harness.projectId=ci-project",
+]
+
+
+class HelmClusterProfileTest(unittest.TestCase):
+    """The generic cluster agent's AgentProfile (#3658)."""
+
+    def _render(self, *extra: str, check: bool = True) -> subprocess.CompletedProcess:
+        cmd = ["helm", "template", "test-release", str(_CHART), *_CHART_CLUSTER_SETS, *extra]
+        return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+    def _cluster_profile(self, stdout: str) -> dict:
+        found = [
+            doc
+            for doc in yaml.safe_load_all(stdout)
+            if doc and doc.get("kind") == "AgentProfile" and doc["metadata"]["name"] == "cluster"
+        ]
+        self.assertEqual(len(found), 1, "expected exactly one AgentProfile/cluster")
+        return found[0]
+
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_not_rendered_by_default(self):
+        proc = self._render()
+        self.assertNotIn('name: "cluster"', proc.stdout)
+
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_not_rendered_when_platform_agent_disabled(self):
+        proc = subprocess.run(
+            [
+                "helm", "template", "test-release", str(_CHART),
+                "--set", "platformAgent.enabled=false",
+                "--set", "profiles.cluster.enabled=true",
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertNotIn("kind: AgentProfile", proc.stdout)
+
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_enabled_renders_the_persona_image_mirrored(self):
+        proc = self._render(
+            "--set", "profiles.cluster.enabled=true",
+            "--set", "global.imageRegistry=us-docker.pkg.dev/my-proj/my-mirror",
+            "--set", "platformAgent.deployment.image.tag=v2026.11.02",
+        )
+        spec = self._cluster_profile(proc.stdout)["spec"]
+        self.assertEqual(
+            spec["persona"]["image"],
+            "us-docker.pkg.dev/my-proj/my-mirror/persona-cluster:v2026.11.02",
+        )
+        self.assertEqual(
+            spec["harness"]["image"],
+            "us-docker.pkg.dev/my-proj/my-mirror/a2a-worker:v2026.11.02",
+        )
+        self.assertEqual(spec["allowedTiers"], ["read"])
+        self.assertNotIn("clusterRef", spec)
+        self.assertNotIn("bus", spec)
+
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_parameters_are_the_personas(self):
+        # The design has the worker refuse a task when the CR's parameters and
+        # the persona's differ, so the chart's fixed list has to be the
+        # persona's own, in its order: nothing says the comparison ignores it.
+        persona = yaml.safe_load(_CLUSTER_PERSONA.read_text(encoding="utf-8"))
+        want = [(p["name"], bool(p.get("required", False))) for p in persona["parameters"]]
+        self.assertTrue(want, "the cluster persona declares no parameters")
+        spec = self._cluster_profile(self._render("--set", "profiles.cluster.enabled=true").stdout)["spec"]
+        got = [(p["name"], bool(p.get("required", False))) for p in spec["parameters"]]
+        self.assertEqual(got, want)
+
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_schema_refuses_an_unknown_tier(self):
+        proc = self._render(
+            "--set", "profiles.cluster.enabled=true",
+            "--set", "profiles.cluster.allowedTiers={write}",
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("allowedTiers", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -83,7 +83,12 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 # `--kubeconfig` scan stops -- in one place. Nothing else in
 # credential_proxy_client runs on import.
 from credential_proxy_client import (  # noqa: F401  (re-export)
+    ADMISSION_BOUND_BACKGROUND,
     API_RELAY_PREFIX,
+    BACKGROUND_NICE,
+    CLASS_BACKGROUND,
+    CLASS_INTERACTIVE,
+    CLASS_LABEL,
     CONTEXT_FLAG,
     END_OF_FLAGS,
     KUBECONFIG_FLAG,
@@ -314,8 +319,8 @@ OUTPUT_COPIES_PER_COMMAND = 6
 # is slower than the OOM exposure the budget prevents, and the case is real --
 # GKE Autopilot without bursting sets a container's limits equal to its
 # requests, so the proxy's limit there is its memory request, which a CR
-# override can set under this floor (the operator's own default is 1Gi,
-# above it, so that the budget runs there). The operator's sizing test holds
+# override can set under this floor (the operator's own default there is
+# 2Gi, above it, so that the budget runs there). The operator's sizing test holds
 # the limit and the default request to the same floor
 # (credentialProxyMinimumAdmittedRequests in credential_proxy_manifests.go).
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
@@ -387,33 +392,26 @@ DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS = 2
 ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS"
 # The scope role's share, for the same reason: the publisher probes one project
 # per call, up to maxProjects calls a run, from the pool the shell uses. One
-# worker is enough for a run every 15 minutes. At serve() it is clamped after
-# the profile share, so session, profile and scope together leave the shell at
-# least one slot (scope_slot_limit_from_env); scope gives way first.
+# worker is enough for a run every 15 minutes. Scope work is background
+# (admission_class), so it also counts against the background cap, and at
+# serve() its share is clamped to that cap (scope_slot_limit_from_env).
 DEFAULT_SCOPE_MAX_CONCURRENT_COMMANDS = 1
 ENV_SCOPE_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SCOPE_MAX_CONCURRENT_COMMANDS"
 # The profile role's share (#3889), the same mechanism as the session's: every
 # AgentProfile worker's calls together hold at most this many of the pool's
 # slots, counted before the pool is asked and refused at once past it.
 #
-# How it sits beside the global cap (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
-# 8 by default and shared by every caller; #4082 redesigns it):
-#   * Profile work cannot starve the shell. At serve() the share is clamped to
-#     the pool minus the session share minus one (but never below one), so
-#     given a pool larger than the session share plus one, even with every
-#     profile and session slot taken the platform agent's shell keeps at least
-#     one slot; with the defaults (8, 2, 4) it keeps two. The child-memory budget
-#     can admit fewer than the slot count, and then the guarantee is in slots,
-#     not in admissions: a budget-bound pool can still queue the shell behind
-#     running profile commands until one finishes.
-#   * The shell and sessions can starve profile work. The shell is
-#     unbounded, so a shell holding the whole pool leaves a profile call
-#     queued until the slot wait expires and then answered busy; sessions
-#     hold at most their own share. That is the intended priority: the
-#     platform agent first.
+# How it sits beside the class caps (credential-broker-exec-tier.md §4.2):
+#   * Profile work is background, so with the scope publisher's it holds at
+#     most the background cap, the admitted count less INTERACTIVE_RESERVE,
+#     in slots and in budget room. At serve() the share is clamped to that cap
+#     (P = min(this, B)), so with the defaults (8 admitted, B = 6, P = 4) the
+#     shell and session pods always find two admissions.
+#   * Interactive work holds at most the admitted count less one, so a shell
+#     holding everything it may still leaves one admission for background
+#     work.
 # Operator-unset: the broker default applies, and spec.deployment.env can set
-# it, as it can the session share; on such a pool the clamp holds the shell's
-# slot whatever value arrives.
+# it, as it can the session share; the clamp holds whatever value arrives.
 DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS = 4
 ENV_PROFILE_SLOTS = "CREDENTIAL_PROXY_PROFILE_SLOTS"
 # How long a request waits for admission -- a slot under the slot cap and room
@@ -529,15 +527,16 @@ API_RELAY_DEADLINE_S = 120
 # smaller `pageSize`, which every listed endpoint supports. Read in chunks up
 # to the cap rather than with `.read()`, so the cap bounds memory too.
 API_RELAY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
-# Pub/Sub's largest message (10 MB of data), and the answer cap the platform
-# Pub/Sub relay carries instead of API_RELAY_MAX_RESPONSE_BYTES: a pull is a
-# lease, Pub/Sub has started the ack deadline and the ack ids are in the body
-# by the time the broker reads it, so an answer refused for size strands the
-# message until the deadline, forever for one that is always over. The adapter
-# pulls one message at a time; 16 MiB holds the largest one base64-encoded
-# (13.4 MiB) with its envelope.
+# Pub/Sub's largest message (10 MB of data), and the answer cap every Pub/Sub
+# call relayed by the watcher and platform families carries instead of
+# API_RELAY_MAX_RESPONSE_BYTES: a pull is a lease, Pub/Sub has started the ack
+# deadline and the ack ids are in the body by the time the broker reads it, so
+# an answer refused for size strands the batch until the deadline, forever for
+# one that is always over. 16 MiB holds the largest message base64-encoded
+# (13.4 MiB) with its envelope, so a pull of one message always fits; the
+# drift-detector's pull asks for a batch and halves it on a 502 until it does.
 PUBSUB_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
-PLATFORM_PUBSUB_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+PUBSUB_RELAY_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 API_RELAY_READ_CHUNK_BYTES = 64 * 1024
 # Query keys removed before forwarding. Each is a way to substitute a
 # credential for the broker's or to change the response class: an API key
@@ -760,8 +759,26 @@ ADMISSION_BOUND_OTHER = "other"
 ADMISSION_BOUND_NONE = "none"
 ADMISSION_BOUNDS = frozenset(
     {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION,
-     ADMISSION_BOUND_PROFILE, ADMISSION_BOUND_SCOPE, ADMISSION_BOUND_NONE}
+     ADMISSION_BOUND_PROFILE, ADMISSION_BOUND_SCOPE, ADMISSION_BOUND_BACKGROUND, ADMISSION_BOUND_NONE}
 )
+# What a caller that hung up while queued was waiting for, by the bound that
+# held it, for the hang-up log line.
+HANG_UP_WAITED_FOR = {
+    ADMISSION_BOUND_SLOT: "a slot",
+    ADMISSION_BOUND_BUDGET: "the memory budget",
+    ADMISSION_BOUND_BACKGROUND: "the background share",
+}
+# Priority admission by class (credential-broker-exec-tier.md §4.2, §12). Of
+# the requests one pod admits at once (`CommandExecutor.admitted_requests`),
+# background work may hold all but INTERACTIVE_RESERVE, so a session or shell
+# command finds room while profile workers and the scope publisher fill the
+# rest; interactive work may hold all but INTERACTIVE_HEADROOM, so one
+# admission stays free for background work and the reserve is not one-way.
+# Constants in Phase 1, as the contract says.
+INTERACTIVE_RESERVE = 2
+INTERACTIVE_HEADROOM = 1
+CLASSES = (CLASS_INTERACTIVE, CLASS_BACKGROUND)
+
 # Edges where a reader wants them: 15 s is the cap the Cluster Agent preflight
 # (cluster_preflight.sh) puts on one brokered call, the shortest caller-side
 # cap in the tree, so "how often did a wait outlast a caller's cap" is a
@@ -1263,6 +1280,17 @@ ROLE_SLOT_ATTRIBUTES: dict[str, str] = {
     CALLER_ROLE_PROFILE: "profile_slots",
     CALLER_ROLE_SCOPE: "scope_slots",
 }
+
+
+# The roles whose commands are background work (§12): the profile workers and
+# the scope publisher. Every other slot-taking role is interactive, the shell
+# included until a turn token can tell its chat turns from its sweeps.
+BACKGROUND_ROLES = frozenset({CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE})
+
+
+def admission_class(role: str) -> str:
+    """The admission class a caller role's commands take, from the role alone."""
+    return CLASS_BACKGROUND if role in BACKGROUND_ROLES else CLASS_INTERACTIVE
 
 
 def executable_permitted(role: str, executable: str) -> bool:
@@ -2317,9 +2345,10 @@ class CommandSlotUnavailable(RuntimeError):
     request in flight for every caller, not just this one.
     """
 
-    def __init__(self, message: str, bound: str = ADMISSION_BOUND_OTHER) -> None:
+    def __init__(self, message: str, bound: str = ADMISSION_BOUND_OTHER, klass: str = CLASS_INTERACTIVE) -> None:
         super().__init__(message)
         self.bound = bound
+        self.klass = klass
 
 
 class AdmissionSnapshot(NamedTuple):
@@ -2626,15 +2655,13 @@ def session_slot_limit_from_env(
     return value
 
 
-def profile_slot_limit_from_env(pool: int, session_limit: int) -> int:
-    """The profile role's concurrent-command share, clamped below the pool.
+def profile_slot_limit_from_env(background_cap: int) -> int:
+    """The profile role's concurrent-command share, clamped to the background cap.
 
     Read like the session's (a non-positive or non-integer value is the
-    default, with a warning), then held to ``pool - session_limit - 1`` so the
-    shell keeps a slot, given a pool larger than the session share plus one
-    (DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS says why). At least one, so a pool
-    too small to share still serves profiles, and then the shell's slot is not
-    guaranteed.
+    default, with a warning), then held to `background_cap`
+    (`CommandExecutor.class_cap(CLASS_BACKGROUND)`, at least one): P = min(P, B),
+    as DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS says.
     """
     raw = os.getenv(ENV_PROFILE_SLOTS, "").strip()
     value = DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS
@@ -2649,35 +2676,32 @@ def profile_slot_limit_from_env(pool: int, session_limit: int) -> int:
                 ENV_PROFILE_SLOTS, raw, DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS,
             )
             value = DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS
-    ceiling = max(1, pool - session_limit - 1)
-    if value > ceiling:
-        LOGGER.warning(
-            "the profile share of %d is more than the pool of %d less the session share of %d and one slot "
-            "for the shell; using %d",
-            value, pool, session_limit, ceiling,
-        )
-        value = ceiling
+    if value > background_cap:
+        # Said only for a value the operator set: the default's clamp on a
+        # small pod (4 on a pod whose background cap is 2) is expected.
+        if raw:
+            LOGGER.warning(
+                "the profile share of %d is more than the background cap of %d; using %d",
+                value, background_cap, background_cap,
+            )
+        value = background_cap
     return value
 
 
-def scope_slot_limit_from_env(pool: int, session_limit: int, profile_limit: int) -> int:
-    """The scope role's concurrent-command share, clamped to what the others leave.
+def scope_slot_limit_from_env(background_cap: int) -> int:
+    """The scope role's concurrent-command share, clamped to the background cap.
 
-    Read like the session's, then held to ``pool - session_limit -
-    profile_limit - 1``, so that with every session, profile and scope slot
-    taken the shell still has one. Profile work keeps its priority: this is
-    decided after its share. Zero when nothing is left, with a warning: the
-    scope publisher is then answered busy, and the shell keeps its slot.
+    Read like the session's, then held to `background_cap`. Scope work is
+    background, so the class cap already keeps it, with profile work, out of
+    the interactive reserve; this keeps the share's own figure honest.
     """
     value = session_slot_limit_from_env(ENV_SCOPE_MAX_CONCURRENT_COMMANDS, DEFAULT_SCOPE_MAX_CONCURRENT_COMMANDS)
-    ceiling = max(0, pool - session_limit - profile_limit - 1)
-    if value > ceiling:
+    if value > background_cap:
         LOGGER.warning(
-            "the scope share of %d is more than the pool of %d less the session share of %d, the profile "
-            "share of %d and one slot for the shell; using %d",
-            value, pool, session_limit, profile_limit, ceiling,
+            "the scope share of %d is more than the background cap of %d; using %d",
+            value, background_cap, background_cap,
         )
-        value = ceiling
+        value = background_cap
     return value
 
 
@@ -2717,6 +2741,7 @@ class SessionSlots:
                     f"the {self.role} role is limited to {self.limit} concurrent command(s) through the "
                     f"credential proxy ({self.env_name}); try again when one finishes",
                     bound=self.bound,
+                    klass=admission_class(self.role),
                 )
             self._in_flight += 1
         try:
@@ -3949,8 +3974,8 @@ class GoogleApiRelay:
     ) -> ApiRelayResponse:
         """One `GET https://{host}{target}` on the broker's credential, or a POST with `body`.
 
-        `max_bytes` is the answer cap, API_RELAY_MAX_RESPONSE_BYTES unless a
-        family carries its own (the platform Pub/Sub relay does).
+        `max_bytes` is the answer cap, API_RELAY_MAX_RESPONSE_BYTES unless the
+        call carries its own (a Pub/Sub call on the watcher and platform relays).
 
         `target` is the path and query as the handler assembled them, already
         checked against the policy and stripped of the credential keys. Raises
@@ -6801,6 +6826,20 @@ def _caller_has_gone(caller: Any) -> bool:
     return bool(flags & CALLER_GONE_EVENTS)
 
 
+def _lower_priority(pid: int) -> None:
+    """Run a background request's child at BACKGROUND_NICE (§4.2, §12), so an
+    interactive command's child wins the CPU under contention. Set on the
+    child's process group, which `start_new_session` made its own, right after
+    the start, so the tree it spawns from then on inherits the value; the short
+    window before the call is accepted. Not `preexec_fn`, which is unsafe in a
+    threaded server, and not a `nice` prefix, which would change the argv the
+    policy checked and the audit records. A child already gone is no fault."""
+    try:
+        os.setpriority(os.PRIO_PGRP, pid, BACKGROUND_NICE)
+    except OSError as exc:
+        LOGGER.debug("could not lower a background child's priority pid=%d type=%s", pid, type(exc).__name__)
+
+
 def _kill_process_group(process: subprocess.Popen) -> None:
     """End a command and everything it started. Never raises.
 
@@ -7099,9 +7138,11 @@ def _capture_output(
 class _AdmissionTicket:
     """A request's place in the admission queue. Compared by identity; the
     kind is kept so a slot-less reserver can tell whether only the slot cap
-    holds the tickets ahead of it (`CommandExecutor._admit`)."""
+    holds the tickets ahead of it, and the class so an interactive request can
+    go ahead of queued background ones (`CommandExecutor._admit`)."""
 
     takes_slot: bool
+    klass: str = CLASS_INTERACTIVE
 
 
 class CommandExecutor:
@@ -7128,14 +7169,18 @@ class CommandExecutor:
         if max_concurrent_commands < 1:
             raise ValueError(f"{ENV_MAX_CONCURRENT_COMMANDS} must be at least 1")
         self.max_concurrent_commands = max_concurrent_commands
-        # The slots are handed out in arrival order: a request holds a ticket
-        # in this queue while it waits, and only the ticket at the head may
-        # take a free slot. A semaphore would not do -- a waiter whose timed
+        # The slots are handed out in arrival order inside each admission
+        # class: a request holds a ticket in this queue while it waits, and
+        # only the first ticket of its class that may go ahead of the others
+        # (`_ahead_may_be_passed`) may take a free slot. A semaphore would not do -- a waiter whose timed
         # acquire lapses rejoins the wait at the back, so under sustained
         # saturation the caller that had waited longest was as likely to be
         # refused as one that had just arrived.
         self._slot_condition = threading.Condition()
         self._slots_in_use = 0
+        # Slot-taking admissions held per class, for the class caps (§4.2);
+        # guarded by `_slot_condition` like the slot count.
+        self._slots_by_class: dict[str, int] = {klass: 0 for klass in CLASSES}
         self._slot_queue: collections.deque[_AdmissionTicket] = collections.deque()
         # The deadline the commands of the request on this thread share; set by
         # `request_slot` for as long as the slot is held, read by `_execute`.
@@ -7482,6 +7527,15 @@ class CommandExecutor:
             f"{self._slots_in_use} requests"
         )
 
+    def class_cap(self, klass: str) -> int:
+        """How many slot-taking admissions `klass` may hold at once (§4.2):
+        background all but INTERACTIVE_RESERVE of `admitted_requests`,
+        interactive all but INTERACTIVE_HEADROOM. Never below one, so a pod
+        too small to reserve anything still serves both classes; the reserve
+        then holds only as far as the pod allows."""
+        withheld = INTERACTIVE_RESERVE if klass == CLASS_BACKGROUND else INTERACTIVE_HEADROOM
+        return max(1, self.admitted_requests() - withheld)
+
     def admitted_requests(self) -> int:
         """How many slot-taking requests the broker admits at once: the slot cap,
         or the child memory budget's count when that is smaller. The figure the
@@ -7521,9 +7575,11 @@ class CommandExecutor:
             )
 
     def _held_bound(self, takes_slot: bool, saw_slots_full: bool) -> str:
-        """Which bound held a request through its wait: the one rule behind
-        the wait log, the histogram label, the hang-up text, the refusal's
-        bound and the refusal's text, so none of them can split from another.
+        """Which bound held a request through its wait: the rule behind the wait
+        log, the histogram label, the hang-up text, the refusal's bound and the
+        refusal's text, so none of them can split from another. `_admit` puts
+        its class caps ahead of it (`background`, and `slot` for the interactive
+        cap); this decides between the slot cap and the budget.
         A slot-taker that ever found the slot cap full (`saw_slots_full`), or
         that waits with the budget off, was held by the slot cap; any other
         wait, a slot-taker's behind a budget-held queue or a slot-less
@@ -7536,7 +7592,7 @@ class CommandExecutor:
         return ADMISSION_BOUND_BUDGET
 
     @contextlib.contextmanager
-    def request_slot(self, caller: socket.socket | None = None) -> Iterator[None]:
+    def request_slot(self, caller: socket.socket | None = None, klass: str = CLASS_INTERACTIVE) -> Iterator[None]:
         """Hold one concurrency slot for the whole of a request.
 
         Taken by the routes that run agent-selected commands -- `/v1/exec` and
@@ -7557,7 +7613,9 @@ class CommandExecutor:
         reservation to fit the budget (`_fits_budget`), in the same queue and
         under the same wait.
 
-        Slots go in arrival order. The wait is woken every
+        Slots go in arrival order inside each admission class (`klass`), with
+        interactive requests ahead of queued background ones and each class
+        held to its cap (`_admit`, §4.2). The wait is woken every
         COMMAND_SLOT_POLL_SECONDS at the latest and `caller`, when given, is
         checked each time: one that has hung up while queued raises
         `CallerHungUp` before anything is started, rather than taking the slot
@@ -7575,7 +7633,7 @@ class CommandExecutor:
         end to end -- longer than the idle time Envoy allows the stream in
         front of the broker, which is sized against this one.
         """
-        with self._admit(takes_slot=True, caller=caller):
+        with self._admit(takes_slot=True, caller=caller, klass=klass):
             yield
 
     @contextlib.contextmanager
@@ -7589,8 +7647,8 @@ class CommandExecutor:
         """Hold a child memory reservation without a slot, for a route that
         spawns but holds no output (the forge refresh, §2.1). Same queue, same
         wait, same refusal and hang-up handling as `request_slot` while the
-        budget is on, except that it is admitted past slot-takers the full
-        slot cap holds (`_admit`). With the budget off it takes no queue at all and only
+        budget is on, except that it is admitted past slot-takers only a slot
+        cap holds, the full slot cap or their own class's (`_admit`). With the budget off it takes no queue at all and only
         marks the thread as covered, so `_execute` takes no transient
         reservation; `caller`, `yield_when`, `deadline` and `queued_at` are
         then unused. All three are passed to `_admit`."""
@@ -7648,8 +7706,15 @@ class CommandExecutor:
         to earlier arrivals and the queue ahead holds this request. Under the
         budget: this request does not fit it now, or it fits and the queue
         ahead, held by the budget, holds it (a slot-less reserver is admitted
-        past tickets the slot cap alone holds, `_admit`). The text never says
+        past tickets only a slot cap holds, `_admit`). The text never says
         a request waited without fitting when it fits."""
+        if bound == ADMISSION_BOUND_BACKGROUND:
+            return (
+                f"the credential proxy keeps {self.admitted_requests() - self.class_cap(CLASS_BACKGROUND)} "
+                f"of its {self.admitted_requests()} admissions for interactive work, background work may hold "
+                f"the other {self.class_cap(CLASS_BACKGROUND)}, and this request waited "
+                f"{COMMAND_SLOT_WAIT_SECONDS}s without reaching one; retry shortly"
+            )
         if bound == ADMISSION_BOUND_SLOT:
             if self._slots_in_use >= self.max_concurrent_commands:
                 # Worded for the queue: slots may well have freed in the
@@ -7696,19 +7761,71 @@ class CommandExecutor:
         finally:
             self._request_budget.exempt = previous
 
-    def _only_the_slot_cap_holds_ahead_of(self, ticket: _AdmissionTicket) -> bool:
-        """Whether every ticket ahead of `ticket` takes a slot while the slots
-        are full. Those wait on the slot cap, not the budget, so a slot-less
-        reserver admitted past them takes nothing they are waiting for (§2.3).
-        Called under `_slot_condition`."""
-        if self._slots_in_use < self.max_concurrent_commands:
-            return False
+    def _only_slot_caps_hold_ahead_of(self, ticket: _AdmissionTicket) -> bool:
+        """Whether every ticket ahead of `ticket` takes a slot and is held by a
+        slot cap: the full slot cap, or its own class's full cap while it would
+        otherwise fit the budget (§4.2). Those wait for a slot, not for the
+        budget, so a slot-less reserver admitted past them takes nothing they
+        are waiting for (§2.3). A class cap that is full because the budget is
+        (a small pod's caps follow its budget) is the budget holding, and order
+        is kept. Called under `_slot_condition`."""
+        slots_full = self._slots_in_use >= self.max_concurrent_commands
         for ahead in self._slot_queue:
             if ahead is ticket:
                 return True
             if not ahead.takes_slot:
                 return False
+            class_full = self._slots_by_class[ahead.klass] >= self.class_cap(ahead.klass)
+            if not (slots_full or (class_full and self._fits_budget(takes_slot=True))):
+                return False
         return False
+
+    def _ahead_may_be_passed(self, ticket: _AdmissionTicket) -> bool:
+        """Whether `ticket` may go ahead of every ticket queued before it
+        (§4.2). Inside a class the order is arrival order, so a ticket of its
+        own class ahead holds it. An interactive request goes ahead of queued
+        background requests. A background request goes ahead of interactive
+        ones only while the interactive cap is full, because the admission
+        that cap leaves is the one kept for background work. For the same
+        priority, a background request also yields to an interactive request
+        queued behind it while the interactive cap has room: a freed admission
+        goes to interactive work first. With one class queued this is today's
+        rule: only the head is eligible. Called under `_slot_condition`."""
+        interactive_full = self._slots_by_class[CLASS_INTERACTIVE] >= self.class_cap(CLASS_INTERACTIVE)
+        if ticket.klass == CLASS_BACKGROUND and not interactive_full and any(
+            queued.klass == CLASS_INTERACTIVE for queued in self._slot_queue
+        ):
+            return False
+        for ahead in self._slot_queue:
+            if ahead is ticket:
+                return True
+            if ahead.klass == ticket.klass:
+                return False
+            if ticket.klass == CLASS_BACKGROUND and not (interactive_full and ahead.takes_slot):
+                return False
+        return False
+
+    def _leaves_reserve(self) -> bool:
+        """Whether one more background slot-taker still leaves the budget room
+        for the interactive reserve (§4.2: the reserve is budget room as well
+        as slots), so a background child cannot take the memory an
+        interactive request needs. Interactive work already running uses its
+        reserve, so only the part of the reserve it does not use is held back.
+        The reserve is the admissions the background cap withholds, so a pod
+        too small to reserve two reserves what it can. Always true with the
+        budget off: the cap is then the whole reserve. Called under
+        `_slot_condition`."""
+        if self.children_budget_bytes is None:
+            return True
+        reserve = self.admitted_requests() - self.class_cap(CLASS_BACKGROUND)
+        unused_reserve = max(0, reserve - self._slots_by_class[CLASS_INTERACTIVE])
+        cost = self._request_cost_bytes(takes_slot=True)
+        needed = (
+            self._reserved_bytes
+            + OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes * self._slots_in_use
+            + cost * (1 + unused_reserve)
+        )
+        return needed <= self.children_budget_bytes
 
     @contextlib.contextmanager
     def _admit(
@@ -7718,10 +7835,13 @@ class CommandExecutor:
         yield_when: Callable[[], bool] | None = None,
         deadline: float | None = None,
         queued_at: float | None = None,
+        klass: str = CLASS_INTERACTIVE,
     ) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
-        reservation whenever the budget is on. One arrival-order queue for
-        both kinds, with one exception: a slot-less reserver that fits the
+        reservation whenever the budget is on. One queue for both kinds, in
+        arrival order inside each class (`_ahead_may_be_passed` says when a
+        ticket goes ahead of another class; `klass` caps each class), with one
+        more exception: a slot-less reserver that fits the
         budget is admitted past tickets ahead of it that are all slot-takers
         held by a full slot cap, because it competes with them for nothing.
         Behind a ticket the budget holds, order is kept, since a reserver
@@ -7756,40 +7876,73 @@ class CommandExecutor:
             queued_at = time.monotonic()
         if deadline is None:
             deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
-        ticket = _AdmissionTicket(takes_slot)
+        ticket = _AdmissionTicket(takes_slot, klass)
         # Set if this slot-taking request ever found the slot cap full while it
         # waited. The wait log names the slot cap only then; otherwise, with the
         # budget on, what held it was the budget, directly or through the
         # budget-held tickets ahead of it.
         saw_slots_full = False
+        # Set if this background slot-taker was ever held by its class cap or
+        # by the interactive reserve's budget room: its refusal and its wait
+        # then name the background bound, which the shim retries elsewhere.
+        held_by_class = False
+        # Set if this interactive slot-taker was ever held by the interactive
+        # cap, the one admission kept for background work. Counted as `slot`,
+        # the bound the shim retries, with its own wording.
+        held_by_interactive_cap = False
+
+        def held_bound() -> str:
+            if held_by_class:
+                return ADMISSION_BOUND_BACKGROUND
+            if held_by_interactive_cap:
+                return ADMISSION_BOUND_SLOT
+            return self._held_bound(takes_slot, saw_slots_full)
+
+        def refusal_text(bound: str) -> str:
+            if held_by_interactive_cap and bound == ADMISSION_BOUND_SLOT:
+                return (
+                    f"the credential proxy keeps one of its {self.admitted_requests()} admissions for "
+                    f"background work, interactive work holds the other {self.class_cap(CLASS_INTERACTIVE)}, "
+                    f"and this request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching one; retry shortly"
+                )
+            return self._refusal_text(takes_slot, bound)
+
         with self._slot_condition:
             self._slot_queue.append(ticket)
             try:
                 while True:
-                    eligible = self._slot_queue[0] is ticket or (
-                        not takes_slot and self._only_the_slot_cap_holds_ahead_of(ticket)
+                    eligible = self._ahead_may_be_passed(ticket) or (
+                        not takes_slot and self._only_slot_caps_hold_ahead_of(ticket)
                     )
                     slot_free = (not takes_slot) or self._slots_in_use < self.max_concurrent_commands
-                    if eligible and slot_free and self._fits_budget(takes_slot):
+                    class_free = (not takes_slot) or self._slots_by_class[klass] < self.class_cap(klass)
+                    reserve_free = not (takes_slot and klass == CLASS_BACKGROUND) or self._leaves_reserve()
+                    if eligible and slot_free and class_free and reserve_free and self._fits_budget(takes_slot):
                         break
                     if takes_slot and self._slots_in_use >= self.max_concurrent_commands:
                         saw_slots_full = True
+                    # A class flag only when the class rule alone holds the
+                    # request: a slot is free and the budget fits. On a pod
+                    # whose cap equals the slot cap or the budget, that bound
+                    # keeps its own name.
+                    held_by_class_rule = slot_free and self._fits_budget(takes_slot)
+                    if takes_slot and klass == CLASS_BACKGROUND and not (class_free and reserve_free) and held_by_class_rule:
+                        held_by_class = True
+                    if takes_slot and klass == CLASS_INTERACTIVE and not class_free and held_by_class_rule:
+                        held_by_interactive_cap = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        bound = self._held_bound(takes_slot, saw_slots_full)
-                        raise CommandSlotUnavailable(self._refusal_text(takes_slot, bound), bound=bound)
+                        bound = held_bound()
+                        raise CommandSlotUnavailable(refusal_text(bound), bound=bound, klass=klass)
                     waited = True
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
-                        held_by_slots = self._held_bound(takes_slot, saw_slots_full) == ADMISSION_BOUND_SLOT
-                        raise CallerHungUp(
-                            "the caller disconnected while queued for "
-                            + ("a slot" if held_by_slots else "the memory budget")
-                        )
+                        raise CallerHungUp("the caller disconnected while queued for " + HANG_UP_WAITED_FOR[held_bound()])
                     if yield_when is not None and yield_when():
                         raise AdmissionYielded("another caller needs to go first", queued_at)
                 if takes_slot:
                     self._slots_in_use += 1
+                    self._slots_by_class[klass] += 1
                 reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if self.children_budget_bytes is not None else 0
                 self._reserved_bytes += reserved
             finally:
@@ -7801,6 +7954,9 @@ class CommandExecutor:
         try:
             if takes_slot:
                 self._request_budget.deadline = time.monotonic() + self.timeout_seconds
+                # Read by `_execute`, which runs a background request's
+                # children at BACKGROUND_NICE.
+                self._request_budget.klass = klass
             self._request_budget.reserved = True
             waited_seconds = time.monotonic() - queued_at
             waited_ms = int(waited_seconds * MILLISECONDS_PER_SECOND)
@@ -7808,14 +7964,29 @@ class CommandExecutor:
             # it writes a line, or under `none` for a request admitted at once,
             # so an idle broker's observations are a measured zero that blames
             # neither bound, and the label does not flip with the memory limit.
-            held = self._held_bound(takes_slot, saw_slots_full) if waited else ADMISSION_BOUND_NONE
+            held = held_bound() if waited else ADMISSION_BOUND_NONE
             if self.metrics is not None:
-                self.metrics.observe_admission_wait(held, waited_seconds)
+                self.metrics.observe_admission_wait(held, waited_seconds, klass)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
                 if held == ADMISSION_BOUND_BUDGET:
                     with self._slot_condition:
                         in_use = self._budget_in_use_text()
                     LOGGER.info("request waited %dms for memory budget (%s)", waited_ms, in_use)
+                elif held == ADMISSION_BOUND_BACKGROUND:
+                    LOGGER.info(
+                        "background request waited %dms for the background share (%d of %d admissions)",
+                        waited_ms,
+                        self.class_cap(CLASS_BACKGROUND),
+                        self.admitted_requests(),
+                    )
+                elif held_by_interactive_cap:
+                    LOGGER.info(
+                        "interactive request waited %dms for the interactive share (%d of %d admissions; "
+                        "one is kept for background work)",
+                        waited_ms,
+                        self.class_cap(CLASS_INTERACTIVE),
+                        self.admitted_requests(),
+                    )
                 else:
                     LOGGER.info(
                         "request waited %dms for a slot (all %d slots were busy)",
@@ -7827,9 +7998,11 @@ class CommandExecutor:
             self._request_budget.reserved = previously_reserved
             if takes_slot:
                 self._request_budget.deadline = None
+                self._request_budget.klass = None
             with self._slot_condition:
                 if takes_slot:
                     self._slots_in_use -= 1
+                    self._slots_by_class[klass] -= 1
                 self._reserved_bytes -= reserved
                 self._slot_condition.notify_all()
 
@@ -9749,6 +9922,8 @@ class CommandExecutor:
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
+            if getattr(self._request_budget, "klass", None) == CLASS_BACKGROUND:
+                _lower_priority(process.pid)
             captured = _capture_output(
                 process,
                 stdin=stdin.encode("utf-8") if stdin is not None else None,
@@ -10443,6 +10618,12 @@ def _tool_audit(
     return record
 
 
+def _known_class(klass: str) -> str:
+    """A class for a metric label: one of CLASSES, anything else as interactive,
+    so no caller text ever opens a series."""
+    return klass if klass in CLASSES else CLASS_INTERACTIVE
+
+
 def _escape_label_value(value: str) -> str:
     # Every label value today is a static enum or a vocabulary word, none of
     # which carries these characters. Kept because the exposition format's
@@ -10478,16 +10659,18 @@ class ProxyMetrics:
         self._details: vcs_readings.DetailsReading | None = None
         self._reading_failures: dict[str, int] = {}
         self._failures: dict[tuple[str, str], int] = {}
-        # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
-        # bound, the +Inf bucket being the count), the sum, and the count.
-        self._duration_buckets: dict[str, list[int]] = {}
-        self._duration_sum: dict[str, float] = {}
-        self._duration_count: dict[str, int] = {}
-        # Admission waits per bound: cumulative buckets, sum and count, as above.
-        self._admission_buckets: dict[str, list[int]] = {}
-        self._admission_sum: dict[str, float] = {}
-        self._admission_count: dict[str, int] = {}
-        self._refusals: dict[str, int] = {}
+        # Per (tool, class): cumulative bucket counts (one per
+        # TOOL_DURATION_BUCKETS bound, the +Inf bucket being the count), the
+        # sum, and the count.
+        self._duration_buckets: dict[tuple[str, ...], list[int]] = {}
+        self._duration_sum: dict[tuple[str, ...], float] = {}
+        self._duration_count: dict[tuple[str, ...], int] = {}
+        # Admission waits per (bound, class): cumulative buckets, sum and
+        # count, as above.
+        self._admission_buckets: dict[tuple[str, ...], list[int]] = {}
+        self._admission_sum: dict[tuple[str, ...], float] = {}
+        self._admission_count: dict[tuple[str, ...], int] = {}
+        self._refusals: dict[tuple[str, str], int] = {}
         # The executor's `admission_snapshot`, read at render time; None until
         # serve() wires one, and the gauges are absent until then.
         self._admission_gauges: Callable[[], AdmissionSnapshot] | None = None
@@ -10497,11 +10680,11 @@ class ProxyMetrics:
 
     @staticmethod
     def _observe(
-        buckets: dict[str, list[int]],
-        sums: dict[str, float],
-        counts: dict[str, int],
+        buckets: dict[tuple[str, ...], list[int]],
+        sums: dict[tuple[str, ...], float],
+        counts: dict[tuple[str, ...], int],
         edges: tuple[float, ...],
-        key: str,
+        key: tuple[str, ...],
         value: float,
     ) -> None:
         """One observation into a histogram family: the cumulative bucket
@@ -10517,32 +10700,32 @@ class ProxyMetrics:
     def _render_histogram(
         lines: list[str],
         name: str,
-        label: str,
+        labels: tuple[str, ...],
         edges: tuple[float, ...],
-        families: dict[str, tuple[list[int], float, int]],
+        families: dict[tuple[str, ...], tuple[list[int], float, int]],
     ) -> None:
         """One histogram family in the text exposition, one series set per
-        label value, in the order the caller sorted them."""
-        for value, (buckets, total, count) in families.items():
-            escaped = _escape_label_value(value)
+        tuple of label values, in the order the caller sorted them."""
+        for values, (buckets, total, count) in families.items():
+            pairs = ",".join(f'{label}="{_escape_label_value(value)}"' for label, value in zip(labels, values))
             for edge, cumulative in zip(edges, buckets):
-                lines.append(f'{name}_bucket{{{label}="{escaped}",le="{edge}"}} {cumulative}')
-            lines.append(f'{name}_bucket{{{label}="{escaped}",le="+Inf"}} {count}')
-            lines.append(f'{name}_sum{{{label}="{escaped}"}} {total:.6f}')
-            lines.append(f'{name}_count{{{label}="{escaped}"}} {count}')
+                lines.append(f'{name}_bucket{{{pairs},le="{edge}"}} {cumulative}')
+            lines.append(f'{name}_bucket{{{pairs},le="+Inf"}} {count}')
+            lines.append(f'{name}_sum{{{pairs}}} {total:.6f}')
+            lines.append(f'{name}_count{{{pairs}}} {count}')
 
-    def observe_admission_wait(self, bound: str, seconds: float) -> None:
+    def observe_admission_wait(self, bound: str, seconds: float, klass: str = CLASS_INTERACTIVE) -> None:
         bound = bound if bound in ADMISSION_BOUNDS else ADMISSION_BOUND_OTHER
         with self._lock:
             self._observe(
                 self._admission_buckets, self._admission_sum, self._admission_count,
-                ADMISSION_WAIT_BUCKETS, bound, seconds,
+                ADMISSION_WAIT_BUCKETS, (bound, _known_class(klass)), seconds,
             )
 
-    def record_refusal(self, bound: str) -> None:
-        bound = bound if bound in ADMISSION_BOUNDS else ADMISSION_BOUND_OTHER
+    def record_refusal(self, bound: str, klass: str = CLASS_INTERACTIVE) -> None:
+        key = (bound if bound in ADMISSION_BOUNDS else ADMISSION_BOUND_OTHER, _known_class(klass))
         with self._lock:
-            self._refusals[bound] = self._refusals.get(bound, 0) + 1
+            self._refusals[key] = self._refusals.get(key, 0) + 1
 
     def set_admission_gauges(self, snapshot: Callable[[], AdmissionSnapshot] | None) -> None:
         with self._lock:
@@ -10557,11 +10740,11 @@ class ProxyMetrics:
         with self._lock:
             self._tool_invocations[key] = self._tool_invocations.get(key, 0) + 1
 
-    def observe_duration(self, tool: str, seconds: float) -> None:
+    def observe_duration(self, tool: str, seconds: float, klass: str = CLASS_INTERACTIVE) -> None:
         with self._lock:
             self._observe(
                 self._duration_buckets, self._duration_sum, self._duration_count,
-                TOOL_DURATION_BUCKETS, tool, seconds,
+                TOOL_DURATION_BUCKETS, (tool, _known_class(klass)), seconds,
             )
 
     def record_request(self, endpoint: str, status_code: str) -> None:
@@ -10703,12 +10886,12 @@ class ProxyMetrics:
             reading_failures = sorted(self._reading_failures.items())
             failures = sorted(self._failures.items())
             durations = {
-                tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
-                for tool in sorted(self._duration_buckets)
+                key: (list(self._duration_buckets[key]), self._duration_sum[key], self._duration_count[key])
+                for key in sorted(self._duration_buckets)
             }
             admissions = {
-                bound: (list(self._admission_buckets[bound]), self._admission_sum[bound], self._admission_count[bound])
-                for bound in sorted(self._admission_buckets)
+                key: (list(self._admission_buckets[key]), self._admission_sum[key], self._admission_count[key])
+                for key in sorted(self._admission_buckets)
             }
             refusals = sorted(self._refusals.items())
             gauges = self._admission_gauges
@@ -10726,10 +10909,10 @@ class ProxyMetrics:
                 f'subcommand="{_escape_label_value(subcommand)}",{TOOL_STATUS_LABEL}="{_escape_label_value(status)}"}} {count}'
             )
         lines += [
-            f"# HELP {TOOL_DURATION_METRIC} Wall-clock seconds a brokered command ran, by tool.",
+            f"# HELP {TOOL_DURATION_METRIC} Wall-clock seconds a brokered command ran, by tool and admission class.",
             f"# TYPE {TOOL_DURATION_METRIC} histogram",
         ]
-        self._render_histogram(lines, TOOL_DURATION_METRIC, "tool", TOOL_DURATION_BUCKETS, durations)
+        self._render_histogram(lines, TOOL_DURATION_METRIC, ("tool", CLASS_LABEL), TOOL_DURATION_BUCKETS, durations)
         lines += [
             f"# HELP {PROXY_REQUESTS_METRIC} HTTP requests answered on the credentialed listener, by route family and status code.",
             f"# TYPE {PROXY_REQUESTS_METRIC} counter",
@@ -10740,16 +10923,21 @@ class ProxyMetrics:
                 f'status_code="{_escape_label_value(status_code)}"}} {count}'
             )
         lines += [
-            f"# HELP {ADMISSION_WAIT_METRIC} Seconds a request waited to be admitted, by the bound that held it (slot cap or child memory budget), or none for a request admitted without a wait.",
+            f"# HELP {ADMISSION_WAIT_METRIC} Seconds a request waited to be admitted, by the bound that held it (slot cap, child memory budget or background share), or none for a request admitted without a wait, and by admission class.",
             f"# TYPE {ADMISSION_WAIT_METRIC} histogram",
         ]
-        self._render_histogram(lines, ADMISSION_WAIT_METRIC, ADMISSION_BOUND_LABEL, ADMISSION_WAIT_BUCKETS, admissions)
+        self._render_histogram(
+            lines, ADMISSION_WAIT_METRIC, (ADMISSION_BOUND_LABEL, CLASS_LABEL), ADMISSION_WAIT_BUCKETS, admissions
+        )
         lines += [
-            f"# HELP {ADMISSION_REFUSALS_METRIC} Requests answered with the busy 503, by the bound that refused them.",
+            f"# HELP {ADMISSION_REFUSALS_METRIC} Requests answered with the busy 503, by the bound that refused them and admission class.",
             f"# TYPE {ADMISSION_REFUSALS_METRIC} counter",
         ]
-        for bound, count in refusals:
-            lines.append(f'{ADMISSION_REFUSALS_METRIC}{{{ADMISSION_BOUND_LABEL}="{_escape_label_value(bound)}"}} {count}')
+        for (bound, klass), count in refusals:
+            lines.append(
+                f'{ADMISSION_REFUSALS_METRIC}{{{ADMISSION_BOUND_LABEL}="{_escape_label_value(bound)}",'
+                f'{CLASS_LABEL}="{_escape_label_value(klass)}"}} {count}'
+            )
         if snapshot is not None:
             lines += [
                 f"# HELP {SLOTS_IN_USE_METRIC} Command slots held right now.",
@@ -11734,7 +11922,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # CommandExecutor.request_slot for why the response is inside it.
             # The session or scope role's own bound is taken first, so a caller
             # past its share never queues for the pool the shell shares.
-            with self._session_slot(principal.role), self._request_slot():
+            with self._session_slot(principal.role), self._request_slot(admission_class(principal.role)):
                 result = self.executor.execute(
                     exec_argv,
                     stdin=stdin,
@@ -11764,7 +11952,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     # request; the invocation and its duration are counted here
                     # or nowhere.
                     self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ABANDONED)
-                    self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
+                    self.metrics.observe_duration(
+                        tool_label, result.duration_ms / MILLISECONDS_PER_SECOND, admission_class(principal.role)
+                    )
                     return
                 LOGGER.info(
                     "command complete request_id=%s exit_code=%d duration_ms=%d truncated=%s",
@@ -11785,7 +11975,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 )
                 if result.timed_out:
                     self.metrics.record_failure(BROKER_FAILURE_EXEC_TIMEOUT, tool=tool_label)
-                self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
+                self.metrics.observe_duration(
+                    tool_label, result.duration_ms / MILLISECONDS_PER_SECOND, admission_class(principal.role)
+                )
                 if scope_admitted is not None and result.exit_code == 0 and not result.truncated and not result.timed_out:
                     scope_policy.record(
                         scope_admitted,
@@ -12368,7 +12560,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 self.command, host, path, body, self.platform_pubsub_subscriptions
             ),
             family="platform Pub/Sub relay",
-            max_bytes=PLATFORM_PUBSUB_MAX_RESPONSE_BYTES,
         )
 
     def _relay_google_call(
@@ -12377,14 +12568,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         prefix: str,
         decide: Callable[[str, str, bytes], command_policy.Decision],
         family: str = "watcher relay",
-        max_bytes: int | None = None,
     ) -> None:
         """Forward one `<prefix><host>/<path>` Google call that `decide` allows.
 
         `label` is the first word of every audit line, naming the family; the
         caller's role was already checked against ROUTE_ROLES by the time this
-        runs, so `decide` is the second gate, on the target. `max_bytes` is the
-        family's answer cap, the relay's own when None.
+        runs, so `decide` is the second gate, on the target. The answer cap is
+        the host's: PUBSUB_RELAY_MAX_RESPONSE_BYTES for a Pub/Sub call, whichever
+        family relays it, and the relay's own for anything else.
         """
         request_id = str(uuid.uuid4())
         parts = urllib.parse.urlsplit(self.path)
@@ -12442,8 +12633,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         extra: dict[str, Any] = {}
         if self.command == watcher_policy.METHOD_POST:
             extra = {"body": body, "headers": (("Content-Type", WATCHER_GCP_CONTENT_TYPE),)}
-        if max_bytes is not None:
-            extra["max_bytes"] = max_bytes
+        if host == watcher_policy.PUBSUB_HOST:
+            extra["max_bytes"] = PUBSUB_RELAY_MAX_RESPONSE_BYTES
         upstream = self._relay_fetch(label, request_id, host, target, authorization, **extra)
         if upstream is None:
             return
@@ -13572,7 +13763,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return contextlib.nullcontext()
         return slots.acquire(role)
 
-    def _request_slot(self) -> contextlib.AbstractContextManager:
+    def _request_slot(self, klass: str = CLASS_INTERACTIVE) -> contextlib.AbstractContextManager:
         """This request's concurrency slot, watched on this connection.
 
         `serve` always installs a `CommandExecutor`, which has one, and every
@@ -13584,7 +13775,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         """
         executor = getattr(self, "executor", None)
         if hasattr(executor, "request_slot"):
-            return executor.request_slot(caller=getattr(self, "connection", None))
+            return executor.request_slot(caller=getattr(self, "connection", None), klass=klass)
         return contextlib.nullcontext()
 
     def _busy(self, exc: CommandSlotUnavailable) -> None:
@@ -13598,7 +13789,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         failure. Counted here, once per route that answers it, under the bound
         the exception carries.
         """
-        self.metrics.record_refusal(getattr(exc, "bound", ADMISSION_BOUND_OTHER))
+        self.metrics.record_refusal(
+            getattr(exc, "bound", ADMISSION_BOUND_OTHER), getattr(exc, "klass", CLASS_INTERACTIVE)
+        )
         self._json(
             HTTPStatus.SERVICE_UNAVAILABLE,
             {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc)},
@@ -13925,19 +14118,13 @@ def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.executor = executor
     CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())
     CredentialProxyHandler.profile_slots = SessionSlots(
-        profile_slot_limit_from_env(executor.max_concurrent_commands, CredentialProxyHandler.session_slots.limit),
+        profile_slot_limit_from_env(executor.class_cap(CLASS_BACKGROUND)),
         role=CALLER_ROLE_PROFILE,
         env_name=ENV_PROFILE_SLOTS,
         bound=ADMISSION_BOUND_PROFILE,
     )
-    # After the profile share, so the scope share takes only what profile and
-    # session work leave the shell's last slot.
     CredentialProxyHandler.scope_slots = SessionSlots(
-        scope_slot_limit_from_env(
-            executor.max_concurrent_commands,
-            CredentialProxyHandler.session_slots.limit,
-            CredentialProxyHandler.profile_slots.limit,
-        ),
+        scope_slot_limit_from_env(executor.class_cap(CLASS_BACKGROUND)),
         role=CALLER_ROLE_SCOPE,
         env_name=ENV_SCOPE_MAX_CONCURRENT_COMMANDS,
         bound=ADMISSION_BOUND_SCOPE,
