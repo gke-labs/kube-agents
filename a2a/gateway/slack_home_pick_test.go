@@ -153,8 +153,9 @@ func TestSlackHomePickViewStates(t *testing.T) {
 // publishes "Checking" then the outcome to the member, posts the two lines,
 // and the view shows the new channel before the file catches up (E7).
 func TestSlackHomePickMovesTheHome(t *testing.T) {
-	a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage, homeRecordKeyRefused: homeRefusedArchived})
+	a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage})
 	writeHomeFile(t, dir, "C0OLD1\n")
+	api.conversations["C0OLD1"] = homeChannelInfo("C0OLD1", nil)
 	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
 	a.publishHome("U1", false)
 	a.publishHome("UX", false)
@@ -163,9 +164,6 @@ func TestSlackHomePickMovesTheHome(t *testing.T) {
 	data := homeRecordData(t, cs)
 	if data[homeRecordKeySlack] != "C0NEW2" || data[homeRecordKeySetBy] != "U1" || data[homeRecordKeyWriter] != homeTestImage || homePatches(cs) != 1 {
 		t.Fatalf("record after the pick = %v (patches %d), want C0NEW2 by U1 in one write", data, homePatches(cs))
-	}
-	if _, stale := data[homeRecordKeyRefused]; stale {
-		t.Errorf("the move kept a stale refusal: %v", data)
 	}
 	if got := viewsFor(api, "U1") - before; got < 2 || !anyView(t, api, "U1", "Checking <#C0NEW2>") {
 		t.Errorf("views to the picker = %d, want the Checking publish and the outcome", got)
@@ -591,5 +589,124 @@ func TestSlackHomeCheckNamesADirectMessageByItsOwnWord(t *testing.T) {
 	}
 	if refused, err := a.checkHomeChannel(context.Background(), "D0DM1"); err != nil || refused != homeRefusedMalformed {
 		t.Errorf("DM id: refused %q err %v, want %q", refused, err, homeRefusedMalformed)
+	}
+}
+
+// TestSlackHomePickOldHomeLineIsGated (the human round): the moved line goes
+// to the previous home only through the channel gate. A channel that became
+// shared since is told nothing; a refusal mark on the record skips the check,
+// and the move still clears that mark.
+func TestSlackHomePickOldHomeLineIsGated(t *testing.T) {
+	t.Run("the old home became shared", func(t *testing.T) {
+		a, api, _, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage})
+		writeHomeFile(t, dir, "C0NEW2\n")
+		api.conversations["C0OLD1"] = homeChannelInfo("C0OLD1", func(c *slack.Channel) { c.IsExtShared = true })
+		api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+		pick(t, a, "U1", "T1", "C0NEW2", "219.1")
+		if len(api.posted) != 1 || api.posted[0].channel != "C0NEW2" || api.conversationInfoCalls != 2 {
+			t.Errorf("posts %+v, conversations.info %d; want the new-channel line only, after one check of the old home", api.posted, api.conversationInfoCalls)
+		}
+	})
+	t.Run("a refusal mark skips the check", func(t *testing.T) {
+		a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage, homeRecordKeyRefused: homeRefusedArchived})
+		writeHomeFile(t, dir, "C0NEW2\n")
+		api.conversations["C0OLD1"] = homeChannelInfo("C0OLD1", nil)
+		api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+		pick(t, a, "U1", "T1", "C0NEW2", "219.2")
+		if len(api.posted) != 1 || api.conversationInfoCalls != 1 {
+			t.Errorf("posts %d, conversations.info %d; want one line and no check of a refused home", len(api.posted), api.conversationInfoCalls)
+		}
+		if data := homeRecordData(t, cs); data[homeRecordKeyRefused] != "" {
+			t.Errorf("the move kept the stale refusal: %v", data)
+		}
+	})
+}
+
+// TestSlackHomePickGuards (the human round, Low 3): the three guards a
+// mutation run found unpinned. The write carries the read resourceVersion; a
+// pick during a change is held by the busy gate; a pick held there is
+// admitted again before anything is published.
+func TestSlackHomePickGuards(t *testing.T) {
+	t.Run("the patch carries the read resourceVersion", func(t *testing.T) {
+		a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage})
+		writeHomeFile(t, dir, "C0NEW2\n")
+		api.conversations["C0OLD1"] = homeChannelInfo("C0OLD1", nil)
+		api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+		cm, _ := cs.Tracker().Get(configMapsGVR, homeTestNamespace, homeTestRecord)
+		obj := cm.(*corev1.ConfigMap)
+		obj.ResourceVersion = "41"
+		_ = cs.Tracker().Update(configMapsGVR, obj, homeTestNamespace)
+		var bodies []string
+		cs.PrependReactor("patch", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			bodies = append(bodies, string(action.(k8stesting.PatchAction).GetPatch()))
+			return false, nil, nil
+		})
+		pick(t, a, "U1", "T1", "C0NEW2", "220.1")
+		if len(bodies) != 1 || !strings.Contains(bodies[0], `"resourceVersion":"41"`) {
+			t.Errorf("patch bodies = %q, want one under resourceVersion 41", bodies)
+		}
+	})
+	t.Run("a pick during a change is held by the busy gate", func(t *testing.T) {
+		a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage})
+		writeHomeFile(t, dir, "C0OLD1\n")
+		api.conversations["C0OLD1"] = homeChannelInfo("C0OLD1", nil)
+		api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+		api.conversations["C0THR3"] = homeChannelInfo("C0THR3", nil)
+		logs := &recordingHandler{}
+		a.log = slog.New(logs)
+		// A second listed member picks, so the first pick's own status does
+		// not overwrite the busy status under test.
+		a.SetHome(func(m string) (bool, bool) { return m == "U1" || m == "U3", false }, func(context.Context) (*lib.Board, error) { return &lib.Board{}, nil })
+		// home.mu parks the first pick inside its run, after the gate closed,
+		// and the second in its busy branch, after it saw the gate.
+		a.home.mu.Lock()
+		first, second := make(chan struct{}), make(chan struct{})
+		go func() { defer close(first); a.interactive(homePickPayload(t, "U1", "T1", "C0NEW2", "221.1")) }()
+		// Bounded by hand: a pick that never takes or sees the gate parks on
+		// home.mu too, and the lock must be released for the test to end.
+		until := func(cond func() bool) bool {
+			deadline := time.Now().Add(2 * time.Second)
+			for !cond() && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+			return cond()
+		}
+		tookGate := until(func() bool {
+			a.homeLearn.mu.Lock()
+			defer a.homeLearn.mu.Unlock()
+			return a.homeLearn.busy
+		})
+		go func() { defer close(second); a.interactive(homePickPayload(t, "U3", "T1", "C0THR3", "221.2")) }()
+		sawGate := tookGate && until(func() bool { return logs.has("channel", "C0THR3") })
+		a.home.mu.Unlock()
+		<-first
+		<-second
+		a.homeLearn.wg.Wait()
+		if data := homeRecordData(t, cs); !sawGate || data[homeRecordKeySlack] != "C0NEW2" || homePatches(cs) != 1 || !anyView(t, api, "U3", slackHomePickBusy) {
+			t.Errorf("gate seen %v, record %v after %d patches, busy status seen %v; want the first move alone", sawGate, data, homePatches(cs), anyView(t, api, "U3", slackHomePickBusy))
+		}
+	})
+	t.Run("a pick during a change is admitted again", func(t *testing.T) {
+		a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage})
+		writeHomeFile(t, dir, "C0OLD1\n")
+		a.homeLearn.mu.Lock()
+		a.homeLearn.busy = true
+		a.homeLearn.mu.Unlock()
+		pick(t, a, "U2", "T1", "C0NEW2", "222.1")
+		if text := lastView(t, api, "U2"); !strings.Contains(text, slackHomeDenied) || strings.Contains(text, slackHomePickBusy) || homePatches(cs) != 0 {
+			t.Errorf("a member the list does not name saw the busy state: %s", text)
+		}
+	})
+}
+
+// TestSlackHomePickOnADisarmedGateway (the human round, Low 1): a pick from a
+// view published while the gateway was armed draws the tab again, so the
+// member sees the state, and writes nothing.
+func TestSlackHomePickOnADisarmedGateway(t *testing.T) {
+	a, api, cs, _ := newHomePickAdapter(t, nil)
+	a.homeLearn.record.client = nil
+	pick(t, a, "U1", "T1", "C0NEW2", "223.1")
+	if text := lastView(t, api, "U1"); !strings.Contains(text, slackHomeLineNotArmed) || homePatches(cs) != 0 {
+		t.Errorf("view = %q, patches %d; want the not-armed line and no write", text, homePatches(cs))
 	}
 }

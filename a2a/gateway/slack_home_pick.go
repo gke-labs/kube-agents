@@ -193,9 +193,21 @@ func (s *SlackAdapter) homePick(p slackClickPayload, channel string) {
 	}
 	l := &s.homeLearn
 	l.mu.Lock()
-	if l.record.client == nil || l.closed {
+	if l.closed {
 		l.mu.Unlock()
-		s.log.Info("slack: dropping a home pick: the learner is not armed or is closing", "member", member)
+		s.log.Info("slack: dropping a home pick: the learner is closing", "member", member)
+		return
+	}
+	if l.record.client == nil {
+		// A pick from a view published while the gateway was armed: the
+		// tab is drawn again so the member sees the state.
+		l.wg.Add(1)
+		l.mu.Unlock()
+		s.log.Info("slack: dropping a home pick: the learner is not armed", "member", member)
+		s.goSession(func() {
+			defer l.wg.Done()
+			s.publishHome(member, false)
+		})
 		return
 	}
 	if l.busy {
@@ -277,7 +289,7 @@ func (s *SlackAdapter) runHomePick(member, team, channel, actionTS string) (move
 		finish(s.homePickRefusal(refused, channel))
 		return "", 0
 	}
-	previous, err := s.moveHome(ctx, channel, member)
+	previous, refused, err := s.moveHome(ctx, channel, member)
 	if !slackIsHomeChannelID(previous) {
 		// A hand-edited record may hold a name; it is never rendered or
 		// posted to, as the learn never names such a value.
@@ -320,9 +332,29 @@ func (s *SlackAdapter) runHomePick(member, team, channel, actionTS string) (move
 	s.homeChanged(false)
 	s.postHomeLine(channel, fmt.Sprintf(homePickedLine, channel, member))
 	if previous != "" {
-		s.postHomeLine(previous, fmt.Sprintf(homeMovedLine, channel, member))
+		s.postOldHomeLine(ctx, previous, refused, fmt.Sprintf(homeMovedLine, channel, member))
 	}
 	return channel, seq
+}
+
+// postOldHomeLine posts the moved line into the previous home through the
+// gate a pick passes: a refusal already on the record, or one from
+// checkHomeChannel now, skips the post, so a channel that became shared or
+// archived since it was learned is told nothing. An unanswered check skips
+// it too.
+func (s *SlackAdapter) postOldHomeLine(ctx context.Context, previous, refused, text string) {
+	if refused == "" {
+		var err error
+		if refused, err = s.checkHomeChannel(ctx, previous); err != nil {
+			s.log.Warn("slack: the previous home could not be checked; its line is not posted", "channel", previous, "err", err)
+			return
+		}
+	}
+	if refused != "" {
+		s.log.Info("slack: the previous home is refused; its line is not posted", "channel", previous, "reason", refused)
+		return
+	}
+	s.postHomeLine(previous, text)
 }
 
 // slackMemberOrSomeone renders a member id as a mention, or "someone" for a
@@ -394,25 +426,26 @@ func (s *SlackAdapter) awaitHomeFile(channel string, seq uint64) (applied, stopp
 // moveHome writes channel as the home: one read, one merge patch under the
 // read resourceVersion, and one retry when a 409 came from a writer of a
 // sibling key. The record's previous channel comes back for the old-home
-// line. A pick of the recorded channel is errHomeAlreadySet and writes
-// nothing; a 409 that moved the home is a homeMoveConflict naming what the
-// record says now. recordHome's adopt loop stays the learn's: a move
-// replaces on purpose.
-func (s *SlackAdapter) moveHome(ctx context.Context, channel, member string) (previous string, err error) {
+// line, with the refusal mark the record held beside it. A pick of the
+// recorded channel is errHomeAlreadySet and writes nothing; a 409 that moved
+// the home is a homeMoveConflict naming what the record says now.
+// recordHome's adopt loop stays the learn's: a move replaces on purpose.
+func (s *SlackAdapter) moveHome(ctx context.Context, channel, member string) (previous, refused string, err error) {
 	l := &s.homeLearn
 	cm, err := l.record.get(ctx)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	for attempt := 0; ; attempt++ {
 		previous = strings.TrimSpace(cm.Data[homeRecordKeySlack])
+		refused = strings.TrimSpace(cm.Data[homeRecordKeyRefused])
 		var patch map[string]*string
 		if previous == channel {
 			// Already the home; a stale refusal beside it (an older
 			// gateway's, a hand edit's) is cleared so the operator admits
 			// it, as a learn that adopts the channel does.
-			if cm.Data[homeRecordKeyRefused] == "" {
-				return previous, errHomeAlreadySet
+			if refused == "" {
+				return previous, refused, errHomeAlreadySet
 			}
 			patch = map[string]*string{homeRecordKeyRefused: nil}
 		} else {
@@ -425,13 +458,13 @@ func (s *SlackAdapter) moveHome(ctx context.Context, channel, member string) (pr
 		err = l.record.patch(ctx, cm.ResourceVersion, patch)
 		if !apierrors.IsConflict(err) {
 			if err == nil && previous == channel {
-				return previous, errHomeAlreadySet
+				return previous, refused, errHomeAlreadySet
 			}
-			return previous, err
+			return previous, refused, err
 		}
 		again, readErr := l.record.get(ctx)
 		if readErr != nil {
-			return previous, err
+			return previous, refused, err
 		}
 		// A 409 names a mover only when the keys that name one changed; a
 		// writer of a sibling key (a post-time refusal) costs one retry under
@@ -443,8 +476,8 @@ func (s *SlackAdapter) moveHome(ctx context.Context, channel, member string) (pr
 		}
 		winner := strings.TrimSpace(again.Data[homeRecordKeySlack])
 		if winner == channel {
-			return previous, errHomeAlreadySet
+			return previous, refused, errHomeAlreadySet
 		}
-		return previous, &homeMoveConflict{winner: winner, by: again.Data[homeRecordKeySetBy]}
+		return previous, refused, &homeMoveConflict{winner: winner, by: again.Data[homeRecordKeySetBy]}
 	}
 }
