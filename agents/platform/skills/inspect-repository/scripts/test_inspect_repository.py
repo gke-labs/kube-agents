@@ -31,7 +31,7 @@ REVISION = "9f8e7d6c5b4a39281706958473625140abcdef01"
 FILES = {"README.md": "# terraform-live\n", "clusters/prod.tf": "replicas = 3\n"}
 
 
-def fake_snapshot(repository, ref=None, paths=None, *, into, max_bytes):
+def fake_snapshot(repository, ref=None, paths=None, *, into, max_bytes, max_files):
     for name, text in FILES.items():
         target = Path(into) / name
         target.parent.mkdir(parents=True, exist_ok=True)

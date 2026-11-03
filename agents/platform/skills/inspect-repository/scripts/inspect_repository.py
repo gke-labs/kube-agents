@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 # Append global scripts path to allow importing the shared helpers
@@ -61,6 +62,11 @@ DEFAULT_MAX_BYTES = vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES
 
 # The broker's refusal of a `paths` entry that names nothing at the revision.
 PATH_NOT_FOUND = "PATH_NOT_FOUND"
+
+# How old a staging directory beside `--into` must be before a clone removes
+# it. A clone takes seconds, so a younger one can belong to a clone that runs
+# now. The same age as sandbox_artifact_patch.STALE_SWEEP_AGE_SECONDS.
+STALE_STAGING_AGE_SECONDS = 3600.0
 
 
 def scratch_root() -> Path:
@@ -96,6 +102,33 @@ def prepare_destination(into: Path, force: bool) -> Path:
             )
     into.mkdir(parents=True, exist_ok=True)
     return into
+
+
+def remove_stale_staging(into: Path) -> None:
+    """Remove the staging directories that an earlier clone of `into` left.
+
+    A clone stages beside `into` and removes the staging directory in a
+    `finally`, which a SIGKILL does not run. Two names are staging: the
+    script's and the client's (`.{name}.*`), and the client's inside the
+    script's (`..{name}.*`). Only a directory older than
+    STALE_STAGING_AGE_SECONDS is removed. A failure here does not stop the clone.
+    """
+    if not into.name:
+        # `--into .` stages inside `into`, so the names would match the caller's files.
+        return
+    prefixes = (f".{into.name}.", f"..{into.name}.")
+    cutoff = time.time() - STALE_STAGING_AGE_SECONDS
+    try:
+        entries = list(into.parent.iterdir())
+    except OSError:
+        return
+    for path in entries:
+        try:
+            # `rmtree` refuses a symbolic link, so a link is never followed.
+            if path.name.startswith(prefixes) and path.is_dir() and path.stat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
 
 
 def copy_over(staging: Path, into: Path) -> None:
@@ -153,23 +186,38 @@ def skipped_reason(reason: str) -> str:
 
 
 def clone_content(args) -> int:
-    """Take one snapshot into a fresh directory, check it, then copy it into place.
+    """Take one snapshot into `into`, or with `--force` beside it and copy it over.
 
-    The snapshot unpacks only into an empty directory, and `--force` is how a
-    caller adds a second `--prefix` to a tree it is building (the fleet audit
-    does). So the snapshot lands beside `into` and is copied over it.
+    The snapshot unpacks only into an empty directory, and it stages beside
+    that directory itself. Without `--force`, `into` is empty, so the snapshot
+    unpacks into it directly. `--force` is how a caller adds a second
+    `--prefix` to a tree it is building (the fleet audit does). So then the
+    snapshot lands beside `into` and is copied over it.
     """
-    into = prepare_destination(
-        Path(args.into) if args.into else default_into(args.repo), args.force
-    )
+    into = Path(args.into).expanduser() if args.into else default_into(args.repo)
+    remove_stale_staging(into)
+    into = prepare_destination(into, args.force)
     paths = [args.prefix] if args.prefix else None
-    staging = Path(tempfile.mkdtemp(dir=str(into.parent), prefix=f".{into.name}."))
+    # `--into .` has no name, and the snapshot cannot replace the current
+    # directory. So it stages as `--force` does.
+    staged = args.force or not into.name
+    staging = (
+        Path(tempfile.mkdtemp(dir=str(into.parent), prefix=f".{into.name}."))
+        if staged
+        else into
+    )
     try:
         try:
             copy = vcs_client.snapshot(
-                args.repo, args.ref, paths, into=staging, max_bytes=args.max_bytes
+                args.repo, args.ref, paths, into=staging,
+                max_bytes=args.max_bytes, max_files=args.max_files,
             )
         except vcs_client.VcsError as exc:
+            if exc.code == vcs_client.SNAPSHOT_TOO_MANY_FILES:
+                raise SystemExit(
+                    f"{args.repo}: {exc} (--max-files). Nothing was written. "
+                    "Name a --prefix to take part of the tree."
+                ) from exc
             if exc.code != PATH_NOT_FOUND or not paths:
                 raise
             # The prefix names nothing at this revision: an empty copy of it,
@@ -182,15 +230,11 @@ def clone_content(args) -> int:
                 "complete": True, "history": "none", "missing": args.prefix,
             }))
             return 0
-        if copy["files"] > args.max_files:
-            raise SystemExit(
-                f"{args.repo} holds {copy['files']} files, over --max-files "
-                f"{args.max_files}. Nothing was written. Name a --prefix to "
-                "take part of the tree."
-            )
-        copy_over(staging, into)
+        if staged:
+            copy_over(staging, into)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        if staged:
+            shutil.rmtree(staging, ignore_errors=True)
     print(json.dumps({
         "mode": "content",
         "forge": copy["forge"],
