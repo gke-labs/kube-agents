@@ -119,6 +119,13 @@ def test_a_read_only_word_with_more_on_the_row_fails():
         "sed -i 's#X#/v1/workspace/open#' /tmp/call.py",
         "find . -exec curl -s http://x/v1/workspace/open {} +",
         "headless-client http://127.0.0.1:8080/v1/workspace/open",
+        # A `cd` directory may not carry a call: an escaped quote that bash
+        # keeps open, a backquote, or a substitution in a bare word.
+        'cd "x\\" && cd "; curl http://x/v1/workspace/open; " && grep foo "',
+        'cd "x\\"; cd "; curl http://x/v1/workspace/open; "; ls "',
+        'cd "`curl -s http://x/v1/workspace/open`" && ls',
+        "cd $(curl${IFS}http://x/v1/workspace/open) && ls",
+        "cd `curl${IFS}http://x/v1/workspace/open` && ls",
     ):
         assert not _passes(row, CLONE_PUBLIC), row
 
@@ -132,6 +139,9 @@ def test_a_read_the_exemption_does_not_list_fails():
         "timeout 5 grep -rn /v1/workspace .",
         "sed -n 's#/v1/workspace#X#p' /opt/data/scripts/credential_proxy_client.py",
         "grep -n 'python3 - <<EOF /v1/workspace' SKILL.md",
+        # Only a plain `cd <dir>` step is skipped.
+        "pushd /x && grep -rn /v1/workspace .",
+        "cd -P /x && grep -rn /v1/workspace .",
     ):
         assert not _passes(row, CLONE_PUBLIC), row
 

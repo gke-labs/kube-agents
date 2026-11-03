@@ -69,8 +69,9 @@
 #   - A read that is not one listed command and nothing else counts as a
 #     call, which is a spurious red: a read behind `if`, `!`, `$(…)` or a
 #     wrapper such as timeout, an unlisted reader (awk, jq, sed, find), an
-#     operator inside a quoted argument (`grep 'a|/v1/workspace'`), and a
-#     collapsed chain whose first command names the route.
+#     operator inside a quoted argument (`grep 'a|/v1/workspace'`), a
+#     `pushd` or `cd -P` step before the read (only a plain `cd <dir>` step
+#     is skipped), and a collapsed chain whose first command names the route.
 # A workspace verb matches as any word after the script, not only as the
 # subcommand. So an option value that is a bare open, list, grep, fetch or
 # close (`clone … --into list`) counts as the verb and fails the check; a
@@ -171,7 +172,7 @@ verification_spec:
       # header lists the commands and the limits.
       exempt_patterns:
         - >-
-          ^(?!.*\s\+\s\d+\scommands?\s*\Z)\s*+(?:cd\s++(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^\s"'`$|;&<>()]+)\s*+(?:&&|;)\s*+)*+(?:(?:/[\w.-]+)*/)?(?:grep|rg|egrep|fgrep|cat|head|tail|less|ls|echo|printf)(?=\s|\Z)(?:[^|;&<>`$\n]|\$(?!\())*\Z
+          ^(?!.*\s\+\s\d+\scommands?\s*\Z)\s*+(?:cd\s++(?:"(?:[^"`$\\]|\$(?!\())*"|'[^']*'|[^\s"'`$|;&<>()]+)\s*+(?:&&|;)\s*+)*+(?:(?:/[\w.-]+)*/)?(?:grep|rg|egrep|fgrep|cat|head|tail|less|ls|echo|printf)(?=\s|\Z)(?:[^|;&<>`$\n]|\$(?!\())*\Z
       # Any row that names the workspace route.
       forbidden_patterns:
         - '/v1/workspace\b'
