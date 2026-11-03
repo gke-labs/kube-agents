@@ -1551,9 +1551,11 @@ platformAgent:
       # each rating keeps its question and answer (a 👎 its note too) on the install for the feedback bucket's max age (30 days as provisioned).
       # false hides the buttons and keeps nothing.
       answerFeedback: true
-      # "auto" (also empty) or "manual". Accepted and recorded in this release
-      # but with no effect yet: the A2A gateway does not learn a home channel,
-      # so homeChannel alone decides.
+      # "auto" (also empty) or "manual". Under spec.mode next with Slack on the
+      # gateway (Google Chat not enabled) and homeChannel empty, "auto" lets the
+      # A2A gateway make the channel of the first top-level mention of the
+      # agent the home channel; "manual" leaves homeChannel alone to decide. A
+      # set homeChannel wins under either.
       homeChannelPolicy: ""
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
@@ -1688,6 +1690,7 @@ webConsole:
         - ALL
 
 # Optional built-in specialist AgentProfiles deployed into the cluster (`spec.mode: next`).
+# `profiles.cluster` is the generic cluster agent, described at its key below.
 # When `profiles.tse.enabled` is true, the operator reconciles the `tse` AgentProfile's
 # ServiceAccount, NATS auth-callout identity, and agent card (`a2a.agents.tse`), and
 # passes `tse` to the gateway pod via KUBE_AGENTS_ENABLED_PROFILES so its Hermes
@@ -1722,6 +1725,45 @@ profiles:
       subscribeTopics:
         - shared.blueprint
         - agent.platform.upgrade-readiness
+    lifecycle:
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 600
+    concurrency: 2
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+  # The generic cluster agent (#3658): a read-only SRE for one GKE cluster,
+  # which each task names by its project, location and cluster parameters
+  # (`agents/cluster/persona`). Its workers come from the profile dispatcher, so
+  # no pod runs it until the operator runs one. The credential broker holds each
+  # task's kubectl and gcloud calls to the task's target.
+  cluster:
+    enabled: false
+    description: >-
+      Read-only SRE for one GKE cluster, named per task: live runtime state and
+      workload debugging (crash loops, OOMKills, pending pods, image-pull and
+      mount errors, connectivity and DNS timeouts, autoscaling, storage binding,
+      silent reconciliation stalls, observability gaps). Returns a grounded root
+      cause analysis and a proposed manifest patch; never mutates cluster state
+      and never opens pull requests.
+    persona:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/persona-cluster
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+    harness:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/a2a-worker
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+      model: model-default
+      maxTurns: 90
+    # Tier is authority, so it lives here and never in the persona. The cluster
+    # agent is read-only; unattended runs it as a Job per task.
+    allowedTiers:
+      - read
     lifecycle:
       activeDeadlineSeconds: 1800
       ttlSecondsAfterFinished: 600

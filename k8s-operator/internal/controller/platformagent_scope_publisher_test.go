@@ -765,7 +765,7 @@ func TestTheScopePublisherComesAndGoesWithTheStack(t *testing.T) {
 	agent := a2aTestAgent()
 	agent.Spec.Scope = &agentv1alpha1.ScopeSpec{Folders: []string{"111111111111"}}
 	r, cl, _ := a2aGateTestReconciler(t, agent)
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}

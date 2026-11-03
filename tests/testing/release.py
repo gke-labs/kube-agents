@@ -22,6 +22,7 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "gke-stockout-investigator",
     "a2a-gateway",
     "a2a-worker",
+    "persona-cluster",
     "a2a-authcallout",
     "a2a-verifier",
     "a2a-console",

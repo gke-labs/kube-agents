@@ -253,6 +253,10 @@ command) carries a top-level `tool_calls_optional: true`, so `bench-gate`'s live
 its reply instead of its empty trajectory as the evidence the agent ran; see
 [bench-case-format.md](../docs/designs/bench-case-format.md).
 
+A task that requests no pull request but whose wrong answer may open one the reply never names
+carries a top-level `writes_alone: true`: the lane runs it alone in the second phase and charges
+it any write in its window; see [bench-case-format.md](../docs/designs/bench-case-format.md).
+
 A new task must also be registered: the presubmit runs only what
 `hack/eval/presubmit-cases.txt` names, the nightly adds what `hack/eval/nightly-cases.txt`
 names (appended when the job exports `EVAL_TIER=nightly`), and
@@ -777,7 +781,8 @@ the workers' calls, read back from the pod, are what name a write there. A write
 in the record and the reason, not charged, so one late write fails the case that named it rather
 than every case running at the time; a write no repetition names fails none, and the job log's
 leftovers listing still names it. The script also runs the cases that request a pull request
-(the same leaf count as the allowance) in a second phase, after every first-phase unit has
+(the same leaf count as the allowance), the stopped asks and the cases that declare
+`writes_alone: true` in a second phase, after every first-phase unit has
 finished (a case that declares `scope_exclude:` runs after them, in a phase of its own), one unit at a time, each after a settle as long as the check's clock-skew tolerance, so no window
 reaches back into the unit before. The lane marks those cases' windows `exclusive_window`, and a
 write in one is charged whether the repetition names it or not, since nothing else was writing;
