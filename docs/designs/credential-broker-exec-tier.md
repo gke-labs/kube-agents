@@ -570,8 +570,12 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
   upgrade retrospective's reads, the reconciler's and the scope publisher's project lookups and
   the stall watch's hops (120 s on a `gcloud` the broker bounds at 300 s), and the scaffold's
   connectivity probe (45 s); under every one of them the deadline admits no retry. A script that
-  caps the shim at or under one admission wait is outside a held refusal's reach either way. The
-  170 s default is the terminal tool's, and a new caller with a cap of its own owes the variable.
+  caps the shim at or under one admission wait is outside a held refusal's reach, but not the
+  resource watermark gate's: its 429 is answered at once, before the queue, and under the 170 s
+  default a 30 s cap fires inside the third or fourth of its waits, so the reconciler's cluster
+  describe and gcloud config fallback (30 s) and the scaffold's credential fetch (60 s) pass the
+  variable too, as the cap less the 300 s `gcloud` run bound. The 170 s default is the terminal
+  tool's, and a new caller with a cap of its own owes the variable.
   Every wait prints one stderr line, and when the retries are spent, by count or by deadline, the
   shim exits 1 after one more:
   `credential proxy throttled: gave up after <n> attempts (HTTP <code>): <broker text>`.

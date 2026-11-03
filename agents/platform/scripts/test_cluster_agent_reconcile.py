@@ -604,6 +604,32 @@ class ClusterExistsTest(unittest.TestCase):
         with self._stub(side_effect=subprocess.TimeoutExpired("gcloud", 30)):
             self.assertIsNone(rec._cluster_exists("p", "c", "us-central1"))
 
+    def test_the_describe_tells_the_shim_a_deadline_under_which_no_retry_fits(self):
+        # The cap holds no admission wait, but the watermark gate's 429 is answered
+        # at once and the shim's default admits three or four of its waits, so the
+        # describe passes its cap less the broker's gcloud run bound: 0 at the
+        # default and at any prune budget under the run bound, and the gate's
+        # refusal is logged with its reason instead of as a timeout.
+        client = rec.credential_proxy_client
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="{}")) as run:
+            self.assertIs(rec._cluster_exists("p", "c", "us-central1"), True)
+        self.assertEqual(run.call_args.kwargs["timeout"], rec.DESCRIBE_TIMEOUT_SECONDS)
+        deadline = max(0, rec.DESCRIBE_TIMEOUT_SECONDS - rec.BROKER_GCLOUD_RUN_SECONDS)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: str(deadline)}, run.call_args.kwargs["remote_env"])
+        self.assertEqual("0", run.call_args.kwargs["remote_env"][client.RETRY_DEADLINE_ENV])
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=float(deadline)))
+        # The gate's shortest wait, half a 5 s Retry-After, does not fit it either.
+        self.assertIsNone(client.retry_wait(1, 0.0, "5", random.Random(1), lambda: 0.0, deadline=float(deadline)))
+        # A describe under the prune budget derives the deadline from the cap it is given.
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="{}")) as run:
+            rec._cluster_exists("p", "c", "us-central1", timeout=7.5)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: "0"}, run.call_args.kwargs["remote_env"])
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="{}")) as run:
+            rec._cluster_exists("p", "c", "us-central1", timeout=rec.BROKER_GCLOUD_RUN_SECONDS + 20)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: "20"}, run.call_args.kwargs["remote_env"])
+
 
 class ReadClusterIdentityTest(unittest.TestCase):
     def _write(self, text):
@@ -3506,6 +3532,25 @@ class ProjectSourceTest(unittest.TestCase):
                     mock.patch.object(rec, "_project_id_of", return_value=(None, outcome)), \
                     mock.patch.object(rec.sandbox_exec, "run", side_effect=AssertionError("gcloud config asked")):
                 self.assertEqual(rec._project_source(), (None, False))
+
+    def test_the_gcloud_config_fallback_tells_the_shim_a_deadline_under_which_no_retry_fits(self):
+        # With no operator project the fallback asks the broker's gcloud config under a
+        # 30 s cap, which holds no admission wait; the watermark gate's 429 chain would
+        # still carry it past the cap on a high Retry-After draw, so the lookup passes
+        # its cap less the broker's gcloud run bound and a refusal fails at once.
+        client = rec.credential_proxy_client
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "", "RECONCILE_PROJECT": ""}), \
+                mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="from-config\n")) as run:
+            self.assertEqual(rec._project_source(), ("from-config", False))
+        self.assertEqual(run.call_args.args[0], ["gcloud", "config", "get-value", "project"])
+        self.assertEqual(run.call_args.kwargs["timeout"], rec.PROJECT_LOOKUP_TIMEOUT_SECONDS)
+        deadline = rec.PROJECT_LOOKUP_SHIM_RETRY_DEADLINE_SECONDS
+        self.assertEqual(max(0, rec.PROJECT_LOOKUP_TIMEOUT_SECONDS - rec.BROKER_GCLOUD_RUN_SECONDS), deadline)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: "0"}, run.call_args.kwargs["remote_env"])
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=float(deadline)))
+        self.assertIsNone(client.retry_wait(1, 0.0, "5", random.Random(1), lambda: 0.0, deadline=float(deadline)))
 
 
 if __name__ == "__main__":

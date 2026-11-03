@@ -796,6 +796,34 @@ class CreateProfileTest(unittest.TestCase):
         self.assertGreater(shortest, deadline)
         self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
 
+    def test_the_credential_fetch_tells_the_shim_a_deadline_under_which_no_retry_fits(self):
+        # The fetch's 60 s cap holds one admission wait at most, so a held refusal
+        # cannot reach a retry; the watermark gate's 429 chain, answered at once
+        # with a 5 to 30 s Retry-After, can, and about half the draws would carry
+        # the fetch past its cap with "timed out" standing in for the refusal. The
+        # shim is told the cap less the broker's gcloud run bound, which admits none.
+        original = self._fake_run
+        fetch_calls = []
+
+        def recording(cmd, **kwargs):
+            if cmd[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
+                fetch_calls.append(kwargs)
+            return original(cmd, **kwargs)
+
+        self._patch(subprocess, "run", recording)
+        self.assertEqual(self.create(), self.name)
+        client = credential_proxy_client
+        self.assertEqual(client.RETRY_DEADLINE_ENV, cap.SHIM_RETRY_DEADLINE_ENV)
+        self.assertEqual(1, len(fetch_calls))
+        self.assertEqual(cap.CREDENTIAL_FETCH_TIMEOUT_SECONDS, fetch_calls[0]["timeout"])
+        self.assertEqual("0", fetch_calls[0]["env"][cap.SHIM_RETRY_DEADLINE_ENV])
+        deadline = float(cap.CREDENTIAL_FETCH_SHIM_RETRY_DEADLINE_SECONDS)
+        self.assertEqual(max(0, cap.CREDENTIAL_FETCH_TIMEOUT_SECONDS - cap.BROKER_GCLOUD_RUN_SECONDS), deadline)
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
+        self.assertIsNone(client.retry_wait(1, 0.0, "5", random.Random(1), lambda: 0.0, deadline=deadline))
+
     def test_a_probe_that_times_out_does_not_fail_the_scaffold(self):
         self.decision = a_decision()
         original = self._fake_run

@@ -200,6 +200,16 @@ LIST_TIMEOUT_SECONDS = 120
 # at once, as cluster_preflight.sh's calls do.
 BROKER_GCLOUD_RUN_SECONDS = 300
 SHIM_RETRY_DEADLINE_SECONDS = max(0, LIST_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
+# The same rule for the two short gcloud hops below the lookups: the describe behind
+# `_cluster_exists` (DESCRIBE_TIMEOUT_SECONDS, or the prune budget left) and the gcloud config
+# fallback in `_project_source`. Neither cap holds a held refusal's 60 s admission wait, but the
+# broker's resource watermark gate refuses at once with a 5 to 30 s Retry-After, and the shim's
+# 170 s default admits three or four such waits, so without the deadline a 30 s cap fires inside
+# the chain on a high draw and TimeoutExpired stands in for the gate's reason. The describe
+# derives the deadline from the cap it is given, so a budget past the run bound would still
+# admit what fits.
+PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
+PROJECT_LOOKUP_SHIM_RETRY_DEADLINE_SECONDS = max(0, PROJECT_LOOKUP_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
 # 12s per listing at four wide: the per-listing share the 150s budget gave at eight.
 LIST_BUDGET_SECONDS = 300
 LIST_GRACE_SECONDS = 5
@@ -348,7 +358,10 @@ def _project_source() -> tuple[str | None, bool]:
     if p:
         return p, True
     try:
-        r = sandbox_exec.run(["gcloud", "config", "get-value", "project"], timeout=30)
+        r = sandbox_exec.run(
+            ["gcloud", "config", "get-value", "project"], timeout=PROJECT_LOOKUP_TIMEOUT_SECONDS,
+            remote_env={credential_proxy_client.RETRY_DEADLINE_ENV: str(PROJECT_LOOKUP_SHIM_RETRY_DEADLINE_SECONDS)},
+        )
         return r.stdout.strip() or None, False
     except Exception:  # noqa: BLE001
         return None, False
@@ -1585,7 +1598,13 @@ def _cluster_exists(project: str, cluster: str, location: str, timeout: float = 
         f"--location={location}", f"--project={project}", "--format=json(status, id)",
     ]
     try:
-        sandbox_exec.run(cmd, check=True, timeout=timeout)
+        # The shim is told the cap less the broker's gcloud run bound (the constants comment at
+        # SHIM_RETRY_DEADLINE_SECONDS), under which no retry fits, so a refusal, held or the
+        # watermark gate's, is logged below with the broker's reason rather than as a timeout.
+        sandbox_exec.run(
+            cmd, check=True, timeout=timeout,
+            remote_env={credential_proxy_client.RETRY_DEADLINE_ENV: str(max(0, timeout - BROKER_GCLOUD_RUN_SECONDS))},
+        )
         return True
     except subprocess.CalledProcessError as e:
         stderr = e.stderr or ""

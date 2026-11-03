@@ -112,6 +112,17 @@ CONNECTIVITY_PROBE_TIMEOUT_SECONDS = 45
 SHIM_RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
 BROKER_KUBECTL_RUN_SECONDS = 60
 PROBE_SHIM_RETRY_DEADLINE_SECONDS = max(0, CONNECTIVITY_PROBE_TIMEOUT_SECONDS - BROKER_KUBECTL_RUN_SECONDS)
+# The credential fetch in step 3 is a gcloud, which the broker bounds at 300 s
+# (its --timeout-seconds default), under a 60 s cap: one admission wait at
+# most, so a held refusal cannot reach a retry, but the broker's resource
+# watermark gate refuses at once with a 5 to 30 s Retry-After and the shim's
+# 170 s default admits three or four such waits, so without the deadline about
+# half the draws carry the fetch past its cap and the scaffold exits on
+# "timed out" where the refusal's reason is the line to read. Same rule, same
+# answer: the cap less the run bound, under which no retry fits.
+CREDENTIAL_FETCH_TIMEOUT_SECONDS = 60
+BROKER_GCLOUD_RUN_SECONDS = 300
+CREDENTIAL_FETCH_SHIM_RETRY_DEADLINE_SECONDS = max(0, CREDENTIAL_FETCH_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
 # What kubectl prints when it never reached the API server, as opposed to an
 # answer it did not like (401, 403, NotFound). The endpoint remedy is about
 # reaching the server, so it is offered only for the first kind.
@@ -695,8 +706,11 @@ def _create_profile(project: str, cluster: str, location: str, name: str) -> str
                 f"--location={location}", f"--project={project}",
                 *endpoint_flags,
             ],
-            check=True, timeout=60,
-            remote_env={"KUBECONFIG": str(kubeconfig)},
+            check=True, timeout=CREDENTIAL_FETCH_TIMEOUT_SECONDS,
+            remote_env={
+                "KUBECONFIG": str(kubeconfig),
+                SHIM_RETRY_DEADLINE_ENV: str(CREDENTIAL_FETCH_SHIM_RETRY_DEADLINE_SECONDS),
+            },
             local_env=env,
             principal=sandbox_exec.TERMINAL_PRINCIPAL,
         )
