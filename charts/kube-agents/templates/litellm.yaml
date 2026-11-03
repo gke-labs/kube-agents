@@ -195,7 +195,12 @@
   The session-affinity hook gives each Gemini conversation a Vertex session_id
   so turn 1 can read another conversation's warm prefix cache. Off by default,
   and vertex_ai only: session_id is a Vertex field, honoured on a project with
-  Vertex's LLM_SESSION_ID label and ignored elsewhere.
+  Vertex's LLM_SESSION_ID label and ignored elsewhere. Registered after the
+  redaction hook, so the id is a hash of redacted text only: hashed before
+  redaction, it would let anyone holding the request recover a short value
+  redaction removed by guessing. Redaction's pseudonyms then have to match on
+  every replica, which needs SESSION_KV_SALT set; without it each pod salts
+  its own and one conversation can get two ids.
 */}}
 {{- $sessionAffinity := $vertex.sessionAffinity | default dict }}
 {{- $sessionAffinityEnabled := and (eq $provider "vertex_ai") (default false $sessionAffinity.enabled) }}

@@ -12,7 +12,10 @@ instead.
 This pre-call hook gives a conversation one of a few ids per prompt prefix. The
 id is a hash of the model alias, the head of the system prompt, the tool list,
 and a slot; the slot is a hash of the whole system prompt and the first user
-message, modulo the slot count. Every turn of a conversation therefore gets the
+message, modulo the slot count. The system prompt here is the system text
+ahead of the first user message, so a system message added later in the
+conversation does not move the id. (That request still misses its cache:
+LiteLLM folds every system message into Vertex's system instruction.) Every turn of a conversation therefore gets the
 same id on every gateway replica and across restarts, with no shared state,
 and a new conversation lands on a replica that another conversation with its
 prompt has used, warm if that was within the last few minutes.
@@ -119,10 +122,16 @@ def _text(value: Any) -> str:
 
 
 def system_prompt(data: dict) -> str:
-    """The request's system text: the /v1/messages ``system`` field, then any system-role messages."""
+    """The request's system text: the /v1/messages ``system`` field, then the system-role messages
+    before the first user message. One a harness adds later in the conversation is left out, so
+    it cannot move a conversation's id mid-way."""
     parts = [_text(data.get(SYSTEM_KEY))] if data.get(SYSTEM_KEY) else []
     for message in data.get(MESSAGES_KEY) or []:
-        if isinstance(message, dict) and message.get(ROLE_KEY) in SYSTEM_ROLES:
+        if not isinstance(message, dict):
+            continue
+        if message.get(ROLE_KEY) == USER_ROLE:
+            break
+        if message.get(ROLE_KEY) in SYSTEM_ROLES:
             parts.append(_text(message.get(CONTENT_KEY)))
     return FIELD_SEPARATOR.join(parts)
 

@@ -432,7 +432,9 @@ litellm:
     # without it Vertex ignores the field. slots is how many session ids one
     # prompt is spread across: 1 puts every concurrent
     # conversation of a profile on one replica, which queues; more spread
-    # them but reuse each less often.
+    # them but reuse each less often. With litellm.redaction on, the id is
+    # hashed from redacted text, so SESSION_KV_SALT must be set for it to
+    # match on every gateway replica.
     sessionAffinity:
       enabled: false
       slots: 2

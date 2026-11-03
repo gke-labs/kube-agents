@@ -18,6 +18,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -146,6 +147,15 @@ class TestHook(unittest.TestCase):
             self.assertLessEqual(-(2**63), value)
             self.assertLess(value, 2**63)
 
+    def test_a_system_message_added_later_in_the_conversation_keeps_the_id(self):
+        # Twenty conversations: a slot that moved would still land on the same
+        # slot half the time, so one conversation alone could pass by chance.
+        for i in range(20):
+            first = self._id(_request(f"t_{i}", turns=3))
+            later = _request(f"t_{i}", turns=3)
+            later["messages"].append({"role": "system", "content": "context compacted"})
+            self.assertEqual(self._id(later), first, f"t_{i}")
+
     def test_a_messages_api_request_with_a_system_field_gets_an_id(self):
         data = {"model": "model-default", "system": _SYSTEM, "messages": [{"role": "user", "content": "work kanban task t_1"}]}
         self.assertIsNotNone(self._id(data))
@@ -267,6 +277,33 @@ class TestChartRender(unittest.TestCase):
             return deployment["spec"]["template"]["metadata"]["annotations"]
 
         self.assertNotEqual(checksum(_VERTEX_GEMINI), checksum(_VERTEX_GEMINI + _ON))
+
+    def test_an_edit_to_the_hook_file_alone_rolls_the_pods(self):
+        # Turning the hook on also changes config.yaml's callback list, so the
+        # on/off comparison above passes even if the hook's source dropped out
+        # of the checksum. Change only the file, in a copy of the chart.
+        def checksum(chart):
+            args = [chart if a == str(_CHART) else a for a in _HELM_BASE_ARGS] + _VERTEX_GEMINI + _ON
+            proc = subprocess.run(args, capture_output=True, text=True, check=False)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            deployment = next(d for d in yaml.safe_load_all(proc.stdout) if d and d["kind"] == "Deployment")
+            return deployment["spec"]["template"]["metadata"]["annotations"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = pathlib.Path(tmp) / "kube-agents"
+            shutil.copytree(_CHART, copy)
+            before = checksum(str(copy))
+            hook = copy / "files" / _KEY
+            hook.write_text(hook.read_text() + "\n# edited\n")
+            self.assertNotEqual(before, checksum(str(copy)))
+
+    def test_it_runs_after_the_redaction_hook(self):
+        # The id leaves the cluster in the Vertex request beside the redacted
+        # text; hashed before redaction it would let a short redacted value
+        # be recovered by guessing.
+        _, callbacks, _, _ = self._parts(_VERTEX_GEMINI + _ON + ["--set", "litellm.redaction.enabled=true"])
+        redaction = "litellm_redaction_callback.proxy_handler_instance"
+        self.assertGreater(callbacks.index(_CALLBACK), callbacks.index(redaction))
 
     def test_the_schema_refuses_a_slot_count_below_one(self):
         proc = self._render(_VERTEX_GEMINI + _ON + ["--set", "litellm.vertex.sessionAffinity.slots=0"])

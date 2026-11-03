@@ -254,6 +254,26 @@ readonly EVAL_LITELLM_SESSION_AFFINITY="${EVAL_LITELLM_SESSION_AFFINITY:-true}"
 # minutes, about as long as a replica keeps the prompt, so splitting them over
 # two ids lets more of them land on a replica that has already dropped it.
 readonly EVAL_LITELLM_SESSION_AFFINITY_SLOTS="${EVAL_LITELLM_SESSION_AFFINITY_SLOTS:-1}"
+# Both reach `helm --set` and the chart's schema, which refuses anything but a
+# boolean and a positive integer only at step 5c, after the image build. This
+# check is stricter than Helm: lowercase true/false, at most three digits.
+# Checked here, before anything runs, the way EVAL_TASK_PARALLELISM is below.
+check_session_affinity_settings() {
+  case "${EVAL_LITELLM_SESSION_AFFINITY}" in
+  true | false) ;;
+  *)
+    echo "ERROR: EVAL_LITELLM_SESSION_AFFINITY='${EVAL_LITELLM_SESSION_AFFINITY}' must be true or false." >&2
+    return 1
+    ;;
+  esac
+  case "${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}" in
+  '' | *[!0-9]* | 0* | ????*)
+    echo "ERROR: EVAL_LITELLM_SESSION_AFFINITY_SLOTS='${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}' must be a positive integer of at most three digits, without leading zeros." >&2
+    return 1
+    ;;
+  esac
+}
+check_session_affinity_settings
 
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —
 # the label pair Helm stamps on every release-record Secret it writes
