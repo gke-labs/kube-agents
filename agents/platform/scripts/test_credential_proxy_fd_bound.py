@@ -130,13 +130,13 @@ class AgentAPIProxyFdBoundTest(unittest.TestCase):
             len(AgentAPIProxyHandler._bridge_session_dbs(self.workspace_dir.name)),
         )
 
-    # DESIRED, not current, behaviour: #4330. The door opens one connection per
-    # profile for the session-id check and holds them through the upstream read
-    # loop, so the mid-stream count today sits PROFILE_COUNT above idle. The fix
-    # closes them before the upstream turn starts; the pull request that lands it
-    # removes this marker, since an unexpected success fails the run.
-    @unittest.expectedFailure
-    def test_open_fds_during_a_stream_do_not_grow_with_the_profile_count(self):
+    def _stream_one_turn(self) -> tuple[int, int]:
+        """Run one streamed turn through the door and return (idle, mid-stream) descriptor counts.
+
+        Every step but the bound is asserted here, so a request the door refuses
+        or a stream it truncates fails the strict test below rather than hiding
+        under the marked one's expected failure.
+        """
         idle = _open_fd_count()
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.proxy.server_port}/api/sessions/{PLAIN_SESSION_ID}/chat/stream",
@@ -149,6 +149,22 @@ class AgentAPIProxyFdBoundTest(unittest.TestCase):
             rest = response.read()
         self.assertTrue(self.second_chunk_released)
         self.assertIn(SECOND_CHUNK, rest)
+        return idle, mid_stream
+
+    def test_a_streamed_turn_round_trips_with_every_profile_seeded(self):
+        """Strict: the request the marked test makes is accepted and streamed to its end."""
+        idle, mid_stream = self._stream_one_turn()
+        self.assertGreater(mid_stream, idle)
+
+    # DESIRED, not current, behaviour: #4330. The door opens one connection per
+    # profile for the session-id check and holds them through the upstream read
+    # loop, so the mid-stream count today sits PROFILE_COUNT above idle. The fix
+    # closes them before the upstream turn starts; the pull request that lands it
+    # removes this marker, since an unexpected success fails the run. Only the
+    # bound is under the marker; the round trip itself is the strict test above.
+    @unittest.expectedFailure
+    def test_open_fds_during_a_stream_do_not_grow_with_the_profile_count(self):
+        idle, mid_stream = self._stream_one_turn()
         self.assertLess(
             mid_stream - idle,
             FD_DELTA_CEILING,
