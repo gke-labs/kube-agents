@@ -215,7 +215,8 @@ SNAPSHOT_LISTING_FORMAT = "--format=%(objectmode) %(objectsize) %(path)"
 # target, which goes in the tar header and not after it, and a tree or a
 # submodule is a directory entry whose name ends in `/`.
 GIT_MODE_SYMLINK = "120000"
-GIT_MODES_DIRECTORY = frozenset({"040000", "160000"})
+GIT_MODE_TREE = "040000"
+GIT_MODES_DIRECTORY = frozenset({GIT_MODE_TREE, "160000"})
 # The tar `git archive` writes, as the measure counts it: one 512-byte header
 # for each entry and the data padded to 512; a pax header (a header block and
 # its padded record) for a name or a link target longer than the 100 bytes the
@@ -228,6 +229,19 @@ TAR_PAX_RECORD_OVERHEAD_BYTES = 32
 TAR_GLOBAL_HEADER_BYTES = 2 * TAR_BLOCK_BYTES
 TAR_END_BYTES = 2 * TAR_BLOCK_BYTES
 TAR_RECORD_BYTES = 20 * TAR_BLOCK_BYTES
+# A tree over the snapshot ceiling is refused with its entries one level
+# below what was asked (the top level, or each of `paths`), each with what its
+# own tar would measure, so a caller can ask again for parts that fit. Past
+# this many entries the refusal carries none: a reply of that size is a cost
+# of its own, and a caller cannot ask for that many parts anyway.
+MAX_SNAPSHOT_ENTRIES = 4096
+SNAPSHOT_ENTRY_TREE = "tree"
+SNAPSHOT_ENTRY_BLOB = "blob"
+# Each entry also counts the files under it a manifest reader reads, so a
+# caller can leave out a part of vendored archives or images without asking
+# for it. Regular files only: a link's blob is its target, not a manifest.
+SNAPSHOT_MANIFEST_SUFFIXES = (".yaml", ".yml", ".json")
+GIT_MODES_REGULAR_FILE = frozenset({"100644", "100755"})
 
 # What git prints when the remote answered the delete and said no for good: a
 # hook, branch rule or ruleset (`[remote rejected] <ref> (... declined)`), a
@@ -404,6 +418,64 @@ def _tar_bytes(listing: str) -> int:
         elif mode not in GIT_MODES_DIRECTORY:
             total += _padded(int(size), TAR_BLOCK_BYTES)
     return _padded(total + TAR_END_BYTES, TAR_RECORD_BYTES)
+
+
+def _snapshot_entries(listing: str, paths: list[str]) -> list[dict[str, Any]] | None:
+    """The entries one level below what a snapshot asked for, each with its own measure.
+
+    ``listing`` is the one `_measure_snapshot` read. With no ``paths`` the
+    entries are the top level of the tree; with ``paths``, the children of
+    each asked directory, and an asked file as itself. Each entry is a `tree`
+    or a `blob` (a link or a submodule counts as a blob: there is nothing
+    under it to ask for) with ``manifests``, its count of regular files named
+    `*.yaml`, `*.yml` or `*.json`, and ``bytes``: what `_tar_bytes` measures for a
+    snapshot of that entry alone, its parent directories included, as `ls-tree`
+    lists them and `archive` writes them. So a snapshot of the entry is refused
+    exactly when ``bytes`` is over the ceiling. None past `MAX_SNAPSHOT_ENTRIES`.
+    """
+    entries = [entry for entry in listing.split("\0") if entry]
+    directories = {
+        path: entry
+        for entry in entries
+        for mode, _size, path in [entry.split(" ", 2)]
+        if mode == GIT_MODE_TREE
+    }
+    grouped: dict[str, list[str]] = {}
+    trees: set[str] = set()
+    manifests: dict[str, int] = {}
+    for entry in entries:
+        mode, _size, path = entry.split(" ", 2)
+        scope = next((asked for asked in paths if path == asked or path.startswith(asked + "/")), None)
+        if scope is None and paths:
+            continue  # a parent directory of an asked path
+        if path == scope:
+            if mode == GIT_MODE_TREE:
+                continue
+            child = path
+        else:
+            rest = path[len(scope) + 1:] if scope else path
+            head, _, below = rest.partition("/")
+            child = f"{scope}/{head}" if scope else head
+            if below or mode == GIT_MODE_TREE:
+                trees.add(child)
+        grouped.setdefault(child, []).append(entry)
+        manifests[child] = manifests.get(child, 0) + (
+            mode in GIT_MODES_REGULAR_FILE and path.lower().endswith(SNAPSHOT_MANIFEST_SUFFIXES)
+        )
+        if len(grouped) > MAX_SNAPSHOT_ENTRIES:
+            return None
+    answer = []
+    for child, own in sorted(grouped.items()):
+        parts = child.split("/")
+        parents = [directories["/".join(parts[:depth])] for depth in range(1, len(parts))
+                   if "/".join(parts[:depth]) in directories]
+        answer.append({
+            "path": child,
+            "type": SNAPSHOT_ENTRY_TREE if child in trees else SNAPSHOT_ENTRY_BLOB,
+            "manifests": manifests[child],
+            "bytes": _tar_bytes("\0".join(parents + own)),
+        })
+    return answer
 
 
 def holds_stored_token(forge: Forge) -> bool:
@@ -1158,13 +1230,23 @@ class VcsBroker:
             "history": SNAPSHOT_HISTORY,
         }
 
-    def _snapshot_too_large(self, repo: str, size: int) -> WorkspaceError:
+    def _snapshot_too_large(
+        self, repo: str, size: int, entries: list[dict[str, Any]] | None = None
+    ) -> WorkspaceError:
+        """The 413, with the entries one level down when the measure listed them.
+
+        `ceiling` goes with it, so a caller can choose entries that fit
+        without knowing this install's setting.
+        """
+        fields: dict[str, Any] = {"code": "SNAPSHOT_TOO_LARGE", "ceiling": self.max_snapshot_bytes}
+        if entries is not None:
+            fields["entries"] = entries
         return WorkspaceError(
             f"the snapshot of {repo} is {size} bytes, over the "
             f"{self.max_snapshot_bytes}-byte ceiling. Name `paths` to "
             "take part of the tree.",
             status=413,
-            code="SNAPSHOT_TOO_LARGE",
+            **fields,
         )
 
     def _measure_snapshot(
@@ -1191,7 +1273,7 @@ class VcsBroker:
             )
         size = _tar_bytes(listed.stdout or "")
         if size > self.max_snapshot_bytes:
-            raise self._snapshot_too_large(repo, size)
+            raise self._snapshot_too_large(repo, size, _snapshot_entries(listed.stdout or "", paths))
 
     def snapshot_source(self, repository: Any) -> tuple[Any, tuple[str, str, str] | None]:
         """The repository `snapshot` resolves, and the read outside the host table, if any.
