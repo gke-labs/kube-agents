@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/prometheus/client_golang/prometheus"
 	appsv1 "k8s.io/api/apps/v1"
@@ -108,7 +109,9 @@ func parseLiteLLMDefaultModel(configYAML string) (inferenceModel, bool) {
 
 // splitInferenceModel splits a LiteLLM model at its first separator. Both sides must be
 // non-empty, the name after trimInferenceModelName included; a value that ends with the
-// separator, or whose provider side is a bare resource reference, is malformed.
+// separator, or whose provider side is a bare resource reference, is malformed. Whitespace
+// on either side is malformed too: a status value, a gauge label and a summary line must
+// each stay on one line.
 func splitInferenceModel(litellmModel string) (inferenceModel, bool) {
 	if strings.HasSuffix(litellmModel, inferenceProviderSeparator) {
 		return inferenceModel{}, false
@@ -118,7 +121,7 @@ func splitInferenceModel(litellmModel string) (inferenceModel, bool) {
 		return inferenceModel{}, false
 	}
 	name = trimInferenceModelName(name)
-	if name == "" {
+	if name == "" || strings.ContainsFunc(name, unicode.IsSpace) {
 		return inferenceModel{}, false
 	}
 	return inferenceModel{Provider: provider, Model: name}, true
@@ -129,6 +132,7 @@ func splitInferenceModel(litellmModel string) (inferenceModel, bool) {
 // malformed: it would put a project id, a region or an account id in the status.
 func validInferenceProvider(provider string) bool {
 	return provider != "" &&
+		!strings.ContainsFunc(provider, unicode.IsSpace) &&
 		!strings.HasPrefix(provider, inferenceARNPrefix) &&
 		!strings.Contains(provider, inferenceARNFieldSeparator) &&
 		provider != strings.TrimSuffix(inferenceResourcePathPrefix, inferenceProviderSeparator)

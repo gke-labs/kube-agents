@@ -46,6 +46,9 @@ func TestParseLiteLLMDefaultModel(t *testing.T) {
 		{"bare arn without a slash", cfg("model-default", "arn:aws:bedrock:us-east-1:123456789012:provisioned-model:abc"), "", "", false},
 		{"bare projects path", cfg("model-default", "projects/acme-prod/locations/us-central1/endpoints/987"), "", "", false},
 		{"bare arn skipped by the fallback", cfg("hermes-agent", "arn:aws:bedrock:us-east-1:123456789012:inference-profile/p1") + cfg("x", "projects/acme-prod/locations/us-central1/endpoints/987") + cfg("y", "openai/gpt-5.4"), "openai", "gpt-5.4", true},
+		{"newline in the name", cfg("model-default", `"gemini/flash\nx"`), "", "", false},
+		{"space in the name", cfg("model-default", `"gemini/gemini 3"`), "", "", false},
+		{"space in the provider", cfg("model-default", `"gem ini/flash"`), "", "", false},
 		{"trailing slash after a name", cfg("model-default", "hosted_vllm/meta-llama/"), "", "", false},
 		{"no qualified entry", cfg("hermes-agent", "gpt-4o"), "", "", false},
 		{"no model_list", "litellm_settings: {}\n", "", "", false},
@@ -410,8 +413,9 @@ func TestIsLiteLLMConfigMapName(t *testing.T) {
 }
 
 // A litellm-config ConfigMap maps to every PlatformAgent in its namespace; any other
-// ConfigMap maps to nothing, and the enqueue is not called for it.
-func TestReconcile_ALiteLLMConfigMapChangeEnqueuesTheAgents(t *testing.T) {
+// ConfigMap maps to nothing, and the enqueue is not called for it. This pins the map
+// function through a stub enqueue, not the Watches wiring in SetupWithManager.
+func TestLiteLLMConfigMapRequests_EnqueueTheNamespacesAgentsForALiteLLMConfigName(t *testing.T) {
 	agents := []reconcile.Request{
 		{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "agent-a"}},
 		{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "agent-b"}},

@@ -36,7 +36,8 @@ entry named `model-default` is the answer when it exists; when it exists but its
 `deploy-litellm` run with `MODEL_DEFAULT_NAME` unset writes, since `envsubst` leaves an unset
 variable empty), the default is known but malformed and the two fields are absent, with no
 fallback to another entry; only when no entry carries that name does the operator fall back to the first
-provider-qualified entry. Profiles that run other models do not change it, and the model that
+provider-qualified entry. A provider or a name that holds any whitespace is malformed too, because
+the status value, the gauge label and the summary line must each stay on one line. Profiles that run other models do not change it, and the model that
 served a given request does not either: the headcount wants one stable label per install, and the
 configured default is the value that does not move with traffic. "Which model served the
 requests" is a non-goal here (section 4).
@@ -90,8 +91,8 @@ One sample per agent; when the model changes the old label pair is deleted
 (`DeletePartialMatch` on the agent's two labels, as `forgetUsage` does) before the new one is set,
 so a collector never sees two models for one install. No sample while the two fields are absent,
 and `forget`, which clears an agent's usage, time and phase samples when the CR is deleted, clears
-this one too, so a deleted install leaves the headcount; `forget` is a method of the usage gauges
-in `usage_gauges.go`, so that file gains the one call. The gauge itself lives in the new
+this one too, so a deleted install leaves the headcount; `Reconcile` in `platformagent_controller.go`
+calls `inferenceMetrics.forget` beside `usageMetrics.forget`, so `usage_gauges.go` does not change. The gauge itself lives in the new
 `inference_status.go` with its reader, not in `usage_gauges.go`, whose header promises closed
 label sets. `sum by (provider, model) (kubeagents_platformagent_model)` over a shared project is
 the headcount.

@@ -32,8 +32,9 @@ import (
 
 const (
 	usageSummaryTitle = "kube-agents usage & feedback summary"
-	// usageSummaryMaxLines is independent of the script's SUMMARY_MAX_LINES:
-	// the script's block has lines this one lacks.
+	//: The block's line cap. The script's SUMMARY_MAX_LINES differs because each cap
+	//: matches its own block's shape (the script adds the performance figures and
+	//: task rows this block does not carry); nothing holds the two in step, by design.
 	usageSummaryMaxLines = 41
 	hoursPerDay          = 24
 	//: The task roll-up's window, as the script's; the gateway clamps it to

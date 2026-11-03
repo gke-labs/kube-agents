@@ -361,6 +361,11 @@ class ParsingTest(unittest.TestCase):
         empty = "model_list:\n  - model_name: model-default\n    litellm_params:\n      model:\n  - model_name: b\n    litellm_params:\n      model: openai/gpt-4o\n"
         self.assertIsNone(fs.model_from_litellm_config(empty))
 
+    def test_whitespace_in_a_provider_or_name_is_malformed(self):
+        for model in ("gemini/flash\nx", "gemini/gemini 3", "gem ini/flash", "gemini/flash\u00a0x"):
+            self.assertIsNone(fs.split_model(model), repr(model))
+        self.assertEqual(fs.split_model("gemini/flash"), "gemini/flash")
+
     def test_without_a_model_default_entry_the_first_qualified_model_answers(self):
         config = (
             "model_list:\n"

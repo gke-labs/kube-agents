@@ -193,6 +193,17 @@ LITELLM_DEFAULT_NAME_LINE = re.compile(
 #: ``overlays/anthropic`` configs, and the ``examples/litellm-*`` configs all put
 #: the name line first. This path runs only for an operator older than
 #: ``status.inference``.
+#:
+#: A hand-edited config can hit further divergences from the operator's Go
+#: parser: a flow-style entry (``- {model_name: model-default, litellm_params:
+#: {model: gemini/x}}``) reads ``unavailable`` here and the pair in Go; a nested
+#: mapping under ``litellm_params`` whose own ``model:`` key precedes the real
+#: one reads the nested value here; a ``#`` inside an unquoted value
+#: (``hosted_vllm/acme#v2``) is truncated at the ``#`` here and kept in Go; an
+#: unquoted value with a space (``gemini/flash 2``) reads the text before the
+#: space here and is malformed in Go; and two entries both named
+#: ``model-default``, the first in params-first order, read the second here and
+#: the first in Go.
 LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
     LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
     r"(?:(?:[ \t]+(?![ \t-])[^\n]*)?\n)*?"
@@ -384,9 +395,10 @@ def trim_model_name(name: str) -> str:
 
 
 def _valid_provider(provider: str) -> bool:
-    """A provider slug: not empty, and not itself a bare ARN or Vertex AI path."""
+    """A provider slug: not empty, no whitespace, and not itself a bare ARN or Vertex AI path."""
     return (
         bool(provider)
+        and not any(c.isspace() for c in provider)
         and not provider.startswith(MODEL_ARN_PREFIX)
         and MODEL_ARN_FIELD_SEPARATOR not in provider
         and provider != MODEL_RESOURCE_PATH_PREFIX.rstrip(MODEL_SEGMENT_SEPARATOR)
@@ -394,14 +406,17 @@ def _valid_provider(provider: str) -> bool:
 
 
 def split_model(litellm_model: str) -> Optional[str]:
-    """``provider/name`` with both sides non-empty after trimming, else None (malformed)."""
+    """``provider/name`` with both sides non-empty after trimming, else None (malformed).
+
+    Whitespace on either side is malformed: the line must stay one line.
+    """
     if litellm_model.endswith(MODEL_SEGMENT_SEPARATOR):
         return None
     provider, found, name = litellm_model.partition(MODEL_SEGMENT_SEPARATOR)
     if not found or not _valid_provider(provider):
         return None
     name = trim_model_name(name)
-    if not name:
+    if not name or any(c.isspace() for c in name):
         return None
     return f"{provider}{MODEL_SEGMENT_SEPARATOR}{name}"
 
