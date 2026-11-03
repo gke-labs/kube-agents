@@ -23,6 +23,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import kanban_workspace_gc as gc
+import profile_scaffold  # noqa: E402
 import sandbox_exec
 
 SCHEMA = """
@@ -649,12 +650,69 @@ class HomeInventoryTest(_HomeFixture):
 class StaleHomesTest(_HomeFixture):
     """#2989 (b): a sandbox cluster home with no profile on the agent pod is removed."""
 
-    def sweep(self, fake, inv=None):
+    def sweep(self, fake, inv=None, lock_root=None):
         inv = inv or self.run_inventory(fake)
         sweep = gc.Sweep()
-        with patch.object(sandbox_exec, "run", side_effect=fake):
+        # The agent pod's data root, where create_profile's locks live too.
+        with patch.object(sandbox_exec, "run", side_effect=fake), \
+             patch.object(gc, "stale_home_lock_root", return_value=lock_root or self.home):
             gc.sweep_stale_homes(inv, self.remote, sweep)
         return inv, sweep
+
+    def test_a_home_whose_profile_lock_is_held_is_left_for_the_next_run(self):
+        # The lock create_profile and delete_profile hold (#4389): a scaffold of
+        # this name is running now, and its sandbox home must not go under it.
+        fake = FakeSandbox(self.tree)
+        with profile_scaffold.profile_lock(self.home, "cluster-gone") as held:
+            self.assertTrue(held)
+            _, sweep = self.sweep(fake)
+        self.assertEqual(self.rms(fake), [])
+        self.assertEqual(sweep.stale_homes_removed, [])
+        self.assertEqual(sweep.stale_homes_failed, [])
+        self.assertEqual(sweep.warnings, [])
+        # Released, the next run removes it.
+        fake = FakeSandbox(self.tree)
+        _, sweep = self.sweep(fake)
+        self.assertEqual(sweep.stale_homes_removed, ["cluster-gone"])
+
+    def test_the_lock_is_create_profiles_own(self):
+        # Not a lookalike: the lock cluster_agent_profile takes for a create holds the sweep off.
+        import cluster_agent_profile as cap
+        fake = FakeSandbox(self.tree)
+        with patch.object(cap, "HERMES_HOME", self.home), cap._profile_lock("cluster-gone") as held:
+            self.assertTrue(held)
+            _, sweep = self.sweep(fake)
+        self.assertEqual(self.rms(fake), [])
+
+    def test_the_lock_is_held_through_the_rm(self):
+        # From the recheck to the rm: a scaffold cannot take the name in between.
+        rp = self.remote / "profiles"
+        home = self.home
+        seen = []
+
+        class Checking(FakeSandbox):
+            def __call__(inner, argv, **kwargs):
+                if argv[0] == gc.REMOTE_RM:
+                    with profile_scaffold.profile_lock(home, "cluster-gone", blocking=False) as free:
+                        seen.append(free)
+                return super().__call__(argv, **kwargs)
+
+        fake = Checking(self.tree)
+        _, sweep = self.sweep(fake)
+        self.assertEqual(sweep.stale_homes_removed, ["cluster-gone"])
+        self.assertEqual(seen, [False], "the profile lock was free while the rm ran")
+        self.assertIn(([gc.REMOTE_RM, "-rf", "--", str(rp / "cluster-gone")], sandbox_exec.TERMINAL_PRINCIPAL),
+                      self.rms(fake))
+
+    def test_a_lock_that_cannot_be_opened_removes_nothing_and_says_so(self):
+        blocked = Path(self.tmp.name) / "not-a-dir"
+        blocked.write_text("x")
+        fake = FakeSandbox(self.tree)
+        _, sweep = self.sweep(fake, lock_root=blocked)
+        self.assertEqual(self.rms(fake), [])
+        self.assertEqual(sweep.stale_homes_removed, [])
+        self.assertTrue(any("could not open the profile lock for 1 stale sandbox cluster home" in w
+                            for w in sweep.warnings), sweep.warnings)
 
     def rms(self, fake):
         return [(argv, kwargs.get("principal")) for argv, kwargs in fake.calls if argv[0] == gc.REMOTE_RM]
@@ -1218,3 +1276,32 @@ class OverridesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class LockRootTest(unittest.TestCase):
+    """create_profile and the stale-home sweep lock the same file under each one's roster (#4389).
+
+    The reconcile, which creates, runs on the chat roster, where HERMES_HOME is the
+    data root. This sweep runs on the platform roster, where HERMES_HOME is
+    profiles/platform and the data root is PLATFORM_AGENT_HOME. The lock is only a
+    lock if both resolve the same root.
+    """
+
+    def test_both_call_sites_resolve_the_same_lock_file(self):
+        import importlib
+
+        import cluster_agent_profile as cap
+        root = "/srv/agent-data"
+        chat = {"HERMES_HOME": root, "PLATFORM_AGENT_HOME": root}
+        platform = {"HERMES_HOME": f"{root}/profiles/platform", "PLATFORM_AGENT_HOME": root}
+        try:
+            with patch.dict("os.environ", chat):
+                create_root = importlib.reload(cap).profile_lock_root()
+        finally:
+            importlib.reload(cap)
+        with patch.dict("os.environ", platform):
+            sweep_root = gc.stale_home_lock_root()
+        self.assertEqual(create_root, Path(root))
+        self.assertEqual(sweep_root, create_root)
+        self.assertEqual(sweep_root / profile_scaffold.PROFILE_LOCKS_DIRNAME / "cluster-x.lock",
+                         create_root / profile_scaffold.PROFILE_LOCKS_DIRNAME / "cluster-x.lock")

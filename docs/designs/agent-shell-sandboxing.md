@@ -2175,8 +2175,11 @@ from the test fleet now that cron runs have a working directory of their own. A 
 is listed before the pod's profile list is read, so a profile scaffolded between the two
 reads is never taken for stale; only cluster-prefixed names go, only when the pod lists the
 platform profile, and only under a profiles root that `find -P` reports as a real directory,
-by one `rm` per home as the model's account, which owns the homes; a home whose `rm` fails
-is named in one chat bullet each night until it goes. The listing runs as
+by one `rm` per home as the model's account, which owns the homes, each under that
+profile's lock, the one `create_profile` and `delete_profile` hold (#4389): taken without
+blocking, from the pod's last-moment recheck through the `rm`, so a name being scaffolded
+right then is left for the next night. A home whose `rm` fails is named in one chat bullet
+each night until it goes. The listing runs as
 `hermes`, the default principal, because its output is believed, under the sandbox's own
 `workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
 name cannot forge a row.
