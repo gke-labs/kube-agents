@@ -1083,7 +1083,7 @@ def test_record_writes_a_today_key_without_a_mode(tmp_path):
 
 
 def test_record_refuses_to_run_on_the_today_lane(tmp_path, monkeypatch, capsys):
-    """The today lane's periodic grades an install rolled back from next over
+    """A today-lane periodic grades an install rolled back from next over
     the api transport: its key reads today, but today's window measures a
     fresh today install. The shell keeps it out; this is the second guard."""
     monkeypatch.setenv("EVAL_ROLLBACK_LANE", "1")

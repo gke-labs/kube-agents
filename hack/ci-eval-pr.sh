@@ -196,8 +196,7 @@ readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
 # The round trip after the suite verdict is for a next-mode run on main: a
 # pull request's next-mode run (the merge-blocking presubmit's, or a batch's
 # that Tide ran) skips it, since nobody reads a report-only result there and the
-# today lane below proves the same path every six hours on main, and on
-# demand on a pull request.
+# today lane below proves the same path on demand on a pull request.
 readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"
 # The today lane, EVAL_ROLLBACK_LANE=1 beside EVAL_MODE_NEXT=1
 # (run_rollback_lane, in section 3): the deploy brings the install up under
@@ -1102,11 +1101,10 @@ export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 
 # ─── The today lane: roll the next install back before grading ──────────────
-# EVAL_ROLLBACK_LANE=1, set beside EVAL_MODE_NEXT=1 on the today lane's jobs
-# (ci-kube-agents-eval-today and pull-kube-agents-smoke-test-today in
-# oss-test-infra). With next the mode new installs get and the merge-blocking
-# presubmit grading it, today is what a rollback lands on, and this lane proves
-# that path: the deploy brings the install up under next exactly as for the
+# EVAL_ROLLBACK_LANE=1, set beside EVAL_MODE_NEXT=1 on the today lane's job
+# (pull-kube-agents-smoke-test-today in oss-test-infra). With next the mode
+# new installs get and the merge-blocking presubmit grading it, today is
+# what a rollback lands on, and this lane proves that path: the deploy brings the install up under next exactly as for the
 # next lane, this step runs hack/rollback-roundtrip.sh with ROLLBACK_END_MODE
 # set to EVAL_ROLLBACK_LANE_END_MODE (next -> today -> next -> today: the
 # rollback, the flip forward on the kept PVC and creds Secret, and the
@@ -5056,8 +5054,8 @@ profile_begin "record + final gate"
 # record once written. The candidate would then be measured for non-inferiority
 # against a window it had just moved.
 #
-# EVAL_ROLLBACK_LANE=1 is the fourth. The today lane's periodic
-# (ci-kube-agents-eval-today) carries EVAL_MODE_NEXT=1 for its deploy and
+# EVAL_ROLLBACK_LANE=1 is the fourth. A today-lane run with no PULL_NUMBER
+# would carry EVAL_MODE_NEXT=1 for its deploy and
 # grades the install after rolling it back to today, over the api transport,
 # so its key reads today; but a rolled-back install is not the fresh today
 # install today's window measures. `bench-gate record` refuses it too.

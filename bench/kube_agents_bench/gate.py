@@ -1031,7 +1031,7 @@ def _cmd_record(args: argparse.Namespace) -> int:
 
     if os.environ.get(ROLLBACK_LANE_ENV) == "1" and not args.force:
         # Third way in, mirrored from hack/ci-eval-pr.sh's recorder decision:
-        # the today lane's periodic on main has no PULL_NUMBER and grades an
+        # a today-lane periodic on main has no PULL_NUMBER and grades an
         # install rolled back from next over the api transport. Its key reads
         # today, and today's window measures a fresh today install.
         print(

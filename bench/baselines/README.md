@@ -105,7 +105,7 @@ above does not cover: the candidate is a commit on `main`, and the run measuring
 it is a periodic with no `PULL_NUMBER`, so it satisfies both conditions exactly.
 `RC_COMMIT_SHA` being set is the third condition, enforced in the same two
 places. `EVAL_ROLLBACK_LANE=1` is the fourth, also enforced in both: the today
-lane's periodic on `main` deploys `next` and rolls it back to `today` before its
+lane deploys `next` and rolls it back to `today` before its
 matrix, so its key reads `today`, but a rolled-back install is not the fresh
 `today` install that window measures. The third has to be enforced twice,
 because the mistake is not correctable afterwards:

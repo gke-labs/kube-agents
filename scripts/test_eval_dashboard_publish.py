@@ -207,7 +207,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
             self.assertEqual(list(dash.glob("*.ran")), [])
 
     def test_a_today_lane_run_never_publishes(self):
-        """The today lane's periodic is also a periodic with no PULL_NUMBER and
+        """A today-lane periodic is also a periodic with no PULL_NUMBER and
         no RC_COMMIT_SHA, flagged EVAL_MODE_NEXT=1 for its deploy. It grades
         an install rolled back from next, which is not main's history.
         Mirrors the baseline recorder's fourth condition."""

@@ -670,12 +670,11 @@ the api transport, and they are kept apart on purpose.
 
 `today`, the mode a rollback lands on, is graded over the api transport by the today lane: the
 optional `pull-kube-agents-smoke-test-today` (on demand with `/test`, and on its own when a pull
-request touches `hack/rollback-roundtrip.sh` or the operator's A2A reconciliation) and the
-six-hourly periodic `ci-kube-agents-eval-today` on `main`. Both run with `EVAL_ROLLBACK_LANE=1`:
+request touches `hack/rollback-roundtrip.sh` or the operator's A2A reconciliation). It runs with `EVAL_ROLLBACK_LANE=1`:
 the deploy brings the install up under `next`, `hack/rollback-roundtrip.sh` takes it to `today`,
 back to `next` and to `today` again before the matrix, and a rollback that fails reds the run.
 The matrix is the presubmit's, roster included, so a case graded only over the api transport is
-graded there, but neither job blocks a merge.
+graded there, but the job does not block a merge.
 
 A check the transport blinds is the scorer's business. The door's trace carries no card ids,
 no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod

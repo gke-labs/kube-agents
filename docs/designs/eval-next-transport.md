@@ -714,8 +714,7 @@ they come from.
 Where the flag is set is the Prow job's choice, not a script default, and since `next` became the
 mode a new install gets, the merge-blocking presubmit sets it: every pull request is graded on
 `next` through the door. `today` stays supported as the rollback, so a second lane proves that
-path. The today lane (`pull-kube-agents-smoke-test-today` on demand, and
-the six-hourly periodic `ci-kube-agents-eval-today` on `main`) sets the flag together with
+path. The today lane (`pull-kube-agents-smoke-test-today`, on demand) sets the flag together with
 `EVAL_ROLLBACK_LANE=1`: the deploy is the flagged one, and `hack/ci-eval-pr.sh` then runs
 `hack/rollback-roundtrip.sh` with `ROLLBACK_END_MODE=today` before the matrix, which adds a third
 leg (`next` to `today` again, with the first leg's checks) and leaves the install rolled back. The
@@ -726,7 +725,7 @@ refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
 The flag admits those jobs by name and nothing else without a pull request: section 2b of the
 deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
 listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
-its Tide batch runs, the today lane's periodic, the main nightly's three parts
+its Tide batch runs, the main nightly's three parts
 `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
 `ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
 under next, and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
