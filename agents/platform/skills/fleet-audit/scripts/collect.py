@@ -159,8 +159,9 @@ DEFAULT_TIMEOUT_S = 60
 # resolved in collect_fleet. Every check is a kubectl or gcloud the credential
 # broker runs, and the broker admits its slot cap or what its child memory
 # budget fits at the container's effective limit, whichever is smaller: 8 at
-# the operator's default 2Gi limit, 4 on GKE Autopilot without bursting, where
-# the limit is the 1Gi request. A wider pool only queues the rest at the broker,
+# the operator's default 2Gi limit, and on GKE Autopilot without bursting, where
+# the limit is the 2Gi default request; fewer where an override sets a smaller
+# memory request. A wider pool only queues the rest at the broker,
 # where a check still waiting at its 60 s admission bound is refused busy, or
 # hits DEFAULT_TIMEOUT_S here first and reads its cluster as unreachable. So the
 # width is read from the broker (GET /v1/exec/admission), less two slots of

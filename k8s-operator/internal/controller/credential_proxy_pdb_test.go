@@ -57,7 +57,7 @@ func reconcileProxyWithFake(t *testing.T, agent *agentv1alpha1.PlatformAgent, se
 		WithInterceptorFuncs(interceptors).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.reconcileCredentialProxy(ctx, agent, brokerTestPolicyHash, nil, true); err != nil {
+	if err := r.reconcileCredentialProxy(ctx, agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
 		t.Fatalf("reconcileCredentialProxy: %v", err)
 	}
 	key := types.NamespacedName{Name: credentialProxyName(agent), Namespace: agent.Namespace}

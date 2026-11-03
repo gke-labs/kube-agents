@@ -1076,6 +1076,24 @@ class SweepIdentityTest(unittest.TestCase):
         self.assertEqual({"author": "app/kube-agents"}, sweep._author_payload(GITHUB_REPO))
         refresh.assert_not_called()
 
+    def test_a_configured_identity_names_the_install_with_no_transport_call(self):
+        # A Bitbucket access token cannot call the current-user route, so the
+        # administrator configures the account's uuid; the sweep must read it
+        # as the broker's verbs do, or the readings are off for the forge.
+        bitbucket = next(cls for cls in providers.AVAILABLE if cls.name == "bitbucket")
+        uuid = "{096cc724-0f87-4779-b7ba-d479a9f67ade}"
+        forge = bitbucket(token_path="/nonexistent/token", identity=uuid)
+        transport = mock.Mock()
+        sweep = ReadingsSweep(
+            registry=FakeRegistry({"bitbucket:bitbucket.org/acme/infra": forge}),
+            transport_for=lambda f, r: transport,
+            metrics=FakeMetrics(),
+            managed_repositories=lambda: frozenset({"bitbucket:bitbucket.org/acme/infra"}),
+        )
+        sweep._bind("bitbucket:bitbucket.org/acme/infra")
+        self.assertEqual(uuid, sweep._login("bitbucket:bitbucket.org/acme/infra"))
+        transport.whoami.assert_not_called()
+
     def test_an_app_credential_is_searched_as_app_slug_with_or_without_the_marking(self):
         # The credential's kind is the primary signal: GraphQL `viewer` may name
         # an App installation without the `[bot]` marking.

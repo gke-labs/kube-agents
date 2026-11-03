@@ -52,6 +52,22 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
+      # Read each tagged `terminal` or `execute_code` call as typed. Without
+      # after_result_pattern the check reads, for a card the front agent
+      # filed, Hermes's one-line rendering of the worker's command, which
+      # shows a chain as its first command plus `+ N commands` (#3128): the
+      # nightly answers ran both probes behind a `printenv` or a `cd`, or
+      # inside a `for` loop over the provisioning models, and the rendering
+      # (`printenv GKE_PROJECT_ID + 2 commands`, `for m in SPOT FLEX_START + 7
+      # commands`) carries at most one probe. The pattern never matches a result
+      # and no forbidden pattern is set, so it opens no window; the card log's
+      # rows join the typed set beside at least one readable tagged call, and
+      # a capture that carried none is `error`, not a pass on the log alone.
+      # A mention of a probe inside a heredoc or a second line is read too,
+      # the admitting side of a text pattern.
+      # bench/tests/test_obtainability_quota_probe_route.py pins the recorded
+      # shapes through the whole check.
+      after_result_pattern: "(?!)"
       required_patterns:
         - "gcloud compute regions describe"
         - "gcloud beta compute advice capacity(?!-)"
