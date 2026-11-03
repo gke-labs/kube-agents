@@ -126,10 +126,15 @@ The rules that keep this safe:
   they are ("minutes ago", "days ago", "in the future", and so on), and an expired certificate never
   matches a valid one. IP addresses stay as they are whenever the request mentions a network range
   (like `10.0.0.0/16`), because then which range an IP falls in can matter.
-- **Opaque fields are never touched.** Fields named for signatures, `provider_specific_fields`,
+- **Opaque fields are never edited.** Fields named for signatures, `provider_specific_fields`,
   and the `id`/`tool_call_id` of tool calls: LiteLLM embeds Gemini's thought signature in
   tool-call ids (`call_…__thought__<base64>`), and rewriting a digit inside it corrupts the
-  signature. The prototype did exactly this before it was fixed.
+  signature. The prototype did exactly this before it was fixed. In the key, each of these
+  becomes one placeholder for the whole value, numbered by first appearance, so a tool result
+  still points at the same call. Live runs get new signatures every time, so keeping them as they
+  are would stop almost every match after the first tool call. The cost is that two requests that
+  differ only in a signature count as the same. Only tool-call ids (they start with `call_`) are
+  treated this way; any other `id` field, like a card or a cluster, goes through the normal rules.
 - **Answers are rewritten by whole token only, and never for bare numbers.** An unrelated `99`
   in an answer must not become this run's row id.
 - **An answer that repeats a number we swapped isn't saved.** Some values are swapped in the
@@ -501,6 +506,14 @@ before stage 2 of the rollout:
    shared cache makes sense. For normalizer fixes, the script compares each miss with the closest
    earlier request, and since we kept the cleaned-up text, we can test a new normalizer rule on the
    same week of data without redeploying anything.
+
+   Exact matches will undercount. In shadow mode every model answer is a fresh live answer, so two
+   runs rarely match exactly after the model's first reply, while under replay those replies would
+   be the saved ones. So the script also reports a **simulated** estimate that ignores the model's
+   own replies when comparing requests, and that's the number to read. It assumes the same tool
+   calls would have returned the same results. To check that assumption, run a few cases with real
+   record and replay (as in "Measurements") and compare their real hit rate with what the simulated
+   estimate predicts for the same cases.
 
    Shadow mode also checks that hits would be safe, not just how many there are. For each request
    it logs a hash of the model's live answer, and once the run is done, whether that run passed. For
