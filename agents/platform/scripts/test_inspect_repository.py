@@ -24,6 +24,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -80,7 +81,10 @@ class InspectRepositoryTestCase(unittest.TestCase):
         patched = patch.object(vcs_client, "call", self.broker)
         patched.start()
         self.addCleanup(patched.stop)
-        endpoint = patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"})
+        endpoint = patch.dict(
+            os.environ,
+            {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765", "PLATFORM_AGENT_HOME": str(self.tmp / "home")},
+        )
         endpoint.start()
         self.addCleanup(endpoint.stop)
 
@@ -289,26 +293,22 @@ class TestClone(InspectRepositoryTestCase):
         )
         self.assertEqual(result["written"], 3)
 
-    def test_a_destination_the_clone_creates_is_unpacked_into_directly(self):
-        """No staging of the script's: the client stages once, beside `into`."""
+    def test_every_clone_stages_in_the_script_s_own_folder(self):
+        """The script's staging and the snapshot's are both in staging_root(), with or without --force."""
         into = self.tmp / "copy"
-        self.assertFalse(into.exists())
-        with patch.object(vcs_client, "snapshot", wraps=vcs_client.snapshot) as snapshot, patch.object(
-            inspect_repository.tempfile, "mkdtemp", wraps=tempfile.mkdtemp
-        ) as mkdtemp:
-            self.run_command(["clone", "--repo", "acme/public", "--into", str(into)])
-        self.assertEqual(snapshot.call_args.kwargs["into"], into)
-        # The client's staging only.
-        self.assertEqual(len(mkdtemp.call_args_list), 1)
+        root = inspect_repository.staging_root()
+        for force in (False, True):
+            with self.subTest(force=force), patch.object(
+                vcs_client, "snapshot", wraps=vcs_client.snapshot
+            ) as snapshot, patch.object(tempfile, "mkdtemp", wraps=tempfile.mkdtemp) as mkdtemp:
+                self.run_command(
+                    ["clone", "--repo", "acme/public", "--into", str(into)] + (["--force"] if force else [])
+                )
+            self.assertEqual(snapshot.call_args.kwargs["into"].parent, root)
+            # The script's staging, then the snapshot's beside it.
+            self.assertEqual([c.kwargs["dir"] for c in mkdtemp.call_args_list], [str(root)] * 2)
+            self.assertEqual(self.staging_left(), [])
         self.assertEqual((into / "cmd" / "main.go").read_text(), "func main() { serve() }\n")
-
-    def test_force_stages_beside_the_destination(self):
-        into = self.tmp / "copy"
-        with patch.object(vcs_client, "snapshot", wraps=vcs_client.snapshot) as snapshot:
-            self.run_command(["clone", "--repo", "acme/public", "--into", str(into), "--force"])
-        self.assertNotEqual(snapshot.call_args.kwargs["into"], into)
-        self.assertTrue(snapshot.call_args.kwargs["into"].name.startswith(".copy."))
-        self.assertEqual(self.staging_left(), [])
 
     def test_the_current_directory_by_its_full_path_stays_valid(self):
         """The snapshot must not remove an empty `into` that existed and put a new one there."""
@@ -340,21 +340,62 @@ class TestClone(InspectRepositoryTestCase):
         self.addCleanup(os.chdir, cwd)
         self.run_command(["clone", "--repo", "acme/public", "--into", "."])
         self.assertEqual((work / "cmd" / "main.go").read_text(), "func main() { serve() }\n")
-        # With no name, the staging names are `..XXXXXXXX` and
-        # `...XXXXXXXX.XXXXXXXX`, inside `into`.
-        hidden = work / "..abc12345"
-        hidden.mkdir()
-        old = time.time() - 2 * inspect_repository.STALE_STAGING_AGE_SECONDS
-        os.utime(hidden, (old, old))
         self.run_command(["clone", "--repo", "acme/public", "--into", ".", "--force"])
-        self.assertTrue(hidden.is_dir())
+        self.assertEqual(sorted(os.listdir(".")), ["README.md", "cmd"])
+
+    def test_two_clones_into_one_fresh_destination_both_complete(self):
+        """Two cards clone one repository to its default destination at the same time."""
+        arrivals = []
+        lock = threading.Lock()
+        second_done = threading.Event()
+
+        def broker(verb, payload):
+            with lock:
+                arrivals.append(threading.current_thread())
+                first = len(arrivals) == 1
+            if first:
+                # Both found the destination empty. The first answer comes
+                # after the second clone wrote into the destination.
+                if not second_done.wait(30):
+                    raise AssertionError("the second clone did not end")
+            return self.broker(verb, payload)
+
+        codes, errors = [], []
+
+        def clone():
+            try:
+                codes.append(inspect_repository.dispatch(["clone", "--repo", "acme/public"]))
+            except BaseException as exc:  # noqa: BLE001 - SystemExit too
+                errors.append(exc)
+            finally:
+                if arrivals and arrivals[0] is not threading.current_thread():
+                    second_done.set()
+
+        out = io.StringIO()
+        with patch.object(vcs_client, "call", broker), redirect_stdout(out):
+            threads = [threading.Thread(target=clone) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(codes, [0, 0])
+        self.assertEqual(len(arrivals), 2)
+        into = inspect_repository.default_into("acme/public")
+        self.assertEqual([json.loads(line)["into"] for line in out.getvalue().splitlines()], [str(into)] * 2)
+        self.assertEqual(
+            sorted(str(p.relative_to(into)) for p in into.rglob("*") if p.is_file()),
+            ["README.md", "cmd/main.go", "cmd/serve.go"],
+        )
+        self.assertEqual(self.staging_left(), [])
 
     def age(self, path):
         old = time.time() - 2 * inspect_repository.STALE_STAGING_AGE_SECONDS
         os.utime(path, (old, old), follow_symlinks=False)
 
     def staging_left(self):
-        return sorted(p.name for p in self.tmp.iterdir() if p.name.startswith((".copy.", "..copy.")))
+        root = inspect_repository.staging_root()
+        return sorted(p.name for p in root.iterdir()) if root.exists() else []
 
     def test_a_clone_killed_before_the_copy_leaves_staging_the_next_clone_removes(self):
         """A SIGKILL does not run the `finally` that removes the staging directory."""
@@ -372,68 +413,55 @@ class TestClone(InspectRepositoryTestCase):
         self.assertTrue(os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, status)
         left = self.staging_left()
         self.assertEqual(len(left), 1, left)
-        self.assertTrue((self.tmp / left[0] / "cmd" / "main.go").is_file())
+        root = inspect_repository.staging_root()
+        self.assertTrue((root / left[0] / "cmd" / "main.go").is_file())
 
         # Young: it can belong to a clone that runs now, so it stays.
         self.run_command(["clone", "--repo", "acme/public", "--into", str(into), "--force"])
         self.assertEqual(self.staging_left(), left)
 
-        self.age(self.tmp / left[0])
+        self.age(root / left[0])
         self.run_command(["clone", "--repo", "acme/public", "--into", str(into), "--force"])
         self.assertEqual(self.staging_left(), [])
 
-    def test_a_clone_removes_only_old_staging_of_its_own_destination(self):
+    def test_a_clone_removes_only_old_entries_of_the_staging_folder(self):
+        root = inspect_repository.staging_root()
+        root.mkdir(parents=True)
         outside = self.tmp / "outside"
         outside.mkdir()
         (outside / "keep.txt").write_text("not staging\n")
-        # Each name, and whether the clone removes it.
-        names = {
-            ".copy.abc12345": True,  # the script's or the client's
-            "..copy.abc12345.def67890": True,  # the client's inside the script's
-            ".copy.fresh123": False,  # young
-            ".other.abc12345": False,  # another destination's
-            "copy-notes": False,
-            ".copy.backup": False,  # the caller's: not a mkdtemp suffix
-            ".copy.d": False,
-            ".copy.cfg.d": False,
-            ".copy.abc12345.bak": False,
-            "..copy.backup": False,
-            "..copy.abc12345": False,
-            "..copy.abc12345.def67890.bak": False,
-            # Eight characters, but not from mkdtemp's alphabet.
-            ".copy.cfg.data": False,
-            ".copy.ABCDEFGH": False,
-            "..copy.abc12345.ab-12345": False,
-        }
-        for name in names:
-            (self.tmp / name).mkdir()
-            (self.tmp / name / "file").write_text("x\n")
-            if name != ".copy.fresh123":
-                self.age(self.tmp / name)
-        (self.tmp / ".copy.link1234").symlink_to(outside)
-        self.age(self.tmp / ".copy.link1234")
+        old = root / "any-name"
+        fresh = root / "clone.fresh123"
+        for path in (old, fresh):
+            path.mkdir()
+            (path / "file").write_text("x\n")
+        self.age(old)
+        link = root / "link"
+        link.symlink_to(outside)
+        self.age(link)
         into = self.tmp / "copy"
         self.run_command(["clone", "--repo", "acme/public", "--into", str(into)])
-        for name, removed in names.items():
-            self.assertEqual((self.tmp / name).exists(), not removed, name)
-        self.assertTrue((self.tmp / ".copy.link1234").is_symlink())
+        self.assertFalse(old.exists())
+        self.assertTrue((fresh / "file").is_file())
+        self.assertTrue(link.is_symlink())
         self.assertEqual((outside / "keep.txt").read_text(), "not staging\n")
         self.assertTrue((into / "README.md").is_file())
 
-    def test_a_destination_name_is_matched_as_text_not_as_a_pattern(self):
-        """`.` and `[` in --into's name are themselves: no wrong sibling, no refused clone."""
-        names = {".x.y.abc12345": True, ".xAy.abc12345": False}
+    def test_a_clone_removes_nothing_beside_the_destination(self):
+        """A caller's old copy beside --into stays, whatever its name."""
+        names = (".src.original", ".src.20251103", ".src.abc12345", "..src.abc12345.def67890")
         for name in names:
             (self.tmp / name).mkdir()
+            (self.tmp / name / "file").write_text("the caller's\n")
             self.age(self.tmp / name)
-        self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "x.y")])
-        for name, removed in names.items():
-            self.assertEqual((self.tmp / name).exists(), not removed, name)
-        result = self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "repo[1")])
-        self.assertEqual(result["written"], 3)
+        into = self.tmp / "src"
+        self.run_command(["clone", "--repo", "acme/public", "--into", str(into)])
+        self.run_command(["clone", "--repo", "acme/public", "--into", str(into), "--force"])
+        for name in names:
+            self.assertEqual((self.tmp / name / "file").read_text(), "the caller's\n", name)
 
     def test_a_leftover_that_cannot_be_removed_does_not_stop_the_clone(self):
-        locked = self.tmp / ".copy.abc12345" / "locked"
+        locked = inspect_repository.staging_root() / "clone.abc12345" / "locked"
         locked.mkdir(parents=True)
         (locked / "file").write_text("x\n")
         locked.chmod(0o500)

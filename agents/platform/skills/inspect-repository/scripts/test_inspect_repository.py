@@ -60,15 +60,18 @@ class DefaultIntoTest(unittest.TestCase):
 
 class ContentModeTest(unittest.TestCase):
     def setUp(self):
-        for patcher in (
-            patch.object(vcs_client, "snapshot", fake_snapshot),
-            patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp_path = Path(tmp.name)
+        for patcher in (
+            patch.object(vcs_client, "snapshot", fake_snapshot),
+            patch.dict(os.environ, {
+                "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765",
+                "PLATFORM_AGENT_HOME": str(self.tmp_path / "home"),
+            }),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def run_command(self, argv):
         out = io.StringIO()
@@ -95,7 +98,8 @@ class ContentModeTest(unittest.TestCase):
     def test_the_staging_directory_does_not_outlive_the_clone(self):
         into = self.tmp_path / "copy"
         self.run_command(["clone", "--repo", REPO, "--into", str(into)])
-        self.assertEqual([p.name for p in self.tmp_path.iterdir()], ["copy"])
+        self.assertEqual(sorted(p.name for p in self.tmp_path.iterdir()), ["copy", "home"])
+        self.assertEqual(list(inspect_repository.staging_root().iterdir()), [])
 
 
 if __name__ == "__main__":

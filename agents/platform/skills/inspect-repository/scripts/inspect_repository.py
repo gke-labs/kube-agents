@@ -37,7 +37,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -64,9 +63,16 @@ DEFAULT_MAX_BYTES = vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES
 # The broker's refusal of a `paths` entry that names nothing at the revision.
 PATH_NOT_FOUND = "PATH_NOT_FOUND"
 
-# How old a staging directory beside `--into` must be before a clone removes
-# it. A clone takes seconds, so a younger one can belong to a clone that runs
-# now. The same age as sandbox_artifact_patch.STALE_SWEEP_AGE_SECONDS.
+# The folder under the scratch directory that holds every clone's staging, and
+# nothing else. The script owns it, so a sweep of it removes no file of the
+# caller's.
+STAGING_DIR_NAME = ".inspect-repository-staging"
+# The name of one clone's staging directory, before mkdtemp's suffix.
+STAGING_PREFIX = "clone."
+
+# How old an entry in the staging folder must be before a clone removes it. A
+# clone takes seconds, so a younger one can belong to a clone that runs now.
+# The same age as sandbox_artifact_patch.STALE_SWEEP_AGE_SECONDS.
 STALE_STAGING_AGE_SECONDS = 3600.0
 
 
@@ -87,6 +93,11 @@ def default_into(repo: str) -> Path:
     return scratch_root() / repo.replace("/", "%2F")
 
 
+def staging_root() -> Path:
+    """The folder that holds every clone's staging, beside `scratch_root()`."""
+    return scratch_root().parent / STAGING_DIR_NAME
+
+
 def prepare_destination(into: Path, force: bool) -> Path:
     """An empty directory to write into, or a refusal naming `--force`.
 
@@ -105,32 +116,24 @@ def prepare_destination(into: Path, force: bool) -> Path:
     return into
 
 
-def remove_stale_staging(into: Path) -> None:
-    """Remove the staging directories that an earlier clone of `into` left.
+def remove_stale_staging() -> None:
+    """Remove the staging directories that an earlier clone left.
 
-    A clone stages beside `into` and removes the staging directory in a
-    `finally`, which a SIGKILL does not run. Two names are staging: the
-    script's and the client's (`.{name}.XXXXXXXX`), and the client's inside the
-    script's (`..{name}.XXXXXXXX.XXXXXXXX`). Each `XXXXXXXX` is the suffix of
-    `tempfile.mkdtemp`: 8 characters from `a-z`, `0-9` and `_`. Only these
-    exact names match, so a name such as `.{name}.backup` stays. Only a
-    directory older than STALE_STAGING_AGE_SECONDS is removed. A failure here
-    does not stop the clone.
+    A clone removes its staging directory in a `finally`, which a SIGKILL does
+    not run. Every staging directory is in `staging_root()`, so each entry
+    there that is older than STALE_STAGING_AGE_SECONDS is removed, whatever
+    its name. Nothing outside that folder is removed. A missing folder or a
+    failure here does not stop the clone.
     """
-    if not into.name:
-        # `--into .` stages inside `into`, so the names would match the caller's files.
-        return
-    name = re.escape(into.name)
-    staging = re.compile(rf"\.{name}\.[a-z0-9_]{{8}}|\.\.{name}\.[a-z0-9_]{{8}}\.[a-z0-9_]{{8}}")
     cutoff = time.time() - STALE_STAGING_AGE_SECONDS
     try:
-        entries = list(into.parent.iterdir())
+        entries = list(staging_root().iterdir())
     except OSError:
         return
     for path in entries:
         try:
             # `rmtree` refuses a symbolic link, so a link is never followed.
-            if staging.fullmatch(path.name) and path.is_dir() and path.stat().st_mtime < cutoff:
+            if path.is_dir() and path.lstat().st_mtime < cutoff:
                 shutil.rmtree(path, ignore_errors=True)
         except OSError:
             continue
@@ -191,31 +194,26 @@ def skipped_reason(reason: str) -> str:
 
 
 def clone_content(args) -> int:
-    """Take one snapshot into `into`, or with `--force` beside it and copy it over.
+    """Take one snapshot into a fresh directory, check it, then copy it into place.
 
-    The snapshot unpacks only into an empty directory, and it stages beside
-    that directory itself. If the clone creates `into`, the snapshot unpacks
-    into it directly. `--force` is how a caller adds a second `--prefix` to a
-    tree it is building (the fleet audit does). So then the snapshot lands
-    beside `into` and is copied over it. A destination that existed before
-    the clone is staged the same way.
+    The snapshot unpacks only into an empty directory, and `--force` is how a
+    caller adds a second `--prefix` to a tree it is building (the fleet audit
+    does). So every clone stages in `staging_root()`, and the copy goes into
+    the directory that `into` names. `into` itself is never removed or
+    replaced. So a second clone that writes into it at the same time does not
+    fail on it, and an `into` that is the current directory, a symbolic link
+    or a mount point stays valid. The snapshot stages beside its own
+    destination, which is the staging directory here, so its staging is in
+    `staging_root()` too.
     """
-    into = Path(args.into).expanduser() if args.into else default_into(args.repo)
-    remove_stale_staging(into)
-    existed = into.exists() or into.is_symlink()
-    into = prepare_destination(into, args.force)
-    paths = [args.prefix] if args.prefix else None
-    # The snapshot removes an empty destination and moves its own directory
-    # to that name. That is safe only for a directory the clone made. A
-    # directory that existed can be the current directory (`.` or its full
-    # path), a symbolic link to a directory, or a mount point. So it stages
-    # as `--force` does, and the copy goes into the directory that is there.
-    staged = args.force or existed
-    staging = (
-        Path(tempfile.mkdtemp(dir=str(into.parent), prefix=f".{into.name}."))
-        if staged
-        else into
+    remove_stale_staging()
+    into = prepare_destination(
+        Path(args.into) if args.into else default_into(args.repo), args.force
     )
+    paths = [args.prefix] if args.prefix else None
+    root = staging_root()
+    root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=str(root), prefix=STAGING_PREFIX))
     try:
         try:
             copy = vcs_client.snapshot(
@@ -240,11 +238,9 @@ def clone_content(args) -> int:
                 "complete": True, "history": "none", "missing": args.prefix,
             }))
             return 0
-        if staged:
-            copy_over(staging, into)
+        copy_over(staging, into)
     finally:
-        if staged:
-            shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
     print(json.dumps({
         "mode": "content",
         "forge": copy["forge"],
