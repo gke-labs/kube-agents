@@ -21,7 +21,7 @@ import unittest
 import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _autopilot import gib_per_vcpu_in_band  # noqa: E402
+from _autopilot import gib_per_vcpu, gib_per_vcpu_in_band  # noqa: E402
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
@@ -87,12 +87,10 @@ class RequestsAreLivableAsLimitsTest(unittest.TestCase):
 
     def test_the_requests_pair_is_in_the_autopilot_band(self):
         requests = _chart_resources()["requests"]
-        millis = int(requests["cpu"][:-1])
-        mib = int(requests["memory"][:-2])
-        gib_per_vcpu = (mib / 1024) / (millis / 1000)
+        ratio = gib_per_vcpu(requests["cpu"], requests["memory"])
         self.assertTrue(
-            gib_per_vcpu_in_band(gib_per_vcpu),
-            f"the operator requests {gib_per_vcpu} GiB per vCPU, outside the band",
+            gib_per_vcpu_in_band(ratio),
+            f"the operator requests {ratio} GiB per vCPU, outside the band",
         )
 
 

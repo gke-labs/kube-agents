@@ -22,38 +22,27 @@ import unittest
 import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _autopilot import AUTOPILOT_MAX_GIB_PER_VCPU, AUTOPILOT_MIN_GIB_PER_VCPU, gib_per_vcpu_in_band  # noqa: E402
+from _autopilot import (  # noqa: E402
+    AUTOPILOT_MAX_GIB_PER_VCPU,
+    AUTOPILOT_MIN_GIB_PER_VCPU,
+    MILLIS_PER_CORE,
+    cpu_millis,
+    gib_per_vcpu,
+    gib_per_vcpu_in_band,
+    memory_gib,
+)
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
 _API_YAML = _ROOT / "k8s-operator" / "config" / "integrations" / "hindsight" / "api.yaml"
 
-# Kubernetes CPU quantities: a bare number is cores, an `m` suffix is
-# thousandths of a core. Nothing here writes any other suffix.
-_MILLI_SUFFIX = "m"
-_MILLIS_PER_CORE = 1000
-# Memory quantities here are whole Gi. The request has to hold the 1.4 GB of
-# model weights the API loads in process when an Autopilot cluster without
-# bursting clamps the limit to it, and the pair the issue pinned.
-_GI_SUFFIX = "Gi"
+# The memory request has to hold the 1.4 GB of model weights the API loads in
+# process when an Autopilot cluster without bursting clamps the limit to it,
+# and the pair the issue pinned. The quantity parsers are _autopilot's, shared
+# with the operator's and the web console's band tests.
 _PINNED_REQUESTS = {"cpu": "500m", "memory": "2Gi"}
 _PINNED_LIMITS = {"cpu": "4", "memory": "4Gi"}
 _MIN_MEMORY_REQUEST_GI = 2
-
-
-def _cpu_millis(quantity):
-    """A CPU quantity as an integer number of millicores."""
-    text = str(quantity)
-    if text.endswith(_MILLI_SUFFIX):
-        return int(text[: -len(_MILLI_SUFFIX)])
-    return int(float(text) * _MILLIS_PER_CORE)
-
-
-def _memory_gi(quantity):
-    """A memory quantity written in Gi as an integer number of GiB."""
-    text = str(quantity)
-    assert text.endswith(_GI_SUFFIX), f"{text} is not written in Gi"
-    return int(text[: -len(_GI_SUFFIX)])
 
 
 def _chart_resources():
@@ -99,8 +88,8 @@ class HindsightApiResourcesTest(unittest.TestCase):
         # The request is sized for steady state, the limit for the reranker's
         # recall bursts. A request that reaches the limit is the shape that
         # never schedules on an e2-standard-4 beside the system daemonsets.
-        request = _cpu_millis(self.chart["requests"]["cpu"])
-        limit = _cpu_millis(self.chart["limits"]["cpu"])
+        request = cpu_millis(self.chart["requests"]["cpu"])
+        limit = cpu_millis(self.chart["limits"]["cpu"])
         self.assertLess(
             request,
             limit,
@@ -113,10 +102,10 @@ class HindsightApiResourcesTest(unittest.TestCase):
         # One core is the ceiling for a request that still co-schedules with the
         # agent pod on a small node; steady state is a few millicores
         # (docs/designs/memory.md, the hindsight-api component entry).
-        request = _cpu_millis(self.chart["requests"]["cpu"])
+        request = cpu_millis(self.chart["requests"]["cpu"])
         self.assertLessEqual(
             request,
-            _MILLIS_PER_CORE,
+            MILLIS_PER_CORE,
             f"hindsight-api requests {request}m CPU; the request reserves capacity "
             "the scheduler and Autopilot billing count continuously, and the "
             "process idles at a few millicores",
@@ -130,7 +119,7 @@ class HindsightApiResourcesTest(unittest.TestCase):
         # An Autopilot cluster without Pod bursting sets the limit equal to
         # the request, and the container loads 1.4 GB of model weights in
         # process, so a request under 2Gi is OOM-killed there on cold start.
-        request = _memory_gi(self.chart["requests"]["memory"])
+        request = memory_gib(self.chart["requests"]["memory"])
         self.assertGreaterEqual(
             request,
             _MIN_MEMORY_REQUEST_GI,
@@ -141,12 +130,10 @@ class HindsightApiResourcesTest(unittest.TestCase):
     def test_the_requests_pair_is_in_the_autopilot_band(self):
         # Outside the band Autopilot raises the smaller request, so the pod it
         # admits is larger than the manifest and the quota preflight counts.
-        gib_per_vcpu = _memory_gi(self.chart["requests"]["memory"]) / (
-            _cpu_millis(self.chart["requests"]["cpu"]) / _MILLIS_PER_CORE
-        )
+        ratio = gib_per_vcpu(self.chart["requests"]["cpu"], self.chart["requests"]["memory"])
         self.assertTrue(
-            gib_per_vcpu_in_band(gib_per_vcpu),
-            f"hindsight-api requests {gib_per_vcpu} GiB per vCPU, outside the "
+            gib_per_vcpu_in_band(ratio),
+            f"hindsight-api requests {ratio} GiB per vCPU, outside the "
             f"{AUTOPILOT_MIN_GIB_PER_VCPU} to {AUTOPILOT_MAX_GIB_PER_VCPU} GiB per vCPU "
             "GKE Autopilot admits unchanged",
         )
