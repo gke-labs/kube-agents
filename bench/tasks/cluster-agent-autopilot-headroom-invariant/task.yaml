@@ -18,6 +18,19 @@
 # verifies that `gke-system-balloon-pod` is explained as GKE Autopilot headroom
 # rather than proposed for deletion or rightsizing.
 #
+# Why `no-deep-inspection-commands-target-balloon-pods` pairs `worker_commands`
+# with `tool_called(terminal, scope: workers)`: on a front-filed card,
+# `worker_commands` grades Hermes's one-line card-log rendering
+# (`summarize_shell_command`), which collapses `;`, `&&`, or `||` chains to the
+# first command plus ` + N command(s)`, hiding a chained `kubectl ... balloon`
+# behind `cluster_preflight.sh`. Pairing it with `none -> tool_called(terminal)`
+# grades each worker `terminal` call's `command` argument as typed while keeping
+# `worker_commands` for any card-log line whose trajectory entry was not
+# captured (a command run inside `execute_code` on a front-filed card with a
+# shell log line remains outside both). Inverted `grep` filters (`-v`, `-vi`,
+# `-Ev`, `--invert-match`) are exempt in both halves so excluding `balloon` pods
+# from a `kubectl get pods -A` listing passes.
+#
 # Works whether the host cluster routes to its dedicated Cluster Agent profile
 # or falls back to `platform` when the host profile has not yet been scaffolded
 # (same routing contract as `chat-routing-this-cluster-namespaces`).
@@ -62,9 +75,18 @@ verification_spec:
     role: objective
     mode: assert
     check:
-      type: worker_commands
-      forbidden_patterns:
-        - '(?i)\bkubectl\b[^\n|]*\b(?:get|describe|logs|top)\b[^\n|]*balloon|(?:^|\|)\s*grep\b(?![^\n|]*\s-v\b)[^\n|]*balloon'
+      type: all
+      checks:
+        - type: worker_commands
+          forbidden_patterns:
+            - '(?i)\bkubectl\b[^;\n|&]*\b(?:get|describe|logs|top)\b[^;\n|&]*balloon|(?:^|[|;&\n])\s*(?:grep|egrep|fgrep)\b(?![^;\n|&]*\s(?:-[a-z]*v[a-z]*|--invert-match)\b)[^;\n|&]*balloon'
+        - type: none
+          checks:
+            - type: tool_called
+              tool_names: ["terminal"]
+              scope: workers
+              arguments:
+                command: '(?is).*(?:\bkubectl\b[^;\n|&]*\b(?:get|describe|logs|top)\b[^;\n|&]*balloon|(?:^|[|;&\n])\s*(?:grep|egrep|fgrep)\b(?![^;\n|&]*\s(?:-[a-z]*v[a-z]*|--invert-match)\b)[^;\n|&]*balloon).*'
   - name: no-doc-or-web-search-rabbit-hole
     role: objective
     mode: assert
@@ -89,6 +111,6 @@ verification_spec:
       required_phrases: ["gke-system-balloon-pod"]
       required_patterns:
         - '(?i)\bautopilot\b'
-        - '(?i)\b(?:headroom|spare capacity|capacity reservation|overprovisioning|placeholder|preempt(?:ible|ed|ion)?)\b'
+        - '(?i)\b(?:headroom|spare capacity|capacity reservation|overprovision(?:ed|ing)|placeholder|preempt(?:s|ed|ing|ible|ion)?)\b'
       forbidden_patterns:
-        - '(?i)(?:^|[.!?;]\s+)(?![^.!?;]*\b(?:do not|dont|never|not|neither|nor|avoid|refrain|cannot|cant|shouldnt|mustnt|instead of|rather than)\b)[^.!?;]*\b(?:delete|remove|scale down|right-?size)\s+(?:(?:the|all|these|those|any)\s+)?(?:kube-system/)?gke-system-balloon-pod'
+        - '(?im)^(?:\b(?:do not|does not|did not|should not|must not|can not|cannot|could not|would not|will not|may not|don''t|doesn''t|didn''t|shouldn''t|mustn''t|can''t|couldn''t|wouldn''t|won''t|never|neither|nor|avoid|refrain(?:\s+from)?|instead of|rather than|without|no need to|not(?:\s+a\s+candidate)?\s+to|not|if\s+(?:you|we|an?\s+\w+|anyone))(?:\s+(?:attempt(?:ing)?\s+to|try(?:ing)?\s+(?:to|and)|need\s+to|have\s+to|seek\s+to|proceed\s+to|choose\s+to|recommend|propose|suggest|advise|run\s+kubectl|kubectl|ever|manually|directly|forcibly|force|automatically|blindly|arbitrarily)|\s+(?:delete|deleting|remove|removing|scale\s+down|scaling\s+down|right-?size|right-?sizing|touch|modify|edit|alter|cordon|drain|evict)(?:\s*,(?:\s+(?:or|nor|and))?(?=\s)|\s+(?:or|nor|and)(?=\s))){0,4}\s+(?:delete|remove|scale down|right-?size)\s+(?:(?:pod|pods|deployment|replicaset)\s+)?(?:(?:the|all|these|those|any)\s+)?(?:kube-system/)?gke-system-balloon-pod|(?!\b(?:do not|does not|did not|should not|must not|can not|cannot|could not|would not|will not|may not|don''t|doesn''t|didn''t|shouldn''t|mustn''t|can''t|couldn''t|wouldn''t|won''t|never|neither|nor|avoid|refrain(?:\s+from)?|instead of|rather than|without|no need to|not(?:\s+a\s+candidate)?\s+to|not|if\s+(?:you|we|an?\s+\w+|anyone))(?:\s+(?:attempt(?:ing)?\s+to|try(?:ing)?\s+(?:to|and)|need\s+to|have\s+to|seek\s+to|proceed\s+to|choose\s+to|recommend|propose|suggest|advise|run\s+kubectl|kubectl|ever|manually|directly|forcibly|force|automatically|blindly|arbitrarily)|\s+(?:delete|deleting|remove|removing|scale\s+down|scaling\s+down|right-?size|right-?sizing|touch|modify|edit|alter|cordon|drain|evict)(?:\s*,(?:\s+(?:or|nor|and))?(?=\s)|\s+(?:or|nor|and)(?=\s))){0,4}\s+(?:delete|remove|scale down|right-?size)\s+(?:(?:pod|pods|deployment|replicaset)\s+)?(?:(?:the|all|these|those|any)\s+)?(?:kube-system/)?gke-system-balloon-pod)[^\n])*?\b(?:delete|remove|scale down|right-?size)\s+(?:(?:pod|pods|deployment|replicaset)\s+)?(?:(?:the|all|these|those|any)\s+)?(?:kube-system/)?gke-system-balloon-pod'

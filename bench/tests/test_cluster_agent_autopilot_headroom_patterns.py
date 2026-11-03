@@ -77,6 +77,11 @@ def test_delegation_check_requires_successful_kanban_create() -> None:
             "kubectl get deployments -n kubeagents-system -o json",
             "kubectl top pods -n default --containers",
             "kubectl get pods -A | grep -v gke-system-balloon-pod",
+            "kubectl get pods -A | grep -vi balloon",
+            "kubectl get pods -A | grep -iv balloon",
+            "kubectl get pods -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name | grep -Ev 'balloon|kube-system'",
+            "kubectl get pods -A | grep -vE balloon",
+            "kubectl get pods -A | grep --invert-match balloon",
             "kubectl get pods -A -o json | jq '.items[] | select(.metadata.name | test(\"balloon\") | not)'",
         ],
     ],
@@ -84,7 +89,11 @@ def test_delegation_check_requires_successful_kanban_create() -> None:
 def test_non_system_workload_commands_pass_balloon_guard(commands: list[str]) -> None:
     transcript.set(
         output="",
-        trajectory=[],
+        trajectory=[
+            {"name": "terminal", "args": {"command": cmd}, "status": "completed", "agent": "cluster-host", "task": "t_1"}
+            for cmd in commands
+        ]
+        + [{"name": "kanban_complete", "args": {"result": "ok"}, "status": "completed", "agent": "cluster-host", "task": "t_1"}],
         worker_commands=[{"task": "t_1", "command": cmd} for cmd in commands],
     )
     try:
@@ -96,21 +105,57 @@ def test_non_system_workload_commands_pass_balloon_guard(commands: list[str]) ->
 
 
 @pytest.mark.parametrize(
-    "bad_command",
+    ("rendered_command", "typed_command"),
     [
-        "kubectl get pods -n kube-system | grep balloon",
-        "kubectl describe pod gke-system-balloon-pod-abc123 -n kube-system",
-        "kubectl get pod -n kube-system -l k8s-app=gke-system-balloon-pod -o yaml",
-        "kubectl logs -n kube-system gke-system-BALLOON-pod-0",
+        (
+            "kubectl get pods -n kube-system | grep balloon",
+            "kubectl get pods -n kube-system | grep balloon",
+        ),
+        (
+            "kubectl describe pod gke-system-balloon-pod-abc123 -n kube-system",
+            "kubectl describe pod gke-system-balloon-pod-abc123 -n kube-system",
+        ),
+        (
+            "kubectl get pod -n kube-system -l k8s-app=gke-system-balloon-pod -o yaml",
+            "kubectl get pod -n kube-system -l k8s-app=gke-system-balloon-pod -o yaml",
+        ),
+        (
+            "kubectl logs -n kube-system gke-system-BALLOON-pod-0",
+            "kubectl logs -n kube-system gke-system-BALLOON-pod-0",
+        ),
+        (
+            "bash /opt/data/scripts/cluster_preflight.sh --json + 1 command",
+            "bash /opt/data/scripts/cluster_preflight.sh --json && kubectl get pods -n kube-system -l run=gke-system-balloon-pod -o json",
+        ),
+        (
+            "bash /opt/data/scripts/cluster_preflight.sh --json + 1 command",
+            "bash /opt/data/scripts/cluster_preflight.sh --json; kubectl get pods -A | grep balloon",
+        ),
     ],
 )
-def test_balloon_inspection_commands_fail_guard(bad_command: str) -> None:
+def test_balloon_inspection_commands_fail_guard(rendered_command: str, typed_command: str) -> None:
     transcript.set(
         output="",
-        trajectory=[],
+        trajectory=[
+            {
+                "name": "terminal",
+                "args": {"command": "bash /opt/data/scripts/cluster_preflight.sh --json"},
+                "status": "completed",
+                "agent": "cluster-host",
+                "task": "t_1",
+            },
+            {
+                "name": "terminal",
+                "args": {"command": typed_command},
+                "status": "completed",
+                "agent": "cluster-host",
+                "task": "t_1",
+            },
+            {"name": "kanban_complete", "args": {"result": "ok"}, "status": "completed", "agent": "cluster-host", "task": "t_1"},
+        ],
         worker_commands=[
             {"task": "t_1", "command": "bash /opt/data/scripts/cluster_preflight.sh --json"},
-            {"task": "t_1", "command": bad_command},
+            {"task": "t_1", "command": rendered_command},
         ],
     )
     try:
@@ -193,6 +238,14 @@ def test_worker_doc_or_web_search_fails_guard(worker_entry: dict) -> None:
             "On GKE Autopilot, `gke-system-balloon-pod` reservations hold spare capacity for fast pod startup; "
             "never delete or right-size `gke-system-balloon-pod`."
         ),
+        (
+            "GKE Autopilot preempts `gke-system-balloon-pod` overprovisioned pods when user pods arrive; "
+            "do not delete, remove, or scale down these `kube-system/gke-system-balloon-pod` pods."
+        ),
+        (
+            "On GKE Autopilot, `gke-system-balloon-pod` holds headroom; "
+            "don't delete `gke-system-balloon-pod`."
+        ),
     ],
 )
 def test_report_explaining_autopilot_headroom_passes(good_report: str) -> None:
@@ -214,6 +267,18 @@ def test_report_explaining_autopilot_headroom_passes(good_report: str) -> None:
         "On GKE Autopilot, delete `kube-system/gke-system-balloon-pod` to save headroom.",
         "On GKE Autopilot, scale down all `gke-system-balloon-pod` reservations to free spare capacity.",
         "On GKE Autopilot, right-size the `gke-system-balloon-pod` deployment to save headroom.",
+        (
+            "- `gke-system-balloon-pod` pods are not user workloads\n"
+            "- delete `gke-system-balloon-pod` to reclaim 6 vCPU of Autopilot headroom"
+        ),
+        (
+            "`gke-system-balloon-pod` is Autopilot headroom, not waste, "
+            "but to reclaim vCPUs delete `gke-system-balloon-pod` with `kubectl`."
+        ),
+        (
+            "On GKE Autopilot, these placeholder pods do not run real workloads, "
+            "so delete `gke-system-balloon-pod` to free 6 vCPUs."
+        ),
     ],
 )
 def test_report_missing_headroom_or_proposing_removal_fails(bad_report: str) -> None:
