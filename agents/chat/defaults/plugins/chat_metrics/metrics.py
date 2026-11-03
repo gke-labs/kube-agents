@@ -1,5 +1,6 @@
-"""Inbound chat messages, new sessions and failed turns by platform, and the board's
-cards that gave up, in the Prometheus text exposition.
+"""Inbound chat messages, new sessions and failed turns by platform, the board's
+cards that gave up, and the proposals ledger by origin, read from Session KV,
+in the Prometheus text exposition.
 
 Hand-rolled, like the credential broker's registry: prometheus_client is not in
 the agent image, and four small counters do not justify a dependency

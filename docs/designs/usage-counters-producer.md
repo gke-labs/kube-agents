@@ -12,7 +12,7 @@ event or tool call. All of those now have an in-cluster source, the watcher's pe
 serves `kubeagents_tool_invocations_total`, `kubeagents_vcs_requests_total` and
 `kubeagents_broker_execution_failures_total` on its metrics-only listener, and the event watcher serves `k8s_event_watcher_events_injected_total` and `k8s_event_watcher_triage_sessions_total` on the gateway
 pod's `agent-api-auth` sidecar, and the `chat_metrics` plugin serves
-`kubeagents_chat_messages_inbound_total`, `kubeagents_chat_sessions_total`, `kubeagents_chat_turns_errored_total`, `kubeagents_kanban_tasks_gave_up_total` and `kubeagents_chat_feedback_negative_total` on the `platform-agent` container, all for the
+`kubeagents_chat_messages_inbound_total`, `kubeagents_chat_sessions_total`, `kubeagents_chat_turns_errored_total`, `kubeagents_kanban_tasks_gave_up_total`, `kubeagents_chat_feedback_negative_total` and the `kubeagents_proposals_opened` gauge on the `platform-agent` container, all for the
 managed-Prometheus collector.
 
 This document settles how the operator turns those series into the status fields: a poller
