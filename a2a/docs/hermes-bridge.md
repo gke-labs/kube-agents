@@ -46,9 +46,10 @@ container; `NATS_URL` for the `<agent>-a2a-nats` Service; `NATS_USER=bridge` and
 `NATS_PASSWORD` from the `bridge-password` key of `<agent>-a2a-nats-creds`;
 `BRIDGE_CONCURRENCY`; and `A2A_ACTIVITY_SECRET` from the same Secret's `bridge-activity-key`,
 optional; `BRIDGE_MEMORY_LIMIT_BYTES`, the container's own `limits.memory` through the
-Downward API, which the bridge turns into its Go soft memory limit (nine tenths of it; an
-explicit `GOMEMLIMIT` wins), so the limit it paces to is the one the cluster admitted, an
-Autopilot clamp to the request included; and `API_SERVER_KEY`, the bearer the agent's API server accepts, which the `api`
+Downward API, which the bridge turns into its Go soft memory limit (nine tenths of it; a
+`GOMEMLIMIT` set on the bridge itself wins, and the agent container's is not inherited), so
+the limit it paces to is the one the cluster admitted, an Autopilot clamp to the request
+included; and `API_SERVER_KEY`, the bearer the agent's API server accepts, which the `api`
 executor needs ([Executors](#executors)). It is set rather than inherited because the agent
 container's entry can come from an AgentPlugin's env, and a blank or unresolvable one would
 quietly switch the bridge to `cli`.
