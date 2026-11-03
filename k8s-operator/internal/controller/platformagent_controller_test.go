@@ -5476,14 +5476,15 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 		t.Fatalf("failed to get updated ConfigMap: %v", err)
 	}
 
-	// Verify repo-1.yaml and repo-2.yaml were created and scoped to all managed repos in org
-	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
-	expectedRepo2 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
+	// Verify repo-1.yaml and repo-2.yaml were created, each scoped to its own repository
+	// alone: listing every managed repository in every key made the ConfigMap quadratic.
+	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n"
+	expectedRepo2 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-2'\n"
 	if updatedCM.Data["repo-1.yaml"] != expectedRepo1 {
-		t.Errorf("expected repo-1.yaml to contain all managed repos in org, got %q", updatedCM.Data["repo-1.yaml"])
+		t.Errorf("expected repo-1.yaml to list repo-1 alone, got %q", updatedCM.Data["repo-1.yaml"])
 	}
 	if updatedCM.Data["repo-2.yaml"] != expectedRepo2 {
-		t.Errorf("expected repo-2.yaml to contain all managed repos in org, got %q", updatedCM.Data["repo-2.yaml"])
+		t.Errorf("expected repo-2.yaml to list repo-2 alone, got %q", updatedCM.Data["repo-2.yaml"])
 	}
 
 	// Verify unmanaged-static.yaml was NOT pruned
@@ -5747,10 +5748,15 @@ func TestSyncGithubTokenMinterConfigMap_AdoptsPreRenderedKeys(t *testing.T) {
 		t.Fatalf("failed to get updated ConfigMap: %v", err)
 	}
 
-	// Verify repo-1.yaml was adopted and updated to include both repos
-	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
+	// Verify repo-1.yaml was adopted and kept at its own repository, and repo-2.yaml rendered
+	// beside it listing repo-2 alone.
+	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n"
 	if updatedCM.Data["repo-1.yaml"] != expectedRepo1 {
-		t.Errorf("expected pre-rendered repo-1.yaml to be updated with all repos, got %q", updatedCM.Data["repo-1.yaml"])
+		t.Errorf("expected pre-rendered repo-1.yaml to list repo-1 alone, got %q", updatedCM.Data["repo-1.yaml"])
+	}
+	expectedRepo2 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-2'\n"
+	if updatedCM.Data["repo-2.yaml"] != expectedRepo2 {
+		t.Errorf("expected repo-2.yaml to list repo-2 alone, got %q", updatedCM.Data["repo-2.yaml"])
 	}
 
 	// Verify managed keys annotation includes both repo-1.yaml and repo-2.yaml
@@ -5992,10 +5998,10 @@ func TestSyncGithubTokenMinterConfigMap_ContextRepos(t *testing.T) {
 	if err := cl.Get(ctx, key, updatedCM); err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	for _, name := range []string{"tf-live.yaml", "tf-modules.yaml"} {
-		readScope = minterPolicyScopes(t, updatedCM.Data[name])["platform-agent-read-scope"].(map[string]interface{})
-		if got := fmt.Sprint(readScope["repositories"]); got != "[tf-live tf-modules]" {
-			t.Errorf("%s: expected every same-org context repository, got %s", name, got)
+	for _, name := range []string{"tf-live", "tf-modules"} {
+		readScope = minterPolicyScopes(t, updatedCM.Data[name+".yaml"])["platform-agent-read-scope"].(map[string]interface{})
+		if got := fmt.Sprint(readScope["repositories"]); got != "["+name+"]" {
+			t.Errorf("%s.yaml: expected the context repository alone, got %s", name, got)
 		}
 	}
 	if _, exists := updatedCM.Data["gitops.yaml"]; exists {
