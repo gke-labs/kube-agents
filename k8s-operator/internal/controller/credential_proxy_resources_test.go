@@ -324,7 +324,7 @@ func TestCredentialProxyVolumeLimitEnvFollowsTheRenderedSizeLimits(t *testing.T)
 			{Name: credentialProxyStateLimitEnv, Value: "1"},
 			{Name: credentialProxyTmpLimitEnv, Value: "1"},
 		}
-		ephemeral := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
+		ephemeral := resolveCredentialProxyResources(agent.Spec.Deployment, renderedSizingTier(agent)).Limits[corev1.ResourceEphemeralStorage]
 		sizeLimits := map[string]int64{}
 		for _, vol := range buildCredentialProxyRuntimeVolumes(agent) {
 			if vol.EmptyDir != nil && vol.EmptyDir.SizeLimit != nil {

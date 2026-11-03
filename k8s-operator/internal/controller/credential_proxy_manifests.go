@@ -998,7 +998,7 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 // against the whole limit, would read two half-full volumes about to evict
 // the pod as normal.
 func credentialProxyVolumeLimitEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
-	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
+	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment, renderedSizingTier(agent)).Limits[corev1.ResourceEphemeralStorage]
 	state := credentialProxyEmptyDirSizeLimit(credentialProxyStateSizeLimit, credentialProxyEphemeralStorageLimit, ephemeralLimit)
 	tmp := resource.MustParse(credentialProxyTmpSizeLimit)
 	stateBytes, tmpBytes := credentialProxyEvictionBytes(*state, tmp, ephemeralLimit)
