@@ -151,6 +151,38 @@ class StampTest(unittest.TestCase):
             sys.modules.pop(turn_context.TURN_CONTEXT_MODULE, None)
             self.assertEqual(GATEWAY_SESSION, kp.trusted_origin_session())
 
+    def _turn_context(self):
+        spec = importlib.util.spec_from_file_location("turn_context_under_test", TURN_CONTEXT)
+        turn_context = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(turn_context)
+        return turn_context
+
+    def test_an_empty_binding_falls_to_the_turns_session_context(self):
+        turn_context = self._turn_context()
+        session_context = SimpleNamespace(
+            get_session_env=lambda name, default="": GATEWAY_SESSION if name == "HERMES_SESSION_ID" else default
+        )
+        gateway = SimpleNamespace(session_context=session_context)
+
+        def turn():
+            turn_context.bind_session("")
+            return kp.trusted_origin_session()
+
+        with mock.patch.dict(sys.modules, {"gateway": gateway, "gateway.session_context": session_context}), \
+                mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "process-wide-stale"}):
+            self.assertEqual(GATEWAY_SESSION, contextvars.copy_context().run(turn))
+
+    def test_no_binding_and_no_session_env_is_no_session(self):
+        turn_context = self._turn_context()
+
+        def turn():
+            turn_context.bind_session("")
+            return kp.trusted_origin_session()
+
+        env = {k: v for k, v in os.environ.items() if k != "HERMES_SESSION_ID"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual("", contextvars.copy_context().run(turn))
+
     def test_the_class_boundary_is_the_floor(self):
         self.assertTrue(kp.is_user_priority(kp.USER_PRIORITY))
         self.assertFalse(kp.is_user_priority(kp.USER_PRIORITY - 1))

@@ -383,12 +383,22 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 
-	b.recordOrigin(taskCtx, sessionID, run.origin)
+	// The session's origin and its conversation route are written side by
+	// side under one deadline, so a store that hangs delays the first turn
+	// by one timeout, not two.
+	recordCtx, cancelRecord := context.WithTimeout(taskCtx, routeTimeout)
+	originDone := make(chan struct{})
+	go func() {
+		defer close(originDone)
+		b.recordOrigin(recordCtx, sessionID, run.origin)
+	}()
 	// Recorded before the first turn, so a card any turn files finds it;
 	// every turn of the task is the same session and conversation. Best
 	// effort: the task runs either way, and a failure is said in the answer.
 	routeLost := false
-	routeErr := b.recordRoute(taskCtx, sessionID, run.origin)
+	routeErr := b.recordRoute(recordCtx, sessionID, run.origin)
+	<-originDone
+	cancelRecord()
 	if routeErr != nil && !errors.Is(routeErr, errNoChatConversation) && !errors.Is(routeErr, errRouteDisabled) {
 		b.cfg.Logger.Warn("conversation route not recorded; a card this task files cannot report back",
 			"task", taskID, "session", sessionID, "err", routeErr)

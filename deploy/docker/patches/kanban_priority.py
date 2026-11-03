@@ -103,8 +103,8 @@ BACKGROUND_SESSION_PREFIXES = ("k8s-evt-", "cron-")
 
 #: Where the chat session_store plugin publishes the Hermes session id it binds
 #: for a gateway turn (agents/chat/defaults/plugins/session_store/turn_context.py
-#: TURN_CONTEXT_MODULE), and the gateway's session env read when no plugin
-#: loaded that module in this process.
+#: TURN_CONTEXT_MODULE), and the gateway's per-turn session env read when that
+#: binding is empty or no plugin loaded the module in this process.
 TURN_CONTEXT_MODULE = "kube_agents_turn_context"
 GATEWAY_SESSION_ENV = "HERMES_SESSION_ID"
 
@@ -136,7 +136,7 @@ def trusted_origin_session() -> str:
     It reads the gateway's ContextVars, not anything the model passed. On a
     gateway platform turn that id is empty, so the Hermes session id the
     session_store plugin bound at dispatch is read instead, and failing that
-    the gateway's ``HERMES_SESSION_ID``.
+    the turn's ``HERMES_SESSION_ID`` from Hermes' session context.
     """
     try:
         from tools.async_delegation import _current_origin_session_id
@@ -146,13 +146,24 @@ def trusted_origin_session() -> str:
         api_session = ""
     if api_session:
         return api_session
+    bound = ""
     turn_context = sys.modules.get(TURN_CONTEXT_MODULE)
     if turn_context is not None:
         try:
-            return turn_context.current_session() or ""
+            bound = turn_context.current_session() or ""
         except Exception:  # noqa: BLE001 — an unreadable binding is no session
-            return ""
-    return os.environ.get(GATEWAY_SESSION_ENV, "")
+            bound = ""
+    return bound or _session_env(GATEWAY_SESSION_ENV)
+
+
+def _session_env(name: str) -> str:
+    """A ``HERMES_SESSION_*`` value from the turn's session context, else the process env."""
+    try:
+        from gateway.session_context import get_session_env
+
+        return get_session_env(name, "") or ""
+    except Exception:  # noqa: BLE001 — not inside Hermes (tests), or a Hermes without it
+        return os.environ.get(name, "")
 
 
 def stamp_priority(

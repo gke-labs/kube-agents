@@ -288,6 +288,8 @@ def log_event_to_db(
     **kwargs: Any,
 ) -> Optional[Dict[str, str]]:
     """Persist session metadata before Hermes dispatches a gateway message."""
+    # Cleared first and kept after return: the turn runs later in this task's
+    # context (turn_context.py says where Hermes copies it).
     turn_context.bind_session("")
     try:
         source = getattr(event, "source", None)

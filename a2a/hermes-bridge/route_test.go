@@ -21,6 +21,8 @@ type routeStore struct {
 	status  int
 	puts    []routePut
 	origins []originPut
+	// originStatus answers origin writes; zero is 200.
+	originStatus int
 }
 
 // originPut is one origin record write the store took, kept apart from the
@@ -51,8 +53,12 @@ func newRouteStore(t *testing.T, status int) *routeStore {
 			_ = json.Unmarshal(raw, &origin)
 			s.mu.Lock()
 			s.origins = append(s.origins, originPut{path: r.Method + " " + r.URL.Path, auth: r.Header.Get("Authorization"), body: origin})
+			status := s.originStatus
 			s.mu.Unlock()
-			w.WriteHeader(http.StatusOK)
+			if status == 0 {
+				status = http.StatusOK
+			}
+			w.WriteHeader(status)
 			return
 		}
 		var body conversationRoute
@@ -490,27 +496,36 @@ func TestRecordRoute_AConsoleRouteForAnotherTurnIsNotTheSame(t *testing.T) {
 // label as its platform, the console is "console", and the A2A and inject doors are "api".
 func TestRecordOriginBeforeTheFirstTurnPerBackend(t *testing.T) {
 	cases := []struct {
-		backend, conversation, origin, platform string
+		name, backend, conversation, origin, platform string
+		// originStatus is the store's answer to the origin write; zero is 200.
+		originStatus int
 	}{
-		{"gchat", "gchat:spaces/S1", "chat", "googlechat"},
-		{"slack", "slack:dm/D1", "chat", "slack"},
-		{"discord", "discord:C1", "chat", "discord"},
-		{"console", "console:tok-1", "console", ""},
-		{"a2a", "a2a:ctx", "api", ""},
-		{"a2a-google", "a2a-google:ctx", "api", ""},
-		{"inject", "inject:eval/run", "api", ""},
+		{"gchat", "gchat", "gchat:spaces/S1", "chat", "googlechat", 0},
+		{"slack", "slack", "slack:dm/D1", "chat", "slack", 0},
+		{"discord", "discord", "discord:C1", "chat", "discord", 0},
+		{"console", "console", "console:tok-1", "console", "", 0},
+		{"a2a", "a2a", "a2a:ctx", "api", "", 0},
+		{"a2a-google", "a2a-google", "a2a-google:ctx", "api", "", 0},
+		{"inject", "inject", "inject:eval/run", "api", "", 0},
+		// A store that fails the write: the turn still runs, and the failure is a Warn.
+		{"store-500", "slack", "slack:dm/D2", "chat", "slack", http.StatusInternalServerError},
 	}
 	for _, tc := range cases {
-		t.Run(tc.backend, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			_, url := startServer(t)
 			store := newRouteStore(t, http.StatusOK)
+			store.originStatus = tc.originStatus
+			logs := &lockedBuffer{}
 			stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
 				if len(store.seenOrigins()) == 0 {
 					t.Error("the turn reached the API server before the origin was recorded")
 				}
 				writeCompletion(w, c.sessionID, "done")
 			})
-			startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+			startAPIBridge(t, url, stub, func(c *Config) {
+				c.RouteURL, c.RouteKey = store.srv.URL, "kv-key"
+				c.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+			})
 			c := gatewayClient(t, url)
 
 			taskID, ctxID := "task-origin", "ctx-origin"
@@ -539,6 +554,10 @@ func TestRecordOriginBeforeTheFirstTurnPerBackend(t *testing.T) {
 				body: sessionOrigin{Origin: tc.origin, Platform: tc.platform}}
 			if got := store.seenOrigins(); len(got) != 1 || got[0] != want {
 				t.Fatalf("origin PUTs = %+v, want %+v", got, want)
+			}
+			warned := strings.Contains(logs.String(), "level=WARN msg=\"session origin not recorded\"")
+			if wantWarn := tc.originStatus != 0; warned != wantWarn {
+				t.Fatalf("origin Warn logged = %v, want %v; logs:\n%s", warned, wantWarn, logs.String())
 			}
 		})
 	}
