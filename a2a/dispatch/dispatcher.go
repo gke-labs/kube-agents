@@ -619,9 +619,12 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		_ = del.Nak(d.cfg.RetryDelay)
 		return
 	}
-	d.clearWaiting(taskID)
+	d.offeringWaiting(taskID)
 
 	rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
+	if err == nil && key != "" {
+		d.clearWaiting(taskID)
+	}
 	if err != nil || key == "" {
 		d.release(h, false)
 		if err != nil {
