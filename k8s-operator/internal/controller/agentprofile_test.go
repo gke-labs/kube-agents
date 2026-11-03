@@ -576,16 +576,13 @@ func TestTheNATSFenceAdmitsTheOperatorFromItsOwnNamespace(t *testing.T) {
 func TestRenderedProfilesAuthMapMatchesTheCalloutFixture(t *testing.T) {
 	withOperatorBusPrincipal(t)
 	agent := authMapTestAgent()
-	cm, _, err := buildA2AAuthMapConfigMap(agent, []agentv1alpha1.AgentProfile{
+	cm, _ := singleA2AAuthMapShard(t, agent, []agentv1alpha1.AgentProfile{
 		testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
 			p.Spec.Bus.PublishTopics = []string{"agent.auditor.findings"}
 			p.Spec.Bus.SubscribeTopics = []string{"shared.blueprint"}
 		}),
 		testAgentProfile(agent.Namespace, "cluster-a"),
 	})
-	if err != nil {
-		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
-	}
 	checkFixture(t, profilesMapFixturePath, cm.Data[a2aAuthMapKey])
 }
 

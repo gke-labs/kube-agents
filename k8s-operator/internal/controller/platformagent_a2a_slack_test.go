@@ -426,7 +426,7 @@ func TestNoRenderedRoleReachesASecret(t *testing.T) {
 	agent := a2aTestAgent()
 	roles := map[string][]rbacv1.PolicyRule{
 		"a2a gateway":        buildA2AGatewayRole(agent).Rules,
-		"a2a callout":        buildA2ACalloutRole(agent).Rules,
+		"a2a callout":        buildA2ACalloutRole(agent, 1).Rules,
 		"broker tokenreview": buildCredentialBrokerTokenReviewRole(agent).Rules,
 		"platform minimal":   buildMinimalPlatformRole(agent).Rules,
 		"platform local":     buildPlatformLocalRole(agent).Rules,
