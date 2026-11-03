@@ -4,8 +4,10 @@ and the value's path to the CR.
 The medium and fleet rows are declared twice: once as the constants in
 k8s-operator/internal/controller/sizing_profile.go, which the operator renders, and
 once as kube-agents.sizingTierRows in the chart, which the quota preflight sums and the
-CR template merges the proxy override over. This test fails if the chart's copy drifts,
-as tests/test_agent_api_auth_sizing_parity.py does for the small row. It also renders
+CR template merges the proxy override over. This test fails if either copy drifts: a chart
+row whose figure differs from the operator's constant or that names no constant, and an
+operator medium or fleet constant that no chart row carries, as
+tests/test_agent_api_auth_sizing_parity.py does for the small row. It also renders
 the chart with the value set, unset and misspelt, so the field's path to the CR, the
 CRD-presence guard's arguments and the schema's enum each have a red when they change.
 """
@@ -50,6 +52,13 @@ ROWS = (
     ("fleet", "credentialProxy", "limits", "ephemeral-storage", "credentialProxyFleetEphemeralStorageLimit"),
     ("fleet", "agentAPIAuth", "limits", "memory", "agentAPIAuthFleetMemoryLimit"),
     ("fleet", "shellSandbox", "limits", "memory", "shellSandboxFleetMemoryLimit"),
+)
+# Every medium or fleet constant sizing_profile.go declares for one of the three containers
+# the profile sizes. Held equal to the constants ROWS names, so a figure added on the
+# operator's side with no chart row behind it fails here rather than at the quota preflight
+# that would count the smaller row.
+OPERATOR_ROW_CONSTANT_RE = re.compile(
+    r'^\s*((?:credentialProxy|agentAPIAuth|shellSandbox)\w*(?:Medium|Fleet)\w*)\s*=\s*"', re.MULTILINE
 )
 PROBE_TEMPLATE = """
 apiVersion: v1
@@ -119,6 +128,16 @@ class SizingTierRowsParity(unittest.TestCase):
                 for side, keys in sides.items():
                     for key in keys:
                         self.assertIn((tier, container, side, key), seen, f"chart row {tier}.{container}.{side}.{key} has no operator constant in ROWS")
+
+
+class OperatorRowConstantsHaveAChartRow(unittest.TestCase):
+    """Every medium or fleet constant the operator declares is named by ROWS, the other
+    direction of the parity above; this one needs no helm."""
+
+    def test_every_operator_row_constant_is_in_rows(self) -> None:
+        declared = set(OPERATOR_ROW_CONSTANT_RE.findall(OPERATOR.read_text(encoding="utf-8")))
+        self.assertTrue(declared, f"{OPERATOR.relative_to(REPO_ROOT)} declares no medium or fleet constant")
+        self.assertEqual(declared, {row[4] for row in ROWS})
 
 
 @unittest.skipUnless(HELM, "helm is not installed")
