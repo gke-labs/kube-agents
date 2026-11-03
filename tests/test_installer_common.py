@@ -6062,6 +6062,9 @@ _ECHO_HELM = (
 )
 
 _FOOTPRINT_LABEL = "(modeled from us-central1 list prices, excluding LLM tokens)"
+# The resource kube-agents.gkeAutopilot probes; the installer tells its render the cluster
+# serves it unless the tfvars say standard, and the notes' parity render here does the same.
+_AUTOPILOT_API = "auto.gke.io/v1/AllowlistedWorkload"
 _NOTES_SETS = [
     "--set", "platformAgent.harness.clusterName=ci-cluster",
     "--set", "platformAgent.harness.location=us-central1",
@@ -6178,6 +6181,9 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertTrue(args_line.startswith("args: template footprint-summary "), args_line)
         for item in _FOOTPRINT_EXPECTED_SETS:
             self.assertIn(item, args_line)
+        # The tfvars say autopilot: the render is told the cluster serves the resource the
+        # chart probes, so the credential proxy is counted at its Autopilot requests.
+        self.assertIn(f"--api-versions {_AUTOPILOT_API}", args_line)
         # The block scalar's indent is stripped and nothing but its lines come out.
         self.assertIn("\nsecond line\n", proc.stdout)
         self.assertNotIn("kind: ConfigMap", proc.stdout)
@@ -6217,8 +6223,11 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("This is a GKE Standard cluster", proc.stdout)
         # The install creates a gVisor pool only when asked; the sentence claims no pool.
         self.assertNotIn("gVisor", proc.stdout)
+        # And its render is not told the cluster is Autopilot.
+        self.assertNotIn("--api-versions", proc.stdout)
         proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM)
         self.assertNotIn("GKE Standard cluster", proc.stdout)
+        self.assertIn(f"--api-versions {_AUTOPILOT_API}", proc.stdout)
 
     def test_extra_helm_values_are_named_as_outside_the_figure(self):
         script = f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"'
@@ -6282,6 +6291,18 @@ class FootprintSummaryTest(unittest.TestCase):
         # the settings the tfvars carry reached the render.
         self.assertIn("Persistent storage:  410 GiB over 5 claims", proc.stdout)
         self.assertIn("Pods:                12", proc.stdout)
+        # The tfvars say autopilot, so the credential proxy is counted at the operator's
+        # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
+        # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
+        self.assertIn("CPU requests:        4.400 cores", proc.stdout)
+        self.assertIn("Memory requests:     10.59 GiB", proc.stdout)
+        standard = self._run(
+            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
+        )
+        self.assertIn("rc=0", standard.stdout, standard.stderr)
+        self.assertIn("CPU requests:        2.900 cores", standard.stdout)
+        self.assertIn("Memory requests:     9.59 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
         self.assertIn("Not counted: the spec.mode next workloads", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
@@ -6290,7 +6311,7 @@ class FootprintSummaryTest(unittest.TestCase):
             chart = chart_with_notes_probe(_REPO_ROOT / "charts" / "kube-agents", pathlib.Path(tmp) / "kube-agents")
             rendered = subprocess.run(
                 ["helm", "template", "test-release", str(chart), "--show-only",
-                 NOTES_PROBE_TEMPLATE, *_NOTES_SETS],
+                 NOTES_PROBE_TEMPLATE, "--api-versions", _AUTOPILOT_API, *_NOTES_SETS],
                 capture_output=True, text=True, check=True,
             )
             notes_text = json.loads(rendered.stdout.split("notes: ", 1)[1].strip())

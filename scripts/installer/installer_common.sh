@@ -107,7 +107,9 @@ readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
 # the chart's helpers, values and footprint file plus a one-template probe, so
 # it prints the figures the chart's notes carry without crossing any other
 # template's gates (a minter without an App ID, a console on a cluster without
-# NetworkPolicy). The apply goes through Terraform, which shows no notes, so
+# NetworkPolicy), told the cluster's shape the way the chart probes it, since
+# the notes on an Autopilot cluster count the credential proxy at the
+# operator's Autopilot requests. The apply goes through Terraform, which shows no notes, so
 # this summary is the one place the front door prints them; after the apply,
 # `helm get notes` is the command that does.
 readonly FOOTPRINT_CHART_SUBDIR="charts/kube-agents"
@@ -124,6 +126,13 @@ readonly FOOTPRINT_PROBE_INDENT=4
 # billed for its node pools instead.
 readonly FOOTPRINT_CLUSTER_MODE_KEY="cluster_mode"
 readonly FOOTPRINT_STANDARD_CLUSTER_MODE="standard"
+# The API the chart's kube-agents.gkeAutopilot probes to count the credential
+# proxy at the operator's Autopilot requests. `helm template` sees no cluster,
+# so the render is told the cluster serves it whenever the tfvars' cluster_mode
+# is not standard; otherwise the installer's figure would carry the Standard
+# pair footprint.yaml records while the notes on the cluster carry the
+# Autopilot pair.
+readonly FOOTPRINT_AUTOPILOT_API_VERSION="auto.gke.io/v1/AllowlistedWorkload"
 # The tfvars key the release namespace is written under, for the `helm get
 # notes` hint; the placeholder stands in when the file does not carry it.
 readonly FOOTPRINT_NAMESPACE_KEY="namespace"
@@ -970,6 +979,9 @@ render_footprint_summary() {
     [ -n "$value" ] || continue
     set_args+=(--set "${pair#*=}=${value}")
   done <<< "$FOOTPRINT_TFVARS_VALUE_MAP"
+  if [ "$(tfvars_scalar "$tfvars_file" "$FOOTPRINT_CLUSTER_MODE_KEY")" != "$FOOTPRINT_STANDARD_CLUSTER_MODE" ]; then
+    set_args+=(--api-versions "$FOOTPRINT_AUTOPILOT_API_VERSION")
+  fi
   local rendered rc=0
   rendered="$(helm template "$FOOTPRINT_PROBE_RELEASE" "$probe_dir" ${set_args[@]+"${set_args[@]}"} 2>&1)" || rc=$?
   rm -rf "$probe_dir"

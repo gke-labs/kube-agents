@@ -1225,7 +1225,10 @@ cluster the bill is the node pools, which pod requests do not price. Helm prints
 after an install or upgrade, and on `helm install --dry-run` without applying (`helm template`
 renders no notes). `install.sh` applies through Terraform, which shows no notes, so it renders
 the same template in its pre-flight summary and prints the figures the notes carry, for the
-values its generator writes; `helm get notes kube-agents -n <namespace>` prints them after the
+values its generator writes, telling the render the cluster serves the `auto.gke.io`
+AllowlistedWorkload resource unless the generated `cluster_mode` is `standard`, so the
+credential proxy is counted at the operator's Autopilot requests there as the notes count it
+on the cluster; `helm get notes kube-agents -n <namespace>` prints them after the
 apply. It follows
 `quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
 refusals name that switch as the way round them, but not the preflight's quota gate: it sums
