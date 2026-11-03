@@ -289,9 +289,10 @@ class TestClone(InspectRepositoryTestCase):
         )
         self.assertEqual(result["written"], 3)
 
-    def test_without_force_the_snapshot_unpacks_into_the_destination(self):
+    def test_a_destination_the_clone_creates_is_unpacked_into_directly(self):
         """No staging of the script's: the client stages once, beside `into`."""
         into = self.tmp / "copy"
+        self.assertFalse(into.exists())
         with patch.object(vcs_client, "snapshot", wraps=vcs_client.snapshot) as snapshot, patch.object(
             inspect_repository.tempfile, "mkdtemp", wraps=tempfile.mkdtemp
         ) as mkdtemp:
@@ -309,6 +310,28 @@ class TestClone(InspectRepositoryTestCase):
         self.assertTrue(snapshot.call_args.kwargs["into"].name.startswith(".copy."))
         self.assertEqual(self.staging_left(), [])
 
+    def test_the_current_directory_by_its_full_path_stays_valid(self):
+        """The snapshot must not remove an empty `into` that existed and put a new one there."""
+        work = self.tmp / "work"
+        work.mkdir()
+        cwd = os.getcwd()
+        os.chdir(work)
+        self.addCleanup(os.chdir, cwd)
+        self.run_command(["clone", "--repo", "acme/public", "--into", str(work)])
+        self.assertEqual(sorted(os.listdir(".")), ["README.md", "cmd"])
+        self.assertEqual(Path("cmd/main.go").read_text(), "func main() { serve() }\n")
+
+    def test_a_link_to_an_empty_directory_is_written_through(self):
+        target = self.tmp / "target"
+        target.mkdir()
+        link = self.tmp / "copy"
+        link.symlink_to(target)
+        result = self.run_command(["clone", "--repo", "acme/public", "--into", str(link)])
+        self.assertEqual(result["written"], 3)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual((target / "cmd" / "main.go").read_text(), "func main() { serve() }\n")
+        self.assertEqual(self.staging_left(), [])
+
     def test_the_current_directory_can_be_the_destination(self):
         work = self.tmp / "work"
         work.mkdir()
@@ -317,8 +340,9 @@ class TestClone(InspectRepositoryTestCase):
         self.addCleanup(os.chdir, cwd)
         self.run_command(["clone", "--repo", "acme/public", "--into", "."])
         self.assertEqual((work / "cmd" / "main.go").read_text(), "func main() { serve() }\n")
-        # With no name, the staging patterns are `..*` and `...*`, inside `into`.
-        hidden = work / "..notes"
+        # With no name, the staging names are `..XXXXXXXX` and
+        # `...XXXXXXXX.XXXXXXXX`, inside `into`.
+        hidden = work / "..abc12345"
         hidden.mkdir()
         old = time.time() - 2 * inspect_repository.STALE_STAGING_AGE_SECONDS
         os.utime(hidden, (old, old))
@@ -369,6 +393,13 @@ class TestClone(InspectRepositoryTestCase):
             ".copy.fresh123": False,  # young
             ".other.abc12345": False,  # another destination's
             "copy-notes": False,
+            ".copy.backup": False,  # the caller's: not a mkdtemp suffix
+            ".copy.d": False,
+            ".copy.cfg.d": False,
+            ".copy.abc12345.bak": False,
+            "..copy.backup": False,
+            "..copy.abc12345": False,
+            "..copy.abc12345.def67890.bak": False,
         }
         for name in names:
             (self.tmp / name).mkdir()

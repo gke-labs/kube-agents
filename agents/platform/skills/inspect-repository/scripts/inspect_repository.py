@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -109,14 +110,18 @@ def remove_stale_staging(into: Path) -> None:
 
     A clone stages beside `into` and removes the staging directory in a
     `finally`, which a SIGKILL does not run. Two names are staging: the
-    script's and the client's (`.{name}.*`), and the client's inside the
-    script's (`..{name}.*`). Only a directory older than
-    STALE_STAGING_AGE_SECONDS is removed. A failure here does not stop the clone.
+    script's and the client's (`.{name}.XXXXXXXX`), and the client's inside the
+    script's (`..{name}.XXXXXXXX.XXXXXXXX`). Each `XXXXXXXX` is the suffix of
+    `tempfile.mkdtemp`: 8 characters from `a-z`, `0-9` and `_`. Only these
+    exact names match, so a name such as `.{name}.backup` stays. Only a
+    directory older than STALE_STAGING_AGE_SECONDS is removed. A failure here
+    does not stop the clone.
     """
     if not into.name:
         # `--into .` stages inside `into`, so the names would match the caller's files.
         return
-    prefixes = (f".{into.name}.", f"..{into.name}.")
+    name = re.escape(into.name)
+    staging = re.compile(rf"\.{name}\.[a-z0-9_]{{8}}|\.\.{name}\.[a-z0-9_]{{8}}\.[a-z0-9_]{{8}}")
     cutoff = time.time() - STALE_STAGING_AGE_SECONDS
     try:
         entries = list(into.parent.iterdir())
@@ -125,7 +130,7 @@ def remove_stale_staging(into: Path) -> None:
     for path in entries:
         try:
             # `rmtree` refuses a symbolic link, so a link is never followed.
-            if path.name.startswith(prefixes) and path.is_dir() and path.stat().st_mtime < cutoff:
+            if staging.fullmatch(path.name) and path.is_dir() and path.stat().st_mtime < cutoff:
                 shutil.rmtree(path, ignore_errors=True)
         except OSError:
             continue
@@ -189,18 +194,23 @@ def clone_content(args) -> int:
     """Take one snapshot into `into`, or with `--force` beside it and copy it over.
 
     The snapshot unpacks only into an empty directory, and it stages beside
-    that directory itself. Without `--force`, `into` is empty, so the snapshot
-    unpacks into it directly. `--force` is how a caller adds a second
-    `--prefix` to a tree it is building (the fleet audit does). So then the
-    snapshot lands beside `into` and is copied over it.
+    that directory itself. If the clone creates `into`, the snapshot unpacks
+    into it directly. `--force` is how a caller adds a second `--prefix` to a
+    tree it is building (the fleet audit does). So then the snapshot lands
+    beside `into` and is copied over it. A destination that existed before
+    the clone is staged the same way.
     """
     into = Path(args.into).expanduser() if args.into else default_into(args.repo)
     remove_stale_staging(into)
+    existed = into.exists() or into.is_symlink()
     into = prepare_destination(into, args.force)
     paths = [args.prefix] if args.prefix else None
-    # `--into .` has no name, and the snapshot cannot replace the current
-    # directory. So it stages as `--force` does.
-    staged = args.force or not into.name
+    # The snapshot removes an empty destination and moves its own directory
+    # to that name. That is safe only for a directory the clone made. A
+    # directory that existed can be the current directory (`.` or its full
+    # path), a symbolic link to a directory, or a mount point. So it stages
+    # as `--force` does, and the copy goes into the directory that is there.
+    staged = args.force or existed
     staging = (
         Path(tempfile.mkdtemp(dir=str(into.parent), prefix=f".{into.name}."))
         if staged
