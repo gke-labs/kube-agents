@@ -9005,6 +9005,38 @@ def test_verified_claims_backed_a_clipped_output_checks_only_the_command():
     assert res.status == "pass" and "1 excerpt(s) not checked, output clipped" in res.reason
 
 
+# A refused call's result as the pod stores it: the JSON, then the note hermes
+# appends after a 403, which is advice to the model and not output.
+_LOGS_CMD = "kubectl logs -n seeded-debug -l app=payments-api --previous --tail=50"
+_LOGS_ERROR = (
+    'Error from server (Forbidden): pods "payments-api-79b77b8c67-tmfvz" is forbidden: User '
+    '"kubeagents-platform-gsa@kube-agents-evals-23.iam.gserviceaccount.com" cannot get resource "pods/log" '
+    'in API group "" in the namespace "seeded-debug": requires one of ["container.pods.getLogs"] permission(s).'
+)
+_LOGS_WARNING = (
+    "\n\n[Tool loop warning: permission_denied; count=0; Permission denied by the API (403). Treat it as final "
+    "for this action: do not retry it through another command, tool, flag or identity.]"
+)
+_LOGS_OUT = json.dumps({"output": _LOGS_ERROR, "exit_code": 1, "error": None}) + _LOGS_WARNING
+
+
+def test_verified_claims_backed_reads_the_output_before_an_appended_tool_loop_warning():
+    excerpt = _LOGS_ERROR[: _LOGS_ERROR.index(" in API group")]
+    res = _grade_claims(_block(_LOGS_CMD, excerpt), [_terminal(_LOGS_CMD, result=_LOGS_OUT)])
+    assert res.status == "pass" and "not checked" not in res.reason, res
+
+
+def test_verified_claims_backed_a_clip_inside_the_warning_leaves_the_output_whole():
+    clipped = _LOGS_OUT[: len(_LOGS_OUT) - 40] + " ...[clipped 40 chars]"
+    res = _grade_claims(_block(_LOGS_CMD, _LOGS_ERROR[:60]), [_terminal(_LOGS_CMD, result=clipped)])
+    assert res.status == "pass" and "not checked" not in res.reason, res
+
+
+def test_verified_claims_backed_an_invented_excerpt_fails_despite_the_warning():
+    res = _grade_claims(_block(_LOGS_CMD, "OOMKilled exit code 137 in the previous container"), [_terminal(_LOGS_CMD, result=_LOGS_OUT)])
+    assert res.status == "fail" and "is not in the output of" in res.reason, res
+
+
 def test_verified_claims_backed_finds_an_excerpt_in_a_clipped_head():
     out = json.dumps({"output": "phase \u2026 node-b NotReady " + "x" * 3000, "exit_code": 0})
     clipped = out[:200] + " ...[clipped 3000 chars]"
