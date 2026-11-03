@@ -49,7 +49,9 @@ Three properties make this sound for grading:
 
 - **A hit means the model saw the same input.** The key covers the whole request: system prompt,
   tool schemas, the model alias, and every message so far, including every tool result, with one
-  exception (the recent-work digest, below). A stored answer is a real sample from the model for
+  exception (the recent-work digest, below). That includes settings like temperature, max tokens,
+  reasoning settings and tool choice; only fields that change how the answer is delivered
+  (`stream`) or who is asking (`user`, `metadata`) are left out. A stored answer is a real sample from the model for
   that exact input. What serving it loses is independence between samples, and under pass-only
   recordings (below) it is also a sample drawn only from runs that passed, which biases a replayed
   run towards passing.
@@ -117,6 +119,12 @@ The rules that keep this safe:
   `lastSeen` field, or "… ago". Kubernetes writes CPU the same way (`120m` means 0.12 of a core),
   and cases get graded on CPU and memory numbers, so those are never touched. (The prototype
   swapped any number ending in `m`; this rule replaces that.)
+- **Times and IP addresses keep what they mean.** A timestamp isn't just an ID: whether it's in the
+  past or the future can be the whole finding (an expired certificate, a CronJob that hasn't run for
+  a month). So timestamps, both dates and epoch seconds, become a token for roughly how far from now
+  they are ("minutes ago", "days ago", "in the future", and so on), and an expired certificate never
+  matches a valid one. IP addresses stay as they are whenever the request mentions a network range
+  (like `10.0.0.0/16`), because then which range an IP falls in can matter.
 - **Opaque fields are never touched.** Fields named for signatures, `provider_specific_fields`,
   and the `id`/`tool_call_id` of tool calls: LiteLLM embeds Gemini's thought signature in
   tool-call ids (`call_…__thought__<base64>`), and rewriting a digit inside it corrupts the
@@ -141,7 +149,9 @@ inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_
 `resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages. Epoch seconds are
 replaced by a fixed token, because two events in one second would otherwise shift every later
 number. Known gaps from the measurements: `ls -l` dates (`Nov  2 04:13`) and Hermes'
-terminal-output cache file suffixes (`…-89b0.log`).
+terminal-output cache file suffixes (`…-89b0.log`). The rules above change two of these classes:
+timestamps get a how-far-from-now token, and IPs stay as they are when a network range is in the
+request.
 
 ## Measurements
 
@@ -229,7 +239,10 @@ that the proxy doesn't have.
 by LiteLLM's disruption budget, its pod spreading rule, its metrics scraping, and the console's
 metrics. The metrics matter most: those tools add up `/metrics` from every `app: litellm` pod. If
 the proxy forwarded `/metrics` to LiteLLM, one LiteLLM pod's numbers would be counted twice. So the
-proxy answers `/metrics` itself, with its own numbers or nothing.
+proxy answers `/metrics` itself, with its own numbers or nothing. Two more: the LiteLLM Deployment
+picks its pods by `app: litellm` alone, so it overlaps with the proxy pod, and the operator's
+LiteLLM network policy applies to the proxy too (which is why the proxy needs its own extra policy
+to reach LiteLLM).
 
 ### One shared cache for all eval projects
 
@@ -242,8 +255,10 @@ cluster versions, different planted problems), their requests differ and the cac
 cache per project would only lose hits we could have had, and every time a prompt changes we'd have
 to refill it once per project instead of once.
 
-The cache lives in a storage bucket that only the eval projects use. It's never shared with dev
-installs or customer installs, because the saved answers contain details about our test clusters.
+The cache lives in a bucket in `kube-agents-prow`, the project that holds the eval system's
+permanent pieces, not in one of the eval-pool projects (the presubmit's account is an admin on all of
+those). It's never shared with dev installs or customer installs, because the saved answers contain
+details about our test clusters.
 
 **The proxy has to remove secrets itself.** It sees every request before anything is cleaned up.
 LiteLLM does have a redaction plugin, but it's off by default and CI doesn't turn it on. So before
@@ -251,7 +266,9 @@ the proxy stores anything, it runs the same cleanup that `worker_trajectory.py` 
 install's `AuditRedactor`, then the rules in `worker_transcript.py`). That cleanup already runs on the
 full tool output in today's eval records, but only the first 2,000 characters of each result are
 kept, so nobody has looked at what it leaves in the rest. We need to check it on full-length output,
-like a Secret dump or a token, before storing any request text.
+like a Secret dump or a token, before storing any request text. And if the cleanup would change an
+answer, that answer isn't saved: replaying it would put `[REDACTED]` into a tool call, and saving it
+uncleaned would put a secret in the bucket.
 
 ### Who can write to the cache
 
@@ -272,7 +289,9 @@ inside the cluster, the job copies them out while it runs, and only these two ca
 shared cache:
 
 - **The nightly.** It runs `main`'s code as `eval-baseline-recorder` and uploads answers from runs
-  that passed.
+  that passed. It streams them out of the cluster as it goes, the way it already streams its
+  results, instead of keeping them there until the end. Its eval cluster is a pool project too, so a
+  pull request job could reach in and change answers left sitting there for hours.
 - **A copy job that runs when a pull request merges.** It runs as a trusted account and copies the
   merged pull request's answers into the shared cache, but only from a presubmit that ran the full
   eval matrix on the exact code that merged. That's safe because by then that code has been
@@ -306,8 +325,9 @@ which need checking before we build:
 - A staging bucket where builds can add files but not overwrite them, with each build also saving a
   list of what it wrote for the copy job to check.
 
-Pull requests read the shared cache using the runner's own read-only token, passed into the cluster,
-not through an account that lives in the cluster.
+Pull requests read the shared cache through a dedicated account that can only read that one bucket.
+Its key ends up inside the eval cluster, where a pull request's code could use it, but all it can do
+is read.
 
 ```mermaid
 flowchart LR
@@ -317,7 +337,7 @@ flowchart LR
     end
     pre["Pull request run<br/>(uses the pull request's code)"]
     own[("That PR's own saved answers<br/>only its own builds can write")]
-    cache[("Shared replay cache<br/>eval-only bucket")]
+    cache[("Shared replay cache<br/>bucket in kube-agents-prow")]
     nightly -- "upload" --> cache
     pre -- "save" --> own
     own -- "on merge" --> copy
@@ -326,6 +346,24 @@ flowchart LR
     own -. "re-runs of the same PR" .-> pre
 ```
 
+### The proxy can't come from the pull request
+
+Protecting writes isn't enough. The proxy decides when two requests match, so whoever controls it
+controls what gets replayed. If a pull request could change the normalizer, it could make its
+requests match `main`'s passing recordings, by accident or on purpose (say, by swapping every tool
+result for the same placeholder). The old passing answers would be replayed, and a broken pull
+request would pass without anything being written to the cache. So:
+
+- the proxy and its normalizer are built from the base branch (`PULL_BASE_SHA`), the same way the
+  scorer and judge are pinned today ([`testing-strategy.md`](../../docs/designs/testing-strategy.md),
+  "Pinning and baselines");
+- the key includes a version hash of the normalizer, so answers saved by a different normalizer
+  never match;
+- the proxy's files need eval-crew approval in `hack/OWNERS`, wherever the code ends up.
+
+Like the scorer's pin, this still relies on eval-crew reviewing changes to the deploy scripts that
+do the pinning, since those run from the pull request's code.
+
 ### What goes into the cache key
 
 Agents don't ask for a specific model. They send the name
@@ -333,8 +371,8 @@ Agents don't ask for a specific model. They send the name
 edits requests with a few plugins (for example, one that strips old thinking text). So a pull
 request that changes any of that sends exactly the same requests as before, and without extra care
 it would get answers from the old setup. To stop that, the key also includes LiteLLM's config
-fingerprint (the chart already keeps one, in the `checksum/config` annotation) and the LiteLLM image
-version.
+fingerprint (the chart already keeps one, in the `checksum/config` annotation), the LiteLLM image
+version, and the normalizer's version hash.
 
 **Backup-model answers are never saved.** LiteLLM can be set up with a backup it uses when the main
 model fails. The backup is the same model with less thinking, so the model name in the reply looks
@@ -461,10 +499,19 @@ before stage 2 of the rollout:
    fingerprints a high one. How many matches came from a different project tells us whether one
    shared cache makes sense. For normalizer fixes, the script compares each miss with the closest
    earlier request, and since we kept the cleaned-up text, we can test a new normalizer rule on the
-   same week of data without redeploying anything. This stage needs no shared cache and no new
-   permissions inside the cluster.
-2. **Turn on replay for pull requests**, once the eval crew has decided the three gate questions above
-   and #1730 is fixed (or they're happy with stripping the recent-work section from the key).
+   same week of data without redeploying anything.
+
+   Shadow mode also checks that hits would be safe, not just how many there are. For each request
+   it logs a hash of the model's live answer, and once the run is done, whether that run passed. For
+   every match, the script compares the two cleaned-up requests and lists what the normalizer
+   swapped to make them match, by type. If two matching requests got answers that led to different
+   results, or a swap hid something that looks like real state, that's a collision. A reviewed
+   collision report is the bar for stage 2. This stage needs no shared cache and no new permissions
+   inside the cluster.
+
+2. **Turn on replay for pull requests**, once the collision report from shadow mode has been reviewed,
+   the eval crew has decided the three gate questions above, and #1730 is fixed (or they're happy with
+   stripping the recent-work section from the key).
 3. **Look at polling.** If shadow mode shows most of the remaining misses come from the `sleep 60`
    polling loop, fix the polling rather than the cache.
 
@@ -479,4 +526,6 @@ before stage 2 of the rollout:
 - **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We
   need to check the two options and pick one before stage 2.
 - **How big does the cache get, and when do entries expire?** Answers recorded for an old version of
-  a prompt can never be hit again, so entries should expire by age.
+  a prompt can never be hit again, so entries should expire by age. Expiry also limits one thing the
+  key can't see: a model update on the provider's side (Vertex) doesn't change our requests or our
+  config, so only the live nightly would notice it.
