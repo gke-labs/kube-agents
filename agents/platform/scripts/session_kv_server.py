@@ -104,7 +104,10 @@ KANBAN_TASK_ORIGINS_SCHEMA = """
 # create through KUBE_AGENTS_CARD_STAMP_TICKET; the board's insert-time stamp
 # (deploy/docker/patches/kanban_origin.py) redeems it once. The ticket is an
 # unguessable reference, not an origin, so a value planted in any environment
-# source is an unknown ticket.
+# source is an unknown ticket. Minting needs this server's key on the agent
+# container's loopback, which the shell-sandbox pod, where the model's commands
+# run, has neither of (docs/credential-isolation-design.md, "The loopback-only
+# exception").
 STAMP_TICKET_BYTES = 16  # os.urandom(16).hex(): 32 hex characters
 STAMP_TICKET_TTL_SECONDS = 300
 STAMP_TICKET_MAX_CHARS = 2 * STAMP_TICKET_BYTES

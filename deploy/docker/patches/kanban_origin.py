@@ -72,11 +72,15 @@ bootstrap (``chat``). None of them passes an origin value. The drift backlog
 runs inside the Session KV server, so once its ``hermes kanban create``
 subprocess returns the id it stamps the card in the board directly, with the
 same ``INSERT OR IGNORE`` (the subprocess has no turn, so the insert left the
-card unstamped). The gate and the bootstrap run ``run_slash`` in their own
-process: just before each create they mint a one-time ticket for their origin
-with ``POST /v1/board/stamp-tickets`` on the Session KV server (the pod's
-Session KV key) and hand it to the create in :data:`STAMP_TICKET_ENV` around
-the call (:func:`writer_ticket`). Before the insert's transaction,
+card unstamped). The gate (a cron script process of its own) and the bootstrap
+(in the gateway's process) run ``run_slash`` in-process: just before each
+create they mint a one-time ticket for their origin with
+``POST /v1/board/stamp-tickets`` on the Session KV server (the pod's Session KV
+key) and hand it to that one create through a ``ContextVar``
+(:func:`writer_ticket`), never ``os.environ``, which is process-wide and would
+let a concurrent create in the same process redeem it. A subprocess caller
+would pass it in the child's :data:`STAMP_TICKET_ENV` instead; the seam reads
+the ``ContextVar`` first, then that variable. Before the insert's transaction,
 :func:`wrap_create_task` redeems it over loopback
 (``POST /v1/board/stamp-tickets/{ticket}/redeem``, also with the pod's key) and
 the insert stamps the origin the server returns, exactly and in the insert's
@@ -89,10 +93,14 @@ trusted channel here: Hermes loads ``$HERMES_HOME/.env``, which the agent can
 write, with ``override=True``, and other dotenv sources besides. A value
 planted in any of them is an unknown ticket; redeeming it fails, the variable
 is ignored, and the card takes the turn's origin as if it were absent. Minting
-a ticket that redeems needs the Session KV key, which the gateway and the
-in-pod scripts hold and the sandbox, where the agent's terminal runs, does not.
-Any failure to redeem (an unknown, spent or expired ticket, no key, the server
-down) falls back the same way.
+a ticket that redeems needs the Session KV key and the agent container's own
+loopback, which the gateway and the in-pod scripts have and the shell-sandbox
+pod, where the model's commands run (terminal, ``execute_code``, file tools),
+does not: see ``docs/credential-isolation-design.md``, "The loopback-only
+exception". Any failure to redeem (an unknown, spent or expired ticket, no key,
+the server down) falls back the same way. A model that schedules a shipped
+script through ``cronjob_manage`` (the issue gate, for example) re-runs a
+trusted writer with that writer's own fixed origin, not one it chooses.
 
 Nothing here may fail a create: every entry point logs and falls back to no
 stamp.
@@ -179,6 +187,10 @@ PRIORITY_MODULES = ("hermes_cli.kanban_priority", "kanban_priority")
 #: insert's transaction and read inside it.
 _pending_origin: contextvars.ContextVar[Optional[tuple[str, str]]] = contextvars.ContextVar(
     "kanban_origin_pending", default=None
+)
+#: An in-process writer's ticket for the create it wraps (:func:`writer_ticket`).
+_writer_ticket: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "kanban_origin_writer_ticket", default=None
 )
 #: Set while the CLI create command runs, whose ``created_by`` is an argument.
 _cli_create: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -354,31 +366,30 @@ def mint_ticket(origin: str, platform: str = "") -> Optional[str]:
 
 @contextlib.contextmanager
 def writer_ticket(origin: str, platform: str = "") -> Iterator[Optional[str]]:
-    """Mint a ticket and set :data:`STAMP_TICKET_ENV` for a writer's in-process ``run_slash`` create.
+    """Mint a ticket and hand it to a writer's in-process ``run_slash`` create.
 
-    Restores the variable afterwards. Yields the ticket, or None when none was
-    minted (the create then takes its own context's origin).
+    Carried in :data:`_writer_ticket`, a ``ContextVar``, and reset afterwards;
+    ``os.environ`` is never touched, so a concurrent create elsewhere in the
+    process cannot redeem it. Yields the ticket, or None when none was minted
+    (the create then takes its own context's origin).
     """
     ticket = mint_ticket(origin, platform)
-    previous = os.environ.get(STAMP_TICKET_ENV)
-    if ticket:
-        os.environ[STAMP_TICKET_ENV] = ticket
+    token = _writer_ticket.set(ticket)
     try:
         yield ticket
     finally:
-        if previous is None:
-            os.environ.pop(STAMP_TICKET_ENV, None)
-        else:
-            os.environ[STAMP_TICKET_ENV] = previous
+        _writer_ticket.reset(token)
 
 
 def ticket_origin() -> Optional[tuple[str, str]]:
-    """The origin the ticket in :data:`STAMP_TICKET_ENV` carries, redeeming it; None otherwise.
+    """The origin this create's ticket carries, redeeming it; None otherwise.
 
-    An unknown, spent or expired ticket, a missing key or an unreachable
-    server is None, as if the variable were absent.
+    The ticket is :func:`writer_ticket`'s ``ContextVar`` when set, else a
+    subprocess caller's :data:`STAMP_TICKET_ENV`. An unknown, spent or expired
+    ticket, a missing key or an unreachable server is None, as if there were
+    no ticket.
     """
-    ticket = (os.environ.get(STAMP_TICKET_ENV) or "").strip()
+    ticket = (_writer_ticket.get() or os.environ.get(STAMP_TICKET_ENV) or "").strip()
     if not ticket:
         return None
     try:

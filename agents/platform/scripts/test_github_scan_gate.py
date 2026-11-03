@@ -569,9 +569,8 @@ class FileCardOriginTest(unittest.TestCase):
         import types
 
         kanban = types.ModuleType("hermes_cli.kanban")
-        kanban.run_slash = lambda cmd: sent.append((cmd, os.environ.get("KUBE_AGENTS_CARD_STAMP_TICKET"))) or (
-            '{"id": "t_1"}'
-        )
+        current = getattr(origin_module, "current", lambda: None)
+        kanban.run_slash = lambda cmd: sent.append((cmd, current())) or '{"id": "t_1"}'
         pkg = types.ModuleType("hermes_cli")
         pkg.kanban = kanban
         modules = {"hermes_cli": pkg, "hermes_cli.kanban": kanban}
@@ -587,16 +586,19 @@ class FileCardOriginTest(unittest.TestCase):
         sent, minted = [], []
         origin = types.ModuleType("hermes_cli.kanban_origin")
 
+        held = []
+
         @contextlib.contextmanager
         def writer_ticket(value):
             minted.append(value)
-            os.environ["KUBE_AGENTS_CARD_STAMP_TICKET"] = f"ticket-{len(minted)}"
+            held.append(f"ticket-{len(minted)}")
             try:
-                yield f"ticket-{len(minted)}"
+                yield held[-1]
             finally:
-                os.environ.pop("KUBE_AGENTS_CARD_STAMP_TICKET", None)
+                held.pop()
 
         origin.writer_ticket = writer_ticket
+        origin.current = lambda: held[-1] if held else None
         card = gate._issue_card({"repository": "o/r", "issue_number": 1, "title_plain": "t"})
         with self._stub(sent, origin):
             self.assertEqual(gate.file_card(card), "t_1")

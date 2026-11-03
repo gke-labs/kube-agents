@@ -436,13 +436,44 @@ class TicketTest(Hermes):
         self.assertEqual(self.origin(first), ("drift", ""))
         self.assertEqual(self.origin(second), ("chat", "slack"), "a spent ticket is the turn's origin")
 
-    def test_writer_ticket_sets_and_restores_the_variable(self):
-        os.environ[kanban_origin.STAMP_TICKET_ENV] = "previous"
+    def test_writer_ticket_never_touches_the_process_environment(self):
         with self.ko.writer_ticket("issue") as ticket:
-            self.assertEqual(os.environ[kanban_origin.STAMP_TICKET_ENV], ticket)
+            self.assertIsNotNone(ticket)
+            self.assertNotIn(kanban_origin.STAMP_TICKET_ENV, os.environ)
             card = self.slash("create --json --assignee platform gate")
-        self.assertEqual(os.environ[kanban_origin.STAMP_TICKET_ENV], "previous")
+        self.assertIsNone(self.ko._writer_ticket.get(), "reset after the call")
         self.assertEqual(self.origin(card), ("issue", ""))
+
+    def test_overlapping_in_process_creates_each_get_their_own_ticket(self):
+        import contextvars
+        import threading
+
+        both_minted = threading.Barrier(2)
+        cards: dict = {}
+        errors: list = []
+
+        def writer(origin):
+            try:
+                with self.ko.writer_ticket(origin):
+                    both_minted.wait(timeout=5)  # both tickets live before either create
+                    # create_task, not run_slash: run_slash captures output by
+                    # swapping the process-wide sys.stdout, which two threads share.
+                    cards[origin] = self.create(title=f"{origin}-card")
+            except Exception as exc:  # surfaced below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=contextvars.copy_context().run, args=(writer, origin))
+            for origin in ("issue", "chat")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(self.origin(cards["issue"]), ("issue", ""))
+        self.assertEqual(self.origin(cards["chat"]), ("chat", ""))
+        self.assertEqual(self.tickets, {}, "each create spent its own ticket")
 
     def test_a_ticket_that_cannot_be_minted_leaves_the_create_to_its_context(self):
         with mock.patch.object(self.ko, "_session_kv", side_effect=OSError("refused")):

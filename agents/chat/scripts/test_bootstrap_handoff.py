@@ -595,14 +595,16 @@ class HandOffTest(unittest.TestCase):
         origin = types.ModuleType("hermes_cli.kanban_origin")
         origin.STAMP_TICKET_ENV = "KUBE_AGENTS_CARD_STAMP_TICKET"
 
+        held = []
+
         @contextlib.contextmanager
         def writer_ticket(value):
             minted.append(value)
-            os.environ[origin.STAMP_TICKET_ENV] = "t1cket"
+            held.append("t1cket")
             try:
                 yield "t1cket"
             finally:
-                os.environ.pop(origin.STAMP_TICKET_ENV, None)
+                held.pop()
 
         origin.writer_ticket = writer_ticket
         kanban_stub = self._stub_kanban(sent, reply=json.dumps({"id": "t_new"}))
@@ -610,7 +612,7 @@ class HandOffTest(unittest.TestCase):
             sys.modules["hermes_cli"].kanban_origin = origin
             kanban = sys.modules["hermes_cli.kanban"]
             reply = kanban.run_slash
-            kanban.run_slash = lambda cmd: seen.append(os.environ.get(origin.STAMP_TICKET_ENV)) or reply(cmd)
+            kanban.run_slash = lambda cmd: seen.append(held[-1] if held else None) or reply(cmd)
             self.assertIsNone(self._run_roster([self._agent("t_a")]))
         self.assertEqual(minted, ["chat"])
         self.assertEqual(h.CARD_ORIGIN, "chat")

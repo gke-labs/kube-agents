@@ -146,7 +146,7 @@ check("the dedupe hit keeps the first stamp", origin(squat) == ("chat", "slack")
 print("the trusted writers' stamp ticket")
 with KO.writer_ticket("issue"):
     gate_card = slash("create --json --assignee default gate-card")
-    check("the ticket is in the create's environment", bool(os.environ.get(KO.STAMP_TICKET_ENV)))
+    check("the ticket rides a ContextVar, not the process environment", KO.STAMP_TICKET_ENV not in os.environ)
 check("a minted ticket stamps its origin", origin(gate_card) == ("issue", ""), str(origin(gate_card)))
 check("the ticket does not outlive the call", KO.STAMP_TICKET_ENV not in os.environ)
 os.environ[KO.STAMP_TICKET_ENV] = KO.mint_ticket("drift")
