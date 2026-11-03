@@ -136,7 +136,17 @@ readonly EVAL_NOT_RUN_STATUS="failed"
 # BENCH_DIR, so a relative value would write in one place and read in another.
 # CDPATH is cleared for that cd: it would send a relative name to another
 # directory and print the path, which the substitution would capture.
+# The substitution also strips a trailing newline, so a value ending in one
+# names a different directory from the one mkdir made, and where that one does
+# not exist every repetition grades MISSING behind the rep-log redirect's
+# || true. Such a value is refused before mkdir, so it leaves nothing behind.
 EVAL_LOG_DIR="${EVAL_LOG_DIR:-/tmp}"
+case "${EVAL_LOG_DIR}" in
+  *$'\n')
+    echo "EVAL_LOG_DIR ends in a newline; set it to the directory's name alone" >&2
+    exit 1
+    ;;
+esac
 mkdir -p "${EVAL_LOG_DIR}"
 EVAL_LOG_DIR="$(CDPATH='' cd -- "${EVAL_LOG_DIR}" && pwd)"
 readonly EVAL_LOG_DIR
