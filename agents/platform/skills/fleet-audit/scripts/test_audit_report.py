@@ -23290,7 +23290,9 @@ metadata:
 
     def firewall_fix(self, text):
         self.write("network/allow-ssh.yaml", text)
+        # A kcc-object-wedged finding carries its object's namespace (collect.py).
         return make_finding(fid="fw", check="kcc-object-wedged", cluster="hub-proj/us-central1/hub", obj="ComputeFirewall/allow-ssh",
+                            namespace="app",
                             remediation={"kind": "manifest", "path": "network/allow-ssh.yaml", "note": "Close port 22."})
 
     def test_a_config_connector_kind_finding_takes_its_project_from_the_declaration_not_the_host(self):
@@ -23310,6 +23312,26 @@ metadata:
         self.assertEqual(self.disclose([finding], two), ["fw"])
         finding = self.firewall_fix(namespace.replace("app-proj", "other-proj") + self.FIREWALL)
         self.assertEqual(self.disclose([finding], self.two_hosts(("hub-proj/us-central1/hub", [stall]))), [])
+
+    def test_a_repository_declaration_for_another_project_blocks_the_wedged_match(self):
+        """Review finding: the generic match dropped the declaration that
+        disagreed with the stall before it looked, so a declaration for
+        another project could never block. The clone index also takes the
+        project of a Namespace the same file declares."""
+        namespace = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: app\n  annotations:\n    cnrm.cloud.google.com/project-id: {project}\n---\n"
+        stall = {"kind": "ComputeFirewall", "namespace": "app", "name": "allow-ssh", "why": "UpdateFailed", "project": "app-proj"}
+        manifest = self.two_hosts(("hub-proj/us-central1/hub", [stall]))
+        for project, expected in (("other-proj", []), ("app-proj", ["fw"])):
+            with self.subTest(project=project):
+                self.write("network/allow-ssh.yaml", namespace.format(project=project) + self.FIREWALL)
+                declarations = audit_report.kcc_declarations(self.root)
+                self.assertEqual([d.project for k, d in declarations.items() if k[0] == "ComputeFirewall"], [project])
+                finding = make_finding(fid="fw", check="kcc-object-wedged", cluster="hub-proj/us-central1/hub",
+                                       obj="ComputeFirewall/allow-ssh", namespace="app",
+                                       remediation={"kind": "manual", "note": "Close port 22."})
+                self.assertEqual(
+                    audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), expected
+                )
 
     def test_a_kcc_object_wedged_finding_on_a_container_cluster_takes_nothing_from_the_host(self):
         """Compliance's finding on `ContainerCluster/prod` sits on the hub in
@@ -23750,8 +23772,8 @@ metadata:
     def test_an_unreachable_cluster_does_not_drop_a_wedged_paragraph(self):
         """Review finding: the multi-host project rule dropped every
         `kcc-object-wedged` paragraph when one cluster was unreachable,
-        although the stall is on the finding's own cluster. A file for
-        another project is still not named as its declaration."""
+        although the stall is on the finding's own cluster. A file that
+        declares the object for another project still blocks it."""
         self.write("pubsub/events.yaml", self.TOPIC_FILE)
         manifest = self.two_hosts(("p/us-central1/hub-a", [dict(self.TOPIC_STALL, project="")]))
         manifest["clusters"].append({"name": "p/us-east1/far", "outcome": "unreachable"})
@@ -23766,8 +23788,7 @@ metadata:
         self.assertNotIn("The declaration is", finding["remediation"]["note"])
         manifest["clusters"][0]["kcc_unready"] = [dict(self.TOPIC_STALL, project="other")]
         finding = self.wedged("p/us-central1/hub-a", kind="manual")
-        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
-        self.assertNotIn("pubsub/events.yaml", finding["remediation"]["note"])
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), [])
 
     SERVICE_STALL = {"kind": "Service", "namespace": "billing", "name": "billing", "project": "acme", "why": "UpdateFailed: 403"}
 

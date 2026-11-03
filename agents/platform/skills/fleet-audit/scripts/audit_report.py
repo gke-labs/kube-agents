@@ -18376,7 +18376,8 @@ class KccDeclaration(NamedTuple):
     tool that applies it): the names Config Connector lists the live object
     by, which `disclose_stalled_kcc_remediations` matches the collector's
     `kcc_unready` objects on. `project` is the declaration's
-    `cnrm.cloud.google.com/project-id` annotation, or empty.
+    `cnrm.cloud.google.com/project-id` annotation, else that annotation on
+    its Namespace when the same file declares the Namespace, or empty.
     """
 
     repo: str
@@ -18400,8 +18401,8 @@ class KccDeclaration(NamedTuple):
 # `namespace` is the file's `metadata.namespace`, empty when the file leaves
 # it to the tool that applies it: two objects of one name in two namespaces
 # are two declarations, not one declared twice.
-# `project` is the file's `cnrm.cloud.google.com/project-id` annotation, empty
-# when the file sets none: `prod` for proj-a and `prod` for proj-b, in one
+# `project` is the declaration's project (`KccDeclaration.project`), empty
+# when the file gives none: `prod` for proj-a and `prod` for proj-b, in one
 # location, are two declarations, and each keeps its own project.
 KccKey = tuple[str, str, str, str, str, str]
 
@@ -18476,6 +18477,9 @@ def _index_kcc_text(
         # A file this audit cannot parse is one it can make no claim
         # about; skipping leaves the finding's `gcloud` kind alone.
         return
+    # A declaration with no project annotation takes its namespace's, as
+    # Config Connector does, when the same file declares that Namespace.
+    namespace_projects = _namespace_projects_of(docs)
     for doc in docs:
         if not isinstance(doc, dict):
             continue
@@ -18498,7 +18502,8 @@ def _index_kcc_text(
             frozenset(str(k) for k in spec),
             str(meta.get("name") or ""),
             str(meta.get("namespace") or ""),
-            str((meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}).get(KCC_PROJECT_ANNOTATION) or ""),
+            str((meta.get("annotations") if isinstance(meta.get("annotations"), dict) else {}).get(KCC_PROJECT_ANNOTATION) or "")
+            or namespace_projects.get(str(meta.get("namespace") or ""), ""),
         )
         _add_kcc_declaration(index, (kind, name, cluster, location, entry.namespace, entry.project), entry)
 
@@ -18999,6 +19004,11 @@ def _namespace_projects(yaml: Any, text: str) -> dict[str, str]:
         docs = list(yaml.safe_load_all(text))
     except (yaml.YAMLError, ValueError, RecursionError):
         return {}
+    return _namespace_projects_of(docs)
+
+
+def _namespace_projects_of(docs: list) -> dict[str, str]:
+    """`_namespace_projects` of documents that are already parsed."""
     projects: dict[str, str] = {}
     for doc in docs:
         if not isinstance(doc, dict) or doc.get("kind") != KCC_NAMESPACE_KIND:
@@ -19204,11 +19214,12 @@ def _generic_object_stalls(
     one, and it is raised on the cluster that holds the object, so the stall
     must be on that host: a kind name alone can be a core Kubernetes kind
     (`Service`) that a Config Connector kind shares. The finding gives no
-    project or location: they come from the one declaration of the object in
-    `declarations`, when there is exactly one. A finding that names a
-    namespace matches only that namespace. Because the stall is on the
-    finding's cluster, the number of hosts does not matter; a known project
-    that differs from the declaration's still blocks the match.
+    project or location, so the declarations give the evidence: when files
+    in `declarations` declare the object in the stall's namespace and every
+    one of them gives a known project or location that differs from the
+    stall's, the match is not certain. A finding that names a namespace
+    matches only that namespace. Because the stall is on the finding's
+    cluster, the number of hosts does not matter.
     """
     if str(finding.get("check") or "") != KCC_OBJECT_CHECK:
         return []
@@ -19225,15 +19236,30 @@ def _generic_object_stalls(
     ]
     certain: list[KccStall] = []
     for stall in fits:
-        found = _declarations_of(stall, declarations)
-        project = found[0][1].project if len(found) == 1 else ""
-        location = found[0][0][3] if len(found) == 1 else ""
         # The stall is on the finding's own cluster, in its namespace, with its
-        # name, so another host cannot hold it: only a known project that
-        # differs still blocks the match (one host for `_project_certain`).
-        if _project_certain(stall, project, 1) and _location_agrees(stall, location):
-            certain.append(stall)
+        # name, so another host cannot hold it, and the number of hosts does
+        # not matter. The files that declare the same object in the same
+        # namespace are the evidence: when at least one does and every one of
+        # them gives a known project or location that differs from the
+        # stall's, the stall is not the object those files declare, and the
+        # match is not certain.
+        same = [
+            (key, declaration)
+            for key, declaration in _declarations_of(stall, declarations, place=False)
+            if declaration.namespace == stall.namespace
+        ]
+        if same and not any(_declaration_agrees(stall, key, declaration) for key, declaration in same):
+            continue
+        certain.append(stall)
     return certain if _one_object(certain) else []
+
+
+def _declaration_agrees(stall: KccStall, key: KccKey, declaration: KccDeclaration) -> bool:
+    """Whether a declaration's known project and location agree with
+    `stall`'s, where both sides know them."""
+    if stall.project and declaration.project and stall.project != declaration.project:
+        return False
+    return _location_agrees(stall, key[3])
 
 
 def kcc_index_needed(findings: list[dict], manifest: dict | None) -> bool:
@@ -19280,13 +19306,15 @@ def _one_object(fits: list[KccStall]) -> bool:
 
 
 def _declarations_of(
-    stall: KccStall, declarations: "dict[KccKey, KccDeclaration]"
+    stall: KccStall, declarations: "dict[KccKey, KccDeclaration]", place: bool = True
 ) -> "list[tuple[KccKey, KccDeclaration]]":
     """The declarations in the repository index that declare `stall`'s object:
     the same kind and `metadata.name`, the same namespace when the file sets
     one, the same `clusterRef` when both name one, and, as
     `_remediation_file_stalls` asks, the same location and project when both
-    sides know them (`_location_agrees`). One per file."""
+    sides know them (`_location_agrees`). One per file. Without `place`,
+    the location and the project are not compared, so a caller can see the
+    declarations that disagree with the stall."""
     found: list[tuple[KccKey, KccDeclaration]] = []
     files: set[tuple[str, str]] = set()
     for key, first in declarations.items():
@@ -19294,7 +19322,7 @@ def _declarations_of(
             continue
         if key[0] in _KCC_OBJECT_KINDS["NodePool"] and stall.cluster and key[2] != stall.cluster:
             continue
-        if not _location_agrees(stall, key[3]):
+        if place and not _location_agrees(stall, key[3]):
             continue
         # Each file on its own fields: the first declaration's do not stand
         # in for the files in its `also`.
@@ -19303,7 +19331,7 @@ def _declarations_of(
                 continue
             if declaration.namespace and declaration.namespace != stall.namespace:
                 continue
-            if stall.project and declaration.project and stall.project != declaration.project:
+            if place and stall.project and declaration.project and stall.project != declaration.project:
                 continue
             where = (declaration.repo, declaration.path)
             if where not in files:
@@ -19547,8 +19575,14 @@ def disclose_stalled_kcc_remediations(
         index = _fix_declarations(finding, _remediation_file_index(finding, root)) if stalled else {}
         in_file = _remediation_file_stalls(finding, index, stalled, health.hosts) if index else []
         namespaces = frozenset(declaration.namespace for declaration in index.values() if declaration.namespace)
+        # The fix's own file is evidence for the own-object match too: a
+        # declaration of the object there that gives another project or
+        # location blocks it (`_generic_object_stalls`).
+        evidence = dict(declarations or {})
+        for key, declaration in index.items():
+            _add_kcc_declaration(evidence, key, declaration)
         matched = in_file or (
-            _object_stalls(finding, stalled, health.hosts, health.targets, namespaces, declarations)
+            _object_stalls(finding, stalled, health.hosts, health.targets, namespaces, evidence)
             if stalled
             else []
         )
