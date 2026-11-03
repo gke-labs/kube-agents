@@ -470,6 +470,21 @@ class TestClone(InspectRepositoryTestCase):
         result = self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "copy")])
         self.assertEqual(result["written"], 3)
 
+    def test_a_leftover_another_clone_removes_meanwhile_does_not_stop_the_clone(self):
+        """Another clone's `finally` can remove its staging between the listing and the age check."""
+        gone = inspect_repository.staging_root() / "clone.gone1234"
+        gone.mkdir(parents=True)
+        real_lstat = Path.lstat
+
+        def lstat(path, *args, **kwargs):
+            if path == gone:
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with patch.object(Path, "lstat", lstat):
+            result = self.run_command(["clone", "--repo", "acme/public", "--into", str(self.tmp / "copy")])
+        self.assertEqual(result["written"], 3)
+
     def test_a_byte_bound_refuses_the_whole_copy(self):
         into = self.tmp / "copy"
         with self.assertRaises(vcs_client.VcsError) as caught:
