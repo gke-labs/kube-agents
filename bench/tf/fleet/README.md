@@ -52,7 +52,7 @@ writer: from `main`, under a Boskos lease per project, creates and in-place upda
 the deletes and replaces `reconcile-allow.json` beside this file declares (one entry per
 address, or per resource to cover every instance of a `count` or `for_each` one, with its
 reason, reviewed in the pull request that needs it and removed by its follow-up; the no-surge
-pool's replace on a minor roll and the scaled-zero gateway's status writer are the two standing ones). Its two Prow
+pool's replace on a minor roll, the scaled-zero gateway's status writer and seeded-a's ConfigConnector writer are the three standing ones). Its two Prow
 entries in `oss-test-infra` run `main` only: a postsubmit on every merge that changes the stack's files
 here, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which says which files, and states
 the rule for a fixture pull request and for proving a branch on one leased project). A hand
@@ -63,7 +63,7 @@ which rewrites the scaled-zero gateway's status after an out-of-band edit the fi
 and `-replace=terraform_data.config_connector`, which applies seeded-a's ConfigConnector object again
 after an out-of-band edit or delete)
 are the exception: the script passes neither `-target` nor `-replace`, so they run by hand
-from a `main` checkout, under a lease on the project. A recovery that re-creates `seeded_a`, and a project's first apply, run as two applies: `-target=google_container_cluster.seeded_a` first, then the whole stack, because the scaled-zero gateway fixture's `kubernetes_manifest` resources read the Gateway API CRDs at plan time and GKE installs them only with the cluster (`scripts/provision_ci_pool_project.sh` does this). A `default-pool-headroom` drift is the one no re-apply or hand recovery clears: it means seeded-a's default pool is within the 100m margin of full, and the repair is a larger `machine_type` or `node_count` on `seeded_a_default` in `main.tf`, merged, which the postsubmit then rolls project by project. The script's `init` runs with `-lockfile=readonly`, so the
+from a `main` checkout, under a lease on the project. A recovery that re-creates `seeded_a`, and a project's first apply, run as two applies: `-target=google_container_cluster.seeded_a` first, then the whole stack, because the scaled-zero gateway fixture's `kubernetes_manifest` resources read the Gateway API CRDs at plan time and GKE installs them only with the cluster (`scripts/provision_ci_pool_project.sh` does this). The second apply also writes the new cluster's ConfigConnector object: the cluster's CA certificate is a trigger of `terraform_data.config_connector`, so a re-created `seeded_a` plans its replace, which the standing `reconcile-allow.json` entry admits. A `default-pool-headroom` drift is the one no re-apply or hand recovery clears: it means seeded-a's default pool is within the 100m margin of full, and the repair is a larger `machine_type` or `node_count` on `seeded_a_default` in `main.tf`, merged, which the postsubmit then rolls project by project. The script's `init` runs with `-lockfile=readonly`, so the
 providers are the ones `.terraform.lock.hcl` pins; to move them, change `versions.tf` if the major
 changes and run `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64 -platform=darwin_amd64`
 here, and commit the result. A resource type that needs a project role the reconciler does not hold

@@ -11,8 +11,10 @@ The script reads the API server address and its CA from the environment, and
 the object's name, mode and labels as well. It takes a fresh access token as
 gateway_status.py does: from Application Default Credentials, then from
 `gcloud auth print-access-token`. It sends one server-side apply, and it tries
-again while the API answers 404, because the add-on can install the CRD some
-minutes after the cluster update is done. Standard library only: the reconcile
+again inside one wait window while the API answers 404, because the add-on can
+install the CRD some minutes after the cluster update is done, and while the
+API answers 5xx or does not answer, because a failed run taints the resource
+and the next reconcile then plans a replace. Standard library only: the reconcile
 image has python3 and gcloud, and kubectl is not promised. It exits non-zero,
 with the API's answer, on any other failure, so the apply fails and does not
 record an object that is not there.
@@ -60,9 +62,16 @@ PATCH = "PATCH"
 REQUEST_TIMEOUT_SECONDS = 30
 # The answer while the add-on has not yet installed the CRD.
 NOT_FOUND = 404
-# How long to wait for the CRD, and how often to ask. Ten minutes covers the
-# add-on's install on a cluster update; a CRD that is still missing after
-# that is an add-on that did not install, and the apply fails.
+# An answer at or above this is the API server's own failure, tried again.
+SERVER_ERROR_FLOOR = 500
+# What apply() returns for an attempt to try again: the CRD is not there, or
+# the API server failed or did not answer.
+APPLIED = 0
+RETRY = 1
+# How long to wait, and how often to ask. Ten minutes covers the add-on's
+# install on a cluster update and a control plane that is briefly away; a CRD
+# still missing, or an API still failing, after that is a fault, and the apply
+# fails.
 CRD_WAIT_SECONDS = 600
 CRD_RETRY_SECONDS = 15
 
@@ -92,8 +101,10 @@ def manifest(name: str, mode: str, labels: dict) -> dict:
     }
 
 
-def apply(host: str, token: str, context: ssl.SSLContext, body: dict) -> int:
-    """Sends the apply once. Returns 0 on success, NOT_FOUND while the CRD is missing; exits on anything else."""
+def apply(host: str, token: str, context: ssl.SSLContext, body: dict) -> tuple[int, str]:
+    """Sends the apply once. Returns (APPLIED, "") on success, and (RETRY,
+    why) while the CRD is missing, the API answers 5xx or nothing answers;
+    exits on any other answer."""
     query = urllib.parse.urlencode({"fieldManager": FIELD_MANAGER, "force": "true"})
     path = OBJECT_PATH.format(name=body["metadata"]["name"])
     request = urllib.request.Request(f"{host}{path}?{query}", data=json.dumps(body).encode(), method=PATCH)
@@ -102,11 +113,17 @@ def apply(host: str, token: str, context: ssl.SSLContext, body: dict) -> int:
     try:
         with urllib.request.urlopen(request, context=context, timeout=REQUEST_TIMEOUT_SECONDS) as reply:
             reply.read()
-            return 0
+            return APPLIED, ""
     except urllib.error.HTTPError as exc:
         if exc.code == NOT_FOUND:
-            return NOT_FOUND
+            return RETRY, "the ConfigConnector CRD is not on the cluster yet"
+        if exc.code >= SERVER_ERROR_FLOOR:
+            return RETRY, f"PATCH {path} answered {exc.code}"
         raise SystemExit(f"{LOG_PREFIX}: PATCH {path} answered {exc.code}: {exc.read().decode(errors='replace')}")
+    except (urllib.error.URLError, OSError) as exc:
+        # URLError and the connection errors (reset, refused, timeout) are
+        # OSErrors: the control plane did not answer.
+        return RETRY, f"PATCH {path} got no answer: {exc}"
 
 
 def main() -> int:
@@ -128,12 +145,13 @@ def main() -> int:
         context = ssl.create_default_context(cafile=ca.name)
         while True:
             # A fresh token for each attempt: the wait can be long.
-            if apply(env[HOST_ENV], access_token(), context, body) == 0:
+            outcome, why = apply(env[HOST_ENV], access_token(), context, body)
+            if outcome == APPLIED:
                 break
             if time.monotonic() >= deadline:
-                sys.stderr.write(f"{LOG_PREFIX}: the ConfigConnector CRD is not on the cluster after {CRD_WAIT_SECONDS}s; the add-on did not install it\n")
+                sys.stderr.write(f"{LOG_PREFIX}: {why} after {CRD_WAIT_SECONDS}s; the add-on did not install it, or the API server did not recover\n")
                 return 1
-            sys.stderr.write(f"{LOG_PREFIX}: the ConfigConnector CRD is not on the cluster yet; trying again in {CRD_RETRY_SECONDS}s\n")
+            sys.stderr.write(f"{LOG_PREFIX}: {why}; trying again in {CRD_RETRY_SECONDS}s\n")
             time.sleep(CRD_RETRY_SECONDS)
     print(f"{LOG_PREFIX}: applied {KIND} {env[NAME_ENV]} with spec.mode {env[MODE_ENV]}")
     return 0

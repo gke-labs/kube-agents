@@ -49,6 +49,10 @@ class FakeApi:
         assert request.get_header("Authorization") == "Bearer t0ken"
         self.requests.append((request.get_method(), url.path, urllib.parse.parse_qs(url.query), request.get_header("Content-type"), json.loads(request.data)))
         code = self.codes.pop(0) if self.codes else 200
+        if code == "URLError":
+            raise urllib.error.URLError("connection refused")
+        if code == "ConnectionResetError":
+            raise ConnectionResetError(104, "Connection reset by peer")
         if code != 200:
             raise urllib.error.HTTPError(request.full_url, code, "refused", {}, io.BytesIO(b'{"reason":"refused"}'))
         return _Reply({})
@@ -109,6 +113,22 @@ class ConfigConnectorApplyTest(unittest.TestCase):
         self.assertIn("did not install it", err)
         self.assertLessEqual(len(api.requests), config_connector.CRD_WAIT_SECONDS // config_connector.CRD_RETRY_SECONDS + 2)
 
+    def test_a_server_error_or_no_answer_is_tried_again_in_the_window(self):
+        # A failed run taints the resource, and the next reconcile would plan
+        # a replace, so a transient answer must not fail the apply.
+        api = FakeApi(503, "URLError", "ConnectionResetError", 500)
+        code, slept, err = _run(api)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(api.requests), 5)
+        self.assertEqual(slept.call_count, 4)
+        self.assertIn("trying again", err)
+
+    def test_a_server_error_still_there_at_the_deadline_fails_the_apply(self):
+        api = FakeApi(*([502] * 100))
+        code, _, err = _run(api)
+        self.assertEqual(code, 1)
+        self.assertIn("502", err)
+
     def test_any_other_refusal_fails_the_apply_at_once(self):
         api = FakeApi(403)
         with self.assertRaises(SystemExit) as raised:
@@ -146,6 +166,20 @@ class ConfigConnectorStackTest(unittest.TestCase):
         self.assertIn('filesha256("${path.module}/config_connector.py")', block)
         self.assertIn('command     = "${path.module}/config_connector.py"', block)
         self.assertIn("seeded_a.endpoint", block)
+
+    def test_a_recreated_cluster_gets_the_object_again(self):
+        # The cluster's CA certificate is new on every re-creation of
+        # seeded-a; in triggers_replace, it re-runs the apply there.
+        block = self._block('resource "terraform_data" "config_connector"')
+        triggers = block[block.index("triggers_replace"):block.index("\n  ]")]
+        self.assertIn("google_container_cluster.seeded_a.master_auth[0].cluster_ca_certificate", triggers)
+
+    def test_the_writer_is_a_standing_reconcile_allow_entry(self):
+        allow = json.loads((_FLEET / "reconcile-allow.json").read_text())
+        entry = [e for e in allow if e["address"] == "terraform_data.config_connector"]
+        self.assertEqual(len(entry), 1)
+        self.assertTrue(entry[0]["standing"])
+        self.assertIn("taint", entry[0]["why"])
 
     def test_the_mode_is_namespaced_and_the_account_holds_no_project_role(self):
         stack = self._stack()

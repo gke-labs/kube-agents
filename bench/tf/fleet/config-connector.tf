@@ -62,18 +62,22 @@ resource "google_service_account_iam_member" "kcc_eval_context_workload_identity
 }
 
 # The ConfigConnector object. Written once, on create, and again when
-# config_connector.py or the object's spec changes. A change to either plans a
-# replace of this resource, which holds no state of its own; that pull request
-# adds its address to reconcile-allow.json. The script waits for the add-on to
-# install the CRD, so this needs no second apply. An out-of-band edit or delete
-# of the object is drift the fixture-state scan reports (the
-# config-connector-namespaced role in fixtures.json); nothing re-plans this
-# resource, so the repair is to replace it by hand (README.md, hand recoveries).
+# config_connector.py or the object's spec changes, or seeded-a is re-created:
+# a new cluster has a new CA certificate, and a new cluster has no object. Each
+# of these plans a replace of this resource, which holds no state of its own.
+# So does a failed run, which taints it. The replace is a standing entry in
+# reconcile-allow.json, so the reconcile applies it. The script waits for the
+# add-on to install the CRD, and tries again while the API fails, so this needs
+# no second apply. An out-of-band edit or delete of the object is drift the
+# fixture-state scan reports (the config-connector-namespaced role in
+# fixtures.json); nothing re-plans this resource, so the repair is to replace it
+# by hand (README.md, hand recoveries).
 resource "terraform_data" "config_connector" {
   triggers_replace = [
     filesha256("${path.module}/config_connector.py"),
     local.config_connector_name,
     local.config_connector_mode,
+    google_container_cluster.seeded_a.master_auth[0].cluster_ca_certificate,
   ]
 
   provisioner "local-exec" {
