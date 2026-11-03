@@ -353,7 +353,9 @@ func TestLosingTheLeaseStepsDownWithTheShortDrain(t *testing.T) {
 // learns of the new term from a fenced write, before its stale view of the
 // lease catches up, must not clear the new leader's hold when it stops.
 func TestAFencedGatewayLeavesTheNewLeadersLeaseAlone(t *testing.T) {
-	cs := fake.NewClientset()
+	// From a released lease, so pod-a's term isn't a crash takeover, which
+	// keeps its lease without reaching the release at all.
+	cs := fake.NewClientset(heldLease("", 1))
 	failing := failRenewalsOf(cs, "pod-a")
 	a := runCampaign(t, cs, "pod-a")
 	receive(t, a.leading, 5*time.Second, "pod-a leading")

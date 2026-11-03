@@ -409,7 +409,8 @@ func runNotifier(ctx context.Context, n *gateway.Notifier, client *lib.Client) f
 }
 
 // serve is realMain's last step: the metrics listener beside the gateway,
-// then the gateway until ctx is done. run is gw.Run; it is a parameter so a
+// then the gateway until ctx is done. run is the gateway's work (lead, or the
+// election that runs it); it is a parameter so a
 // test can reach this step without a bus and see that a metrics listener
 // which cannot start leaves its ALERT line and does not stop the gateway.
 func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, log *slog.Logger, run func(context.Context) error) error {

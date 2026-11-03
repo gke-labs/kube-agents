@@ -637,6 +637,8 @@ func TestACounterPastTheWritersTermNamesTheCounter(t *testing.T) {
 	}
 	reg := NewRegistry(r.client)
 	reg.setEpoch(2)
+	steps := 0
+	reg.SetOnFenced(func() { steps++ })
 	for name, err := range map[string]error{
 		"Put":    reg.Put(ctx, &SessionRecord{Key: "slack:T1/C1/bumped", Addressee: "platform"}),
 		"Create": reg.Create(ctx, &SessionRecord{Key: "slack:T1/C1/bumped-new"}),
@@ -644,5 +646,10 @@ func TestACounterPastTheWritersTermNamesTheCounter(t *testing.T) {
 		if !errors.Is(err, ErrFenced) || !strings.Contains(err.Error(), termKey) || !strings.Contains(err.Error(), "9") {
 			t.Errorf("%s under a counter past its term = %v, want ErrFenced naming %s and 9", name, err, termKey)
 		}
+	}
+	// A counter past this gateway's term is a newer term: both writes step
+	// the gateway down.
+	if steps != 2 {
+		t.Fatalf("the step-down hook ran %d times for two writes refused at the counter check, want 2", steps)
 	}
 }

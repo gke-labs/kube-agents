@@ -146,7 +146,10 @@ every write to a record whose term is above its own, naming the counter in both 
 a hand fix: the counter set to at least the highest term a record carries.
 
 A write the fence refuses means a newer term has started, so the gateway steps down there, as it
-does on a lost lease, without waiting to see the lease move.
+does on a lost lease, without waiting to see the lease move. The exceptions are a write refused by
+a record above a counter reset by hand, and one whose counter can't be read again to tell a reset
+from a new term: no newer term is known to exist there, and stepping down would only hand the same
+refusal to the next replica.
 
 The election's identity is the pod name. client-go lets a process whose identity matches the
 current holder renew without waiting, so a container restarting in its own pod re-takes the lease

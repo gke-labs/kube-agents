@@ -711,6 +711,7 @@ func (g *Gateway) bindRelay(ctx context.Context) (lib.Subscription, error) {
 	if err != nil {
 		return nil, fmt.Errorf("event relay subscription: %w", err)
 	}
+	g.log.Info("event relay bound", "durable", g.relayDurable)
 	return sub, nil
 }
 
