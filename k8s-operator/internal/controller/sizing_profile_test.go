@@ -284,6 +284,37 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 			t.Error("no event recorded for the capped promotion")
 		}
 	})
+	t.Run("the event watcher switched off by spec clears the condition", func(t *testing.T) {
+		t.Parallel()
+		// The first pass caps the tier. The watcher is then switched off by
+		// spec and the poller clears both gauges for as long as it stays off,
+		// so a cap carried through that state would outlive the quota being
+		// raised; auto cannot promote without a reading, so the pass clears
+		// the condition and keeps the latch.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+		quota := sizingQuota("platform-baseline-quota", "10Gi", "8Gi")
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("first pass: %v", err)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond == nil {
+			t.Fatal("the first pass did not cap the tier")
+		}
+		agent.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)}
+		agent.Status.Usage.ClustersRegistered = nil
+		agent.Status.Usage.ClustersMonitored = nil
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("pass with the watcher off: %v", err)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Errorf("SizingCappedByQuota kept while the watcher is off by spec: %+v", cond)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Errorf("status.effectiveSizingTier = %q, want the small latch kept", agent.Status.EffectiveSizingTier)
+		}
+	})
 	t.Run("a quota with headroom lets the promotion through and clears the condition", func(t *testing.T) {
 		t.Parallel()
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)

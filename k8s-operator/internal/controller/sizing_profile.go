@@ -541,7 +541,10 @@ func sizingCappedConditionMessage(agent *agentv1alpha1.PlatformAgent) string {
 // gauges absent before the first poll, or cleared after two polls that read
 // no gateway) leaves the latch and the condition both where they are, so a
 // gateway outage neither clears a cap the quota still imposes nor records it
-// again when the reading returns. The write is gated on a change, as the
+// again when the reading returns. The one no-reading state that is not an
+// outage, the event watcher switched off by spec, clears the condition
+// instead, since the gauges stay absent for as long as it is off and nothing
+// could lift the cap. The write is gated on a change, as the
 // other status writers' are, because the PlatformAgent watch has no predicate
 // and every write re-enqueues the object; under a served CRD that prunes
 // status.effectiveSizingTier the field reads "" after every write, so the
@@ -571,7 +574,14 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					capped = fmt.Sprintf(sizingCappedByQuotaMessageFormat, earned, shortfall.quota, shortfall.key, tier, tier)
 				}
 			}
-		} else {
+		} else if eventWatcherEnabled(agent) {
+			// No reading with the watcher on is an outage or the time before
+			// the first poll: the cap stands as written. With the watcher off
+			// by spec the poller clears the gauges for as long as it stays
+			// off, and a cap carried through that would outlive the quota
+			// being raised; auto cannot promote without a reading, so there
+			// is nothing to cap, and the first reading after the watcher is
+			// switched back on checks the quota again.
 			capped = sizingCappedConditionMessage(agent)
 		}
 	}
