@@ -24158,6 +24158,31 @@ class TestStalledKccInFinish(HarnessTestCase):
         self.assertFalse(audit_report.kcc_index_needed([other, elsewhere, make_finding()], manifest))
         self.assertFalse(audit_report.kcc_index_needed([cluster], _full_manifest()))
 
+    def remediate(self, *extra):
+        doc = self.doc_and_file()
+        path = self.write_findings(doc)
+        fid = audit_report.derive_finding_id(doc["findings"][0])
+        return self.run_main(["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", fid,
+                              "--manifest-file", self.manifest_file(self.stalled_manifest()), *extra])
+
+    def test_remediate_dry_run_previews_the_paragraph(self):
+        """Review finding: `remediate` opened and previewed pull requests with
+        no Config Connector pass, and `finish` skips a finding whose pull
+        request is open, so that pull request never got the paragraph."""
+        self.assertEqual(self.remediate("--dry-run"), 0, self.err)
+        self.assertIn("WOULD OPEN: platform-agent/fix-", self.err)
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, self.out)
+
+    def test_remediate_opens_the_pull_request_with_the_paragraph(self):
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.assertEqual(self.remediate(), 0, self.err)
+        proposals = self.harness.forge_calls("proposal-create")
+        self.assertTrue(proposals, self.err)
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, proposals[0]["body"])
+
     def test_a_merged_fix_that_still_reproduces_says_config_connector_is_not_applying_it(self):
         doc = self.doc_and_file()
         branch = audit_report.group_branch_for(AUDIT, doc["findings"])

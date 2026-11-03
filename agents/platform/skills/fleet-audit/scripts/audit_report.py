@@ -21337,6 +21337,18 @@ def handle_remediate(args: argparse.Namespace) -> None:
             # that is a forge call. Say so rather than let the missing "Part of
             # #N" read as a defect in the rendering.
             log("DRY RUN: no --issue given, so the 'Part of #N' link is omitted.")
+        if manifest is not None:
+            # The paragraph `finish` adds when Config Connector does not apply
+            # the object, so the preview shows what the pull request says.
+            disclose_stalled_kcc_and_log(
+                findings,
+                manifest,
+                dry_root,
+                prefix="DRY RUN: ",
+                declarations=kcc_paragraph_index(repo_hint or "", None, kcc_declaration_roots(audit_id, dry_root, record))
+                if kcc_index_needed(findings, manifest)
+                else {},
+            )
         for group in groups:
             log(f"WOULD OPEN: {group_branch_for(audit_id, group)}")
             print(
@@ -21382,6 +21394,18 @@ def handle_remediate(args: argparse.Namespace) -> None:
     probe = _RepositoryProbe(repo, root)
     try:
         unlisted = set(degrade_unlisted_kustomize_additions(findings, probe, noun))
+        # A pull request that `remediate` opens carries the Config Connector
+        # paragraph, as one that `finish` opens does: `finish` does not
+        # revisit a finding whose pull request is open.
+        if manifest is not None:
+            disclose_stalled_kcc_and_log(
+                findings,
+                manifest,
+                root,
+                declarations=kcc_paragraph_index(repo, probe, kcc_declaration_roots(audit_id, root, record))
+                if kcc_index_needed(findings, manifest)
+                else {},
+            )
     finally:
         probe.close()
     for fid in [fid for fid in requested if fid in unlisted]:
@@ -22913,6 +22937,26 @@ def findings_predate_run(path: str, audit_id: str) -> str | None:
     return str(started_raw)
 
 
+def kcc_paragraph_index(
+    repo: str, probe: "_RepositoryProbe | None", roots: list[tuple[str, Path]]
+) -> dict[KccKey, KccDeclaration]:
+    """The index the Config Connector paragraph names a declaration from:
+    the clones in `roots`, and in content mode first the paragraph's own
+    broker search (every kind, `every_kind`), apart from the gcloud check's.
+    `finish` and `remediate` build it the same way. With no `probe` (a dry
+    run), only the clones are read."""
+    if probe is None or not content_mode():
+        return kcc_declaration_index(roots)
+    paragraph_scan = _kcc_paragraph_scan(repo, probe)
+    if paragraph_scan.truncated or paragraph_scan.failed:
+        log(
+            f"WARNING: the Config Connector paragraph's search of {repo} "
+            f"{'stopped short' if paragraph_scan.truncated else 'did not run'}; "
+            "a paragraph can name no declaration file that the repository has."
+        )
+    return kcc_declaration_index(roots, paragraph_scan.declarations)
+
+
 def _kcc_paragraph_scan(repo: str, probe: _RepositoryProbe) -> KccBrokerScan:
     """The broker search that the Config Connector paragraph names a
     declaration from, over every kind (`every_kind`).
@@ -23181,21 +23225,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 "publish as written, so their absence here proves nothing."
             )
     kcc_roots = kcc_declaration_roots(audit_id, root, record)
-    # The index the Config Connector paragraph names a declaration from: read
-    # only when a finding's own object can be stalled (`kcc_index_needed`), with its own broker search in
-    # content mode (every kind, `every_kind`), apart from the gcloud check's.
-    kcc_index: dict[KccKey, KccDeclaration] = {}
-    if kcc_index_wanted and content_mode():
-        paragraph_scan = _kcc_paragraph_scan(repo, probe)
-        if paragraph_scan.truncated or paragraph_scan.failed:
-            log(
-                f"WARNING: the Config Connector paragraph's search of {repo} "
-                f"{'stopped short' if paragraph_scan.truncated else 'did not run'}; "
-                "a paragraph can name no declaration file that the repository has."
-            )
-        kcc_index = kcc_declaration_index(kcc_roots, paragraph_scan.declarations)
-    elif kcc_index_wanted:
-        kcc_index = kcc_declaration_index(kcc_roots)
+    kcc_index = kcc_paragraph_index(repo, probe, kcc_roots) if kcc_index_wanted else {}
     for fid in degrade_reverted_gcloud_remediations(
         findings, kcc_roots, prebuilt=kcc_prebuilt
     ):
