@@ -2,6 +2,9 @@
 
 ## This directory contains an example of deploying a Inference Replay proxy. It intercepts traffic destined for your primary LLM gateway (`inference-gateway`), serves instant repeated responses from a local Persistent Disk (PVC), and forwards cache misses to the real LLM gateway automatically.
 
+Using replay to cut inference in eval runs, with normalization, measurements and a CI rollout, is
+designed in [`eval-design.md`](eval-design.md).
+
 ## Architecture Overview
 
 ```mermaid

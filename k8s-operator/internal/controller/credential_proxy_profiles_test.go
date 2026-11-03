@@ -309,3 +309,20 @@ func TestTheFlipToTodayRemovesALoneTaskSigningKey(t *testing.T) {
 		t.Errorf("the task-signing key Secret survived the flip to today (err=%v): the early exit stepped over it", err)
 	}
 }
+
+// The eval lanes turn the broker's proposal readings sweep off through
+// spec.deployment.env (hack/ci-deploy.sh, #4611), so the name has to stay out
+// of the reserved set and reach the broker as the CR wrote it.
+func TestTheReadingsSweepSwitchReachesTheBrokerFromTheCR(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_VCS_READINGS", Value: "off"}},
+	}
+	env := buildCredentialProxyEnvForPlugins(agent, nil, allBrokerCallersOwned, credentialProxyProfileConfig{})
+	if got, ok := brokerEnvValue(env, "CREDENTIAL_PROXY_VCS_READINGS"); !ok || got != "off" {
+		t.Errorf("CREDENTIAL_PROXY_VCS_READINGS = %q (present %v), want off from spec.deployment.env", got, ok)
+	}
+	if n := brokerEnvCount(env, "CREDENTIAL_PROXY_VCS_READINGS"); n != 1 {
+		t.Errorf("CREDENTIAL_PROXY_VCS_READINGS rendered %d times, want 1", n)
+	}
+}
