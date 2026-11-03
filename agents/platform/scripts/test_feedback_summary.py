@@ -564,7 +564,7 @@ class CollectTest(unittest.TestCase):
             snapshot = fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW, in_pod=False))
         self.assertEqual(fs.model_from_litellm_config(snapshot.litellm_config), "vertex_ai/claude-opus-5")
         run, _ = self.fake_run({
-            "get platformagent": json.dumps(CR),
+            "get platformagent": json.dumps(legacy_cr),
             "get configmap": json.dumps({"items": [
                 {"metadata": {"name": "litellm-config-a1b2stale", "creationTimestamp": "2026-10-01T00:00:00Z"}, "data": {"config.yaml": "model: vertex_ai/old-model\n"}},
                 {"metadata": {"name": "litellm-config-k4b9ht22c7", "creationTimestamp": "2026-10-10T00:00:00Z"}, "data": {"config.yaml": LITELLM_CONFIG_YAML}},
