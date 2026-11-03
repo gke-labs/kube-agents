@@ -48,6 +48,25 @@ The palettes live in `theme.py`, except Streamlit's base theme for `default`,
 which stays in `.streamlit/config.toml` at the repository root. The theme
 changes colours only; it adds no Google Cloud logo or font.
 
+Every console page first asks the cluster which PlatformAgent is canonical,
+and every runtime read which gateway pod runs it. Each console process holds
+those two answers for 30 seconds: the API server's copy serves the API, the chat poll and the Chat, LLM
+Gateway and Google Chat pages, and is dropped after a chat action or an LLM
+Gateway change; the Streamlit process's copy serves Task Kanban, Scheduled Cron
+and the Connection check, and lasts the window. Either copy is dropped when a
+discovery fails, and lookups queued behind a failed discovery get its error
+rather than each asking in turn. A read, or the LLM Gateway page's verification
+call, that the cluster fails against the held pod discovers again and retries
+once if the pod has moved; a timeout, a failure before kubectl ran, or a
+failure whose rediscovery fails too is reported as the read's own error, since
+none of them says the pod moved. The data read itself is
+never held. The API server also keeps one runtime provider and one chat backend
+per target, so the settlement poll does not rebuild them every two seconds. To
+change the window, set `ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS` in seconds; `0`
+disables the cache, and an unparsable value keeps the default. The console
+processes read it directly; the launcher does not validate it as it does its
+`ADMIN_PORTAL_*` settings.
+
 This loopback-only launcher is the authentication boundary for the prototype.
 A remotely deployed console still requires application-level authentication
 and authorization as described in the design.

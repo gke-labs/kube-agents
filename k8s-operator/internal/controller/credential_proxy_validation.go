@@ -35,7 +35,7 @@ import (
 // otherwise. The band applies to requests alone; limits Autopilot either sets
 // equal to the requests (no bursting) or keeps as declared (bursting),
 // whatever their ratio. The operator declares the proxy's default requests
-// inside the band (500m and 1Gi, 2 GiB per vCPU) so the manifest it writes is
+// inside the band (500m and 1Gi, and 2 CPU and 2Gi on Autopilot) so the manifest it writes is
 // the pod Autopilot admits; a requests override that leaves the band is admitted
 // at figures the CR does not show, and the chart's quota preflight, which sums
 // the CR's figures, is short by the difference. A warning rather than a
@@ -292,7 +292,9 @@ func validateContainerResources(override, merged corev1.ResourceRequirements, pa
 }
 
 // credentialProxyMessages is the credential-proxy container's wording for
-// validateContainerResources.
+// validateContainerResources. crossedDefRequestFmt does not reach the proxy:
+// resolveCredentialProxyResourcesFor lowers a default request to a limit set
+// alone below it, so that crossed pair never forms.
 var credentialProxyMessages = containerResourceMessages{
 	resourceName:           credentialProxyResourceNameRefusal,
 	claims:                 credentialProxyClaimsRefusal,
@@ -314,6 +316,12 @@ var credentialProxyMessages = containerResourceMessages{
 // same override rather than rendering it. It adds one refusal to the shared
 // validateContainerResources: a memory limit under the floor at which the
 // broker's child memory budget admits two commands.
+//
+// The merge it checks is the Autopilot one. The webhook cannot see the cluster
+// type, and the two warnings are about Autopilot alone (the CPU:memory band,
+// and a limit Autopilot clamps to its request), so they name the figures
+// Autopilot runs. The refusals come out the same either way: the limits do not
+// differ, and a limit set alone lowers its request on both cluster types.
 func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, path *field.Path) (field.ErrorList, admission.Warnings) {
 	if deployment == nil || deployment.CredentialProxy == nil || deployment.CredentialProxy.Resources == nil {
 		return nil, nil
@@ -325,7 +333,7 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 			return fmt.Sprintf(credentialProxyFloorRefusalFmt, limit.String(), floorBytes/bytesPerMiB, credentialProxyMinimumAdmittedRequests)
 		},
 	}
-	return validateContainerResources(*deployment.CredentialProxy.Resources, resolveCredentialProxyResources(deployment),
+	return validateContainerResources(*deployment.CredentialProxy.Resources, resolveCredentialProxyResourcesFor(deployment, true),
 		path, acceptedContainerResourceNames, credentialProxyMessages, floor)
 }
 

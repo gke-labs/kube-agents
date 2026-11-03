@@ -191,6 +191,29 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # the CR.
 readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 
+# The gateway's own retries, on this install only (the chart default is none).
+# A Vertex 429 on a per-minute quota comes back with no Retry-After, and
+# LiteLLM's stock pause retries it inside the same closed minute; two retries
+# 20s apart let the gateway ride out a short storm before the agent sees it,
+# and the agent's own 30-60s backoff floor
+# (deploy/docker/patches/rate_limit_backoff_floor.py) covers the long ones.
+# The hold is silent: while the gateway retries, the agent's stream carries no
+# byte, and the Platform and Cluster Agents drop a stream with no first chunk
+# for stale_timeout_seconds (120s, agents/platform/config.yaml and
+# agents/cluster/config.yaml) and retry blind, never seeing the 429, so the
+# backoff floor would not engage. The pair below therefore has to keep
+# (EVAL_LITELLM_NUM_RETRIES + 1) pauses (LiteLLM sleeps before each retry and
+# once more after the last failed one) plus the model's time to first chunk
+# under that bound: 3 x 20s = 60s, leaving 60s for Vertex. The chart's render
+# refuses a pair that does not (kube-agents.litellmConfig in
+# charts/kube-agents/templates/_helpers.tpl), so a bad override fails the helm
+# upgrade below before anything is deployed. Each gateway response says what it
+# did in x-litellm-attempted-retries. To turn the retries off set both to 0:
+# the chart refuses a pause without retries. tests/test_ci_deploy_litellm_vertex.py
+# pins the flags and the defaults, and holds the defaults under the chart's bound.
+readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"
+readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-20}"
+
 # The credential-proxy container's memory limit on the eval install. The broker
 # admits a request only while its child memory reservation fits the budget it
 # derives from this limit (agents/platform/scripts/credential_proxy.py,
@@ -313,11 +336,9 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # The Prow jobs that deploy under the flag with no PULL_NUMBER: the
 # merge-blocking presubmit in a batch Tide ran (it grades next since next became
-# the mode new installs get, #2007, "The cutover itself"); the today lane's
-# six-hourly periodic on main, which deploys next and rolls it back to today
-# before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's three parts on
-# main (the main part's two halves, main-a and main-b, and the writers part),
-# which grade the full catalog under next (the nightly the dashboard and
+# the mode new installs get, #2007, "The cutover itself"); the main nightly's
+# three parts on main (the main part's two halves, main-a and main-b, and
+# the writers part), which grade the full catalog under next (the nightly the dashboard and
 # the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
 # hack/eval/gitlab-cases.txt) and the GHES lane's (EVAL_FORGE=ghes,
 # hack/eval/ghes-cases.txt), each beside its today-mode nightly; and the
@@ -327,7 +348,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # carries a PULL_NUMBER. Section 2b admits the flag on a run whose JOB_NAME is
 # one of these (space-separated, matched whole) or that carries a PULL_NUMBER
 # -- a presubmit is admitted by the second on a pull request and the blocking
-# one by the first on a batch Tide ran, the periodic, the nightlies and the RC
+# one by the first on a batch Tide ran, the nightlies and the RC
 # postsubmit only by the first -- and refuses it on any other Prow run, so
 # the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
@@ -336,7 +357,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -983,8 +1004,8 @@ else
 fi
 
 # The mode flip exists for the runs that grade next or roll it back: a pull
-# request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the today
-# lane's periodic and the main, GitLab and GHES nightlies on main, the blocking presubmit
+# request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the main,
+# GitLab and GHES nightlies on main, the blocking presubmit
 # in a batch Tide ran, and the release-candidate eval).
 # A flagged run on main records under the version key's next mode, never into
 # today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
@@ -1918,6 +1939,8 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
     --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
     --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+    --set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}" \
+    --set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}" \
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     --set "platformAgent.deployment.availability.runtimeClassName=" \
     --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
@@ -2580,6 +2603,23 @@ cleanup_pf_and_dump() {
 trap cleanup_pf_and_dump EXIT
 
 CONNECTIVITY_ATTEMPTS=5
+# The ping is one real agent turn, so its deadline has to outlast what the
+# agent may wait inside it on a 429 that names no reset window, and it moves
+# with the knobs that set those waits: the gateway holds each of the agent's
+# calls for EVAL_LITELLM_NUM_RETRIES + 1 pauses of
+# EVAL_LITELLM_RETRY_AFTER_SECONDS (LiteLLM sleeps before each retry and once
+# more after the last failed one), and the image's rate_limit_backoff_floor
+# patch holds each of the agent's retries up to
+# AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS. At the defaults: 4 x 3 x 20s = 240s at
+# the gateway, 3 x 60s = 180s in the agent, plus the allowance for the model
+# calls themselves, 480s. A deadline inside that sum cut such a turn off
+# mid-retry, and the next attempt started another one against the same closed
+# quota. scripts/test_ci_connectivity_retry.py holds the deadline above the
+# sum at the defaults and under an override.
+readonly AGENT_API_CALLS_PER_TURN=4          # Hermes' default api_max_retries (3) plus the first call
+readonly AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS=60 # FLOOR_MAX_SECONDS in deploy/docker/patches/rate_limit_backoff_floor.py
+readonly PING_MODEL_LATENCY_ALLOWANCE_SECONDS=60
+readonly CONNECTIVITY_PING_MAX_TIME_SECONDS=$((AGENT_API_CALLS_PER_TURN * (EVAL_LITELLM_NUM_RETRIES + 1) * EVAL_LITELLM_RETRY_AFTER_SECONDS + (AGENT_API_CALLS_PER_TURN - 1) * AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS + PING_MODEL_LATENCY_ALLOWANCE_SECONDS))
 CONNECTIVITY_OK="false"
 : >/tmp/pf-8642.log
 for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
@@ -2601,7 +2641,7 @@ for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
     sleep 1
   done
 
-  HEALTH_RESP="$(curl -s --max-time 120 -X POST http://localhost:8642/v1/responses \
+  HEALTH_RESP="$(curl -s --max-time "${CONNECTIVITY_PING_MAX_TIME_SECONDS}" -X POST http://localhost:8642/v1/responses \
     -H "Authorization: Bearer ${API_KEY}" \
     -H "Content-Type: application/json" \
     -d '{"model": "model-default", "input": "ping"}' || true)"

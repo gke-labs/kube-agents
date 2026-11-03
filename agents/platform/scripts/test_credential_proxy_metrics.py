@@ -762,10 +762,10 @@ class VcsProviderLabelsTest(unittest.TestCase):
 
     def test_a_provider_outside_the_known_set_is_folded_to_other(self):
         metrics = ProxyMetrics()
-        metrics.record_vcs("proposal-create", "success", "bitbucket")
+        metrics.record_vcs("proposal-create", "success", "gogs")
         families = _parse(metrics.render())
         self.assertEqual(1, _series(families, self.FAMILY, verb="proposal-create", status="success", provider="other"))
-        self.assertNotIn("bitbucket", metrics.render())
+        self.assertNotIn("gogs", metrics.render())
 
     def test_a_status_outside_the_closed_set_is_folded_to_error(self):
         # An exit that named no outcome (a bare return) or an unlisted word

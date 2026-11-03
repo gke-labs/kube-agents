@@ -400,7 +400,7 @@ What `finish` does with it:
 
 Where the sha comes from is the SOP's §4a, and it is the same for the harness and the worker: in
 content mode `list`, `grep` and `fetch` print it for the GitOps repository and
-`inspect_repository.py clone` and `open` print it for a context copy; in directory mode it is
+`inspect_repository.py clone` prints it for a context copy; in directory mode it is
 `git -C <dir> rev-parse HEAD` on the GitOps clone and on the `workspace` that `clone` named for
 the context copy.
 
