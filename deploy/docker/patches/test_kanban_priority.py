@@ -13,6 +13,10 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import contextvars
+import importlib.util
+import os
+import sys
 import json
 import sqlite3
 import tempfile
@@ -34,6 +38,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 SESSION_KV_SERVER = REPO / "agents" / "platform" / "scripts" / "session_kv_server.py"
 DOCKERFILE = HERE.parent / "Dockerfile"
+TURN_CONTEXT = REPO / "agents" / "chat" / "defaults" / "plugins" / "session_store" / "turn_context.py"
 
 QUEUED_LINE = "⏳ Queued: the system is busy. Your request will start when a worker frees up."
 
@@ -122,6 +127,29 @@ class StampTest(unittest.TestCase):
     def test_the_runtime_origin_fails_toward_no_session(self):
         # No tools.async_delegation on the host: the read must not raise.
         self.assertEqual(kp.trusted_origin_session(), "")
+
+    def test_trusted_origin_session_falls_back_to_the_gateway_binding(self):
+        # A gateway platform turn: no api_server id, so the Hermes session id
+        # the session_store plugin bound at dispatch is the origin session.
+        spec = importlib.util.spec_from_file_location("turn_context_under_test", TURN_CONTEXT)
+        turn_context = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(turn_context)
+
+        def gateway_turn():
+            turn_context.bind_session(GATEWAY_SESSION)
+            return kp.trusted_origin_session()
+
+        self.assertEqual(GATEWAY_SESSION, contextvars.copy_context().run(gateway_turn))
+
+        # An api_server turn's own id wins over any binding.
+        api = SimpleNamespace(_current_origin_session_id=lambda: EVENT_SESSION)
+        with mock.patch.dict(sys.modules, {"tools": SimpleNamespace(async_delegation=api), "tools.async_delegation": api}):
+            self.assertEqual(EVENT_SESSION, contextvars.copy_context().run(gateway_turn))
+
+        # No plugin loaded in this process: the gateway's session env.
+        with mock.patch.dict(sys.modules), mock.patch.dict(os.environ, {"HERMES_SESSION_ID": GATEWAY_SESSION}):
+            sys.modules.pop(turn_context.TURN_CONTEXT_MODULE, None)
+            self.assertEqual(GATEWAY_SESSION, kp.trusted_origin_session())
 
     def test_the_class_boundary_is_the_floor(self):
         self.assertTrue(kp.is_user_priority(kp.USER_PRIORITY))

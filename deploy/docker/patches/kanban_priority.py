@@ -78,6 +78,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from typing import Any, Callable, Iterable, Optional
 
@@ -99,6 +100,13 @@ USER_PRIORITY = 100
 #: ``test_kanban_priority`` pins both against that file, so a renamed prefix
 #: fails CI rather than silently turning triage into user work.
 BACKGROUND_SESSION_PREFIXES = ("k8s-evt-", "cron-")
+
+#: Where the chat session_store plugin publishes the Hermes session id it binds
+#: for a gateway turn (agents/chat/defaults/plugins/session_store/turn_context.py
+#: TURN_CONTEXT_MODULE), and the gateway's session env read when no plugin
+#: loaded that module in this process.
+TURN_CONTEXT_MODULE = "kube_agents_turn_context"
+GATEWAY_SESSION_ENV = "HERMES_SESSION_ID"
 
 
 def is_background_session(session_id: object) -> bool:
@@ -125,14 +133,26 @@ def trusted_origin_session() -> str:
     Upstream's ``tools.async_delegation._current_origin_session_id``: the
     request-scoped ``HERMES_SESSION_CHAT_ID`` of an ``api_server`` turn, which
     is where event triage (``k8s-evt-...``) and cron relays (``cron-...``) run.
-    It reads the gateway's ContextVars, not anything the model passed.
+    It reads the gateway's ContextVars, not anything the model passed. On a
+    gateway platform turn that id is empty, so the Hermes session id the
+    session_store plugin bound at dispatch is read instead, and failing that
+    the gateway's ``HERMES_SESSION_ID``.
     """
     try:
         from tools.async_delegation import _current_origin_session_id
 
-        return _current_origin_session_id() or ""
+        api_session = _current_origin_session_id() or ""
     except Exception:  # noqa: BLE001 — no session context is not an error
-        return ""
+        api_session = ""
+    if api_session:
+        return api_session
+    turn_context = sys.modules.get(TURN_CONTEXT_MODULE)
+    if turn_context is not None:
+        try:
+            return turn_context.current_session() or ""
+        except Exception:  # noqa: BLE001 — an unreadable binding is no session
+            return ""
+    return os.environ.get(GATEWAY_SESSION_ENV, "")
 
 
 def stamp_priority(

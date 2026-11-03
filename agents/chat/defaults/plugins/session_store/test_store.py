@@ -5,12 +5,15 @@ Platform Agent later reads back out of `session_metadata` is exactly what a
 compromised database would leak.
 """
 
+import contextvars
 import json
 import os
 import re
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +26,7 @@ from chat_metrics import metrics as chat_metrics  # noqa: E402
 from common.redactor import SALT_ENV_VAR, AuditRedactor  # noqa: E402
 
 import store  # noqa: E402
+import turn_context  # noqa: E402
 from store import SessionMetadata, SessionMetadataStore, log_event_to_db  # noqa: E402
 
 EMAIL = "alice@example.com"
@@ -186,6 +190,74 @@ class TestWriteThrough(SaltedTestCase):
         with mock.patch.object(chat_metrics, "REGISTRY", Exploding()), self.assertLogs(store.logger, level="ERROR"):
             self.assertIsNone(log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-9")))
         self.assertIsNotNone(self._stored("sess-9"), "the row is written before the count")
+
+    def _row(self, session_id):
+        raw = self._stored(session_id)
+        return json.loads(raw) if raw else None
+
+    def _seed(self, session_id, metadata):
+        conn = sqlite3.connect(os.environ["SESSION_KV_DB_PATH"])
+        try:
+            conn.execute(store.CREATE_SESSION_METADATA_TABLE_SQL)
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                (session_id, json.dumps(metadata)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_write_keeps_an_origin_another_writer_set(self):
+        self._seed("sess-1", {"origin": "drift", "origin_platform": ""})
+        log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
+        row = self._row("sess-1")
+        self.assertEqual("drift", row["origin"])
+        self.assertEqual("", row["origin_platform"])
+        self.assertEqual("spaces/AAA", row["chat_id"], "the event's own keys are still written")
+
+    def test_write_sets_chat_with_the_platform_when_absent(self):
+        log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
+        row = self._row("sess-1")
+        self.assertEqual("chat", row["origin"])
+        self.assertEqual("googlechat", row["origin_platform"])
+        log_event_to_db(_event(platform="slack", user_id="U1"), gateway=None, session_store=_SessionStore("sess-2"))
+        self.assertEqual(("chat", "slack"), (self._row("sess-2")["origin"], self._row("sess-2")["origin_platform"]))
+
+    def test_write_merges_under_one_transaction(self):
+        # Another writer (the Session KV server) holds the write lock and is
+        # recording the session's origin: the plugin's write waits for it and
+        # then carries that origin forward rather than replacing the row with
+        # what it read before.
+        self._seed("sess-1", {"chat_id": "spaces/AAA"})
+        SessionMetadataStore.get_db_connection()  # the pod's database is already in WAL mode
+        other = sqlite3.connect(os.environ["SESSION_KV_DB_PATH"], isolation_level=None)
+        self.addCleanup(other.close)
+        other.execute("BEGIN IMMEDIATE")
+        other.execute(
+            "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
+            (json.dumps({"chat_id": "spaces/AAA", "origin": "console", "origin_platform": ""}), "sess-1"),
+        )
+        writer = threading.Thread(
+            target=log_event_to_db, args=(_event(),), kwargs={"gateway": None, "session_store": _SessionStore("sess-1")}
+        )
+        writer.start()
+        time.sleep(0.3)
+        self.assertTrue(writer.is_alive(), "the write waits for the other writer's transaction")
+        other.execute("COMMIT")
+        writer.join(timeout=10)
+        self.assertFalse(writer.is_alive())
+        row = self._row("sess-1")
+        self.assertEqual("console", row["origin"])
+        self.assertEqual("spaces/AAA/threads/BBB", row["thread_id"])
+
+    def test_dispatch_binds_the_hermes_session_id(self):
+        def dispatch():
+            log_event_to_db(_event(), gateway=None, session_store=_SessionStore("20261103_101500_ab12cd34"))
+            return turn_context.current_session()
+
+        before = turn_context.current_session()
+        self.assertEqual("20261103_101500_ab12cd34", contextvars.copy_context().run(dispatch))
+        self.assertEqual(before, turn_context.current_session(), "the binding stays in the turn's context")
 
     def test_an_empty_session_id_writes_nothing(self):
         # Not even the database file: the early return happens before the

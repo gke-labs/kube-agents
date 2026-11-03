@@ -2,6 +2,7 @@ package hermesbridge
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,10 +16,18 @@ import (
 )
 
 type routeStore struct {
-	mu     sync.Mutex
-	srv    *httptest.Server
-	status int
-	puts   []routePut
+	mu      sync.Mutex
+	srv     *httptest.Server
+	status  int
+	puts    []routePut
+	origins []originPut
+}
+
+// originPut is one origin record write the store took, kept apart from the
+// route writes so a test of either counts its own.
+type originPut struct {
+	path, auth string
+	body       sessionOrigin
 }
 
 type routePut struct {
@@ -37,6 +46,15 @@ func newRouteStore(t *testing.T, status int) *routeStore {
 			return
 		}
 		raw, _ := io.ReadAll(r.Body)
+		if strings.HasSuffix(r.URL.Path, "/origin") {
+			var origin sessionOrigin
+			_ = json.Unmarshal(raw, &origin)
+			s.mu.Lock()
+			s.origins = append(s.origins, originPut{path: r.Method + " " + r.URL.Path, auth: r.Header.Get("Authorization"), body: origin})
+			s.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		var body conversationRoute
 		_ = json.Unmarshal(raw, &body)
 		s.mu.Lock()
@@ -60,6 +78,12 @@ func (s *routeStore) seen() []routePut {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]routePut(nil), s.puts...)
+}
+
+func (s *routeStore) seenOrigins() []originPut {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]originPut(nil), s.origins...)
 }
 
 // submitFrom is submitIn with the gateway's audience: the conversation the
@@ -458,5 +482,76 @@ func TestRecordRoute_AConsoleRouteForAnotherTurnIsNotTheSame(t *testing.T) {
 	turn2.TaskID = "task-2"
 	if err := b.recordRoute(testCtx(t), "a2a-ctx-c", turn2); err == nil {
 		t.Fatal("a failed PUT for another turn = nil, want the error: its card would report under task-1")
+	}
+}
+
+// Before the first turn, the bridge records the session's origin from the
+// door the task came through: a chat door is "chat" with the door as its
+// platform, the console is "console", and the A2A and inject doors are "api".
+func TestRecordOriginBeforeTheFirstTurnPerBackend(t *testing.T) {
+	cases := []struct {
+		backend, conversation, origin, platform string
+	}{
+		{"gchat", "gchat:spaces/S1", "chat", "gchat"},
+		{"slack", "slack:dm/D1", "chat", "slack"},
+		{"discord", "discord:C1", "chat", "discord"},
+		{"console", "console:tok-1", "console", ""},
+		{"a2a", "a2a:ctx", "api", ""},
+		{"a2a-google", "a2a-google:ctx", "api", ""},
+		{"inject", "inject:eval/run", "api", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.backend, func(t *testing.T) {
+			_, url := startServer(t)
+			store := newRouteStore(t, http.StatusOK)
+			stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
+				if len(store.seenOrigins()) == 0 {
+					t.Error("the turn reached the API server before the origin was recorded")
+				}
+				writeCompletion(w, c.sessionID, "done")
+			})
+			startAPIBridge(t, url, stub, func(c *Config) { c.RouteURL, c.RouteKey = store.srv.URL, "kv-key" })
+			c := gatewayClient(t, url)
+
+			taskID, ctxID := "task-origin", "ctx-origin"
+			var auth map[string]any
+			if err := json.Unmarshal(authorityFor(t, mintFor(t, c, taskID, "platform")), &auth); err != nil {
+				t.Fatal(err)
+			}
+			auth["audience"] = map[string]any{"conversation": tc.conversation, "kind": "dm"}
+			auth["requester"] = map[string]any{"principal": "hmac:0123456789abcdef0123456789abcdef", "backend": tc.backend}
+			raw, err := json.Marshal(auth)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, err := lib.NewMessageEnvelope(gatewayParty, taskID, ctxID, "corr-"+taskID,
+				messagePayload(t, taskID, ctxID, "hello"), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), env); err != nil {
+				t.Fatal(err)
+			}
+			if task := waitTerminal(t, c, taskID); task.State != lib.StateCompleted {
+				t.Fatalf("state = %s, want completed", task.State)
+			}
+			want := originPut{path: "PUT /v1/sessions/a2a-ctx-origin/origin", auth: "Bearer kv-key",
+				body: sessionOrigin{Origin: tc.origin, Platform: tc.platform}}
+			if got := store.seenOrigins(); len(got) != 1 || got[0] != want {
+				t.Fatalf("origin PUTs = %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+// A 409 is the store's existing record (a resumed session), not a failure.
+func TestPutOrigin_A409IsTheExistingRecord(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+	}))
+	t.Cleanup(srv.Close)
+	b := &Bridge{cfg: Config{RouteURL: srv.URL, RouteKey: "kv-key", Logger: discardLogger()}, routeClient: http.DefaultClient}
+	if err := b.putOrigin(testCtx(t), "a2a-ctx", "chat", "slack"); !errors.Is(err, errOriginExists) {
+		t.Fatalf("putOrigin on 409 = %v, want errOriginExists", err)
 	}
 }

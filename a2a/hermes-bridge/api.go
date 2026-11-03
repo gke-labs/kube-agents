@@ -383,6 +383,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 
+	b.recordOrigin(taskCtx, sessionID, run.origin)
 	// Recorded before the first turn, so a card any turn files finds it;
 	// every turn of the task is the same session and conversation. Best
 	// effort: the task runs either way, and a failure is said in the answer.

@@ -19,10 +19,22 @@ if _PLUGINS_DIR not in sys.path:
 from chat_metrics import metrics as chat_metrics  # noqa: E402
 from common.redactor import AuditRedactor  # noqa: E402
 
+try:
+    from . import turn_context
+except ImportError:  # loaded as a top-level module, as the tests load it
+    import turn_context  # noqa: E402
+
 logger = logging.getLogger("hermes.plugin.session_store")
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 DEFAULT_RETENTION_DAYS = 7
+# The session's origin (docs/designs/proposal-origin.md §2.1), the keys the
+# Session KV server reads (agents/platform/scripts/session_kv_server.py
+# ORIGIN_KEY, ORIGIN_PLATFORM_KEY). A session this plugin records is a chat
+# session unless another writer recorded its origin first.
+ORIGIN_KEY = "origin"
+ORIGIN_PLATFORM_KEY = "origin_platform"
+ORIGIN_CHAT = "chat"
 CREATE_SESSION_METADATA_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS session_metadata (
     session_id TEXT PRIMARY KEY,
@@ -44,6 +56,8 @@ class SessionMetadata:
         "chat_id",
         "thread_id",
         "updated_at",
+        ORIGIN_KEY,
+        ORIGIN_PLATFORM_KEY,
     )
 
     def __init__(
@@ -123,6 +137,30 @@ def _retention_days() -> int:
         return DEFAULT_RETENTION_DAYS
 
 
+def _origin_platform(platform: Any) -> str:
+    """The chat metrics label for a Hermes platform name, or the name itself when unmapped."""
+    name = str(platform or "").strip().lower()
+    return chat_metrics.HERMES_PLATFORM_LABELS.get(name, name)
+
+
+def _merge_origin(existing: Optional[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """`metadata` with the stored row's origin carried forward, or `chat` when it has none."""
+    merged = dict(metadata)
+    stored: Any = {}
+    if existing:
+        try:
+            stored = json.loads(existing)
+        except ValueError:
+            stored = {}
+    if isinstance(stored, dict) and stored.get(ORIGIN_KEY):
+        merged[ORIGIN_KEY] = stored[ORIGIN_KEY]
+        merged[ORIGIN_PLATFORM_KEY] = stored.get(ORIGIN_PLATFORM_KEY, "")
+    else:
+        merged[ORIGIN_KEY] = ORIGIN_CHAT
+        merged[ORIGIN_PLATFORM_KEY] = _origin_platform(metadata.get("platform"))
+    return merged
+
+
 def _platform_value(source: Any) -> str:
     platform = getattr(source, "platform", "") or ""
     return getattr(platform, "value", None) or str(platform)
@@ -156,16 +194,23 @@ class SessionMetadataStore:
         The retention sweep below bounds that: a session idle past
         SESSION_KV_RETENTION_DAYS whose row was swept, then written to again,
         is counted a second time.
+
+        The row is read and rewritten in one `BEGIN IMMEDIATE` transaction:
+        an origin already on it is carried forward, and a row without one is
+        recorded as a chat session on the event's platform.
         """
-        payload = json.dumps(metadata, sort_keys=True)
         for attempt in range(2):
             with cls._lock:
                 conn = cls.get_db_connection()
                 try:
-                    existed = conn.execute(
-                        "SELECT 1 FROM session_metadata WHERE session_id = ?",
+                    # One transaction from the read to the write, so an origin
+                    # another writer records in between is not replaced.
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute(
+                        "SELECT metadata FROM session_metadata WHERE session_id = ?",
                         (session_id,),
-                    ).fetchone() is not None
+                    ).fetchone()
+                    payload = json.dumps(_merge_origin(row[0] if row else None, metadata), sort_keys=True)
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO session_metadata
@@ -179,7 +224,7 @@ class SessionMetadataStore:
                         (f"-{_retention_days()} days",),
                     )
                     conn.commit()
-                    return not existed
+                    return row is None
                 except sqlite3.Error:
                     cls._close_unlocked()
                     if attempt == 1:
@@ -242,6 +287,7 @@ def log_event_to_db(
     **kwargs: Any,
 ) -> Optional[Dict[str, str]]:
     """Persist session metadata before Hermes dispatches a gateway message."""
+    turn_context.bind_session("")
     try:
         source = getattr(event, "source", None)
         if source is None:
@@ -249,6 +295,9 @@ def log_event_to_db(
 
         session_entry = session_store.get_or_create_session(source)
         session_id = getattr(session_entry, "session_id", "") or ""
+        # The turn's own session id, for the kanban patches' origin read: a
+        # gateway turn binds only the chat id where a tool can read it.
+        turn_context.bind_session(session_id)
         metadata = SessionMetadata.from_event(event, session_id)
         if write_session_metadata(session_id, metadata.to_dict()):
             count_session(metadata.platform)
