@@ -303,7 +303,7 @@ the repetition's reply, or its or its workers' call that created the write, name
 a case wraps it in `none` to say the agent wrote nothing it was not asked for,
 and both lanes append exactly that entry to every case they run), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from the worker log of each card the front agent filed before the harness
-purges it and, for any card with no log line (the cards those workers filed in turn, or a filed card that ran only code), from its tagged `terminal` and `execute_code` calls in the trajectory, and with `after_result_pattern` set from every card's tagged calls as typed, beside the logs when the check has no forbidden set; each of its `exempt_patterns` removes the text it matches from a
+purges it and, for any card with no log line (the cards those workers filed in turn, or a filed card that ran only code), from its tagged `terminal` and `execute_code` calls in the trajectory; the required patterns and runs also read a logged card's tagged calls; with `after_result_pattern` set, the check reads every card's tagged calls as typed, beside the logs when the check has no forbidden set; each of its `exempt_patterns` removes the text it matches from a
 command, a log line or a tagged call alike, before the forbidden list reads it, and nothing else, and takes a
 command it touched out of the required list, for a command that can fetch and
 send nothing but carries a forbidden word as its argument, such as a plain
@@ -432,8 +432,9 @@ filed is read from the trajectory, as far as the capture reached it) — a route
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
 pass. For a card the front agent filed it reads the one-line rendering hermes writes to the card
 log, not the command as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||`
-arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a pattern
-never sees a command chained behind another, and the quotes stay, so a listed word the command
+arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a forbidden pattern or
+run never sees a command chained behind another (a required pattern or run also reads that
+card's tagged calls as typed, so it does), and the quotes stay, so a listed word the command
 splits with an empty quote inside it is one word to the shell and none to the pattern. For a card a
 worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
 written against the rendering can miss that card's command behind a `cd … &&` or on a second

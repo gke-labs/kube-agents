@@ -344,7 +344,7 @@ the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
-the kanban worker logs by card id (with `after_result_pattern`, the tagged `terminal` and `execute_code` entries
+the kanban worker logs by card id (for the required checks, and for every check with `after_result_pattern`, also the tagged `terminal` and `execute_code` entries
 the harness appends to the trajectory from the workers' sessions as well, present when the
 wait found the cards and the door showed the trace); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
