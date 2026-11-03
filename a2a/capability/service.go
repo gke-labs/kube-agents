@@ -451,6 +451,12 @@ func NewClient(nc *nats.Conn, self string) (*Client, error) {
 // outcome Check retries.
 var errUnreachable = refuse(unreachableRule)
 
+// IsUnreachable reports whether err is Check's refusal for an ask no
+// verifier answered within the window, rather than a verdict. A caller that
+// can hold its request (the profile dispatcher holds a submission) asks
+// again; every other caller treats it as the refusal it is.
+func IsUnreachable(err error) bool { return errors.Is(err, errUnreachable) }
+
 // Check asks whether the capability at ref permits verb v on resource r.
 // A nil error means permitted. Everything else — refused, unreachable,
 // malformed — is a denial, because the alternative is a broker that proceeds

@@ -1509,19 +1509,18 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	}
 	// Pinned here as well as in the goldens: a golden regeneration blesses
 	// whatever the builder renders, so a request that drifted back down would
-	// otherwise pass every test. 500m is what lets a mint finish inside its
-	// five-second timeouts while an evicted pod's replacement warms up, and
-	// 1Gi is the memory the child memory budget needs when Autopilot without
-	// bursting makes the request the limit: above the 512Mi the CPU:memory
-	// band would admit a 500m pod at, and above the budget's 672Mi floor.
+	// otherwise pass every test. This is the Standard render: 500m lets a mint
+	// finish inside its timeouts while an evicted pod's replacement warms up,
+	// 1Gi is above the budget's 672Mi floor, and the 2 CPU limit is the load
+	// measurement's figure (#4106), which the broker bursts to.
 	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
 		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
 	}
 	if got := container.Resources.Requests.Memory().String(); got != "1Gi" {
 		t.Errorf("expected a 1Gi memory request on the proxy container, got %s", got)
 	}
-	if got := container.Resources.Limits.Cpu().String(); got != "1" {
-		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)
+	if got := container.Resources.Limits.Cpu().String(); got != "2" {
+		t.Errorf("expected a 2 CPU limit on the proxy container, got %s", got)
 	}
 	env := make(map[string]corev1.EnvVar)
 	for _, item := range container.Env {
@@ -7743,5 +7742,61 @@ func TestLeaderRolePodsRuleVerbsAboveOneReplica(t *testing.T) {
 		if slices.Contains(r.Resources, "pods") {
 			t.Errorf("a pods rule at one replica: %v", r)
 		}
+	}
+}
+
+// The gateway's startup and readiness probes run the same curl against the
+// Hermes API on loopback. curl carries its own --max-time under kubelet's
+// TimeoutSeconds, so a hung listener is reported as curl's exit 28 rather
+// than cut off by kubelet's exec kill; each timeout stays within its probe's
+// period so a slow check never delays the next tick; and the startup probe's
+// budget is the 905s cold boot gatewayProgressDeadlineSeconds is sized over.
+// The golden manifests pin the exact numbers; this test holds the relations
+// between them.
+func TestAgentAPIProbesTimeOutUnderKubeletAndKeepTheStartupBudget(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true})
+	c, ok := findContainer(dep.Spec.Template.Spec, "platform-agent")
+	if !ok {
+		t.Fatal("the platform-agent container is missing")
+	}
+	maxTime := regexp.MustCompile(`--max-time (\d+)`)
+	probes := map[string]*corev1.Probe{"startup": c.StartupProbe, "readiness": c.ReadinessProbe}
+	for name, probe := range probes {
+		if probe == nil || probe.Exec == nil || len(probe.Exec.Command) == 0 {
+			t.Fatalf("%s probe = %+v, want an exec probe", name, probe)
+		}
+		cmd := strings.Join(probe.Exec.Command, " ")
+		for _, want := range []string{
+			`http://127.0.0.1:8642/api/sessions?limit=1`,
+			`-H "Authorization: Bearer $API_SERVER_KEY"`,
+			`[ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION" = "true" ] && exit 0`,
+		} {
+			if !strings.Contains(cmd, want) {
+				t.Errorf("%s probe command %q lacks %q", name, cmd, want)
+			}
+		}
+		m := maxTime.FindStringSubmatch(cmd)
+		if m == nil {
+			t.Errorf("%s probe command %q has no curl --max-time: a hung listener would run to kubelet's kill", name, cmd)
+		} else if secs, _ := strconv.Atoi(m[1]); secs <= 0 || int32(secs) >= probe.TimeoutSeconds {
+			t.Errorf("%s probe --max-time %d must sit under TimeoutSeconds %d", name, secs, probe.TimeoutSeconds)
+		}
+		if probe.TimeoutSeconds > probe.PeriodSeconds {
+			t.Errorf("%s probe TimeoutSeconds %d exceeds PeriodSeconds %d: a slow check would skip the next tick", name, probe.TimeoutSeconds, probe.PeriodSeconds)
+		}
+	}
+	startup, readiness := probes["startup"], probes["readiness"]
+	budget := startup.InitialDelaySeconds + startup.PeriodSeconds*startup.FailureThreshold
+	if budget != 905 {
+		t.Errorf("startup probe budget = %ds, want the 905s cold boot gatewayProgressDeadlineSeconds is sized over", budget)
+	}
+	if budget >= gatewayProgressDeadlineSeconds {
+		t.Errorf("startup probe budget %ds must stay under gatewayProgressDeadlineSeconds %d", budget, gatewayProgressDeadlineSeconds)
+	}
+	if window := readiness.PeriodSeconds * readiness.FailureThreshold; window >= budget {
+		t.Errorf("readiness withdraws after %ds, which is not quicker than the %ds startup budget", window, budget)
 	}
 }

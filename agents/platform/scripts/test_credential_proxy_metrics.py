@@ -74,6 +74,11 @@ def _parse(exposition):
     return families
 
 
+# The class label the broker puts on the admission and duration series; every
+# caller these tests drive is interactive.
+INTERACTIVE = {credential_proxy.CLASS_LABEL: credential_proxy.CLASS_INTERACTIVE}
+
+
 def _series(families, name, **labels):
     return families.get(name, {}).get(frozenset(labels.items()))
 
@@ -167,8 +172,8 @@ class ToolInvocationCountingTest(_BrokerFixture):
         self.assertEqual(
             1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="success")
         )
-        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
-        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le="+Inf"))
+        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le="+Inf", **INTERACTIVE))
 
     def test_a_non_zero_exit_counts_as_error(self):
         # The response still says `completed`: it reports that the broker ran
@@ -235,7 +240,7 @@ class ToolInvocationCountingTest(_BrokerFixture):
         self.assertIn("kubernetes.no-secrets", json.dumps(body))
         families = self.families()
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="blocked"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
 
     def routed_git(self):
         # `/v1/exec` refuses `git` before either git gate, so admit it to count
@@ -270,7 +275,7 @@ class ToolInvocationCountingTest(_BrokerFixture):
         self.assertEqual(400, status)
         families = self.families()
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="error"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
         self.assertEqual(1, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="400"))
 
 
@@ -316,7 +321,7 @@ class AbandonedCommandTest(unittest.TestCase):
             urllib.request.urlopen(request, timeout=5)
         families = _parse(CredentialProxyHandler.metrics.render())
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="abandoned"))
-        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
         self.assertIsNone(_series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="200"))
 
 
@@ -427,9 +432,9 @@ class AdmissionMetricsTest(unittest.TestCase):
         with executor.request_slot():
             pass
         families = self.families()
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1"))
-        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1", **INTERACTIVE))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot", **INTERACTIVE))
 
     def test_an_unwaited_admission_is_none_whether_the_budget_is_on_or_off(self):
         # The label an idle broker shows does not flip with the memory limit:
@@ -439,9 +444,9 @@ class AdmissionMetricsTest(unittest.TestCase):
             with executor.request_slot():
                 pass
         families = self.families()
-        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
-        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
-        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
+        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none", **INTERACTIVE))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget", **INTERACTIVE))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot", **INTERACTIVE))
 
     def test_a_wait_for_a_slot_is_observed_under_the_slot_bound(self):
         executor = self.executor(max_concurrent_commands=1)
@@ -452,22 +457,22 @@ class AdmissionMetricsTest(unittest.TestCase):
         families = self.families()
         # Two admissions: the holder's, which waited for nothing and is `none`,
         # and this one, under the slot cap.
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
-        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
-        total = _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="slot")
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot", **INTERACTIVE))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget", **INTERACTIVE))
+        total = _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="slot", **INTERACTIVE)
         self.assertGreaterEqual(total, 0.5)
         self.assertLessEqual(total, waited + 0.1)
         # Cumulative buckets in bound order: this wait is past the first edge
         # and inside the last; the holder's zero sits in `none`'s first bucket.
         buckets = [
-            _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="slot", le=str(bound))
+            _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="slot", le=str(bound), **INTERACTIVE)
             for bound in credential_proxy.ADMISSION_WAIT_BUCKETS
         ]
         self.assertEqual(buckets, sorted(buckets))
         self.assertEqual(0, buckets[0])
         self.assertEqual(1, buckets[-1])
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1", **INTERACTIVE))
 
     def test_a_wait_for_the_budget_is_observed_under_the_budget_bound(self):
         # Eight slots, a budget for one: the second request waits for the
@@ -481,10 +486,10 @@ class AdmissionMetricsTest(unittest.TestCase):
         # The holder's admission waited for nothing (`none`); this one waited
         # under the budget: with the budget on and no slot ever full, the
         # budget is what the queue is for.
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
-        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
-        self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"), 0.5)
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget", **INTERACTIVE))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot", **INTERACTIVE))
+        self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget", **INTERACTIVE), 0.5)
 
     def test_the_buckets_put_the_preflight_cap_and_the_refusal_bound_on_an_edge(self):
         # 15 s is the cap the Cluster Agent preflight puts on one brokered
@@ -590,15 +595,15 @@ class AdmissionMetricsTest(unittest.TestCase):
                 self.fail("admitted instead of yielding")
         arrival = raised.exception.queued_at
         # Only the holder's own (unwaited, `none`) admission is observed so far.
-        self.assertIsNone(_series(_parse(self.metrics.render()), "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        self.assertIsNone(_series(_parse(self.metrics.render()), "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget", **INTERACTIVE))
         holder.join()
         with executor.reserve_child_memory(deadline=time.monotonic() + 5, queued_at=arrival):
             pass
         families = _parse(self.metrics.render())
         # The second leg was admitted at once, but it carries the first leg's
         # arrival, so it is a waited admission under the budget, not `none`.
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none", **INTERACTIVE))
         # Measured from the first leg's arrival, which comes after the holder
         # took its slot, so the wait is at least the time from arrival to the
         # earliest the slot could come free -- not the whole 0.4 s hold, which
@@ -610,7 +615,7 @@ class AdmissionMetricsTest(unittest.TestCase):
         # falls under.
         earliest_release = holder.held_at + 0.4
         self.assertGreaterEqual(
-            _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"),
+            _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget", **INTERACTIVE),
             earliest_release - arrival - 1e-6,
         )
 
@@ -640,18 +645,19 @@ class AdmissionMetricsTest(unittest.TestCase):
         self.metrics.record_refusal(credential_proxy.ADMISSION_BOUND_SLOT)
         self.metrics.record_refusal(credential_proxy.ADMISSION_BOUND_BUDGET)
         families = self.families()
-        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="slot"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="budget"))
+        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="slot", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="budget", **INTERACTIVE))
         for labels in families["kubeagents_credential_proxy_admission_refusals_total"]:
-            self.assertEqual({"bound"}, {key for key, _ in labels})
+            self.assertEqual({"bound", "class"}, {key for key, _ in labels})
             self.assertRegex(dict(labels)["bound"], _WORD_LABEL)
+            self.assertIn(dict(labels)["class"], credential_proxy.CLASSES)
 
     def test_a_refusal_bound_outside_the_vocabulary_is_counted_as_other(self):
         # The label set is closed: a bound the code does not name counts under
         # `other` rather than opening a series per message.
         self.metrics.record_refusal("something a caller wrote")
         families = self.families()
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="other"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="other", **INTERACTIVE))
         self.assertNotIn("something a caller wrote", self.metrics.render())
 
     def test_the_gauges_read_the_slots_and_bytes_in_use_against_each_cap(self):
@@ -701,7 +707,7 @@ class BusyRouteCountingTest(_BrokerFixture):
             status, body = self.post(["kubectl", "get", "pods"])
         self.assertEqual((503, "busy", "CREDENTIAL_PROXY_BUSY"), (status, body["status"], body["code"]))
         families = self.families()
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="slot"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="slot", **INTERACTIVE))
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="busy"))
 
 
@@ -756,10 +762,10 @@ class VcsProviderLabelsTest(unittest.TestCase):
 
     def test_a_provider_outside_the_known_set_is_folded_to_other(self):
         metrics = ProxyMetrics()
-        metrics.record_vcs("proposal-create", "success", "bitbucket")
+        metrics.record_vcs("proposal-create", "success", "gogs")
         families = _parse(metrics.render())
         self.assertEqual(1, _series(families, self.FAMILY, verb="proposal-create", status="success", provider="other"))
-        self.assertNotIn("bitbucket", metrics.render())
+        self.assertNotIn("gogs", metrics.render())
 
     def test_a_status_outside_the_closed_set_is_folded_to_error(self):
         # An exit that named no outcome (a bare return) or an unlisted word
@@ -1052,7 +1058,7 @@ class VcsRequestCountingTest(_BrokerFixture):
 
     def test_a_broker_at_its_cap_counts_as_busy(self):
         @contextlib.contextmanager
-        def no_slot_free(caller=None):
+        def no_slot_free(caller=None, klass=None):
             raise credential_proxy.CommandSlotUnavailable("limit of 8 concurrent commands")
             yield  # pragma: no cover
 
@@ -1088,7 +1094,7 @@ class VcsRequestCountingTest(_BrokerFixture):
 
     def test_a_caller_that_leaves_the_queue_counts_as_abandoned(self):
         @contextlib.contextmanager
-        def caller_gone(caller=None):
+        def caller_gone(caller=None, klass=None):
             raise credential_proxy.CallerHungUp()
             yield  # pragma: no cover
 
@@ -1369,14 +1375,14 @@ class MetricsListenerTest(unittest.TestCase):
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="success"))
         # Cumulative buckets, in bound order, ending at the count.
         buckets = [
-            _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le=str(bound))
+            _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le=str(bound), **INTERACTIVE)
             for bound in credential_proxy.TOOL_DURATION_BUCKETS
         ]
         self.assertEqual(buckets, sorted(buckets))
         self.assertEqual(0, buckets[0])
         self.assertEqual(1, buckets[-1])
-        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le="+Inf"))
-        self.assertAlmostEqual(0.24, _series(families, "kubeagents_tool_execution_duration_seconds_sum", tool="kubectl"))
+        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le="+Inf", **INTERACTIVE))
+        self.assertAlmostEqual(0.24, _series(families, "kubeagents_tool_execution_duration_seconds_sum", tool="kubectl", **INTERACTIVE))
         self.assertIn("# HELP kubeagents_credential_proxy_requests_total", body)
 
     def test_the_listener_serves_nothing_else(self):
@@ -1700,7 +1706,7 @@ class RegistryTest(unittest.TestCase):
             worker.join()
         families = _parse(metrics.render())
         self.assertEqual(per_thread * threads, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="success"))
-        self.assertEqual(per_thread * threads, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertEqual(per_thread * threads, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
         self.assertEqual(per_thread * threads, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="200"))
 
     def test_label_values_are_escaped(self):
@@ -1745,7 +1751,7 @@ class NeverStartedCommandTest(unittest.TestCase):
         CredentialProxyHandler.max_request_bytes = 65536
         CredentialProxyHandler.enforce_read_only = True
         CredentialProxyHandler.authenticator = credential_proxy.NullAuthenticator()
-        CredentialProxyHandler._request_slot = lambda handler: _refusing_slot(exc)
+        CredentialProxyHandler._request_slot = lambda handler, klass=None: _refusing_slot(exc)
         server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
@@ -1764,7 +1770,7 @@ class NeverStartedCommandTest(unittest.TestCase):
         self.assertEqual(503, caught.exception.code)
         families = _parse(CredentialProxyHandler.metrics.render())
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="busy"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
         self.assertEqual(1, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="503"))
 
     def test_a_caller_that_leaves_the_queue_is_counted_as_abandoned(self):
@@ -1774,7 +1780,7 @@ class NeverStartedCommandTest(unittest.TestCase):
             urllib.request.urlopen(request, timeout=5)
         families = _parse(CredentialProxyHandler.metrics.render())
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="abandoned"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
 
 
 class FaultOutcomeTest(unittest.TestCase):
@@ -1828,14 +1834,14 @@ class FaultOutcomeTest(unittest.TestCase):
         self.assertEqual("gcp.scoped-sa.unmapped-scope", body.get("rule"))
         families = _parse(CredentialProxyHandler.metrics.render())
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="blocked"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
 
     def test_a_broker_fault_counts_as_error(self):
         status, _ = self._post_with(RuntimeError("boom"))
         self.assertEqual(500, status)
         families = _parse(CredentialProxyHandler.metrics.render())
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="error"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
         self.assertEqual(1, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="500"))
 
 

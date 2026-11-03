@@ -424,7 +424,7 @@ class SlackRouteTest(unittest.TestCase):
     CHAT = {"schema": "kube-agents.chat/v1", "headline": "Security audit: 2 critical findings",
             "choices": [{"text": "Look at the first one", "primary": True}]}
 
-    def _gateway_post(self, returncode, stdout, thread=""):
+    def _gateway_post(self, returncode, stdout, thread="", platform="slack"):
         seen = {}
 
         def run(argv, **_kwargs):
@@ -435,8 +435,15 @@ class SlackRouteTest(unittest.TestCase):
             return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr="refused")
 
         with mock.patch.object(self.skv.subprocess, "run", side_effect=run):
-            post = self.skv._post_audit_chat_via_gateway("platform", "fleet-audit", self.CHAT, "3 findings", thread, 30)
+            post = self.skv._post_audit_chat_via_gateway(platform, "platform", "fleet-audit", self.CHAT, "3 findings", thread, 30)
         return post, seen
+
+    def test_the_audit_card_goes_to_the_gateway_for_google_chat_too(self):
+        # Under next the gateway lays the card out on Google Chat as on Slack; the thread
+        # it lands in is read back from the Chat message name.
+        post, seen = self._gateway_post(0, json.dumps({"message_id": "spaces/H/messages/M.M"}), platform="google_chat")
+        self.assertEqual(seen["argv"][:4], ["a2a", "notify", "--platform", "google_chat"])
+        self.assertEqual(post, self.skv.AuditPost("spaces/H/threads/M"))
 
     def test_the_gateway_card_keeps_its_buttons(self):
         # The gateway draws a chat message's choices itself, so nothing is stripped.
@@ -476,9 +483,9 @@ class SlackRouteTest(unittest.TestCase):
                 mock.patch.object(self.skv.slack_audit_report, "blocks_from_issue") as blocks, \
                 mock.patch.object(self.skv.slack_audit_report, "chat_from_issue", return_value=(self.CHAT, "t")), \
                 mock.patch.object(self.skv, "_post_audit_chat_via_gateway", return_value=self.skv.AuditPost("9.9")) as via:
-            post = self.skv._post_audit_blocks("platform", "fleet-audit", headline, "m", "", "", float("inf"))
+            post = self.skv._post_audit_blocks("slack", "platform", "fleet-audit", headline, "m", "", "", float("inf"))
         self.assertEqual(post, self.skv.AuditPost("9.9"))
-        self.assertEqual(via.call_args.args[2:4], (self.CHAT, "t"))
+        self.assertEqual(via.call_args.args[3:5], (self.CHAT, "t"))
         blocks.assert_not_called()
 
     def test_the_audit_report_keeps_block_kit_when_slack_is_not_routed(self):
@@ -488,7 +495,7 @@ class SlackRouteTest(unittest.TestCase):
                 mock.patch.object(self.skv.slack_audit_report, "chat_from_issue") as chat, \
                 mock.patch.object(self.skv.slack_audit_report, "blocks_from_issue", return_value=([{"type": "divider"}], "t")), \
                 mock.patch.object(self.skv.slack_blocks_post, "post", return_value="4.4") as post_blocks:
-            post = self.skv._post_audit_blocks("platform", "fleet-audit", headline, "m", "C1", "", float("inf"))
+            post = self.skv._post_audit_blocks("slack", "platform", "fleet-audit", headline, "m", "C1", "", float("inf"))
         self.assertEqual(post, self.skv.AuditPost("4.4"))
         self.assertEqual(post_blocks.call_args.args[:3], ("C1", "t", [{"type": "divider"}]))
         chat.assert_not_called()

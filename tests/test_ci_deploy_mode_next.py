@@ -97,12 +97,11 @@ _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "con
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
-# request: the merge-blocking presubmit (in a Tide batch), the today lane's
-# periodic, the main nightly's three parts and the GitLab next nightly; the
+# request: the merge-blocking presubmit (in a Tide batch), the main nightly's
+# three parts and the GitLab next nightly; the
 # today-mode GitLab nightly and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
-    "ci-kube-agents-eval-today",
     "ci-kube-agents-eval-nightly",
     "ci-kube-agents-eval-nightly-main-b",
     "ci-kube-agents-eval-nightly-writers",
@@ -589,7 +588,7 @@ class FlagSetIsNextTest(unittest.TestCase):
 
     def test_a_prow_run_without_a_pull_request_refuses_the_flag_unless_the_job_is_the_lanes(self) -> None:
         """Section 2b admits the flag on a pull request's run and on the jobs
-        EVAL_MODE_NEXT_JOB_NAMES lists (the next lane's periodic and nightly have
+        EVAL_MODE_NEXT_JOB_NAMES lists (the nightlies and the RC postsubmit have
         no PULL_NUMBER); every other Prow run under it is still refused, with the
         error naming the job, and the flag unset changes nothing."""
         guard = prow_guard()
@@ -651,7 +650,7 @@ class FlagSetIsNextTest(unittest.TestCase):
 
     def test_the_lane_allow_list_matches_whole_job_names(self) -> None:
         """A prefix, a suffix or a substring of a listed name is not the job:
-        `ci-kube-agents-eval-today-2` or `kube-agents-eval-today` must refuse.
+        `ci-kube-agents-eval-nightly-2` or `kube-agents-eval-nightly` must refuse.
         So must a value spelling two adjacent entries with the space between
         them, which a pattern over the joined list would have admitted."""
         guard = prow_guard()
@@ -1189,7 +1188,7 @@ class ProvisionRerunGateTest(unittest.TestCase):
         # The ordering the wait relies on: the pass rolls the agent
         # Deployment before it creates or sweeps the provision Job, and
         # nothing watches Jobs, so the Failed status arrives on a requeue.
-        self.assertLess(controller.index("r.reconcileWorkload(ctx, instance,"), controller.index("r.reconcileA2A(ctx, instance)"))
+        self.assertLess(controller.index("r.reconcileWorkload(ctx, instance,"), controller.index("r.reconcileA2A(ctx, instance,"))
         self.assertNotIn("Owns(&batchv1.Job{})", controller)
 
 

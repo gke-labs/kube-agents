@@ -44,7 +44,7 @@ variable "source_sink_writer_identity_overrides" {
 }
 
 variable "exclude_machine_lease_heartbeats" {
-  description = "Drop coordination.k8s.io Lease writes made by machine identities (system: principals and *.iam.gserviceaccount.com service accounts) at the sink. These are leader-election and node heartbeats, never GitOps-managed, and measured at ~96% of all mutating calls. Lease writes by human principals still pass through. Set false to export the unfiltered stream for debugging."
+  description = "Drop coordination.k8s.io Lease writes made by machine identities (system: principals and every *.gserviceaccount.com service account, Google-managed ones such as the Compute Engine default included) at the sink. These are leader-election and node heartbeats, never GitOps-managed, and measured at ~96% of all mutating calls. Lease writes by human principals still pass through. Set false to export the unfiltered stream for debugging."
   type        = bool
   default     = true
 }

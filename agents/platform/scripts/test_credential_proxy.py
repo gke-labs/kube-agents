@@ -2616,6 +2616,218 @@ class ExecRouteRefusesGitTest(_ExecRouteServer):
         self.assertNotIn("git", credential_proxy.EXEC_ROUTE_EXECUTABLES)
 
 
+class ResourcePressureRouteTest(unittest.TestCase):
+    """The resource watermark gate (#4333) as a caller meets it: over /v1/exec
+    and /v1/vcs/*, and on the watcher's Kubernetes reads."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        root = Path(self.temp_dir.name)
+        policy_path = root / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(root / "state"),
+            scoped_pool=None,
+        )
+        stub_dir = root / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/bash\necho pods\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+        CredentialProxyHandler.max_request_bytes = 65536
+        self.cgroup = root / "cgroup"
+        self.cgroup.mkdir()
+        (self.cgroup / "memory.max").write_text("1000\n")
+        self.set_memory_percent(86)
+        self.gate = credential_proxy.ResourceWatermarkGate(
+            credential_proxy.watermark_thresholds_from_env({}),
+            (credential_proxy.WatchedVolume("tmp", root / "tmp", 1000),),
+            cgroup_dir=self.cgroup,
+            tree_bytes=lambda path: 0,
+            retry_after=lambda low, high: 11,
+        )
+        CredentialProxyHandler.executor.watermark_gate = self.gate
+        CredentialProxyHandler.watermark_gate = self.gate
+        self.addCleanup(setattr, CredentialProxyHandler, "watermark_gate", None)
+        self.metrics = credential_proxy.ProxyMetrics()
+        self.addCleanup(setattr, CredentialProxyHandler, "metrics", CredentialProxyHandler.metrics)
+        CredentialProxyHandler.metrics = self.metrics
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def set_memory_percent(self, percent):
+        (self.cgroup / "memory.current").write_text(f"{percent * 10}\n")
+
+    def as_role(self, role):
+        authenticator = types.SimpleNamespace(
+            authenticates=True,
+            authenticate=lambda headers: credential_proxy.Principal(workload="system:serviceaccount:ns:caller", role=role),
+        )
+        patcher = mock.patch.object(CredentialProxyHandler, "authenticator", authenticator)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def post(self, payload, path="/v1/exec"):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, dict(response.headers), json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, dict(error.headers), json.loads(error.read())
+
+    def test_a_shell_caller_at_the_hard_watermark_is_answered_429_with_retry_after(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, headers, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(429, status)
+        self.assertEqual("11", headers["Retry-After"])
+        self.assertEqual(
+            {"status": "busy", "code": "CREDENTIAL_PROXY_RESOURCE_PRESSURE", "retry_after": 11},
+            {key: body[key] for key in ("status", "code", "retry_after")},
+        )
+        self.assertIn("hard resource watermark (memory=86%)", body["error"])
+        self.assertIn("command refused under resource pressure request_id=", "\n".join(logs.output))
+        self.assertEqual(0, CredentialProxyHandler.executor.slots_in_use)
+        # The shell role is interactive to the executor's class caps (admission_class) and
+        # background to the gate (INTERACTIVE_ROLES); the counter carries the former.
+        self.assertIn(
+            'kubeagents_credential_proxy_admission_refusals_total{bound="pressure",class="interactive"} 1',
+            self.metrics.render(),
+        )
+        self.assertIn('status="busy"', self.metrics.render())
+
+    def test_a_session_caller_is_admitted_at_the_hard_watermark_and_everyone_under_it(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SESSION)
+        status, headers, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+        self.assertNotIn("Retry-After", headers)
+        self.set_memory_percent(50)
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        status, _, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        self.assertEqual(200, status, body)
+
+    def test_a_vcs_verb_at_the_hard_watermark_is_answered_429_before_its_body_is_read(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"probe": lambda payload: {"ok": True}}),
+        ):
+            status, headers, body = self.post({}, path="/v1/vcs/probe")
+        self.assertEqual(429, status)
+        self.assertEqual("11", headers["Retry-After"])
+        self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
+
+    def _watcher_handler(self, path):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.command = "GET"
+        handler.path = path
+        handler.headers = {}
+        handler.principal = credential_proxy.Principal(workload="system:serviceaccount:ns:gateway", role=credential_proxy.CALLER_ROLE_WATCHER)
+        handler.replies = []
+        handler._json = lambda status, payload, headers=None: handler.replies.append((status, payload, headers))
+        handler.endpoints_asked = []
+        handler._watcher_cluster_endpoint = lambda target, request_id: handler.endpoints_asked.append(target) or None
+        return handler
+
+    def test_a_workspace_write_at_the_hard_watermark_is_refused_and_a_read_passes(self):
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        routed = []
+        store = types.SimpleNamespace()
+        with (
+            mock.patch.object(CredentialProxyHandler, "workspaces", store),
+            mock.patch.object(CredentialProxyHandler, "_workspace_route", lambda self, route, payload: routed.append(route) or {"ok": True}),
+        ):
+            status, headers, body = self.post({"repo": "acme/fleet"}, path="/v1/workspace/open")
+            self.assertEqual(429, status)
+            self.assertEqual("11", headers["Retry-After"])
+            self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
+            self.assertEqual([], routed)
+            # A commit fetches into the state volume and writes the changed
+            # files, so it is refused the same way; a push, which fetches
+            # nothing, still runs a git child and takes the check too.
+            for verb in ("commit", "push"):
+                status, _, body = self.post({"handle": "h", "branch": "fix/it"}, path=f"/v1/workspace/{verb}")
+                self.assertEqual(429, status, verb)
+                self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
+            self.assertEqual([], routed)
+            status, _, _ = self.post({"handle": "h", "path": "README.md"}, path="/v1/workspace/read")
+            self.assertEqual(200, status)
+            self.assertEqual(["read"], routed)
+            self.set_memory_percent(50)
+            status, _, _ = self.post({"repo": "acme/fleet"}, path="/v1/workspace/open")
+            self.assertEqual(200, status)
+
+    def test_a_workspace_write_refused_at_the_hard_watermark_still_delivers_its_429_under_a_large_body(self):
+        # The refusal is written before the body is read. A commit body larger
+        # than the socket buffers is still being sent when the handler closes,
+        # and closing on it resets the connection, which swallows the 429 and
+        # its Retry-After unless the body is drained first (the vcs route's
+        # refusal drains for the same reason). Read after the close has landed
+        # rather than into the race, as the agent API proxy's drain test does.
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        routed = []
+        body = json.dumps({"handle": "h", "pad": "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS}).encode("utf-8")
+        with (
+            mock.patch.object(CredentialProxyHandler, "workspaces", types.SimpleNamespace()),
+            mock.patch.object(CredentialProxyHandler, "_workspace_route", lambda self, route, payload: routed.append(route) or {"ok": True}),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING"),
+        ):
+            request = (
+                b"POST /v1/workspace/commit HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            received = b""
+            with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=10) as client:
+                try:
+                    client.sendall(request)
+                    time.sleep(_RESET_SETTLE_SECONDS)
+                    while chunk := client.recv(65536):
+                        received += chunk
+                except OSError as exc:
+                    self.fail(
+                        "the broker abandoned the connection instead of delivering its 429, "
+                        f"which reads to a caller as a dead broker: {exc}"
+                    )
+        head, _, payload = received.partition(b"\r\n\r\n")
+        self.assertIn(b" 429 ", head.split(b"\r\n", 1)[0])
+        self.assertIn(b"Retry-After: 11", head)
+        self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", json.loads(payload)["code"])
+        self.assertEqual([], routed)
+
+    def test_a_watcher_list_at_the_hard_watermark_is_refused_and_a_watch_passes(self):
+        listing = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?limit=500")
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            listing._handle_watcher_k8s()
+        status, payload, headers = listing.replies[0]
+        self.assertEqual(HTTPStatus.TOO_MANY_REQUESTS, status)
+        self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", payload["code"])
+        self.assertEqual({"Retry-After": "11"}, headers)
+        self.assertEqual([], listing.endpoints_asked)
+        watch = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?watch=true&resourceVersion=1")
+        watch._handle_watcher_k8s()
+        self.assertEqual([], watch.replies)
+        self.assertEqual(1, len(watch.endpoints_asked))
+        self.set_memory_percent(50)
+        listing = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?limit=500")
+        listing._handle_watcher_k8s()
+        self.assertEqual([], listing.replies)
+        self.assertEqual(1, len(listing.endpoints_asked))
+
+
 class ExecRouteCapacityTest(unittest.TestCase):
     """The concurrency cap and the caller watch as the agent meets them: over /v1/exec."""
 
@@ -2669,7 +2881,7 @@ class ExecRouteCapacityTest(unittest.TestCase):
 
     @staticmethod
     @contextlib.contextmanager
-    def no_slot_free(caller=None):
+    def no_slot_free(caller=None, klass=None):
         """What `request_slot` does when every slot stays busy for the wait."""
         raise credential_proxy.CommandSlotUnavailable("limit of 8 concurrent commands and this request waited 60s without reaching a free slot")
         yield  # pragma: no cover -- makes this a generator, as a context manager needs
@@ -2910,7 +3122,7 @@ class ExecRouteCapacityTest(unittest.TestCase):
         why = "the caller disconnected while queued for the memory budget"
 
         @contextlib.contextmanager
-        def gone(caller=None):
+        def gone(caller=None, klass=None):
             raise credential_proxy.CallerHungUp(why)
             yield  # pragma: no cover -- makes this a generator, as a context manager needs
 
@@ -2996,6 +3208,298 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertEqual("pods\n", body["stdout"])
         self.assertEqual(1, len(seen))
         self.assertIsInstance(seen[0], socket.socket)
+
+
+class _Holder:
+    """A request admitted under `klass` on its own thread, held until released.
+
+    `admitted` is set once the request is in; `refused` holds the busy
+    exception if it was turned away instead."""
+
+    def __init__(self, executor, klass):
+        self.admitted = threading.Event()
+        self.release = threading.Event()
+        self.refused = None
+        self.thread = threading.Thread(target=self._run, args=(executor, klass), daemon=True)
+        self.thread.start()
+
+    def _run(self, executor, klass):
+        try:
+            with executor.request_slot(klass=klass):
+                self.admitted.set()
+                self.release.wait(10)
+        except credential_proxy.CommandSlotUnavailable as exc:
+            self.refused = exc
+
+    def done(self):
+        self.release.set()
+        self.thread.join(10)
+
+
+class _Reserver(_Holder):
+    """A slot-less child memory reservation (the forge refresh's kind), held on
+    its own thread until released."""
+
+    def _run(self, executor, klass):
+        try:
+            with executor.reserve_child_memory():
+                self.admitted.set()
+                self.release.wait(10)
+        except credential_proxy.CommandSlotUnavailable as exc:
+            self.refused = exc
+
+
+class ClassAdmissionTest(unittest.TestCase):
+    """Priority admission by class (credential-broker-exec-tier.md §4.2, §12)."""
+
+    I = credential_proxy.CLASS_INTERACTIVE
+    B = credential_proxy.CLASS_BACKGROUND
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.holders = []
+        self.addCleanup(self._release_all)
+        patcher = mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.6)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _release_all(self):
+        for holder in self.holders:
+            holder.done()
+
+    def executor(self, memory_limit_bytes=None, metrics=None):
+        return CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=1024,
+            state_dir=self.temp_dir.name,
+            scoped_pool=None,
+            max_concurrent_commands=8,
+            memory_limit_bytes=memory_limit_bytes,
+            metrics=metrics,
+        )
+
+    def budgeted(self, admits, metrics=None):
+        per_request = credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + credential_proxy.OUTPUT_COPIES_PER_COMMAND * 1024
+        limit = (
+            credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
+            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
+            + admits * per_request
+        )
+        with mock.patch.object(credential_proxy, "BUDGET_MINIMUM_ADMITTED_REQUESTS", min(admits, 2)):
+            executor = self.executor(memory_limit_bytes=limit, metrics=metrics)
+        self.assertEqual(admits, executor.admitted_requests())
+        return executor
+
+    def hold(self, executor, klass, count=1):
+        made = []
+        for _ in range(count):
+            holder = _Holder(executor, klass)
+            self.holders.append(holder)
+            self.assertTrue(holder.admitted.wait(5), f"a {klass} request was not admitted")
+            made.append(holder)
+        return made
+
+    def queue(self, executor, klass):
+        holder = _Holder(executor, klass)
+        self.holders.append(holder)
+        return holder
+
+    def wait_queued(self, executor, count):
+        deadline = time.monotonic() + 5
+        while executor.queued_requests < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(count, executor.queued_requests)
+
+    def test_the_class_comes_from_the_role(self):
+        for role, want in (
+            (credential_proxy.CALLER_ROLE_PROFILE, self.B),
+            (credential_proxy.CALLER_ROLE_SCOPE, self.B),
+            (credential_proxy.CALLER_ROLE_SESSION, self.I),
+            (credential_proxy.CALLER_ROLE_SHELL, self.I),
+            (credential_proxy.CALLER_ROLE_MCP, self.I),
+            ("", self.I),
+        ):
+            with self.subTest(role=role):
+                self.assertEqual(want, credential_proxy.admission_class(role))
+
+    def test_the_caps(self):
+        executor = self.executor()
+        self.assertEqual((7, 6), (executor.class_cap(self.I), executor.class_cap(self.B)))
+        budgeted = self.budgeted(4)
+        self.assertEqual((3, 2), (budgeted.class_cap(self.I), budgeted.class_cap(self.B)))
+        tiny = self.budgeted(2)
+        # Never below one: a pod too small to reserve still serves both classes.
+        self.assertEqual((1, 1), (tiny.class_cap(self.I), tiny.class_cap(self.B)))
+
+    def test_a_full_background_share_leaves_the_reserve_to_interactive_work(self):
+        executor = self.executor()
+        self.hold(executor, self.B, 6)
+        late = self.queue(executor, self.B)
+        self.hold(executor, self.I, 2)  # the reserve, admitted at once
+        late.thread.join(5)
+        self.assertIsNotNone(late.refused)
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_BACKGROUND, late.refused.bound)
+        self.assertEqual(self.B, late.refused.klass)
+        self.assertIn("for interactive work", str(late.refused))
+        self.assertIn(credential_proxy.ADMISSION_BOUND_BACKGROUND, credential_proxy.ADMISSION_BOUNDS)
+
+    def test_interactive_work_leaves_one_admission_to_background_work(self):
+        executor = self.executor()
+        self.hold(executor, self.I, 7)
+        late = self.queue(executor, self.I)
+        self.wait_queued(executor, 1)
+        self.hold(executor, self.B)  # passes the capped interactive request
+        late.thread.join(5)
+        self.assertIsNotNone(late.refused)
+
+    def test_an_interactive_request_at_its_cap_is_refused_as_a_slot_with_its_own_reason(self):
+        for executor in (self.executor(), self.budgeted(4)):
+            with self.subTest(admitted=executor.admitted_requests()):
+                self.hold(executor, self.I, executor.class_cap(self.I))
+                late = self.queue(executor, self.I)
+                late.thread.join(5)
+                self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, late.refused.bound)
+                self.assertIn("for background work", str(late.refused))
+                self.assertNotIn("memory budget", str(late.refused))
+                self._release_all()
+
+    def test_an_interactive_request_goes_ahead_of_queued_background_ones(self):
+        executor = self.executor()
+        background = self.hold(executor, self.B, 6)
+        self.hold(executor, self.I, 2)
+        waiting_background = self.queue(executor, self.B)
+        self.wait_queued(executor, 1)
+        waiting_interactive = self.queue(executor, self.I)
+        self.wait_queued(executor, 2)
+        background[0].done()  # one slot, and room under the background cap
+        self.assertTrue(waiting_interactive.admitted.wait(5))
+        self.assertFalse(waiting_background.admitted.is_set())
+
+    def test_arrival_order_holds_inside_a_class(self):
+        executor = self.executor()
+        held = self.hold(executor, self.I, 7)
+        first = self.queue(executor, self.I)
+        self.wait_queued(executor, 1)
+        second = self.queue(executor, self.I)
+        self.wait_queued(executor, 2)
+        held[0].done()
+        self.assertTrue(first.admitted.wait(5))
+        self.assertFalse(second.admitted.is_set())
+
+    def test_the_reserve_is_budget_room_as_well_as_slots(self):
+        # The budget admits 4 and binds before the 8 slots: B = 2, I = 3.
+        # Background work takes its two, and the budget's last two admissions
+        # stay free for interactive work although slots are free too.
+        executor = self.budgeted(4)
+        self.hold(executor, self.B, 2)
+        late = self.queue(executor, self.B)
+        late.thread.join(5)
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_BACKGROUND, late.refused.bound)
+        self.hold(executor, self.I, 2)
+
+    def test_running_interactive_work_uses_its_own_reserve(self):
+        # Interactive work already running counts against the reserve, not
+        # against the background share: with one interactive request in, two
+        # background requests still fit (1 + 2 + the reserve's unused 1 = 4).
+        executor = self.budgeted(4)
+        self.hold(executor, self.I)
+        self.hold(executor, self.B, 2)
+        self.hold(executor, self.I)
+
+    def test_with_the_budget_on_interactive_work_still_leaves_one_admission_to_background(self):
+        executor = self.budgeted(4)
+        self.hold(executor, self.I, 3)
+        self.hold(executor, self.B)
+
+    def test_a_freed_admission_goes_to_interactive_work_first(self):
+        # The background request queued first is under its cap, but an
+        # interactive request queued behind it takes the admission that frees.
+        executor = self.executor()
+        held = self.hold(executor, self.I, 3)
+        self.hold(executor, self.B, 5)
+        waiting_background = self.queue(executor, self.B)
+        self.wait_queued(executor, 1)
+        waiting_interactive = self.queue(executor, self.I)
+        self.wait_queued(executor, 2)
+        held[0].done()
+        self.assertTrue(waiting_interactive.admitted.wait(5))
+        self.assertFalse(waiting_background.admitted.is_set())
+
+    def test_the_reserve_holds_budget_room_a_slot_less_reservation_would_take(self):
+        # The budget admits 4 (B = 2). A forge refresh's slot-less reservation
+        # takes budget but no slot and no class share. The first background
+        # request still leaves the reserve's two admissions; a second is under
+        # its cap of two and fits the budget, but would leave room for one.
+        executor = self.budgeted(4)
+        reserver = _Reserver(executor, self.I)
+        self.holders.append(reserver)
+        self.assertTrue(reserver.admitted.wait(5))
+        self.hold(executor, self.B)
+        late = self.queue(executor, self.B)
+        late.thread.join(5)
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_BACKGROUND, late.refused.bound)
+
+    def test_a_slot_less_reservation_passes_a_request_its_class_cap_holds(self):
+        # With the budget on, the interactive cap full and a slot free, an
+        # interactive request queues on its cap; a forge refresh's reservation
+        # behind it takes no slot and is admitted past it.
+        executor = self.executor(
+            memory_limit_bytes=credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
+            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
+            + 9 * (credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + credential_proxy.OUTPUT_COPIES_PER_COMMAND * 1024)
+        )
+        self.assertEqual(8, executor.admitted_requests())
+        self.hold(executor, self.I, 7)
+        capped = self.queue(executor, self.I)
+        self.wait_queued(executor, 1)
+        reserver = _Reserver(executor, self.I)
+        self.holders.append(reserver)
+        self.assertTrue(reserver.admitted.wait(5))
+        self.assertFalse(capped.admitted.is_set())
+
+    def test_one_class_alone_keeps_todays_order(self):
+        executor = self.executor()
+        held = self.hold(executor, self.B, 6)
+        queued = [self.queue(executor, self.B) for _ in range(2)]
+        self.wait_queued(executor, 2)
+        held[0].done()
+        self.assertTrue(queued[0].admitted.wait(5))
+        self.assertFalse(queued[1].admitted.is_set())
+
+    def test_a_background_child_runs_at_the_background_nice_value(self):
+        executor = self.executor()
+        stub_dir = Path(self.temp_dir.name) / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/bash\necho ok\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["kubectl"] = str(stub)
+        for klass, lowered in ((self.B, True), (self.I, False)):
+            with self.subTest(klass=klass):
+                with mock.patch.object(credential_proxy.os, "setpriority") as setpriority:
+                    with executor.request_slot(klass=klass):
+                        result = executor.execute(["kubectl", "version"])
+                self.assertEqual(0, result.exit_code)
+                if lowered:
+                    setpriority.assert_called_once()
+                    which, _pid, value = setpriority.call_args.args
+                    self.assertEqual((credential_proxy.os.PRIO_PGRP, credential_proxy.BACKGROUND_NICE), (which, value))
+                else:
+                    setpriority.assert_not_called()
+
+    def test_a_child_already_gone_is_no_fault(self):
+        with mock.patch.object(credential_proxy.os, "setpriority", side_effect=ProcessLookupError()):
+            credential_proxy._lower_priority(12345)
+
+    def test_the_class_label_is_closed(self):
+        metrics = credential_proxy.ProxyMetrics()
+        metrics.record_refusal(credential_proxy.ADMISSION_BOUND_SLOT, "something a caller wrote")
+        metrics.observe_duration("kubectl", 0.1, self.B)
+        body = metrics.render()
+        self.assertNotIn("something a caller wrote", body)
+        self.assertIn('kubeagents_credential_proxy_admission_refusals_total{bound="slot",class="interactive"} 1', body)
+        self.assertIn('kubeagents_tool_execution_duration_seconds_count{tool="kubectl",class="background"} 1', body)
 
 
 class SessionSlotCapTest(unittest.TestCase):
@@ -3442,6 +3946,16 @@ class ChildMemoryBudgetDerivationTest(unittest.TestCase):
         self.assertEqual("/sys/fs/cgroup/memory.max", credential_proxy.CGROUP_MEMORY_MAX_PATH)
         self.assertEqual("max", credential_proxy.CGROUP_NO_LIMIT)
         self.assertEqual(2, credential_proxy.BUDGET_MINIMUM_ADMITTED_REQUESTS)
+
+
+def _without_interactive_headroom(test: unittest.TestCase) -> None:
+    """Let interactive work hold every admission, for a test of the slot cap or
+    the child memory budget that fills them with interactive requests. The
+    class caps have tests of their own (`ClassAdmissionTest`); here the cap of
+    admitted - 1 would stop the last request before the bound under test."""
+    patcher = mock.patch.object(credential_proxy, "INTERACTIVE_HEADROOM", 0)
+    patcher.start()
+    test.addCleanup(patcher.stop)
 
 
 class CommandExecutorTest(unittest.TestCase):
@@ -5003,7 +5517,7 @@ class CommandExecutorTest(unittest.TestCase):
         mib = credential_proxy.MEBIBYTE
         with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
             executor = self.executor(memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib)
-        # GKE Autopilot without bursting: the limit is the 1Gi request, and 704 MiB fits 4.
+        # GKE Autopilot without bursting, with a CR that sets a 1Gi request: the limit is the request, and 704 MiB fits 4.
         self.assertEqual(
             {"slot_cap": 8, "budget_admits": 4, "admitted": 4, "session_cap": 2},
             self._admission_report(executor),
@@ -5223,6 +5737,7 @@ class CommandExecutorTest(unittest.TestCase):
             pass
 
     def test_the_output_term_is_charged_for_slots_in_use_not_the_cap(self):
+        _without_interactive_headroom(self)
         # Budget for exactly two requests at a 1 KiB cap. With the output
         # allowance charged for the cap of eight up front, the first request
         # would cost 128 MiB + 8 x 6 KiB and the second would not fit, since
@@ -5249,6 +5764,7 @@ class CommandExecutorTest(unittest.TestCase):
         release.set()
 
     def test_four_requests_fit_at_the_defaults_and_a_fifth_waits(self):
+        _without_interactive_headroom(self)
         # Design §2.2: a 1024 MiB limit and an 8 MiB output cap leave 704 MiB
         # for children, four requests of 128 + 6 x 8 MiB. Without the
         # slots-in-use output term a fifth would fit (5 x 128 = 640 <= 704).
@@ -5295,6 +5811,7 @@ class CommandExecutorTest(unittest.TestCase):
         )
 
     def test_a_wait_behind_a_budget_held_head_is_logged_as_the_budget(self):
+        _without_interactive_headroom(self)
         # Two slots of eight in use fill the budget: the head waits for it and
         # the slot taker behind it never sees the slot cap full. Both are
         # admitted on the one wake that frees the budget, and neither wait was
@@ -5349,13 +5866,13 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(1, executor.slots_in_use)
         holder.join()
 
-    def queue_a_slot_taker(self, executor, refused=None):
+    def queue_a_slot_taker(self, executor, refused=None, interactive=False):
         """Queue a slot-taking request on another thread and return once it
         is in the queue; a refusal at the bound is recorded in `refused`."""
 
         def head():
             try:
-                with executor.request_slot():
+                with executor.request_slot(interactive=interactive):
                     pass
             except credential_proxy.CommandSlotUnavailable as error:
                 if refused is not None:
@@ -5446,6 +5963,35 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertIn("waited 0.3s behind them", message)
         self.assertNotIn("without fitting", message)
         self.assertNotIn("concurrent commands", message)
+
+    def test_a_fitting_reservation_keeps_its_place_behind_an_interactive_head_the_budget_holds(self):
+        # The pressure clamp is on: a background command holds the one slot
+        # the clamp leaves, and the interactive head has the reserved slot
+        # free, so what holds it is the budget (one slot-taker's worth plus
+        # one reservation and a byte). The reservation behind it fits, and
+        # admitting it would take the budget the head is waiting for; the
+        # cap it is read against is the head's own, not the background cap.
+        mib = credential_proxy.MEBIBYTE
+        executor = self.budgeted(admits=1, max_output_bytes=mib)
+        executor.children_budget_bytes += credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + 1
+        executor.watermark_gate = types.SimpleNamespace(clamps_concurrency=True)
+        self.assertEqual(1, executor._effective_cap())
+        self.assertEqual(2, executor._effective_cap(interactive=True))
+        release = threading.Event()
+        self.hold_a_slot_until(executor, release)
+        self.assertFalse(executor._fits_budget(takes_slot=True))
+        self.assertTrue(executor._fits_budget(takes_slot=False))
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 2):
+            self.queue_a_slot_taker(executor, interactive=True)
+            with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.3):
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                    with executor.reserve_child_memory():
+                        self.fail("admitted ahead of an interactive head the budget holds")
+            self.assertEqual(1, executor.queued_requests, "the interactive head should still be queued")
+            release.set()
+        message = str(raised.exception)
+        self.assertIn("admission queue is held by requests waiting for its child memory budget", message)
+        self.assertIn("waited 0.3s behind them", message)
 
     def test_a_reservation_that_does_not_fit_is_not_admitted_past_a_slot_held_head(self):
         # One slot, a budget for one: the head waits for the slot cap, but the
@@ -7894,6 +8440,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         return route, route_results, verb_results, leave
 
     def test_a_route_caller_still_stale_after_its_yield_gives_the_lock_up_to_a_verb_that_holds_the_budget(self):
+        _without_interactive_headroom(self)
         # After its one yield the route caller re-takes the lock and waits for
         # the budget again. A second vcs verb, admitted meanwhile and so
         # holding the budget it waits for, needs that lock: the route caller
@@ -12748,9 +13295,14 @@ class RequiredRoleTest(unittest.TestCase):
                     credential_proxy.required_roles(path),
                 )
 
-    def test_the_exec_route_admits_the_shell_the_session_and_the_profile(self):
+    def test_the_exec_route_admits_the_shell_the_session_the_profile_and_the_scope_publisher(self):
         self.assertEqual(
-            (credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_PROFILE),
+            (
+                credential_proxy.CALLER_ROLE_SHELL,
+                credential_proxy.CALLER_ROLE_SESSION,
+                credential_proxy.CALLER_ROLE_PROFILE,
+                credential_proxy.CALLER_ROLE_SCOPE,
+            ),
             credential_proxy.required_roles("/v1/exec"),
         )
 
@@ -16969,6 +17521,443 @@ class GitAllowProtocolForHttpForgeTest(unittest.TestCase):
             for verb, allow_http in asked:
                 if verb in remote_verbs:
                     self.assertTrue(allow_http, f"git {verb} did not ask for allow_http")
+
+
+class ScopeCallerBindingTest(unittest.TestCase):
+    """The scope role is bound to the publisher's ServiceAccount in both directions.
+
+    The mcp binding's shape (MCPCallerBindingTest): no scope callers named
+    means the scope audience confers nothing.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    MCP = "kubeagents-credential-proxy-mcp"
+    SCOPE = "kubeagents-credential-proxy-scope"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    MCP_SA = "system:serviceaccount:kubeagents-system:agent-a2a-mcp"
+    SCOPE_SA = "system:serviceaccount:kubeagents-system:agent-scope-publisher"
+
+    def _authenticator(self, scope_callers=frozenset({SCOPE_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.MCP: credential_proxy.CALLER_ROLE_MCP,
+                self.SCOPE: credential_proxy.CALLER_ROLE_SCOPE,
+            },
+            allowed_callers=frozenset({self.AGENT, self.MCP_SA, self.SCOPE_SA}),
+            mcp_callers=frozenset({self.MCP_SA}),
+            scope_callers=scope_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_a_scope_caller_presenting_any_other_audience_is_refused(self):
+        for audience in (self.SHELL, self.CHAT, self.MCP):
+            with self.subTest(audience=audience):
+                with self.assertRaises(credential_proxy.AuthenticationError):
+                    self._authenticator()._principal_from(self._review(self.SCOPE_SA, audience))
+
+    def test_a_scope_caller_presenting_the_scope_audience_is_the_scope_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.SCOPE_SA, self.SCOPE))
+        self.assertEqual(credential_proxy.CALLER_ROLE_SCOPE, principal.role)
+
+    def test_another_caller_presenting_the_scope_audience_is_refused(self):
+        for caller in (self.AGENT, self.MCP_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaises(credential_proxy.AuthenticationError):
+                    self._authenticator()._principal_from(self._review(caller, self.SCOPE))
+
+    def test_with_no_scope_callers_named_the_scope_audience_confers_nothing(self):
+        for caller in (self.AGENT, self.SCOPE_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only for scope callers"
+                ):
+                    self._authenticator(frozenset())._principal_from(self._review(caller, self.SCOPE))
+
+    def test_the_scope_callers_are_read_from_the_environment(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{self.AGENT},{self.SCOPE_SA}",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_SCOPE_AUDIENCE": "aud-scope",
+            "CREDENTIAL_PROXY_SCOPE_CALLERS": f" {self.SCOPE_SA} , ",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset({self.SCOPE_SA}), authenticator.scope_callers)
+        self.assertEqual(
+            credential_proxy.CALLER_ROLE_SCOPE,
+            authenticator._principal_from(self._review(self.SCOPE_SA, "aud-scope")).role,
+        )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(
+                self._review(self.SCOPE_SA, credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE)
+            )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self._review(self.AGENT, "aud-scope"))
+
+    def test_a_scope_audience_without_scope_callers_warns(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": self.AGENT,
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_SCOPE_AUDIENCE": "aud-scope",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.scope_callers)
+        self.assertTrue(any("CREDENTIAL_PROXY_SCOPE_CALLERS" in line for line in logs.output))
+
+
+class ScopeAudienceTest(unittest.TestCase):
+    """The scope publisher's audience: read raw, only inside the chat split, refused on a collision."""
+
+    BASE = {
+        "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+        "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+        "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+    }
+
+    def _build(self, **env):
+        with mock.patch.dict(os.environ, {**self.BASE, **env}, clear=True):
+            return credential_proxy.build_authenticator()
+
+    def test_the_scope_audience_confers_its_own_role(self):
+        authenticator = self._build(
+            CREDENTIAL_PROXY_CHAT_AUDIENCE="aud-chat",
+            CREDENTIAL_PROXY_SCOPE_AUDIENCE=credential_proxy.DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE,
+            CREDENTIAL_PROXY_SCOPE_CALLERS="system:serviceaccount:ns:agent-scope-publisher",
+        )
+        self.assertEqual(
+            {
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: credential_proxy.CALLER_ROLE_SHELL,
+                "aud-chat": credential_proxy.CALLER_ROLE_CHAT,
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE: credential_proxy.CALLER_ROLE_SCOPE,
+            },
+            authenticator.audience_roles,
+        )
+
+    def test_unset_means_the_role_is_never_conferred(self):
+        authenticator = self._build(CREDENTIAL_PROXY_CHAT_AUDIENCE="aud-chat")
+        self.assertNotIn(credential_proxy.CALLER_ROLE_SCOPE, authenticator.audience_roles.values())
+
+    def test_the_scope_audience_means_nothing_without_the_chat_split(self):
+        # Without the split every caller is role "", which reaches every
+        # route; the scope audience must never land there.
+        with mock.patch.dict(
+            os.environ, {**self.BASE, "CREDENTIAL_PROXY_SCOPE_AUDIENCE": "aud-scope"}, clear=True
+        ):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            {credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: ""}, authenticator.audience_roles
+        )
+        self.assertTrue(any("CREDENTIAL_PROXY_SCOPE_AUDIENCE" in line for line in logs.output))
+
+    def test_a_scope_audience_equal_to_another_roles_is_refused_with_a_warning(self):
+        others = {
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-a2a",
+            "CREDENTIAL_PROXY_SESSION_AUDIENCE": "aud-session",
+            "CREDENTIAL_PROXY_SESSION_CALLERS": "system:serviceaccount:ns:session",
+            "CREDENTIAL_PROXY_WATCHER_AUDIENCE": "aud-watcher",
+            "CREDENTIAL_PROXY_MCP_AUDIENCE": "aud-mcp",
+            "CREDENTIAL_PROXY_MCP_CALLERS": "system:serviceaccount:ns:mcp",
+        }
+        for clash, role in (
+            (credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE, credential_proxy.CALLER_ROLE_SHELL),
+            ("aud-chat", credential_proxy.CALLER_ROLE_CHAT),
+            ("aud-a2a", credential_proxy.CALLER_ROLE_A2A_CHAT),
+            ("aud-session", credential_proxy.CALLER_ROLE_SESSION),
+            ("aud-watcher", credential_proxy.CALLER_ROLE_WATCHER),
+            ("aud-mcp", credential_proxy.CALLER_ROLE_MCP),
+        ):
+            with self.subTest(clash=clash):
+                with mock.patch.dict(
+                    os.environ,
+                    {**self.BASE, **others, "CREDENTIAL_PROXY_SCOPE_AUDIENCE": clash},
+                    clear=True,
+                ):
+                    with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                        authenticator = credential_proxy.build_authenticator()
+                self.assertNotIn(credential_proxy.CALLER_ROLE_SCOPE, authenticator.audience_roles.values())
+                self.assertEqual(role, authenticator.audience_roles[clash])
+                self.assertTrue(any("CREDENTIAL_PROXY_SCOPE_AUDIENCE" in line for line in logs.output))
+
+    def test_the_default_scope_audience_is_no_other_roles_default(self):
+        self.assertNotIn(
+            credential_proxy.DEFAULT_CREDENTIAL_PROXY_SCOPE_AUDIENCE,
+            {
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE,
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE,
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE,
+                "kubeagents-credential-proxy-a2a-chat",
+                "kubeagents-credential-proxy-watcher",
+                "kubeagents-credential-proxy-session",
+            },
+        )
+        self.assertIn(credential_proxy.CALLER_ROLE_SCOPE, credential_proxy.CALLER_ROLES)
+
+
+class ScopeRouteAdmissionTest(unittest.TestCase):
+    """The scope role reaches /v1/exec and no other route family."""
+
+    def _permits(self, path):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = path
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent-scope-publisher", uid="u", groups=(),
+            role=credential_proxy.CALLER_ROLE_SCOPE,
+        )
+        return handler._role_permits(principal), handler.replies
+
+    def test_the_exec_route_admits_the_scope_role(self):
+        permitted, replies = self._permits("/v1/exec")
+        self.assertTrue(permitted)
+        self.assertEqual([], replies)
+
+    def test_every_other_route_family_refuses_the_scope_role(self):
+        for path in (
+            credential_proxy.ADMISSION_PATH,
+            "/v1/vcs/proposal-view",
+            "/v1/github/refresh",
+            "/v1/forge/refresh",
+            "/v1/workspace/open",
+            credential_proxy.API_RELAY_PREFIX + "cloudasset.googleapis.com/v1/x",
+            credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "server/x",
+            credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + "x",
+            credential_proxy.watcher_policy.WATCHER_K8S_PREFIX + "api/v1/pods",
+            credential_proxy.watcher_policy.PLATFORM_PUBSUB_PREFIX + "x",
+            feedback_broker.ROUTE,
+            "/v1/chat/api",
+            "/v1/chat/a2a/events",
+            "/v1/chat/events",
+        ):
+            with self.subTest(path=path):
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                    permitted, replies = self._permits(path)
+                self.assertFalse(permitted)
+                self.assertEqual("CALLER_ROLE_FORBIDDEN", replies[0][1]["code"])
+
+    def test_the_scope_role_runs_gcloud_only(self):
+        self.assertEqual(frozenset({"gcloud"}), credential_proxy.ROLE_EXECUTABLES[credential_proxy.CALLER_ROLE_SCOPE])
+        self.assertFalse(credential_proxy.executable_permitted(credential_proxy.CALLER_ROLE_SCOPE, "kubectl"))
+
+
+class ScopeSlotShareTest(unittest.TestCase):
+    """The scope share defaults to one and is held to the background cap."""
+
+    def limit(self, raw, background_cap):
+        with mock.patch.dict(os.environ, {credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS: raw}):
+            return credential_proxy.scope_slot_limit_from_env(background_cap)
+
+    def test_the_default_is_one(self):
+        self.assertEqual(1, credential_proxy.DEFAULT_SCOPE_MAX_CONCURRENT_COMMANDS)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(1, credential_proxy.scope_slot_limit_from_env(6))
+
+    def test_the_share_is_held_to_the_background_cap(self):
+        for raw, background_cap, want, warns in (
+            ("1", 6, 1, False),
+            ("4", 6, 4, False),
+            ("8", 6, 6, True),
+            ("2", 1, 1, True),
+            ("x", 6, 1, True),   # an unreadable value is the default
+        ):
+            with self.subTest(raw=raw, background_cap=background_cap):
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING") if warns else contextlib.nullcontext():
+                    self.assertEqual(want, self.limit(raw, background_cap))
+
+
+SCOPE_ASSET_SEARCH = [
+    "gcloud", "asset", "search-all-resources", "--scope=folders/111",
+    "--asset-types=container.googleapis.com/Cluster", "--format=json(name,location)",
+]
+SCOPE_PROBE = ["gcloud", "container", "clusters", "list", "--project", "p-one", "--format=value(name,location)"]
+
+
+class ScopeExecRouteTest(unittest.TestCase):
+    """The scope role through the real exec route, with a gcloud stub."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        root = Path(self.temp_dir.name)
+        policy_path = root / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        self.scope_file = root / "scope.json"
+        self.scope_file.write_text(json.dumps({
+            "present": True, "projects": [], "folders": ["111"], "organizations": [],
+            "sharedVpcHosts": [], "metricsScopes": [], "maxProjects": 10,
+            "exclude": {"projects": [], "clusters": []},
+        }), encoding="utf-8")
+        env = mock.patch.dict(os.environ, {credential_proxy.scope_policy.SCOPE_FILE_ENV: str(self.scope_file)})
+        env.start()
+        self.addCleanup(env.stop)
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5, max_output_bytes=65536, state_dir=str(root / "state"), scoped_pool=None
+        )
+        stub_dir = root / "bin"
+        stub_dir.mkdir()
+        self.exit_file = root / "exit"
+        self.exit_file.write_text("0", encoding="utf-8")
+        gcloud = stub_dir / "gcloud"
+        gcloud.write_text(textwrap.dedent(f"""\
+            #!/bin/bash
+            echo "$@" >> {root / "calls"}
+            case "$1" in
+              asset) echo '[{{"name":"//container.googleapis.com/projects/p-one/locations/us-central1/clusters/c1","location":"us-central1"}}]' ;;
+              container) echo "c1 us-central1" ;;
+            esac
+            exit "$(cat {self.exit_file})"
+            """), encoding="utf-8")
+        gcloud.chmod(0o755)
+        CredentialProxyHandler.executor.executables["gcloud"] = str(gcloud)
+        self.calls = root / "calls"
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.scope_window = credential_proxy.scope_policy.MemberWindow()
+        self.addCleanup(setattr, CredentialProxyHandler, "scope_window", credential_proxy.scope_policy.MemberWindow())
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post_as(self, role, payload):
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent-scope-publisher", uid="u", groups=(), role=role
+        )
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with mock.patch.object(CredentialProxyHandler, "_authenticated", return_value=principal):
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read())
+
+    def scope(self, payload):
+        return self.post_as(credential_proxy.CALLER_ROLE_SCOPE, payload)
+
+    def refused(self, payload, rule):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.scope(payload)
+        self.assertEqual(403, status, body)
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual(rule, body["rule"])
+        return body
+
+    def test_a_lookup_opens_the_probe_for_the_members_it_returned(self):
+        self.refused({"argv": SCOPE_PROBE}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})
+        self.assertEqual(200, status, body)
+        self.assertEqual(0, body["exitCode"])
+        status, body = self.scope({"argv": SCOPE_PROBE})
+        self.assertEqual(200, status, body)
+        self.assertEqual("c1 us-central1\n", body["stdout"])
+        self.assertEqual(2, len(self.calls.read_text(encoding="utf-8").splitlines()))
+
+    def test_a_failed_lookup_records_nothing(self):
+        self.exit_file.write_text("1", encoding="utf-8")
+        status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})
+        self.assertEqual(200, status, body)
+        self.assertEqual(1, body["exitCode"])
+        self.refused({"argv": SCOPE_PROBE}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+
+    def test_refusals_never_run_gcloud(self):
+        for payload, rule in (
+            ({"argv": [*SCOPE_ASSET_SEARCH, "--impersonate-service-account=x@y"]}, credential_proxy.scope_policy.RULE_SCOPE_ARGV),
+            ({"argv": [*SCOPE_ASSET_SEARCH, "--verbosity=debug"]}, credential_proxy.scope_policy.RULE_SCOPE_ARGV),
+            ({"argv": ["gcloud", "auth", "print-access-token"]}, credential_proxy.scope_policy.RULE_SCOPE_ARGV),
+            ({"argv": [*SCOPE_ASSET_SEARCH[:3], "--scope=folders/999", *SCOPE_ASSET_SEARCH[4:]]}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT),
+            ({"argv": SCOPE_ASSET_SEARCH, "stdin": "x"}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
+            ({"argv": SCOPE_ASSET_SEARCH, "cwd": "/tmp"}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
+            ({"argv": SCOPE_ASSET_SEARCH, "kubeconfigContext": "gke_p_l_c"}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
+            ({"argv": SCOPE_ASSET_SEARCH, "wantsKubeconfig": True}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
+            ({"argv": ["kubectl", "get", "pods"]}, credential_proxy.RULE_CALLER_EXECUTABLE),
+        ):
+            with self.subTest(payload=payload):
+                self.refused(payload, rule)
+        self.assertFalse(self.calls.exists())
+
+    def test_without_a_scope_file_nothing_is_admitted(self):
+        self.scope_file.unlink()
+        self.refused({"argv": SCOPE_ASSET_SEARCH}, credential_proxy.scope_policy.RULE_SCOPE_ARGUMENT)
+        self.assertFalse(self.calls.exists())
+
+    def test_scope_commands_are_admitted_as_background_work(self):
+        asked = []
+        real = CredentialProxyHandler.executor.request_slot
+
+        def recording(caller=None, klass=None):
+            asked.append(klass)
+            return real(caller=caller, klass=klass)
+
+        with mock.patch.object(CredentialProxyHandler.executor, "request_slot", recording):
+            status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})
+            self.assertEqual(200, status, body)
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["gcloud", "container", "clusters", "list"]})
+            self.assertEqual(200, status, body)
+        self.assertEqual([credential_proxy.CLASS_BACKGROUND, credential_proxy.CLASS_INTERACTIVE], asked)
+
+    def test_the_shell_is_not_held_to_the_scope_shapes(self):
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["gcloud", "container", "clusters", "list"]})
+        self.assertEqual(200, status, body)
+
+    def test_the_scope_role_has_its_own_slot_bound(self):
+        slots = credential_proxy.SessionSlots(
+            1, role=credential_proxy.CALLER_ROLE_SCOPE,
+            env_name=credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS, bound=credential_proxy.ADMISSION_BOUND_SCOPE,
+        )
+        with slots.acquire(credential_proxy.CALLER_ROLE_SCOPE):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as refused:
+                with slots.acquire(credential_proxy.CALLER_ROLE_SCOPE):
+                    pass
+            self.assertIn("scope", str(refused.exception))
+            self.assertIn(credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS, str(refused.exception))
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_SCOPE, refused.exception.bound)
+            # The session and the shell are not counted against it.
+            with slots.acquire(credential_proxy.CALLER_ROLE_SESSION), slots.acquire(credential_proxy.CALLER_ROLE_SHELL):
+                pass
+        self.assertIn(credential_proxy.ADMISSION_BOUND_SCOPE, credential_proxy.ADMISSION_BOUNDS)
+
+    def test_a_scope_command_at_its_bound_is_answered_busy(self):
+        CredentialProxyHandler.scope_slots = credential_proxy.SessionSlots(
+            0, role=credential_proxy.CALLER_ROLE_SCOPE,
+            env_name=credential_proxy.ENV_SCOPE_MAX_CONCURRENT_COMMANDS, bound=credential_proxy.ADMISSION_BOUND_SCOPE,
+        )
+        self.addCleanup(setattr, CredentialProxyHandler, "scope_slots", None)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})
+        self.assertEqual(503, status, body)
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
+        self.assertFalse(self.calls.exists())
 
 
 class TeamsRelayTest(unittest.TestCase):

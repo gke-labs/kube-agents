@@ -1,0 +1,10 @@
+{
+  "forges": [
+    {
+      "provider": "bitbucket",
+      "host": "bitbucket.org",
+      "token_path": "/var/run/kube-agents/forge-credentials/bitbucket/token",
+      "allowed_paths": []
+    }
+  ]
+}

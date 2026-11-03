@@ -15,7 +15,8 @@ import (
 
 // Verifier is the one verifier call the dispatcher makes: may the grant at
 // ref run profile at tier for target. It is capability.Client's
-// CheckProfileRun (#3734); a nil error means permitted, anything else is a
+// CheckProfileRun (#3734); a nil error means permitted, an error wrapping
+// ErrVerifierUnreachable means no verifier answered, and anything else is a
 // refusal.
 type Verifier interface {
 	CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error
@@ -36,6 +37,12 @@ const (
 // back rather than refused.
 var errStopping = errors.New("dispatcher stopping")
 
+// ErrVerifierUnreachable is a Verifier's error when no verifier answered
+// (the bus or the verifiers away, the dispatcher's own connection being
+// replaced): not a verdict, so the submission stays queued and is asked
+// about again, until a verdict or its queue timeout ends it.
+var ErrVerifierUnreachable = errors.New("the verifier could not be reached")
+
 // refusal is an admission verdict against a submission.
 type refusal struct {
 	reason string
@@ -46,7 +53,9 @@ type refusal struct {
 // queue age, the parameters, then the verifier. A nil refusal admits, and
 // then cluster is the cluster the verifier permitted the task on (nil when
 // the task names none and was checked against the namespace): the target a
-// task credential for the credential proxy confines it to (#3889). The
+// task credential for the credential proxy confines it to (#3889). An error
+// is no verdict (errStopping, or a verifier that could not be reached,
+// ErrVerifierUnreachable), and the submission is not refused for it. The
 // verifier's permit is reused for verifiedFor across the same submission's
 // retries over a cap, so a queue waiting on a cap doesn't call the verifier
 // once per retry delay, but only while the retry asks for the same ref and
@@ -90,6 +99,9 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target); err != nil {
 		if ctx.Err() != nil {
 			return nil, nil, errStopping
+		}
+		if errors.Is(err, ErrVerifierUnreachable) {
+			return nil, nil, err
 		}
 		return nil, &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
 	}

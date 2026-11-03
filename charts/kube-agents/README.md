@@ -835,6 +835,23 @@ predates `spec.storage`. The
 [PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specstorage)
 is canonical for the behaviour.
 
+### Sizing for a fleet (`examples/values-fleet.yaml`)
+
+The defaults fit a fleet of under 10 clusters. `examples/values-fleet.yaml` sets what the chart
+exposes for 25 clusters or more: `operator.resources` at 1Gi, `platformAgent.storage.size` at
+100Gi, `platformAgent.harness.tuning.maxInProgress` at 3, the credential-proxy and
+`agent-api-auth` resource blocks, and two `platformAgent.deployment.env` entries
+(`INCIDENT_WORKLOAD_DEDUP_SECONDS`, `KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its
+reason and what GKE Autopilot without bursting runs it at. It does not size the agent container
+itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
+sandbox, whose `platformAgent.harness.experimental.shellSandbox.resources` it leaves at the
+operator's 2 CPU and 2Gi defaults. The two env names reach the containers that read them;
+`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
+allowlist, would reach only the credential-proxy and `agent-api-auth` containers, and are left
+out. Pass it beside your own values with `-f charts/kube-agents/examples/values-fleet.yaml`,
+after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
+[fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
+
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,
@@ -869,6 +886,19 @@ chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
 does): against a CRD that predates `spec.deployment.credentialProxy`, the API
 server would prune the value silently while the release record kept it, so the
 chart looks up the installed CRD and fails the upgrade instead.
+
+`platformAgent.harness.experimental.shellSandbox.resources` sizes the shell
+container the same way: forwarded to the CR's
+`spec.harness.experimental.shellSandbox.resources` when any key is set and merged
+over the operator's defaults per key, with the
+[`shellSandbox` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#shellsandbox)
+canonical for the defaults and the refusals. The chart fails the render on the
+same shape faults (a key other than `requests`, `limits` and `claims`, a name
+the container does not declare, a quantity it cannot read) and leaves the
+crossed-pair and zero-limit refusals to the operator; the quota preflight counts
+the override, at the defaults when the operator would refuse it (it then renders
+the shell at them), and the same CRD guard fails the upgrade when the installed CRD
+predates the field.
 
 `platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
 `critical`, `warning`, `info` and `drift`, and each key that is set becomes an
@@ -947,6 +977,8 @@ These knobs need context beyond the chart:
   other lands on. It has no default: unset leaves the sandbox on the node's
   standard runtime, and `gvisor` needs the same GKE Sandbox node pool the agent's
   key does.
+- `harness.experimental.shellSandbox.resources` sizes the shell container; see
+  the sizing-override paragraph above.
 - `security.workloadIdentityFederation` needs a Workload Identity pool and
   provider trusting the cluster's OIDC issuer, and one
   `roles/iam.workloadIdentityUser` grant on the agent's GSA. Nothing creates
@@ -1098,10 +1130,18 @@ since the operator runs the gateway as a single replica whatever the value); the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
 it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
 merged over its footprint entry per key, as the operator renders it, so a raised limit is
-summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
+summed at the raised figure; on GKE Autopilot (a cluster serving the `auto.gke.io` AllowlistedWorkload resource) it is counted at
+the operator's Autopilot requests, 2 CPU and 2Gi, with a CPU request the override does not set
+held to at most one CPU per GiB of the memory request. A cpu or memory limit set alone below the default
+request lowers the counted request to that limit, as the operator does. An override setting only
+`limits.ephemeral-storage` is counted
 as a request of that size too, because the operator renders no ephemeral-storage request and
-the API server defaults it to the limit; a `PlatformAgent` edited by hand after the install is
-outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
+the API server defaults it to the limit. The shell sandbox is counted the same way with
+`platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
+ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own; an
+override the operator refuses (a zero limit, a request above its limit) is counted at the defaults
+the operator renders in its place, because the chart does not fail the render on those. A
+`PlatformAgent` edited by hand after the install is outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
@@ -1198,7 +1238,7 @@ bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets 
 the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
 rendered manifest. A cluster with bursting admits the manifest as rendered.
 
-### Optional AgentProfiles (`profiles.tse`)
+### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`)
 
 `profiles.tse.enabled` (default `false`) renders the optional `AgentProfile/tse`
 (GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
@@ -1207,6 +1247,18 @@ rendered manifest. A cluster with bursting admits the manifest as rendered.
 controlling its `AgentProfile` spec. When bound, the operator passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
 scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+
+`profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
+generic cluster agent: one profile for every cluster in scope, with the
+target named per task by the `project`, `location` and `cluster` parameters.
+Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
+and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
+control its spec. The parameters are fixed, in the persona's order, because
+the design has the worker refuse a task when they differ from the persona's.
+No pod runs it until the profile dispatcher, worker and pool land and the
+operator runs them, though enabling it already gets the profile its
+ServiceAccounts, bus identity and agent card. A cluster that needs its own
+persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
 
 ## Uninstalling
 
