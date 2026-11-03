@@ -2656,7 +2656,11 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         plugin = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(plugin)
         self.assertEqual(session_kv_server.PR_OPENED_EVENT_KIND, plugin.PR_OPENED_KIND)
-        self.assertEqual(session_kv_server.PROPOSAL_OPEN_STATE, plugin.OPEN_STATE)
+        # The forge check moved from the plugin to the broker's `proposal-claim`;
+        # the broker now holds the open state the fold waits for.
+        import vcs_broker
+
+        self.assertEqual(session_kv_server.PROPOSAL_OPEN_STATE, vcs_broker.OPEN_PROPOSAL_STATE)
         self.assertEqual(session_kv_server.PROPOSAL_URL_RE.pattern, plugin.PROPOSAL_URL.pattern)
 
     def test_off_by_default(self):
