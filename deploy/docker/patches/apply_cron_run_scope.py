@@ -2,7 +2,7 @@
 """Wire tools/cron_run_scope.py into the Hermes source tree.
 
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Two AST locators
-and nineteen anchored string replacements across four files is past the point
+and twenty anchored string replacements across four files is past the point
 where an inline ``python3 -c`` stays readable, so the edits live here — but the
 guarantee is the same as the other patches in the Dockerfile: every anchor must
 be found the number of times expected, every edited file must still parse, and
@@ -175,7 +175,7 @@ CRONJOB_IMPORT_ANCHOR = "def _notify_provider_jobs_changed_safe() -> None:"
 
 CRONJOB_IMPORT_PATCHED = (
     "# kube-agents patch: see tools/cron_run_scope.py\n"
-    "from tools.cron_run_scope import clip_cron_response, cron_run_scope\n"
+    "from tools.cron_run_scope import clip_cron_response, cron_run_scope, with_direct_origin\n"
     "\n"
     "\n" + CRONJOB_IMPORT_ANCHOR
 )
@@ -250,6 +250,22 @@ CRONJOB_RESULT_PATCHED = (
     '    if exec_result.get("delivery_error"):\n'
     '        result["delivery_error"] = str(exec_result["delivery_error"])\n'
     '    return _dumps({"success": True, "job": result})\n'
+)
+
+# A direct run resolves as the session that asked for it. Inside the run,
+# Hermes' cron scope blanks the session platform and chat id and the cron
+# agent's own ``cron_<job>_<ts>`` id has no origin record, so the asking turn's
+# origin is resolved here, on the asking turn's thread before the run starts,
+# and bound for the run's context (``cron_direct_origin_scope``). A decorator on
+# the action, so both the background dispatch (its pool copies the context at
+# submit) and the inline fallback run inside it. The tick path does not pass
+# through this action. See tools/cron_run_scope.py.
+CRONJOB_ACTION_RUN_ANCHOR = "def _action_run(job: Dict[str, Any], a: Dict[str, Any]) -> str:\n"
+
+CRONJOB_ACTION_RUN_PATCHED = (
+    "# kube-agents patch: a direct run carries the asking turn's origin.\n"
+    "# See tools/cron_run_scope.py.\n"
+    "@with_direct_origin\n" + CRONJOB_ACTION_RUN_ANCHOR
 )
 
 # Allow runtime cronjob create to accept an explicit or default risk tier.
@@ -459,6 +475,11 @@ def apply(root: Path) -> None:
     cronjob.substitute(CRONJOB_RETURN, CRONJOB_RETURN_PATCHED, label="run report")
     cronjob.substitute(CRONJOB_RESULT, CRONJOB_RESULT_PATCHED, label="tool result")
     cronjob.substitute(
+        CRONJOB_ACTION_RUN_ANCHOR,
+        CRONJOB_ACTION_RUN_PATCHED,
+        label="direct run origin",
+    )
+    cronjob.substitute(
         CRONJOB_CREATE_PARAM_ANCHOR,
         CRONJOB_CREATE_PARAM_PATCHED,
         label="create param",
@@ -476,7 +497,7 @@ def apply(root: Path) -> None:
     cronjob.substitute(
         CRONJOB_UPDATE_ANCHOR, CRONJOB_UPDATE_PATCHED, label="update records origin"
     )
-    cronjob.commit("8 anchors")
+    cronjob.commit("9 anchors")
 
     jobs = patchlib.Patch(root, "cron/jobs.py", prefix=PREFIX)
     jobs.substitute(

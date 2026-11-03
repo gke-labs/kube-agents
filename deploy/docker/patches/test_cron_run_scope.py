@@ -19,6 +19,7 @@ from unittest import mock
 
 import apply_cron_run_scope
 import cron_job_template
+import kanban_origin
 import cron_run_scope as cron_run_scope_module
 from cron_run_scope import (
     CRON_RESPONSE_LIMIT,
@@ -422,9 +423,11 @@ def _action_update(job, a):
     return _dumps({"success": True, "job": updated})
 
 
-def _action_run(job, a):
+def _action_run(job: Dict[str, Any], a: Dict[str, Any]) -> str:
     exec_result = a["exec_result"]
-    result = a["result"]
+    if exec_result is None:
+        exec_result = _run_claimed_job(job)
+    result = a["result"] or {}
     claimed = exec_result.get("claimed", False)
     if not claimed:
         result["execution_skipped"] = exec_result.get("error")
@@ -664,10 +667,16 @@ class ApplierTest(unittest.TestCase):
         exec(compile((root / relative).read_text(), relative, "exec"), ns)
         return ns
 
-    def _scheduler(self, root: Path, seen: list) -> dict:
-        """The patched scheduler stub, whose ``run_job`` records the run's context."""
+    def _scheduler(self, root: Path, seen: list, inside_run=None) -> dict:
+        """The patched scheduler stub, whose ``run_job`` records the run's context.
+
+        ``inside_run`` runs first inside ``run_job``, the way Hermes' own cron
+        scope rebinds the session before the agent starts.
+        """
 
         def run_job(job, **_kwargs):
+            if inside_run is not None:
+                inside_run()
             seen.append((current_cron_job(), current_cron_origin()))
             return True, "output", "final", None
 
@@ -706,15 +715,93 @@ class ApplierTest(unittest.TestCase):
         self.assertEqual(seen, [(JOB_ID, ("other", ""))])
         self.assertIsNone(current_cron_origin())
 
+    def _direct_tool(self, root: Path, seen: list, inside_run=None) -> dict:
+        """The patched cronjob tool, over the patched scheduler stub."""
+        scheduler = self._scheduler(root, seen, inside_run)
+        fake_scheduler = types.ModuleType("cron.scheduler")
+        fake_scheduler.run_one_job = scheduler["run_one_job"]
+        fake_scheduler.release_running_job = lambda job_id: None
+        fake_scheduler.try_register_running_job = lambda job_id: True
+        cron_package = types.ModuleType("cron")
+        cron_package.__path__ = []
+        cron_package.scheduler = fake_scheduler
+        patcher = mock.patch.dict(sys.modules, {"cron": cron_package, "cron.scheduler": fake_scheduler})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return self._patched_namespace(
+            root,
+            "tools/cronjob_tools.py",
+            _run_heartbeat=lambda name: contextlib.nullcontext(),
+            adapters=None,
+            gateway_loop=None,
+            get_job=lambda job_id: {"last_status": "ok"},
+        )
+
+    def _asking_turn(self, records: dict) -> contextvars.ContextVar:
+        """Bind ``kanban_origin``'s turn to a session ContextVar and these session records."""
+        session: contextvars.ContextVar = contextvars.ContextVar("asking_session", default="")
+        kanban_origin._ORIGIN_CACHE.clear()
+        self.addCleanup(kanban_origin._ORIGIN_CACHE.clear)
+        for patcher in (
+            mock.patch.object(kanban_origin, "_session_id", lambda: session.get()),
+            mock.patch.object(kanban_origin, "_record_origin", lambda sid: records.get(sid)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return session
+
+    def test_a_direct_run_resolves_as_the_session_that_asked_for_it(self):
+        """``cronjob(action='run')`` from a chat turn: the run reads the asking turn's origin.
+
+        Inside the run Hermes rebinds the session to the cron agent's own
+        ``cron_<job>_<ts>`` id, which has no record, so the origin must be
+        captured before the run starts.
+        """
+        self._template()
+        session = self._asking_turn({"sess-chat": ("chat", "slack")})
+        seen: list = []
+        tool = self._direct_tool(
+            self._apply_all(), seen, inside_run=lambda: session.set(f"cron_{JOB_ID}_1"))
+        session.set("sess-chat")
+        raw = tool["cronjob"]("run", job_id=JOB_ID)
+        self.assertTrue(json.loads(raw)["success"], raw)
+        self.assertEqual(seen, [(JOB_ID, ("chat", "slack"))])
+        self.assertIsNone(current_cron_origin())
+
+    def test_a_direct_run_from_an_unresolved_turn_is_other_not_the_template(self):
+        """An unresolved asking turn runs as ``other``, never as the tick's ``audit``."""
+        self._template()
+        self._asking_turn({})
+        seen: list = []
+        tool = self._direct_tool(self._apply_all(), seen)
+        tool["cronjob"]("run", job_id=JOB_ID)
+        self.assertEqual(seen, [(JOB_ID, ("other", ""))])
+
+    def test_a_direct_run_dispatched_to_a_pool_keeps_the_asking_origin(self):
+        """The background path: the pool copies the context at submit, as Hermes' does."""
+        session = self._asking_turn({"sess-chat": ("chat", "slack")})
+        seen: list = []
+        tool = self._direct_tool(self._apply_all(), seen)
+        run = tool["_run_claimed_job"]
+
+        def background(job):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(contextvars.copy_context().run, run, job).result()
+
+        tool["_run_claimed_job"] = background
+        session.set("sess-chat")
+        tool["cronjob"]("run", job_id=JOB_ID)
+        self.assertEqual(seen, [(JOB_ID, ("chat", "slack"))])
+
     def test_a_direct_run_sets_no_run_origin(self):
-        """``run_one_job`` called by the cronjob tool runs under the run scope, with no origin."""
+        """``run_one_job`` outside the run action's scope runs under the run scope, with no origin."""
         self._template()
         seen: list = []
         root = self._apply_all()
         scheduler = self._scheduler(root, seen)
         scheduler["run_one_job"]({"id": JOB_ID, **TICK_JOB})
         self.assertEqual(seen, [(JOB_ID, None)])
-        # Through the patched tool's own direct path too.
+        # Through the patched tool's claimed-run body too.
         seen.clear()
         fake_scheduler = types.ModuleType("cron.scheduler")
         fake_scheduler.run_one_job = scheduler["run_one_job"]

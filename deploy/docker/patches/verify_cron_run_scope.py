@@ -68,7 +68,12 @@ def main() -> int:
     import tools.cronjob_tools as ct
     import tools.kanban_tools as kt
     from agent.delegation_context import non_dispatcher_owned_context
-    from tools.cron_run_scope import cron_run_scope, current_cron_job, current_cron_risk
+    from tools.cron_run_scope import (
+        cron_run_scope,
+        current_cron_job,
+        current_cron_origin,
+        current_cron_risk,
+    )
 
     # --- outside a cron run: the worker keeps its ambient card --------------
     check("worker default task", kt._default_task_id(None), CALLER_CARD)
@@ -303,7 +308,11 @@ def main() -> int:
     # stub that refuses it fails inside the tool's own try/except — which
     # reports as every downstream check going false at once and blames the
     # patch for a stale stand-in.
-    ct._execute_job_now = lambda job, **kw: dict(exec_result)
+    def fake_execute_job_now(job, **kw):
+        seen["direct_origin"] = current_cron_origin()
+        return dict(exec_result)
+
+    ct._execute_job_now = fake_execute_job_now
     ct.resolve_job_ref = lambda ref: {"id": JOB_ID, "name": "Workload Reliability Audit"}
     ct._format_job = lambda job: {"id": JOB_ID, "name": "Workload Reliability Audit"}
     # Pin the branch. v2026.8.13 made background dispatch the *preferred* path
@@ -332,6 +341,10 @@ def main() -> int:
         check("output_file is a string", isinstance(job.get("output_file"), str), True)
         check("output_file is the real path", job.get("output_file"), str(OUTPUT_FILE))
         check("delivery_error in the JSON", bool(job.get("delivery_error")), True)
+    # The run action binds the asking turn's origin for the run. The build has
+    # no turn, so it is the unresolved origin, and never None (no scope).
+    check("a direct run carries the asking turn's origin", seen.get("direct_origin"), ("other", ""))
+    check("and the origin is cleared after the run", current_cron_origin(), None)
 
     # --- and the dispatched path, which carries no report at all ------------
     # v2026.8.13's preferred path hands the run to the background and returns a

@@ -300,9 +300,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lin
 # final response and lets the run inherit HERMES_KANBAN_TASK, which is how
 # three fleet-audit streams published wrong ledgers on 2026-08-04. The same
 # applier also carries the work's origin: it wraps the scheduler tick's run in
-# cron_tick_origin_scope, and makes the cronjob tool record a job's origin on
-# create and update (deploy/docker/patches/cron_job_template.py). Nineteen
-# edits across four files, so the surgery lives in an applier script rather
+# cron_tick_origin_scope, runs the cronjob tool's run action in the asking
+# turn's origin (cron_direct_origin_scope), and makes the cronjob tool record a
+# job's origin on create and update (deploy/docker/patches/cron_job_template.py).
+# Twenty edits across four files, so the surgery lives in an applier script rather
 # than inline; it fails the build on any anchor that no longer matches. Since
 # v2026.9.14 split the run body, the saved output path rides back on
 # upstream's _RunDelivery record before the out-param is filled in.
@@ -343,10 +344,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_run_scope.py /opt/hermes && \
     grep -q 'd.output_file = str(output_file)' /opt/hermes/cron/scheduler.py && \
     grep -q 'job\["risk"\] = _eff_risk' /opt/hermes/cron/jobs.py && \
     grep -qF 'with cron_tick_origin_scope(claimed_job):' /opt/hermes/cron/scheduler.py && \
+    grep -qxF '@with_direct_origin' /opt/hermes/tools/cronjob_tools.py && \
     grep -c 'record_job_origin(job\["id"\])' /opt/hermes/tools/cronjob_tools.py | grep -qx 2 && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
 from gateway.kanban_handoff_clip import clip_handoff; \
-from tools.cron_run_scope import clip_cron_response, cron_run_scope, cron_tick_origin_scope; \
+from tools.cron_run_scope import clip_cron_response, cron_direct_origin_scope, cron_run_scope, cron_tick_origin_scope, with_direct_origin; \
 from tools.cron_job_template import record_job_origin, run_origin; \
 clipped = clip_cron_response(('word ' * 2000) + 'https://example.invalid/issues/27'); \
 exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None" && \
