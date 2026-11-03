@@ -704,6 +704,53 @@ class StaleHomesTest(_HomeFixture):
         self.assertIn(([gc.REMOTE_RM, "-rf", "--", str(rp / "cluster-gone")], sandbox_exec.TERMINAL_PRINCIPAL),
                       self.rms(fake))
 
+    def test_the_lock_is_taken_before_the_pod_is_rechecked(self):
+        # Lock, then recheck, then rm. Rechecked first, a scaffold could take the
+        # lock, make its home and let go between the recheck and the sweep's lock.
+        home = self.home
+        seen = []
+        real = gc._pod_home_present
+
+        def recheck(path):
+            with profile_scaffold.profile_lock(home, path.name, blocking=False) as free:
+                seen.append((path.name, free))
+            return real(path)
+
+        fake = FakeSandbox(self.tree)
+        with patch.object(gc, "_pod_home_present", side_effect=recheck):
+            _, sweep = self.sweep(fake)
+        self.assertEqual(sweep.stale_homes_removed, ["cluster-gone"])
+        self.assertEqual(seen, [("cluster-gone", False)], "the pod was rechecked before the lock was held")
+
+    def test_the_batch_past_the_limit_is_locked_too(self):
+        rp = self.remote / "profiles"
+        many = [f"cluster-old-{i:02d}" for i in range(gc.INVENTORY_LIMIT + 5)]
+        self.tree[str(rp)] = [("platform", "1.0", "1", "d"), ("cluster-a", "1.0", "1", "d")] + [
+            (n, "1.0", "1", "d") for n in many]
+        last = many[-1]  # past INVENTORY_LIMIT: removed in the one batched rm
+        fake = FakeSandbox(self.tree)
+        with profile_scaffold.profile_lock(self.home, last) as held:
+            self.assertTrue(held)
+            _, sweep = self.sweep(fake)
+        self.assertNotIn(last, sweep.stale_homes_removed)
+        self.assertEqual(len(sweep.stale_homes_removed), len(many) - 1)
+        for argv, _ in self.rms(fake):
+            self.assertNotIn(str(rp / last), argv)
+
+    def test_a_name_too_long_for_a_plain_lock_file_is_still_locked_and_removed(self):
+        rp = self.remote / "profiles"
+        long_name = "cluster-" + "x" * 245  # 253 bytes: a directory can have it, NAME.lock cannot
+        self.tree[str(rp)].append((long_name, "1.0", "1", "d"))
+        fake = FakeSandbox(self.tree)
+        _, sweep = self.sweep(fake)
+        self.assertIn(long_name, sweep.stale_homes_removed)
+        self.assertEqual(sweep.warnings, [])
+        fake = FakeSandbox(self.tree)
+        with profile_scaffold.profile_lock(self.home, long_name) as held:
+            self.assertTrue(held)
+            _, sweep = self.sweep(fake)
+        self.assertNotIn(long_name, sweep.stale_homes_removed)
+
     def test_a_lock_that_cannot_be_opened_removes_nothing_and_says_so(self):
         blocked = Path(self.tmp.name) / "not-a-dir"
         blocked.write_text("x")
@@ -1274,9 +1321,6 @@ class OverridesTest(unittest.TestCase):
         self.assertIsNone(gc.OVERRIDE_NAME.fullmatch("skills_override\n"))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class LockRootTest(unittest.TestCase):
     """create_profile and the stale-home sweep lock the same file under each one's roster (#4389).
@@ -1305,3 +1349,7 @@ class LockRootTest(unittest.TestCase):
         self.assertEqual(sweep_root, create_root)
         self.assertEqual(sweep_root / profile_scaffold.PROFILE_LOCKS_DIRNAME / "cluster-x.lock",
                          create_root / profile_scaffold.PROFILE_LOCKS_DIRNAME / "cluster-x.lock")
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+

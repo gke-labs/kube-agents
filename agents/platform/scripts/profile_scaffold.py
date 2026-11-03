@@ -162,6 +162,21 @@ def profiles_base(hermes_home: Path) -> Path:
 PROFILE_LOCKS_DIRNAME = ".profile-locks"
 
 
+# Longer names get a hashed lock-file name, the same for every caller, so a name
+# the filesystem can hold as a directory (up to 255 bytes) can always be locked.
+PROFILE_LOCK_NAME_MAX = 200
+
+
+def profile_lock_file(data_root: Path, name: str) -> Path:
+    """Where profile *name*'s lock lives under *data_root*."""
+    if len(name.encode("utf-8", "surrogateescape")) > PROFILE_LOCK_NAME_MAX:
+        import hashlib
+
+        digest = hashlib.sha256(name.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+        name = f"{name[:64]}-{digest}"
+    return data_root / PROFILE_LOCKS_DIRNAME / f"{name}.lock"
+
+
 @contextlib.contextmanager
 def profile_lock(data_root: Path, name: str, blocking: bool = True, on_error=None):
     """Hold profile *name*'s lock under *data_root*; yield whether it is held.
@@ -173,10 +188,10 @@ def profile_lock(data_root: Path, name: str, blocking: bool = True, on_error=Non
     sets the machine HERMES_HOME from it). An unopenable lock yields False, with
     the error passed to *on_error*; so does a held one when *blocking* is False.
     """
-    locks = data_root / PROFILE_LOCKS_DIRNAME
+    path = profile_lock_file(data_root, name)
     try:
-        locks.mkdir(parents=True, exist_ok=True)
-        handle = open(locks / f"{name}.lock", "w")  # noqa: SIM115 - closed below
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "w")  # noqa: SIM115 - closed below
     except OSError as e:
         if on_error is not None:
             on_error(e)

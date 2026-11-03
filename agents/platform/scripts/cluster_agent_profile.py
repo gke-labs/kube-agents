@@ -30,7 +30,7 @@ import sandbox_exec
 from gke_endpoint import EndpointDecision, endpoint_decision
 from profile_scaffold import (
     HERMES_BIN,
-    PROFILE_LOCKS_DIRNAME,  # noqa: F401 - re-exported for callers and tests
+    PROFILE_LOCKS_DIRNAME,  # noqa: F401 - re-exported for this script's tests
     backfill_cron_file,
     ensure_profile,
     is_scaffolded,
