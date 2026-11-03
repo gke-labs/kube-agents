@@ -324,7 +324,7 @@ FIXTURE_NOT_READY = {
     # snapshot ceiling, with a planted removed apiVersion outside the part
     # that makes it large; the task.yaml's header specifies it.
     "upgrades-api-deprecation-large-repo": (
-        "#FIXTURE_ISSUE: needs a public GitOps repository over the broker's snapshot "
+        "#4705: needs a public GitOps repository over the broker's snapshot "
         "ceiling that holds a manifest on a removed apiVersion"
     ),
     "fanout-bound-ten-cards": (
