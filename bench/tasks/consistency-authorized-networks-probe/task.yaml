@@ -21,8 +21,8 @@
 # the domain's presubmit seat is the full audit since 2026-10-26. Full audit
 # SOP fidelity lives in
 # the fleet-audits canary (compliance-rbac-overgrant, 606s measured
-# 2026-08-26; nightly 2026-09-22 to 2026-09-29, presubmit held out since
-# (#2013)) and consistency-drift-outlier (nightly from 2026-08-26, on the
+# 2026-08-26; nightly 2026-09-22 to 2026-09-29, presubmit held out
+# 2026-09-29 to 2026-11-02, on the roster since, #2013) and consistency-drift-outlier (nightly from 2026-08-26, on the
 # blocking roster since 2026-10-26).
 # Expected cost bracket: ~150-350s.
 #

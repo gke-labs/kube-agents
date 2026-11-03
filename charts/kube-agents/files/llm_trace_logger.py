@@ -20,8 +20,9 @@ grows past its cap and the trail on the gateway pod's `/tmp` `emptyDir` holds
 at most 20 MiB. Each record is serialised, redacted and written on one writer
 thread, off the proxy's event loop, so records never contend for the file.
 
-Designed to be registered in `litellm_settings.callbacks` alongside
-`litellm_thinking_replay_callback.proxy_handler_instance`. Never mutates the
+Designed to be registered in `litellm_settings.callbacks` alongside the
+always-on hooks (`litellm_thinking_replay_callback.proxy_handler_instance`,
+`litellm_cache_control_strip_callback.proxy_handler_instance`). Never mutates the
 live request or response payload in place, and logs a once-per-path warning to
 stderr if a write fails rather than breaking inference.
 """

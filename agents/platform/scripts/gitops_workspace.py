@@ -192,6 +192,8 @@ FORGE_PROPOSAL_NOUNS = {
     GITHUB_REPO_TYPE: "pull request",
     "gitlab": "merge request",
     GITEA_REPO_TYPE: "pull request",
+    "bitbucket": "pull request",
+    "bitbucket-datacenter": "pull request",
 }
 
 #: How a host-qualified name's `/` is spelt in its workspace directory name.

@@ -235,8 +235,12 @@ func TestRedactSecretResponse(t *testing.T) {
 
 	t.Run("gzip", func(t *testing.T) {
 		resp := jsonResponse(gzipped(t, secretJSON), http.Header{headerContentEncoding: {encodingGzip}})
-		redactSecretResponse(resp, get)
+		var refused error
+		redactSecretResponse(resp, get, func(err error) { refused = err })
 		body, _ := io.ReadAll(resp.Body)
+		if refused != nil {
+			t.Errorf("refused: %v", refused)
+		}
 		if resp.StatusCode != http.StatusOK || resp.Header.Get(headerContentEncoding) != "" {
 			t.Fatalf("code %d, encoding %q: %s", resp.StatusCode, resp.Header.Get(headerContentEncoding), body)
 		}
@@ -253,7 +257,8 @@ func TestRedactSecretResponse(t *testing.T) {
 		"unknown kind":     jsonResponse([]byte(`{"apiVersion":"v1","kind":"ConfigMap","data":{"k":"c2VjcmV0"}}`), nil),
 	} {
 		t.Run("502 for "+name, func(t *testing.T) {
-			redactSecretResponse(resp, get)
+			var refused error
+			redactSecretResponse(resp, get, func(err error) { refused = err })
 			body, _ := io.ReadAll(resp.Body)
 			if resp.StatusCode != http.StatusBadGateway {
 				t.Fatalf("code = %d: %s", resp.StatusCode, body)
@@ -262,6 +267,9 @@ func TestRedactSecretResponse(t *testing.T) {
 			var s metav1.Status
 			if err := json.Unmarshal(body, &s); err != nil || s.Code != http.StatusBadGateway || s.Kind != statusKind {
 				t.Errorf("body is not a 502 Status: %s", body)
+			}
+			if refused == nil || !strings.HasSuffix(s.Message, refused.Error()) {
+				t.Errorf("refused = %v, want the cause the Status names: %q", refused, s.Message)
 			}
 		})
 	}
@@ -276,10 +284,13 @@ func oneLine(s string) string {
 	return buf.String()
 }
 
-func readWatch(t *testing.T, src string, view secretView) []map[string]any {
+// readWatch returns the redacted events of src, and the cause of a refusal if the stream ended
+// with one.
+func readWatch(t *testing.T, src string, view secretView) ([]map[string]any, error) {
 	t.Helper()
 	resp := jsonResponse([]byte(src), nil)
-	redactSecretResponse(resp, &secretRedaction{view: view, verb: verbWatch})
+	var refused error
+	redactSecretResponse(resp, &secretRedaction{view: view, verb: verbWatch}, func(err error) { refused = err })
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
@@ -294,13 +305,13 @@ func readWatch(t *testing.T, src string, view secretView) []map[string]any {
 		}
 		events = append(events, e)
 	}
-	return events
+	return events, refused
 }
 
 func TestWatchRedactor(t *testing.T) {
 	t.Run("sets a plain JSON content type", func(t *testing.T) {
 		resp := jsonResponse([]byte(`{"type":"ADDED","object":`+oneLine(partialJSON)+"}\n"), http.Header{headerContentType: {acceptPartial}})
-		redactSecretResponse(resp, &secretRedaction{view: viewObject, verb: verbWatch})
+		redactSecretResponse(resp, &secretRedaction{view: viewObject, verb: verbWatch}, func(error) {})
 		if got := resp.Header.Get(headerContentType); got != contentTypeJSON {
 			t.Errorf("Content-Type = %q", got)
 		}
@@ -309,17 +320,20 @@ func TestWatchRedactor(t *testing.T) {
 	t.Run("ends with an error event on an oversized event", func(t *testing.T) {
 		big := `{"type":"ADDED","object":{"apiVersion":"v1","kind":"Secret","metadata":{"name":"` +
 			strings.Repeat("a", maxWatchEventBytes) + `"},"data":{"k":"c2VjcmV0"}}}`
-		events := readWatch(t, big+"\n", viewObject)
+		events, refused := readWatch(t, big+"\n", viewObject)
 		if len(events) != 1 || events[0][fieldType] != watchEventError {
 			t.Fatalf("got %d events", len(events))
+		}
+		if refused == nil {
+			t.Error("the oversized event was not reported as a refusal")
 		}
 	})
 
 	t.Run("redacts each event", func(t *testing.T) {
 		src := `{"type":"ADDED","object":` + oneLine(partialJSON) + "}\n" + `{"type":"MODIFIED","object":` + oneLine(secretJSON) + "}\n"
-		events := readWatch(t, src, viewObject)
-		if len(events) != 2 {
-			t.Fatalf("events = %v", events)
+		events, refused := readWatch(t, src, viewObject)
+		if len(events) != 2 || refused != nil {
+			t.Fatalf("events = %v, refused = %v", events, refused)
 		}
 		for _, e := range events {
 			if e[fieldObject].(map[string]any)[fieldKind] != kindSecret {
@@ -335,9 +349,9 @@ func TestWatchRedactor(t *testing.T) {
 	} {
 		t.Run("ends with an error event on "+name, func(t *testing.T) {
 			src := `{"type":"ADDED","object":` + oneLine(secretJSON) + "}\n" + bad + "\n" + `{"type":"ADDED","object":` + oneLine(secretJSON) + "}\n"
-			events := readWatch(t, src, viewObject)
-			if len(events) != 2 || events[1][fieldType] != watchEventError {
-				t.Fatalf("events = %v", events)
+			events, refused := readWatch(t, src, viewObject)
+			if len(events) != 2 || events[1][fieldType] != watchEventError || refused == nil {
+				t.Fatalf("events = %v, refused = %v", events, refused)
 			}
 			if status, _ := events[1][fieldObject].(map[string]any); status[fieldKind] != statusKind {
 				t.Errorf("error event object = %v", events[1][fieldObject])

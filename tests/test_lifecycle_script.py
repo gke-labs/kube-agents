@@ -90,6 +90,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_cluster_name="null",
                    tfvar_enable_minter="false",
                    gcloud_key_version="",
+                   gcloud_scheduled_version="",
+                   gcloud_scheduled_fail=False,
                    gcloud_kms_fail=False,
                    gcloud_kms_error="ERROR: permission denied",
                    gcloud_kms_notice="",
@@ -121,9 +123,19 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                 # gcloud_kms_notice models a warning written to stderr on a zero exit.
                 notice = f"echo '{gcloud_kms_notice}' >&2; " if gcloud_kms_notice else ""
                 kms_behavior = f"{notice}echo '{gcloud_key_version}'; exit 0"
+            # The guard's second list asks for DESTROY_SCHEDULED versions only.
+            # Answered apart only when a test sets it: restore_key_versions sends
+            # the same filter, and its tests read the answer from gcloud_key_version.
+            scheduled_clause = ""
+            if gcloud_scheduled_version or gcloud_scheduled_fail:
+                scheduled_behavior = ("exit 1" if gcloud_scheduled_fail
+                                      else f"echo '{gcloud_scheduled_version}'; exit 0")
+                scheduled_clause = (
+                    'if [[ "$*" == *"kms keys versions list"* && "$*" == *"state=DESTROY_SCHEDULED"* ]]; then\n'
+                    f"    {scheduled_behavior}\nfi\n")
             gcloud.write_text(f"""#!/usr/bin/env bash
 set -e
-if [[ "$*" == *"kms keys versions list"* ]]; then
+{scheduled_clause}if [[ "$*" == *"kms keys versions list"* ]]; then
     {kms_behavior}
 fi
 {gcloud_stub}
@@ -895,6 +907,56 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("enable_github_minter is true, but KMS signing key 'us-central1/github-token-minter-keyring/github-token-minter-key' has no ENABLED version.", proc.stderr)
         self.assertIn("Applying now would deploy the minter and wedge waiting on its readiness probe.", proc.stderr)
+        # A key never imported has nothing to restore: the import advice stands.
+        self.assertIn("Import the GitHub App private key before applying", proc.stderr)
+        self.assertNotIn("adopt-kms", proc.stderr)
+
+    def test_guard_minter_key_names_the_restore_when_versions_are_scheduled_for_destruction(self):
+        """A raw terraform destroy leaves the key's versions DESTROY_SCHEDULED.
+
+        The apply is still refused (the guard runs before adopt_kms, so a refused
+        apply changes no state), but the message names the restore adopt-kms does
+        instead of sending the operator to re-import the private key.
+        """
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_scheduled_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/1",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("has no ENABLED version.", proc.stderr)
+        self.assertIn("Its versions are scheduled for destruction", proc.stderr)
+        self.assertIn("Run './lifecycle.sh adopt-kms'", proc.stderr)
+        self.assertNotIn("Import the GitHub App private key", proc.stderr)
+
+    def test_guard_minter_key_names_the_gcloud_restore_when_the_key_is_still_in_state(self):
+        """adopt_kms restores only a key it imports or untaints, so for a key still in
+        state the guard names the gcloud restore, not adopt-kms, which would change nothing."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_scheduled_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/1",
+            state_list="module.github_minter[0].google_kms_crypto_key.minter",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Its versions are scheduled for destruction", proc.stderr)
+        self.assertIn("The key is still in Terraform state", proc.stderr)
+        self.assertIn("gcloud kms keys versions restore <version> --key github-token-minter-key", proc.stderr)
+        self.assertNotIn("adopt-kms", proc.stderr)
+
+    def test_guard_minter_key_keeps_the_import_advice_when_the_scheduled_query_fails(self):
+        """If the second list fails, nothing says the versions are restorable, so the import advice stands."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_scheduled_fail=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Import the GitHub App private key before applying", proc.stderr)
+        self.assertNotIn("adopt-kms", proc.stderr)
 
     def test_guard_minter_key_warns_and_proceeds_when_gcloud_fails(self):
         """When enable_github_minter is true but gcloud command fails, guard_minter_key logs warning and allows apply."""
@@ -925,6 +987,9 @@ resource "google_service_account" "agent" {
         self.assertIn("KMS signing key 'us-central1/github-token-minter-keyring/github-token-minter-key' does not exist yet.", proc.stderr)
         self.assertIn("Applying now would deploy the minter and wedge waiting on its readiness probe.", proc.stderr)
         self.assertNotIn("Proceeding with apply", proc.stderr)
+        # The first-install wedge: nothing to restore, so the import advice stands.
+        self.assertIn("Import the GitHub App private key before applying", proc.stderr)
+        self.assertNotIn("adopt-kms", proc.stderr)
 
     def test_guard_minter_key_refuses_when_cloud_kms_is_not_enabled_yet(self):
         """A disabled Cloud KMS API is the same first-apply state as an absent key.
