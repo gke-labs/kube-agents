@@ -9824,6 +9824,8 @@ spec:
                             treats it as a ceiling: a card's credential-proxy busy answer, a lost sandbox
                             SSH session or sandbox-shell memory pressure steps the effective cap down to
                             one worker for an interval, and it climbs back one slot per clean interval.
+                            The shares below follow the lowered cap for new spawns; while the cards already
+                            running fill it, nothing is held open, and a user card waits as it does at 1.
 
                             One slot is guaranteed to each class of card. At 2 or more, background work (event
                             triage and cron report relays) may hold every slot but one, so a question asked in

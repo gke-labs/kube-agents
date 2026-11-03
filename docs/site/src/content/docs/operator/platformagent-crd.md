@@ -392,17 +392,24 @@ The value is a ceiling for the kanban dispatcher; under `mode: next`, `profiles.
 move with it. Three signals drop the kanban dispatcher's effective cap to one worker. A card
 reports that the credential proxy refused its brokered `kubectl` or `gcloud` as busy (the broker's
 own `503` carrying the code `CREDENTIAL_PROXY_BUSY`; a bare `503` from a sidecar restarting is a
-failed command, not this signal). A card's sandbox command,
-or the dispatcher's own check of the sandbox shell, loses its SSH session (exit `255` with no exit
-marker). The sandbox shell, while a card is running, holds more than 75% of its memory limit in
-memory that reclaim cannot free.
+failed command, not this signal). A card's sandbox command, or the dispatcher's own check of the
+sandbox shell, loses its SSH session (exit `255` with no exit marker). The sandbox shell, while a
+card is running, holds more than 75% of its memory limit in memory that reclaim cannot free.
+
+The busy signal is read from the command's own exit status and output. It carries only when the
+shim's exit status is the command's and its stderr reaches the result. A `kubectl` piped into
+`head` or `jq`, or run with its stderr sent to a file, meets the busy broker without reporting it.
 
 The cap holds at one worker for one interval. It then rises by one slot for every clean interval
 until it is back at `maxInProgress`. A card that keeps signalling does not restart the interval on
 its own. The interval is 60 seconds. `KANBAN_AIMD_COOLDOWN_SECONDS` in the chart value
 `platformAgent.deployment.env` (the CR's `spec.deployment.env`) sets another, in seconds, up to a
-day (`86400`); a value that is not a finite positive number, or is above that, keeps the default. Under the lowered cap each class of card
-still keeps its one guaranteed slot. The gateway log names each step in lines that start with
+day (`86400`); a value that is not a finite positive number, or is above that, keeps the default.
+
+The lowered cap sizes the class shares for new spawns as a configured cap of that size would, and
+a user card still sorts first for the next free slot. It holds nothing open. While the cards
+already running fill the lowered cap, a user card filed in chat waits for one of them to finish,
+as it does at a configured cap of 1. The gateway log names each step in lines that start with
 `kanban aimd:`.
 
 ```yaml
