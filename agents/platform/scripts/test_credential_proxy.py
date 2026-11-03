@@ -3078,12 +3078,15 @@ class ResourcePressureRouteTest(unittest.TestCase):
             self.assertEqual(200, status)
 
     def test_a_workspace_write_refused_at_the_hard_watermark_still_delivers_its_429_under_a_large_body(self):
-        # The refusal is written before the body is read. A commit body larger
-        # than the socket buffers is still being sent when the handler closes,
-        # and closing on it resets the connection, which swallows the 429 and
-        # its Retry-After unless the body is drained first (the vcs route's
-        # refusal drains for the same reason). Read after the close has landed
-        # rather than into the race, as the agent API proxy's drain test does.
+        # The refusal is decided before the body is read. A commit body larger
+        # than the socket buffers is still being sent when the answer is
+        # written, and a response over unread body bytes closes the
+        # connection, which resets it and swallows the 429 and its Retry-After
+        # unless the body is drained first (the vcs route's refusal drains for
+        # the same reason). Drained, the body counts as read, so the 429 is
+        # framed on a connection kept open, and the next request on it is
+        # answered: proof the drain left no body byte to be parsed as that
+        # request's line.
         self.as_role(credential_proxy.CALLER_ROLE_SHELL)
         routed = []
         body = json.dumps({"handle": "h", "pad": "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS}).encode("utf-8")
@@ -3098,22 +3101,25 @@ class ResourcePressureRouteTest(unittest.TestCase):
                 b"Content-Type: application/json\r\n"
                 b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
             )
-            received = b""
             with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=10) as client:
                 try:
                     client.sendall(request)
-                    time.sleep(_RESET_SETTLE_SECONDS)
-                    while chunk := client.recv(65536):
-                        received += chunk
+                    refusal = http.client.HTTPResponse(client)
+                    refusal.begin()
+                    payload = refusal.read()
                 except OSError as exc:
                     self.fail(
                         "the broker abandoned the connection instead of delivering its 429, "
                         f"which reads to a caller as a dead broker: {exc}"
                     )
-        head, _, payload = received.partition(b"\r\n\r\n")
-        self.assertIn(b" 429 ", head.split(b"\r\n", 1)[0])
-        self.assertIn(b"Retry-After: 11", head)
-        self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", json.loads(payload)["code"])
+                self.assertEqual(429, refusal.status)
+                self.assertEqual("11", refusal.getheader("Retry-After"))
+                self.assertNotEqual("close", (refusal.getheader("Connection") or "").lower())
+                self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", json.loads(payload)["code"])
+                client.sendall(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                probe = http.client.HTTPResponse(client)
+                probe.begin()
+                self.assertEqual((200, b'{"status":"ok"}'), (probe.status, probe.read()))
         self.assertEqual([], routed)
 
     def test_a_watcher_list_at_the_hard_watermark_is_refused_and_a_watch_passes(self):
