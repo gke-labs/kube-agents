@@ -779,12 +779,14 @@ METRICS_CONNECTION_DEADLINE_SECONDS = 10
 # exists; a probe caught in a burst that way reads as not ready. (The TCP
 # listeners share the constant; there a full queue drops the SYN and the
 # client stalls until it retries.) The stdlib's 5 is smaller than one sweep's
-# command slots. Envoy's default per-cluster connection ceiling is 1024, the
+# command slots. Envoy's per-cluster connection ceiling for the credentialed
+# route (max_connections in deploy/shared/envoy-credential-proxy.yaml) is the
 # most it can hold open to the broker at once, so a queue of that size leaves
-# Envoy's own breaker, never this queue, as what refuses first. listen()
-# clamps it to net.core.somaxconn: 4096 on a recent Linux kernel, 1024 inside
-# a gVisor sandbox, so the queue is at most this size and never less.
-LISTEN_BACKLOG = 1024
+# Envoy's own breaker, never this queue, as what refuses first; the test pins
+# this constant to that number. listen() clamps it to net.core.somaxconn: 4096
+# on a recent Linux kernel, 1024 inside a gVisor sandbox, so the queue is at
+# most this size and never less.
+LISTEN_BACKLOG = 4096
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what

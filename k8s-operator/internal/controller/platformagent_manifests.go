@@ -142,6 +142,24 @@ const (
 	credentialProxyMetricsPort     int32 = 8766
 	credentialProxyMetricsPortName       = "cred-metrics"                  // #nosec G101 -- Container port name, not a credential
 	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyHealthPort is Envoy's health listener in the broker
+	// container, where the readinessProbe goes. The credentialed listener
+	// sends every path, /healthz included, through one upstream cluster, and
+	// the fleet's open cluster watches hold that cluster's connections, so a
+	// probe through it is refused with the watches' 503 and three of those
+	// remove the pod from the Service. The health listener routes /healthz
+	// alone, through a cluster with a breaker of its own on the same socket,
+	// so ready still means the broker answers and no watch can mark it
+	// unready. The number is baked into the image's Envoy config
+	// (deploy/shared/envoy-credential-proxy.yaml); the operator declares the
+	// container port and the probe, and a test holds the two equal. Neither
+	// the Service nor the NetworkPolicy admits it: the kubelet probes the pod
+	// IP outside both. 8767 is left to the broker's own listener. A broker
+	// image older than this listener never becomes Ready under an operator
+	// that probes it, which is the standing rule that a pinned image is at
+	// least as new as the operator.
+	credentialProxyHealthPort     int32 = 8768
+	credentialProxyHealthPortName       = "cred-health" // #nosec G101 -- Container port name, not a credential
 	// credentialProxyPortEnv tells the runtime the credentialed port, so its
 	// refusal of a metrics port equal to it compares against the number the
 	// operator renders rather than the runtime's own default.

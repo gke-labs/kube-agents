@@ -674,10 +674,19 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 			// The runtime's metrics-only listener, for the chart's PodMonitoring
 			// (see credentialProxyMetricsPort).
 			{Name: credentialProxyMetricsPortName, ContainerPort: credentialProxyMetricsPort},
+			// Envoy's health listener, for the readinessProbe alone (see
+			// credentialProxyHealthPort).
+			{Name: credentialProxyHealthPortName, ContainerPort: credentialProxyHealthPort},
 		},
+		// On the health listener, not the credentialed one, so that the
+		// fleet's open watches cannot fill the breaker the probe goes
+		// through (credentialProxyHealthPort). No livenessProbe: the start
+		// script supervises both processes and restarts the runtime in
+		// place, and a probe-driven restart would drop every open watch and
+		// the broker's workspace state.
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
-				Path: "/healthz", Port: intstr.FromString("cred-proxy"),
+				Path: "/healthz", Port: intstr.FromString(credentialProxyHealthPortName),
 			}},
 			InitialDelaySeconds: 5,
 			PeriodSeconds:       10,

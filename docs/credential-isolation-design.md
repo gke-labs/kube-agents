@@ -205,9 +205,9 @@ PlatformAgent gateway Pod
 credential-proxy Pod
 
   envoy-credential-proxy
-    Envoy listener
-              |
-              | private Unix socket
+    Envoy listener :8765        Envoy health listener :8768 (readinessProbe)
+              |                             |
+              | private Unix socket         | same socket, /healthz only
               v
     credential runtime
     real CLIs, Slack/Chat clients, Minty client
@@ -247,6 +247,25 @@ which one presented the token â€” the audience and the route table it feeds do â
 allowlist itself keeps other workloads out rather than telling those callers apart. The token
 crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
+
+Envoy opens a second listener, on port 8768 (`credentialProxyHealthPort` in the operator,
+the container port `cred-health`), where the broker Pod's `readinessProbe` reads `/healthz`.
+The credentialed listener sends every path through the `credential_runtime` cluster, and
+every open cluster watch holds one of that cluster's connections, so a probe through it is
+refused with the watches' 503 once the fleet reaches the cluster's connection ceiling, and
+three refusals remove the Pod from the Service. That ceiling is declared rather than
+inherited: `circuit_breakers.thresholds` on both priorities, 4096 connections, 1024 pending
+requests and 4096 requests, where Envoy's default is 1024 of each; the broker's listen
+backlog (`LISTEN_BACKLOG`) is sized to the same 4096 so that the breaker, never the queue,
+refuses first. The health listener routes `/healthz` alone to a `credential_health` cluster
+on the same Unix socket, behind a breaker of 64, so ready still means the broker answers and
+no watch can mark the Pod unready; any other path on it is a 404. The Service and the
+NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
+`start-services.sh` rebinds both listeners from loopback to the Pod IP together and refuses
+to start Envoy if a render leaves one behind. There is no `livenessProbe`: the start script
+supervises both processes and restarts the runtime in place, and a probe-driven restart
+would drop every open watch and the broker's workspace state. Envoy's admin interface stays
+on its Unix socket, where nothing on the Pod network reaches it.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port
 8643 and forwards to the agent on loopback using a non-secret sentinel. It is a

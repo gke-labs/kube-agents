@@ -1147,11 +1147,13 @@ spec:
               name: cred-proxy
             - containerPort: 8766
               name: cred-metrics
+            - containerPort: 8768
+              name: cred-health
           readinessProbe:
             failureThreshold: 3
             httpGet:
               path: /healthz
-              port: cred-proxy
+              port: cred-health
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
