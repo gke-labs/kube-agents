@@ -6,28 +6,40 @@
 # group by project and location instead of naming each agent
 # (agents/chat/scripts/agent_roster.py), and agents/chat/SOUL.md §1 and §3
 # tell the front door to find a named cluster's assignee through
-# `list_agents(filter=<cluster>)` and route the card to it, or to `platform`
-# when it returns none. This case grades that a question naming one seeded
-# cluster still reaches that cluster's Cluster Agent under the counted block.
+# `list_agents(filter=<cluster>)` and route the card to it, calling again
+# when the lookup says the roster could not be fully read and routing to
+# `platform` only when it says no agent matches. This case grades that a
+# question naming one seeded cluster still reaches that cluster's Cluster
+# Agent under the counted block.
 #
 # Which form the case grades is the install's, not the case's: the counted
 # block is reached only on an install whose threshold is set below its
 # Cluster Agent count (`KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD: "1"` in
-# spec.deployment.env). No CI install sets it, so the nightly grades the
-# named route, where the block names every agent and the lookup is never
-# called; that is also correct, and the case cannot go red on an install
-# that never counts. The lookup route (`list_agents(filter=...)`, then the
-# card to the assignee it returned) is graded only where the threshold is
-# set, as the pull request that added this case did on its own install;
-# admitting it to a CI lane is the eval install's setting to make.
+# spec.deployment.env). No CI install sets it, so in CI the block names
+# every agent and the lookup is never called; that route is also correct,
+# and the case cannot go red on an install that never counts. The lookup
+# route (`list_agents(filter=...)`, then the card to the assignee it
+# returned) is graded only where the threshold is set, as the pull request
+# that added this case did on its own install; admitting it to a CI lane
+# is the eval install's setting to make.
 #
-# What it grades: a successful kanban_create; the seeded-a Cluster Agent
-# among the workers (worker_agents, set aside on the inject lane where the
-# workers are not read); the cluster's namespaces in the answer, including
-# the crashloop-workload fixture's seeded-debug, which only a read of
-# seeded-a can name; and no "which cluster" question. seeded-a is read
-# through its own Cluster Agent, so the fixture declared is the one on that
-# slot; this case asserts nothing about the fixture's state.
+# What it grades, and where: that the card's `assignee` is seeded-a's
+# Cluster Agent, read from kanban_create's arguments in the router's own
+# trajectory, which the inject lane's trace carries too, so the nightly
+# grades the route; that kanban_create succeeded; that seeded-a's Cluster
+# Agent is among the workers (worker_agents, set aside on the inject lane,
+# where the workers are not read, so graded over the agent API only: a dev
+# install, the today lane); that the answer names the cluster's namespaces,
+# including seeded-debug, which only a read of seeded-a can name; and that
+# no "which cluster" question was asked.
+#
+# No `fixtures:` list. seeded-debug is the crashloop-workload fixture's
+# namespace on seeded-a's slot, named here so the fleet owner replacing that
+# slot finds this case, but the case asserts nothing about the fixture's
+# state: the namespace is created apart from its pods, and a one-role
+# `fixtures:` list would tell the runner the grade depends on that role and
+# have the nightly set the case aside whenever it drifts
+# (bench/kube_agents_bench/fixture_drift.py, case_roles).
 #
 # Planted defect required: none. Isolation class: read-only. deployer: noop,
 # one front-door turn plus the card round trip.
@@ -46,11 +58,6 @@ validated: false
 # Slug per docs/designs/domains.yaml: the front door's routing journey.
 domain: chat-and-routing
 
-# seeded-a's crashloop-workload namespace is one of the phrases graded below;
-# the role is declared so the fleet owner replacing that slot finds this case.
-fixtures:
-  - crashloop-workload
-
 verification_spec:
   # assert, not the converge default: the transcript is immutable once the
   # run ends, so polling a failed check would only wait out the timeout.
@@ -63,7 +70,18 @@ verification_spec:
       require_success: true
   # Profile names are `cluster-<project>-<cluster>-<location>`
   # (cluster_agent_profile.profile_name); the project and location are the
-  # install's.
+  # install's. Router scope with no `result` pattern, so the inject lane's
+  # trace grades it (kube_agents_bench.cases, _reads_the_workers): this is
+  # the route check every lane reads.
+  - name: the-card-was-filed-for-seeded-a-s-cluster-agent
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      arguments:
+        assignee: "cluster-.+-seeded-a-.+"
+  # The same route read from the workers' side; the inject lane sets it aside.
   - name: seeded-a-cluster-agent-did-the-work
     role: objective
     mode: assert
