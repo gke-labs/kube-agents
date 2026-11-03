@@ -137,6 +137,12 @@ SCRIPTS_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 #: (``…/-/merge_requests/<n>``): the repository url before it, and the number.
 PROPOSAL_URL = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
 
+#: A ``"claim": "<token>"`` member wherever it sits on a line, for a record that
+#: does not parse as a whole line (one ``2>&1`` merged after other text). Its
+#: value is blanked, so the line keeps its shape and loses the token.
+CLAIM_MEMBER = re.compile(r'("claim"\s*:\s*)"[^"]*"')
+CLAIM_MEMBER_BLANKED = r'\1""'
+
 #: The broker verb that burns a claim token and confirms its proposal with the forge.
 PROPOSAL_CLAIM_VERB = "proposal-claim"
 
@@ -181,7 +187,7 @@ def _record_of(line):
         return None
     try:
         record = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):  # not JSON, or nested past the parser's depth
         return None
     if not isinstance(record, dict) or record.get(PROPOSAL_OPENED_KEY) != PROPOSAL_OPENED_EVENT:
         return None
@@ -213,6 +219,27 @@ def without_claim(line):
     lead = line[: len(line) - len(line.lstrip())]
     trail = line[len(line.rstrip()):]
     return lead + json.dumps(record, separators=RECORD_SEPARATORS) + trail
+
+
+def strip_tokens(line):
+    """``line`` with every claim token taken out: the record's field, else any ``"claim"`` member."""
+    stripped = without_claim(line)
+    if PROPOSAL_OPENED_KEY in stripped:
+        stripped = CLAIM_MEMBER.sub(CLAIM_MEMBER_BLANKED, stripped)
+    return stripped
+
+
+def _strip_all(output):
+    """``output`` with :func:`strip_tokens` applied to every line naming a record. Never raises."""
+    kept = []
+    for line in output.splitlines(keepends=True):
+        if PROPOSAL_OPENED_KEY in line:
+            try:
+                line = strip_tokens(line)
+            except Exception:  # noqa: BLE001 — the member regex alone still takes the token out
+                line = CLAIM_MEMBER.sub(CLAIM_MEMBER_BLANKED, line)
+        kept.append(line)
+    return "".join(kept)
 
 
 def _forge():
@@ -266,7 +293,7 @@ def _first_module(names):
     for name in names:
         try:
             return importlib.import_module(name)
-        except ImportError:
+        except Exception:  # noqa: BLE001 — absent, or failing at import: either way not here
             continue
     return None
 
@@ -300,10 +327,10 @@ def resolve_origin():
             return stamped
     try:
         found = origins.turn_origin()
+        return tuple(found) if found else NO_ORIGIN
     except Exception as exc:  # noqa: BLE001 — never fail the command over its origin
         logger.warning("pr_opened: the turn's origin is unreadable: %r", exc)
         return NO_ORIGIN
-    return tuple(found) if found else NO_ORIGIN
 
 
 def _session_kv_post(path, payload):
@@ -354,21 +381,37 @@ def on_terminal_output(command="", output="", **_):
 
     At most :data:`RECORDS_CHECKED_MAX` distinct urls carrying a token are
     claimed. A claimed proposal goes to the ledger under :func:`resolve_origin`;
-    in a kanban worker it also goes on the card and its line leaves the output.
-    Every other record line stays without its ``claim`` field. The first claim
-    the broker does not answer ends the claiming for this output, so a hop that
-    is down costs one timeout, not one per url. Returns the changed output, or
-    None (unchanged) when no line was removed or stripped.
+    in a kanban worker it also goes on the card and its line, with every line
+    repeating its url, leaves the output. Every other line naming a record stays
+    without its token. The first claim the broker does not answer ends the
+    claiming for this output, so a hop that is down costs one timeout, not one
+    per url. Returns the changed output, or None (unchanged) when no line was
+    removed or stripped. Once a record is seen, nothing raises: a fault returns
+    the output with every token stripped, since the seam would otherwise hand
+    the model the original.
     """
     if not isinstance(output, str) or PROPOSAL_OPENED_KEY not in output:
         return None
+    try:
+        return _claim_output(output)
+    except Exception as exc:  # noqa: BLE001 — the seam would hand the model the original, tokens and all
+        logger.warning("pr_opened: claiming this output failed (%s); its tokens are stripped", type(exc).__name__)
+        return _strip_all(output)
+
+
+def _claim_output(output):
+    """:func:`on_terminal_output`'s work, for an output that names a record. May raise."""
     task_id = os.environ.get(TASK_ENV, "").strip()
-    asked, kept, unanswered, origin, changed = set(), [], False, None, False
+    asked, removed, kept, unanswered, origin, changed = set(), set(), [], False, None, False
     for line in output.splitlines(keepends=True):
         proposal = opened(line)
+        if proposal is not None and proposal["url"] in removed:
+            changed = True
+            continue
         if (
             proposal is not None
             and proposal.get(CLAIM_FIELD)
+            and PROPOSAL_URL.match(proposal["url"])
             and proposal["url"] not in asked
             and len(asked) < RECORDS_CHECKED_MAX
             and not unanswered
@@ -384,12 +427,14 @@ def on_terminal_output(command="", output="", **_):
                 origin = origin or resolve_origin()
                 write_ledger(confirmed["url"], origin)
                 if task_id and _recorded(task_id, confirmed):
+                    removed.add(proposal["url"])
                     changed = True
                     continue
-        stripped = without_claim(line) if proposal is not None else line
+        stripped = strip_tokens(line) if PROPOSAL_OPENED_KEY in line else line
         changed = changed or stripped != line
         kept.append(stripped)
     return "".join(kept) if changed else None
+
 
 def _own_run_id():
     """``(task_id, run_id)`` when this process is a dispatcher worker with both set, else None."""

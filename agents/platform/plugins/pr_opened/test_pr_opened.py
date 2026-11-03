@@ -185,16 +185,79 @@ class PrOpenedTest(unittest.TestCase):
         self.assertEqual([payload["url"] for _, payload in self.ledger], [URL])
 
     def test_records_past_the_cap_lose_their_token_unclaimed(self):
+        cap = plugin.RECORDS_CHECKED_MAX
+        urls = [f"{REPOSITORY}/pull/{n}" for n in range(cap + 3)]
+        issue = "https://github.com/acme/fleet-config/issues/3"
+        for task in (TASK, ""):
+            kanban, broker = _Kanban(), _Broker()
+            first = broker.line(url=urls[0], number=0)
+            flood = broker.line(url=issue, number=3) + first * 3 + "".join(
+                broker.line(url=url, number=n) for n, url in enumerate(urls[1:], 1)
+            )
+            with self.subTest(worker=bool(task)):
+                out = self.run_hook(flood, kanban, task=task, broker=broker)
+                self.assertEqual(
+                    [payload["url"] for _, _, payload, _ in broker.asked], urls[:cap],
+                    "one claim per distinct url, up to the cap; a url that names no proposal takes no slot",
+                )
+                self.assertEqual(_tokens(out), [], "no token survives, claimed or not")
+                kept = [plugin.opened(line)["url"] for line in out.splitlines()]
+                if task:
+                    self.assertEqual(len(kanban.events), cap)
+                    self.assertEqual(kept, [issue] + urls[cap:], "a claimed url's repeats leave with it")
+                else:
+                    self.assertEqual(kanban.events, [])
+                    self.assertEqual(kept, [issue] + [urls[0]] * 3 + urls[1:], "outside a worker every line stays")
+
+    def test_a_repeat_of_a_url_whose_claim_failed_stays_without_its_token(self):
+        kanban, broker = _Kanban(), _Broker(refuse="CLAIM_NOT_CONFIRMED")
+        with self.assertLogs(plugin.logger, "WARNING"):
+            out = self.run_hook(broker.line() * 2, kanban, broker=broker)
+        self.assertEqual(len(broker.asked), 1)
+        self.assertEqual([plugin.opened(line)["url"] for line in out.splitlines()], [URL, URL])
+        self.assertEqual(_tokens(out), [])
+
+    def test_a_record_too_deeply_nested_to_parse_does_not_return_a_token(self):
+        broker = _Broker()
+        deep = '{"kube-agents.event":' + "[" * 200000 + "\n"
+        self.assertIsNone(plugin.opened(deep), "the parser's RecursionError reads as not a record")
+        for task in (TASK, ""):
+            with self.subTest(worker=bool(task)):
+                out = self.run_hook(deep + broker.line() + "done\n", _Kanban(), task=task, broker=broker)
+                self.assertNotIn('"claim"', out)
+                self.assertTrue(out.endswith("done\n"))
+
+    def test_a_resolver_that_raises_does_not_return_a_token(self):
+        origins = types.ModuleType("kanban_origin")
+        origins.origin_of = lambda conn, task_id: ("other", "")
+
+        def broken():
+            raise RuntimeError("session store down")
+
+        origins.turn_origin = broken
+        broker = _Broker()
+        with self.assertLogs(plugin.logger, "WARNING"):
+            out = self.run_hook(broker.line() + "done\n", _Kanban(), task="", broker=broker, origins=origins)
+        self.assertNotIn('"claim"', out)
+        self.assertEqual([payload["origin"] for _, payload in self.ledger], ["other"])
+        broker = _Broker()
+        line = broker.line()
+        with mock.patch.object(plugin, "resolve_origin", side_effect=RuntimeError("boom")), \
+                self.assertLogs(plugin.logger, "WARNING") as logs:
+            out = self.run_hook(line + "done\n", _Kanban(), broker=broker)
+        self.assertEqual(_tokens(out), [])
+        self.assertEqual(plugin.opened(out.splitlines()[0])["url"], URL)
+        self.assertIn("RuntimeError", "\n".join(logs.output))
+
+    def test_a_record_merged_after_other_text_loses_its_token_unclaimed(self):
+        # `2>&1` can put the record after text on the same line; it is not counted, and never read back.
         kanban, broker = _Kanban(), _Broker()
-        urls = [f"{REPOSITORY}/pull/{n}" for n in range(plugin.RECORDS_CHECKED_MAX + 3)]
-        first = broker.line(url=urls[0], number=0)
-        flood = first * 3 + "".join(broker.line(url=url, number=n) for n, url in enumerate(urls[1:], 1))
-        out = self.run_hook(flood, kanban, broker=broker)
-        self.assertEqual(len(broker.asked), plugin.RECORDS_CHECKED_MAX, "one claim per distinct url, up to the cap")
-        self.assertEqual(_tokens(out), [], "no token survives, claimed or not")
-        self.assertEqual(len(kanban.events), plugin.RECORDS_CHECKED_MAX)
-        kept = [plugin.opened(line)["url"] for line in out.splitlines()]
-        self.assertEqual(kept, [urls[0]] * 2 + urls[plugin.RECORDS_CHECKED_MAX:], "repeats and lines past the cap stay")
+        line = broker.line()
+        token = _tokens(line)[0]
+        out = self.run_hook("Cloning into 'wc'... " + line, kanban, broker=broker)
+        self.assertNotIn(token, out)
+        self.assertIn('"claim":""', out)
+        self.assertEqual((broker.asked, kanban.events), ([], []))
 
     def test_a_failed_claim_leaves_the_line_without_its_token(self):
         for refusal in ("CLAIM_NOT_CONFIRMED", "REPOSITORY_NOT_MANAGED", "FORGE_UNAVAILABLE"):
