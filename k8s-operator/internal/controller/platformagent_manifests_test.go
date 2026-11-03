@@ -1496,6 +1496,25 @@ func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesRosterSummaryThreshold(t *testing.T) {
+	// agent_roster.py reads the threshold from the agent container's own
+	// environment (and the router MCP child's, through the chat config's env
+	// block); off the allowlist, the documented spec.deployment.env entry never
+	// reaches either.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD", Value: "1"}})
+	if len(got) != 1 || got[0].Name != "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD" || got[0].Value != "1" {
+		t.Errorf("expected KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD=1 to pass, got %#v", got)
+	}
+	// Literal values only, as for every name on the list.
+	got = safeSandboxEnvOverrides([]corev1.EnvVar{{
+		Name:      "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD",
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "n"}},
+	}})
+	if len(got) != 0 {
+		t.Errorf("a ValueFrom KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD must not pass, got %#v", got)
+	}
+}
+
 func TestBuildCredentialProxyContainer(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},

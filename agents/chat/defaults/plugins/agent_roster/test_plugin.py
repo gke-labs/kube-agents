@@ -102,6 +102,36 @@ class InjectionTest(unittest.TestCase):
         self._profile("cluster-new", "Diagnostics for the new cluster.")
         self.assertIn("cluster-new", plugin.handle_pre_llm_call()["context"])
 
+    def _cluster_profile(self, project, cluster, location):
+        name = f"cluster-{project}-{cluster}-{location}"
+        self._profile(name, "One cluster's runtime state.")
+        (self.profiles / name / "config.yaml").write_text(
+            f"cluster_identity:\n  cluster: {cluster}\n  location: {location}\n  project: {project}\n"
+        )
+
+    def test_a_counted_block_adds_the_lookup_footer(self):
+        self._profile("default")
+        self._profile("platform", "Fleet work.")
+        for cluster in ("a", "b", "c"):
+            self._cluster_profile("p", cluster, "us")
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": "2"}):
+            context = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("  - by project: p (3)", context)
+        self.assertNotIn("cluster-p-a-us", context)
+        self.assertIn("`list_agents` with `filter` set to that cluster's name", context)
+        # The standing footer still rides along: the distinct specialists are named.
+        self.assertIn("verbatim as the `assignee`", context)
+
+    def test_a_named_block_carries_no_lookup_footer(self):
+        self._profile("default")
+        self._profile("platform", "Fleet work.")
+        for cluster in ("a", "b", "c"):
+            self._cluster_profile("p", cluster, "us")
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": "3"}):
+            context = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("  - cluster-p-a-us (the a cluster agent", context)
+        self.assertNotIn("`list_agents` with `filter`", context)
+
     def test_missing_script_is_silent_not_fatal(self):
         # This hook runs ahead of every user turn on the front door: a raise
         # here is a Chat Agent that cannot answer at all.

@@ -37,8 +37,12 @@ CHARS_PER_TOKEN = 4
 # ROSTER_RENDER_SECONDS bounds one render at N; the gate as a whole has two
 # minutes, and the Go half of it takes about one second.
 ROSTER_RENDER_SECONDS = 60
-# ROSTER_FIX_ISSUE owns the change that brings the roster under budget.
+# ROSTER_FIX_ISSUE is the change that brought the roster under budget.
 ROSTER_FIX_ISSUE = "#4432"
+# CACHE_AGED_SECONDS is how far back a fixture's mtimes are set so the cache
+# trusts them (agent_roster.CACHE_RACY_SECONDS refuses a tree changed within
+# the last two seconds, because filesystem timestamps are coarse).
+CACHE_AGED_SECONDS = 60
 # One fixture profile: the name as cluster_agent_profile.profile_name derives
 # it, and the identity block the scaffold stamps into config.yaml.
 FLEET_SCALE_PROJECT = "fleet-project"
@@ -73,6 +77,29 @@ def _write_cluster_profile(base: Path, name: str, project: str, cluster: str, lo
         "cluster_identity:\n"
         f"  cluster: {cluster}\n  location: {location}\n  project: {project}\n"
     )
+
+
+def _age(path: Path) -> None:
+    """Date ``path`` CACHE_AGED_SECONDS back, so the cache does not treat it as racy."""
+    then = time.time_ns() - CACHE_AGED_SECONDS * 1_000_000_000
+    os.utime(path, ns=(then, then))
+
+
+def _forget() -> None:
+    """Drop the module's cached roster, so a test starts from a miss."""
+    agent_roster._cache_key = agent_roster._cache_agents = agent_roster._cache_text = None
+
+
+@contextmanager
+def _counting_reads():
+    """Count every file read and directory listing pathlib performs inside the block."""
+    from unittest import mock
+
+    read_text, iterdir = Path.read_text, Path.iterdir
+    with mock.patch.object(Path, "read_text", autospec=True, side_effect=read_text) as reads, \
+            mock.patch.object(Path, "iterdir", autospec=True, side_effect=iterdir) as lists:
+        counts = {"reads": reads, "lists": lists}
+        yield counts
 
 
 class TestDiscovery(unittest.TestCase):
@@ -764,16 +791,14 @@ class TestFleetScaleRoster(unittest.TestCase):
         self.assertIsNotNone(out)
         return out
 
-    @unittest.expectedFailure
     def test_the_injected_roster_fits_the_token_budget(self):
-        """DESIRED, not current, behaviour: the budget the fix issue brings the roster under.
+        """The budget ROSTER_FIX_ISSUE brought the roster under.
 
-        Today format_roster names every one of the N agents with its cluster
-        note, about 130 characters a line at the scaffold's name length, so
-        the injected block costs tens of thousands of tokens on every turn. This flips from expectedFailure to
-        green in the pull request that closes ROSTER_FIX_ISSUE; a run that
-        passes before then is that fix landing without the flip, and unittest
-        reports it as an unexpected success.
+        Before it, format_roster named every one of the N agents with its
+        cluster note, about 130 characters a line at the scaffold's name
+        length, so the injected block cost tens of thousands of tokens on
+        every turn. Now a shared-role group past the threshold is counted by
+        project and location, and the block is constant in N.
         """
         with TemporaryDirectory() as tmp:
             out = self._render(self._fleet(tmp))
@@ -783,8 +808,30 @@ class TestFleetScaleRoster(unittest.TestCase):
             ROSTER_TOKEN_BUDGET,
             f"the roster at N={FLEET_SCALE_PROFILES} is about {tokens} tokens "
             f"({len(out)} characters at {CHARS_PER_TOKEN} per token), over the "
-            f"{ROSTER_TOKEN_BUDGET}-token budget; {ROSTER_FIX_ISSUE} owns the fix",
+            f"{ROSTER_TOKEN_BUDGET}-token budget",
         )
+        self.assertIn(f"The following {FLEET_SCALE_PROFILES} agents share one role", out)
+        self.assertIn(f"  - by project: {FLEET_SCALE_PROJECT} ({FLEET_SCALE_PROFILES})", out)
+        self.assertIn(f"  - by location: {FLEET_SCALE_LOCATION} ({FLEET_SCALE_PROFILES})", out)
+        self.assertIn(agent_roster.SUMMARY_HINT, out)
+        # The named block is gone, the distinct specialist is not.
+        self.assertNotIn(FLEET_SCALE_CLUSTER_FORMAT.format(index=1), out)
+        self.assertIn("- platform: Fleet work.", out)
+
+    def test_a_second_render_at_fleet_scale_reads_nothing(self):
+        # The other half of the acceptance: pre_llm_call reads no files when
+        # nothing changed. The first render pays 3N reads; the second, the
+        # same tree, pays stats and no reads and no listing.
+        _forget()
+        with TemporaryDirectory() as tmp:
+            base = self._fleet(tmp)
+            _age(base)
+            first = self._render(base)
+            with _counting_reads() as counts:
+                second = self._render(base)
+        self.assertEqual(first, second)
+        self.assertEqual(counts["reads"].call_count, 0, "a cache hit read a file")
+        self.assertEqual(counts["lists"].call_count, 0, "a cache hit listed a directory")
 
     def test_the_fixture_is_the_fleet_the_gate_measures(self):
         # Checked on discovery, the renderer's input, not on the rendered
@@ -807,6 +854,306 @@ class TestFleetScaleRoster(unittest.TestCase):
         self.assertLess(elapsed, ROSTER_RENDER_SECONDS, f"rendering N={FLEET_SCALE_PROFILES} took {elapsed:.1f}s")
 
 
+class TestRosterCache(unittest.TestCase):
+    """render() re-reads the tree only when something it depends on changed."""
+
+    def setUp(self):
+        _forget()
+        self._tmp = TemporaryDirectory()
+        self.base = Path(self._tmp.name) / "profiles"
+        self.base.mkdir()
+        self._profile("platform", "Fleet work.")
+        _write_cluster_profile(self.base, "cluster-p-a-us", "p", "a", "us")
+        _age(self.base)
+
+    def tearDown(self):
+        _forget()
+        self._tmp.cleanup()
+
+    def _profile(self, name, capabilities):
+        (self.base / name).mkdir()
+        (self.base / name / "CAPABILITIES.md").write_text(capabilities)
+
+    def _render(self, env=None):
+        return _render_roster(self.base, env or {})
+
+    def _reads_on_render(self, env=None):
+        with _counting_reads() as counts:
+            out = self._render(env)
+        return out, counts["reads"].call_count
+
+    def test_a_hit_reads_no_files(self):
+        self._render()
+        out, reads = self._reads_on_render()
+        self.assertEqual(reads, 0)
+        self.assertIn("- platform: Fleet work.", out)
+        self.assertIn("cluster-p-a-us (the a cluster agent", out)
+
+    def test_adding_a_profile_invalidates(self):
+        self.assertNotIn("cluster-new", self._render())
+        _write_cluster_profile(self.base, "cluster-new", "p", "new", "us")
+        # The directory was just written: racy, so re-read with no ageing.
+        self.assertIn("cluster-new (the new cluster agent", self._render())
+        # And once the tree is quiet it caches again.
+        _age(self.base)
+        self._render()
+        _, reads = self._reads_on_render()
+        self.assertEqual(reads, 0)
+
+    def test_removing_a_profile_invalidates(self):
+        self.assertIn("cluster-p-a-us", self._render())
+        for child in (self.base / "cluster-p-a-us").iterdir():
+            child.unlink()
+        (self.base / "cluster-p-a-us").rmdir()
+        self.assertNotIn("cluster-p-a-us", self._render())
+
+    def test_a_tree_changed_within_the_racy_window_is_not_cached(self):
+        # Filesystem timestamps are coarse: two writes inside one tick share
+        # an mtime, so a tree touched just now is re-read until it is quiet.
+        now = time.time_ns()
+        os.utime(self.base, ns=(now, now))
+        self._render()
+        _, reads = self._reads_on_render()
+        self.assertGreater(reads, 0)
+
+    def test_a_scope_snapshot_rewrite_invalidates(self):
+        snapshot = self.base.parent / "fleet_scope.json"
+        snapshot.write_text(
+            '{"boundary": true, "declared": {"projects": ["p"]}, "projects": '
+            '[{"id": "p", "state": "in-scope", "outcome": "ok", "via": ["projects"]}]}\n'
+        )
+        _age(snapshot)
+        self.assertIn("GCP projects in scope (1): p", self._render())
+        snapshot.write_text(
+            '{"boundary": true, "declared": {"projects": ["p", "q"]}, "projects": '
+            '[{"id": "p", "state": "in-scope", "outcome": "ok", "via": ["projects"]}, '
+            '{"id": "q", "state": "in-scope", "outcome": "ok", "via": ["projects"]}]}\n'
+        )
+        # A rewrite in place moves the file's mtime, not the directory's.
+        self.assertIn("GCP projects in scope (2): p, q", self._render())
+
+    def test_an_unstamped_cluster_profile_is_re_read_until_stamped(self):
+        # The scaffold creates the directory, then rewrites config.yaml in
+        # place; the second step changes no directory mtime, so a roster
+        # cached between the two would never learn the cluster's name.
+        (self.base / "cluster-p-b-us").mkdir()
+        (self.base / "cluster-p-b-us" / "CAPABILITIES.md").write_text(CLUSTER_ROLE)
+        _age(self.base)
+        out = self._render()
+        self.assertIn("  - cluster-p-b-us\n", out)
+        (self.base / "cluster-p-b-us" / "config.yaml").write_text(
+            "cluster_identity:\n  cluster: b\n  location: us\n  project: p\n"
+        )
+        self.assertIn("cluster-p-b-us (the b cluster agent", self._render())
+        # Stamped, it caches like any other.
+        self._render()
+        _, reads = self._reads_on_render()
+        self.assertEqual(reads, 0)
+
+    def test_a_different_threshold_is_a_different_key(self):
+        for _ in range(3):
+            _write_cluster_profile(self.base, f"cluster-p-{_}-us", "p", str(_), "us")
+        _age(self.base)
+        self.assertIn("  - cluster-p-0-us", self._render({agent_roster.SUMMARY_THRESHOLD_ENV: "9"}))
+        self.assertIn("counted here rather than named", self._render({agent_roster.SUMMARY_THRESHOLD_ENV: "1"}))
+
+    def test_a_failed_discovery_is_not_cached(self):
+        from unittest import mock
+
+        with mock.patch.object(agent_roster, "discover", return_value=None):
+            self.assertIsNone(self._render())
+        self.assertIn("- platform: Fleet work.", self._render())
+
+    def test_an_explicit_base_is_part_of_the_key(self):
+        self._render()
+        with TemporaryDirectory() as other:
+            base = Path(other) / "profiles"
+            (base / "tse").mkdir(parents=True)
+            (base / "tse" / "CAPABILITIES.md").write_text("Support.")
+            _age(base)
+            self.assertIn("- tse: Support.", _render_roster(base, {}))
+
+
+class TestSummaryThreshold(unittest.TestCase):
+    def _threshold(self, value):
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {agent_roster.SUMMARY_THRESHOLD_ENV: value}):
+            return agent_roster.summary_threshold()
+
+    def test_unset_is_the_default(self):
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(agent_roster.SUMMARY_THRESHOLD_ENV, None)
+            self.assertEqual(agent_roster.summary_threshold(), agent_roster.SUMMARY_THRESHOLD_DEFAULT)
+
+    def test_a_whole_number_is_read(self):
+        self.assertEqual(self._threshold("5"), 5)
+        self.assertEqual(self._threshold(" 0 "), 0)
+
+    def test_anything_else_is_the_default(self):
+        default = agent_roster.SUMMARY_THRESHOLD_DEFAULT
+        for value in ("", "-1", "2.5", "many", "${KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD}"):
+            self.assertEqual(self._threshold(value), default, value)
+
+
+class TestSummarizedGroup(unittest.TestCase):
+    """A shared-role group past the threshold is counted, not named."""
+
+    def _fleet(self, tmp, clusters):
+        base = Path(tmp) / "profiles"
+        (base / "platform").mkdir(parents=True)
+        (base / "platform" / "CAPABILITIES.md").write_text("Fleet work.")
+        for project, cluster, location in clusters:
+            name = agent_roster._profile_name(project, cluster, location)
+            _write_cluster_profile(base, name, project, cluster, location)
+        return base
+
+    def test_counts_by_project_and_location_with_the_role_and_the_hint(self):
+        clusters = [("p1", "a", "us"), ("p1", "b", "us"), ("p2", "c", "eu")]
+        with TemporaryDirectory() as tmp:
+            out = _render_roster(self._fleet(tmp, clusters), {agent_roster.SUMMARY_THRESHOLD_ENV: "2"})
+        self.assertIn(
+            "The following 3 agents share one role and are counted here rather than named:\n"
+            "  - by project: p1 (2), p2 (1)\n"
+            "  - by location: us (2), eu (1)\n"
+            f"  Shared role: {CLUSTER_ROLE.strip()}\n"
+            f"{agent_roster.SUMMARY_HINT}",
+            out,
+        )
+        self.assertNotIn("cluster-p1-a-us", out)
+        self.assertIn("- platform: Fleet work.", out)
+
+    def test_at_the_threshold_the_names_stay(self):
+        clusters = [("p1", "a", "us"), ("p1", "b", "us")]
+        with TemporaryDirectory() as tmp:
+            out = _render_roster(self._fleet(tmp, clusters), {agent_roster.SUMMARY_THRESHOLD_ENV: "2"})
+        self.assertIn("  - cluster-p1-a-us (the a cluster agent; project p1, location us)", out)
+        self.assertNotIn("counted here", out)
+
+    def test_the_default_threshold_names_twenty(self):
+        clusters = [("p", f"c{i:02d}", "us") for i in range(20)]
+        with TemporaryDirectory() as tmp:
+            base = self._fleet(tmp, clusters)
+            out = _render_roster(base, {})
+            self.assertIn("The following 20 agents share one role — pick the one", out)
+            _write_cluster_profile(base, "cluster-p-c20-us", "p", "c20", "us")
+            out = _render_roster(base, {})
+        self.assertIn("The following 21 agents share one role and are counted", out)
+
+    def test_the_named_cap_counts_the_rest(self):
+        clusters = [(f"p{i:02d}", f"c{i:02d}", "us") for i in range(25)]
+        with TemporaryDirectory() as tmp:
+            out = _render_roster(self._fleet(tmp, clusters), {agent_roster.SUMMARY_THRESHOLD_ENV: "1"})
+        self.assertIn("p19 (1), and 5 more projects (5 agents)", out)
+        self.assertNotIn("p20 (1)", out)
+        self.assertIn("  - by location: us (25)", out)
+
+    def test_an_unstamped_member_is_counted_as_such(self):
+        with TemporaryDirectory() as tmp:
+            base = self._fleet(tmp, [("p", "a", "us"), ("p", "b", "us")])
+            (base / "tse-1").mkdir()
+            (base / "tse-1" / "CAPABILITIES.md").write_text(CLUSTER_ROLE)
+            out = _render_roster(base, {agent_roster.SUMMARY_THRESHOLD_ENV: "0"})
+        self.assertIn("  - by project: p (2), (unstamped) (1)", out)
+
+    def test_a_distinct_specialist_and_the_sections_are_unchanged(self):
+        clusters = [("p", "a", "us"), ("p", "b", "us")]
+        env = {
+            agent_roster.SUMMARY_THRESHOLD_ENV: "1",
+            "GKE_CLUSTER_NAME": "a", "GKE_PROJECT_ID": "p", "GKE_LOCATION": "us",
+        }
+        with TemporaryDirectory() as tmp:
+            out = _render_roster(self._fleet(tmp, clusters), env)
+        self.assertIn("- platform: Fleet work.", out)
+        self.assertIn(
+            "- cluster=a, project=p, location=us, assignee=cluster-p-a-us", out,
+            "the host line still names its assignee under a counted block",
+        )
+
+
+class TestFilter(unittest.TestCase):
+    """format_matches hands back the names a counted block withheld."""
+
+    def setUp(self):
+        self.agents = [
+            {"name": "platform", "responsibilities": "Fleet work."},
+            *(
+                {
+                    "name": agent_roster._profile_name(p, c, l),
+                    "responsibilities": CLUSTER_ROLE,
+                    "cluster_cluster": c, "cluster_project": p, "cluster_location": l,
+                }
+                for p, c, l in (("proj-one", "seeded-a", "us-central1"),
+                                ("proj-one", "seeded-b", "us-central1"),
+                                ("proj-two", "Seeded-C", "europe-west1"))
+            ),
+        ]
+
+    def test_matches_a_cluster_name(self):
+        out = agent_roster.format_matches(self.agents, "seeded-a")
+        self.assertTrue(out.startswith('Agents matching "seeded-a" (1 of 1 matched, 4 on the roster):\n'))
+        self.assertIn(
+            "- cluster-proj-one-seeded-a-us-central1 (the seeded-a cluster agent; "
+            f"project proj-one, location us-central1): {CLUSTER_ROLE}",
+            out,
+        )
+        self.assertNotIn("seeded-b", out)
+        self.assertNotIn("platform", out)
+
+    def test_matches_project_location_and_assignee_id_case_insensitively(self):
+        self.assertIn("2 of 2 matched", agent_roster.format_matches(self.agents, "PROJ-ONE"))
+        self.assertIn("1 of 1 matched", agent_roster.format_matches(self.agents, "europe"))
+        self.assertIn("1 of 1 matched", agent_roster.format_matches(self.agents, "seeded-c"))
+        self.assertIn("1 of 1 matched", agent_roster.format_matches(self.agents, " platform "))
+
+    def test_matches_are_grouped_never_summarized(self):
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {agent_roster.SUMMARY_THRESHOLD_ENV: "0"}):
+            out = agent_roster.format_matches(self.agents, "us-central1")
+        self.assertIn("The following 2 agents share one role — pick the one whose cluster you need:", out)
+        self.assertIn("  - cluster-proj-one-seeded-a-us-central1 (the seeded-a cluster agent", out)
+        self.assertNotIn("counted here", out)
+
+    def test_no_match_says_so_and_points_at_platform(self):
+        out = agent_roster.format_matches(self.agents, "nope")
+        self.assertEqual(out, agent_roster.FILTER_NONE.format(query="nope", total=4))
+        self.assertIn("route the request to `platform`", out)
+
+    def test_the_cap_counts_the_rest(self):
+        agents = [
+            {"name": f"cluster-p-c{i:03d}-us", "responsibilities": CLUSTER_ROLE,
+             "cluster_cluster": f"c{i:03d}", "cluster_project": "p", "cluster_location": "us"}
+            for i in range(60)
+        ]
+        out = agent_roster.format_matches(agents, "p")
+        self.assertIn("(50 of 60 matched, 60 on the roster)", out)
+        self.assertTrue(out.endswith("... and 10 more; narrow the filter."))
+        self.assertIn("cluster-p-c049-us", out)
+        self.assertNotIn("cluster-p-c050-us", out)
+
+    def test_unknown_in_unknown_out(self):
+        self.assertIsNone(agent_roster.format_matches(None, "x"))
+
+    def test_render_filtered_reads_the_cached_tree(self):
+        _forget()
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp) / "profiles"
+            base.mkdir()
+            _write_cluster_profile(base, "cluster-p-a-us", "p", "a", "us")
+            _write_cluster_profile(base, "cluster-p-b-us", "p", "b", "us")
+            _age(base)
+            _render_roster(base, {})
+            with _counting_reads() as counts:
+                out = agent_roster.render_filtered("b", base)
+            self.assertEqual(counts["reads"].call_count, 0)
+        _forget()
+        self.assertIn("cluster-p-b-us (the b cluster agent", out)
+        self.assertNotIn("cluster-p-a-us", out)
+
+
 class TestRouterEnvCarriesTheRosterInputs(unittest.TestCase):
     """list_agents renders what the injected block renders only if its env block passes the inputs."""
 
@@ -816,7 +1163,7 @@ class TestRouterEnvCarriesTheRosterInputs(unittest.TestCase):
         config = yaml.safe_load((Path(__file__).resolve().parents[1] / "config.yaml").read_text())
         env = config["mcp_servers"]["router"]["env"]
         needed = {agent_roster.HOST_CLUSTER_ENV, agent_roster.HOST_LOCATION_ENV,
-                  agent_roster.HOST_PROJECT_ENV}
+                  agent_roster.HOST_PROJECT_ENV, agent_roster.SUMMARY_THRESHOLD_ENV}
         reader = agent_roster._scope_reader()
         self.assertIsNotNone(reader)
         needed |= {reader.SCOPE_FILE_ENV, *reader.MANAGEMENT_PROJECT_ENVS}

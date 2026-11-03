@@ -9,8 +9,11 @@
 # The roster itself is now injected into every turn by the `agent_roster`
 # plugin, so this tool is the REFRESH path rather than the common path: a
 # specialist created moments ago, or an injected block the model has reason to
-# doubt. Both read the same `agent_roster` module, so the tool and the injected
-# block can never describe the fleet differently.
+# doubt. It is also the LOOKUP path: above a threshold the injected block
+# counts a shared-role group (the Cluster Agents) instead of naming each, and
+# `filter` hands back the names for one cluster, project or location. Both read
+# the same `agent_roster` module, so the tool and the injected block can never
+# describe the fleet differently.
 #
 # Delegation itself does NOT happen here: the Chat Agent delegates exclusively
 # via the asynchronous kanban board (`kanban_create`), so the user sees live,
@@ -32,8 +35,8 @@ mcp = MCPServer("Chat Router")
 
 
 @mcp.tool()
-def list_agents() -> str:
-    """Refresh the roster of specialist agents you can route to.
+def list_agents(filter: str = "") -> str:
+    """Refresh the roster of specialist agents you can route to, or look one up.
 
     The current roster is ALREADY in your context — it is injected at the start of
     every turn. Call this only to re-read it: when an agent you expect is missing,
@@ -42,12 +45,20 @@ def list_agents() -> str:
 
     Agents sharing an identical role description (every Cluster Agent is scaffolded from the
     same template) are grouped so the description is stated once instead of repeated verbatim
-    per agent. Assignee names are always listed individually.
+    per agent. A group larger than the install's threshold is counted by project and location
+    instead of named; pass `filter` (a cluster name, assignee id, project or location; a
+    case-insensitive substring) to get the matching agents by name, up to 50, so you can copy
+    the one `assignee` you need. With no match the answer says so; route a named cluster that
+    has no agent to `platform`. Without `filter` the tool renders what the injected block
+    renders.
     """
     # A tool has to answer with a string, so an unreadable roster (render() -> None)
     # is spelled out rather than collapsed into "no agents exist". The injecting
     # plugin has the better option there and simply stays quiet.
-    roster = agent_roster.render()
+    if filter.strip():
+        roster = agent_roster.render_filtered(filter)
+    else:
+        roster = agent_roster.render()
     return agent_roster.UNKNOWN_ROSTER if roster is None else roster
 
 
