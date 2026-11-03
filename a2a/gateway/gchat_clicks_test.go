@@ -667,10 +667,9 @@ func TestGchatSettlingAnUnrememberedQuestionForgetsItsPendingClick(t *testing.T)
 	}
 }
 
-// A click on a home card in a DM home space binds to the card's thread,
-// not the DM's root: the alert edited into its triage is the head of its
-// thread, and Chat marks no threadReply on a click on a head, so the
-// event's surface alone would bind the turn top-level.
+// Every click in a DM binds to its card's thread, a home card's included,
+// remembered or not. The home mark stays on a home card's buttons, because
+// cards already posted carry it.
 func TestGchatClickOnAHomeCardInADMBindsToItsThread(t *testing.T) {
 	f := newFakeChatRelay(t)
 	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1", "thread": map[string]any{"name": "spaces/_c2fixtureAA/threads/BOT1"}}
@@ -703,8 +702,8 @@ func TestGchatClickOnAHomeCardInADMBindsToItsThread(t *testing.T) {
 	if ps := params(f.call(1)); len(ps) != 2 {
 		t.Fatalf("conversation button parameters = %v; want no home mark", ps)
 	}
-	// After a restart the adapter remembers nothing; the mark on the
-	// clicked button binds the click to the thread all the same.
+	// After a restart the adapter remembers nothing; the click binds to the
+	// card's thread, with the mark or without it.
 	restarted := newTestGchatAdapterWithRelay(t, f)
 	later := gchatClickEvent(t)
 	later.click.Parameters[gchatChatParamHome] = gchatChatParamHomeValue
