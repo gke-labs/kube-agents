@@ -4,6 +4,8 @@ import http.client
 import io
 import json
 import os
+import socket
+import struct
 import tempfile
 import threading
 import time
@@ -19,6 +21,9 @@ RULES = str(REPO_ROOT / "agents/platform/scripts/worker_transcript.py")
 TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
 LOG_WAIT_SECONDS = 5
 POLL_SECONDS = 0.02
+STALL_SECONDS = 0.3
+SLOW_CHUNKS = 100
+SLOW_CHUNK_SECONDS = 0.05
 
 
 class FakeLiteLLM(BaseHTTPRequestHandler):
@@ -27,6 +32,11 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     calls = []
     fallbacks = "0"
+    # "normal", "stall_reset" (one chunk, a pause, then a TCP reset),
+    # "early_close" (two chunks, then the connection closes without the last
+    # chunk), or "slow" (many chunks, slowly; `aborted` is set when a write fails).
+    mode = "normal"
+    aborted = threading.Event()
     lock = threading.Lock()
 
     def log_message(self, *args):
@@ -75,9 +85,29 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
         for key, value in headers.items():
             self.send_header(key, value)
         self.end_headers()
-        for chunk in self.stream_chunks(number, task):
-            self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
-            self.wfile.flush()
+        chunks = self.stream_chunks(number, task)
+        if self.mode == "slow":
+            chunks = [b": keep-alive\n\n"] * SLOW_CHUNKS + chunks
+        for index, chunk in enumerate(chunks):
+            try:
+                self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+                self.wfile.flush()
+            except OSError:
+                FakeLiteLLM.aborted.set()
+                self.close_connection = True
+                return
+            if self.mode == "slow":
+                time.sleep(SLOW_CHUNK_SECONDS)
+            if self.mode == "stall_reset" and index == 0:
+                time.sleep(STALL_SECONDS)
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                self.connection.close()
+                self.close_connection = True
+                return
+            if self.mode == "early_close" and index == 1:
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.close_connection = True
+                return
         self.wfile.write(b"0\r\n\r\n")
 
     @staticmethod
@@ -115,19 +145,24 @@ def chat(task, stream, model="model-default", extra_messages=()):
 
 class ProxyTestCase(unittest.TestCase):
     redactor_path = REDACTOR
+    upstream_timeout = replay_proxy.DEFAULT_UPSTREAM_TIMEOUT_SECONDS
+    store_dir = None
 
     def setUp(self):
         FakeLiteLLM.calls = []
         FakeLiteLLM.fallbacks = "0"
+        FakeLiteLLM.mode = "normal"
+        FakeLiteLLM.aborted = threading.Event()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeLiteLLM)
         threading.Thread(target=self.upstream.serve_forever, args=(POLL_SECONDS,), daemon=True).start()
-        self.store = tempfile.mkdtemp()
+        self.store = self.store_dir or tempfile.mkdtemp()
         self.out = io.StringIO()
         config = replay_proxy.Config(
             listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
             store_dir=self.store, redactor_path=self.redactor_path, transcript_rules_path=RULES,
+            upstream_timeout_seconds=self.upstream_timeout,
             litellm_config_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
-            job_kind="presubmit", job_project="pool-1", job_build="42",
+            job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
         )
         self.server = replay_proxy.make_server(config, host="127.0.0.1", out=self.out)
         self.proxy = self.server.proxy
@@ -145,7 +180,10 @@ class ProxyTestCase(unittest.TestCase):
         data = json.dumps(body).encode() if isinstance(body, dict) else body
         conn.request(method, path, body=data, headers={"Content-Type": "application/json"} if data else {})
         resp = conn.getresponse()
-        payload = resp.read()
+        try:
+            payload = resp.read()
+        except http.client.IncompleteRead as exc:  # an upstream cut short shows as a cut-short response
+            payload = exc.partial
         headers = {k.lower(): v for k, v in resp.getheaders()}
         conn.close()
         return resp.status, headers, payload
@@ -210,15 +248,80 @@ class PassThroughTest(ProxyTestCase):
 
     def test_analysis_failure_never_costs_the_answer(self):
         def explode(*_args):
-            raise RuntimeError("bug")
+            raise RuntimeError(f"bug near {TOKEN}")
 
         self.proxy.analyze = explode
         status, _, payload = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
         self.assertEqual(status, 200)
         self.assertIn(b"answer 1", payload)
         line = self.lines(1)[0]
-        self.assertIn("RuntimeError", line["error"])
+        self.assertEqual(line["error"], "RuntimeError")
         self.assertEqual(self.proxy.metrics.get("analysis_errors"), 1)
+
+
+class UpstreamFailureTest(ProxyTestCase):
+    def assert_incomplete_line(self):
+        line = self.lines(1)[0]
+        self.assertTrue(line["upstream_incomplete"])
+        self.assertEqual(line["unstorable"], ["upstream_incomplete"])
+        self.assertTrue(line["fingerprint"])
+        self.assertEqual(self.proxy.metrics.get("upstream_errors"), 1)
+
+    def test_stall_then_reset(self):
+        FakeLiteLLM.mode = "stall_reset"
+        status, _, payload = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=True))
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"[DONE]", payload)
+        self.assert_incomplete_line()
+
+    def test_chunked_stream_closed_early(self):
+        FakeLiteLLM.mode = "early_close"
+        status, _, payload = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=True))
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"[DONE]", payload)
+        self.assert_incomplete_line()
+
+
+class UpstreamTimeoutTest(ProxyTestCase):
+    upstream_timeout = STALL_SECONDS / 3
+
+    def test_stall_past_the_timeout(self):
+        FakeLiteLLM.mode = "stall_reset"
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=True))
+        line = self.lines(1)[0]
+        self.assertEqual(line["unstorable"], ["upstream_incomplete"])
+        self.assertEqual(self.proxy.metrics.get("upstream_errors"), 1)
+
+
+class ClientDisconnectTest(ProxyTestCase):
+    def test_upstream_is_closed_when_the_client_goes(self):
+        FakeLiteLLM.mode = "slow"
+        data = json.dumps(chat("t_11111111", stream=True)).encode()
+        client = socket.create_connection(("127.0.0.1", self.port))
+        client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                       + f"Content-Length: {len(data)}\r\n\r\n".encode() + data)
+        client.recv(1024)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        client.close()
+        line = self.lines(1)[0]
+        self.assertTrue(line["client_disconnected"])
+        self.assertEqual(line["unstorable"], ["client_disconnected"])
+        # Closed, not read to the end: the upstream's next write fails long
+        # before its stream would have finished.
+        self.assertTrue(FakeLiteLLM.aborted.wait(SLOW_CHUNKS * SLOW_CHUNK_SECONDS / 2))
+
+
+class StoreWriteFailureTest(ProxyTestCase):
+    store_dir = tempfile.mkstemp()[1]  # a file, so no directory can be made under it
+
+    def test_write_failure_keeps_the_line(self):
+        status, _, _ = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.assertEqual(status, 200)
+        line = self.lines(1)[0]
+        self.assertFalse(line["stored"])
+        self.assertTrue(line["store_skipped"].startswith("write_failed"), line["store_skipped"])
+        self.assertTrue(line["fingerprint"])
+        self.assertTrue(line["message_hashes"])
 
 
 class LocalEndpointTest(ProxyTestCase):
@@ -247,7 +350,7 @@ class LogLineTest(ProxyTestCase):
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
         line = self.lines(1)[0]
         self.assertEqual(line["event"], "replay_shadow_request")
-        self.assertEqual(line["job"], {"kind": "presubmit", "project": "pool-1", "build": "42"})
+        self.assertEqual(line["job"], {"kind": "presubmit", "project": "pool-1", "build": "42", "pr": "4700"})
         self.assertEqual((line["prompt_tokens"], line["cached_tokens"], line["completion_tokens"]), (1000, 600, 7))
         self.assertEqual(len(line["fingerprint"]), 64)
         self.assertEqual(len(line["message_hashes"]), 2)
@@ -279,6 +382,25 @@ class LogLineTest(ProxyTestCase):
         for text in (TOKEN, "t_11111111", "web-7d4b9c8f6d", "platform agent", "answer 1"):
             self.assertNotIn(text, log)
 
+    def test_message_and_answer_hashes_are_of_scrubbed_text(self):
+        other = "ghp_" + "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2"
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        body = chat("t_11111111", stream=False)
+        body["messages"][-1]["content"] = body["messages"][-1]["content"].replace(TOKEN, other)
+        self.request("POST", "/v1/chat/completions", body)
+        a, b = self.lines(2)
+        # Different secrets, same scrubbed text: the hashes cannot tell them apart.
+        self.assertNotEqual(a["fingerprint"], b["fingerprint"])
+        self.assertEqual(a["message_hashes"], b["message_hashes"])
+
+    def test_scrubbed_message_hashes_are_prefix_stable(self):
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        extra = ({"role": "user", "content": f"earlier turn t_99999999 with {TOKEN}"},)
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False, extra_messages=extra))
+        a, b = self.lines(2)
+        self.assertEqual(a["message_hashes"][:1], b["message_hashes"][:1])
+        self.assertEqual(len(b["message_hashes"]), 3)
+
     def test_fallback_answer_is_marked_unstorable(self):
         FakeLiteLLM.fallbacks = "1"
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
@@ -309,6 +431,8 @@ class FailClosedProxyTest(ProxyTestCase):
         self.assertEqual(os.listdir(self.store), [])
         self.assertIn("replay_shadow_scrubbers_loaded 0", self.request("GET", "/metrics")[2].decode())
         self.assertIn("scrubbers_unavailable", line["unstorable"])
+        self.assertNotIn("message_hashes", line)
+        self.assertNotIn("answer_hash", line)
 
 
 class ConfigTest(unittest.TestCase):

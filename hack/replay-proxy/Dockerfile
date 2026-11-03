@@ -3,7 +3,7 @@
 #
 # Build from the repository root, because the image carries the install's
 # scrubbers from agents/:
-#   docker build --platform linux/amd64 -f hack/replay-proxy/Dockerfile -t <registry>/replay-proxy:<tag> .
+#   docker build --platform linux/amd64 -f hack/replay-proxy/Dockerfile -t <registry>/replay-proxy-shadow:<tag> .
 #
 # The base comes from images.json, spelled as
 # examples/inference-replay/replay-proxy/Dockerfile spells it, so

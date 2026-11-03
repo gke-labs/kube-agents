@@ -139,9 +139,26 @@ class TimeTest(unittest.TestCase):
             fp(request("created 2026-11-04T11:50:00Z"), now=NOW + normalizer.SECONDS_PER_DAY),
         )
 
-    def test_epoch_seconds_and_millis(self):
-        self.assertEqual(norm("at 1793440000 and 1793440000123"), "at ⟦TIME_past_days⟧ and ⟦TIME_past_days⟧")
-        self.assertEqual(norm(str(int(NOW) + 3 * 3600)), "⟦TIME_future_hours⟧")
+    def test_epoch_under_a_time_key(self):
+        out = normalizer.Normalizer(NOW, False).walk(
+            {"created_at": 1793440000, "ts": "1793440000123", "updatedAt": int(NOW) + 3 * 3600, "timestamp": 1793440000.5}
+        )
+        self.assertEqual(
+            out,
+            {"created_at": "⟦TIME_past_days⟧", "timestamp": "⟦TIME_past_days⟧", "ts": "⟦TIME_past_days⟧",
+             "updatedAt": "⟦TIME_future_hours⟧"},
+        )
+        self.assertEqual(norm("created_at: 1793440000, \"ts\": 1793440000123"), "created_at: ⟦TIME_past_days⟧, \"ts\": ⟦TIME_past_days⟧")
+
+    def test_free_text_epoch_shaped_number_stays_literal(self):
+        self.assertEqual(norm("memory: 1717986918 bytes"), "memory: 1717986918 bytes")
+        self.assertEqual(norm("at 1793440000"), "at 1793440000")
+        out = normalizer.Normalizer(NOW, False).walk({"size": 1717986918, "count": "1793440000"})
+        self.assertEqual(out, {"count": "1793440000", "size": 1717986918})
+
+    def test_epoch_under_a_time_key_cannot_be_put_back_in_an_answer(self):
+        normalized = normalizer.normalize_request(request(json.dumps({"created_at": 1793440000})), NOW)
+        self.assertTrue(normalized.mapping.answer_repeats_bare_number("sleep until 1793440000"))
 
     def test_ls_l_dates(self):
         self.assertEqual(norm("-rw-r--r-- 1 root root 12 Nov  3 11:40 a.txt"), "-rw-r--r-- 1 root root 12 ⟦TIME_past_minutes⟧ a.txt")
@@ -226,6 +243,16 @@ class OpaqueTest(unittest.TestCase):
             {"messages": [{"role": "tool", "content": json.dumps({"task": {"id": "t_3c176184"}})}]}, NOW
         )
         self.assertIn("⟦TASK_1⟧", json.dumps(normalized.messages, ensure_ascii=False))
+
+    def test_claude_tool_use_ids_match(self):
+        self.assertEqual(fp(self.body("toolu_01AbCdEf", "s")), fp(self.body("toolu_01ZyXwVu", "s")))
+        normalized = normalizer.normalize_request(self.body("toolu_01AbCdEf", "s"), NOW)
+        self.assertEqual(normalized.messages[0]["tool_calls"][0]["id"], "⟦OPAQUE_1⟧")
+        self.assertEqual(normalized.messages[1]["tool_call_id"], "⟦OPAQUE_1⟧")
+
+    def test_an_id_outside_tool_calls_is_not_opaque(self):
+        out = normalizer.Normalizer(NOW, False).walk({"items": [{"id": "call web-7d4b9c8f6d-x2k9p"}]})
+        self.assertEqual(out, {"items": [{"id": "call web-⟦POD_1⟧"}]})
 
     def test_runs_differing_only_in_call_ids_match(self):
         self.assertEqual(fp(self.body("call_aaa__thought__x", "s1")), fp(self.body("call_bbb__thought__y", "s2")))

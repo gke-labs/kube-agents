@@ -42,6 +42,15 @@ START_EVENT = "replay_shadow_start"
 DEFAULT_BIND_HOST = "0.0.0.0"
 BODY_METHODS = ("POST", "PUT", "PATCH")
 HEAD_METHOD = "HEAD"
+GET_METHOD = "GET"
+POST_METHOD = "POST"
+HOST_HEADER = "Host"
+CONTENT_TYPE_HEADER = "Content-Type"
+CONTENT_LENGTH_HEADER = "Content-Length"
+TRANSFER_ENCODING_HEADER = "Transfer-Encoding"
+# Why replay would not have saved an answer, in the line's `unstorable`.
+UNSTORABLE_UPSTREAM_INCOMPLETE = "upstream_incomplete"
+UNSTORABLE_CLIENT_DISCONNECTED = "client_disconnected"
 LOG_SCHEMA_VERSION = 1
 
 DEFAULT_LISTEN_PORT = 8080
@@ -82,6 +91,9 @@ MS_PER_SECOND = 1000
 CHUNKED = "chunked"
 CRLF = b"\r\n"
 HEX_BASE = 16
+# What a broken upstream raises: a timeout or reset (OSError), or a response
+# cut short (http.client.IncompleteRead and the other HTTPExceptions).
+UPSTREAM_ERRORS = (OSError, http.client.HTTPException)
 # Streamed fields concatenated across deltas.
 CONCAT_KEYS = ("content", "reasoning_content", "arguments")
 
@@ -103,6 +115,7 @@ class Config:
     job_kind: str = UNSET
     job_project: str = UNSET
     job_build: str = UNSET
+    job_pr: str = UNSET
 
     @classmethod
     def from_env(cls, env: Dict[str, str]) -> "Config":
@@ -119,6 +132,7 @@ class Config:
             job_kind=env.get("REPLAY_JOB_KIND", UNSET),
             job_project=env.get("REPLAY_JOB_PROJECT", UNSET),
             job_build=env.get("REPLAY_JOB_BUILD", UNSET),
+            job_pr=env.get("REPLAY_JOB_PR", UNSET),
         )
 
 
@@ -277,9 +291,16 @@ def answer_hash(message: Dict[str, Any], mapping: normalizer.Mapping) -> Optiona
 def unstorable_reasons(
     body: Dict[str, Any], status: int, message: Dict[str, Any], headers: Dict[str, str],
     mapping: normalizer.Mapping, scrubber: request_store.Scrubber,
+    upstream_incomplete: bool = False, client_disconnected: bool = False,
 ) -> List[str]:
     """Why replay would not have saved this answer (eval-design.md); empty when it would."""
     reasons = []
+    if upstream_incomplete:
+        reasons.append(UNSTORABLE_UPSTREAM_INCOMPLETE)
+        return reasons
+    if client_disconnected:
+        reasons.append(UNSTORABLE_CLIENT_DISCONNECTED)
+        return reasons
     if status != HTTP_OK or not (message.get("content") or message.get("tool_calls")):
         reasons.append("no_answer")
         return reasons
@@ -321,7 +342,12 @@ class ShadowProxy:
             self.out.flush()
 
     def job(self) -> Dict[str, str]:
-        return {"kind": self.config.job_kind, "project": self.config.job_project, "build": self.config.job_build}
+        return {
+            "kind": self.config.job_kind,
+            "project": self.config.job_project,
+            "build": self.config.job_build,
+            "pr": self.config.job_pr,
+        }
 
     def startup_line(self) -> Dict[str, Any]:
         return {
@@ -352,6 +378,7 @@ class ShadowProxy:
             "status": upstream["status"],
             "latency_ms": upstream["latency_ms"],
             "client_disconnected": upstream["client_disconnected"],
+            "upstream_incomplete": upstream["upstream_incomplete"],
             "litellm_model_group": upstream["headers"].get(MODEL_GROUP_HEADER),
             "litellm_attempted_fallbacks": upstream["headers"].get(ATTEMPTED_FALLBACKS_HEADER),
         }
@@ -361,14 +388,28 @@ class ShadowProxy:
         entry.update(
             fingerprint=fingerprint,
             settings_hash=normalizer.settings_hash(normalized, self.key_context),
-            message_hashes=normalized.message_hashes,
             roles=normalized.roles(),
-            answer_hash=answer_hash(upstream["message"], normalized.mapping),
             unstorable=unstorable_reasons(
-                body, upstream["status"], upstream["message"], upstream["headers"], normalized.mapping, self.scrubber
+                body, upstream["status"], upstream["message"], upstream["headers"], normalized.mapping, self.scrubber,
+                upstream_incomplete=upstream["upstream_incomplete"],
+                client_disconnected=upstream["client_disconnected"],
             ),
         )
-        skipped = self.store.store(request_id, fingerprint, body)
+        scrubbed, skipped = self.store.scrub(body)
+        if scrubbed is not None:
+            # The per-message and answer hashes are of scrubbed text, so a
+            # short secret cannot be recovered from the public log by guessing.
+            # The scrubbed messages are normalized on their own, in order, so
+            # a shared prefix still has the same hashes.
+            scrubbed_body = dict(body)
+            scrubbed_body[request_store.MESSAGES_KEY] = scrubbed[0]
+            hashed = normalizer.normalize_request(scrubbed_body, received)
+            entry["message_hashes"] = hashed.message_hashes
+            try:
+                entry["answer_hash"] = answer_hash(self.scrubber.answer(upstream["message"]), hashed.mapping)
+            except Exception:  # an answer that cannot be scrubbed is not hashed
+                entry["answer_hash"] = None
+            skipped = self.store.write(request_id, fingerprint, scrubbed)
         entry["stored"] = skipped is None
         entry["store_skipped"] = skipped
         self.metrics.add("stored" if skipped is None else "store_skipped")
@@ -388,7 +429,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.path.split("?", 1)[0]
 
     def _read_body(self) -> bytes:
-        if CHUNKED in (self.headers.get("Transfer-Encoding") or "").lower():
+        if CHUNKED in (self.headers.get(TRANSFER_ENCODING_HEADER) or "").lower():
             data = bytearray()
             while True:
                 size = int(self.rfile.readline().split(b";", 1)[0].strip() or b"0", HEX_BASE)
@@ -398,13 +439,13 @@ class Handler(BaseHTTPRequestHandler):
                     return bytes(data)
                 data.extend(self.rfile.read(size))
                 self.rfile.readline()
-        length = int(self.headers.get("Content-Length") or 0)
+        length = int(self.headers.get(CONTENT_LENGTH_HEADER) or 0)
         return self.rfile.read(length) if length else b""
 
     def _send_local(self, status: int, payload: bytes, content_type: str) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
+        self.send_header(CONTENT_TYPE_HEADER, content_type)
+        self.send_header(CONTENT_LENGTH_HEADER, str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
@@ -412,7 +453,7 @@ class Handler(BaseHTTPRequestHandler):
         """Answer /metrics and the health check here; True when handled."""
         path = self._path()
         if path == METRICS_PATH:
-            if self.command != "GET":
+            if self.command != GET_METHOD:
                 self._send_local(HTTP_METHOD_NOT_ALLOWED, b"", METRICS_CONTENT_TYPE)
             else:
                 self._send_local(HTTP_OK, self.proxy.metrics.render().encode(), METRICS_CONTENT_TYPE)
@@ -429,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.proxy.metrics.add("requests")
         body = None
-        if self.command == "POST" and self._path() == COMPLETIONS_PATH:
+        if self.command == POST_METHOD and self._path() == COMPLETIONS_PATH:
             try:
                 parsed = json.loads(raw)
                 body = parsed if isinstance(parsed, dict) else None
@@ -444,8 +485,9 @@ class Handler(BaseHTTPRequestHandler):
             entry = self.proxy.analyze(body, received, upstream)
         except Exception as exc:  # the analysis must never cost the agent its answer
             self.proxy.metrics.add("analysis_errors")
+            # The type name only: an exception's message can quote request text.
             entry = {"event": LOG_EVENT, "schema": LOG_SCHEMA_VERSION, "ts": received, "job": self.proxy.job(),
-                     "status": upstream["status"], "error": f"{type(exc).__name__}: {exc}"}
+                     "status": upstream["status"], "error": type(exc).__name__}
         self.proxy.log(entry)
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
@@ -454,9 +496,9 @@ class Handler(BaseHTTPRequestHandler):
         """Send the request upstream and copy the response back byte for byte."""
         config = self.proxy.config
         headers = {k: v for k, v in self.headers.items() if k.lower() not in DROPPED_REQUEST_HEADERS}
-        headers["Host"] = f"{config.upstream_host}:{config.upstream_port}"
+        headers[HOST_HEADER] = f"{config.upstream_host}:{config.upstream_port}"
         result: Dict[str, Any] = {"status": HTTP_BAD_GATEWAY, "headers": {}, "usage": None, "message": {},
-                                  "latency_ms": None, "client_disconnected": False}
+                                  "latency_ms": None, "client_disconnected": False, "upstream_incomplete": False}
         started = time.monotonic()
         conn = http.client.HTTPConnection(config.upstream_host, config.upstream_port,
                                           timeout=config.upstream_timeout_seconds)
@@ -464,7 +506,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.request(self.command, self.path, body=raw if raw or self.command in BODY_METHODS else None,
                          headers=headers)
             resp = conn.getresponse()
-        except OSError as exc:
+        except UPSTREAM_ERRORS as exc:
             conn.close()
             self.proxy.metrics.add("upstream_errors")
             message = json.dumps({"error": f"replay proxy: upstream unreachable: {type(exc).__name__}"}).encode()
@@ -476,7 +518,7 @@ class Handler(BaseHTTPRequestHandler):
         result["status"] = resp.status
         result["headers"] = {k.lower(): v for k, v in resp.getheaders()}
         observer = ResponseObserver(streaming and resp.status == HTTP_OK) if observe else None
-        length = resp.getheader("Content-Length")
+        length = resp.getheader(CONTENT_LENGTH_HEADER)
         has_body = (
             self.command != HEAD_METHOD
             and resp.status not in HTTP_BODYLESS
@@ -484,44 +526,33 @@ class Handler(BaseHTTPRequestHandler):
         )
         chunked = has_body and length is None
         try:
-            self.send_response_only(resp.status, resp.reason)
-            for key, value in resp.getheaders():
-                if key.lower() not in DROPPED_RESPONSE_HEADERS:
-                    self.send_header(key, value)
-            if chunked:
-                self.send_header("Transfer-Encoding", CHUNKED)
-            elif length is not None:
-                self.send_header("Content-Length", length)
-            self.end_headers()
+            if not self._send_upstream_headers(resp, chunked, length):
+                result["client_disconnected"] = True
+                return result
             while has_body:
-                data = resp.read1(READ_CHUNK_BYTES)
+                try:
+                    data = resp.read1(READ_CHUNK_BYTES)
+                except UPSTREAM_ERRORS:
+                    # The upstream stalled past the timeout, reset, or closed a
+                    # chunked stream early. The client's response is left
+                    # unterminated so it cannot read as complete.
+                    result["upstream_incomplete"] = True
+                    self.proxy.metrics.add("upstream_errors")
+                    self.close_connection = True
+                    break
                 if not data:
                     break
                 if observer is not None:
                     observer.feed(data)
-                if chunked:
-                    self.wfile.write(f"{len(data):x}".encode() + CRLF + data + CRLF)
-                else:
-                    self.wfile.write(data)
-                self.wfile.flush()
-            if chunked:
-                self.wfile.write(b"0" + CRLF + CRLF)
-                self.wfile.flush()
-        except OSError:
-            # The client went away (or the upstream did): read what is left so
-            # the line still carries usage when the upstream finished.
-            result["client_disconnected"] = True
-            self.close_connection = True
-            try:
-                while True:
-                    data = resp.read1(READ_CHUNK_BYTES)
-                    if not data:
-                        break
-                    if observer is not None:
-                        observer.feed(data)
-            except OSError:
-                pass
+                if not self._send_client(chunked, data):
+                    result["client_disconnected"] = True
+                    break
+            if chunked and not result["upstream_incomplete"] and not result["client_disconnected"]:
+                if not self._send_client(chunked, b""):
+                    result["client_disconnected"] = True
         finally:
+            # Closed rather than drained when the client has gone: nobody reads
+            # the rest, and the model may still be generating it.
             conn.close()
         result["latency_ms"] = int((time.monotonic() - started) * MS_PER_SECOND)
         if observer is not None and resp.status == HTTP_OK:
@@ -529,6 +560,36 @@ class Handler(BaseHTTPRequestHandler):
             result["usage"] = observer.usage
             result["message"] = observer.message if isinstance(observer.message, dict) else {}
         return result
+
+    def _send_upstream_headers(self, resp: http.client.HTTPResponse, chunked: bool, length: Optional[str]) -> bool:
+        """Copy the upstream status and headers to the client; False when the client has gone."""
+        try:
+            self.send_response_only(resp.status, resp.reason)
+            for key, value in resp.getheaders():
+                if key.lower() not in DROPPED_RESPONSE_HEADERS:
+                    self.send_header(key, value)
+            if chunked:
+                self.send_header(TRANSFER_ENCODING_HEADER, CHUNKED)
+            elif length is not None:
+                self.send_header(CONTENT_LENGTH_HEADER, length)
+            self.end_headers()
+            return True
+        except OSError:
+            self.close_connection = True
+            return False
+
+    def _send_client(self, chunked: bool, data: bytes) -> bool:
+        """Write body bytes to the client (an empty chunk ends a chunked body); False when it has gone."""
+        try:
+            if chunked:
+                self.wfile.write(f"{len(data):x}".encode() + CRLF + data + CRLF)
+            else:
+                self.wfile.write(data)
+            self.wfile.flush()
+            return True
+        except OSError:
+            self.close_connection = True
+            return False
 
 
 def make_server(config: Config, host: str = DEFAULT_BIND_HOST, out=None) -> ThreadingHTTPServer:

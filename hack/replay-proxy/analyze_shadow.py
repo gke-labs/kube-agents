@@ -1,34 +1,37 @@
 """Estimate what replay would have saved, from the shadow proxy's JSON lines.
 
 Reads the lines replay_proxy.py writes (one per chat request, collected from
-each job with `kubectl logs -f`), in time order, and asks of every presubmit
-request whether its fingerprint was seen earlier
-(examples/inference-replay/eval-design.md, Rollout step 1):
+each job with `kubectl logs -f`) and asks of every presubmit request whether
+replay would have had an answer for it, from the sources the design allows
+(examples/inference-replay/eval-design.md, "How a pull request run finds an
+answer" and Rollout step 1):
 
-- low estimate: seen earlier from a nightly;
-- high estimate: seen earlier from a nightly or from another presubmit build
-  (a build never replays its own answers);
-- replay-simulated: as high, but each assistant message in the history counts
-  as the answer the request before it would have been served. In shadow mode
-  every answer is a fresh sample, so a later request matches exactly only when
-  the model repeated every earlier answer word for word; under replay those
-  answers would have been the recorded ones. This is an approximation: it
-  assumes the tool calls of the recorded answer produced the tool results
-  this run saw.
+- low estimate: the same fingerprint from a nightly;
+- high estimate: also from an earlier, finished build of the same pull
+  request (never the same build, never another pull request), and, with
+  `--merged`, from another pull request once it merged (the merge copy);
+- simulated: as high, but with the assistant messages in the history left out
+  of the comparison. In shadow mode every answer is a fresh sample, so a later
+  request matches exactly only when the model repeated every earlier answer;
+  under replay those answers would have been the recorded ones. It assumes the
+  recorded answer's tool calls would have returned the results this run saw.
 
-A sighting counts as a recording only when replay would have saved it (the
-line's `unstorable` list is empty); `--ignore-storable` drops that rule.
+A sighting is available from when its answer finished (`ts + latency_ms`),
+and counts only when replay would have saved it (the line's `unstorable` list
+is empty, so a cut-short upstream answer never counts); `--ignore-storable`
+drops that rule. A build counts as finished once its last answer has.
 
-Also reported: the share of hits whose first sighting was in another project,
-the tokens and model time hits would save, and for misses the closest earlier
-request by longest matching per-message-hash prefix, ranked by tokens lost.
-The stored, scrubbed text of both is under their request_id for a diff.
+Also reported: the share of hits first seen in another project, the tokens and
+model time hits would save, and for misses the closest earlier request by
+longest matching per-message-hash prefix, ranked by tokens lost. The stored,
+scrubbed text of both is under their request_id for a diff.
 
 A collision audit (did two requests that matched lead to different results?)
 is a later step: it joins each `Hit` from `iter_hits` with run verdicts and the
 stored text. Nothing here reads verdicts yet.
 
-Usage: python3 analyze_shadow.py LOG [LOG ...] [--top N] [--json] [--ignore-storable]
+Usage: python3 analyze_shadow.py LOG [LOG ...] [--merged MERGED.json] [--top N] [--json] [--ignore-storable]
+MERGED.json maps a pull request number to its merge time in epoch seconds.
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ import argparse
 import hashlib
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 LOG_EVENT = "replay_shadow_request"
@@ -45,13 +48,22 @@ NIGHTLY = "nightly"
 PRESUBMIT = "presubmit"
 JOB_KINDS = (NIGHTLY, PRESUBMIT)
 ASSISTANT_ROLE = "assistant"
-# Stands in for an assistant message in the replay-simulated key.
-SIMULATED_ANSWER = "answer-to-prefix"
+MESSAGE_HASHES_FIELD = "message_hashes"
+# Stands in for an assistant message's content in the simulated key: its place
+# in the conversation counts, its words do not.
+ANSWER_PLACEHOLDER = "assistant-message"
 LOW, HIGH, SIMULATED = "low", "high", "simulated"
 ESTIMATES = (LOW, HIGH, SIMULATED)
 DEFAULT_TOP_MISSES = 20
 PERCENT = 100.0
 PERCENT_DECIMALS = 1
+MS_PER_SECOND = 1000.0
+# Why a line was skipped, counted for the report.
+SKIP_NOT_JSON = "not_json"
+SKIP_OTHER_EVENT = "other_event"
+SKIP_UNTAGGED = "untagged"
+SKIP_NO_FINGERPRINT = "no_fingerprint"
+SKIP_REASONS = (SKIP_NOT_JSON, SKIP_OTHER_EVENT, SKIP_UNTAGGED, SKIP_NO_FINGERPRINT)
 
 
 @dataclass
@@ -63,9 +75,10 @@ class Record:
     kind: str
     project: str
     build: str
+    pr: str
     fingerprint: str
     settings_hash: str
-    message_hashes: List[str]
+    message_hashes: Optional[List[str]]
     roles: List[str]
     prompt_tokens: int
     completion_tokens: int
@@ -75,15 +88,18 @@ class Record:
     @classmethod
     def from_line(cls, entry: Dict[str, Any]) -> "Record":
         job = entry.get("job") or {}
+        hashes = entry.get(MESSAGE_HASHES_FIELD)
         return cls(
             request_id=str(entry.get("request_id", "")),
             ts=float(entry["ts"]),
             kind=str(job.get("kind") or ""),
             project=str(job.get("project") or ""),
             build=str(job.get("build") or ""),
+            pr=str(job.get("pr") or ""),
             fingerprint=str(entry["fingerprint"]),
             settings_hash=str(entry.get("settings_hash") or ""),
-            message_hashes=list(entry.get("message_hashes") or []),
+            # Absent when the proxy could not scrub the request.
+            message_hashes=list(hashes) if isinstance(hashes, list) else None,
             roles=list(entry.get("roles") or []),
             prompt_tokens=int(entry.get("prompt_tokens") or 0),
             completion_tokens=int(entry.get("completion_tokens") or 0),
@@ -91,21 +107,32 @@ class Record:
             storable=not entry.get("unstorable"),
         )
 
-    def chain(self, simulate_answers: bool = False) -> List[str]:
+    @property
+    def available_at(self) -> float:
+        """When this request's answer existed, so replay could have served it."""
+        return self.ts + self.latency_ms / MS_PER_SECOND
+
+    @property
+    def build_key(self) -> Tuple[str, str, str]:
+        return (self.kind, self.pr, self.build)
+
+    def chain(self, skip_answers: bool = False) -> List[str]:
         """Prefix hashes: element k identifies the settings plus the first k+1 messages."""
         out = []
         current = self.settings_hash
-        for index, message_hash in enumerate(self.message_hashes):
+        for index, message_hash in enumerate(self.message_hashes or []):
             role = self.roles[index] if index < len(self.roles) else ""
-            part = SIMULATED_ANSWER if simulate_answers and role == ASSISTANT_ROLE else message_hash
+            part = ANSWER_PLACEHOLDER if skip_answers and role == ASSISTANT_ROLE else message_hash
             current = hashlib.sha256(f"{current}|{part}".encode()).hexdigest()
             out.append(current)
         return out
 
-    def key(self, estimate: str) -> str:
+    def key(self, estimate: str) -> Optional[str]:
         if estimate != SIMULATED:
             return self.fingerprint
-        chain = self.chain(simulate_answers=True)
+        if self.message_hashes is None:
+            return None
+        chain = self.chain(skip_answers=True)
         return chain[-1] if chain else self.settings_hash
 
 
@@ -125,60 +152,93 @@ class Miss:
 
     @property
     def first_difference_role(self) -> str:
+        if self.request.message_hashes is None:
+            return "unhashed"
         if self.matched_messages < len(self.request.roles):
             return self.request.roles[self.matched_messages] or "unknown"
         return "settings" if self.closest is None else "none"
 
 
-@dataclass
-class FirstSightings:
-    """The earliest recording of each key: from a nightly, and per presubmit build."""
+class Sources:
+    """Where replay may take an answer from, per key, under the design's rules."""
 
-    nightly: Dict[str, Record] = field(default_factory=dict)
-    presubmit: Dict[str, Dict[str, Record]] = field(default_factory=dict)
+    def __init__(self, records: List[Record], merged: Dict[str, float], require_storable: bool):
+        self.merged = merged
+        self.build_end: Dict[Tuple[str, str, str], float] = {}
+        for record in records:
+            end = self.build_end.get(record.build_key, record.available_at)
+            self.build_end[record.build_key] = max(end, record.available_at)
+        self.nightly: Dict[str, Record] = {}
+        self.merge_copy: Dict[str, Tuple[float, Record]] = {}
+        self.by_pr: Dict[str, Dict[str, List[Record]]] = {}
+        for record in records:
+            if record.storable or not require_storable:
+                for key in self.keys_of(record):
+                    self.add(key, record)
+
+    def keys_of(self, record: Record) -> List[str]:
+        """The keys a record is a source for; each subclass says."""
+        raise NotImplementedError
 
     def add(self, key: str, record: Record) -> None:
         if record.kind == NIGHTLY:
-            self.nightly.setdefault(key, record)
-        else:
-            self.presubmit.setdefault(key, {}).setdefault(record.build, record)
+            best = self.nightly.get(key)
+            if best is None or record.available_at < best.available_at:
+                self.nightly[key] = record
+            return
+        merged_at = self.merged.get(record.pr)
+        if merged_at is not None and record.available_at <= merged_at:
+            best_copy = self.merge_copy.get(key)
+            if best_copy is None or merged_at < best_copy[0]:
+                self.merge_copy[key] = (merged_at, record)
+        if record.pr:
+            self.by_pr.setdefault(key, {}).setdefault(record.pr, []).append(record)
 
-    def find(self, key: str, request: Record, include_presubmits: bool) -> Optional[Record]:
-        candidates = [self.nightly[key]] if key in self.nightly else []
-        if include_presubmits:
-            candidates += [r for build, r in self.presubmit.get(key, {}).items() if build != request.build]
-        return min(candidates, key=lambda r: r.ts) if candidates else None
-
-
-@dataclass
-class PrefixIndex:
-    """Prefix hash -> the first earlier request with that prefix, and the first from another build."""
-
-    first: Dict[str, Record] = field(default_factory=dict)
-    other_build: Dict[str, Record] = field(default_factory=dict)
-
-    def add(self, record: Record) -> None:
-        for prefix in [record.settings_hash] + record.chain():
-            first = self.first.setdefault(prefix, record)
-            if first.build != record.build or first.kind != record.kind:
-                self.other_build.setdefault(prefix, record)
-
-    def lookup(self, prefix: str, request: Record) -> Optional[Record]:
-        first = self.first.get(prefix)
-        if first is None:
+    def find(self, key: Optional[str], request: Record, nightly_only: bool) -> Optional[Record]:
+        """The earliest source of `key` available to `request`, or None."""
+        if key is None:
             return None
-        if first.kind == NIGHTLY or first.build != request.build:
-            return first
-        alt = self.other_build.get(prefix)
-        return alt if alt is not None and (alt.kind == NIGHTLY or alt.build != request.build) else None
+        candidates: List[Tuple[float, Record]] = []
+        night = self.nightly.get(key)
+        if night is not None and night.available_at <= request.ts:
+            candidates.append((night.available_at, night))
+        if not nightly_only:
+            copy = self.merge_copy.get(key)
+            if copy is not None and copy[0] <= request.ts and copy[1].pr != request.pr:
+                candidates.append(copy)
+            for earlier in self.by_pr.get(key, {}).get(request.pr, []) if request.pr else []:
+                if earlier.build != request.build and self.build_end[earlier.build_key] <= request.ts:
+                    candidates.append((self.build_end[earlier.build_key], earlier))
+        return min(candidates, key=lambda c: c[0])[1] if candidates else None
+
+
+class KeySources(Sources):
+    def __init__(self, records: List[Record], merged: Dict[str, float], require_storable: bool, estimate: str):
+        self.estimate = estimate
+        super().__init__(records, merged, require_storable)
+
+    def keys_of(self, record: Record) -> List[str]:
+        key = record.key(self.estimate)
+        return [key] if key is not None else []
+
+
+class PrefixSources(Sources):
+    """Every prefix of every request, for the closest-earlier-request search."""
+
+    def keys_of(self, record: Record) -> List[str]:
+        if record.message_hashes is None:
+            return []
+        return [record.settings_hash] + record.chain()
 
     def closest(self, request: Record) -> Tuple[Optional[Record], int]:
-        best = self.lookup(request.settings_hash, request)
+        if request.message_hashes is None:
+            return None, 0
+        best = self.find(request.settings_hash, request, nightly_only=False)
         if best is None:
             return None, 0
         matched = 0
         for prefix in request.chain():
-            found = self.lookup(prefix, request)
+            found = self.find(prefix, request, nightly_only=False)
             if found is None:
                 break
             best, matched = found, matched + 1
@@ -187,7 +247,8 @@ class PrefixIndex:
 
 def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
     """Read JSON lines from each path; returns the records in time order and skip counts."""
-    records, skipped = [], {"not_json": 0, "other_event": 0, "untagged": 0, "no_fingerprint": 0}
+    records: List[Record] = []
+    skipped = {reason: 0 for reason in SKIP_REASONS}
     for path in paths:
         with open(path, encoding="utf-8") as handle:
             for line in handle:
@@ -197,50 +258,47 @@ def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
                 try:
                     entry = json.loads(line)
                 except ValueError:
-                    skipped["not_json"] += 1
+                    skipped[SKIP_NOT_JSON] += 1
                     continue
                 if not isinstance(entry, dict) or entry.get("event") != LOG_EVENT:
-                    skipped["other_event"] += 1
+                    skipped[SKIP_OTHER_EVENT] += 1
                     continue
                 if not entry.get("fingerprint"):
-                    skipped["no_fingerprint"] += 1
+                    skipped[SKIP_NO_FINGERPRINT] += 1
                     continue
                 if (entry.get("job") or {}).get("kind") not in JOB_KINDS:
-                    skipped["untagged"] += 1
+                    skipped[SKIP_UNTAGGED] += 1
                     continue
                 records.append(Record.from_line(entry))
     records.sort(key=lambda r: r.ts)
     return records, skipped
 
 
-def iter_hits(records: List[Record], estimate: str, require_storable: bool = True) -> Iterator[Tuple[Record, Optional[Hit]]]:
+def iter_hits(
+    records: List[Record], estimate: str, require_storable: bool = True, merged: Optional[Dict[str, float]] = None
+) -> Iterator[Tuple[Record, Optional[Hit]]]:
     """Each presubmit request in time order, with its Hit under `estimate` or None.
 
     This is the seam a collision audit reads: every Hit pairs a request with
     the recording it would have been served from.
     """
-    sightings = FirstSightings()
+    sources = KeySources(records, merged or {}, require_storable, estimate)
     for record in records:
-        key = record.key(estimate)
         if record.kind == PRESUBMIT:
-            recording = sightings.find(key, record, include_presubmits=estimate != LOW)
+            recording = sources.find(record.key(estimate), record, nightly_only=estimate == LOW)
             yield record, (Hit(record, recording) if recording is not None else None)
-        if record.storable or not require_storable:
-            sightings.add(key, record)
 
 
-def find_misses(records: List[Record], require_storable: bool = True) -> List[Miss]:
+def find_misses(
+    records: List[Record], require_storable: bool = True, merged: Optional[Dict[str, float]] = None
+) -> List[Miss]:
     """High-estimate misses, each with its closest earlier request."""
-    index = PrefixIndex()
-    sightings = FirstSightings()
+    prefixes = PrefixSources(records, merged or {}, require_storable)
     misses = []
-    for record in records:
-        if record.kind == PRESUBMIT and sightings.find(record.fingerprint, record, include_presubmits=True) is None:
-            closest, matched = index.closest(record)
+    for record, hit in iter_hits(records, HIGH, require_storable, merged):
+        if hit is None:
+            closest, matched = prefixes.closest(record)
             misses.append(Miss(record, closest, matched))
-        if record.storable or not require_storable:
-            sightings.add(record.fingerprint, record)
-            index.add(record)
     return misses
 
 
@@ -248,7 +306,10 @@ def percent(part: float, whole: float) -> float:
     return round(PERCENT * part / whole, PERCENT_DECIMALS) if whole else 0.0
 
 
-def summarize(records: List[Record], require_storable: bool = True, top: int = DEFAULT_TOP_MISSES) -> Dict[str, Any]:
+def summarize(
+    records: List[Record], require_storable: bool = True, top: int = DEFAULT_TOP_MISSES,
+    merged: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
     presubmit = [r for r in records if r.kind == PRESUBMIT]
     total_tokens = sum(r.prompt_tokens for r in presubmit)
     report: Dict[str, Any] = {
@@ -257,10 +318,12 @@ def summarize(records: List[Record], require_storable: bool = True, top: int = D
         "nightly_requests": len(records) - len(presubmit),
         "presubmit_prompt_tokens": total_tokens,
         "unstorable_sightings": sum(1 for r in records if not r.storable),
+        "unhashed_requests": sum(1 for r in records if r.message_hashes is None),
+        "merge_times_given": len(merged or {}),
         "estimates": {},
     }
     for estimate in ESTIMATES:
-        hits = [hit for _, hit in iter_hits(records, estimate, require_storable) if hit is not None]
+        hits = [hit for _, hit in iter_hits(records, estimate, require_storable, merged) if hit is not None]
         hit_tokens = sum(h.request.prompt_tokens for h in hits)
         cross = [h for h in hits if h.recording.project != h.request.project]
         report["estimates"][estimate] = {
@@ -271,7 +334,7 @@ def summarize(records: List[Record], require_storable: bool = True, top: int = D
             "saved_model_ms": sum(h.request.latency_ms for h in hits),
             "cross_project_hit_percent": percent(sum(h.request.prompt_tokens for h in cross), hit_tokens),
         }
-    misses = sorted(find_misses(records, require_storable), key=lambda m: m.request.prompt_tokens, reverse=True)
+    misses = sorted(find_misses(records, require_storable, merged), key=lambda m: m.request.prompt_tokens, reverse=True)
     by_role: Dict[str, int] = {}
     for miss in misses:
         by_role[miss.first_difference_role] = by_role.get(miss.first_difference_role, 0) + miss.request.prompt_tokens
@@ -280,9 +343,10 @@ def summarize(records: List[Record], require_storable: bool = True, top: int = D
         {
             "request_id": m.request.request_id,
             "project": m.request.project,
+            "pr": m.request.pr,
             "build": m.request.build,
             "prompt_tokens": m.request.prompt_tokens,
-            "messages": len(m.request.message_hashes),
+            "messages": len(m.request.message_hashes or []),
             "matched_messages": m.matched_messages,
             "first_difference_role": m.first_difference_role,
             "closest_request_id": m.closest.request_id if m.closest else None,
@@ -297,7 +361,8 @@ def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
     lines = [
         f"requests: {report['requests']} ({report['presubmit_requests']} presubmit, {report['nightly_requests']} nightly);"
         f" presubmit prompt tokens: {report['presubmit_prompt_tokens']}",
-        f"skipped lines: {skipped}; sightings replay would not have saved: {report['unstorable_sightings']}",
+        f"skipped lines: {skipped}; sightings replay would not have saved: {report['unstorable_sightings']};"
+        f" requests without message hashes: {report['unhashed_requests']}; merge times given: {report['merge_times_given']}",
         "",
         "estimate    hits   token-weighted   cross-project   saved prompt / completion tokens   saved model time",
     ]
@@ -316,15 +381,24 @@ def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
     return "\n".join(lines)
 
 
+def load_merged(path: Optional[str]) -> Dict[str, float]:
+    if not path:
+        return {}
+    with open(path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    return {str(pr): float(when) for pr, when in raw.items()}
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("logs", nargs="+", help="JSONL files written by replay_proxy.py")
+    parser.add_argument("--merged", help="JSON file mapping a pull request number to its merge time (epoch seconds)")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP_MISSES, help="misses to list")
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.add_argument("--ignore-storable", action="store_true", help="count sightings replay would not have saved")
     args = parser.parse_args(argv)
     records, skipped = load(args.logs)
-    report = summarize(records, require_storable=not args.ignore_storable, top=args.top)
+    report = summarize(records, require_storable=not args.ignore_storable, top=args.top, merged=load_merged(args.merged))
     if args.json:
         report["skipped_lines"] = skipped
         print(json.dumps(report, indent=2, sort_keys=True))

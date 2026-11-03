@@ -48,13 +48,13 @@ PLACEHOLDER_RE = re.compile(re.escape(OPEN) + r"[^" + re.escape(CLOSE) + r"]+" +
 # forwarded request is never modified; this is the key only.
 OPAQUE_KEY_RE = re.compile(r"signature|provider_specific_fields", re.I)
 OPAQUE_ALWAYS_KEYS = ("tool_call_id",)
-# `id` is opaque only when it is a tool-call id (LiteLLM and OpenAI-style
-# clients prefix those with `call_`). Any other string `id` -- a kanban card,
-# a cluster, a resource -- goes through the normal rules, so a meaningful value
-# is never hidden behind a positional placeholder. A numeric `id` is a row id
-# (below).
+# `id` is opaque only as the `id` of an item in a `tool_calls` list, whatever
+# the provider's prefix (`call_…` from Gemini through LiteLLM, `toolu_…` from
+# Claude). Any other string `id` -- a kanban card, a cluster, a resource --
+# goes through the normal rules, so a meaningful value is never hidden behind
+# a positional placeholder. A numeric `id` is a row id (below).
 ID_KEY = "id"
-TOOL_CALL_ID_PREFIX = "call_"
+TOOL_CALLS_KEY = "tool_calls"
 OPAQUE_CLASS = "OPAQUE"
 
 # Keys whose numeric value is a per-run counter or row id.
@@ -129,8 +129,15 @@ RFC1123_RE = re.compile(
 OPENSSL_TS_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})(?: GMT)?\b")
 # `Nov  2 04:13` and `Nov  2  2025` (ls -l).
 LS_DATE_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) {1,2}(?:(\d{2}):(\d{2})|(\d{4}))\b")
-# Epoch seconds 2020-2033, and the same in milliseconds.
-EPOCH_RE = re.compile(r"(?<![\w.])(1[6-9]\d{8})(\d{3})?(?:\.\d+)?(?![\w])")
+# Epoch seconds 2020-2033, and the same in milliseconds, bucketed only under a
+# key that names a time: a free-text 10-digit number (`memory: 1717986918
+# bytes`) stays literal.
+EPOCH_FULL_RE = re.compile(r"^(1[6-9]\d{8})(\d{3})?(?:\.\d+)?$")
+TIME_KEY_PATTERN = r"(?:[A-Za-z0-9_]*_at|[A-Za-z0-9]*[a-z]At|time|timestamp|ts|date|[A-Za-z0-9_]*_(?:time|timestamp|ts|date))"
+TIME_KEY_RE = re.compile(r"^" + TIME_KEY_PATTERN + r"$")
+KEYED_EPOCH_TEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(" + TIME_KEY_PATTERN + r")(\\?[\"']?\s*[:=]\s*\\?[\"']?)(1[6-9]\d{8}(?:\d{3})?(?:\.\d+)?)(?![\w.])"
+)
 MILLIS_PER_SECOND = 1000
 
 # IPv4 addresses, kept literal whenever the request names a CIDR range.
@@ -257,9 +264,11 @@ class Normalizer:
 
     # -- structure ---------------------------------------------------------
 
-    def walk(self, obj: Any, key: Optional[str] = None) -> Any:
-        if key is not None and self.is_opaque(key, obj):
+    def walk(self, obj: Any, key: Optional[str] = None, in_tool_call: bool = False) -> Any:
+        if key is not None and self.is_opaque(key, in_tool_call):
             return self.opaque(obj)
+        if key is not None and TIME_KEY_RE.match(key) and self.epoch_value(obj) is not None:
+            return self.epoch_token(str(obj), self.epoch_value(obj))
         if key in KEYED_NUMBER_KEYS and self.is_number(obj):
             return self.mapping.placeholder(NUMBER_CLASS, str(obj))
         if key in AGE_KEYS and isinstance(obj, str) and AGE_FULL_RE.match(obj):
@@ -267,16 +276,27 @@ class Normalizer:
         if isinstance(obj, str):
             return self.text(obj)
         if isinstance(obj, list):
-            return [self.walk(v) for v in obj]
+            return [self.walk_dict(v, True) if key == TOOL_CALLS_KEY and isinstance(v, dict) else self.walk(v) for v in obj]
         if isinstance(obj, dict):
-            return {k: self.walk(obj[k], k) for k in sorted(obj)}
+            return self.walk_dict(obj, False)
         return obj
 
+    def walk_dict(self, obj: Dict[str, Any], in_tool_call: bool) -> Dict[str, Any]:
+        return {k: self.walk(obj[k], k, in_tool_call) for k in sorted(obj)}
+
     @staticmethod
-    def is_opaque(key: str, value: Any) -> bool:
+    def is_opaque(key: str, in_tool_call: bool) -> bool:
         if OPAQUE_KEY_RE.search(key) or key in OPAQUE_ALWAYS_KEYS:
             return True
-        return key == ID_KEY and isinstance(value, str) and value.startswith(TOOL_CALL_ID_PREFIX)
+        return key == ID_KEY and in_tool_call
+
+    @staticmethod
+    def epoch_value(value: Any) -> Optional[float]:
+        """Epoch seconds when `value` is an epoch in seconds or milliseconds, else None."""
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            return None
+        match = EPOCH_FULL_RE.match(str(value))
+        return float(match.group(1)) if match else None
 
     @staticmethod
     def is_number(value: Any) -> bool:
@@ -305,7 +325,7 @@ class Normalizer:
         text = self.timestamps(text)
         text = self.sub_group(KEYED_NUMBER_TEXT_RE, 3, lambda v: self.mapping.placeholder(NUMBER_CLASS, v), text)
         text = self.sub_group(PID_PROSE_RE, 3, lambda v: self.mapping.placeholder(NUMBER_CLASS, v), text)
-        text = EPOCH_RE.sub(self.epoch, text)
+        text = KEYED_EPOCH_TEXT_RE.sub(self.keyed_epoch, text)
         if not self.keep_ips:
             text = IPV4_RE.sub(self.ip, text)
         text = self.sub_group(AGE_FIELD_RE, 3, self.age, text)
@@ -347,9 +367,13 @@ class Normalizer:
             return value
         return self.mapping.placeholder(IP_CLASS, value)
 
-    def epoch(self, m: "re.Match[str]") -> str:
-        self.mapping.bare_numbers.add(m.group(0))
-        return time_bucket(float(m.group(1)), self.now)
+    def epoch_token(self, raw: str, seconds: float) -> str:
+        self.mapping.bare_numbers.add(raw)
+        return time_bucket(seconds, self.now)
+
+    def keyed_epoch(self, m: "re.Match[str]") -> str:
+        raw = m.group(3)
+        return m.group(1) + m.group(2) + self.epoch_token(raw, self.epoch_value(raw))
 
     def timestamps(self, text: str) -> str:
         text = ISO_TS_RE.sub(self.iso, text)

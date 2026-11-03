@@ -52,6 +52,17 @@ PLAIN_KEYS = ("role", "name", "tool_call_id", "type", "index", "id")
 CONTENT_KEY = "content"
 TOOL_CALLS_KEY = "tool_calls"
 TEXT_PART_TYPE = "text"
+TYPE_KEY = "type"
+TEXT_KEY = "text"
+OMITTED_KEY = "omitted"
+ID_KEY = "id"
+TOOL_CALL_ID_KEY = "tool_call_id"
+TEXT_ENCODING = "utf-8"
+
+# Why a request's text was not written, for the log line's `store_skipped`.
+SKIP_SCRUBBERS_UNAVAILABLE = "scrubbers_unavailable"
+SKIP_SCRUB_FAILED = "scrub_failed"
+SKIP_WRITE_FAILED = "write_failed"
 
 WITHHELD = "[WITHHELD: scrubber unavailable]"
 WITHHELD_READ_RESULT = "[REDACTED_RESULT: the call read a credential; its output is not recorded]"
@@ -59,6 +70,10 @@ WITHHELD_READ_RESULT = "[REDACTED_RESULT: the call read a credential; its output
 BLOBS_DIR = "blobs"
 REQUESTS_DIR = "requests"
 JSON_SUFFIX = ".json"
+
+
+# A scrubbed request: (messages, tools, other settings).
+Scrubbed = Tuple[List[Any], Any, Dict[str, Any]]
 
 
 def _load_module(name: str, path: str) -> Any:
@@ -117,7 +132,7 @@ class Scrubber:
                     continue
                 arguments = (call.get(FUNCTION_KEY) or {}).get(ARGUMENTS_KEY)
                 if arguments is not None and self.rules.is_secret_read_tool_call(arguments):
-                    ids.add(call.get("id"))
+                    ids.add(call.get(ID_KEY))
         return ids
 
     def content(self, kind: str, content: Any) -> Any:
@@ -126,10 +141,10 @@ class Scrubber:
         if isinstance(content, list):
             parts = []
             for part in content:
-                if isinstance(part, dict) and part.get("type") == TEXT_PART_TYPE:
-                    parts.append({"type": TEXT_PART_TYPE, "text": self.text(kind, part.get("text", ""))})
+                if isinstance(part, dict) and part.get(TYPE_KEY) == TEXT_PART_TYPE:
+                    parts.append({TYPE_KEY: TEXT_PART_TYPE, TEXT_KEY: self.text(kind, part.get(TEXT_KEY, ""))})
                 elif isinstance(part, dict):
-                    parts.append({"type": part.get("type"), "omitted": True})
+                    parts.append({TYPE_KEY: part.get(TYPE_KEY), OMITTED_KEY: True})
             return parts
         if content is None:
             return None
@@ -145,7 +160,7 @@ class Scrubber:
             if key in PLAIN_KEYS:
                 out[key] = value
             elif key == CONTENT_KEY:
-                if role == TOOL_ROLE and message.get("tool_call_id") in secret_reads and value is not None:
+                if role == TOOL_ROLE and message.get(TOOL_CALL_ID_KEY) in secret_reads and value is not None:
                     out[key] = WITHHELD_READ_RESULT
                 else:
                     out[key] = self.content(kind, value)
@@ -183,6 +198,23 @@ class Scrubber:
         scrubbed_settings = json.loads(self.text(KIND_TOOL_RESULT, settings))
         return scrubbed, scrubbed_tools, scrubbed_settings
 
+    def answer(self, answer: Dict[str, Any]) -> Dict[str, Any]:
+        """An answer's text and tool-call arguments, scrubbed."""
+        out = dict(answer)
+        if isinstance(answer.get(CONTENT_KEY), str):
+            out[CONTENT_KEY] = self.text(KIND_REPLY, answer[CONTENT_KEY])
+        calls = []
+        for call in answer.get(TOOL_CALLS_KEY) or []:
+            call = dict(call) if isinstance(call, dict) else {}
+            function = dict(call.get(FUNCTION_KEY) or {})
+            if function.get(ARGUMENTS_KEY):
+                function[ARGUMENTS_KEY] = self.text(KIND_TOOL_CALL, function[ARGUMENTS_KEY])
+            call[FUNCTION_KEY] = function
+            calls.append(call)
+        if calls:
+            out[TOOL_CALLS_KEY] = calls
+        return out
+
     def answer_changes(self, answer: Dict[str, Any]) -> bool:
         """Whether scrubbing would change an answer (such an answer is never saved)."""
         if not self.available:
@@ -206,7 +238,7 @@ class RequestStore:
 
     def _blob(self, value: Any) -> str:
         data = _canonical(value)
-        digest = hashlib.sha256(data.encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(data.encode(TEXT_ENCODING)).hexdigest()
         path = os.path.join(self.root, BLOBS_DIR, digest + JSON_SUFFIX)
         if not os.path.exists(path):
             self._write(path, data)
@@ -216,25 +248,39 @@ class RequestStore:
     def _write(path: str, data: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
+        with open(tmp, "w", encoding=TEXT_ENCODING) as handle:
             handle.write(data)
         os.replace(tmp, path)
 
+    def scrub(self, body: Dict[str, Any]) -> Tuple[Optional[Scrubbed], Optional[str]]:
+        """(scrubbed request, None), or (None, why it could not be scrubbed)."""
+        if not self.scrubber.available:
+            return None, SKIP_SCRUBBERS_UNAVAILABLE
+        try:
+            return self.scrubber.request(body), None
+        except Exception as exc:  # scrubbing failed: keep nothing from this request
+            return None, f"{SKIP_SCRUB_FAILED}: {type(exc).__name__}"
+
+    def write(self, request_id: str, fingerprint: str, scrubbed: Scrubbed) -> Optional[str]:
+        """Write one scrubbed request; returns None when written, else why not."""
+        messages, tools, settings = scrubbed
+        try:
+            with self._lock:
+                manifest = {
+                    "request_id": request_id,
+                    "fingerprint": fingerprint,
+                    "settings": self._blob(settings),
+                    "tools": self._blob(tools) if tools is not None else None,
+                    "messages": [self._blob(m) for m in messages],
+                }
+                self._write(os.path.join(self.root, REQUESTS_DIR, request_id + JSON_SUFFIX), _canonical(manifest))
+        except OSError as exc:  # a full or read-only disk costs the text, never the log line
+            return f"{SKIP_WRITE_FAILED}: {type(exc).__name__}"
+        return None
+
     def store(self, request_id: str, fingerprint: str, body: Dict[str, Any]) -> Optional[str]:
         """Scrub and write one request; returns None when stored, else why nothing was written."""
-        if not self.scrubber.available:
-            return "scrubbers_unavailable"
-        try:
-            messages, tools, settings = self.scrubber.request(body)
-        except Exception as exc:  # scrubbing failed: keep nothing from this request
-            return f"scrub_failed: {type(exc).__name__}"
-        with self._lock:
-            manifest = {
-                "request_id": request_id,
-                "fingerprint": fingerprint,
-                "settings": self._blob(settings),
-                "tools": self._blob(tools) if tools is not None else None,
-                "messages": [self._blob(m) for m in messages],
-            }
-            self._write(os.path.join(self.root, REQUESTS_DIR, request_id + JSON_SUFFIX), _canonical(manifest))
-        return None
+        scrubbed, reason = self.scrub(body)
+        if scrubbed is None:
+            return reason
+        return self.write(request_id, fingerprint, scrubbed)

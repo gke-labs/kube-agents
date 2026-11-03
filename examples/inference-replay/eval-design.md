@@ -1,9 +1,11 @@
 # Inference replay for evals
 
-> **STATUS — proposal; measured; shadow mode built, not deployed.** A prototype proxy was run
-> against a dev install on 2026-10-31 to 2026-11-02. The shadow-mode proxy (Rollout step 1) is in
-> [`hack/replay-proxy/`](../../hack/replay-proxy/README.md). Nothing here is wired into
-> `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` or the chart. Shadow mode changes no verdict.
+> **STATUS — proposal; measured; part of shadow mode built, not deployed.** A prototype proxy was
+> run against a dev install on 2026-10-31 to 2026-11-02. [`hack/replay-proxy/`](../../hack/replay-proxy/README.md)
+> has the shadow-mode proxy, its fingerprint log, the scrubbed request store and the hit-rate
+> script; the join with run verdicts and the collision report (Rollout step 1) are not built yet.
+> Nothing here is wired into `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` or the chart. Shadow mode
+> changes no verdict.
 
 **Scope:** serving recorded model answers to eval runs whose model input has not changed, so a
 presubmit pays for inference only from the first point where a run differs from one already graded.
@@ -124,8 +126,10 @@ The rules that keep this safe:
   past or the future can be the whole finding (an expired certificate, a CronJob that hasn't run for
   a month). So timestamps, both dates and epoch seconds, become a token for roughly how far from now
   they are ("minutes ago", "days ago", "in the future", and so on), and an expired certificate never
-  matches a valid one. IP addresses stay as they are whenever the request mentions a network range
-  (like `10.0.0.0/16`), because then which range an IP falls in can matter.
+  matches a valid one. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
+  `timestamp`); any other 10-digit number, like `memory: 1717986918`, stays as it is. IP addresses
+  stay as they are whenever the request mentions a network range (like `10.0.0.0/16`), because then
+  which range an IP falls in can matter.
 - **Opaque fields are never edited.** Fields named for signatures, `provider_specific_fields`,
   and the `id`/`tool_call_id` of tool calls: LiteLLM embeds Gemini's thought signature in
   tool-call ids (`call_…__thought__<base64>`), and rewriting a digit inside it corrupts the
@@ -133,8 +137,9 @@ The rules that keep this safe:
   becomes one placeholder for the whole value, numbered by first appearance, so a tool result
   still points at the same call. Live runs get new signatures every time, so keeping them as they
   are would stop almost every match after the first tool call. The cost is that two requests that
-  differ only in a signature count as the same. Only tool-call ids (they start with `call_`) are
-  treated this way; any other `id` field, like a card or a cluster, goes through the normal rules.
+  differ only in a signature count as the same. Only the `id` of an entry in a message's
+  `tool_calls` list is treated this way, whatever its prefix (`call_…` from Gemini, `toolu_…` from
+  Claude); any other `id` field, like a card or a cluster, goes through the normal rules.
 - **Answers are rewritten by whole token only, and never for bare numbers.** An unrelated `99`
   in an answer must not become this run's row id.
 - **An answer that repeats a number we swapped isn't saved.** Some values are swapped in the
@@ -365,7 +370,7 @@ request would pass without anything being written to the cache. So:
   "Pinning and baselines");
 - the key includes a version hash of the normalizer, so answers saved by a different normalizer
   never match;
-- the proxy's files need eval-crew approval in `hack/OWNERS`, wherever the code ends up.
+- the proxy's files, in `hack/replay-proxy/`, need eval-crew approval in `hack/OWNERS`.
 
 Like the scorer's pin, this still relies on eval-crew reviewing changes to the deploy scripts that
 do the pinning, since those run from the pull request's code.
