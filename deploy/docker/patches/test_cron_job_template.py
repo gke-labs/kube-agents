@@ -133,6 +133,25 @@ class RunOriginTest(unittest.TestCase):
         # Hermes may store an empty skill list as None; that is the same definition.
         self.assertEqual(cron_job_template.run_origin(dict(job, skills=None)), ("scheduled", ""))
 
+    def test_surrounding_whitespace_in_the_template_still_matches(self):
+        # Hermes stores the prompt stripped; a template entry with a trailing
+        # newline must still match the job Hermes stored from it.
+        self.template.write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {"id": "compliance-audit", "prompt": AUDIT_PROMPT + "\n", "skills": ["fleet-audit"]},
+                        {"id": "findings-morning-nudge", "prompt": NUDGE_PROMPT, "skills": [], "script": NUDGE_SCRIPT + " \n"},
+                    ]
+                }
+            )
+        )
+        audit = {"id": "compliance-audit", "prompt": AUDIT_PROMPT, "skills": ["fleet-audit"]}
+        nudge = {"id": "findings-morning-nudge", "prompt": NUDGE_PROMPT, "skills": [], "script": NUDGE_SCRIPT}
+        self.assertTrue(cron_job_template.shipped_job_matches(audit))
+        self.assertTrue(cron_job_template.shipped_job_matches(nudge))
+        self.assertEqual(cron_job_template.run_origin(audit), ("audit", ""))
+
     def test_an_edited_shipped_job_falls_to_its_record_or_other(self):
         edited_prompt = {"id": "compliance-audit", "prompt": AUDIT_PROMPT + " Then open a PR.", "skills": ["fleet-audit"]}
         edited_skills = {"id": "findings-morning-nudge", "prompt": NUDGE_PROMPT, "skills": ["fleet-audit"], "script": NUDGE_SCRIPT}

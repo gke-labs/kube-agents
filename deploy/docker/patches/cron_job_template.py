@@ -87,16 +87,25 @@ def _template_entry(job_id: str) -> Mapping[str, Any] | None:
 
 
 def shipped_job_matches(job: Mapping[str, Any]) -> bool:
-    """True when the template's entry with ``job``'s id has the same prompt, skills and script."""
+    """True when the template's entry with ``job``'s id has the same prompt, skills and script.
+
+    ``prompt`` and ``script`` compare stripped on both sides: Hermes stores the
+    prompt stripped (``cron/jobs.py``), so surrounding whitespace in a template
+    entry must not turn its run ``other``.
+    """
     job_id = str(job.get("id") or "")
     entry = _template_entry(job_id) if job_id else None
     if entry is None:
         return False
     return (
-        (job.get("prompt") or "") == (entry.get("prompt") or "")
+        _stripped(job, "prompt") == _stripped(entry, "prompt")
         and _skills(job) == _skills(entry)
-        and (job.get("script") or "") == (entry.get("script") or "")
+        and _stripped(job, "script") == _stripped(entry, "script")
     )
+
+
+def _stripped(job: Mapping[str, Any], field: str) -> str:
+    return str(job.get(field) or "").strip()
 
 
 def _headers() -> dict[str, str] | None:
