@@ -14505,7 +14505,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                             },
                         )
                         return TOOL_STATUS_BLOCKED
-                    payload = {"repository": entry.repository, "url": entry.url, "number": entry.number}
+                    payload = {"repository": entry.repository, CLAIM_URL_FIELD: entry.url, "number": entry.number}
                 role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS
                 named, outside = payload.get("repository"), None
                 if role_selected:

@@ -15048,8 +15048,11 @@ class ProposalClaimRouteTest(unittest.TestCase):
         self.metrics = credential_proxy.ProxyMetrics()
         self.claimed = []
         self.refuse = False
+        self.create_fails = False
 
     def _create(self, payload):
+        if self.create_fails:
+            raise providers.WorkspaceError("the forge refused the proposal", status=422, code="FORGE_REFUSED")
         return {
             "proposal": {"number": 7, "url": self.URL, "title": "Bump replicas", "state": "open"},
             "forge": "github",
@@ -15064,7 +15067,7 @@ class ProposalClaimRouteTest(unittest.TestCase):
             )
         return {"url": payload["url"], "number": payload["number"], "title": "Bump replicas"}
 
-    def _post(self, verb, body, role=credential_proxy.CALLER_ROLE_SHELL):
+    def _post(self, verb, body, role=credential_proxy.CALLER_ROLE_SHELL, managed=True):
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
         handler.path = "/v1/vcs/" + verb
         handler.principal = credential_proxy.Principal(
@@ -15084,7 +15087,7 @@ class ProposalClaimRouteTest(unittest.TestCase):
         handler.vcs.registry.resolve.return_value = (forge, "acme/infra")
         routes = {"proposal-create": self._create, "proposal-claim": self._claim}
         with mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value=routes), \
-                mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+                mock.patch.object(credential_proxy, "repository_is_managed", return_value=managed):
             handler._handle_vcs_post()
         self.assertEqual(1, len(replies), replies)
         return replies[0]
@@ -15155,9 +15158,35 @@ class ProposalClaimRouteTest(unittest.TestCase):
         self.assertEqual("CLAIM_UNKNOWN", answer["code"])
         self.assertEqual([], self.claimed)
         self.assertEqual(900, credential_proxy.CLAIM_TOKEN_TTL_SECONDS)
-        # Pruned on the next write, not only refused on read.
+
+    def test_an_expired_claim_is_pruned_on_the_next_mint(self):
+        # A token nobody claims leaves only by the prune, not by a burn.
         self._created_token()
         self.assertEqual(1, len(self.tokens))
+        self.clock[0] += credential_proxy.CLAIM_TOKEN_TTL_SECONDS
+        self._created_token()
+        self.assertEqual(1, len(self.tokens))
+
+    def test_a_claim_on_a_repository_no_longer_managed_is_403_and_burned(self):
+        token = self._created_token()
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token}, managed=False)
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("REPOSITORY_NOT_MANAGED", answer["code"])
+        self.assertEqual([], self.claimed)
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual([], self.claimed)
+
+    def test_a_failed_proposal_create_mints_no_claim(self):
+        self.create_fails = True
+        status, answer = self._post(
+            "proposal-create",
+            {"repository": self.REPOSITORY, "source": "fix/a", "target": "main", "title": "t"},
+        )
+        self.assertEqual(422, status)
+        self.assertNotIn(credential_proxy.CLAIM_TOKEN_FIELD, answer)
+        self.assertEqual(0, len(self.tokens))
 
     def test_a_claim_whose_forge_check_fails_is_409_and_burned(self):
         token = self._created_token()

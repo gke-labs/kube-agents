@@ -369,6 +369,8 @@ def _git_refusal(forge: Forge, repo: str, stderr: Any, verb: str) -> WorkspaceEr
     forge.credential.headers(repo)
     LOGGER.warning("git refused the %s credential for a %s call", forge.name, verb)
     return WorkspaceError(text, status=401, code="FORGE_UNAUTHENTICATED")
+
+
 def _age_seconds(created: Any, now: datetime) -> float | None:
     """Seconds since a forge's `created` timestamp, or None when it cannot be read."""
     try:
