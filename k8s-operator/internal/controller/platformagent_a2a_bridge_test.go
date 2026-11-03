@@ -29,6 +29,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 )
 
 func bridgeTestPod(agent *agentv1alpha1.PlatformAgent) corev1.PodTemplateSpec {
@@ -681,5 +682,24 @@ func TestAnAgentsMemoryLimitVariableDoesNotReachTheBridge(t *testing.T) {
 	}
 	if slices.ContainsFunc(b.Env, func(e corev1.EnvVar) bool { return e.Name == a2aBridgeMemoryLimitEnvVar && e.Value == "1" }) {
 		t.Error("the agent's hand-set value reached the bridge")
+	}
+}
+
+// GOMEMLIMIT is applied by the Go runtime before main, ahead of the limit the
+// bridge derives from its own container, and the agent container's env is
+// assembled from the plugins' spec.Env: a plugin's GOMEMLIMIT on the Python
+// agent must not become the bridge's soft limit. Only the env channel is
+// filtered by name; EnvFrom is copied as the agent's.
+func TestAnAgentsGoMemLimitDoesNotReachTheBridge(t *testing.T) {
+	agentC := containersNamed(bridgeTestPod(provisionedAgent()), a2aAgentContainerName)[0]
+	agentC.Env = append(agentC.Env, corev1.EnvVar{Name: memlimit.GoMemLimitEnv, Value: "1"})
+	b := buildA2ABridgeContainer(provisionedAgent(), agentC)
+	if slices.ContainsFunc(b.Env, func(e corev1.EnvVar) bool { return e.Name == memlimit.GoMemLimitEnv }) {
+		t.Errorf("the agent's %s reached the bridge, where the runtime would apply it over the derived limit", memlimit.GoMemLimitEnv)
+	}
+	if !slices.ContainsFunc(b.Env, func(e corev1.EnvVar) bool {
+		return e.Name == a2aBridgeMemoryLimitEnvVar && e.ValueFrom != nil && e.ValueFrom.ResourceFieldRef != nil
+	}) {
+		t.Errorf("the bridge's %s resourceFieldRef is missing; the derived limit has nothing to read", a2aBridgeMemoryLimitEnvVar)
 	}
 }

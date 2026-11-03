@@ -31,6 +31,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 )
 
 // The Hermes bridge, rendered by the operator.
@@ -364,8 +365,12 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 
 // a2aBridgeDroppedAgentEnv are agent env names the bridge must not inherit:
 // its own settings (replaced above, API_SERVER_KEY among them, so no plugin
-// value picks its executor), and the agent's bus identity, which names the
-// `agent` principal and its inbox rather than the bridge's.
+// value picks its executor), the agent's bus identity, which names the
+// `agent` principal and its inbox rather than the bridge's, and GOMEMLIMIT,
+// which the Go runtime applies before main and which would otherwise let a
+// plugin's value on the Python agent container override the soft limit the
+// bridge derives from its own admitted memory limit. A bridge-specific
+// GOMEMLIMIT belongs in a2aBridgeOwnEnv.
 var a2aBridgeDroppedAgentEnv = map[string]bool{
 	sharedStateSetupEnvVar:      true,
 	a2aBridgeNATSURLEnvVar:      true,
@@ -377,6 +382,7 @@ var a2aBridgeDroppedAgentEnv = map[string]bool{
 	a2aBusUserEnv:               true,
 	a2aBridgeAPIServerKeyEnvVar: true,
 	a2aBridgeMemoryLimitEnvVar:  true,
+	memlimit.GoMemLimitEnv:      true,
 }
 
 // buildA2ABridgeContainer renders the bridge from the finished agent
