@@ -4147,6 +4147,32 @@ def test_an_infra_status_turn_floors_its_purge_too(
     assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))
 
 
+def test_an_unfloored_purge_clears_the_runs_files_from_the_shell_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no floor every root is the run's own, so its files go even if python never starts."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "")
+    harness._purge_card_state(["t_1"], 5.0)
+    harness._purge_card_state(["t_1"], 5.0, floor=1_700_000_000)
+    unfloored, floored = scripts
+    assert unfloored.index(f"rm -rf {harness._ATTACHMENTS_DIR}") < unfloored.index("-c ")
+    # With a floor a root may not be the run's, so only the script may delete its files.
+    assert "rm -rf" not in floored
+
+
+def test_a_root_older_than_the_floor_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It may be an earlier repetition's leftover, which nothing purges now."""
+    monkeypatch.setattr(
+        harness, "_agent_shell", lambda script, timeout: "foreign t_old\nforeign t_adopted\npurged\n"
+    )
+    with caplog.at_level("INFO", logger="kube_agents_bench.harness"):
+        harness._purge_card_state(["t_old", "t_new"], 5.0, ["t_adopted"], floor=1_700_000_000)
+    warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warned) == 1 and "t_old" in warned[0] and "t_adopted" not in warned[0]
+    assert any("t_adopted" in r.getMessage() for r in caplog.records if r.levelname == "INFO")
+
+
 def test_a_purge_that_cannot_reach_the_board_is_a_warning(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

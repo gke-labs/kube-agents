@@ -62,8 +62,10 @@ report and terminal commands are read back with `kubectl exec` from
 deleted. So are the board rows of the card and of every card its worker, or theirs, filed, since
 Hermes shows the assignee's recent completed runs on every card and would hand the next repetition
 this one's summary. A worker's card counts only when Hermes recorded the run as its creator, so a
-card a worker's create handed back by an existing idempotency key stays, files included. A card
-keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
+card a worker's create handed back by an existing idempotency key stays, files included. Likewise
+a card the front door's create returned that was created before the run started, by the agent pod's
+clock read before the agent is invoked, is not this run's and stays, files included; this holds on
+both waits below. A card keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
 other than a follow-up linked to its creator. A card still running when the wait ran out is archived
 first, which stops its worker, and so are the cards its worker fanned out. A
 customer sees the card result relayed to their thread; they never see the files, the
@@ -633,7 +635,7 @@ which the conversation shows as the needs-you message, is appended under
 returned, and the worker logs are read by those ids for `worker_commands` without `after_result_pattern`. A card still running at
 the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
 result) is not its answer, so the repetition is recorded at the ceiling and the card is only
-archived and purged. A door that reports no `contextId`, a session the store does not hold (the
+archived and purged (a card created before the run started is left, as above). A door that reports no `contextId`, a session the store does not hold (the
 `cli` executor), or a first read of the store that fails three times running, before any card is
 found, falls back to the status-turn wait. That wait takes its card ids from the trajectory, which
 holds none on this path, so it settles at once on the reply and sends no status turn; the last of

@@ -456,8 +456,8 @@ _MAX_ARTIFACTS = 8
 _EXEC_TIMEOUT = 60.0
 
 # The agent pod's clock at the run's start, the purge's floor for the run's own
-# cards (:func:`_pod_clock`). A shell builtin's worth of work, not python3:
-# that takes about 30 s to start in the sandboxed container. Shorter than
+# cards (:func:`_pod_clock`). ``sh`` and ``date``, two process spawns, not
+# python3: that takes about 30 s to start in the sandboxed container. Shorter than
 # ``_EXEC_TIMEOUT`` because the run waits on it before the agent is invoked.
 _POD_CLOCK_SCRIPT = "date +%s"
 _POD_CLOCK_TIMEOUT_SECONDS = 15.0
@@ -1536,8 +1536,16 @@ def _purge_card_state(
     if not task_ids:
         return
     args = " ".join(_shell_quote(a) for a in _purge_argv(task_ids, fanned_out, floor))
+    # With no floor every root is the run's own, so its files go from the shell
+    # first and still go when python cannot start; with one, the script decides.
+    unfloored = "" if floor is not None else (
+        f"for t in {' '.join(_shell_quote(t) for t in task_ids)}; do "
+        f'  rm -rf {_ATTACHMENTS_DIR}/"$t" {_LOGS_DIR}/"$t".log; '
+        "done; "
+    )
     script = (
-        f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
+        unfloored
+        + f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
         f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
         f'"$PY" -c {_shell_quote(_PURGE_ROWS_SCRIPT)} {args}'
     )
@@ -1553,10 +1561,19 @@ def _purge_card_state(
             "aside), and stay on the board; the next run's role-history digest can show their "
             "summaries", ", ".join(kept),
         )
-    if foreign := marked(_PURGE_FOREIGN_MARKER):
+    foreign = marked(_PURGE_FOREIGN_MARKER)
+    if older := [t for t in foreign if t in task_ids]:
+        # Someone else's card, or an earlier repetition's leftover that the
+        # front door's create handed back by its key: nothing purges it now.
+        _log.warning(
+            "left cards %s on the board: the front door's kanban_create returned them, but they were "
+            "created before this run started; if one is an earlier run's, its summary can reach the "
+            "next run's role-history digest", ", ".join(older),
+        )
+    if adopted := [t for t in foreign if t not in task_ids]:
         _log.info(
-            "left cards %s on the board: created before the run started, or attributed to the run's "
-            "workers but not created by them", ", ".join(foreign),
+            "left cards %s on the board: attributed to the run's workers, but not created by them",
+            ", ".join(adopted),
         )
     if _PURGE_DONE_MARKER not in lines:
         _log.warning(
