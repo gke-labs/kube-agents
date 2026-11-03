@@ -91,6 +91,7 @@ from providers import (
     validate_revision,
 )
 from providers.credentials import CREDENTIAL_HELPER_KEY
+from providers.errors import UNAVAILABLE, UNRECOGNISED
 from workspace_paths import WorkspaceError, validate_path
 
 LOGGER = logging.getLogger("credential-proxy.vcs")
@@ -162,6 +163,11 @@ OPEN_PROPOSAL_STATE = "open"
 CLAIM_WINDOW_SECONDS = 900
 CLAIM_CLOCK_SKEW_SECONDS = 60
 CLAIM_TITLE_MAX = 300
+# The forge failures `proposal-claim` asks again once: the two refusals the
+# provider layer reads as the forge's own trouble (`providers/errors.py`), the
+# set the agent side's `forge.TRANSIENT_CODES` retries reads on. The claim
+# token is spent before the check, so without this one 502 loses the claim.
+CLAIM_TRANSIENT_CODES = frozenset({UNAVAILABLE.code, UNRECOGNISED.code})
 # A forge's timestamp spells UTC as `Z`, which `fromisoformat` reads as an
 # offset only from Python 3.11.
 ISO_UTC_SUFFIX = "Z"
@@ -369,6 +375,20 @@ def _git_refusal(forge: Forge, repo: str, stderr: Any, verb: str) -> WorkspaceEr
     forge.credential.headers(repo)
     LOGGER.warning("git refused the %s credential for a %s call", forge.name, verb)
     return WorkspaceError(text, status=401, code="FORGE_UNAUTHENTICATED")
+
+
+def _once_more_if_transient(what: str, call: Callable[[], Any]) -> Any:
+    """`call()`, asked once more when the forge's failure is in CLAIM_TRANSIENT_CODES.
+
+    A second failure, or any other refusal, is raised as the forge gave it.
+    """
+    try:
+        return call()
+    except WorkspaceError as error:
+        if error.fields.get("code") not in CLAIM_TRANSIENT_CODES:
+            raise
+        LOGGER.warning("proposal-claim: %s failed with %s; retrying once", what, error.fields.get("code"))
+    return call()
 
 
 def _age_seconds(created: Any, now: datetime) -> float | None:
@@ -2147,16 +2167,24 @@ class VcsBroker:
         open state, a creation time inside CLAIM_WINDOW_SECONDS, and as author
         the account this credential acts as. Anything else is a 409; the
         answer is the forge's, never the caller's. The repository was held to
-        the managed list by the route before this ran.
+        the managed list by the route before this ran. The route spent the
+        token before this ran, so a transient forge failure on either read
+        (CLAIM_TRANSIENT_CODES) is asked once more before it is answered.
         """
         url = payload.get("url")
         number = validate_number(payload.get("number"))
         bound = self._bind(payload)
         try:
-            viewer = self._viewer(bound)
+            viewer = _once_more_if_transient("whoami", lambda: self._viewer(bound))
         except IdentityUnknown:
             viewer = ""
-        view = (bound.forge.proposal_view(bound.api, bound.repo, {"number": number}) or {}).get("proposal") or {}
+        view = (
+            _once_more_if_transient(
+                "proposal-view",
+                lambda: bound.forge.proposal_view(bound.api, bound.repo, {"number": number}),
+            )
+            or {}
+        ).get("proposal") or {}
         age = _age_seconds(view.get("created"), datetime.now(timezone.utc))
         if not (
             viewer

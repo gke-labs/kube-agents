@@ -260,7 +260,8 @@ def claim(record):
     """The forge's ``{url, number, title}`` when the broker accepts ``record``'s token, else None.
 
     The broker burns the token whatever it then finds, so a claim is never
-    retried. A refusal (an unknown, replayed or expired token, a proposal the
+    retried here; the broker itself asks the forge once more on a transient
+    failure. A refusal (an unknown, replayed or expired token, a proposal the
     forge does not confirm, a repository no longer managed) is logged by its code
     alone, never with the token or the url. Raises :class:`ClaimUnanswered` when
     the broker could not be asked.

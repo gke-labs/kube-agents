@@ -2433,6 +2433,43 @@ class CollaborationTest(unittest.TestCase):
             broker.proposal_claim(dict(self.CLAIM))
         self.assertEqual(409, caught.exception.status)
 
+    BAD_GATEWAY = subprocess.CompletedProcess(["gh"], 1, "", "gh: Bad Gateway (HTTP 502)")
+
+    def test_proposal_claim_asks_the_forge_once_more_after_a_transient_failure(self):
+        # The token is spent before the check, so one 502 must not lose the claim.
+        for case, answers in (
+            ("proposal-view", (self.CLAIM_STATUS, self.BAD_GATEWAY, self._claim_node())),
+            ("whoami", (self.BAD_GATEWAY, self.CLAIM_STATUS, self._claim_node())),
+        ):
+            with self.subTest(case=case):
+                broker, recorder = self.broker(*answers)
+                answer = broker.proposal_claim(dict(self.CLAIM))
+                self.assertEqual(7, answer["number"])
+                self.assertEqual(3, len(recorder.calls))
+
+    def test_proposal_claim_fails_with_the_forges_error_after_two_transient_failures(self):
+        broker, recorder = self.broker(self.CLAIM_STATUS, self.BAD_GATEWAY, self.BAD_GATEWAY, self._claim_node())
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.proposal_claim(dict(self.CLAIM))
+        self.assertEqual(503, caught.exception.status)
+        self.assertEqual("FORGE_UNAVAILABLE", caught.exception.fields.get("code"))
+        self.assertEqual(3, len(recorder.calls), "one retry, not two")
+
+    def test_proposal_claim_does_not_retry_a_refusal_that_is_not_transient(self):
+        not_found = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
+        broker, recorder = self.broker(self.CLAIM_STATUS, not_found, self._claim_node())
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.proposal_claim(dict(self.CLAIM))
+        self.assertEqual("FORGE_NOT_FOUND", caught.exception.fields.get("code"))
+        self.assertEqual(2, len(recorder.calls))
+
+    def test_the_claims_transient_codes_are_the_agent_sides(self):
+        try:
+            import forge
+        except ImportError as exc:  # pragma: no cover -- forge imports the sandbox helpers
+            self.skipTest(f"forge is not importable here: {exc}")
+        self.assertEqual(forge.TRANSIENT_CODES, vcs_broker.CLAIM_TRANSIENT_CODES)
+
     def test_only_the_api_subcommand_is_ever_invoked(self):
         # A forge CLI's higher-level subcommands infer a repository from a
         # `.git/config` found above the cwd, which is the file this design
