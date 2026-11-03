@@ -629,7 +629,7 @@ def parse_time(stamp):
 
 
 def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
-    """Every open pull request on `base`, with what the sweep reads, in one query per 50."""
+    """Every open pull request on `base`, with what the sweep reads, a page (`PULLS_PAGE_SIZE`) per query."""
     owner, name = api.repo.split("/", 1)
     pulls = []
     after = None
