@@ -115,7 +115,9 @@ logger = logging.getLogger(__name__)
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The platform whose gateway conversations a card can report back to
 # (a2aNotifyConversationsEnvVar). Rendered whenever the gateway arms the route,
-# home channel or not; A2A_NOTIFY_PLATFORM above is home posts, and needs one.
+# home channel or not; A2A_NOTIFY_PLATFORM above is home posts, rendered with a
+# home channel or when the backend is the install's only chat platform (the
+# gateway then keeps a refused post for its digest).
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # The operator's projection of the home channel, mounted in the agent pod
 # (agents/platform/scripts/chat_notify.py keeps the same three names).

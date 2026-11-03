@@ -2689,9 +2689,11 @@ def _post_initial_alert(active_platform: str, alert_msg: str, session_id: str = 
     """Send the initial warning alert and return the thread/message ID.
 
     Posts with `hermes send`, or with `a2a notify` for the platform the A2A
-    gateway holds under next (chat_notify.py). Three outcomes, not two: a thread
-    id, `None` when the send failed, and :data:`ALERT_SENT_WITHOUT_THREAD` when
-    it succeeded (or may have) and the id could not be read. The route's own docstring names that third case as one that has
+    gateway holds under next (chat_notify.py). Four outcomes, not two: a thread
+    id, `None` when the send failed, :data:`ALERT_SENT_WITHOUT_THREAD` when
+    it succeeded (or may have) and the id could not be read, and
+    :data:`ALERT_KEPT_FOR_DIGEST` when the gateway kept it for want of a home
+    channel (the caller records it as kept and does not re-send). The route's own docstring names that third case as one that has
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
@@ -4910,6 +4912,9 @@ def _send_to_chat(
             # as a success does; a fresh post has no thread to register.
             logger.warning(f"Relayed report to {target} got no answer in time; treating it as sent")
             return thread_id if threaded else ALERT_SENT_WITHOUT_THREAD
+        if chat_notify.kept(exc.returncode):
+            logger.warning(f"Relayed report to {target} was kept by the gateway for its digest (no home channel)")
+            return None
         logger.error(f"Failed to post relayed report to {target}. Stderr: {exc.stderr}")
         return None
     except Exception as exc:
@@ -4945,6 +4950,13 @@ class AuditPost(NamedTuple):
     """Where :func:`_post_audit_blocks` left the report: its thread."""
 
     thread_id: str
+
+
+# `_post_audit_chat_via_gateway`'s answer when the gateway refused the card for
+# want of a home channel and kept it for its digest (chat_notify.kept): the leg
+# is undelivered, and the text fallback must not follow, or the one report is
+# kept twice.
+AUDIT_POST_KEPT = AuditPost("")
 
 
 class AuditHeadline(NamedTuple):
@@ -5243,7 +5255,8 @@ def _post_audit_chat_via_gateway(
     gateway lays it out, its buttons included. ``text`` is the message's fallback, which the gateway
     posts itself when it does not lay the message out. Same outcomes as the
     relay path: None, to post text instead, after a refusal, a failure to
-    send, or a post that may have landed.
+    send, or a post that may have landed; and :data:`AUDIT_POST_KEPT` when the
+    gateway kept the card for want of a home channel, so no text follows.
     """
     path = ""
     try:
@@ -5270,6 +5283,9 @@ def _post_audit_chat_via_gateway(
             except OSError:
                 pass
     if res.returncode != 0:
+        if chat_notify.kept(res.returncode):
+            logger.warning(f"Relay for {profile}/{job_id}: report card kept by the gateway for its digest (no home channel); no text follows")
+            return AUDIT_POST_KEPT
         if chat_notify.outcome_unknown(res.returncode):
             logger.warning(f"Relay for {profile}/{job_id}: report card may have posted, posting text: {res.stderr.strip()}")
         else:
@@ -5885,7 +5901,12 @@ def relay_cron_report(
                     posted = _post_failed_audit_via_gateway(
                         platform, profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
                     )
-        if posted is not None:
+        if posted is AUDIT_POST_KEPT:
+            # Kept by the gateway for its digest: undelivered, and no text
+            # follows, or the report is kept twice.
+            new_thread_id = None
+            posted = None
+        elif posted is not None:
             new_thread_id = posted.thread_id or None
         else:
             # A failed audit whose folded card did not post goes out whole: under

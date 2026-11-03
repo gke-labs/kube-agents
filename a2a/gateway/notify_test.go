@@ -82,6 +82,12 @@ func serveBytes(t *testing.T, n *Notifier, body []byte) lib.NotifyReply {
 	t.Helper()
 	req, home, refusal := n.validate(body)
 	if refusal != nil {
+		if refusal.Kept {
+			// As handle does: the keeper answers once the store has the post.
+			done := make(chan lib.NotifyReply, 1)
+			n.keepRefused(req, func(r lib.NotifyReply) { done <- r })
+			return <-done
+		}
 		return *refusal
 	}
 	var answers []lib.NotifyReply

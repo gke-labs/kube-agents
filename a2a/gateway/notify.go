@@ -256,6 +256,10 @@ type Notifier struct {
 	keptPrimed  bool
 	keptPriming bool
 	keptPending bool
+	// keeps queues the refused home posts for the one keeper goroutine
+	// (keepWork), bounded like jobs; keepDone closes when it has drained.
+	keeps    chan keepJob
+	keepDone chan struct{}
 }
 
 // notifyMarkJob is one conversation mark waiting to be drawn.
@@ -382,6 +386,7 @@ func (n *Notifier) Start(client *lib.Client) (lib.Subscription, error) {
 	if err != nil {
 		return nil, fmt.Errorf("notify: %w", err)
 	}
+	n.startKeeper()
 	go n.work()
 	home, source := n.homeState()
 	n.log.Info("chat.notify route armed", "subject", n.subject, "home", home, "homeSource", source, "conversations", n.ServesConversations())
@@ -481,6 +486,13 @@ func (s *notifierSub) Stop() {
 		s.n.drainRefusing()
 		s.n.mu.Lock()
 		close(s.n.jobs)
+		// The keeper drains what is queued and exits; a later Start arms a
+		// new one, so the closed queue is let go of here.
+		keepDone := s.n.keepDone
+		if s.n.keeps != nil {
+			close(s.n.keeps)
+			s.n.keeps = nil
+		}
 		s.n.mu.Unlock()
 		// One grace for both waits, inside the pod's termination grace: an
 		// instant, not a one-shot channel, so the second wait keeps whatever
@@ -494,7 +506,13 @@ func (s *notifierSub) Stop() {
 		// A keep or a digest in flight finishes inside its own store
 		// timeout; wait for it so a refused post is not lost to the exit.
 		kept := make(chan struct{})
-		go func() { s.n.keptWG.Wait(); close(kept) }()
+		go func() {
+			s.n.keptWG.Wait()
+			if keepDone != nil {
+				<-keepDone
+			}
+			close(kept)
+		}()
 		select {
 		case <-kept:
 		case <-time.After(time.Until(end)):
@@ -525,6 +543,10 @@ func (n *Notifier) handle(m *nats.Msg) {
 	}
 	req, home, refusal := n.validate(m.Data)
 	if refusal != nil {
+		if refusal.Kept {
+			n.keepRefused(req, answer)
+			return
+		}
 		answer(*refusal)
 		return
 	}
@@ -630,9 +652,9 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, string, *lib.Notify
 	if home == "" {
 		n.log.Debug("notify refused: no home channel", "homeSource", source)
 		if n.kept != nil {
-			n.keepRefused(req)
-			r := n.refuse(notifyNoHomeKept)
-			r.Kept = true
+			// Answered by handle from the keep itself (keepRefused): Kept is
+			// a promise the store has to have made good on first.
+			r := lib.NotifyReply{Error: notifyNoHomeKept, Kept: true}
 			return req, "", &r
 		}
 		return refuse(notifyNoHome)

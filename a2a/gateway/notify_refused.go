@@ -363,30 +363,74 @@ func (n *Notifier) Backend() string {
 	return n.backend
 }
 
-// keepRefused keeps a refused home post, off the route's delivery goroutine
-// and one at a time, so the count is exact and a slow store never holds the
-// subscription, and marks a digest owed. Best effort: the refusal already
-// went back, and a keep that fails is logged.
-func (n *Notifier) keepRefused(req lib.NotifyRequest) {
-	if n.kept == nil {
+// keepJob is one refused home post on its way to the store, with the
+// requester's answer: Kept goes back only once the store has it.
+type keepJob struct {
+	post   refusedPost
+	answer func(lib.NotifyReply)
+}
+
+// startKeeper arms the keep queue and its one goroutine, before the route
+// subscribes. One keeper, so the count is exact and a slow store never holds
+// the subscription; a bounded queue (notifyQueueDepth, as jobs), so a sender
+// refusing faster than the store keeps cannot grow the process without
+// limit, and a post the queue cannot take is answered as a plain refusal.
+func (n *Notifier) startKeeper() {
+	if n.kept == nil || n.keeps != nil {
 		return
 	}
-	post := refusedPost{At: time.Now(), Backend: n.backend, Subject: firstLine(req.Text, refusedSubjectMax), Text: req.Text, Blocks: req.Blocks}
-	n.keptWG.Add(1)
-	go func() {
-		defer n.keptWG.Done()
+	n.keeps = make(chan keepJob, notifyQueueDepth)
+	n.keepDone = make(chan struct{})
+	go n.keepWork(n.keeps, n.keepDone)
+}
+
+// keepWork keeps the queued posts one at a time and answers each requester:
+// Kept once the store has the post, the plain no-home refusal when it does
+// not. A prune that fails after the post and the count were written is
+// logged and not a failed keep. Each kept post marks a digest owed. The
+// channels come as arguments: Stop lets go of the queue field once it has
+// closed it, and the keeper must not read the field after that.
+func (n *Notifier) keepWork(keeps <-chan keepJob, done chan<- struct{}) {
+	defer close(done)
+	for job := range keeps {
 		n.keptMu.Lock()
-		defer n.keptMu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), refusedStoreTimeout)
-		defer cancel()
-		meta, err := n.kept.Keep(ctx, post)
+		meta, err := n.kept.Keep(ctx, job.post)
+		cancel()
+		if err != nil && meta.Count == 0 {
+			n.keptMu.Unlock()
+			n.log.Error("notify refused and not kept", "backend", n.backend, "subject", job.post.Subject, "err", err)
+			job.answer(n.refuse(notifyNoHome))
+			continue
+		}
 		if err != nil {
-			n.log.Error("notify refused and not kept", "backend", n.backend, "subject", post.Subject, "err", err)
-			return
+			n.log.Warn("kept posts not pruned; the next keep prunes again", "backend", n.backend, "err", err)
 		}
 		n.keptPending = true
-		n.log.Warn("notify refused and kept: no home channel", "backend", n.backend, "subject", post.Subject, "refused", meta.Count)
-	}()
+		n.keptMu.Unlock()
+		n.log.Warn("notify refused and kept: no home channel", "backend", n.backend, "subject", job.post.Subject, "refused", meta.Count)
+		job.answer(lib.NotifyReply{Error: notifyNoHomeKept, Kept: true})
+	}
+}
+
+// keepRefused queues a refused home post for the keeper, which answers the
+// requester. With no keeper (no store, before Start, or stopping) or a full
+// queue the post is not kept and the requester gets the plain refusal, so
+// Kept never names a post the store does not hold.
+func (n *Notifier) keepRefused(req lib.NotifyRequest, answer func(lib.NotifyReply)) {
+	post := refusedPost{At: time.Now(), Backend: n.backend, Subject: firstLine(req.Text, refusedSubjectMax), Text: req.Text, Blocks: req.Blocks}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.keeps == nil || n.stopping {
+		answer(n.refuse(notifyNoHome))
+		return
+	}
+	select {
+	case n.keeps <- keepJob{post: post, answer: answer}:
+	default:
+		n.log.Error("notify refused and not kept: the keep queue is full", "backend", n.backend, "subject", post.Subject, "depth", notifyQueueDepth)
+		answer(n.refuse(notifyNoHome))
+	}
 }
 
 // primeKept reads, once per process, the count an earlier process left: a
@@ -472,7 +516,12 @@ func (n *Notifier) digestKept(home string) {
 		text := refusedDigest(meta, kept)
 		job := notifyJob{req: lib.NotifyRequest{Text: text}, home: home, answer: func(r lib.NotifyReply) {
 			if r.Error != "" {
+				// Owed again: the next home request posts it, not only the
+				// next restart or the next refusal.
 				n.log.Error("refused-post digest not posted; the count stands", "backend", n.backend, "refused", meta.Count, "err", r.Error)
+				n.keptMu.Lock()
+				n.keptPending = true
+				n.keptMu.Unlock()
 				return
 			}
 			// Only what this digest named comes off the count: a refusal

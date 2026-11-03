@@ -15,8 +15,9 @@ type memRefusedStore struct {
 	mu       sync.Mutex
 	posts    []refusedPost
 	meta     refusedMeta
-	fail     bool
-	metaFail int // Meta errors this many times, then answers
+	fail      bool
+	pruneFail bool // Keep stores, then errors as a failed prune would
+	metaFail  int  // Meta errors this many times, then answers
 	metaWait time.Duration
 	metaRead int // Meta calls so far
 	keepWait time.Duration
@@ -33,6 +34,9 @@ func (m *memRefusedStore) Keep(_ context.Context, post refusedPost) (refusedMeta
 	}
 	m.posts = append(m.posts, post)
 	m.meta = metaWith(m.meta, post)
+	if m.pruneFail {
+		return m.meta, context.DeadlineExceeded
+	}
 	return m.meta, nil
 }
 
@@ -106,6 +110,7 @@ func startWorker(t *testing.T, n *Notifier) {
 	t.Helper()
 	n.jobs = make(chan notifyJob, notifyQueueDepth)
 	n.done = make(chan struct{})
+	n.startKeeper()
 	go n.work()
 	n.primeKept()
 	n.keptWG.Wait()
@@ -113,8 +118,14 @@ func startWorker(t *testing.T, n *Notifier) {
 		n.mu.Lock()
 		n.stopping = true
 		close(n.jobs)
+		if n.keeps != nil {
+			close(n.keeps)
+		}
 		n.mu.Unlock()
 		<-n.done
+		if n.keepDone != nil {
+			<-n.keepDone
+		}
 	})
 }
 
@@ -162,6 +173,7 @@ func TestNotify_ARefusedHomePostIsKeptAndCounted(t *testing.T) {
 	}
 	store := &memRefusedStore{}
 	n.SetKept(store)
+	startWorker(t, n)
 
 	reply := serveJSON(t, n, lib.NotifyRequest{Text: "🔴 prod-eu: 3 pods CrashLoopBackOff\n\nthe rest of the alert"})
 	if reply.Error != notifyNoHomeKept || !reply.Kept {
@@ -181,8 +193,8 @@ func TestNotify_ARefusedHomePostIsKeptAndCounted(t *testing.T) {
 	}
 }
 
-// A store that fails leaves the refusal as it was: logged, not surfaced to
-// the requester, and nothing posted.
+// A store that fails leaves the refusal as it was: the plain no-home
+// refusal, not kept, so no sender files the post as handled; nothing posted.
 func TestNotify_AKeepThatFailsLeavesTheRefusalAlone(t *testing.T) {
 	poster := &fakeNotifyPoster{}
 	n, err := NewSlackNotifier(poster, "", nil)
@@ -190,10 +202,79 @@ func TestNotify_AKeepThatFailsLeavesTheRefusalAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	n.SetKept(&memRefusedStore{fail: true})
-	if reply := serveJSON(t, n, lib.NotifyRequest{Text: "an alert"}); reply.Error != notifyNoHomeKept {
-		t.Fatalf("reply = %+v", reply)
+	startWorker(t, n)
+	if reply := serveJSON(t, n, lib.NotifyRequest{Text: "an alert"}); reply.Error != notifyNoHome || reply.Kept {
+		t.Fatalf("reply = %+v, want the plain refusal", reply)
 	}
-	n.keptWG.Wait()
+	n.keptMu.Lock()
+	pending := n.keptPending
+	n.keptMu.Unlock()
+	if pending {
+		t.Fatal("a failed keep marked a digest owed")
+	}
+}
+
+// A prune that fails after the post and the count are written is not a
+// failed keep: the requester is told kept, and the digest is owed.
+func TestNotify_APruneThatFailsStillKeeps(t *testing.T) {
+	poster := &fakeNotifyPoster{}
+	n, err := NewSlackNotifier(poster, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &memRefusedStore{pruneFail: true}
+	n.SetKept(store)
+	startWorker(t, n)
+	if reply := serveJSON(t, n, lib.NotifyRequest{Text: "an alert"}); reply.Error != notifyNoHomeKept || !reply.Kept {
+		t.Fatalf("reply = %+v, want kept", reply)
+	}
+	n.keptMu.Lock()
+	pending := n.keptPending
+	n.keptMu.Unlock()
+	if _, meta := store.snapshot(); meta.Count != 1 || !pending {
+		t.Fatalf("meta %+v pending %v, want the post counted and a digest owed", meta, pending)
+	}
+}
+
+// Refusals arriving faster than a slow store keeps them do not pile up
+// without bound: past the queue's depth a post is answered as a plain
+// refusal, never as kept, and every requester gets exactly one answer.
+func TestNotify_AFullKeepQueueRefusesPlainly(t *testing.T) {
+	poster := &fakeNotifyPoster{}
+	n, err := NewSlackNotifier(poster, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &memRefusedStore{keepWait: 50 * time.Millisecond}
+	n.SetKept(store)
+	startWorker(t, n)
+	const burst = notifyQueueDepth * 2
+	answers := make(chan lib.NotifyReply, burst)
+	for i := 0; i < burst; i++ {
+		n.keepRefused(lib.NotifyRequest{Text: "alert"}, func(r lib.NotifyReply) { answers <- r })
+	}
+	kept, plain := 0, 0
+	for i := 0; i < burst; i++ {
+		select {
+		case r := <-answers:
+			switch {
+			case r.Kept && r.Error == notifyNoHomeKept:
+				kept++
+			case !r.Kept && r.Error == notifyNoHome:
+				plain++
+			default:
+				t.Fatalf("answer %+v", r)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("answered %d of %d", i, burst)
+		}
+	}
+	if plain == 0 || kept == 0 || kept > notifyQueueDepth+1 {
+		t.Fatalf("kept %d plain %d, want the queue's depth kept and the rest refused plainly", kept, plain)
+	}
+	if posts, _ := store.snapshot(); len(posts) != kept {
+		t.Fatalf("store holds %d, %d were answered kept", len(posts), kept)
+	}
 }
 
 // A conversation request on a route with no home channel is not a refused
@@ -319,7 +400,11 @@ func TestNotify_StartWithAHomeChannelPostsTheDigestOnce(t *testing.T) {
 	if meta := waitCleared(store); meta.Count != 0 {
 		t.Fatalf("meta after the digest = %+v", meta)
 	}
-	// A rebind after a lost connection is not a new arrival.
+	// A rebind after a lost connection is not a new arrival: a count another
+	// process left meanwhile is read by the next process, not by this one.
+	if _, err := store.Keep(context.Background(), refusedPost{At: time.Now(), Subject: "left by another process", Text: "x"}); err != nil {
+		t.Fatal(err)
+	}
 	sub.Stop()
 	sub2, err := n.Start(client)
 	if err != nil {
@@ -392,7 +477,8 @@ func TestNotify_StopWaitsForAKeepInFlight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serveJSON(t, n, lib.NotifyRequest{Text: "an alert"})
+	// Queued, not awaited: Stop has to drain it.
+	n.keepRefused(lib.NotifyRequest{Text: "an alert"}, func(lib.NotifyReply) {})
 	sub.Stop()
 	if posts, _ := store.snapshot(); len(posts) != 1 {
 		t.Fatalf("Stop returned before the keep landed: kept %d", len(posts))
@@ -513,11 +599,8 @@ func TestNotify_ADigestThatFailsToPostKeepsTheCount(t *testing.T) {
 	if _, meta := store.snapshot(); meta.Count != 1 {
 		t.Fatalf("meta = %+v, want the count kept after a failed post", meta)
 	}
-	// The next arrival posts it: the count was never cleared and the store
-	// still says one, so the digest is read anew.
-	n.keptMu.Lock()
-	n.keptPending = true
-	n.keptMu.Unlock()
+	// The next arrival posts it: the failed post re-armed the digest, and
+	// the store still says one, so it is read anew.
 	n.digestKept(testHome)
 	n.keptWG.Wait()
 	if posts := waitPosts(poster, 2); len(digestPosts(posts)) != 2 {
