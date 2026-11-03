@@ -332,9 +332,9 @@ FIXTURE_NOT_READY = {
         "GKE waits per node"
     ),
     "networking-world-open-ingress": (
-        "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
-        "every pool project (fleet re-apply); no pool project has a rule opening a "
-        "management port to the internet"
+        "#2682: bench/tf/fleet's world_open firewall rule and VM are applied; the "
+        "un-park cites a fixture-state scan that reads the world-open-ingress role "
+        "healthy on every pool project"
     ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
@@ -421,13 +421,14 @@ FIXTURE_NOT_READY = {
         "which is broken rather than red"
     ),
     "gce-startup-script-failure": (
-        "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
-        "(fleet re-apply); no pool project runs a VM whose startup script fails"
+        "#2483: bench/tf/fleet's startup_fail VM is applied; the un-park cites a "
+        "fixture-state scan that reads the startup-fail-vm role healthy on every "
+        "pool project"
     ),
     "gce-chat-request-runs-collector": (
-        "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
-        "(fleet re-apply), as gce-startup-script-failure does; until then it runs by "
-        "hand on a dev install with the VM planted"
+        "#2483: bench/tf/fleet's startup_fail VM is applied, as for "
+        "gce-startup-script-failure; the un-park cites a fixture-state scan that "
+        "reads the startup-fail-vm role healthy on every pool project"
     ),
     "obtainability-pdb-kustomize-overlay": (
         "#2686: needs checkout-gateway declared in a Kustomize root under "
@@ -905,9 +906,10 @@ def _overlay_fixtures() -> list[dict[str, Any]]:
 def known_fixture_roles() -> set[str]:
     """Every role slug a task.yaml may name.
 
-    bench/tf/fleet/fixtures.json is the vocabulary; the overlay contributes
-    only the roles that have no cluster slot, which a catalogue keyed by slot
-    cannot hold (orphan-disks is project-scoped). Rejecting a slug is not the
+    bench/tf/fleet/fixtures.json is the vocabulary, its project-scoped roles
+    (`cluster_slot: null`) included; the overlay contributes the roles that
+    have no cluster slot and that the catalogue does not probe (orphan-disks).
+    Rejecting a slug is not the
     place to also complain that the two disagree -- that is a repository-level
     fault, not a fault of the case that happened to name the role, so it is
     reported once by fixture_catalog_disagreements() instead of once per case.
@@ -928,12 +930,15 @@ def fixture_catalog_disagreements() -> list[str]:
     """
     catalog = _catalog_roles()
     problems = []
+    overlay_project_roles = set()
     for entry in _overlay_fixtures():
         role, slot = entry.get("role"), entry.get("slot")
         if not isinstance(role, str):
             problems.append(f"fleet-fixtures.yaml: {role!r} is not a role slug")
         elif slot is None:
-            if role in catalog:
+            overlay_project_roles.add(role)
+            # A project-scoped catalogue role (`cluster_slot: null`) agrees.
+            if role in catalog and catalog[role].get("cluster_slot") is not None:
                 problems.append(
                     f"fleet-fixtures.yaml: {role!r} declares no slot, but "
                     "bench/tf/fleet/fixtures.json gives it slot "
@@ -950,6 +955,15 @@ def fixture_catalog_disagreements() -> list[str]:
                 f"fleet-fixtures.yaml puts {role!r} on slot {slot!r}; "
                 "bench/tf/fleet/fixtures.json puts it on "
                 f"{catalog[role].get('cluster_slot')!r}"
+            )
+    # The other direction for a project-scoped catalogue role: the overlay is
+    # where such a role's day-N gate and objects are written down.
+    for role, spec in sorted(catalog.items()):
+        if isinstance(spec, dict) and spec.get("cluster_slot") is None and role not in overlay_project_roles:
+            problems.append(
+                f"bench/tf/fleet/fixtures.json: {role!r} is project-scoped "
+                "(cluster_slot null), but fleet-fixtures.yaml does not list it "
+                "with slot null"
             )
     return problems
 
@@ -1136,6 +1150,29 @@ def _fixture_roles(node: Any, found: set[str], plural: set[str] | None = None) -
                     plural.add(role)
     for child in node.get("checks") or []:
         _fixture_roles(child, found, plural)
+
+
+def _singular_fixture_roles(node: Any, found: set[str]) -> None:
+    """Every singular `fixture_role:` in one check subtree."""
+    if not isinstance(node, dict):
+        return
+    role = node.get("fixture_role")
+    if isinstance(role, str):
+        found.add(role)
+    for child in node.get("checks") or []:
+        _singular_fixture_roles(child, found)
+
+
+def _catalog_slot_roles() -> set[str]:
+    """Catalogue roles on a cluster slot: the ones the runner records a slot
+    and writes a kubeconfig for."""
+    return {role for role, spec in _catalog_roles().items() if isinstance(spec, dict) and spec.get("cluster_slot") is not None}
+
+
+def _catalog_project_roles() -> set[str]:
+    """Catalogue roles with `cluster_slot: null`: Compute Engine objects the
+    runner probes in the project and publishes with no kubeconfig."""
+    return set(_catalog_roles()) - _catalog_slot_roles()
 
 
 def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) -> None:
@@ -1405,11 +1442,24 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         # which is not in the catalogue yet by definition; it is off every
         # roster, so the plural is held to the catalogue only once it runs.
         if name not in FIXTURE_NOT_READY:
-            for role in sorted(slot_roles - set(_catalog_roles())):
+            for role in sorted(slot_roles - _catalog_slot_roles()):
                 problems.append(
                     f"'fixture_roles:' names {role!r}, which has no cluster slot "
                     "in the fleet catalogue; the runner records a slot for "
                     "catalogue roles only, so the check would error on every run"
+                )
+            # A project-scoped role has no kubeconfig, so a check that reads
+            # a role's objects through `fixture_role:` cannot open one.
+            singular: set[str] = set()
+            for entry in entries:
+                if isinstance(entry, dict):
+                    _singular_fixture_roles(entry.get("check"), singular)
+            for role in sorted(singular & _catalog_project_roles()):
+                problems.append(
+                    f"'fixture_role:' names {role!r}, a project-scoped role "
+                    "(cluster_slot null in the fleet catalogue); the runner "
+                    "writes no kubeconfig for it, so the check would error on "
+                    "every run"
                 )
 
         # The two ways a case names a fixture have to be the same name. A

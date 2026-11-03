@@ -4431,7 +4431,9 @@ FLEET_RESOURCE_ROLES = {
     "google_project_iam_member": {"roles/resourcemanager.projectIamAdmin"},
     # terraform_data.scaled_zero_status's local-exec runs
     # bench/tf/fleet/gateway_status.py, which writes the Gateway and HTTPRoute
-    # status subresources on seeded-a as the reconciler.
+    # status subresources on seeded-a as the reconciler, and
+    # terraform_data.config_connector's runs config_connector.py, which applies
+    # seeded-a's ConfigConnector object the same way.
     "terraform_data": {"roles/container.admin"},
     # Data sources: reads the plan makes before anything is created. external
     # runs bench/tf/fleet/seeded_b_pin.py, whose reads are `gcloud container
@@ -4460,9 +4462,10 @@ class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
     # The names tofu's loader skips are skipped here too, so a parked file
     # neither demands a role nor keeps one accounted for.
     # seeded_b_pin.py is the program data.external runs, and gateway_status.py
-    # the one a terraform_data local-exec runs, not something tofu loads; their
-    # calls are accounted for on the external and terraform_data types above.
-    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py"}
+    # and config_connector.py the ones the terraform_data local-execs run, not
+    # something tofu loads; their calls are accounted for on the external and
+    # terraform_data types above.
+    _INERT_FILES = {"README.md", ".terraform.lock.hcl", "fixtures.json", "reconcile-allow.json", "seeded_b_pin.py", "gateway_status.py", "config_connector.py"}
     _READ_BLOCKS = {"resource", "data"}
     # moved renames a state address and declares no resource: the type it
     # names is read from the resource block it points at.

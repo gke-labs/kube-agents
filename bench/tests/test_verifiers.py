@@ -319,7 +319,10 @@ _FLEET_CATALOG = TASKS.parent / "tf" / "fleet" / "fixtures.json"
 # runner's side of the contract); the slot letters below come from the same
 # parse.
 _CATALOG = json.loads(_FLEET_CATALOG.read_text(encoding="utf-8"))
-_CATALOG_ROLES = _CATALOG["roles"]
+# The roles on a cluster slot: the runner records a slot and writes a
+# kubeconfig for these only. A project-scoped role (`cluster_slot: null`) has
+# neither, and no check reads it through a slot.
+_CATALOG_ROLES = {role: spec for role, spec in _CATALOG["roles"].items() if spec["cluster_slot"] is not None}
 
 
 def _catalog_slots() -> list[str]:

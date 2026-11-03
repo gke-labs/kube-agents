@@ -124,6 +124,22 @@ if args[:3] == ["container", "clusters", "describe"]:
 if args[:2] == ["container", "get-server-config"]:
     print(json.dumps(world.get("server_config", {})))
     sys.exit(0)
+if args[0] == "compute" and args[2] == "list":
+    # A project-scoped role's probe (`--format=value(name)`) or state read
+    # (`--format json`): the objects of world["compute"][project][collection]
+    # whose name starts with the filter's prefix.
+    objects = world.get("compute", {}).get(project, {}).get(args[1])
+    if objects is None:
+        print(f"ERROR: (gcloud.compute.{args[1]}.list) Required 'compute.{args[1]}.list' permission for 'projects/{project}'", file=sys.stderr)
+        sys.exit(1)
+    prefix = (flag("--filter") or "").split("^", 1)[-1]
+    matched = [o for o in objects if o["name"].startswith(prefix)]
+    if flag("--format") == "json":
+        print(json.dumps(matched))
+    else:
+        for o in matched:
+            print(o["name"])
+    sys.exit(0)
 print("unexpected gcloud call: " + " ".join(args), file=sys.stderr)
 sys.exit(64)
 '''
@@ -242,8 +258,19 @@ def _cluster_b():
 def healthy_world(*projects):
     """Every role planted and in its designed state on each project."""
     fleet = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"], ["seeded-d", "us-central1-a"]]
+    compute = {
+        "instances": [
+            {"name": "startup-fail-seeded", "status": "RUNNING", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
+            {"name": "world-open-seeded", "status": "RUNNING", "networkInterfaces": [{"accessConfigs": [{"type": "ONE_TO_ONE_NAT"}]}]},
+        ],
+        "firewall-rules": [
+            {"name": "world-open-2379-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "allowed": [{"IPProtocol": "tcp", "ports": ["2379"]}]},
+            {"name": "world-open-deny-remote-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"]},
+        ],
+    }
     return {
         "clusters": {project: fleet for project in projects},
+        "compute": {project: compute for project in projects},
         "kubectl": {
             "namespace/seeded-debug": {"metadata": {"name": "seeded-debug"}},
             "namespace/seeded-capacity": {"metadata": {"name": "seeded-capacity"}},
@@ -371,6 +398,7 @@ def healthy_world(*projects):
                 "spec": {"template": {"spec": {"hostNetwork": True, "volumes": [{"name": "cni-conf", "hostPath": {"path": "/etc/cni/net.d", "type": "Directory"}}]}}},
                 "status": {"desiredNumberScheduled": 2, "numberReady": 2},
             },
+            "configconnector/configconnector.core.cnrm.cloud.google.com": {"spec": {"mode": "namespaced"}, "status": {"healthy": True}},
             "cronjob/cuda-pinned-trainer": {"spec": {"schedule": "0 3 * * *", "suspend": True, "jobTemplate": {"spec": {"template": {"spec": {"nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}, "containers": [{"name": "trainer", "image": "docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04"}]}}}}}},
             # seeded-scaled-zero: a switched-off environment behind a Gateway.
             "namespace/seeded-scaled-zero": {"metadata": {"name": "seeded-scaled-zero"}},
@@ -523,10 +551,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 37, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 40, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 37, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 40, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -580,7 +608,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 73, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 79, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):
@@ -603,7 +631,11 @@ class NotChecked(ScanHarness):
         world["clusters"] = {}
         doc, _ = self.scan(world)
         states = self.states(doc)
-        self.assertEqual(set(states.values()), {"not_checked"})
+        # The project-scoped roles are read with gcloud compute, not through a
+        # cluster, so a refused cluster list leaves them readable.
+        project_roles = {"startup-fail-vm", "world-open-ingress"}
+        self.assertEqual({s for r, s in states.items() if r not in project_roles}, {"not_checked"})
+        self.assertEqual({states[r] for r in project_roles}, {"healthy"})
         detail = doc["projects"][PROJECT]["roles"]["crashloop-workload"]["detail"]
         self.assertIn("could not list clusters", detail[0])
         self.assertNotIn("error", doc["projects"][PROJECT], "the runner ran and said why; that is not a scan error")
@@ -695,6 +727,20 @@ class NotChecked(ScanHarness):
         other = ["x absent from a.kubeconfig in p, so fixture role 'idle-nodepool' was never planted (or has already been destroyed)."]
         self.assertEqual(fixture_state.unpublished_state("crashloop-workload", "a", other)[0], "not_checked")
         self.assertEqual(fixture_state.unpublished_state("idle-nodepool", "a", other)[0], "absent")
+
+    def test_a_project_scoped_role_is_decided_by_its_own_warning_alone(self):
+        # A project-scoped role (slot "") is probed in the project with gcloud,
+        # so a cluster-side warning says nothing about it.
+        cluster_side = [
+            "project p carries no clusters labelled environment=seeded,managed-by=kube-agents-seeded-fleet. Apply bench/tf/fleet/ there",
+            "could not list clusters in p; every fleet check will report status=error",
+        ]
+        self.assertEqual(fixture_state.unpublished_state("startup-fail-vm", "", cluster_side)[0], "not_checked")
+        own = ["instance/startup-fail-* absent from project p, so fixture role 'startup-fail-vm' was never planted (or has already been destroyed)."]
+        self.assertEqual(fixture_state.unpublished_state("startup-fail-vm", "", cluster_side + own), ("absent", own[0]))
+        refused = ["instance/startup-fail-* could not be read from project p (403), so fixture role 'startup-fail-vm' could not be checked."]
+        self.assertEqual(fixture_state.unpublished_state("startup-fail-vm", "", refused), ("not_checked", refused[0]))
+        self.assertEqual(fixture_state.catalog_roles(fixture_state.FLEET_CATALOG)["startup-fail-vm"], "")
 
     def test_a_read_that_fails_is_not_checked_not_drift(self):
         world = healthy_world(PROJECT)
