@@ -106,8 +106,10 @@ def routes_to_vertex_gemini(model_name: str, router: Any) -> bool:
         _warn_blind(f"the router could not resolve {model_name!r} ({exc})")
         return False
     models = [(d.get(DEPLOYMENT_PARAMS_KEY) or {}).get(DEPLOYMENT_MODEL_KEY, "") for d in deployments]
+    # No deployments is what the router answers for an alias it does not
+    # serve, which the proxy refuses right after this hook: not a sign the hook
+    # is blind, so no warning, and the one warning stays for a real blindness.
     if not models or not any(models):
-        _warn_blind(f"the router returned no deployment model for {model_name!r}")
         return False
     return all(is_vertex_gemini_model(m) for m in models)
 

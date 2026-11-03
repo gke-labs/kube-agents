@@ -175,6 +175,14 @@ class TestHook(unittest.TestCase):
             with self.subTest(model=model):
                 self.assertNotIn("extra_body", self._run(_request("t_1", model=model)))
 
+    def test_an_alias_the_router_does_not_serve_is_not_reported_as_blindness(self):
+        with self.assertNoLogs(self.hook.logger, level="WARNING"):
+            self.assertNotIn("extra_body", self._run(_request("t_1", model="unknown")))
+        with mock.patch.object(self.hook, "_router", return_value=None):
+            with self.assertLogs(self.hook.logger, level="WARNING") as logs:
+                self._run(_request("t_1"))
+        self.assertIn("hook inactive", logs.output[0])
+
     def test_without_a_router_the_request_is_left_alone(self):
         with mock.patch.object(self.hook, "_router", return_value=None):
             self.assertNotIn("extra_body", self._run(_request("t_1")))
