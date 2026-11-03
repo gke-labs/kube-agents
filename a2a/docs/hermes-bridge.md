@@ -470,8 +470,10 @@ store can be found from the terminal alone. The bridge keeps at most 8 MiB of th
 (`cliStdoutCap` in `bridge.go`, the `api` executor's read cap) and counts the rest, so a child
 that prints without end cannot grow the bridge's heap with it; a clean exit whose stdout went
 past the cap ends `failed` with `reason: hermes-cli-oversize`, the limit named, refused rather
-than published cut. Exit 75 is Hermes's `EX_TEMPFAIL` for a turn that
-gave up on the provider's rate limit or billing; it is named `reason: hermes-rate-limited` instead,
+than published cut; a non-zero exit past it keeps the terminal above, whose stdout tail is read
+from its own 2 KiB writer and so is the stream's end, with the bytes the cap dropped noted. Exit
+75 is Hermes's `EX_TEMPFAIL` for a turn that gave up on the provider's rate limit or billing; it
+is named `reason: hermes-rate-limited` instead,
 which the eval harness classes as infrastructure rather than the persona's failure (the image patch
 `apply_quiet_rate_limit_exit.py` makes a plain `-Q` run exit 75 on that failure, as a kanban worker
 already did). An answer whose first non-empty line (any case, surrounding whitespace ignored) is

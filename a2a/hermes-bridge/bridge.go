@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -63,6 +64,10 @@ const (
 	// `hermes chat -Q` prints a failed turn's final_response (its own
 	// "Error: …" summary when the retries gave up) on stdout and exits 1,
 	// so a terminal that kept stderr alone threw the diagnosis away (#2036).
+	// The cli executor keeps that tail in a writer of its own beside the
+	// capped answer buffer, so it is the stream's end whether or not the
+	// answer went past cliStdoutCap: the error is printed last, after any
+	// dump the cap dropped.
 	stderrTailBytes = 2048
 	stdoutTailBytes = 2048
 	// cliStdoutCap bounds what the cli executor keeps of a child's stdout,
@@ -1480,9 +1485,13 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	argv := promptArgv(b.cfg.Command, prompt)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// stdout is the answer, kept to the cap; stdoutTail is the last
+	// stdoutTailBytes of the same stream for a failed run's terminal, which
+	// the cap cannot cut (the two writers' comments at the constants).
 	stdout := newBoundedBuffer(cliStdoutCap)
+	stdoutTail := newTailBuffer(stdoutTailBytes)
 	stderr := newTailBuffer(stderrTailBytes)
-	cmd.Stdout = stdout
+	cmd.Stdout = io.MultiWriter(stdout, stdoutTail)
 	cmd.Stderr = stderr
 	// WaitDelay bounds the reap. Neither stream is an *os.File, so os/exec
 	// copies each through a pipe and Wait joins the copies, which end at
@@ -1613,20 +1622,20 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
 		}
 		run.mu.Unlock()
-		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String())+cliStdoutCutNote(stdout.Dropped()), nil)
+		b.finalize(run, lib.StateFailed, failureReason(err, stdoutTail.String(), stderr.String())+cliStdoutCutNote(stdout.Dropped()), nil)
 	}
 }
 
 // cliStdoutCutNote is what a failed run's reason adds when the child's
 // stdout went past cliStdoutCap by dropped bytes, or "". The stdout tail
-// the reason quotes is then the end of the kept prefix, not of the stream,
-// so the note says so: the child's own error, printed last, is among the
-// bytes dropped, and a reader diagnosing from the quote should know it.
+// the reason quotes comes from its own writer and is the stream's end
+// either way, so the note says what the cap did cut: the answer the run
+// would have published, had it exited clean, and how much of it.
 func cliStdoutCutNote(dropped int64) string {
 	if dropped <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("; stdout kept to the %d-byte cap (cliStdoutCap in bridge.go), %d bytes past it dropped, so the stdout tail above ends at the cap", cliStdoutCap, dropped)
+	return fmt.Sprintf("; stdout kept to the %d-byte cap (cliStdoutCap in bridge.go), %d bytes past it dropped; the stdout tail above is still the stream's end", cliStdoutCap, dropped)
 }
 
 // reapCutNote is the detail a killed run's reason adds when the reap after
@@ -2186,7 +2195,8 @@ func isTaskNotFound(err error) bool {
 // boundedBuffer keeps the first cap bytes written to it and counts the rest.
 // The cli executor's stdout goes through one, so a child's whole output is
 // never held: past the cap the answer is refused (cliOversizeReason), and
-// what is kept is only quoted, as a failed run's stdout tail.
+// a failed run's terminal quotes the stream's tail from a tailBuffer fed
+// beside it, not from what this one kept.
 type boundedBuffer struct {
 	mu      sync.Mutex
 	buf     []byte
@@ -2239,8 +2249,8 @@ func (b *boundedBuffer) String() string {
 	return string(kept)
 }
 
-// tailBuffer keeps the last cap bytes written - stderr evidence for the
-// failed reason without holding a runaway stream.
+// tailBuffer keeps the last cap bytes written - the stderr and stdout
+// evidence for the failed reason without holding a runaway stream.
 type tailBuffer struct {
 	mu  sync.Mutex
 	buf []byte

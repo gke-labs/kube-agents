@@ -146,9 +146,11 @@ func TestCLI_StdoutAtTheCapCompletes(t *testing.T) {
 }
 
 // A child that wrote past the cap and then exited non-zero keeps its failure
-// terminal (the exit, the tails) and adds that the quoted stdout tail ends at
-// the cap, with the bytes dropped counted; a child that fit adds nothing.
-func TestCLI_FailedRunPastTheCapSaysItsStdoutWasCut(t *testing.T) {
+// terminal, and its quoted stdout tail is the stream's end: the #2036 shape,
+// a dump past the cap and then the child's own error on stdout before exit 1,
+// quotes that error, not the last bytes under the cap. The reason adds how
+// much the cap dropped; a child that fit adds nothing.
+func TestCLI_FailedRunPastTheCapQuotesTheStreamsEnd(t *testing.T) {
 	if got := cliStdoutCutNote(0); got != "" {
 		t.Fatalf("a stream that fit added %q", got)
 	}
@@ -159,7 +161,8 @@ func TestCLI_FailedRunPastTheCapSaysItsStdoutWasCut(t *testing.T) {
 	}
 
 	_, url := startServer(t)
-	startBridge(t, url, script(t, fmt.Sprintf(`head -c %d /dev/zero | tr '\0' x; echo "the real error" >&2; exit 1`, cliStdoutCap+1)))
+	startBridge(t, url, script(t, fmt.Sprintf(
+		`head -c %d /dev/zero | tr '\0' x; echo "Error: the retries gave up"; echo "the real error" >&2; exit 1`, cliStdoutCap+1)))
 	c := gatewayClient(t, url)
 	submit(t, c, "task-cli-cut-failed", "dump and fail")
 	task := waitTerminalFor(t, c, "task-cli-cut-failed", atCapTerminalWait)
@@ -170,10 +173,12 @@ func TestCLI_FailedRunPastTheCapSaysItsStdoutWasCut(t *testing.T) {
 	if !strings.HasPrefix(reason, "reason: hermes-exited-nonzero - exit status 1") {
 		t.Fatalf("reason = %q, want the non-zero exit named first", reason[:min(len(reason), 80)])
 	}
-	if !strings.Contains(reason, "stderr tail: the real error") {
-		t.Errorf("reason lost the stderr tail: %q", reason[len(reason)-200:])
+	// The stdout tail ends where the stream did, on the error printed after
+	// the dump; the dump's last bytes under the cap are not the tail.
+	if !strings.Contains(reason, "xError: the retries gave up\n; stderr tail: the real error") {
+		t.Errorf("stdout tail is not the stream's end: ...%q", reason[len(reason)-300:])
 	}
-	if !strings.HasSuffix(reason, "so the stdout tail above ends at the cap") {
-		t.Errorf("reason does not say the stdout was cut: ...%q", reason[len(reason)-120:])
+	if !strings.HasSuffix(reason, "the stdout tail above is still the stream's end") {
+		t.Errorf("reason does not say how much the cap dropped: ...%q", reason[len(reason)-120:])
 	}
 }
