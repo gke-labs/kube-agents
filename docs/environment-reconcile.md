@@ -215,15 +215,34 @@ neither list recognises is refused before the teardown rather than by
 refused the same way rather than read as `false`: unset means "say nothing about
 this setting", and guessing `false` from whitespace would rebuild the
 environment with the feature off and nothing in the log saying so.
+`HELM_UPGRADE_INSTALL` is checked there the same way, though it is no
+`install.sh` flag: the installer's tfvars generator refuses a spelling it does
+not recognise, and that refusal would otherwise come after the teardown.
 
 Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `GOOGLE_CHAT_MODE`, `GOOGLE_CHAT_HOME_CHANNEL`,
 `CHAT_TOPIC_NAME`, `CHAT_SUB_NAME`, `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`,
 `SLACK_HOME_CHANNEL_NAME`, `SLACK_HOME_CHANNEL_POLICY`, `PLATFORM_AGENT_CUSTOM_ROLES`,
 `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
-`KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`, `PLATFORM_AGENT_MODE`. Secrets: `GH_APP_ID`,
+`KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`, `PLATFORM_AGENT_MODE`,
+`HELM_UPGRADE_INSTALL`. Secrets: `GH_APP_ID`,
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`,
 `SLACK_APP_TOKEN`.
+
+`HELM_UPGRADE_INSTALL=true` makes the composition create the `kube-agents` Helm
+release with `helm upgrade --install` (the release's `upgrade_install`). The Helm
+provider can drop a live release from state when a refresh lookup fails
+([hashicorp/terraform-provider-helm#1669](https://github.com/hashicorp/terraform-provider-helm/issues/1669)),
+and the next apply then plans a create that stops with "cannot re-use a name that
+is still in use". With the variable on, that create
+adopts the running release. Absent means `false`, today's behaviour, and destroys
+nothing, so it is not among the required settings. Set it only on a long-lived
+environment whose own state owns the release: it also takes over, silently, a
+release another Terraform state or a manual `helm install` owns in that namespace,
+where `false` fails loudly instead. Turning it on for a running install is an
+in-place change that runs one `helm upgrade` (a new release revision). It does not
+recover a release left in a `pending-install` or `pending-upgrade` state; Helm still
+refuses those with "another operation is in progress".
 
 `PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`; the
 renderer refuses anything else and writes `today` as no key, because an absent
