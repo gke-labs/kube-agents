@@ -334,7 +334,9 @@ func shellSandboxTierResources(tier sizingTier) corev1.ResourceRequirements {
 
 // sizingStep is what a step from one tier to another adds, per resource name,
 // on the requests side and on the limits side: the differences across the
-// three containers a profile sizes, as the CR's overrides leave them. Each of
+// three containers a profile sizes, each side as the reconciler renders that
+// tier (the CR's override where the tier admits it, the row where it does
+// not). Each of
 // the three pods is replaced rather than surged on a template change (the
 // proxy's and the gateway's Recreate Deployments, the sandbox StatefulSet's
 // ordered roll), so what the quota has to admit is the difference, not a
@@ -345,13 +347,53 @@ type sizingStep struct {
 	limits   corev1.ResourceList
 }
 
-// sizingStepBetween is the sizingStep from tier from to tier to for agent.
+// renderedCredentialProxyResourcesAt is the credential-proxy container as
+// reconcileCredentialProxy renders it at tier: the CR's override merged over
+// the row when the tier's validator admits it, and the bare row when it
+// refuses it, because the reconciler strips a refused override and renders
+// the row (credentialProxyResourcesRefusal, read at the rendered tier). The
+// step between two tiers reads each side through this rather than through the
+// resolver alone: an override the lower row refuses and the higher row admits
+// (a 3 CPU request against the small row's 2 CPU limit and the fleet row's 8)
+// moves the pod from the row to the override, and a step that merged it on
+// both sides would count that move as zero and consult no quota for it. The
+// validator is the one the reconciler reads, so the two agree on every
+// refusal; the stripped render is the resolver on a nil override, the row.
+func renderedCredentialProxyResourcesAt(deployment *agentv1alpha1.DeploymentSpec, autopilot bool, tier sizingTier) corev1.ResourceRequirements {
+	if errs, _ := validateCredentialProxyResourcesAt(deployment, tier, credentialProxyResourcesPath); len(errs) > 0 {
+		return credentialProxyTierResources(tier, autopilot)
+	}
+	return resolveCredentialProxyResourcesFor(deployment, autopilot, tier)
+}
+
+// renderedAgentAPIAuthResourcesAt is the agent-api-auth sidecar as
+// reconcileWorkload renders it at tier, on renderedCredentialProxyResourcesAt's
+// rule.
+func renderedAgentAPIAuthResourcesAt(deployment *agentv1alpha1.DeploymentSpec, tier sizingTier) corev1.ResourceRequirements {
+	if errs, _ := validateAgentAPIAuthResourcesAt(deployment, tier, agentAPIAuthResourcesPath); len(errs) > 0 {
+		return agentAPIAuthTierResources(tier)
+	}
+	return resolveAgentAPIAuthResources(deployment, tier)
+}
+
+// renderedShellSandboxResourcesAt is the shell container as
+// reconcileShellSandbox renders it at tier, on
+// renderedCredentialProxyResourcesAt's rule.
+func renderedShellSandboxResourcesAt(agent *agentv1alpha1.PlatformAgent, tier sizingTier) corev1.ResourceRequirements {
+	if errs, _ := validateShellSandboxResourcesAt(agent, tier, shellSandboxResourcesPath); len(errs) > 0 {
+		return shellSandboxTierResources(tier)
+	}
+	return resolveShellSandboxResources(agent, tier)
+}
+
+// sizingStepBetween is the sizingStep from tier from to tier to for agent,
+// each side as the reconciler renders that tier.
 func sizingStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, from, to sizingTier) sizingStep {
 	deployment := agent.Spec.Deployment
 	pairs := [][2]corev1.ResourceRequirements{
-		{resolveCredentialProxyResourcesFor(deployment, autopilot, from), resolveCredentialProxyResourcesFor(deployment, autopilot, to)},
-		{resolveAgentAPIAuthResources(deployment, from), resolveAgentAPIAuthResources(deployment, to)},
-		{resolveShellSandboxResources(agent, from), resolveShellSandboxResources(agent, to)},
+		{renderedCredentialProxyResourcesAt(deployment, autopilot, from), renderedCredentialProxyResourcesAt(deployment, autopilot, to)},
+		{renderedAgentAPIAuthResourcesAt(deployment, from), renderedAgentAPIAuthResourcesAt(deployment, to)},
+		{renderedShellSandboxResourcesAt(agent, from), renderedShellSandboxResourcesAt(agent, to)},
 	}
 	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
 	for _, pair := range pairs {

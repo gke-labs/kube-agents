@@ -250,6 +250,40 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 			t.Fatalf("after the count fell under the threshold: condition %+v, %d writes; want absent and 2", cond, writes)
 		}
 	})
+	t.Run("an override the earned row admits is counted against the quota", func(t *testing.T) {
+		t.Parallel()
+		// Webhook off, auto, latched small, a 3 CPU broker request: the small
+		// row refuses it (2 CPU limit), so the pod runs the row's 500m; the
+		// fleet row admits it, so the promotion asks the quota for 3 CPU. A
+		// step read with the override merged on both sides would move
+		// requests.cpu by zero and promote past a quota with 2 CPU free; the
+		// step the reconciler renders adds 2500m, and the quota is short.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
+		}}
+		quota := &corev1.ResourceQuota{
+			ObjectMeta: metav1.ObjectMeta{Name: "cpu-quota", Namespace: "kubeagents-system"},
+			Spec:       corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{corev1.ResourceRequestsCPU: resource.MustParse("4")}},
+			Status:     corev1.ResourceQuotaStatus{Used: corev1.ResourceList{corev1.ResourceRequestsCPU: resource.MustParse("2")}},
+		}
+		stored, recorder := resolveSizing(t, agent, quota)
+		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small: the step from the row to the admitted override was not counted", stored.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || !strings.Contains(cond.Message, "ResourceQuota cpu-quota has no room on requests.cpu") {
+			t.Fatalf("SizingCappedByQuota = %+v", cond)
+		}
+		select {
+		case event := <-recorder.Events:
+			if !strings.Contains(event, "the step adds 2500m") {
+				t.Errorf("event does not carry the step from the row to the override: %s", event)
+			}
+		default:
+			t.Error("no event recorded for the capped promotion")
+		}
+	})
 	t.Run("a quota with headroom lets the promotion through and clears the condition", func(t *testing.T) {
 		t.Parallel()
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
@@ -339,6 +373,47 @@ func TestSizingStepBetweenSumsTheThreeContainers(t *testing.T) {
 		t.Errorf("Autopilot small -> medium moved the CPU request by %s", q.String())
 	}
 	assertQuantity(t, autopilot.requests, corev1.ResourceMemory, "2Gi")
+}
+
+// TestSizingStepReadsEachSideAsRendered pins the step's reading of an
+// override against what the reconciler renders at each tier: a refused
+// override is the row on that side, an admitted one the override.
+func TestSizingStepReadsEachSideAsRendered(t *testing.T) {
+	t.Parallel()
+	// The broker's 3 CPU request crosses the small row's 2 CPU limit and sits
+	// under the fleet row's 8; the shell's 3Gi memory request crosses the
+	// small row's 2Gi limit and sits under the fleet row's 4Gi. Small renders
+	// the rows (500m and 512Mi), fleet renders the overrides.
+	agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
+	agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
+	}}
+	agent.Spec.Harness.Experimental = &agentv1alpha1.ExperimentalSpec{ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Resources: &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
+	}}}
+	small := renderedCredentialProxyResourcesAt(agent.Spec.Deployment, false, sizingTierSmall)
+	assertQuantity(t, small.Requests, corev1.ResourceCPU, credentialProxyCPURequest)
+	fleet := renderedCredentialProxyResourcesAt(agent.Spec.Deployment, false, sizingTierFleet)
+	assertQuantity(t, fleet.Requests, corev1.ResourceCPU, "3")
+	shellSmall := renderedShellSandboxResourcesAt(agent, sizingTierSmall)
+	assertQuantity(t, shellSmall.Requests, corev1.ResourceMemory, shellSandboxMemoryRequest)
+	shellFleet := renderedShellSandboxResourcesAt(agent, sizingTierFleet)
+	assertQuantity(t, shellFleet.Requests, corev1.ResourceMemory, "3Gi")
+	// The step: the broker 500m -> 3 CPU and 1Gi -> 8Gi, the shell 512Mi ->
+	// 3Gi; merged on both sides, the two overrides would read as zero.
+	step := sizingStepBetween(agent, false, sizingTierSmall, sizingTierFleet)
+	assertQuantity(t, step.requests, corev1.ResourceCPU, "2500m")
+	assertQuantity(t, step.requests, corev1.ResourceMemory, "9728Mi")
+	// An override every row admits is the override on both sides, so the
+	// step on its key is zero, as before.
+	admitted := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
+	admitted.Spec.Deployment.AgentAPIAuth = &agentv1alpha1.AgentAPIAuthSpec{Resources: &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+	}}
+	sidecar := sizingStepBetween(admitted, false, sizingTierSmall, sizingTierFleet)
+	// 6Gi from the broker and 2Gi from the shell; the sidecar's 1Gi limit
+	// holds on both rows.
+	assertQuantity(t, sidecar.limits, corev1.ResourceMemory, "8Gi")
 }
 
 func TestSizingTierRows(t *testing.T) {
