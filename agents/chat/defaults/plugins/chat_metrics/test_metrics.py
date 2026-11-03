@@ -3,11 +3,11 @@
 Run: cd agents/chat/defaults/plugins && python3 -m pytest chat_metrics/test_metrics.py -q
 """
 
+import json
 import os
 import re
 import sqlite3
 import sys
-import json
 import tempfile
 import threading
 import unittest
@@ -25,6 +25,20 @@ from chat_metrics import plugin  # noqa: E402
 
 _SERIES_LINE = re.compile(r'^kubeagents_chat_messages_inbound_total\{platform="([a-z]+)"\} (\d+)$', re.M)
 _SESSIONS_LINE = re.compile(r'^kubeagents_chat_sessions_total\{platform="([a-z]+)"\} (\d+)$', re.M)
+
+
+_LEDGER_KEY_PATCH = mock.patch.dict(os.environ)
+
+
+def setUpModule():
+    # A registry built with no gauge injected reads the ledger over loopback when
+    # the Session KV key is in the environment; the suite never wants that read.
+    _LEDGER_KEY_PATCH.start()
+    os.environ.pop(metrics.SESSION_KV_KEY_ENV, None)
+
+
+def tearDownModule():
+    _LEDGER_KEY_PATCH.stop()
 
 
 def _event(platform="google_chat", text="hi"):
