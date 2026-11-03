@@ -26,10 +26,11 @@ line before it exits, so "launched after" is exact. (Timestamps taken with a
 under CPU load, and a window of 0.3s around them miscounted a holder as a
 waiter: #4482.) A `sleep` executable first on PATH turns the dispatcher's 3s
 polls into a tenth of a second (a shell function named `sleep` breaks
-background jobs under bash 3.2). What remains time-shaped is the scenario,
-not the measurement: a "launched while X ran" check needs X's hold (1-3s
-here) to outlast the dispatcher's reaction, a few polls of a tenth of a
-second, and the deadline is counted in tries, so it stretches with load.
+background jobs under bash 3.2). No hold is a duration a slow launch can
+outrun: the deadline is counted in tries, the dead holder's hold is counted
+in the same tries, and a "launched while X ran" check keeps X's locks until a
+named unit has started (`hold_until_started`), so load stretches every side
+of each order alike.
 
 The order the dispatcher launched units in is read off the launch sequence
 number it hands each unit (`UNIT_SEQ`, logged on the `start` line), not off
@@ -40,6 +41,9 @@ lock-infra is a scheduling race. A test that needs a particular holder names
 it with `held_first_by`: the other lock takers wait until that unit holds its
 locks before they contend, up to the stub's deadline, so a dispatcher that
 never launches the named unit fails the test rather than hanging it.
+`hold_until_started` is the same gate at the other end: every other unit
+keeps its locks until the named unit has started, up to the deadline, so a
+dispatcher that holds the named unit back fails the test the same way.
 """
 
 import os
@@ -110,6 +114,11 @@ HOLD_TRIES=$((GIVEUP_TRIES / 2))
 # lock-infra; empty for no such order. A gated unit waits GIVEUP_TRIES tries
 # at most, then contends anyway.
 HELD_FIRST_BY="${HELD_FIRST_BY:-}"
+# The unit every other unit keeps its locks until it has started; empty for
+# no such hold. It replaces a run time chosen to outlast the dispatcher's
+# launches: a hold that ends on an event does not shorten under load. Bounded
+# by GIVEUP_TRIES tries, like the gate above.
+HOLD_UNTIL_STARTED="${HOLD_UNTIL_STARTED:-}"
 STATE_DIR="$2"
 TASKS=("${TASK_NAMES[@]}"); TASK_REUSE=(); TASK_STREAMS=()
 for i in "${!TASK_NAMES[@]}"; do TASK_REUSE[i]=""; TASK_STREAMS[i]=""; done
@@ -125,6 +134,7 @@ event() { printf '%s %s%s\n' "$1" "$2" "${3:+ $3}" >> "${LOG}"; }
 run_one_unit() { # <task-path> <task-name> <rep> <reuse> <has-stack> <seq> <streams>
   local name="$2" i state tries=0 parked=""
   event "${name}" start "$6"
+  mkdir -p "${STATE_DIR}/started-${name}"
   for i in "${!TASK_NAMES[@]}"; do
     if [ "${TASK_NAMES[i]}" = "${name}" ]; then break; fi
   done
@@ -155,6 +165,12 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse> <has-stack> <seq> <stre
   # Logged first, then marked: the marker's mkdir is a spawn, and a unit gated
   # on HELD_FIRST_BY waits for the marker, not the log line. Never removed.
   mkdir -p "${STATE_DIR}/held-${name}"
+  if [ -n "${HOLD_UNTIL_STARTED}" ] && [ "${name}" != "${HOLD_UNTIL_STARTED}" ]; then
+    tries=0
+    until [ -d "${STATE_DIR}/started-${HOLD_UNTIL_STARTED}" ] || [ "${tries}" -ge "${GIVEUP_TRIES}" ]; do
+      /bin/sleep "${TRY_SECONDS}"; tries=$((tries + 1))
+    done
+  fi
   if [ "${name}" = "stack-dies" ]; then
     # Each iteration is one waiter try: a failing mkdir on the lock it holds
     # and one sleep.
@@ -211,7 +227,7 @@ def _peak_in_flight(events, names):
 class InfraSlotTest(unittest.TestCase):
     maxDiff = None
 
-    def _run(self, queue_indexes, parallelism, giveup_tries=200, held_first_by="", reps=None):
+    def _run(self, queue_indexes, parallelism, giveup_tries=200, held_first_by="", reps=None, hold_until_started=""):
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = pathlib.Path(tmp)
             log = tmpdir / "units.log"
@@ -237,6 +253,7 @@ class InfraSlotTest(unittest.TestCase):
                 PATH=f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}",
                 GIVEUP_TRIES=str(giveup_tries),
                 HELD_FIRST_BY=held_first_by,
+                HOLD_UNTIL_STARTED=hold_until_started,
             )
             result = subprocess.run(
                 ["bash", "-c", script, "harness", str(log), str(tmpdir)],
@@ -275,8 +292,11 @@ class InfraSlotTest(unittest.TestCase):
         # Four slots and three stack units at the head of the queue: before
         # this rule the three stack units and one plain unit took the four
         # slots; now the third stack unit waits in the queue and two plain
-        # units are among the first four the dispatcher launches.
-        self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=4)
+        # units are among the first four the dispatcher launches. The lock
+        # takers hold until plain-2 has started, so no slot frees before the
+        # dispatcher has passed the third stack unit twice, however slow the
+        # launches are.
+        self._run([0, 1, 2, 3, 4, 5, 6, 7, 8], parallelism=4, hold_until_started="plain-2")
         at_once = [name for name in self.launched[:4] if name.startswith("plain-")]
         self.assertGreaterEqual(len(at_once), 2, f"only {at_once} launched with the first units: {self.launched}")
 
@@ -317,19 +337,22 @@ class InfraSlotTest(unittest.TestCase):
         # it launches beside two counted lock takers rather than after one of
         # them has ended. (The launch order alone cannot tell the two apart:
         # oobe is third either way. The exempt-to-empty mapping is built
-        # outside the functions extracted here and is not under test.)
-        events = self._run([0, 1, 9], parallelism=4)
+        # outside the functions extracted here and is not under test.) The
+        # two lock takers hold until oobe has started, so its launch order,
+        # not their run time, is what the assertions read.
+        events = self._run([0, 1, 9], parallelism=4, hold_until_started="oobe-first-run-audits")
         oobe_start = _at(events, "oobe-first-run-audits", START)
         self.assertLess(oobe_start, _at(events, "stack-a", END), "the exempt stack launched only after a lock taker ended")
         self.assertLess(oobe_start, _at(events, "stack-b", END), "the exempt stack launched only after a lock taker ended")
 
     def test_lock_takers_waiting_on_a_busy_state_lock_do_not_hold_up_the_chain(self):
-        # oobe-first-run-audits (exempt) holds "onboarding" for 3s; both
-        # bootstrap units take lock-infra, find the state busy and give it
-        # back. Counted, they would fill the limit and stack-a would launch
-        # only after a bootstrap unit ended, which none can before oobe
-        # releases the state; uncounted, stack-a launches with them.
-        events = self._run([9, 11, 12, 0], parallelism=6, held_first_by="oobe-first-run-audits")
+        # oobe-first-run-audits (exempt) holds "onboarding" until stack-a has
+        # started; both bootstrap units take lock-infra, find the state busy
+        # and give it back. Counted, they would fill the limit and stack-a
+        # would launch only after a bootstrap unit ended, which none can
+        # before oobe releases the state; uncounted, stack-a launches with
+        # them.
+        events = self._run([9, 11, 12, 0], parallelism=6, held_first_by="oobe-first-run-audits", hold_until_started="stack-a")
         self.assertEqual([name for name, kind in events if kind == GAVEUP], [])
         stack_a_start = _at(events, "stack-a", START)
         for bootstrap in ("bootstrap-discovery-fanout", "bootstrap-inventory-posture-scope"):
