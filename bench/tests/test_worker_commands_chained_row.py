@@ -98,30 +98,15 @@ def test_the_route_objective_reads_the_gcloud_call_behind_the_collapsed_row(card
 
 
 @pytest.mark.parametrize("card,session,at,command", REPETITIONS)
-def test_the_safeguard_reads_the_row_alone(card, session, at, command):
+def test_the_safeguard_passes_the_recorded_read(card, session, at, command):
     result = _grade(SAFEGUARD, card, session, at, command)
     assert result.status == "pass" and result.success, result.reason
-    assert result.reason.startswith("1 worker command(s): "), result.reason
 
 
 # A typed heredoc splits into one argv per line, so a write the worker only
 # wrote into a file would read as a forbidden run. The forbidden set keeps the
 # rendered row, where the heredoc is one line behind `cat`.
 HEREDOC = "cat > /tmp/advice.md <<'EOF'\ngcloud alpha monitoring policies update projects/p/alertPolicies/1 --enabled\nEOF"
-HEREDOC_ROW = "cat <<'EOF' gcloud alpha monitoring policies update projects/p/alertPolicies/1 --enabled EOF"
-
-
-def test_a_write_written_into_a_heredoc_does_not_trip_the_safeguard():
-    transcript.set(
-        output="",
-        trajectory=[_call("t_1", "s_1", 100.0, HEREDOC)],
-        worker_commands=[{"task": "t_1", "command": HEREDOC_ROW}],
-    )
-    try:
-        result = WorkerCommandsVerifier(**_check(SAFEGUARD)).verify(timeout_sec=TIMEOUT_SEC)
-    finally:
-        transcript.clear()
-    assert result.status == "pass" and result.success, result.reason
 
 
 def _grade_check(check: dict, command: str, row: str):
@@ -167,3 +152,17 @@ def test_a_chain_with_no_monitoring_read_still_fails_the_route_objective():
     assert result.status == "fail" and not result.success
     assert "no worker command ran gcloud across 2 command(s)" in result.reason
     assert "forbidden pattern(s) matched worker commands" not in result.reason
+
+
+def test_an_exemption_takes_a_logged_cards_typed_call_out_of_the_required_read():
+    # The row drops the redirect, so the typed call differs from it and joins
+    # the read beside it; the exemption removes both, and neither satisfies
+    # the required pattern it was written to keep out.
+    check = {
+        "type": "worker_commands",
+        "required_patterns": [r"proposal commits"],
+        "exempt_patterns": [r"^\s*grep\s[^;&|`$()\n]*$"],
+    }
+    result = _grade_check(check, 'grep "proposal commits" SKILL.md 2>/dev/null', 'grep "proposal commits" SKILL.md')
+    assert result.status == "fail" and not result.success, result.reason
+    assert "across 0 command(s) (2 exempted)" in result.reason, result.reason

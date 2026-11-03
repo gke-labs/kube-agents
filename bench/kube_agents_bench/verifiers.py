@@ -2825,7 +2825,14 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``bash -s < run.sh``) is not read as one, since the argv names the file or
     the shell and not what was written to it, which no reading of the argv
     recovers -- a case names a run this way where the persona dictates one typed
-    command, and a worker that runs it through a file is not credited. Under
+    command. The exception is a file the worker wrote with a heredoc in a
+    typed call: the typed text splits the heredoc into one argv per body
+    line, so a run written into the file is credited whether or not the file
+    ran. A required pattern or run reads typed calls (a logged card's always,
+    every card's under ``after_result_pattern``), so it credits that line; a
+    forbidden run reads a logged card's row, where the heredoc is one line
+    behind ``cat``, and does not. A card with no log line is read from its
+    typed calls by both. Under
     ``after_result_pattern``: a refused command whose output the call discarded
     prints nothing into its result; a result is clipped in the pod at
     ``worker_trajectory.MAX_RESULT_CHARS``; a read whose output quotes the
