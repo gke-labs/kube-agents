@@ -921,6 +921,18 @@ the override, at the defaults when the operator would refuse it (it then renders
 the shell at them), and the same CRD guard fails the upgrade when the installed CRD
 predates the field.
 
+`platformAgent.deployment.sizingProfile` picks the preset the three containers
+above start from, forwarded to the CR's `spec.deployment.sizingProfile` when set:
+`small` (the operator's defaults, and what an unset value means), `medium`,
+`fleet`, or `auto`, which steps the tier up with the cluster count the operator
+polls and never down, holding a step the namespace's ResourceQuota has no room
+for. The
+[`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
+has each row's figures and the auto rules. The per-key overrides are applied over
+the preset, so an explicit key wins. The quota preflight sums the small row
+whatever the profile. The same CRD guard fails the upgrade when the installed CRD
+predates the field.
+
 `platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
 `critical`, `warning`, `info` and `drift`, and each key that is set becomes an
 `ALERT_DAILY_LIMIT_<KEY>` entry in the CR's `spec.deployment.env`. A key that is not set keeps the

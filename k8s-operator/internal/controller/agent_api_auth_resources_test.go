@@ -43,7 +43,7 @@ func apiAuthAgentWithResources(override *corev1.ResourceRequirements) *agentv1al
 // goldens and the chart's quota preflight all carry.
 func TestAgentAPIAuthResourcesDefaultToTheOperatorsValues(t *testing.T) {
 	for _, deployment := range []*agentv1alpha1.DeploymentSpec{nil, {}, {AgentAPIAuth: &agentv1alpha1.AgentAPIAuthSpec{}}} {
-		got := resolveAgentAPIAuthResources(deployment)
+		got := resolveAgentAPIAuthResources(deployment, sizingTierSmall)
 		assertQuantity(t, got.Requests, corev1.ResourceCPU, "150m")
 		assertQuantity(t, got.Requests, corev1.ResourceMemory, "384Mi")
 		assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
@@ -120,7 +120,7 @@ func TestAgentAPIAuthFullOverrideReplacesEveryKey(t *testing.T) {
 func TestAgentAPIAuthOverrideDoesNotAliasTheCR(t *testing.T) {
 	override := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")}}
 	agent := apiAuthAgentWithResources(override)
-	resolved := resolveAgentAPIAuthResources(agent.Spec.Deployment)
+	resolved := resolveAgentAPIAuthResources(agent.Spec.Deployment, sizingTierSmall)
 	m := resolved.Limits[corev1.ResourceMemory]
 	m.Add(resource.MustParse("1Gi"))
 	resolved.Limits[corev1.ResourceMemory] = m

@@ -4260,22 +4260,14 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 }
 
 // resolveAgentAPIAuthResources merges the CR's spec.deployment.agentAPIAuth
-// override over the operator's defaults, one key at a time, so a CR that sets
-// only limits.memory keeps every other default. A nil override returns the
-// defaults unchanged, which the goldens and the chart's quota preflight carry.
-// ValidateAgentAPIAuthResources reads the same merged result.
-func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
-	resolved := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
-			corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
-			corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
-			corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
-		},
-	}
+// override over the tier's row (agentAPIAuthTierResources; the small row is
+// the operator's defaults), one key at a time, so a CR that sets only
+// limits.memory keeps every other figure of the row. A nil override on the
+// small row returns the defaults unchanged, which the goldens and the chart's
+// quota preflight carry. ValidateAgentAPIAuthResources reads the same merged
+// result.
+func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec, tier sizingTier) corev1.ResourceRequirements {
+	resolved := agentAPIAuthTierResources(tier)
 	if deployment == nil || deployment.AgentAPIAuth == nil || deployment.AgentAPIAuth.Resources == nil {
 		return resolved
 	}
@@ -4433,7 +4425,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		// delivered (watcher.go, Run). The event watcher reads the memory limit
 		// through EVENT_WATCHER_MEMORY_LIMIT_BYTES below and sets GOMEMLIMIT to
 		// half of it, so a raised limit raises the soft limit with no other change.
-		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment),
+		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment, renderedSizingTier(agent)),
 		VolumeMounts: []corev1.VolumeMount{
 			// No policy mount: the executor it configures is not built in this
 			// role, and a policy file here would only be misleading.

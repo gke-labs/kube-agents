@@ -922,23 +922,15 @@ func buildShellSandboxImageTreesInitContainer(agent *agentv1alpha1.PlatformAgent
 }
 
 // resolveShellSandboxResources merges the CR's
-// spec.harness.experimental.shellSandbox.resources override over the operator's
-// defaults, one key at a time, so a CR that sets only requests.memory keeps
-// every other default. A nil override returns the defaults unchanged, which the
-// goldens and the chart's quota preflight carry. ValidateShellSandboxResources
-// reads the same merged result, and reconcileShellSandbox renders the defaults
-// in place of an override it refuses.
-func resolveShellSandboxResources(agent *agentv1alpha1.PlatformAgent) corev1.ResourceRequirements {
-	resolved := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(shellSandboxCPURequest),
-			corev1.ResourceMemory: resource.MustParse(shellSandboxMemoryRequest),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(shellSandboxCPULimit),
-			corev1.ResourceMemory: resource.MustParse(shellSandboxMemoryLimit),
-		},
-	}
+// spec.harness.experimental.shellSandbox.resources override over the tier's
+// row (shellSandboxTierResources; the small row is the operator's defaults),
+// one key at a time, so a CR that sets only requests.memory keeps every other
+// figure of the row. A nil override on the small row returns the defaults
+// unchanged, which the goldens and the chart's quota preflight carry.
+// ValidateShellSandboxResources reads the same merged result, and
+// reconcileShellSandbox renders the row in place of an override it refuses.
+func resolveShellSandboxResources(agent *agentv1alpha1.PlatformAgent, tier sizingTier) corev1.ResourceRequirements {
+	resolved := shellSandboxTierResources(tier)
 	spec := shellSandboxSpec(agent)
 	if spec == nil || spec.Resources == nil {
 		return resolved
@@ -1003,7 +995,7 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 		// spec.harness.experimental.shellSandbox.resources merged over them
 		// per key; the constants' comment says why every container carries
 		// both sides.
-		Resources: resolveShellSandboxResources(agent),
+		Resources: resolveShellSandboxResources(agent, renderedSizingTier(agent)),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: shellSandboxKeysVolume, MountPath: shellSandboxKeysPath, ReadOnly: true},
 			{Name: shellSandboxDataVolume, MountPath: shellSandboxDataPath},

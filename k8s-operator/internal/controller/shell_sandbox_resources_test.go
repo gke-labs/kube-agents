@@ -75,7 +75,7 @@ func TestShellSandboxResourcesDefaultToTheOperatorsValues(t *testing.T) {
 		sandboxAgentWithResources(nil),
 		{Spec: agentv1alpha1.PlatformAgentSpec{Harness: &agentv1alpha1.HarnessSpec{Experimental: &agentv1alpha1.ExperimentalSpec{ShellSandbox: &agentv1alpha1.ShellSandboxSpec{}}}}},
 	} {
-		got := resolveShellSandboxResources(agent)
+		got := resolveShellSandboxResources(agent, sizingTierSmall)
 		assertQuantity(t, got.Requests, corev1.ResourceCPU, "200m")
 		assertQuantity(t, got.Requests, corev1.ResourceMemory, "512Mi")
 		assertQuantity(t, got.Limits, corev1.ResourceCPU, "2")
@@ -141,7 +141,7 @@ func TestShellSandboxOverrideDoesNotAliasTheCR(t *testing.T) {
 	decimalLimit := resource.MustParse("4Gi")
 	decimalLimit.ToDec()
 	override := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: decimalLimit}}
-	resolved := resolveShellSandboxResources(sandboxAgentWithResources(override))
+	resolved := resolveShellSandboxResources(sandboxAgentWithResources(override), sizingTierSmall)
 	m := resolved.Limits[corev1.ResourceMemory]
 	m.Add(resource.MustParse("1Gi"))
 	resolved.Limits[corev1.ResourceMemory] = m
@@ -290,7 +290,7 @@ func TestReconcileInvalidShellSandboxResources(t *testing.T) {
 	if shell == nil {
 		t.Fatal("no shell container in the sandbox StatefulSet")
 	}
-	wantResources := resolveShellSandboxResources(nil)
+	wantResources := resolveShellSandboxResources(nil, sizingTierSmall)
 	if !equality.Semantic.DeepEqual(shell.Resources, wantResources) {
 		t.Errorf("the shell container's resources = %v, want the operator's defaults %v; a refused override is ignored", shell.Resources, wantResources)
 	}

@@ -60,13 +60,15 @@ var shellSandboxResourcesPath = field.NewPath("spec", "harness", "experimental",
 // an admission count from its limit, so any positive limit at or above the
 // request is accepted. The webhook calls it at apply and the reconciler before
 // writing the StatefulSet, so an install without the webhook refuses the same
-// override rather than rendering it.
+// override rather than rendering it. The row the override merges over is the
+// rendered tier's (renderedSizingTier): the webhook has the whole object, and
+// under auto reads whatever latch its status carries, small when none.
 func ValidateShellSandboxResources(agent *agentv1alpha1.PlatformAgent, path *field.Path) (field.ErrorList, admission.Warnings) {
 	spec := shellSandboxSpec(agent)
 	if spec == nil || spec.Resources == nil {
 		return nil, nil
 	}
-	return validateContainerResources(*spec.Resources, resolveShellSandboxResources(agent),
+	return validateContainerResources(*spec.Resources, resolveShellSandboxResources(agent, renderedSizingTier(agent)),
 		path, acceptedContainerResourceNames, shellSandboxMessages, nil)
 }
 

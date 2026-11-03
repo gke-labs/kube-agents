@@ -61,19 +61,27 @@ var agentAPIAuthResourcesPath = field.NewPath("spec", "deployment", "agentAPIAut
 // the request is accepted. The webhook calls it at apply and the reconciler
 // before writing the sidecar, so an install without the webhook refuses the same
 // override rather than rendering it.
+// The row the override merges over is the one the spec alone fixes
+// (specSizingTier), as ValidateCredentialProxyResources explains.
 func ValidateAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec, path *field.Path) (field.ErrorList, admission.Warnings) {
+	return validateAgentAPIAuthResourcesAt(deployment, specSizingTier(deployment), path)
+}
+
+// validateAgentAPIAuthResourcesAt is ValidateAgentAPIAuthResources against
+// the given tier's row.
+func validateAgentAPIAuthResourcesAt(deployment *agentv1alpha1.DeploymentSpec, tier sizingTier, path *field.Path) (field.ErrorList, admission.Warnings) {
 	if deployment == nil || deployment.AgentAPIAuth == nil || deployment.AgentAPIAuth.Resources == nil {
 		return nil, nil
 	}
-	return validateContainerResources(*deployment.AgentAPIAuth.Resources, resolveAgentAPIAuthResources(deployment),
+	return validateContainerResources(*deployment.AgentAPIAuth.Resources, resolveAgentAPIAuthResources(deployment, tier),
 		path, acceptedContainerResourceNames, agentAPIAuthMessages, nil)
 }
 
 // agentAPIAuthResourcesRefusal is the reconciler's reading of
-// ValidateAgentAPIAuthResources: the first refusal with the count of the rest
-// within the shared budget, or "" when the override is valid. Warnings are not
-// refusals; the caller logs them.
+// ValidateAgentAPIAuthResources, against the tier this pass renders: the
+// first refusal with the count of the rest within the shared budget, or ""
+// when the override is valid. Warnings are not refusals; the caller logs them.
 func agentAPIAuthResourcesRefusal(agent *agentv1alpha1.PlatformAgent) (string, admission.Warnings) {
-	errs, warnings := ValidateAgentAPIAuthResources(agent.Spec.Deployment, agentAPIAuthResourcesPath)
+	errs, warnings := validateAgentAPIAuthResourcesAt(agent.Spec.Deployment, renderedSizingTier(agent), agentAPIAuthResourcesPath)
 	return boundCredentialProxyRefusal(errs), warnings
 }

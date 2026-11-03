@@ -322,7 +322,20 @@ var credentialProxyMessages = containerResourceMessages{
 // and a limit Autopilot clamps to its request), so they name the figures
 // Autopilot runs. The refusals come out the same either way: the limits do not
 // differ, and a limit set alone lowers its request on both cluster types.
+//
+// The row the override merges over is the one the spec alone fixes
+// (specSizingTier): the explicit profile's, or small under auto, whose latched
+// tier admission cannot read. The reconciler validates against the rendered
+// tier through validateCredentialProxyResourcesAt, and a higher row never
+// refuses what a lower one admitted, so the two agree on every refusal
+// admission makes.
 func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, path *field.Path) (field.ErrorList, admission.Warnings) {
+	return validateCredentialProxyResourcesAt(deployment, specSizingTier(deployment), path)
+}
+
+// validateCredentialProxyResourcesAt is ValidateCredentialProxyResources
+// against the given tier's row.
+func validateCredentialProxyResourcesAt(deployment *agentv1alpha1.DeploymentSpec, tier sizingTier, path *field.Path) (field.ErrorList, admission.Warnings) {
 	if deployment == nil || deployment.CredentialProxy == nil || deployment.CredentialProxy.Resources == nil {
 		return nil, nil
 	}
@@ -333,7 +346,7 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 			return fmt.Sprintf(credentialProxyFloorRefusalFmt, limit.String(), floorBytes/bytesPerMiB, credentialProxyMinimumAdmittedRequests)
 		},
 	}
-	return validateContainerResources(*deployment.CredentialProxy.Resources, resolveCredentialProxyResourcesFor(deployment, true),
+	return validateContainerResources(*deployment.CredentialProxy.Resources, resolveCredentialProxyResourcesFor(deployment, true, tier),
 		path, acceptedContainerResourceNames, credentialProxyMessages, floor)
 }
 
@@ -349,12 +362,12 @@ func sortedResourceNames(list corev1.ResourceList) []corev1.ResourceName {
 }
 
 // credentialProxyResourcesRefusal is the reconciler's reading of
-// ValidateCredentialProxyResources: the first refusal with the count of the
-// rest, within credentialProxyRefusalMessageBudget, or "" when the override is
-// valid. Warnings are not refusals; the
-// caller logs them.
+// ValidateCredentialProxyResources, against the tier this pass renders: the
+// first refusal with the count of the rest, within
+// credentialProxyRefusalMessageBudget, or "" when the override is valid.
+// Warnings are not refusals; the caller logs them.
 func credentialProxyResourcesRefusal(agent *agentv1alpha1.PlatformAgent) (string, admission.Warnings) {
-	errs, warnings := ValidateCredentialProxyResources(agent.Spec.Deployment, credentialProxyResourcesPath)
+	errs, warnings := validateCredentialProxyResourcesAt(agent.Spec.Deployment, renderedSizingTier(agent), credentialProxyResourcesPath)
 	return boundCredentialProxyRefusal(errs), warnings
 }
 

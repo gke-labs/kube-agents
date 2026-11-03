@@ -1223,6 +1223,10 @@
                   "type": "object"
                 }
               }
+            },
+            "sizingProfile": {
+              "type": ["string", "null"],
+              "enum": ["", "small", "medium", "fleet", "auto", null]
             }
           }
         },

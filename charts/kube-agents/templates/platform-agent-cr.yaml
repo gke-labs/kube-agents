@@ -321,6 +321,17 @@ spec:
     {{- with (include "kube-agents.imagePullSecrets" .) }}
     {{- . | nindent 4 }}
     {{- end }}
+    {{- /*
+      The sizing preset, forwarded as spec.deployment.sizingProfile when set.
+      The schema holds the value to the CRD's enum, so the only shape fault
+      left to guard is the one the API server would prune silently: a profile
+      set against an installed CRD that predates the field, through the same
+      guard the three resources overrides use.
+    */}}
+    {{- with .Values.platformAgent.deployment.sizingProfile }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.sizingProfile" "path" (list "deployment") "field" "sizingProfile") }}
+    sizingProfile: {{ . | quote }}
+    {{- end }}
     {{- $availability := .Values.platformAgent.deployment.availability | default dict }}
     {{- with include "kube-agents.compactFields" (dict
           "replicas" $availability.replicas

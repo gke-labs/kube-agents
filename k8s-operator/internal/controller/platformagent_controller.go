@@ -1004,6 +1004,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
+	// 10a. Resolve the sizing tier the three sized containers render at, and
+	// write it to status with the SizingCappedByQuota condition, before the
+	// sandbox, the broker and the gateway below read renderedSizingTier. Above
+	// the renders rather than in the Ready writer so the status says what the
+	// pods run even when a later step of this pass fails, and so a pass that
+	// parks Degraded below still leaves the latch where this pass moved it.
+	if err := r.resolveSizingTier(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 10b. Grant the broker and kube-proxy the one verb they need to authenticate
 	// their callers, and reconcile kube-proxy before the shell sandbox so the TLS
 	// CA Secret and proxy Service exist before the shell mounts and dials them.
