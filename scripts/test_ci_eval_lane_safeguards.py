@@ -380,6 +380,9 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         self.assertEqual([lines[i] for i in fences], ["FENCE " + lines[i].split(" ", 1)[1] for i in writers[0::2]])
         for fence, start in zip(fences, writers[0::2]):
             self.assertLess(fence, start)
+        # Fence k comes after writer k-1 has ended, and the first after phase 1.
+        for prev_end, fence in zip(writers[1::2], fences[1:]):
+            self.assertLess(prev_end, fence)
         self.assertLess(max(others_ended), min(fences))
 
     def test_with_no_requesting_case_there_is_one_phase(self):
