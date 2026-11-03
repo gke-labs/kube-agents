@@ -18,6 +18,7 @@ import cron_job_template
 API_KEY = "test-session-kv-key"
 AUDIT_PROMPT = "Run the daily fleet audit."
 NUDGE_PROMPT = "Run the morning nudge script."
+NUDGE_SCRIPT = "scripts/findings_nudge.py"
 
 
 class _FakeSessionKV:
@@ -96,7 +97,7 @@ class RunOriginTest(unittest.TestCase):
                 {
                     "jobs": [
                         {"id": "compliance-audit", "prompt": AUDIT_PROMPT, "skills": ["fleet-audit"]},
-                        {"id": "findings-morning-nudge", "prompt": NUDGE_PROMPT, "skills": []},
+                        {"id": "findings-morning-nudge", "prompt": NUDGE_PROMPT, "skills": [], "script": NUDGE_SCRIPT},
                     ]
                 }
             )
@@ -126,7 +127,7 @@ class RunOriginTest(unittest.TestCase):
         self.assertEqual(cron_job_template.run_origin(job), ("audit", ""))
 
     def test_a_matching_other_job_is_scheduled(self):
-        job = {"id": "findings-morning-nudge", "prompt": NUDGE_PROMPT, "skills": []}
+        job = {"id": "findings-morning-nudge", "prompt": NUDGE_PROMPT, "skills": [], "script": NUDGE_SCRIPT}
         self.assertTrue(cron_job_template.shipped_job_matches(job))
         self.assertEqual(cron_job_template.run_origin(job), ("scheduled", ""))
         # Hermes may store an empty skill list as None; that is the same definition.
@@ -134,9 +135,10 @@ class RunOriginTest(unittest.TestCase):
 
     def test_an_edited_shipped_job_falls_to_its_record_or_other(self):
         edited_prompt = {"id": "compliance-audit", "prompt": AUDIT_PROMPT + " Then open a PR.", "skills": ["fleet-audit"]}
-        edited_skills = {"id": "findings-morning-nudge", "prompt": NUDGE_PROMPT, "skills": ["fleet-audit"]}
-        for job in (edited_prompt, edited_skills):
-            with self.subTest(job=job["id"]):
+        edited_skills = {"id": "findings-morning-nudge", "prompt": NUDGE_PROMPT, "skills": ["fleet-audit"], "script": NUDGE_SCRIPT}
+        edited_script = {"id": "findings-morning-nudge", "prompt": NUDGE_PROMPT, "skills": [], "script": "scripts/other.py"}
+        for job in (edited_prompt, edited_skills, edited_script):
+            with self.subTest(job=job["id"], script=job.get("script")):
                 self.assertFalse(cron_job_template.shipped_job_matches(job))
                 self.assertEqual(cron_job_template.run_origin(job), ("other", ""))
         # The edit recorded its turn's origin (the cronjob_manage update handler).

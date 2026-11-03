@@ -7,7 +7,7 @@ wired into ``cron/scheduler.py`` and ``tools/cronjob_tools.py`` by
 
 A run the scheduler's own tick started is ``audit`` or ``scheduled`` only when
 the job's definition equals its entry in the image's template,
-:data:`TEMPLATE_JOBS_PATH`: the same id, prompt and skills. The profile's own
+:data:`TEMPLATE_JOBS_PATH`: the same id, prompt, skills and script. The profile's own
 ``cron/jobs.json`` is the agent's to write, so an id alone proves nothing.
 ``audit`` is a matching job whose ``skills`` names ``fleet-audit``; any other
 matching job is ``scheduled``.
@@ -87,12 +87,16 @@ def _template_entry(job_id: str) -> Mapping[str, Any] | None:
 
 
 def shipped_job_matches(job: Mapping[str, Any]) -> bool:
-    """True when the template's entry with ``job``'s id has the same prompt and skills."""
+    """True when the template's entry with ``job``'s id has the same prompt, skills and script."""
     job_id = str(job.get("id") or "")
     entry = _template_entry(job_id) if job_id else None
     if entry is None:
         return False
-    return (job.get("prompt") or "") == (entry.get("prompt") or "") and _skills(job) == _skills(entry)
+    return (
+        (job.get("prompt") or "") == (entry.get("prompt") or "")
+        and _skills(job) == _skills(entry)
+        and (job.get("script") or "") == (entry.get("script") or "")
+    )
 
 
 def _headers() -> dict[str, str] | None:
