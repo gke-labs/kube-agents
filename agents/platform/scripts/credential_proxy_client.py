@@ -191,6 +191,11 @@ BROKER_URL_ENV = "CREDENTIAL_PROXY_URL"
 # shim's own (cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE) or a broker
 # refusal look like the cluster's (CONNECTIVITY_FAILURE_RE).
 EXEC_FALLBACK_NOTICE = "exec tier not reachable; this command went to the stateful broker"
+# The line a malformed exec URL writes, once per process, when the stateful
+# broker takes its place. No "credential proxy" prefix, for the same reason as
+# EXEC_FALLBACK_NOTICE; the reason names the shape, never a network cause.
+EXEC_URL_IGNORED_NOTICE = "{name} ignored ({reason}); commands go to the stateful broker"
+_exec_url_notice_written = False
 # A connection that closed once the request was sent: the command may have run,
 # so it is never sent again. The `credential proxy error` prefix marks the line
 # as the shim's own for kubectl's failure classifiers.
@@ -300,8 +305,9 @@ class BrokerUnreachable(OSError):
 def exec_endpoints() -> tuple[str | None, str | None]:
     """The broker an exec-role call goes to, and the one it falls back on.
 
-    The exec tier when the operator set its URL, with the stateful broker as
-    the fallback; else the stateful broker alone, as before the exec tier.
+    The exec tier when the operator set a well-formed URL, with the stateful
+    broker as the fallback; else the stateful broker alone, as before the exec
+    tier. A malformed URL is ignored with one stderr line (`_exec_url_fault`).
     `execute` falls back only when no connection to the exec tier could be
     made (`BrokerUnreachable`): then no request reached a broker, and nothing
     ran. `ApiSession` also falls back after a dropped connection, because its
@@ -313,8 +319,40 @@ def exec_endpoints() -> tuple[str | None, str | None]:
     stateful = os.getenv("CREDENTIAL_PROXY_URL")
     exec_url = os.getenv(EXEC_URL_ENV, "").strip()
     if exec_url:
-        return exec_url, stateful or None
+        reason = _exec_url_fault(exec_url)
+        if reason is None or not stateful:
+            # With no stateful broker to use instead, a malformed URL is
+            # reported when the call is made, as before this check.
+            return exec_url, stateful or None
+        global _exec_url_notice_written
+        if not _exec_url_notice_written:
+            print(EXEC_URL_IGNORED_NOTICE.format(name=EXEC_URL_ENV, reason=reason), file=sys.stderr)
+            _exec_url_notice_written = True
+        return stateful, None
     return stateful, None
+
+
+def _exec_url_fault(url: str) -> str | None:
+    """Why the exec URL can't be used, or None.
+
+    The broker opener's connect bound and its `BrokerUnreachable` signal are on
+    plain http only, so an https URL would get neither the bound nor the
+    fallback. A bad port or a missing scheme fails before any socket opens.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        # A bracketed host that is not an IPv6 address, such as `http://[::1`.
+        return "not a valid URL"
+    if parts.scheme != "http":
+        return "not an http:// URL"
+    if not parts.hostname:
+        return "no host"
+    try:
+        parts.port
+    except ValueError:
+        return "the port is not a number from 0 to 65535"
+    return None
 
 
 class _BrokerHTTPHandler(urllib.request.HTTPHandler):
@@ -2336,11 +2374,13 @@ def read_stdin_if_requested(argv: list[str]) -> str | None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # No default: a named endpoint is used as given, with no exec routing and
-    # no fallback, and an unnamed one is resolved by `exec_endpoints`.
+    # no fallback, and an unnamed one is resolved by `exec_endpoints`. Read from
+    # the environment here, not through `exec_endpoints`, which would write its
+    # malformed-URL line even when an endpoint is named.
     parser.add_argument(
         "--endpoint",
         default=None,
-        required=exec_endpoints()[0] is None,
+        required=not os.getenv(EXEC_URL_ENV, "").strip() and os.getenv(BROKER_URL_ENV) is None,
     )
     parser.add_argument(
         "executable",
