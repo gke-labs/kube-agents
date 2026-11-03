@@ -11,8 +11,10 @@ module assembles that block from three sources and nothing else:
   task feed on its loopback port, rolled up to counts and durations, and the
   inference gateway's Prometheus text for token, spend and latency figures;
 * ``kubectl version`` for the Kubernetes version (optional); the model name is
-  the resource's ``status.inference``, and the gateway's ConfigMap only when an
-  operator from before that field leaves the key absent (optional).
+  the resource's ``status.inference``, and the gateway's ConfigMap whenever the
+  status has no ``inference`` key (optional): under an operator older than the
+  field, before this operator's first Ready write (so for a CR Degraded since it
+  was created), and under a served CRD that prunes the field.
 
 The block carries static enums, version strings, integer counters and durations.
 No cluster name, project id, namespace, task title, summary, result or error text
@@ -191,8 +193,10 @@ LITELLM_DEFAULT_NAME_LINE = re.compile(
 #: config the repository renders uses either: the chart's
 #: ``kube-agents.litellmConfig``, the kustomize ``litellm/base`` and
 #: ``overlays/anthropic`` configs, and the ``examples/litellm-*`` configs all put
-#: the name line first. This path runs only for an operator older than
-#: ``status.inference``.
+#: the name line first. This path runs whenever the status has no
+#: ``inference`` key: under an operator older than ``status.inference``, before
+#: this operator's first Ready write (so for a CR Degraded since it was
+#: created), and under a served CRD that prunes the field.
 #:
 #: A hand-edited config can hit further divergences from the operator's Go
 #: parser: a flow-style entry (``- {model_name: model-default, litellm_params:
@@ -474,7 +478,8 @@ def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
 def model_from_status(status: Mapping[str, Any]) -> Optional[str]:
     """``provider/model`` from ``status.inference``; UNAVAILABLE when the key is
     present without both fields (the operator's definite negative); None when the
-    key is absent (an operator or a served CRD from before the field)."""
+    key is absent (an operator older than the field, no Ready write yet, or a
+    served CRD that prunes it)."""
     if INFERENCE_STATUS_KEY not in status:
         return None
     inference = status.get(INFERENCE_STATUS_KEY)
@@ -792,8 +797,9 @@ def collect(options: Options) -> Snapshot:
         except ValueError:
             server_version = None
     # The ConfigMap is the fallback for a status with no ``inference`` key (an
-    # operator or a served CRD from before the field); with the key present the
-    # listing would be fetched and thrown away, so it is not made.
+    # operator older than the field, no Ready write yet, or a served CRD that
+    # prunes it); with the key present the listing would be fetched and thrown
+    # away, so it is not made.
     status = cr.get("status") if isinstance(cr.get("status"), Mapping) else {}
     litellm_config = None if INFERENCE_STATUS_KEY in status else _litellm_config(options)
     tasks: Optional[Sequence[Mapping[str, Any]]] = None
