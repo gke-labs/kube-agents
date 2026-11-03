@@ -64,6 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
 
+import credential_proxy_client
 import sandbox_exec
 import chat_notify
 from chat_platforms import enabled_chat_platforms
@@ -190,6 +191,15 @@ _api_disabled_this_run: set[str] = set()
 # still waiting at its 60s admission bound is refused busy and reads unlisted for the tick.
 LIST_WORKERS = 4
 LIST_TIMEOUT_SECONDS = 120
+# The broker bounds one gcloud it runs at 300 s (its `--timeout-seconds` default), so the cap
+# above holds one admission wait and part of one run. The shim retries a refusal on its own
+# (credential_proxy_client, keeping a retry's admission wait, not its run, inside a deadline the
+# caller may shorten), and under this cap a retry would carry past it, where TimeoutExpired
+# stands in for the broker's reason. `_run` and scope_publisher's `broker_run` tell the shim the
+# cap less the run bound, under which no retry fits, so a refused lookup logs the refusal's text
+# at once, as cluster_preflight.sh's calls do.
+BROKER_GCLOUD_RUN_SECONDS = 300
+SHIM_RETRY_DEADLINE_SECONDS = max(0, LIST_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
 # 12s per listing at four wide: the per-listing share the 150s budget gave at eight.
 LIST_BUDGET_SECONDS = 300
 LIST_GRACE_SECONDS = 5
@@ -285,8 +295,14 @@ def _run_env() -> dict[str, str]:
 
 
 def _run(argv: list[str], *, check: bool, timeout: float):
-    """One scope lookup's gcloud, through COMMAND_RUNNER when one is set, else `sandbox_exec.run`."""
-    return (COMMAND_RUNNER or sandbox_exec.run)(argv, check=check, timeout=timeout)
+    """One scope lookup's gcloud, through COMMAND_RUNNER when one is set, else `sandbox_exec.run`
+    with the shim told its retry deadline (a COMMAND_RUNNER sets that in its own environment)."""
+    if COMMAND_RUNNER is not None:
+        return COMMAND_RUNNER(argv, check=check, timeout=timeout)
+    return sandbox_exec.run(
+        argv, check=check, timeout=timeout,
+        remote_env={credential_proxy_client.RETRY_DEADLINE_ENV: str(SHIM_RETRY_DEADLINE_SECONDS)},
+    )
 
 
 def _project_source() -> tuple[str | None, bool]:

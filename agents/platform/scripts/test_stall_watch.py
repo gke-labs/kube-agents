@@ -7,6 +7,7 @@ import http.client
 import io
 import json
 import os
+import random
 import shlex
 import shutil
 import sqlite3
@@ -1840,10 +1841,26 @@ class Scope(Base):
     def test_only_kubeconfig_and_stdin_cross_into_the_sandbox(self):
         with patch.object(stall_watch.sandbox_exec, "run", return_value=completed([], "[]")) as run:
             stall_watch.run_sandbox(["python3", "-I", "-"], timeout=5, kubeconfig="/k", stdin="print(1)")
-        self.assertEqual(run.call_args.kwargs["remote_env"], {"KUBECONFIG": "/k"})
+        self.assertEqual(
+            run.call_args.kwargs["remote_env"],
+            {"KUBECONFIG": "/k", stall_watch.credential_proxy_client.RETRY_DEADLINE_ENV: str(stall_watch.SHIM_RETRY_DEADLINE_SECONDS)},
+        )
         self.assertEqual(run.call_args.kwargs["timeout"], 5)
         self.assertEqual(run.call_args.kwargs["stdin"], "print(1)")
         self.assertNotIn("principal", run.call_args.kwargs)
+
+    def test_every_hop_tells_the_shim_a_deadline_under_which_no_retry_fits(self):
+        # No cap in the watch holds more than one admission wait and one run, so
+        # the deadline every hop passes admits not even a refusal answered at once.
+        client = stall_watch.credential_proxy_client
+        deadline = float(stall_watch.SHIM_RETRY_DEADLINE_SECONDS)
+        self.assertEqual(max(0, stall_watch.CLUSTER_LIST_TIMEOUT_SECONDS - stall_watch.BROKER_GCLOUD_RUN_SECONDS), deadline)
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
+        with patch.object(stall_watch.sandbox_exec, "run", return_value=completed([], "[]")) as run:
+            stall_watch.run_sandbox(["gcloud", "container", "clusters", "list"], timeout=stall_watch.CLUSTER_LIST_TIMEOUT_SECONDS)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: str(stall_watch.SHIM_RETRY_DEADLINE_SECONDS)}, run.call_args.kwargs["remote_env"])
 
     def test_production_kubeconfig_path_is_under_hermes_home_with_the_watch_prefix(self):
         with patch.object(stall_watch.sandbox_exec, "sandbox_enabled", return_value=True):

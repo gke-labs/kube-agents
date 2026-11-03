@@ -8,6 +8,7 @@ profile_name is a pure, deterministic function; the module imports without pyyam
 
 import io
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -768,6 +769,29 @@ class CreateProfileTest(unittest.TestCase):
         self.create()
         self.assertIn("cannot reach the cluster API server", self.stderr)
         self.assertIn("i/o timeout", self.stderr)
+
+    def test_the_probe_tells_the_shim_a_deadline_under_which_no_retry_fits(self):
+        # The probe's bound is shorter than one admission wait, so a retry could
+        # only end in the probe's own kill with the refusal unread; the shim is
+        # told a deadline that admits none and prints the first refusal.
+        self.decision = a_decision()
+        original = self._fake_run
+        probe_envs = []
+
+        def recording(cmd, **kwargs):
+            if cmd[:2] == ["kubectl", "version"]:
+                probe_envs.append(kwargs["env"])
+            return original(cmd, **kwargs)
+
+        self._patch(subprocess, "run", recording)
+        self.assertEqual(self.create(), self.name)
+        client = cap.credential_proxy_client
+        self.assertEqual([str(cap.PROBE_SHIM_RETRY_DEADLINE_SECONDS)], [env[client.RETRY_DEADLINE_ENV] for env in probe_envs])
+        deadline = float(cap.PROBE_SHIM_RETRY_DEADLINE_SECONDS)
+        self.assertEqual(max(0, cap.CONNECTIVITY_PROBE_TIMEOUT_SECONDS - cap.BROKER_KUBECTL_RUN_SECONDS), deadline)
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
 
     def test_a_probe_that_times_out_does_not_fail_the_scaffold(self):
         self.decision = a_decision()

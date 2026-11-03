@@ -148,6 +148,7 @@ from pathlib import Path
 # Siblings in `$HERMES_HOME/scripts`, this script's own directory and therefore
 # already on `sys.path` when the scheduler runs it as a plain subprocess.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
 from gke_endpoint import dns_endpoint_args  # noqa: E402
@@ -401,6 +402,18 @@ SYSTEM_NAMESPACE_PREFIXES = ("gke-", "gke-managed-", "config-management-")
 #: goes dark mid-sweep costs one scan timeout rather than one per namespace.
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 CLUSTER_LIST_TIMEOUT_SECONDS = 120
+#: The broker bounds one gcloud it runs at 300 s (its ``--timeout-seconds``
+#: default) and a one-shot kubectl at 60 s. No cap in this file holds more than
+#: one broker admission wait and one such run. The shim retries a refusal on
+#: its own (credential_proxy_client, keeping a retry's admission wait, not its
+#: run, inside a deadline the caller may shorten), and under these caps a retry
+#: would carry past the cap, where TimeoutExpired stands in for the broker's
+#: reason. Every hop tells the shim the longest cap less the gcloud run bound,
+#: under which no retry fits (the kubectl hops' 60 s caps less their 60 s run
+#: bound give the same), so a refused hop reads the refusal's text at once, as
+#: cluster_preflight.sh's calls do.
+BROKER_GCLOUD_RUN_SECONDS = 300
+SHIM_RETRY_DEADLINE_SECONDS = max(0, CLUSTER_LIST_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
 #: Projects are listed the way the reconciler lists them: the management
 #: project first and alone, since its ssh opens the connection the rest share,
 #: then LIST_WORKERS at a time, each gcloud timeout cut to the budget left. A
@@ -575,9 +588,12 @@ def now_iso() -> str:
 def run_sandbox(
     argv: list[str], *, timeout: float, kubeconfig: str | None = None, stdin: str | None = None
 ) -> subprocess.CompletedProcess:
-    """One hop into the shell sandbox. Only KUBECONFIG crosses; the rest of
-    this process's environment has no business on the other side."""
-    remote_env = {"KUBECONFIG": kubeconfig} if kubeconfig else None
+    """One hop into the shell sandbox. Only KUBECONFIG and the shim's retry
+    deadline cross; the rest of this process's environment has no business on
+    the other side."""
+    remote_env = {credential_proxy_client.RETRY_DEADLINE_ENV: str(SHIM_RETRY_DEADLINE_SECONDS)}
+    if kubeconfig:
+        remote_env["KUBECONFIG"] = kubeconfig
     return sandbox_exec.run(argv, remote_env=remote_env, timeout=timeout, check=False, stdin=stdin)
 
 

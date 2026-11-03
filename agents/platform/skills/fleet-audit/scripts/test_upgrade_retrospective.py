@@ -17,6 +17,7 @@ import inspect
 import io
 import json
 import os
+import random
 import re
 import stat
 import subprocess
@@ -6554,6 +6555,36 @@ class DefaultRunTest(unittest.TestCase):
             result = ur.default_run(["kubectl"], timeout=1)
         self.assertEqual((result.rc, result.stdout, result.stderr), (ur.TIMEOUT_RC, "partial", "late"))
         self.assertEqual(ur.default_run(["/nonexistent/binary"]).rc, -1)
+
+
+class DefaultRunTellsTheShimItsDeadlineTest(unittest.TestCase):
+    """Each read's cap holds one admission wait and one run at most, so `default_run` tells the
+    shim a retry deadline under which no retry fits, in the caller's environment or the process's."""
+
+    def test_the_deadline_is_the_cap_less_the_run_bound_and_admits_no_retry(self):
+        client = ur.credential_proxy_client
+        deadline = float(ur.SHIM_RETRY_DEADLINE_S)
+        self.assertEqual(max(0, min(ur.GCLOUD_TIMEOUT_S, ur.KUBECTL_TIMEOUT_S) - max(ur.BROKER_GCLOUD_RUN_S, ur.BROKER_KUBECTL_RUN_S)), deadline)
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
+
+    def test_every_run_carries_the_deadline_in_its_environment(self):
+        calls = []
+
+        def fake(argv, *, env=None, timeout):
+            calls.append((argv, env, timeout))
+            return ur.Run(argv, 0, "", "", 0.0)
+
+        name = ur.credential_proxy_client.RETRY_DEADLINE_ENV
+        with mock.patch.object(ur.collector_run, "default_run", fake), mock.patch.dict(os.environ, {"KUBECONFIG": "/inherited"}):
+            ur.default_run(["gcloud", "projects", "list"])
+            ur.default_run(["kubectl", "get", "nodes"], env={"KUBECONFIG": "/given"}, timeout=ur.KUBECTL_TIMEOUT_S)
+        (argv_a, env_a, timeout_a), (argv_b, env_b, timeout_b) = calls
+        self.assertEqual((["gcloud", "projects", "list"], ur.GCLOUD_TIMEOUT_S), (argv_a, timeout_a))
+        self.assertEqual(("/inherited", str(ur.SHIM_RETRY_DEADLINE_S)), (env_a["KUBECONFIG"], env_a[name]))
+        self.assertEqual((["kubectl", "get", "nodes"], ur.KUBECTL_TIMEOUT_S), (argv_b, timeout_b))
+        self.assertEqual({"KUBECONFIG": "/given", name: str(ur.SHIM_RETRY_DEADLINE_S)}, env_b)
 
 
 if __name__ == "__main__":

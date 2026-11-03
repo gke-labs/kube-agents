@@ -565,7 +565,13 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
   holds one admission wait and one command run, and passes that cap less its margin and the run
   bound, 60 s, under which no retry fits: the shim gives up at the first refusal, held or
   immediate, with the broker's reason, so the preflight's own timeout text never stands in for a
-  retry chain.
+  retry chain. The scripts that cap a brokered command themselves do the same, each from its own
+  cap: the storage, networking and certificate audits (125 s on a one-shot `kubectl`), the
+  upgrade retrospective's reads, the reconciler's and the scope publisher's project lookups and
+  the stall watch's hops (120 s on a `gcloud` the broker bounds at 300 s), and the scaffold's
+  connectivity probe (45 s); under every one of them the deadline admits no retry. A script that
+  caps the shim at or under one admission wait is outside a held refusal's reach either way. The
+  170 s default is the terminal tool's, and a new caller with a cap of its own owes the variable.
   Every wait prints one stderr line, and when the retries are spent, by count or by deadline, the
   shim exits 1 after one more:
   `credential proxy throttled: gave up after <n> attempts (HTTP <code>): <broker text>`.

@@ -26,6 +26,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
+import credential_proxy_client
 import sandbox_exec
 from gke_endpoint import EndpointDecision, endpoint_decision
 from profile_scaffold import (
@@ -97,6 +98,16 @@ SOUL_SECTION_1_ANCHOR = "---\n\n## 1. Core Truths"
 # a minute per cluster on a busy broker.
 CONNECTIVITY_PROBE_REQUEST_TIMEOUT = "5s"
 CONNECTIVITY_PROBE_TIMEOUT_SECONDS = 45
+# The shim retries a broker refusal on its own (credential_proxy_client, keeping
+# a retry's admission wait, not its run, inside a deadline the caller may
+# shorten). The probe's bound is shorter than one admission wait, let alone a
+# one-shot kubectl's 60 s run after it (the broker's --kubectl-timeout-seconds
+# default), so a retry could only end in the probe's own kill, with the
+# refusal's text, the one line the probe exists to log, unread. The probe tells
+# the shim its bound less the run bound, under which no retry fits, and a
+# refused probe logs the refusal at once.
+BROKER_KUBECTL_RUN_SECONDS = 60
+PROBE_SHIM_RETRY_DEADLINE_SECONDS = max(0, CONNECTIVITY_PROBE_TIMEOUT_SECONDS - BROKER_KUBECTL_RUN_SECONDS)
 # What kubectl prints when it never reached the API server, as opposed to an
 # answer it did not like (401, 403, NotFound). The endpoint remedy is about
 # reaching the server, so it is offered only for the first kind.
@@ -518,7 +529,10 @@ def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision 
         # cost one misleading line in the scaffold log.
         completed = sandbox_exec.run(
             argv,
-            remote_env={"KUBECONFIG": str(kubeconfig)},
+            remote_env={
+                "KUBECONFIG": str(kubeconfig),
+                credential_proxy_client.RETRY_DEADLINE_ENV: str(PROBE_SHIM_RETRY_DEADLINE_SECONDS),
+            },
             local_env=_run_env({"KUBECONFIG": str(kubeconfig)}),
             timeout=CONNECTIVITY_PROBE_TIMEOUT_SECONDS,
             principal=sandbox_exec.TERMINAL_PRINCIPAL,

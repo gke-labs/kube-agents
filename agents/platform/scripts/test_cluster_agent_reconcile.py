@@ -8,6 +8,7 @@ deleted.
 """
 
 import json
+import random
 import time
 from datetime import datetime, timezone
 import os
@@ -2061,11 +2062,27 @@ class ScopeTest(HomesMixin):
                 lookup()
             self.assertEqual(runner.call_args[0][0], argv)
             self.assertTrue(runner.call_args[1]["check"])
+            # A COMMAND_RUNNER sets the shim's deadline in its own environment (scope_publisher).
+            self.assertNotIn("remote_env", runner.call_args[1])
             sandboxed.assert_not_called()
             with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="", stderr="")) as sandboxed, \
                     mock.patch.object(rec, "log"):
                 lookup()
             self.assertEqual(sandboxed.call_args[0][0], argv)
+            self.assertEqual(
+                {rec.credential_proxy_client.RETRY_DEADLINE_ENV: str(rec.SHIM_RETRY_DEADLINE_SECONDS)},
+                sandboxed.call_args[1]["remote_env"],
+            )
+
+    def test_the_lookups_cap_leaves_the_shim_no_retry(self):
+        # The cap holds one admission wait and part of one gcloud run, so the
+        # deadline the lookups pass admits not even a refusal answered at once.
+        client = rec.credential_proxy_client
+        deadline = float(rec.SHIM_RETRY_DEADLINE_SECONDS)
+        self.assertEqual(max(0, rec.LIST_TIMEOUT_SECONDS - rec.BROKER_GCLOUD_RUN_SECONDS), deadline)
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
 
     def test_the_notification_counts_unlisted_projects_past_a_limit_and_names_containers(self):
         report = {"created": ["cluster-x"], "pruned": [], "create_failed": [], "skipped_error": [],
