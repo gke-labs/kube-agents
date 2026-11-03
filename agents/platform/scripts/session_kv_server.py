@@ -6762,8 +6762,20 @@ def inject_message(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="inner payload must be a JSON object")
 
+    answer = _dispatch_inject(session_id, payload, background_tasks, x_watcher_features)
+    # After the handler accepted the inject: a payload it refused does not
+    # decide the session's origin.
     _stamp_watcher_session_origin(session_id, payload.get("kind"))
+    return answer
 
+
+def _dispatch_inject(
+    session_id: str,
+    payload: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    x_watcher_features: str,
+) -> Dict[str, Any]:
+    """The kind dispatch and the event path of `inject_message`, on its parsed payload."""
     if payload.get("kind") == INJECT_KIND_DRIFT:
         return _inject_drift(session_id, payload, background_tasks)
     if payload.get("kind") == INJECT_KIND_STALL:
@@ -7501,6 +7513,8 @@ def put_board_task_origin(task_id: str, request_data: Dict[str, Any]) -> Dict[st
     For the trusted writers that know better than their own context (the issue
     gate, the drift backlog, the chat bootstrap), after a create that reported a
     fresh insert. `stamped` is False when the card already carried a stamp.
+    It does not check that the card exists on the board, so a caller holding the
+    API key can stamp an id no card has yet.
     """
     if not task_id or len(task_id) > ORIGIN_TASK_ID_MAX_CHARS:
         raise HTTPException(status_code=400, detail=f"task_id must be 1 to {ORIGIN_TASK_ID_MAX_CHARS} characters")

@@ -12497,6 +12497,18 @@ class TestProposalOrigin(unittest.TestCase):
         self.assertEqual(session_kv_server._session_origin(drift_sid), ("drift", ""))
         self.assertEqual(self._meta("k8s-evt-shared0"), {})
 
+    def test_a_refused_inject_leaves_no_origin(self):
+        # A `controller-stall` record with no objects is refused with 400; it must
+        # not fix the origin, so the next accepted inject (drift) decides it.
+        refused = json.dumps({"kind": session_kv_server.INJECT_KIND_STALL, "cluster": "c", "namespace": "n", "objects": []})
+        drift = json.dumps({"kind": session_kv_server.INJECT_KIND_DRIFT})
+        sid = self.client.post("/sessions").json()["sessionID"]
+        self.assertEqual(self.client.post(f"/sessions/{sid}/inject", json={"message": refused}).status_code, 400)
+        self.assertNotIn(session_kv_server.ORIGIN_KEY, self._meta(sid))
+        with patch.object(session_kv_server, "_inject_drift", return_value={"status": "injected"}):
+            self.assertEqual(self.client.post(f"/sessions/{sid}/inject", json={"message": drift}).status_code, 200)
+        self.assertEqual(session_kv_server._session_origin(sid), ("drift", ""))
+
     def test_cron_job_origin_is_upserted(self):
         self.assertIsNone(session_kv_server._cron_job_origin("job-a"))
         self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "chat", "platform": "slack"}).status_code, 200)
@@ -12508,9 +12520,13 @@ class TestProposalOrigin(unittest.TestCase):
     def test_proposals_opened_is_idempotent_on_url(self):
         url = "https://github.com/example/fleet/pull/7"
         body = {"url": url, "origin": "audit", "platform": "", "opened_at": "2026-11-03T10:00:00+00:00"}
-        self.assertEqual(self.client.post("/v1/proposals/opened", json=body).status_code, 200)
+        first = self.client.post("/v1/proposals/opened", json=body)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json(), {"recorded": True})
         again = dict(body, origin="chat", platform="slack")
-        self.assertEqual(self.client.post("/v1/proposals/opened", json=again).status_code, 200)
+        second = self.client.post("/v1/proposals/opened", json=again)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json(), {"recorded": False})
         counts = self.client.get("/v1/proposals/opened/counts").json()
         self.assertEqual(counts["audit"], {"": 1})
         self.assertEqual(counts["chat"], {"": 0})
