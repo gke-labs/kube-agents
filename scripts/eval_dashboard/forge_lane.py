@@ -228,7 +228,9 @@ def digest_line(data: dict | None, now: datetime.datetime) -> str | None:
             if started is None or now - started > nightly.LAST_NIGHT_MAX_AGE:
                 parts.append(f"{label} no night last night")
             else:
-                parts.append(f"{label} {'green' if nights[0]['green'] else 'red'}")
+                # A night with no recorded result is neither, as in _counts.
+                newest = nights[0]
+                parts.append(f"{label} {'green' if newest['green'] else 'red' if newest['result'] else 'no result'}")
     for reason, labels in waiting.items():
         # A job with a reason is one not enabled yet; one without has run
         # before, its nights just outside what data.json holds.

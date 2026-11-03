@@ -121,6 +121,16 @@ class LaneDocumentTest(unittest.TestCase):
             " · GitLab CE next not enabled yet (their Prow jobs are on hold in GoogleCloudPlatform/oss-test-infra#2755)",
         )
         self.assertIsNone(forge_lane.digest_line(None, now))
+        # A lane with a reason whose only night is old reads as missing last night, the reason dropped;
+        # a night with no recorded result is neither green nor red.
+        old = {"runs": [
+            dict(run("20", tier="ghes", job="ci-kube-agents-eval-nightly-ghes-next", pr=None), started="2026-10-28T10:00:00+00:00"),
+            dict(run("21", tier="gitlab-ce", job="ci-kube-agents-eval-nightly-gitlab-ce-next", pr=None, result=None), started="2026-11-03T10:00:00+00:00"),
+        ]}
+        line = forge_lane.digest_line(old, now)
+        self.assertIn("GHES next no night last night", line)
+        self.assertIn("GitLab CE next no result", line)
+        self.assertNotIn("oss-test-infra#2755", line)
 
     def test_the_tier_filter_is_the_shared_one(self):
         self.assertTrue(tiers.is_gitlab({"tier": "gitlab"}))
