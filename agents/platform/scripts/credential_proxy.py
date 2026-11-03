@@ -843,22 +843,74 @@ METRICS_SERVER_HEADER = "credential-proxy-metrics"
 METRICS_MAX_CONNECTIONS = 16
 METRICS_CONNECTION_DEADLINE_SECONDS = 10
 # How many connections the kernel queues for the credentialed listener between
-# accepts. The handler speaks HTTP/1.0 and closes after every response, so Envoy
-# opens a fresh upstream connection for every request: each brokered command,
-# each event-pull iteration and each readiness probe is one connect() on the
-# Unix socket. On that socket a connect() past the queue is refused with EAGAIN
-# at once, and Envoy answers the caller with a 503 before any handler thread
-# exists; a probe caught in a burst that way reads as not ready. (The TCP
-# listeners share the constant; there a full queue drops the SYN and the
-# client stalls until it retries.) The stdlib's 5 is smaller than one sweep's
-# command slots. Envoy's per-cluster connection ceiling for the credentialed
-# route (max_connections in deploy/shared/envoy-credential-proxy.yaml) is the
-# most it can hold open to the broker at once, so a queue of that size leaves
-# Envoy's own breaker, never this queue, as what refuses first; the test holds
-# this constant at or above that number. listen() clamps it to net.core.somaxconn: 4096
-# on a recent Linux kernel, 1024 inside a gVisor sandbox, so the queue is at
-# most this size and never less.
+# accepts. Envoy reuses an upstream connection across requests (the handler
+# speaks HTTP/1.1 and keeps the connection open, below), so the queue sees a
+# connect() only when Envoy's pool grows: a burst of brokered commands, event
+# pulls and probes past the connections it already holds open. On the Unix
+# socket a connect() past the queue is refused with EAGAIN at once, and Envoy
+# answers the caller with a 503 before any handler thread exists; a probe
+# caught in a burst that way reads as not ready. (The TCP listeners share the
+# constant; there a full queue drops the SYN and the client stalls until it
+# retries.) The stdlib's 5 is smaller than one sweep's command slots. Envoy's
+# per-cluster connection ceiling for the credentialed route (max_connections
+# in deploy/shared/envoy-credential-proxy.yaml) is the most it can hold open
+# to the broker at once, so a queue of that size leaves Envoy's own breaker,
+# never this queue, as what refuses first; the test holds this constant at or
+# above that number. listen() clamps it to net.core.somaxconn: 4096 on a
+# recent Linux kernel, 1024 inside a gVisor sandbox, so the queue is at most
+# this size and never less.
 LISTEN_BACKLOG = 4096
+# How long the credentialed handler holds an idle keep-alive connection open
+# for its next request before closing it. Envoy, the only client, closes an
+# idle upstream connection at the shorter timeout in
+# deploy/shared/envoy-credential-proxy.yaml, so the side that sends on a
+# connection is never the side that just closed it; this is the backstop for
+# a peer that does not.
+KEEPALIVE_IDLE_SECONDS = 60
+# The most connections the credentialed listeners (the Unix socket or TCP
+# port behind Envoy, and the agent API door) hold a thread for at once. The
+# stdlib server starts one OS thread per accepted connection with no cap; one
+# past this is answered THREAD_CAP_REFUSAL on the accept loop's thread and
+# closed, with no thread spent. The default equals Envoy's per-cluster
+# connection ceiling and the listen backlog, so the cap backstops the
+# admission the broker already does through its command, session, profile
+# and scope slots rather than refusing ahead of them.
+MAX_THREADS_ENV = "CREDENTIAL_PROXY_MAX_THREADS"
+DEFAULT_MAX_THREADS = 1024
+# The 503 a connection past the thread cap is written before it is closed: a
+# whole HTTP/1.1 response with an empty body, so a client that already sent
+# its request reads an answer that says when to retry rather than a reset.
+THREAD_CAP_RETRY_AFTER_SECONDS = 5
+THREAD_CAP_REFUSAL = (
+    "HTTP/1.1 503 Service Unavailable\r\n"
+    f"Retry-After: {THREAD_CAP_RETRY_AFTER_SECONDS}\r\n"
+    "Content-Length: 0\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+).encode("ascii")
+# The accept loop writes that refusal itself and then reads what the peer
+# sent until the peer closes: a socket closed with unread bytes in it resets
+# the peer, and the reset discards the 503 before the peer reads it. A peer
+# that neither closes nor stops sending holds the accept loop no longer than
+# this; Envoy, the client the cap is for, closes on reading the answer.
+THREAD_CAP_REFUSAL_SECONDS = 0.5
+THREAD_CAP_DRAIN_CHUNK_BYTES = 64 * 1024
+# The stack reserved for every thread the broker starts. The platform default
+# (8 MiB on glibc) is virtual, but at a thousand threads it is a gigabyte of
+# address space per thousand; one mebibyte holds a handler's deepest call
+# chain with room, and the stdlib's recursion limit is reached well inside it.
+THREAD_STACK_BYTES = MEBIBYTE
+# The health-only listener: GET /healthz and nothing else, on a TCP port of
+# its own beside the metrics listener, so a probe reads the broker's liveness
+# even while every thread the credentialed listener may spend is spent. Bound
+# on the same host as the metrics listener, which is the pod IP in the
+# operator's layout, so a kubelet probe can reach it; /healthz stays on the
+# credentialed listener too. Unset means the default; 0 means no listener.
+HEALTH_PORT_ENV = "CREDENTIAL_PROXY_HEALTH_PORT"
+DEFAULT_HEALTH_PORT = 8767
+HEALTH_SERVER_HEADER = "credential-proxy-health"
+# What /healthz answers, on both listeners.
+HEALTHZ_PAYLOAD = {"status": "ok"}
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what
@@ -1251,14 +1303,124 @@ class HandlerErrorsToLog:
         LOGGER.exception("request handler failed type=%s", type(sys.exc_info()[1]).__name__)
 
 
-class ThreadingUnixHTTPServer(HandlerErrorsToLog, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class ConnectionCap:
+    """A ceiling on the connections a threading server holds a thread for.
+
+    socketserver's ThreadingMixIn starts one thread per accepted connection
+    with no cap. Mixed in ahead of it, this admits ``cap`` connections at a
+    time and hands one past that to ``refuse_connection`` on the accept
+    loop's thread, before any thread is spent on it; a slot comes back when
+    the admitted connection's handler returns.
+    """
+
+    def __init__(self, *args: Any, cap: int, **kwargs: Any) -> None:
+        self.connection_cap = cap
+        self._cap_slots = threading.BoundedSemaphore(cap)
+        super().__init__(*args, **kwargs)
+
+    def refuse_connection(self, request: Any) -> None:
+        """Dispose of a connection past the cap; the default closes it unserved."""
+        self.shutdown_request(request)
+
+    def connection_released(self) -> None:
+        """Called once an admitted connection's handler has returned."""
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._cap_slots.acquire(blocking=False):
+            self.refuse_connection(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._cap_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._cap_slots.release()
+            self.connection_released()
+
+
+class ThreadCap(ConnectionCap):
+    """ConnectionCap for the credentialed listeners: the refused connection is told.
+
+    A peer past the cap is written THREAD_CAP_REFUSAL, a complete 503 with a
+    Retry-After, and closed; Envoy relays that answer to the caller, where a
+    bare close would be a reset. The cap is MAX_THREADS_ENV, read once by
+    serve(); a test passes ``max_threads`` directly. The log carries one line
+    when the cap is first reached and one when it is next released, not one
+    per refused connection, so a burst cannot fill the log.
+    """
+
+    # The cap every credentialed listener is built with unless told otherwise;
+    # serve() sets it from MAX_THREADS_ENV before building any.
+    max_threads: int = DEFAULT_MAX_THREADS
+
+    def __init__(self, *args: Any, max_threads: int | None = None, **kwargs: Any) -> None:
+        self._refused = 0
+        self._refused_lock = threading.Lock()
+        cap = self.max_threads if max_threads is None else max_threads
+        super().__init__(*args, cap=cap, **kwargs)
+
+    def refuse_connection(self, request: Any) -> None:
+        with self._refused_lock:
+            self._refused += 1
+            first = self._refused == 1
+        if first:
+            LOGGER.warning(
+                "ALERT connection refused: %d connections hold a thread (%s); answering 503 "
+                "with Retry-After until one closes",
+                self.connection_cap,
+                MAX_THREADS_ENV,
+            )
+        deadline = time.monotonic() + THREAD_CAP_REFUSAL_SECONDS
+        try:
+            request.settimeout(THREAD_CAP_REFUSAL_SECONDS)
+            request.sendall(THREAD_CAP_REFUSAL)
+            request.shutdown(socket.SHUT_WR)
+            # The request the peer sent in the meantime, or the start of it,
+            # read and dropped until the peer closes on the answer, so that
+            # the close below finds nothing unread.
+            while (left := deadline - time.monotonic()) > 0:
+                request.settimeout(left)
+                if not request.recv(THREAD_CAP_DRAIN_CHUNK_BYTES):
+                    break
+        except OSError as exc:
+            LOGGER.debug("thread cap refusal not delivered type=%s", type(exc).__name__)
+        self.shutdown_request(request)
+
+    def connection_released(self) -> None:
+        with self._refused_lock:
+            refused, self._refused = self._refused, 0
+        if refused:
+            LOGGER.warning("thread cap released after refusing %d connection(s)", refused)
+
+
+def thread_cap_from_env() -> int:
+    """MAX_THREADS_ENV as a positive integer, or the default with a WARNING."""
+    raw = os.getenv(MAX_THREADS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_MAX_THREADS
+    value = _positive_int(raw)
+    if value is None:
+        LOGGER.warning(
+            "%s=%r is not a positive integer; using the default of %d",
+            MAX_THREADS_ENV, raw, DEFAULT_MAX_THREADS,
+        )
+        return DEFAULT_MAX_THREADS
+    return value
+
+
+class ThreadingUnixHTTPServer(HandlerErrorsToLog, ThreadCap, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     """HTTP server over a private Unix socket used behind Envoy."""
 
     daemon_threads = True
     request_queue_size = LISTEN_BACKLOG
 
 
-class ThreadingTCPHTTPServer(HandlerErrorsToLog, ThreadingHTTPServer):
+class ThreadingTCPHTTPServer(HandlerErrorsToLog, ThreadCap, ThreadingHTTPServer):
     """ThreadingHTTPServer for the credentialed and API-relay listeners on TCP."""
 
     request_queue_size = LISTEN_BACKLOG
@@ -12073,7 +12235,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
         return
 
 
-class MetricsServer(HandlerErrorsToLog, ThreadingHTTPServer):
+class MetricsServer(HandlerErrorsToLog, ConnectionCap, ThreadingHTTPServer):
     """ThreadingHTTPServer with a ceiling on live connections.
 
     The stdlib server starts one thread per accepted connection with no cap,
@@ -12084,47 +12246,70 @@ class MetricsServer(HandlerErrorsToLog, ThreadingHTTPServer):
     to MetricsHandler's deadline.
     """
 
+    listener_label = "metrics"
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._slots = threading.BoundedSemaphore(METRICS_MAX_CONNECTIONS)
+        super().__init__(*args, cap=METRICS_MAX_CONNECTIONS, **kwargs)
 
-    def process_request(self, request: Any, client_address: Any) -> None:
-        if not self._slots.acquire(blocking=False):
-            LOGGER.debug("metrics connection closed unserved: %d already open", METRICS_MAX_CONNECTIONS)
-            self.shutdown_request(request)
+    def refuse_connection(self, request: Any) -> None:
+        LOGGER.debug(
+            "%s connection closed unserved: %d already open", self.listener_label, self.connection_cap
+        )
+        self.shutdown_request(request)
+
+
+class HealthHandler(MetricsHandler):
+    """The health-only listener: GET /healthz, and nothing else.
+
+    MetricsHandler's bounds, deadline and silence, serving the answer the
+    credentialed listener's /healthz gives and nothing the process knows:
+    unauthenticated, like that route, because the probe runs before any
+    token would be available and reveals nothing. A separate port so that a
+    credentialed listener at its thread cap still reads as alive.
+    """
+
+    server_version = HEALTH_SERVER_HEADER
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != HEALTHZ_PATH:
+            self.send_error(HTTPStatus.NOT_FOUND)
             return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self._slots.release()
-            raise
-
-    def process_request_thread(self, request: Any, client_address: Any) -> None:
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._slots.release()
+        body = json.dumps(HEALTHZ_PAYLOAD, separators=(",", ":")).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
-def start_metrics_listener(host: str, port: int) -> MetricsServer | None:
-    """Open the metrics-only listener on a daemon thread; log, not raise, when it cannot.
+class HealthServer(MetricsServer):
+    """MetricsServer's connection ceiling, for the health-only listener."""
+
+    listener_label = "health"
+
+
+def _start_auxiliary_listener(
+    server_class: type[MetricsServer], handler: type[BaseHTTPRequestHandler], host: str, port: int, serves: str
+) -> MetricsServer | None:
+    """Open one of the two auxiliary listeners on a daemon thread; log, not raise, when it cannot.
 
     Never fatal: a port that cannot be bound, or that is no port at all (bind
-    raises OverflowError, not OSError, past 65535), costs the broker its
-    metrics, not the commands it exists to broker, and the ALERT line is the
+    raises OverflowError, not OSError, past 65535), costs the broker that
+    listener, not the commands it exists to broker, and the ALERT line is the
     signal.
     """
+    label = server_class.listener_label
     try:
-        server = MetricsServer((host, port), MetricsHandler)
+        server = server_class((host, port), handler)
     except (OSError, OverflowError) as exc:
         LOGGER.error(
-            "ALERT metrics listener on %s:%d unavailable type=%s; the broker serves no "
-            "/metrics until it restarts, and commands are unaffected",
-            host, port, type(exc).__name__,
+            "ALERT %s listener on %s:%d unavailable type=%s; the broker serves no "
+            "%s until it restarts, and commands are unaffected",
+            label, host, port, type(exc).__name__, serves,
         )
         return None
-    threading.Thread(target=server.serve_forever, daemon=True, name="metrics").start()
-    LOGGER.info("metrics listening on %s:%d", host, port)
+    threading.Thread(target=server.serve_forever, daemon=True, name=label).start()
+    LOGGER.info("%s listening on %s:%d", label, host, port)
     return server
 
 
@@ -12162,7 +12347,65 @@ def mcp_relay_decision(
     return mcp_policy.evaluate_for_profile(server_name, message), offered
 
 
+def start_metrics_listener(host: str, port: int) -> MetricsServer | None:
+    """Open the metrics-only listener; see _start_auxiliary_listener."""
+    return _start_auxiliary_listener(MetricsServer, MetricsHandler, host, port, METRICS_PATH)
+
+
+def start_health_listener(host: str, port: int) -> HealthServer | None:
+    """Open the health-only listener; see _start_auxiliary_listener.
+
+    The credentialed listener's /healthz is unaffected by a failure here: a
+    probe pointed at this port reads connection refused, which is the signal.
+    """
+    return _start_auxiliary_listener(HealthServer, HealthHandler, host, port, f"{HEALTHZ_PATH} on it")
+
+
+class _CountingReader:
+    """The handler's request stream, counting the bytes handed out.
+
+    What the keep-alive framing below needs to know is whether a route read
+    the body its request announced: a response written over unread body
+    bytes, on a connection kept open, would leave those bytes to be parsed
+    as the next request line. The count is the only addition; every read
+    goes to the buffered reader socketserver made.
+    """
+
+    __slots__ = ("_raw", "consumed")
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self.consumed = 0
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._raw.read(size)
+        self.consumed += len(data)
+        return data
+
+    def read1(self, size: int = -1) -> bytes:
+        data = self._raw.read1(size)
+        self.consumed += len(data)
+        return data
+
+    def readline(self, size: int = -1) -> bytes:
+        data = self._raw.readline(size)
+        self.consumed += len(data)
+        return data
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw, name)
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
+    # HTTP/1.1, so Envoy reuses one upstream connection for request after
+    # request instead of opening one per brokered command, event pull and
+    # probe. Every response is then framed: _json and the relays' direct
+    # writes carry a Content-Length, the one stream of unknown length (the
+    # watcher's Kubernetes relay) says `Connection: close` and closes, and a
+    # response written while the request's body is still unread closes too
+    # (_body_unread), so no body byte is ever read as the next request line.
+    # A connection idle between requests is closed at KEEPALIVE_IDLE_SECONDS.
+    protocol_version = "HTTP/1.1"
     policy: Policy
     executor: CommandExecutor
     # resolve_role()'s answer, set by serve(). On EXEC_ROLE the handler serves
@@ -13945,9 +14188,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             content_type = response.getheader("Content-Type", "")
             if content_type:
                 self.send_header("Content-Type", sanitize_header(content_type))
+            # No Content-Length: a stream of unknown length ends with the
+            # connection, so the response says it will close and the handler
+            # closes after the body (send_header sets close_connection).
+            self.send_header("Connection", "close")
             self.end_headers()
-            # No Content-Length: the handler speaks HTTP/1.0 and closes after the
-            # body, which is how a stream of unknown length ends.
             sent = 0
             while True:
                 if watching and time.monotonic() - started > WATCHER_WATCH_MAX_S:
@@ -14743,26 +14988,71 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 body["slack"] = fields
             self._json(HTTPStatus.BAD_GATEWAY, body)
 
+    def setup(self) -> None:
+        super().setup()
+        self.rfile = _CountingReader(self.rfile)
+
+    def parse_request(self) -> bool:
+        # Where this request's body starts in the stream, and how long it
+        # said it was: None when it cannot be framed (a Transfer-Encoding,
+        # which no route reads, or a length that is not a number), which
+        # _body_unread reads as unread.
+        parsed = super().parse_request()
+        if parsed:
+            self._body_start = self.rfile.consumed
+            if self.headers.get("Transfer-Encoding"):
+                self._body_length: int | None = None
+            else:
+                try:
+                    self._body_length = max(int(self.headers.get("Content-Length", "0")), 0)
+                except ValueError:
+                    self._body_length = None
+        return parsed
+
+    def _body_unread(self) -> bool:
+        """Did this request announce body bytes no route has read yet?
+
+        False for a handler built without a socket (the route tests' stand-ins
+        assign their own rfile), whose connection nothing keeps open.
+        """
+        consumed = getattr(self.rfile, "consumed", None)
+        start = getattr(self, "_body_start", None)
+        if consumed is None or start is None:
+            return False
+        if self._body_length is None:
+            return True
+        return consumed - start < self._body_length
+
     def handle_one_request(self) -> None:
         # Counted in flight from here until its answer is written, for the
         # broker's drain (install_shutdown_handler); _refused_while_draining
         # lets a long poll or a watch out of the count once its path is known.
         self._counted_in_flight = True
         self.in_flight.enter()
+        # A peer that resets the connection while its request is being read,
+        # or before an error page is on the wire, is a debug line and a closed
+        # connection, as on the metrics listener; the exception would
+        # otherwise leave the handler and reach the server's error hook. No
+        # audit record is lost: every site logs before its response is
+        # written, and _json guards its own writes. The idle timeout is armed
+        # here, before the request line is read, so the same bound holds for
+        # the first request and for every one a kept-open connection carries
+        # after it; a route that changed the timeout has it put back.
+        with contextlib.suppress(OSError):
+            self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
         try:
-            # A peer that resets the connection while its request is being read,
-            # or before an error page is on the wire, is a debug line and a closed
-            # connection, as on the metrics listener; the exception would
-            # otherwise leave the handler and reach the server's error hook. No
-            # audit record is lost: every site logs before its response is
-            # written, and _json guards its own writes.
-            try:
-                super().handle_one_request()
-            except OSError as exc:
-                self.close_connection = True
-                LOGGER.debug("request not answered type=%s", type(exc).__name__)
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("request not answered type=%s", type(exc).__name__)
+            return
         finally:
             self._leave_in_flight()
+        if not self.close_connection and self._body_unread():
+            # A route that wrote its response directly, without _json, over a
+            # body it never read: the connection is closed rather than the
+            # body parsed as the next request.
+            self.close_connection = True
 
     def _leave_in_flight(self) -> None:
         if getattr(self, "_counted_in_flight", False):
@@ -14909,6 +15199,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # The one extra header any route sends is Retry-After, a number.
             for name, value in (headers or {}).items():
                 self.send_header(name, value)
+            if self._body_unread():
+                # A refusal written before the body was read (a 401, a 403, a
+                # 413): the connection closes with the answer, so the unread
+                # body is never parsed as the next request. send_header sets
+                # close_connection on seeing this header.
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except OSError as exc:
@@ -15328,6 +15624,10 @@ def install_shutdown_handler(
 
 
 def serve(args: argparse.Namespace) -> None:
+    # Before the first thread: every thread the broker starts, a connection's
+    # or a sampler's, reserves this much stack rather than the platform's.
+    threading.stack_size(THREAD_STACK_BYTES)
+    ThreadCap.max_threads = thread_cap_from_env()
     role = resolve_role()
     if role == ROLE_API_PROXY:
         start_agent_api_proxy().serve_forever()
@@ -15574,6 +15874,25 @@ def serve(args: argparse.Namespace) -> None:
             )
         else:
             start_metrics_listener(args.host, metrics_port)
+    # The health-only listener, on the same terms: after the credentialed
+    # server, never fatal, and on a port neither of the other two holds.
+    health_port = int(getattr(args, "health_port", 0) or 0)
+    if not health_port:
+        raw = os.getenv(HEALTH_PORT_ENV)
+        LOGGER.info(
+            "health listener disabled: --health-port resolved to 0 (%s is %s)",
+            HEALTH_PORT_ENV, "unset" if raw is None or not raw.strip() else repr(raw),
+        )
+    else:
+        refusal = _health_port_refusal(health_port, args, metrics_port)
+        if refusal is not None:
+            LOGGER.error(
+                "ALERT %s=%d %s; the broker serves no %s on a port of its own until it "
+                "restarts with another, and commands are unaffected",
+                HEALTH_PORT_ENV, health_port, refusal, HEALTHZ_PATH,
+            )
+        else:
+            start_health_listener(args.host, health_port)
     install_shutdown_handler(
         server,
         [
@@ -15608,6 +15927,44 @@ def _metrics_port_refusal(metrics_port: int, args: argparse.Namespace) -> str | 
     if metrics_port == args.port:
         return f"is the credentialed listener's port {args.port}"
     return None
+
+
+def _health_port_refusal(health_port: int, args: argparse.Namespace, metrics_port: int) -> str | None:
+    """Why the health listener must not open on this port, or None if it may.
+
+    _metrics_port_refusal's two cases, and the metrics port itself: the three
+    listeners are three ports, and which of two processes wins a port depends
+    on start order.
+    """
+    refusal = _metrics_port_refusal(health_port, args)
+    if refusal is not None:
+        return refusal
+    if health_port == metrics_port:
+        return f"is the metrics listener's port {metrics_port}"
+    return None
+
+
+def _health_port_default() -> int:
+    """HEALTH_PORT_ENV as an integer, DEFAULT_HEALTH_PORT when unset, or 0 with an ALERT.
+
+    Unlike the metrics port, unset means the default rather than no listener:
+    the port serves one unauthenticated route that reveals nothing, and a
+    probe that an operator points at it should find it on an install whose
+    environment never named it. 0 turns it off; a value that is no integer
+    costs the listener alone, as a bad metrics port does.
+    """
+    raw = os.getenv(HEALTH_PORT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_HEALTH_PORT
+    try:
+        return int(raw)
+    except ValueError:
+        LOGGER.error(
+            "ALERT %s=%r is not an integer; the broker serves no %s on a port of its own "
+            "until it restarts with a port, and commands are unaffected",
+            HEALTH_PORT_ENV, raw, HEALTHZ_PATH,
+        )
+        return 0
 
 
 def _metrics_port_default() -> int:
@@ -15651,6 +16008,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=_metrics_port_default(),
         help="Port of the metrics-only listener (GET /metrics); 0 or unset opens none",
+    )
+    parser.add_argument(
+        "--health-port",
+        type=int,
+        default=_health_port_default(),
+        help=(
+            f"Port of the health-only listener (GET {HEALTHZ_PATH}); unset opens it on "
+            f"{DEFAULT_HEALTH_PORT}, 0 opens none"
+        ),
     )
     parser.add_argument(
         "--timeout-seconds",

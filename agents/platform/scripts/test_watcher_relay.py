@@ -260,6 +260,25 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - arrived, EVENT_GAP_S * 0.5)
         connection.close()
 
+    def test_a_watch_stream_says_it_will_close_and_ends_with_eof(self):
+        # The one response of unknown length the credentialed handler writes:
+        # no Content-Length, `Connection: close`, and the connection closed
+        # after the body, so a keep-alive client knows where the stream ends.
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        connection.request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?watch=true",
+                           headers={"Authorization": "Bearer watcher-token"})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual("close", (response.getheader("Connection") or "").lower())
+        self.assertIsNone(response.getheader("Content-Length"))
+        self.assertIsNone(response.getheader("Transfer-Encoding"))
+        # A close-delimited read returns only at EOF: the server closed, within
+        # the client's timeout, or this raises.
+        self.assertTrue(response.will_close)
+        body = response.read()
+        self.assertEqual(["e1", "e2"], [json.loads(line)["object"]["metadata"]["name"] for line in body.splitlines()])
+        connection.close()
+
     def test_secrets_writes_and_other_lists_never_reach_the_api_server(self):
         for method, path in (
             ("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/secrets/db"),

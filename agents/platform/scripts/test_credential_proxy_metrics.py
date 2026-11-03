@@ -1902,7 +1902,7 @@ class ServeWiringTest(unittest.TestCase):
     class _Stop(Exception):
         pass
 
-    def _serve(self, metrics_port, env_value=None, started=None, unix_server=None):
+    def _serve(self, metrics_port, env_value=None, started=None, unix_server=None, health_port=0, health_started=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         policy_path = Path(tmp.name) / "policy.json"
@@ -1918,6 +1918,7 @@ class ServeWiringTest(unittest.TestCase):
             state_dir=str(Path(tmp.name) / "state"),
             role="full",
             metrics_port=metrics_port,
+            health_port=health_port,
         )
         environment = {
             "API_SERVER_EXTERNAL_KEY": "external",
@@ -1941,6 +1942,7 @@ class ServeWiringTest(unittest.TestCase):
                 pass
 
         started = started if started is not None else mock.MagicMock(return_value=None)
+        health_started = health_started if health_started is not None else mock.MagicMock(return_value=None)
         unix_server = unix_server if unix_server is not None else credential_proxy.ThreadingUnixHTTPServer
         try:
             with mock.patch.dict(os.environ, environment, clear=True), \
@@ -1949,6 +1951,7 @@ class ServeWiringTest(unittest.TestCase):
                     mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
                     mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop), \
                     mock.patch.object(credential_proxy, "start_metrics_listener", started), \
+                    mock.patch.object(credential_proxy, "start_health_listener", health_started), \
                     self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
                 with self.assertRaises(self._Stop):
                     credential_proxy.serve(args)
@@ -2003,7 +2006,43 @@ class ServeWiringTest(unittest.TestCase):
                 started.assert_not_called()
                 self.assertTrue(any("metrics listener disabled" in line and expected in line for line in logs), logs)
                 if env_value is not None:
-                    self.assertFalse(any("is unset" in line for line in logs), logs)
+                    self.assertFalse(any("metrics listener disabled" in line and "is unset" in line for line in logs), logs)
+
+    def test_the_health_port_reaches_its_listener_after_the_credentialed_server(self):
+        order = []
+
+        class _Recording(credential_proxy.ThreadingUnixHTTPServer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                order.append("credentialed")
+
+        health_started = mock.MagicMock(side_effect=lambda *args: order.append("health"))
+        self._serve(8766, unix_server=_Recording, health_port=8767, health_started=health_started)
+        health_started.assert_called_once_with("127.0.0.1", 8767)
+        self.assertEqual(["credentialed", "health"], order)
+
+    def test_a_health_port_the_other_listeners_hold_is_refused_by_name_and_never_bound(self):
+        for health_port, named in ((8766, "metrics"), (0, None), (70000, "1-65535")):
+            with self.subTest(health_port=health_port):
+                started, logs = self._serve(8766, health_port=health_port, health_started=mock.MagicMock())
+                if named is None:
+                    self.assertTrue(any("health listener disabled" in line for line in logs), logs)
+                else:
+                    self.assertTrue(
+                        any("ALERT" in line and credential_proxy.HEALTH_PORT_ENV in line and named in line for line in logs),
+                        logs,
+                    )
+
+    def test_serve_sets_the_thread_cap_and_the_stack_size_before_any_listener(self):
+        # _serve clears the environment, so the reader is stood in for; the
+        # reader itself is ThreadCapTest's.
+        with mock.patch.object(credential_proxy.threading, "stack_size") as stack_size, \
+                mock.patch.object(credential_proxy, "thread_cap_from_env", return_value=12):
+            self.addCleanup(setattr, credential_proxy.ThreadCap, "max_threads", credential_proxy.ThreadCap.max_threads)
+            self._serve(8766)
+        stack_size.assert_called_once_with(credential_proxy.THREAD_STACK_BYTES)
+        self.assertEqual(credential_proxy.MEBIBYTE, credential_proxy.THREAD_STACK_BYTES)
+        self.assertEqual(12, credential_proxy.ThreadCap.max_threads)
 
 
 if __name__ == "__main__":
