@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -48,14 +49,17 @@ const (
 	slackHomePickAlready     = "<#%s> is already the home channel."
 	slackHomePickBusy        = "A home-channel change is in progress; pick again in a moment."
 	slackHomePickConflict    = "Moved to <#%s> by %s a moment ago; pick again to override."
-	slackHomePickNoAPI       = "Not moved: the cluster API did not answer; pick again."
-	slackHomePickNoCheck     = "Could not check <#%s> with Slack; pick again."
-	slackHomePickNotApplied  = "The operator has not applied the move; check the operator."
-	slackHomePickNotMember   = "Invite the app to <#%s> with /invite <@%s>, then pick it again."
-	slackHomePickArchived    = "<#%s> is archived."
-	slackHomePickShared      = "A channel shared through Slack Connect cannot be the home channel."
-	slackHomePickMalformed   = "That is not a channel."
-	slackHomePickGuest       = "Only a member of this workspace can move the home channel."
+	// The record changed under the move to a value that is not a channel id
+	// (a hand edit): the value is not rendered.
+	slackHomePickConflictUnnamed = "The home channel record was changed by %s a moment ago; pick again to override."
+	slackHomePickNoAPI           = "Not moved: the cluster API did not answer; pick again."
+	slackHomePickNoCheck         = "Could not check <#%s> with Slack; pick again."
+	slackHomePickNotApplied      = "The operator has not applied the move; check the operator."
+	slackHomePickNotMember       = "Invite the app to <#%s> with /invite <@%s>, then pick it again."
+	slackHomePickArchived        = "<#%s> is archived."
+	slackHomePickShared          = "A channel shared through Slack Connect cannot be the home channel."
+	slackHomePickMalformed       = "That is not a channel."
+	slackHomePickGuest           = "Only a member of this workspace can move the home channel."
 
 	// homePickedLine goes into the new home; homeMovedLine into the old one.
 	// Posted raw, as homeLearnedLine is: the ids are checked channel ids.
@@ -65,6 +69,10 @@ const (
 
 // errHomeAlreadySet is moveHome's answer to a pick of the recorded channel.
 var errHomeAlreadySet = errors.New("already the home channel")
+
+// slackMemberIDPattern is a Slack member id, as the gateway's mention pattern
+// reads one.
+var slackMemberIDPattern = regexp.MustCompile(`^[UW][A-Z0-9]+$`)
 
 // homeMoveConflict is a 409 on the move: the record changed under the write,
 // and winner and by name what it says now.
@@ -79,8 +87,8 @@ func (c *homeMoveConflict) Error() string {
 // slackHomePickPendingTTL, so every viewer sees the move before the kubelet
 // does.
 type slackHomePending struct {
-	channel, member string
-	at              time.Time
+	channel string
+	at      time.Time
 }
 
 // slackHomePickStatus is one member's last pick outcome, drawn under the
@@ -192,13 +200,14 @@ func (s *SlackAdapter) homePick(p slackClickPayload, channel string) {
 		return
 	}
 	if l.busy {
+		// Added under the lock the closed check ran under, as the other two
+		// sites are, so nothing starts after closeHomeLearn's wait.
+		l.wg.Add(1)
 		l.mu.Unlock()
 		s.log.Info("slack: a home pick arrived while a change runs", "member", member, "channel", channel)
 		s.setPickStatus(member, slackHomePickBusy)
 		// Admission runs again (republish=false): the member may have left
-		// the allowlist since they opened the tab. Under the wait group, so
-		// the publish does not outlive Run.
-		l.wg.Add(1)
+		// the allowlist since they opened the tab.
 		s.goSession(func() {
 			defer l.wg.Done()
 			s.publishHome(member, false)
@@ -267,6 +276,11 @@ func (s *SlackAdapter) runHomePick(member, team, channel, actionTS string) (move
 		return ""
 	}
 	previous, err := s.moveHome(ctx, channel, member)
+	if !slackIsHomeChannelID(previous) {
+		// A hand-edited record may hold a name; it is never rendered or
+		// posted to, as the learn never names such a value.
+		previous = ""
+	}
 	var conflict *homeMoveConflict
 	switch {
 	case errors.Is(err, errHomeAlreadySet):
@@ -279,6 +293,10 @@ func (s *SlackAdapter) runHomePick(member, team, channel, actionTS string) (move
 			finish(slackHomePickNoAPI)
 			return ""
 		}
+		if !slackIsHomeChannelID(conflict.winner) {
+			finish(fmt.Sprintf(slackHomePickConflictUnnamed, slackMemberOrSomeone(conflict.by)))
+			return ""
+		}
 		finish(fmt.Sprintf(slackHomePickConflict, conflict.winner, slackMemberOrSomeone(conflict.by)))
 		return ""
 	case err != nil:
@@ -287,7 +305,7 @@ func (s *SlackAdapter) runHomePick(member, team, channel, actionTS string) (move
 		return ""
 	}
 	s.home.mu.Lock()
-	s.home.pending = &slackHomePending{channel: channel, member: member, at: time.Now()}
+	s.home.pending = &slackHomePending{channel: channel, at: time.Now()}
 	s.home.mu.Unlock()
 	s.log.Info("slack: home channel moved", "member", member, "old", previous, "new", channel, "actionTS", actionTS, "via", slackHomePickVia)
 	status := fmt.Sprintf(slackHomePickRecordedNew, channel)
@@ -304,9 +322,9 @@ func (s *SlackAdapter) runHomePick(member, team, channel, actionTS string) (move
 }
 
 // slackMemberOrSomeone renders a member id as a mention, or "someone" for a
-// record with no setBy (a hand edit).
+// record whose setBy is empty or not a member id (a hand edit).
 func slackMemberOrSomeone(member string) string {
-	if member == "" {
+	if !slackMemberIDPattern.MatchString(member) {
 		return "someone"
 	}
 	return "<@" + member + ">"
@@ -380,7 +398,7 @@ func (s *SlackAdapter) moveHome(ctx context.Context, channel, member string) (pr
 		// that adopts the channel does.
 		if cm.Data[homeRecordKeyRefused] != "" {
 			if err := l.record.patch(ctx, cm.ResourceVersion, map[string]*string{homeRecordKeyRefused: nil}); err != nil {
-				return previous, err
+				return previous, s.moveConflict(ctx, channel, err)
 			}
 		}
 		return previous, errHomeAlreadySet
@@ -390,11 +408,24 @@ func (s *SlackAdapter) moveHome(ctx context.Context, channel, member string) (pr
 		homeRecordKeySlack: &channel, homeRecordKeySetBy: &member, homeRecordKeySetAt: &now,
 		homeRecordKeyWriter: &l.image, homeRecordKeyRefused: nil,
 	})
-	if apierrors.IsConflict(err) {
-		if again, readErr := l.record.get(ctx); readErr == nil {
-			return previous, &homeMoveConflict{winner: strings.TrimSpace(again.Data[homeRecordKeySlack]), by: again.Data[homeRecordKeySetBy]}
-		}
-		return previous, err
+	return previous, s.moveConflict(ctx, channel, err)
+}
+
+// moveConflict maps a 409 on either write to what the record says now:
+// errHomeAlreadySet while it still names channel (the other writer cleared
+// or kept it), a homeMoveConflict naming the winner otherwise. Any other
+// error, or a failed re-read, comes back as it was.
+func (s *SlackAdapter) moveConflict(ctx context.Context, channel string, err error) error {
+	if !apierrors.IsConflict(err) {
+		return err
 	}
-	return previous, err
+	again, readErr := s.homeLearn.record.get(ctx)
+	if readErr != nil {
+		return err
+	}
+	winner := strings.TrimSpace(again.Data[homeRecordKeySlack])
+	if winner == channel {
+		return errHomeAlreadySet
+	}
+	return &homeMoveConflict{winner: winner, by: again.Data[homeRecordKeySetBy]}
 }

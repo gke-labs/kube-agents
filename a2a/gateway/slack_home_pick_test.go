@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -373,5 +375,120 @@ func TestSlackHomePickNotAHomeTabAction(t *testing.T) {
 	pick(t, a, "U1", "T1", "", "208.1")
 	if homePatches(cs) != 0 || api.conversationInfoCalls != 0 || len(api.views) != 0 {
 		t.Errorf("a non-view action did work: patches %d, info %d, views %d", homePatches(cs), api.conversationInfoCalls, len(api.views))
+	}
+}
+
+// TestSlackHomePickHandEditedRecordValues: a record value that is not a
+// channel id (a hand edit) is neither rendered nor posted to, on a move and
+// on a 409.
+func TestSlackHomePickHandEditedRecordValues(t *testing.T) {
+	a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "general", homeRecordKeySetBy: "ops team"})
+	// The file already names the new channel, so the follow-up finds the
+	// move applied and the pick's own status stays on the view.
+	writeHomeFile(t, dir, "C0NEW2\n")
+	api.conversations["C0NEW2"] = homeChannelInfo("C0NEW2", nil)
+	pick(t, a, "U1", "T1", "C0NEW2", "211.1")
+	if data := homeRecordData(t, cs); data[homeRecordKeySlack] != "C0NEW2" {
+		t.Fatalf("record = %v", data)
+	}
+	text := lastView(t, api, "U1")
+	if !strings.Contains(text, fmt.Sprintf(slackHomePickRecordedNew, "C0NEW2")) || strings.Contains(text, "general") {
+		t.Errorf("a hand-edited previous value was rendered:\n%s", text)
+	}
+	if len(api.posted) != 1 || api.posted[0].channel != "C0NEW2" {
+		t.Errorf("posts = %+v, want the new-channel line only", api.posted)
+	}
+	// A 409 whose winner is a hand edit: no channel or member is rendered.
+	var once sync.Once
+	cs.PrependReactor("patch", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		conflicted := false
+		once.Do(func() {
+			conflicted = true
+			cm, _ := cs.Tracker().Get(configMapsGVR, homeTestNamespace, homeTestRecord)
+			obj := cm.(*corev1.ConfigMap)
+			obj.Data = map[string]string{homeRecordKeySlack: "general", homeRecordKeySetBy: "ops team"}
+			obj.ResourceVersion = "9"
+			_ = cs.Tracker().Update(configMapsGVR, obj, homeTestNamespace)
+		})
+		if conflicted {
+			return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, homeTestRecord, errors.New("changed"))
+		}
+		return false, nil, nil
+	})
+	api.conversations["C0NEW3"] = homeChannelInfo("C0NEW3", nil)
+	pick(t, a, "U1", "T1", "C0NEW3", "212.1")
+	text = lastView(t, api, "U1")
+	if !strings.Contains(text, fmt.Sprintf(slackHomePickConflictUnnamed, "someone")) || strings.Contains(text, "<#general>") || strings.Contains(text, "<@ops team>") {
+		t.Errorf("a hand-edited winner was rendered:\n%s", text)
+	}
+}
+
+// TestSlackHomePickStaleRefusalClearConflict: a 409 while clearing a stale
+// refusal on the recorded channel reads as "already the home channel" while
+// the record still names it, and names the winner once it moved.
+func TestSlackHomePickStaleRefusalClearConflict(t *testing.T) {
+	a, api, cs, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyRefused: homeRefusedArchived})
+	writeHomeFile(t, dir, "")
+	api.conversations["C0OLD1"] = homeChannelInfo("C0OLD1", nil)
+	moved := ""
+	cs.PrependReactor("patch", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if moved != "" {
+			cm, _ := cs.Tracker().Get(configMapsGVR, homeTestNamespace, homeTestRecord)
+			obj := cm.(*corev1.ConfigMap)
+			obj.Data = map[string]string{homeRecordKeySlack: moved, homeRecordKeySetBy: "U7"}
+			_ = cs.Tracker().Update(configMapsGVR, obj, homeTestNamespace)
+		}
+		return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, homeTestRecord, errors.New("changed"))
+	})
+	pick(t, a, "U1", "T1", "C0OLD1", "213.1")
+	if text := lastView(t, api, "U1"); !strings.Contains(text, "already the home channel") || strings.Contains(text, slackHomePickNoAPI) {
+		t.Errorf("a 409 on the refusal clear with the record unchanged:\n%s", text)
+	}
+	moved = "C0WIN3"
+	pick(t, a, "U1", "T1", "C0OLD1", "214.1")
+	if text := lastView(t, api, "U1"); !strings.Contains(text, "Moved to <#C0WIN3> by <@U7>") {
+		t.Errorf("a 409 on the refusal clear with the record moved:\n%s", text)
+	}
+}
+
+// TestSlackHomePickBusyPublishEndsBeforeTheClose (round 1): a pick that
+// arrives while a change runs publishes under the learner's wait group, so
+// closeHomeLearn's wait returns only after that publish. The pump is parked
+// between the busy check and the publish by holding home.mu, which
+// setPickStatus takes; the learner closes while it is parked.
+func TestSlackHomePickBusyPublishEndsBeforeTheClose(t *testing.T) {
+	a, api, _, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage})
+	writeHomeFile(t, dir, "C0OLD1\n")
+	api.conversations["C0OLD1"] = homeChannelInfo("C0OLD1", nil)
+	pick(t, a, "U1", "T1", "C0OLD1", "214.9") // U1 has the tab open
+	logs := &recordingHandler{}
+	a.log = slog.New(logs)
+	a.homeLearn.mu.Lock()
+	a.homeLearn.busy = true
+	a.homeLearn.mu.Unlock()
+	before := viewsFor(api, "U1")
+	a.home.mu.Lock()
+	pumped := make(chan struct{})
+	go func() {
+		defer close(pumped)
+		if _, ok := a.interactive(homePickPayload(t, "U1", "T1", "C0NEW2", "215.1")); ok {
+			t.Error("a home pick became a turn")
+		}
+	}()
+	waitFor(t, "the pump to pass the busy check", func() bool { return logs.has("channel", "C0NEW2") })
+	atClose := make(chan int, 1)
+	go func() {
+		a.closeHomeLearn()
+		atClose <- viewsFor(api, "U1")
+	}()
+	// With the publish counted under the lock, the close waits here; a
+	// branch that adds after the unlock lets it return at once.
+	time.Sleep(50 * time.Millisecond)
+	a.home.mu.Unlock()
+	<-pumped
+	closedAt := <-atClose
+	a.homeLearn.wg.Wait()
+	if final := viewsFor(api, "U1"); closedAt != final || final != before+1 {
+		t.Errorf("views at the close %d, after it %d, before the pick %d: a publish ran after closeHomeLearn's wait returned", closedAt, final, before)
 	}
 }
