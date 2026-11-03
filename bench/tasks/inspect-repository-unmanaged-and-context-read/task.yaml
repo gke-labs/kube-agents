@@ -46,17 +46,31 @@
 # fails the check. The workspace route itself is a text pattern, because a
 # run must name every client that could carry it (curl, wget, python in any
 # version and form, a heredoc, a wrapper such as timeout), and each one it
-# misses is a workspace call that passes. The pattern matches any row that
-# names /v1/workspace, except a row whose command is one that only reads or
-# prints (grep, rg, egrep, fgrep, cat, echo, printf, sed, head, tail, less,
-# find, ls), after an optional leading `cd <dir> &&` or `cd <dir>;`. So a
-# grep of the skill tree does not fail the check, and a python heredoc, a
-# `python3 -Ic` program or an assignment that holds the route does. The
-# check does not see a route that no row names: a script file that names it
-# (`python3 /tmp/call.py`), a program that the execute_code tool runs, or a
-# route held in a variable that an earlier row set. A row that reads first
-# and then calls the route in the same chain (`grep … && curl …/v1/workspace`)
-# is read as a mention.
+# misses is a workspace call that passes. The pattern fails any row that
+# names /v1/workspace. An exemption first removes a whole row when the row is
+# one read-only command and nothing else: grep, rg, egrep, fgrep, cat, head,
+# tail, less, ls, echo or printf, by name or by an absolute path
+# (/usr/bin/grep), after optional leading spaces and any number of
+# `cd <dir> &&` or `cd <dir>;` steps (a quoted or a bare <dir>). After that
+# command the row has no |, ;, &, <, >, backquote, `$(` or newline, and it
+# is not a collapsed chain (a row ending ` + N command(s)`). So a grep of the
+# skill tree does not fail the check. A heredoc, a pipe into curl, a
+# substitution, a second line, a python program or an assignment that holds
+# the route does. sed and find are not exempt, because `sed -i` writes and
+# `find -exec` runs a command.
+# Known limits:
+#   - The check does not see a route that no row names: a script file that
+#     names it (`python3 /tmp/call.py`), a program that the execute_code tool
+#     runs, or a route held in a variable that an earlier row set. On a card
+#     log row, hermes drops a redirection and joins lines with a space, so
+#     `echo …/v1/workspace/open > /tmp/call.py`, or a call on the line after
+#     a grep, reads as one read-only command. A call chained behind a read
+#     (`grep … && curl …/v1/workspace`) is not on the row.
+#   - A read that is not one listed command and nothing else counts as a
+#     call, which is a spurious red: a read behind `if`, `!`, `$(…)` or a
+#     wrapper such as timeout, an unlisted reader (awk, jq, sed, find), an
+#     operator inside a quoted argument (`grep 'a|/v1/workspace'`), and a
+#     collapsed chain whose first command names the route.
 # A workspace verb matches as any word after the script, not only as the
 # subcommand. So an option value that is a bare open, list, grep, fetch or
 # close (`clone … --into list`) counts as the verb and fails the check; a
@@ -153,7 +167,11 @@ verification_spec:
       forbidden_runs:
         - script: inspect_repository.py
           word_patterns: ["^ ?(open|list|grep|fetch|close)$"]
-      # Any row that names the workspace route, unless its command only
-      # reads or prints; the case header lists the commands and the limits.
+      # A row that is one read-only command and nothing else; the case
+      # header lists the commands and the limits.
+      exempt_patterns:
+        - >-
+          ^(?!.*\s\+\s\d+\scommands?\s*\Z)\s*+(?:cd\s++(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^\s"'`$|;&<>()]+)\s*+(?:&&|;)\s*+)*+(?:(?:/[\w.-]+)*/)?(?:grep|rg|egrep|fgrep|cat|head|tail|less|ls|echo|printf)(?=\s|\Z)(?:[^|;&<>`$\n]|\$(?!\())*\Z
+      # Any row that names the workspace route.
       forbidden_patterns:
-        - '(?s)^\s*(?:cd\s+\S+\s*(?:&&|;)\s*)?+(?!(?:grep|rg|egrep|fgrep|cat|echo|printf|sed|head|tail|less|find|ls)\b).*/v1/workspace\b'
+        - '/v1/workspace\b'
