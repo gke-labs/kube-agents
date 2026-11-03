@@ -710,8 +710,9 @@ block above it, naming the issue that decides when it goes, and `scripts/test_ev
 holds every entry to that, the way the validator's `FIXTURE_NOT_READY` holds a case with no
 fixture to an issue. The case keeps its seat in `presubmit-cases.txt` or `nightly-cases.txt` and
 on the blocking roster, but it stops running wherever the inject lane runs, the nightlies
-included. The only api-transport job on `main` is the today lane, which runs the presubmit
-matrix: a listed presubmit case still runs there, and a listed nightly case runs nowhere in CI.
+included. No job on `main` runs the presubmit matrix over the api transport now: a listed
+presubmit case runs only when the today presubmit (`pull-kube-agents-smoke-test-today`) runs on a
+pull request, and a listed nightly case runs nowhere in CI.
 An entry also leaves what can red a pull request, because the merge-blocking presubmit is on the inject lane: `hack/ci-eval-pr.sh` drops it
 from the matrix and from `BOOTSTRAP_ADMITTED` there. No roster case is listed, so the
 merge-blocking run grades delegation through the chat front door with `agent-kanban-smoke`.
