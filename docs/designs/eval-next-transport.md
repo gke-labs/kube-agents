@@ -148,12 +148,16 @@ the presubmit exports nothing new until it chooses to. The exchange:
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` artifacts into the trajectory when the executor publishes them
    (the `progress` artifact's last line goes to the harness result's `metadata`, which devops-bench
-   does not write to the record, so it reaches the log and nothing graded). Token counts are not
-   on the bus, and the scorer's liveness rule
+   does not write to the record, so it reaches the log and nothing graded). The front door's
+   token counts come from one probed read after the terminal (`usage=chain`), which sums the `usage` artifact of the root
+   turn and every wake that continued its chain
+   (`input` and `output` and their `total`; Hermes reports no cached or reasoning split), reports
+   the chain's child tasks apart (`tokens.children`, added into `total` with the workers'), and
+   leaves them null when it carries none. The scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,
-   `working` and the terminal, is a trajectory entry under the status-event name, the token
-   buckets are null, the latency is set, and the scorer's rung-3 rule accepts a `working` or a
+   `working` and the terminal, is a trajectory entry under the status-event name, the latency
+   is set, and the scorer's rung-3 rule accepts a `working` or a
    final status entry as liveness evidence in place of a token total; `working` counts because
    a graded timeout, canceled at the budget with the cancel unconfirmed, has no final entry and
    would otherwise block as not a real run, and a `submitted` entry alone still blocks. A task
@@ -254,8 +258,8 @@ other; an active task with no executor event, nobody took it, infrastructure, wh
 gateway has released the conversation yet; an active task at `submitted` and never `working`, an
 executor accepted it and queued it for the whole budget, infrastructure; an active task at
 `working`, a graded timeout; and an active task whose stream already folds to a terminal, which
-is the relay's lost record write, the event acked when the relay enqueued it, before the queued
-write cleared `ActiveTask`, and an acked event is never redelivered. That fifth outcome is graded
+is the relay's lost record write: the relay acks a terminal once it has rendered it, whether or
+not the record write after it cleared `ActiveTask`, and an acked event is never redelivered. That fifth outcome is graded
 like the first, with the answer read from the fold rather than the posted message, and gets no
 cancel, because there is nothing left to cancel; the record then holds a finished task until
 something releases it, which on a key never reused is nothing and costs nothing. The sixth is
@@ -682,8 +686,8 @@ grade. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off ne
 nor the transport: on both lanes they are appended to a scratch copy of every remaining task
 file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
 `BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
-request, and the stopped asks, run in a second phase after every other unit, one at a time and
-each after a settle, so no repetition that requests nothing shares the repository with one that
+request, and the stopped asks, run in a second phase after every first-phase unit (a case that
+declares `scope_exclude:` runs after them, in a phase of its own), one at a time and each after a settle, so no repetition that requests nothing shares the repository with one that
 writes by design and no window reaches back into the unit before; and after the fan-out the
 script lists in the job log what the run left on that repository, closing nothing. With the flag
 unset, the transport, the inject lane's exclusion list, the card stop and the rollback check

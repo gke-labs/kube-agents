@@ -278,6 +278,51 @@ __INLINE_HEALTH__
   .detail .close { margin-left:auto; font:inherit; font-size:13px; color:var(--text-muted); background:none; border:0; cursor:pointer; }
   .detail .sub { color:var(--text-muted); font-size:13px; margin:4px 0 10px; }
 
+  /* the Cases page's two views: a second row of tabs in the top bar's style */
+  .subnav { display:flex; gap:20px; margin-top:22px; border-bottom:1px solid var(--line); }
+  .subnav a { color:var(--text-muted); font-size:13px; font-weight:650; padding:6px 0; margin-bottom:-1px; border-bottom:2px solid transparent; }
+  .subnav a.on { color:var(--text-primary); border-bottom-color:var(--accent); }
+  .subnav a:hover { text-decoration:none; color:var(--text-primary); }
+  .subnav + .sec.head { margin-top:22px; }
+
+  /* the Cases page's scenarios view: one folded card per case in a grid per domain,
+     the confidence level as a badge beside the roster pill, hover notes
+     the page draws itself */
+  .scn { display:grid; grid-template-columns:repeat(auto-fill,minmax(400px,1fr)); gap:10px; margin-top:12px; }
+  .scn .card { background:var(--surface-1); border:1px solid var(--line); border-radius:12px; padding:10px 14px; box-shadow:var(--shadow); }
+  .scn .card summary { list-style:none; cursor:pointer; display:flex; flex-direction:column; gap:4px; }
+  .scn .card summary::-webkit-details-marker { display:none; }
+  .scn .card:hover { border-color:var(--accent); }
+  .scn .card[open] summary { margin-bottom:6px; }
+  .scn .hd { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .scn .ft { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; }
+  .scn .more { margin-left:auto; font-size:12px; font-weight:600; color:var(--accent-link,var(--accent)); white-space:nowrap; }
+  .scn .more .close, .scn .card[open] .more .open { display:none; }
+  .scn .card[open] .more .close { display:inline; }
+  .scn h3 { font-size:14.5px; line-height:1.35; font-weight:650; }
+  .scn p { margin:6px 0 0; font-size:13px; line-height:1.45; color:var(--text-secondary); }
+  .scn .lbl { display:block; font-size:10.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent-link,var(--accent)); font-weight:800; margin:4px 0 1px; }
+  .scn .rec, .scn .tms { font-size:12.5px; color:var(--text-secondary); font-variant-numeric:tabular-nums; }
+  .scn .rec { margin-top:6px; }
+  .scn .tms b { color:var(--text-primary); }
+  .scn .links { margin-top:8px; font-size:12.5px; }
+  .dsum { font-size:13px; color:var(--text-muted); margin-top:4px; }
+  .gloss { margin-top:8px; font-size:12.5px; color:var(--text-muted); }
+  .gloss summary { display:inline-block; list-style:none; cursor:pointer; color:var(--text-muted); border-bottom:1px dotted var(--text-muted); }
+  .gloss summary::-webkit-details-marker { display:none; }
+  .gloss ul { margin:8px 0 0; padding:0 0 0 2px; list-style:none; }
+  .gloss li { padding:3px 0; }
+  .gloss b { color:var(--text-secondary); }
+  .hint { color:var(--text-muted); border-bottom:1px dotted var(--text-muted); cursor:help; }
+  .scn [data-tip] { position:relative; }
+  .scn [data-tip]:hover::after { content:attr(data-tip); position:absolute; left:0; bottom:calc(100% + 6px); z-index:4; width:max-content; max-width:320px;
+    white-space:normal; background:var(--text-primary); color:var(--surface-0); font:500 12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    padding:6px 9px; border-radius:6px; box-shadow:var(--shadow); pointer-events:none; }
+  .lvl { display:inline-flex; align-items:baseline; gap:6px; border-radius:6px; padding:3px 9px; font-size:11px; font-weight:750; letter-spacing:.03em; white-space:nowrap; }
+  .lvl.proven { background:var(--good-bg); color:var(--good-text); }
+  .lvl.proving { background:var(--accent-soft); color:var(--accent-link,var(--accent)); }
+  .lvl.in_development { background:var(--skip-bg); color:var(--text-secondary); }
+
   /* the Brief's release table */
   table.rel { width:100%; border-collapse:collapse; background:var(--surface-1); border:1px solid var(--line); border-radius:12px; overflow:hidden; font-size:13.5px; box-shadow:var(--shadow); }
   table.rel th { text-align:left; font-size:11px; color:var(--text-muted); text-transform:uppercase; letter-spacing:.06em; font-weight:700; padding:9px 12px; border-bottom:1px solid var(--line); }

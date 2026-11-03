@@ -72,12 +72,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import hashlib
 import json
 import re
 import shlex
 import os
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -110,12 +111,9 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 
 AUDIT_ID = "security-patch-orchestrator"
 DEFAULT_TIMEOUT_S = 60
-# What `timeout(1)` exits with, so a timed-out gcloud reads the same in the
-# manifest whichever layer cut it off.
-TIMEOUT_RC = 124
-# The credential proxy's admitted count at the operator's default limit;
-# collect.py's MAX_WORKERS comment has the reasoning.
-MAX_WORKERS = 4
+# How many clusters a sweep reads at once is broker_admission.sweep_width(),
+# resolved in collect_fleet: what the credential broker admits, less headroom
+# for chat (collect.py's comment above its own collect_fleet has the reasoning).
 # How much of gcloud's stderr a `gate-failed` entry keeps: enough to carry the
 # API's error sentence, short enough not to dominate the manifest.
 ERROR_EXCERPT_CHARS = 300
@@ -160,6 +158,8 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -242,9 +242,9 @@ BEHIND_CHECKS = (MASTER_BEHIND_CHECK, "pool-skew")
 # has to leave room: a cluster whose run overruns it loses 3.11
 # (unevaluated, below) rather than the manifest.
 READINESS_TIMEOUT_S = 240
-# The reporter runs sit on `MAX_WORKERS` threads, so a per-run cap bounds one
+# The reporter runs sit on `max_workers` threads, so a per-run cap bounds one
 # project and not the sum: a fleet with more behind projects than workers
-# queues the rest behind the first `MAX_WORKERS`. This is the budget for all of them
+# queues the rest behind the first `max_workers`. This is the budget for all of them
 # together, measured from the moment the fleet collection starts, and a
 # reporter that would start with less than the floor left is not started.
 READINESS_FLEET_BUDGET_S = 420
@@ -473,44 +473,14 @@ def log(msg: str) -> None:
     print(f"[patch_readiness] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+Discovery = collector_run.Discovery
+run_and_gate = collector_run.run_and_gate
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
-
-
-def _text(output: str | bytes | None) -> str:
-    if isinstance(output, bytes):
-        return output.decode(errors="replace")
-    return output or ""
-
-
-def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
-        # or not, and every caller matches markers against a str.
-        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn = default_run) -> tuple[object | None, Run]:
-    result = run(argv)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 def output_digest(text: str) -> str:
@@ -524,17 +494,6 @@ def _record(argv_str: str, result: Run) -> dict:
         "duration_s": round(result.duration_s, 2),
         "output_sha256": output_digest(result.stdout),
     }
-
-
-class Discovery(NamedTuple):
-    projects: list[str]
-    # Set when no project could be resolved at all: an empty fleet is then a
-    # failure to look, and the manifest says so with a top-level `error`.
-    error: str | None
-    # Set when the scope is provably short -- `projects list` failed or
-    # filtered out the active project, or `--project` narrowed it -- and
-    # turned into a `project/UNENUMERATED_PROJECTS` row by `collect_fleet`.
-    partial: str | None = None
 
 
 def _stderr_excerpt(result: Run) -> str:
@@ -2185,7 +2144,8 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
     return entries + shortfall
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int | None = None, now: datetime | None = None) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
     # The clock for 3.11's budget starts here, before discovery: what the

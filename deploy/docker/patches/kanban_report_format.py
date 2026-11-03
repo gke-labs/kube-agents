@@ -139,6 +139,8 @@ past 4000 characters across messages:
   Slack shows the step as a button that sends its words, so write what the
   user would type, at most 75 characters, with no backticks, link or
   mention. Never more than one, and none when no single step is obvious.
+  The step is for the requester to send: never act on it yourself, before
+  or after kanban_complete.
 - A question gets that paragraph and nothing more: no sections, no list of the
   commands you ran. A question that spans clusters may follow it with one pipe
   table, a row per cluster, holding the finding each one rests on.

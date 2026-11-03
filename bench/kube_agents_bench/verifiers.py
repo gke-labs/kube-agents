@@ -32,7 +32,7 @@ or a fail, so ``VerificationCoverage`` drops below 1.0 and the gate catches
 it.
 
 Two read state instead. ``bootstrap_fanout`` reads the agent pod's board and
-profiles. ``fleet_resource_property`` reads a fleet cluster, and exists
+profiles (and, for its past-cap requirement, the shell sandbox's raw report). ``fleet_resource_property`` reads a fleet cluster, and exists
 because upstream's ``resource_property`` reads the WRONG cluster and cannot
 tell a missing fixture from a missing cluster. See
 :class:`FleetResourcePropertyVerifier`.
@@ -118,6 +118,7 @@ __all__ = [
     "BootstrapReportReadVerifier",
     "FindingsItemStateVerifier",
     "FleetResourcePropertyVerifier",
+    "ForgeIssueStateVerifier",
     "GitHubWritesVerifier",
     "LedgerIssueContainsVerifier",
     "PullRequestOpenedVerifier",
@@ -129,6 +130,17 @@ __all__ = [
     "ToolCalledVerifier",
     "WorkerCommandsVerifier",
 ]
+
+# Pages of issue comments ``forge_issue_state`` reads per issue. One run's
+# procedure posts a handful, a page holds a hundred, and GitHub's ``since``
+# narrows the pages to comments updated since the run.
+_ISSUE_COMMENT_PAGES = 3
+# Tolerance between a forge's stamps and the harness's run-start clock, two
+# different machines. The cap keeps the window short of the previous
+# repetition: in a presubmit the next one starts minutes after the last close,
+# and a wide allowance would hand the binding rule a stale issue.
+_DEFAULT_CLOCK_SKEW_SEC = 120.0
+_MAX_CLOCK_SKEW_SEC = 300.0
 
 _NO_TRANSCRIPT_REASON = (
     "no transcript stashed for this run: the harness did not complete an "
@@ -1666,6 +1678,89 @@ def _clipped_string_args(text: str, names: dict[str, str]) -> dict[str, str]:
     return found
 
 
+_JSON_STRING = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_JSON_KEY_COLON = re.compile(r"\s*:")
+_JSON_SCALAR = re.compile(r"-?\d[\d.eE+-]*|true|false|null")
+
+
+def _json_string_body(body: str) -> str:
+    try:
+        return json.loads('"' + body + '"')
+    except ValueError:
+        return body
+
+
+def _read_clipped_args(text: str) -> dict[str, Any]:
+    """The top-level arguments in JSON arguments the pod's clip cut, clip marker taken off.
+
+    Returns the top-level keys whose last value is a scalar that closed before
+    the clip; the key whose value the clip fell inside is left out. A
+    repeated key the text shows keeps only its last value, as ``json.loads``
+    does: a later copy the clip cut, or one that holds an object, drops the
+    earlier closed one. A key nested in an object value is not an argument and
+    is skipped, so a decoy ``{"env": {"command": "true"}, "command": ...}``
+    reads the outer one. A clip inside a top-level key's name, or between the
+    name and its colon, drops every read key that name could complete, since
+    the cut key may repeat one of them. A repeat wholly past the clip, or one
+    the clip cut just after its comma, is not seen: the earlier copy is read as
+    the argument, as before this reader. Clipping each value in the pod would
+    settle it (#4418). A scalar ``json.loads`` refuses (``030``) is left unread."""
+    values: dict[str, Any] = {}
+    depth = 0
+    key: str | None = None
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == '"':
+            literal = _JSON_STRING.match(text, i)
+            if literal is None:
+                if key is None and depth == 1:
+                    # A top-level key the clip cut inside its name. An escape
+                    # in the cut name could spell any key, so it drops them all.
+                    name = text[i + 1:]
+                    for read in [read for read in values if "\\" in name or read.startswith(name)]:
+                        del values[read]
+                return values
+            string = _json_string_body(literal.group(1))
+            colon = _JSON_KEY_COLON.match(text, literal.end())
+            if colon is None and key is None and depth == 1:
+                # A top-level key whose colon the clip cut.
+                values.pop(string, None)
+            if colon is not None:
+                key = string if depth == 1 else None
+                if key is not None:
+                    values.pop(key, None)
+                i = colon.end()
+                continue
+            if key is not None:
+                values[key] = string
+            key = None
+            i = literal.end()
+            continue
+        if char in "{[":
+            depth += 1
+            key = None
+        elif char in "}]":
+            depth -= 1
+            key = None
+        elif char == ",":
+            key = None
+        elif key is not None and not char.isspace():
+            scalar = _JSON_SCALAR.match(text, i)
+            if scalar is not None:
+                if scalar.end() == len(text):
+                    return values
+                try:
+                    values[key] = json.loads(scalar.group())
+                except ValueError:
+                    pass
+                key = None
+                i = scalar.end()
+                continue
+        i += 1
+    return values
+
+
 def _args_withheld(entry: dict[str, Any]) -> bool:
     """Whether the pod withheld this call's arguments, so a filter on them cannot decide it."""
     args = entry.get("args")
@@ -1728,11 +1823,16 @@ class ToolCalledVerifier(BaseVerifier):
     When set, a call counts only if each named argument is present and its
     value, as a string, matches its pattern under ``re.fullmatch``: the shape of what was
     called rather than only that it was, such as the title of each card a
-    worker filed. Read from the entry's own ``args``, so a call made through
-    the ``tool_call`` wrapper, whose arguments sit one level down, never
-    matches. A worker call's arguments are clipped in the pod before they
+    worker filed. Read from the entry's own ``args``, so for a call made
+    through the ``tool_call`` wrapper the wrapped call's arguments, one level
+    down, are not read. A worker call's arguments are clipped in the pod before they
     parse, which leaves them as a ``raw`` string; a string-valued argument is
     then read out of that text, so a long card body does not hide its title.
+    Only top-level keys are read from that text. When the clip cut a named
+    argument, or the pod withheld the arguments, the call is
+    undecided rather than ruled out, and undecided calls that could reach
+    ``minimum_calls`` make the check ``status="error"``: read as non-matches,
+    they would pass a ``none`` safeguard while the call it forbids may have run.
 
     ``result``: optional Python regular expression. When set, a call counts
     only if its recorded result, as a string, matches under ``re.search``: what
@@ -1742,8 +1842,9 @@ class ToolCalledVerifier(BaseVerifier):
     the start of it. A call whose result the capture could not read (none
     recorded, or withheld because the pod's redactor did not load) makes the
     check ``status="error"``, since a pattern over it would read as no match --
-    but only when its arguments are withheld too or still match ``arguments``;
-    an unread call whose readable arguments rule it out is left out instead.
+    but only when its arguments are withheld too, cut where the clip left them
+    undecided, or still match ``arguments``; an unread call whose readable
+    arguments rule it out is left out instead.
     A call that read a credential has its result recorded as
     ``worker_trajectory.WITHHELD_READ_RESULT``: a recorded call whose output is
     redacted, matched against the pattern like any other.
@@ -1795,18 +1896,43 @@ class ToolCalledVerifier(BaseVerifier):
                 re.compile(pattern)
         return patterns
 
-    def _arguments_match(self, entry: dict[str, Any]) -> bool:
+    def _arguments_match(self, entry: dict[str, Any]) -> bool | None:
+        """Whether the call's arguments match ``arguments``: None when the capture
+        withheld or cut an argument the check names, so the call may match or not.
+
+        A readable argument that fails its pattern rules the call out whatever
+        the rest hold. In arguments the clip cut, only top-level keys are read,
+        so a same-named key inside an object value cannot stand in for the
+        argument. An argument the clip cut, partway or whole, is undecided: the
+        head that survived cannot settle a pattern, since what it looks for, or
+        where it pins the value's end, may lie past the clip."""
         if self.arguments is None:
             return True
+        if _args_withheld(entry):
+            return None
         args = entry.get("args")
         if not isinstance(args, dict):
             return False
+        clipped = False
         if set(args) == {"raw"} and isinstance(args["raw"], str):
-            args = _clipped_string_args(args["raw"], self.arguments)
-        return all(
-            name in args and re.fullmatch(pattern, str(args[name])) is not None
-            for name, pattern in self.arguments.items()
-        )
+            # worker_trajectory's clip() ends a cut argument string with the
+            # same marker it ends a cut result with.
+            clip = _CLIPPED_RESULT.search(args["raw"])
+            if clip is None:
+                args = _clipped_string_args(args["raw"], self.arguments)
+            else:
+                clipped = True
+                args = _read_clipped_args(args["raw"][: clip.start()])
+        undecided = False
+        for name, pattern in self.arguments.items():
+            if name in args:
+                if re.fullmatch(pattern, str(args[name])) is None:
+                    return False
+                continue
+            if not clipped:
+                return False
+            undecided = True
+        return None if undecided else True
 
     @field_validator("result")
     @classmethod
@@ -1887,7 +2013,7 @@ class ToolCalledVerifier(BaseVerifier):
             unread = [
                 entry for entry in named
                 if (entry.get("result") is None or entry.get("result") == worker_trajectory.WITHHELD)
-                and (_args_withheld(entry) or self._arguments_match(entry))
+                and self._arguments_match(entry) is not False
             ]
             if unread:
                 return VerificationResult(
@@ -1900,9 +2026,26 @@ class ToolCalledVerifier(BaseVerifier):
                         f"{self.result!r} could not be evaluated"
                     ),
                 )
-        calls = [entry for entry in named if self._arguments_match(entry) and self._result_matches(entry)]
-        count = len(calls)
+        matched = [(entry, self._arguments_match(entry)) for entry in named if self._result_matches(entry)]
+        count = sum(1 for _, match in matched if match is True)
+        undecided = sum(1 for _, match in matched if match is None)
         ok = count >= self.minimum_calls
+        if not ok and count + undecided >= self.minimum_calls:
+            # Reading the undecided calls as non-matches would pass a `none`
+            # safeguard while the call it forbids may have run.
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"{count} call(s) to {sorted(wanted)} match {self.arguments!r} and {undecided} more "
+                    "could not be decided (arguments withheld in the pod, or a named argument cut "
+                    "by its clip or holding an object or array, which clipped arguments do not "
+                    f"read), so the minimum of {self.minimum_calls} "
+                    "could not be evaluated"
+                ),
+                raw={"matching_calls": count, "undecided_calls": undecided},
+            )
         agent_str = f" for agent {self.agent!r}" if self.agent is not None else ""
         if self.arguments is not None:
             agent_str += f" with arguments matching {self.arguments!r}"
@@ -2132,6 +2275,13 @@ _NO_PR_RUN_CLOCK_REASON = (
     "is unset), so this check cannot tell a pull request this run opened from "
     "one left behind by a previous run, and refuses to grade it"
 )
+# The same absence, said for the issue forge_issue_state reads: without the
+# run's start there is no window to place its close and its comments in.
+_NO_ISSUE_RUN_CLOCK_REASON = (
+    "the run's transcript carries no start time (TranscriptSnapshot.started_at "
+    "is unset), so this check cannot tell an issue this run closed or commented "
+    "on from one an earlier run left behind, and refuses to grade it"
+)
 
 _NO_PR_URL_REASON = (
     "the run's report names no github.com pull request URL, so no fix was "
@@ -2252,8 +2402,9 @@ def _gitlab_path_key(value: str) -> str:
 
     Surrounding slashes off, as `GitHubWritesVerifier` takes them off the
     same variable on GitLab -- a path copied out of a URL often keeps one --
-    and case folded, because GitLab paths compare that way. Only GitLab's
-    callers use it; GitHub reads its repository exactly as given.
+    and case folded, because GitLab paths compare that way, and GitHub's
+    owner/name pairs compare case-insensitively too, so the repository
+    binding of ``forge_issue_state`` uses it on both forges.
     """
     return value.strip().strip("/").lower()
 
@@ -2262,6 +2413,46 @@ def _issue_api_url(forge: str, repo: str, number: int) -> str:
     if forge == forges.FORGE_GITLAB:
         return f"{forges.gitlab_api_root()}{forges.gitlab_project_path(repo)}/issues/{number}"
     return f"{forges.github_api_root()}/repos/{repo}/issues/{number}"
+
+
+def _issue_comments(
+    api_url: str,
+    token: str,
+    budget: float,
+    forge: str,
+    since: datetime,
+    pages: int = 1,
+) -> list[tuple[datetime | None, str]] | None:
+    """``(created_at, body)`` of an issue's comments; None when they could not be read.
+
+    GitHub's ``since`` filters on a comment's update stamp, which is never
+    earlier than its creation, so it only narrows the pages and the caller
+    decides on ``created_at``. GitLab's notes take no ``since``; they are
+    read newest first, one page, and its system notes (a label or state
+    change) are skipped, since nobody posted those. A non-200 answer or a
+    payload that is not a list is None; transport failures propagate as
+    :class:`OSError`, for the caller to name.
+    """
+    stamp = since.astimezone(timezone.utc).strftime(_GITHUB_SINCE_FORMAT)
+    if forge == forges.FORGE_GITLAB:
+        urls = [f"{api_url}/notes?sort=desc&order_by=created_at&per_page={_GITHUB_PAGE_SIZE}"]
+    else:
+        first = f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={stamp}"
+        urls = [first] + [f"{first}&page={page}" for page in range(2, pages + 1)]
+    comments: list[tuple[datetime | None, str]] = []
+    for url in urls:
+        status_code, payload = _http_get_json(url, token, budget)
+        if status_code != 200 or not isinstance(payload, list):
+            return None
+        for comment in payload:
+            if not isinstance(comment, dict) or comment.get("system"):
+                continue
+            comments.append(
+                (_parse_github_time(comment.get("created_at")), str(comment.get("body") or ""))
+            )
+        if len(payload) < _GITHUB_PAGE_SIZE:
+            break
+    return comments
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -3513,7 +3704,7 @@ class BootstrapFanoutVerifier(BaseVerifier):
     """Checks the cluster cards filed for the onboarding discovery sweep.
 
     The onboarding gate, a cron job, files the sweep card and one card per
-    Cluster Agent, so neither the transcript nor the harness's delegation
+    Cluster Agent up to the first-run cap, so neither the transcript nor the harness's delegation
     capture sees them; this reads the sweep, the ``bootstrap-inventory-cluster-*``
     cards created at or after it, and the Cluster Agent roster off the agent's
     disk (:mod:`kube_agents_bench.discovery`).
@@ -3525,14 +3716,49 @@ class BootstrapFanoutVerifier(BaseVerifier):
       ``bootstrap-inventory-cluster-*`` card, assigned to it and keyed by its
       profile name, and no such card went anywhere else.
 
+    The first-run cap (#3702) has the gate file cards for only the first
+    ``cap`` Cluster Agents by profile name and leave the rest to the sweep's
+    own worker. Two requirements grade it, each with ``cap`` set to the value
+    the case's stack wrote. The carded set is the one the sweep marker's
+    ``carded=`` records, the agents the sweep card listed when it was filed; a
+    marker without one (an older build) falls back to the first ``cap`` of the
+    roster by profile name. A profile scaffolded after the filing can sort
+    first and still be the sweep's.
+
+    - ``cards_for_first_cap_profiles``: exactly the carded profiles got one
+      card each, assigned to and keyed by the profile; no other profile got
+      one, and no card went anywhere else. A build without the cap files a
+      card for every profile, which fails here.
+    - ``past_cap_clusters_sweep_audited``: every roster cluster outside the
+      carded set is in ``INVENTORY.raw.md`` on the shell sandbox as audited by the sweep
+      itself: a Coverage row whose card is the sweep (or the hand-off's "the
+      sweep audited it itself" gap line), not a row from a card of its own and
+      not the gap line for a fleet cluster no audit reported on. The cap's
+      risk is a cluster nobody audits, which reads as clean; this is the half
+      that catches it. It reads a second pod, so it is a requirement of its own
+      and a broken report does not hide behind, or get blamed on, the cards.
+
     Fails closed: an unreadable pod, no sweep marker, a board that cannot be
     queried, a sweep card the board does not know, or an empty roster is
-    ``status="error"``. A ``fail`` from an earlier poll outranks a final read
-    that errors.
+    ``status="error"``; so, for the two capped requirements, is a roster no
+    longer than ``cap``, where the cap files every card and the case cannot
+    tell a capped build from one without the cap, and an unreadable sandbox.
+    A ``fail`` from an earlier poll outranks a final read that errors.
     """
 
     type: Literal["bootstrap_fanout"]
-    require: Literal["one_card_per_cluster_agent"]
+    require: Literal["one_card_per_cluster_agent", "cards_for_first_cap_profiles", "past_cap_clusters_sweep_audited"]
+    # The first-run cap the case's stack wrote; only the capped requirements take it.
+    cap: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _cap_matches_require(self) -> BootstrapFanoutVerifier:
+        if self.require == "one_card_per_cluster_agent":
+            if self.cap is not None:
+                raise ValueError("cap applies only to cards_for_first_cap_profiles and past_cap_clusters_sweep_audited")
+        elif self.cap is None:
+            raise ValueError(f"{self.require} needs cap: the first-run cluster card cap the case's stack wrote")
+        return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         read_timeout = min(single_call_timeout(timeout_sec), _FANOUT_READ_TIMEOUT_SEC)
@@ -3582,6 +3808,8 @@ class BootstrapFanoutVerifier(BaseVerifier):
                 + (f" (profiles whose scaffold did not finish: {not_ready})" if not_ready else ""),
                 payload,
             )
+        if self.require != "one_card_per_cluster_agent":
+            return self._capped(payload, where, roster, cards, read_timeout)
         expected = {(r["profile"], r["key"]) for r in roster}
         filed = [(c.get("assignee"), c.get("key")) for c in cards]
         missing = sorted(expected - set(filed))
@@ -3597,6 +3825,125 @@ class BootstrapFanoutVerifier(BaseVerifier):
                 parts.append(f"card(s) matching no Cluster Agent: {stray}")
             return "fail", "; ".join(parts), payload
         return "pass", f"{where}: one card for each of {len(roster)} Cluster Agent(s)", payload
+
+    def _capped(
+        self,
+        payload: dict[str, Any],
+        where: str,
+        roster: list[dict[str, Any]],
+        cards: list[dict[str, Any]],
+        read_timeout: float,
+    ) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        cap = int(self.cap or 0)
+        # The gate's own order (bootstrap_scan_gate.cluster_agents sorts by profile name).
+        ordered = sorted(roster, key=lambda r: r["profile"])
+        if len(ordered) <= cap:
+            return (
+                "error",
+                f"{where}: roster of {len(ordered)} is not above the cap of {cap}; the case cannot tell a capped "
+                f"build from one without the cap ({[r['profile'] for r in ordered]})",
+                payload,
+            )
+        carded = payload.get("carded")
+        if carded is not None:
+            keys = set(carded)
+            first = [r for r in ordered if r["key"] in keys]
+            rest = [r for r in ordered if r["key"] not in keys]
+            chosen = "the profiles the sweep marker lists as carded"
+            # The marker is the gate's own record, so grading against it alone
+            # would pass a gate that carded too few or named a profile that is
+            # not there. (a) every carded key is a roster profile; (b) the set
+            # is the cap's worth, or the whole roster when that is smaller. A
+            # profile scaffolded after filing raises the roster without
+            # changing the set, which can make (b) strict where the roster was
+            # under the cap at filing; with the roster above the cap, as this
+            # check requires, it cannot. Whether the set is the first by
+            # profile name at filing needs the profiles' scaffold times, which
+            # the follow-up issue covers.
+            unknown = sorted(keys - {r["key"] for r in ordered})
+            if unknown:
+                return "fail", f"{where}: the sweep marker lists carded key(s) for no roster profile: {unknown}", payload
+            want = min(cap, len(ordered))
+            if len(keys) != want:
+                return (
+                    "fail",
+                    f"{where}: the sweep marker lists {len(keys)} carded profile(s); a cap of {cap} over a roster "
+                    f"of {len(ordered)} cards {want}",
+                    payload,
+                )
+        else:
+            first, rest = ordered[:cap], ordered[cap:]
+            chosen = f"the first {cap} by profile name"
+        if self.require == "cards_for_first_cap_profiles":
+            expected = {(r["profile"], r["key"]) for r in first}
+            past = {(r["profile"], r["key"]) for r in rest}
+            filed = [(c.get("assignee"), c.get("key")) for c in cards]
+            missing = sorted(expected - set(filed))
+            duplicated = sorted({f for f in filed if filed.count(f) > 1})
+            over = sorted(set(filed) & past)
+            stray = sorted(set(filed) - expected - past)
+            if missing or duplicated or over or stray:
+                parts = [
+                    f"{where} filed {len(cards)} cluster card(s) for a roster of {len(ordered)} under a cap of {cap}"
+                ]
+                if over:
+                    parts.append(f"card(s) for profile(s) past the cap: {[p for p, _ in over]}")
+                if missing:
+                    parts.append(f"no card for {[p for p, _ in missing]}, among {chosen}")
+                if duplicated:
+                    parts.append(f"more than one card for {[p for p, _ in duplicated]}")
+                if stray:
+                    parts.append(f"card(s) matching no Cluster Agent: {stray}")
+                return "fail", "; ".join(parts), payload
+            if carded is not None:
+                return (
+                    "pass",
+                    f"{where}: one card for each of the {len(first)} of {len(ordered)} Cluster Agent(s) the sweep "
+                    "marker lists as carded, and none past the cap",
+                    payload,
+                )
+            return (
+                "pass",
+                f"{where}: one card for each of the first {cap} of {len(ordered)} Cluster Agent(s) by profile name, "
+                "and none past the cap",
+                payload,
+            )
+        read = onboarding.read_raw_coverage(onboarding.sandbox_shell, read_timeout)
+        pod, raw_file = onboarding.sandbox_pod(), onboarding.RAW_FILE
+        if read is None:
+            return "error", f"{pod} could not be read (kubectl exec failed or the command did not run)", payload
+        raw = {"fanout": payload, "raw": read}
+        if read.get("raw") == "absent":
+            return "fail", f"{where}: there is no {raw_file} on {pod}, so no cluster past the cap is shown audited", raw
+        if read.get("rows") is None:
+            return "fail", f"{where}: {raw_file} on {pod}: {read.get('error')}", raw
+        sweep_id = str((payload.get("sweep") or {}).get("id") or "")
+        audited_by_line = {tuple(p) for p in read.get("sweep_audited") or []}
+        unreported = {tuple(p) for p in read.get("unreported") or []}
+        problems = []
+        for r in rest:
+            ident = (r.get("cluster"), r.get("project"))
+            label = f"{r['profile']} ({ident[0]} in {ident[1]})"
+            rows = [row for row in read["rows"] if (row.get("cluster"), row.get("project")) == ident]
+            if ident in unreported:
+                problems.append(f"{label} is listed in the fleet but no audit reported on it")
+            elif any(row.get("card") == sweep_id for row in rows) or ident in audited_by_line:
+                continue
+            elif rows:
+                problems.append(f"{label} was audited on card(s) {[row.get('card') for row in rows]}, not by the sweep")
+            else:
+                problems.append(f"{label} has no Coverage row and no line saying the sweep audited it")
+        if problems:
+            return (
+                "fail",
+                f"{where}: of the {len(rest)} Cluster Agent(s) past the cap of {cap}, in {raw_file}: " + "; ".join(problems),
+                raw,
+            )
+        return (
+            "pass",
+            f"{where}: all {len(rest)} cluster(s) past the cap of {cap} are in {raw_file} as audited by the sweep",
+            raw,
+        )
 
 
 def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
@@ -3897,24 +4244,16 @@ class LedgerIssueContainsVerifier(BaseVerifier):
         skipped, since the marker is a comment the reset posts.
         """
         closed_at = closed_at.astimezone(timezone.utc)
-        since = (closed_at - _RESET_COMMENT_LOOKBACK).strftime(_GITHUB_SINCE_FORMAT)
-        if forge == forges.FORGE_GITLAB:
-            url = f"{api_url}/notes?sort=desc&order_by=created_at&per_page={_GITHUB_PAGE_SIZE}"
-        else:
-            url = f"{api_url}/comments?per_page={_GITHUB_PAGE_SIZE}&since={since}"
         try:
-            status_code, payload = _http_get_json(url, token, budget)
+            comments = _issue_comments(
+                api_url, token, budget, forge, closed_at - _RESET_COMMENT_LOOKBACK
+            )
         except OSError:
             return None
-        if status_code != 200 or not isinstance(payload, list):
+        if comments is None:
             return None
-        for comment in payload:
-            if not isinstance(comment, dict) or comment.get("system"):
-                continue
-            if LEDGER_RESET_MARKER not in str(comment.get("body") or ""):
-                continue
-            created_at = _parse_github_time(comment.get("created_at"))
-            if created_at is None:
+        for created_at, body in comments:
+            if LEDGER_RESET_MARKER not in body or created_at is None:
                 continue
             if abs((closed_at - created_at).total_seconds()) <= self.max_clock_skew_sec:
                 return True
@@ -4256,6 +4595,238 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             f"{surface}, generated at {generated_at.isoformat()} by this run, "
             "contains " + ", ".join(satisfied),
             raw=raw,
+        )
+
+
+@VERIFIERS.register("forge_issue_state")
+class ForgeIssueStateVerifier(BaseVerifier):
+    """The state of the issue the run's reply names, read from the forge.
+
+    WHY THIS EXISTS. A procedure that ends on an issue -- claim it, comment
+    on it, label it, close it -- leaves its evidence on the issue; the reply
+    only describes it. A ``report_contains`` over a list of phrasings for
+    "the report was posted" grades the description: it fails a run that did
+    every step and worded the reply another way, and it passes one that wrote
+    the words and skipped the steps. This check reads the artifact.
+
+    HOW IT FINDS THE ISSUE. Every issue web URL the final message carries in
+    full (:func:`forges.issue_refs`), as ``ledger_issue_contains`` and
+    ``pull_request_opened`` find theirs. Each URL is a POINTER, never
+    evidence: everything asserted comes from what the forge returns for it.
+    The check passes when one named issue satisfies every assertion, and the
+    reason says why each other one did not.
+
+    WHICH REPOSITORY. Only the GitOps repository this job grades, read from
+    ``BENCH_GITOPS_REPO`` as ``github_writes`` reads it (``hack/ci-eval-pr.sh``
+    exports it on both lanes). The procedure under test works the ticket in
+    the repository the install manages; an issue anywhere else, however
+    well it matches, was not worked by that procedure and is rejected before
+    it is read. An unset variable is ``status="error"``.
+
+    WHAT IS ASSERTED, all from the API response. ``state``, when set.
+    ``labels``, every one present. ``min_comments`` comments created at or
+    after the run started, less ``max_clock_skew_sec``. That window is what
+    binds the issue to THIS run: a previous repetition leaves a closed,
+    labelled issue behind, and a reply pointing at it would otherwise pass
+    forever. For the same reason a ``closed`` assertion also requires
+    ``closed_at`` inside the window, and a spec must set ``state: closed``
+    or ``min_comments`` of at least 1: ``labels`` alone, or ``state: open``
+    alone, binds nothing and is refused at spec load. GitLab's system notes
+    (a label or state change) are not comments and are not counted.
+
+    AUTHENTICATION. The runner's read token, as ``ledger_issue_contains``
+    documents it, and never the agent's own credential. An absent token is
+    ``status="error"``, never a pass.
+    """
+
+    type: Literal["forge_issue_state"]
+    state: Literal["open", "closed"] | None = None
+    labels: list[str] = Field(default_factory=list)
+    min_comments: int = Field(default=0, ge=0)
+    max_clock_skew_sec: float = Field(default=_DEFAULT_CLOCK_SKEW_SEC, ge=0, le=_MAX_CLOCK_SKEW_SEC)
+
+    @model_validator(mode="after")
+    def _binds_the_issue_to_the_run(self) -> ForgeIssueStateVerifier:
+        if self.state != "closed" and self.min_comments < 1:
+            raise ValueError(
+                "forge_issue_state must bind the issue to this run: set state: closed "
+                "(the close must fall inside the run) or min_comments of at least 1 "
+                "(comments posted inside the run); labels alone, or state: open alone, "
+                "would pass on an issue an earlier run left behind"
+            )
+        return self
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def done(
+            success: bool,
+            reason: str,
+            *,
+            status: str | None = None,
+            raw: dict | None = None,
+        ) -> VerificationResult:
+            return VerificationResult(
+                success=success,
+                status=status,
+                elapsed_time=time.monotonic() - start,
+                reason=reason,
+                raw=raw,
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return done(False, _NO_TRANSCRIPT_REASON, status="error")
+        if not snap.started_at:
+            return done(False, _NO_ISSUE_RUN_CLOCK_REASON, status="error")
+        try:
+            forge = forges.forge_name()
+        except forges.UnknownForge as exc:
+            return done(False, str(exc), status="error")
+        token = forges.read_token(forge)
+        if not token:
+            return done(False, _no_token_reason(forge), status="error")
+        host = forges.web_host(forge)
+        label = _forge_label(forge)
+
+        seen = forges.issue_refs(snap.final_message, forge)
+        if not seen:
+            return done(
+                False,
+                f"the run's reply names no {host} issue URL in full, so there is "
+                "no issue to read the state of; a reply that completed the "
+                "procedure names the ticket it worked",
+            )
+        if len(seen) > _MAX_LEDGER_CANDIDATES:
+            return done(
+                False,
+                f"the run's reply names {len(seen)} distinct issue URLs; more than "
+                f"{_MAX_LEDGER_CANDIDATES} is a reply to read by hand, not a set of "
+                "candidates to resolve",
+            )
+
+        gitops_repo = os.environ.get(github_writes.GITOPS_REPO_ENV_VAR, "").strip().strip("/")
+        if not gitops_repo or "/" not in gitops_repo:
+            return done(False, _NO_GITOPS_REPO_REASON, status="error")
+
+        started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        window_start = started - timedelta(seconds=self.max_clock_skew_sec)
+        budget = single_call_timeout(timeout_sec)
+        rejected: list[str] = []
+        for repo, number in seen:
+            slug = f"{repo}#{number}"
+            if _gitlab_path_key(repo) != _gitlab_path_key(gitops_repo):
+                rejected.append(
+                    f"{slug}: not in the GitOps repository this job grades ({gitops_repo})"
+                )
+                continue
+            url = _issue_api_url(forge, repo, number)
+            try:
+                status_code, payload = _http_get_json(url, token, budget)
+            except OSError as exc:
+                return done(
+                    False,
+                    f"could not reach the {label} API for {slug}: "
+                    f"{exc}; this check could not be evaluated",
+                    status="error",
+                )
+            if status_code == 404:
+                if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
+                    try:
+                        why = _gitlab_project_unseen(repo, token, budget)
+                    except OSError as exc:
+                        why = f"could not reach the GitLab API for {repo}: {exc}"
+                    if why:
+                        return done(False, why, status="error")
+                rejected.append(f"{slug}: no such issue (404)")
+                continue
+            if status_code in (401, 403):
+                return done(
+                    False,
+                    f"{label} returned {status_code} for {slug}: the configured token "
+                    "cannot read this repository's issues, so this check could not "
+                    "be evaluated",
+                    status="error",
+                )
+            if status_code != 200 or not isinstance(payload, dict):
+                return done(
+                    False,
+                    f"unexpected {label} response {status_code} for {slug}; "
+                    "this check could not be evaluated",
+                    status="error",
+                )
+            view = _issue_view(forge, payload)
+            closed_at: datetime | None = view["closed_at"]
+            faults: list[str] = []
+            if self.state is not None and view["state"] != self.state:
+                faults.append(f"is {view['state'] or 'in no readable state'}, not {self.state}")
+            elif self.state == "closed":
+                if closed_at is None:
+                    faults.append(
+                        "is closed with no readable closed_at, so the close cannot "
+                        "be placed inside this run"
+                    )
+                elif closed_at < window_start:
+                    faults.append(
+                        f"was closed at {closed_at.isoformat()}, "
+                        f"{(started - closed_at).total_seconds():.0f}s before this run "
+                        f"started ({started.isoformat()}): an earlier run's close"
+                    )
+            missing = [name for name in self.labels if name not in view["labels"]]
+            if missing:
+                faults.append(f"lacks the label(s) {missing} (labels: {sorted(view['labels'])})")
+            comments: int | None = None
+            if self.min_comments:
+                try:
+                    listed = _issue_comments(
+                        url, token, budget, forge, window_start, _ISSUE_COMMENT_PAGES
+                    )
+                except OSError as exc:
+                    return done(
+                        False,
+                        f"could not read the comments of {slug}: {exc}; "
+                        "this check could not be evaluated",
+                        status="error",
+                    )
+                if listed is None:
+                    return done(
+                        False,
+                        f"the comments of {slug} could not be read ({label} did not "
+                        "answer 200 with a list), so this check could not be evaluated",
+                        status="error",
+                    )
+                comments = sum(
+                    1 for created_at, _ in listed
+                    if created_at is not None and created_at >= window_start
+                )
+                if comments < self.min_comments:
+                    faults.append(
+                        f"carries {comments} comment(s) posted since this run started, "
+                        f"{self.min_comments} required"
+                    )
+            if faults:
+                rejected.append(f"{slug} " + ", ".join(faults))
+                continue
+            reason = f"{slug} is {view['state']}"
+            if closed_at is not None:
+                reason += f" (closed at {closed_at.isoformat()})"
+            reason += f", labelled {sorted(view['labels'])}"
+            if comments is not None:
+                reason += f", with {comments} comment(s) posted since this run started"
+            return done(
+                True,
+                reason,
+                raw={
+                    "issue": slug,
+                    "state": view["state"],
+                    "closed_at": closed_at.isoformat() if closed_at else None,
+                    "labels": sorted(view["labels"]),
+                    "comments_since_start": comments,
+                },
+            )
+        return done(
+            False,
+            "none of the issues the reply names satisfies the check: " + "; ".join(rejected),
         )
 
 
@@ -7434,7 +8005,10 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     the Session KV server's own ``GET /v1/findings`` in the agent container
     (:mod:`kube_agents_bench.findings`). Passes when every row in
     ``finding_ids`` is in ``state``; a row in any other state fails, and the
-    reason names the state of each row not in ``state``.
+    reason names the state of each row not in ``state``. With ``not_state``
+    instead, passes when no row is in it, for a property a single state cannot
+    say: "not dismissed" holds while the install's own nudge moves a queued
+    row to surfaced. Exactly one of the two is set.
 
     A listed row the queue does not hold is ``status="error"``: the case's plant
     is missing, so there is nothing to grade. An unreadable pod or a queue that
@@ -7444,7 +8018,14 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     type: Literal["findings_item_state"]
     project: str = Field(min_length=1)
     finding_ids: list[str] = Field(min_length=1)
-    state: FindingState
+    state: FindingState | None = None
+    not_state: FindingState | None = None
+
+    @model_validator(mode="after")
+    def _one_state(self) -> "FindingsItemStateVerifier":
+        if (self.state is None) == (self.not_state is None):
+            raise ValueError("set exactly one of state and not_state")
+        return self
 
     @field_validator("finding_ids")
     @classmethod
@@ -7469,6 +8050,20 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
                 "error",
                 f"the findings queue holds no row {missing} under project {self.project!r}: "
                 "the case's plant is missing, so there is nothing to grade",
+                raw,
+            )
+        if self.not_state is not None:
+            hit = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] == self.not_state}
+            if hit:
+                return (
+                    "fail",
+                    f"{len(hit)} of {len(self.finding_ids)} row(s) are {self.not_state}: " + ", ".join(hit),
+                    raw,
+                )
+            return (
+                "pass",
+                f"none of {len(self.finding_ids)} row(s) are {self.not_state}; "
+                + ", ".join(f"{finding_id} is {state}" for finding_id, state in raw["states"].items()),
                 raw,
             )
         wrong = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] != self.state}

@@ -9,7 +9,7 @@ Everything the [installer](/kube-agents/install/quickstart-gke/) applies is stan
 
 Pages in this section:
 
-- [**Network policies and Service**](/kube-agents/deploy/kustomize/) — the gateway NetworkPolicy and the Service the operator renders, and the Kustomize dev copies of the integrations.
+- [**Network policies and Service**](/kube-agents/deploy/kustomize/) — the gateway NetworkPolicy and the Service the operator renders, and the Kustomize dev copies of the integrations. The page's `kustomize` address is historical, from the Kustomize base it once described.
 - [**Docker images**](/kube-agents/deploy/docker-images/) — the container images and their tags.
 - [**Token minter (Minty)**](/kube-agents/deploy/token-minter/) — how the GitHub App identity is brokered.
 - [**Release versioning & artifacts**](/kube-agents/deploy/release-versioning/) — what a version number means, what each release publishes, how to verify a release bundle, and how to pin a release.
@@ -17,6 +17,6 @@ Pages in this section:
 - [**GitOps with ArgoCD**](/kube-agents/deploy/gitops-argocd/) — standing up ArgoCD as the reconciler that applies what the agent proposes. The reference layout recommends Config Sync when you need charts ([Reconciler](https://github.com/gke-labs/kube-agents/tree/main/examples/gitops-repo#reconciler)).
 - [**Rolling back a release**](/kube-agents/deploy/rollback/) — moving an install from GA release N back to N-1 with the N-1 checkout's `upgrade.sh`, and what that leaves in place.
 - [**Multiple GCP projects**](/kube-agents/deploy/multi-project/) — granting one install access to clusters in other projects, and removing it.
-- [**Web console**](/kube-agents/deploy/web-console/) — a browser page for the agent on installs with no chat platform, reached through `kubectl port-forward`. It shows event triage and scheduled checks as channels you can reply in, holds your own chat threads, and shows the model and LiteLLM usage.
+- [**Web console**](/kube-agents/deploy/web-console/) — a browser page for the agent on installs with no chat platform, reached through `kubectl port-forward`. It shows event triage and scheduled checks as channels you can reply in, holds your own chat threads, and shows the model and LiteLLM usage. [User interfaces](/kube-agents/reference/user-interfaces/) compares it with the A2A console and the other browser pages.
 
 The forward move lives with the installer: [Upgrading an install](/kube-agents/install/upgrade/) takes an install to a newer release, and the pages here cover what surrounds it.

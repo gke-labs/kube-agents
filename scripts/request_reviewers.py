@@ -104,8 +104,8 @@ GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 # relative to the OWNERS file's directory; `no_parent_owners` stops the walk
 # once a file has matched something at that level. `OWNERS_ALIASES` expands
 # names in either list. This repository has three shapes today: root OWNERS
-# approvers, `hack/OWNERS`'s eval-crew filter, and `k8s-api-proxy/OWNERS`, a
-# plain nested list that adds to the root's.
+# approvers, the eval-crew filters in `hack/OWNERS` and `scripts/installer/OWNERS`,
+# and `k8s-api-proxy/OWNERS`, a plain nested list that adds to the root's.
 OWNERS_FILENAME = "OWNERS"
 OWNERS_ALIASES_FILENAME = "OWNERS_ALIASES"
 DEFAULT_OWNERS_ROOT = "."

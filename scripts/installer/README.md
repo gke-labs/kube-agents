@@ -164,7 +164,8 @@ The chat flags are held to the file rather than overriding it for one run, becau
 `upgrade.sh` renders the chat integrations from the file alone and takes none of them, so a
 one-run override would be undone by the next full upgrade without a word. They are
 `--enable-slack`, `--enable-google-chat`, `--slack-allowed-users`, `--slack-home-channel`,
-`--slack-home-channel-name`, `--google-chat-allowed-users`, `--google-chat-home-channel`,
+`--slack-home-channel-name`, `--slack-home-channel-policy`, `--google-chat-allowed-users`,
+`--google-chat-home-channel`,
 `--google-chat-mode`, `--chat-topic-name`, `--slack-bot-token` and `--slack-app-token`.
 `--mode` follows the same rule, for the same reason, with `PLATFORM_AGENT_MODE` (below); it
 is not a chat key and brings no other settings with it.
@@ -190,7 +191,7 @@ nothing, since it is as often a decline as a hand-off: it prints the `KEY=value`
 record (never a token), for an operator who goes on to run `lifecycle.sh apply` by hand to add
 first, so a later `upgrade.sh` renders what they applied. A toggle recorded `true` brings the settings of
 its integration the file also lacks, with the values the run applied: `SLACK_ALLOWED_USERS`,
-`SLACK_HOME_CHANNEL` and `SLACK_HOME_CHANNEL_NAME` for Slack; `ALLOWED_USERS`,
+`SLACK_HOME_CHANNEL`, `SLACK_HOME_CHANNEL_NAME` and `SLACK_HOME_CHANNEL_POLICY` for Slack; `ALLOWED_USERS`,
 `CHAT_TOPIC_NAME`, `GOOGLE_CHAT_HOME_CHANNEL` and `GOOGLE_CHAT_MODE` for Google Chat. The
 toggle is written after them, so a record cut short leaves the settings with the integration
 off, never the integration on without its allowlist. Otherwise
@@ -210,6 +211,19 @@ variable that renders its key (the Google Chat allowlist flag also reads
 `GOOGLE_CHAT_ALLOWED_USERS` first, which no workflow sets), so on a runner a flag either agrees
 with the rendered key or is appended to the runner's copy, which goes when the runner does. The `--menu` route refuses the chat flags; it
 edits the keys on its own screens.
+
+`SLACK_HOME_CHANNEL_POLICY` (`--slack-home-channel-policy`) is `auto` (the default, also empty) or
+`manual`, and renders `spec.integration.slack.homeChannelPolicy` on the PlatformAgent; the
+[CRD reference](../../docs/site/src/content/docs/operator/platformagent-crd.md#specintegration)
+describes the field. The interview does not ask for it: the field is an opt-out, set in the
+file by the few installs that want it. `write_tfvars_from_state` refuses any other spelling before
+a file is written, on every route, because the CRD accepts only those two. A shell export of the
+key, like an export of any Slack key, is read only when the file does not assign it: a first
+`install.sh` run records it in the `install.env` it writes, and `upgrade.sh` applies it for that
+run alone. A
+full or operator `upgrade.sh` applies the CRDs before the chart; a `lifecycle.sh apply` run by hand
+after `--generate-only` does not, so on an install whose CRD predates the field apply
+`charts/kube-agents/crds/` first, or the chart refuses the value with a message that says so.
 
 **`terraform/examples/full-install/terraform.tfvars`** is the derived artifact,
 regenerated on every run from the loaded environment. Nobody edits it.

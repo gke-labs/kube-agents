@@ -297,7 +297,7 @@ func TestTwoSessionsOnOneServiceAccountAreRefusedOnEachOthersSubjects(t *testing
 // to publish anywhere, reading in production as nothing at all.
 func TestASessionTokenBoundToNoPodIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, sessionMap, sessionTokens())
-	if nc, err := nats.Connect(h.url, h.tls, nats.Token(tokenNoPod), nats.CustomInboxPrefix("_INBOX."+podA)); err == nil {
+	if nc, err := nats.Connect(h.url, h.dial, nats.Token(tokenNoPod), nats.CustomInboxPrefix("_INBOX."+podA)); err == nil {
 		nc.Close()
 		t.Fatal("a session token bound to no pod was accepted")
 	}
@@ -309,7 +309,7 @@ func TestASessionTokenBoundToNoPodIsRefusedAtConnect(t *testing.T) {
 // every grant.
 func TestASessionPodNameThatIsNotOneSubjectTokenIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, sessionMap, sessionTokens())
-	if nc, err := nats.Connect(h.url, h.tls, nats.Token(tokenDotted), nats.CustomInboxPrefix("_INBOX.chat")); err == nil {
+	if nc, err := nats.Connect(h.url, h.dial, nats.Token(tokenDotted), nats.CustomInboxPrefix("_INBOX.chat")); err == nil {
 		nc.Close()
 		t.Fatal("a session whose pod name is not a single subject token was accepted")
 	}

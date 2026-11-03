@@ -312,6 +312,7 @@ jobs:
           SLACK_ALLOWED_USERS: ${{ vars.SLACK_ALLOWED_USERS }}
           SLACK_HOME_CHANNEL: ${{ vars.SLACK_HOME_CHANNEL }}
           SLACK_HOME_CHANNEL_NAME: ${{ vars.SLACK_HOME_CHANNEL_NAME }}
+          SLACK_HOME_CHANNEL_POLICY: ${{ vars.SLACK_HOME_CHANNEL_POLICY }}
           # Not install.env keys, and deliberately so: an empty allowlist is
           # already what makes the operator admit everyone. These say that the
           # empty one is intended, which is the difference between an open
@@ -328,6 +329,12 @@ jobs:
           # every reconcile, so a line added to that file by hand does not survive
           # to the next run and this variable is the only durable opt-out.
           ENABLE_DRIFT_DETECTOR: ${{ vars.ENABLE_DRIFT_DETECTOR }}
+          # The same shape, for a vertex_ai install: unset enables the Vertex AI
+          # API and grants the gateway's role on the serving project, and false
+          # is the only durable way to decline when this environment cannot
+          # administer that project. On an environment whose earlier applies made
+          # the grant, false revokes it: see docs/environment-reconcile.md first.
+          VERTEX_MANAGE_SERVING_PROJECT: ${{ vars.VERTEX_MANAGE_SERVING_PROJECT }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
           # The PlatformAgent's spec.mode. Unset or `today` renders no key, so

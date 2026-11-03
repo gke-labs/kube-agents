@@ -6,7 +6,7 @@ alert reads the operator's gauges (usage_gauges.go in k8s-operator), per agent,
 by agent_namespace and agent; the ratios are recorded once and the alerts read
 the recorded series, so a dashboard and an alert see one number.
 
-Three rules of PromQL here, each held by tests/test_chart_platform_agent_health_rules.py:
+Four rules of PromQL here, each held by tests/test_chart_platform_agent_health_rules.py:
 
 - An increase() is folded with `sum by` over the agent's labels: an operator
   roll-over splits a window's increase across the old and the new pod's series,
@@ -16,6 +16,17 @@ Three rules of PromQL here, each held by tests/test_chart_platform_agent_health_
 - A recorded series carries the scoping labels the rule-evaluator appends
   (project_id, location, cluster, namespace) and an inline `max by` side does
   not, so every `and` and `unless` matches `on (agent_namespace, agent)`.
+- A delta() or resets() runs over a `max by` recorded series, never over the
+  raw gauge. The proposal fields are forge readings that fall when a
+  repository leaves the managed list or a proposal is deleted, so increase()
+  would read the fall as a reset and inflate the window; a delta() has no
+  aggregation of its own to fold a roll-over's two pod series, so each reading
+  is first recorded as `max by (agent_namespace, agent, field)` and the window
+  is taken over that. Each window is then folded `max by (agent_namespace,
+  agent)`, which drops the `field` label: a ratio keeps its left side's labels,
+  and a field on it would name one input of two. A fall in proposalsAuthored, which a reopen does not
+  move, removes both proposal ratios for the window: resets() sees it where a
+  delta() nets it out behind later rises.
 - A day-long condition is a plain `for`. A window in the expression over a
   subquery would survive a rule-evaluator restart, which resets a pending
   alert, but it fires on a young series: five minutes of Degraded after an
@@ -45,6 +56,11 @@ the operator's scrape, so enabling them without it is refused at render.
 {{- $sum := printf "sum by (%s)" $by }}
 {{- $max := printf "max by (%s)" $by }}
 {{- $usage := "kubeagents_platformagent_usage" }}
+{{- $reading := "kubeagents:platformagent:usage_reading:max" }}
+{{- $merged := "kubeagents:platformagent:proposals_merged_14d" }}
+{{- $closed := "kubeagents:platformagent:proposals_closed_14d" }}
+{{- $authored := "kubeagents:platformagent:proposals_authored_14d" }}
+{{- $fell := "kubeagents:platformagent:proposals_fell_14d" }}
 {{- $times := "kubeagents_platformagent_usage_time_seconds" }}
 {{- $phase := "kubeagents_platformagent_phase" }}
 {{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
@@ -66,10 +82,20 @@ spec:
           expr: {{ $sum }} (increase({{ $usage }}{field="brokerFailuresTotal"}[1d])) / {{ $sum }} (increase({{ $usage }}{field="toolExecutionsTotal"}[1d]))
         - record: kubeagents:platformagent:commands_blocked_ratio_1d
           expr: {{ $sum }} (increase({{ $usage }}{field="toolExecutionsBlockedTotal"}[1d])) / {{ $sum }} (increase({{ $usage }}{field="toolExecutionsTotal"}[1d]))
+        - record: {{ $reading }}
+          expr: max by ({{ $by }}, field) ({{ $usage }}{field=~"remediationsMergedTotal|remediationsClosedUnmergedTotal|proposalsAuthored"})
+        - record: {{ $merged }}
+          expr: {{ $max }} (clamp_min(delta({{ $reading }}{field="remediationsMergedTotal"}[14d]), 0))
+        - record: {{ $closed }}
+          expr: {{ $max }} (clamp_min(delta({{ $reading }}{field="remediationsClosedUnmergedTotal"}[14d]), 0))
+        - record: {{ $authored }}
+          expr: {{ $max }} (clamp_min(delta({{ $reading }}{field="proposalsAuthored"}[14d]), 0))
+        - record: {{ $fell }}
+          expr: {{ $max }} (resets({{ $reading }}{field="proposalsAuthored"}[14d]) > 0)
         - record: kubeagents:platformagent:proposals_rejected_ratio_14d
-          expr: {{ $sum }} (increase({{ $usage }}{field="remediationsClosedUnmergedTotal"}[14d])) / ({{ $sum }} (increase({{ $usage }}{field="remediationsClosedUnmergedTotal"}[14d])) + {{ $sum }} (increase({{ $usage }}{field="remediationsMergedTotal"}[14d])))
+          expr: {{ $closed }} / {{ $on }} ({{ $closed }} + {{ $on }} {{ $merged }}) unless {{ $on }} {{ $fell }}
         - record: kubeagents:platformagent:proposals_merge_rate_14d
-          expr: {{ $sum }} (increase({{ $usage }}{field="remediationsMergedTotal"}[14d])) / {{ $sum }} (increase({{ $usage }}{field="remediationsProposedTotal"}[14d]))
+          expr: {{ $merged }} / {{ $on }} {{ $authored }} unless {{ $on }} {{ $fell }}
     - name: kubeagents-health-at-risk
       rules:
         - alert: KubeAgentsAgentDegraded
@@ -117,14 +143,14 @@ spec:
           annotations:
             summary: "{{ $who }} is older than {{ $t.stalledOnboardingDays }} days and no person has sent it a message in {{ $t.stalledOnboardingSilentDays }} days"
         - alert: KubeAgentsProposalsRejected
-          expr: kubeagents:platformagent:proposals_rejected_ratio_14d >= {{ $t.proposalsRejectedRatio }} and {{ $on }} {{ $sum }} (increase({{ $usage }}{field="remediationsClosedUnmergedTotal"}[14d])) >= {{ $t.proposalsRejectedMin14d }} and {{ $on }} ({{ $sum }} (increase({{ $usage }}{field="remediationsClosedUnmergedTotal"}[14d])) + {{ $sum }} (increase({{ $usage }}{field="remediationsMergedTotal"}[14d]))) >= {{ $t.proposalsDecidedMin14d }}
+          expr: kubeagents:platformagent:proposals_rejected_ratio_14d >= {{ $t.proposalsRejectedRatio }} and {{ $on }} {{ $closed }} >= {{ $t.proposalsRejectedMin14d }} and {{ $on }} ({{ $closed }} + {{ $on }} {{ $merged }}) >= {{ $t.proposalsDecidedMin14d }}
           for: {{ $t.ratiosFor }}
           labels:
             severity: friction
           annotations:
             summary: "{{ $who }}: {{ "{{ $value | humanizePercentage }}" }} of its decided proposals were closed unmerged in 14 days"
         - alert: KubeAgentsProposalsUnmerged
-          expr: kubeagents:platformagent:proposals_merge_rate_14d < {{ $t.proposalsMergeRateBelow }} and {{ $on }} {{ $sum }} (increase({{ $usage }}{field="remediationsProposedTotal"}[14d])) >= {{ $t.proposalsProposedMin14d }}
+          expr: kubeagents:platformagent:proposals_merge_rate_14d < {{ $t.proposalsMergeRateBelow }} and {{ $on }} {{ $authored }} >= {{ $t.proposalsProposedMin14d }}
           for: {{ $t.ratiosFor }}
           labels:
             severity: friction

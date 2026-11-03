@@ -62,7 +62,7 @@ func reconcileCalloutWithFake(t *testing.T, agent *agentv1alpha1.PlatformAgent, 
 		WithInterceptorFuncs(interceptors).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if _, err := r.reconcileA2ACallout(ctx, agent); err != nil {
+	if _, err := r.reconcileA2ACallout(ctx, agent, ""); err != nil {
 		t.Fatalf("reconcileA2ACallout: %v", err)
 	}
 	key := types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}
@@ -173,7 +173,7 @@ func TestTheCalloutBudgetAndEveryOtherBudgetAreDisjoint(t *testing.T) {
 // forever.
 func TestTheCalloutSpreadsAcrossNodesWithoutRefusingToSchedule(t *testing.T) {
 	agent := identityTestAgent()
-	dep := buildA2ACalloutDeployment(agent)
+	dep := buildA2ACalloutDeployment(agent, "")
 	pod := dep.Spec.Template.Spec
 
 	if len(pod.TopologySpreadConstraints) != 1 {
@@ -217,7 +217,7 @@ func TestReconcileA2ACalloutRecoversFromAForeignBudgetField(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace},
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MinAvailable: ptr.To(intstr.FromInt32(1)),
-			Selector:     buildA2ACalloutDeployment(agent).Spec.Selector,
+			Selector:     buildA2ACalloutDeployment(agent, "").Spec.Selector,
 		},
 	}
 	pdb, _ := reconcileCalloutWithFake(t, agent, live)

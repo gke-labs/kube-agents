@@ -198,7 +198,7 @@ class CapabilitiesTest(unittest.TestCase):
         jobs = [
             job
             for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
-            if job.get("enabled") and generate_docs.AUDIT_SKILL in job.get("skills", [])
+            if job.get("enabled") and generate_docs.is_audit(job)
         ]
         audits = generate_docs.governance_audits()
         self.assertEqual(sorted(a["id"] for a in audits), sorted(j["id"] for j in jobs))
@@ -218,9 +218,53 @@ class CapabilitiesTest(unittest.TestCase):
         names = {
             *generate_docs._read_skills(generate_docs.SKILLS_DIR),
             *generate_docs._read_skills(generate_docs.CLUSTER_SKILLS_DIR),
+            *generate_docs._read_skills(generate_docs.TSE_SKILLS_DIR),
         }
+        self.assertTrue(names)
         for name in names:
             self.assertIn(f"`{name}`", skills)
+
+    def test_the_catalog_lists_the_support_agent_skills_under_their_own_group(self):
+        tse_skills = generate_docs._read_skills(generate_docs.TSE_SKILLS_DIR)
+        self.assertTrue(tse_skills, "agents/tse/skills holds no SKILL.md")
+        body = generate_docs.gen_skill_catalog()
+        group = body.split(f"### {generate_docs.TSE_SKILL_GROUP}\n")[1]
+        for name in tse_skills:
+            self.assertIn(
+                f"[`{name}`]({generate_docs.GITHUB_BLOB}/agents/tse/skills/{name}/SKILL.md)",
+                group,
+            )
+        self.assertTrue(body.rstrip().endswith(group.rstrip()))
+
+    def test_a_name_shared_across_personas_keeps_each_directory_s_description(self):
+        shared = next(iter(generate_docs.SKILL_GROUPS.values()))[0]
+        by_dir = {
+            generate_docs.SKILLS_DIR: {shared: "platform description"},
+            generate_docs.CLUSTER_SKILLS_DIR: {shared: "cluster description"},
+            generate_docs.TSE_SKILLS_DIR: {},
+        }
+        with mock.patch.object(generate_docs, "_read_skills", side_effect=by_dir.__getitem__):
+            body = generate_docs.gen_skill_catalog()
+        platform_rows, cluster_rows = body.split(f"### {generate_docs.CLUSTER_SKILL_GROUP}\n")
+        blob = generate_docs.GITHUB_BLOB
+        self.assertIn(
+            f"| [`{shared}`]({blob}/agents/platform/skills/{shared}/SKILL.md) | platform description |",
+            platform_rows,
+        )
+        self.assertIn(
+            f"| [`{shared}`]({blob}/agents/cluster/skills/{shared}/SKILL.md) | cluster description |",
+            cluster_rows,
+        )
+        self.assertNotIn("cluster description", platform_rows)
+
+    def test_a_persona_group_with_no_skills_is_left_out(self):
+        grouped = generate_docs.group_skills({"fleet-audit": "d"}, {})
+        for group, _ in generate_docs.PERSONA_SKILL_GROUPS:
+            self.assertEqual(grouped[group], [])
+        with mock.patch.object(generate_docs, "read_persona_skills", return_value={}):
+            body = generate_docs.gen_skill_catalog()
+        self.assertNotIn(generate_docs.TSE_SKILL_GROUP, body)
+        self.assertNotIn(generate_docs.CLUSTER_SKILL_GROUP, body)
 
     def test_daily_audits_come_first_and_untimed_schedules_last(self):
         roster = [
@@ -287,6 +331,150 @@ class CapabilitiesTest(unittest.TestCase):
         self.assertIn(
             "[`Odd-Name_SOP.md`](agents/platform/governance/Odd-Name_SOP.md)", body
         )
+
+
+def helper_job(job_id: str, expr: str, **overrides) -> dict:
+    job = {
+        "id": job_id,
+        "name": job_id.replace("-", " ").title(),
+        "schedule": {"kind": "cron", "expr": expr, "display": expr},
+        "skills": [],
+        "no_agent": True,
+        "script": f"{job_id.replace('-', '_')}.py",
+        "enabled": True,
+    }
+    job.update(overrides)
+    return job
+
+
+class CronHelperJobsTest(unittest.TestCase):
+    """The watchdogs page's helper-job table is the roster's non-audit entries."""
+
+    def test_the_block_is_registered_for_the_watchdogs_page(self):
+        self.assertEqual(
+            generate_docs.BLOCKS["cron-helper-jobs"],
+            ((generate_docs.WATCHDOGS_PAGE,), generate_docs.gen_cron_helper_jobs),
+        )
+
+    def test_exactly_the_enabled_non_audit_jobs_are_listed_in_roster_order(self):
+        roster = generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
+        expected = [job["id"] for job in roster if job.get("enabled") and not generate_docs.is_audit(job)]
+        self.assertTrue(expected)
+        body = generate_docs.gen_cron_helper_jobs()
+        listed = re.findall(r"^\| `([^`]+)` \|", body, re.M)
+        self.assertEqual(listed, expected)
+        for job in roster:
+            if generate_docs.is_audit(job):
+                self.assertNotIn(f"`{job['id']}`", body)
+
+    def test_helpers_and_audits_partition_the_enabled_roster(self):
+        # The two regions share `is_audit`; this holds them to the roster from
+        # the other side, so neither can gain or lose an entry on its own.
+        enabled = [
+            job["id"]
+            for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER)
+            if job.get("enabled")
+        ]
+        helpers = [job["id"] for job in generate_docs.helper_jobs()]
+        audits = [audit["id"] for audit in generate_docs.governance_audits()]
+        self.assertEqual(sorted(helpers + audits), sorted(enabled))
+        self.assertFalse(set(helpers) & set(audits))
+
+    def test_a_null_skills_entry_is_a_helper_in_both_regions(self):
+        # `jobs.json` readers elsewhere in the tree accept `"skills": null`;
+        # the helper filter used to raise `TypeError` on it while the audit
+        # filter read it as no skills.
+        roster = [
+            helper_job("no-skills", "0 6 * * *", skills=None),
+            audit_job("audit", {"expr": "0 6 * * *"}),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+            audits = [audit["id"] for audit in generate_docs.governance_audits()]
+        self.assertIn("| `no-skills` | script, `no_skills.py` |", body)
+        self.assertNotIn("`audit`", body)
+        self.assertEqual(audits, ["audit"])
+
+    def test_disabled_and_audit_entries_are_left_out(self):
+        roster = [
+            helper_job("off", "0 6 * * *", enabled=False),
+            helper_job("audit", "0 6 * * *", no_agent=None, skills=[generate_docs.AUDIT_SKILL]),
+            helper_job("kept", "0 6 * * *"),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+        self.assertNotIn("`off`", body)
+        self.assertNotIn("`audit`", body)
+        self.assertIn("| `kept` | script, `kept.py` |", body)
+
+    def test_the_type_column_tells_a_script_from_a_prompt_job(self):
+        roster = [
+            helper_job("plain-prompt", "0 7 * * 6", no_agent=None, script=None),
+            helper_job("prompt-after", "0 7 * * 6", no_agent=None, script="queue.py"),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+        self.assertIn("| `plain-prompt` | prompt | Weekly, Saturday 07:00 |", body)
+        self.assertIn("| `prompt-after` | prompt, after `queue.py` |", body)
+
+    def test_an_unglossed_schedule_shows_its_expression_and_a_name_is_escaped(self):
+        roster = [
+            helper_job("odd", "7 3 * * 2", name="A | B <x>"),
+            helper_job("interval", "", schedule={"kind": "interval", "minutes": 5, "display": "every 5m"}),
+        ]
+        with mock.patch.object(generate_docs, "load_roster", return_value=roster):
+            body = generate_docs.gen_cron_helper_jobs()
+        self.assertIn("| `odd` | script, `odd.py` | `7 3 * * 2` | A \\| B &lt;x&gt; |", body)
+        self.assertIn("| `every 5m` |", body)
+
+
+class GovernanceAuditsTest(unittest.TestCase):
+    """The governance page's matrix is the roster's audits, in README order."""
+
+    def test_the_block_is_registered_for_the_governance_page(self):
+        self.assertEqual(
+            generate_docs.BLOCKS["governance-audits"],
+            ((generate_docs.GOVERNANCE_PAGE,), generate_docs.gen_governance_audits),
+        )
+
+    def test_each_audit_is_a_row_with_its_sop_watchdog_cadence_and_name(self):
+        audits = generate_docs.governance_audits()
+        self.assertTrue(audits)
+        body = generate_docs.gen_governance_audits()
+        rows = [line for line in body.splitlines()[2:]]
+        self.assertEqual(len(rows), len(audits))
+        for audit, row in zip(audits, rows):
+            self.assertEqual(
+                row,
+                "| `{sop}` | `{id}` | {cadence} | {name} |".format(
+                    sop=Path(audit["sop"]).name,
+                    id=audit["id"],
+                    cadence=generate_docs.CRON_CADENCE[audit["expr"]],
+                    name=generate_docs.md_escape(audit["name"]),
+                ),
+            )
+
+    def test_script_jobs_are_not_in_the_matrix(self):
+        body = generate_docs.gen_governance_audits()
+        for job in generate_docs.load_roster(generate_docs.PLATFORM_CRON_ROSTER):
+            if job.get("no_agent"):
+                self.assertNotIn(f"`{job['id']}`", body)
+
+
+class CadenceCellTest(unittest.TestCase):
+    """One helper decides what every generated cadence cell shows."""
+
+    def test_a_glossed_expression_shows_its_gloss(self):
+        self.assertEqual(generate_docs.cadence_cell({"expr": "20 6 * * *"}), "Daily 06:20")
+
+    def test_an_unglossed_expression_shows_itself_or_the_fallback(self):
+        self.assertEqual(generate_docs.cadence_cell({"expr": "7 3 * * 2"}), "`7 3 * * 2`")
+        self.assertEqual(generate_docs.cadence_cell({"expr": "7 3 * * 2"}, "—"), "—")
+
+    def test_an_interval_schedule_shows_its_display(self):
+        schedule = {"kind": "interval", "minutes": 5, "display": "every 5m"}
+        self.assertEqual(generate_docs.cadence_cell(schedule), "`every 5m`")
+        self.assertEqual(generate_docs.schedule_expr(schedule), ("", "every 5m"))
 
 
 class CRDFieldBlocksTest(unittest.TestCase):

@@ -20,6 +20,7 @@ it did is on the agent's data volume: the card id in
 ``.bootstrap_scan_filed``, the cluster cards the gate filed for it (keyed
 ``bootstrap-inventory-cluster-*`` and created at or after it), and the
 Cluster Agent roster under ``profiles/``.
+The marker's ``carded=`` list, when the gate wrote one, comes back with them.
 This module reads all three in one ``kubectl exec``, the way
 :mod:`kube_agents_bench.board` reads card statuses.
 
@@ -67,7 +68,7 @@ import json, os, re, sqlite3, sys
 ROOT, BOARD, SENTINEL, MARKER, PREFIX, READY = sys.argv[1:7]
 RESERVED = set(sys.argv[7:])
 SQLITE_BUSY_TIMEOUT = 10
-out = {"sweep": None, "roster": [], "unidentified": [], "not_ready": [], "children": [], "error": None}
+out = {"sweep": None, "roster": [], "unidentified": [], "not_ready": [], "children": [], "carded": None, "error": None}
 
 
 def fail(message):
@@ -79,12 +80,19 @@ def fail(message):
 
 try:
     with open(os.path.join(ROOT, MARKER)) as fh:
-        ids = [m.group(1) for m in (re.search(r"(?:^|\s)task_id\s*=\s*(\S+)", line) for line in fh) if m]
+        lines = fh.read().splitlines()
 except OSError as exc:
     fail("no discovery sweep has been filed: %s" % exc)
+ids = [m.group(1) for m in (re.search(r"(?:^|\s)task_id\s*=\s*(\S+)", line) for line in lines) if m]
 sweep_id = ids[0] if ids else ""
 if not sweep_id:
     fail("%s names no task_id" % MARKER)
+# The agents the sweep card listed for cards (#3702), as bootstrap_handoff.carded_keys
+# reads them: entries that are not a cluster card key are dropped. None without one.
+carded = [m.group(1) for m in (re.search(r"(?:^|\s)carded\s*=\s*(\S+)", line) for line in lines) if m]
+if carded:
+    key_re = re.compile("^" + re.escape(PREFIX) + "[a-zA-Z0-9._-]+$")
+    out["carded"] = [k for k in carded[0].split(",") if key_re.match(k)]
 
 try:
     import yaml
@@ -108,7 +116,10 @@ for name in names:
     if not isinstance(ident, dict) or not all(ident.get(k) for k in ("project", "cluster", "location")):
         out["unidentified"].append(name)
         continue
-    out["roster"].append({"profile": name, "key": PREFIX + name})
+    out["roster"].append({
+        "profile": name, "key": PREFIX + name,
+        "project": ident["project"], "cluster": ident["cluster"], "location": ident["location"],
+    })
 
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)

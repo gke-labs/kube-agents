@@ -51,6 +51,8 @@ const (
 	a2aCalloutKeysSuffix = "-keys"
 	a2aNATSTLSSuffix     = "-tls"
 	a2aNATSCASuffix      = "-ca"
+
+	a2aTaskSigningKeySuffix = "-a2a-task-signing-key"
 )
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
@@ -77,6 +79,13 @@ func A2ACalloutName(agentName string) string { return agentName + a2aCalloutName
 // among them the issuer seed that signs every identity the bus accepts.
 func A2ACalloutKeysSecretName(agentName string) string {
 	return A2ACalloutName(agentName) + a2aCalloutKeysSuffix
+}
+
+// A2ATaskSigningKeySecretName is the Secret holding the task-signing key the
+// dispatcher signs per-task credentials with (#3889). Generated beside the
+// callout's keys; only the dispatcher will mount it, and nothing mounts it yet.
+func A2ATaskSigningKeySecretName(agentName string) string {
+	return agentName + a2aTaskSigningKeySuffix
 }
 
 // A2ANATSTLSSecretName is the Secret holding the bus's serving certificate
@@ -106,6 +115,9 @@ func A2ACredentialSecretNames(agentName string) []string {
 		// a certificate that does the same.
 		A2ANATSTLSSecretName(agentName),
 		A2ANATSCASecretName(agentName),
+		// The task-signing seed: with a worker pod's own token, it scopes
+		// that pod to any task of its profile.
+		A2ATaskSigningKeySecretName(agentName),
 	}
 }
 
@@ -307,13 +319,14 @@ const BusCredentialRouteVolumeSource = -1
 // ServiceAccount, so the name on the volume changes nothing about what the
 // callout sees. The Secrets in A2ACredentialSecretNames need no token minting
 // at all and are the cheaper route; a check on the audience alone would narrow
-// the expensive route and advertise the cheap one. There are five of them:
+// the expensive route and advertise the cheap one. There are six of them:
 // the creds Secret holds the static passwords (`bridge-password` among them),
 // the nats-config Secret holds nats.conf with every one of those passwords
 // inline, the callout-keys Secret holds the issuer seed that signs every
 // identity the bus accepts, which is worth more than any password in the
 // others, and the two TLS Secrets hold the keys that let a pod pass as the
-// bus: the serving key, and the CA key that can mint another.
+// bus: the serving key, and the CA key that can mint another. The sixth holds
+// the dispatcher's task-signing seed.
 //
 // Volume shapes only. A `secret` volume and a projected `secret` source are
 // the two volume shapes that put a Secret's data in the container; the other
@@ -454,10 +467,34 @@ type HarnessSpec struct {
 	// +optional
 	Tuning *TuningSpec `json:"tuning,omitempty"`
 
+	// Retention bounds how long the agent keeps its own working data: the session
+	// history in every profile's state.db and its rotated log files. Absent keeps
+	// the operator's default.
+	// +optional
+	Retention *RetentionSpec `json:"retention,omitempty"`
+
 	// Experimental holds opt-in behaviour that is not supported and may change
 	// or disappear in any release.
 	// +optional
 	Experimental *ExperimentalSpec `json:"experimental,omitempty"`
+}
+
+// RetentionSpec sets how long the agent keeps its working data.
+type RetentionSpec struct {
+	// SessionDays is how many days of inactivity an ended session is kept before
+	// Hermes' own pruning deletes it, with its messages and transcript files, in
+	// every profile: the front door's conversations, the Platform Agent's, and each
+	// Cluster Agent's. Rotated log backups older than this are removed too. Open,
+	// pinned and mid-turn sessions are never pruned, and the daily job pins a
+	// session another still points to as its parent before it prunes. Unset uses the operator's default
+	// (defaultSessionRetentionDays in the controller, 90). The minimum is 90 for
+	// now: some readers follow a session's lineage further than the parent guard
+	// has been shown to hold below that. Lowering it deletes the older history at
+	// the next daily prune.
+	// +kubebuilder:validation:Minimum=90
+	// +kubebuilder:validation:Maximum=365
+	// +optional
+	SessionDays *int `json:"sessionDays,omitempty"`
 }
 
 // ExperimentalSpec gathers the unsupported switches. Nothing here carries a
@@ -1092,7 +1129,7 @@ type DeploymentSpec struct {
 	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
 	// to one of the Secrets the operator renders bus credentials into
 	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys,
-	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca),
+	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca, <agent>-a2a-task-signing-key),
 	// as either a secret volume or a projected secret source. The refusal is on
 	// the name and the shape of the source, not on what a given Secret happens to
 	// hold at the time. Reading those Secrets through env is not refused here. On
@@ -1110,7 +1147,8 @@ type DeploymentSpec struct {
 	// The same reserved names and reserved sources as SidecarVolumes are refused
 	// at admission -- a ServiceAccount token projection for the "a2a-bus"
 	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config,
-	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls or <agent>-a2a-nats-ca -- and
+	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls, <agent>-a2a-nats-ca or
+	// <agent>-a2a-task-signing-key -- and
 	// dropped from the render on an install
 	// running the A2A surface.
 	// +listType=map
@@ -1173,13 +1211,22 @@ type CredentialProxySpec struct {
 	// Each key set here replaces the operator's default for that key and the
 	// rest keep their defaults, unlike spec.deployment.resources, which replaces
 	// the agent container's block wholesale: a CR that sets only limits.memory
-	// keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage
+	// keeps the default 500m CPU request, 1 CPU limit and 8Gi ephemeral-storage
 	// limit. The broker sizes how many commands it admits at once from the
 	// memory limit, so raising the limit is the one knob for an install whose
 	// fleet outgrows the default; the ephemeral-storage limit bounds the content
-	// workspace the broker clones into; the proxy's state and /tmp emptyDirs
-	// (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
-	// defaults, so the kubelet does not evict the pod at the smaller figure.
+	// workspace the broker clones into; the proxy's state emptyDir (sizeLimit
+	// 5Gi) grows by whatever the limit is raised above the 8Gi default, and
+	// its /tmp emptyDir keeps its 2Gi, so the kubelet does not evict the pod
+	// at the smaller figure.
+	// The limit a fleet needs grows with the size of its clusters as well as
+	// their number: the broker charges each command about 128Mi, the size of
+	// a listing of a small cluster, and a kubectl listing thousands of objects
+	// holds several hundred Mi on its own, so size the limit to the largest
+	// listing the fleet produces for every command that runs at once (eight
+	// at the slot cap) plus the 320Mi of fixed reserves (192Mi for the broker
+	// and Envoy, 128Mi for the content workspace); the broker's child peak and
+	// memory high-water series give the figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
 	// refuses a memory limit below what admits two commands at once, a limits
@@ -2219,7 +2266,7 @@ type NetworkPolicyStatus struct {
 
 // AgentStatus defines the observed state of an agent.
 type AgentStatus struct {
-	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed).
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
@@ -2294,14 +2341,15 @@ type AgentStatus struct {
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
 // update, and ToolExecutionsTotal, ToolExecutionsBlockedTotal, EventsIngestedTotal,
-// SessionsTotal, RemediationsProposedTotal, RemediationsMergedTotal,
-// ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime, ClustersRegistered and
+// SessionsTotal, RemediationsProposedTotal, ChatMessagesInboundTotal,
+// LastActiveTime, LastHumanActiveTime, ClustersRegistered and
 // ClustersMonitored from the broker's, the event watcher's, the chat
 // plugin's and, on a next install, the A2A gateway's metrics
-// listeners, which it reads every five minutes on the leader; the agent's own
-// ServiceAccount holds no write verb on this status. RemediationsAppliedTotal
-// is declared so that the schema names it, but nothing writes it yet, and it
-// is absent (omitempty) until a series exists for it.
+// listeners, and the six proposal readings (RemediationsMergedTotal,
+// RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
+// ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, all
+// of which it reads every five minutes on the leader; the agent's own
+// ServiceAccount holds no write verb on this status.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative count of sessions the agent opened: the
 	// triage sessions the event watcher opened for events the daemon
@@ -2348,28 +2396,39 @@ type AgentUsageStatus struct {
 	// +optional
 	RemediationsProposedTotal int64 `json:"remediationsProposedTotal,omitempty"`
 
-	// RemediationsAppliedTotal is the cumulative count of remediations approved and applied.
-	// Nothing writes it yet.
+	// RemediationsMergedTotal is the forge's count now of the proposals this
+	// install authored in its managed repositories that are merged: the
+	// broker's readings sweep asks the forge, and this is its
+	// kubeagents_vcs_proposals under state merged, projected as the latest
+	// poll's reading. A reading, not an accumulation: it falls when a
+	// repository leaves the managed list, and the name keeps its Total for
+	// the readers that already use it. Part of the outcomes reading with
+	// RemediationsOpen and ProposalsAuthored: one poll that cannot read the
+	// broker, or reads it without that reading, leaves the three where they
+	// were, and a second in a row clears them to absent; the broker itself
+	// stops serving a reading more than an hour old. A 0 is a reading. A merge
+	// no longer moves LastActiveTime: a reading cannot say when a merge
+	// happened, and a merge is a person's or a forge rule's act.
 	// +optional
-	RemediationsAppliedTotal int64 `json:"remediationsAppliedTotal,omitempty"`
+	RemediationsMergedTotal *int64 `json:"remediationsMergedTotal,omitempty"`
 
-	// RemediationsMergedTotal is the cumulative count of proposals this install
-	// opened that the forge reported merged. The agent never merges, so the
-	// credential broker learns of a merge when one of its own reads of the
-	// proposal, proposal-list or proposal-view, shows the merged state; it
-	// counts each such proposal once per broker process, only when its author
-	// is the broker's own login and it merged no earlier than the broker
-	// process started, so a restart cannot count a merge twice, to within the
-	// forge's and the pod's clocks agreeing. Read from the
-	// broker's kubeagents_vcs_proposals_merged_total every five minutes and
-	// kept monotonic the same way as ToolExecutionsTotal. A merge no read of
-	// the broker's ever shows is not counted, and a credential whose login the
-	// broker cannot name counts nothing (the broker logs that once), so this
-	// under-counts rather than over-counts and stays absent on such an
-	// install; it is the forge's word, where RemediationsAppliedTotal is the
-	// install's. Moves LastActiveTime.
+	// RemediationsOpen is the forge's count now of this install's proposals
+	// that are open: kubeagents_vcs_proposals under state open. Part of the
+	// outcomes reading, absent on the same terms as RemediationsMergedTotal.
+	// Does not move LastActiveTime.
 	// +optional
-	RemediationsMergedTotal int64 `json:"remediationsMergedTotal,omitempty"`
+	RemediationsOpen *int64 `json:"remediationsOpen,omitempty"`
+
+	// ProposalsAuthored is the forge's count now of every proposal this
+	// install authored in its managed repositories, open, merged or closed,
+	// its own closes included: kubeagents_vcs_proposals summed over state.
+	// The denominator of the merge rate, from the same reading as
+	// RemediationsMergedTotal; RemediationsProposedTotal, the install's own
+	// record of the proposals it opened, can differ from it. Part of the
+	// outcomes reading, absent on the same terms as RemediationsMergedTotal.
+	// Does not move LastActiveTime.
+	// +optional
+	ProposalsAuthored *int64 `json:"proposalsAuthored,omitempty"`
 
 	// ChatMessagesInboundTotal is the cumulative count of chat messages that
 	// reached the gateway, from every platform it serves: Google Chat, Slack,
@@ -2477,23 +2536,42 @@ type AgentUsageStatus struct {
 	// reacted to already did.
 	// +optional
 	NegativeFeedbackTotal int64 `json:"negativeFeedbackTotal,omitempty"`
-	// RemediationsClosedUnmergedTotal is the cumulative count of proposals
-	// this install opened that the forge reported closed without a merge, by
-	// a person, a forge rule or a bot; a close the broker made itself, the
-	// fleet audit tidying a stale proposal, is not counted. The broker counts
-	// each once per broker process when one of its own reads, proposal-list
-	// or proposal-view, shows it closed, under the rules
-	// RemediationsMergedTotal uses: the author is the credential's login, the
-	// close is not before the process started, each proposal once. Read from the broker's
-	// kubeagents_vcs_proposals_closed_unmerged_total every five minutes and
-	// kept monotonic the same way as ToolExecutionsTotal. A close no read
-	// shows is not counted, so it under-counts; a proposal closed, reopened
-	// and merged counts here and in RemediationsMergedTotal once each. A high
-	// share of this against RemediationsMergedTotal says the agent's proposals
-	// are being rejected. Does not move LastActiveTime: a close is not the
-	// agent at work.
+	// RemediationsClosedUnmergedTotal is the forge's count now of this
+	// install's proposals closed without a merge by a person or a bot:
+	// kubeagents_vcs_proposals_closed_by under actor human plus actor bot. A
+	// close the install made itself, the fleet audit tidying a stale
+	// proposal, is not counted. A reading, not an accumulation, projected as
+	// the latest poll's; the name keeps its Total for the readers that already
+	// use it. A high share of this against RemediationsMergedTotal says the
+	// agent's proposals are being rejected. Part of the details reading with
+	// ProposalHumanTouches and ProposalsMergedUntouched: one poll that cannot
+	// read the broker, or reads it without that reading, leaves the three
+	// where they were, and a second in a row clears them to absent; a broker
+	// still warming serves the outcomes reading without this one, and one
+	// whose last sweep could not read the details keeps serving the details
+	// it last read, for an hour. A 0 is a reading. Does not
+	// move LastActiveTime: a close is not the agent at work.
 	// +optional
-	RemediationsClosedUnmergedTotal int64 `json:"remediationsClosedUnmergedTotal,omitempty"`
+	RemediationsClosedUnmergedTotal *int64 `json:"remediationsClosedUnmergedTotal,omitempty"`
+
+	// ProposalHumanTouches is the forge's count now of the events people
+	// made on this install's proposals: reviews, inline and conversation
+	// comments, commits on the source branch and /agent addresses by any
+	// account the forge does not mark as automation, summed over every
+	// proposal (kubeagents_vcs_proposal_touches under actor human, summed over
+	// kind). Part of the details reading, absent on the same terms as
+	// RemediationsClosedUnmergedTotal. Moves neither LastActiveTime nor
+	// LastHumanActiveTime.
+	// +optional
+	ProposalHumanTouches *int64 `json:"proposalHumanTouches,omitempty"`
+
+	// ProposalsMergedUntouched is the forge's count now of this install's
+	// merged proposals that carried no human touch of any kind:
+	// kubeagents_vcs_proposal_touches_per_proposal under outcome merged and le
+	// 0. Part of the details reading, absent on the same terms as
+	// RemediationsClosedUnmergedTotal. Does not move LastActiveTime.
+	// +optional
+	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
@@ -2538,11 +2616,11 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran or was refused, a proposal was opened or
-	// merged, a chat message reached the gateway, or an event was accepted
-	// for triage; BrokerFailuresTotal, ChatTurnsErroredTotal,
-	// BackgroundTasksGaveUpTotal, NegativeFeedbackTotal and
-	// RemediationsClosedUnmergedTotal alone leave it where it was.
+	// moved: a brokered command ran or was refused, a proposal was opened, a
+	// chat message reached the gateway, or an event was accepted for triage;
+	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal
+	// and NegativeFeedbackTotal alone leave it where it was, and the six
+	// proposal readings never move it.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use
@@ -2556,10 +2634,9 @@ type AgentUsageStatus struct {
 	// message that reached the gateway, counted before the sender allowlist,
 	// so an unlisted sender is still a person. Nothing else moves it. Brokered
 	// commands and accepted events come from the stall-watch cron and the
-	// event watcher on their own, proposals from the fleet audits, which open
-	// them with nobody asking, and a merge or a close can be a forge rule or
-	// a bot; all of those
-	// move LastActiveTime and leave this alone, so an install nobody has
+	// event watcher on their own, and proposals from the fleet audits, which
+	// open them with nobody asking; those move LastActiveTime and leave this
+	// alone, as the proposal readings leave both alone, so an install nobody has
 	// talked to in a month shows it. Absent until a person has sent a message
 	// since the operator that writes it started. Advances at most once per
 	// five minutes.

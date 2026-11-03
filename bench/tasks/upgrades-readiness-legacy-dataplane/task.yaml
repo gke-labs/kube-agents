@@ -71,11 +71,11 @@ expected_output: >-
   The version table and the readiness table read during this run. Every seeded
   cluster is reported on the legacy dataplane with the network policy add-on
   off, so none of them enforces a NetworkPolicy today, and the clusters that
-  carry policies (seeded-a's nine namespaces: default-deny in
+  carry policies (seeded-a's eleven namespaces: default-deny in
   seeded-reliability, seeded-debug, seeded-capacity, seeded-stall,
-  seeded-token, seeded-headroom, seeded-shapes and seeded-defaults, an
-  egress-only policy in seeded-deprecation and a second one in seeded-shapes,
-  ten policies in all; seeded-b's seeded-upgrade; seeded-d's seeded-topology)
+  seeded-token, seeded-headroom, seeded-qos, seeded-scaled-zero, seeded-shapes
+  and seeded-defaults, an egress-only policy in seeded-deprecation and a
+  second one in seeded-shapes, twelve policies in all; seeded-b's seeded-upgrade; seeded-d's seeded-topology)
   are named with those namespaces, each with its policy count,
   as the ones whose traffic would start to be blocked the moment enforcement
   turns on, at the node rebuild that follows enabling the add-on or on a

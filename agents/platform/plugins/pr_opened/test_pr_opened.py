@@ -229,10 +229,143 @@ class PrOpenedTest(unittest.TestCase):
         self.run_hook(_vcs_record(), kanban, forge=_Forge(title="x" * (plugin.TITLE_MAX * 2)))
         self.assertEqual(len(kanban.events[0][2]["title"]), plugin.TITLE_MAX)
 
-    def test_registers_the_terminal_output_hook(self):
+    def test_registers_the_terminal_output_and_pre_tool_call_hooks(self):
         registered = []
         plugin.register(types.SimpleNamespace(register_hook=lambda name, fn: registered.append((name, fn))))
-        self.assertEqual(registered, [("transform_terminal_output", plugin.on_terminal_output)])
+        self.assertEqual(registered, [
+            ("transform_terminal_output", plugin.on_terminal_output),
+            ("pre_tool_call", plugin.on_pre_tool_call),
+        ])
+
+
+PREPARE = (
+    'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py prepare \\\n'
+    '  --repo "acme/fleet-config" --branch "platform-agent/add-checkout-gateway-pdb"'
+)
+SUBMIT = (
+    'BODY=$(mktemp -p /opt/data/scratch pr_body.XXXXXX.md)\ncat > "$BODY" <<\'EOF\'\nAdds a PDB\nEOF\n'
+    'python3 /opt/data/profiles/platform/skills/submit-suggestion/scripts/submit_suggestion.py submit '
+    '--branch platform-agent/add-checkout-gateway-pdb --title "Add PDB" --body-file "$BODY"'
+)
+RUN_ID = 41
+
+
+class _Board:
+    """A sqlite board holding one card, behind a stand-in ``hermes_cli.kanban_db_connect``."""
+
+    def __init__(self, tmp, status="running", current_run_id=RUN_ID, fail=None):
+        import sqlite3
+
+        self.path = str(Path(tmp) / "kanban.db")
+        self.fail = fail
+        with contextlib.closing(sqlite3.connect(self.path)) as conn:
+            conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, current_run_id INTEGER)")
+            conn.execute("INSERT INTO tasks VALUES (?, ?, ?)", (TASK, status, current_run_id))
+            conn.commit()
+
+    def modules(self):
+        import sqlite3
+
+        connect = types.ModuleType("hermes_cli.kanban_db_connect")
+        board = self
+
+        @contextlib.contextmanager
+        def connect_closing(db_path=None, *, board_slug=None):
+            if board.fail:
+                raise board.fail
+            # As Hermes' connect does: a 120 s writer timeout, set by PRAGMA.
+            with contextlib.closing(sqlite3.connect(board.path, timeout=120)) as conn:
+                conn.execute("PRAGMA busy_timeout=120000")
+                yield conn
+
+        connect.connect_closing = connect_closing
+        package = types.ModuleType("hermes_cli")
+        package.kanban_db_connect = connect
+        return {"hermes_cli": package, "hermes_cli.kanban_db_connect": connect}
+
+
+class EndedRunGuardTest(unittest.TestCase):
+    """submit_suggestion.py is refused once the worker's own card run has ended (#2610)."""
+
+    def call(self, command, *, status="running", current_run_id=RUN_ID, env=None, fail=None, tool="terminal"):
+        env = {plugin.TASK_ENV: TASK, plugin.RUN_ID_ENV: str(RUN_ID)} if env is None else env
+        with tempfile.TemporaryDirectory() as tmp:
+            board = _Board(tmp, status=status, current_run_id=current_run_id, fail=fail)
+            with mock.patch.dict(sys.modules, board.modules()), mock.patch.dict(os.environ, env, clear=True):
+                return plugin.on_pre_tool_call(tool_name=tool, args={"command": command}, task_id="x")
+
+    def test_a_locked_board_lets_the_call_through_well_inside_hermes_hook_timeout(self):
+        # Hermes blocks a pre_tool_call hook that runs past 30 s, so a read that waited out the
+        # board's 120 s writer timeout would refuse a live card's submit.
+        import sqlite3
+        import time
+
+        env = {plugin.TASK_ENV: TASK, plugin.RUN_ID_ENV: str(RUN_ID)}
+        with tempfile.TemporaryDirectory() as tmp:
+            board = _Board(tmp, status="done")
+            with contextlib.closing(sqlite3.connect(board.path, isolation_level=None)) as holder:
+                holder.execute("BEGIN EXCLUSIVE")
+                with mock.patch.dict(sys.modules, board.modules()), mock.patch.dict(os.environ, env, clear=True):
+                    start = time.monotonic()
+                    with self.assertLogs(plugin.logger, "WARNING"):
+                        verdict = plugin.on_pre_tool_call(tool_name="terminal", args={"command": PREPARE}, task_id="x")
+                    took = time.monotonic() - start
+                holder.execute("ROLLBACK")
+        self.assertIsNone(verdict)
+        self.assertLess(took, 10)
+
+    def test_a_worker_whose_card_is_done_is_refused_prepare_and_submit(self):
+        # #3622's shape: kanban_complete, then the worker acts on its own [next: ...] line.
+        for command in (PREPARE, SUBMIT):
+            with self.subTest(command=command[:40]), self.assertLogs(plugin.logger, "WARNING"):
+                verdict = self.call(command, status="done")
+            self.assertEqual(verdict["action"], "block")
+            self.assertIn(f"card {TASK} is done", verdict["message"])
+            self.assertIn("[next: ...] line", verdict["message"])
+
+    def test_a_run_another_run_took_over_or_that_was_blocked_is_refused(self):
+        for status, current in (("running", RUN_ID + 1), ("blocked", None), ("todo", None)):
+            with self.subTest(status=status, current=current), self.assertLogs(plugin.logger, "WARNING"):
+                self.assertEqual(self.call(PREPARE, status=status, current_run_id=current)["action"], "block")
+
+    def test_a_live_run_is_let_through(self):
+        # The card asked for the pull request and the run is still open: the write path stays.
+        self.assertIsNone(self.call(PREPARE))
+        self.assertIsNone(self.call(SUBMIT))
+
+    def test_a_process_that_is_not_a_dispatcher_worker_is_let_through(self):
+        # The gateway's own sessions and cron runs carry no card: the main-session path is unchanged.
+        for env in ({}, {plugin.TASK_ENV: TASK}, {plugin.TASK_ENV: TASK, plugin.RUN_ID_ENV: "not-a-number"}):
+            with self.subTest(env=env):
+                self.assertIsNone(self.call(PREPARE, status="done", env=env))
+
+    def test_an_unreadable_board_or_a_missing_card_is_let_through(self):
+        with self.assertLogs(plugin.logger, "WARNING"):
+            self.assertIsNone(self.call(PREPARE, status="done", fail=RuntimeError("database is locked")))
+        env = {plugin.TASK_ENV: "t_other", plugin.RUN_ID_ENV: str(RUN_ID)}
+        self.assertIsNone(self.call(PREPARE, status="done", env=env))
+
+    def test_the_bare_old_shape_is_refused_too(self):
+        # The script reads a first argument that isn't a command as `submit`.
+        for command in (
+            'python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py --branch platform-agent/pdb --title "Add PDB" --body-file "$BODY"',
+            "cd /tmp/wc && python3 submit_suggestion.py --branch x --title y",
+        ):
+            with self.subTest(command=command[:50]), self.assertLogs(plugin.logger, "WARNING"):
+                self.assertEqual(self.call(command, status="done")["action"], "block")
+
+    def test_other_commands_and_tools_are_never_looked_at(self):
+        for command in (
+            "kubectl get pdb -A -o json",
+            'python3 "$HERMES_HOME"/scripts/gitops_preflight.py --list',
+            "python3 submit_suggestion.py --help",
+            "python3 submit_suggestion.py -h",
+            "python3 submit_suggestion.py list --handle x",
+            "cat agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.call(command, status="done"))
+        self.assertIsNone(self.call(PREPARE, status="done", tool="read_file"))
 
 
 class RealForgeTest(unittest.TestCase):
@@ -297,6 +430,48 @@ class RealBoardTest(unittest.TestCase):
                         (task_id, plugin.PR_OPENED_KIND),
                     ).fetchall()
         self.assertEqual([(row[0], json.loads(row[1])["url"]) for row in rows], [("pr_opened", URL)])
+
+    def test_submit_suggestion_is_refused_after_kanban_complete_on_a_real_card(self):
+        # The real board: a live run is let through; once complete_task ends the run, refused.
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import connect_closing
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kanban.db")
+            with mock.patch.dict(os.environ, {"HERMES_KANBAN_DB": db, "HERMES_HOME": tmp}):
+                kb.init_db()
+                with connect_closing() as conn:
+                    task_id = kb.create_task(conn, title="propose a PDB", assignee="platform")
+                    claimed = kb.claim_task(conn, task_id)
+                    run_id = claimed.current_run_id
+                worker = {plugin.TASK_ENV: task_id, plugin.RUN_ID_ENV: str(run_id)}
+                with mock.patch.dict(os.environ, worker):
+                    live = plugin.on_pre_tool_call(tool_name="terminal", args={"command": PREPARE})
+                    with connect_closing() as conn:
+                        self.assertTrue(kb.complete_task(conn, task_id, result="the manifest", expected_run_id=run_id))
+                    with self.assertLogs(plugin.logger, "WARNING"):
+                        ended = plugin.on_pre_tool_call(tool_name="terminal", args={"command": PREPARE})
+        self.assertIsNone(live)
+        self.assertEqual(ended["action"], "block")
+
+    def test_hermes_own_pre_tool_call_seam_blocks_with_the_message(self):
+        # Hermes's own dispatch: the block directive becomes the message the tool call returns.
+        from hermes_cli import lifecycle  # noqa: F401
+        from hermes_cli import plugins as hermes_plugins
+
+        manager = hermes_plugins.get_plugin_manager()
+        mock.patch.object(manager, "_discovered", True, create=True).start()
+        self.addCleanup(mock.patch.stopall)
+        hooks = manager._hooks.setdefault("pre_tool_call", [])
+        hooks.append(plugin.on_pre_tool_call)
+        self.addCleanup(hooks.remove, plugin.on_pre_tool_call)
+        with tempfile.TemporaryDirectory() as tmp:
+            board = _Board(tmp, status="done")
+            env = {plugin.TASK_ENV: TASK, plugin.RUN_ID_ENV: str(RUN_ID)}
+            with mock.patch.dict(sys.modules, board.modules()), mock.patch.dict(os.environ, env), \
+                    self.assertLogs(plugin.logger, "WARNING"):
+                message, _ = hermes_plugins._dispatch_pre_tool_call_hooks("terminal", {"command": PREPARE})
+        self.assertEqual(message, plugin.ended_run_text(TASK, "done"))
 
     def test_hermes_own_terminal_output_seam_calls_the_hook_and_takes_its_answer(self):
         # The plugin registered through Hermes's plugin manager, and the output transform driven by

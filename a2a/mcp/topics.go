@@ -34,9 +34,14 @@ const (
 	topicSubjects = "a2a.topics.>"
 	topicSep      = "."
 
-	// topicReadTimeout bounds one call end to end, whatever the caller's
-	// context allows.
+	// topicReadTimeout bounds one read, which runs detached from its
+	// callers; a caller can still leave earlier, when its own context ends.
 	topicReadTimeout = 10 * time.Second
+
+	// maxTopicReads bounds the reads in flight across all keys. Keys are any
+	// well-formed topic name, so without it a client sending many distinct
+	// names could start that many detached reads at once.
+	maxTopicReads = maxTaskReaders
 
 	// maxTopicNameBytes is longer than any topic subject the registry can
 	// hold (a2a.topics.agent.{63}.{63}); a longer name is refused unread.
@@ -124,9 +129,13 @@ type readTopicsArgs struct {
 	Topic  string `json:"topic"`
 }
 
+// errTopicReadsBusy is every topic read in flight (maxTopicReads), a bound on
+// distinct uncached keys, apart from the bus reader slots errReadersBusy names.
+var errTopicReadsBusy = fmt.Errorf("this server is already reading %d topics; try again once a read finishes (each takes at most %s)", maxTopicReads, topicReadTimeout)
+
 // topicCache answers a repeated call from the last read for statusCacheTTL,
-// as the status does, and runs one read at a time. Each read opens consumers
-// the console cannot delete, which the server reaps only after
+// as the status does, and runs at most one read per key at a time. Each read
+// opens consumers the console cannot delete, which the server reaps only after
 // taskConsumerIdle. The shared reader slots are held until that reap, but
 // AgentCards takes none, and the slots are shared with task reads, so this is
 // what keeps a caller polling fast from filling the topic streams' and
@@ -136,14 +145,17 @@ type readTopicsArgs struct {
 // that reports problems is, since the read is not the caller's (below), so a
 // problem is the bus's and the next caller would only meet it again.
 //
-// The read runs detached from its caller, under its own topicReadTimeout
-// starting once the lock is held, as the status read does: a caller that
-// hangs up, or one that queued behind a slow read, cannot make the shared
-// answer a short one.
+// The lock is never held across a read, as in NATSBus.Status: a key with a
+// kept answer is answered at once while another key is being read, and the
+// callers of a key being read wait for that read's result, each leaving on
+// its own context. The read runs detached from its callers, under its own
+// topicReadTimeout, so a caller that hangs up cannot make the shared answer a
+// short one, and the read it started still answers the next caller.
 type topicCache struct {
-	mu      sync.Mutex
-	now     func() time.Time
-	entries map[string]topicAnswer
+	mu       sync.Mutex
+	now      func() time.Time
+	entries  map[string]topicAnswer
+	inflight map[string]*topicRead
 }
 
 type topicAnswer struct {
@@ -151,9 +163,20 @@ type topicAnswer struct {
 	text string
 }
 
+// topicRead is one read in flight: text and err are its result once done is
+// closed.
+type topicRead struct {
+	done chan struct{}
+	text string
+	err  error
+}
+
+func newTopicCache(now func() time.Time) *topicCache {
+	return &topicCache{now: now, entries: map[string]topicAnswer{}, inflight: map[string]*topicRead{}}
+}
+
 func (c *topicCache) answer(ctx context.Context, key string, read func(context.Context) (string, error)) (string, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	now := c.now()
 	for k, a := range c.entries {
 		if now.Sub(a.at) >= statusCacheTTL {
@@ -161,18 +184,60 @@ func (c *topicCache) answer(ctx context.Context, key string, read func(context.C
 		}
 	}
 	if a, ok := c.entries[key]; ok {
+		c.mu.Unlock()
 		return a.text, nil
 	}
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), topicReadTimeout)
-	defer cancel()
-	text, err := read(rctx)
-	if err != nil {
-		return "", err
+	r := c.inflight[key]
+	if r == nil {
+		// A caller already gone starts nothing, and a full set of reads
+		// turns the next new key away rather than queueing it.
+		if err := ctx.Err(); err != nil {
+			c.mu.Unlock()
+			return "", err
+		}
+		if len(c.inflight) >= maxTopicReads {
+			c.mu.Unlock()
+			return "", errTopicReadsBusy
+		}
+		r = &topicRead{done: make(chan struct{})}
+		c.inflight[key] = r
+		// Detached from the caller's cancellation and deadline, as
+		// NATSBus.Status's read is, but keeping its values (a trace or
+		// request-scoped logger, if any reach the bus calls).
+		go c.refresh(context.WithoutCancel(ctx), key, r, read)
 	}
-	// Stamped when the read ends, so a slow read is still served for the
-	// full window.
-	c.entries[key] = topicAnswer{at: c.now(), text: text}
-	return text, nil
+	c.mu.Unlock()
+	select {
+	case <-r.done:
+		return r.text, r.err
+	case <-ctx.Done():
+		return "", fmt.Errorf("the request ended while the topic read was still running: %w", ctx.Err())
+	}
+}
+
+// refresh runs one read for key, keeps a successful answer, and releases the
+// read's waiters.
+func (c *topicCache) refresh(ctx context.Context, key string, r *topicRead, read func(context.Context) (string, error)) {
+	rctx, cancel := context.WithTimeout(ctx, topicReadTimeout)
+	defer cancel()
+	// The read runs outside net/http's per-request recovery, so a panic in
+	// it becomes the read's error here; either way its waiters are released
+	// and the key freed, or every later caller of the key would wait on it.
+	defer func() {
+		if p := recover(); p != nil {
+			r.text, r.err = "", fmt.Errorf("the topic read failed: %v", p)
+		}
+		c.mu.Lock()
+		if r.err == nil {
+			// Stamped when the read ends, so a slow read is still served
+			// for the full window.
+			c.entries[key] = topicAnswer{at: c.now(), text: r.text}
+		}
+		delete(c.inflight, key)
+		c.mu.Unlock()
+		close(r.done)
+	}()
+	r.text, r.err = read(rctx)
 }
 
 // ReadTopicsTool reads the install's standing topics (TOPICS-STATE and
@@ -181,7 +246,7 @@ func (c *topicCache) answer(ctx context.Context, key string, read func(context.C
 func ReadTopicsTool(bus TopicsBus) Tool { return readTopicsTool(bus, time.Now) }
 
 func readTopicsTool(bus TopicsBus, now func() time.Time) Tool {
-	cache := &topicCache{now: now, entries: map[string]topicAnswer{}}
+	cache := newTopicCache(now)
 	list := func(ctx context.Context) (string, error) {
 		l, err := bus.ListTopics(ctx)
 		if err != nil {

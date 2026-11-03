@@ -1,4 +1,4 @@
-"""The latency block of the 9 AM digest's nightly section: last night's
+"""The latency block of the 11 AM digest's nightly section: last night's
 timing against its own recent past, and the cases that slowed down.
 
 The nightly runs record each repetition's timing (``agent_s``, the agent

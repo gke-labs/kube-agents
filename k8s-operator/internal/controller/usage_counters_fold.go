@@ -60,16 +60,20 @@ const (
 
 	// The counters the document keeps, named for the status fields they
 	// project to, so the JSON reads beside the status.
-	usageCounterToolExecutions             = "toolExecutionsTotal"
-	usageCounterEventsIngested             = "eventsIngestedTotal"
-	usageCounterRemediationsProposed       = "remediationsProposedTotal"
-	usageCounterRemediationsMerged         = "remediationsMergedTotal"
-	usageCounterChatMessagesInbound        = "chatMessagesInboundTotal"
-	usageCounterBrokerFailures             = "brokerFailuresTotal"
-	usageCounterChatTurnsErrored           = "chatTurnsErroredTotal"
-	usageCounterBackgroundTasksGaveUp      = "backgroundTasksGaveUpTotal"
-	usageCounterNegativeFeedback           = "negativeFeedbackTotal"
-	usageCounterRemediationsClosedUnmerged = "remediationsClosedUnmergedTotal"
+	usageCounterToolExecutions        = "toolExecutionsTotal"
+	usageCounterEventsIngested        = "eventsIngestedTotal"
+	usageCounterRemediationsProposed  = "remediationsProposedTotal"
+	usageCounterChatMessagesInbound   = "chatMessagesInboundTotal"
+	usageCounterBrokerFailures        = "brokerFailuresTotal"
+	usageCounterChatTurnsErrored      = "chatTurnsErroredTotal"
+	usageCounterBackgroundTasksGaveUp = "backgroundTasksGaveUpTotal"
+	usageCounterNegativeFeedback      = "negativeFeedbackTotal"
+	// The two counters an earlier release kept for the proposals merged and
+	// closed unmerged, which are readings now (usageReadingSpecs): a document
+	// that carries them has their totals and pod entries dropped on read
+	// (migrateUsageDocument). Named for the fields they projected to.
+	usageCounterRemediationsMerged         = usageExportRemediationsMerged
+	usageCounterRemediationsClosedUnmerged = usageExportRemediationsClosedUnmerged
 	// sessionsTotal is two document counters, because its halves aggregate
 	// differently (usageAggregationFor): the sessions the watcher opens for
 	// triage, read on every gateway replica over the same event stream, and
@@ -102,26 +106,28 @@ var (
 	// reaction hook alone counts; asking would seed an idle entry per A2A pod
 	// and name the field in that pod's Warning.
 	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored}
-	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterRemediationsClosedUnmerged}
+	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback, usageCounterRemediationsClosedUnmerged}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback}
+	// usageRetiredCounters are the counters an earlier release kept and this
+	// one does not: migrateUsageDocument drops them from a document.
+	usageRetiredCounters = []string{usageCounterRemediationsMerged, usageCounterRemediationsClosedUnmerged}
 	// usageQuietCounters are the counters whose advance is not activity and
 	// leaves LastMoved alone: the broker's failures, which a watcher retrying
 	// an unreachable fleet cluster through the relay produces every poll on
 	// an install nobody is using; the failed turns, each a failure whose
 	// message already moved the time; and a background card giving up, a
-	// failure, not the agent at work; a thumbs-down, a person's verdict on a
-	// message that already moved it; and the proposals closed without a merge,
-	// a person's, a rule's or a bot's act, not the agent's.
-	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true, usageCounterNegativeFeedback: true, usageCounterRemediationsClosedUnmerged: true}
+	// failure, not the agent at work; and a thumbs-down, a person's verdict on
+	// a message that already moved it.
+	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true, usageCounterNegativeFeedback: true}
 	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.
 	usageSessionsCounters = []string{usageCounterSessionsTriage, usageCounterSessionsChat}
 	// usageHumanCounters is the counter only a person moves: a chat message.
 	// An advance in it stamps LastHumanMoved as well as LastMoved. Every other
 	// counter stamps LastMoved alone: the stall-watch cron runs brokered
 	// commands and the event watcher accepts events on their own, the fleet
-	// audits open proposals with nobody asking, a merge can be a forge rule,
-	// and a chat session begins with a message this counter already counted.
+	// audits open proposals with nobody asking, and a chat session begins
+	// with a message this counter already counted.
 	usageHumanCounters = map[string]bool{usageCounterChatMessagesInbound: true}
 )
 
@@ -226,6 +232,12 @@ type usageDocument struct {
 	// says the change was the layout, not only a counter the document predated.
 	// Not serialised.
 	migrated bool
+	// retired says migrateUsageDocument dropped a retired counter's total or
+	// pod entries. Not serialised.
+	retired bool
+	// added is whether a counter this operator keeps was missing from the
+	// document and was added at its status floor.
+	added bool
 	// Unfolded names the counters migrateUsageDocument added to Totals at
 	// zero and no pod has been recorded for since: the status carried nothing
 	// for them and no pod's sample has been folded into them through this
@@ -267,6 +279,10 @@ func usageUnfolded(doc *usageDocument, counter string) bool {
 // first that reads the pod. The two sessions halves share one field: with a
 // status that carries sessions, neither half is unfolded, since the triage
 // half's share of that status sits in the chat half's floor.
+// A retired counter (usageRetiredCounters) loses its total, its pod entries
+// and its unfolded mark, the same at either version, so the layout keeps its
+// version: dropping is idempotent, and every other counter keeps its baseline
+// where a re-seed would reset them all.
 // Any other version is left for usageDocumentInvalid to refuse.
 func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 	if doc.Pods == nil || doc.Totals == nil {
@@ -292,12 +308,32 @@ func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 	default:
 		return
 	}
+	for _, counter := range usageRetiredCounters {
+		if _, ok := doc.Totals[counter]; ok {
+			delete(doc.Totals, counter)
+			doc.retired = true
+		}
+		if i := slices.Index(doc.Unfolded, counter); i >= 0 {
+			doc.Unfolded = slices.Delete(doc.Unfolded, i, i+1)
+			doc.retired = true
+		}
+	}
+	for key, entry := range doc.Pods {
+		if entry != nil && slices.Contains(usageRetiredCounters, entry.Counter) {
+			delete(doc.Pods, key)
+			doc.retired = true
+		}
+	}
+	if doc.retired {
+		doc.migrated = true
+	}
 	for _, counter := range usageCounters {
 		if _, ok := doc.Totals[counter]; ok {
 			continue
 		}
 		doc.Totals[counter] = floors[counter]
 		doc.migrated = true
+		doc.added = true
 		if usageFieldFloor(floors, counter) == 0 && !usageUnfolded(doc, counter) {
 			doc.Unfolded = append(doc.Unfolded, counter)
 		}
@@ -339,6 +375,11 @@ type usageScrapedPod struct {
 	// Clusters is the watcher's cluster gauges, nil for any pod but a gateway's.
 	// Not folded: the poll projects the largest reading as it stands.
 	Clusters *usageClusterGauges
+	// Readings and ReadingsPresent are the broker's proposal readings, nil
+	// for any pod but a broker's. Not folded either: the poll projects the
+	// largest of each field across the brokers read (usageReadingsForPoll).
+	Readings        map[string]int64
+	ReadingsPresent map[usageReadingKind]bool
 }
 
 // usageSeed is what a poll that finds no usable document starts from: the

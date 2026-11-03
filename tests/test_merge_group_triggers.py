@@ -8,11 +8,11 @@ workflow edited without it still runs on every pull request exactly as before.
 This roster is the ten required contexts as of the Tide-to-merge-queue
 migration (gke-labs/kube-agents#1363), less `cla/google`, which is an external
 app's check run rather than a workflow, plus `Run A2A Module Tests`, which
-became required on 2026-10-13, and `Run k8s-api-proxy Tests`, held to the
-trigger before it joins the ruleset. `merge-gate.yml` posts the two checks
-that stand in for Tide in the queue, and is held to the same trigger. Every job
-in these workflows also sets its own `timeout-minutes`, because the queue holds
-all merges behind a hung required job.
+became required on 2026-10-13, and `Run k8s-api-proxy Tests`, on 2026-10-28.
+`merge-gate.yml` posts the two checks that stand in for Tide in the queue, and
+is held to the same trigger. Every job in these workflows also sets its own
+`timeout-minutes`, because the queue holds all merges behind a hung required
+job.
 """
 
 import pathlib

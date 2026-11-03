@@ -25,8 +25,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,18 +36,20 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 )
 
 const (
+	// componentName prefixes the profile scan's log lines, as the binary's
+	// name, and skipConsequence finishes their "its cluster will NOT be ...".
+	componentName   = "k8s-event-watcher"
+	skipConsequence = "watched"
 	// memoryLimitEnv carries the container's memory limit in bytes. The
 	// operator sets it through the Downward API from the agent-api-auth
 	// container's limits.memory (see buildAgentAPIAuthSidecar), so the watcher
 	// learns the ceiling it shares without a flag that could drift from it.
+	// An explicit GOMEMLIMIT takes precedence (internal/memlimit).
 	memoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
-	// goMemLimitEnv is the Go runtime's own soft-limit variable. When it is
-	// set the runtime has already applied it before main runs, and it is an
-	// explicit choice that this process does not second-guess.
-	goMemLimitEnv = "GOMEMLIMIT"
 	// memoryLimitFraction is the share of the container limit the watcher
 	// claims as its soft limit. The Python API authenticator lives in the same
 	// container, so the whole limit is not the watcher's to spend; half leaves
@@ -117,9 +117,12 @@ type flags struct {
 	// image-pull family; see filter.go.
 	imagePullTransientMinCount int
 	// failedSchedulingMinCount is the FailedScheduling backstop when
-	// cluster-autoscaler has said nothing about the pod; scaleUpHold is how
-	// long its TriggeredScaleUp holds the pod's events. See filter.go.
+	// cluster-autoscaler has said nothing about the pod, and
+	// failedSchedulingMinSpan how long such an event must have lasted on top;
+	// scaleUpHold is how long its TriggeredScaleUp holds the pod's events.
+	// See filter.go.
 	failedSchedulingMinCount int
+	failedSchedulingMinSpan  time.Duration
 	scaleUpHold              time.Duration
 	// autopilotScaleToZeroHold holds the FailedScheduling an Autopilot cluster
 	// emits for GKE's own system pods once it has scaled to zero nodes. On by
@@ -168,7 +171,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.IntVar(&f.unhealthyMinCount, "unhealthy-min-count", 3, "Require this many consecutive Unhealthy events before firing.")
 	fs.IntVar(&f.backoffMinCount, "backoff-min-count", 3, "Require this many consecutive crash-loop (BackOff/CrashLoopBackOff) events before firing. Suppresses startup races that resolve on their own. 1 = fire on the first event.")
 	fs.IntVar(&f.imagePullTransientMinCount, "imagepull-transient-min-count", 3, "Require this many consecutive image-pull failures before firing, when the error looks self-clearing (registry 429/5xx, timeouts). Terminal causes such as a bad tag, and any cause the classifier does not recognize, always fire on the first event. 1 = fire on the first event.")
-	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1 = fire on the first event.")
+	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1, with --failedscheduling-min-span=0, = fire on the first event.")
+	fs.DurationVar(&f.failedSchedulingMinSpan, "failedscheduling-min-span", defaultFailedSchedulingMinSpan, "How long a FailedScheduling with no cluster-autoscaler verdict has to have lasted, by the event's own first and last sighting, before it fires, on top of --failedscheduling-min-count. Holds the burst a node scale-down drives the count through for a pod placed seconds later. 0 = off.")
 	fs.DurationVar(&f.scaleUpHold, "scaleup-hold", defaultScaleUpHold, "How long a TriggeredScaleUp on a pod holds its FailedScheduling events, measured from the autoscaler's event to the FailedScheduling's own last sighting. Past it the count threshold applies again. Cluster-autoscaler's default node-provision timeout.")
 	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy; the reasons kubelet re-emits while they last) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
 	fs.DurationVar(&f.quietAfter, "quiet-after", defaultQuietAfter, "How long after its last sighting an incident whose alert went out is reported quiet: the daemon gets one k8s-event-followup inject for it, which it posts into the alert's thread and onto its card (the card alone where no thread is routed). Silence is read off the events alone; no object is read back. 0 = off.")
@@ -209,9 +213,10 @@ func (f *flags) filterThresholds() filterThresholds {
 		backoffMinCount:                 f.backoffMinCount,
 		imagePullTransientMinCount:      f.imagePullTransientMinCount,
 		failedSchedulingMinCount:        f.failedSchedulingMinCount,
+		failedSchedulingMinSpan:         offThreshold(f.failedSchedulingMinSpan),
 		scaleUpHold:                     f.scaleUpHold,
 		disableAutopilotScaleToZeroHold: !f.autopilotScaleToZeroHold,
-		settle:                          settleThreshold(f.settle),
+		settle:                          offThreshold(f.settle),
 	}
 }
 
@@ -229,10 +234,11 @@ func settleClearedTTL(dedupWindow time.Duration) time.Duration {
 	return settleClearedFloor
 }
 
-// settleThreshold turns the flag's reading into the config's: on the flag 0
-// is off and the default is the flag's own; in filterThresholds 0 is the
-// default, as it is for every count, so off travels as a negative.
-func settleThreshold(flagValue time.Duration) time.Duration {
+// offThreshold turns a duration flag's reading into the config's, for
+// --settle and --failedscheduling-min-span: on the flag 0 is off and the
+// default is the flag's own; in filterThresholds 0 is the default, as it is
+// for every count, so off travels as a negative.
+func offThreshold(flagValue time.Duration) time.Duration {
 	if flagValue == 0 {
 		return -1
 	}
@@ -278,6 +284,9 @@ func (f *flags) validate() error {
 	}
 	if f.settle < 0 {
 		return errors.New("--settle must be >= 0 (0 = off)")
+	}
+	if f.failedSchedulingMinSpan < 0 {
+		return errors.New("--failedscheduling-min-span must be >= 0 (0 = off)")
 	}
 	if f.quietAfter < 0 {
 		return errors.New("--quiet-after must be >= 0 (0 = off)")
@@ -434,78 +443,51 @@ func (tc targetCluster) identity() string {
 // discovery is the profile scan discoverClusterProfiles runs. Its zero value
 // reaches the real GKE API with this pod's own credentials, or through the
 // credential proxy when clusterprofiles.BrokerFromEnv names one; the tests replace
-// its Describe and TokenSource fields so the scan needs neither. OnSkip is set
-// per call instead, because it needs the metrics registry the caller holds.
+// its Describe and TokenSource fields so the scan needs neither.
 var discovery clusterprofiles.Discoverer
 
 // discoverClusterProfiles scans a Hermes profiles directory (normally
 // /opt/data/profiles) and returns one targetCluster per Cluster Agent profile
-// found. clusterprofiles.Discoverer.Discover does the scanning and the
-// addressing — read its doc comment for what counts as a cluster profile and
-// which failures are fatal — and this function adds the two things that are the
-// watcher's rather than the package's: a Kubernetes client per cluster, and
-// what a skipped profile looks like in the logs and in clusterDiscoveryErrors.
-//
-// The package returns configs rather than clients because the drift detector
-// wants a dynamic.Interface from the same scan. Building the informer-backed
-// kubernetes.Interface here is what keeps that choice with the caller who makes
-// it.
+// found. clusterprofiles.DiscoverAndBuild does the scanning, the addressing and
+// the failure policy — read its doc comment for which failures are fatal — and
+// this function adds the two things that are the watcher's rather than the
+// package's: an informer-backed Kubernetes client per cluster, and a
+// clusterDiscoveryErrors{profile} increment per skip.
 //
 // A profile that looks like a cluster profile but fails to load is skipped, not
 // fatal. Dropping one cluster is bad; the alternative is worse, because these
 // errors would propagate out of buildWatchSet before it has even built the
 // direct client, so a single unparseable config.yaml would stop the watcher
 // monitoring anything at all — including the management cluster, whose client
-// would have been fine. Every skip logs and increments
-// clusterDiscoveryErrors{profile}, so "this cluster is not being watched" stays
-// visible and alertable without being fatal.
+// would have been fine. Every skip, the unreadable directory included under
+// clusterprofiles.NoProfile, increments clusterDiscoveryErrors{profile}, so
+// "this cluster is not being watched" stays visible and alertable without
+// being fatal.
 func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]targetCluster, error) {
-	skip := func(profile string, err error) {
-		if profile == clusterprofiles.NoProfile {
-			// The directory itself, not a profile in it — the error already
-			// says which directory and what it means.
-			log.Printf("k8s-event-watcher: %v", err)
-		} else {
-			log.Printf("k8s-event-watcher: skipping profile %s, its cluster will NOT be watched: %v", profile, err)
-		}
-		m.clusterDiscoveryErrors.WithLabelValues(profile).Inc()
-	}
-
-	// A copy, so setting OnSkip does not write to the package-level seam.
-	d := discovery
-	d.OnSkip = skip
-	// The credential proxy, when the operator names one, in place of this
-	// pod's Workload Identity; a half-set pair is fatal (BrokerFromEnv). A
-	// Broker already on the seam is a test's and is kept.
-	if d.Broker == nil {
-		broker, err := clusterprofiles.BrokerFromEnv()
-		if err != nil {
-			return nil, err
-		}
-		d.Broker = broker
-	}
-	discovered, err := d.Discover(ctx, dir)
-	if err != nil {
-		return nil, err
-	}
-
-	clusters := make([]targetCluster, 0, len(discovered))
-	for _, c := range discovered {
+	scan, err := clusterprofiles.DiscoverAndBuild(ctx, discovery, dir, clusterprofiles.ScanOptions{
+		Component:   componentName,
+		Consequence: skipConsequence,
+		OnSkip: func(profile string, _ error) {
+			m.clusterDiscoveryErrors.WithLabelValues(profile).Inc()
+		},
+	}, func(c clusterprofiles.Cluster) (targetCluster, error) {
 		client, err := kubernetes.NewForConfig(c.Config)
 		if err != nil {
-			skip(c.Profile, fmt.Errorf("kubernetes client: %w", err))
-			continue
+			return targetCluster{}, fmt.Errorf("kubernetes client: %w", err)
 		}
-		clusters = append(clusters, targetCluster{
+		return targetCluster{
 			Name:      c.Identity.Cluster,
 			ProjectID: c.Identity.Project,
 			Location:  c.Identity.Location,
 			Profile:   c.Profile,
 			Client:    client,
 			Autopilot: c.Autopilot,
-		})
+		}, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return clusters, nil
+	return scan.Built, nil
 }
 
 // initialSyncGrace is how long the process will run with nothing synced before
@@ -1043,40 +1025,19 @@ func runSweepLoop(ctx context.Context, d *dispatcher, interval time.Duration) {
 	}
 }
 
-// deriveMemoryLimit decides the Go soft memory limit from the two variables
-// that can set it. It returns the limit in bytes and true when
-// memoryLimitEnv should be applied, or zero, false and the reason when the
-// runtime's own setting should stand: GOMEMLIMIT already set (the runtime
-// applied it and it wins), the container limit absent (running outside the
-// operator's Deployment), or unparseable or non-positive (the value is not a
-// byte count, so nothing is derived from it).
-func deriveMemoryLimit(goMemLimit, containerLimit string) (int64, bool, string) {
-	if goMemLimit != "" {
-		return 0, false, fmt.Sprintf("%s=%s is set and takes precedence", goMemLimitEnv, goMemLimit)
-	}
-	if containerLimit == "" {
-		return 0, false, fmt.Sprintf("%s is not set; the runtime default applies", memoryLimitEnv)
-	}
-	limitBytes, err := strconv.ParseInt(containerLimit, 10, 64)
-	if err != nil || limitBytes <= 0 {
-		return 0, false, fmt.Sprintf("%s=%q is not a positive byte count; the runtime default applies", memoryLimitEnv, containerLimit)
-	}
-	return int64(float64(limitBytes) * memoryLimitFraction), true, ""
-}
-
 // applyMemoryLimit sets the Go runtime's soft memory limit to
 // memoryLimitFraction of the container's, when the operator has told the
-// watcher what that is and nothing else has set a limit. debug.SetMemoryLimit
-// is the same knob GOMEMLIMIT turns; doing it here rather than in the
-// entrypoint keeps the derivation under test. One line either way, so the
-// startup log says which limit the process is running under.
+// watcher what that is and nothing else has set a limit (memlimit.Apply, the
+// derivation the manager shares; its input classes are tested there). Doing
+// it here rather than in the entrypoint keeps the call under test. One line
+// either way, so the startup log says which limit the process is running
+// under.
 func applyMemoryLimit() {
-	limitBytes, apply, reason := deriveMemoryLimit(os.Getenv(goMemLimitEnv), os.Getenv(memoryLimitEnv))
-	if !apply {
+	limitBytes, applied, reason := memlimit.Apply(memoryLimitEnv, memoryLimitFraction)
+	if !applied {
 		log.Printf("k8s-event-watcher: memory limit not derived: %s", reason)
 		return
 	}
-	debug.SetMemoryLimit(limitBytes)
 	log.Printf("k8s-event-watcher: Go soft memory limit set to %d bytes (%s=%s × %g)",
 		limitBytes, memoryLimitEnv, os.Getenv(memoryLimitEnv), memoryLimitFraction)
 }

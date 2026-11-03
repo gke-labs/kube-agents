@@ -268,8 +268,8 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         self.assertEqual(_cr_resources(cr), {"requests": {"memory": "1Gi"}})
 
     def test_an_ephemeral_storage_request_above_the_default_limit_fails(self):
-        err = self._render_error([f"{_VALUE_PATH}.requests.ephemeral-storage=3Gi"])
-        self.assertIn("limits.ephemeral-storage (2Gi)", err)
+        err = self._render_error([f"{_VALUE_PATH}.requests.ephemeral-storage=9Gi"])
+        self.assertIn("limits.ephemeral-storage (8Gi)", err)
 
     def test_a_negative_quantity_fails(self):
         err = self._render_error(values=_proxy_values({"requests": {"cpu": "-1"}}))

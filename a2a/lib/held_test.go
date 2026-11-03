@@ -23,6 +23,7 @@ type heldHarness struct {
 	ctx     context.Context
 	req     *Client
 	profile string
+	url     string
 }
 
 func newHeldHarness(t *testing.T, profile string) (*heldHarness, *Client) {
@@ -40,7 +41,7 @@ func newHeldHarness(t *testing.T, profile string) (*heldHarness, *Client) {
 		t.Fatalf("Connect worker: %v", err)
 	}
 	t.Cleanup(worker.Close)
-	return &heldHarness{t: t, ctx: ctx, req: req, profile: profile}, worker
+	return &heldHarness{t: t, ctx: ctx, req: req, profile: profile, url: clientURL(s)}, worker
 }
 
 func (h *heldHarness) cfg() SubscribeConfig {

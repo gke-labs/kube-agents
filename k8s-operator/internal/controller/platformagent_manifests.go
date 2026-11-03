@@ -1138,6 +1138,34 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // admitting at least this many.
 const defaultKanbanMaxInProgress = 6
 
+// defaultSessionRetentionDays is how long an ended session is kept when
+// spec.harness.retention.sessionDays says nothing: Hermes' own default
+// (hermes_cli/config_defaults.py, sessions.retention_days), so an upgrade that
+// starts rendering the key deletes nothing it would not have deleted anyway. The
+// fleet-scale requirements propose 7 days for working data; flipping to that is
+// this one constant, plus the release note that names the deletion it causes.
+const defaultSessionRetentionDays = 90
+
+// managedSessionsConfig is the `sessions` block in the managed scope. Hermes
+// prunes ended sessions inactive for retention_days whenever a CLI or the gateway
+// starts (at most once a day per state.db), and the session-retention cron job
+// runs the same maintenance daily for profiles that do not start on their own.
+// auto_prune is rendered true so a later Hermes default cannot switch it off.
+type managedSessionsConfig struct {
+	AutoPrune     bool `json:"auto_prune"`
+	RetentionDays int  `json:"retention_days"`
+}
+
+// resolveSessionRetentionDays is spec.harness.retention.sessionDays, or
+// defaultSessionRetentionDays when it is unset.
+func resolveSessionRetentionDays(agent *agentv1alpha1.PlatformAgent) int {
+	if agent != nil && agent.Spec.Harness != nil && agent.Spec.Harness.Retention != nil &&
+		agent.Spec.Harness.Retention.SessionDays != nil {
+		return *agent.Spec.Harness.Retention.SessionDays
+	}
+	return defaultSessionRetentionDays
+}
+
 // defaultProfileLimits, platformProfileLimits and clusterProfileLimits read
 // spec.harness.tuning, tolerating every level being nil.
 func defaultProfileLimits(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.AgentLimits {
@@ -1990,6 +2018,14 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		Kanban struct {
 			MaxInProgress int `json:"max_in_progress"`
 		} `json:"kanban"`
+		// Session retention, read by Hermes' own state.db auto-maintenance in every
+		// profile (cli.py and gateway/run.py: sessions.auto_prune / retention_days).
+		// Always rendered, and rendered here because it meets both of this function's
+		// tests. Uniform: one retention policy for the install's working data, the
+		// same for every profile. Beyond the agent's repair: a profile that lengthened
+		// its own retention would keep conversation history past the period the
+		// install promises to delete it after.
+		Sessions managedSessionsConfig `json:"sessions"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -2059,6 +2095,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// became 6. A pin is applied over the persisted config on every load, whatever that
 	// file's history.
 	cfg.Kanban.MaxInProgress = resolveKanbanMaxInProgress(agent)
+	cfg.Sessions = managedSessionsConfig{AutoPrune: true, RetentionDays: resolveSessionRetentionDays(agent)}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
 
@@ -4378,13 +4415,15 @@ func harnessOnKind(harness *agentv1alpha1.HarnessSpec) bool {
 // buildCredentialProxyEnv is buildCredentialProxyEnvForPlugins with no plugins:
 // every variable but the platform Pub/Sub relay's subscription set.
 func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
-	return buildCredentialProxyEnvForPlugins(agent, nil, true)
+	return buildCredentialProxyEnvForPlugins(agent, nil, true, credentialProxyProfileConfig{})
 }
 
 // buildCredentialProxyEnvForPlugins renders the broker's environment for an
 // agent and the AgentPlugins resolved for it. The plugins contribute one
-// variable: the subscriptions the Pub/Sub platform relay may reach.
-func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool) []corev1.EnvVar {
+// variable: the subscriptions the Pub/Sub platform relay may reach. profiles
+// is the profile role's configuration (credentialProxyProfileEnv); its zero
+// value renders no profile role.
+func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool, profiles credentialProxyProfileConfig) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
 		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
@@ -4511,7 +4550,10 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		// than as "the gateway has the shell's role" — so the two can roll in
 		// either order without chat answering 403 in between.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CHAT_AUDIENCE", Value: credentialProxyChatAudience},
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent, mcpIdentityOwned)},
+		// The profile workers' ServiceAccounts join the list only with a
+		// profile caller to confer the role on; the broker holds each to the
+		// profile audience by the identity map rendered below.
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: strings.Join(append([]string{allowedBrokerCallers(agent, mcpIdentityOwned)}, profiles.callers()...), ",")},
 		// The watchers' audience, in both modes: agent-api-auth always runs
 		// them.
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_WATCHER_AUDIENCE", Value: credentialProxyWatcherAudience},
@@ -4534,6 +4576,9 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// The MCP server's audience, under its flag on a mode-next install only
 	// (a2aMCPBrokerEnabled), so an install without it confers no mcp role.
 	envVars = append(envVars, a2aMCPBrokerEnv(agent, mcpIdentityOwned)...)
+	// The profile workers' audience, identity map and the task-signing public
+	// key, with a profile caller only (credential_proxy_profiles.go).
+	envVars = append(envVars, credentialProxyProfileEnv(profiles)...)
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
@@ -4722,6 +4767,17 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyMCPCallersEnvVar,
 		a2aMCPBrokerURLEnvVar,
 		a2aMCPBrokerTokenFileEnvVar,
+		// The profile role's four, by name because each is rendered only
+		// with a profile caller. One that could set the audience or the
+		// identity map would decide who holds the profile role and as which
+		// (profile, tier); one that could set the signing keys would choose
+		// whose task credentials the broker trusts, and so which cluster a
+		// profile task's calls are confined to; one that could set the
+		// lifetime would choose how long a credential lives.
+		credentialProxyProfileAudienceEnvVar,
+		credentialProxyProfileIdentitiesEnvVar,
+		credentialProxyTaskSigningKeysEnvVar,
+		credentialProxyTaskCredentialMaxLifetimeEnvVar,
 		// One that could set the watcher audience would decide who holds the
 		// watcher role; one that could set the subscription would point the
 		// watcher relay at any subscription the broker's credential can pull;

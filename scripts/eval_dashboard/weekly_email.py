@@ -60,9 +60,11 @@ reason:
 
 The rendered page goes next to ``data.json`` as ``health-email.html`` (the
 workflow's render step). With ``--chat-out``, a page that passed also
-writes the week's Chat summary (``chat_text``: the same week, tiles,
+writes the week's Chat summary (``chat_card``, a Chat card, with
+``chat_text`` as its plain-text fallback: the same week, tiles,
 needs-attention rows and open-bug counts the page printed, plus the task
-time's 90th percentile and slowest area), which ``weekly_chat.py`` posts to
+time's 90th percentile and slowest area, and the tokens line when the week
+has counts), which ``weekly_chat.py`` posts to
 the CI-health space once a week; a refused week writes none, so nothing is
 posted. TODO(#3440): mailing the page -- to whom, from which account -- is
 not built; it needs a mail route and permissions a maintainer decides.
@@ -124,6 +126,20 @@ SECONDS_PER_MINUTE = 60
 # read as "the slowest 10%".
 TIME_PERCENTILE = 90
 SLOWEST_SHARE = f"slowest {PERCENT - TIME_PERCENTILE}%"
+# Tokens: a repetition's count is its record's ``total`` (SCHEMA.md,
+# ``reps[].tokens``); with no total, input + output, which misses what the
+# workers billed, so that sum is short like a ``partial`` record. A short
+# count is kept out of the median and counted apart.
+TOKENS_KEY = "tokens"
+TOKENS_TOTAL = "total"
+TOKENS_INPUT = "input"
+TOKENS_OUTPUT = "output"
+TOKENS_PARTIAL = "partial"
+THOUSAND = 1_000
+MILLION = 1_000_000
+TOKENS_UNITS = "{count}"
+TOKENS_THOUSANDS = "{count}k"
+TOKENS_MILLIONS = "{count:.1f}M"
 
 TREND_UP = "up"
 TREND_DOWN = "down"
@@ -210,6 +226,17 @@ TILE_TIME_VALUE = "{minutes} min"
 TILE_TIME_SUB = "middle of {count} timed runs; " + SLOWEST_SHARE + " over {p90} min"
 TILE_TIME_NONE = "n/a"
 TILE_TIME_NONE_SUB = "no timing on record"
+TILE_TOKENS_LABEL = "typical tokens per run"
+TILE_TOKENS_SUB = "middle of {count} counted runs"
+TILE_TOKENS_UP = "; &#9650; {pct}% vs last week on the same scenarios"
+TILE_TOKENS_DOWN = "; &#9660; {pct}% vs last week on the same scenarios"
+TILE_TOKENS_SAME = "; flat vs last week on the same scenarios"
+TILE_TOKENS_PARTIAL = "; {count} partial left out"
+TILE_TOKENS_NONE = "n/a"
+TILE_TOKENS_NONE_SUB = "no full count; {count} partial left out"
+# Three tiles share the row, or four with the tokens tile.
+TILE_WIDTH = "33%"
+TILE_WIDTH_FOUR = "25%"
 CHANGE_UP = "&#9650; {pts} pts vs last week"
 CHANGE_DOWN = "&#9660; {pts} pts vs last week"
 CHANGE_STEADY = "&#8594; steady vs last week"
@@ -289,6 +316,7 @@ REPORT_URL = f"{DASHBOARD_SITE}/{OUT_NAME}"
 # The --chat-out file's keys, which weekly_chat.py reads.
 CHAT_WEEK_KEY = "week_end"
 CHAT_TEXT_KEY = "text"
+CHAT_CARD_KEY = "card"
 CHAT_TITLE = "*kube-agents weekly health · {range}*"
 CHAT_LEAD = "{pct}% of nightly test runs passed ({passed} of {graded}) across {scenarios} scenarios{change}."
 CHAT_CHANGE_UP = ", up {pts} points from last week"
@@ -315,9 +343,57 @@ CHAT_TIME_DOWN = " (down {minutes} min from last week)"
 CHAT_TIME_SAME = " (same as last week)"
 CHAT_TIME_SLOWEST = " · slowest area: {name} ({minutes} min)"
 CHAT_TIME_NONE = "⏱ Task time: no timing on record"
+# The tokens line, the same on the card and in its text fallback; left out
+# of both when no repetition the week compared carries a count.
+CHAT_TOKENS = "🔢 Tokens: typical {typical} per run{change}{partial}"
+CHAT_TOKENS_NONE = "🔢 Tokens: no full count{partial}"
+CHAT_TOKENS_UP = " (▲ {pct}% vs last week on the same scenarios)"
+CHAT_TOKENS_DOWN = " (▼ {pct}% vs last week on the same scenarios)"
+CHAT_TOKENS_SAME = " (flat vs last week on the same scenarios)"
+CHAT_TOKENS_PARTIAL = " · {count} partial"
 CHAT_LINKS = "<{report}|full report> · <{dashboard}|dashboard>"
 CHAT_JOIN = " · "
 CHAT_BLOCK_JOIN = "\n\n"
+
+# The same post as a Google Chat card (cardsV2; ``chat_card``). Card text is
+# Chat's HTML subset (<b>, <font color>), so names are escaped.
+CARD_ID = "weekly-health"
+CARD_TITLE = "kube-agents · weekly health"
+CARD_SUBTITLE = "Nightly evals · {range}"
+CARD_IMAGE_TYPE = "SQUARE"
+CARD_LEAD = "<b>{pct}% of test runs passed</b>"
+CARD_COUNTS = "{passed} of {graded} runs · {scenarios} scenarios"
+CARD_CHANGE_UP = f'<font color="{GOOD}">▲ {{pts}} points from last week</font>'
+CARD_CHANGE_DOWN = f'<font color="{BAD}">▼ {{pts}} points from last week</font>'
+CARD_CHANGE_STEADY = "→ steady with last week"
+CARD_NO_TREND = "No trend this week: {counted} of {dates} nights counted ({why})"
+CARD_NO_TREND_PREV = "No trend this week: {counted} of last week's {dates} nights counted ({why})"
+CARD_ATTENTION_TITLE = ATTENTION_TITLE
+CARD_ATTENTION_ITEM = "{dot} {name} {state} · {bugs}"
+# Below LESS_THAN_HALF_PCT red, otherwise orange.
+CARD_DOT_LOW = "🔴"
+CARD_DOT = "🟠"
+CARD_VIEW = "View"
+CARD_BY_AREA_TITLE = BY_AREA_TITLE
+CARD_AREA_ITEM = "{name}  {bar}  {pct}%"
+# Ten steps, a step per full 10%: only 100% fills the bar.
+CARD_BAR_STEPS = 10
+CARD_BAR_FULL = "▰"
+CARD_BAR_EMPTY = "▱"
+# Chat collapses a section to its first N widgets (it cannot keep the last).
+CARD_AREAS_SHOWN = 3
+CARD_TIME_TITLE = "Task time"
+CARD_TIME = "⏱ Typical {typical} min · " + SLOWEST_SHARE + " over {p90} min{slowest}"
+CARD_TIME_SLOWEST = " · Slowest area: {name} ({minutes} min)"
+CARD_TIME_NONE = "⏱ No timing on record"
+CARD_REPORT = "Full report"
+CARD_DASHBOARD = "Dashboard"
+CARD_ALL_BUGS = "All open bugs"
+ALL_BUGS_QUERY = "is:issue is:open label:{label}"
+# The nightly tier runs on a spec.mode: next install (nightly.py).
+CARD_FOOTER = f'<font color="{FAINT}">{{label}}: {{models}} · next mode</font>'
+CARD_MODEL = "Model"
+CARD_MODELS = "Models"
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{title}</title></head>
 <body style="margin:0;padding:0;background:{page_bg};">
@@ -339,7 +415,7 @@ INTRO_ROW = """<tr><td style="padding:24px 32px 0;"><div style="font-size:15px;l
 TILES_ROW = """<tr><td style="padding:20px 26px 8px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
 {tiles}
 </tr></table></td></tr>"""
-TILE = """<td style="width:33%;padding:0 6px;vertical-align:top;"><div style="border:1px solid {rule};border-radius:12px;padding:16px;">
+TILE = """<td style="width:{width};padding:0 6px;vertical-align:top;"><div style="border:1px solid {rule};border-radius:12px;padding:16px;">
 <div style="font-size:28px;font-weight:600;letter-spacing:-0.5px;color:{ink};line-height:32px;">{value}</div>
 <div style="font-size:13px;color:{ink};padding-top:4px;">{label}</div><div style="font-size:12px;color:{faint};padding-top:2px;">{sub}</div></div></td>"""
 ATTENTION_ROW = """<tr><td style="padding:24px 32px 0;"><div style="background:{bg};border-radius:12px;padding:16px 18px;">
@@ -425,6 +501,60 @@ def percentile(values: list[float], pct: int) -> float | None:
     if len(values) == 1:
         return values[0]
     return statistics.quantiles(values, n=PERCENT, method="inclusive")[pct - 1]
+
+
+def rep_tokens(rep: dict) -> tuple[int | None, bool] | None:
+    """``(count, short)`` for a repetition's token record, or None when it
+    has none. The count is ``total``, else ``input + output`` (short: it
+    misses the workers); short too when the record says ``partial``. A
+    record with neither is None, like no record."""
+    tokens = rep.get(TOKENS_KEY)
+    if not isinstance(tokens, dict):
+        return None
+
+    def count(key):
+        value = tokens.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    total, inp, out = count(TOKENS_TOTAL), count(TOKENS_INPUT), count(TOKENS_OUTPUT)
+    if total is not None:
+        return total, tokens.get(TOKENS_PARTIAL) is True
+    if inp is not None and out is not None:
+        return inp + out, True
+    return None
+
+
+def tokens_text(count: float) -> str:
+    """135000 -> "135k", 1250000 -> "1.2M"; rounded before the unit is
+    picked, so 999600 is "1.0M", not "1000k"."""
+    if round(count / THOUSAND) >= THOUSAND:
+        return TOKENS_MILLIONS.format(count=count / MILLION)
+    if round(count) >= THOUSAND:
+        return TOKENS_THOUSANDS.format(count=round(count / THOUSAND))
+    return TOKENS_UNITS.format(count=round(count))
+
+
+def tokens_change(overall: dict) -> int | None:
+    """This week's tokens against last week's, in whole percent: the median
+    over the scenarios with a full count in both weeks of each scenario's
+    own median over its full counts, so a scenario's partial counts do not
+    move it; None without a trend this week or such a scenario."""
+    now, before = overall["paired_tokens_median"], overall["prev_paired_tokens_median"]
+    if overall["trend"] is None or now is None or not before:
+        return None
+    return round((now - before) * PERCENT / before)
+
+
+def tokens_figures(overall: dict) -> dict | None:
+    """What the tile and the Chat line both print: ``{typical, pct, partial,
+    counted}`` (``typical`` None with only partial counts); None when no
+    repetition the week compared carries a count."""
+    partial = overall["tokens_partial"]
+    if overall["tokens_median"] is None and not partial:
+        return None
+    typical = tokens_text(overall["tokens_median"]) if overall["tokens_median"] is not None else None
+    return {"typical": typical, "pct": tokens_change(overall) if typical else None, "partial": partial,
+            "counted": overall["counted_runs"]}
 
 
 def short_date(day: datetime.date) -> str:
@@ -584,8 +714,10 @@ def nights_by_date(data: dict) -> tuple[dict[datetime.date, list[dict]], dict[da
 
 
 def night_reps(night: dict[str, dict]) -> dict[str, dict]:
-    """``{case: {passed, graded, agent_s: [...]}}`` for every case the night
-    graded; a case both parts recorded counts as the main part recorded it."""
+    """``{case: {passed, graded, agent_s: [...], tokens: [...], tokens_partial}}``
+    for every case the night graded (``rep_tokens``: full counts listed,
+    short ones counted); a case both parts recorded counts as the main part
+    recorded it."""
     out: dict[str, dict] = {}
     for run in nightly.night_parts(night):
         for task in classify.run_tasks(run):
@@ -596,9 +728,11 @@ def night_reps(night: dict[str, dict]) -> dict[str, dict]:
             graded = counts["pass"] + counts["fail"]
             if not graded:
                 continue
-            times = [rep["agent_s"] for rep in classify.task_reps(task)
-                     if classify.rep_kind(rep) in (classify.REP_PASS, classify.REP_FAIL) and isinstance(rep.get("agent_s"), (int, float))]
-            out[name] = {"passed": counts["pass"], "graded": graded, "agent_s": times}
+            reps = [rep for rep in classify.task_reps(task) if classify.rep_kind(rep) in (classify.REP_PASS, classify.REP_FAIL)]
+            times = [rep["agent_s"] for rep in reps if isinstance(rep.get("agent_s"), (int, float))]
+            tokens = [t for t in map(rep_tokens, reps) if t is not None]
+            out[name] = {"passed": counts["pass"], "graded": graded, "agent_s": times,
+                         "tokens": [n for n, short in tokens if not short], "tokens_partial": sum(short for _, short in tokens)}
     return out
 
 
@@ -613,14 +747,17 @@ def date_reps(nights: list[dict]) -> dict[str, dict]:
 
 
 def week_cases(counted: dict[datetime.date, list[dict]], days: list[datetime.date]) -> dict[str, dict]:
-    """``{case: {passed, graded, agent_s}}`` summed over the week's counted dates."""
+    """``{case: {passed, graded, agent_s, tokens, tokens_partial}}`` summed
+    over the week's counted dates."""
     out: dict[str, dict] = {}
     for day in days:
         for name, reps in date_reps(counted.get(day, [])).items():
-            row = out.setdefault(name, {"passed": 0, "graded": 0, "agent_s": []})
+            row = out.setdefault(name, {"passed": 0, "graded": 0, "agent_s": [], "tokens": [], "tokens_partial": 0})
             row["passed"] += reps["passed"]
             row["graded"] += reps["graded"]
             row["agent_s"] += reps["agent_s"]
+            row["tokens"] += reps["tokens"]
+            row["tokens_partial"] += reps["tokens_partial"]
     return out
 
 
@@ -764,6 +901,17 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
     overall["agent_s_p90"] = percentile(times, TIME_PERCENTILE)
     overall["prev_agent_s_median"] = statistics.median(prev_times) if prev_times else None
     overall["timed_runs"] = len(times)
+    tokens = [n for c in common for n in this_cases[c]["tokens"]]
+    overall["tokens_median"] = statistics.median(tokens) if tokens else None
+    paired = [c for c in common if this_cases[c]["tokens"] and prev_cases[c]["tokens"]]
+    # Each paired scenario counts once, by its own median, so how many full
+    # counts it kept this week does not weigh it.
+    paired_tokens = [statistics.median(this_cases[c]["tokens"]) for c in paired]
+    prev_paired_tokens = [statistics.median(prev_cases[c]["tokens"]) for c in paired]
+    overall["paired_tokens_median"] = statistics.median(paired_tokens) if paired_tokens else None
+    overall["prev_paired_tokens_median"] = statistics.median(prev_paired_tokens) if prev_paired_tokens else None
+    overall["counted_runs"] = len(tokens)
+    overall["tokens_partial"] = sum(this_cases[c]["tokens_partial"] for c in common)
     week["overall"] = overall
 
     known = {row["slug"]: row for row in domain_rows}
@@ -992,11 +1140,14 @@ def recheck_footer(week: dict, data: dict, store: dict | None) -> list[str]:
 
 
 def footer_text(week: dict) -> str:
+    start, end = (datetime.date.fromisoformat(d) for d in week["footer"]["range"])
+    return FOOTER.format(range=date_range(start, end), models=html.escape(footer_models(week)), rendered=week.get("rendered", ""))
+
+
+def footer_models(week: dict) -> str:
     footer = week["footer"]
-    start, end = (datetime.date.fromisoformat(d) for d in footer["range"])
     this, prev = NAMES_JOIN.join(footer["models"]), NAMES_JOIN.join(footer["prev_models"])
-    models = this if this == prev or not prev else FOOTER_MODELS.format(this=this, prev=prev)
-    return FOOTER.format(range=date_range(start, end), models=html.escape(models), rendered=week.get("rendered", ""))
+    return this if this == prev or not prev else FOOTER_MODELS.format(this=this, prev=prev)
 
 
 def change_label(trend: str | None, change: int | None) -> tuple[str, str]:
@@ -1033,12 +1184,13 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
         time_sub = TILE_TIME_SUB.format(count=overall["timed_runs"], p90=minutes(overall["agent_s_p90"]))
     else:
         time_value, time_sub = TILE_TIME_NONE, TILE_TIME_NONE_SUB
-    tile = {"rule": RULE, "ink": INK, "faint": FAINT}
+    tokens_tile = tokens_tile_text(tokens_figures(overall))
+    tile = {"rule": RULE, "ink": INK, "faint": FAINT, "width": TILE_WIDTH_FOUR if tokens_tile else TILE_WIDTH}
     tiles = TILES_ROW.format(tiles="".join([
         TILE.format(value=f"{overall['pct']}%", label=TILE_RATE_LABEL, sub=change, **tile),
         TILE.format(value=overall["scenarios"], label=TILE_SCENARIOS_LABEL, sub=TILE_SCENARIOS_SUB, **tile),
         TILE.format(value=time_value, label=TILE_TIME_LABEL, sub=time_sub, **tile),
-    ]))
+    ] + ([TILE.format(value=tokens_tile[0], label=TILE_TOKENS_LABEL, sub=tokens_tile[1], **tile)] if tokens_tile else [])))
 
     shown = {}
     items = []
@@ -1084,6 +1236,19 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
                        rows=ROWS_JOIN.join([header, intro, tiles, attention, by_area, fix, close]))
 
 
+def tokens_tile_text(figures: dict | None) -> tuple[str, str] | None:
+    """The tokens tile's ``(value, sub)`` from ``tokens_figures``, or None
+    (the tile is left out)."""
+    if figures is None:
+        return None
+    partial, pct = figures["partial"], figures["pct"]
+    if figures["typical"] is None:
+        return TILE_TOKENS_NONE, TILE_TOKENS_NONE_SUB.format(count=partial)
+    change = "" if pct is None else TILE_TOKENS_UP.format(pct=pct) if pct > 0 else TILE_TOKENS_DOWN.format(pct=-pct) if pct < 0 else TILE_TOKENS_SAME
+    sub = TILE_TOKENS_SUB.format(count=figures["counted"]) + change + (TILE_TOKENS_PARTIAL.format(count=partial) if partial else "")
+    return figures["typical"], sub
+
+
 def attention_state(row: dict) -> str:
     if row["few"]:
         return ATTENTION_FEW.format(pct=row["pct"])
@@ -1096,7 +1261,7 @@ def attention_state(row: dict) -> str:
 # the Chat post
 
 
-def chat_no_trend(week: dict) -> str:
+def chat_no_trend(week: dict, this_template: str = CHAT_NO_TREND, prev_template: str = CHAT_NO_TREND_PREV) -> str:
     """Why no change is called: the short week's counted nights and why the
     rest are left out, this week's when it is the short one."""
     this_short = len(week["counted"]) < MIN_COUNTED_NIGHTS
@@ -1108,7 +1273,7 @@ def chat_no_trend(week: dict) -> str:
             whys[why] = whys.get(why, 0) + 1
     why = NAMES_JOIN.join(CHAT_LEFT_OUT.format(count=count, why=CHAT_WHY.get(reason, reason))
                           for reason, count in sorted(whys.items(), key=lambda item: (-item[1], item[0])))
-    return (CHAT_NO_TREND if this_short else CHAT_NO_TREND_PREV).format(counted=len(counted), dates=len(days), why=why)
+    return (this_template if this_short else prev_template).format(counted=len(counted), dates=len(days), why=why)
 
 
 def chat_time(week: dict) -> str:
@@ -1125,6 +1290,20 @@ def chat_time(week: dict) -> str:
         row = next(r for r in week["rows"] if r["slug"] == overall["slowest_area"])
         slowest = CHAT_TIME_SLOWEST.format(name=row["name"], minutes=minutes(row["agent_s_median"]))
     return CHAT_TIME.format(typical=typical, change=change, p90=minutes(overall["agent_s_p90"]), slowest=slowest)
+
+
+def chat_tokens(week: dict) -> str | None:
+    """The tokens line of the card and its text fallback, from the numbers
+    the page's tile printed (``tokens_figures``); None when the tile is left out."""
+    figures = tokens_figures(week["overall"])
+    if figures is None:
+        return None
+    partial, pct = figures["partial"], figures["pct"]
+    partial_text = CHAT_TOKENS_PARTIAL.format(count=partial) if partial else ""
+    if figures["typical"] is None:
+        return CHAT_TOKENS_NONE.format(partial=partial_text)
+    change = "" if pct is None else CHAT_TOKENS_UP.format(pct=pct) if pct > 0 else CHAT_TOKENS_DOWN.format(pct=-pct) if pct < 0 else CHAT_TOKENS_SAME
+    return CHAT_TOKENS.format(typical=figures["typical"], change=change, partial=partial_text)
 
 
 def chat_text(week: dict) -> str:
@@ -1157,8 +1336,84 @@ def chat_text(week: dict) -> str:
     if strongest:
         tail.append(CHAT_STRONGEST.format(items=CHAT_JOIN.join(CHAT_STRONGEST_ITEM.format(name=r["name"], pct=r["pct"]) for r in strongest)))
     tail.append(chat_time(week))
+    tail += [line for line in [chat_tokens(week)] if line]
     links = CHAT_LINKS.format(report=REPORT_URL, dashboard=DASHBOARD_URL)
     return CHAT_BLOCK_JOIN.join(ROWS_JOIN.join(block) for block in (head, attention, tail, [links]))
+
+
+def card_bar(pct: int) -> str:
+    filled = pct * CARD_BAR_STEPS // PERCENT
+    return CARD_BAR_FULL * filled + CARD_BAR_EMPTY * (CARD_BAR_STEPS - filled)
+
+
+def card_link(text: str, url: str) -> dict:
+    return {"text": text, "onClick": {"openLink": {"url": url}}}
+
+
+def card_text(text: str) -> dict:
+    return {"textParagraph": {"text": text}}
+
+
+def chat_card(week: dict) -> dict:
+    """The weekly Chat post as a cardsV2 card, from the same week, numbers
+    and open-bug counts as ``chat_text`` (which travels as its fallback)."""
+    def esc(text: str) -> str:
+        return html.escape(text, quote=False)
+
+    overall = week["overall"]
+    rows_by_slug = {r["slug"]: r for r in week["rows"]}
+    days = [datetime.date.fromisoformat(d) for d in week["days"]]
+
+    lead = [card_text(CARD_LEAD.format(pct=overall["pct"])),
+            card_text(CARD_COUNTS.format(passed=overall["passed"], graded=overall["graded"], scenarios=overall["scenarios"]))]
+    if overall["trend"] == TREND_UP:
+        lead.append(card_text(CARD_CHANGE_UP.format(pts=overall["change"])))
+    elif overall["trend"] == TREND_DOWN:
+        lead.append(card_text(CARD_CHANGE_DOWN.format(pts=-overall["change"])))
+    elif overall["trend"] == TREND_STEADY:
+        lead.append(card_text(CARD_CHANGE_STEADY))
+    if not week["trend_ok"]:
+        lead.append(card_text(esc(chat_no_trend(week, CARD_NO_TREND, CARD_NO_TREND_PREV))))
+    lead += [card_text(esc(claim_text(c, rows_by_slug))) for c in week["claims"] if c["kind"] == CLAIM_MODEL_CHANGE]
+    sections = [{"widgets": lead}]
+
+    if week["attention"]:
+        items = []
+        for slug in week["attention"]:
+            row, count = rows_by_slug[slug], week["shown_bugs"][slug]
+            text = CARD_ATTENTION_ITEM.format(dot=CARD_DOT_LOW if row["pct"] < LESS_THAN_HALF_PCT else CARD_DOT, name=esc(row["name"]),
+                                              state=attention_state(row), bugs=CHAT_BUG if count == 1 else CHAT_BUGS.format(count=count))
+            items.append({"decoratedText": {"text": text, "wrapText": True, "button": card_link(CARD_VIEW, bugs_url(week["repo"], slug))}})
+        sections.append({"header": CARD_ATTENTION_TITLE, "widgets": items})
+
+    areas = {"header": CARD_BY_AREA_TITLE, "widgets": [
+        {"decoratedText": {"text": CARD_AREA_ITEM.format(name=esc(r["name"]), bar=card_bar(r["pct"]), pct=r["pct"]), "wrapText": True}} for r in week["rows"]]}
+    if len(week["rows"]) > CARD_AREAS_SHOWN:
+        areas.update(collapsible=True, uncollapsibleWidgetsCount=CARD_AREAS_SHOWN)
+    sections.append(areas)
+
+    if overall["agent_s_median"] is None:
+        time = CARD_TIME_NONE
+    else:
+        slowest = ""
+        if overall["slowest_area"] is not None:
+            row = rows_by_slug[overall["slowest_area"]]
+            slowest = CARD_TIME_SLOWEST.format(name=esc(row["name"]), minutes=minutes(row["agent_s_median"]))
+        time = CARD_TIME.format(typical=minutes(overall["agent_s_median"]), p90=minutes(overall["agent_s_p90"]), slowest=slowest)
+    sections.append({"header": CARD_TIME_TITLE, "widgets": [card_text(time)] + [card_text(line) for line in [chat_tokens(week)] if line]})
+
+    footer = week["footer"]
+    all_bugs = ISSUES_SEARCH_URL.format(repo=week["repo"], query=urllib.parse.quote(ALL_BUGS_QUERY.format(label=BUG_LABEL), safe=""))
+    sections.append({"widgets": [
+        {"buttonList": {"buttons": [card_link(CARD_REPORT, REPORT_URL), card_link(CARD_DASHBOARD, DASHBOARD_URL),
+                                    card_link(CARD_ALL_BUGS, all_bugs)]}},
+        card_text(CARD_FOOTER.format(label=CARD_MODELS if len(set(footer["models"]) | set(footer["prev_models"])) > 1 else CARD_MODEL,
+                                     models=esc(footer_models(week)))),
+    ]})
+    return {"cardId": CARD_ID, "card": {
+        "header": {"title": CARD_TITLE, "subtitle": CARD_SUBTITLE.format(range=date_range(days[0], days[-1])),
+                   "imageUrl": ROBOT_URL, "imageType": CARD_IMAGE_TYPE},
+        "sections": sections}}
 
 
 # ---------------------------------------------------------------------------
@@ -1194,7 +1449,7 @@ def parse_args(argv=None):
     parser.add_argument("--week-end", type=datetime.date.fromisoformat, help="the week's last nightly date (default: the Sunday before today, UTC)")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO)
     parser.add_argument("--repo-root", type=pathlib.Path, default=REPO_ROOT, help="checkout holding domains.yaml and bench/tasks")
-    parser.add_argument("--chat-out", type=pathlib.Path, help="also write the week's Chat summary here (JSON: week_end, text) for weekly_chat.py; not written when the page is refused")
+    parser.add_argument("--chat-out", type=pathlib.Path, help="also write the week's Chat summary here (JSON: week_end, text, card) for weekly_chat.py; not written when the page is refused")
     return parser.parse_args(argv)
 
 
@@ -1228,7 +1483,8 @@ def main(argv=None, gh_runner=None, now: datetime.datetime | None = None) -> int
     print(f"weekly health email for the week ending {week_end}: wrote {args.out}")
     if args.chat_out:
         args.chat_out.parent.mkdir(parents=True, exist_ok=True)
-        args.chat_out.write_text(json.dumps({CHAT_WEEK_KEY: week_end.isoformat(), CHAT_TEXT_KEY: chat_text(week)}, ensure_ascii=False) + "\n")
+        args.chat_out.write_text(json.dumps({CHAT_WEEK_KEY: week_end.isoformat(), CHAT_TEXT_KEY: chat_text(week),
+                                             CHAT_CARD_KEY: chat_card(week)}, ensure_ascii=False) + "\n")
         print(f"weekly Chat summary for the week ending {week_end}: wrote {args.chat_out}")
     return 0
 

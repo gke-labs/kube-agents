@@ -29,14 +29,60 @@ func gaugeTestAgent() *agentv1alpha1.PlatformAgent {
 	agent.Namespace = "ns"
 	agent.Status.Phase = "Ready"
 	agent.Status.Usage = agentv1alpha1.AgentUsageStatus{
-		ToolExecutionsTotal:      5,
-		ChatMessagesInboundTotal: 2,
-		NegativeFeedbackTotal:    1,
-		ClustersRegistered:       ptr.To(int64(3)),
-		ClustersMonitored:        ptr.To(int64(1)),
-		LastActiveTime:           &metav1.Time{Time: usageClock(10)},
+		ToolExecutionsTotal:             5,
+		ChatMessagesInboundTotal:        2,
+		NegativeFeedbackTotal:           1,
+		ClustersRegistered:              ptr.To(int64(3)),
+		ClustersMonitored:               ptr.To(int64(1)),
+		RemediationsMergedTotal:         ptr.To(int64(4)),
+		RemediationsOpen:                ptr.To(int64(2)),
+		ProposalsAuthored:               ptr.To(int64(7)),
+		RemediationsClosedUnmergedTotal: ptr.To(int64(1)),
+		ProposalHumanTouches:            ptr.To(int64(9)),
+		ProposalsMergedUntouched:        ptr.To(int64(0)),
+		LastActiveTime:                  &metav1.Time{Time: usageClock(10)},
 	}
 	return agent
+}
+
+// The six proposal readings are pointer rows: a reading at zero publishes a
+// zero sample and makes the block non-empty, an absent one publishes none,
+// and the one pruning record the poller keeps for them holds back all six.
+func TestUsageGauges_PointerRowsForTheSixReadings(t *testing.T) {
+	readings := []string{"remediationsMergedTotal", "remediationsOpen", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"}
+	rows := map[string]usageExportField{}
+	for _, f := range usageExportFields {
+		rows[f.name] = f
+	}
+	for _, name := range readings {
+		if f, ok := rows[name]; !ok || !f.pointer {
+			t.Errorf("%s: row %+v, want a pointer row", name, f)
+		}
+	}
+	if got := usageExportFieldsOfRecord(usageNewerFieldReadings); !slices.Equal(got, readings) {
+		t.Errorf("the readings record covers %v, want %v", got, readings)
+	}
+
+	reg := prometheus.NewRegistry()
+	g := newUsageGauges(reg)
+	agent := &agentv1alpha1.PlatformAgent{}
+	agent.Name = "pa"
+	agent.Namespace = "ns"
+	agent.Status.Usage.ProposalsMergedUntouched = ptr.To(int64(0))
+	if usageBlockEmpty(&agent.Status.Usage) {
+		t.Error("a block holding a reading at zero reads as empty")
+	}
+	g.publishUsage(agent)
+	if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", "proposalsMergedUntouched")); got != 0 {
+		t.Errorf("proposalsMergedUntouched = %v, want 0", got)
+	}
+	g.usage.Reset()
+	g.publishUsage(agent)
+	// One pointer row present: the counters' int rows always publish, the
+	// other seven pointer rows (two gauges, five readings) publish nothing.
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-7 {
+		t.Errorf("%d usage samples, want %d: an absent reading has no sample", n, len(usageExportFields)-7)
+	}
 }
 
 // Every counter and gauge of status.usage lands as one sample of the usage
@@ -321,8 +367,15 @@ func TestReconcile_PublishesAUsageBlockThatHoldsAnyValue(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if n := samplesOfAgent(t, usageMetrics.usage, agent.Namespace); n != len(usageExportFields)-1 {
-		t.Errorf("%d usage samples, want %d: a block with a gauge in it is published", n, len(usageExportFields)-1)
+	// Every int row publishes, and of the pointer rows the one gauge present.
+	pointers := 0
+	for _, f := range usageExportFields {
+		if f.pointer {
+			pointers++
+		}
+	}
+	if n := samplesOfAgent(t, usageMetrics.usage, agent.Namespace); n != len(usageExportFields)-pointers+1 {
+		t.Errorf("%d usage samples, want %d: a block with a gauge in it is published", n, len(usageExportFields)-pointers+1)
 	}
 }
 

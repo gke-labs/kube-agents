@@ -148,7 +148,7 @@ func TestTheBrokerLearnsTheSubscriptionSetAndTheGatewayTheRelayURL(t *testing.T)
 	agent := agentInProject("my-gcp-project")
 	plugins := []*agentv1alpha1.AgentPlugin{pubsubPlugin("stockout", stockoutPluginConfig)}
 
-	brokerEnv := buildCredentialProxyEnvForPlugins(agent, plugins, true)
+	brokerEnv := buildCredentialProxyEnvForPlugins(agent, plugins, true, credentialProxyProfileConfig{})
 	value, count := envValueCount(brokerEnv, platformPubsubSubscriptionsEnvVar)
 	if count != 1 || value != "projects/my-gcp-project/subscriptions/gke-stockout-alerts-sub" {
 		t.Fatalf("broker env %s: value %q count %d", platformPubsubSubscriptionsEnvVar, value, count)
@@ -157,7 +157,7 @@ func TestTheBrokerLearnsTheSubscriptionSetAndTheGatewayTheRelayURL(t *testing.T)
 		t.Fatalf("with no plugins the broker must not carry %s", platformPubsubSubscriptionsEnvVar)
 	}
 
-	deployment := buildCredentialProxyDeploymentForPlugins(agent, "hash", plugins, true)
+	deployment := buildCredentialProxyDeploymentForPlugins(agent, "hash", plugins, true, credentialProxyProfileConfig{})
 	if _, count := envValueCount(deployment.Spec.Template.Spec.Containers[0].Env, platformPubsubSubscriptionsEnvVar); count != 1 {
 		t.Fatalf("the broker Deployment render must carry the set through to the container")
 	}

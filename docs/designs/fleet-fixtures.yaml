@@ -459,6 +459,19 @@ fixtures:
     defect: >-
       cuda-pinned-trainer CronJob, suspended: requests one GPU on an nvidia-l4 pool with an image pinned to CUDA 12.2, so its manifest carries the driver dependency without ever running
 
+  - role: scaled-zero-gateway
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/storefront
+      - deployment/envoy-seeded-scaled-zero-storefront-edge
+      - service/storefront
+      - gateway/storefront-edge
+      - httproute/storefront
+    namespace: seeded-scaled-zero
+    defect: >-
+      Not a defect: an environment switched off on purpose. The backend and the Gateway's proxy Deployment are at replicas 0, and the Gateway reports Programmed=False (NoResources), the status Envoy Gateway v1.9.2 wrote for that shape. No controller runs. A stall check that reports it is wrong
+
   - role: zonal-skew-scheduling
     slot: d
     available_from_day: 0
@@ -485,6 +498,7 @@ fixtures:
     available_from_day: 0
     objects:
       - deployment/capacity-starved-worker
+      - deployment/first-zone-sponge
     namespace: seeded-topology
     defect: >-
       Four replicas at 120m CPU against two e2-small nodes, so those that do

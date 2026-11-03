@@ -48,6 +48,15 @@ _LEDGER_MINT = _REPO_ROOT / "hack" / "ledger_token_mint.py"
 # test that supplies both halves of an agreement cannot detect them diverging.
 _TERMINAL_RC = 1
 
+# The renewal tests below poll with these, through the wait_until helper
+# in LedgerTokenRenewalTest._run; together they give about twenty seconds.
+# Nominal completion is two to five seconds (a two-second period, then
+# one-second retries), the bound sits inside the subprocess's sixty-second
+# timeout, and the slack is for a saturated runner, where the unit-test job
+# ran one file per CPU in three shards.
+_RENEWAL_POLLS = 40
+_RENEWAL_POLL_SECONDS = 0.5
+
 
 def _extract(pattern, what):
     text = _CI_EVAL_PR.read_text(encoding="utf-8")
@@ -255,9 +264,40 @@ class LedgerTokenRenewalTest(unittest.TestCase):
     def _run(self, body, **env):
         key_file = self.tmp / "ledger.pem"
         key_file.write_text("not a real key -- the mint itself is stubbed\n")
+        # stderr goes to a file rather than a pipe so the body can read what
+        # the renewer has printed so far (RENEWER_LOG) while it is still
+        # running; it is read back into proc.stderr once bash exits, so the
+        # assertions see the same text they would from a pipe.
+        log_file = self.tmp / "renewer.log"
         script = "\n".join(
             [
                 "set -euo pipefail",
+                f"RENEWAL_POLLS={_RENEWAL_POLLS}",
+                f"RENEWAL_POLL_SECONDS={_RENEWAL_POLL_SECONDS}",
+                # The one poll loop every body uses: runs the command until it
+                # succeeds or the shared bound runs out, and falls through on
+                # the bound so the test's assertions, not the loop, report it.
+                "wait_until() {",
+                '  for _ in $(seq 1 "${RENEWAL_POLLS}"); do',
+                '    "$@" && return 0',
+                '    command sleep "${RENEWAL_POLL_SECONDS}"',
+                "  done",
+                "  return 0",
+                "}",
+                # The renewer calls plain `sleep` once per tick and inherits
+                # this function, which writes a `tick` line to its stderr
+                # ahead of each sleep. The renewer's stderr is RENEWER_LOG, so
+                # the ticks land in order with its own lines, and the ticks
+                # before its "renewed after" line are a count the renewer
+                # alone decides: the retry step is visible there whatever the
+                # scheduler does to the stop. The bodies' own waits use
+                # `command sleep` and are not counted; the stub's refusal is
+                # terminal, so mint_ledger_token's own retry sleep never runs
+                # here (and the renewer discards the mint's stderr anyway).
+                "sleep() {",
+                "  echo tick >&2",
+                '  command sleep "$@"',
+                "}",
                 _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
                 _extract(r"^LEDGER_MINT_ATTEMPTS=\d+$", "LEDGER_MINT_ATTEMPTS"),
                 _extract(r"^LEDGER_GRADING_MINT_BODY=[^\n]*$", "LEDGER_GRADING_MINT_BODY"),
@@ -287,15 +327,20 @@ class LedgerTokenRenewalTest(unittest.TestCase):
             "BENCH_GITHUB_TOKEN": "tok-at-launch",
             "TOKEN_FILE": str(self.tmp / "unit.ledger-token"),
             "COUNT_FILE": str(self.tmp / "mint-count"),
+            "RENEWER_LOG": str(log_file),
         }
         overrides.update(env)
-        return subprocess.run(
-            ["bash", "-c", script],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            env=get_isolated_test_env(overrides=overrides),
-        )
+        with log_file.open("w", encoding="utf-8") as log:
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=log,
+                text=True,
+                timeout=60,
+                env=get_isolated_test_env(overrides=overrides),
+            )
+        proc.stderr = log_file.read_text(encoding="utf-8")
+        return proc
 
     def test_the_file_starts_with_the_launch_token_and_is_renewed_then_removed(self):
         proc = self._run(
@@ -305,10 +350,7 @@ class LedgerTokenRenewalTest(unittest.TestCase):
                 echo "EXPORTED=${BENCH_GITHUB_TOKEN_FILE}"
                 echo "AT_LAUNCH=$(cat "${TOKEN_FILE}")"
                 echo "MODE=$(stat -c %a "${TOKEN_FILE}" 2>/dev/null || stat -f %Lp "${TOKEN_FILE}")"
-                for _ in $(seq 1 20); do
-                  grep -q tok-renewed "${TOKEN_FILE}" && break
-                  command sleep 0.5
-                done
+                wait_until grep -q tok-renewed "${TOKEN_FILE}"
                 echo "RENEWED=$(cat "${TOKEN_FILE}")"
                 renewer="${LEDGER_TOKEN_RENEWER}"
                 stop_ledger_token_renewal "${TOKEN_FILE}"
@@ -330,17 +372,27 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         self.assertNotIn("tok-renewed", proc.stderr, "a renewal never prints the token")
 
     def test_a_failed_renewal_is_retried_soon_rather_than_a_period_later(self):
-        # Two refusals, then a mint. With the retry at a whole period the
-        # third attempt would come six seconds in; at the retry step it comes
-        # in about four, well inside the wait below.
+        # Two refusals, then a mint. The renewer sleeps one tick per second:
+        # at the retry step the mint that succeeds is on the fourth tick (two
+        # for the period, one per retry); with the retry at a whole period it
+        # would be on the sixth. The ticks the renewer writes before its
+        # "renewed after" line are what tell the two apart, and that count
+        # is the renewer's own: the fifth tick follows the line at once and
+        # the sixth a second later, so a count taken at stop time would
+        # depend on how fast the stop lands, but one taken from the log
+        # ahead of the line does not. The wait bound is slack, not the
+        # discriminator.
+        #
+        # The wait is on the renewer's "renewed after" line, not on the token
+        # file: the renewer moves the new token into the file and only then
+        # prints the line, so a stop issued as soon as the file changes can
+        # kill it between the two and the assertion on the line fails. Once
+        # the line is on record the file already holds the renewed token.
         proc = self._run(
             textwrap.dedent(
                 """\
                 start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
-                for _ in $(seq 1 12); do
-                  grep -q tok-renewed "${TOKEN_FILE}" && break
-                  command sleep 0.5
-                done
+                wait_until grep -q "renewed after" "${RENEWER_LOG}"
                 echo "RENEWED=$(cat "${TOKEN_FILE}")"
                 stop_ledger_token_renewal "${TOKEN_FILE}"
                 """
@@ -350,19 +402,23 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("RENEWED=tok-renewed", proc.stdout)
         self.assertIn("renewed after 2 failed attempt(s)", proc.stderr)
+        before_the_line = proc.stderr.split("renewed after", 1)[0]
+        ticks = len(re.findall(r"^tick$", before_the_line, re.M))
+        self.assertEqual(4, ticks, proc.stderr)
 
     def test_a_failure_streak_warns_once_without_the_mints_error_block(self):
         # The mint's ERROR block says grading cannot proceed, which is false
         # while the file still holds a live token; repeated on every retry it
         # filled the job log for the rest of the unit.
+        #
+        # Waits on the renewer's "renewed after" line rather than the token
+        # file, for the reason given in the test above: the line is printed
+        # after the token swap, and a stop between the two loses it.
         proc = self._run(
             textwrap.dedent(
                 """\
                 start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
-                for _ in $(seq 1 16); do
-                  grep -q tok-renewed "${TOKEN_FILE}" && break
-                  command sleep 0.5
-                done
+                wait_until grep -q "renewed after" "${RENEWER_LOG}"
                 echo "RENEWED=$(cat "${TOKEN_FILE}")"
                 stop_ledger_token_renewal "${TOKEN_FILE}"
                 echo "MINTS=$(cat "${COUNT_FILE}")"
@@ -389,10 +445,8 @@ class LedgerTokenRenewalTest(unittest.TestCase):
                 ( start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
                   echo "${LEDGER_TOKEN_RENEWER}" > "${TOKEN_FILE}.pid" )
                 renewer="$(cat "${TOKEN_FILE}.pid")"
-                for _ in $(seq 1 10); do
-                  kill -0 "${renewer}" 2>/dev/null || break
-                  command sleep 0.5
-                done
+                gone() { ! kill -0 "$1" 2>/dev/null; }
+                wait_until gone "${renewer}"
                 kill -0 "${renewer}" 2>/dev/null && echo "RENEWER=alive" || echo "RENEWER=gone"
                 kill "${renewer}" 2>/dev/null || true
                 """

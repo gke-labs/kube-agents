@@ -429,6 +429,10 @@ type rig struct {
 	// stop cancels the gateway's context, on the rigs restartRig can
 	// replace (startRigWithSpawnerCap); nil elsewhere.
 	stop context.CancelFunc
+	// ran is closed when the gateway's Run returns, on the same rigs: a
+	// gateway is stopped once Run has returned, the order cmd/gateway keeps
+	// before it closes the client. nil elsewhere.
+	ran chan struct{}
 }
 
 // startRig assembles a gateway on an embedded server, with user 1001 mapped
@@ -1474,9 +1478,10 @@ func startRigWithSpawnerAdapter(t *testing.T, defaultAddressee string, maxSessio
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	go func() { _ = g.Run(ctx) }()
+	ran := make(chan struct{})
+	go func() { _ = g.Run(ctx); close(ran) }()
 
-	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel}, spawn
+	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel, ran: ran}, spawn
 }
 
 // restartRig stops r's gateway and starts a second one over the same server,
@@ -1498,7 +1503,7 @@ func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, wh
 	t.Helper()
 	r.stop()
 	select {
-	case <-r.adapter.stopped:
+	case <-r.ran:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the first gateway did not stop")
 	}
@@ -1527,8 +1532,9 @@ func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, wh
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	go func() { _ = g.Run(ctx) }()
-	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel}, spawn
+	ran := make(chan struct{})
+	go func() { _ = g.Run(ctx); close(ran) }()
+	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel, ran: ran}, spawn
 }
 
 // TestDelegatePrefixSpawnsSessionWorker: the W4 amendment's flow - a
@@ -1924,13 +1930,11 @@ func TestNoTaskTurnDoesNotReadmitAThread(t *testing.T) {
 		}
 		return false
 	})
-	after, err := r.g.reg.Get(ctx, conv)
-	if err != nil || after == nil {
-		t.Fatal(err)
-	}
-	if !after.LastActivity.After(stale) {
-		t.Fatalf("a verified turn must still count for the reap: LastActivity %v not after %v", after.LastActivity, stale)
-	}
+	// The gateway writes the record after it posts the answer, so the
+	// reap's clock is polled for rather than read once (see waitForRecord).
+	after := waitForRecord(t, r, conv, "a verified turn to count for the reap", func(rec *SessionRecord) bool {
+		return rec.LastActivity.After(stale)
+	})
 	if !after.LastTaskActivity.Equal(stale) {
 		t.Fatalf("a turn that started nothing moved the task clock: %v, want %v", after.LastTaskActivity, stale)
 	}
