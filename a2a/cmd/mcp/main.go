@@ -250,7 +250,7 @@ func dialWithRetry[B any](ctx context.Context, log *slog.Logger, backoff time.Du
 		// log rather than retrying for minutes as "not reachable yet".
 		if mcp.DialRefused(err) {
 			var zero B
-			return zero, fmt.Errorf("the bus refused the connection (check the console credential and the bus CA): %w", err)
+			return zero, fmt.Errorf("the bus refused the connection (check the console-mcp credential and the bus CA): %w", err)
 		}
 		log.Warn("the bus is not reachable yet; retrying", "in", backoff, "err", err)
 		select {

@@ -1077,8 +1077,9 @@ func webIdentity() a2aIdentity {
 	}
 }
 
-// console: the web console's credential - the read surface plus one narrow
-// publish, the inbound chat subject the gateway's console adapter subscribes.
+// console: the web console's credential - the read surface plus narrow
+// publishes: the inbound chat subject the gateway's console adapter
+// subscribes, and the console confirmation subject.
 //
 // STATIC permanently, for web's reason: a browser holds no ServiceAccount
 // token. What makes this credential a chat identity rather than a read
@@ -1086,7 +1087,8 @@ func webIdentity() a2aIdentity {
 // that subject, so the gateway takes a frame there as coming from the
 // principal nats:console with no mapping table in between (the same
 // subject-derived identity every other writer on this bus has). One shared
-// principal is the posture until the account split makes it one per person.
+// principal is the posture; the account split puts it in CONSOLE beside the
+// MCP server, and does not make it one per person.
 //
 // The console holds no JetStream verb on any KV_* stream, STREAM.INFO
 // included: STREAM.INFO accepts a subjects_filter in its request body and

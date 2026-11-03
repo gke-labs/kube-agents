@@ -1059,11 +1059,12 @@ func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 	}
 }
 
-// TestJetStreamStoreMigrationFromAPPToTRUSTED verifies the StatefulSet startup
-// migration path (`mv /data/jetstream/APP /data/jetstream/TRUSTED`): a bus
-// provisioned under the single-account layout (where `APP` owned `jetstream:
-// enabled`) preserves its streams, messages, consumers, and KV entries when
-// upgraded to the three-account layout (`TRUSTED`, `CONSOLE`, `APP`).
+// TestJetStreamStoreMigrationFromAPPToTRUSTED verifies that a store moved from
+// `jetstream/APP` to `jetstream/TRUSTED` (the move the startup script makes;
+// TestTheBusStartupScriptMovesTheStoreOnce runs the script itself) keeps a
+// bus provisioned under the single-account layout, where `APP` owned
+// `jetstream: enabled`: its streams, messages, consumers and KV entries are
+// all readable under the three-account layout (`TRUSTED`, `CONSOLE`, `APP`).
 func TestJetStreamStoreMigrationFromAPPToTRUSTED(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])

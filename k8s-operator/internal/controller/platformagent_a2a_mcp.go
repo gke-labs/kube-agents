@@ -382,7 +382,13 @@ func a2aMCPTokenUsable(v []byte) bool {
 // it here would create and delete it on each pass, each an event that
 // wakes the next (NetworkPolicy is an Owns() kind). A fence over nothing
 // denies nothing.
-func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+//
+// busHeld is a2aProvisionState.busHeld: the bus is still on its previous
+// config, which may not have the user a new render of the server dials as.
+// An existing Deployment is left as it is until the bus moves, so the pod
+// that is connected keeps running; a server rendered for the first time is
+// applied as usual.
+func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent, busHeld bool) (string, error) {
 	if !a2aMCPDoorEnabled() {
 		return "", r.removeA2AMCP(ctx, agent)
 	}
@@ -393,10 +399,16 @@ func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *ag
 	if !tokenOwned {
 		return a2aMCPTokenUnownedReason, r.removeA2AMCPServer(ctx, agent)
 	}
-	for _, obj := range []client.Object{
-		buildA2AMCPDeployment(agent),
-		buildA2AMCPService(agent),
-	} {
+	objs := []client.Object{buildA2AMCPService(agent)}
+	dep := buildA2AMCPDeployment(agent)
+	if !busHeld {
+		objs = append([]client.Object{dep}, objs...)
+	} else if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{}); errors.IsNotFound(err) {
+		objs = append([]client.Object{dep}, objs...)
+	} else if err != nil {
+		return "", err
+	}
+	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return "", err
 		}

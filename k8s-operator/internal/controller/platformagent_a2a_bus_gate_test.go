@@ -187,6 +187,7 @@ func TestAFreshInstallRendersTheBusWithoutWaitingForTheCallout(t *testing.T) {
 // and while one is still terminating, and moves on the pass after the last
 // one goes.
 func TestAChangedBusConfigWaitsUntilNoPreviousCalloutPodCanAnswer(t *testing.T) {
+	t.Setenv(a2aMCPDoorEnvVar, "true")
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconciler(t, agent)
 	ctx := context.Background()
@@ -208,6 +209,37 @@ func TestAChangedBusConfigWaitsUntilNoPreviousCalloutPodCanAnswer(t *testing.T) 
 	renderedConf := busConfigText(t, ctx, cl, agent)
 
 	putTheBusOnAPreviousConfig(t, ctx, cl, agent)
+	// The MCP server as the previous release rendered it, dialing a user the
+	// held bus has; a render for this one names a user only the new config
+	// has, so it waits with the bus.
+	mcpUser := func() string {
+		t.Helper()
+		dep := &appsv1.Deployment{}
+		if err := cl.Get(ctx, types.NamespacedName{Name: a2aMCPName(agent), Namespace: agent.Namespace}, dep); err != nil {
+			t.Fatalf("get the MCP Deployment: %v", err)
+		}
+		for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == a2aMCPEnvBusUser {
+				return e.Value
+			}
+		}
+		return ""
+	}
+	rendered0 := mcpUser()
+	{
+		dep := &appsv1.Deployment{}
+		if err := cl.Get(ctx, types.NamespacedName{Name: a2aMCPName(agent), Namespace: agent.Namespace}, dep); err != nil {
+			t.Fatalf("get the MCP Deployment: %v", err)
+		}
+		for i, e := range dep.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == a2aMCPEnvBusUser {
+				dep.Spec.Template.Spec.Containers[0].Env[i].Value = "previous-user"
+			}
+		}
+		if err := cl.Update(ctx, dep); err != nil {
+			t.Fatalf("put the MCP Deployment on the previous render: %v", err)
+		}
+	}
 
 	// Mid-roll: the new ReplicaSet has its first pod, and both pods of
 	// the previous one are still serving.
@@ -221,6 +253,9 @@ func TestAChangedBusConfigWaitsUntilNoPreviousCalloutPodCanAnswer(t *testing.T) 
 	}
 	if busConfigText(t, ctx, cl, agent) != "previous" {
 		t.Error("the bus config Secret moved while the StatefulSet was held; a bus pod restarted meanwhile would start on it")
+	}
+	if got := mcpUser(); got != "previous-user" {
+		t.Errorf("the MCP Deployment was re-rendered to dial as %q while the bus was held on a config without that user", got)
 	}
 	if res.RequeueAfter == 0 || res.RequeueAfter >= settled.RequeueAfter {
 		t.Errorf("a held bus requeued after %v, no sooner than the settled install's %v; nothing else guarantees a timely pass that sees the roll finish", res.RequeueAfter, settled.RequeueAfter)
@@ -266,6 +301,10 @@ func TestAChangedBusConfigWaitsUntilNoPreviousCalloutPodCanAnswer(t *testing.T) 
 	}
 	if busConfigText(t, ctx, cl, agent) != renderedConf {
 		t.Error("the bus config Secret did not move with the StatefulSet")
+	}
+	busGatePass(t, ctx, r, req, "after the bus moved")
+	if got := mcpUser(); got != rendered0 || got == "" {
+		t.Errorf("the MCP Deployment dials as %q once the bus has moved, want the current render's %q", got, rendered0)
 	}
 }
 

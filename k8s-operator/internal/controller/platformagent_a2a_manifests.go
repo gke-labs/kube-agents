@@ -5621,7 +5621,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, err
 	}
 	if mcpIdentityOwned {
-		reason, err := r.reconcileA2AMCP(ctx, agent)
+		reason, err := r.reconcileA2AMCP(ctx, agent, state.busHeld)
 		if err != nil {
 			return state, err
 		}
