@@ -460,16 +460,17 @@ def keys(failed_jobs):
     too. A job whose log names none files under its job and step, in the same
     attempt as the others: a leg that died downloading is not the same flake as
     the leg that failed a test. One exception: a job with no matrix suffix that
-    names no test drops out when a matrix leg of the same name names tests.
-    That is a join over its legs, such as `Run Python Unit Tests` over its
-    `(shard k/3)` shards, failing because a shard did; its log names no test,
-    and filing it would open an issue per failed join step on every flake. A
-    failure of the join's own, such as a coverage download, in the same
-    attempt as a shard that names tests drops out with it: the tracker does
-    not read the join's steps. A join that fails alone still files under its steps, and so does a matrix leg
-    that names no test beside one that does. When one attempt names more
-    containers than MAX_CONTAINERS_PER_ATTEMPT the failure is the jobs', not
-    the tests', and every job files under its name with the ids it named.
+    names no test drops out when a matrix leg of the same name failed. That is
+    a join over its legs, such as `Run Python Unit Tests` over its `(shard k/3)`
+    shards, failing because a shard did; its log names no test, and filing it
+    would open an issue per failed join step on every shard failure. A failure
+    of the join's own, such as a coverage download, beside a failed shard drops
+    out with it: the tracker cannot tell it from the join steps that fail
+    because a shard did. A join that fails alone still files under its steps,
+    and so does a matrix leg that names no test beside one that does. When one
+    attempt names more containers than MAX_CONTAINERS_PER_ATTEMPT the failure
+    is the jobs', not the tests', and every job files under its name with the
+    ids it named.
     """
 
     with_ids = [job for job in failed_jobs if job["test_ids"]]
@@ -482,11 +483,11 @@ def keys(failed_jobs):
     else:
         for key in containers:
             found[key] = [test_id for test_id in ids if container(test_id) == key]
-        legs_naming_tests = {
-            MATRIX_SUFFIX.sub("", job["name"]) for job in with_ids if MATRIX_SUFFIX.search(job["name"])
+        failed_legs = {
+            MATRIX_SUFFIX.sub("", job["name"]) for job in failed_jobs if MATRIX_SUFFIX.search(job["name"])
         }
         without = [
-            job for job in without if MATRIX_SUFFIX.search(job["name"]) or job["name"] not in legs_naming_tests
+            job for job in without if MATRIX_SUFFIX.search(job["name"]) or job["name"] not in failed_legs
         ]
     for job in without:
         for key in job_keys(job):

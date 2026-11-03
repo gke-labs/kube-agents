@@ -325,6 +325,16 @@ class FingerprintTest(unittest.TestCase):
         jobs = [{"name": "Run Python Unit Tests", "steps": join_steps, "test_ids": []}]
         self.assertEqual(reporter.keys(jobs), {"Run Python Unit Tests / step 2": []})
 
+    def test_a_join_drops_out_beside_a_shard_that_failed_without_naming_a_test(self):
+        """A shard that died installing names no test; it files, and the join does not."""
+        shard_steps = job("x", "failure", ("failure",))["steps"]
+        join_steps = job("x", "failure", ("success", "failure", "failure"))["steps"]
+        jobs = [
+            {"name": "Run Python Unit Tests (shard 2/3)", "steps": shard_steps, "test_ids": []},
+            {"name": "Run Python Unit Tests", "steps": join_steps, "test_ids": []},
+        ]
+        self.assertEqual(reporter.keys(jobs), {"Run Python Unit Tests / step 1": []})
+
     def test_a_job_of_another_name_that_names_no_test_still_files(self):
         shard_steps = job("x", "failure", ("failure",))["steps"]
         jobs = [
