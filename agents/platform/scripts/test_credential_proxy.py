@@ -7842,7 +7842,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 )
             return credential_proxy.ExecutionResult(
                 exit_code=0,
-                stdout="gke-agentic/infra\n" if len(calls) == 2 else "gke-agentic/other\n",
+                stdout="gke-agentic/infra\n",
                 stderr="",
                 duration_ms=5,
                 truncated=False,
@@ -7853,24 +7853,71 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
         # Call 1 for gke-agentic/infra fails at 100.0 (queued_at=100.0, now=100.0, failed_at=100.0)
         # Call 2 for gke-agentic/infra succeeds at 101.0 (queued_at=101.0, now=101.0, success_at=101.0)
-        #   -> clears failure memo at L4501 and records scope {gke-agentic/infra}
-        # Call 3 for gke-agentic/other queued at 50.0 (before Call 1 failed), acquires lock at 102.0:
-        #   -> not in scope {gke-agentic/infra}, so does not coalesce
+        #   -> clears the repository's failure memo and records scope {gke-agentic/infra}
+        # Call 3 for gke-agentic/infra queued at 50.0 (before Call 1 failed), acquires lock at 1000.0:
+        #   -> the coalesce window on Call 2's token has passed, so it does not coalesce
         #   -> failure memo was cleared on Call 2 success, so Call 3 does not raise stale error
         #   -> Call 3 executes helper and succeeds (len(calls) == 3)
-        # If L4501 is deleted, Call 3 finds Call 1's memo (100.0 >= 50.0) and raises RuntimeError.
+        # If the pop on success is deleted, Call 3 finds Call 1's memo (100.0 >= 50.0) and raises RuntimeError.
+        later = 101.0 + credential_proxy.FORGE_REFRESH_COALESCE_SECONDS + 1.0
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
              mock.patch.object(credential_proxy.time, "monotonic", side_effect=[
                  100.0, 100.0, 100.0, 100.0,  # Call 1: queued_at, lock-free now, now, failed_at
                  101.0, 101.0, 101.0, 101.0,  # Call 2: queued_at, lock-free now, now, success_at
-                 50.0, 102.0, 102.0, 102.0,   # Call 3: queued_at, lock-free now, now, success_at
+                 50.0, later, later, later,   # Call 3: queued_at, lock-free now, now, success_at
              ]):
             with self.assertRaises(RuntimeError):
                 executor.refresh_forge_credential("github", "gke-agentic/infra")
             executor.refresh_forge_credential("github", "gke-agentic/infra")
-            executor.refresh_forge_credential("github", "gke-agentic/other")
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
 
         self.assertEqual(len(calls), 3)
+
+    def test_a_failed_refresh_for_one_repository_is_not_handed_to_another_in_its_organisation(self):
+        # The helper mints for the one repository named, so a failure for
+        # gke-agentic/broken says nothing about gke-agentic/good: a caller
+        # for the second repository that queued before the first one failed
+        # runs the helper rather than re-raising the first one's error.
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+
+        def handle_call(argv, cwd=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                return credential_proxy.ExecutionResult(
+                    exit_code=1,
+                    stdout="",
+                    stderr="no policy for gke-agentic/broken",
+                    duration_ms=5,
+                    truncated=False,
+                    timed_out=False,
+                )
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="gke-agentic/good\n",
+                stderr="",
+                duration_ms=5,
+                truncated=False,
+                timed_out=False,
+            )
+
+        executor.execute_internal = handle_call
+
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[
+                 100.0, 100.0, 100.0, 100.0,  # broken: queued_at, lock-free now, now, failed_at
+                 50.0, 101.0, 101.0, 101.0,   # good, queued before the failure: queued_at, lock-free now, now, success_at
+             ]):
+            with self.assertRaises(RuntimeError):
+                executor.refresh_forge_credential("github", "gke-agentic/broken")
+            executor.refresh_forge_credential("github", "gke-agentic/good")
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][-1], "gke-agentic/good")
+        self.assertIn(("github", credential_proxy._provider_forge("github").hosts[0], "gke-agentic/broken"),
+                      executor._refresh_failure_cache)
 
     # ---- Where the child memory budget is charged (design §2.1) -------------
 
@@ -10009,13 +10056,13 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with("banana"))
 
-    def _served_sweep(self, role, managed):
+    def _served_sweep(self, role, managed, extra_env=None):
         """The sweep `serve` started in `role`, with `start` stubbed; None if none was."""
         with mock.patch.object(credential_proxy, "resolve_role", return_value=role), \
                 mock.patch.object(credential_proxy, "managed_repositories", managed), \
                 mock.patch.object(credential_proxy, "start_agent_api_proxy", mock.MagicMock()), \
                 mock.patch.object(credential_proxy.vcs_readings.ReadingsSweep, "start", autospec=True) as start:
-            self._serve_with(None)
+            self._serve_with(None, extra_env=extra_env)
         if not start.called:
             return None
         start.assert_called_once()
@@ -10043,6 +10090,24 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             credential_proxy.serve(types.SimpleNamespace())
         proxy.serve_forever.assert_called_once_with()
         start.assert_not_called()
+
+    def test_the_sweep_env_turns_it_off_and_nothing_else_does(self):
+        # Installs sharing one App installation (the eval lanes, #4611) turn
+        # the sweep off, in any of the spellings the broker's other switches
+        # take; an unset, "on" or misspelt value leaves it on, so a typo can't
+        # quietly stop a real install's readings.
+        managed = mock.Mock(return_value=frozenset({"github.com/acme/infra"}))
+        env = credential_proxy.VCS_READINGS_ENV
+        for value in ("off", " OFF ", "false", "0", "no"):
+            with self.subTest(value=value):
+                self.assertIsNone(self._served_sweep("broker", managed, {env: value}))
+        for value in ("", "on", "true", "1", "banana"):
+            with self.subTest(value=value):
+                self.assertIsNotNone(self._served_sweep("broker", managed, {env: value}))
+        with mock.patch.dict(os.environ, {env: "banana"}), \
+                self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertTrue(credential_proxy.readings_sweep_enabled())
+        self.assertIn("stays on", "\n".join(logs.output))
 
     def test_the_sweep_starts_on_an_empty_list_and_its_pass_makes_no_forge_call(self):
         sweep = self._served_sweep("broker", mock.Mock(return_value=frozenset()))
