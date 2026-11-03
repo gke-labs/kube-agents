@@ -327,7 +327,12 @@ def _symlink_shape(link: Path) -> str:
     try:
         link.stat()
     except OSError as exc:
-        return "a symlink loop" if exc.errno == errno.ELOOP else "a dangling symlink"
+        if exc.errno == errno.ELOOP:
+            return "a symlink loop"
+        if exc.errno == errno.ENOENT:
+            return "a dangling symlink"
+        # ENOTDIR, EACCES and the rest: the target is there but cannot be reached.
+        return f"a symlink whose target cannot be reached ({exc.strerror})"
     return "a symlink to somewhere other than the shared cache"
 
 

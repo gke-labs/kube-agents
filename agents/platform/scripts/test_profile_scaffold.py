@@ -806,6 +806,7 @@ class NpmCacheTest(unittest.TestCase):
         """A home the sweep cannot point at the shared cache gets one line naming the shape."""
         elsewhere = self.tmp / "elsewhere"
         elsewhere.mkdir()
+        (self.tmp / "a-file").write_text("x", encoding="utf-8")
         shapes = {
             "is not a directory": lambda npm: npm.write_text("x", encoding="utf-8"),
             "is a dangling symlink": lambda npm: npm.symlink_to(self.tmp / "gone"),
@@ -813,6 +814,10 @@ class NpmCacheTest(unittest.TestCase):
             # Before Python 3.13 resolving a loop raised RuntimeError, which
             # stopped the sweep for every home after this one.
             "is a symlink loop": lambda npm: npm.symlink_to(npm.name),
+            # A target under a regular file stats as ENOTDIR, not ENOENT, and is
+            # named by its own error rather than called dangling.
+            "is a symlink whose target cannot be reached (Not a directory)":
+                lambda npm: npm.symlink_to(self.tmp / "a-file" / "npm"),
         }
         for shape, make in shapes.items():
             with self.subTest(shape=shape):
