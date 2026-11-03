@@ -120,6 +120,12 @@ _FAKE_CLOCK_DECIMALS = 9
 # breaker is the ceiling LISTEN_BACKLOG is sized to.
 _ENVOY_CONFIG = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "envoy-credential-proxy.yaml"
 
+# The role shares `serve` installs on CredentialProxyHandler, whose class
+# default is None (unbounded). A test that calls `serve` puts them back: a later
+# class left with serve's bounded shares (session 2, scope 1 by default) gets
+# 503 busy when its next request beats the previous release.
+_SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots")
+
 
 class _FakeClock:
     """A `time` stand-in for the kill's waits: `sleep` advances `monotonic`.
@@ -10595,6 +10601,8 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
 
     def setUp(self):
         self.original = CredentialProxyHandler.enforce_read_only
+        for attribute in _SERVE_SHARES:
+            self.addCleanup(setattr, CredentialProxyHandler, attribute, getattr(CredentialProxyHandler, attribute))
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.policy_path = Path(self.tmp.name) / "policy.json"
@@ -13200,7 +13208,7 @@ class BackendSocketModeTest(unittest.TestCase):
         # `serve` assigns these on the class; put them back for whatever runs
         # next. Some are bare annotations until something sets them, so an
         # unset one has to be unset again rather than restored.
-        for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes"):
+        for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes", *_SERVE_SHARES):
             self.addCleanup(
                 self._restore,
                 attribute,
@@ -15055,6 +15063,8 @@ class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
     """
 
     def setUp(self):
+        for attribute in _SERVE_SHARES:
+            self.addCleanup(setattr, CredentialProxyHandler, attribute, getattr(CredentialProxyHandler, attribute))
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.policy_path = Path(self.tmp.name) / "policy.json"
@@ -15175,6 +15185,22 @@ class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
             if original is not None:
                 CredentialProxyHandler.authenticator = original
         del owner
+
+
+class ServeTestsPutTheSharesBackTest(unittest.TestCase):
+    """Each class that calls `serve` leaves the role shares as it found them."""
+
+    def test_each_serve_class_restores_the_shares(self):
+        for attribute in _SERVE_SHARES:
+            self.addCleanup(setattr, CredentialProxyHandler, attribute, getattr(CredentialProxyHandler, attribute))
+        for case in (BackendSocketModeTest, ServeArmsTheReadOnlyGateTest, ServeRefusesAnUnauthenticatedTCPListenerTest):
+            with self.subTest(case=case.__name__):
+                before = {attribute: getattr(CredentialProxyHandler, attribute) for attribute in _SERVE_SHARES}
+                result = unittest.TestResult()
+                unittest.defaultTestLoader.loadTestsFromTestCase(case).run(result)
+                self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+                after = {attribute: getattr(CredentialProxyHandler, attribute) for attribute in _SERVE_SHARES}
+                self.assertEqual(after, before)
 
 
 class AuthenticationOverTheSocketTest(unittest.TestCase):
