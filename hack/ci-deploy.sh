@@ -715,11 +715,16 @@ A2A_OPERATOR_ENV_ARGS=()
 # It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
 # scaffold `/opt/data/profiles/tse` (#3492). Empty on the today lane, so that
 # release stays byte-for-byte the same.
+# env[3], set on every lane in the install below, turns the broker's proposal
+# readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
+# budget is sized for one install per GitHub App installation, and every eval
+# project shares one, so concurrent lanes drained its quota and the cases' own
+# forge calls failed with FORGE_RATE_LIMITED (#4611). Hence env[4] here.
 MODE_NEXT_ENV_ARGS=()
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
-    --set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
-    --set-string "platformAgent.deployment.env[3].value=false"
+    --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+    --set-string "platformAgent.deployment.env[4].value=false"
     --set "profiles.tse.enabled=true"
   )
 fi
@@ -1951,6 +1956,8 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[1].value=${EVAL_ALERT_DAILY_LIMIT_DRIFT}" \
     --set-string "platformAgent.deployment.env[2].name=INCIDENT_WORKLOAD_DEDUP_SECONDS" \
     --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
+    --set-string "platformAgent.deployment.env[3].name=CREDENTIAL_PROXY_VCS_READINGS" \
+    --set-string "platformAgent.deployment.env[3].value=off" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \
