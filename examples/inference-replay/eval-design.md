@@ -373,7 +373,7 @@ still get reused; only the steps that belong to the failed run go back to the mo
 flowchart TD
     req["Model request from a pull request run"]
     shared{"In the shared cache?"}
-    own{"In this PR's own answers,<br/>from a passing run?"}
+    own{"In this PR's own answers,<br/>from an earlier build's passing run?"}
     replay["Replay the saved answer"]
     model["Ask the model"]
     save["Save the answer in this PR's<br/>own storage (never the shared cache)"]
