@@ -21549,18 +21549,19 @@ def handle_remediate(args: argparse.Namespace) -> None:
             # that is a forge call. Say so rather than let the missing "Part of
             # #N" read as a defect in the rendering.
             log("DRY RUN: no --issue given, so the 'Part of #N' link is omitted.")
-        if manifest is not None:
-            # The paragraph `finish` adds when Config Connector does not apply
-            # the object, so the preview shows what the pull request says.
-            disclose_stalled_kcc_and_log(
-                findings,
-                manifest,
-                dry_root,
-                prefix="DRY RUN: ",
-                declarations=kcc_paragraph_index(repo_hint or "", None, kcc_declaration_roots(audit_id, dry_root, record))
-                if kcc_index_needed(findings, manifest)
-                else {},
-            )
+        # The paragraph `finish` adds when Config Connector does not apply
+        # the object, so the preview shows what the pull request says. Also
+        # with no manifest, as in `finish`: the pass removes a paragraph the
+        # worker copied from an earlier ledger and claims no stall.
+        disclose_stalled_kcc_and_log(
+            findings,
+            manifest,
+            dry_root,
+            prefix="DRY RUN: ",
+            declarations=kcc_paragraph_index(repo_hint or "", None, kcc_declaration_roots(audit_id, dry_root, record))
+            if kcc_index_needed(findings, manifest)
+            else {},
+        )
         for group in groups:
             log(f"WOULD OPEN: {group_branch_for(audit_id, group)}")
             print(
@@ -21608,16 +21609,16 @@ def handle_remediate(args: argparse.Namespace) -> None:
         unlisted = set(degrade_unlisted_kustomize_additions(findings, probe, noun))
         # A pull request that `remediate` opens carries the Config Connector
         # paragraph, as one that `finish` opens does: `finish` does not
-        # revisit a finding whose pull request is open.
-        if manifest is not None:
-            disclose_stalled_kcc_and_log(
-                findings,
-                manifest,
-                root,
-                declarations=kcc_paragraph_index(repo, probe, kcc_declaration_roots(audit_id, root, record))
-                if kcc_index_needed(findings, manifest)
-                else {},
-            )
+        # revisit a finding whose pull request is open. Also with no
+        # manifest, so a paragraph the worker copied is removed.
+        disclose_stalled_kcc_and_log(
+            findings,
+            manifest,
+            root,
+            declarations=kcc_paragraph_index(repo, probe, kcc_declaration_roots(audit_id, root, record))
+            if kcc_index_needed(findings, manifest)
+            else {},
+        )
     finally:
         probe.close()
     for fid in [fid for fid in requested if fid in unlisted]:

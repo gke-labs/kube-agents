@@ -24409,6 +24409,37 @@ class TestStalledKccInFinish(HarnessTestCase):
         self.assertTrue(proposals, self.err)
         self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, proposals[0]["body"])
 
+    def copied_paragraph_argv(self):
+        """`remediate` argv for a fix whose note carries a Config Connector
+        paragraph copied from an earlier ledger, with no `--manifest-file`."""
+        copied = (f"{audit_report.KCC_STALLED_NOTE_MARK} When the audit ran, Config Connector reported `Ready=False` on "
+                  "`ContainerCluster infra/prod-usc1` (`UpdateFailed: OLD`).")
+        doc = self.doc_and_file()
+        doc["findings"][0]["remediation"]["note"] += "\n\n" + copied
+        path = self.write_findings(doc)
+        fid = audit_report.derive_finding_id(doc["findings"][0])
+        return ["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", fid]
+
+    def test_remediate_dry_run_without_a_manifest_removes_a_copied_paragraph(self):
+        """Review finding: with no `--manifest-file`, `remediate` ran no
+        Config Connector pass, so a paragraph the worker copied from an
+        earlier ledger went into the pull request and claimed a stall."""
+        self.assertEqual(self.run_main([*self.copied_paragraph_argv(), "--dry-run"]), 0, self.err)
+        self.assertIn("WOULD OPEN: platform-agent/fix-", self.err)
+        self.assertNotIn("UpdateFailed: OLD", self.out)
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, self.out)
+
+    def test_remediate_without_a_manifest_opens_no_copied_paragraph(self):
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.assertEqual(self.run_main(self.copied_paragraph_argv()), 0, self.err)
+        proposals = self.harness.forge_calls("proposal-create")
+        self.assertTrue(proposals, self.err)
+        self.assertNotIn("UpdateFailed: OLD", proposals[0]["body"])
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, proposals[0]["body"])
+
     def test_a_merged_fix_that_still_reproduces_says_config_connector_is_not_applying_it(self):
         doc = self.doc_and_file()
         branch = audit_report.group_branch_for(AUDIT, doc["findings"])
