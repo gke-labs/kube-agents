@@ -183,8 +183,8 @@ lint-python: ## Run ruff's error rules over every Python file (the set tests/tes
 # flake in a young seam test could not red an already-gating job; it finished
 # that period without a single failure, and a tier nothing gates on is a tier
 # people learn to merge around. It is deterministic by construction -- real
-# components, no model calls -- so it belongs in the sweep the `test` job runs
-# rather than beside it. The one thing that costs: the injector seam shells out
+# components, no model calls -- so it belongs in the sweep the `test-shard` jobs
+# run rather than beside it. The one thing that costs: the injector seam shells out
 # to `go test`, so every job that expands this list needs a Go toolchain on
 # PATH or those tests skip themselves and the sweep reports green without them.
 PYTHON_TEST_FILES := $(sort \
@@ -669,7 +669,7 @@ coverage-merge: ## Join the coverage the sharded `make coverage` runs left in CO
 	fi
 
 # 55 is a deliberately loose placeholder: the real floor gets committed from the
-# first green CI run of the `test` job's coverage sweep, not from a laptop
+# first green CI run of the coverage the `test` job joins from the shards, not from a laptop
 # measurement, because CI's Python and dependency set produce a different number.
 COVERAGE_FLOOR ?= 55
 
@@ -758,7 +758,7 @@ bench-case-check: ## Validate every bench task.yaml against the case-format cont
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).
 # The tier now gates: tests/integration is in PYTHON_TEST_DIRS, so `make
-# test-python` and the CI `test` job both run it, and a red seam test is a red
+# test-python` and the CI `test-shard` jobs both run it, and a red seam test is a red
 # pull request. This target is a convenience for running that one tier while
 # you work on a seam -- seconds instead of the whole sweep -- and is not what
 # CI invokes, so do not reach for it as the definition of what must pass.

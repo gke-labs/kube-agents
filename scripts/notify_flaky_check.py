@@ -453,22 +453,23 @@ def keys(failed_jobs):
     """What one failed attempt files under, as key -> the test ids behind it.
     Each key is one issue.
 
-    `failed_jobs` is one attempt's failing jobs, dicts with `name`, `steps`
-    and `test_ids`. A job whose log names tests files under their containers
-    -- pooled across jobs, so two legs of a matrix failing the same test are
-    one flake, and two attempts failing different tests of one class are one
-    flake too. A job whose log names none files under its job and step, in
-    the same attempt as the others: a leg that died downloading is not the
-    same flake as the leg that failed a test. One exception: a job with no
-    matrix suffix that names no test drops out when a matrix leg of the same
-    name names tests. That is a join over its legs, such as `Run Python Unit
-    Tests` over its `(shard k/3)` shards, failing because a shard did; its
-    log names no test, and filing it would open an issue per failed join
-    step on every flake. A join that fails alone still files under its
-    steps, and so does a matrix leg that names no test beside one that does. When one attempt names more containers than
-    MAX_CONTAINERS_PER_ATTEMPT the failure is the jobs', not the tests', and
-    every job files under its name with the ids it named.
+    `failed_jobs` is one attempt's failing jobs, dicts with `name`, `steps` and
+    `test_ids`. A job whose log names tests files under their containers --
+    pooled across jobs, so two legs of a matrix failing the same test are one
+    flake, and two attempts failing different tests of one class are one flake
+    too. A job whose log names none files under its job and step, in the same
+    attempt as the others: a leg that died downloading is not the same flake as
+    the leg that failed a test. One exception: a job with no matrix suffix that
+    names no test drops out when a matrix leg of the same name names tests.
+    That is a join over its legs, such as `Run Python Unit Tests` over its
+    `(shard k/3)` shards, failing because a shard did; its log names no test,
+    and filing it would open an issue per failed join step on every flake. A
+    join that fails alone still files under its steps, and so does a matrix leg
+    that names no test beside one that does. When one attempt names more
+    containers than MAX_CONTAINERS_PER_ATTEMPT the failure is the jobs', not
+    the tests', and every job files under its name with the ids it named.
     """
+
     with_ids = [job for job in failed_jobs if job["test_ids"]]
     without = [job for job in failed_jobs if not job["test_ids"]]
     ids = all_test_ids(with_ids)
@@ -479,8 +480,12 @@ def keys(failed_jobs):
     else:
         for key in containers:
             found[key] = [test_id for test_id in ids if container(test_id) == key]
-        legs_naming_tests = {MATRIX_SUFFIX.sub("", job["name"]) for job in with_ids if MATRIX_SUFFIX.search(job["name"])}
-        without = [job for job in without if MATRIX_SUFFIX.search(job["name"]) or job["name"] not in legs_naming_tests]
+        legs_naming_tests = {
+            MATRIX_SUFFIX.sub("", job["name"]) for job in with_ids if MATRIX_SUFFIX.search(job["name"])
+        }
+        without = [
+            job for job in without if MATRIX_SUFFIX.search(job["name"]) or job["name"] not in legs_naming_tests
+        ]
     for job in without:
         for key in job_keys(job):
             found[key] = sorted(set(found.get(key, [])) | set(job["test_ids"]))
