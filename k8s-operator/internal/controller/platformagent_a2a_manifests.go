@@ -491,14 +491,14 @@ const (
 	// a secretKeyRef — and a key that disagrees between them renders
 	// `password: ""` or mounts nothing, so they are named rather than spelled
 	// out at each site.
-	a2aGatewayPasswordKey = "gateway-password" // #nosec G101 -- Secret key name, not a credential
-	a2aBridgePasswordKey  = "bridge-password"  // #nosec G101 -- Secret key name, not a credential
-	a2aSeedPasswordKey    = "seed-password"    // #nosec G101 -- Secret key name, not a credential
+	a2aGatewayPasswordKey    = "gateway-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aBridgePasswordKey     = "bridge-password"      // #nosec G101 -- Secret key name, not a credential
+	a2aSeedPasswordKey       = "seed-password"        // #nosec G101 -- Secret key name, not a credential
 	a2aWebPasswordKey        = "web-password"         // #nosec G101 -- Secret key name, not a credential
 	a2aConsolePasswordKey    = "console-password"     // #nosec G101 -- Secret key name, not a credential
 	a2aConsoleMCPPasswordKey = "console-mcp-password" // #nosec G101 -- Secret key name, not a credential
 	a2aSysPasswordKey        = "sys-password"         // #nosec G101 -- Secret key name, not a credential
-	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
+	a2aCalloutPasswordKey    = "callout-password"     // #nosec G101 -- Secret key name, not a credential
 	// a2aBridgeActivityKey signs the gateway's tool-call deliveries to the
 	// bridge's activity door when the bridge runs tasks through the pod's API
 	// server (a2a/hermes-bridge/api.go): the agent container's hermes signs
@@ -2245,12 +2245,14 @@ accounts {
   # explicit stream and service exports declared below.
   TRUSTED {
     jetstream: enabled
+    # MSG.NEXT answers one pull with a batch, so its export streams
+    # responses; the default single response would cut every batch to one.
     exports [
       { service: "$JS.API.INFO", accounts: [ APP, CONSOLE ] }
       { service: "$JS.API.STREAM.INFO.*", accounts: [ APP, CONSOLE ] }
       { service: "$JS.API.CONSUMER.CREATE.>", accounts: [ APP, CONSOLE ] }
       { service: "$JS.API.CONSUMER.INFO.>", accounts: [ APP, CONSOLE ] }
-      { service: "$JS.API.CONSUMER.MSG.NEXT.>", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.API.CONSUMER.MSG.NEXT.>", accounts: [ APP, CONSOLE ], response_type: stream }
       { service: "$JS.API.CONSUMER.DELETE.>", accounts: [ APP, CONSOLE ] }
       { service: "$JS.API.DIRECT.GET.>", accounts: [ APP, CONSOLE ] }
       { service: "$JS.ACK.TASKS.>", accounts: [ APP ] }
@@ -2510,7 +2512,11 @@ const (
 	// account split. On a single-node server, stream and consumer metadata live
 	// under <store>/jetstream/<account>/streams/ with no SYS/_js_/ Raft metadata
 	// group, so moving the account directory relocates the store cleanly.
-	a2aNATSStartupScript = "if [ -d /data/jetstream/APP ] && [ ! -e /data/jetstream/TRUSTED ]; then mv /data/jetstream/APP /data/jetstream/TRUSTED; fi && exec nats-server -c /etc/nats/nats.conf"
+	// When both directories exist (a rollback that skipped moving the store
+	// back), it starts on TRUSTED, leaves APP in place and says so.
+	a2aNATSStartupScript = "if [ -d /data/jetstream/APP ] && [ ! -e /data/jetstream/TRUSTED ]; then mv /data/jetstream/APP /data/jetstream/TRUSTED; " +
+		"elif [ -d /data/jetstream/APP ]; then echo 'both /data/jetstream/APP and /data/jetstream/TRUSTED exist: starting on TRUSTED, APP left in place' >&2; fi && " +
+		"exec nats-server -c /etc/nats/nats.conf"
 )
 
 // a2aProvisionResources adds the provision container's ephemeral-storage

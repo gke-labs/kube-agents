@@ -45,7 +45,7 @@ import (
 // install with the operator flag below, like the inject backend and the
 // agent door, and while it is off nothing of it is rendered. It runs in its
 // own pod, not the gateway's, so the only bus credential within its reach is
-// the console password, and the only way in is a kubectl port-forward and
+// its own console-mcp password, and the only way in is a kubectl port-forward and
 // the server's own bearer token. A CR field can replace the flag if the
 // server becomes a supported, documented feature.
 const (
@@ -73,8 +73,8 @@ const (
 	a2aMCPAccessKey      = "token"
 	a2aMCPAccessVolume   = "mcp-token"
 	a2aMCPAccessMountDir = "/var/run/secrets/a2a-mcp"
-	// The console password, one key of the creds Secret, mounted the way the
-	// console server mounts it.
+	// The console-mcp password, one key of the creds Secret, mounted the way
+	// the console server mounts its own.
 	a2aMCPBusKeyVolume   = "bus-key"
 	a2aMCPBusKeyMountDir = "/var/run/secrets/a2a-mcp-bus"
 

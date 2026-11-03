@@ -111,7 +111,7 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 	if url == "" {
 		return settings{}, fmt.Errorf("%s is required", envBusURL)
 	}
-	// TLS by construction: the server sends the console password at
+	// TLS by construction: the server sends its console-mcp password at
 	// connect, so a plaintext URL is refused rather than left to the bus to
 	// upgrade.
 	if !strings.HasPrefix(url, busScheme) {

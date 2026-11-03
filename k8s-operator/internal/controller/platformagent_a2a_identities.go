@@ -247,9 +247,9 @@ const (
 	// confirmation surface are distinct from the browser's.
 	a2aConsoleMCPUser = "console-mcp"
 
-	// a2aConsoleConfirmSubject is the console confirmation subject
-	// (a2a/gateway/console.go): published by console alone and subscribed
-	// by gateway alone.
+	// a2aConsoleConfirmSubject is the console confirmation subject: console
+	// alone may publish it and gateway alone may subscribe to it. Its
+	// publisher and subscriber land with #4457.
 	a2aConsoleConfirmSubject = "chat.console.*.confirm"
 
 	// a2aBusUserEnv carries a2aAgentBusUser into the agent container. Not a

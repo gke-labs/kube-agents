@@ -345,7 +345,9 @@ Layout:
   credentials. `TRUSTED` holds the control-plane services (the gateway, provision, the
   verifier, the operator, seed and the dispatcher) and the JetStream store. `CONSOLE` holds
   the web console and its MCP server (`console-mcp`). `APP` holds agent and session workers
-  and the read-only principals.
+  and the read-only principals. The static user blocks are rendered per account, still from
+  `platformagent_a2a_identities.go`, so where this document says the config's APP and `$SYS`
+  static user blocks, read the `TRUSTED`, `CONSOLE`, `APP` and `$SYS` blocks.
 - **One user per agent identity** inside the account. Permissions are exact subject lists,
   deny by default: publish only to the subjects its role emits on, subscribe only to its own
   addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the shared topics it
@@ -638,6 +640,10 @@ Layout:
   and the pod's ingress is deny-all. Reading the token needs `get` on that Secret, so the
   access gate is the Secret's RBAC plus `pods/portforward`. That is a gate the console does
   not have: its pod hands the password to whoever forwards to it.
+  **Amended 11/3:** the MCP server no longer shares `console`. It holds its own principal,
+  `console-mcp`, in the `CONSOLE` account, with its own password (`console-mcp-password` in
+  the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
+  console's read surface and `chat.console.*.in`, without the console's confirmation subject.
 
 - **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
   kanban card's report back to the gateway conversation it was filed in

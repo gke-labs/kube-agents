@@ -447,8 +447,8 @@ func encodeA2AJSONPrefixed(v any, prefix, indent string) ([]byte, error) {
 //     in this system to read from the outside, because the connection behaves
 //     normally in every other respect.
 //   - The account becomes the audience of the user JWT the callout signs, so
-//     it decides which account a connection lands in. Only APP is mintable;
-//     SYS above all is not.
+//     it decides which account a connection lands in. Only APP and TRUSTED
+//     are mintable, a narrowed entry only into APP; SYS above all is not.
 //   - Duplicate ServiceAccounts make the grant set a function of map order,
 //     and duplicate users re-create the shared-credential problem and collide
 //     on each other's inbox prefix.

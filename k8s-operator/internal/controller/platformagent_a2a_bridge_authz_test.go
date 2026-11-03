@@ -424,13 +424,9 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 	}
 	allowed("$KV.runtime-state delete (clearInFlight)", kv.Delete(ctx, "bridge.platform.t1"))
 
-	for _, line := range log.publishViolations("bridge") {
-		if strings.Contains(line, "$JS.API.CONSUMER.DELETE.TASKS.") {
-			// OrderedConsumer's it.Stop() sends a fire-and-forget CONSUMER.DELETE.TASKS.<ephemeral>,
-			// which the grant withholds on purpose so the bridge cannot delete gateway-relay.
-			continue
-		}
-		t.Errorf("the bridge's own operations tripped an unexpected publish violation:\n%s", line)
+	if v := log.publishViolations("bridge"); len(v) != 0 {
+		t.Errorf("the bridge's own operations tripped %d publish violations; each is a grant a2aBridgeJetStreamGrants is missing:\n%s",
+			len(v), strings.Join(v, "\n"))
 	}
 
 	// Table 2: what the wildcard allowed and the grant refuses. The bodies are
@@ -828,33 +824,23 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 
 		// Read, route two: filter_subject travels in the request BODY, so a
 		// consumer scoped to the whole plane is permitted by a grant that
-		// names only the stream. Across the APP -> TRUSTED service import,
-		// nats-server rewrites the request reply inbox to a single-response
-		// service reply subject, so each Fetch delivers one message per
-		// MSG.NEXT request.
+		// names only the stream. No subject grant can scope this one.
 		whole, err := js.CreateOrUpdateConsumer(ctx, "TASKS", jetstream.ConsumerConfig{
 			Durable: "bridge-wholeplane", FilterSubject: "a2a.tasks.>", AckPolicy: jetstream.AckExplicitPolicy,
 		})
 		if err != nil {
 			t.Fatalf("CONSUMER.CREATE filtered on the whole task plane: %v", err)
 		}
+		drain, err := whole.Fetch(16, jetstream.FetchMaxWait(5*time.Second))
+		if err != nil {
+			t.Fatalf("fetch from the whole-plane consumer: %v", err)
+		}
 		var sawOther bool
-		for range 8 {
-			drain, err := whole.FetchNoWait(1)
-			if err != nil {
-				t.Fatalf("fetch from the whole-plane consumer: %v", err)
+		for m := range drain.Messages() {
+			if m.Subject() == otherIn && string(m.Data()) == otherBody {
+				sawOther = true
 			}
-			var gotMsg bool
-			for m := range drain.Messages() {
-				gotMsg = true
-				if m.Subject() == otherIn && string(m.Data()) == otherBody {
-					sawOther = true
-				}
-				_ = m.Ack()
-			}
-			if sawOther || !gotMsg {
-				break
-			}
+			_ = m.Ack()
 		}
 		if !sawOther {
 			t.Error("a consumer filtered on a2a.tasks.> delivered nothing from another addressee: " +
