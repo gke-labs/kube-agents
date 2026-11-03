@@ -1758,7 +1758,8 @@ nothing. A remembered question binds its click to the conversation it was posted
 event's surface binds only a click on one the adapter does not remember. A question posted
 to the home channel (chat.notify) has no conversation at post time, so its click binds by the
 same surface rule as a typed message, to the thread the event names, in the kind the event
-names, so the binding survives a restart without any mark, and a typed reply in its thread
+names, or, where the adapter clears the thread (an unthreaded space, a click event with no
+thread name), to the shared space, as a typed message there does, so the binding survives a restart without any mark, and a typed reply in its thread
 does not answer it; its buttons do. A
 rewrite that fails posts the line in the conversation instead. The questions and answers
 are held in the process: after a restart a question keeps its buttons until clicked, the click

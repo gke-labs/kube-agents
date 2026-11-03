@@ -102,8 +102,12 @@ These are the regressions #2765 fixed, and the design must not bring them back:
   the gateway's "pushed report attached" log line: acceptance item 3 holds only if the follow-up
   continues the same session, whether or not a report was also attached.
 - **Call 3: every DM click binds to the clicked card's thread.** With the DM clearing gone, a click
-  classifies to its message's thread by the same rule as a typed message, and the two `home`
-  guards in the click path no longer change an outcome. The `home` button parameter stays on the
+  classifies to its message's thread by the same rule as a typed message. The two `home` guards
+  in the click path change one outcome: in a DM whose thread the adapter clears (an
+  `UNTHREADED_MESSAGES` space, or a click event with no thread name), a home card's click used to
+  bind to the card's thread and now binds to the shared space conversation, like a typed message
+  there. That class is the shared space everywhere, so the pushed-report splice does not apply to
+  it, as for any thread-less key. The `home` button parameter stays on the
   wire, since cards already posted carry it, and the guards that no longer branch are removed. The
   test that asserted an unmarked click after a restart binds to the DM root now asserts it binds to
   the card's thread. Consequence: a card with choices posted at a DM's top level under a legacy

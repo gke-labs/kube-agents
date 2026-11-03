@@ -730,6 +730,31 @@ func TestGchatClickOnAHomeCardInADMBindsToItsThread(t *testing.T) {
 	}
 }
 
+// Where the adapter clears a DM's thread (an unthreaded space, or a click
+// event with no thread name), a home card's click binds the shared space
+// conversation, as a typed message there does.
+func TestGchatClickOnAHomeCardInAnUnthreadedDMBindsTheSpace(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1", "thread": map[string]any{"name": "spaces/_c2fixtureAA/threads/BOT1"}}
+	ask := OutMessage{Text: "which?", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster?", Choices: []chatmsg.Choice{{Text: "Look at the first one", Reply: "Look at the first one: prod-eu"}}}}
+	unthreaded := gchatClickEvent(t)
+	unthreaded.Space.SpaceThreadingState = gchatThreadingUnthreaded
+	threadless := gchatClickEvent(t)
+	threadless.Message.Thread.Name = ""
+	// One adapter per click: a second click on the same question is held as
+	// already waiting.
+	for name, ev := range map[string]*gchatEvent{"unthreaded space": unthreaded, "no thread name": threadless} {
+		a := newTestGchatAdapterWithRelay(t, f)
+		if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", ask); err != nil {
+			t.Fatal(err)
+		}
+		msg, reason := a.classifyClick(ev)
+		if reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != sessionKindDM {
+			t.Errorf("%s: click = %+v (%q); want it bound to the shared space", name, msg, reason)
+		}
+	}
+}
+
 // A re-ask whose patch fails with the message left as it was (a rate limit)
 // keeps the answer the message still shows; one whose layout Chat refuses
 // forgets it, since the notifier's text edit follows.
