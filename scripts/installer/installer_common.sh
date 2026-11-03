@@ -1518,7 +1518,7 @@ next_home_channel_unset_message() {
   # Only the Chat key can have Slack beside it: Slack holds the gateway only
   # with Chat off, so with the Slack key the posts are kept, never sent on.
   if [ "${1:-}" = GOOGLE_CHAT_HOME_CHANNEL ]; then
-    meanwhile="${meanwhile} (or, with Slack enabled too, they go to Slack)"
+    meanwhile="${meanwhile} (or, with Slack enabled too, they go to the Slack Hermes platform, which delivers them only if Slack has a home channel)"
   fi
   printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set ${meanwhile}; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
 }

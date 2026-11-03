@@ -657,9 +657,12 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, string, *lib.Notify
 	home, source := n.homeState()
 	if home == "" {
 		n.log.Debug("notify refused: no home channel", "homeSource", source)
-		if n.kept != nil {
+		if n.kept != nil && req.Thread == "" {
 			// Answered by handle from the keep itself (keepRefused): Kept is
-			// a promise the store has to have made good on first.
+			// a promise the store has to have made good on first. Only a
+			// top-level post is kept: a reply into a thread of the channel
+			// (a follow-up, a card's note) is not a proactive post the digest
+			// should count, and its thread is gone with the channel.
 			r := lib.NotifyReply{Error: notifyNoHomeKept, Kept: true}
 			return req, "", &r
 		}

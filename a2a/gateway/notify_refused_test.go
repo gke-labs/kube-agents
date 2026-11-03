@@ -278,7 +278,9 @@ func TestNotify_AFullKeepQueueRefusesPlainly(t *testing.T) {
 }
 
 // A conversation request on a route with no home channel is not a refused
-// home post; nothing is kept.
+// home post; nothing is kept. Nor is a reply into a thread of the home
+// channel: it gets the plain refusal, so follow-ups and card notes do not
+// count as proactive posts in the digest.
 func TestNotify_AConversationRequestIsNotKept(t *testing.T) {
 	poster := &fakeNotifyPoster{}
 	n, err := NewGchatNotifier(poster, "", nil)
@@ -287,7 +289,11 @@ func TestNotify_AConversationRequestIsNotKept(t *testing.T) {
 	}
 	store := &memRefusedStore{}
 	n.SetKept(store)
+	startWorker(t, n)
 	serveJSON(t, n, lib.NotifyRequest{Text: "report", Conversation: "gchat:spaces/X/threads/Y", ContextID: "ctx"})
+	if reply := serveJSON(t, n, lib.NotifyRequest{Text: "follow-up", Thread: "spaces/H/threads/T"}); reply.Error != notifyNoHome || reply.Kept {
+		t.Fatalf("thread reply with no home = %+v, want the plain refusal", reply)
+	}
 	n.keptWG.Wait()
 	if posts, _ := store.snapshot(); len(posts) != 0 {
 		t.Fatalf("kept %+v", posts)
