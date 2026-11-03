@@ -76,8 +76,10 @@ class Cluster:
 
     def __init__(
         self, crd=True, namespace_owner=None, ready="False", fail_on=None, mode=None, context_healthy=True,
-        context_stuck=False, kcc_left=0, finalized=None,
+        context_stuck=False, kcc_left=0, finalized=None, patch_errors=None,
     ):
+        # `patch_errors`: object name -> the stderr its finalizer patch fails with.
+        self.patch_errors = patch_errors or {}
         # `context_stuck`: the operator cannot finish the context delete.
         # `kcc_left`: the Config Connector objects still in the namespace.
         # `finalized`: resource -> the objects a list of it in the namespace returns.
@@ -121,6 +123,8 @@ class Cluster:
             return done(stdout=json.dumps({"status": {"healthy": self.context_healthy, "errors": errors}}))
         if argv[:2] == ["kubectl", "patch"]:
             self.patched.append(list(argv))
+            if argv[3] in self.patch_errors:
+                return done(1, stderr=self.patch_errors[argv[3]])
             return done()
         if argv[:3] == ["kubectl", "delete", plant.CONTEXT_RESOURCE] and self.context_stuck:
             return done(1, stderr="error: timed out waiting for the condition on configconnectorcontexts/x")
@@ -473,6 +477,23 @@ def test_a_stuck_context_loses_the_operators_finalizer_after_the_node_pool_is_go
     assert ["kubectl", "wait", "--for=delete", "namespace/eval-kcc-stalled", f"--timeout={plant.NAMESPACE_WAIT_S}s"] in cluster.calls
     err = capsys.readouterr().err
     assert "WARNING" in err and "edgenetworknetworks" in err
+
+
+def test_a_failed_finalizer_patch_is_recorded_and_the_namespace_delete_still_runs():
+    """Review finding: a failed patch stopped the teardown before the
+    namespace delete. A failed `test` op is an error that the teardown
+    reports after it deletes the namespace and waits; an object that went
+    away is not an error."""
+    wait = ["kubectl", "wait", "--for=delete", "namespace/eval-kcc-stalled", f"--timeout={plant.NAMESPACE_WAIT_S}s"]
+    failed = 'The request is invalid: the server rejected our request due to an error in our request: "test" operation failed'
+    for stderr, ok in ((failed, False), ('Error from server (NotFound): rolebindings "x" not found', True)):
+        cluster = Cluster(namespace_owner="kube-agents-bench", mode="namespaced", context_stuck=True, finalized=finalized_objects(),
+                          patch_errors={"cnrm-admin-binding-eval-kcc-stalled": stderr})
+        assert new_plant(cluster, Forge()).teardown() is ok
+        # The patch after the failed one still ran, and so did the namespace delete and the wait.
+        assert [patch[3] for patch in cluster.patched][-1] == "cnrm-manager-ns-binding-eval-kcc-stalled"
+        assert DELETE_NAMESPACE in cluster.calls
+        assert wait in cluster.calls
 
 
 def test_no_finalizer_is_removed_while_a_config_connector_object_remains():

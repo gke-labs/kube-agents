@@ -630,15 +630,19 @@ class Plant:
             return ""
         return "; ".join(str(e) for e in errors)
 
-    def strip_operator_finalizer(self) -> list[str]:
+    def strip_operator_finalizer(self) -> tuple[list[str], list[str]]:
         """Remove `OPERATOR_FINALIZER` from each object in the stack's
-        namespace that carries it; the objects changed.
+        namespace that carries it; the objects changed, and the errors.
 
         Every read and patch names the namespace with `-n`, so nothing outside
         it changes. A JSON patch `test` op guards each removal, so a list that
-        changed since the read is not cut at the wrong place.
+        changed since the read is not cut at the wrong place. A patch that
+        fails is recorded and the next object is tried, as `delete_object`
+        does: an object that went away (NotFound) is not an error, and a
+        failed `test` op is.
         """
         changed: list[str] = []
+        errors: list[str] = []
         namespace = self.settings.namespace
         for resource in FINALIZER_RESOURCES:
             result = self.run(["kubectl", "get", resource, "-n", namespace, "-o", "json"], env=self.env)
@@ -655,25 +659,34 @@ class Plant:
                     {"op": "remove", "path": f"/metadata/finalizers/{index}"},
                 ]
                 name = str(meta.get("name") or "")
-                self.must(["kubectl", "patch", resource, name, "-n", namespace, "--type=json", "-p", json.dumps(patch)])
-                changed.append(f"{resource}/{name}")
-        return changed
+                result = self.run(
+                    ["kubectl", "patch", resource, name, "-n", namespace, "--type=json", "-p", json.dumps(patch)], env=self.env
+                )
+                if result.returncode == 0:
+                    changed.append(f"{resource}/{name}")
+                elif not any(marker in result.stderr for marker in NOT_FOUND_MARKERS):
+                    error = f"the finalizer patch of {resource}/{name} exited {result.returncode}: {result.stderr.strip()}"
+                    log(f"{error}; the teardown goes on")
+                    errors.append(error)
+        return changed, errors
 
-    def release_stuck_context(self) -> str:
+    def release_stuck_context(self) -> tuple[str, bool]:
         """After a context delete that ran out of time: remove the operator's
-        finalizer when no Config Connector object is left; the error, or `""`."""
+        finalizer when no Config Connector object is left. Returns the error,
+        or `""`, and whether the removal ran, so the caller waits for the
+        namespace also when one patch failed."""
         left = self.kcc_objects_left()
         if left is None:
-            return "cannot read the Config Connector objects in the namespace, so no finalizer is removed"
+            return "cannot read the Config Connector objects in the namespace, so no finalizer is removed", False
         if left:
-            return f"{left} Config Connector object(s) are still in the namespace, so no finalizer is removed"
+            return f"{left} Config Connector object(s) are still in the namespace, so no finalizer is removed", False
         reason = self.operator_error() or "no error on the context's status"
-        changed = self.strip_operator_finalizer()
+        changed, errors = self.strip_operator_finalizer()
         log(
             f"WARNING: the Config Connector operator did not finish the {CONTEXT_KIND} delete ({reason}); "
             f"removed {OPERATOR_FINALIZER} from {', '.join(changed) or 'nothing'} in {self.settings.namespace}"
         )
-        return ""
+        return "; ".join(errors), True
 
     def delete_kubernetes(self) -> None:
         """Delete the node pool, then the context, then the namespace.
@@ -690,9 +703,8 @@ class Plant:
         errors = [pool_error, context_error]
         released = False
         if context_timed_out:
-            release_error = self.release_stuck_context()
+            release_error, released = self.release_stuck_context()
             errors.append(release_error)
-            released = not release_error
         self.must(["kubectl", "delete", "namespace", self.settings.namespace, "--ignore-not-found", "--wait=false"])
         if released:
             waited = self.run(
