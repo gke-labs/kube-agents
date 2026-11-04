@@ -32,6 +32,32 @@ os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 # no test here reaches the network or depends on the host's broker.
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
+
+# The collector pages its kinds through `kubectl get --raw`; the fakes below
+# still answer the one-shot dump, and the adapter feeds the real paging from
+# it (test_collector_run.paged_dump_over). The tests that assert the paged
+# argv itself pass a `--raw`-aware fake and bypass this by patching it back.
+_PAGED_DUMP = patch.object(fs, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
@@ -1531,6 +1557,58 @@ class CollectClusterTest(unittest.TestCase):
         "ERROR: (gcloud.container.node-pools.list) ResponseError: code=400, "
         "message=Autopilot node pools cannot be accessed or modified."
     )
+
+    def test_the_cluster_is_read_as_one_crd_read_and_four_paged_kinds(self):
+        """The real paging, not the adapter: ComputeClass keeps its one-shot
+        read (a CRD outside the paged collections), the four built-in kinds
+        are paged `kubectl get --raw` reads, and a cut page fails the cluster
+        closed with the shim's marker in the error."""
+        issued = []
+
+        def run(argv, cut=False, **kwargs):
+            issued.append(argv)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:3] == ["kubectl", "get", "computeclasses"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                return run_of(0, json.dumps({"metadata": {}, "items": []}))
+            if argv[:2] == ["kubectl", "get"]:
+                raise AssertionError(f"a one-shot dump was issued: {argv}")
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp, patch.object(fs, "KUBECONFIG_DIR", Path(tmp)), patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry = fs.collect_cluster(self.CLUSTER, run=run)
+        self.assertEqual(entry["outcome"], "collected", entry.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(
+            ["/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/statefulsets?limit=500",
+             "/apis/storage.k8s.io/v1/storageclasses?limit=500", "/api/v1/nodes?limit=100"],
+            raw,
+        )
+        self.assertEqual(1, len([a for a in issued if a[:3] == ["kubectl", "get", "computeclasses"]]))
+        command = next(c["command"] for c in entry["commands"] if c["check"] == "dangling-compute-class")
+        kubeconfig = next(part for part in command.split() if part.startswith("KUBECONFIG=")).removeprefix("KUBECONFIG=")
+        self.assertEqual(command.split("; ")[0], f"KUBECONFIG={kubeconfig} kubectl get computeclasses -A -o json")
+        # The one-shot read under the kubeconfig, then the paged chain with the
+        # kubeconfig exported once for every read in it: the line is recorded
+        # to be pasted unchanged.
+        self.assertEqual(command, f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}")
+        self.assertIn(f"; ( export KUBECONFIG={kubeconfig}; kubectl get --raw ", command)
+        self.assertEqual(2, command.count("KUBECONFIG="), command)
+
+        def cut_run(argv, **kwargs):
+            if argv[:3] == ["kubectl", "get", "--raw"] and argv[3].startswith("/api/v1/nodes"):
+                return run_of(74, '{"items": [{"metadata": {"name": "n', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)")
+            return run(argv, **kwargs)
+
+        with TemporaryDirectory() as tmp, patch.object(fs, "KUBECONFIG_DIR", Path(tmp)), patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry = fs.collect_cluster(self.CLUSTER, run=cut_run)
+        self.assertEqual(entry["outcome"], fs.GATE_FAILED_OUTCOME)
+        self.assertIn("rc=74", entry["error"])
+        self.assertIn("credential proxy output truncated", entry["error"])
 
     def run_with(
         self,
@@ -3665,6 +3743,19 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
+
+
+class RecordedChainUnderTheCommandCapTest(unittest.TestCase):
+    def test_the_recorded_chain_stays_under_the_published_command_cap(self):
+        """The compute-class read and the paged chain are recorded as one line and copied
+        verbatim into `checks_run`; held under `MAX_COMMAND_CHARS` at the longest kubeconfig
+        path the platform profile makes."""
+        with patch.object(fs, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fs.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        text = f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}"
+        self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+        self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "dangling-compute-class"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,8 @@ import contextlib
 from datetime import datetime, timedelta, timezone
 import io
 from pathlib import Path
+import random
+import subprocess
 import sys
 import threading
 import unittest
@@ -23,6 +25,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 import audit_certificates  # noqa: E402
 import audit_networking  # noqa: E402
 import audit_storage  # noqa: E402
+import credential_proxy_client  # noqa: E402
 
 GATEWAYS_CRD = "gateways.gateway.networking.k8s.io"
 HTTPROUTES_CRD = "httproutes.gateway.networking.k8s.io"
@@ -1494,6 +1497,19 @@ class TestAuditStorage(unittest.TestCase):
         self.assertNotEqual(t_code, 0)
         self.assertIn("credential proxy output truncated", t_data["error"])
 
+        # The shim now exits 74 on a cut reply, with the counts after the
+        # marker; the read fails closed the same way, and the error still
+        # names the cut rather than a bare exit code.
+        cut_proc = mock.Mock(
+            returncode=74,
+            stdout="PODS\nprod\tweb-0\tPending\tpvc-a\n",
+            stderr="credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)",
+        )
+        with mock.patch.object(audit_storage.subprocess, "run", return_value=cut_proc):
+            c_code, c_data = self._real_run_kubectl_pods({})
+        self.assertEqual(c_code, 74)
+        self.assertIn("credential proxy output truncated", c_data["error"])
+
         warn_proc = mock.Mock(
             returncode=0,
             stdout="PODS\nprod\tweb-0\tPending\tpvc-a\n",
@@ -2474,6 +2490,56 @@ class TestCollectorOutputSanitization(unittest.TestCase):
                 out,
                 "CLEAN_AUDIT_STOP: NO — Inspect degraded storage resources below.",
             )
+
+
+class TestTheShimIsToldItsRetryDeadline(unittest.TestCase):
+    """Each collector caps one brokered kubectl at one admission wait plus one run, so it tells
+    the shim a retry deadline under which no retry fits, the way cluster_preflight.sh does."""
+
+    COLLECTORS = (
+        (audit_storage, audit_storage.audit_storage),
+        (audit_networking, audit_networking.audit_networking),
+        (audit_certificates, audit_certificates.audit_certificates),
+    )
+
+    def test_the_variable_is_the_shims_and_the_deadline_is_the_cap_less_the_margin_and_the_run_bound(self):
+        for module, _ in self.COLLECTORS:
+            with self.subTest(module=module.__name__):
+                self.assertEqual(credential_proxy_client.RETRY_DEADLINE_ENV, module.SHIM_RETRY_DEADLINE_ENV)
+                self.assertEqual(credential_proxy_client.BROKER_ADMISSION_WAIT_SECONDS, module.BROKER_ADMISSION_WAIT_SECONDS)
+                self.assertEqual(
+                    module.KUBECTL_TIMEOUT_SECONDS - module.KUBECTL_CAP_MARGIN_SECONDS - module.BROKER_KUBECTL_RUN_SECONDS,
+                    module.SHIM_RETRY_DEADLINE_SECONDS,
+                )
+
+    def test_under_that_deadline_the_shim_makes_no_retry(self):
+        # The shortest retry, the jitter floor on the first backoff base plus an
+        # admission wait, already reaches the deadline (test_cluster_preflight.py
+        # holds the same of the preflight's).
+        client = credential_proxy_client
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        for module, _ in self.COLLECTORS:
+            with self.subTest(module=module.__name__):
+                deadline = float(module.SHIM_RETRY_DEADLINE_SECONDS)
+                self.assertGreater(shortest, deadline)
+                self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
+
+    def test_every_kubectl_the_collectors_run_carries_the_deadline(self):
+        for module, collect in self.COLLECTORS:
+            envs = []
+
+            def fake_run(cmd, **kwargs):
+                envs.append(kwargs["env"])
+                return subprocess.CompletedProcess(cmd, 1, "", "kubectl exit 1 (scripted)")
+
+            with self.subTest(module=module.__name__), \
+                    mock.patch.object(module.subprocess, "run", side_effect=fake_run), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                collect()
+                self.assertTrue(envs, "no kubectl was run")
+                for env in envs:
+                    self.assertEqual(str(module.SHIM_RETRY_DEADLINE_SECONDS), env[module.SHIM_RETRY_DEADLINE_ENV])
+                    self.assertTrue(env["PATH"].startswith(module.CREDENTIAL_PROXY_BIN + ":"))
 
 
 if __name__ == "__main__":

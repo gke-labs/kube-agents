@@ -143,6 +143,8 @@ check_base_image() {
 
 check_base_image envoy deploy/docker/Dockerfile ENVOY_IMAGE ENVOY_VERSION
 check_base_image golang deploy/docker/Dockerfile GOLANG_IMAGE GOLANG_VERSION
+check_base_image golang deploy/kube-proxy/Dockerfile GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static deploy/kube-proxy/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
@@ -299,6 +301,7 @@ check_go_directive() {
 }
 
 check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
+check_go_directive deploy/kube-proxy/Dockerfile GOLANG_VERSION k8s-api-proxy/go.mod
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
 check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
@@ -397,6 +400,7 @@ check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platform
 check_compiled_image_name a2a-dispatcher k8s-operator/internal/controller/platformagent_a2a_dispatcher.go a2aDispatcherImageName
 check_compiled_image_name a2a-console k8s-operator/internal/controller/platformagent_a2a_console.go a2aConsoleImageName
 check_compiled_image_name hermes-bridge k8s-operator/internal/controller/platformagent_a2a_bridge.go a2aBridgeImageName
+check_compiled_image_name kube-proxy k8s-operator/internal/controller/kube_proxy_manifests.go kubeProxyRepositoryName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------

@@ -5172,6 +5172,24 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// changes which cards the front door files and nothing else: the pull
 		// request still goes through submit-suggestion and a human merges it.
 		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
+
+		// How many Cluster Agent profiles one reconcile run scaffolds before it
+		// leaves the rest for the next run (MAX_CREATES_PER_RUN_ENV in
+		// cluster_agent_reconcile.py). Parsed as a whole number; anything but a
+		// positive integer reads as the default, so an arbitrary value bounds
+		// how many profiles a run creates and reaches nothing else.
+		"BOOTSTRAP_MAX_CREATES_PER_TICK": {},
+
+		// The group size above which the front door's injected roster counts
+		// a shared-role group (the Cluster Agents) by project and location
+		// instead of naming each (agents/chat/scripts/agent_roster.py,
+		// summary_threshold; default 20). Parsed as a whole number of zero
+		// or more, and any other value means the default, so it changes how
+		// many names one block of prompt text carries and reaches nothing
+		// else: the names it withholds come back through the same module's
+		// list_agents filter, and no value adds an agent, a path or a
+		// destination.
+		"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

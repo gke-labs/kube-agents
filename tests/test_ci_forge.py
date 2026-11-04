@@ -24,6 +24,10 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 HACK = REPO_ROOT / "hack"
 PROJECT = "kube-agents-evals-2"
 FORGE_IP = "10.128.0.251"
+# How long the kubectl stub holds the keeper's `wait` back before recording it:
+# the keeper issues `run` and `wait` as two processes, so the call log can be
+# read between them, and the keeper test keeps that window open on purpose.
+KEEPER_WAIT_DELAY_SECONDS = "0.3"
 
 # gcloud: records argv; answers the reads `up` makes from a per-test state
 # directory (what exists is a file in GCLOUD_STATE), and the serial console from
@@ -76,7 +80,7 @@ FORGE_KNOBS_ABSENT = (
     "JOB_NAME", "EVAL_GHES_HOST", "EVAL_GITLAB_CE_HOST", "FORGE_SKIP_CLUSTER_CHECK", "FORGE_VM_ZONE", "AR_REPO",
     "FORGE_IMAGE_TAG", "GHES_READY_TIMEOUT_SECONDS", "GITLAB_CE_READY_TIMEOUT_SECONDS", "FORGE_BUILD_TIMEOUT_SECONDS",
     "FORGE_BUILD_CLIENT_BOUND_SECONDS", "FORGE_READY_POLL_SECONDS", "FORGE_TUNNEL_HOSTS_FILE",
-    "FORGE_TUNNEL_POLL_SECONDS", "KUBECTL_CODE", "KUBECTL_EXIT", "CURL_CODE", "MAKE_CERTS_LEAF_ONLY",
+    "FORGE_TUNNEL_POLL_SECONDS", "KUBECTL_CODE", "KUBECTL_EXIT", "CURL_CODE", "MAKE_CERTS_LEAF_ONLY", "STUB_WAIT_DELAY_SECONDS",
 )
 
 # kubectl: the in-cluster check answers the code the test puts in KUBECTL_CODE
@@ -86,6 +90,9 @@ FORGE_KNOBS_ABSENT = (
 STUB_KUBECTL = textwrap.dedent(
     """\
     #!/usr/bin/env bash
+    # STUB_WAIT_DELAY_SECONDS: the keeper's `wait` is recorded that long after
+    # its `run` returned, as on a busy runner.
+    case "$*" in "--context "*" wait "*) [ -z "${STUB_WAIT_DELAY_SECONDS:-}" ] || sleep "${STUB_WAIT_DELAY_SECONDS}" ;; esac
     printf 'kubectl %s\\n' "$*" >> "${STUB_CALLS}"
     case "$*" in
       "--context "*" port-forward "*)
@@ -552,16 +559,17 @@ class ForgeScriptTest(unittest.TestCase):
     def test_the_keeper_re_creates_a_relay_pod_that_is_gone(self):
         self.provision()
         marker = self.dir / "relay-gone"
-        self.assertEqual(self.run_forge("up", forge="gitlab-ce", STUB_RELAY_GONE=str(marker)).returncode, 0)
-        recreated = []
-        for _ in range(100):  # the keeper's restart pause is 2 s
+        self.assertEqual(self.run_forge("up", forge="gitlab-ce", STUB_RELAY_GONE=str(marker), STUB_WAIT_DELAY_SECONDS=KEEPER_WAIT_DELAY_SECONDS).returncode, 0)
+        recreated, waited = [], []
+        for _ in range(100):  # the keeper's restart pause is 2 s, and its `wait` follows its `run` as a second process
             recreated = self.calls_of("kubectl --context host-ctx run forge-relay ")
-            if recreated:
+            waited = self.calls_of("kubectl --context host-ctx wait --for=condition=Ready pod/forge-relay")
+            if recreated and waited:
                 break
             time.sleep(0.1)
         self.assertTrue(recreated, "a relay the drain took is re-created, in the recorded context")
         self.assertIn("TCP-LISTEN:8443,fork,reuseaddr", recreated[0])
-        self.assertTrue(self.calls_of("kubectl --context host-ctx wait --for=condition=Ready pod/forge-relay"))
+        self.assertTrue(waited, "the re-created relay is waited for, in the recorded context")
         self.assertEqual(self.run_forge("down", forge="gitlab-ce").returncode, 0)
 
     def test_down_on_ghes_deletes_a_relay_pod_a_dead_gitlab_ce_run_left(self):
