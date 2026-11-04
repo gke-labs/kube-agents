@@ -1,6 +1,6 @@
 # Human interaction: chat sessions and the people behind them
 
-**Status:** proposed, 2026-10-30. Workstream 4 of the telemetry epic that asked five product
+**Status:** implementing, 2026-11-02: the first pull request (2.1, the bucket and the series) is on main; the operator's people reading, the summary rows and the five answers (2.4) follow. Proposed 2026-10-30. Workstream 4 of the telemetry epic that asked five product
 questions of `status.usage` (its question: how often do customers interact with kube-agents).
 Builds on [`usage-counters-producer.md`](usage-counters-producer.md) (the counters and the poller)
 and [`proposal-outcome-readings.md`](proposal-outcome-readings.md) (the readings slot: a gauge the
@@ -191,7 +191,7 @@ names exists on `main`:
 | How many human touches per PR        | `proposalHumanTouches` over `proposalsAuthored`; the per-proposal distribution is `kubeagents_vcs_proposal_touches_per_proposal` in Prometheus                                                                                         |
 | How often do customers interact      | `chatSessionsTotal` and `chatMessagesInboundTotal` for how much (console conversations included), `peopleSeen7d` and `peopleSeen30d` for how many people (the console's one shared principal excluded), `lastHumanActiveTime` for when |
 
-The breakdown of proposals by what started them (Workstream 3) is not part of this design. The sixth
+The breakdown of proposals by what started them (Workstream 3) is [`proposal-origin.md`](proposal-origin.md) (proposed); its one-line answer joins this list when it lands. The sixth
 question the epic added later, which provider and model serve the install, is
 [`install-model-reading.md`](install-model-reading.md)'s; its answer joins this list when that
 design lands.

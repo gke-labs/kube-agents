@@ -90,11 +90,13 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Collection
+from contextlib import ExitStack
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import sandbox_exec  # noqa: E402
+from profile_scaffold import profile_lock  # noqa: E402
 
 # The statuses Hermes itself treats as terminal, from the child query in
 # ``_cleanup_workspace``. Used for both halves of the decision: a task is a
@@ -193,6 +195,11 @@ FIND_FORMAT = r"%f\t%T@\t%s\t%y\0"
 # and the install this was written against had about 150 probe scripts in one
 # home.
 INVENTORY_LIMIT = 40
+# Past INVENTORY_LIMIT, the most names one batched rm takes when each holds its
+# profile lock open until the rm: one file descriptor each, so a worker that
+# planted thousands of homes cannot exhaust the descriptors the rm's own
+# subprocess needs.
+HELD_BATCH_MAX = 200
 
 # Where the job's own record goes: `<agent home>/logs/`, which the gateway
 # pod's fluent-bit sidecar tails and ships to Cloud Logging.  Not stderr: the
@@ -337,7 +344,8 @@ def _remove_remote(root: Path, names: list[str], sweep: Sweep) -> None:
 
 
 def _remove_remote_batched(root: Path, names: list[str], sweep: Sweep,
-                           keep: Callable[[str], bool] | None = None) -> tuple[list[str], list[str]]:
+                           keep: Callable[[str], bool] | None = None,
+                           hold: Callable[[str], object] | None = None) -> tuple[list[str], list[str]]:
     """`_remove_remote` one name at a time up to INVENTORY_LIMIT, then the rest in one call.
 
     One rm per name, so a name the worker made unremovable doesn't hide the
@@ -346,25 +354,34 @@ def _remove_remote_batched(root: Path, names: list[str], sweep: Sweep,
     each.  *keep*, when given, is asked about each name right before its
     batch's rm, so a caller's last-moment check is as fresh as the rm it
     guards rather than one check for the whole run.  A name it refuses is
-    neither removed nor failed.  Returns (removed, failed); the names are
-    left out of ``sweep.remote_removed`` for the caller to account for.
+    neither removed nor failed.  *hold*, when given, returns a context
+    manager for each name that yields whether the name may be touched (its
+    profile lock): it is entered before *keep* is asked and left after the
+    batch's rm, and a name it refuses is skipped like one *keep* refuses.
+    Returns (removed, failed); the names are left out of
+    ``sweep.remote_removed`` for the caller to account for.
     """
     batches = [[name] for name in names[:INVENTORY_LIMIT]]
-    if names[INVENTORY_LIMIT:]:
-        batches.append(names[INVENTORY_LIMIT:])
+    rest = names[INVENTORY_LIMIT:]
+    # Held names keep a descriptor each until their rm, so their tail is chunked.
+    step = HELD_BATCH_MAX if hold is not None else len(rest) or 1
+    batches.extend(rest[i:i + step] for i in range(0, len(rest), step))
     removed_all: list[str] = []
     failed_all: list[str] = []
     for batch in batches:
-        if keep is not None:
-            batch = [name for name in batch if keep(name)]
+        with ExitStack() as held:
+            if hold is not None:
+                batch = [name for name in batch if held.enter_context(hold(name))]
+            if keep is not None:
+                batch = [name for name in batch if keep(name)]
             if not batch:
                 continue
-        before = len(sweep.remote_removed)
-        _remove_remote(root, batch, sweep)
-        removed = sweep.remote_removed[before:]
-        del sweep.remote_removed[before:]
-        removed_all.extend(removed)
-        failed_all.extend(name for name in batch if name not in removed)
+            before = len(sweep.remote_removed)
+            _remove_remote(root, batch, sweep)
+            removed = sweep.remote_removed[before:]
+            del sweep.remote_removed[before:]
+            removed_all.extend(removed)
+            failed_all.extend(name for name in batch if name not in removed)
     return removed_all, failed_all
 
 
@@ -394,6 +411,15 @@ def agent_home() -> Path:
     Not ``HERMES_HOME``, which names the platform profile's home.
     """
     return Path(os.environ.get("PLATFORM_AGENT_HOME") or "/opt/data")
+
+
+def stale_home_lock_root() -> Path:
+    """The data root the stale-home sweep takes profile locks under (#4389).
+
+    `agent_home()`, never HERMES_HOME: under this script's roster HERMES_HOME is
+    profiles/platform, and a lock there is not the one create_profile takes.
+    """
+    return agent_home()
 
 
 def sandbox_root() -> Path:
@@ -571,7 +597,10 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
     ``rm``: the inventory's per-home listings and the earlier ``rm`` calls sit
     between the first pod read and a given home's turn, and a cluster
     re-scaffolded in that window under a name whose old sandbox home is still
-    stale would otherwise lose the home it just got.
+    stale would otherwise lose the home it just got.  That recheck and the
+    ``rm`` both run under the name's profile lock (#4389), the one
+    create_profile holds, so a scaffold cannot start between them either; a
+    held lock leaves the home for the next run.
     """
     names = [row[0] for row in inv.stale_homes if _is_stale_cluster_home(row[0])]
     if not names or inv.remote_profiles is None or inv.agent_profiles_path is None:
@@ -595,8 +624,18 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
         )
         return
     pod_profiles = inv.agent_profiles_path
+    lock_root = stale_home_lock_root()
+    # Each name under its profile lock, the one create_profile and delete_profile
+    # hold, taken without blocking: a held lock is a scaffold or delete of that
+    # name running now, so the home is left for the next run. Held from the
+    # recheck through the rm, so a scaffold cannot land in between (#4389).
+    # A lock that cannot be opened leaves its home too, and says so once.
+    lock_errors: list[str] = []
     removed, failed = _remove_remote_batched(
-        remote_profiles, names, sweep, keep=lambda name: not _pod_home_present(pod_profiles / name))
+        remote_profiles, names, sweep,
+        keep=lambda name: not _pod_home_present(pod_profiles / name),
+        hold=lambda name: profile_lock(lock_root, name, blocking=False,
+                                       on_error=lambda e, n=name: lock_errors.append(f"{n}: {e}")))
     sweep.stale_homes_removed.extend(removed)
     if failed:
         # One chat bullet for the run that names the homes, with the rm's own
@@ -608,6 +647,13 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
         more = f" and {len(failed) - INVENTORY_LIMIT} more" if len(failed) > INVENTORY_LIMIT else ""
         sweep.warnings.append(
             f"stale sandbox cluster home(s) not removed: {shown}{more}: {detail[:STDERR_EXCERPT_CHARS]}"
+        )
+    # After the rm bullet, which folds every warning appended since first_warning
+    # into itself: this one stands on its own.
+    if lock_errors:
+        sweep.warnings.append(
+            f"could not open the profile lock for {len(lock_errors)} stale sandbox cluster home(s), "
+            f"so they were not removed: {'; '.join(lock_errors)[:STDERR_EXCERPT_CHARS]}"
         )
 
 

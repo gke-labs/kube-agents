@@ -401,9 +401,11 @@ func TestReconcile_HoldsBackTheFieldsTheServedCRDPrunesAndPublishesTheRest(t *te
 	p.noteNewerFieldEcho(ctx, agent, usageCounterChatMessagesInbound, false)
 	p.noteNewerFieldEcho(ctx, agent, usageNewerFieldGauges, false)
 	p.noteNewerFieldEcho(ctx, agent, usageNewerFieldLastHumanActive, false)
+	p.noteNewerFieldEcho(ctx, agent, usageStatusFieldChatSessions, false)
 	// Samples from before the records, as a restart's first pass leaves them.
 	usageMetrics.usage.WithLabelValues(agent.Namespace, agent.Name, usageCounterChatMessagesInbound).Set(0)
 	usageMetrics.usage.WithLabelValues(agent.Namespace, agent.Name, "clustersMonitored").Set(0)
+	usageMetrics.usage.WithLabelValues(agent.Namespace, agent.Name, usageStatusFieldChatSessions).Set(0)
 	usageMetrics.times.WithLabelValues(agent.Namespace, agent.Name, usageNewerFieldLastHumanActive).Set(1)
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -426,7 +428,7 @@ func TestReconcile_HoldsBackTheFieldsTheServedCRDPrunesAndPublishesTheRest(t *te
 			}
 		}
 	}
-	for _, held := range []string{usageCounterChatMessagesInbound, "clustersRegistered", "clustersMonitored", usageNewerFieldLastHumanActive} {
+	for _, held := range []string{usageCounterChatMessagesInbound, "clustersRegistered", "clustersMonitored", usageNewerFieldLastHumanActive, usageStatusFieldChatSessions} {
 		if _, ok := got[held]; ok {
 			t.Errorf("%s has a sample while the served CRD prunes it; a zero here reads as idle", held)
 		}

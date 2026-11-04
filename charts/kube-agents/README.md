@@ -852,6 +852,22 @@ out. Pass it beside your own values with `-f charts/kube-agents/examples/values-
 after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
 [fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
 
+### People seen (`platformAgent.telemetry.peopleSeen`)
+
+`platformAgent.telemetry.peopleSeen` is the CR's `spec.telemetry.peopleSeen`. Under
+`spec.mode: next`, the A2A gateway keeps one hashed key and a last-active time per chat person
+for 30 days, and serves the people seen in the last 7 and 30 days as
+`kubeagents_a2a_gateway_people_seen`. Under
+`today` there is no gateway, so the value has no effect.
+It defaults to `true`, which renders no field, and the CRD default (`true`) applies.
+`false` renders the field: the gateway writes no key, purges the bucket at its next start, and
+serves no sample. Set it with `--set platformAgent.telemetry.peopleSeen=false`, or on an
+`install.sh` install with
+`TF_VAR_extra_helm_values='{platformAgent={telemetry={peopleSeen=false}}}'` in `install.env`.
+The render fails on a live install whose CRD predates `spec.telemetry.peopleSeen`. The
+[PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#spectelemetry)
+is canonical for the behaviour.
+
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,

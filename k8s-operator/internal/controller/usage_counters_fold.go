@@ -86,7 +86,12 @@ const (
 	// counters project to, and the name the Warning for a failed listener
 	// carries. The field is in status.usage's first schema, so it has no
 	// pruning record of its own.
-	usageStatusFieldSessions          = "sessionsTotal"
+	usageStatusFieldSessions = "sessionsTotal"
+	// usageStatusFieldChatSessions is the status field the chat half alone
+	// projects to, and its pruning record's key: it arrived after the first
+	// schema, and usageExportFieldsOfRecord maps a record named for its
+	// field to that field.
+	usageStatusFieldChatSessions      = "chatSessionsTotal"
 	usageCounterToolExecutionsBlocked = "toolExecutionsBlockedTotal"
 	// usagePodEntryKeySeparator joins a pod UID and a counter into an entry
 	// key; a UID carries no slash.
@@ -151,14 +156,15 @@ func usageSessionsTotal(totals map[string]int64) int64 {
 }
 
 // usageFieldFloor is the status floor of the field a counter projects to: the
-// counter's own for every counter but the sessions halves, whose one status
-// value the seed puts in the chat half. The unfolded rule reads this rather
-// than the half's own floor, because a zero floor means none of any sample is
-// in the total, and after a rollback and return the triage half's share of a
-// non-zero status is in the chat half's floor.
+// counter's own for every counter but the sessions halves, whose floor is the
+// two halves' summed floors, sessionsTotal as the seed split it
+// (usageStatusSeed). The unfolded rule reads this rather than the half's own
+// floor, because a zero floor means none of any sample is in the total, and
+// after a rollback and return the triage half's share of a non-zero status
+// may be in the chat half's floor.
 func usageFieldFloor(floors map[string]int64, counter string) int64 {
 	if slices.Contains(usageSessionsCounters, counter) {
-		return floors[usageCounterSessionsChat]
+		return floors[usageCounterSessionsChat] + floors[usageCounterSessionsTriage]
 	}
 	return floors[counter]
 }
@@ -280,9 +286,10 @@ func usageUnfolded(doc *usageDocument, counter string) bool {
 // are baselined at their samples, and only a counter whose field's floor is
 // zero (usageFieldFloor), so that none of any sample can be in the total, is
 // recorded in Unfolded for foldUsage to add whole, on this poll or on the
-// first that reads the pod. The two sessions halves share one field: with a
-// status that carries sessions, neither half is unfolded, since the triage
-// half's share of that status sits in the chat half's floor.
+// first that reads the pod. The two sessions halves share one field, whose
+// floor is the halves' summed floors: with a status that carries sessions,
+// neither half is unfolded, since the triage half's share of that status sits
+// in the chat half's floor, or, under a split seed, in the triage half's own.
 // A retired counter (usageRetiredCounters) loses its total, its pod entries
 // and its unfolded mark, the same at either version, so the layout keeps its
 // version: dropping is idempotent, and every other counter keeps its baseline

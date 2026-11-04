@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -67,6 +68,12 @@ const (
 	// chat_metrics plugin serve it (docs/designs/usage-counters-producer.md,
 	// "Resets"). Unprefixed: it is the process's, not the gateway's.
 	processStartTimeName = "process_start_time_seconds"
+	// peopleSeenName is the gauge of distinct chat people seen in each
+	// window (people.go); it serves no sample until the people map holds
+	// the bucket.
+	peopleSeenName = "people_seen"
+	// peopleSeenHelp is peopleSeenName's help text.
+	peopleSeenHelp = "Distinct people whose last verified chat turn, within an hour, is inside the window."
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
@@ -76,6 +83,7 @@ const (
 	labelOutcome  = "outcome"
 	labelPlatform = "platform"
 	labelRating   = "rating"
+	labelWindow   = "window"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
 	// for the ones they share, so one series name reads the same on either
@@ -85,6 +93,9 @@ const (
 	platformSlack      = "slack"
 	platformDiscord    = "discord"
 	platformConsole    = "console"
+	// The window label's values: peopleWindowShort and peopleWindowLong.
+	peopleWindowShortLabel = "7d"
+	peopleWindowLongLabel  = "30d"
 
 	// metricsLabelOther is the bucket for a value outside a closed list.
 	// observeTaskTerminal sees only the four final states and the four
@@ -180,6 +191,39 @@ type Metrics struct {
 	// processStart is processStartTimeName, set once in NewMetrics and constant
 	// for the life of the process by construction.
 	processStart prometheus.Gauge
+	// peopleSource is the people desk's count, set once the count is on;
+	// unset, the people gauge serves no sample.
+	peopleSource atomic.Pointer[peopleCount]
+}
+
+// peopleCount reports the distinct people seen in the short and long windows,
+// on the source's own clock, and whether the count holds the bucket (ok).
+type peopleCount func() (short, long int, ok bool)
+
+// peopleCollector serves peopleSeenName from the Metrics' people source: two
+// samples, one per window, while the source reports ok, and none otherwise.
+type peopleCollector struct {
+	m    *Metrics
+	desc *prometheus.Desc
+}
+
+// Describe sends the people gauge's one Desc.
+func (c *peopleCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.desc
+}
+
+// Collect emits the two window samples when a source is set and reports ok.
+func (c *peopleCollector) Collect(ch chan<- prometheus.Metric) {
+	fn := c.m.peopleSource.Load()
+	if fn == nil {
+		return
+	}
+	short, long, ok := (*fn)()
+	if !ok {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, float64(short), peopleWindowShortLabel)
+	ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, float64(long), peopleWindowLongLabel)
 }
 
 // NewMetrics builds the counters on a fresh registry.
@@ -240,7 +284,11 @@ func NewMetrics() *Metrics {
 		}),
 	}
 	m.processStart.Set(float64(time.Now().UnixNano()) / float64(time.Second))
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.sessions, m.processStart)
+	people := &peopleCollector{
+		m:    m,
+		desc: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, peopleSeenName), peopleSeenHelp, []string{labelWindow}, nil),
+	}
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.sessions, m.processStart, people)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}
@@ -260,6 +308,14 @@ func NewMetrics() *Metrics {
 		m.answerFeedback.WithLabelValues(platformSlack, rating)
 	}
 	return m
+}
+
+// setPeopleSource makes fn the people gauge's source.
+func (m *Metrics) setPeopleSource(fn peopleCount) {
+	if m == nil {
+		return
+	}
+	m.peopleSource.Store(&fn)
 }
 
 // Handler serves the registry in the Prometheus text format.

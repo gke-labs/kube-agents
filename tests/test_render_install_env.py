@@ -365,6 +365,23 @@ class RenderingTest(unittest.TestCase):
         self.assertEqual(rendered["ENABLE_STOCKOUT_INVESTIGATOR"], "false")
         self.assertEqual(rendered["WEB_CONSOLE_ENABLED"], "true")
 
+    def test_helm_upgrade_install_is_rendered_when_set_and_omitted_when_not(self):
+        """Opt-in per environment (#4108): unset leaves the key out, so the
+        installer's default (false) answers, and set reaches install.env."""
+        rc, log, text = render(dict(_COORDS))
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("HELM_UPGRADE_INSTALL", parse(text))
+        rc, log, text = render({**_COORDS, "HELM_UPGRADE_INSTALL": "true"})
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(parse(text)["HELM_UPGRADE_INSTALL"], "true")
+
+    def test_helm_upgrade_install_is_not_required_under_strict(self):
+        """Absent keeps today's behaviour and destroys nothing, so a strict
+        render must not ask for it."""
+        rc, log, _ = render({**_COORDS, **_STRICT_OK}, strict=True)
+        self.assertEqual(rc, 0, log)
+        self.assertNotIn("HELM_UPGRADE_INSTALL", log)
+
     def test_the_github_side_names_are_translated_to_installer_names(self):
         rc, log, text = render(dict(_COORDS))
         self.assertEqual(rc, 0, log)
