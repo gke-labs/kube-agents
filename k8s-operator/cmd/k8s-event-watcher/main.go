@@ -1253,10 +1253,15 @@ func realMain(argv []string) error {
 	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.filterThresholds())
 	// A malformed list fails open, as the entrypoint's tunables do: stopping
 	// here would end incident detection for every cluster to silence a few.
-	if filterCfg.alertExclude, err = parseAlertExclude(f.alertExclude); err != nil {
+	// Assigned only on success, so a parse error can never leave a partial
+	// list in force while the log says none is.
+	rules, err := parseAlertExclude(f.alertExclude)
+	switch {
+	case err != nil:
 		log.Printf("k8s-event-watcher: ALERT %v — running with no alert-exclude rules, so every event they would match opens an incident", err)
-	} else if n := len(filterCfg.alertExclude); n > 0 {
-		log.Printf("k8s-event-watcher: %d alert-exclude rules; events they match open no incident and count as gate=%s", n, gateAlertExcluded)
+	case len(rules) > 0:
+		filterCfg.alertExclude = rules
+		log.Printf("k8s-event-watcher: %d alert-exclude rules; events they match open no incident and count as gate=%s", len(rules), gateAlertExcluded)
 	}
 	filter := newFilter(filterCfg)
 

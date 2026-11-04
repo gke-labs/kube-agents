@@ -39,9 +39,9 @@ const alertExcludeNameWildcard = "*"
 type alertExcludeRule struct {
 	Cluster   *alertExcludeCluster `json:"cluster,omitempty"`
 	Namespace string               `json:"namespace,omitempty"`
-	// Reason matches the event's reason or its canonical reason, so
-	// CrashLoopBackOff also matches kubelet's Reason=BackOff crash-loop
-	// events (canonicalizeReason).
+	// Reason matches the event's reason or its canonical reason, without
+	// regard to case, as Kind does: CrashLoopBackOff also matches kubelet's
+	// Reason=BackOff crash-loop events (canonicalizeReason).
 	Reason string `json:"reason,omitempty"`
 	// Kind is the involved object's kind, matched without regard to case,
 	// as workloadOf does.
@@ -105,7 +105,7 @@ func (r alertExcludeRule) matches(ev TriageEvent) bool {
 	if r.Namespace != "" && r.Namespace != ev.Namespace {
 		return false
 	}
-	if r.Reason != "" && r.Reason != ev.Key.Reason && r.Reason != canonicalizeReason(ev.Key.Reason, ev.Message) {
+	if r.Reason != "" && !strings.EqualFold(r.Reason, ev.Key.Reason) && !strings.EqualFold(r.Reason, canonicalizeReason(ev.Key.Reason, ev.Message)) {
 		return false
 	}
 	if r.Kind != "" && !strings.EqualFold(r.Kind, ev.KindOfObject) {

@@ -64,9 +64,14 @@ func TestParseAlertExcludeRefuses(t *testing.T) {
 		{"text after the list", `[{"namespace": "a"}] [{"namespace": "b"}]`, "text follows the list"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := parseAlertExclude(tc.raw)
+			rules, err := parseAlertExclude(tc.raw)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("parseAlertExclude(%s) err = %v; want it to contain %q", tc.raw, err, tc.want)
+			}
+			// No rule of a refused list may be returned: the caller runs with
+			// none, and a partial list could keep the very rule refused.
+			if len(rules) != 0 {
+				t.Errorf("parseAlertExclude(%s) returned %d rules with its error; want none", tc.raw, len(rules))
 			}
 		})
 	}
@@ -97,6 +102,8 @@ func TestAlertExcludeRuleMatches(t *testing.T) {
 		{"the wire reason", alertExcludeRule{Reason: "BackOff"}, ev, true},
 		{"the canonical reason", alertExcludeRule{Reason: "CrashLoopBackOff"}, ev, true},
 		{"another reason", alertExcludeRule{Reason: "FailedScheduling"}, ev, false},
+		{"the wire reason in another case", alertExcludeRule{Reason: "backoff"}, ev, true},
+		{"the canonical reason in another case", alertExcludeRule{Reason: "crashloopbackoff"}, ev, true},
 		{"cluster by name", alertExcludeRule{Cluster: &alertExcludeCluster{ClusterName: "seeded-a"}}, ev, true},
 		{"cluster by all three keys", alertExcludeRule{Cluster: &alertExcludeCluster{ProjectID: "p", Location: "us-central1", ClusterName: "seeded-a"}}, ev, true},
 		{"another cluster", alertExcludeRule{Cluster: &alertExcludeCluster{ClusterName: "seeded-b"}}, ev, false},
