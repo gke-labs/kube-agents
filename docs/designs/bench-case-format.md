@@ -536,15 +536,20 @@ reason and what would close it. An entry there is a debt with a name on it.
 ## Registration
 
 `hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
-job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and only those.
-Cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
+job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and, under
+`EVAL_TIER=certification`, the cases in `hack/eval/certification-cases.txt` alone. A case
+runs because one of those files names it; cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
 the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
 case for months.
 
 A new case lands in the nightly file's sorted section, the last one, at its place in
 case-id order with its reason as the `#` lines directly above its entry (#3495; the roster
-test checks both, so two case pull requests don't edit the same lines). It lands there by
+test checks both, so two case pull requests don't edit the same lines). A case with
+`suite: certification` in its task file is the exception: it registers in
+`hack/eval/certification-cases.txt`, runs only under `EVAL_TIER=certification`, and never
+in the presubmit or nightly files
+([`bench/README.md`](../../bench/README.md#certification-suite)). It lands there by
 decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from

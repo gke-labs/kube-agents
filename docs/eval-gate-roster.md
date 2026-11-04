@@ -20,7 +20,7 @@ verdict in place of a run), `hack/fleet-fixture-state.py` (its report excuses ca
 `scripts/installer/gke_dns_endpoint.sh` (sourced by `ci-env.sh`, under `scripts/installer/OWNERS`)
 ([`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2, "Pinning and baselines").
 Nothing else carries the rule:
-`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
+`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -958,6 +958,25 @@ GHES-only case `ghes-pdb-remediation-pr` (the same task with a writes safeguard 
 appends anyway) stays unregistered, since a nightly registration would run it on the github.com
 nightly as a second copy of `pdb-remediation-pr`; it joins the list when the registration rules
 grow a lane-only seat.
+
+## The certification suite
+
+The certification suite, the cases behind the certified-capabilities page, is the one list
+under `hack/eval/` that is not a view of the catalogue: `hack/eval/certification-cases.txt`
+registers its own cases, each a top-level case under
+`bench/tasks/` with `suite: certification` in its task file, and `EVAL_TIER=certification` in
+`hack/ci-eval-pr.sh` runs that file alone, in `# part N` sections under `EVAL_CERTIFICATION_PART`,
+one Prow periodic per section, rerun from Deck and never on a cron. The script refuses an entry
+that is also in `presubmit-cases.txt` or `nightly-cases.txt`, and `scripts/validate_bench_cases.py`
+refuses a rostered case without the suite line, so a case holds one record on one lane. The roster
+above never reaches it: the blocking roster is a subset of the presubmit, so rung 4 is disarmed on
+the lane by construction and the script exports no roster name there; rungs 1 to 3 red a run like
+every case, as does rung 5 (an `expected_fail: true` case that passes every repetition), and a
+failing certification case is a record for the page rather than a red. The lane appends nothing to
+the evidence store and publishes no dashboard; its record is its logs bucket. A certification case never
+earns a seat here; a capability the presubmit must guard gets a case of its own in the catalogue.
+The file needs the normal approvers, like `nightly-cases.txt`. The rules a certification fixture
+meets are in [`bench/README.md`](../bench/README.md#certification-suite).
 
 ## Demoting a flaky case
 

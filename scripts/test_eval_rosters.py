@@ -45,6 +45,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -52,6 +53,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import eval_rosters
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 
 # The TASKS array's uncommented entries at the split (main at 8263e7fd), in
@@ -398,6 +400,62 @@ class ParserTest(unittest.TestCase):
         self.assertTrue(eval_rosters.presubmit_cases())
         self.assertTrue(eval_rosters.nightly_cases())
         self.assertTrue(eval_rosters.blocking_roster())
+
+
+CERTIFICATION_SUITE_LINE_RE = re.compile(r"^suite:\s*certification\s*$", re.MULTILINE)
+
+
+def cases_without_a_suite_line(roster: pathlib.Path, tasks_dir: pathlib.Path) -> list[str]:
+    """Certification-roster cases whose task file lacks `suite: certification`."""
+    return [
+        case for case in eval_rosters.certification_cases(roster)
+        if not CERTIFICATION_SUITE_LINE_RE.search((tasks_dir / case / "task.yaml").read_text(encoding="utf-8"))
+    ]
+
+
+class CertificationFileTest(unittest.TestCase):
+    """hack/eval/certification-cases.txt: the suite's own lane, in `# part N`
+    sections, disjoint from the presubmit and nightly files."""
+
+    def test_the_parts_parser_reads_the_markers_the_shell_reads(self):
+        text = "# header\n./tasks/a-case/task.yaml\n# part 2\n./tasks/b-case/task.yaml # note\n\n#  part 4\n./tasks/c-case/task.yaml\n# part 3\n"
+        self.assertEqual(eval_rosters.parse_certification_parts(text), {1: ["a-case"], 2: ["b-case"], 4: ["c-case"]})
+        self.assertEqual(eval_rosters.parse_certification_parts("# part 1\n"), {})
+        with self.assertRaises(ValueError):
+            eval_rosters.parse_certification_parts("# part 1\na-case\n")
+
+    def test_a_line_that_is_not_a_marker_to_the_shell_is_a_comment_here_too(self):
+        # The awk twin in hack/ci-eval-pr.sh: `#` then whitespace, `part`, a
+        # number from 1, nothing else, at the start of the line.
+        for not_a_marker in ("#part 2\n", "  # part 2\n", "# part 0\n", "# part 2 # note\n", "# parts 2\n"):
+            with self.subTest(line=not_a_marker):
+                parts = eval_rosters.parse_certification_parts(not_a_marker + "./tasks/a-case/task.yaml\n")
+                self.assertEqual(parts, {1: ["a-case"]})
+
+    def test_the_suite_line_check_runs_over_a_scratch_roster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for case, body in (("with-line", "id: with-line\nsuite: certification\n"), ("without-line", "id: without-line\n")):
+                (root / case).mkdir()
+                (root / case / "task.yaml").write_text(body)
+            roster = root / "certification-cases.txt"
+            roster.write_text("./tasks/with-line/task.yaml\n./tasks/without-line/task.yaml\n")
+            self.assertEqual(cases_without_a_suite_line(roster, root), ["without-line"])
+
+    def test_the_real_file_parses_and_shares_no_case_with_the_other_rosters(self):
+        certification = eval_rosters.certification_cases()
+        self.assertEqual(sorted(certification), sorted(set(certification)), "a case is listed once")
+        shared = set(certification) & (set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()))
+        self.assertEqual(shared, set(), "a certification case runs on its lane only")
+        self.assertEqual(sum(len(v) for v in eval_rosters.certification_parts().values()), len(certification))
+
+    def test_every_certification_case_declares_its_suite(self):
+        self.assertEqual(cases_without_a_suite_line(eval_rosters.CERTIFICATION_CASES_FILE, TASKS_DIR), [])
+
+    def test_the_summary_counts_the_file(self):
+        got = eval_rosters.summary()
+        self.assertEqual(got["certification cases"], len(eval_rosters.certification_cases()))
+        self.assertEqual(got["certification parts"], len(eval_rosters.certification_parts()))
 
 
 class NightlySortedSectionTest(unittest.TestCase):

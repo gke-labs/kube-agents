@@ -66,7 +66,12 @@ YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # runs, what the nightly adds. A case is registered by being in one of them.
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
 NIGHTLY_CASES_FILE = eval_rosters.NIGHTLY_CASES_FILE
-ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE)
+# The certification suite's file: a case there is registered too, on a lane
+# of its own, and its task file must say so with `suite: certification`.
+CERTIFICATION_CASES_FILE = eval_rosters.CERTIFICATION_CASES_FILE
+ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE, CERTIFICATION_CASES_FILE)
+SUITE_KEY = "suite"
+CERTIFICATION_SUITE = eval_rosters.CERTIFICATION_SUITE
 # The synthetic result key validate_all() reports a broken roster parse under,
 # so a tree whose roster files cannot be read fails loudly instead of calling
 # every case an orphan.
@@ -960,11 +965,12 @@ def fixture_catalog_disagreements() -> list[str]:
 
 
 def registered_cases() -> set[str] | None:
-    """Case names the eval runs: hack/eval/presubmit-cases.txt and nightly-cases.txt.
+    """Case names the eval runs: the presubmit, nightly and certification files.
 
-    An entry in either file is registered; the presubmit one runs on every
+    An entry in any of them is registered; the presubmit one runs on every
     pull request, the nightly one every night (EVAL_TIER=nightly in
-    hack/ci-eval-pr.sh). A commented-out path counts for nothing -- that
+    hack/ci-eval-pr.sh), the certification one on its own lane
+    (EVAL_TIER=certification). A commented-out path counts for nothing -- that
     parking state is retired; a case whose fixture does not exist waits in
     FIXTURE_NOT_READY instead, and commented_out_registrations() reports the
     comment as a finding.
@@ -981,6 +987,19 @@ def registered_cases() -> set[str] | None:
         except (OSError, ValueError):
             return None
     return names
+
+
+def _roster_display(path: pathlib.Path) -> str:
+    """A roster file's path as the messages spell it, relative to the repository."""
+    return path.relative_to(REPO_ROOT).as_posix() if path.is_relative_to(REPO_ROOT) else path.as_posix()
+
+
+def certification_cases() -> set[str] | None:
+    """Case names in hack/eval/certification-cases.txt; None when it cannot be read."""
+    try:
+        return set(eval_rosters.certification_cases())
+    except (OSError, ValueError):
+        return None
 
 
 def commented_out_registrations() -> dict[str, str]:
@@ -1180,12 +1199,31 @@ def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) ->
         problems.append(f"{where}: weight {weight!r} must be a number greater than 0")
 
 
-def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None) -> list[str]:
+def validate_case(
+    name: str, path: pathlib.Path, *, registered: set[str] | None, certification: set[str] | None = None
+) -> list[str]:
     """Every problem with one case file, as reader-facing sentences."""
     problems: list[str] = []
     spec = _load_yaml(path)
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
+
+    # The suite. A certification case says so in its file and sits in the
+    # certification roster; one without the other is a case on the wrong lane.
+    suite = spec.get(SUITE_KEY)
+    if suite is not None and suite != CERTIFICATION_SUITE:
+        problems.append(f"declares '{SUITE_KEY}: {suite}'; the only suite is '{CERTIFICATION_SUITE}'")
+    if certification is not None:
+        if name in certification and suite != CERTIFICATION_SUITE:
+            problems.append(
+                f"is in {_roster_display(CERTIFICATION_CASES_FILE)} but declares no "
+                f"'{SUITE_KEY}: {CERTIFICATION_SUITE}'; add the line, or take the case off the roster"
+            )
+        if name not in certification and suite == CERTIFICATION_SUITE:
+            problems.append(
+                f"declares '{SUITE_KEY}: {CERTIFICATION_SUITE}' but is not in "
+                f"{_roster_display(CERTIFICATION_CASES_FILE)}; a certification case runs on that lane only"
+            )
 
     # The id key. devops-bench accepts task_id as an alias for id
     # (tasks/schema.py, from_dict) and prefers id when both are present, so a
@@ -1547,12 +1585,15 @@ def validate_paths(paths: list[pathlib.Path]) -> dict[str, list[str]]:
     findings that matter.
     """
     registered = registered_cases()
+    certification = certification_cases()
     out: dict[str, list[str]] = {}
     for path in paths:
         resolved = path.resolve()
         in_tree = resolved.parent.parent == TASKS_DIR
         name = resolved.parent.name if resolved.name == "task.yaml" else resolved.stem
-        out[name] = validate_case(name, resolved, registered=registered if in_tree else None)
+        out[name] = validate_case(
+            name, resolved, registered=registered if in_tree else None, certification=certification if in_tree else None
+        )
     return out
 
 
@@ -1562,9 +1603,10 @@ def validate_all() -> dict[str, list[str]]:
     if registered is None:
         return {
             ROSTER_PARSE_KEY: [
-                "could not read hack/eval/presubmit-cases.txt and "
-                "hack/eval/nightly-cases.txt as case lists -- a file is missing "
-                "or holds a line that is not a ./tasks/<id>/task.yaml path"
+                "could not read hack/eval/presubmit-cases.txt, "
+                "hack/eval/nightly-cases.txt and hack/eval/certification-cases.txt "
+                "as case lists -- a file is missing or holds a line that is not a "
+                "./tasks/<id>/task.yaml path"
             ]
         }
     if not registered:
@@ -1577,10 +1619,11 @@ def validate_all() -> dict[str, list[str]]:
         }
     results: dict[str, list[str]] = {}
     cases = bench_cases()
+    certification = certification_cases()
     for name, path in cases.items():
         # One unreadable file must not hide every other case's findings.
         try:
-            results[name] = validate_case(name, path, registered=registered)
+            results[name] = validate_case(name, path, registered=registered, certification=certification)
         except CaseError as exc:
             results[name] = [str(exc)]
     for name, problems in greet_phrase_collisions(cases).items():

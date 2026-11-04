@@ -40,6 +40,7 @@ readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
 readonly EVAL_GHES_CASES_FILE="eval/ghes-cases.txt"
+readonly EVAL_CERTIFICATION_CASES_FILE="eval/certification-cases.txt"
 # The stack-bearing cases of the nightly's main part that run in main-b, when
 # EVAL_NIGHTLY_PART splits that part in two (#3384).
 readonly EVAL_NIGHTLY_MAIN_B_FILE="eval/nightly-main-b.txt"
@@ -631,6 +632,10 @@ publish_eval_dashboard() {
   fi
   if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
     echo "eval-dashboard publish skipped: EVAL_ROLLBACK_LANE=1 is set: the today lane grades a rolled-back install, which is not main's history"
+    return 0
+  fi
+  if [ "${EVAL_TIER:-}" = "certification" ]; then
+    echo "eval-dashboard publish skipped: EVAL_TIER=certification: the certification lane's record is its logs bucket, read by the certified-capabilities page, not the nightly dashboard"
     return 0
   fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
@@ -2530,10 +2535,12 @@ fi
 # ./tasks/<id>/task.yaml path, a path with no case directory behind it, or a
 # nightly entry that is also a presubmit one (it would run twice a night) all
 # stop the job here, before it spends a cluster, rather than running a wrong
-# matrix and reporting green around it.
+# matrix and reporting green around it. certification-cases.txt is what
+# EVAL_TIER=certification runs on its own (the certification tier, below).
 BENCH_DIR="${SCRIPT_DIR}/../bench"
 PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
 NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
+CERTIFICATION_CASES_FILE="${SCRIPT_DIR}/${EVAL_CERTIFICATION_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
 # Which lane list a forge runs (kube-agents#3682): the GitLab list on either
 # GitLab, gitlab.com or a self-managed instance, since the cases grade the
@@ -2648,6 +2655,46 @@ for ENTRY in "${NIGHTLY_TASKS[@]}"; do
   fi
 done
 
+# ─── The certification tier ──────────────────────────────────────────────────
+# The certification suite: the cases behind the certified-capabilities page,
+# graded on their own lane (the ci-kube-agents-certification periodics in
+# oss-test-infra, EVAL_TIER=certification) and never on a pull request or a
+# nightly. Every entry is a top-level case under bench/tasks/ whose task file
+# carries `suite: certification` (scripts/validate_bench_cases.py holds the
+# roster to that); an entry that is also a presubmit or nightly case stops the
+# job, since a case graded on two lanes would hold two records under one
+# name. The file may be empty between the tier landing and its first case,
+# so the empty read is refused only when this tier is the one running.
+# `# part N` lines (N from 1, the line on its own) split the file into
+# sections, one periodic each (EVAL_CERTIFICATION_PART below); an entry
+# above the first marker is part 1. scripts/eval_rosters.py reads the same
+# grammar (PART_MARKER_RE); the two must stay twins.
+CERTIFICATION_ENTRIES="$(roster_entries "${CERTIFICATION_CASES_FILE}")"
+CERTIFICATION_TASKS=()
+while IFS= read -r ENTRY; do
+  if [ -n "${ENTRY}" ]; then CERTIFICATION_TASKS+=("${ENTRY}"); fi
+done <<< "${CERTIFICATION_ENTRIES}"
+check_case_entries "${CERTIFICATION_CASES_FILE}" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
+for ENTRY in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
+  if printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+    echo "ERROR: ${CERTIFICATION_CASES_FILE}: '${ENTRY}' is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
+    exit 1
+  fi
+done
+
+# The entries of one `# part N` section of the certification file, in file
+# order, with the same comment and whitespace rules as roster_entries.
+certification_part_entries() { # <file> <N>
+  awk -v want="$2" '
+    BEGIN { part = 1 }
+    /^#[[:space:]]+part[[:space:]]+[1-9][0-9]*[[:space:]]*$/ { part = $3 + 0; next }
+    {
+      sub(/#.*$/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      if ($0 != "" && part == want + 0) print
+    }
+  ' "$1"
+}
+
 # Which matrix this run gets. "presubmit" -- the default, and what every
 # existing job runs -- is exactly the presubmit file, so the tier is dormant
 # everywhere until a job exports the other value: the same
@@ -2710,8 +2757,24 @@ case "${EVAL_TIER}" in
       echo "EVAL_TIER=nightly: ${#NIGHTLY_TASKS[@]} nightly-only task(s) join the matrix, ${#TASKS[@]} tasks total"
     fi
     ;;
+  certification)
+    # The suite replaces the presubmit matrix: nothing from the other two
+    # files runs here, and the blocking roster, a subset of the presubmit,
+    # arms nothing, so a failing certification case is a record and never a
+    # red. The suite grades GitHub only.
+    if [ -n "${LANE_CASES_FILE}" ]; then
+      echo "ERROR: EVAL_TIER=certification grades GitHub only; unset EVAL_FORGE=${EVAL_FORGE}." >&2
+      exit 1
+    fi
+    if [ "${#CERTIFICATION_TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: ${CERTIFICATION_CASES_FILE} names no case; the certification tier would run nothing and report green." >&2
+      exit 1
+    fi
+    TASKS=("${CERTIFICATION_TASKS[@]}")
+    echo "EVAL_TIER=certification: ${#TASKS[@]} certification case(s) make the matrix; no presubmit or nightly case runs"
+    ;;
   *)
-    echo "ERROR: EVAL_TIER must be 'presubmit' or 'nightly', got '${EVAL_TIER}'." >&2
+    echo "ERROR: EVAL_TIER must be 'presubmit', 'nightly' or 'certification', got '${EVAL_TIER}'." >&2
     exit 1
     ;;
 esac
@@ -2744,6 +2807,38 @@ case "${EVAL_NIGHTLY_PART}" in
   *)
     echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main', 'main-a', 'main-b' or 'writers', got '${EVAL_NIGHTLY_PART}'." >&2
     exit 1
+    ;;
+esac
+
+# ─── The certification part ──────────────────────────────────────────────────
+# Which `# part N` section of the certification file this run takes, applied
+# to TASKS here, before the exclusions and TASK_NAMES are built from it, so
+# the suite can run as one periodic per section on one leased project each: a
+# week's worth of runs at three repetitions is longer than any single job
+# here. "all", the default, is the whole file. A part outside the
+# certification tier would be a typo that silently ran the wrong matrix, so
+# it stops the job, as does any value that is not "all" or a whole number.
+EVAL_CERTIFICATION_PART="${EVAL_CERTIFICATION_PART:-all}"
+case "${EVAL_CERTIFICATION_PART}" in
+  all) ;;
+  *[!0-9]* | 0*)
+    echo "ERROR: EVAL_CERTIFICATION_PART must be 'all' or a whole number from 1, got '${EVAL_CERTIFICATION_PART}'." >&2
+    exit 1
+    ;;
+  *)
+    if [ "${EVAL_TIER}" != "certification" ]; then
+      echo "ERROR: EVAL_CERTIFICATION_PART=${EVAL_CERTIFICATION_PART} selects part of the certification matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the certification tier." >&2
+      exit 1
+    fi
+    TASKS=()
+    while IFS= read -r ENTRY; do
+      if [ -n "${ENTRY}" ]; then TASKS+=("${ENTRY}"); fi
+    done <<< "$(certification_part_entries "${CERTIFICATION_CASES_FILE}" "${EVAL_CERTIFICATION_PART}")"
+    if [ "${#TASKS[@]}" -eq 0 ]; then
+      echo "ERROR: EVAL_CERTIFICATION_PART=${EVAL_CERTIFICATION_PART} selects no case of the ${#CERTIFICATION_TASKS[@]}-case certification file; the run would grade nothing and report green." >&2
+      exit 1
+    fi
+    echo "Certification part: ${EVAL_CERTIFICATION_PART} (${#TASKS[@]} of ${#CERTIFICATION_TASKS[@]} cases)"
     ;;
 esac
 
@@ -3535,6 +3630,15 @@ if [ -z "${BLOCKING_ROSTER_ENTRIES}" ]; then
 fi
 BLOCKING_ROSTER_DEFAULT=""
 BLOCKING_ROSTER_ON_LANE=""
+# The certification tier grades no presubmit case, so no roster name is in
+# its matrix: every name leaves the export (the file is still checked below,
+# since it stays the presubmit's roster), or bench-gate's "BOOTSTRAP_ADMITTED
+# names no graded case" banner, which exists to catch a misspelled entry,
+# would open every certification run. Rung 4 is disarmed on the lane by
+# construction; said once in the log.
+if [ "${EVAL_TIER}" = "certification" ]; then
+  echo "EVAL_TIER=certification: no blocking-roster case is in the certification matrix, so rung 4 is disarmed on this lane (rungs 1-3 and rung 5 still red it)."
+fi
 # Set when the inject lane's exclusion list drops a ROSTER case: what the
 # every-roster-case-excluded guard below tests, since an empty
 # BLOCKING_ROSTER_ON_LANE has a second cause on the GitLab lane.
@@ -3560,6 +3664,9 @@ while IFS= read -r NAME; do
   # off that lane) leaves the export too, and is not "on the lane" for the
   # guard below: the GitHub presubmit grades it.
   if [ -n "${GITLAB_LANE_DROPPED:-}" ] && grep -qxF -- "${NAME}" <<< "${GITLAB_LANE_DROPPED:-}"; then
+    continue
+  fi
+  if [ "${EVAL_TIER}" = "certification" ]; then
     continue
   fi
   BLOCKING_ROSTER_ON_LANE="true"
@@ -3660,6 +3767,13 @@ if [ "${EVAL_FORGE:-github}" != "github" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
+# The certification lane never appends either: its record is the logs
+# bucket, read by the certified-capabilities page per case and model, and
+# none of its cases is on the blocking roster, so the admission window has
+# nothing to decide for them. It reads the store like a presubmit.
+if [ "${EVAL_TIER}" = "certification" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 # The commit each line is stamped with. A postsubmit carries it as
