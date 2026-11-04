@@ -127,6 +127,11 @@ RECORD_BUDGET_MIB = "budget_mib"
 RECORD_USAGE_MIB = "usage_mib"
 RECORD_SOURCE = "source"
 RECORD_REFUSED = "refused"
+RECORD_SPAWN_CAP = "spawn_cap"
+#: What one new worker is reserved at when the tick's spawns are bounded by the
+#: budget's headroom: upstream's MEMORY_GUARD_MB_PER_WORKER, the figure its
+#: memory-derived default cap divides by, and about one measured idle worker.
+WORKER_RESERVE_MIB = 512
 
 #: ``DispatchResult`` fields whose ids a tick skipped for a reason of its own,
 #: so they are never refused for capacity: plain id lists, and lists of tuples
@@ -543,6 +548,41 @@ def pressure_level_for_tick(result: Any, *, settings: Optional[AdmissionSettings
         },
     )
     return level
+
+
+def cap_spawn_budget(result: Any, spawn_budget: Optional[int]) -> Optional[int]:
+    """Bound this tick's spawns by the budget's headroom, one worker per reserve.
+
+    The pressure level is read once per tick, so an ``ok`` reading would let the
+    ready loop spawn the whole slot budget at once, past the pod's budget before
+    the next read. With a budget and a usage figure recorded on the result, the
+    cap is ``(budget - usage) // WORKER_RESERVE_MIB``. A cap of zero is recorded
+    as capacity-limiting so an overdue card is refused rather than left
+    waiting; a smaller cap the loop can still spend is left to
+    :func:`tick_was_limited`. Without a reading the budget is unchanged.
+    """
+    record = getattr(result, RESULT_ATTR, None)
+    if not isinstance(record, Mapping):
+        return spawn_budget
+    budget_mib = record.get(RECORD_BUDGET_MIB)
+    usage_mib = record.get(RECORD_USAGE_MIB)
+    if not isinstance(budget_mib, int) or not isinstance(usage_mib, int):
+        return spawn_budget
+    cap = max(0, (budget_mib - usage_mib) // WORKER_RESERVE_MIB)
+    if spawn_budget is not None and cap >= spawn_budget:
+        return spawn_budget
+    # A cap the ready loop can still spend is not a limit yet: tick_was_limited
+    # sees the loop exhaust it. Only a cap of zero decides the tick here.
+    fields = {RECORD_SPAWN_CAP: cap}
+    if cap == 0:
+        fields[RECORD_LIMITED] = True
+    _record(result, **fields)
+    logger.warning(
+        "%s headroom of %s MiB bounds this tick to %s new worker(s) (slot budget %s)",
+        LOG_PREFIX, f"{budget_mib - usage_mib:,}", cap,
+        "uncapped" if spawn_budget is None else spawn_budget,
+    )
+    return cap
 
 
 def tick_was_limited(result: Any, *, spawn_budget: Optional[int], spawned: int) -> bool:

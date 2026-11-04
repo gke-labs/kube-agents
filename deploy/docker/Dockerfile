@@ -1352,6 +1352,7 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
     install -m 0644 /tmp/kanban-scheduling/kanban_admission.py /opt/hermes/hermes_cli/kanban_admission.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_admission.py /opt/hermes && \
     grep -qF "pressure = _kanban_admission.pressure_level_for_tick(result)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -qF "spawn_budget = _kanban_admission.cap_spawn_budget(result, spawn_budget)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
     grep -qF "result.auto_blocked.extend(_kanban_admission.enforce_worker_rss_caps(conn))" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
     test "$(grep -c '_kanban_admission.refuse_overdue_ready(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "2" && \
     test "$(grep -c 'from hermes_cli import kanban_admission as _kanban_admission' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \

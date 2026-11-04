@@ -204,7 +204,7 @@ keep one vocabulary. At the default budget, the container's 2,048 MiB request, t
 under the request: 307 MiB at 2 GiB, 614 MiB at 4 GiB. One setting carries it; there is no second
 constant for the reserve, and the reserve moves with the request.
 
-The sample is taken once per tick, 5 s on the gateway's profile (`kanban.dispatch_interval_seconds`),
+The sample is taken once per tick, 5 s on the gateway's profile (`kanban.dispatch_interval_seconds`), and the tick's spawns are then bounded by the budget's headroom at one worker per 512 MiB (`cap_spawn_budget`, the reserve upstream's memory-derived default cap divides by), so an `ok` reading cannot let one tick spawn the whole slot budget past the budget;
 so a decision holds for a tick by construction: the one-tick half of N3.
 
 `sample_memory()` itself and the cgroup v2 patch stay as they are. The heartbeat, the dashboard and
@@ -373,12 +373,12 @@ the foreground run cut by the tool-call guard killed with its process tree (R9).
    every tick is `critical`, nothing ever spawns, and every card is refused by age with the same
    reason. Both are visible in the log and in every reply; neither is prevented by the schema's
    bounds, which are absolute. Open question 2 asks whether the operator should clamp or warn.
-3. A cold burst inside one tick. The sample is taken once per tick; under `ok` the loops may spawn
-   the whole slot budget. From an idle board that is six workers at about 430 MiB each, 2.6 GiB, on
-   one reading that said the pod was under 1,741 MiB. The next tick reads `critical` and spawns
-   nothing, and the per-worker cap holds each of the six, but their sum has already passed a 2 GiB
-   budget. PR 1 does not close this; the cost estimate does, and open question 3 asks whether PR 1
-   should bound a tick's spawns by the headroom meanwhile.
+3. A cold burst inside one tick. The sample is taken once per tick; under `ok` the loops could
+   otherwise spawn the whole slot budget, six workers at about 430 MiB each from an idle board, on
+   one reading that said the pod was under 1,741 MiB. The tick's spawns are therefore bounded by
+   the budget's headroom at one worker per 512 MiB (`cap_spawn_budget`): at 800 MiB used of a
+   2,048 MiB budget that is two new workers per tick, and the next tick reads the result before
+   admitting more. The cost estimate of a later stage refines the reserve per request.
 4. Running workers together exceed the budget while each stays under its cap. Six workers at
    1.5 GiB are 9 GiB. The cap bounds one runaway, the pattern of the three evictions; the sum is
    bounded only by `max_in_progress` times the cap until the class budgets land. The guard stops
@@ -452,9 +452,10 @@ on every pull request.
 2. A setting outside the sane range relative to the resolved resources (a budget above the limit,
    a cap above the budget): clamp in the operator, warn in the CR's status, or accept and log in the
    dispatcher. The bounds in the schema are absolute and cannot express the relation.
-3. A tick's spawns under `ok`: bound them by the headroom divided by 512 MiB (upstream's
-   `MEMORY_GUARD_MB_PER_WORKER`, the footprint its derived cap assumes per worker) in PR 1, or
-   leave the cold burst to the cost estimate.
+3. Settled in PR 1: a tick's spawns under `ok` are bounded by the headroom divided by 512 MiB
+   (upstream's `MEMORY_GUARD_MB_PER_WORKER`, the footprint its derived cap assumes per worker).
+   Whether the reserve should follow the measured per-worker size instead of a constant is for
+   the cost estimate.
 4. Whether a reserve setting is needed beside the budget. The classifier's 15% band is the reserve
    this design uses: 307 MiB at a 2 GiB request, 614 MiB at 4 GiB, against the 512 MiB first
    proposed.

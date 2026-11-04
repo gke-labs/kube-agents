@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Wire ``hermes_cli/kanban_admission.py`` into the kanban dispatcher.
 
-Four edits (five anchors) across two files plus one import trailer, applied
+Five edits (six anchors) across two files plus one import trailer, applied
 after ``apply_kanban_scheduling.py`` and before ``apply_kanban_fanout_reaper.py``
 in the Dockerfile; every anchor is upstream v2026.9.14 text that both of those
 leave in place. Why the change is needed is in the module docstring of
@@ -77,6 +77,17 @@ PRESSURE_PATCHED = (
     f"    pressure = {MODULE_ALIAS}.pressure_level_for_tick(result)\n"
 )
 
+# --- 1b. _tick_spawn_budget: bound the tick's spawns by headroom -------------
+#
+# The function's last line. The pressure read above is once per tick, so an
+# ``ok`` reading alone would let the ready loop spawn the whole slot budget in
+# one tick; the cap is the budget's headroom at one worker reserve each.
+HEADROOM_ANCHOR = "    return True, spawn_budget\n"
+HEADROOM_PATCHED = (
+    f"    spawn_budget = {MODULE_ALIAS}.cap_spawn_budget(result, spawn_budget)\n"
+    "    return True, spawn_budget\n"
+)
+
 # --- 2. _run_reclaim_phase: the worker RSS cap -------------------------------
 #
 # The reclaim phase's runtime enforcement, which only it has. The line stays:
@@ -147,6 +158,7 @@ TRAILER = (
 # anchor is load-bearing in the file it names.
 EDITS = (
     (DISPATCH_RELATIVE, "_tick_spawn_budget pressure", PRESSURE_ANCHOR, PRESSURE_PATCHED),
+    (DISPATCH_RELATIVE, "_tick_spawn_budget headroom cap", HEADROOM_ANCHOR, HEADROOM_PATCHED),
     (DISPATCH_RELATIVE, "_run_reclaim_phase RSS cap", RSS_CAP_ANCHOR, RSS_CAP_PATCHED),
     (DISPATCH_RELATIVE, "_dispatch_once_locked early return", EARLY_RETURN_ANCHOR, EARLY_RETURN_PATCHED),
     (DISPATCH_RELATIVE, "_dispatch_once_locked final return", FINAL_RETURN_ANCHOR, FINAL_RETURN_PATCHED),
@@ -159,12 +171,14 @@ TRAILERS = ((DISPATCH_RELATIVE, TRAILER),)
 # grep strings have one home; test_kanban_admission asserts the Dockerfile
 # still greps for each.
 PRESSURE_BUILD_MARKER = f"pressure = {MODULE_ALIAS}.pressure_level_for_tick(result)"
+HEADROOM_BUILD_MARKER = f"spawn_budget = {MODULE_ALIAS}.cap_spawn_budget(result, spawn_budget)"
 RSS_CAP_BUILD_MARKER = f"result.auto_blocked.extend({MODULE_ALIAS}.enforce_worker_rss_caps(conn))"
 REFUSE_BUILD_MARKER = f"{MODULE_ALIAS}.refuse_overdue_ready("
 TRAILER_BUILD_MARKER = f"from hermes_cli import kanban_admission as {MODULE_ALIAS}"
 KINDS_BUILD_MARKER = f'"transient", "{_admission.CAPACITY_KIND}"}}'
 BUILD_MARKERS = (
     PRESSURE_BUILD_MARKER,
+    HEADROOM_BUILD_MARKER,
     RSS_CAP_BUILD_MARKER,
     REFUSE_BUILD_MARKER,
     TRAILER_BUILD_MARKER,
@@ -172,7 +186,7 @@ BUILD_MARKERS = (
 )
 
 # Written by a successful apply and by nothing else, one set per file. Three
-# of the five anchors survive their own replacement (edits 2 and 3 insert
+# of the six anchors survive their own replacement (edits 2 and 3 insert
 # around theirs), so counting alone cannot tell a fresh tree from a patched
 # one; these can.
 DISPATCH_MARKERS = (

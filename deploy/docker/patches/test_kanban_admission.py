@@ -17,6 +17,7 @@ import json
 import signal
 import sqlite3
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1038,8 +1039,49 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("verify_kanban_admission.py", text)
 
     def test_the_edit_count_matches_what_the_prose_claims(self):
-        self.assertEqual(len(applier.EDITS), 5)
-        self.assertIn("Four edits (five anchors)", applier.__doc__)
+        self.assertEqual(len(applier.EDITS), 6)
+        self.assertIn("Five edits (six anchors)", applier.__doc__)
+
+
+class CapSpawnBudgetTest(unittest.TestCase):
+    """The per-tick headroom cap: one new worker per WORKER_RESERVE_MIB of headroom."""
+
+    def _result(self, budget_mib, usage_mib):
+        result = types.SimpleNamespace()
+        setattr(result, admission.RESULT_ATTR, {
+            admission.RECORD_BUDGET_MIB: budget_mib, admission.RECORD_USAGE_MIB: usage_mib,
+            admission.RECORD_LIMITED: False,
+        })
+        return result
+
+    def test_without_a_reading_the_slot_budget_is_unchanged(self):
+        result = types.SimpleNamespace()
+        self.assertEqual(admission.cap_spawn_budget(result, 6), 6)
+        self.assertIsNone(admission.cap_spawn_budget(result, None))
+
+    def test_enough_headroom_leaves_the_slot_budget_alone(self):
+        result = self._result(4096, 800)  # 3,296 MiB free -> 6 workers at 512 each
+        self.assertEqual(admission.cap_spawn_budget(result, 6), 6)
+        self.assertFalse(getattr(result, admission.RESULT_ATTR)[admission.RECORD_LIMITED])
+
+    def test_little_headroom_caps_the_tick_without_deciding_it(self):
+        result = self._result(2048, 1300)  # 748 MiB free -> 1 worker
+        self.assertEqual(admission.cap_spawn_budget(result, 6), 1)
+        record = getattr(result, admission.RESULT_ATTR)
+        self.assertFalse(record[admission.RECORD_LIMITED])  # the loop may still spend the one
+        self.assertEqual(record[admission.RECORD_SPAWN_CAP], 1)
+        # tick_was_limited sees the loop exhaust the cap.
+        self.assertTrue(admission.tick_was_limited(result, spawn_budget=1, spawned=1))
+        self.assertFalse(admission.tick_was_limited(result, spawn_budget=1, spawned=0))
+
+    def test_an_uncapped_slot_budget_is_bounded_too(self):
+        result = self._result(2048, 800)  # 1,248 MiB free -> 2 workers
+        self.assertEqual(admission.cap_spawn_budget(result, None), 2)
+
+    def test_usage_past_the_budget_spawns_nothing(self):
+        result = self._result(2048, 2100)
+        self.assertEqual(admission.cap_spawn_budget(result, 6), 0)
+        self.assertTrue(getattr(result, admission.RESULT_ATTR)[admission.RECORD_LIMITED])
 
 
 if __name__ == "__main__":

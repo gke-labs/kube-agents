@@ -61,10 +61,12 @@ FANOUT_REAPER_ANCHOR = "    result.timed_out = enforce_max_runtime(conn)\n"
 # Figures the drive uses, in MiB. The budget is the operator default; the
 # three usages sit in upstream's ok, elevated (< 15% available) and critical
 # (< 5% or < 64 MiB available) bands against it.
-BUDGET_MIB = 2048
-USAGE_OK_MIB = 500
-USAGE_ELEVATED_MIB = 1900
-USAGE_CRITICAL_MIB = 2000
+BUDGET_MIB = 4096  # the budget the drive classifies against; elevated keeps room for one worker at this size
+USAGE_OK_MIB = 800  # 3,296 MiB free: ok, six workers of headroom
+SMALL_BUDGET_MIB = 2048  # the stock request today, where elevated leaves under one reserve
+SMALL_USAGE_MIB = 1900  # 148 MiB free: elevated, no room for a worker
+USAGE_ELEVATED_MIB = 3500  # 596 MiB free: under 15% of the budget, one worker reserve of headroom
+USAGE_CRITICAL_MIB = 3950  # 146 MiB free: under 5% of the budget
 WORKER_CAP_MIB = 100
 WORKER_OVER_CAP_MIB = 150
 WORKER_UNDER_CAP_MIB = 10
@@ -929,6 +931,23 @@ def drive(h: Harness) -> None:
     asked, res = h.tick(conn)
     check("A5. an ok budget sample spawns the rest",
           len(asked) == 1 and res.memory_pressure is None, h.why(conn, res, first, second))
+    # The headroom cap: elevated with less than one worker reserve free spawns nothing,
+    # whatever upstream's "at most one" would allow, and the tick counts as limited.
+    h.configure(memory_budget_mib=SMALL_BUDGET_MIB)
+    h.use_sample({
+        admission.TOTAL_KEY: SMALL_BUDGET_MIB * KIB_PER_MIB,
+        admission.AVAILABLE_KEY: (SMALL_BUDGET_MIB - SMALL_USAGE_MIB) * KIB_PER_MIB,
+        admission.USAGE_KEY: SMALL_USAGE_MIB * KIB_PER_MIB,
+        admission.SOURCE_KEY: admission.SOURCE_CGROUP_V1,
+    })
+    third = h.new_card(conn, "A third card under a small budget")
+    asked, res = h.tick(conn)
+    record = getattr(res, KA.RESULT_ATTR, {})
+    check("A6. elevated with under one reserve of headroom spawns nothing and is limited",
+          asked == [] and res.memory_pressure == "elevated" and record.get("spawn_cap") == 0
+          and record.get("limited") is True and h.status(conn, third) == "ready",
+          f"spawned {asked}, pressure {res.memory_pressure}, record {record!r}")
+    h.configure(memory_budget_mib=BUDGET_MIB)
     conn.close()
 
     # B. Unreadable counters fail closed, or fall back when told to.
@@ -1098,7 +1117,7 @@ def fixture_half() -> None:
           str(dispatch.count(FANOUT_REAPER_ANCHOR)))
     tree = ast.parse(dispatch)
     inserted = _inserted_statements(tree)
-    check("four statements call through the alias", len(inserted) == 4, str(len(inserted)))
+    check("five statements call through the alias", len(inserted) == 5, str(len(inserted)))
     for node in inserted:
         names = patchlib.unbound(tree, node)
         check(f"line {node.lineno} reads only bound names", not names, f"unbound {names}")
