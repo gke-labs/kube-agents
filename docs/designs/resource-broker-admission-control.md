@@ -37,6 +37,12 @@ object. The cost check therefore goes in the shell's `kubectl` wrapper, which ev
 in the shell passes through. The credential proxy's existing admission no longer applies to
 `kubectl`, because `kubectl` no longer runs there.
 
+A prototype of the memory guard and the cost check ran on the reproduction fleet at the default
+shell limit (§6.3). With the guard alone, the shell had no OOMKill; the guard stopped three
+`kubectl` processes instead of the whole shell. With the guard and the cost check, the audit's two
+oversized reads were refused in under a second, the guard stopped nothing, and the shell peaked at
+468 MiB.
+
 ## 1. Scope
 
 **Owns:** the admission rules of the resource broker: the memory guard, the per-capability fair
@@ -319,28 +325,57 @@ The check runs in the shell's `kubectl` wrapper (`/usr/local/bin/kubectl`, built
 through it: the skill scripts, the agents' terminals and the jobs. It is in the container that
 decodes the list, so it can read that container's free memory, and it sees the output format.
 
-Before it runs a `get` across all namespaces (`-A`) with no label or field selector, the wrapper
-asks the API server for one item: `?limit=1` returns `remainingItemCount`. It estimates the memory as `items × bytes per item`, summed over the
-resources in the call. Bytes per item comes from the format:
+Before it runs a potentially large list, the wrapper counts the objects. A potentially large list
+is a `get` of one or more kinds across all namespaces (`-A`), or of a cluster-scoped kind such as
+`nodes`. A `get` of named objects, of one namespace, a watch and a `--raw` read pass straight
+through. For each kind, one request with `?limit=1` returns `remainingItemCount`. The estimate is
+`KUBECTL_BASE + items × bytes per item`, summed over the kinds in the call. `KUBECTL_BASE` is
+64 MiB, and bytes per item comes from the output format:
 
 | Output format                                      | Bytes per item (initial) |
 | -------------------------------------------------- | ------------------------ |
 | `-o json`, `-o yaml`, `jsonpath`, `custom-columns` | 100 KiB                  |
 | table, `-o wide`, `-o name`                        | 45 KiB                   |
 
-The initial values are the measurements in §2. KWOK Pods are small, so real objects cost more; the
-values are kept up to date from the guard's kills and the completed calls.
+The initial values are the measurements in §2. KWOK Pods are small, so real objects cost more. The
+values are lower bounds until they are measured on real objects, and are then kept up to date from
+the guard's kills and the completed calls.
 
-- The budget B is H minus the memory now in use (`memory.current` less page cache). A call whose
-  estimate fits B runs. A call that does not fit B now but fits H − K waits up to W for memory to
-  free, then is refused with `429`.
-- A call whose estimate is above C = H − K, so it cannot fit even alone, is refused at once with
-  `422` and a message:
-  "this read would need about 3.2 GiB in the shell; narrow it: add `-l`, `--field-selector` or
-  `-n`, or use `-o name`, or page it with `--chunk-size` and process each page".
-- The count is cached per (cluster, resource) for 60 s, so one estimate covers a burst of reads.
+**Reservations.** Admission does not read free memory alone. Two wrappers that read it at the same
+time both see room, and both start; this is the gap of fact 6. Each admitted call writes a
+reservation, a file named by the wrapper's PID that holds its estimate, in a shared directory. A
+lock (`flock`) on one file makes each admission decision atomic. The free budget is
 
-At the default shell limit (2 GiB, H = 1,792 MiB, K about 300 MiB) C allows about 15,000 objects in
+    B = H − (memory in use − memory of admitted calls) − Σ reservations
+
+so every running call counts at its full estimate, even while it is still small. A reservation is
+removed when its call exits, and pruned when its PID no longer exists.
+
+- A call whose estimate fits B runs. The wrapper runs `kubectl` as a child and keeps the
+  reservation until the child exits.
+- A call that does not fit B now waits up to W = 30 s for reservations to end, then fails with
+  exit code 75 (temporary failure) and a message that says how much memory it needs and how much
+  is free.
+- A call whose estimate is above C = H − K, so it cannot fit even alone, fails at once with exit
+  code 3 and a message: "this read lists 105,000 objects and would need about 10,300 MiB in the
+  shell, which can hold at most 1,536 MiB for one read; narrow it: add `-n`, `-l` or
+  `--field-selector`; or read one namespace at a time and handle each before the next: list them with
+  `kubectl get ns -o name`, then `kubectl get pods -n <namespace>` for each". The advice names no
+  `--chunk-size`, because `kubectl` already reads in chunks of 500 and keeps every chunk. It names
+  no `kubectl get --raw` page loop either: `--raw` replaces the server URL's path, so through the
+  Kubernetes API proxy (server `…/clusters/<cluster>`) it reads the proxy's default cluster, not the
+  fleet cluster. The wrapper's own count request joins the path onto the server URL for the same
+  reason.
+- **Selectors.** The API server does not return `remainingItemCount` for a list with a label or
+  field selector, and a selector such as `status.phase=Running` can match most objects. A call with
+  a selector is never refused for its size. It reserves the smaller of its unfiltered estimate and
+  C, so large selector calls run one after another instead of together.
+- The count is cached per (kubeconfig, context, collection) for 60 s, so one estimate covers a
+  burst of reads.
+- If the guard kills an admitted call, the wrapper prints the guard's reason (the memory of the
+  call and of the shell) and the same advice, so the agent sees why the call stopped.
+
+At the default shell limit (2 GiB, H = 1,792 MiB, K = 256 MiB) C allows about 15,000 objects in
 `-o json`; at the L size (8 GB) about 65,000; at 16 GiB about 140,000. One cluster of 105,000 Pods
 therefore needs a paged read at every size below 16 GiB.
 
@@ -352,9 +387,57 @@ seats in proportion to the number of objects it returns.
 
 ### 6.2 What this guarantees
 
-Nothing on its own: an estimate can be wrong, and a read the check misses (a selector that matches
-most objects) still runs. Layer 1 is the guarantee. The cost check changes the common failure
-from "the call ran for 30 s and was killed" to "the call was refused in 200 ms with advice".
+Nothing on its own. The check covers only `kubectl` calls that pass through the wrapper. A script
+that calls the binary at `/usr/local/libexec/kubectl`, a Python Kubernetes client, `curl` to the
+Kubernetes API proxy, or a script that loads a large file all go around it. An estimate can also be
+low. Layer 1 is the guarantee, because it acts on every process in the container, whatever started
+it. The cost check changes the common failure from "the call ran for 30 s and was killed" to "the
+call was refused in under a second with advice", and the reservations stop two large calls from
+starting together.
+
+A refusal is text the model reads, so the wrapper ships with an evaluation case: an agent asked a
+fleet-wide question on a large cluster narrows or pages the read after a refusal, and does not
+send the same read again.
+
+### 6.3 Prototype results
+
+A prototype of layers 1 and 3 ran in the sandbox shell of a scale test install, against the OOM
+reproduction fleet: two clusters of about 105,000 Pods each and two Events-only clusters. The guard
+is one Python process (standard library, Δ = 100 ms). The wrapper is a Python script in front of the
+existing `kubectl` wrapper, with the reservation directory and the per-format costs of §6.1. Each run
+is the harness's `proxy` scenario at the default shell limit (2 GiB) for 10 minutes.
+
+| Run                  | Shell OOMKills | Shell peak (`memory.current`) | Guard kills | Admission                                                                                                         |
+| -------------------- | -------------- | ----------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------- |
+| No guard (§2)        | 3 in 2.5 min   | 2,048 MiB (killed)            | —           | —                                                                                                                 |
+| Guard only           | 0              | 1,781 MiB                     | 3           | —                                                                                                                 |
+| Guard and cost check | 0              | 468 MiB                       | 0           | 2 refused for size (the audit's workload dump of each large cluster, about 108,000 objects, 10.6 GiB), 8 admitted |
+
+- **Guard only.** The guard killed the audit's two `get deploy,sts,ds,cronjob,pod -A -o json` calls
+  at 943 and 1,753 MiB, and an agent's `get pods -A` at 1,800 MiB. The shell peaked 28 to 44 MiB
+  above H, within the 256 MiB headroom. A process that allocated 100 MiB per second to 3 GiB was
+  killed at 1,808 MiB with the shell at 1,820 MiB.
+- **Guard and cost check.** A refusal took 256 ms with a count request and under 80 ms with a
+  cached count. The audit sent neither refused read again. A call with a selector that matched
+  most Pods was admitted with the capped reservation and killed by the guard at 1,771 MiB: the
+  estimate missed, and layer 1 held. A second large call that arrived while it ran waited W and was
+  refused as busy (exit code 75).
+
+The prototype found four requirements that §6.1 now states or that the implementation must meet:
+
+1. **Fail open.** In the first run with the wrapper, it could not open its lock file and exited
+   with a traceback. The audit's reads failed, and the agent started to improvise (`curl` to the API
+   server, `kubectl get pods -A --chunk-size=1`). An error in the admission must run the command
+   unchanged; layer 1 still bounds it.
+2. **State shared across users.** Sessions run as separate users (`agent`, `hermes`) with
+   `umask 077`. The reservation directory is world-writable with the sticky bit, the lock file is
+   created world-writable at start, and the wrapper sets `umask 022` so that every user can read
+   every reservation. The count cache is per user.
+3. **Count from the server URL.** `kubectl get --raw` drops the server URL's path, so through the
+   Kubernetes API proxy it counted the host cluster (78 Pods instead of 104,944). The count request
+   joins the path onto the server URL and authenticates as the kubeconfig says.
+4. **Advice that works through the proxy.** The refusal names per-namespace reads, not a `--raw`
+   page loop, for the same reason.
 
 ## 7. The event watcher
 
@@ -376,8 +459,7 @@ because stopping the process is the failure. It needs a bound inside the process
 
 - **An in-flight limit.** A weighted semaphore in front of the reverse proxy refuses a request
   past the limit with `429` and `Retry-After`. The initial limit is 64 at the 512Mi limit: (512 MiB −
-  about 100 MiB of memory kept between bursts) / about 3.6 MiB per stream is about 110, halved for
-  margin. The limit follows the live memory limit, as N does in §8.
+  about 100 MiB of memory kept between bursts) / about 3.6 MiB per stream is about 110, halved for margin. The 3.6 MiB comes from unpaged `curl` lists; paged `kubectl` traffic holds a page per stream, so the limit is measured again with `kubectl` traffic before it ships. The limit follows the live memory limit, as N does in §8.
 - **A Go memory limit.** `GOMEMLIMIT` at about 80 % of the container limit (400MiB at 512Mi) makes
   the Go runtime collect and return memory before the kernel acts.
 - **A settable limit.** The proxy's resources become a `PlatformAgent` field, like the credential
@@ -447,7 +529,7 @@ for everyone.
    page size, not the cluster size. Its sweep width follows the shell's memory, not the credential
    proxy's admitted count. This removes the largest consumer before any admission rule is needed.
 2. **Memory guard** in the sandbox shell and the credential proxy. This alone meets G1 for those
-   containers. Acceptance: the harness's `proxy` scenario at the default limits ends with zero
+   containers. A prototype met the acceptance below in the shell (§6.3). Acceptance: the harness's `proxy` scenario at the default limits ends with zero
    OOMKills and one guard kill per oversized read.
 3. **Event watcher** paged initial lists and the size-weighted gate (§7). Acceptance: the
    harness's `watcher` scenario at the default limits ends with zero OOMKills.
