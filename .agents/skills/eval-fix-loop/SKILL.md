@@ -93,6 +93,7 @@ The card and the fix it proposes obey these rules:
 | Put numbers in a table and link every pull request and issue.                | Add a constant or a mechanism for its own sake.            |
 | Keep every claim on the record, with its run directory or line.              | Widen the fix mid-loop without a new card.                 |
 | Stop after the card and wait for the word.                                   | Take a review clear as push authority.                     |
+| Let the review check's green or the third round assign the human reviewer.   | Request a human reviewer by hand.                          |
 
 ## Step 4: red
 
