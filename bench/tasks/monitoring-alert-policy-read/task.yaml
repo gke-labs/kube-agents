@@ -25,7 +25,10 @@
 #
 # Planted defect required: none; the fixture is the planted policy.
 # Isolation class: planted per run, destroyed by the teardown.
-# Tier: nightly (hack/eval/nightly-cases.txt).
+# Tier: presubmit, on the blocking roster since 2026-11-02
+# (hack/eval/presubmit-cases.txt and hack/eval/blocking-roster.txt, the
+# observability domain's seat, #4095); nightly-only from 2026-10-23 until
+# then. The nightly still runs it, through the presubmit file, in main-b.
 id: monitoring-alert-policy-read
 name: Alert policy question is answered from Cloud Monitoring through the broker
 domain: observability

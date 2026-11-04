@@ -306,6 +306,13 @@ class DeleteProfileTest(unittest.TestCase):
         self.assertIn("could not take the profile lock", str(refused.exception))
         self.assertEqual(entered, [])
 
+    def test_an_unopenable_lock_is_logged_with_what_each_caller_does(self):
+        (self.home_root / cap.PROFILE_LOCKS_DIRNAME).write_text("a file where the lock dir goes")
+        with redirect_stderr(io.StringIO()) as err:
+            cap.delete_profile(self.NAME)
+        self.assertIn("could not open the profile lock", err.getvalue())
+        self.assertIn("a create refuses, a delete leaves the sandbox home", err.getvalue())
+
     def test_other_names_do_not_wait(self):
         with cap._profile_lock("cluster-two"):
             worker = threading.Thread(target=self.delete)

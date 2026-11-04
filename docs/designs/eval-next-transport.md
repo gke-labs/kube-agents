@@ -59,7 +59,13 @@ every card has settled or
 six full-audit units). The delivered card results are appended to the answer, and the worker's
 report and terminal commands are read back with `kubectl exec` from
 `/opt/data/kanban/attachments/<id>/` and `/opt/data/kanban/logs/<id>.log` in the agent pod, then
-deleted; a card still running when the wait ran out is archived first, which stops its worker, and so are the cards its worker fanned out (#3019). A
+deleted. So are the board rows of the card and of every card its worker, or theirs, filed, since
+Hermes shows the assignee's recent completed runs on every card and would hand the next repetition
+this one's summary. A worker's card counts only when Hermes recorded the run as its creator, so a
+card a worker's create handed back by an existing idempotency key stays, files included. A card
+keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
+other than a follow-up linked to its creator. A card still running when the wait ran out is archived
+first, which stops its worker, and so are the cards its worker fanned out. A
 customer sees the card result relayed to their thread; they never see the files, the
 store reads, or the collecting turn, which is a model call the customer never made.
 
