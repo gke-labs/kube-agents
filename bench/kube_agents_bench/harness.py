@@ -418,6 +418,11 @@ _PURGE_PENDING_SUFFIX = ".json"
 # running a day later is stuck, and a nightly is over well inside it; a count of
 # tries would not do, since every purge retries and a nightly runs hundreds.
 _PURGE_PENDING_MAX_AGE_SECONDS = 24 * 60 * 60
+# What an id read back from a pending file must look like before the purge
+# joins it to a path or prints it: anything with a shell on the volume can
+# write there, and an empty id or one holding ``/`` or ``..`` would widen a
+# delete to other cards' files.
+_PURGE_PENDING_ID = r"[A-Za-z0-9_-]+"
 # The hermes CLI in the agent pod, for when it is not on the exec shell's PATH.
 _HERMES_BIN_FALLBACK = "/opt/hermes/.venv/bin/hermes"
 # What ``hermes kanban archive <id>`` prints on success. A refusal goes to
@@ -478,8 +483,9 @@ _POD_CLOCK_SCRIPT = (
 )
 _POD_CLOCK_TIMEOUT_SECONDS = 15.0
 # How long the purge's shell fallback (clearing the run's files when the script
-# never sorted them) may take. Short: it is ``rm`` alone, and on a pod the
-# purge could not reach at all it would otherwise cost a second full timeout.
+# never sorted them, and writing down the purge it owes) may take. Short: it is
+# ``rm``, ``printf`` and ``mv``, and on a pod the purge could not reach at all
+# it would otherwise cost a second full timeout.
 _FALLBACK_CLEAR_TIMEOUT_SECONDS = 15.0
 
 _PF_LOCK = threading.Lock()  # guards the three registries below
@@ -686,7 +692,7 @@ def _pod_start() -> tuple[int | None, bool]:
     """
     lines = [line.strip() for line in _agent_shell(_POD_CLOCK_SCRIPT, _POD_CLOCK_TIMEOUT_SECONDS).splitlines()]
     clock = lines[0] if lines else ""
-    pending = _PURGE_PENDING_PRESENT in lines[1:]
+    pending = _PURGE_PENDING_PRESENT in lines
     if clock.isascii() and clock.isdigit():
         return int(clock), pending
     _log.warning(
@@ -1481,10 +1487,13 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # Every run of the script, the harness's pre-run retry included
 # (:func:`_retry_pending_purges`), takes those purges on after its own, through
 # the same rules, and writes what it still keeps as a new file with the old one's
-# first-owed time (the old file goes only once the new one is written); one owed
+# earliest first-owed time (the old file goes only once the new one is written); one owed
 # longer than ``MAX_AGE`` is printed ``abandoned <id>`` and dropped. Each purge is
 # held to its own floor: a card the run's front door handed back by its key is
-# foreign to the run and still owed by the purge that kept it. Two scripts retrying the same file at once each take the write
+# foreign to the run and still owed by the purge that kept it. A retried purge's
+# files go only with its rows: the purge that owed it already cleared its own
+# roots', and a card it kept keeps them. A file whose ids are not card ids, or
+# whose times are not whole numbers, is dropped unread. Two scripts retrying the same file at once each take the write
 # lock in turn, so the second finds the rows gone; a card both keep is owed twice,
 # which costs a second look.
 #
@@ -1494,14 +1503,14 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # Everything the harness also knows is passed in (:func:`_purge_argv`), so the
 # markers it parses are spelled once.
 _PURGE_ROWS_SCRIPT = r"""
-import json, os, shutil, sqlite3, sys, time, uuid
+import json, os, re, shutil, sqlite3, sys, time, uuid
 ROOT, BUSY = sys.argv[1], float(sys.argv[2])
 KEPT, FOREIGN, DONE, ATTACHMENTS, LOGS, SORTED = sys.argv[3:9]
 FLOOR = int(sys.argv[9]) if sys.argv[9] else None
 PENDING, SUFFIX, LEFT, ABANDONED = sys.argv[10:14]
-MAX_AGE = int(sys.argv[14])
-rest = [a for a in sys.argv[16:] if a]
-roots, fanned = rest[:int(sys.argv[15])], rest[int(sys.argv[15]):]
+MAX_AGE, CARD = int(sys.argv[14]), re.compile(sys.argv[15])
+rest = [a for a in sys.argv[17:] if a]
+roots, fanned = rest[:int(sys.argv[16])], rest[int(sys.argv[16]):]
 NOW = int(time.time())
 BY_TASK = ("task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")
 LIVE = ("todo", "scheduled", "ready", "running")
@@ -1535,10 +1544,19 @@ def owe(owed_roots, owed_fanned, floor, first):
             json.dump({"roots": owed_roots, "fanned": owed_fanned, "floor": floor, "first": first}, f)
         os.replace(tmp, os.path.join(PENDING, name + SUFFIX))
     except OSError:
+        drop(tmp)
         return False
     for tid in owed_roots + owed_fanned:
         print("%s %s" % (LEFT, tid))
     return True
+def card_ids(v):
+    if not isinstance(v, list) or not all(isinstance(t, str) and CARD.fullmatch(t) for t in v):
+        raise ValueError(v)
+    return v
+def whole(v):
+    if type(v) is not int:
+        raise ValueError(v)
+    return v
 def still_owed():
     for g in groups[1:]:
         for tid in g[0] + g[1]:
@@ -1553,8 +1571,8 @@ for name in names:
     try:
         with open(path) as f:
             g = json.load(f)
-        floor = None if g["floor"] is None else int(g["floor"])
-        group = ([str(t) for t in g["roots"]], [str(t) for t in g["fanned"]], floor, int(g["first"]), path)
+        floor = None if g["floor"] is None else whole(g["floor"])
+        group = (card_ids(g["roots"]), card_ids(g["fanned"]), floor, whole(g["first"]), path)
     except (OSError, ValueError, KeyError, TypeError):
         drop(path)
         continue
@@ -1580,7 +1598,8 @@ owed = {tid for i, g in enumerate(groups) for tid in g[0] if (i, tid) not in old
 for i, g in enumerate(groups):
     for tid in g[0]:
         if (i, tid) not in older:
-            unlink(tid)
+            if i == 0:
+                unlink(tid)
         elif tid not in owed:
             print("%s %s" % (FOREIGN, tid))
 mark_sorted(True)
@@ -1590,7 +1609,10 @@ if failed is not None:
     still_owed()
     print("rows kept: %s" % failed)
     sys.exit(0)
-order, seen = [], set()
+order, seen, first = [], set(), {}
+for g in groups:
+    for tid in g[0] + g[1]:
+        first[tid] = min(first.get(tid, g[3]), g[3])
 for i, g in enumerate(groups):
     for tid in g[0]:
         if (i, tid) not in older and tid not in seen:
@@ -1643,7 +1665,7 @@ try:
             print("%s %s" % (KEPT, tid))
             left.setdefault(i, []).append(tid)
             continue
-        if tid not in own:
+        if i > 0 or tid not in own:
             gone.append(tid)
         kb.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (tid, tid))
         for table in BY_TASK:
@@ -1658,7 +1680,7 @@ try:
     for tid in gone:
         unlink(tid)
     for i, g in enumerate(groups):
-        if (owe(left[i], [], None, g[3]) if i in left else True) and g[4]:
+        if (owe(left[i], [], None, min(first[t] for t in left[i])) if i in left else True) and g[4]:
             drop(g[4])
     print(DONE)
 except sqlite3.Error as exc:
@@ -1705,6 +1727,7 @@ def _purge_argv(
         _PURGE_PENDING_MARKER,
         _PURGE_ABANDONED_MARKER,
         str(_PURGE_PENDING_MAX_AGE_SECONDS),
+        _PURGE_PENDING_ID,
         str(len(task_ids)),
         *task_ids,
         *fanned_out,
@@ -1811,7 +1834,7 @@ def _purge_python(task_ids: list[str], fanned_out: Sequence[str], floor: int | N
 
 def _purge_marked(lines: list[str], marker: str) -> list[str]:
     """The ids the purge script printed after ``marker``."""
-    return [line.split()[1] for line in lines if line.startswith(marker + " ")]
+    return [parts[1] for parts in map(str.split, lines) if len(parts) > 1 and parts[0] == marker]
 
 
 def _owe_script(task_ids: list[str], fanned_out: Sequence[str], floor: int | None) -> str:
@@ -1825,15 +1848,22 @@ def _owe_script(task_ids: list[str], fanned_out: Sequence[str], floor: int | Non
     tmp, final = f"{_PURGE_PENDING_DIR}/.{name}", f"{_PURGE_PENDING_DIR}/{name}{_PURGE_PENDING_SUFFIX}"
     fields = [json.dumps(list(task_ids)), json.dumps(list(fanned_out)), json.dumps(floor)]
     return (
-        f"mkdir -p {_PURGE_PENDING_DIR} && "
+        f"{{ mkdir -p {_PURGE_PENDING_DIR} && "
         "printf '{\"roots\": %s, \"fanned\": %s, \"floor\": %s, \"first\": %s}' "
         f"{' '.join(_shell_quote(f) for f in fields)} \"$(date +%s)\" > {_shell_quote(tmp)} && "
-        f"mv {_shell_quote(tmp)} {_shell_quote(final)} && echo {_PURGE_PENDING_PRESENT}"
+        f"mv {_shell_quote(tmp)} {_shell_quote(final)} && echo {_PURGE_PENDING_PRESENT}; }} "
+        f"|| rm -f {_shell_quote(tmp)}"
     )
 
 
 def _log_retried(lines: list[str], mine: Collection[str] = ()) -> list[str]:
-    """Warn of earlier runs' owed cards the script gave up; return those it still owes."""
+    """Warn of earlier runs' owed cards the script gave up or found not theirs; return those it still owes."""
+    if foreign := [t for t in _purge_marked(lines, _PURGE_FOREIGN_MARKER) if t not in mine]:
+        _log.warning(
+            "left cards %s on the board for good: an earlier run's owed purge found them not that run's "
+            "(created before it started, or not filed by its cards); if one is an earlier run's, its "
+            "summary can reach a later run's role-history digest", ", ".join(foreign),
+        )
     if abandoned := [t for t in _purge_marked(lines, _PURGE_ABANDONED_MARKER) if t not in mine]:
         _log.warning(
             "gave up purging cards %s: an earlier run's purge has owed them for over %d s; if one "

@@ -4119,6 +4119,8 @@ def test_a_kept_card_is_owed_and_the_next_run_deletes_it_once_it_settles(tmp_pat
     assert _run_purge(tmp_path, []) == ["kept t_parent", "kept t_c1", "pending t_parent", "pending t_c1", "purged"]
     (again,) = _owed(tmp_path)
     assert again["first"] == owed["first"]
+    # t_c1's creator is not running, but t_c1 is: its worker still has its files.
+    assert _has_files(tmp_path, "t_c1")
 
     kb.execute("UPDATE tasks SET status = 'done' WHERE id = 't_c1'")
     kb.commit()
@@ -4155,6 +4157,8 @@ def test_an_owed_purge_whose_rewrite_fails_keeps_its_old_file(tmp_path: Path) ->
     assert _run_purge(tmp_path, [], prelude=disk_full) == ["kept t_x", "purged"]
     (owed,) = _owed(tmp_path)
     assert owed["roots"] == ["t_x"]
+    pending = tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name
+    assert [f.name for f in pending.iterdir() if f.name.startswith(".")] == []
 
 
 def test_a_root_an_earlier_purge_still_keeps_is_owed_not_foreign(
@@ -4173,6 +4177,56 @@ def test_a_root_an_earlier_purge_still_keeps_is_owed_not_foreign(
     with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
         harness._purge_card_state(["t_x"], 5.0, floor=_FLOOR)
     assert "owed to a later purge" in caplog.text and "left cards" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"roots": ["t_1"], "fanned": [], "floor": None, "first": 1e999},
+        {"roots": [""], "fanned": [], "floor": None, "first": 0},
+        {"roots": [""], "fanned": [], "floor": None, "first": 2_000_000_000},
+        {"roots": ["../attachments"], "fanned": [], "floor": None, "first": 2_000_000_000},
+        {"roots": ["t_1"], "fanned": ["t 2"], "floor": None, "first": 2_000_000_000},
+        {"roots": ["t_1"], "fanned": [], "floor": "1700000000", "first": 2_000_000_000},
+        ["t_1"],
+    ],
+)
+def test_an_owed_purge_that_is_not_card_ids_and_whole_times_is_dropped_unread(tmp_path: Path, body: Any) -> None:
+    """Anything with a shell on the volume can write here: nothing it writes may crash the script or widen a delete."""
+    _purge_board(tmp_path)
+    _card_files(tmp_path, "t_1")
+    pending = tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name
+    pending.mkdir()
+    (pending / f"x{harness._PURGE_PENDING_SUFFIX}").write_text(json.dumps(body))
+
+    assert _run_purge(tmp_path, []) == ["purged"]
+    assert _owed(tmp_path) == [] and _has_files(tmp_path, "t_1")
+
+
+def test_a_marker_with_no_id_is_skipped() -> None:
+    assert harness._purge_marked(["abandoned ", "abandoned", "abandoned t_1", "pending t_2"], "abandoned") == ["t_1"]
+
+
+def test_a_card_owed_again_keeps_its_earliest_owed_time(tmp_path: Path) -> None:
+    """Named again by a run that could not read its clock: the 24 h limit runs from the first debt, not this one."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_x", "running")
+    kb.commit()
+    long_ago = int(time.time()) - 3600
+    _owe(tmp_path, ["t_x"], first=long_ago)
+
+    assert _run_purge(tmp_path, ["t_x"]) == ["kept t_x", "pending t_x", "purged"]
+    (owed,) = _owed(tmp_path)
+    assert owed["first"] == long_ago
+
+
+def test_a_retried_purge_that_finds_a_card_not_its_own_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "foreign t_old\nforeign t_cron\npurged\n")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._retry_pending_purges(5.0)
+    assert "left cards t_old, t_cron on the board for good" in caplog.text
 
 
 def test_a_purge_whose_board_step_failed_is_retried_under_its_own_rules(tmp_path: Path) -> None:
@@ -4273,7 +4327,8 @@ def test_the_pod_clock_read_is_the_floor_or_none(
 ) -> None:
     # "²" is a digit to str.isdigit() and not to int(): it must not raise out of run().
     flagged = f"1700000000\n{harness._PURGE_PENDING_PRESENT}\n"
-    replies = iter(["1700000000\n", flagged, "", "Error from server\n", "\u00b2\n"])
+    flag_only = f"{harness._PURGE_PENDING_PRESENT}\n"
+    replies = iter(["1700000000\n", flagged, "", "Error from server\n", "\u00b2\n", flag_only])
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: next(replies))
     assert harness._pod_start() == (_FLOOR, False)
     assert harness._pod_start() == (_FLOOR, True)
@@ -4281,7 +4336,9 @@ def test_the_pod_clock_read_is_the_floor_or_none(
         assert harness._pod_start() == (None, False)
         assert harness._pod_start() == (None, False)
         assert harness._pod_start() == (None, False)
-    assert caplog.text.count("could not read the agent pod's clock") == 3
+        # date printed nothing: the clock is unread, but the owed purge is still seen.
+        assert harness._pod_start() == (None, True)
+    assert caplog.text.count("could not read the agent pod's clock") == 4
 
 
 def _clocked_pod(
