@@ -24,9 +24,10 @@ import fleet_waste as fw  # noqa: E402
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 # The sweep width is read from the credential broker (broker_admission); with its
-# URL unset that read makes no request and the width is the fallback, four, so
+# URLs unset that read makes no request and the width is the fallback, four, so
 # no test here reaches the network or depends on the host's broker.
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 import test_collector_run as _shared_run_tests  # noqa: E402
 import audit_report  # noqa: E402

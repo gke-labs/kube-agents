@@ -241,7 +241,7 @@ field, and publishes nothing:
   you: it validates the shape of a path, not whether anything reconciles it, and it will create
   missing parents and commit the file happily. A manifest in a directory the deploying tool does not
   apply merges clean, closes the finding for exactly one run, and changes nothing on the cluster —
-  then returns next run as `pr-merged-persists`, where neither documented explanation fits.
+  then returns next run as `pr-merged-persists`, where none of the documented explanations fits.
 - **`finish` adds to each `manual` `note` where the fix belongs, from the collector's candidate.**
   It names the `declaration` file, or else the `release_declaration` file (its next sync or upgrade
   can revert a patch to the live object), or else the `namespace_directory` for a new object (with

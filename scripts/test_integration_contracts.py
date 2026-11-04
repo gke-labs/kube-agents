@@ -871,6 +871,29 @@ class WorkflowNameJoinTest(unittest.TestCase):
             "but would not fail the check",
         )
 
+    def test_the_join_reads_each_shards_latest_attempt(self):
+        """A re-run shard's upload must not hide behind its earlier attempt's.
+
+        download-artifact keeps the same-named artifact with the highest ID,
+        and IDs do not follow upload order, so a join once read a re-run
+        shard's red first attempt. The shards put the run attempt in the name,
+        and the join keeps the latest attempt per shard before coverage-merge.
+        """
+        workflow = _yaml().safe_load((WORKFLOWS / "python-tests.yml").read_text())
+        uploads = [
+            step for step in workflow["jobs"]["test-shard"]["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        ]
+        self.assertEqual(len(uploads), 1, "the shard job does not have exactly one upload step")
+        self.assertIn("${{github.run_attempt}}", self._expr(uploads[0]["with"]["name"]),
+                      "the shard's artifact name does not carry the run attempt")
+        runs = [str(step.get("run", "")) for step in workflow["jobs"]["test"]["steps"]]
+        select = [i for i, run in enumerate(runs) if "scripts/coverage_shard_attempts.py" in run]
+        merge = [i for i, run in enumerate(runs) if "coverage-merge" in run]
+        self.assertEqual(len(select), 1, "the join does not run scripts/coverage_shard_attempts.py once")
+        self.assertEqual(len(merge), 1, "the join does not run coverage-merge once")
+        self.assertLess(select[0], merge[0], "the join merges before it keeps each shard's latest attempt")
+
     SHARD_RESULT = "${{needs.test-shard.result}}"
     BENCH_RESULT = "${{needs.bench-tests.result}}"
     NOT_SUCCESS = ("failure", "cancelled", "skipped")

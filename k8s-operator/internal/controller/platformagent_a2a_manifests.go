@@ -3787,10 +3787,10 @@ const defaultA2AMaxSessions = 10
 // and the scope publisher's, one at a time and only while it runs, since a
 // finished pod counts against no quota), rollout surge doubling a
 // Deployment for a moment, and the gateway's count-then-create overshoot. Fifteen covered roughly ten standing pods plus
-// surge; the console server made it eleven, hence sixteen. If the base
-// install grows again, raise this before anything user-visible starts failing
-// admission.
-const a2aQuotaHeadroom = 16
+// surge; the console server made it eleven, hence sixteen, and the
+// kube-proxy's second replica seventeen. If the base install grows again,
+// raise this before anything user-visible starts failing admission.
+const a2aQuotaHeadroom = 17
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {

@@ -327,6 +327,14 @@ FIXTURE_NOT_READY = {
         "#4705: needs a public GitOps repository over the broker's snapshot "
         "ceiling that holds a manifest on a removed apiVersion"
     ),
+    # Needs a cluster that runs Config Connector in the audited fleet of a
+    # pool project; no pool project runs it (provisioning-kcc-cluster-without-
+    # crds-stops relies on that). bench/tf/prebuilt/kcc-stalled-declaration
+    # plants the stalled object on such a cluster and removes it.
+    "fleet-audit-manifest-fix-names-stalled-config-connector": (
+        "#4218: needs a cluster that runs Config Connector in the pool fleet, for the "
+        "stalled ContainerNodePool the stack plants; no pool project runs Config Connector"
+    ),
     "fanout-bound-ten-cards": (
         "#3560: needs an eval install with more than ten clusters in scope, so a "
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
