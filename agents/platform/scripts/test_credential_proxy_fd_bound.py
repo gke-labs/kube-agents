@@ -2,18 +2,19 @@
 
 `AgentAPIProxyHandler` checks a request's session id against every profile's
 `state.db` so an external caller cannot continue a bridge-owned session. The
-check opens one read-only SQLite connection per profile, and today the
-connections stay open until the request ends: through the upstream read loop
-that relays a streamed turn (SSE), which can run for minutes. With `N` cluster
-profiles, one streamed turn holds `N + 1` descriptors for its whole length, and a
-fleet of a few hundred clusters meets `EMFILE` mid-stream (#4330).
+check opens one read-only SQLite connection per profile. Until the fix for
+#4330 the connections stayed open until the request ended: through the upstream
+read loop that relays a streamed turn (SSE), which can run for minutes. With `N`
+cluster profiles, one streamed turn held `N + 1` descriptors for its whole
+length, and a fleet of a few hundred clusters met `EMFILE` mid-stream. The door
+now closes every handle before the upstream turn starts.
 
-The test below is the gate for that: it creates `PROFILE_COUNT` profile
+The test below is the gate that keeps it so: it creates `PROFILE_COUNT` profile
 databases, starts a streamed turn whose upstream holds after its first chunk,
 and counts `/proc/self/fd` while the stream is open. The count may exceed the
 idle count by the request's own sockets, never by anything that grows with
-`PROFILE_COUNT`. It lives in its own file so #4330's fix, which edits
-`test_credential_proxy.py`, and this gate do not collide.
+`PROFILE_COUNT`. It lives in its own file so changes to the door's own tests in
+`test_credential_proxy.py` and this gate do not collide.
 """
 
 from __future__ import annotations
@@ -134,8 +135,8 @@ class AgentAPIProxyFdBoundTest(unittest.TestCase):
         """Run one streamed turn through the door and return (idle, mid-stream) descriptor counts.
 
         Every step but the bound is asserted here, so a request the door refuses
-        or a stream it truncates fails the strict test below rather than hiding
-        under the marked one's expected failure.
+        or a stream it truncates fails the round-trip test on its own line rather
+        than reading as a descriptor count.
         """
         idle = _open_fd_count()
         request = urllib.request.Request(
@@ -152,17 +153,14 @@ class AgentAPIProxyFdBoundTest(unittest.TestCase):
         return idle, mid_stream
 
     def test_a_streamed_turn_round_trips_with_every_profile_seeded(self):
-        """Strict: the request the marked test makes is accepted and streamed to its end."""
+        """The request the bound test makes is accepted and streamed to its end."""
         idle, mid_stream = self._stream_one_turn()
         self.assertGreater(mid_stream, idle)
 
-    # DESIRED, not current, behaviour: #4330. The door opens one connection per
-    # profile for the session-id check and holds them through the upstream read
-    # loop, so the mid-stream count today sits PROFILE_COUNT above idle. The fix
-    # closes them before the upstream turn starts; the pull request that lands it
-    # removes this marker, since an unexpected success fails the run. Only the
-    # bound is under the marker; the round trip itself is the strict test above.
-    @unittest.expectedFailure
+    # The bound #4330's fix restored: the door opens one connection per profile
+    # for the session-id check and closes them before the upstream read loop, so
+    # the mid-stream count sits a few sockets above idle, not PROFILE_COUNT. A
+    # handle held through the stream again puts this PROFILE_COUNT above idle.
     def test_open_fds_during_a_stream_do_not_grow_with_the_profile_count(self):
         idle, mid_stream = self._stream_one_turn()
         self.assertLess(
