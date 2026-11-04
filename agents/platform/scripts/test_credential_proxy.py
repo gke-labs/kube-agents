@@ -5985,6 +5985,82 @@ class CommandExecutorTest(unittest.TestCase):
             self._admission_report(executor),
         )
 
+    def _report_with_replicas_file(self, content, executor=None):
+        """The admission report with the replicas file at a temporary path
+        holding ``content``; None writes no file."""
+        executor = executor or self.executor()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        path = os.path.join(directory, "replicas")
+        if content is not None:
+            Path(path).write_text(content, encoding="utf-8")
+        with mock.patch.dict(os.environ, {credential_proxy.EXEC_REPLICAS_FILE_ENV: path}):
+            return self._admission_report(executor)
+
+    def test_a_replica_count_adds_the_tiers_totals(self):
+        self.assertEqual(
+            {
+                "slot_cap": 8, "budget_admits": None, "admitted": 8, "interactive_cap": 7, "session_cap": 2,
+                "replicas": 2, "tier_admitted": 16, "tier_interactive_cap": 14,
+            },
+            self._report_with_replicas_file(" 2\n"),
+        )
+
+    def test_the_tiers_totals_are_the_admitted_count_below_the_slot_cap(self):
+        mib = credential_proxy.MEBIBYTE
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            executor = self.executor(memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib)
+        # The 1Gi budget admits 4 of the 8 slots, so each total is the admitted count's, not the slot cap's.
+        self.assertEqual(
+            {
+                "slot_cap": 8, "budget_admits": 4, "admitted": 4, "interactive_cap": 3, "session_cap": 2,
+                "replicas": 2, "tier_admitted": 8, "tier_interactive_cap": 6,
+            },
+            self._report_with_replicas_file("2", executor),
+        )
+
+    def test_a_replica_count_above_the_crs_bound_is_held_to_it(self):
+        report = self._report_with_replicas_file("40")
+        self.assertEqual(credential_proxy.EXEC_REPLICAS_MAX, report["replicas"])
+        self.assertEqual(8 * credential_proxy.EXEC_REPLICAS_MAX, report["tier_admitted"])
+        self.assertEqual(7 * credential_proxy.EXEC_REPLICAS_MAX, report["tier_interactive_cap"])
+
+    def test_no_usable_replica_count_adds_no_tier_keys(self):
+        per_replica = {"slot_cap": 8, "budget_admits": None, "admitted": 8, "interactive_cap": 7, "session_cap": 2}
+        executor = self.executor()
+        for name, content in {
+            "missing": None, "empty": "", "blank": " \n", "text": "abc", "zero": "0", "negative": "-1",
+            "a sign": "+2", "an underscore": "1_0", "a fraction": "2.5",
+        }.items():
+            with self.subTest(case=name), self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+                self.assertEqual(per_replica, self._report_with_replicas_file(content, executor))
+
+    def test_an_unreadable_replicas_file_adds_no_tier_keys(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        not_utf8 = os.path.join(directory, "not-utf8")
+        Path(not_utf8).write_bytes(b"\xff2")
+        executor = self.executor()
+        for name, path in {"a directory": directory, "not UTF-8": not_utf8}.items():
+            with self.subTest(case=name), mock.patch.dict(os.environ, {credential_proxy.EXEC_REPLICAS_FILE_ENV: path}), \
+                    self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+                self.assertNotIn("replicas", self._admission_report(executor))
+
+    def test_the_replicas_file_is_the_default_path_unless_the_variable_names_another(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        default, named = os.path.join(directory, "default"), os.path.join(directory, "named")
+        Path(default).write_text("2", encoding="utf-8")
+        Path(named).write_text("3", encoding="utf-8")
+        executor = self.executor()
+        environ = {k: v for k, v in os.environ.items() if k != credential_proxy.EXEC_REPLICAS_FILE_ENV}
+        with mock.patch.object(credential_proxy, "EXEC_REPLICAS_FILE", default):
+            with mock.patch.dict(os.environ, environ, clear=True):
+                self.assertEqual(2, self._admission_report(executor)["replicas"])
+            with mock.patch.dict(os.environ, {credential_proxy.EXEC_REPLICAS_FILE_ENV: named}):
+                self.assertEqual(3, self._admission_report(executor)["replicas"])
+        self.assertEqual("/etc/credential-proxy-exec-tier/replicas", credential_proxy_client.EXEC_REPLICAS_FILE)
+
     def test_a_missing_limit_is_logged_once_at_startup(self):
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
             self.executor(memory_limit_bytes=None)
@@ -15513,6 +15589,32 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
             report,
         )
         self.assertEqual([], self.executor.executed, "the admission report must run nothing")
+
+    def test_a_new_replica_count_changes_the_next_admission_report_without_a_restart(self):
+        """A scale change rewrites the ConfigMap and does not restart the pod,
+        so the running server reads the file again on each request."""
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        path = Path(directory) / "replicas"
+
+        def report():
+            request = urllib.request.Request(
+                self.endpoint + credential_proxy.ADMISSION_PATH,
+                headers={"Authorization": "Bearer good-token"},
+                method="GET",
+            )
+            with urllib.request.urlopen(request) as response:
+                return json.loads(response.read())
+
+        def tier(answer):
+            return answer["replicas"], answer["tier_admitted"], answer["tier_interactive_cap"]
+
+        with mock.patch.dict(os.environ, {credential_proxy.EXEC_REPLICAS_FILE_ENV: str(path)}):
+            self.assertNotIn("replicas", report())
+            path.write_text("2", encoding="utf-8")
+            self.assertEqual((2, 16, 14), tier(report()))
+            path.write_text("3", encoding="utf-8")
+            self.assertEqual((3, 24, 21), tier(report()))
 
     def test_an_unauthenticated_get_on_the_admission_report_is_401(self):
         request = urllib.request.Request(self.endpoint + credential_proxy.ADMISSION_PATH, method="GET")
