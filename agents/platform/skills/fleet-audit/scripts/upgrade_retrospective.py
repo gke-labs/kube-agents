@@ -247,7 +247,6 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
-import credential_proxy_client  # noqa: E402
 
 # The install's declared scope, handed in by the SOP from the platform_control
 # `fleet_scope` tool (`--scope-projects`, `--scope-unread`), one holder per
@@ -359,21 +358,12 @@ SINCE_DAYS_RE = re.compile(r"^(\d+)d?$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 REPORT_DATE_FORMAT = "%Y-%m-%d"
 
+# Neither cap holds more than one broker admission wait and one run, so a read reaches the
+# shim with a retry deadline under which no retry fits: collector_run.default_run derives it
+# from the cap for every read, inherited environment or a `{**os.environ, "KUBECONFIG": ...}`
+# built at the read alike.
 GCLOUD_TIMEOUT_S = 120
 KUBECTL_TIMEOUT_S = 120
-# The broker's bound on one gcloud it runs (its `--timeout-seconds` default) and on a one-shot
-# kubectl (its `--kubectl-timeout-seconds` default). Neither cap above holds more than one
-# broker admission wait and one run. The shim retries a refusal on its own
-# (credential_proxy_client, keeping a retry's admission wait, not its run, inside a deadline the
-# caller may shorten), and under these caps a retry would carry past the cap, where TIMEOUT_RC
-# stands in for the broker's reason. So `main` puts the shorter cap less the longer run bound,
-# under which no retry fits, into the process environment, which every read's environment is
-# (inherited, or `{**os.environ, "KUBECONFIG": ...}` built at the read), and a refused read
-# records the refusal's text at once, as cluster_preflight.sh's calls do. `default_run` itself
-# stays the shared binding collector_run owns (test_collector_run.py refuses a wrapper).
-BROKER_GCLOUD_RUN_S = 300
-BROKER_KUBECTL_RUN_S = 60
-SHIM_RETRY_DEADLINE_S = max(0, min(GCLOUD_TIMEOUT_S, KUBECTL_TIMEOUT_S) - max(BROKER_GCLOUD_RUN_S, BROKER_KUBECTL_RUN_S))
 # How many clusters a sweep reads at once is broker_admission.sweep_width(),
 # resolved in collect_fleet: what the credential broker admits, less headroom
 # for chat (collect.py's comment above its own collect_fleet has the reasoning).
@@ -6982,8 +6972,6 @@ def reset_ledger(store: Path, now: datetime, ledger_path: Path | None = None, gu
 
 def main(argv: list[str] | None = None) -> int:
     run_started = time.monotonic()  # the deadline counts the lock wait too
-    # Every read's environment descends from this process's (SHIM_RETRY_DEADLINE_S's comment).
-    os.environ[credential_proxy_client.RETRY_DEADLINE_ENV] = str(SHIM_RETRY_DEADLINE_S)
     args = build_parser().parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     try:

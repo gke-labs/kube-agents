@@ -567,15 +567,20 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
   immediate, with the broker's reason, so the preflight's own timeout text never stands in for a
   retry chain. The scripts that cap a brokered command themselves do the same, each from its own
   cap: the storage, networking and certificate audits (125 s on a one-shot `kubectl`), the
-  upgrade retrospective's reads, the reconciler's and the scope publisher's project lookups and
-  the stall watch's hops (120 s on a `gcloud` the broker bounds at 300 s), and the scaffold's
-  connectivity probe (45 s); under every one of them the deadline admits no retry. A script that
+  reconciler's and the scope publisher's project lookups and the stall watch's hops (120 s on a
+  `gcloud` the broker bounds at 300 s), and the scaffold's connectivity probe (45 s); under every
+  one of them the deadline admits no retry. The fleet-audit collectors (the upgrade retrospective
+  and the seven scripts that bind the same `collector_run.default_run`, at caps of 60 to 240 s)
+  get it from that one entry point: it hands every child the cap it was called with less the
+  300 s `gcloud` run bound, 0 under every cap a collector binds, unless the environment the
+  caller passed already names a deadline, so no collector sets the variable itself. A script that
   caps the shim at or under one admission wait is outside a held refusal's reach, but not the
   resource watermark gate's: its 429 is answered at once, before the queue, and under the 170 s
   default a 30 s cap fires inside the third or fourth of its waits, so the reconciler's cluster
   describe and gcloud config fallback (30 s) and the scaffold's credential fetch (60 s) pass the
   variable too, as the cap less the 300 s `gcloud` run bound. The 170 s default is the terminal
-  tool's, and a new caller with a cap of its own owes the variable.
+  tool's, and a new caller with a cap of its own owes the variable unless its commands go through
+  `collector_run.default_run`.
   Every wait prints one stderr line, and when the retries are spent, by count or by deadline, the
   shim exits 1 after one more:
   `credential proxy throttled: gave up after <n> attempts (HTTP <code>): <broker text>`.

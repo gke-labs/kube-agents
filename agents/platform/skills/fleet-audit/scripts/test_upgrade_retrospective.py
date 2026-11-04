@@ -17,7 +17,6 @@ import inspect
 import io
 import json
 import os
-import random
 import re
 import stat
 import subprocess
@@ -6557,42 +6556,25 @@ class DefaultRunTest(unittest.TestCase):
         self.assertEqual(ur.default_run(["/nonexistent/binary"]).rc, -1)
 
 
-class MainTellsTheShimItsDeadlineTest(unittest.TestCase):
-    """Each read's cap holds one admission wait and one run at most, so `main` puts a retry
-    deadline under which no retry fits into the process environment, which every read's
-    environment descends from. `default_run` itself stays collector_run's binding, which
-    test_collector_run.py pins, so the deadline cannot travel through a wrapper of it."""
+class ReadsTellTheShimTheirDeadlineTest(unittest.TestCase):
+    """Each read's cap holds one admission wait and one run at most. The deadline under which
+    no retry fits is collector_run's to derive from the cap (test_collector_run.py holds the
+    rule and the binding); what is this file's is that the retrospective's reads, with and
+    without an environment of their own, reach a child that was told it."""
 
-    def test_the_deadline_is_the_cap_less_the_run_bound_and_admits_no_retry(self):
-        client = ur.credential_proxy_client
-        deadline = float(ur.SHIM_RETRY_DEADLINE_S)
-        self.assertEqual(max(0, min(ur.GCLOUD_TIMEOUT_S, ur.KUBECTL_TIMEOUT_S) - max(ur.BROKER_GCLOUD_RUN_S, ur.BROKER_KUBECTL_RUN_S)), deadline)
-        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
-        self.assertGreater(shortest, deadline)
-        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
-
-    def test_main_sets_the_deadline_before_the_first_read_and_every_read_sees_it(self):
-        name = ur.credential_proxy_client.RETRY_DEADLINE_ENV
-        fleet = FakeFleet()
-        seen = []
-
-        def recording(argv, *, timeout=None, env=None):
-            # What the shim would read: the process environment for a read that inherits it, the
-            # caller's dict for a read handed one (the kubectl reads, with their kubeconfig).
-            seen.append((argv[0], os.environ.get(name), None if env is None else env.get(name)))
-            return fleet(argv, timeout=timeout, env=env)
-
-        with tempfile.TemporaryDirectory() as home:
-            scoped = {ur.HERMES_HOME_ENV: home, ur.STORE_HOME_ENV: home}
-            with mock.patch.dict(os.environ, scoped), mock.patch.object(ur, "default_run", recording), mock.patch.object(ur, "now_utc", lambda: NOW):
-                os.environ.pop(name, None)
-                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    self.assertEqual(ur.main(["--full", "--scope-projects", PROJECT, "--no-report"]), 0)
-        self.assertNotIn(name, os.environ, "the patch.dict restored the test's environment")
-        self.assertTrue(seen, "the run issued no read")
-        self.assertEqual({"gcloud", "kubectl"}, {binary for binary, _, _ in seen})
-        self.assertEqual({str(ur.SHIM_RETRY_DEADLINE_S)}, {inherited for _, inherited, _ in seen})
-        self.assertEqual({str(ur.SHIM_RETRY_DEADLINE_S)}, {given for _, _, given in seen if given is not None}, "a read handed its own environment lost the deadline")
+    def test_a_read_with_and_without_its_own_environment_hands_the_child_the_deadline(self):
+        name = ur.collector_run.SHIM_RETRY_DEADLINE_ENV
+        done = subprocess.CompletedProcess(["kubectl"], 0, stdout="", stderr="")
+        with mock.patch.dict(os.environ, {"KUBECONFIG": "/outer"}), mock.patch.object(ur.subprocess, "run", return_value=done) as run:
+            os.environ.pop(name, None)
+            ur.default_run(["gcloud", "container", "operations", "list"])
+            inherited = run.call_args.kwargs["env"]
+            ur.default_run(["kubectl", "get", "nodes"], env={**os.environ, "KUBECONFIG": "/k"})
+            given = run.call_args.kwargs["env"]
+        expected = str(ur.collector_run.shim_retry_deadline(ur.GCLOUD_TIMEOUT_S))
+        self.assertEqual(("/outer", expected), (inherited["KUBECONFIG"], inherited[name]))
+        self.assertEqual(("/k", expected), (given["KUBECONFIG"], given[name]))
+        self.assertEqual("0", expected, "the cap admits no retry")
 
 
 if __name__ == "__main__":
