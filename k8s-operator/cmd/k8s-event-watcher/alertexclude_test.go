@@ -168,12 +168,11 @@ func TestFilterDecideAlertExcluded(t *testing.T) {
 	if got := f.Decide(early); got != gateAlertExcluded {
 		t.Errorf("an early crash loop in an excluded namespace: gate %q; want %q", got, gateAlertExcluded)
 	}
-	// An autoscaler verdict on an excluded pod stops here too: only that pod's
-	// FailedScheduling reads it, and the same rule excludes that.
+	// The autoscaler verdicts are not checked against the rules.
 	mark := autoscalerEvent("pod-1", "NotTriggerScaleUp", now)
 	mark.Namespace = "payments"
-	if got := f.Decide(mark); got != gateAlertExcluded {
-		t.Errorf("a scale-up verdict in an excluded namespace: gate %q; want %q", got, gateAlertExcluded)
+	if got := f.Decide(mark); got != gateScaleUpMark {
+		t.Errorf("a scale-up verdict in an excluded namespace: gate %q; want %q", got, gateScaleUpMark)
 	}
 	other := backoffEvent(10)
 	other.Namespace = "shop"
@@ -209,6 +208,28 @@ func TestDispatcherAlertExcludedOpensNoIncident(t *testing.T) {
 	disp.Dispatch(ctx, kept)
 	if *injectCount != 1 || (*injected)[0].Namespace != "default" {
 		t.Errorf("an event no rule matches fired %d injects (%v); want 1 from namespace default", *injectCount, *injected)
+	}
+}
+
+// A rule whose reason names a cluster-autoscaler verdict does not drop the
+// verdict: the pod's FailedScheduling carries another reason, so the rule
+// leaves it to the scale-up hold, which needs the verdict on record.
+func TestDispatcherAReasonRuleOnAVerdictLeavesTheScaleUpHold(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	disp, _, injectCount := newScaleUpDispatcher(t, filterThresholds{failedSchedulingMinCount: 1, failedSchedulingMinSpan: -1}, &now)
+	cfg := disp.filter.cfg
+	cfg.alertExclude = []alertExcludeRule{{Reason: "TriggeredScaleUp"}}
+	disp.filter = newFilter(cfg)
+	disp.filter.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "TriggeredScaleUp", now))
+	if got := disp.scaleUps.Len(); got != 1 {
+		t.Fatalf("memo holds %d marks; want 1", got)
+	}
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 5, now.Add(time.Minute)))
+	if *injectCount != 0 {
+		t.Errorf("a FailedScheduling under a recorded TriggeredScaleUp fired %d injects; want 0 (held)", *injectCount)
 	}
 }
 

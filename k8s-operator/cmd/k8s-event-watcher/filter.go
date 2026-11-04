@@ -473,7 +473,10 @@ const (
 //  1. Reason is allowed.
 //  2. Namespace is not explicitly excluded (exclude wins).
 //  3. Namespace is in the allowed list (or allowed list is empty), and no
-//     --alert-exclude rule matches (gateAlertExcluded).
+//     --alert-exclude rule matches (gateAlertExcluded). The two
+//     cluster-autoscaler verdicts are not checked against the rules: a rule
+//     whose reason names one would drop the verdict while leaving the pod's
+//     FailedScheduling, which carries another reason, to rule 6 without it.
 //  4. Repeat count threshold is met, for the families that flap: "Unhealthy"
 //     probe warnings, the crash-loop family, and retryable image pulls.
 //  5. The settle family (settleApplies) has lasted the settle period by the
@@ -506,7 +509,7 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 			return gateNamespaceNotAllowed
 		}
 	}
-	if alertExcluded(f.cfg.alertExclude, ev) {
+	if scaleUpVerdictFor(ev.Key.Reason) == scaleUpNone && alertExcluded(f.cfg.alertExclude, ev) {
 		return gateAlertExcluded
 	}
 	if ev.Key.Reason == "Unhealthy" && belowMinCount(ev.Count, f.cfg.unhealthyMinCount) {
