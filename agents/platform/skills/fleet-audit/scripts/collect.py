@@ -328,10 +328,11 @@ MIRROR_TREE_NAME = "tree"
 # The only names the indexes open. `KUSTOMIZATION_FILE_NAMES` adds the one
 # extension-less spelling Kustomize also accepts.
 MIRROR_SUFFIXES = (".yaml", ".yml")
-# Bounds on one repository: the YAML files the indexes read, and the bytes of
-# the whole unpacked snapshot, so a repository nobody sized cannot fill the
-# sandbox's disk. Hitting either abandons the mirror rather than indexing part
-# of the tree: `broker_mirror` says why a partial region is worse than none.
+# Bounds on one repository. MIRROR_MAX_BYTES caps the unpacked snapshot, so a
+# repository nobody sized cannot fill the sandbox's disk; MIRROR_MAX_FILES caps
+# the YAML files the indexes read, counted once the tree is on disk. Hitting
+# either abandons the mirror rather than indexing part of the tree:
+# `broker_mirror` says why a partial region is worse than none.
 MIRROR_MAX_FILES = 5000
 MIRROR_MAX_BYTES = 64 << 20
 # The codes a snapshot is refused with for its size, and the broker's knob for
@@ -9889,12 +9890,24 @@ def broker_mirror(repo: str, dest: Path, snapshot: Callable | None = None) -> bo
     try:
         # Links the repository itself leaves with no target, which a clone
         # reads the same way; only the ones the drop below breaks are charged.
-        broken = {
-            Path(directory, name).relative_to(dest).as_posix()
-            for directory, _subdirs, names in os.walk(dest)
-            for name in names
-            if _mirrored(name) and Path(directory, name).is_symlink() and not Path(directory, name).exists()
-        }
+        # A link into an entry the snapshot left out has a target in a clone,
+        # so it is not one of these, and the loop charges it.
+        broken = set()
+        root = dest.resolve()
+        for directory, _subdirs, names in os.walk(dest):
+            for name in names:
+                path = Path(directory, name)
+                if not (_mirrored(name) and path.is_symlink() and not path.exists()):
+                    continue
+                try:
+                    target = path.resolve().relative_to(root).as_posix()
+                except ValueError:
+                    target = None
+                if target is not None and any(
+                    target == entry or target.startswith(entry + "/") for entry in left_out if entry
+                ):
+                    continue
+                broken.add(path.relative_to(dest).as_posix())
         # Repeated, because dropping a tree can leave a file link elsewhere
         # with no target, and that link's own region is then partial too. A
         # directory link is in `subdirs` and is not entered; a file link is in

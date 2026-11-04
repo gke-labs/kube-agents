@@ -10446,14 +10446,31 @@ class TestBrokerMirror(unittest.TestCase):
         self.assertNotIn("WARNING", err.getvalue())
         self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
 
+    def test_a_link_into_an_entry_the_snapshot_left_out_drops_its_tree(self):
+        """In a clone the link reads a real file, which may declare an object
+        the tree declares again, so the tree is not indexed partial."""
+        snapshot = _FakeSnapshot(
+            self.two_clusters(),
+            links={"clusters/other/apps/fixture-app.yaml": "../../../fixtures/app.yaml"},
+            skipped=self.left_out("fixtures", self.BARE),
+        )
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            index = collect.workload_declarations(dest)
+            clusters = collect._withheld_clusters(dest)
+        self.assertEqual(clusters, {"other"})
+        self.assertEqual({key[0] for key in index}, {"spot-capacity-test"})
+
     def test_a_chain_of_links_into_dropped_trees_drops_every_tree_on_it(self):
         """a's tree goes for its bare layout, so b's link into it dangles and b
-        goes, so c's link into b dangles and c goes: one pass per link."""
+        goes; only then does c's link to b's file dangle, and c goes: one pass
+        per link, so a loop bounded at two passes leaves c indexed."""
         deployment = self.DEPLOYMENT
         files = {
             f"clusters/{c}/apps/web.yaml": deployment.replace("spot-capacity-test", c).encode() for c in ("a", "b", "c")
         }
-        links = {"clusters/b/apps/y.yaml": "../../a/apps/web.yaml", "clusters/c/apps/z.yaml": "../../b/apps/y.yaml"}
+        links = {"clusters/b/apps/y.yaml": "../../a/apps/web.yaml", "clusters/c/apps/z.yaml": "../../b/apps/web.yaml"}
         snapshot = _FakeSnapshot(files, links=links, skipped=self.left_out("clusters/a/vendor", self.BARE))
         with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO):
             dest = Path(tmp) / "tree"
