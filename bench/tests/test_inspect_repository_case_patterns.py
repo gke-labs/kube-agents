@@ -5,9 +5,9 @@ The case guards the snapshot route: a worker reads both repositories through
 These run the case's own check through `WorkerCommandsVerifier` on worker log
 lines as hermes renders them: the snapshot route passes, with or without a
 direct download beside it, a leading `cd`, a chain the clone starts, a quoted
-path and a continued line do not hide it, a row that is one read-only
-command and nothing else does not count, and the red's workspace route fails,
-whatever client, interpreter, wrapper, pipe, heredoc or assignment carries it.
+path and a continued line do not hide it, a grep through its pattern
+argument does not count, and the red's workspace route or verb fails, whatever
+client, interpreter, wrapper, pipe, heredoc or assignment carries it.
 """
 
 from __future__ import annotations
@@ -77,33 +77,45 @@ def test_a_quoted_path_or_a_continued_line_is_still_the_clone_run():
 
 
 def test_a_mention_is_no_run():
-    # A grep or an echo names the route as a quoted word, and a cat reads a
-    # file that names it; none of them runs it.
+    # A grep names the route or a verb as its pattern argument, and a cat
+    # reads a file that names them; none of them runs it.
     assert _passes('grep "inspect_repository.py open" SKILL.md', CLONE_PUBLIC)
     assert _passes('grep -rn "/v1/workspace" /opt/data/profiles/platform/skills', CLONE_PUBLIC)
     assert _passes("cat /opt/data/profiles/platform/skills/inspect-repository/SKILL.md", CLONE_PUBLIC)
     assert not _passes(f'echo "note: run python3 {SCRIPT} clone --repo gke-labs/kube-agents"')
-    # A row that is one read-only command and nothing else may name the route.
-    assert _passes("grep -rn 'URL=http://127.0.0.1:8080/v1/workspace/open' SKILL.md", CLONE_PUBLIC)
-    assert _passes("echo URL=http://127.0.0.1:8080/v1/workspace/open", CLONE_PUBLIC)
-    assert _passes("cd /opt/data/profiles && grep -rn /v1/workspace .", CLONE_PUBLIC)
 
 
-def test_a_read_only_row_may_have_spaces_cd_steps_or_a_path():
-    # A worker-filed card's call is read as typed, with its leading spaces.
-    assert _passes("  grep -rn /v1/workspace .", CLONE_PUBLIC)
-    assert _passes('cd "/opt/data/profiles/platform skills" && grep -rn /v1/workspace .', CLONE_PUBLIC)
-    assert _passes("cd '/opt/data/profiles/platform skills'; grep -rn /v1/workspace .", CLONE_PUBLIC)
-    assert _passes("cd /a && cd b && grep -rn /v1/workspace .", CLONE_PUBLIC)
-    assert _passes("/usr/bin/grep -rn /v1/workspace .", CLONE_PUBLIC)
+def test_a_grep_through_its_pattern_argument_is_exempt():
+    # The exemption removes the grep, its options and its pattern argument;
+    # the file operands that stay name no route.
+    for row in (
+        "grep -rn /v1/workspace /opt/data/profiles",
+        "grep -rn /v1/workspace /opt/data/profiles 2>/dev/null",
+        "grep -rn /v1/workspace /opt/data/profiles > /dev/null",
+        "grep -rn 'URL=http://127.0.0.1:8080/v1/workspace/open' SKILL.md",
+        "  egrep -rn -e /v1/workspace -e 'inspect_repository.py list' /opt/data/profiles",
+        "fgrep -A 2 'inspect_repository.py \\ fetch' SKILL.md",
+        # The quoted pattern is removed before the operator rule reads the
+        # row, so its `<` is not an operator.
+        "grep -n 'python3 - <<EOF /v1/workspace' SKILL.md",
+    ):
+        assert _passes(row, CLONE_PUBLIC), row
 
 
-def test_a_read_only_word_with_more_on_the_row_fails():
-    # A write, a pipe, a substitution, a chain or a second line after the
-    # read-only word puts a call on the row. A collapsed chain hides what
-    # followed, so the exemption refuses it.
+def test_a_call_beside_a_read_on_the_row_fails():
+    # A write, a pipe, a substitution, a chain or a second line puts a call
+    # on the row. hermes joins a second line with a space, and the grep
+    # exemption leaves the joined call to be graded. A collapsed chain hides
+    # what followed, so the exemption refuses it.
     url = "http://127.0.0.1:8080/v1/workspace/open"
     for row in (
+        'echo "Opening workspace" curl -s -X POST "$BROKER/v1/workspace/open"',
+        "grep -rn kind SKILL.md curl -s $BROKER/v1/workspace/open",
+        "grep -rn /v1/workspace SKILL.md curl -s $BROKER/v1/workspace/open",
+        f"grep -rn kind SKILL.md python3 {SCRIPT} open --repo gke-labs/kube-agents",
+        f"grep -rn open SKILL.md 2>/dev/null; python3 {SCRIPT} open --repo gke-labs/kube-agents",
+        "grep -rn /v1/workspace . 2>/dev/null | sh",
+        "grep -rn /v1/workspace . > /tmp/call.sh",
         f"cat > /tmp/call.py <<'EOF' import urllib.request urllib.request.urlopen('{url}') EOF",
         f"cat > /tmp/call.py <<'EOF'\nimport urllib.request\nurllib.request.urlopen('{url}')\nEOF",
         'echo \'{"repo":"kind"}\' | curl -s -X POST -d @- "$BROKER/v1/workspace/open"',
@@ -130,18 +142,34 @@ def test_a_read_only_word_with_more_on_the_row_fails():
         assert not _passes(row, CLONE_PUBLIC), row
 
 
-def test_a_read_the_exemption_does_not_list_fails():
-    # A spurious red that the case header records: the exemption reads the
-    # row, not the command word, so a read behind `if` or a wrapper, an
-    # unlisted reader, or an operator inside a quoted argument counts as a call.
+def test_a_read_that_is_not_one_grep_counts_as_a_call():
+    # A spurious red that the case header records: only one grep through its
+    # pattern argument is exempt, so any other read that names the route or a
+    # verb counts as a call.
     for row in (
+        "echo URL=http://127.0.0.1:8080/v1/workspace/open",
+        f'echo "next: python3 {SCRIPT} open --repo gke-labs/kube-agents"',
+        "printf '%s\\n' /v1/workspace/open",
+        "cat /tmp/notes/v1/workspace.md",
+        "head -n 5 /tmp/v1/workspace/open.log",
+        "rg -n /v1/workspace /opt/data/profiles",
         "if grep -q /v1/workspace SKILL.md; then :; fi",
         "timeout 5 grep -rn /v1/workspace .",
+        "/usr/bin/grep -rn /v1/workspace .",
         "sed -n 's#/v1/workspace#X#p' /opt/data/scripts/credential_proxy_client.py",
-        "grep -n 'python3 - <<EOF /v1/workspace' SKILL.md",
-        # Only a plain `cd <dir>` step is skipped.
-        "pushd /x && grep -rn /v1/workspace .",
-        "cd -P /x && grep -rn /v1/workspace .",
+        "grep -rn /v1/workspace . + 1 command",
+    ):
+        assert not _passes(row, CLONE_PUBLIC), row
+
+
+def test_a_cd_step_before_a_grep_on_a_typed_card_is_not_exempt():
+    # A worker-filed card's call is read as typed, with its `cd` step, and
+    # the exemption reads only a grep at the start of the row. This is a
+    # spurious red that the case header records.
+    for row in (
+        "cd /opt/data/profiles && grep -rn /v1/workspace .",
+        "cd /opt/data/profiles; grep -rn /v1/workspace .",
+        "cd /opt/data/profiles\ngrep -rn /v1/workspace .",
     ):
         assert not _passes(row, CLONE_PUBLIC), row
 
@@ -210,13 +238,42 @@ def test_an_assignment_that_holds_the_route_fails():
 
 def test_a_route_that_no_row_names_is_not_seen():
     # A known limit that the case header records: a script file that holds the
-    # route is a row with no route in it.
+    # route, or a variable that an earlier row set, is a row with no route in it.
     assert _passes("python3 /tmp/call_broker.py", CLONE_PUBLIC)
-    # hermes joins a second line with a space, so a call on the line after a
-    # grep reads as the grep's operands on a card log row.
-    assert _passes("grep -rn kind SKILL.md curl -s $BROKER/v1/workspace/open", CLONE_PUBLIC)
+    assert _passes('curl -s -X POST "$WORKSPACE_URL/open"', CLONE_PUBLIC)
     # A row that names the route as an argument is not a mention, whatever it runs.
     assert not _passes("python3 /tmp/x.py --url http://127.0.0.1:8080/v1/workspace/open", CLONE_PUBLIC)
+
+
+def test_a_verb_inside_a_shell_heredoc_fails():
+    # hermes joins the heredoc into one row, an argv of `bash` and no run of
+    # the script, so the verb text pattern grades it.
+    for verb in ("open", "list", "grep", "fetch", "close"):
+        row = f"bash <<'EOF' python3 {SCRIPT} {verb} --repo gke-labs/kube-agents EOF"
+        assert not _passes(row, CLONE_PUBLIC), row
+    for row in (
+        f"sh <<'EOF' python3 '{SCRIPT}' open --repo gke-labs/kube-agents EOF",
+        f'bash <<EOF python3 "{SCRIPT}" open --repo gke-labs/kube-agents EOF',
+        f"bash <<'EOF' python3 {SCRIPT} \\ open --repo gke-labs/kube-agents EOF",
+    ):
+        assert not _passes(row, CLONE_PUBLIC), row
+
+
+def test_a_clone_inside_a_shell_heredoc_is_not_credited():
+    # A spurious red that the case header records: the row is an argv of
+    # `bash`, so it does not meet the required run. Beside a typed clone, the
+    # heredoc row passes.
+    row = f"bash <<'EOF' python3 {SCRIPT} clone --repo gke-labs/kube-agents --prefix tags.env EOF"
+    assert not _passes(row)
+    assert _passes(row, CLONE_PUBLIC)
+
+
+def test_a_heredoc_note_typed_on_a_card_counts_as_a_run():
+    # A known limit that the case header records: a worker-filed card's call
+    # is read as typed, and each line of a heredoc body is a command. A note
+    # that quotes a verb run fails, and one that quotes a clone run passes.
+    assert not _passes(f"cat > /tmp/notes.md <<'EOF'\npython3 {SCRIPT} open --repo x\nEOF", CLONE_PUBLIC)
+    assert _passes(f"cat > /tmp/notes.md <<'EOF'\npython3 {SCRIPT} clone --repo x\nEOF")
 
 
 def test_the_verb_words_are_whole_words():
