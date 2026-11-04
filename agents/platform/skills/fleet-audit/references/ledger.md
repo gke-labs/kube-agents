@@ -62,6 +62,8 @@ April close every morning forever. Post a fresh one.
 
 `pr-merged-persists` is the state worth reading twice: a fix merged and the deviation is still
 there. Either the remediation was incomplete or something outside this repository reverted it.
+When the collector's manifest shows that Config Connector does not apply the object, `finish` writes
+that cause in the ledger row and in the comment on the merged pull request instead.
 
 Below the findings, a ledger whose document carried a `declared` list renders a **Declared intent**
 table: one row per entry, with the check, the cluster, the object, `repo:path`, and the title and

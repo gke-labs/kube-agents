@@ -1267,6 +1267,21 @@ func TestSafeSandboxEnvOverridesPassesHermesOtelEnabled(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
+	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
+	// reconcile run scaffolds; the site documents it as a spec.deployment.env
+	// entry, which only reaches the agent container through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "BOOTSTRAP_MAX_CREATES_PER_TICK", Value: "25"},
+		{Name: "BOOTSTRAP_MAX_CREATES_PER_TICK", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{Key: "cap"},
+		}},
+	})
+	if len(got) != 1 || got[0].Name != "BOOTSTRAP_MAX_CREATES_PER_TICK" || got[0].Value != "25" || got[0].ValueFrom != nil {
+		t.Fatalf("expected only the literal BOOTSTRAP_MAX_CREATES_PER_TICK=25 to pass, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// The session server reads its daily alert ceilings from the environment,
 	// so an operator has to be able to tune or disable them on the CR. Without
@@ -1478,6 +1493,25 @@ func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
 	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "900"}})
 	if len(got) != 1 || got[0].Name != "INCIDENT_WORKLOAD_DEDUP_SECONDS" || got[0].Value != "900" {
 		t.Errorf("expected INCIDENT_WORKLOAD_DEDUP_SECONDS=900 to pass, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesRosterSummaryThreshold(t *testing.T) {
+	// agent_roster.py reads the threshold from the agent container's own
+	// environment (and the router MCP child's, through the chat config's env
+	// block); off the allowlist, the documented spec.deployment.env entry never
+	// reaches either.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD", Value: "1"}})
+	if len(got) != 1 || got[0].Name != "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD" || got[0].Value != "1" {
+		t.Errorf("expected KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD=1 to pass, got %#v", got)
+	}
+	// Literal values only, as for every name on the list.
+	got = safeSandboxEnvOverrides([]corev1.EnvVar{{
+		Name:      "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD",
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "n"}},
+	}})
+	if len(got) != 0 {
+		t.Errorf("a ValueFrom KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD must not pass, got %#v", got)
 	}
 }
 

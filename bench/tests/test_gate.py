@@ -26,8 +26,8 @@ the JSON hand-off -- so those are what this module pins. In particular:
    admitted case that lost every repetition to infrastructure, or every case
    lost -- and reds on a case result the loop never wrote: unaccounted work
    is not a pass, and it is not weather either.
-3. **The `Task <id> Result: [...]` line keeps its shape**, because people and
-   scripts grep build logs for it.
+3. **The `Task <id> Result: [...]` line keeps its shape**, because the dashboard
+   collector and people grep the grading artifact for it.
 4. **The environment carries every threshold**, since all of them are meant
    to be tuned against observed movement on main.
 5. **`record` is the only writer, and only on main.** It refuses with

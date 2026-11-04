@@ -246,6 +246,7 @@ class CutOffReportTest(unittest.TestCase):
                 f'BENCH_DIR="{tmp}"',
                 f'STATE_DIR="{tmp}/state"; mkdir -p "${{STATE_DIR}}"',
                 f'ARTIFACT_DIR="{tmp}/artifacts"; mkdir -p "${{ARTIFACT_DIR}}"',
+                'EVAL_GRADING_LOG_FILE="eval-grading.log"',
                 "TASK_NAMES=(case-a case-b case-c)",
                 f'EVAL_RECORDED_MANIFEST="{tmp}/artifacts/baseline-recorded.jsonl"',
                 setup,

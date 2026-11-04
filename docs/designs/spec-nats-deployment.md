@@ -273,7 +273,10 @@ short-lived, kubelet-rotated) and returns the account and the permission set.
 Revocation is the issuer's problem for the credential, and the issuer has solved it: a
 projected token is bound to its pod, so the API server stops authenticating it once the
 pod object is gone - measured at about ten seconds behind the delete, which is the
-TokenReview success cache rather than the token's hour. That governs the NEXT connection
+TokenReview success cache rather than the token's hour. The callout adds a cache of its
+own in front of that, thirty seconds on a successful review and nothing on a failure, so
+a deleted pod's token can open a new connection for up to about forty seconds after the
+delete. That governs the NEXT connection
 and only the next one. An ALREADY-OPEN connection is not revoked by anything above: the
 callout is consulted once, at CONNECT, and the server holds the grants it issued in a
 signed user JWT until that JWT expires - the callout's grant TTL, an hour less jitter.
@@ -780,6 +783,10 @@ profiles need the same refusal, from a set that follows them, when the CRD lands
 A reaped session's credential stops working because the pod object is gone, not because
 the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token
 10.1 seconds later, the API server's successful-authentication cache being the delay. The
+callout's own thirty-second memory of a successful review (below, "The throughput
+ceiling") sits in front of that, so a new connection on the reaped pod's token is refused
+within about forty seconds of the delete rather than ten; a connection already open is
+bounded by the grant TTL either way. The
 one-hour token lifetime is not the revocation story and must not be read as one.
 Profiles come and go at runtime, so the map cannot be a static gitops artifact; the CRs
 are the declarative source and admission bounds what a profile may grant. The agents
@@ -988,20 +995,38 @@ not gracefully degraded. Established sessions and the resilience contract below 
 what make that acceptable at this stage; a hardened HA callout is production posture,
 not part of stage 1.
 
-**The throughput ceiling, so it is known rather than discovered.** A replica answers
-authorization requests one at a time: the subscription is a queue-group subscription with
-an async handler, the client library dispatches one subscription's callbacks from one
-goroutine, and the handler does its TokenReview round trip inline. Two replicas is
-therefore two authorizations in flight for the whole fabric, and a slow API server sets
-the rate directly: two divided by the TokenReview latency, which is about 20 connections a
-second at a 100ms round trip. The queue behind it is bounded by the same under-two-second
-budget as everything else on this path. Measured, not read off the code, by
-`TestTheCalloutAnswersOneAuthorizationAtATime` in `a2a/authcallout`, which makes the
-TokenReview slow and observes that no two overlap. It is adequate for the connection rate
-this stage has - connections are rare compared to messages - and it is the first thing to
-look at if a fleet reconnecting at once is slow to come back. Raising it means handling
-each request in its own goroutine with a bound, which is a change to make against a
-measurement rather than in advance of one.
+**The throughput ceiling, so it is known rather than discovered.** A replica decides
+sixteen authorization requests at once: the subscription is a queue-group subscription
+with an async handler, the client library dispatches one subscription's callbacks from
+one goroutine, and the handler hands each request to a goroutine that decodes it, then
+takes one of sixteen worker slots before it reviews, mints and responds (the decode comes
+first because a refusal has to be addressed to the decoded user nkey). The under-two-second
+budget starts at receipt, so time spent waiting for a slot counts against it, and a
+request whose budget lapses before it gets one is refused rather than decided late. Two
+bounds then set the rate of fresh reviews per replica: sixteen divided by the TokenReview
+latency (160 a second at a 100ms round trip), and the TokenReview client's own limit of
+50 requests a second with a burst of 100, raised from client-go's defaults of 5 and 10,
+which the serial handler never reached and the pool would have hit before the API server
+was asked. So a replica sustains about 50 fresh reviews a second and absorbs a burst of
+100, and two replicas twice that. In front of the API server the callout remembers a
+successful review for thirty seconds, keyed by an HMAC-SHA-256 of the token under a key
+each replica draws at start (the API server's own token cache uses the same construction),
+so the token itself is not held and a cache key says nothing about its token outside that
+process, with concurrent presentations of one token sharing one review; a failure is
+never remembered, and the identity-map lookup is not cached, so a map change reaches the
+next connection as before. A reconnecting fleet therefore costs one review per distinct
+token per thirty seconds, its retries are free, and the log line for an authorized
+connection says whether its review was `fresh` or `cached`. Measured, not read off the
+code, by two tests in `a2a/authcallout`: `TestTheCalloutAnswersSixteenAuthorizationsAtOnce`
+connects sixty-four clients with distinct tokens to the operator's rendered server, holds
+every review until sixteen are in flight, and asserts the peak is exactly sixteen; and
+`TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast` hands sixty-four requests to the
+handler directly with a 50ms review each and asserts every one is answered inside a
+second, sixteen abreast. Before this the
+handler did its TokenReview inline and a replica answered one request at a time, and
+twelve A2A workers reconnecting per replica were enough to queue past the first-ping
+timer, each failed connect reconnecting and reviewing again; that outage was the
+measurement this paragraph had said to wait for before raising the ceiling.
 
 ## Transport encryption
 

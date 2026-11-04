@@ -1092,6 +1092,9 @@ def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
     out = {
         "build": verdict["build"],
         "pr": run.get("pr"),
+        # Where the build lives (SCHEMA.md, runs[].gcs_base); the pages link
+        # it there, Spyglass for a record without it.
+        "gcs_base": run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None,
         "head_sha": run.get("head_sha") if isinstance(run.get("head_sha"), str) else None,
         "project": run.get("project") if isinstance(run.get("project"), str) else None,
         "started": run.get("started") if iso_ms(run.get("started")) is not None else None,

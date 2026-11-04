@@ -167,9 +167,11 @@ def test_each_run_earns_the_verdict_the_case_states(run, verdict):
 
 
 @pytest.mark.parametrize("run", CHAINED)
-def test_the_rendering_alone_misses_a_chained_probe(run):
+def test_the_default_read_also_reaches_a_chained_probe(run):
+    # A probe is missing from the rendered rows. Without the switch the
+    # required check still reads the logged card's typed call (#4620).
     without = {k: v for k, v in _check().items() if k != AS_TYPED}
-    assert _status(without, run) == "fail", "a probe is missing from the rendered rows; the switch is what reads the typed call"
+    assert _status(without, run) == "pass", "the required check reads the logged card's typed call"
 
 
 BOTH_PROBES_IN_PROSE = (

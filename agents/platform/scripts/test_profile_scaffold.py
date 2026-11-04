@@ -830,6 +830,45 @@ class BackfillCronStoreTest(unittest.TestCase):
     def test_backfill_cron_file_handles_nonexistent_file(self):
         self.assertFalse(ps.backfill_cron_file(self.root / "absent.json"))
 
+    def test_backfill_cron_file_tells_a_store_it_cannot_read_from_nothing_to_do(self):
+        # None, not False: the entrypoint stamps a cluster profile as refreshed only
+        # when every step finished, so a store it could not parse must not read as one
+        # with nothing to back-fill.
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text("{not json", encoding="utf-8")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertIsNone(ps.backfill_cron_file(cron_file))
+        self.assertIn("WARN: could not read cron store", err.getvalue())
+        self.assertEqual(cron_file.read_text(encoding="utf-8"), "{not json")
+
+    def test_backfill_cron_file_tells_a_store_it_cannot_rewrite_from_nothing_to_do(self):
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text(json.dumps({"jobs": [{"id": "job1"}]}))
+        err = io.StringIO()
+        with unittest.mock.patch.object(ps.os, "replace", side_effect=OSError("read-only file system")), \
+                redirect_stderr(err):
+            self.assertIsNone(ps.backfill_cron_file(cron_file))
+        self.assertIn("WARN: could not backfill cron store", err.getvalue())
+        self.assertEqual(json.loads(cron_file.read_text()), {"jobs": [{"id": "job1"}]})
+
+    def test_backfill_cron_cli_exits_non_zero_for_a_store_it_could_not_back_fill(self):
+        # The entrypoint reads this exit code and nothing else from the step.
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text("{not json", encoding="utf-8")
+        with unittest.mock.patch.object(sys, "argv", ["profile_scaffold.py", "--backfill-cron", str(cron_file)]), \
+                redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            ps.main()
+        self.assertNotEqual(raised.exception.code, 0)
+        self.assertIn("could not read or rewrite", str(raised.exception.code))
+
+    def test_backfill_cron_cli_exits_zero_for_a_store_with_nothing_to_do(self):
+        cron_file = self.root / "jobs.json"
+        cron_file.write_text(json.dumps({"jobs": [{"id": "job1", "risk": "low"}]}))
+        with unittest.mock.patch.object(sys, "argv", ["profile_scaffold.py", "--backfill-cron", str(cron_file)]), \
+                redirect_stderr(io.StringIO()):
+            self.assertIsNone(ps.main())
+
     def test_backfill_cron_file_holds_cron_jobs_lock(self):
         cron_file = self.root / "jobs.json"
         cron_file.write_text(json.dumps({"jobs": [{"id": "job1"}]}))

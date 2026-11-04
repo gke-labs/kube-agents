@@ -592,7 +592,7 @@ repetitions inside one lease gradable: rep 2 pushing onto rep 1's branch moves t
 rep 2 quoting rep 1's URL does not. The job itself empties the leased repository of the agent's
 pull requests and branches at lease time and before every repetition of a case that requests a
 pull request (`hack/ci_reset_agent_pulls.py`, [`ci-pool-projects.md`](../docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it)), and a Prow periodic (`hack/ci_sweep_agent_pulls.py --pool`, run from
-`main` only) closes what a run killed hard left in free pool projects every ten minutes; a
+`main` only) closes what a run killed hard left in free pool projects hourly; a
 leftover branch would refuse an identical fix "nothing to commit", which is why both delete
 branches too. The head-commit check is what keeps anything inherited from grading.
 A pull request closed without being merged is rejected: closing moves `updated_at` too, and
@@ -783,8 +783,10 @@ than every case running at the time; a write no repetition names fails none, and
 leftovers listing still names it. The script also runs the cases that request a pull request
 (the same leaf count as the allowance), the stopped asks and the cases that declare
 `writes_alone: true` in a second phase, after every first-phase unit has
-finished (a case that declares `scope_exclude:` runs after them, in a phase of its own), one unit at a time, each after a settle as long as the check's clock-skew tolerance, so no window
-reaches back into the unit before. The lane marks those cases' windows `exclusive_window`, and a
+finished, one unit at a time. Before each of those units the script archives every kanban card
+still live that was filed since the fan-out began, then settles as long as the check's clock-skew
+tolerance, so no window reaches back into the unit before. A case that declares `scope_exclude:`
+runs after them, in a phase of its own. The lane marks those cases' windows `exclusive_window`, and a
 write in one is charged whether the repetition names it or not, since nothing else was writing;
 each is allowed the pull requests its own reply names. A pull request that was only
 commented on, labelled or closed in the window is not a write: an `updated_at` moved without a

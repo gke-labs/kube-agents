@@ -103,6 +103,24 @@ class EvalLogDirTest(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(os.path.realpath("/tmp"), os.path.realpath(out))
 
+    def test_a_path_ending_in_a_newline_resolves_to_the_directory_mkdir_made(self):
+        # A plain substitution strips the newline and names "logs", which was
+        # never created, or names an unrelated "logs" that exists (#3394). cd
+        # drops a trailing "/" or "/.", so those values end pwd's path in a
+        # newline too. Values stay relative, so a regression writes inside cwd.
+        for value in ("logs\n", "logs\n/", "logs\n/."):
+            for existing in ([], ["logs"]):
+                with self.subTest(value=value, existing=existing), tempfile.TemporaryDirectory() as cwd:
+                    for name in existing:
+                        os.mkdir(os.path.join(cwd, name))
+                    out = subprocess.run(
+                        ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\nprintf "%s" "${EVAL_LOG_DIR}"'],
+                        cwd=cwd, env={**os.environ, "EVAL_LOG_DIR": value, "CDPATH": ""},
+                        capture_output=True, text=True, check=True,
+                    ).stdout
+                    self.assertEqual(os.path.realpath(os.path.join(cwd, "logs\n")), os.path.realpath(out))
+                    self.assertTrue(os.path.isdir(out))
+
 
 class LockTest(unittest.TestCase):
     def test_a_dead_holders_lock_fails_the_contender_loudly(self):
@@ -304,8 +322,9 @@ class PerCaseGradingTest(unittest.TestCase):
 
     run_one_unit writes its state files while it still holds the task lock
     and counts them there, so exactly one repetition sees the count reach
-    EVAL_REPETITIONS; finish_case then grades under one grading lock, prints
-    the block in one piece, and marks the case `.graded` only when the
+    EVAL_REPETITIONS; finish_case then grades under one grading lock, appends
+    the block to the grading artifact with a pointer line in the job log, and
+    marks the case `.graded` only when the
     grading produced its JSON. The loop after the fan-out grades what has no
     sentinel and the record step passes the manifest that keeps a case from
     being appended twice.
@@ -541,9 +560,10 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
     FINISH_STUBS = """
 lock_acquire() { echo "lock $(basename "$1")"; }
 lock_release() { echo "unlock $(basename "$1")"; }
-grade_case() { echo "Task $2 Result: [PASSED] passed all 3 repetitions"; echo "  rep 1: pass -- ok"; : > "${ARTIFACT_DIR}/case-$2.json"; return "${GRADE_STATUS:-0}"; }
+grade_case() { echo "Task $2 Result: [PASSED] passed all 3 repetitions"; echo "  rep 1: pass -- ok"; echo "WARNING: $2: a bench-gate note" >&2; : > "${ARTIFACT_DIR}/case-$2.json"; return "${GRADE_STATUS:-0}"; }
 record_case() { echo "  recorded $1: 3/3 -> store"; }
 STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"
+EVAL_GRADING_LOG_FILE="eval-grading.log"; EVAL_GRADING_LOG="${ARTIFACT_DIR}/${EVAL_GRADING_LOG_FILE}"
 """
 
     def run_finish(self, grade_status: int) -> subprocess.CompletedProcess:
@@ -553,29 +573,75 @@ STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"
             f"GRADE_STATUS={grade_status}",
             "finish_case ./tasks/x/task.yaml case-x",
             '[ -f "${STATE_DIR}/case-x.graded" ] && echo GRADED || echo NOT_GRADED',
+            'echo "GRADING_LOG=${EVAL_GRADING_LOG}"',
         ])
         return run_bash(body)
 
-    def test_a_graded_case_is_marked_recorded_and_printed_in_one_piece(self):
+    @staticmethod
+    def grading_log(out: str) -> str:
+        """What finish_case appended to the grading artifact, "" when nothing."""
+        path = re.search(r"^GRADING_LOG=(.*)$", out, re.MULTILINE).group(1)
+        return pathlib.Path(path).read_text() if os.path.exists(path) else ""
+
+    def test_a_graded_case_is_marked_recorded_and_its_block_goes_to_the_artifact(self):
         out = self.run_finish(0).stdout
         self.assertIn("GRADED", out)
-        self.assertLess(out.index("lock lock-grade"), out.index("Task case-x Result:"))
-        self.assertLess(out.index("Task case-x Result:"), out.index("  recorded case-x"))
-        self.assertLess(out.index("  recorded case-x"), out.index("unlock lock-grade"))
+        block = self.grading_log(out)
+        self.assertLess(block.index("Task case-x Result:"), block.index("  recorded case-x"))
+        # The job log gets the pointer, between the lock lines, and none of the detail.
+        pointer = "case-x: graded; its block is in eval-grading.log"
+        self.assertLess(out.index("lock lock-grade"), out.index(pointer))
+        self.assertLess(out.index(pointer), out.index("unlock lock-grade"))
+        self.assertNotIn("Task case-x Result:", out, "grading detail never reaches the public job log")
+        self.assertNotIn("recorded case-x", out)
+        # bench-gate's stderr is not grading detail: it stays on the job log.
+        self.assertIn("WARNING: case-x: a bench-gate note", self.run_finish(0).stderr)
+        self.assertNotIn("a bench-gate note", block)
 
     def test_a_grading_that_failed_is_left_for_the_loop_after_the_fan_out(self):
         out = self.run_finish(2).stdout
         self.assertIn("NOT_GRADED", out)
         self.assertIn("grading case-x inside the fan-out failed (status 2)", out)
         self.assertNotIn("recorded case-x", out)
+        self.assertNotIn("Task case-x Result:", out)
+        self.assertIn("Task case-x Result:", self.grading_log(out), "what the grading printed before failing is kept")
         self.assertIn("unlock lock-grade", out, "the throttle is released either way")
 
     def test_the_loop_after_the_fan_out_skips_what_the_fan_out_graded(self):
         src = SCRIPT.read_text(encoding="utf-8")
         loop = src[src.index("# ─── Per-case verdicts, in the order TASKS declares"):src.index('profile_begin "record + final gate"')]
         self.assertIn('if [ -f "${STATE_DIR}/${TASK_NAME}.graded" ] && [ -f "${CASE_JSON}" ]; then', loop)
-        self.assertIn('grade_case "${TASK}" "${TASK_NAME}"', loop)
+        self.assertIn('grade_case "${TASK}" "${TASK_NAME}" >> "${EVAL_GRADING_LOG}" || {', loop)
+        self.assertNotIn('"${EVAL_GRADING_LOG}" 2>&1', loop, "stderr stays on the job log")
         self.assertIn('CASE_RESULTS+=(--case-result "${CASE_JSON}")', loop)
+
+    def test_grading_detail_reaches_the_job_log_nowhere(self):
+        """Every writer of grading detail -- `bench-gate case` through
+        grade_case, `bench-gate suite`'s table -- lands in EVAL_GRADING_LOG,
+        and the ledger lines that quote audit titles and token lifetimes go
+        the same way. The live job log of a public repository is served to
+        anyone by Deck; who reads the artifact is the bucket's IAM."""
+        src = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('cat "${block}" >> "${EVAL_GRADING_LOG}"', lifted("finish_case"))
+        self.assertIn('--json-out "${ARTIFACT_DIR}/eval-verdict.json") >> "${EVAL_GRADING_LOG}" || SUITE_STATUS=$?', src)
+        self.assertIn('sed "s/^/Ledger reset (${label}): /" >> "${EVAL_GRADING_LOG}"', lifted("reset_audit_ledgers"))
+        self.assertIn('expires ${minted##* }" >> "${EVAL_GRADING_LOG}"', lifted("mint_ledger_token"))
+        self.assertEqual(src.count("uv run bench-gate case"), 1, "grade_case is the one caller; both of its call sites redirect")
+        # The table pointer is printed only when the table exists; a suite
+        # that died before writing it says so instead.
+        self.assertIn('if [ -f "${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE}" ]; then', src)
+        self.assertIn('WARNING: bench-gate suite exited ${SUITE_STATUS} without writing', src)
+        # The two sides of the artifact's name: the script writes it, the
+        # collector reads it; a rename on one side records every build with
+        # no tasks, and nothing else pins the pair.
+        from eval_dashboard import collect
+        name = re.search(r'^readonly EVAL_GRADING_LOG_FILE="([^"]+)"$', src, re.MULTILINE).group(1)
+        self.assertEqual(name, os.path.basename(collect.EVAL_GRADING_FILE))
+        # A grading the loop after the fan-out could not run still stops the
+        # job, and the job log says where its output went.
+        loop = src[src.index("# ─── Per-case verdicts, in the order TASKS declares"):src.index('profile_begin "record + final gate"')]
+        self.assertIn('echo "ERROR: grading ${TASK_NAME} failed (status ${rc}); its output is in ${EVAL_GRADING_LOG_FILE}" >&2', loop)
+        self.assertIn('exit "${rc}"', loop)
 
     def test_both_record_calls_share_the_manifest(self):
         src = SCRIPT.read_text(encoding="utf-8")

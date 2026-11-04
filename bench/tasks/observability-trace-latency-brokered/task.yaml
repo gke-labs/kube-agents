@@ -64,6 +64,9 @@
 # an `echo` of the project id, which the rendering shows as `printenv
 # GKE_PROJECT_ID + 1 command`, and were graded as not having run it; a run
 # inside a parenthesised subshell or behind an `ls` is seen the same way.
+# The default read now takes a logged card's calls beside its rows for a
+# required check too; the switch is kept for the error
+# named below.
 # Two costs come with the typed read: a mention of the invocation on a
 # second line or inside a heredoc the worker never ran is read as a run,
 # the admitting side of a text pattern; and the card log's rows join the
