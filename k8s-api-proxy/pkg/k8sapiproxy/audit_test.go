@@ -106,6 +106,12 @@ func TestHandlerAuditEvents(t *testing.T) {
 			wantErr: "token expired", noCaller: true,
 		},
 		{
+			name: "authentication unavailable", method: http.MethodGet, target: "/api/v1/pods",
+			cfg:     Config{Authenticator: staticAuthenticator{err: fmt.Errorf("%w: %w", errAuthenticationUnavailable, errors.New("connection refused"))}},
+			want:    AuditEvent{Path: "/api/v1/pods", Outcome: OutcomeAuthUnavailable, StatusCode: http.StatusServiceUnavailable},
+			wantErr: "caller authentication is unavailable: connection refused", noCaller: true,
+		},
+		{
 			name: "invalid cluster", method: http.MethodGet, target: "/clusters/bad$id/api/v1/pods",
 			want: AuditEvent{Path: "/clusters/bad$id/api/v1/pods", Outcome: OutcomeRefused, Reason: ReasonInvalidRoute,
 				StatusCode: http.StatusBadRequest},
@@ -278,6 +284,12 @@ func TestSlogAuditSink(t *testing.T) {
 			event:     AuditEvent{Outcome: OutcomeUnauthenticated, Err: errors.New("token expired"), StatusCode: http.StatusUnauthorized},
 			wantLevel: "WARN",
 			want:      map[string]any{auditKeyError: "token expired"},
+		},
+		{
+			name:      "authentication unavailable",
+			event:     AuditEvent{Outcome: OutcomeAuthUnavailable, Err: errAuthenticationUnavailable, StatusCode: http.StatusServiceUnavailable},
+			wantLevel: "ERROR",
+			want:      map[string]any{auditKeyOutcome: "auth_unavailable", auditKeyError: "caller authentication is unavailable"},
 		},
 		{
 			name:      "upstream error",

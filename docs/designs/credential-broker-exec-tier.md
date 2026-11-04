@@ -765,9 +765,9 @@ cache contract.
      cluster serves the `auto.gke.io` AllowlistedWorkload resource. On Standard the requests stay 500m / 1 GiB and the broker bursts
      to the limit: a 2-CPU request has to fit on one node before the single, `Recreate` broker
      can start, and a one-node default pool with the agent pods on it has no 2 cores free.
-   - **Graceful shutdown.** Today `serve()` runs `serve_forever()` with no SIGTERM handler, and
-     the Deployment sets no `terminationGracePeriodSeconds` and no `preStop`, so a pod stop drops
-     the commands in flight. The broker gets a SIGTERM handler that stops admitting (new requests
+   - **Graceful shutdown.** Before this step `serve()` ran `serve_forever()` with no SIGTERM
+     handler, and the Deployment set no `terminationGracePeriodSeconds` and no `preStop`, so a pod
+     stop dropped the commands in flight. The broker gets a SIGTERM handler that stops admitting (new requests
      get a 503 with the new bound `draining`, which §4.3's retry sends to another replica while
      exec routing is on) and
      drains the commands in flight. The drain depends
@@ -776,7 +776,10 @@ cache contract.
        the new one, so every route is down while the pod drains. There the drain is short and
        bounded: it finishes commands for up to 30 s, then ends the rest. The pod drains its relays
        in the same window, and its `terminationGracePeriodSeconds` is 45 s, so the kubelet does
-       not kill it before the drain and the exit end, and events are not lost.
+       not kill it before the drain and the exit end. Chat receipts still unsettled go back to
+       Pub/Sub; Slack and Teams events the gateway did not pull before the exit end with the
+       process, and the Slack count is logged. This half is implemented (`install_shutdown_handler`
+       in `credential_proxy.py`, the broker role only).
      - On the exec tier, `RollingUpdate` keeps another replica serving, so the drain is long: a
        `terminationGracePeriodSeconds` longer than the longest command it admits. A
        PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or more; at 1

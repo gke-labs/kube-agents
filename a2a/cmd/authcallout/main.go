@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -31,17 +32,18 @@ import (
 )
 
 const (
-	envNATSURL      = "NATS_URL"
-	envNATSUser     = "NATS_USER"
-	envNATSPassword = "NATS_PASSWORD"
-	envNamespace    = "POD_NAMESPACE"
-	envAuthMapName  = "A2A_AUTHMAP_NAME"
-	envAuthMapKey   = "A2A_AUTHMAP_KEY"
-	envAudience     = "A2A_TOKEN_AUDIENCE"
-	envIssuerSeed   = "A2A_ISSUER_SEED"
-	envXKeySeed     = "A2A_XKEY_SEED"
-	envGrantTTL     = "A2A_GRANT_TTL_SECONDS"
-	envStatusAddr   = "A2A_STATUS_ADDR"
+	envNATSURL       = "NATS_URL"
+	envNATSUser      = "NATS_USER"
+	envNATSPassword  = "NATS_PASSWORD"
+	envNamespace     = "POD_NAMESPACE"
+	envAuthMapName   = "A2A_AUTHMAP_NAME"
+	envAuthMapKey    = "A2A_AUTHMAP_KEY"
+	envAuthMapShards = "A2A_AUTHMAP_SHARDS"
+	envAudience      = "A2A_TOKEN_AUDIENCE"
+	envIssuerSeed    = "A2A_ISSUER_SEED"
+	envXKeySeed      = "A2A_XKEY_SEED"
+	envGrantTTL      = "A2A_GRANT_TTL_SECONDS"
+	envStatusAddr    = "A2A_STATUS_ADDR"
 
 	// envReservedPrincipals carries the static nats.conf user names, comma
 	// separated, which the operator renders from the list it renders
@@ -117,6 +119,21 @@ func run(log *slog.Logger) error {
 	if authMapKey == "" {
 		authMapKey = defaultAuthMapKey
 	}
+	// The shard count. Refused rather than defaulted, like the reserved
+	// names below: the operator cuts the map into numbered ConfigMaps and
+	// renders the count here beside the Role that names them, so a callout
+	// that guessed one would watch one name and serve part of a map whose
+	// other parts it cannot see. An image newer than the operator rendering
+	// it lands here, which is the safe direction: the rollout stalls on the
+	// new pods and the old ones keep serving.
+	rawShards, ok := os.LookupEnv(envAuthMapShards)
+	if !ok {
+		return fmt.Errorf("%s is required; the operator renders it from the number of identity map shards it cut", envAuthMapShards)
+	}
+	authMapShards, err := strconv.Atoi(strings.TrimSpace(rawShards))
+	if err != nil || authMapShards < 1 {
+		return fmt.Errorf("%s=%q is not a shard count of one or more", envAuthMapShards, rawShards)
+	}
 	audience := os.Getenv(envAudience)
 	if audience == "" {
 		// Refused rather than defaulted. A TokenReview with no audience
@@ -182,7 +199,10 @@ func run(log *slog.Logger) error {
 		return fmt.Errorf("building the Kubernetes client: %w", err)
 	}
 
-	store := authcallout.NewStore(log)
+	store, err := authcallout.NewShardedStore(log, authMapShards)
+	if err != nil {
+		return fmt.Errorf("%s: %w", envAuthMapShards, err)
+	}
 	validator, err := authcallout.NewTokenValidator(clientset, audience)
 	if err != nil {
 		return err
@@ -244,11 +264,12 @@ func run(log *slog.Logger) error {
 		_ = statusSrv.Shutdown(shutdownCtx)
 	}()
 
-	// WatchConfigMap returns only when the context ends, so there is no
-	// error branch here to log: the informer retries internally and a
+	// WatchConfigMapShards returns only when the context ends, so there is
+	// no error branch here to log: the informers retry internally and a
 	// genuinely broken watch surfaces as the store never becoming ready,
-	// which WaitForMap below reports with the reason attached.
-	go func() { _ = store.WatchConfigMap(ctx, clientset, namespace, authMapName, authMapKey) }()
+	// which WaitForMap below reports with the reason attached. One by-name
+	// watch per shard, <authMapName>-0 through -<authMapShards-1>.
+	go func() { _ = store.WatchConfigMapShards(ctx, clientset, namespace, authMapName, authMapKey) }()
 
 	// Serving nothing means refusing everything, so do not subscribe until
 	// there is a map to answer from. Subscribing first would mean the window
