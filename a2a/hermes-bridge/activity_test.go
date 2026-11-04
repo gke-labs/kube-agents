@@ -64,6 +64,14 @@ def call(tool, args, call_id, status="ok", error_type=None, ms=12):
 	return []string{path}
 }
 
+// stubMarkerEnv and stubBarrierEnv carry a test's paths to its stub through
+// the environment the child inherits, not through the stub's source, where a
+// Go-quoted path is not always a Python string with the same bytes.
+const (
+	stubMarkerEnv  = "HERMES_STUB_TEST_MARKER"
+	stubBarrierEnv = "HERMES_STUB_TEST_BARRIER"
+)
+
 // waitForFile returns once path exists or d has passed. It runs off the test
 // goroutine, so it reports nothing: the caller's assertions fail instead.
 func waitForFile(path string, d time.Duration) {
@@ -253,11 +261,12 @@ print("done")
 func TestActivity_AnOpenCallIsReportedInterruptedAtTheDeadline(t *testing.T) {
 	_, url := startServer(t)
 	posted := filepath.Join(t.TempDir(), "posted")
-	startBridgeCfgHooked(t, url, hermesStub(t, fmt.Sprintf(`
+	t.Setenv(stubMarkerEnv, posted)
+	startBridgeCfgHooked(t, url, hermesStub(t, `
 post("pre_tool_call", "terminal", {"cmd": "sleep 60", "secret": "x"}, {"tool_call_id": "c-open", "task_id": ""})
-open(%q, "w").close()
+open(os.environ["`+stubMarkerEnv+`"], "w").close()
 time.sleep(30)
-`, posted)), func(c *Config) {
+`), func(c *Config) {
 		c.TaskDeadline = 2 * time.Second
 		c.KillGrace = 200 * time.Millisecond
 	}, func(b *Bridge) {
@@ -595,12 +604,12 @@ const concurrentBarrierWait = 10 * time.Second
 // loaded runner crossed with the tasks running at once.
 func TestActivity_ConcurrentTasksKeepTheirOwnTraces(t *testing.T) {
 	_, url := startServer(t)
-	barrier := t.TempDir()
+	t.Setenv(stubBarrierEnv, t.TempDir())
 	startBridgeCfg(t, url, hermesStub(t, fmt.Sprintf(`
 prompt = sys.argv[-1]
 tool = "tool-for-" + prompt
 call(tool, {"which": ord(prompt)}, "call-" + prompt)
-barrier = %q
+barrier = os.environ["`+stubBarrierEnv+`"]
 open(os.path.join(barrier, prompt), "w").close()
 give_up = time.monotonic() + %g
 while not all(os.path.exists(os.path.join(barrier, p)) for p in ("A", "B")):
@@ -609,7 +618,7 @@ while not all(os.path.exists(os.path.join(barrier, p)) for p in ("A", "B")):
     time.sleep(0.05)
 call(tool + "-again", {"which": ord(prompt)}, "call2-" + prompt)
 print("answer for " + prompt)
-`, barrier, concurrentBarrierWait.Seconds())), func(c *Config) { c.Concurrency = 2 })
+`, concurrentBarrierWait.Seconds())), func(c *Config) { c.Concurrency = 2 })
 	c := gatewayClient(t, url)
 
 	submit(t, c, "task-a", "A")
