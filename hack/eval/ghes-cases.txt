@@ -9,7 +9,7 @@
 # cases below grade the forge the way gitlab-cases.txt's do, and the same rules
 # hold: one `./tasks/<id>/task.yaml` path per line, every entry a registered
 # case (presubmit-cases.txt or nightly-cases.txt) with a positive forge check,
-# pinned by scripts/test_eval_rosters.py. Neither nightly appends to the
+# pinned by scripts/test_eval_rosters.py. The nightly does not append to the
 # evidence store.
 #
 # WHAT A PASS PROVES. The agent reached the forge at the GHES host: the pull
