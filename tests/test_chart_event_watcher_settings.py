@@ -191,6 +191,7 @@ class EventWatcherSettingsRenderTest(unittest.TestCase):
         for settings in (
             {"dedupWindow": "0"}, {"dedupWindow": "0s"}, {"dedupWindow": 0},
             {"scaleUpHold": "0"}, {"scaleUpHold": 0},
+            {"dedupWindow": "0.5ns"}, {"scaleUpHold": "0.5ns"}, {"scaleUpHold": "0s0.999ns"},
             {"backoffMinCount": 0}, {"failedSchedulingMinCount": 0}, {"imagePullTransientMinCount": 0},
             {"settle": "5x"}, {"settle": "2 m"}, {"settle": 30}, {"settle": True},
             {"backoffMinCount": -1}, {"backoffMinCount": 2.5}, {"backoffMinCount": "3"},
