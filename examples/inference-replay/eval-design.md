@@ -361,8 +361,8 @@ request would pass without anything being written to the cache. So:
   never match;
 - the proxy's files need eval-crew approval in `hack/OWNERS`, wherever the code ends up.
 
-Like the scorer's pin, this still relies on eval-crew reviewing changes to the deploy scripts that
-do the pinning, since those run from the pull request's code.
+Like the scorer's pin, this still relies on root-approver review of changes to the deploy scripts
+that do the pinning, since those run from the pull request's code.
 
 ### What goes into the cache key
 
