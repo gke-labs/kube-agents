@@ -28,6 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 import credential_proxy
 import credential_proxy_client
 import feedback_broker
@@ -86,6 +88,10 @@ _ANNOUNCED_BODY_NEVER_SENT = 1024 * 1024
 # Decimal places the fake clock keeps; enough for any poll interval the kill
 # uses, few enough that repeated sums stay exact.
 _FAKE_CLOCK_DECIMALS = 9
+
+# The Envoy config baked into the broker image, whose credential_runtime
+# breaker is the ceiling LISTEN_BACKLOG is sized to.
+_ENVOY_CONFIG = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "envoy-credential-proxy.yaml"
 
 
 class _FakeClock:
@@ -15172,9 +15178,17 @@ class ListenBacklogTest(unittest.TestCase):
         self.assertEqual(
             credential_proxy.LISTEN_BACKLOG, credential_proxy.ThreadingTCPHTTPServer.request_queue_size
         )
-        # Envoy's per-cluster connection ceiling, the most it can ever hold open
-        # to the broker at once; the queue must not be what refuses first.
-        self.assertGreaterEqual(credential_proxy.LISTEN_BACKLOG, 1024)
+        # Envoy's per-cluster connection ceiling on the credentialed route, the
+        # most it can ever hold open to the broker at once; the queue must not
+        # be what refuses first. Read off the shipped config rather than
+        # written here, so that raising one without the other fails.
+        envoy = yaml.safe_load(_ENVOY_CONFIG.read_text())
+        runtime = next(
+            cluster for cluster in envoy["static_resources"]["clusters"] if cluster["name"] == "credential_runtime"
+        )
+        ceilings = {threshold["max_connections"] for threshold in runtime["circuit_breakers"]["thresholds"]}
+        self.assertEqual(1, len(ceilings), f"credential_runtime's priorities disagree on max_connections: {ceilings}")
+        self.assertGreaterEqual(credential_proxy.LISTEN_BACKLOG, ceilings.pop())
 
 
 class ScopedServiceAccountPathTest(unittest.TestCase):

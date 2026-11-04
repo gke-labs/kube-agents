@@ -716,7 +716,7 @@ The credential broker is a Deployment of its own, never a container of this Pod,
 Abstracts the pod/deployment configuration. The controller synthesises a `Deployment` from these plus the workspace ConfigMaps. Available fields:
 
 - `image` — container image repository.
-- `tag` — image tag. Applies only when `image` is set without a tag or digest, falling back to `latest` there; when `image` is omitted, the operator's default platform-agent version applies instead.
+- `tag` — image tag. Applies only when `image` is set without a tag or digest, falling back to `latest` there; when `image` is omitted, the operator's default platform-agent version applies instead. The credential broker's image is derived from the same repository and tag, and a pinned one must be at least as new as the operator. The operator reads the broker's readiness on a health listener (port 8768) that older broker images do not open, so a broker Pod running one never becomes Ready.
 - `imagePullPolicy` — one of `Always`, `Never`, `IfNotPresent`. Default `IfNotPresent`.
 - `imagePullSecrets` — Secrets in the agent's namespace holding registry credentials, as
   `- name: <secret>` entries. Referenced, not created: each must exist before the pod is
