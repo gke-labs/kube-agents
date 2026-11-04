@@ -568,6 +568,7 @@ def test_parse_takes_a_size_and_fleet_load_requires_names(tmp_path):
 
 def test_load_targets_refuses_names_outside_the_fleet():
     assert cli.load_targets("oom-01,oom-02", ["oom-01", "oom-02", "oom-03"]) == ["oom-01", "oom-02"]
+    assert cli.load_targets("oom-01, oom-02", ["oom-01", "oom-02"]) == ["oom-01", "oom-02"]
     with pytest.raises(SystemExit):
         cli.load_targets("oom-01,kwok-09", ["oom-01", "oom-02"])
     with pytest.raises(SystemExit):

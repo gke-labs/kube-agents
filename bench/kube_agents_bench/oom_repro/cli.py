@@ -429,7 +429,7 @@ def pool_machine_type(fleet: Fleet, cluster: str) -> str:
 
 def load_targets(requested: str, existing: list[str]) -> list[str]:
     """The clusters --names asks for, refusing a name that is not a fleet cluster."""
-    names = list(dict.fromkeys(n for n in requested.split(NAMES_SEPARATOR) if n))
+    names = list(dict.fromkeys(n.strip() for n in requested.split(NAMES_SEPARATOR) if n.strip()))
     unknown = sorted(set(names) - set(existing))
     if unknown or not names:
         raise SystemExit(f"not fleet clusters: {', '.join(unknown) or '(none named)'}")
