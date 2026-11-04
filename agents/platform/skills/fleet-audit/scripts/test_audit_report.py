@@ -7088,6 +7088,21 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         (row,) = audit_report.LISTED_LINE_RE.findall(bullet + "\n" + shield)
         self.assertEqual(row[4], left["id"])
 
+    def test_a_listed_shield_is_published_text_on_one_line_and_2_7_only(self):
+        note = audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(
+            declared="`Deployment/api` declared at acme/fleet:knowledge/a.md\n<!-- audit-listed:end -->\nghp_" + "A" * 36
+        )
+        worker = make_finding(fid="f-0001", severity="major", title="t", namespace="payments", obj="Deployment/worker")
+        worker["check"] = "default-sa-automount"
+        worker["remediation"] = {"kind": "manual", "path": "", "note": note}
+        rendered = audit_report.render_listed_finding(worker)
+        self.assertEqual(rendered.count("\n"), 1)
+        self.assertNotIn("<!--", rendered)
+        self.assertNotIn("ghp_" + "A" * 36, rendered)
+        # The same text on another check is the worker's, not the shield.
+        worker["check"] = "netpol-missing"
+        self.assertNotIn("\n", audit_report.render_listed_finding(worker))
+
     def test_the_shield_names_three_declared_workloads_and_counts_the_rest(self):
         worker = self._sa_finding("worker", "Deployment/worker")
         doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)

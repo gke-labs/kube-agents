@@ -11645,12 +11645,22 @@ def render_listed_finding(
 
 
 def _shared_account_shield(finding: dict) -> str:
-    """The shield note at the head of a finding's remediation note, or ""."""
+    """The shield note at the head of a 2.7 finding's remediation note, or "".
+
+    Through `clip_text` like every other note bound for the body, and on one
+    line: the note's text is the harness's, but the names in it come from the
+    repository, and a newline or comment opener in them must not reach the
+    listed section's brackets.
+    """
+    if str(finding.get("check", "")) != SHARED_ACCOUNT_CHECK:
+        return ""
     note = str((finding.get("remediation") or {}).get("note", ""))
     if not note.startswith(SHARED_ACCOUNT_SHIELD_PREFIX):
         return ""
     end = note.find(SHARED_ACCOUNT_SHIELD_END)
-    return note[: end + len(SHARED_ACCOUNT_SHIELD_END)] if end != -1 else ""
+    if end == -1:
+        return ""
+    return " ".join(clip_text(note[: end + len(SHARED_ACCOUNT_SHIELD_END)], MAX_NOTE_CHARS).split())
 
 
 def _listed_header(count: int) -> list[str]:

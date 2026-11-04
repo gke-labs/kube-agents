@@ -904,7 +904,8 @@ headroom for the trailing marker and for anything a later section appends.
 - **A name outranks a full block, except a critical's.** When the full blocks do not all fit, the
   findings left over are each listed on one line — severity, title, location, id, then any fix
   state and its pull request — under
-  `### Listed without detail (N)`. Bands are taken most severe first. A non-critical band shows as
+  `### Listed without detail (N)`; a 2.7 finding the shared-account shield made manual keeps the
+  shield's note on an indented line under its row. Bands are taken most severe first. A non-critical band shows as
   many full blocks as still leave room to name the rest of it and every finding below it; the
   critical band keeps room for its own names only, so a critical never loses its evidence to a less
   severe finding's name. When naming everything below cannot fit even with no full blocks, a
