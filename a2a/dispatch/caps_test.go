@@ -9,7 +9,7 @@ import (
 )
 
 func bareDispatcher() *Dispatcher {
-	return &Dispatcher{cfg: testConfig(), now: time.Now, active: map[holdKey]*holding{}, waiting: map[string]waiting{},
+	return &Dispatcher{cfg: testConfig(), now: time.Now, active: map[holdKey]*holding{}, waiting: map[holdKey]waiting{},
 		lastAdmit: map[string]time.Time{}, released: map[string]time.Time{}, verified: map[holdKey]permit{}}
 }
 
@@ -169,4 +169,35 @@ func TestOverCapStaysQueuedAndRunsLater(t *testing.T) {
 			t.Errorf("%s: %+v, want completed", id, ts)
 		}
 	}
+}
+
+// The health line's waiting entries are keyed like the rest of the
+// in-flight state, by (profile, tier, kind, task): two durables waiting on
+// the same task id are two entries, each under its own durable with its own
+// reason, and clearing or offering one leaves the other.
+func TestWaitingIsKeptPerDurableForASharedTaskID(t *testing.T) {
+	d := bareDispatcher()
+	a := holdKey{"tse", "read", lib.SubmitKindTop, "task-1"}
+	b := holdKey{"tse2", "read", lib.SubmitKindTop, "task-1"}
+	durA := lib.ProfileDurableName(a.profile, a.tier, a.kind)
+	durB := lib.ProfileDurableName(b.profile, b.tier, b.kind)
+	check := func(step string, wantA, wantB, wantNoWorkerB int) {
+		t.Helper()
+		h := d.Health()
+		if h.Waiting[durA] != wantA || h.Waiting[durB] != wantB || h.NoWorker[durA] != 0 || h.NoWorker[durB] != wantNoWorkerB {
+			t.Errorf("%s: waiting %v noWorker %v, want %s=%d %s=%d (no worker %d)", step, h.Waiting, h.NoWorker, durA, wantA, durB, wantB, wantNoWorkerB)
+		}
+	}
+	d.noteWaiting(a, time.Now(), "profile concurrency")
+	d.noteWaiting(b, time.Now(), ReasonNoWorker)
+	check("both noted", 1, 1, 1)
+	// a's offer round ends its wait over a cap; b's no-worker wait is its own.
+	d.offeringWaiting(a)
+	check("a offered", 0, 1, 1)
+	d.noteWaiting(a, time.Now(), "profile concurrency")
+	d.clearWaiting(a)
+	check("a cleared", 0, 1, 1)
+	d.noteWaiting(a, time.Now(), "profile concurrency")
+	d.clearWaiting(b)
+	check("b cleared", 1, 0, 0)
 }

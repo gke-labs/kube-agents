@@ -165,7 +165,7 @@ type Dispatcher struct {
 	started   time.Time
 	active    map[holdKey]*holding
 	offers    map[offerKey]chan lib.DispatchAccept
-	waiting   map[string]waiting
+	waiting   map[holdKey]waiting
 	lastAdmit map[string]time.Time
 	// released is the lease keys of tasks whose final renewal came while no
 	// hold here had them, by when: settled, not failed, when the
@@ -224,7 +224,7 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 		cfg: cfg, bus: bus, src: src, pool: pool, verifier: verifier, log: log, now: time.Now,
 		active:     map[holdKey]*holding{},
 		offers:     map[offerKey]chan lib.DispatchAccept{},
-		waiting:    map[string]waiting{},
+		waiting:    map[holdKey]waiting{},
 		lastAdmit:  map[string]time.Time{},
 		released:   map[string]time.Time{},
 		verified:   map[holdKey]permit{},
@@ -601,7 +601,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 	if ref != nil {
 		log.Info("submission refused at admission", "reason", ref.reason, "detail", ref.detail)
-		d.clearWaiting(taskID)
+		d.clearWaiting(hk)
 		d.reject(ctx, log, del, hk, ref)
 		return
 	}
@@ -614,23 +614,23 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 				return
 			}
 		}
-		d.noteWaiting(taskID, lib.ProfileDurableName(profile, tier, kind), del.Received(), why)
+		d.noteWaiting(hk, del.Received(), why)
 		log.Debug("over a cap; the submission stays queued", "cap", why)
 		_ = del.Nak(d.cfg.RetryDelay)
 		return
 	}
-	d.offeringWaiting(taskID)
+	d.offeringWaiting(hk)
 
 	rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
 	if err == nil && key != "" {
-		d.clearWaiting(taskID)
+		d.clearWaiting(hk)
 	}
 	if err != nil || key == "" {
 		d.release(h, false)
 		if err != nil {
 			log.Warn("hand-off failed; the submission stays queued", "err", err)
 		} else {
-			d.noteWaiting(taskID, lib.ProfileDurableName(profile, tier, kind), del.Received(), ReasonNoWorker)
+			d.noteWaiting(hk, del.Received(), ReasonNoWorker)
 			log.Info("no worker took the task; the submission stays queued")
 		}
 		if ctx.Err() == nil {
