@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +70,41 @@ func TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed(t *testing.T) {
 // keeps the default cap, which reads and refuses but never folds or
 // publishes.
 const atCapAnswerBytes = 512 << 10
+
+// fullCapEnv opts in to TestAPI_AnswerAtTheProductionCapReachesATerminal,
+// and fullCapTerminalWait is its terminal budget. An answer of apiResponseCap
+// bytes reached its terminal in about 10 s under the race detector on an idle
+// machine, and in 58 s to 132 s with the module's packages sharing four
+// starved cores; the budget is over twice the slowest.
+const (
+	fullCapEnv          = "HERMES_BRIDGE_TEST_FULL_CAP"
+	fullCapTerminalWait = 300 * time.Second
+)
+
+// An answer of exactly apiResponseCap bytes, folded and published, reaches a
+// terminal. finalizeResult publishes the result chunks and the terminal inside
+// one finalizePublishTimeout window, so on a host slow enough that the chunks
+// use the window, the terminal publish fails too and no terminal arrives
+// until the sweep. This test observes that defect; the at-cap boundary itself
+// is TestAPI_AnswerAtTheCapCompletes, at atCapAnswerBytes.
+//
+// It runs only with fullCapEnv set. On a loaded host the window, not the
+// wait, decides: with twenty-four busy loops on eight cores (load average 57
+// to 72), 8 of 8 runs had no terminal at fullCapTerminalWait. Set it on an
+// idle host, or to watch the defect.
+func TestAPI_AnswerAtTheProductionCapReachesATerminal(t *testing.T) {
+	if os.Getenv(fullCapEnv) == "" {
+		t.Skipf("set %s to run an answer of apiResponseCap bytes to its terminal", fullCapEnv)
+	}
+	_, url := startServer(t)
+	startAPIBridge(t, url, newAPIStub(t, completionOfSize(t, apiResponseCap)), nil)
+	c := gatewayClient(t, url)
+	submitIn(t, c, "task-fullcap", "ctx-fullcap", "write something enormous")
+	task := waitTerminalFor(t, c, "task-fullcap", fullCapTerminalWait)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s (%v), want completed", task.State, task.FinalMessage)
+	}
+}
 
 // resultPublishCall is what the at-cap test's hooks record: when the
 // bridge's chat fold returned, and the deadline of the context resultPublish
