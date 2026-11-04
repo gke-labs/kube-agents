@@ -286,7 +286,7 @@ class Hermes(unittest.TestCase):
 
     def _ticket_server(self, path, payload=None):
         if path == kanban_origin.STAMP_TICKETS_PATH:
-            ticket = f"{len(self.minted):032x}"
+            ticket = os.urandom(16).hex()
             self.minted.append(ticket)
             self.tickets[ticket] = {"origin": payload["origin"], "platform": payload.get("platform", "")}
             return {"ticket": ticket}
@@ -805,23 +805,35 @@ class ApplierTest(unittest.TestCase):
             self.assertEqual(PRISTINE[relative].count(call), 1, function)
 
     def test_every_locator_is_load_bearing(self):
-        for relative, anchor in (
-            (applier.DB_RELATIVE, applier.INSERT_SITES[0][2]),
-            (applier.GRAPH_RELATIVE, applier.INSERT_SITES[1][2]),
-            (applier.GRAPH_RELATIVE, "def inherit_creator_origin("),
-            (applier.CLI_RELATIVE, "def _cmd_create("),
-            (applier.CLI_RELATIVE, applier.HANDLERS_ENTRY),
-            (applier.CLI_RELATIVE, "def _cmd_swarm("),
-            (applier.CLI_RELATIVE, applier.HANDLERS_SWARM_ENTRY),
+        # Each rename keeps the fixture parsing, so the exit is the locator's, never the parser's.
+        db_call, graph_call = applier.INSERT_SITES[0][2], applier.INSERT_SITES[1][2]
+        for relative, anchor, renamed, names in (
+            (applier.DB_RELATIVE, db_call, db_call.replace("origin(", "origin_moved(", 1), "inside create_task()"),
+            (applier.GRAPH_RELATIVE, graph_call, graph_call.replace("origin(", "origin_moved(", 1),
+             "inside _insert_decomposed_child()"),
+            (applier.GRAPH_RELATIVE, "def inherit_creator_origin(", "def inherit_creator_origin_moved(",
+             "def inherit_creator_origin() for the creator-origin inheritance"),
+            (applier.CLI_RELATIVE, "def _cmd_create(", "def _cmd_create_moved(",
+             "def _cmd_create() for the CLI create command"),
+            (applier.CLI_RELATIVE, applier.HANDLERS_ENTRY, '"made": _cmd_create',
+             f"_HANDLERS no longer maps {applier.HANDLERS_ENTRY!r}"),
+            (applier.CLI_RELATIVE, "def _cmd_swarm(", "def _cmd_swarm_moved(",
+             "def _cmd_swarm() for the CLI swarm command"),
+            (applier.CLI_RELATIVE, applier.HANDLERS_SWARM_ENTRY, '"swarmed": _cmd_swarm',
+             f"_HANDLERS no longer maps {applier.HANDLERS_SWARM_ENTRY!r}"),
         ):
             with self.subTest(anchor=anchor):
-                root, targets = self._tree({relative: PRISTINE[relative].replace(anchor, "pass  # ", 1)})
-                with self.assertRaises(SystemExit):
+                broken = PRISTINE[relative].replace(anchor, renamed, 1)
+                self.assertNotEqual(broken, PRISTINE[relative], "the anchor is in the fixture")
+                compile(broken, relative, "exec")
+                root, targets = self._tree({relative: broken})
+                with self.assertRaises(SystemExit) as caught:
                     applier.apply(root)
+                said = str(caught.exception)
+                self.assertIn(names, said)
+                self.assertNotIn("does not parse", said)
                 for rel, target in targets.items():
-                    self.assertEqual(target.read_text(), (
-                        PRISTINE[rel].replace(anchor, "pass  # ", 1) if rel == relative else PRISTINE[rel]
-                    ), "nothing written")
+                    self.assertEqual(target.read_text(), broken if rel == relative else PRISTINE[rel], "nothing written")
 
     def test_a_second_run_is_refused(self):
         root, _ = self._tree()
