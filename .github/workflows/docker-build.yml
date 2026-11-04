@@ -38,8 +38,9 @@ jobs:
     timeout-minutes: 60
     # Every step that reaches a service this repository does not control -- the
     # buildx setup and each image build, the gate build included -- runs once
-    # more if its first attempt fails. Five failed attempts between 2026-10-22 and 2026-11-03 each died on a
-    # different service, and each passed on a manual re-run of the same commit:
+    # more if its first attempt fails. Five failed attempts between 2026-10-22
+    # and 2026-11-03 each died on a different service, and each passed on a
+    # manual re-run of the same commit:
     #
     #   - mirror.gcr.io, pulling the builder image: a per-minute project quota
     #     (`toomanyrequests`), and a manifest whose config blob was `not found`
@@ -220,8 +221,10 @@ jobs:
       # Dockerfile.
       #
       # Retried like the builds: the stage fetches nothing new, but the solve still
-      # resolves the tag-referenced bases of `platform` against the mirror. A real
-      # gate failure fails both attempts.
+      # resolves the tag-referenced bases of `platform` against the mirror. The
+      # retry also gives an intermittent gate failure (a race in the entrypoint) a
+      # second chance; the read-only step below runs the same check once more with
+      # no retry, so such a race has to pass twice in a row to go green.
       - name: Verify entrypoint shared-state gate (in-image)
         id: build-gate
         continue-on-error: true
