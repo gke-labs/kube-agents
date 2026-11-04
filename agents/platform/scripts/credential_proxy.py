@@ -15762,8 +15762,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         self.in_flight.enter()
         # Where this request's body starts in the stream, and how long it
         # said it was: None when it cannot be framed (a Transfer-Encoding,
-        # which no route reads, or a length that is not a number), which
-        # _body_unread reads as unread.
+        # which no route reads; a length that is not a number, or is
+        # negative; or two Content-Length headers that disagree, of which
+        # the routes read the first), which _body_unread reads as unread, so
+        # the answer closes the connection and whatever follows the headers
+        # is never read as the next request line (RFC 9112 section 6.3).
         parsed = super().parse_request()
         if parsed:
             self._body_start = self.rfile.consumed
@@ -15771,9 +15774,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 self._body_length: int | None = None
             else:
                 try:
-                    self._body_length = max(int(self.headers.get("Content-Length", "0")), 0)
+                    lengths = {int(value) for value in self.headers.get_all("Content-Length") or ["0"]}
                 except ValueError:
-                    self._body_length = None
+                    lengths = set()
+                length = lengths.pop() if len(lengths) == 1 else -1
+                self._body_length = length if length >= 0 else None
         return parsed
 
     def _body_unread(self) -> bool:

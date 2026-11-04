@@ -16120,6 +16120,39 @@ class KeepAliveTest(_CredentialedUnixServer):
         self.assertEqual("close", headers.get("connection", "").lower(), (status, headers))
         self.assertTrue(self.closed_by_server(sock))
 
+    def test_a_content_length_that_cannot_frame_the_body_closes_the_connection(self):
+        # A negative length, or two Content-Length headers that disagree, is
+        # a body no route can read to its end (RFC 9112 section 6.3), so the
+        # answer closes the connection whatever the route did with the first
+        # value it read: a 413 on the negative length without a read, a 413
+        # on the zero of a disagreeing pair with the body left on the wire,
+        # a 403 after reading the body when the pair's first value was its
+        # length. The bytes behind the pair are never read as the next
+        # request line.
+        body = b'{"argv":["kubectl","get","pods"]}'
+        cases = {
+            "413 negative": (["Content-Length: -5"], b""),
+            "413 two lengths, the first zero": (["Content-Length: 0", f"Content-Length: {len(body)}"], body),
+            "403 two lengths, the first the body's": ([f"Content-Length: {len(body)}", "Content-Length: 0"], body),
+        }
+        for label, (sent_headers, sent) in cases.items():
+            with self.subTest(label):
+                sock = self.connect()
+                self.send(sock, "POST", "/v1/exec", self.SHELL, sent_headers, sent)
+                status, headers, _ = self.response(sock)
+                self.assertEqual(int(label.split()[0]), status)
+                self.assertEqual("close", headers.get("connection", "").lower(), (status, headers))
+                self.assertTrue(self.closed_by_server(sock), f"{label}: the connection stayed open")
+        # Two that agree frame the body as one does: the route reads it and
+        # the connection carries the next request.
+        sock = self.connect()
+        self.send(sock, "POST", "/v1/exec", self.SHELL, [f"Content-Length: {len(body)}"] * 2, body)
+        status, headers, _ = self.response(sock)
+        self.assertEqual(403, status, "an empty policy blocks the command; the body was read first")
+        self.assertNotEqual("close", headers.get("connection", "").lower(), headers)
+        self.send(sock, "GET", "/healthz")
+        self.assertEqual(200, self.response(sock)[0])
+
     def test_a_rejected_request_line_on_a_kept_open_connection_counts_under_other(self):
         # The stdlib resets the command and never the path on a parse failure,
         # so without the handler clearing it a bad second request line would
