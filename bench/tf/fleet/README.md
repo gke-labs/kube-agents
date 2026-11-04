@@ -84,22 +84,33 @@ project in the #1278 retest sweep); a role still drifted at the deadline gets a
 observed, so the operator knows whether it is a `tofu apply` or a node.
 
 The reconcile is load-bearing for `seeded-b` in particular, and it does two distinct
-things there. First, it **carries the control plane forward**: `min_master_version` is
+things there. First, it **moves the control plane at a minor roll**: `min_master_version` is
 not a creation-time floor — the field is neither `ForceNew` nor ignored, and the
 provider answers a raised value with an operator-initiated `clusters.update` carrying
 `desiredMasterVersion` (it upgrades only when the recorded master is lower, never
-down). That is what keeps the pin from rotting: a new patch inside the held minor moves
-the master onto it, and the day the REGULAR default rolls a minor, the derived pin
-recomputes and the next apply walks the master to the new default-minus-one, so the lag
-stays one minor without anyone touching the file, a hold excepted. The pin is drawn from
+down). That is what keeps the pin from rotting: the day the REGULAR default rolls a
+minor, the derived pin recomputes and the next apply walks the master to the new
+default-minus-one, so the lag stays one minor without anyone touching the file, a hold
+excepted. Inside the lag minor the pin is the running version, listed by REGULAR or
+not: a pin at REGULAR's newest patch of the minor moved the master onto the channel's
+list on every apply, and the upgrades cases that read `seeded-b` for a patch REGULAR
+has moved past (`upgrades-readiness-target-patch-valid`,
+`upgrades-master-behind-offered-elsewhere`) never found one for longer than the hours
+between a channel roll and the next reconcile. GKE's own patch auto-upgrade, which the
+exclusion lets through, can still move the master within the minor in a maintenance
+window once the channel's upgrade target passes it. The pin is drawn from
 REGULAR's own version list by `seeded_b_pin.py` (the stack's `external` data source),
 never from the provider's all-channel list: GKE lets a cluster running a patch its
 channel does not carry upgrade only within that minor, so a pin from a newer channel
 turns the next minor roll into a refused apply on every project. When `seeded-b` is
-found on such a patch, the script holds the pin instead, at the newest REGULAR patch of
-that minor above the running one if there is one, else at the running version, and the
-apply after that step does the minor bump, one minor per apply (GKE's control-plane
-rule), so a master the hold left two minors behind reaches the target over two applies.
+found below the lag minor on such a patch, the script steps it first, to the newest
+REGULAR patch of that minor above the running one if there is one, else holds it at the
+running version, and the apply after that step does the minor bump, one minor per apply
+(GKE's control-plane rule), so a master the hold left two minors behind reaches the
+target over two applies. That is also the ordinary path at a REGULAR minor roll when
+`seeded-b` sits on a patch REGULAR has dropped: the roll takes two reconciles, the step
+and then the bump, and `minor_behind_channel_default` reads `version-laggard` as drifted
+for the day between them.
 While a hold lasts the master may run a patch newer than any REGULAR patch of its minor,
 and after a minor roll the lag is two minors, not one: `hack/fleet-fixture-state.py` reads
 `version-laggard` as drifted on either (`not_ahead_of_channel`,
@@ -278,9 +289,9 @@ so the regular family's rollout never waits on the lag. The key is on every clus
 this stack because the drift audit's label-keys facet compares label keys across the
 cohort: a key on three clusters and not the fourth would be a drift finding.
 
-`seeded-b`'s lag is derived at apply time (the newest patch REGULAR itself offers one
-minor behind its default, read by `seeded_b_pin.py`), so the pin re-computes each
-reconcile instead of rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
+`seeded-b`'s lag is derived at apply time (on a create, the newest patch REGULAR itself
+offers one minor behind its default, read by `seeded_b_pin.py`; afterwards the running
+version inside that minor), so the pin re-computes each reconcile instead of rotting. `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
 SOP's master-behind check compares a cluster's master minor against its own channel's
 default, so a channel-less cluster falls out of that comparison entirely and the lag
 would be invisible to the audit it was planted for. The maintenance exclusion above is

@@ -222,22 +222,23 @@ resource "google_project_iam_member" "pool_state_readers" {
 # ForceNew nor ignored, and the provider answers a raised value with
 # clusters.update carrying desiredMasterVersion, upgrading only when the
 # recorded master is lower (resource_container_cluster.go). So the reconcile
-# CARRIES THE MASTER FORWARD: a new REGULAR patch inside the held minor moves
-# the master to it, and the day REGULAR's default rolls a minor the pin
-# recomputes and the next apply walks the master to the new
+# MOVES THE MASTER BETWEEN MINORS: the day REGULAR's default rolls a minor
+# the pin recomputes and the next apply walks the master to the new
 # default-minus-one, one minor per apply (GKE's control-plane rule), so a
-# master further behind reaches the target over the applies that follow.
-# Both are manual upgrades in GKE's sense, which the
-# exclusion does not gate; the channel rule above does. So when the running
-# patch is one REGULAR does not carry, the script HOLDS the pin instead of
-# asking for the refused bump: the newest REGULAR patch of the running minor
-# above it when there is one (the one upgrade GKE allows), else the running
-# version, and the rest of the project applies; the apply after the step does
-# the minor bump from an on-channel patch. As of 2026-10-14 REGULAR's newest
-# 1.34 is below seeded-b's 1.34.12-gke.1011000, so the hold lasts until
-# REGULAR ships a 1.34 patch above it; if REGULAR drops 1.34 first, no pin
-# can recover and the cluster is upgraded by hand or destroyed and
-# re-created (the recovery below).
+# master further behind reaches the lag minor over the applies that follow.
+# Inside the lag minor the pin is the running version, so the patch does not
+# move: a pin at REGULAR's newest patch put seeded-b back on the channel's
+# list every morning, and the upgrades cases that read seeded-b for a patch
+# REGULAR has moved past never saw one. A provider upgrade is a
+# manual upgrade in GKE's sense, which the exclusion does not gate; the
+# channel rule above does. So when a cluster below the lag minor runs a
+# patch REGULAR does not carry, the script steps it first instead of asking
+# for the refused bump: the newest REGULAR patch of the running minor above
+# it when there is one (the one upgrade GKE allows), else the running
+# version, and the rest of the project applies; the apply after the step
+# does the minor bump from an on-channel patch. If REGULAR drops the minor
+# first, no pin can recover and the cluster is upgraded by hand or destroyed
+# and re-created (the recovery below).
 #
 # The provider only ever upgrades (cur < des) and a control plane cannot be
 # downgraded, so the pin is one-way: if the master ever gets AHEAD of it --
@@ -530,8 +531,9 @@ resource "google_container_cluster" "seeded_b" {
   resource_labels          = local.held_cluster_labels
   deletion_protection      = false
 
-  # REGULAR's own newest previous-minor patch, or the hold when the running
-  # patch is one REGULAR does not carry: the comment above the data source.
+  # REGULAR's own newest previous-minor patch on a create; the running
+  # version once the cluster is in that minor, listed by REGULAR or not;
+  # the comment above the data source has the rest.
   min_master_version = local.lagging_version
   release_channel {
     channel = "REGULAR"
@@ -595,15 +597,15 @@ resource "google_container_node_pool" "seeded_b_default" {
   version    = local.lagging_version
 
   # The pool takes the SAME derived pin as the master, and is deliberately
-  # not ignore_changes'd: min_master_version carries the control plane
-  # forward on every reconcile (see the block above), so a frozen pool
-  # would skew against it. Freezing it costs a finding in both directions:
+  # not ignore_changes'd: min_master_version moves the control plane at a
+  # minor roll (see the block above), so a frozen pool would skew against
+  # it. Freezing it costs a finding in both directions:
   # at the next REGULAR minor roll the master moves and the pool does not,
   # which is upgrade SOP 3.2 `pool-skew` -- exactly one minor behind with
   # autoUpgrade true, severity minor -- and even without a minor roll the
-  # same asymmetry leaks at patch level, because GKE auto-upgrades the pool
-  # to the channel's default patch while the pin pushes the master to the
-  # freshest patch of the minor, which 3.2 flags as patch-only drift.
+  # same asymmetry leaks at patch level, because GKE's own patch
+  # auto-upgrade may move the master in its window while a frozen pool
+  # waits for node auto-upgrade, which 3.2 flags as patch-only drift.
   # Either would be an undeclared finding on a fleet whose whole premise is
   # that a correct audit's findings are known in advance. Driving both from
   # local.lagging_version keeps them equal at steady state; the pool
