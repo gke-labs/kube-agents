@@ -124,7 +124,11 @@ When executing the `k8s-event-watcher` service binary directly, the following co
 
 ### Switching the Watcher Off in a Deployed Install
 
-None of the flags above reach a running pod: the entrypoint sets them, not the operator. The one
+None of the flags above are fields on the `PlatformAgent`: the entrypoint sets them, not the operator.
+The ones that the entrypoint reads from `WATCHER_*` variables (the table names each one) can be set
+through `spec.deployment.env`, which the operator merges into the `agent-api-auth` container. A chart install sets
+them with `platformAgent.deployment.eventWatcher`
+([chart README](../../../charts/kube-agents/README.md#agent-runtime-knobs)). The one
 setting that _is_ exposed on the `PlatformAgent` is whether the watcher runs at all —
 `spec.harness.eventWatcher.enabled: false` is the emergency stop for an event storm.
 

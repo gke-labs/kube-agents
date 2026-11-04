@@ -7342,7 +7342,16 @@ main() {
     # after_summary is true for the repeat at the end of main(), where the
     # component summary has already printed the web console command.
     local after_summary="${1:-false}"
+    # The resolved PlatformAgent mode: after the apply as the closing summary
+    # reads it, and at the chat step (before main() has resolved its own
+    # copy) from the flag or the fallback the mode check settled. Under next
+    # the CR carries the NoChatPlatform condition, which says where the
+    # agent's findings go.
+    local mode="${PLATFORM_AGENT_MODE_AFTER_APPLY:-${platform_agent_mode:-${PARAM_PLATFORM_AGENT_MODE:-${PLATFORM_AGENT_MODE_FALLBACK:-}}}}"
     print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+    if [ "$mode" = "next" ]; then
+      print_info "The PlatformAgent carries the NoChatPlatform condition, which says where the agent's findings go instead of chat."
+    fi
 
     # gcloud rejects --dns-endpoint on clusters without an external DNS
     # endpoint, so print the resolved flag rather than a literal one. Resolved

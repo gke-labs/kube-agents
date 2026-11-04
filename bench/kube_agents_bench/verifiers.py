@@ -3627,18 +3627,22 @@ def _same_command(stored: str, cited: str) -> bool:
 def _terminal_output(result: str) -> tuple[str, bool]:
     """The ``output`` of a terminal result as the trajectory stores it, and whether the pod clipped it.
 
-    The result is the JSON text of ``{"output": ..., "exit_code": ...}``. A
-    clipped one no longer parses; its surviving head is decoded as a JSON
-    string, less any escape the cut split.
+    The result is the JSON text of ``{"output": ..., "exit_code": ...}``.
+    Hermes may append a note after it (a tool-loop warning or hard stop, a
+    repeated-call notice), which is advice to the model and not output, so
+    the leading JSON object is decoded and whatever follows it is left
+    alone; that also reads a result whose clip landed inside the note. A
+    result whose JSON itself was cut no longer parses; its surviving head
+    is decoded as a JSON string, less any escape the cut split.
     """
+    try:
+        parsed, _ = json.JSONDecoder().raw_decode(result)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+        return parsed["output"], False
     clipped = _CLIPPED_RESULT_RE.search(result)
     if not clipped:
-        try:
-            parsed = json.loads(result)
-        except ValueError:
-            return result, False
-        if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
-            return parsed["output"], False
         return result, False
     head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])
     for cut in range(_MAX_SPLIT_ESCAPE + 1):

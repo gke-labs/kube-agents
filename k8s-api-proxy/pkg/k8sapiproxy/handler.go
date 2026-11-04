@@ -112,8 +112,9 @@ func NewHandler(cfg Config) (http.Handler, error) {
 				// Redacting here rather than in ModifyResponse keeps the plan off resp.Request,
 				// which a transport may replace with a request of its own.
 				if plan, ok := req.Context().Value(secretRedactionKey{}).(*secretRedaction); ok && resp != nil {
-					redactSecretResponse(resp, plan, func(cause error) { ev.Err = cause })
-					metrics.recordSecretRedaction(SecretActionPayloadScrubbed)
+					if redactSecretResponse(resp, plan, func(cause error) { ev.Err = cause }) {
+						metrics.recordSecretRedaction(SecretActionPayloadScrubbed)
+					}
 				}
 				return resp, err
 			}),
@@ -199,6 +200,9 @@ func (h *handler) recordObservability(r *http.Request, info *request.RequestInfo
 		}
 		spanReason = ev.Reason
 		h.metrics.recordRejection(ev.Reason, verbLabel, resLabel, subLabel, h.policy.Mode)
+	// Neither is the upstream failing: the TokenReview did (503), or the caller left, before or during the copy.
+	case ev.Outcome == OutcomeAuthUnavailable, ev.Outcome == OutcomeCanceled:
+		metricOutcome = string(ev.Outcome)
 	case ev.Outcome == OutcomeUpstreamError || ev.Outcome == OutcomeAborted || ev.StatusCode >= http.StatusInternalServerError:
 		metricOutcome = string(OutcomeUpstreamError)
 	default:
