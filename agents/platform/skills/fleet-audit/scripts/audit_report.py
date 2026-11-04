@@ -1869,8 +1869,11 @@ SHARED_ACCOUNT_SHIELD_NAMES = 3
 # it (`render_listed_finding`), since its full block, where the note is, is not
 # on the ledger.
 SHARED_ACCOUNT_SHIELD_PREFIX = SHARED_ACCOUNT_SHIELD_NOTE[: SHARED_ACCOUNT_SHIELD_NOTE.index(";")]
-# Where the shield note ends inside a remediation note it opens.
-SHARED_ACCOUNT_SHIELD_END = ")_"
+# Where the shield note ends inside a remediation note it opens: the
+# template's closing `.)_` at the end of the note or before the worker's own
+# text. The declared names in between come from the repository, so a bare `)_`
+# in a path or object is not the end.
+SHARED_ACCOUNT_SHIELD_END_RE = re.compile(r"\.\)_(?=\s|$)")
 # The kinds a 2.7 declaration may name: collect.py's COMPLIANCE_WORKLOAD_KINDS,
 # the set `check_default_sa_automount` walks, folded as `_object_kind_segment`
 # folds them. An item naming anything else covers no workload's token.
@@ -11657,10 +11660,10 @@ def _shared_account_shield(finding: dict) -> str:
     note = str((finding.get("remediation") or {}).get("note", ""))
     if not note.startswith(SHARED_ACCOUNT_SHIELD_PREFIX):
         return ""
-    end = note.find(SHARED_ACCOUNT_SHIELD_END)
-    if end == -1:
+    end = SHARED_ACCOUNT_SHIELD_END_RE.search(note)
+    if end is None:
         return ""
-    return " ".join(clip_text(note[: end + len(SHARED_ACCOUNT_SHIELD_END)], MAX_NOTE_CHARS).split())
+    return " ".join(clip_text(note[: end.end()], MAX_NOTE_CHARS).split())
 
 
 def _listed_header(count: int) -> list[str]:
