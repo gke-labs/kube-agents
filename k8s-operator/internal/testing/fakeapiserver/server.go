@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -184,6 +185,10 @@ type Counts struct {
 	// Expired is every 410 served: a list below the floor, a watch opened
 	// below it, or an open watch ended by Expire.
 	Expired int64
+	// Connections is every TCP connection the server has accepted. A client
+	// built from Config opens one per request, so it tracks Requests; a
+	// client that pools connections falls behind it.
+	Connections int64
 }
 
 // Server is one fake cluster. Its embedded httptest.Server's URL is the API
@@ -211,7 +216,7 @@ type Server struct {
 	retryAfterSeconds int
 
 	requests, lists, watches, watchLists, throttled, expired atomic.Int64
-	watchListsRefused                                        atomic.Int64
+	watchListsRefused, connections                           atomic.Int64
 }
 
 // kind is one of the three served resources: its path, the generator for its
@@ -307,13 +312,29 @@ func Start(opts Options) *Server {
 	if s.rv < firstResourceVersion {
 		s.rv = firstResourceVersion
 	}
-	s.Server = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
+	s.Server = httptest.NewUnstartedServer(http.HandlerFunc(s.serveHTTP))
+	s.Server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			s.connections.Add(1)
+		}
+	}
+	s.Server.Start()
 	return s
 }
 
-// Config is a rest.Config for the fake, as a kubeconfig entry for it would be.
+// Config is a rest.Config for the fake, as a kubeconfig entry for it would
+// be, except that its transport keeps no connection alive between requests.
+// Over a pooled HTTP/1.1 connection, Go's transport (1.27) can leave a body
+// reader that reaches EOF while the body is being closed, which is how
+// client-go ends a 410 stream, parked on the connection, and the next
+// response on the reused connection wakes that reader rather than the one
+// waiting for it; a reflector's re-stream then delivers nothing until the
+// connection idles out. A connection per request leaves nothing to reuse.
+// The cost is one dial per request, which the paged soaks absorb. A test
+// that sets TLS options on this config fails at client construction, since
+// rest.Config refuses them next to a Transport.
 func (s *Server) Config() *rest.Config {
-	return &rest.Config{Host: s.URL}
+	return &rest.Config{Host: s.URL, Transport: &http.Transport{DisableKeepAlives: true}}
 }
 
 // Generator is the generator the server serves from, for a test that wants
@@ -339,6 +360,7 @@ func (s *Server) Counts() Counts {
 		WatchListsRefused: s.watchListsRefused.Load(),
 		Throttled:         s.throttled.Load(),
 		Expired:           s.expired.Load(),
+		Connections:       s.connections.Load(),
 	}
 }
 
