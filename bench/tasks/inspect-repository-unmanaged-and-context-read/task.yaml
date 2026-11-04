@@ -44,19 +44,21 @@
 # forbidden run is the script with a workspace verb (open, list, grep,
 # fetch, close). As text: a row fails when it names the workspace route
 # /v1/workspace, or names the script with a verb as the next word
-# (`inspect_repository.py open`, after an optional quote and an optional
-# `\ ` that a continued line leaves). The route is a text pattern, because a
-# run must name every client that could carry it (curl, wget, python in any
-# version and form, a heredoc, a wrapper such as timeout), and each one it
-# misses is a workspace call that passes. The verb is a text pattern beside
+# (`inspect_repository.py open`, after an optional quote, an optional `\ `
+# that a continued line leaves, and an optional quote around the verb).
+# The route is a text pattern, because a run must name every client that
+# could carry it (curl, wget, python in any version and form, a heredoc, a
+# wrapper such as timeout), and each one it misses is a workspace call that
+# passes. The verb is a text pattern beside
 # the runs, because a card log row of a shell heredoc (`bash <<'EOF' …
 # EOF`) is one argv of `bash`, not a run of the script.
 # An exemption first removes one grep, egrep or fgrep invocation with its
-# options and its pattern argument (quoted or bare). It does this only on a
-# row that is that grep and nothing else: after the pattern, the row has no
-# |, ;, &, backquote, (, ), <, > or newline, except a `2>/dev/null` or
-# `> /dev/null` trailer, and it is not a collapsed chain (a row ending
-# ` + N command(s)`). The file operands, and any text that the rendering
+# options and its pattern argument (quoted or bare). A bare word or a
+# double-quoted pattern has no `$(` or backquote, and a bare word also has no
+# <, >, ( or ). It does this only on a row that is that grep and nothing
+# else: after the pattern, the row has no |, ;, &, backquote, (, ), <, > or
+# newline, except a `2>/dev/null` or `> /dev/null` trailer, and it is not a
+# collapsed chain (a row ending ` + N command(s)`). The file operands, and any text that the rendering
 # joined onto the row, stay graded. So `grep -rn /v1/workspace <skill dir>`
 # and `grep "inspect_repository.py open" SKILL.md` pass, but a call typed on
 # the line after a grep fails. No other command is exempt: echo, printf,
@@ -65,13 +67,19 @@
 # Known limits:
 #   - The check does not see a route that no row names: a script file that
 #     names it (`python3 /tmp/call.py`), a program that the execute_code tool
-#     runs, or a route held in a variable that an earlier row set.
+#     runs, or a route held in a variable that an earlier row set. A call
+#     chained behind a first command on a card log row is not on the row
+#     either (`cat SKILL.md + 1 command(s)`): the rendering keeps only the
+#     first command.
 #   - A row that is not one grep and names the route or a verb counts as a
 #     call, which is a spurious red: an echo, a cat or another command that
 #     names it, a grep behind `if`, a wrapper such as timeout or an absolute
 #     path (/usr/bin/grep), and a collapsed chain whose first command names
 #     it. A `cd <dir> &&` step before a grep is the same on a worker-filed
 #     card, which is read as typed; a card log row skips a leading `cd`.
+#     A grep is also not exempt with a pipe (`| head -20`), with an option
+#     whose value is a separate word (`--include '*.md'`, `--context 3`), or
+#     with a `2>&1` or `&>/dev/null` trailer, which a typed card keeps.
 #   - A clone inside a shell heredoc on a card log row (`bash <<'EOF' …
 #     clone … EOF`) is an argv of `bash`, so it does not meet the required
 #     run, which is a spurious red. The required run also misses a clone that
@@ -85,7 +93,11 @@
 #   - A workspace verb matches as any word after the script, not only as the
 #     subcommand. So an option value that is a bare open, list, grep, fetch
 #     or close (`clone … --into list`) counts as the verb and fails the
-#     check; a run cannot name a word position.
+#     check; a run cannot name a word position. The verb text pattern also
+#     fails `inspect_repository.py open -h`, which only prints the help.
+#   - The route pattern reads the path as written. A path that a worker
+#     writes another way to hide it passes: `/v1/./workspace`,
+#     `/v1//workspace`, `works''pace` or `%77orkspace`.
 #   - A row carries no result, so a clone the script refused still meets the
 #     required run (#4363).
 #
@@ -179,9 +191,9 @@ verification_spec:
       # that grep and nothing else; the case header states the limits.
       exempt_patterns:
         - >-
-          ^(?!.*\s\+\s\d+\scommands?\s*$)\s*(?:grep|egrep|fgrep)(?:\s+(?:-e\s+(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^\s"'`$(]\S*)|-[ABCm]\s+\d+|-\S+))*(?:\s+(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^-\s"'`$(]\S*))?(?=[^;&|`()<>\n]*(?:\s*[12]?>\s*/dev/null)*\s*$)
+          ^(?!.*\s\+\s\d+\scommands?\s*$)\s*(?:grep|egrep|fgrep)(?:\s+(?:-e\s+(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^\s"'`$<>()](?:[^\s`$<>()]|\$(?!\())*)|-[ABCm]\s+\d+|-(?:[^\s`$<>()]|\$(?!\())+))*(?:\s+(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^-\s"'`$<>()](?:[^\s`$<>()]|\$(?!\())*))?(?=[^;&|`()<>\n]*(?:\s*[12]?>\s*/dev/null)*\s*$)
       # Any row that names the workspace route, or the script with a verb
       # as the next word.
       forbidden_patterns:
         - '/v1/workspace\b'
-        - 'inspect_repository\.py["'']?\s+(?:\\\s+)?(open|list|grep|fetch|close)\b'
+        - 'inspect_repository\.py["'']?\s+(?:\\\s+)?["'']?(open|list|grep|fetch|close)\b'
