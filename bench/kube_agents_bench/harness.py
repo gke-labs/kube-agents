@@ -1453,7 +1453,8 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # :func:`_pod_start`) and the card's ``tasks.created_at`` is earlier: a
 # front-door ``kanban_create`` whose ``idempotency_key`` matches a live card
 # returns that card in a result that looks like a create (#4591). Such a card
-# is printed ``foreign <id>`` and left alone, files included. The other own
+# is printed ``foreign <id>`` and left alone, files included, unless an earlier
+# purge owes it (below). The other own
 # cards' files go before the board step, so they still go when it fails; with
 # a floor but no board read to check it against, every root's files go too: a
 # stranger's card losing its files is rarer, and cheaper, than the run's own
@@ -1575,12 +1576,13 @@ try:
                 older.add((i, tid))
 except sqlite3.Error as exc:
     failed = exc
+owed = {tid for i, g in enumerate(groups) for tid in g[0] if (i, tid) not in older}
 for i, g in enumerate(groups):
     for tid in g[0]:
-        if (i, tid) in older:
-            print("%s %s" % (FOREIGN, tid))
-        else:
+        if (i, tid) not in older:
             unlink(tid)
+        elif tid not in owed:
+            print("%s %s" % (FOREIGN, tid))
 mark_sorted(True)
 if failed is not None:
     mark_sorted(False)

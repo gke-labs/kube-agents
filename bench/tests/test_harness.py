@@ -3872,11 +3872,13 @@ def _purge_card(
 
 
 def _run_purge(
-    root: Path, roots: list[str], fanned_out: list[str] = (), *, floor: int | None = None, busy: str = ""
+    root: Path, roots: list[str], fanned_out: list[str] = (), *, floor: int | None = None, busy: str = "",
+    prelude: str = "",
 ) -> list[str]:
     """The in-pod script on the harness's own argv, pointed at a temporary tree.
 
-    ``busy`` replaces the lock wait, for a test that holds the write lock.
+    ``busy`` replaces the lock wait, for a test that holds the write lock;
+    ``prelude`` runs first, for a test that breaks part of the filesystem.
     """
     argv = harness._purge_argv(roots, fanned_out, floor)
     paths = [worker_trajectory.DATA_ROOT, harness._ATTACHMENTS_DIR, harness._LOGS_DIR]
@@ -3886,7 +3888,8 @@ def _run_purge(
     if busy:
         argv[1] = busy
     proc = subprocess.run(
-        [sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, *argv], capture_output=True, text=True, check=True,
+        [sys.executable, "-c", prelude + harness._PURGE_ROWS_SCRIPT, *argv], capture_output=True, text=True,
+        check=True,
     )
     return proc.stdout.splitlines()
 
@@ -4135,9 +4138,41 @@ def test_an_owed_card_the_next_runs_front_door_hands_back_is_still_owed(tmp_path
     kb.execute("UPDATE tasks SET status = 'done' WHERE id = 't_x'")
     kb.commit()
     # The next run's create returned t_x by its idempotency key, so it is among that run's roots.
-    assert _run_purge(tmp_path, ["t_x"], floor=_FLOOR) == ["foreign t_x", "purged"]
+    # Not "foreign": the earlier purge's debt takes it, so nothing is left behind to warn of.
+    assert _run_purge(tmp_path, ["t_x"], floor=_FLOOR) == ["purged"]
     assert kb.execute("SELECT COUNT(*) FROM tasks WHERE id = 't_x'").fetchone() == (0,)
     assert _owed(tmp_path) == []
+
+
+def test_an_owed_purge_whose_rewrite_fails_keeps_its_old_file(tmp_path: Path) -> None:
+    """A full data volume must not erase the debt: the old file goes only once the new one is written."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_x", "running")
+    kb.commit()
+    _owe(tmp_path, ["t_x"], first=int(time.time()))
+    disk_full = "import os\ndef _full(*a):\n    raise OSError('No space left on device')\nos.replace = _full\n"
+
+    assert _run_purge(tmp_path, [], prelude=disk_full) == ["kept t_x", "purged"]
+    (owed,) = _owed(tmp_path)
+    assert owed["roots"] == ["t_x"]
+
+
+def test_a_root_an_earlier_purge_still_keeps_is_owed_not_foreign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Handed back by the next run's front door while still running: owed, and logged as owed only."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_x", "running")
+    _stamp(kb, {"t_x": _FLOOR - 1})
+    _owe(tmp_path, ["t_x"], first=int(time.time()))
+
+    out = _run_purge(tmp_path, ["t_x"], floor=_FLOOR)
+    assert out == ["kept t_x", "pending t_x", "purged"]
+
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "\n".join(out) + "\n")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._purge_card_state(["t_x"], 5.0, floor=_FLOOR)
+    assert "owed to a later purge" in caplog.text and "left cards" not in caplog.text
 
 
 def test_a_purge_whose_board_step_failed_is_retried_under_its_own_rules(tmp_path: Path) -> None:
