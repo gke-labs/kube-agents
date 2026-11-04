@@ -592,7 +592,7 @@ the last of them moved. After its own
 patch the poller reads the echo the same way `noteUsageStatusEcho` does: counters it wrote that
 come back absent mean the pruning, recorded in the shared map; counters that come back clear it.
 The fields added after `status.usage`'s first schema, the two cluster gauges (one record between them),
-the six proposal readings (one record among them), `chatMessagesInboundTotal`, `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`, `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`, have a record each, in the poller, because a CRD at a previous
+the six proposal readings (one record among them), the two people readings (one record between them), `chatMessagesInboundTotal`, `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`, `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`, have a record each, in the poller, because a CRD at a previous
 schema prunes some or all of those and serves the first-schema counters (every CRD with
 `status.usage` has carried `remediationsProposedTotal` and `sessionsTotal`, so `sessionsTotal` shares the first three counters' treatment and has no record of its own; `chatSessionsTotal`, the chat half alone, arrived later and has its record, named for the field), the shared record would hold those back
 for the interval too, and one record for all the newer fields would hold the gauges back on the CRD
