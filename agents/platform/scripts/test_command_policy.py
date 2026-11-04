@@ -532,6 +532,17 @@ class KubectlRawPathTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.refused(argv)
 
+    def test_the_endpoint_reader_decodes_the_path_and_leaves_the_query(self):
+        # The broker's session walker and the profile confinement keep the
+        # endpoints to the shell role through this reader, so it decodes as
+        # the rule does and reads the path alone; the rule refuses the query.
+        for value in ("/metrics", "/%6detrics", "/%6Detrics", "/metrics?watch=true"):
+            with self.subTest(value=value):
+                self.assertEqual("/metrics", command_policy.kubectl_raw_endpoint(value))
+        for value in ("/api/v1/pods?limit=500", "/metrics/", "/metricsx", "/healthz", "/", ""):
+            with self.subTest(value=value):
+                self.assertIsNone(command_policy.kubectl_raw_endpoint(value))
+
     def test_the_grammar_is_anchored_at_both_ends(self):
         # `re.match(..., "$")` would pass a trailing newline; fullmatch does not,
         # and limit=0 asks for the unpaged list this rule exists to avoid.

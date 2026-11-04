@@ -822,7 +822,7 @@ KUBERNETES_READ_ONLY_RULE = "kubernetes.read-only"
 # passed the read table, so a refused raw read names this rule rather than
 # passing as a `get`, and a write carrying `--raw` is still refused as a write.
 KUBERNETES_RAW_PATH_RULE = "kubernetes.raw-path"
-_KUBECTL_RAW_FLAG = "--raw"
+KUBECTL_RAW_FLAG = "--raw"
 # The list verb's paging and selection parameters. `watch` is not here (it
 # holds a broker slot until the deadline), nor is anything a subresource takes.
 KUBECTL_RAW_QUERY_KEYS = frozenset(
@@ -875,7 +875,10 @@ KUBECTL_RAW_COLLECTIONS: frozenset[str] = frozenset(
 # verbatim: gke-upgrades reads the API server's own metrics through
 # `kubectl get --raw /metrics`. Admitted as exact paths, with no query, so the
 # rule keeps every other non-collection path (`/proxy`, `/exec`, `/logs`,
-# `/healthz` verbosity switches) closed.
+# `/healthz` verbosity switches) closed. They are the shell role's: this
+# rule takes no role, so the broker's session walker and the profile
+# confinement refuse a `--raw` that names one (`kubectl_raw_endpoint`) before
+# the rule reads it.
 KUBECTL_RAW_ENDPOINTS: frozenset[str] = frozenset({"/metrics"})
 # One path segment as Kubernetes names resources and namespaces: lowercase
 # DNS-label characters, so `..`, an empty segment (`//`), a backslash, a
@@ -912,6 +915,8 @@ _QUERY_PAIR_SEPARATOR = "&"
 _QUERY_KEY_VALUE_SEPARATOR = "="
 _QUERY_PLUS = "+"
 _QUERY_SPACE = " "
+# What separates a raw value's path from its query.
+_RAW_QUERY_SEPARATOR = "?"
 _RAW_SHAPE = (
     "kubectl get --raw reads one API collection: a relative /api/v1/<resource> or "
     "/apis/<group>/<version>/<resource> path, optionally under /namespaces/<name>, on a "
@@ -1392,7 +1397,7 @@ def _kubectl_raw_values(argv: list[str]) -> list[str | None]:
     while index < len(argv):
         token = argv[index]
         name, separator, value = token.partition("=")
-        if name == _KUBECTL_RAW_FLAG:
+        if name == KUBECTL_RAW_FLAG:
             if separator:
                 values.append(value)
             elif index + 1 < len(argv):
@@ -1436,11 +1441,23 @@ def _query_pairs(query: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def kubectl_raw_endpoint(value: str) -> str | None:
+    """The exact endpoint in KUBECTL_RAW_ENDPOINTS a `--raw` value names once
+    its path is percent-decoded, or None when it names a collection or nothing
+    the rule knows. The query is not read: `/metrics?watch=true` names
+    `/metrics`, and the rule refuses the query on its own. The broker's
+    session walker and the profile confinement keep the endpoints to the shell
+    role through this reader, so `/%6detrics` is `/metrics` to all three."""
+    path, _, _ = value.partition(_RAW_QUERY_SEPARATOR)
+    decoded = _percent_decode(path)
+    return decoded if decoded in KUBECTL_RAW_ENDPOINTS else None
+
+
 def _kubectl_raw_path_problem(value: str | None) -> str | None:
     """Why one `--raw` value is not a paged collection read, or None when it is."""
     if value is None:
         return "--raw was given no path"
-    path, _, query = value.partition("?")
+    path, _, query = value.partition(_RAW_QUERY_SEPARATOR)
     decoded = _percent_decode(path)
     if decoded in KUBECTL_RAW_ENDPOINTS:
         return None if not query else f"{decoded} takes no query"
@@ -1484,7 +1501,7 @@ def _kubectl_raw_refusal(argv: list[str], verb: tuple[str, ...]) -> Decision | N
         rule_id=KUBERNETES_RAW_PATH_RULE,
         message=f"{_RAW_SHAPE} Refused: {problem}. {_ACTION_BOUNDARY_NOTICE}",
         verb_tuple=verb,
-        offending_flag=_KUBECTL_RAW_FLAG,
+        offending_flag=KUBECTL_RAW_FLAG,
     )
 
 

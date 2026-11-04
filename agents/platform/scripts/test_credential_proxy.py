@@ -4025,6 +4025,7 @@ class SessionRoleExecutableTest(unittest.TestCase):
 
     def test_the_table_of_kubectl_flags(self):
         S = credential_proxy.CALLER_ROLE_SESSION
+        P = credential_proxy.CALLER_ROLE_PROFILE
         for role, argv, want in (
             # The file routes the fence exists to close, in every spelling
             # pflag accepts: separate value, attached, `=`, and clustered
@@ -4057,6 +4058,20 @@ class SessionRoleExecutableTest(unittest.TestCase):
             # `kubernetes.raw-path` rule judges the path.
             (S, ["kubectl", "get", "--raw", "/api/v1/pods?limit=500"], None),
             (S, ["kubectl", "get", "--raw=/apis/apps/v1/deployments?limit=500&continue=t"], None),
+            (P, ["kubectl", "get", "--raw", "/api/v1/pods?limit=500"], None),
+            # The rule's exact endpoints (`/metrics`) are the shell role's:
+            # refused for both narrowed roles, in each spelling and
+            # percent-encoded, through the policy's own decoder.
+            (S, ["kubectl", "get", "--raw", "/metrics"], "--raw"),
+            (S, ["kubectl", "get", "--raw=/metrics"], "--raw"),
+            (S, ["kubectl", "get", "--raw", "/%6detrics"], "--raw"),
+            (S, ["kubectl", "get", "--raw=/%6Detrics"], "--raw"),
+            (S, ["kubectl", "get", "--raw", "/metrics?watch=true"], "--raw"),
+            (P, ["kubectl", "get", "--raw", "/metrics"], "--raw"),
+            (P, ["kubectl", "get", "--raw=/metrics"], "--raw"),
+            (P, ["kubectl", "get", "--raw", "/%6detrics"], "--raw"),
+            (P, ["kubectl", "get", "--raw=/%6Detrics"], "--raw"),
+            (credential_proxy.CALLER_ROLE_SHELL, ["kubectl", "get", "--raw", "/metrics"], None),
             (S, ["kubectl", "get", "pods", "-v=9"], "-v"),
             (S, ["kubectl", "get", "pods", "--server=https://x"], "--server"),
             # The inspection surface passes, in the spellings a model emits.
@@ -4126,6 +4141,19 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
         status, body = self.post_as("", {"argv": ["kubectl", "get", "-f", "x.yaml"]})
         self.assertEqual(200, status, body)
+
+    def test_a_metrics_read_from_a_session_is_refused_as_a_flag_before_the_policy(self):
+        # The raw-path rule admits /metrics for every caller; the walker keeps
+        # it from the session, plain or percent-encoded, under the flag rule.
+        for path in ("/metrics", "/%6detrics"):
+            with self.subTest(path=path), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(
+                    credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "--raw", path]}
+                )
+                self.assertEqual(403, status)
+                self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+                self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
+                self.assertIn("--raw", body["message"])
 
 
 class GetCredentialsFlagsBetweenWordsTest(unittest.TestCase):

@@ -143,6 +143,20 @@ class KubectlConfinementTest(unittest.TestCase):
         # flag table admits the flag so a profile task can page a large kind.
         confine(["kubectl", "get", "--raw", "/api/v1/pods?limit=500"], None, TARGET)
 
+    def test_a_raw_endpoint_read_is_refused_in_every_spelling(self):
+        # The rule's exact endpoints (`/metrics`) are the shell role's. The
+        # confinement decodes the path as the rule does, so an encoded
+        # spelling is the same path, and the query does not hide it.
+        for argv in (
+            ["kubectl", "get", "--raw", "/metrics"],
+            ["kubectl", "get", "--raw=/metrics"],
+            ["kubectl", "get", "--raw", "/%6detrics"],
+            ["kubectl", "get", "--raw=/%6Detrics"],
+            ["kubectl", "get", "--raw", "/metrics?watch=true"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn("/metrics", self.refused(argv))
+
     def test_a_flag_after_double_dash_is_the_remote_commands(self):
         # After `--` the words are the command kubectl exec runs in the pod.
         confine(["kubectl", "exec", "pod/x", "--", "tool", f"--context={OTHER_CONTEXT}"], None, TARGET)

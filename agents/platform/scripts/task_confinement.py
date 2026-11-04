@@ -500,7 +500,7 @@ def _kubectl_is_local(flags: list[tuple[str, str | None]], words: list[str]) -> 
 def _confine_kubectl(argv: list[str], kubeconfig_context: str | None, target: ClusterTarget | None) -> Confined:
     flags, words, rest = _kubectl_walk(argv)
     value_flags, boolean_flags, _ = _kubectl_tables()
-    for name, _ in flags:
+    for name, value in flags:
         if name in KUBECTL_REDIRECT_FLAGS:
             raise ConfinementRefusal(
                 f"{name} is refused for a profile task: the cluster and the credential are the task's, not the caller's"
@@ -510,6 +510,17 @@ def _confine_kubectl(argv: list[str], kubeconfig_context: str | None, target: Cl
         # guessed.
         if name not in value_flags and name not in boolean_flags:
             raise ConfinementRefusal(f"{name} is not a flag the broker can read for a profile task")
+        # The raw-path rule's exact endpoints (`/metrics`) are the shell
+        # role's; the rule takes no role, and the session allowlist refused
+        # this already, so it is refused here as well, decoded as the rule
+        # decodes it, rather than resting on that walker alone.
+        if name == command_policy.KUBECTL_RAW_FLAG and value is not None:
+            endpoint = command_policy.kubectl_raw_endpoint(value)
+            if endpoint is not None:
+                raise ConfinementRefusal(
+                    f"{name} may not read {endpoint} for a profile task: the API server's own endpoints "
+                    "are the shell role's"
+                )
     # Before the target check, so it holds with or without one, and before
     # the help check: a write is refused however it is spelled.
     if words[:1] == ["config"] and len(words) > 1 and words[1] not in KUBECTL_CONFIG_READ_VERBS:
