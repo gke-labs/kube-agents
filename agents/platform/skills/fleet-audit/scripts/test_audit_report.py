@@ -7065,6 +7065,29 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         self.assertTrue(left["remediation"]["note"].endswith("Set automountServiceAccountToken: false on the default ServiceAccount."))
         self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", left["remediation"]["note"])
 
+    def test_a_shielded_sibling_listed_on_one_line_keeps_the_shield(self):
+        # gke-labs/kube-agents#4748: a ledger too long for the body lists most
+        # majors on one line, and the shield note lived only in the full block,
+        # so a listed sibling read like any other 2.7 finding.
+        api = self._sa_finding("api", "Deployment/api")
+        worker = self._sa_finding("worker", "Deployment/worker")
+        worker["remediation"] = {"kind": "manual", "path": "", "note": "Set automountServiceAccountToken: false on the default ServiceAccount."}
+        doc = audit_report.validate_findings(make_doc(findings=[api, worker], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.apply_declarations(doc, [declaration])
+            audit_report.shield_declared_account_siblings(doc)
+        (left,) = doc["findings"]
+        bullet, shield = audit_report.render_listed_finding(left).split("\n")
+        self.assertTrue(shield.startswith("  _(A declared workload shares this namespace's `default` ServiceAccount;"))
+        self.assertTrue(shield.endswith(".)_"))
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", shield)
+        # The worker's own text is the shared-account fix the shield forbids.
+        self.assertNotIn("automountServiceAccountToken: false on the default ServiceAccount", shield)
+        # The bullet line is still the one the listed-row reader parses.
+        (row,) = audit_report.LISTED_LINE_RE.findall(bullet + "\n" + shield)
+        self.assertEqual(row[4], left["id"])
+
     def test_the_shield_names_three_declared_workloads_and_counts_the_rest(self):
         worker = self._sa_finding("worker", "Deployment/worker")
         doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)

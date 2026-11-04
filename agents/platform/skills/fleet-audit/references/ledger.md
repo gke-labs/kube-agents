@@ -86,7 +86,8 @@ must not work around:
   while names fit; past that, and in the bands below, they may get no line, only the count.
 - **Findings are named while names fit, after the criticals' full blocks.** Findings without room
   for their full block are each listed on one line (severity, title, location, id, and any fix state
-  with its pull request) under `### Listed without detail`. Below the critical band, full blocks give
+  with its pull request) under `### Listed without detail`; a 2.7 finding the shared-account shield
+  made manual keeps the shield's note on an indented line under its row. Below the critical band, full blocks give
   way to names, so as many findings as possible are named; the critical band trades full blocks only
   for names of more criticals. Past what one line each can hold, the body gives a count.
 - **The title's counts stay true.** If the body omits findings it says so explicitly. Never
