@@ -5655,6 +5655,20 @@ func TestKanbanAdmissionIsPinnedInTheManagedScope(t *testing.T) {
 	assertAdmission(t, "decimal request", managedAdmission(t, decimal),
 		1907, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
 
+	// A request the operator cannot read as a budget is clamped to the CRD's floor rather
+	// than rendered as 0 (which the dispatcher reads as no budget) or as a figure under the
+	// floor (which refuses every card): a bare "2" is two bytes, and 256Mi is under the floor.
+	for name, quantity := range map[string]string{"bare number request": "2", "sub-floor request": "256Mi"} {
+		small := withResources(corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(quantity)},
+		})
+		assertAdmission(t, name, managedAdmission(t, small),
+			admissionMemoryBudgetFloorMiB, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+	}
+	if admissionMemoryBudgetFloorMiB != 512 {
+		t.Errorf("admissionMemoryBudgetFloorMiB = %d; the CRD's Minimum on memoryBudgetMiB is 512, keep the two equal", admissionMemoryBudgetFloorMiB)
+	}
+
 	// The CR's values win over every default, the derived budget included, and a false
 	// fail_closed is rendered rather than dropped: an absent key would read as the default.
 	tuned := agentWithTuning(&agentv1alpha1.TuningSpec{Admission: &agentv1alpha1.AdmissionSpec{

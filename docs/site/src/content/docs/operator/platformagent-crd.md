@@ -503,8 +503,7 @@ container's memory request, 2Gi unless `spec.deployment.resources` raises it, an
 agent container alone. A tick admits one new worker per 512 MiB of headroom under the budget. From
 the container's measured idle set of about 800 MiB that is two; above about 1 GiB in use it is one,
 and above about 1.5 GiB none. Six workers at 430 MiB add about 2.6 GiB, so a board meant to run six
-at once needs a request of about 4Gi. The request is the figure to raise: the kubelet evicts the
-pod once its working set passes it ([`admission`](#specharnesstuning)).
+at once needs a request of about 4Gi. The request is the figure to raise: under node pressure the kubelet evicts the pod once its working set passes it ([`admission`](#specharnesstuning)).
 
 [`docs/designs/safe-throttling.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/safe-throttling.md)
 is the design for admission by memory beside this count: a pressure guard on the container's own

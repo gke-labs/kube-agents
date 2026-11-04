@@ -2,7 +2,7 @@
 """Build gate for the kanban admission patch.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_kanban_admission.py``. The applier proves five anchors matched once;
+``apply_kanban_admission.py``. The applier proves six anchors matched once;
 this proves the engine those edits produce admits and refuses the way the
 module says, twice over:
 
@@ -753,6 +753,46 @@ FIXTURE_FILES = {
 }
 
 
+#: The function every event write goes through, called bare or as ``_kb.<name>``.
+EVENT_WRITER = "_append_event"
+#: Its positional argument that carries the kind: ``(conn, task_id, kind, ...)``.
+EVENT_KIND_ARGUMENT = 2
+
+
+def event_kinds_written(paths) -> set:
+    """The event kinds the modules at ``paths`` write through ``_append_event``.
+
+    Parsed, not grepped: the kind argument of every call, as a string literal
+    or as a name bound to one at module level, so a payload key, a comment or
+    a status rendering that happens to spell a kind does not count.
+    """
+    kinds: set = set()
+    for path in paths:
+        try:
+            tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        constants = {
+            target.id: node.value.value
+            for node in tree.body if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+            for target in node.targets if isinstance(target, ast.Name)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or len(node.args) <= EVENT_KIND_ARGUMENT:
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+            if name != EVENT_WRITER:
+                continue
+            kind = node.args[EVENT_KIND_ARGUMENT]
+            if isinstance(kind, ast.Constant) and isinstance(kind.value, str):
+                kinds.add(kind.value)
+            elif isinstance(kind, ast.Name) and kind.id in constants:
+                kinds.add(constants[kind.id])
+    return kinds
+
+
 def fixture_sources() -> dict:
     """``{relative path: source}`` of the pristine fixture tree; the tests read it too."""
     return dict(FIXTURE_FILES)
@@ -1035,6 +1075,12 @@ def drive(h: Harness) -> None:
     h.use_upstream_sample(PLENTIFUL_SAMPLE)
 
     # D. A worker over its RSS cap is stopped and its card refused.
+    if not Path(admission.PROC_ROOT).is_dir():
+        # A developer's host without /proc (macOS): the worker identity check
+        # reads boot and start times there, so it is bypassed for the drive's
+        # real process; the image's real-tree half runs it on Linux.
+        print(f"  note: no {admission.PROC_ROOT} on this host; the worker identity check is bypassed in the drive")
+        h.KA.is_runs_worker = lambda pid, task_id, run_started_at, proc_root=admission.PROC_ROOT: True
     h.configure(memory_budget_mib=BUDGET_MIB, worker_rss_cap_mib=WORKER_CAP_MIB)
     h.use_sample(_sample(USAGE_OK_MIB))
     conn = h.board()
@@ -1256,11 +1302,16 @@ def real_half() -> None:
         check(f"the installed dispatcher carries {marker!r}", marker in dispatch)
     # The queue clock's event kinds are a copy of what the pinned release
     # writes when a card returns to ready; a release that renames one would
-    # otherwise measure that lane re-entry from the card's creation.
-    db_text = (HERMES / applier.DB_RELATIVE).read_text()
+    # otherwise measure that lane re-entry from the card's creation. Parsed
+    # from the writers' call sites, in upstream's two modules and the
+    # repository's scheduling patch, which writes the reclaim event.
+    written = event_kinds_written([
+        HERMES / applier.DB_RELATIVE, HERMES / applier.DISPATCH_RELATIVE,
+        HERMES / "hermes_cli" / "kanban_scheduling.py",
+    ])
     for kind in KA.READY_ENTRY_EVENT_KINDS:
         check(f"the installed release writes the {kind!r} event the queue clock reads",
-              f'"{kind}"' in db_text or f'"{kind}"' in dispatch)
+              kind in written, f"kinds written: {sorted(written)}")
 
     def configure(config: dict) -> None:
         KA._ENGINE.config = lambda: config

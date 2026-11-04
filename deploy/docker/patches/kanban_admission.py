@@ -34,7 +34,7 @@ Three admission decisions, each a function the dispatcher patch
   for an exhausted slot budget or for a slot held for the other class of
   card, with the same kind. Never a card the tick
   skipped for a reason of its own: unassigned, not a profile, respawn-guarded,
-  per-profile capped.
+  per-profile capped; a row the ready loop never reached is asked all four.
 
 A ``capacity`` block carries one sentence of cause and the options, so the
 front door can answer with the alternatives instead of retrying. Every log
@@ -102,13 +102,27 @@ SOURCE_UPSTREAM = "meminfo"
 #: ``/proc/<pid>/status`` carries the resident set as ``VmRSS:  <n> kB``.
 #: ``/proc/<pid>/stat`` carries, after the parenthesised command, the state,
 #: then the parent pid (the file's field 4), the process group (field 5) and
-#: the start time (field 22).
+#: the start time (field 22), in clock ticks since boot; ``/proc/stat`` carries
+#: the boot time as ``btime <epoch seconds>``. The two give a process's start
+#: as an epoch, which is how a row's pid is told from a predecessor's: after a
+#: container restart the namespace hands the same numbers out again, and a
+#: process that started before the row's run cannot be its worker.
 PROC_STATUS_FILE = "status"
 PROC_STAT_FILE = "stat"
+PROC_CMDLINE_FILE = "cmdline"
 VMRSS_FIELD = "VmRSS:"
+BTIME_FIELD = "btime"
 STAT_PPID_INDEX = 1
 STAT_PGRP_INDEX = 2
 STAT_STARTTIME_INDEX = 19
+CLOCK_TICKS_NAME = "SC_CLK_TCK"
+DEFAULT_CLOCK_TICKS = 100
+#: A process may legitimately start this much before its run row's timestamp:
+#: the dispatcher records the run, then spawns, on the same second clock.
+START_SKEW_SECONDS = 2
+#: Without a boot time the worker is told from its command line: upstream
+#: spawns ``hermes -p <profile> chat -q "work kanban task <id>"``.
+WORKER_CMDLINE_TASK_MARK = "work kanban task "
 
 BYTES_PER_KIB = 1024
 KIB_PER_MIB = 1024
@@ -209,9 +223,13 @@ _OVERDUE_SQL = (
 
 #: Running rows with a worker to measure.
 _RUNNING_SQL = (
-    "SELECT id, worker_pid, claim_lock, current_run_id FROM tasks "
-    "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    "SELECT t.id, t.worker_pid, t.claim_lock, t.current_run_id, r.started_at "
+    "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+    "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
 )
+
+#: Running cards per assignee, upstream's per-profile cap count.
+_RUNNING_FOR_ASSIGNEE_SQL = "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND assignee = ?"
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +446,64 @@ def _stat_field(proc_root: str, pid: int, index: int) -> Optional[str]:
     return fields[index]
 
 
+def _boot_time(proc_root: str) -> Optional[int]:
+    """The epoch second the kernel booted at, from ``/proc/stat``'s ``btime``."""
+    try:
+        with open(os.path.join(proc_root, PROC_STAT_FILE), encoding="utf-8") as fh:
+            for line in fh:
+                name, _, value = line.partition(" ")
+                if name == BTIME_FIELD:
+                    return int(value.strip())
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _clock_ticks() -> int:
+    try:
+        ticks = os.sysconf(CLOCK_TICKS_NAME)
+    except (AttributeError, OSError, ValueError):
+        return DEFAULT_CLOCK_TICKS
+    return int(ticks) if ticks and ticks > 0 else DEFAULT_CLOCK_TICKS
+
+
+def process_started_at(pid: int, *, proc_root: str = PROC_ROOT) -> Optional[float]:
+    """When ``pid`` started, as an epoch; None when the boot time or the start time is unreadable."""
+    boot = _boot_time(proc_root)
+    started = _stat_field(proc_root, pid, STAT_STARTTIME_INDEX)
+    if boot is None or started is None or not started.isdigit():
+        return None
+    return boot + int(started) / _clock_ticks()
+
+
+def _cmdline(proc_root: str, pid: int) -> Optional[str]:
+    try:
+        with open(_proc_path(proc_root, pid, PROC_CMDLINE_FILE), "rb") as fh:
+            return fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def is_runs_worker(pid: int, task_id: str, run_started_at: Any, *, proc_root: str = PROC_ROOT) -> bool:
+    """Whether the process at ``pid`` is the worker the card's run recorded.
+
+    After a container restart the pid namespace starts over and a stale
+    running row's pid is handed to a new process within seconds, so a pid on
+    its own identifies nothing. A process that started before the run cannot
+    be its worker; without a readable boot time the command line decides,
+    because upstream's spawn names the task in it; unverifiable means no,
+    and the row is left to the crash sweep rather than measured.
+    """
+    started = process_started_at(pid, proc_root=proc_root)
+    run_start = _positive_int(run_started_at)
+    if started is not None and run_start is not None:
+        return started >= run_start - START_SKEW_SECONDS
+    cmdline = _cmdline(proc_root, pid)
+    if cmdline is None:
+        return False
+    return f"{WORKER_CMDLINE_TASK_MARK}{task_id}" in cmdline
+
+
 def _children_map(proc_root: str) -> dict:
     """``parent pid -> [child pids]`` over everything under ``proc_root``."""
     children: dict = {}
@@ -581,12 +657,18 @@ def pressure_level_for_tick(result: Any, *, settings: Optional[AdmissionSettings
                 source = sample.get(SOURCE_KEY)
                 if level == LEVEL_UNKNOWN:
                     cause = f"the sample from {source} did not classify"
-            if level == LEVEL_UNKNOWN and not fail_closed:
-                level = engine.upstream_pressure_level()
-                source = SOURCE_UPSTREAM
     except Exception as exc:  # noqa: BLE001 - the tick decides anyway
         level = LEVEL_UNKNOWN
         cause = f"the pressure check raised {exc!r}"
+    # The fail-open fallback sits outside the try so that a sampler that
+    # raised reaches it as a sampler that read nothing does.
+    if level == LEVEL_UNKNOWN and not fail_closed and source != SOURCE_UPSTREAM:
+        try:
+            level = engine.upstream_pressure_level()
+            source = SOURCE_UPSTREAM
+        except Exception as exc:  # noqa: BLE001
+            level = LEVEL_UNKNOWN
+            cause = f"upstream's pressure check raised {exc!r}"
     failed_closed = False
     if level == LEVEL_UNKNOWN and fail_closed:
         failed_closed = True
@@ -684,13 +766,13 @@ def _extend_auto_blocked(result: Any, task_ids: list) -> None:
         auto_blocked.extend(task_ids)
 
 
-def _own_reason(engine, conn, task_id: str, assignee: Any) -> Optional[str]:
+def _own_reason(engine, conn, task_id: str, assignee: Any, per_profile_cap: Optional[int]) -> Optional[str]:
     """Why the ready loop would skip this row for a reason of its own, or None.
 
     The loop records those reasons only for the rows it reached; a row behind
-    an exhausted budget is asked the same questions here, so a card that is
-    unrouted, aimed at no profile, or respawn-guarded is never told it waited
-    for capacity.
+    an exhausted budget is asked the same four questions here, so a card that
+    is unrouted, aimed at no profile, at its profile's cap, or respawn-guarded
+    is never told it waited for capacity.
     """
     if not assignee:
         return "unassigned"
@@ -699,6 +781,13 @@ def _own_reason(engine, conn, task_id: str, assignee: Any) -> Optional[str]:
             return "nonspawnable"
     except Exception:  # noqa: BLE001 - an unanswerable question is not a reason
         pass
+    if per_profile_cap is not None:
+        try:
+            running_here = int(conn.execute(_RUNNING_FOR_ASSIGNEE_SQL, (assignee,)).fetchone()[0])
+        except Exception:  # noqa: BLE001
+            running_here = 0
+        if running_here >= per_profile_cap:
+            return f"per_profile_capped:{running_here}"
     try:
         guard = engine.respawn_guard_reason(conn, task_id)
     except Exception:  # noqa: BLE001
@@ -708,16 +797,17 @@ def _own_reason(engine, conn, task_id: str, assignee: Any) -> Optional[str]:
 
 def refuse_overdue_ready(conn, result: Any, *, limited_by_capacity: bool,
                          settings: Optional[AdmissionSettings] = None, dry_run: bool = False,
-                         now: Optional[float] = None, engine=None) -> list:
+                         now: Optional[float] = None, engine=None, per_profile_cap: Any = None) -> list:
     """Block, with kind ``capacity``, the ready cards this tick left waiting past the bound.
 
     Only when ``limited_by_capacity`` holds: the tick was memory-limited, its
     slot budget was exhausted, or the sibling kanban_priority patch's per-class
     reservation held a row back. A card the tick skipped for a reason of its own
     (``EXCLUDED_ID_FIELDS``, ``EXCLUDED_TUPLE_FIELDS``, or :func:`_own_reason`
-    for a row the loop never reached) is never refused. The wait is measured
-    from the card's last entry into the ready lane. Returns the ids blocked,
-    which also join ``result.auto_blocked``.
+    for a row the loop never reached) is never refused; ``per_profile_cap`` is
+    the dispatcher's ``kanban.max_in_progress_per_profile``, so that question
+    is asked too. The wait is measured from the card's last entry into the
+    ready lane. Returns the ids blocked, which also join ``result.auto_blocked``.
     """
     if not limited_by_capacity or dry_run:
         return []
@@ -728,12 +818,13 @@ def refuse_overdue_ready(conn, result: Any, *, limited_by_capacity: bool,
         moment = int(time.time() if now is None else now)
         bound = settings.queue_bound_seconds
         excluded = _excluded_ids(result)
+        profile_cap = _positive_int(per_profile_cap)
         rows = conn.execute(_OVERDUE_SQL, READY_ENTRY_EVENT_KINDS).fetchall()
         for row in rows:
             task_id, assignee, waited = row[0], row[1], moment - int(row[2])
             if task_id in excluded or waited < bound:
                 continue
-            own_reason = _own_reason(engine, conn, task_id, assignee)
+            own_reason = _own_reason(engine, conn, task_id, assignee, profile_cap)
             if own_reason is not None:
                 logger.debug("%s %s waits for %s, not capacity; left alone", LOG_PREFIX, task_id, own_reason)
                 continue
@@ -839,19 +930,25 @@ def _worker_outlived_the_ladder(engine, pid: int, outcome: Mapping[str, Any]) ->
 
 
 def enforce_worker_rss_caps(conn, *, signal_fn=None, settings: Optional[AdmissionSettings] = None,
-                            rss_fn=None, engine=None, proc_root: str = PROC_ROOT) -> list:
+                            rss_fn=None, engine=None, proc_root: str = PROC_ROOT, identity_fn=None) -> list:
     """Stop each host-local worker whose process tree is over the cap; block its card.
 
     Mirrors ``enforce_max_runtime``: host-local claims only, kill with grace,
     then the card leaves ``running``, here through ``block_task`` with kind
-    ``capacity`` and the figures in the reason. A worker the ladder could not
-    signal keeps its card, so a card is never blocked under a live worker the
-    dispatcher cannot stop; the next tick measures it again. A worker with a
-    SIGKILL delivered is treated as gone, whatever the first probe said.
-    ``signal_fn`` and ``rss_fn`` are test hooks. Returns the ids blocked.
+    ``capacity`` and the figures in the reason. A row's pid is measured only
+    when the process is the run's own worker (:func:`is_runs_worker`): after a
+    container restart the namespace hands a predecessor's pid to a new process
+    while the stale row is still host-local, and that process is somebody
+    else's. A worker the ladder could not signal keeps its card, so a card is
+    never blocked under a live worker the dispatcher cannot stop; the next tick
+    measures it again. A worker with a SIGKILL delivered is treated as gone,
+    whatever the first probe said. ``signal_fn``, ``rss_fn`` and
+    ``identity_fn`` are test hooks. Returns the ids blocked.
     """
     engine = engine or _ENGINE
     stopped: list = []
+    is_worker = identity_fn or (lambda pid, task_id, run_started_at: is_runs_worker(
+        pid, task_id, run_started_at, proc_root=proc_root))
     try:
         settings = settings or load_settings(engine=engine)
         cap_mib = settings.worker_rss_cap_mib
@@ -859,11 +956,17 @@ def enforce_worker_rss_caps(conn, *, signal_fn=None, settings: Optional[Admissio
         host_prefix = engine.host_prefix()
         rows = conn.execute(_RUNNING_SQL).fetchall()
         for row in rows:
-            task_id, worker_pid, lock, run_id = row[0], row[1], row[2] or "", row[3]
+            task_id, worker_pid, lock, run_id, run_started_at = row[0], row[1], row[2] or "", row[3], row[4]
             if not str(lock).startswith(host_prefix):
                 continue
             pid = _positive_int(worker_pid)
             if pid is None:
+                continue
+            if not is_worker(pid, task_id, run_started_at):
+                logger.debug(
+                    "%s pid %s is not the worker of %s's run (a predecessor's pid, or unverifiable); "
+                    "left to the crash sweep", LOG_PREFIX, pid, task_id,
+                )
                 continue
             rss_kib = rss_fn(pid) if rss_fn is not None else process_tree_rss_kib(pid, proc_root=proc_root)
             if rss_kib is None or rss_kib <= cap_kib:

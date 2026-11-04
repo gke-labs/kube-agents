@@ -1248,6 +1248,13 @@ const (
 	defaultAdmissionWorkerRssCapMiB   = 1536
 	defaultAdmissionQueueBoundSeconds = 120
 	defaultAdmissionFailClosed        = true
+	// admissionMemoryBudgetFloorMiB is the least budget the operator renders, the
+	// CRD's Minimum on memoryBudgetMiB (common_types.go) applied to the derived
+	// figure too: a request the operator cannot read as a budget (a bare "2", a
+	// 256Mi) would otherwise render 0, which the dispatcher reads as no budget and
+	// answers with upstream's meminfo guard, or a figure under the floor that
+	// refuses every card. The clamp is logged; the CR is the place to fix it.
+	admissionMemoryBudgetFloorMiB = 512
 )
 
 // defaultSessionRetentionDays is how long an ended session is kept when
@@ -1566,13 +1573,22 @@ func agentMemoryRequestMiB(agent *agentv1alpha1.PlatformAgent) int {
 		deployment = agent.Spec.Deployment
 	}
 	resources := resolveResources(deployment)
-	if mib, ok := memoryMiB(resources.Requests); ok {
-		return mib
+	mib, ok := memoryMiB(resources.Requests)
+	if !ok {
+		mib, ok = memoryMiB(resources.Limits)
 	}
-	if mib, ok := memoryMiB(resources.Limits); ok {
-		return mib
+	if !ok {
+		mib, _ = memoryMiB(resolveResources(nil).Requests)
 	}
-	mib, _ := memoryMiB(resolveResources(nil).Requests)
+	if mib < admissionMemoryBudgetFloorMiB {
+		name := ""
+		if agent != nil {
+			name = agent.Name
+		}
+		manifestsLog.Info("admission memory budget clamped to the floor: the agent container's memory request is below it",
+			"platformagent", name, "requestMiB", mib, "budgetMiB", admissionMemoryBudgetFloorMiB)
+		return admissionMemoryBudgetFloorMiB
+	}
 	return mib
 }
 

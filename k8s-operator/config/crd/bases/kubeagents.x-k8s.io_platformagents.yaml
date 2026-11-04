@@ -9812,10 +9812,18 @@ spec:
                                 in MiB (2048 at the operator's default resources), so a CR that raises
                                 the request raises the budget with it.
 
-                                The classification is Hermes' own (gateway/memory_status.py): with less
-                                than 15% of the budget, or 128 MiB, left the tick spawns at most one
-                                worker; with less than 5%, or 64 MiB, left it spawns none. A card the
-                                tick cannot spawn waits, and is refused after QueueBoundSeconds. Set the
+                                Two bounds act on the budget. Each tick admits one new worker per
+                                512 MiB of headroom under it, so with the container's working set at W
+                                the tick spawns at most (budget - W) / 512 workers and none once the
+                                headroom is under 512 MiB; and Hermes' own classification
+                                (gateway/memory_status.py) permits at most one worker with less than
+                                15% of the budget, or 128 MiB, left and none with less than 5%, or
+                                64 MiB. At the default budget the headroom bound acts first. A budget
+                                under the container's idle working set plus 512 MiB therefore admits
+                                no worker and refuses every card after QueueBoundSeconds; the schema's
+                                minimum of 512 is left there for a test install that wants exactly
+                                that, and a derived budget under it is clamped to it. A card the tick
+                                cannot spawn waits, and is refused after QueueBoundSeconds. Set the
                                 budget below the request to keep headroom for the gateway's own growth,
                                 or above it, up to the limit, on a node pool where eviction is not the
                                 risk; past the limit the OOM killer, not this budget, is what stops a

@@ -117,6 +117,7 @@ EARLY_RETURN_PATCHED = EARLY_RETURN_ANCHOR + (
     "        # See hermes_cli/kanban_admission.py.\n"
     f"        {MODULE_ALIAS}.refuse_overdue_ready(\n"
     "            conn, result, limited_by_capacity=True, dry_run=dry_run,\n"
+    "            per_profile_cap=max_in_progress_per_profile,\n"
     "        )\n"
 )
 
@@ -136,6 +137,7 @@ FINAL_RETURN_PATCHED = (
     "            result, spawn_budget=spawn_budget, spawned=spawned,\n"
     "        ),\n"
     "        dry_run=dry_run,\n"
+    "        per_profile_cap=max_in_progress_per_profile,\n"
     "    )\n"
 ) + FINAL_RETURN_ANCHOR
 
@@ -188,12 +190,13 @@ BUILD_MARKERS = (
     KINDS_BUILD_MARKER,
 )
 
-# Written by a successful apply and by nothing else, one set per file. Three
-# of the six anchors survive their own replacement (edits 2 and 3 insert
+# Written by a successful apply and by nothing else, one set per file. Four
+# of the six anchors survive their own replacement (edits 1b, 2 and 3 insert
 # around theirs), so counting alone cannot tell a fresh tree from a patched
-# one; these can.
+# one; these can, one per edit.
 DISPATCH_MARKERS = (
     PRESSURE_BUILD_MARKER,
+    HEADROOM_BUILD_MARKER,
     RSS_CAP_BUILD_MARKER,
     REFUSE_BUILD_MARKER,
     TRAILER_BUILD_MARKER,

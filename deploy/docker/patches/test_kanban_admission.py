@@ -312,11 +312,17 @@ def sample(budget_mib, used_mib, source="cgroup-v1"):
 class FakeTree:
     """``<root>/proc/<pid>/{stat,status}`` and the two cgroup files, on demand."""
 
+    #: The fake kernel booted 100 s before NOW; a process's default start time
+    #: (11,000 ticks at 100 Hz) is 10 s after NOW, inside every test run's row.
+    BTIME = NOW - 100
+    DEFAULT_STARTTIME = 11_000
+
     def __init__(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.proc = self.root / "proc"
         self.proc.mkdir()
+        self.boot(self.BTIME)
         self.v1 = str(self.root / "memory.usage_in_bytes")
         self.v2 = str(self.root / "memory.current")
         self.v1_stat = str(self.root / "memory.stat.v1")
@@ -325,9 +331,18 @@ class FakeTree:
     def close(self):
         self.tmp.cleanup()
 
-    def process(self, pid, *, ppid, rss_kib=None, starttime=1000, comm="python3", pgrp=0):
+    def boot(self, btime):
+        (self.proc / "stat").write_text(f"cpu 1 2 3 4\nbtime {btime}\nprocesses 42\n")
+
+    def no_boot_time(self):
+        (self.proc / "stat").unlink()
+
+    def process(self, pid, *, ppid, rss_kib=None, starttime=None, comm="python3", pgrp=0, cmdline=None):
+        starttime = self.DEFAULT_STARTTIME if starttime is None else starttime
         here = self.proc / str(pid)
         here.mkdir()
+        if cmdline is not None:
+            (here / "cmdline").write_bytes(b"\0".join(part.encode() for part in cmdline) + b"\0")
         # pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt
         # utime stime cutime cstime priority nice threads itrealvalue starttime ...
         tail = ["S", str(ppid), str(pgrp)] + ["0"] * 16 + [str(starttime), "0", "0"]
@@ -644,6 +659,13 @@ class PressureTest(unittest.TestCase):
             )
         self.assertEqual(got, "critical")
         self.assertIn("cgroup went away", getattr(res, admission.RESULT_ATTR)["cause"])
+        engine = FakeEngine(upstream_level="elevated")
+        res = result()
+        got = admission.pressure_level_for_tick(
+            res, settings=settings(memory_budget_mib=2048, fail_closed=False), sample_fn=boom, engine=engine,
+        )
+        self.assertEqual((got, engine.upstream_calls), ("elevated", 1))
+        self.assertEqual(getattr(res, admission.RESULT_ATTR)["source"], "meminfo")
         got = admission.pressure_level_for_tick(
             result(), settings=settings(memory_budget_mib=2048, fail_closed=False), sample_fn=boom,
             engine=FakeEngine(upstream_level="unknown"),
@@ -702,8 +724,65 @@ class RssCapTest(unittest.TestCase):
     def enforce(self, conn, engine, sizes_mib, **kwargs):
         return admission.enforce_worker_rss_caps(
             conn, settings=settings(worker_rss_cap_mib=1536), engine=engine,
-            rss_fn=lambda pid: None if sizes_mib.get(pid) is None else sizes_mib[pid] * MIB, **kwargs,
+            rss_fn=lambda pid: None if sizes_mib.get(pid) is None else sizes_mib[pid] * MIB,
+            identity_fn=lambda pid, task_id, run_started_at: True, **kwargs,
         )
+
+    def test_a_stale_rows_pid_that_predates_the_run_is_never_measured_or_killed(self):
+        """After a container restart the namespace hands a predecessor's pid to a
+        new process while the stale running row is still host-local; a process
+        that started before the row's run is not its worker, and the row is left
+        to the crash sweep."""
+        tree = FakeTree()
+        self.addCleanup(tree.close)
+        tree.process(1, ppid=0, rss_kib=1)
+        # Started 95 s before NOW; the run row says NOW.
+        tree.process(900, ppid=1, rss_kib=4000 * MIB, starttime=500)
+        conn = board()
+        running(conn, "t_stale", pid=900)
+        engine = FakeEngine(alive={900})
+        got = admission.enforce_worker_rss_caps(
+            conn, settings=settings(worker_rss_cap_mib=1536), engine=engine, proc_root=str(tree.proc),
+        )
+        self.assertEqual((got, engine.kills, status(conn, "t_stale")), ([], [], "running"))
+
+    def test_the_runs_own_worker_is_measured(self):
+        tree = FakeTree()
+        self.addCleanup(tree.close)
+        tree.process(1, ppid=0, rss_kib=1)
+        tree.process(901, ppid=1, rss_kib=4000 * MIB)  # default start: 10 s after the run
+        conn = board()
+        running(conn, "t_own", pid=901)
+        engine = FakeEngine(alive={901})
+        engine.dies_on_term = {901}
+        got = admission.enforce_worker_rss_caps(
+            conn, settings=settings(worker_rss_cap_mib=1536), engine=engine, proc_root=str(tree.proc),
+        )
+        self.assertEqual((got, status(conn, "t_own")), (["t_own"], "blocked"))
+
+    def test_without_a_boot_time_the_command_line_names_the_worker(self):
+        tree = FakeTree()
+        self.addCleanup(tree.close)
+        tree.no_boot_time()
+        tree.process(1, ppid=0, rss_kib=1)
+        tree.process(910, ppid=1, cmdline=["hermes", "-p", "platform", "chat", "-q", "work kanban task t_mine"])
+        tree.process(911, ppid=1, cmdline=["hermes", "-p", "platform", "chat", "-q", "work kanban task t_other"])
+        tree.process(912, ppid=1)
+        root = str(tree.proc)
+        self.assertTrue(admission.is_runs_worker(910, "t_mine", NOW, proc_root=root))
+        self.assertFalse(admission.is_runs_worker(911, "t_mine", NOW, proc_root=root))
+        self.assertFalse(admission.is_runs_worker(912, "t_mine", NOW, proc_root=root))
+
+    def test_a_start_inside_the_skew_counts_as_the_worker(self):
+        tree = FakeTree()
+        self.addCleanup(tree.close)
+        # 1 s before the run's second: the dispatcher records the run on a second clock.
+        tree.process(920, ppid=1, starttime=(100 - 1) * 100)
+        self.assertTrue(admission.is_runs_worker(920, "t_x", NOW, proc_root=str(tree.proc)))
+        tree.process(921, ppid=1, starttime=(100 - 3) * 100)
+        self.assertFalse(admission.is_runs_worker(921, "t_x", NOW, proc_root=str(tree.proc)))
+        # No run start on the row and a boot time present: the command line is not consulted; no.
+        self.assertFalse(admission.is_runs_worker(920, "t_x", None, proc_root=str(tree.proc)))
 
     def test_an_oversized_worker_is_terminated_and_its_card_blocked_with_capacity(self):
         conn = board()
@@ -783,6 +862,7 @@ class RssCapTest(unittest.TestCase):
         with self.assertLogs(admission.logger, level="WARNING") as logs:
             got = admission.enforce_worker_rss_caps(
                 conn, settings=settings(worker_rss_cap_mib=1536), engine=engine, rss_fn=measure_and_race,
+                identity_fn=lambda pid, task_id, run_started_at: True,
             )
         self.assertEqual(got, [])
         self.assertEqual(engine.kills, [(15, signal.SIGTERM)])
@@ -984,6 +1064,27 @@ class OverdueTest(unittest.TestCase):
         for tid in ("t_unrouted", "t_blank", "t_no_profile", "t_guarded"):
             with self.subTest(tid=tid):
                 self.assertEqual(status(conn, tid), "ready")
+
+    def test_a_card_at_its_profiles_cap_is_not_refused(self):
+        """Upstream's per-profile cap is a quota, not capacity; a row the loop
+        never reached is asked that question too, from the running counts."""
+        conn = board()
+        running(conn, "t_run_a", pid=51)
+        running(conn, "t_run_b", pid=52)
+        ready(conn, "t_capped", age=600, assignee="platform")
+        ready(conn, "t_other", age=600, assignee="orion")
+        self.assertEqual(self.refuse(conn, per_profile_cap=2), ["t_other"])
+        self.assertEqual(status(conn, "t_capped"), "ready")
+        self.assertEqual(self.refuse(conn, per_profile_cap=3), ["t_capped"])
+
+    def test_a_per_profile_cap_that_is_not_a_positive_int_asks_nothing(self):
+        conn = board()
+        running(conn, "t_run", pid=53)
+        ready(conn, "t_waiting", age=600, assignee="platform")
+        for cap in (None, 0, -1, "two"):
+            with self.subTest(cap=cap):
+                conn.execute("UPDATE tasks SET status = 'ready' WHERE id = 't_waiting'")
+                self.assertEqual(self.refuse(conn, per_profile_cap=cap), ["t_waiting"])
 
     def test_an_engine_that_cannot_name_profiles_trusts_the_assignee(self):
         conn = board()
@@ -1212,6 +1313,24 @@ class ApplierTest(unittest.TestCase):
             for relative, label, their_anchor, their_patched in scheduling.EDITS:
                 with self.subTest(ours=_label, theirs=label):
                     self.assertEqual(their_patched.count(anchor), their_anchor.count(anchor))
+
+    def test_the_event_kind_check_reads_call_sites_not_words(self):
+        """A kind counts when ``_append_event`` is called with it, as a literal
+        or a module constant; a payload key, a comment or a status that spells
+        the word does not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            module = Path(tmp) / "writer.py"
+            module.write_text(
+                "RECLAIM_EVENT_KIND = \"reclaimed\"\n"
+                "def f(conn, tid):\n"
+                "    _append_event(conn, tid, \"promoted\", {\"unblocked\": 1})\n"
+                "    _kb._append_event(conn, tid, RECLAIM_EVENT_KIND, None, run_id=3)\n"
+                "    # the assigned event is written elsewhere\n"
+                "    status = 'assigned'\n"
+                "    log(\"review_reopened\")\n"
+            )
+            self.assertEqual(verifier.event_kinds_written([module]), {"promoted", "reclaimed"})
+            self.assertEqual(verifier.event_kinds_written([Path(tmp) / "absent.py"]), set())
 
     def test_the_dockerfile_greps_for_the_markers_this_file_defines(self):
         dockerfile = Path(applier.__file__).parents[1] / "Dockerfile"
