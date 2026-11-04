@@ -113,23 +113,28 @@ func TestSlackSessionTitleNoCompatibilityForm(t *testing.T) {
 	}
 }
 
-// linearTitleBudget is the time one 40 000-unit input may take. One linear
-// parse of it takes about 0.4 s under the race detector on an idle machine
-// and up to 1.3 s on a starved core, where a one-second budget failed. The
-// shape this guards against is a parse of the rest of the message per unit,
-// 10 000 to 40 000 such parses depending on the unit, which runs for hours;
-// a bare byte rescan per unit is cheaper than one parse here, and no time
-// budget tells it apart.
+// linearTitleBudget is the CPU time one 40 000-unit input may take. One
+// linear parse of it takes about 0.4 s under the race detector. The budget is
+// CPU time on the parsing thread, not wall time: wall time also counts the
+// time the thread waited for a core, and on a loaded runner that took a
+// linear parse past 5 s. The shape this guards against is a parse of the rest
+// of the message per unit, 10 000 to 40 000 such parses depending on the
+// unit, which runs for hours; a bare byte rescan per unit is cheaper than one
+// parse here, and no time budget tells it apart.
 const linearTitleBudget = 5 * time.Second
 
 func TestSlackSessionTitleLinearOnUnclosedMarkup(t *testing.T) {
 	const slackMessageMax = 40_000
 	for _, unit := range []string{"<", "<!", "<@", "<#A|", "<a|"} {
 		ask := strings.Repeat(unit, slackMessageMax/len(unit))
-		start := time.Now()
-		slackSessionTitle(ask)
-		if d := time.Since(start); d > linearTitleBudget {
-			t.Errorf("%q x %d took %v", unit, slackMessageMax/len(unit), d)
+		d, ok := threadCPU(func() { slackSessionTitle(ask) })
+		if !ok {
+			t.Skip("no per-thread CPU clock on this platform")
+		}
+		if d > linearTitleBudget {
+			t.Errorf("%q x %d took %v of CPU", unit, slackMessageMax/len(unit), d)
+		} else {
+			t.Logf("%q x %d took %v of CPU", unit, slackMessageMax/len(unit), d)
 		}
 	}
 }
