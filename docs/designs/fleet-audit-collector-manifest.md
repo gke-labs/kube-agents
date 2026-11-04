@@ -129,8 +129,12 @@ sets those while it still applies the object.
 The read is `kcc_health.read_objects`. Discovery (`kubectl api-resources -o wide`, which needs no
 RBAC grant) finds the Config Connector kinds: a group that ends in `.cnrm.cloud.google.com`, in the
 `gcp` category, with the `list` verb. Then each kind is listed with
-`kubectl get --raw /apis/<group>/<version>/<plural>?limit=500` (`kcc_health.KIND_PAGE_LIMIT`), one
-request per page, following `metadata.continue`, so no reply holds a whole large kind. Every
+`kubectl get --raw <prefix>/apis/<group>/<version>/<plural>?limit=500`
+(`kcc_health.KIND_PAGE_LIMIT`), one request per page, following `metadata.continue`, so no reply
+holds a whole large kind. `<prefix>` is the path of the kubeconfig's server URL, read first with
+`kubectl config view --minify` (`kcc_health.server_prefix`): kubectl drops that path from an
+absolute `--raw` path, and through the install's kube-proxy (`/clusters/<context>`) a bare path
+reads the proxy's default cluster. A cluster whose server URL cannot be read is `kcc_unread`. Every
 `kubectl` call of the read takes one of `kcc_health.proxy_slots()` slots
 first: the broker's sweep width (`broker_admission.sweep_width`), so no more requests than the
 credential broker admits are in flight in the process across clusters. The compliance collector lists every kind, because
