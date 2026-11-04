@@ -31,8 +31,9 @@ const (
 	// readHeaderTimeout closes a connection whose request headers have not
 	// arrived in time, so a slow client cannot hold one open indefinitely.
 	readHeaderTimeout = 15 * time.Second
-	// serverShutdownTimeout is how long in-flight requests get to finish
-	// after SIGTERM before their connections are closed.
+	// serverShutdownTimeout bounds srv.Shutdown after SIGTERM. main does not
+	// wait for Shutdown to return, so a request still in flight when the
+	// process exits is cut.
 	serverShutdownTimeout = 10 * time.Second
 )
 
