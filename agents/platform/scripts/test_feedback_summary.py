@@ -461,6 +461,16 @@ class RenderTest(unittest.TestCase):
         self.assertIn("\n  proposals by origin: no reading (as the agent reports)\n", text)
         self.assertIn("\n  proposals by origin: no reading (as the agent reports)\n", fs.render(full_snapshot(cr={})))
 
+    def test_the_origin_line_lists_the_present_non_zero_origins_of_a_partial_status(self):
+        """A status with some of the nine prints the present non-zero ones; the gateway asserts the same lines."""
+        cr = json.loads(json.dumps(CR))
+        for field in fs.USAGE_ORIGIN_FIELDS:
+            cr["status"]["usage"].pop(field, None)
+        cr["status"]["usage"].update({"proposalsFromChat": 2, "proposalsFromDrift": 0})
+        self.assertIn("\n  proposals by origin: chat 2 (as the agent reports)\n", fs.render(full_snapshot(cr=cr)))
+        del cr["status"]["usage"]["proposalsFromChat"]
+        self.assertIn("\n  proposals by origin: none (as the agent reports)\n", fs.render(full_snapshot(cr=cr)))
+
     def test_the_origin_fields_are_the_nine_status_fields_in_the_table_order(self):
         self.assertEqual(
             list(fs.USAGE_ORIGIN_FIELDS),

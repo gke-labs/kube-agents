@@ -242,6 +242,23 @@ func TestRenderUsageSummaryOriginLinePrintsNoReadingWhenTheOriginsAreAbsent(t *t
 	}
 }
 
+// TestRenderUsageSummaryOriginLineListsThePresentNonZeroOriginsOfAPartialStatus:
+// a status with some of the nine prints the present non-zero ones; the script
+// asserts the same lines.
+func TestRenderUsageSummaryOriginLineListsThePresentNonZeroOriginsOfAPartialStatus(t *testing.T) {
+	cr := summaryOriginCR(nil)
+	usage := cr["status"].(map[string]any)["usage"].(map[string]any)
+	usage["proposalsFromChat"] = int64(2)
+	usage["proposalsFromDrift"] = int64(0)
+	if want, text := "\n  proposals by origin: chat 2 (as the agent reports)\n", renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, want) {
+		t.Fatalf("block lacks %q:\n%s", want, text)
+	}
+	delete(usage, "proposalsFromChat")
+	if want, text := "\n  proposals by origin: none (as the agent reports)\n", renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, want) {
+		t.Fatalf("block lacks %q:\n%s", want, text)
+	}
+}
+
 func TestUsageSummaryOriginFieldsAreTheNineStatusFieldsInTheTableOrder(t *testing.T) {
 	var want []string
 	for _, origin := range []string{"Chat", "Console", "Api", "Event", "Drift", "Audit", "Scheduled", "Issue", "Other"} {

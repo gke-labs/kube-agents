@@ -36,6 +36,8 @@ _CHAT_METRICS_PY = _REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "ch
 _MANIFESTS_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
 _A2A_METRICS_GO = _REPO_ROOT / "a2a" / "gateway" / "metrics.go"
 _A2A_LIB_PAYLOAD_GO = _REPO_ROOT / "a2a" / "lib" / "payload.go"
+_COMMON_TYPES_GO = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
+_FEEDBACK_SUMMARY_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "feedback_summary.py"
 
 
 def _go_const(path, name):
@@ -186,6 +188,16 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         operator = re.findall(r'^\s*proposalOrigin[A-Z]\w*\s*=\s*"([a-z]+)"', _SCRAPE_GO.read_text(), re.M)
         self.assertEqual(plugin, operator)
         self.assertEqual(len(plugin), 9)
+
+    def test_the_usage_summarys_origin_fields_are_the_crds_json_tags(self):
+        """The summary reads the nine fields by their json names; a renamed tag would leave
+        that origin unprinted with every suite green. The gateway's copy is pinned to the
+        script's in test_feedback_summary.py."""
+        crd = re.findall(r'json:"(proposalsFrom\w+),omitempty"', _COMMON_TYPES_GO.read_text())
+        match = re.search(r"^USAGE_ORIGIN_FIELDS[^=]*= \(([^)]*)\)", _FEEDBACK_SUMMARY_PY.read_text(), re.M)
+        self.assertIsNotNone(match, "USAGE_ORIGIN_FIELDS not found")
+        self.assertEqual(re.findall(r'"(\w+)"', match.group(1)), crd)
+        self.assertEqual(len(crd), 9)
 
     def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))
