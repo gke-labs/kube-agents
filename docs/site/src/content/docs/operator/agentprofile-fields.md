@@ -30,7 +30,7 @@ Every field of the `AgentProfile` resource's `spec` and `status`, generated from
 | `bus.publishTopics` | `[]string` | no |  | max items `32`; items pattern `^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$`; items max length `133` | PublishTopics are the topics the profile's pods may write. |
 | `bus.subscribeTopics` | `[]string` | no |  | max items `32`; items pattern `^(shared\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\|agent\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)$`; items max length `133` | SubscribeTopics are the topics the profile's pods may read. |
 | `identity` | `object` | no |  |  | Identity names the ServiceAccount the profile's pods run as. Absent, the operator creates one with zero RBAC bindings: the token exists to authenticate to the bus, not to talk to the API server. |
-| `identity.serviceAccountName` | `string` | no |  | max length `253`; pattern `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` | ServiceAccountName is an existing ServiceAccount in the profile's namespace. Naming one hands this profile's pods whatever RBAC it holds; absent, the operator creates a ServiceAccount with none. |
+| `identity.serviceAccountName` | `string` | no |  | max length `253`; pattern `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` | ServiceAccountName is an existing ServiceAccount in the profile namespace (&lt;namespace&gt;-profiles), and it serves the profile's one allowed tier. Naming one hands this profile's pods whatever RBAC it holds; absent, the operator creates a ServiceAccount per tier with none. |
 | `clusterRef` | `object` | no |  |  | ClusterRef is set on cluster agents only: the cluster this profile is scoped to, as structured data rather than a parsed name. |
 | `clusterRef.projectId` | `string` | yes |  | min length `1` |  |
 | `clusterRef.cluster` | `string` | yes |  | min length `1` |  |
@@ -41,6 +41,9 @@ Every field of the `AgentProfile` resource's `spec` and `status`, generated from
 | `queueTimeoutSeconds` | `integer` | no |  | min `0` | QueueTimeoutSeconds is how stale a queued submission may be, by its JetStream server ingest time, before the dispatcher refuses to run it. Absent or zero means DefaultAgentProfileQueueTimeoutSeconds. |
 | `concurrency` | `integer` | yes |  | min `1` | Concurrency is the most pods this profile runs at once. |
 | `allowedTiers` | `[]string` | no |  | min items `1`; max items `2`; items one of `read`, `unattended` | AllowedTiers are the tiers this profile may run at. A task runs at its requester's tier, and the dispatcher refuses one whose tier is not listed here; a pinned production profile might allow only read. Tier is authority, so it lives on the CR, never in the persona. Absent means read alone (AllowedTierList). |
+| `parameters` | `[]object` | no |  | max items `16` | Parameters are the task parameters this profile's persona declares, as the gateway and the dispatcher need them without reading the persona image: the gateway routes cluster work to a profile that declares project, location and cluster, and the dispatcher refuses a submission missing a required one. The worker checks this list against the persona's at start and refuses to run a task when they differ. |
+| `parameters[].name` | `string` | yes |  | pattern `^[a-z][a-z0-9_]{0,62}$` |  |
+| `parameters[].required` | `boolean` | no |  |  | Required means a submission without it is refused. |
 | `resources` | `object` | yes |  |  | Resources is the pod resource class. |
 | `resources.requests` | `object` | yes |  |  | AgentProfileResourceList is a cpu and memory pair. |
 | `resources.requests.cpu` | `resource.Quantity` | yes |  |  |  |
@@ -55,7 +58,7 @@ Every field of the `AgentProfile` resource's `spec` and `status`, generated from
 | ----- | ---- | -------- | ------- | ----------- | ----------- |
 | `observedGeneration` | `integer` | no |  |  | ObservedGeneration is the .metadata.generation the status was last computed from. |
 | `agentRef` | `string` | no |  |  | AgentRef is the PlatformAgent this profile is bound to: the one in its namespace. |
-| `serviceAccountName` | `string` | no |  |  | ServiceAccountName is the ServiceAccount the profile's pods run as, whether named in spec.identity or created by the operator. |
+| `serviceAccountName` | `string` | no |  |  | ServiceAccountName lists the ServiceAccounts the profile's pods run as, in the profile namespace: one per allowed tier, comma-separated, or the one named in spec.identity. |
 | `conditions` | `[]metav1.Condition` | no |  |  | Conditions represent the latest available observations of the profile. |
 
 <!-- prettier-ignore-end -->

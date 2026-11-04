@@ -106,6 +106,10 @@ GITHUB_PATH_DEPTH = 2
 #: the install's to declare and is not known here.
 GITLAB_CANONICAL_HOST = "gitlab.com"
 
+#: The one host of the Bitbucket Cloud provider. A Bitbucket Data Center host is
+#: the install's to declare and is not known here.
+BITBUCKET_CANONICAL_HOST = "bitbucket.org"
+
 #: Hosts a schemeless value may name in its first segment — see "On the host".
 #: Spelled out rather than aliased to `GITHUB_HOSTS`: this set is the shorthand
 #: an operator types, not the set of remotes git can produce, and the two grow
@@ -116,7 +120,7 @@ GITLAB_CANONICAL_HOST = "gitlab.com"
 #: self-managed host is not here: it is lifted by the broker's registry, which
 #: knows the hosts this install configured, and `repo_ref.go` lifts it from the
 #: forge it was declared on.
-KNOWN_HOSTS = frozenset({GITHUB_CANONICAL_HOST, GITLAB_CANONICAL_HOST})
+KNOWN_HOSTS = frozenset({GITHUB_CANONICAL_HOST, GITLAB_CANONICAL_HOST, BITBUCKET_CANONICAL_HOST})
 
 #: Matches `forge.RepoUnparseable`, whose reason codes are operator-facing.
 REASON_UNPARSEABLE = "GIT_REPO_UNPARSEABLE"

@@ -275,6 +275,18 @@ type SlackAdapter struct {
 	// pressers caches each Stop presser's workspace answer (slack_stop.go,
 	// presserInWorkspace), so a press costs at most one users.info call.
 	pressers map[string]slackPresser
+	// boardActor acts on a board-health row's Retry or Drop, and boardTaps
+	// holds each row whose tap is running or landed, under s.mu
+	// (slack_board.go).
+	boardActor     BoardActor
+	boardTaps      map[string]bool
+	boardTapsOrder []string
+	// boardSent is the blocks each board card's last edit sent, by
+	// channel/ts, under s.mu, bounded oldest first like boardTaps
+	// (remember); boardEditMu runs one board edit at a time.
+	boardSent      map[string]json.RawMessage
+	boardSentOrder []string
+	boardEditMu    sync.Mutex
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
@@ -887,6 +899,16 @@ func (s *SlackAdapter) PostNotifyMessage(channel, thread string, m OutMessage) (
 	// later click on it is dropped.
 	s.trackQuestion(slackConversationID(slackChannelTypeChannel, channel, thread), ts, m)
 	return ts, thread, nil
+}
+
+// EditNotifyMessage is EditMessage for the chat.notify route's home posts
+// (notifyChatEditor): the message ts on channel's thread, edited in place,
+// its question tracked under the thread's key as PostNotifyMessage tracks it.
+func (s *SlackAdapter) EditNotifyMessage(channel, thread, messageID string, m OutMessage) error {
+	if !slackIsHomeChannelID(channel) {
+		return fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	return s.EditMessage(slackConversationID(slackChannelTypeChannel, channel, thread), messageID, m)
 }
 
 // slackIsHomeChannelID reports a public ("C...") or private ("G...")

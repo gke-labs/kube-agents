@@ -541,16 +541,20 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertTrue(argv[argv.index("--") + 1].startswith(reshaped.rstrip("\n")))
         self.assertIn("no INVENTORY.items.json", stage_log(self.d))
 
-    def test_a_google_chat_conversation_gets_the_text_and_the_log_says_why(self):
+    def test_a_google_chat_conversation_under_next_gets_the_card(self):
+        # The gateway lays the card out on Google Chat under next, so the conversation
+        # door sends it as a chat message there as it does on Slack.
         conversation = dict(CONVERSATION, platform="google_chat", conversation="google_chat:spaces/A/threads/B")
         (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(conversation), encoding="utf-8")
-        plant_card_files(self.d)
+        card = plant_card_files(self.d)
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
             self._run()
-        (argv,) = self.calls
-        self.assertNotIn("--chat-file", argv)
-        self.assertTrue(argv[argv.index("--") + 1].startswith(self.REPORT.rstrip("\n")))
-        self.assertIn("the report goes to google_chat, which takes text", stage_log(self.d))
+        argv = self.calls[0]
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "google_chat"])
+        self.assertIn("--chat-file", argv)
+        self.assertEqual(argv[-1], inventory_card.chat(card)[1])
+        self.assertNotIn("which takes text", stage_log(self.d))
+
 
     def test_a_failed_note_after_the_card_keeps_the_report_delivered(self):
         self._answer()
@@ -1650,6 +1654,57 @@ class DeliveryCardTest(unittest.TestCase):
         self.assertEqual(chat["choices"][0]["text"], "Fix the first one")
         self.assertFalse(os.path.exists(argv[argv.index("--chat-file") + 1]))
 
+    def test_a_google_chat_origin_under_next_gets_the_card_through_the_gateway(self):
+        # The home door on Google Chat: the card goes to the gateway with the thread's
+        # resource name as it is, no channel qualifier, and nothing to the Slack relay.
+        origin = dict(self.ORIGIN, platform="google_chat", chat_id="spaces/A", thread_id="spaces/A/threads/B")
+        environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM")}
+        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_PLATFORM": "google_chat"})
+        self.notifies = []
+
+        def run(argv, **_kwargs):
+            with open(argv[argv.index("--chat-file") + 1], encoding="utf-8") as handle:
+                self.notifies.append((argv, json.load(handle)))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        out = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(self.sbp, "post") as poster,
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(out.getvalue(), RUNNING_NOTE + "\n")
+        poster.assert_not_called()
+        ((argv, chat),) = self.notifies
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "google_chat"])
+        self.assertEqual(argv[argv.index("--thread") + 1], "spaces/A/threads/B")
+        self.assertEqual(chat, inventory_card.chat(self.card)[0])
+
+    def test_a_google_chat_origin_with_no_routed_home_gets_the_text_and_the_log_says_why(self):
+        # A conversations-only gateway serves Google Chat, so the card is built, but the
+        # home door has nowhere to send it: the report prints as text and the log says so.
+        origin = dict(self.ORIGIN, platform="google_chat", chat_id="spaces/A", thread_id="spaces/A/threads/B")
+        environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM", "A2A_NOTIFY_CONVERSATIONS")}
+        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_CONVERSATIONS": "google_chat"})
+        out = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(self.sbp, "post") as poster,
+            mock.patch.object(bootstrap_delivery.subprocess, "run") as run,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        poster.assert_not_called()
+        run.assert_not_called()
+        self.assertTrue(out.getvalue().startswith(self.text.rstrip("\n")[:40]))
+        self.assertIn("the gateway routes no home posts to google_chat", stage_log(self.d))
+
     def test_a_skip_goes_out_as_its_own_message_after_the_card(self):
         (self.d / oobe.SCAN_FILED_MARKER).write_text("task_id=t_sweep\n", encoding="utf-8")
         with contextlib.redirect_stderr(io.StringIO()):
@@ -2336,6 +2391,75 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 2)
         self.assertEqual(bootstrap_scan_gate._reconcile_since(self.d), started)
 
+    def test_a_reconcile_that_deferred_creates_defers_the_sweep_and_ends_the_failure_streak(self):
+        # EXIT_CREATES_DEFERRED: the run created its cap's worth and left the rest for
+        # the next tick. Progress, not failure: the sweep waits, the streak of failed
+        # ticks before it is over, as on exit 0, and the counts the reconcile logged
+        # are repeated for the gate's reader.
+        import cluster_agent_reconcile as rec
+        self.assertEqual(bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, rec.EXIT_CREATES_DEFERRED)
+        started = time.time()
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, 2, started)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, "",
+                "[CLUSTER-RECONCILE] Done: created=100 failed=0 deferred=150 pruned=0 kept=0 no_identity=0 unknown=0.\n")
+
+        err = io.StringIO()
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(err):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+        self.assertIsNone(bootstrap_scan_gate._reconcile_since(self.d))
+        self.assertIn("deferred the rest to the next tick", err.getvalue())
+        self.assertIn("created=100 failed=0 deferred=150", err.getvalue())
+
+    def test_a_failure_streak_before_the_first_batch_does_not_give_up_mid_fleet(self):
+        # A fresh install fails its first ticks while IAM propagates, then the fleet
+        # starts arriving in batches that run past the give-up window those failures
+        # opened. The first batch ended the streak, so the clock has nothing to fire
+        # on: every deferred tick waits, and the finishing one files the sweep.
+        t0 = 1_700_000_000.0
+        clock = [t0 + 60.0]
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS, t0)
+        codes = iter([bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED,
+                      bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, 0])
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, next(codes), "", "")
+
+        err = io.StringIO()
+        ticks = []
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(bootstrap_scan_gate.time, "time", lambda: clock[0]), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(err):
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+            clock[0] = t0 + bootstrap_scan_gate.RECONCILE_GIVE_UP_SECONDS + 60.0
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(ticks, [False, False, True])
+        self.assertNotIn("filing the sweep anyway", err.getvalue())
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+
+    def test_a_fleet_of_three_batches_files_the_sweep_on_the_third_tick(self):
+        # 250 clusters at the default cap: two ticks that defer, then the one that
+        # finishes; no attempt is spent along the way, so the ceiling never fires.
+        codes = iter([bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED,
+                      bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, 0])
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, next(codes), "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ticks = [bootstrap_scan_gate.ensure_cluster_agents(self.d) for _ in range(3)]
+        self.assertEqual(ticks, [False, False, True])
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+
     def test_body_forbids_creating_profiles_by_hand(self):
         """The regression that made the first roster fix worse than the bug.
 
@@ -2389,14 +2513,140 @@ class ScanGateTest(unittest.TestCase):
         keys = [a["key"] for a in bootstrap_scan_gate.cluster_agents()]
         self.assertEqual(keys, [f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}"])
 
+    def test_the_roster_is_capped_for_the_first_run_in_profile_order(self):
+        # #3702: the first so many by profile name get cards and are listed in
+        # the sweep card; the rest stay off the roster, so the sweep audits them.
+        names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}):
+            roster = bootstrap_scan_gate.cluster_agents()
+            body = bootstrap_scan_gate._task_body()
+        self.assertEqual([a["name"] for a in roster], sorted(names)[:2])
+        for name in sorted(names)[:2]:
+            self.assertIn(f"`{name}`", body)
+        for name in sorted(names)[2:]:
+            self.assertNotIn(f"`{name}`", body)
+        # The clusters past the cap are named as having agents, so the worker
+        # audits them without reporting them as lacking one.
+        self.assertIn("Past the first-run cap", body)
+        self.assertIn("This fleet is past the first-run cap, so they include at least the clusters", body)
+        for i in range(5):
+            if f"cluster-proj-c{i}-us-east4" in sorted(names)[2:]:
+                self.assertIn(f"`c{i}`", body.split("Past the first-run cap", 1)[1])
+
+    def test_the_sweep_marker_records_the_agents_past_the_cap(self):
+        [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}):
+            ready = bootstrap_scan_gate.cluster_agents(capped=False)
+            bootstrap_scan_gate._mark_filed(
+                self.d, "t_sweep", uncarded=len(ready) - bootstrap_scan_gate.bootstrap_handoff.first_run_cluster_cards(self.d)
+            )
+        self.assertEqual(bootstrap_scan_gate.bootstrap_handoff.uncarded_agents(self.d / SCAN_FILED), 3)
+
+    def test_filing_the_sweep_records_the_agents_past_the_cap(self):
+        # The real file_scan_task, so the count it writes is the one under test.
+        [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        filed = []
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: filed.append(cmd) or '{"id": "t_real"}'
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                mock.patch.dict(sys.modules, modules), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ready = bootstrap_scan_gate.cluster_agents(capped=False)
+            self.assertEqual(self._orig(self.d), "t_real")
+        self.assertEqual(len(filed), 1)
+        self.assertIn("uncarded=3\n", (self.d / SCAN_FILED).read_text())
+        self.assertIn("cap=2\n", (self.d / SCAN_FILED).read_text())
+        self.assertIn("carded=" + ",".join(a["key"] for a in ready[:2]) + "\n", (self.d / SCAN_FILED).read_text())
+        self.assertEqual(bootstrap_scan_gate.bootstrap_handoff.uncarded_agents(self.d / SCAN_FILED), len(ready) - 2)
+
+    def test_a_filed_sweep_keeps_the_cap_it_was_filed_under(self):
+        # #3702: the hand-off's roster holds to the marker's cap, so raising the
+        # file mid-sweep cannot card a cluster the sweep card gave its worker.
+        names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("4")
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\nuncarded=3\ncap=2\n")
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), contextlib.redirect_stderr(io.StringIO()):
+            roster = bootstrap_scan_gate.cluster_agents()
+        self.assertEqual([a["name"] for a in roster], sorted(names)[:2])
+
+    def test_a_filed_sweep_cards_only_the_agents_its_marker_lists(self):
+        # #3702: a profile that sorts first but was not ready when the sweep was
+        # filed is the sweep worker's, even with a slot free under the cap.
+        names = sorted(self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(4))
+        prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
+        (self.d / SCAN_FILED).write_text(
+            f"task_id=t_sweep\nfiled_at=1\ncap=3\ncarded={prefix}{names[1]},{prefix}{names[2]}\n"
+        )
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), contextlib.redirect_stderr(io.StringIO()):
+            roster = bootstrap_scan_gate.cluster_agents()
+        self.assertEqual([a["name"] for a in roster], names[1:3])
+
+    def test_filing_the_sweep_lists_the_roster_once(self):
+        # A second listing could fail or see another roster; the marker records
+        # what the card listed.
+        agents = [{"name": f"cluster-c{i}", "key": f"{bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX}cluster-c{i}",
+                   "title": f"t{i}", "cluster_label": f"`c{i}`"} for i in range(5)]
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: '{"id": "t_real"}'
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+        listing = mock.Mock(side_effect=[agents, agents[:1], []])
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(bootstrap_scan_gate, "cluster_agents", listing), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self._orig(self.d), "t_real")
+        listing.assert_called_once_with(capped=False)
+        marker = (self.d / SCAN_FILED).read_text()
+        self.assertIn("uncarded=3\n", marker)
+        self.assertIn(f"carded={agents[0]['key']},{agents[1]['key']}\n", marker)
+
+    def test_an_empty_listing_at_filing_pins_nothing(self):
+        # The listing returns [] when it fails as well as when there are no
+        # Cluster Agents. Pinned as empty, a failed listing would leave every
+        # Cluster Agent uncarded; unpinned, the next tick cards the live roster
+        # under the cap.
+        (self.d / bootstrap_scan_gate.bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_FILE).write_text("2")
+        kanban = types.ModuleType("hermes_cli.kanban")
+        kanban.run_slash = lambda cmd: '{"id": "t_real"}'
+        modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.kanban": kanban}
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), \
+                mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(bootstrap_scan_gate, "cluster_agents", mock.Mock(return_value=[])), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self._orig(self.d), "t_real")
+        marker = (self.d / SCAN_FILED).read_text()
+        self.assertNotIn("carded=", marker)
+        self.assertNotIn("uncarded=", marker)
+        names = sorted(self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(5))
+        with mock.patch.dict("os.environ", {"HERMES_HOME": str(self.d)}), contextlib.redirect_stderr(io.StringIO()):
+            roster = bootstrap_scan_gate.cluster_agents()
+        self.assertEqual([a["name"] for a in roster], names[:2])
+
+    def test_a_roster_under_the_cap_is_listed_whole(self):
+        names = [self._cluster_agent("proj", f"c{i}", "us-east4") for i in range(3)]
+        self.assertEqual([a["name"] for a in bootstrap_scan_gate.cluster_agents()], sorted(names))
+        body = bootstrap_scan_gate._task_body()
+        self.assertNotIn("Past the first-run cap", body)
+        self.assertIn("On a fleet under the first-run cap there are usually none.", body)
+
     def test_a_filed_sweep_runs_the_hand_off_instead_of_filing(self):
         (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n")
         with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:
             rc, out = self._run()
         self.assertEqual((rc, out, self.filed), (0, "", []))
         hand_off.assert_called_once_with(
-            self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id, roster=bootstrap_scan_gate.cluster_agents
+            self.d, self.d / SCAN_FILED, bootstrap_scan_gate._parse_task_id, roster=bootstrap_scan_gate.cluster_agents,
+            full_roster=mock.ANY,
         )
+        # The uncapped roster, for the time limit of a sweep the marker did not pin.
+        with mock.patch.object(bootstrap_scan_gate, "cluster_agents", return_value=["x"]) as listing:
+            self.assertEqual(hand_off.call_args.kwargs["full_roster"](), ["x"])
+        listing.assert_called_once_with(capped=False)
 
     def test_filing_the_sweep_files_the_cluster_cards_in_the_same_tick(self):
         with mock.patch.object(bootstrap_scan_gate.bootstrap_handoff, "hand_off") as hand_off:

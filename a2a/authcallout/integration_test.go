@@ -2,6 +2,8 @@ package authcallout
 
 import (
 	"bufio"
+	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -16,9 +18,10 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 	authnv1 "k8s.io/api/authentication/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
-	k8stesting "k8s.io/client-go/testing"
+	authnv1client "k8s.io/client-go/kubernetes/typed/authentication/v1"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -84,27 +87,26 @@ type harness struct {
 	url    string
 	store  *Store
 	tokens map[string]Attested
-	// tls trusts the CA the rendered conf's serving pair was minted from;
-	// every connection the suite makes needs it, since the render requires
-	// TLS of every client.
-	tls nats.Option
+	// dial trusts the CA the rendered conf's serving pair was minted from
+	// and sets the suite's connect timeout (withTestTLS); every connection
+	// the suite makes needs it, since the render requires TLS of every
+	// client.
+	dial nats.Option
 }
 
 // tokenReviewer maps a presented token to what the cluster would vouch for,
 // and refuses anything else — the shape of a real TokenReview answer, including
 // the audience the validator insists on and the pod-bound Extra fields the
 // authenticator writes for a projected token.
-func tokenReviewer(tokens map[string]Attested, onReview func(token string) func()) *fake.Clientset {
-	c := fake.NewSimpleClientset()
-	c.PrependReactor("create", "tokenreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		req := action.(k8stesting.CreateAction).GetObject().(*authnv1.TokenReview)
+func tokenReviewer(tokens map[string]Attested, onReview func(token string) func()) kubernetes.Interface {
+	return clientWithTokenReviews(func(_ context.Context, req *authnv1.TokenReview) (*authnv1.TokenReview, error) {
 		if onReview != nil {
 			defer onReview(req.Spec.Token)()
 		}
 		att, ok := tokens[req.Spec.Token]
 		if !ok {
 			req.Status = authnv1.TokenReviewStatus{Authenticated: false, Error: "invalid bearer token"}
-			return true, req, nil
+			return req, nil
 		}
 		user := authnv1.UserInfo{Username: att.ServiceAccount}
 		if att.PodName != "" || att.PodUID != "" {
@@ -118,12 +120,54 @@ func tokenReviewer(tokens map[string]Attested, onReview func(token string) func(
 			User:          user,
 			Audiences:     req.Spec.Audiences,
 		}
-		return true, req, nil
+		return req, nil
 	})
-	return c
 }
 
-// harnessOption tweaks one harness. There is one so far; see onTokenReview.
+// tokenReviewCreate answers one TokenReview, with the validator's context.
+type tokenReviewCreate func(ctx context.Context, req *authnv1.TokenReview) (*authnv1.TokenReview, error)
+
+// clientWithTokenReviews is the fake clientset with its TokenReview endpoint
+// answered by create: concurrently, and with the caller's context, neither
+// of which the fake's reactor chain offers. testing.Fake.Invokes holds one
+// mutex across every reactor call, so a reactor would serialize the reviews
+// and hide the callout's worker pool from the tests that measure it, and the
+// typed fake drops the context before the reactor sees it. Only
+// TokenReviews().Create is taken over; the rest of the clientset is the
+// fake's.
+func clientWithTokenReviews(create tokenReviewCreate) kubernetes.Interface {
+	return &reviewingClientset{Clientset: fake.NewSimpleClientset(), create: create}
+}
+
+// reviewingClientset is the fake clientset with a TokenReview endpoint of the
+// test's own in front of it.
+type reviewingClientset struct {
+	*fake.Clientset
+	create tokenReviewCreate
+}
+
+func (c *reviewingClientset) AuthenticationV1() authnv1client.AuthenticationV1Interface {
+	return &reviewingAuthenticationV1{AuthenticationV1Interface: c.Clientset.AuthenticationV1(), reviews: c}
+}
+
+type reviewingAuthenticationV1 struct {
+	authnv1client.AuthenticationV1Interface
+	reviews authnv1client.TokenReviewInterface
+}
+
+func (a *reviewingAuthenticationV1) TokenReviews() authnv1client.TokenReviewInterface {
+	return a.reviews
+}
+
+// TokenReviewInterface's Create is the one call the validator makes; the
+// embedded fake answers the others, which nothing here calls.
+var _ authnv1client.TokenReviewInterface = (*reviewingClientset)(nil)
+
+func (c *reviewingClientset) Create(ctx context.Context, req *authnv1.TokenReview, _ metav1.CreateOptions) (*authnv1.TokenReview, error) {
+	return c.create(ctx, req.DeepCopy())
+}
+
+// harnessOption tweaks one harness.
 type harnessOption func(*harnessOptions)
 
 type harnessOptions struct {
@@ -135,6 +179,19 @@ type harnessOptions struct {
 	// grantTTL, when set, replaces the callout's one-hour grant lifetime,
 	// so a test can watch a connection outlive the JWT it was issued.
 	grantTTL time.Duration
+	// taskKeys are the task-signing public keys the callout trusts, for the
+	// per-task credential tests (task_credential_test.go).
+	taskKeys []string
+	// now, when set, is the callout's clock.
+	now func() time.Time
+	// taskLifetime and taskLifetimeErr are the callout's task credential
+	// lifetime settings (Config.TaskCredentialMaxLifetime and ...Invalid).
+	taskLifetime    time.Duration
+	taskLifetimeErr error
+	// noReviewCache turns the validator's 30s memory of a successful
+	// TokenReview off, for a test that counts reviews to count reconnects
+	// of one token.
+	noReviewCache bool
 }
 
 // withGrantTTL shortens every grant the callout issues.
@@ -142,9 +199,34 @@ func withGrantTTL(d time.Duration) harnessOption {
 	return func(o *harnessOptions) { o.grantTTL = d }
 }
 
-// watchingTokenReviews wraps every TokenReview the callout performs.
+// withTaskSigningKeys makes the callout honour task credentials from these
+// keys.
+func withTaskSigningKeys(keys ...string) harnessOption {
+	return func(o *harnessOptions) { o.taskKeys = keys }
+}
+
+// withTaskLifetime sets the callout's task credential lifetime, as
+// ParseTaskCredentialMaxLifetime returned it.
+func withTaskLifetime(d time.Duration, err error) harnessOption {
+	return func(o *harnessOptions) { o.taskLifetime, o.taskLifetimeErr = d, err }
+}
+
+// withNow sets the callout's clock.
+func withNow(now func() time.Time) harnessOption {
+	return func(o *harnessOptions) { o.now = now }
+}
+
+// watchingTokenReviews wraps every TokenReview the callout performs. The
+// validator remembers a success for reviewCacheTTL, so a token presented
+// again inside it is not reviewed again and is not seen here; a test that
+// needs every presentation adds withoutReviewCache.
 func watchingTokenReviews(around func(token string) func()) harnessOption {
 	return func(o *harnessOptions) { o.onTokenReview = around }
+}
+
+// withoutReviewCache makes the callout review every presented token.
+func withoutReviewCache() harnessOption {
+	return func(o *harnessOptions) { o.noReviewCache = true }
 }
 
 // startHarness renders a real nats.conf with an auth_callout block, starts a
@@ -198,7 +280,7 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	}
 	conf := replaceConfKey(string(rendered), "issuer: ", issuerPub)
 	conf = replaceConfKey(conf, "xkey: ", xkeyPub)
-	conf, tlsOpt := withTestTLS(t, conf)
+	conf, dialOpt := withTestTLS(t, conf)
 
 	confPath := filepath.Join(t.TempDir(), "nats.conf")
 	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
@@ -210,12 +292,15 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		t.Fatalf("the rendered nats.conf was refused by the server: %v", err)
 	}
 	opts.NoLog, opts.NoSigs = true, true
-	// Ports and paths are the only things a test may move: the render pins
-	// 4222, 8222 and 9222 and a JetStream store at /data, none of which a
-	// test process can have. -1 asks the server for a free port on each
-	// listener, the monitor included, so the server keeps the shipped shape
-	// while nothing fixed is bound. Everything the test is actually asserting
-	// about — accounts, users, grants, the callout block — is untouched.
+	serverConnectBudget(opts)
+	// Ports, paths and the connect budget are the only things a test may
+	// move: the render pins 4222, 8222 and 9222 and a JetStream store at
+	// /data, none of which a test process can have. -1 asks the server for a
+	// free port on each listener, the monitor included, so the server keeps
+	// the shipped shape while nothing fixed is bound. Everything the test is
+	// actually asserting about — accounts, users, grants, the callout block's
+	// keys and policy — is untouched; its two-second timeout is the one
+	// value serverConnectBudget lifts, and why.
 	opts.Port = -1
 	opts.Websocket.Port = -1
 	opts.HTTPPort = -1
@@ -241,6 +326,9 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	if err != nil {
 		t.Fatalf("NewTokenValidator: %v", err)
 	}
+	if options.noReviewCache {
+		validator.cacheTTL = 0
+	}
 
 	svc, err := NewService(store, validator, Config{
 		IssuerSeed: string(issuerSeed),
@@ -254,7 +342,12 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		// keeps equal to its render.
 		ReservedAddressees: renderedFixtureAddressees(t),
 
-		GrantTTL: options.grantTTL,
+		GrantTTL:        options.grantTTL,
+		TaskSigningKeys: options.taskKeys,
+		Now:             options.now,
+
+		TaskCredentialMaxLifetime:        options.taskLifetime,
+		TaskCredentialMaxLifetimeInvalid: options.taskLifetimeErr,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
@@ -263,7 +356,7 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	// The callout is itself a bus client, and it authenticates statically
 	// because it cannot authenticate through itself. auth_users is what
 	// exempts it.
-	svcConn, err := nats.Connect(srv.ClientURL(), nats.UserInfo(svcUser, svcPass), nats.Name("auth-callout"), tlsOpt)
+	svcConn, err := nats.Connect(srv.ClientURL(), nats.UserInfo(svcUser, svcPass), nats.Name("auth-callout"), dialOpt)
 	if err != nil {
 		t.Fatalf("the callout service could not connect: %v", err)
 	}
@@ -272,14 +365,14 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens, tls: tlsOpt}
+	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens, dial: dialOpt}
 }
 
 // connectAs dials with a ServiceAccount token, the way a workload will.
 func (h *harness) connectAs(t *testing.T, user, token string) (*nats.Conn, chan error) {
 	t.Helper()
 	violations := make(chan error, 16)
-	nc, err := nats.Connect(h.url, h.tls,
+	nc, err := nats.Connect(h.url, h.dial,
 		nats.Token(token),
 		nats.CustomInboxPrefix("_INBOX."+user),
 		nats.Name(user),
@@ -369,7 +462,7 @@ func TestADifferentServiceAccountGetsADifferentGrantSet(t *testing.T) {
 func TestAnUnmappedServiceAccountIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, h.tls, nats.Token(strangerTok), nats.Name("stranger"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Token(strangerTok), nats.Name("stranger"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a ServiceAccount absent from the identity map connected")
@@ -382,7 +475,7 @@ func TestAnUnmappedServiceAccountIsRefusedAtConnect(t *testing.T) {
 func TestATokenTheClusterRefusesIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, h.tls, nats.Token("a-token-no-cluster-ever-issued"), nats.Name("forged"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Token("a-token-no-cluster-ever-issued"), nats.Name("forged"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a token the cluster does not authenticate was accepted")
@@ -423,7 +516,7 @@ func TestTheRenderedBusRefusesPlaintextAndUntrustedClients(t *testing.T) {
 	}
 
 	t.Setenv(lib.EnvNATSCAFile, "")
-	nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.Name("untrusted"))
+	nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.Name("untrusted"), nats.Timeout(testDialTimeout))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a client that does not trust the bus CA connected")
@@ -455,7 +548,7 @@ func TestLibTLSOptionsVerifiesTheBus(t *testing.T) {
 		t.Helper()
 		t.Setenv(lib.EnvNATSCAFile, ca)
 		t.Setenv(lib.EnvNATSTLSServerName, serverName)
-		nc, err := nats.Connect(h.url, append(lib.TLSOptions(), nats.Token(gatewayToken), nats.Name("tls-options"))...)
+		nc, err := nats.Connect(h.url, append(lib.TLSOptions(), nats.Token(gatewayToken), nats.Name("tls-options"), nats.Timeout(testDialTimeout))...)
 		if err == nil {
 			nc.Close()
 		}
@@ -475,7 +568,7 @@ func TestLibTLSOptionsVerifiesTheBus(t *testing.T) {
 func TestNoTokenIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, h.tls, nats.Name("anonymous"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Name("anonymous"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a client presenting no credential at all connected")
@@ -488,7 +581,7 @@ func TestNoTokenIsRefusedAtConnect(t *testing.T) {
 func TestTheTokenIsAcceptedAsAPasswordToo(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, h.tls,
+	nc, err := nats.Connect(h.url, h.dial,
 		nats.UserInfo(agentSA, agentToken),
 		nats.CustomInboxPrefix("_INBOX.agent"),
 		nats.Name("agent-via-userinfo"))
@@ -516,7 +609,7 @@ func TestAClientMustUseTheInboxPrefixItsGrantsCover(t *testing.T) {
 	}
 
 	// The default random inbox is not covered by the gateway's grant.
-	wrong, err := nats.Connect(h.url, h.tls, nats.Token(gatewayToken), nats.Name("gateway-default-inbox"))
+	wrong, err := nats.Connect(h.url, h.dial, nats.Token(gatewayToken), nats.Name("gateway-default-inbox"))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -547,7 +640,7 @@ func TestACalloutWithNoMapRefusesEveryConnection(t *testing.T) {
 	// the same state a callout is in before its first informer sync.
 	h.store.current.Store(nil)
 
-	nc, err := nats.Connect(h.url, h.tls, nats.Token(gatewayToken), nats.Name("gateway"))
+	nc, err := nats.Connect(h.url, h.dial, nats.Token(gatewayToken), nats.Name("gateway"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a connection was authorized while no identity map was being served")
@@ -614,41 +707,70 @@ func TestIssuedUsersLandInTheAccountTheirMapEntryNames(t *testing.T) {
 	}
 }
 
-// TestTheCalloutAnswersOneAuthorizationAtATime measures the throughput ceiling
-// a replica has, so the number in the deployment spec is a measurement rather
-// than a reading of the code.
+// TestTheCalloutAnswersSixteenAuthorizationsAtOnce measures the throughput
+// ceiling a replica has, so the number in the deployment spec is a measurement
+// rather than a reading of the code.
 //
 // Subscribe joins the queue group with an async handler, and the client library
-// dispatches one subscription's callbacks from one goroutine. handle does the
-// TokenReview round trip inline, so a replica answers connections strictly one
-// at a time, and each one holds the line for as long as the API server takes.
-// Two replicas is therefore two authorizations in flight for the whole fabric,
-// not two hundred. Nothing here is wrong today -- connections are rare compared
-// to messages, and the queue group means the second replica does take the next
-// one -- but it is a property worth knowing before a fleet reconnects at once.
+// dispatches one subscription's callbacks from one goroutine. Until #4332 handle
+// did the TokenReview round trip inline, so a replica answered connections
+// strictly one at a time, and twelve workers reconnecting per replica queued
+// past the server's two-second first-ping timer. handle now hands each request
+// to a goroutine that takes one of calloutWorkers slots, so a replica decides
+// sixteen at once and the slow API server bounds the rate at sixteen divided by
+// its latency rather than one.
 //
 // Measured by making the TokenReview slow and watching how many are open at the
-// same moment, which is the only way to tell serial dispatch from a race that
-// happened not to overlap.
-func TestTheCalloutAnswersOneAuthorizationAtATime(t *testing.T) {
-	const clients = 4
-	// Long enough that concurrent handling would overlap unmistakably, short
-	// enough that four in series stay inside authDecisionBudget and well
-	// inside the server's first-ping timer.
-	const reviewCost = 120 * time.Millisecond
+// same moment, which is the only way to tell pooled dispatch from a race that
+// happened not to overlap. The tokens are distinct so every connection is one
+// review; the same token sixty-four times would measure the validator's cache
+// instead (tokenreview_test.go has that).
+func TestTheCalloutAnswersSixteenAuthorizationsAtOnce(t *testing.T) {
+	const clients = 64
+	// A review slow enough that overlap is unmistakable. Serially sixty-four
+	// of them are 3.2s of review alone.
+	const reviewCost = 50 * time.Millisecond
+	// How long the first reviews wait for the sixteenth to join them before
+	// the test gives up on it; far past any arrival skew, and then the peak
+	// assertion below says what went wrong.
+	const gateWait = 10 * time.Second
+
+	tokens := defaultTokens()
+	clientTokens := make([]string, clients)
+	for i := range clientTokens {
+		clientTokens[i] = fmt.Sprintf("token-for-agent-replica-%02d-padded-to-a-realistic-length", i)
+		tokens[clientTokens[i]] = Attested{ServiceAccount: agentSA}
+	}
 
 	var mu sync.Mutex
 	inFlight, peak, reviews := 0, 0, 0
+	// Every review is held until sixteen are in flight at once, and the
+	// sixteenth releases them all. Clients arrive as their TLS handshakes
+	// finish, spread over most of a second under the race detector, so an
+	// unheld pool would show whatever overlap the arrivals happened to
+	// produce; held, the peak is the pool's width or the test is wrong.
+	// A seventeenth can never join: the slot it needs is held.
+	poolFull := make(chan struct{})
+	poolFilled := false
+	var deciding time.Time
 
-	h := startHarness(t, twoIdentityMap, defaultTokens(), watchingTokenReviews(func(string) func() {
+	h := startHarness(t, twoIdentityMap, tokens, watchingTokenReviews(func(string) func() {
 		mu.Lock()
 		inFlight++
 		reviews++
 		if inFlight > peak {
 			peak = inFlight
 		}
+		if inFlight == calloutWorkers && !poolFilled {
+			poolFilled, deciding = true, time.Now()
+			close(poolFull)
+		}
 		mu.Unlock()
 
+		select {
+		case <-poolFull:
+		case <-time.After(gateWait):
+		}
 		time.Sleep(reviewCost)
 
 		return func() {
@@ -663,18 +785,19 @@ func TestTheCalloutAnswersOneAuthorizationAtATime(t *testing.T) {
 	start := time.Now()
 	for i := 0; i < clients; i++ {
 		wg.Add(1)
-		go func() {
+		go func(token string) {
 			defer wg.Done()
-			nc, err := nats.Connect(h.url, h.tls, nats.Token(agentToken), nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
+			nc, err := nats.Connect(h.url, h.dial, nats.Token(token), nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
 			if err != nil {
 				failures <- err
 				return
 			}
 			nc.Close()
-		}()
+		}(clientTokens[i])
 	}
 	wg.Wait()
-	elapsed := time.Since(start)
+	connected := time.Now()
+	elapsed := connected.Sub(start)
 	close(failures)
 	for err := range failures {
 		t.Fatalf("a client could not connect: %v", err)
@@ -682,21 +805,19 @@ func TestTheCalloutAnswersOneAuthorizationAtATime(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
+	t.Logf("%d connections at %v of TokenReview each: peak %d in flight, %v from the pool filling until every client was connected, %v in all",
+		clients, reviewCost, peak, connected.Sub(deciding), elapsed)
 
 	if reviews != clients {
 		t.Fatalf("TokenReviews = %d for %d connections; the measurement below is not of what it claims", reviews, clients)
 	}
-	if peak != 1 {
-		t.Errorf("peak concurrent authorizations = %d, want 1.\n"+
-			"A replica now answers more than one at a time, which is better than what shipped -- "+
-			"update the per-replica ceiling in docs/designs/spec-nats-deployment.md rather than this number.", peak)
-	}
-	// The consequence, stated as time rather than as a count: the last client
-	// waits behind all the others. Three costs, not four, so a slow scheduler
-	// cannot make this flake.
-	if floor := (clients - 1) * reviewCost; elapsed < floor {
-		t.Errorf("%d connections at %v of TokenReview each took %v, less than the %v serial handling implies; "+
-			"either dispatch is no longer serial or the measurement is not reaching the handler", clients, reviewCost, elapsed, floor)
+	// Sixteen held at once is the whole measurement: serial dispatch cannot
+	// show it, and the pool cannot show more. The wall clock is logged and
+	// not asserted, since sixty-four TLS handshakes on a loaded runner set
+	// it; the one-second bound the issue asks for is measured without them,
+	// in TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast.
+	if peak != calloutWorkers {
+		t.Errorf("peak concurrent authorizations = %d, want exactly the %d slots: fewer means the sixteenth never arrived while the first was held, more means the pool bounds nothing", peak, calloutWorkers)
 	}
 }
 

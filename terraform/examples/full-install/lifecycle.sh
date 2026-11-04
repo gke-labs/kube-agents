@@ -13,7 +13,10 @@
 #      VERSIONS for destruction, so even an imported key cannot encrypt and the
 #      cluster refuses to come back. `destroy` forgets them from state first so
 #      Terraform never touches them; `adopt-kms` imports them back and restores
-#      any version a bare `terraform destroy` already scheduled.
+#      any version a bare `terraform destroy` already scheduled. The key's grant
+#      to the GKE service agent is forgotten with them: the installs in the
+#      project that use the same key (same names, same region) share that one
+#      grant, so destroying it would cut off the other clusters.
 #   2. The PlatformAgent CR carries a finalizer only the operator can clear, and
 #      `terraform destroy` removes the CR and the operator together. The chart's
 #      pre-delete hook handles the ordinary case; this deletes the CR up front so
@@ -160,7 +163,7 @@ readonly CLUSTER_ADDRESSES
 # The cluster's CMEK resources, every one of which the gke-cluster module
 # manages only alongside a cluster it creates. The ring and the key are named
 # on their own because adopt_kms imports them and guard_kms_identity reads
-# them; the other two ride along in the list.
+# them; the other two ride along in the list (forget_kms says why).
 readonly CLUSTER_KMS_KEYRING_ADDRESS="module.gke_cluster.google_kms_key_ring.gke_keyring[0]"
 readonly CLUSTER_KMS_KEY_ADDRESS="module.gke_cluster.google_kms_crypto_key.gke_key[0]"
 CLUSTER_KMS_ADDRESSES=(
@@ -1135,9 +1138,18 @@ forget_unmanaged_cluster_kms() {
 # exactly the wedge above, so refuse. PERMISSION_DENIED or a transient API error
 # means the guard could not ask, which is not evidence that the key is missing:
 # warn and proceed rather than blocking an apply on the guard's own blind spot.
+#
+# A key with no ENABLED version is refused either way, but there are two causes
+# with different fixes. A key never imported needs the GitHub App private key.
+# A key whose versions are DESTROY_SCHEDULED -- what any destroy of the key
+# leaves, a raw `terraform destroy` or an apply with enable_github_minter =
+# false -- needs only a restore. The guard runs before adopt_kms so a refused
+# apply changes no state, so it names that restore rather than a re-import:
+# adopt-kms for a key out of state (it restores what it imports), and the
+# gcloud restore for a key still in state, which adopt_kms leaves alone.
 guard_minter_key() {
   [[ "$(tfvar enable_github_minter)" == "true" ]] || return 0
-  local project location keyring key versions list_err err_file reason="" list_rc=0
+  local project location keyring key versions list_err err_file reason="" list_rc=0 scheduled=""
   project=$(tfvar project_id)
   location=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
   keyring=$(tfvar github_minter_kms_keyring)
@@ -1162,14 +1174,32 @@ guard_minter_key() {
     reason="does not exist yet"
   elif [[ -z "$(head -1 <<<"$versions")" ]]; then
     reason="has no ENABLED version"
+    # A failed query leaves scheduled empty, and the import advice below stands.
+    scheduled=$(gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+      --location "$location" --project "$project" \
+      --filter='state=DESTROY_SCHEDULED' --format='value(name)' 2>/dev/null) || scheduled=""
   else
     return 0
   fi
 
   warn "enable_github_minter is true, but KMS signing key '$location/$keyring/$key' $reason."
   warn "Applying now would deploy the minter and wedge waiting on its readiness probe."
-  warn "Import the GitHub App private key before applying (see https://github.com/abcxyz/github-token-minter),"
-  warn "or set enable_github_minter = false in terraform.tfvars."
+  if [[ -n "$(head -1 <<<"$scheduled")" ]]; then
+    warn "Its versions are scheduled for destruction, as a destroy of the key leaves them."
+    warn "Restore them rather than re-importing the key; a restore works only until their destruction time."
+    load_state
+    if in_state "$MINTER_KMS_KEY_ADDRESS"; then
+      warn "The key is still in Terraform state, so restore each version with gcloud, then apply again:"
+      warn "  gcloud kms keys versions restore <version> --key $key --keyring $keyring --location $location --project $project"
+      warn "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
+    else
+      warn "Run './lifecycle.sh adopt-kms' in terraform/examples/full-install, which imports the key"
+      warn "back and restores and re-enables those versions, then apply again."
+    fi
+  else
+    warn "Import the GitHub App private key before applying (see https://github.com/abcxyz/github-token-minter),"
+    warn "or set enable_github_minter = false in terraform.tfvars."
+  fi
   exit 1
 }
 
@@ -1498,20 +1528,24 @@ disable_deletion_protection() {
 # resource still schedules every version for destruction — leaving a key that
 # exists and cannot encrypt. Forgetting these before the destroy is what keeps
 # them genuinely untouched, so the next apply adopts a working key rather than a
-# hollow one. They are re-imported by adopt-kms.
+# hollow one. They are re-imported by adopt-kms. The key's grant to the GKE
+# service agent is forgotten too: the installs in the project that use the same
+# key use it through that one grant, and destroying it would cut off their
+# clusters. A grant left on a key that stays costs nothing. The agent's identity
+# rides along with it; its destroy does nothing in GCP. The next apply puts both
+# back in state with no import.
 forget_kms() {
   load_state
   local address
   for address in \
-    "$CLUSTER_KMS_KEY_ADDRESS" \
-    "$CLUSTER_KMS_KEYRING_ADDRESS" \
+    "${CLUSTER_KMS_ADDRESSES[@]}" \
     "$MINTER_KMS_KEY_ADDRESS" \
     "$MINTER_KMS_KEYRING_ADDRESS"; do
     in_state "$address" || continue
-    log "forgetting $address (kept in GCP; re-adopted on the next apply)"
+    log "forgetting $address (kept in GCP; back in state after the next apply)"
     state_changed
     terraform state rm "$address" >/dev/null 2>&1 ||
-      warn "could not forget $address; its key versions may be scheduled for destruction"
+      warn "could not forget $address; the destroy may act on it in GCP (a key's versions are scheduled for destruction; the key's grant is revoked for the other clusters that use the key)"
   done
 }
 
@@ -1701,13 +1735,16 @@ case "${1:-}" in
     # since destroy prints every release value going to null.
     terraform destroy -var="deletion_protection=false" "$@" | redact_helm_release_metadata
     log "done. The KMS key rings remain in the project by design — GCP cannot"
-    log "delete them. The next 'lifecycle.sh apply' adopts them automatically."
+    log "delete them — and so does the cluster key's grant to the GKE service"
+    log "agent when this install made it, which other installs that use the key"
+    log "need. The next 'lifecycle.sh apply' adopts the key rings and puts the"
+    log "grant back in state."
     ;;
   *)
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,84p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,87p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

@@ -41,6 +41,28 @@ taken out. A check or a record that fails is logged and the line left in: the
 PR is open either way, and the thread falls back to reading the worker's own
 note. Background processes are not covered, since this hook runs on
 foreground output only.
+
+The plugin also refuses ``submit_suggestion.py prepare`` and ``submit`` from a
+kanban worker whose own run on its card has ended (:func:`on_pre_tool_call`).
+On a presubmit eval in October 2026 (issue #2610) a platform worker asked to
+propose a PodDisruptionBudget called ``kanban_complete`` with the manifest in
+its result and a closing ``[next: Submit a pull request with this manifest]``
+line, then, still in the same session, acted on that line and opened the pull
+request three minutes after its card was done. Nobody had asked for one.
+
+The check has to sit here, in the worker process. The script runs in the shell
+sandbox, which learns the card id from the working directory
+(``deploy/sandbox/session-command.sh``) but never the run id, and neither the
+sandbox nor the credential broker can read the board. The worker process has
+both: ``HERMES_KANBAN_TASK`` and ``HERMES_KANBAN_RUN_ID`` from the dispatcher,
+and the board on its own volume. A worker whose card is no longer ``running``
+under its run is refused before the command crosses to the sandbox. Everything
+else is left alone: a process that is not a dispatcher worker (the gateway's
+own sessions, a cron run), a worker whose run is still live, and any case where
+the board cannot be read, which keeps today's behaviour rather than taking the
+write path from a live card. Same rule as
+``deploy/docker/patches/kanban_ended_run.py``, which refuses a finished run's
+``kanban_complete`` and ``kanban_block``.
 """
 
 import json
@@ -64,6 +86,38 @@ PR_OPENED_KIND = "pr_opened"
 
 #: The card a dispatcher-spawned worker is running, as the dispatcher sets it.
 TASK_ENV = "HERMES_KANBAN_TASK"
+
+#: The dispatcher's run id for that card, as it sets it beside ``TASK_ENV``.
+RUN_ID_ENV = "HERMES_KANBAN_RUN_ID"
+
+#: The tool whose commands reach the shell sandbox.
+TERMINAL_TOOL = "terminal"
+
+#: ``submit_suggestion.py`` and the first argument after it, if any. The script
+#: reads any first argument that isn't a command as ``submit`` (its
+#: ``normalise_argv``: the old bare ``--branch/--title/--body`` shape), so every
+#: invocation runs ``prepare`` or ``submit`` except a help request and a retired
+#: command, which errors on its own.
+SUBMIT_SUGGESTION_ARG = re.compile(r"submit_suggestion\.py[\"']?(?:\s+([^\s;|&]+))?")
+
+#: First arguments that don't run ``prepare`` or ``submit``
+#: (``submit_suggestion.RETIRED_COMMANDS`` and the help flags).
+NOT_A_RUN = frozenset({"-h", "--help", "list", "fetch"})
+
+
+def runs_submit_suggestion(command):
+    """True when ``command`` runs the submit-suggestion skill's ``prepare`` or ``submit``, in any form."""
+    for match in SUBMIT_SUGGESTION_ARG.finditer(command):
+        first = (match.group(1) or "").strip("\"'")
+        if first and first not in NOT_A_RUN:
+            return True
+    return False
+
+#: The card status a live run holds.
+RUNNING_STATUS = "running"
+
+#: The card's status and current run, as ``kanban_ended_run.ended_run_refusal`` reads them.
+CARD_RUN_SQL = "SELECT status, current_run_id FROM tasks WHERE id = ?"
 
 #: The longest title kept on the event; the thread shows it clipped shorter.
 TITLE_MAX = 300
@@ -110,6 +164,7 @@ ISO_UTC_OFFSET = "+00:00"
 
 def register(ctx):
     ctx.register_hook("transform_terminal_output", on_terminal_output)
+    ctx.register_hook("pre_tool_call", on_pre_tool_call)
 
 
 def opened(line):
@@ -249,3 +304,78 @@ def on_terminal_output(command="", output="", **_):
         if not verdicts.get(url):
             kept.append(line)
     return "".join(kept) if any(verdicts.values()) else None
+
+
+def _own_run_id():
+    """``(task_id, run_id)`` when this process is a dispatcher worker with both set, else None."""
+    task_id = os.environ.get(TASK_ENV, "").strip()
+    raw = os.environ.get(RUN_ID_ENV, "").strip()
+    if not task_id or not raw:
+        return None
+    try:
+        return task_id, int(raw)
+    except ValueError:
+        return None
+
+
+def _card_run(task_id):
+    """``(status, current_run_id)`` of card ``task_id`` on this process's board, or None when it has no row.
+
+    The read waits at most CARD_READ_BUSY_MS on a locked board, not Hermes' 120 s writer timeout: Hermes
+    gives a pre_tool_call hook 30 s and blocks the call when it runs over, which would refuse a live
+    card's submit. A board still locked after that raises, and the caller lets the call through.
+    """
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    with connect_closing() as conn:
+        conn.execute(f"PRAGMA busy_timeout={CARD_READ_BUSY_MS}")
+        row = conn.execute(CARD_RUN_SQL, (task_id,)).fetchone()
+    return None if row is None else (row[0], row[1])
+
+
+# How long the guard's card read waits on a locked board (see _card_run).
+CARD_READ_BUSY_MS = 2000
+
+
+def ended_run_text(task_id, status):
+    """What the worker reads in place of the command's output."""
+    return (
+        f"Refused: card {task_id} is {status} and your run on it has ended, so this session may not run "
+        "submit_suggestion.py. A proposal you put in your result is the answer: the requester reads it, and a "
+        "[next: ...] line in it is theirs to send, never yours to carry out. If they want the pull request, "
+        "they will ask, and that request carries it. Do not retry this another way; end your turn."
+    )
+
+
+def on_pre_tool_call(tool_name="", args=None, **_):
+    """Block ``submit_suggestion.py prepare``/``submit`` from a worker whose own card run has ended.
+
+    Returns Hermes' ``{"action": "block", "message": ...}`` directive, or None to let the call through.
+    Only a board that answers, for this worker's own card, a status other than ``running`` or a current
+    run other than this worker's, blocks; every other case (not a terminal call, not this script, not a
+    dispatcher worker, no row, a board that cannot be read) passes, as it did before this check existed.
+    """
+    if tool_name != TERMINAL_TOOL or not isinstance(args, dict):
+        return None
+    command = args.get("command")
+    if not isinstance(command, str) or not runs_submit_suggestion(command):
+        return None
+    own = _own_run_id()
+    if own is None:
+        return None
+    task_id, run_id = own
+    try:
+        card = _card_run(task_id)
+    except Exception as exc:  # noqa: BLE001 -- an unreadable board keeps today's behaviour
+        logger.warning("pr_opened: could not read card %s before submit_suggestion.py: %s", task_id, exc)
+        return None
+    if card is None:
+        return None
+    status, current = card
+    if status == RUNNING_STATUS and current == run_id:
+        return None
+    logger.warning(
+        "pr_opened: refused submit_suggestion.py from run %s on %s (status %s, current run %s)",
+        run_id, task_id, status, current,
+    )
+    return {"action": "block", "message": ended_run_text(task_id, status)}

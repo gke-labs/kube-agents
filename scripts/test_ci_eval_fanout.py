@@ -8,8 +8,9 @@ out of the script, in the same style as test_ci_eval_trap.py:
   - the lock deadline: a holder that died without releasing must convert into
     a loud per-unit failure, never a silent spin `wait` can outlast;
   - lock mutual exclusion: two contenders never hold one lock at once;
-  - queue order: repetition-major, cost-descending within a repetition, so a
-    lane is never parked on the task lock of a unit launched seconds earlier
+  - queue order: case by case, cost-descending, each case's repetitions
+    together, so a deadline-cut night keeps whole cases (#3939); launch_units
+    holds a unit back while its task runs, so no lane parks on the task lock
     (the 2026-08-31 pool run paid two of four lanes for twelve minutes that
     way).
 
@@ -102,6 +103,24 @@ class EvalLogDirTest(unittest.TestCase):
         ).stdout.strip()
         self.assertEqual(os.path.realpath("/tmp"), os.path.realpath(out))
 
+    def test_a_path_ending_in_a_newline_resolves_to_the_directory_mkdir_made(self):
+        # A plain substitution strips the newline and names "logs", which was
+        # never created, or names an unrelated "logs" that exists (#3394). cd
+        # drops a trailing "/" or "/.", so those values end pwd's path in a
+        # newline too. Values stay relative, so a regression writes inside cwd.
+        for value in ("logs\n", "logs\n/", "logs\n/."):
+            for existing in ([], ["logs"]):
+                with self.subTest(value=value, existing=existing), tempfile.TemporaryDirectory() as cwd:
+                    for name in existing:
+                        os.mkdir(os.path.join(cwd, name))
+                    out = subprocess.run(
+                        ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\nprintf "%s" "${EVAL_LOG_DIR}"'],
+                        cwd=cwd, env={**os.environ, "EVAL_LOG_DIR": value, "CDPATH": ""},
+                        capture_output=True, text=True, check=True,
+                    ).stdout
+                    self.assertEqual(os.path.realpath(os.path.join(cwd, "logs\n")), os.path.realpath(out))
+                    self.assertTrue(os.path.isdir(out))
+
 
 class LockTest(unittest.TestCase):
     def test_a_dead_holders_lock_fails_the_contender_loudly(self):
@@ -148,11 +167,11 @@ class LockTest(unittest.TestCase):
 
 
 class QueueOrderTest(unittest.TestCase):
-    def queue(self, reps: int) -> list[tuple[int, int, int]]:
+    def queue(self, reps: int, block: str = "UNIT_QUEUE", requesting: str = "") -> list[tuple[int, int, int]]:
         src = SCRIPT.read_text(encoding="utf-8")
-        match = re.search(r'^UNIT_QUEUE="\$\(\n.*?^\)"$', src, re.DOTALL | re.MULTILINE)
+        match = re.search(rf'^{block}="\$\(\n.*?^\)"$', src, re.DOTALL | re.MULTILINE)
         if match is None:  # pragma: no cover
-            raise AssertionError(f"UNIT_QUEUE block not found in {SCRIPT}")
+            raise AssertionError(f"{block} block not found in {SCRIPT}")
         body = "\n".join(
             [
                 lifted("unit_cost_hint"),
@@ -161,12 +180,13 @@ class QueueOrderTest(unittest.TestCase):
                 # task is in this queue, as on the api lane.
                 lifted("unit_phase"),
                 f"EVAL_REPETITIONS={reps}",
+                f'INJECT_LANE_REQUESTING="{requesting}"',
                 # compliance carries a 1000 hint, the probe 200: order within a
                 # repetition must be cost-descending.
                 'TASKS=("t/reliability-pdb-probe/task.yaml" "t/compliance-rbac-overgrant/task.yaml")',
                 'TASK_NAMES=(reliability-pdb-probe compliance-rbac-overgrant)',
                 match.group(0),
-                'printf "%s\\n" "${UNIT_QUEUE}"',
+                f'printf "%s\\n" "${{{block}}}"',
             ]
         )
         result = run_bash(body)
@@ -177,15 +197,21 @@ class QueueOrderTest(unittest.TestCase):
                 rows.append((int(rep), int(cost), int(idx)))
         return rows
 
-    def test_rep_major_then_cost_descending(self):
+    def test_case_major_cost_descending_then_rep_ascending(self):
         rows = self.queue(reps=3)
         self.assertEqual(len(rows), 6)
-        # All rep-1 units precede any rep-2 unit: a task's second repetition
-        # must not launch while its first plausibly still runs.
-        self.assertEqual([r for r, _, _ in rows], [1, 1, 2, 2, 3, 3])
-        # Within a repetition, the expensive unit launches first.
-        for pair in (rows[0:2], rows[2:4], rows[4:6]):
-            self.assertGreaterEqual(pair[0][1], pair[1][1])
+        # Every repetition of a case precedes the next case's first (#3939), so
+        # a deadline kill leaves whole cases graded; the expensive case first.
+        # launch_units, not the queue, keeps a task's next repetition from
+        # launching while its last still runs.
+        self.assertEqual([(r, i) for r, _, i in rows], [(1, 1), (2, 1), (3, 1), (1, 0), (2, 0), (3, 0)])
+        self.assertGreater(rows[0][1], rows[3][1])
+
+    def test_the_writers_queue_is_case_major_too(self):
+        # The second phase runs one unit at a time, so its queue order alone
+        # decides what a cut-off writers night keeps.
+        rows = self.queue(reps=3, block="UNIT_QUEUE_WRITERS", requesting="reliability-pdb-probe,compliance-rbac-overgrant")
+        self.assertEqual([(r, i) for r, _, i in rows], [(1, 1), (2, 1), (3, 1), (1, 0), (2, 0), (3, 0)])
 
 
 class DelegationCeilingTest(unittest.TestCase):

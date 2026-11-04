@@ -220,7 +220,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 		{Name: "DIRECTORY", Subjects: []string{"a2a.agents.>"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
 			MaxMsgsPerSubject: 1, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
-		{Name: "TOPICS-STATE", Subjects: []string{"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"},
+		{Name: "TOPICS-STATE", Subjects: []string{"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"},
 			Storage: jetstream.FileStorage, Retention: jetstream.LimitsPolicy, Discard: jetstream.DiscardOld,
 			MaxMsgsPerSubject: 8, MaxBytes: 1073741824, Replicas: 1, MaxConsumers: 64, AllowDirect: true},
 		{Name: "TOPICS-JOURNAL", Subjects: []string{"a2a.topics.shared.annotations"},
@@ -230,7 +230,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 }
 
 // a2aProvisionLikeTheScript seeds a test bus with what the provision Job
-// creates: the streams above and four KV buckets.
+// creates: the streams above and six KV buckets.
 func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 	t.Helper()
 	_, js := a2aConnectAs(t, url, "seed", seedPassword)
@@ -249,11 +249,23 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 			t.Fatalf("provision bucket %s as seed: %v", bucket, err)
 		}
 	}
-	// `nats kv add feedback --ttl=720h`: the one bucket with a max age.
+	// `nats kv add feedback --ttl=720h` and `nats kv add people --ttl=720h`:
+	// the two buckets with a max age.
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket: "feedback", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 67108864, TTL: 720 * time.Hour,
 	}); err != nil {
 		t.Fatalf("provision bucket feedback as seed: %v", err)
+	}
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "people", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 33554432, TTL: 720 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket people as seed: %v", err)
+	}
+	// `nats kv add PROFILE_LEASES`: the dispatcher's leases, no TTL.
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "PROFILE_LEASES", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 67108864,
+	}); err != nil {
+		t.Fatalf("provision bucket PROFILE_LEASES as seed: %v", err)
 	}
 }
 
@@ -471,6 +483,7 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 		// WRITE the blackboard, which is the half an agent would notice.
 		{"a2a.topics.shared.blueprint", `{"kind":"topic-entry"}`},
 		{"a2a.topics.agent.platform.upgrade-readiness", `{"kind":"topic-entry"}`},
+		{"a2a.topics.agent.platform.topology-skew", `{"kind":"topic-entry"}`},
 		{"$JS.API.INFO", ""},
 		{"$JS.API.STREAM.NAMES", ""},
 		{"$JS.API.STREAM.LIST", ""},

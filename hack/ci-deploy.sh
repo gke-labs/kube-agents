@@ -88,16 +88,18 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 #   (autoops-warning-event-triage, autoops-crashloop-config-triage,
 #   autoops-warning-event-no-action-triage, whose plant also fails on any
 #   answer but `injected`). A window longer than the gap folds repetition 2's
-#   incident into repetition 1's and no card comes. The unit queue below is
-#   repetition-major (`sort -k1,1n`), so the rest of the matrix runs between
-#   two repetitions of one case: over 18 nightlies (2026-10) the watcher's own
-#   log (artifacts/agent-api-auth.log) put consecutive repetitions of the first
-#   two at least 48.5 and 51.8 minutes apart, and the third's 181 minutes. A
-#   matrix holding one such case alone runs them back to back, and a
-#   repetition then still lasts at least 4.5 minutes (the third's shortest).
+#   incident into repetition 1's and no card comes. The fan-out in
+#   hack/ci-eval-pr.sh queues case by case and can launch a case's next
+#   repetition as soon as its last ends (#3939), so the gap can be as short
+#   as one repetition: at least 4.5 minutes (the third's shortest). Under
+#   the repetition-major queue before it, the rest of the matrix ran in
+#   between: over 18 nightlies (2026-10) the watcher's own log
+#   (artifacts/agent-api-auth.log) put consecutive repetitions of the first
+#   two at least 48.5 and 51.8 minutes apart, and the third's 181 minutes.
 #
 # 150 s clears the first by almost five times and stays under the second's
-# floor of 270 s. tests/test_ci_deploy_alert_quota.py holds it between them.
+# floor of 270 s, a margin of 120 s. tests/test_ci_deploy_alert_quota.py holds
+# it between them.
 readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="150"
 
 # The subscription the drift detector pulls from. The pool project's own
@@ -189,33 +191,93 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # the CR.
 readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 
-# The credential-proxy container's memory limit on the eval install. The broker
-# admits a request only while its child memory reservation fits the budget it
-# derives from this limit (agents/platform/scripts/credential_proxy.py,
-# docs/designs/credential-proxy-child-memory-budget.md): at the operator's 1Gi
-# default that is four requests at once, under its slot cap of eight. The eval
-# runs EVAL_TASK_PARALLELISM lanes of Platform Agents, each fanning Cluster
-# Agents out over the seeded fleet, and on the default the queue behind those
-# four reached p50 waits of 8-22s and a longest wait of 56.7s against the
-# broker's 60s refusal: Cluster Agents' commands timed out and the judge graded
-# the answers as regressions on pull requests that never touched the path
-# (#2632). At 2Gi the budget admits nine, so the slot cap is the binding bound
-# again and the queue is the one the broker had before the budget existed,
-# with the OOM the budget exists to prevent still held off by the budget
-# (#2455's live test ran this figure: the broker's startup line read "admits 9
-# requests at once beside the slot cap of 8"). Set on this install only, through
-# spec.deployment.credentialProxy.resources, so the production default stays
-# where the CRD reference argues it should and an install that outgrows it
-# raises the same field. A string, because the CRD's quantity is int-or-string.
+# The gateway's own retries, on this install only (the chart default is none).
+# A Vertex 429 on a per-minute quota comes back with no Retry-After, and
+# LiteLLM's stock pause retries it inside the same closed minute; two retries
+# 20s apart let the gateway ride out a short storm before the agent sees it,
+# and the agent's own 30-60s backoff floor
+# (deploy/docker/patches/rate_limit_backoff_floor.py) covers the long ones.
+# The hold is silent: while the gateway retries, the agent's stream carries no
+# byte, and the Platform and Cluster Agents drop a stream with no first chunk
+# for stale_timeout_seconds (120s, agents/platform/config.yaml and
+# agents/cluster/config.yaml) and retry blind, never seeing the 429, so the
+# backoff floor would not engage. The pair below therefore has to keep
+# (EVAL_LITELLM_NUM_RETRIES + 1) pauses (LiteLLM sleeps before each retry and
+# once more after the last failed one) plus the model's time to first chunk
+# under that bound: 3 x 20s = 60s, leaving 60s for Vertex. The chart's render
+# refuses a pair that does not (kube-agents.litellmConfig in
+# charts/kube-agents/templates/_helpers.tpl), so a bad override fails the helm
+# upgrade below before anything is deployed. Each gateway response says what it
+# did in x-litellm-attempted-retries. To turn the retries off set both to 0:
+# the chart refuses a pause without retries. tests/test_ci_deploy_litellm_vertex.py
+# pins the flags and the defaults, and holds the defaults under the chart's bound.
+readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"
+readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-20}"
+
+# The credential-proxy container's memory limit on the eval install, pinned.
+# The broker admits a request only while its child memory reservation fits the
+# budget it derives from this limit (agents/platform/scripts/credential_proxy.py,
+# docs/designs/credential-proxy-child-memory-budget.md): at 2Gi the budget
+# admits nine, so the slot cap of eight is the binding bound. The operator's
+# default limit is 2Gi as well, and so is its default memory request on GKE
+# Autopilot, so today this override changes nothing. It stays as a pin: if the
+# operator default moves, the eval install keeps the budget its cases were
+# measured at. The cost is that the eval does not run the operator default;
+# to run it there, drop this constant, its echo and --set-string below, and the
+# three limit tests in tests/test_ci_deploy_credential_proxy_limit.py (that
+# file's CRD-order test guards step 5b' and stays).
+# The figure comes from #2632: at the 1Gi limit the operator defaulted to then,
+# the budget admitted four, and the eval's EVAL_TASK_PARALLELISM lanes of
+# Platform Agents, each fanning Cluster Agents out over the seeded fleet, queued
+# behind those four at p50 waits of 8-22s and a longest wait of 56.7s against
+# the broker's 60s refusal: Cluster Agents' commands timed out and the judge
+# graded the answers as regressions on pull requests that never touched the
+# path. #2455's live test ran this figure: the broker's startup line read
+# "admits 9 requests at once beside the slot cap of 8". Set on this install
+# only, through spec.deployment.credentialProxy.resources. A string, because
+# the CRD's quantity is int-or-string.
 # Limits only: the pool's host clusters are Autopilot with bursting, where a
 # limit above its request stands (the #2454 presubmit's proxy pod rendered
 # limits.memory 1Gi over a 512Mi request, QoS Burstable, and its broker read
 # the 1Gi), so requests.memory stays at the operator's default. On an Autopilot
-# cluster without bursting this override would be inert, as the CRD field doc
-# says, and requests.memory is the figure to raise there.
+# cluster without bursting the limit equals the request, and requests.memory is
+# the figure to set there.
 # tests/test_ci_deploy_credential_proxy_limit.py pins the flag, that the limit
 # admits at least the slot cap, and the chart rendering it onto the CR.
 readonly EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT="2Gi"
+
+# The gateway's session-affinity hook (litellm.vertex.sessionAffinity) routes
+# each Gemini conversation to one of a few replicas per prompt, so a worker's
+# first turn can read the system prompt and tools another worker warmed. It
+# takes effect only on a project with Vertex's LLM_SESSION_ID label, which is
+# granted outside this repository (docs/ci-pool-projects.md, section 1.1); on
+# one without it Vertex ignores the field and the run routes as before.
+# Override with EVAL_LITELLM_SESSION_AFFINITY=false to compare a run without it.
+readonly EVAL_LITELLM_SESSION_AFFINITY="${EVAL_LITELLM_SESSION_AFFINITY:-true}"
+# One id per prompt, not the chart's two: a profile's sessions start every few
+# minutes, about as long as a replica keeps the prompt, so splitting them over
+# two ids lets more of them land on a replica that has already dropped it.
+readonly EVAL_LITELLM_SESSION_AFFINITY_SLOTS="${EVAL_LITELLM_SESSION_AFFINITY_SLOTS:-1}"
+# Both reach `helm --set` and the chart's schema, which refuses anything but a
+# boolean and a positive integer only at step 5c, after the image build. This
+# check is stricter than Helm: lowercase true/false, at most three digits.
+# Checked here, before anything runs, the way EVAL_TASK_PARALLELISM is below.
+check_session_affinity_settings() {
+  case "${EVAL_LITELLM_SESSION_AFFINITY}" in
+  true | false) ;;
+  *)
+    echo "ERROR: EVAL_LITELLM_SESSION_AFFINITY='${EVAL_LITELLM_SESSION_AFFINITY}' must be true or false." >&2
+    return 1
+    ;;
+  esac
+  case "${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}" in
+  '' | *[!0-9]* | 0* | ????*)
+    echo "ERROR: EVAL_LITELLM_SESSION_AFFINITY_SLOTS='${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}' must be a positive integer of at most three digits, without leading zeros." >&2
+    return 1
+    ;;
+  esac
+}
+check_session_affinity_settings
 
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —
 # the label pair Helm stamps on every release-record Secret it writes
@@ -311,20 +373,19 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # The Prow jobs that deploy under the flag with no PULL_NUMBER: the
 # merge-blocking presubmit in a batch Tide ran (it grades next since next became
-# the mode new installs get, #2007, "The cutover itself"); the today lane's
-# six-hourly periodic on main, which deploys next and rolls it back to today
-# before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's three parts on
-# main (the main part's two halves, main-a and main-b, and the writers part),
-# which grade the full catalog under next (the nightly the dashboard and
+# the mode new installs get, #2007, "The cutover itself"); the main nightly's
+# three parts on main (the main part's two halves, main-a and main-b, and
+# the writers part), which grade the full catalog under next (the nightly the dashboard and
 # the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
-# hack/eval/gitlab-cases.txt, beside the today-mode GitLab nightly); and the
+# hack/eval/gitlab-cases.txt) and the GHES lane's (EVAL_FORGE=ghes,
+# hack/eval/ghes-cases.txt), each beside its today-mode nightly; and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
 # is optional, so Tide never batched it, and a pull request's run of it
 # carries a PULL_NUMBER. Section 2b admits the flag on a run whose JOB_NAME is
 # one of these (space-separated, matched whole) or that carries a PULL_NUMBER
 # -- a presubmit is admitted by the second on a pull request and the blocking
-# one by the first on a batch Tide ran, the periodic, the nightlies and the RC
+# one by the first on a batch Tide ran, the nightlies and the RC
 # postsubmit only by the first -- and refuses it on any other Prow run, so
 # the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
@@ -333,7 +394,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -691,11 +752,16 @@ A2A_OPERATOR_ENV_ARGS=()
 # It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
 # scaffold `/opt/data/profiles/tse` (#3492). Empty on the today lane, so that
 # release stays byte-for-byte the same.
+# env[3], set on every lane in the install below, turns the broker's proposal
+# readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
+# budget is sized for one install per GitHub App installation, and every eval
+# project shares one, so concurrent lanes drained its quota and the cases' own
+# forge calls failed with FORGE_RATE_LIMITED (#4611). Hence env[4] here.
 MODE_NEXT_ENV_ARGS=()
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
-    --set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
-    --set-string "platformAgent.deployment.env[3].value=false"
+    --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+    --set-string "platformAgent.deployment.env[4].value=false"
     --set "profiles.tse.enabled=true"
   )
 fi
@@ -980,8 +1046,8 @@ else
 fi
 
 # The mode flip exists for the runs that grade next or roll it back: a pull
-# request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the today
-# lane's periodic and the main and GitLab nightlies on main, the blocking presubmit
+# request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the main,
+# GitLab and GHES nightlies on main, the blocking presubmit
 # in a batch Tide ran, and the release-candidate eval).
 # A flagged run on main records under the version key's next mode, never into
 # today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
@@ -1061,15 +1127,80 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   fi
 fi
 
+# The forge table (kube-agents#3682): one row per EVAL_FORGE value, giving the
+# forge's kind (the provider the chart registers), its host, and whether it is
+# self-managed (a private host with a private CA the run supplies). A lane is a
+# row; a new forge is a new row, nothing else here changes. The self-managed
+# hosts can be overridden for a developer's own instance. hack/ci-eval-pr.sh
+# and hack/ci-forge.sh lift this function, as the first lifts the project
+# tables, so the three scripts read one table; tests/test_ci_gitops_repo.py
+# pins the rows.
+EVAL_FORGE_DEFAULT_GHES_HOST="ghes.eval.internal"
+EVAL_FORGE_DEFAULT_GITLAB_CE_HOST="gitlab.eval.internal"
+forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"; 1 unknown forge, 2 bad host override
+  local kind host var example
+  case "$1" in
+    github)    echo "github github.com no"; return 0 ;;
+    gitlab)    echo "gitlab gitlab.com no"; return 0 ;;
+    ghes)      kind=github; var=EVAL_GHES_HOST; example="${EVAL_FORGE_DEFAULT_GHES_HOST}"; host="${EVAL_GHES_HOST:-${example}}" ;;
+    gitlab-ce) kind=gitlab; var=EVAL_GITLAB_CE_HOST; example="${EVAL_FORGE_DEFAULT_GITLAB_CE_HOST}"; host="${EVAL_GITLAB_CE_HOST:-${example}}" ;;
+    *) return 1 ;;
+  esac
+  # A dotted bare hostname only: the row is split on whitespace, and the chart
+  # takes a host without scheme, port or path (hack/ghes-proxy/README.md). The
+  # two public hosts are not self-managed; the chart refuses them with a CA set.
+  # The chart's finer rules (reserved domains, length) stay the chart's.
+  if ! [[ "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+    echo "ERROR: ${var}='${host}' is not a dotted bare hostname (no scheme, port, path or spaces); the forge table takes a name such as ${example}." >&2
+    return 2
+  fi
+  case "$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')" in
+    github.com|www.github.com|ssh.github.com|gitlab.com|www.gitlab.com)
+      echo "ERROR: ${var}='${host}' is a public forge, not a self-managed one; EVAL_FORGE=github or gitlab is that row." >&2
+      return 2 ;;
+  esac
+  echo "${kind} ${host} yes"
+}
+
 # --- Which forge this run deploys against (EVAL_FORGE) ----------------------
-# EVAL_FORGE picks the forge the eval run drives: github (default; the
-# resolution below) or gitlab (issue #2394). Under gitlab the GitHub
-# integration and its minter stay off, the PlatformAgent declares one GitLab
-# forge whose credential is a Kubernetes Secret (step 5 fills it from the
-# pool's Secret Manager secret gitlab-agent-token in GITLAB_SECRETS_PROJECT),
-# and the pool project's GitLab project is its gitops repository. Mapped and gated here, ahead of the
-# GitHub resolution, so an unmapped project is refused naming this table.
+# EVAL_FORGE picks the forge the eval run drives, a row of forge_profile above:
+# github (default; the resolution below), gitlab (issue #2394), ghes (a GitHub
+# Enterprise Server at a private host) or gitlab-ce (a self-managed GitLab at a
+# private host), the last two kube-agents#3682. Under the gitlab kind the
+# GitHub integration and its minter stay off, the PlatformAgent declares one
+# GitLab forge whose credential is a Kubernetes Secret (step 5 fills it: from
+# the pool's Secret Manager secret gitlab-agent-token in GITLAB_SECRETS_PROJECT
+# on gitlab.com, from the run's own forge state directory on a self-managed
+# instance), and the pool project's GitLab project is its gitops repository.
+# Under ghes the GitHub path runs against the private host: the pool's App and
+# repositories stay on github.com behind the proxy that serves that host. A
+# self-managed forge needs the run's private CA in the state directory; the
+# deploy writes it into the Secret the forge's caBundleRef names. Mapped and
+# gated here, ahead of the GitHub resolution, so an unmapped project is refused
+# naming this table.
 EVAL_FORGE="${EVAL_FORGE:-github}"
+# Where the lane step that stands the forge up (the forge VM, kube-agents#3683
+# and #3684) leaves what this deploy and the eval need: ca.crt for a
+# self-managed forge, agent-token and ledger-token for a per-run GitLab. A
+# private directory of the job's pod, never under the artifacts, so none of it
+# is uploaded.
+EVAL_FORGE_STATE_DIR="${EVAL_FORGE_STATE_DIR:-/tmp/eval-forge}"
+case "${EVAL_FORGE_STATE_DIR}" in
+  /*) ;;
+  *) echo "ERROR: EVAL_FORGE_STATE_DIR='${EVAL_FORGE_STATE_DIR}' must be an absolute path: the grader runs under bench/ and reads the CA by this path (kube-agents#3682)." >&2; exit 1 ;;
+esac
+FORGE_CA_FILE="${EVAL_FORGE_STATE_DIR}/ca.crt"
+# The Secret the forge's caBundleRef names, per kind: the installer's names,
+# so an install made by hand and one made here read the same way.
+GITLAB_FORGE_CA_SECRET_NAME="gitlab-forge-ca"
+GITHUB_FORGE_CA_SECRET_NAME="github-forge-ca"
+FORGE_CA_SECRET_KEY="ca.crt"
+# On a per-run GitLab there is no table to map: the lane step seeds the group
+# and the project the pool's gitlab.com layout has, `gke-agentic/<PROJECT_ID>-infra`,
+# which is also what hack/ci_gitlab_forge.py's project guard accepts (GROUP,
+# PROJECT_SUFFIX there; scripts/test_ci_gitlab_forge.py pins the pair equal).
+GITLAB_FORGE_GROUP="gke-agentic"
+GITLAB_FORGE_PROJECT_SUFFIX="-infra"
 # The Secret the forge's credentialsRef names, and the key the token sits
 # under. The key is this deploy's choice: the operator reads only the Secret's
 # name today, and the GitLab provider, when it lands, fixes the key it reads.
@@ -1082,12 +1213,39 @@ GITLAB_AGENT_SM_SECRET="gitlab-agent-token"
 # so the pair is rotated by a human with overlap, and one home keeps that
 # the same size however many projects the pool has (docs/ci-pool-projects.md 5.6).
 GITLAB_SECRETS_PROJECT="kube-agents-prow"
-GITLAB_FORGE_HOST="gitlab.com"
-case "${EVAL_FORGE}" in
+EVAL_FORGE_PROFILE_RC=0
+EVAL_FORGE_PROFILE="$(forge_profile "${EVAL_FORGE}")" || EVAL_FORGE_PROFILE_RC=$?
+if [ "${EVAL_FORGE_PROFILE_RC}" -ne 0 ]; then
+  # 2 is a host override that is not a bare hostname; forge_profile said so itself.
+  [ "${EVAL_FORGE_PROFILE_RC}" -eq 2 ] || echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this deploy knows; use github (default), gitlab, ghes or gitlab-ce (forge_profile in hack/ci-deploy.sh)." >&2
+  exit 1
+fi
+read -r EVAL_FORGE_KIND EVAL_FORGE_HOST EVAL_FORGE_SELF_MANAGED <<<"${EVAL_FORGE_PROFILE}"
+if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+  if [ ! -s "${FORGE_CA_FILE}" ]; then
+    echo "ERROR: EVAL_FORGE=${EVAL_FORGE} is a self-managed forge at ${EVAL_FORGE_HOST}, but ${FORGE_CA_FILE} (its private CA) is missing or empty." >&2
+    echo "       The lane step that stands the forge up writes it to EVAL_FORGE_STATE_DIR (kube-agents#3682); not deploying against a host the broker could not trust." >&2
+    exit 1
+  fi
+  # A CA, not any certificate: the grader verifies strictly, so a leaf or a
+  # CA without CA:TRUE fails after the build. hack/ghes-proxy/make-certs.sh sets it.
+  if ! openssl x509 -noout -text -in "${FORGE_CA_FILE}" 2>/dev/null | grep -q 'CA:TRUE'; then
+    echo "ERROR: ${FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
+    exit 1
+  fi
+elif [ -s "${FORGE_CA_FILE}" ]; then
+  echo "ERROR: ${FORGE_CA_FILE} exists but EVAL_FORGE=${EVAL_FORGE} is ${EVAL_FORGE_HOST}, a public forge that takes no private CA; remove it or pick the self-managed forge it belongs to." >&2
+  exit 1
+fi
+# The GitLab host the values below name: the table's, public or self-managed.
+GITLAB_FORGE_HOST="${EVAL_FORGE_HOST}"
+case "${EVAL_FORGE_KIND}" in
   github) ;;
   gitlab)
-    if ! GITLAB_PROJECT="$(gitlab_project_for_project "${PROJECT_ID}")"; then
-      echo "ERROR: EVAL_FORGE=gitlab but no GitLab project is mapped for PROJECT_ID=${PROJECT_ID}." >&2
+    if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+      GITLAB_PROJECT="${GITLAB_FORGE_GROUP}/${PROJECT_ID}${GITLAB_FORGE_PROJECT_SUFFIX}"
+    elif ! GITLAB_PROJECT="$(gitlab_project_for_project "${PROJECT_ID}")"; then
+      echo "ERROR: EVAL_FORGE=${EVAL_FORGE} but no GitLab project is mapped for PROJECT_ID=${PROJECT_ID}." >&2
       echo "       Add it to gitlab_project_for_project() in hack/ci-deploy.sh once the project" >&2
       echo "       exists and the bot is a Developer on it (docs/ci-pool-projects.md 5.6)." >&2
       exit 1
@@ -1100,16 +1258,12 @@ case "${EVAL_FORGE}" in
     CHART_HELPERS="${SCRIPT_DIR}/../charts/kube-agents/templates/_helpers.tpl"
     if ! grep -Eq '^[[:space:]]+- gitlab$' "${PLATFORM_AGENT_CRD}" \
       || ! grep -Eq 'registered := list .*"gitlab"' "${CHART_HELPERS}"; then
-      echo "ERROR: EVAL_FORGE=gitlab, but the chart in this checkout does not register provider" >&2
+      echo "ERROR: EVAL_FORGE=${EVAL_FORGE}, but the chart in this checkout does not register provider" >&2
       echo "       gitlab (${PLATFORM_AGENT_CRD#"${SCRIPT_DIR}/../"} and ${CHART_HELPERS#"${SCRIPT_DIR}/../"}" >&2
       echo "       both have to list it). The GitLab provider is the operator half of" >&2
       echo "       gke-labs/kube-agents#1154; this deploy waits for it (#2394)." >&2
       exit 1
     fi
-    ;;
-  *)
-    echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this deploy knows; use github (default) or gitlab." >&2
-    exit 1
     ;;
 esac
 
@@ -1130,6 +1284,13 @@ if [ -n "${EVAL_GITOPS_REPO:-}" ]; then
   echo "GitOps repo: ${GITOPS_REPO} (from EVAL_GITOPS_REPO)"
 elif GITOPS_REPO="$(gitops_repo_for_project "${PROJECT_ID}")"; then
   echo "GitOps repo: ${GITOPS_REPO} (mapped from PROJECT_ID=${PROJECT_ID})"
+elif [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
+  # The GitHub repository is not read under the gitlab kind (the GitLab
+  # project is the gitops repository and the alias is set empty below), so a
+  # project with no GitHub row, a per-run GitLab on an unmapped project, is
+  # not a refusal here.
+  GITOPS_REPO=""
+  echo "GitOps repo: none on GitHub (EVAL_FORGE=${EVAL_FORGE}; the GitLab project ${GITLAB_PROJECT} is the gitops repository)"
 elif [ "${IS_PROW_RUN}" = "true" ]; then
   echo "ERROR: no GitOps repo is mapped for PROJECT_ID=${PROJECT_ID}." >&2
   echo "       Every project in the kube-agents-evals-project Boskos pool needs its own" >&2
@@ -1154,6 +1315,8 @@ fi
 if [ "${GITOPS_REPO}" = "none" ]; then
   echo "GitHub integration: disabled for this deploy (EVAL_GITOPS_REPO=none)"
   GITOPS_REPO=""
+elif [ -z "${GITOPS_REPO}" ] && [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
+  : # resolved above: no GitHub repository under the gitlab kind
 elif ! printf '%s' "${GITOPS_REPO}" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
   echo "ERROR: GitOps repo '${GITOPS_REPO}' is not in owner/repo form." >&2
   echo "       The minty rule ConfigMap is keyed on the org and repo separately, so the" >&2
@@ -1188,9 +1351,9 @@ fi
 # kubeagents-platform-gsa@<harness.projectId> — exactly the GSA_NAME/PROJECT_ID
 # pair this deploy annotates the agent KSA with, so the rule is keyed on this
 # project's platform GSA and no other's.
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
-  echo "GitHub token minter: off (EVAL_FORGE=gitlab)"
+  echo "GitHub token minter: off (EVAL_FORGE=${EVAL_FORGE})"
 elif [ -n "${GITOPS_REPO}" ] && [ -n "${EVAL_GITHUB_APP_ID:-}" ]; then
   GITHUB_MINTER_ARGS=(
     --set "githubMinter.enabled=true"
@@ -1206,10 +1369,14 @@ else
 fi
 
 # The values the chart receives for the forge: forges[] + repositories[] for
-# gitlab, the deprecated github.gitRepo alias otherwise (the chart refuses both
-# at once, so the alias is set empty beside the lists).
-case "${EVAL_FORGE}" in
-  gitlab)
+# the gitlab kind and for a GitHub forge at a self-managed host (the deprecated
+# github.gitRepo alias has no host and always means github.com), the alias for
+# github.com (the chart refuses both at once, so the alias is set empty beside
+# the lists). A self-managed forge also names the CA Secret step 5 writes; the
+# chart hands it to the credential broker, and on a GitHub forge to the token
+# minter, which it points at https://<host>/api/v3.
+case "${EVAL_FORGE_KIND}:${EVAL_FORGE_SELF_MANAGED}" in
+  gitlab:*)
     GITOPS_REPO=""
     GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
     FORGE_ARGS=(
@@ -1223,7 +1390,32 @@ case "${EVAL_FORGE}" in
       --set-string "platformAgent.integration.repositories[0].repository=https://${GITLAB_FORGE_HOST}/${GITLAB_PROJECT}"
       --set-string "platformAgent.integration.repositories[0].role=gitops"
     )
-    echo "Forge: gitlab — ${GITLAB_FORGE_HOST}/${GITLAB_PROJECT} (mapped from PROJECT_ID=${PROJECT_ID}); GitHub integration and minter off"
+    if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+      FORGE_ARGS+=(
+        --set-string "platformAgent.integration.forges[0].caBundleRef.name=${GITLAB_FORGE_CA_SECRET_NAME}"
+        --set-string "platformAgent.integration.forges[0].caBundleRef.key=${FORGE_CA_SECRET_KEY}"
+      )
+    fi
+    echo "Forge: ${EVAL_FORGE} — ${GITLAB_FORGE_HOST}/${GITLAB_PROJECT} (mapped from PROJECT_ID=${PROJECT_ID}); GitHub integration and minter off"
+    ;;
+  github:yes)
+    if [ -z "${GITOPS_REPO}" ]; then
+      echo "ERROR: EVAL_FORGE=${EVAL_FORGE} declares the GitHub forge at ${EVAL_FORGE_HOST} for the pool's repository, and none resolved (EVAL_GITOPS_REPO=none is not an option on this forge)." >&2
+      exit 1
+    fi
+    FORGE_ARGS=(
+      --set-string "platformAgent.integration.github.gitRepo="
+      --set-string "platformAgent.integration.forges[0].name=github"
+      --set-string "platformAgent.integration.forges[0].provider=github"
+      --set-string "platformAgent.integration.forges[0].host=${EVAL_FORGE_HOST}"
+      --set-string "platformAgent.integration.forges[0].namespace=${GITOPS_REPO%%/*}"
+      --set-string "platformAgent.integration.forges[0].caBundleRef.name=${GITHUB_FORGE_CA_SECRET_NAME}"
+      --set-string "platformAgent.integration.forges[0].caBundleRef.key=${FORGE_CA_SECRET_KEY}"
+      --set-string "platformAgent.integration.repositories[0].forge=github"
+      --set-string "platformAgent.integration.repositories[0].repository=https://${EVAL_FORGE_HOST}/${GITOPS_REPO}"
+      --set-string "platformAgent.integration.repositories[0].role=gitops"
+    )
+    echo "Forge: ${EVAL_FORGE} — the GitHub forge at ${EVAL_FORGE_HOST}, repository ${GITOPS_REPO} (the pool's github.com repository behind that host); the minter follows the forge's host and CA"
     ;;
   *)
     FORGE_ARGS=(--set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}")
@@ -1264,14 +1456,30 @@ preflight_fleet_reader
 # without the accessor grant, or a secret that is gone, should fail here,
 # not after the image build. The value is discarded; step 5 reads it again
 # into the Kubernetes Secret.
+# A per-run GitLab (gitlab-ce) has no pool secret: the lane step that stood
+# the instance up left the agent token in the forge state directory.
+GITLAB_FORGE_AGENT_TOKEN_FILE="${EVAL_FORGE_STATE_DIR}/agent-token"
+# Both functions below stand alone (the tests lift each by name): the source
+# switch is inline. On a self-managed instance the token is the file the lane
+# step left; on gitlab.com it is the pool's Secret Manager secret. The value is
+# newline-stripped either way (one stored with a trailing newline would
+# otherwise reach GitLab as part of the token).
 preflight_gitlab_forge_secret() {
+  if [ "${EVAL_FORGE_SELF_MANAGED:-no}" = "yes" ]; then
+    if [ ! -s "${GITLAB_FORGE_AGENT_TOKEN_FILE:-}" ]; then
+      echo "FATAL: stopping before the build: ${GITLAB_FORGE_AGENT_TOKEN_FILE:-the per-run agent token file} (the per-run GitLab agent token) is missing or empty; the lane step that stands the instance up writes it (kube-agents#3683)." >&2
+      exit 1
+    fi
+    echo "GitLab forge credential: ${GITLAB_FORGE_AGENT_TOKEN_FILE} readable"
+    return 0
+  fi
   if ! gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" >/dev/null; then
     echo "FATAL: stopping before the build: Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} cannot be read as this runner (docs/ci-pool-projects.md 5.6: the secret and the runner's secretAccessor grant are hand steps)." >&2
     exit 1
   fi
   echo "GitLab forge credential: ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET} readable"
 }
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   preflight_gitlab_forge_secret
 fi
 
@@ -1527,7 +1735,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1
@@ -1675,27 +1883,60 @@ ssh-keygen -q -t "${SANDBOX_SSH_KEY_TYPE}" -N '' -C "${SANDBOX_SSH_KEY_COMMENT}"
 # token leaves the host cluster with the lease instead of outliving it.
 GITLAB_FORGE_SECRET_LABEL="app.kubernetes.io/part-of=kube-agents"
 materialize_gitlab_forge_secret() {
-  local manifest
+  local manifest source
   # Rendered first, applied second: in one pipe the apply would run on the
   # empty stream a failed read leaves, and only then would pipefail report it.
   # tr: a value stored with a trailing newline (echo into --data-file=-) would
   # otherwise reach GitLab as part of the token.
-  manifest="$(gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" \
-    | tr -d '\r\n' \
-    | kubectl create secret generic "${GITLAB_FORGE_SECRET_NAME}" -n "${NAMESPACE}" \
-        --from-file="${GITLAB_FORGE_SECRET_KEY}=/dev/stdin" --dry-run=client -o yaml \
-    | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || {
+  if [ "${EVAL_FORGE_SELF_MANAGED:-no}" = "yes" ]; then
+    source="${GITLAB_FORGE_AGENT_TOKEN_FILE}"
+    manifest="$(tr -d '\r\n' <"${GITLAB_FORGE_AGENT_TOKEN_FILE}" \
+      | kubectl create secret generic "${GITLAB_FORGE_SECRET_NAME}" -n "${NAMESPACE}" \
+          --from-file="${GITLAB_FORGE_SECRET_KEY}=/dev/stdin" --dry-run=client -o yaml \
+      | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || manifest=""
+  else
+    source="Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}"
+    manifest="$(gcloud secrets versions access latest --secret="${GITLAB_AGENT_SM_SECRET}" --project="${GITLAB_SECRETS_PROJECT}" \
+      | tr -d '\r\n' \
+      | kubectl create secret generic "${GITLAB_FORGE_SECRET_NAME}" -n "${NAMESPACE}" \
+          --from-file="${GITLAB_FORGE_SECRET_KEY}=/dev/stdin" --dry-run=client -o yaml \
+      | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || manifest=""
+  fi
+  if [ -z "${manifest}" ]; then
     # The read itself passed the preflight in 2d, so the stage that failed is
     # as likely a kubectl one; each stage's own stderr is just above this line.
-    echo "ERROR: could not render the GitLab forge Secret from Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}; the failing stage (gcloud, tr, kubectl create, kubectl label) reported just above (docs/ci-pool-projects.md 5.6)." >&2
+    echo "ERROR: could not render the GitLab forge Secret from ${source}; the failing stage (the read, tr, kubectl create, kubectl label) reported just above (docs/ci-pool-projects.md 5.6)." >&2
+    return 1
+  fi
+  kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  printf '%s\n' "${manifest}" | kubectl apply -f - >/dev/null
+  echo "GitLab forge credential: Secret ${NAMESPACE}/${GITLAB_FORGE_SECRET_NAME} (key ${GITLAB_FORGE_SECRET_KEY}) from ${source}"
+}
+# The private CA of a self-managed forge, as the Secret the forge's caBundleRef
+# names (the installer's name per kind), so the credential broker trusts the
+# host, and the token minter too on a GitHub forge. Read from the file the lane
+# step left; the file never reaches the artifacts.
+materialize_forge_ca_secret() {
+  local name manifest
+  case "${EVAL_FORGE_KIND}" in
+    gitlab) name="${GITLAB_FORGE_CA_SECRET_NAME}" ;;
+    *) name="${GITHUB_FORGE_CA_SECRET_NAME}" ;;
+  esac
+  manifest="$(kubectl create secret generic "${name}" -n "${NAMESPACE}" \
+        --from-file="${FORGE_CA_SECRET_KEY}=${FORGE_CA_FILE}" --dry-run=client -o yaml \
+    | kubectl label --local -f - "${GITLAB_FORGE_SECRET_LABEL}" -o yaml)" || {
+    echo "ERROR: could not render the forge CA Secret ${NAMESPACE}/${name} from ${FORGE_CA_FILE}; the failing stage reported just above (kube-agents#3682)." >&2
     return 1
   }
   kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
   printf '%s\n' "${manifest}" | kubectl apply -f - >/dev/null
-  echo "GitLab forge credential: Secret ${NAMESPACE}/${GITLAB_FORGE_SECRET_NAME} (key ${GITLAB_FORGE_SECRET_KEY}) from Secret Manager ${GITLAB_SECRETS_PROJECT}/${GITLAB_AGENT_SM_SECRET}"
+  echo "Forge CA: Secret ${NAMESPACE}/${name} (key ${FORGE_CA_SECRET_KEY}) from ${FORGE_CA_FILE}, for ${EVAL_FORGE_HOST}"
 }
-if [ "${EVAL_FORGE}" = "gitlab" ]; then
+if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   materialize_gitlab_forge_secret
+fi
+if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+  materialize_forge_ca_secret
 fi
 
 # ─── 5b′. The chart's CRDs, before the chart ─────────────────────────────────
@@ -1740,7 +1981,11 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
     --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
     --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+    --set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}" \
+    --set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}" \
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --set "litellm.vertex.sessionAffinity.enabled=${EVAL_LITELLM_SESSION_AFFINITY}" \
+    --set "litellm.vertex.sessionAffinity.slots=${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}" \
     --set "platformAgent.deployment.availability.runtimeClassName=" \
     --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
     --set-string "platformAgent.deployment.credentialProxy.resources.limits.memory=${EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT}" \
@@ -1750,6 +1995,8 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[1].value=${EVAL_ALERT_DAILY_LIMIT_DRIFT}" \
     --set-string "platformAgent.deployment.env[2].name=INCIDENT_WORKLOAD_DEDUP_SECONDS" \
     --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
+    --set-string "platformAgent.deployment.env[3].name=CREDENTIAL_PROXY_VCS_READINGS" \
+    --set-string "platformAgent.deployment.env[3].value=off" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \
@@ -2402,6 +2649,23 @@ cleanup_pf_and_dump() {
 trap cleanup_pf_and_dump EXIT
 
 CONNECTIVITY_ATTEMPTS=5
+# The ping is one real agent turn, so its deadline has to outlast what the
+# agent may wait inside it on a 429 that names no reset window, and it moves
+# with the knobs that set those waits: the gateway holds each of the agent's
+# calls for EVAL_LITELLM_NUM_RETRIES + 1 pauses of
+# EVAL_LITELLM_RETRY_AFTER_SECONDS (LiteLLM sleeps before each retry and once
+# more after the last failed one), and the image's rate_limit_backoff_floor
+# patch holds each of the agent's retries up to
+# AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS. At the defaults: 4 x 3 x 20s = 240s at
+# the gateway, 3 x 60s = 180s in the agent, plus the allowance for the model
+# calls themselves, 480s. A deadline inside that sum cut such a turn off
+# mid-retry, and the next attempt started another one against the same closed
+# quota. scripts/test_ci_connectivity_retry.py holds the deadline above the
+# sum at the defaults and under an override.
+readonly AGENT_API_CALLS_PER_TURN=4          # Hermes' default api_max_retries (3) plus the first call
+readonly AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS=60 # FLOOR_MAX_SECONDS in deploy/docker/patches/rate_limit_backoff_floor.py
+readonly PING_MODEL_LATENCY_ALLOWANCE_SECONDS=60
+readonly CONNECTIVITY_PING_MAX_TIME_SECONDS=$((AGENT_API_CALLS_PER_TURN * (EVAL_LITELLM_NUM_RETRIES + 1) * EVAL_LITELLM_RETRY_AFTER_SECONDS + (AGENT_API_CALLS_PER_TURN - 1) * AGENT_RATE_LIMIT_FLOOR_MAX_SECONDS + PING_MODEL_LATENCY_ALLOWANCE_SECONDS))
 CONNECTIVITY_OK="false"
 : >/tmp/pf-8642.log
 for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
@@ -2423,7 +2687,7 @@ for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
     sleep 1
   done
 
-  HEALTH_RESP="$(curl -s --max-time 120 -X POST http://localhost:8642/v1/responses \
+  HEALTH_RESP="$(curl -s --max-time "${CONNECTIVITY_PING_MAX_TIME_SECONDS}" -X POST http://localhost:8642/v1/responses \
     -H "Authorization: Bearer ${API_KEY}" \
     -H "Content-Type: application/json" \
     -d '{"model": "model-default", "input": "ping"}' || true)"

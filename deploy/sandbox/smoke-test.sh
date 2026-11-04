@@ -36,6 +36,23 @@ readonly IMAGE_TREE_HOMES=("" profiles/platform)
 readonly IMAGE_TREE_PINS=(profiles profiles/platform)
 # shellSandboxImageTreesMode: what the operator sets SANDBOX_IMAGE_TREES to.
 readonly IMAGE_TREES_MODE=read-only-mounts
+# Section 4g: the limits sshd_config sets, the sessions opened on one shared
+# connection (the issue's acceptance figure, under the limit with room for the
+# sessions the agent's own tools hold), and how long each holds its channel so
+# that all of them overlap.
+readonly CHANNEL_SESSION_LIMIT=128
+readonly CHANNEL_STARTUP_LIMIT=64:30:256
+readonly CHANNEL_FANOUT=64
+# How long the test waits for every session to be open at once before it lets
+# them finish; how long each session itself waits for the barrier (longer than
+# that wait plus the lift, so no session gives up under a barrier about to be
+# lifted, and finite, so a lift that never arrives ends in returned=0 rather
+# than a `wait` only the image build's timeout ends); and how long a smoke
+# master lingers idle (sections 4f and 4g) if the script aborts between opening
+# and closing it.
+readonly CHANNEL_BARRIER_TIMEOUT_SECONDS=60
+readonly CHANNEL_SESSION_TIMEOUT_SECONDS=$((CHANNEL_BARRIER_TIMEOUT_SECONDS * 2))
+readonly SMOKE_MASTER_PERSIST_SECONDS=60
 
 IMAGE="${1:-agent-sandbox:latest}"
 PORT="${2:-12222}"
@@ -296,7 +313,7 @@ HERMES_SSH=(ssh "${SSH_OPTS[@]}" hermes@127.0.0.1)
 check "the same key opens a hermes session" "hermes" "$("${HERMES_SSH[@]}" whoami 2>&1)"
 check "hermes gets the forwarded proxy URL too" "http://127.0.0.1:9999" \
   "$("${HERMES_SSH[@]}" 'echo "$CREDENTIAL_PROXY_URL"' 2>&1)"
-check "hermes gets the wrapper PATH too" "/opt/credential-proxy/bin/kubectl" \
+check "hermes gets stock kubectl on PATH" "/usr/local/bin/kubectl" \
   "$("${HERMES_SSH[@]}" 'command -v kubectl' 2>&1)"
 
 # The property the whole account exists for: nothing the model leaves behind
@@ -425,6 +442,13 @@ check "tar exists (file sync is tar over ssh, not sftp)" "tar" \
   "$("${SSH[@]}" 'command -v tar' 2>&1)"
 check "leeway exists (topology drift CLI)" "v0.1.3" \
   "$("${SSH[@]}" 'leeway version' 2>&1)"
+# tar run as root keeps the owner an archive records unless told
+# --no-same-owner, and the helm and leeway archives both record uid 1001, which
+# is hermes here. -L tests what a link resolves to, so a tool put on PATH by a
+# symlink is held to its target; only a dangling link skips the mode test.
+check "every file in /usr/local/bin is root's and writable by nobody else" "all root, go-w" \
+  "$(docker exec "$NAME" sh -c 'out=$(find -L /usr/local/bin \( ! -user root -o \( ! -type l -perm /022 \) \) 2>&1) &&
+    [ -z "$out" ] && echo "all root, go-w" || echo "$out"' 2>&1)"
 # Not SSH_OPTS: sftp spells the port -P, and -p means something else entirely.
 check "no sftp subsystem is advertised" "subsystem request failed" \
   "$(sftp -i "$WORK/id" -P "$PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
@@ -800,11 +824,11 @@ if docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1; then
       umask 077 && mkdir -p /tmp/smoke && cat >/tmp/smoke/id || exit 1
       port=$1 host=$2
       opts="-n -i /tmp/smoke/id -p $port -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 -o ControlPath=/tmp/smoke/control"
-      HERMES_HOME=$SMOKE_MASTER_HOME ssh $opts -o ControlMaster=yes -o ControlPersist=60 "agent@$host" \
+      HERMES_HOME=$SMOKE_MASTER_HOME ssh $opts -o ControlMaster=yes -o "ControlPersist=$3" "agent@$host" \
         "echo \"master: home=[\$HERMES_HOME] named=[\$HERMES_PROFILE_HOME]\""
       HERMES_HOME=$SMOKE_CLIENT_HOME ssh $opts -o ControlMaster=auto "agent@$host" \
         "echo \"mux: home=[\$HERMES_HOME] named=[\$HERMES_PROFILE_HOME]\""
-      ssh -o ControlPath=/tmp/smoke/control -O exit "agent@$host" 2>/dev/null' _ "$PORT" "$SANDBOX_ALIAS" <"$WORK/id" 2>&1)
+      ssh -o ControlPath=/tmp/smoke/control -O exit "agent@$host" 2>/dev/null' _ "$PORT" "$SANDBOX_ALIAS" "$SMOKE_MASTER_PERSIST_SECONDS" <"$WORK/id" 2>&1)
   check "the master session is its own profile" "master: home=[$PP] named=[$PP]" "$mux"
   check "a session multiplexed over it is the caller's, not the master's" "mux: home=[$CP] named=[$CP]" "$mux"
 else
@@ -813,11 +837,84 @@ fi
 "${SSH[@]}" "rm -rf $CP $SWS $PP/kanban /opt/data/scratch/smoke-$$" >/dev/null 2>&1
 
 echo
-echo "== 5. credential-proxy wrappers =="
-for cli in kubectl gcloud; do
-  check "$cli resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/$cli" \
-    "$("${SSH[@]}" "command -v $cli" 2>&1)"
+echo "== 4g. channels on one shared connection =="
+# Every ssh the agent image spawns rides one ControlMaster connection per
+# user@host:port, so concurrent commands are sessions on a single connection
+# and sshd's MaxSessions is the ceiling on fan-out. OpenSSH's default is 10:
+# the eleventh concurrent command is refused by the master, and a client under
+# ControlMaster=auto then says so on stderr and falls back to a connection of
+# its own, where MaxStartups decides whether it runs or exits 255 with nothing
+# said. sshd_config sets 128, and this opens one master, runs 64 sessions over
+# it, each blocking on a barrier file until the test has seen all 64 open at
+# once on the server side, then lifts the barrier and counts the ones that
+# returned and the ones that fell back. The barrier is what makes the
+# concurrency real rather than a product of fork timing: a loaded runner that
+# forks the clients slowly still has to reach 64 open sessions before any may
+# finish; the fallback check is what ties the 64 to the one connection, since
+# the server-side count is of sessions whatever connection carries them. A
+# failure here is the default back in force (a dropped line, an Include that
+# overrides it), or a MaxStartups so low that the master itself is refused.
+check "sshd reports the raised session limit" "maxsessions $CHANNEL_SESSION_LIMIT" \
+  "$(docker exec "$NAME" sshd -T 2>&1 | grep -i '^maxsessions')"
+check "and the raised startup limit" "maxstartups $CHANNEL_STARTUP_LIMIT" \
+  "$(docker exec "$NAME" sshd -T 2>&1 | grep -i '^maxstartups')"
+CONTROL_PATH="$WORK/cm-%C"
+MASTER_OPTS=(-o ControlMaster=auto -o "ControlPath=$CONTROL_PATH" -o "ControlPersist=$SMOKE_MASTER_PERSIST_SECONDS")
+ssh "${SSH_OPTS[@]}" "${MASTER_OPTS[@]}" agent@127.0.0.1 true 2>&1
+check "a master opens over the control socket" "Master running" \
+  "$(ssh "${SSH_OPTS[@]}" -o "ControlPath=$CONTROL_PATH" -O check agent@127.0.0.1 2>&1)"
+CHANNEL_OUT="$WORK/channels"
+mkdir -p "$CHANNEL_OUT"
+# The barrier lives on the model's volume, where a session can see it, and is
+# named per run so a leftover from an aborted run cannot lift it early. A
+# session waits for it a bounded time and prints its marker only once it has
+# seen it, so a lift that never arrives is counted as sessions that did not
+# return, not waited for by the bare `wait` below until the job's timeout.
+BARRIER="/opt/data/.smoke-barrier-$$"
+for i in $(seq 1 "$CHANNEL_FANOUT"); do
+  (
+    ssh "${SSH_OPTS[@]}" "${MASTER_OPTS[@]}" agent@127.0.0.1 \
+      "d=\$((SECONDS + $CHANNEL_SESSION_TIMEOUT_SECONDS)); until [ -e $BARRIER ] || [ \$SECONDS -ge \$d ]; do sleep 0.2; done; [ -e $BARRIER ] && echo smoke-channel-$i"
+    echo "rc=$?"
+  ) > "$CHANNEL_OUT/$i" 2>&1 &
 done
+# Each session's command carries its own marker, so the server-side count is
+# of distinct sessions open at once, whatever the wrapper forks around them.
+open_sessions() {
+  docker exec "$NAME" ps -eo args 2>/dev/null | grep -o 'smoke-channel-[0-9]*' | sort -u | wc -l
+}
+peak=0
+deadline=$((SECONDS + CHANNEL_BARRIER_TIMEOUT_SECONDS))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  peak=$(open_sessions)
+  [ "$peak" -ge "$CHANNEL_FANOUT" ] && break
+  sleep 0.5
+done
+check "all $CHANNEL_FANOUT sessions were open at once" "open=$CHANNEL_FANOUT" "open=$peak"
+"${SSH[@]}" "touch $BARRIER" 2>&1
+wait
+returned=$(grep -l '^smoke-channel-' "$CHANNEL_OUT"/* | wc -l)
+check "and all $CHANNEL_FANOUT returned" "returned=$CHANNEL_FANOUT" "returned=$returned"
+# A session the master refuses is the client exiting 255 with nothing else
+# said, which is the failure the limit exists to end.
+check_absent "and none was refused by the master" "rc=255" \
+  "$(cat "$CHANNEL_OUT"/*)"
+# A session the master could not open ran on a connection of its own, and the
+# client said so (an error-level line, so it survives LogLevel=ERROR). Without
+# this check, MaxSessions back at 10 under a raised MaxStartups passes the
+# three above: 54 fallbacks, 55 connections, every marker seen, every session
+# returned.
+check_absent "and none fell back to a connection of its own" "disabling multiplexing" \
+  "$(cat "$CHANNEL_OUT"/*)"
+"${SSH[@]}" "rm -f $BARRIER" 2>&1
+ssh "${SSH_OPTS[@]}" -o "ControlPath=$CONTROL_PATH" -O exit agent@127.0.0.1 2>/dev/null
+
+echo
+echo "== 5. credential-proxy wrappers and stock kubectl =="
+check "gcloud resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/gcloud" \
+  "$("${SSH[@]}" "command -v gcloud" 2>&1)"
+check "kubectl resolves to stock kubectl in /usr/local/bin" "/usr/local/bin/kubectl" \
+  "$("${SSH[@]}" "command -v kubectl" 2>&1)"
 # Non-login is the shape of every command the agent sends, and the case that
 # reads no /etc/profile. This is the check that caught the original bug: PATH
 # arrived and CREDENTIAL_PROXY_URL did not, so the wrappers resolved and then
@@ -831,16 +928,49 @@ check "and into a login session" "http://127.0.0.1:9999" \
 # path gets a 401 from every wrapper rather than a connection error.
 check "CREDENTIAL_PROXY_TOKEN_FILE crosses too" "/var/run/secrets/kubeagents/credential-proxy/token" \
   "$("${SSH[@]}" 'echo "$CREDENTIAL_PROXY_TOKEN_FILE"' 2>&1)"
-check "the wrapper dispatches rather than refusing to start" "credential proxy" \
-  "$("${SSH[@]}" 'kubectl version 2>&1' 2>&1)"
-check "leeway report dispatches cluster reads through the kubectl wrapper" "credential proxy" \
+check "the gcloud wrapper dispatches rather than refusing to start" "credential proxy" \
+  "$("${SSH[@]}" 'gcloud version 2>&1' 2>&1)"
+check "leeway report dispatches cluster reads through stock kubectl" "kubectl get nodes" \
   "$("${SSH[@]}" 'leeway report --clusters p/l/c' 2>&1)"
+# The kube-proxy kubeconfigs name the cluster in the server URL's path
+# (entrypoint.sh: `server: ${KUBE_PROXY_URL}/clusters/<ctx>`), and before
+# kubectl 1.34 `get --raw` replaced that path with the raw path, so every paged
+# collection read landed on the proxy's default cluster and nothing failed.
+# Proved against the installed binary rather than its version string: a server
+# inside the container records the path it receives from a `--raw` read sent
+# through a kubeconfig whose server carries `/clusters/seeded-a`.
+check "kubectl get --raw keeps the kubeconfig server's /clusters/<ctx> path" \
+  "request path /clusters/seeded-a/api/v1/pods?limit=1" \
+  "$("${SSH[@]}" "python3 - <<'PY'
+import http.server, json, os, subprocess, tempfile, threading
+seen = []
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        seen.append(self.path)
+        body = json.dumps({'kind': 'PodList', 'apiVersion': 'v1', 'metadata': {}, 'items': []}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+with tempfile.TemporaryDirectory() as d:
+    kc = os.path.join(d, 'kubeconfig')
+    with open(kc, 'w') as f:
+        f.write('apiVersion: v1\\nkind: Config\\nclusters:\\n- name: seeded-a\\n  cluster:\\n    server: http://127.0.0.1:%d/clusters/seeded-a\\nusers:\\n- name: u\\n  user:\\n    token: not-a-token\\ncontexts:\\n- name: seeded-a\\n  context: {cluster: seeded-a, user: u}\\ncurrent-context: seeded-a\\n' % srv.server_address[1])
+    r = subprocess.run(['kubectl', 'get', '--raw', '/api/v1/pods?limit=1', '--kubeconfig', kc], capture_output=True, text=True, timeout=60)
+srv.shutdown()
+print('request path', ' '.join(seen), '(exit %d)' % r.returncode, r.stderr.strip())
+PY" 2>&1)"
 check "the wrappers are on PATH" "/opt/credential-proxy/bin:" \
   "$("${SSH[@]}" 'echo "$PATH"' 2>&1)"
 # A login shell runs /etc/profile, which overwrites PATH wholesale; profile.d is
 # what puts the wrappers back. Both paths, because only one of them is sshd's.
-check "PATH survives /etc/profile in a login shell" "/opt/credential-proxy/bin/kubectl" \
-  "$("${SSH[@]}" 'bash -l -c "command -v kubectl"' 2>&1)"
+check "PATH survives /etc/profile in a login shell" "/opt/credential-proxy/bin/gcloud" \
+  "$("${SSH[@]}" 'bash -l -c "command -v gcloud"' 2>&1)"
 
 echo
 echo "== 5b. the version-control skill's local git =="
@@ -861,6 +991,11 @@ check "nor in a login session" "absent" \
 check "a repository's own hooksPath does not reach the wrapper" "/opt/vcs/share/no-hooks" \
   "$("${SSH[@]}" 'git init -q /tmp/sh && git -C /tmp/sh config core.hooksPath .githooks && git -C /tmp/sh config core.hooksPath' 2>&1)"
 "${SSH[@]}" 'rm -rf /tmp/sh' >/dev/null 2>&1
+# A directory laid out as a bare repository is not opened from inside it, so
+# its `config` is never read: a snapshot's tree can have that layout.
+check "a bare repository is not discovered from its own directory" "safe.bareRepository" \
+  "$("${SSH[@]}" 'git init -q --bare /tmp/sb && cd /tmp/sb && git rev-parse --git-dir' 2>&1)"
+"${SSH[@]}" 'rm -rf /tmp/sb' >/dev/null 2>&1
 check "the local git is a real git" "git version" \
   "$("${SSH[@]}" '/opt/vcs/libexec/git --version' 2>&1)"
 # The message, not the exit status: example.invalid resolves nowhere, so an

@@ -62,7 +62,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
-from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
+from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
 
 __all__ = [
@@ -214,9 +214,12 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
 #: The trajectory entry name the harness's inject transport gives a task's
 #: lifecycle events (``inject_transport.EVENT_ENTRY_STATUS``; a transport
-#: that read the bus directly would use the same name). The gateway reports
-#: no token usage, so such a record's ``tokens`` are all null and its
-#: liveness signal is the executor's own events instead: an entry of this
+#: that read the bus directly would use the same name). Such a record's
+#: ``tokens`` are the chain's usage as the gateway's probe reported it, and
+#: its ``total`` is null when it reported none (a gateway older than the
+#: field, or turns that published no usage), whatever the delegated workers
+#: billed; its liveness signal is then the
+#: executor's own events instead: an entry of this
 #: name whose ``args.final`` is true (the task ended), or whose ``args.state``
 #: is ``working`` (the executor spawned the persona; a task the harness
 #: cancelled at its budget has no final entry and is still a run). A
@@ -606,6 +609,29 @@ def _as_str(value: Any) -> str | None:
     return str(value) if value is not None else None
 
 
+def token_count(value: Any) -> int | None:
+    """A token bucket's value as a count, or None when it is not one: null,
+    a flag, a float or a negative number."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _tokens_partial(tokens: dict[str, Any]) -> bool:
+    """Whether the record's counts are short of what the run billed: the
+    inject transport could not read a link of the chain (``usage_partial``),
+    a delegated worker's session reported no counts (``workers.unbilled``),
+    or the run delegated and no worker could be billed (``workers`` null:
+    the pod read failed, or every session was unbilled), so nothing of the
+    workers' is in ``total``. A run that delegated nothing has no ``workers``.
+    """
+    if "workers" in tokens and tokens["workers"] is None:
+        return True
+    workers = tokens.get("workers")
+    unbilled = workers.get("unbilled") if isinstance(workers, dict) else None
+    return tokens.get("usage_partial") is True or bool(unbilled)
+
+
 @dataclass(frozen=True)
 class RepResult:
     """One repetition's verdict.
@@ -630,6 +656,12 @@ class RepResult:
     latency: float | None = None
     turn1_s: float | None = None
     total_tokens: int | None = None
+    #: The record's top-level ``input`` and ``output`` buckets, and whether
+    #: its counts are short (:func:`_tokens_partial`), for the build log's
+    #: tokens line. Not in the hand-off: the dashboard reads them from the log.
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    tokens_partial: bool = False
     #: The agent's final report, verbatim, for the build log's excerpt line.
     #: Not in the hand-off: the dashboard reads it from the log.
     report: str = ""
@@ -718,8 +750,8 @@ def _liveness_failures(record: RunRecord, *, tool_calls_optional: bool = False) 
     # empty_tokens() fills every bucket with None, so a skeleton record reads
     # None here rather than 0. Both are liveness failures; the wording differs
     # so the log says which one happened. The one record that legitimately
-    # carries null buckets is an inject transport run: the gateway
-    # reports no usage, and its liveness is the executor's status events in
+    # carries null buckets is an inject transport run whose gateway
+    # reported no usage, and its liveness is the executor's status events in
     # the trajectory instead (see _a2a_run_evidence).
     total = record.tokens.get("total")
     if total is None:
@@ -831,16 +863,29 @@ def _inject_trace_vouched(trajectory: list[Any]) -> bool:
     not show, and a check graded over it could fail a call that was made or
     pass a safeguard over one; such a record is treated as blind, like one
     with no marker. A marker whose args are not a mapping vouches for
-    nothing.
+    nothing. A record of more than one task (a pushed-report replay's two
+    turns, ``pushed_report.merge``) needs a marker per task, every one
+    clean: a clean opening beside a lossy reply, or a task whose reads never
+    carried the trace at all beside one whose did, would otherwise grade a
+    safeguard in full over a trace missing calls. Tasks are counted by their
+    terminal ``a2a.status-update`` entries, which the same fold writes.
     """
+    markers = 0
+    tasks = 0
     for entry in trajectory:
-        if not isinstance(entry, dict) or entry.get("name") != INJECT_ACTIVITY_EVENT:
+        if not isinstance(entry, dict):
             continue
         args = entry.get("args")
-        if not isinstance(args, dict):
+        if entry.get("name") == A2A_STATUS_EVENT:
+            if isinstance(args, dict) and args.get("final"):
+                tasks += 1
+            continue
+        if entry.get("name") != INJECT_ACTIVITY_EVENT:
+            continue
+        if not isinstance(args, dict) or any(args.get(loss) for loss in INJECT_ACTIVITY_LOSS_ARGS):
             return False
-        return all(not args.get(loss) for loss in INJECT_ACTIVITY_LOSS_ARGS)
-    return False
+        markers += 1
+    return markers > 0 and markers >= tasks
 
 
 def _inject_blind(trajectory: list[Any]) -> bool:
@@ -856,13 +901,17 @@ def _inject_blind(trajectory: list[Any]) -> bool:
     loss, on which every check grades as on the api transport with or
     without a call behind the marker, and for one that carries a tool entry
     with no marker at all (no shipped transport writes that; it grades as
-    it did before the marker existed).
+    it did before the marker existed). The entries the harness writes itself
+    (``cases.HARNESS_WRITTEN_ENTRIES``: a stopped ask's, a pushed-report
+    replay's plant) are part of the envelope here: they are not calls the
+    door showed, so a record with one and no marker is still a trace the
+    door never showed.
     """
     if not _inject_record(trajectory):
         return False
     names = [entry.get("name") if isinstance(entry, dict) else None for entry in trajectory]
     if INJECT_ACTIVITY_EVENT not in names:
-        return all(name in INJECT_ENVELOPE_EVENTS for name in names)
+        return all(name in INJECT_ENVELOPE_EVENTS or name in HARNESS_WRITTEN_ENTRIES for name in names)
     return not _inject_trace_vouched(trajectory)
 
 
@@ -1127,6 +1176,9 @@ def classify_rep(
             total_tokens=(
                 record.tokens.get("total") if record and record.tokens else None
             ),
+            input_tokens=token_count(record.tokens.get("input")) if record else None,
+            output_tokens=token_count(record.tokens.get("output")) if record else None,
+            tokens_partial=_tokens_partial(record.tokens) if record else False,
             report=record.output if record else "",
             not_applicable_checks=list(lane.not_applicable) if lane else [],
         )

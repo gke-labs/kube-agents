@@ -31,6 +31,32 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import collect  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
+
+# The collector pages its kinds through `kubectl get --raw`; the fakes below
+# still answer the one-shot dump, and the adapter feeds the real paging from
+# it (test_collector_run.paged_dump_over). The tests that assert the paged
+# argv itself patch the real `paged_dump` back in.
+_PAGED_DUMP = patch.object(collect, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 # Every resolver asks the operator's answer when a run passes neither scope flag:
 # the root-owned file the sandbox writes, else KUBEAGENTS_SCOPE_DECLARED. A shell
@@ -38,6 +64,10 @@ import collect  # noqa: E402
 # would turn this suite's listing tests into refusals. The suite is about the
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URL unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
@@ -428,24 +458,20 @@ def context_of(dump=None, **overrides):
 
 
 class TestSweepPool(unittest.TestCase):
-    # The credential proxy admits four requests at once under its child memory
-    # budget at the operator's default 1Gi limit
-    # (docs/designs/credential-proxy-child-memory-budget.md §2.2). stall_watch.py and
-    # cluster_agent_reconcile.py pin the same figure for their listing pools; the
-    # broker computes the admitted count at runtime from its container limit and
-    # exposes no constant, so this pins the shared figure the pools agree on at the
-    # default limit -- four -- not the broker's running count. A non-default proxy
-    # limit is the caller's to re-sync (see collect.py and #2639).
-    DEFAULT_LIMIT_ADMITTED_COUNT = 4
+    # Every check a sweep runs is a command the credential broker executes, and
+    # the broker admits its slot cap or what its child memory budget fits at the
+    # container's effective limit (8 at the default 2Gi, 4 on Autopilot without
+    # bursting). Only the broker sees that limit, so each collector reads its
+    # width from it through broker_admission.sweep_width() rather than carrying a
+    # constant (broker_admission.py has the formula and the fallback).
 
-    def test_collector_pools_pin_the_default_limit_admitted_count(self):
-        self.assertEqual(collect.MAX_WORKERS, self.DEFAULT_LIMIT_ADMITTED_COUNT)
+    def test_collector_pools_resolve_the_broker_width(self):
         here = Path(__file__).resolve().parent
         # Every module in this directory that runs a worker pool is a sweep
         # collector and must be pinned. Discovered by the pool it runs
         # (ThreadPoolExecutor), not by a constant name the diff happens to use, so
-        # a collector added under MAX_WORKERS, LIST_WORKERS, WORKERS or any other
-        # name fails this test rather than slipping through unpinned.
+        # a collector added under any name fails this test rather than slipping
+        # through unpinned.
         pooled = sorted(
             path
             for path in here.glob("*.py")
@@ -454,17 +480,36 @@ class TestSweepPool(unittest.TestCase):
         self.assertTrue(pooled, "no pooled collector modules discovered -- did the scan break?")
         for path in pooled:
             with self.subTest(collector=path.name):
-                mod = importlib.import_module(path.stem)
-                self.assertTrue(
-                    hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"),
-                    f"{path.name} runs a worker pool but exposes no MAX_WORKERS + collect_fleet to pin; "
-                    "name its pool MAX_WORKERS and its entry collect_fleet, or widen this scan",
-                )
-                self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
-                self.assertEqual(
-                    inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
-                    mod.MAX_WORKERS,
-                )
+                assert_resolves_the_broker_width(self, importlib.import_module(path.stem), path.name)
+
+
+class _WidthAsked(Exception):
+    """Raised by a patched broker_admission.sweep_width, to show it was asked."""
+
+
+def assert_resolves_the_broker_width(case, mod, name):
+    """``mod``'s pool width is the broker's: ``collect_fleet(max_workers=None)``
+    resolves it through broker_admission, and no constant stands in for it."""
+    case.assertTrue(hasattr(mod, "collect_fleet"), f"{name} runs a worker pool but exposes no collect_fleet to pin")
+    case.assertIsNone(
+        inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
+        f"{name}: collect_fleet's max_workers must default to None, resolved from the broker",
+    )
+    case.assertIn("broker_admission", vars(mod), f"{name} doesn't import broker_admission")
+    case.assertFalse(hasattr(mod, "MAX_WORKERS"), f"{name} still carries a MAX_WORKERS constant")
+    # By behaviour, not by the line's spelling: with max_workers unset,
+    # collect_fleet asks the broker before anything else. The patched
+    # sweep_width raises, so nothing past that point runs, and the required
+    # arguments it never reaches can be placeholders.
+    required = [
+        param
+        for param in inspect.signature(mod.collect_fleet).parameters.values()
+        if param.default is inspect.Parameter.empty
+        and param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    with mock.patch.object(mod.broker_admission, "sweep_width", side_effect=_WidthAsked):
+        with case.assertRaises(_WidthAsked, msg=f"{name}: collect_fleet doesn't ask broker_admission.sweep_width() for its width"):
+            mod.collect_fleet(*[None] * len(required))
 
 
 class TestNoRequests(unittest.TestCase):
@@ -3971,8 +4016,7 @@ class TestDumpStateGate(unittest.TestCase):
             return Run(argv, rc, stdout, "", 0.05)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "SCRATCH_DIR", tmp):
-                return collect.dump_state(Path(tmp) / "kc.yaml", "c1", run=run)
+            return collect.dump_state(Path(tmp) / "kc.yaml", "c1", run=run)
 
     def test_a_well_formed_dump_passes_the_gate(self):
         _, _, gate_ok = self.run_dump(json.dumps({"items": []}))
@@ -3997,22 +4041,61 @@ class TestDumpStateGate(unittest.TestCase):
         _, _, gate_ok = self.run_dump(json.dumps({"error": "no"}))
         self.assertFalse(gate_ok)
 
-    def test_two_same_named_clusters_in_two_projects_write_two_files(self):
-        """The design's thread-safety rule is that a worker writes only to
-        paths keyed by its own cluster, and named this file as the case no two
-        threads can collide on. A cluster name is unique within a project, not
-        across the eight this collector runs at once: two clusters called
-        `prod` wrote one path, and the loser re-read the winner's dump — one
-        cluster's workloads published under the other's name."""
+    def test_the_dump_is_returned_parsed_and_nothing_is_written(self):
+        """The dump used to land in a `wra_state_<project>_<cluster>_<location>.json`
+        scratch file and be read straight back (two same-named clusters in two
+        projects once shared one path). Nothing read it after that, so the
+        parsed dict is the whole answer and the scratch directory stays empty."""
 
         def run(argv, **kwargs):
-            return Run(argv, 0, json.dumps({"items": []}), "", 0.05)
+            return Run(argv, 0, json.dumps({"items": [{"kind": "Deployment", "metadata": {"name": "web"}}]}), "", 0.05)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "SCRATCH_DIR", tmp):
-                a, _, _ = collect.dump_state(Path(tmp) / "kc.yaml", "prod", project="acme-a", location="us-central1", run=run)
-                b, _, _ = collect.dump_state(Path(tmp) / "kc.yaml", "prod", project="acme-b", location="us-central1", run=run)
-        self.assertNotEqual(a, b)
+            with patch.dict(os.environ, {"FLEET_AUDIT_SCRATCH_DIR": tmp}):
+                parsed, _, gate_ok = collect.dump_state(Path(tmp) / "kc.yaml", "prod", project="acme-a", location="us-central1", run=run)
+            self.assertEqual([], [p.name for p in Path(tmp).iterdir()])
+        self.assertTrue(gate_ok)
+        self.assertEqual(["web"], [i["metadata"]["name"] for i in parsed["items"]])
+        self.assertFalse(hasattr(collect, "SCRATCH_DIR"))
+
+    def test_the_dump_is_one_paged_raw_read_per_kind(self):
+        """The real paging, not the adapter: every kind in DUMP_COMMAND_KINDS is
+        a `kubectl get --raw` collection read with a page limit, the
+        deployments' continue token is followed, and a cut page fails the gate
+        with the shim's exit code on the run."""
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            path, _, query = argv[3].partition("?")
+            if path == "/apis/apps/v1/deployments" and "continue=" not in query:
+                return Run(argv, 0, json.dumps({"metadata": {"continue": "next"}, "items": [{"metadata": {"name": "a", "managedFields": [{}]}}]}), "", 0.01)
+            if path == "/apis/apps/v1/deployments":
+                return Run(argv, 0, json.dumps({"metadata": {}, "items": [{"metadata": {"name": "b"}}]}), "", 0.01)
+            return Run(argv, 0, json.dumps({"metadata": {}, "items": []}), "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump):
+            parsed, result, gate_ok = collect.dump_state(Path(tmp) / "kc.yaml", "c1", run=run)
+        self.assertTrue(gate_ok)
+        self.assertEqual(len(collect.DUMP_COMMAND_KINDS.split(",")) + 1, len(issued))
+        self.assertTrue(all(a[:3] == ["kubectl", "get", "--raw"] for a in issued))
+        self.assertIn("/apis/apps/v1/deployments?limit=500&continue=next", [a[3] for a in issued])
+        self.assertIn("/api/v1/nodes?limit=100", [a[3] for a in issued])
+        self.assertEqual([("Deployment", "a"), ("Deployment", "b")], [(i["kind"], i["metadata"]["name"]) for i in parsed["items"]])
+        self.assertNotIn("managedFields", parsed["items"][0]["metadata"])
+        self.assertEqual(0, result.rc)
+
+        def cut(argv, **kwargs):
+            if argv[3].startswith("/api/v1/services"):
+                return Run(argv, 74, '{"items": [{"metadata": {"name": "s', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n", 0.01)
+            return run(argv, **kwargs)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump):
+            parsed, result, gate_ok = collect.dump_state(Path(tmp) / "kc.yaml", "c1", run=cut)
+        self.assertFalse(gate_ok)
+        self.assertIsNone(parsed)
+        self.assertEqual(74, result.rc)
+        self.assertIn("credential proxy output truncated", result.stderr)
 
 
 class TestCollectCluster(unittest.TestCase):
@@ -4030,8 +4113,7 @@ class TestCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(
                     cluster or self.CLUSTER, "obtainability-audit",
                     checks or collect.OBTAINABILITY_CHECKS, run=run
@@ -4248,8 +4330,7 @@ class TestCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(cluster, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
         by_slug = {c["check"]: c for c in result["candidates"]}
         self.assertEqual(by_slug["no-requests"]["severity"], "minor")
@@ -4352,6 +4433,33 @@ class TestCollectCluster(unittest.TestCase):
         )
         self.assertIn("kubectl get computeclasses", cc_cmd)
 
+    def test_every_check_records_the_paged_dump_chain_under_the_clusters_kubeconfig(self):
+        """The record, not only the reads: each obtainability check's `command` is
+        the chain `paged_command_text` builds for DUMP_COMMAND_KINDS under the
+        cluster's kubeconfig in the patched directory, the SOP's evidence command.
+        A record put back to the one-shot `kubectl get <kinds> -A -o json` fails
+        here however `dump_state` reads."""
+
+        def run(argv, **kwargs):
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.1)
+            if argv[:2] == ["kubectl", "get"]:
+                return Run(argv, 0, json.dumps(dump_of(deployment("api"))), "", 0.2)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
+            result = collect.collect_cluster(self.CLUSTER, "obtainability-audit", collect.OBTAINABILITY_CHECKS, run=run)
+            kubeconfig = collect.kubeconfig_path(self.CLUSTER["project"], self.CLUSTER["name"], self.CLUSTER["location"])
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        self.assertTrue(str(kubeconfig).startswith(tmp), kubeconfig)
+        expected = collect.paged_command_text(collect.DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig)
+        self.assertTrue(expected.startswith("( export KUBECONFIG="), expected)
+        dump_slugs = {c["check"] for c in result["commands"] if c["check"] != "untargeted-compute-class-workload"}
+        self.assertEqual({spec.slug for spec in collect.OBTAINABILITY_CHECKS} - {"untargeted-compute-class-workload"}, dump_slugs)
+        for c in result["commands"]:
+            if c["check"] != "untargeted-compute-class-workload":
+                self.assertEqual(expected, c["command"], c["check"])
+
 
 class TestCollectFleet(unittest.TestCase):
     def test_every_enumerated_cluster_gets_an_entry_even_under_parallelism(self):
@@ -4378,8 +4486,7 @@ class TestCollectFleet(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet("obtainability-audit", "acme", run=run, max_workers=3)
 
         names = {c["name"]: c["outcome"] for c in manifest["clusters"]}
@@ -4417,8 +4524,7 @@ class TestCollectFleet(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet("obtainability-audit", "acme", run=run)
         outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"]}
         self.assertEqual(
@@ -4454,8 +4560,7 @@ class TestCollectFleet(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet("obtainability-audit", "acme", run=run)
 
         outcomes = {c["name"]: c["outcome"] for c in manifest["clusters"]}
@@ -4580,7 +4685,7 @@ class TestDiscovery(unittest.TestCase):
 
     def collect(self, run):
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 return collect.collect_fleet("obtainability-audit", run=run)
 
     def test_every_listed_project_is_swept_and_named_by_its_qualified_target(self):
@@ -4692,8 +4797,7 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 return collect.collect_fleet("obtainability-audit", run=run)
 
     def test_the_full_roster_of_checks_run_verifies_against_the_real_manifest(self):
@@ -4759,7 +4863,7 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet("compliance-audit", run=run)
 
         checks_run = [{"check": c.slug, "command": "x"} for c in collect.COMPLIANCE_CHECKS]
@@ -4781,7 +4885,7 @@ class TestManifestComposesWithAuditReport(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet("ai-security-audit", run=run)
 
         checks_run = [{"check": c.slug, "command": "x"} for c in collect.AI_SECURITY_CHECKS]
@@ -7835,7 +7939,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 return collect.collect_cluster(target, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
 
     def test_a_clean_cluster_reports_nothing(self):
@@ -7848,6 +7952,73 @@ class TestComplianceCollectCluster(unittest.TestCase):
         self.assertEqual(result["outcome"], "collected")
         self.assertEqual(result["candidates"], [])
         self.assertEqual(len(result["commands"]), 15)
+
+    def test_the_five_built_in_reads_are_paged_raw_reads_one_kind_at_a_time(self):
+        """The real paging, not the module's adapter: the workload, RBAC,
+        NetworkPolicy/Namespace, Service and ServiceAccount reads each go out
+        as `kubectl get --raw` collection pages, one kind at a time, and each
+        record names that paged read under the cluster's kubeconfig. A
+        `_collect_compliance` that went back to a one-shot
+        `kubectl get <kinds> -A -o json` for any of the five passes every other
+        test in this class, because the adapter answers that argv; here it
+        fails."""
+        issued = []
+        one_shot_kinds = {
+            collect.COMPLIANCE_DUMP_KINDS, collect.RBAC_DUMP_KINDS, collect.NETPOL_DUMP_KINDS,
+            collect.SERVICE_DUMP_KINDS, collect.SERVICEACCOUNT_DUMP_KINDS,
+        }
+        # One in-scope pod on the pods page, as a raw list carries it (no
+        # `kind`), so the workload- and account-scoped checks run and record
+        # their reads rather than being declared inapplicable.
+        pod = {k: v for k, v in self.benign_pod().items() if k not in ("kind", "apiVersion")}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                items = [pod] if argv[3].startswith("/api/v1/pods?") else []
+                return Run(argv, 0, json.dumps({"metadata": {}, "items": items}), "", 0.01)
+            if argv[:2] == ["kubectl", "get"]:
+                if argv[2] in one_shot_kinds:
+                    raise AssertionError(f"a one-shot dump was issued: {argv}")
+                # The CRD and category reads keep their one-shot shape; a
+                # cluster without any of them is their ordinary answer.
+                return Run(argv, 1, "", f'error: the server doesn\'t have a resource type "{argv[2]}"', 0.05)
+            if argv[:3] == ["gcloud", "container", "clusters"]:
+                return Run(argv, 0, json.dumps({"workloadIdentityConfig": {"workloadPool": "acme.svc.id.goog"}}), "", 0.1)
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return Run(argv, 0, "[]", "", 0.1)
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump):
+            result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(
+            [
+                "/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/statefulsets?limit=500",
+                "/apis/apps/v1/daemonsets?limit=500", "/apis/batch/v1/cronjobs?limit=500", "/api/v1/pods?limit=500",
+                "/apis/rbac.authorization.k8s.io/v1/clusterroles?limit=500", "/apis/rbac.authorization.k8s.io/v1/roles?limit=500",
+                "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings?limit=500", "/apis/rbac.authorization.k8s.io/v1/rolebindings?limit=500",
+                "/apis/networking.k8s.io/v1/networkpolicies?limit=500", "/api/v1/namespaces?limit=500",
+                "/api/v1/services?limit=500",
+                "/api/v1/serviceaccounts?limit=500",
+            ],
+            raw,
+        )
+        commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
+        kubeconfig = re.search(r"KUBECONFIG=([^\s;]+)", commands_by_slug["privileged-container"]).group(1)
+        self.assertTrue(kubeconfig.startswith(tmp), kubeconfig)
+        self.assertTrue(commands_by_slug["privileged-container"].startswith("( export KUBECONFIG="), commands_by_slug["privileged-container"])
+        for slug, kinds in (
+            ("privileged-container", collect.COMPLIANCE_DUMP_KINDS),
+            ("cluster-admin-binding", collect.RBAC_DUMP_KINDS),
+            ("netpol-missing", collect.NETPOL_DUMP_KINDS),
+            ("lb-world-open", collect.SERVICE_DUMP_KINDS),
+            ("default-sa-automount", collect.SERVICEACCOUNT_DUMP_KINDS),
+        ):
+            self.assertEqual(collect.paged_command_text(kinds.split(","), kubeconfig=kubeconfig), commands_by_slug[slug], slug)
 
     def test_a_dirty_cluster_reports_across_multiple_sources(self):
         privileged_pod = compliance_pod("bad")
@@ -7911,7 +8082,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
         self.assertEqual(result["outcome"], "gate-failed")
         self.assertNotIn("candidates", result)
@@ -8252,7 +8423,7 @@ class TestComplianceCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(self.CLUSTER, "compliance-audit", collect.COMPLIANCE_CHECKS, run=run)
         self.assertEqual(result["outcome"], "gate-failed")
         self.assertIn("node-pools", result["error"])
@@ -9493,7 +9664,7 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 return collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
 
     def test_the_reconciled_model_plant_files_one_manual_candidate_with_its_reconciler(self):
@@ -9681,7 +9852,7 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
         self.assertEqual(result["outcome"], "gate-failed")
         self.assertNotIn("candidates", result)
@@ -9709,10 +9880,63 @@ class TestAiSecurityCollectCluster(unittest.TestCase):
     def test_the_service_dump_backs_only_inference_endpoint_public(self):
         result = self.run_with(workload_items=[deployment("web")], service_items=[])
         commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
-        self.assertIn(" svc ", commands_by_slug["inference-endpoint-public"])
-        for slug in commands_by_slug:
+        self.assertIn("kubectl get --raw '/api/v1/services?limit=500'", commands_by_slug["inference-endpoint-public"])
+        for slug, command in commands_by_slug.items():
             if slug != "inference-endpoint-public":
-                self.assertIn(collect.COMPLIANCE_DUMP_KINDS, commands_by_slug[slug])
+                # The cluster's kubeconfig exported once for the chain, so the
+                # recorded line runs every read against the audited cluster
+                # when pasted unchanged.
+                kubeconfig = re.search(r"KUBECONFIG=([^\s;]+)", command).group(1)
+                self.assertTrue(kubeconfig.endswith(".yaml"), command)
+                self.assertEqual(collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), command)
+
+    def test_the_two_reads_are_paged_raw_reads_one_kind_at_a_time(self):
+        """The real paging, not the module's adapter: the workload dump and
+        the Service dump each go out as `kubectl get --raw` collection pages,
+        one kind at a time, and each record names that paged read under the
+        cluster's kubeconfig. A `_collect_ai_security` that went back to a
+        one-shot `kubectl get <kinds> -A -o json` for either passes every
+        other test in this class, because the adapter answers that argv;
+        here it fails."""
+        issued = []
+        # One AI workload on the deployments page, as a raw list carries it
+        # (no `kind`), so the workload checks have something to examine.
+        workload = {k: v for k, v in ai_workload().items() if k not in ("kind", "apiVersion")}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            if "get-credentials" in argv:
+                return Run(argv, 0, "", "", 0.05)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                items = [workload] if argv[3].startswith("/apis/apps/v1/deployments?") else []
+                return Run(argv, 0, json.dumps({"metadata": {}, "items": items}), "", 0.01)
+            if argv[:2] == ["kubectl", "get"] and argv[2] in (collect.COMPLIANCE_DUMP_KINDS, collect.SERVICE_DUMP_KINDS):
+                raise AssertionError(f"a one-shot dump was issued: {argv}")
+            return Run(argv, 0, "", "", 0.01)
+
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "paged_dump", _shared_run_tests.cr.paged_dump):
+            result = collect.collect_cluster(self.CLUSTER, "ai-security-audit", collect.AI_SECURITY_CHECKS, run=run)
+        self.assertEqual(result["outcome"], "collected", result.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(
+            [
+                "/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/statefulsets?limit=500",
+                "/apis/apps/v1/daemonsets?limit=500", "/apis/batch/v1/cronjobs?limit=500", "/api/v1/pods?limit=500",
+                "/api/v1/services?limit=500",
+            ],
+            raw,
+        )
+        commands_by_slug = {c["check"]: c["command"] for c in result["commands"]}
+        kubeconfig = re.search(r"KUBECONFIG=([^\s;]+)", commands_by_slug["inference-endpoint-public"]).group(1)
+        self.assertTrue(kubeconfig.startswith(tmp), kubeconfig)
+        self.assertEqual(
+            collect.paged_command_text(collect.SERVICE_DUMP_KINDS.split(","), kubeconfig=kubeconfig),
+            commands_by_slug["inference-endpoint-public"],
+        )
+        workload_slugs = [slug for slug in commands_by_slug if slug != "inference-endpoint-public"]
+        self.assertTrue(workload_slugs, commands_by_slug)
+        for slug in workload_slugs:
+            self.assertEqual(collect.paged_command_text(collect.COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), commands_by_slug[slug], slug)
 
 
 class TestEvidenceCommandsArePasteable(unittest.TestCase):
@@ -9748,7 +9972,7 @@ class TestEvidenceCommandsArePasteable(unittest.TestCase):
 
     def test_the_compliance_describe_command_survives_a_shell(self):
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(
                     {"name": "kube-agents-host", "location": "us-east4", "project": "adamparco-kage"},
                     "compliance-audit",
@@ -9783,7 +10007,7 @@ class TestEvidenceCommandsArePasteable(unittest.TestCase):
         # netpol-missing reads the namespaces holding live Pods instead and
         # still ran.
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 result = collect.collect_cluster(
                     {"name": "c1", "location": "us-east4", "project": "p"},
                     "compliance-audit",
@@ -10986,8 +11210,7 @@ class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
 
     def test_a_declared_object_carries_its_path_and_directory(self):
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     "obtainability-audit", "acme",
                     run=self.fleet_run("api", "web"), workspace=self.clone(tmp),
@@ -11019,8 +11242,7 @@ class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
         GitOps repository does not contain.
         """
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     "obtainability-audit", "acme",
                     run=self.fleet_run("api"), workspace=self.clone(tmp),
@@ -11044,8 +11266,7 @@ class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             empty = Path(tmp) / "empty"
             empty.mkdir()
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     "obtainability-audit", "acme", run=self.fleet_run("api"), workspace=empty,
                 )
@@ -11071,8 +11292,7 @@ class TestCandidatesCarryTheirDeclaration(unittest.TestCase):
         existed, on a run that actually produces candidates.
         """
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     "obtainability-audit", "acme", run=self.fleet_run("api"),
                 )
@@ -11872,8 +12092,7 @@ class TestCandidatesCarryTheirReleaseDeclaration(unittest.TestCase):
 
     def candidates(self, *items, audit_id="obtainability-audit"):
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     audit_id, "acme",
                     run=self.fleet_run(*items), workspace=self.clone(tmp),
@@ -12350,8 +12569,7 @@ class TestCandidatesCarryTheirNamespaceDirectory(unittest.TestCase):
             return Run(argv, 0, "", "", 0.01)
 
         with TemporaryDirectory() as tmp:
-            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), \
-                    patch.object(collect, "SCRATCH_DIR", tmp):
+            with patch.object(collect, "KUBECONFIG_DIR", Path(tmp)):
                 manifest = collect.collect_fleet(
                     "obtainability-audit", "acme", run=run, workspace=self.clone(tmp),
                 )
@@ -13077,6 +13295,38 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
+
+class DefaultRunFailureTest(unittest.TestCase):
+    """`default_run` turns a child that could not start into a failed `Run`, so
+    project discovery records the failure instead of ending the run with a
+    traceback and no manifest."""
+
+    def test_a_missing_gcloud_is_a_recorded_discovery_error_not_a_raise(self):
+        collect.declared_scope.set(None, None)
+        missing = FileNotFoundError(2, "No such file or directory", "gcloud")
+        with mock.patch.object(collect.subprocess, "run", side_effect=missing), redirect_stderr(io.StringIO()):
+            discovery = collect.discover_fleet(None)
+        self.assertEqual(discovery.projects, [])
+        self.assertIn("rc=-1", discovery.error)
+        self.assertIn("No such file or directory", discovery.error)
+
+
+class RecordedChainsUnderTheCommandCapTest(unittest.TestCase):
+    """Every paged chain `collect.py` records is copied verbatim into `checks_run` and into
+    `evidence.command`; `finish` refuses the first over `MAX_COMMAND_CHARS` and clips the
+    second. Held at the longest kubeconfig path the platform profile can produce."""
+
+    def test_every_recorded_chain_passes_the_validator_at_the_longest_path(self):
+        with patch.object(collect, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = collect.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        for name in ("DUMP_COMMAND_KINDS", "COMPLIANCE_DUMP_KINDS", "RBAC_DUMP_KINDS", "NETPOL_DUMP_KINDS", "SERVICE_DUMP_KINDS", "SERVICEACCOUNT_DUMP_KINDS"):
+            kinds = getattr(collect, name)
+            with self.subTest(kinds=name):
+                text = collect.paged_command_text(kinds.split(","), kubeconfig=kubeconfig)
+                self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+                self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "privileged-container"))
+                self.assertEqual(text, audit_report.trim_command(text))
+
 
 if __name__ == "__main__":
     unittest.main()

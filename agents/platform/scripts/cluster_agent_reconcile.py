@@ -15,7 +15,8 @@
 # working for one release alongside `exclude.clusters`. Per run this deterministic engine:
 #   • CREATE — scaffolds a profile for every cluster in scope that doesn't have one yet;
 #   • PRUNE  — deletes a profile whose cluster is *definitively* gone (a NotFound/404 from
-#     `gcloud container clusters describe`), whose cluster is excluded (a triple in
+#     the GKE API: the relayed `clusters.get`, or `gcloud container clusters describe` on
+#     the fallback), whose cluster is excluded (a triple in
 #     `spec.scope.exclude.clusters`, or a bare name in RECONCILE_EXCLUDE), or whose project the
 #     scope has dropped, under the three conditions `reconcile()` states. Any other error path
 #     — auth, network, timeout, quota, an unreadable identity — is treated as "unknown" and
@@ -63,6 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
 
+import credential_proxy_client
 import sandbox_exec
 import chat_notify
 from chat_platforms import enabled_chat_platforms
@@ -153,7 +155,8 @@ ASSET_TYPE_CLUSTER = "container.googleapis.com/Cluster"
 # The two fields the resolver reads, projected so a container of thousands of clusters
 # stays far below the credential proxy's output cap; full-fidelity JSON is ~1 KB a row.
 ASSET_SEARCH_FORMAT = "json(name,location)"
-# The credential proxy's stderr note when it cut a stream at its output cap.
+# The credential proxy's stderr note when it cut a stream at its output cap; the
+# shim exits 74 with it, so the note is read before the exit code.
 _PROXY_TRUNCATED_MARKER = "truncated"
 # Regional clusters render as .../locations/<L>/clusters/<C>, zonal ones as
 # .../zones/<Z>/clusters/<C>; a parser written to one shape drops the other (design §4).
@@ -175,7 +178,9 @@ _api_disabled_this_run: set[str] = set()
 # with nothing written. The listing budget caps the phase at LIST_BUDGET_SECONDS whatever
 # hangs, with the rest recorded unlisted, and the gate's 390s ceiling leaves the prune and
 # settle time after it. Creates still run in the fixed order.
-# Every lookup is a gcloud process the credential proxy runs. The pool was sized to the
+# A project list or describe goes through the broker's Cloud API relay first (#3703; see
+# GKE_READS_HELPER below); this pool is the gcloud fallback, and the path every other
+# lookup takes. Each gcloud lookup is a process the credential proxy runs. The pool was sized to the
 # four requests the proxy admitted under its child memory budget at the old 1Gi default
 # (docs/designs/credential-proxy-child-memory-budget.md §2.2): credential_proxy.py's
 # children budget, 704 MiB of the 1 GiB limit after BROKER_RESIDENT_RESERVE_BYTES and
@@ -187,6 +192,25 @@ _api_disabled_this_run: set[str] = set()
 # still waiting at its 60s admission bound is refused busy and reads unlisted for the tick.
 LIST_WORKERS = 4
 LIST_TIMEOUT_SECONDS = 120
+# The broker bounds one gcloud it runs at 300 s (its `--timeout-seconds` default), so the cap
+# above holds one admission wait and part of one run. The shim retries a refusal on its own
+# (credential_proxy_client, keeping a retry's admission wait, not its run, inside a deadline the
+# caller may shorten), and under this cap a retry would carry past it, where TimeoutExpired
+# stands in for the broker's reason. `_run` and scope_publisher's `broker_run` tell the shim the
+# cap less the run bound, under which no retry fits, so a refused lookup logs the refusal's text
+# at once, as cluster_preflight.sh's calls do.
+BROKER_GCLOUD_RUN_SECONDS = 300
+SHIM_RETRY_DEADLINE_SECONDS = max(0, LIST_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
+# The same rule for the two short gcloud hops below the lookups: the describe behind
+# `_cluster_exists` (DESCRIBE_TIMEOUT_SECONDS, or the prune budget left) and the gcloud config
+# fallback in `_project_source`. Neither cap holds a held refusal's 60 s admission wait, but the
+# broker's resource watermark gate refuses at once with a 5 to 30 s Retry-After, and the shim's
+# 170 s default admits three or four such waits, so without the deadline a 30 s cap fires inside
+# the chain on a high draw and TimeoutExpired stands in for the gate's reason. The describe
+# derives the deadline from the cap it is given, so a budget past the run bound would still
+# admit what fits.
+PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
+PROJECT_LOOKUP_SHIM_RETRY_DEADLINE_SECONDS = max(0, PROJECT_LOOKUP_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
 # 12s per listing at four wide: the per-listing share the 150s budget gave at eight.
 LIST_BUDGET_SECONDS = 300
 LIST_GRACE_SECONDS = 5
@@ -206,6 +230,26 @@ PRUNE_SECONDS_PER_DESCRIBE = 3
 # container can resolve to thousands of projects, a chat message has a size ceiling, and
 # a message the platform drops for its size takes the created/pruned summary with it.
 NOTIFY_UNLISTED_LIMIT = 8
+# The most profiles one run creates; the rest are deferred to the next run and listed under
+# `create_deferred`. The bootstrap gate runs this script under a ceiling
+# (RECONCILE_TIMEOUT_SECONDS there), and a fleet whose missing profiles cannot all be
+# scaffolded inside it would otherwise be killed mid-run on every tick, leaving half-built
+# homes and no progress; under `--require-create-pass` a run that deferred exits
+# EXIT_CREATES_DEFERRED so the gate asks again next tick. Only a create that succeeded
+# counts: a failed one costs the run its time but not a place in the batch, so a cluster
+# sorted behind a hundred failing ones is still attempted, as every cluster was before the
+# cap, and a deferral always means the run made its cap's worth of progress. The hourly
+# producer takes the same cap, so a scope widening onboards that many clusters an hour. Read
+# from the agent container's environment (`spec.deployment.env` carries it); anything but a
+# positive integer reads as the default.
+MAX_CREATES_PER_RUN_ENV = "BOOTSTRAP_MAX_CREATES_PER_TICK"
+MAX_CREATES_PER_RUN_DEFAULT = 100
+try:
+    MAX_CREATES_PER_RUN = int(os.environ.get(MAX_CREATES_PER_RUN_ENV) or MAX_CREATES_PER_RUN_DEFAULT)
+except ValueError:
+    MAX_CREATES_PER_RUN = MAX_CREATES_PER_RUN_DEFAULT
+if MAX_CREATES_PER_RUN < 1:
+    MAX_CREATES_PER_RUN = MAX_CREATES_PER_RUN_DEFAULT
 VIA_MANAGEMENT = "management"
 VIA_EXPLICIT = "explicit"
 # Two caps (design §3): the CRD caps each declared list at 100, and the declared
@@ -242,6 +286,11 @@ _DENIED_MARKERS = ("PERMISSION_DENIED", "403", "does not have permission", "Perm
 _CREATE_DENIED_MARKERS = ("PERMISSION_DENIED", "code=403", "does not have permission")
 _API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "API has not been used",
                          "is not enabled", "has not been enabled")
+# The runner the scope lookups' gcloud goes through (`_run`). None is `sandbox_exec.run`, the
+# reconcile's own route through the shell sandbox. The scope publisher (scope_publisher.py), a
+# Job with no sandbox, sets its broker runner here before its first lookup. Read at call time,
+# so a test that patches `sandbox_exec.run` still reaches the lookups.
+COMMAND_RUNNER = None
 
 
 
@@ -269,9 +318,22 @@ def _run_env() -> dict[str, str]:
     For `hermes` only. Every gcloud call in this file goes through
     `sandbox_exec.run`, which runs it in the shell sandbox and builds its own
     environment there — this one carries the agent pod's, including
-    `API_SERVER_KEY`, and must not travel over the connection.
+    `API_SERVER_KEY`, and must not travel over the connection. The scope lookups
+    go by way of `_run`, which a caller with no sandbox (scope_publisher.py)
+    points at its own runner instead.
     """
     return {**os.environ, "HOME": "/tmp"}
+
+
+def _run(argv: list[str], *, check: bool, timeout: float):
+    """One scope lookup's gcloud, through COMMAND_RUNNER when one is set, else `sandbox_exec.run`
+    with the shim told its retry deadline (a COMMAND_RUNNER sets that in its own environment)."""
+    if COMMAND_RUNNER is not None:
+        return COMMAND_RUNNER(argv, check=check, timeout=timeout)
+    return sandbox_exec.run(
+        argv, check=check, timeout=timeout,
+        remote_env={credential_proxy_client.RETRY_DEADLINE_ENV: str(SHIM_RETRY_DEADLINE_SECONDS)},
+    )
 
 
 def _project_source() -> tuple[str | None, bool]:
@@ -317,7 +379,10 @@ def _project_source() -> tuple[str | None, bool]:
     if p:
         return p, True
     try:
-        r = sandbox_exec.run(["gcloud", "config", "get-value", "project"], timeout=30)
+        r = sandbox_exec.run(
+            ["gcloud", "config", "get-value", "project"], timeout=PROJECT_LOOKUP_TIMEOUT_SECONDS,
+            remote_env={credential_proxy_client.RETRY_DEADLINE_ENV: str(PROJECT_LOOKUP_SHIM_RETRY_DEADLINE_SECONDS)},
+        )
         return r.stdout.strip() or None, False
     except Exception:  # noqa: BLE001
         return None, False
@@ -401,7 +466,256 @@ def _list_projects(projects: list[str], deadline: float, workers: int = LIST_WOR
     budget, before calling this: its listing decides `create_pass_ran`, and when it
     reaches the sandbox its ssh opens the multiplexed connection the pool then shares.
     """
-    return _bounded_map(_list_project, projects, deadline, "listing clusters in", workers, budget_seconds)
+    if not projects:
+        return {}
+    listed = _relay_lists(projects, deadline) or {}
+    rest = [p for p in projects if p not in listed]
+    if rest:
+        listed.update(_bounded_map(_list_project, rest, deadline, "listing clusters in", workers, budget_seconds))
+    return listed
+
+
+# The GKE reads through the broker's read-only Cloud API relay (#3703), from one sandbox
+# process per batch: `gke_cluster_reads.py` does every list and get as a REST call on the
+# shell's token (`api_policy` routes gcp.api.container.clusters-list and -get, projected
+# to name, location, status and id). A `gcloud` process per read cost ~2.4 s of the
+# sandbox's CPU each; a REST call costs a fraction of that.
+#
+# gcloud stays the fallback, at two grains. For the rest of the run, when the relay
+# itself is unusable: the helper is missing (a sandbox image older than this script)
+# or broken, the broker refuses the host (a broker older than the routes) or this
+# caller's role, or every read in a batch failed in the relay (no answer from the
+# broker, a 401, the broker without its credential). For one
+# read, when the broker refused that read alone: a body over its cap, a path its
+# table does not take, an answer it could not project, or a read the helper's own
+# deadline left unstarted. A version skew between the pods costs speed, never
+# correctness.
+# The root-owned copy `hermes` may run, never one under /opt/defaults or /opt/data
+# (gke_cluster_reads.SANDBOX_GKE_READS; test_gke_cluster_reads holds the two equal).
+GKE_READS_HELPER = "/opt/vcs/libexec/platform/gke_cluster_reads.py"
+GKE_READS_WORKERS = 16
+# The share of a pass's remaining budget a relay batch may spend, so a helper that
+# stalls leaves gcloud the rest.
+RELAY_BUDGET_SHARE = 0.5
+# What the helper's own deadline leaves for the ssh login and the interpreter's start.
+RELAY_STARTUP_SECONDS = 3.0
+# Below this, a batch is not tried: the helper could not finish a call in it.
+RELAY_MIN_BATCH_SECONDS = 2.0
+# Refusals about the relay, not one read: the host (a broker older than the routes),
+# the caller's role, a handler with no relay. The run uses gcloud from here on.
+_RELAY_OFF_CODES = frozenset({"CALLER_ROLE_FORBIDDEN", "API_RELAY_DISABLED"})
+_RELAY_OFF_RULES = frozenset({"gcp.api.host", "gcp.api.host-refused"})
+# Refusals about one read: that read goes to gcloud, and the batch's others stand.
+_RELAY_ROW_CODES = frozenset({"SECURITY_POLICY_BLOCKED", "UPSTREAM_UNEXPECTED", "UPSTREAM_RESPONSE_TOO_LARGE",
+                              "UPSTREAM_REDIRECTED"})
+# Failures that say the relay cannot serve this caller at all: no HTTP answer from the
+# broker, a 401, or the broker without its own credential. One on one row is that read's
+# "unknown"; on every row of a batch the run falls back to gcloud. The broker's other
+# failure codes (UPSTREAM_TIMEOUT and the rest) are about one call to Google, come only
+# after the relay has accepted the read, and stay that read's "unknown" however many
+# rows carry them -- the management project is a batch of one.
+_RELAY_UNREACHABLE_CODES = frozenset({"RELAY_CREDENTIAL_UNAVAILABLE"})
+# A project, location or cluster name the helper may put in a URL path. Anything else
+# (a slash, a dot segment, a `?` or `#`, which `requests` would read as the end of the
+# path) is read with gcloud instead, so a malformed identity can never be looked up as
+# some other cluster.
+_RELAY_SEGMENT = re.compile(r"[a-z0-9][a-z0-9.:-]*")
+_relay_unusable_this_run = False
+
+
+def _relayable(*segments: str) -> bool:
+    return all(isinstance(x, str) and _RELAY_SEGMENT.fullmatch(x) and ".." not in x for x in segments)
+
+
+class _RelayUnusable(Exception):
+    """The relay answered in a way that says nothing about the clusters; use gcloud."""
+
+
+class _RowToGcloud(Exception):
+    """The broker refused this one read; gcloud reads it instead."""
+
+
+def _relay_budget(deadline: float) -> tuple[float, float] | None:
+    """(seconds to wait for the helper, the helper's own budget), or None to skip the relay.
+
+    The helper's budget sits under the wait by the start-up allowance, and the helper
+    starts no call it could not finish inside it, so a slow call is one read's
+    "unknown" and the batch comes back whole.
+    """
+    wait = (deadline - time.monotonic()) * RELAY_BUDGET_SHARE
+    if wait < RELAY_MIN_BATCH_SECONDS + RELAY_STARTUP_SECONDS:
+        return None
+    return wait, wait - RELAY_STARTUP_SECONDS
+
+
+def _relay_reads(request: dict, timeout: float) -> dict | None:
+    """One batch through the sandbox helper, or None when it could not run or answer.
+
+    A helper that ran out of time costs this batch only; one that could not run at all
+    (missing, broken, unreadable answer) turns the relay off for the run.
+    """
+    global _relay_unusable_this_run
+    try:
+        result = sandbox_exec.run(["python3", GKE_READS_HELPER], stdin=json.dumps(request),
+                                  check=True, timeout=timeout)
+        answer = json.loads(result.stdout or "")
+    except subprocess.TimeoutExpired:
+        log(f"the GKE relay helper did not answer within {timeout:.0f}s; using gcloud for this batch.")
+        return None
+    except subprocess.CalledProcessError as e:
+        _relay_unusable_this_run = True
+        # CalledProcessError stringifies to just the exit status; the reason is on stderr.
+        reason = (e.stderr or "").strip()[-LOG_ROW_PREVIEW_CHARS:] or f"exit status {e.returncode}"
+        log(f"the GKE relay helper could not run ({reason}); using gcloud this run.")
+        return None
+    except Exception as e:  # noqa: BLE001 - any failure means "use gcloud", never a verdict
+        _relay_unusable_this_run = True
+        log(f"the GKE relay helper could not run ({type(e).__name__}: {str(e)[:LOG_ROW_PREVIEW_CHARS]}); "
+            f"using gcloud this run.")
+        return None
+    if not isinstance(answer, dict):
+        _relay_unusable_this_run = True
+        log("the GKE relay helper answered something other than a JSON object; using gcloud this run.")
+        return None
+    return answer
+
+
+def _google_error_text(error: dict | None) -> str:
+    """The Google error's status, reasons and message as one string for the classifier."""
+    inner = (error or {}).get("error")
+    if not isinstance(inner, dict):
+        return json.dumps(error or {})[:LOG_ROW_PREVIEW_CHARS]
+    reasons = [d.get("reason", "") for d in inner.get("details") or [] if isinstance(d, dict)]
+    reasons += [e.get("reason", "") for e in inner.get("errors") or [] if isinstance(e, dict)]
+    return " ".join(str(x) for x in (inner.get("status", ""), inner.get("code", ""), *reasons, inner.get("message", "")))
+
+
+def _check_relay_answer(row) -> dict:
+    if not isinstance(row, dict):
+        raise _RelayUnusable("a row that is not an object")
+    error = row.get("error")
+    if not isinstance(error, dict):
+        return row
+    code = error.get("code")
+    if code in _RELAY_OFF_CODES or (code == "SECURITY_POLICY_BLOCKED" and error.get("rule") in _RELAY_OFF_RULES):
+        raise _RelayUnusable(f"the broker answered {code} ({error.get('rule', '')})")
+    if code in _RELAY_ROW_CODES:
+        raise _RowToGcloud(f"{code} ({error.get('rule', '')})")
+    if error.get("skipped"):
+        raise _RowToGcloud(f"not started: {error['skipped']}")
+    return row
+
+
+def _transport_failure(row) -> bool:
+    if not isinstance(row, dict):
+        return False
+    error = row.get("error")
+    error = error if isinstance(error, dict) else {}
+    # A read timeout means the broker took the connection and had not finished within a
+    # window the helper chose: that read's "unknown", like the broker's own UPSTREAM_TIMEOUT.
+    if error.get("skipped") or error.get("exception") == "ReadTimeout":
+        return False
+    return not row.get("status") or row.get("status") == 401 or error.get("code") in _RELAY_UNREACHABLE_CODES
+
+
+def _check_relay_batch(rows: list) -> None:
+    """Raise _RelayUnusable when every read in a batch failed in the relay, not at Google."""
+    if rows and all(_transport_failure(row) for row in rows):
+        raise _RelayUnusable(f"all {len(rows)} read(s) failed in the relay, e.g. status {rows[0].get('status') or 0}: "
+                             f"{json.dumps(rows[0].get('error') or {})[:LOG_ROW_PREVIEW_CHARS]}")
+
+
+def _read_list(project: str, row) -> tuple[list | None, str]:
+    """A relayed `clusters.list` answer in `_list_project`'s shape."""
+    row = _check_relay_answer(row)
+    if row.get("status") == 200 and isinstance(row.get("clusters"), list):
+        return [(project, name, location) for name, location in row["clusters"]], OUTCOME_OK
+    if not row.get("status"):
+        log(f"listing clusters in {project} got no HTTP answer ({OUTCOME_UNREACHABLE}; skipping create for it "
+            f"this run): {json.dumps(row.get('error') or {})[:LOG_ROW_PREVIEW_CHARS]}")
+        return None, OUTCOME_UNREACHABLE
+    text = _google_error_text(row.get("error"))
+    outcome = _classify_list_failure(text)
+    log(f"listing clusters in {project} failed ({outcome}; skipping create for it this run): {text}")
+    return None, outcome
+
+
+def _read_get(project: str, location: str, cluster: str, row) -> bool | None:
+    """A relayed `clusters.get` answer as `_cluster_exists` answers: True, False or None.
+
+    False only for the API's own NotFound: a 404 whose body is a Google error with status
+    NOT_FOUND. A 404 from anywhere else (the broker, a proxy in between) is unknown.
+    """
+    row = _check_relay_answer(row)
+    status = row.get("status")
+    if status == 200:
+        return True
+    inner = (row.get("error") or {}).get("error")
+    if status == 404 and isinstance(inner, dict) and inner.get("status") == "NOT_FOUND":
+        return False
+    text = _google_error_text(row.get("error"))
+    classified = _classify_list_failure(text)
+    if classified == OUTCOME_DENIED:
+        _denied_this_run.add(project)
+    elif classified == OUTCOME_API_DISABLED:
+        _api_disabled_this_run.add(project)
+    log(f"describe {cluster} ({project}/{location}) through the relay answered {status or 'nothing'} "
+        f"(treating as unknown): {text}")
+    return None
+
+
+def _relay_batch(kind: str, keys: dict, request: dict, rows_of, read, deadline: float) -> dict | None:
+    """`key -> read(row)` for each key the relay answered, or None to use gcloud for all.
+
+    A key missing from the result is one the broker refused alone, or one the helper's
+    deadline left unstarted: the caller reads it with gcloud.
+    """
+    global _relay_unusable_this_run
+    if _relay_unusable_this_run:
+        return None
+    budget = _relay_budget(deadline)
+    if budget is None:
+        return None
+    wait, helper_budget = budget
+    answer = _relay_reads({**request, "workers": GKE_READS_WORKERS, "budget_seconds": helper_budget}, wait)
+    if answer is None:
+        return None
+    try:
+        rows = rows_of(answer)
+        _check_relay_batch([rows[k] for k in keys.values()])
+        out = {}
+        for key, row_key in keys.items():
+            try:
+                out[key] = read(key, rows[row_key])
+            except _RowToGcloud as e:
+                log(f"the relay refused {kind} {key} alone ({e}); reading it with gcloud.")
+        return out
+    except (KeyError, TypeError, ValueError, _RelayUnusable) as e:
+        _relay_unusable_this_run = True
+        log(f"the GKE relay is not usable this run ({type(e).__name__}: {e}); {kind} with gcloud.")
+        return None
+
+
+def _relay_lists(projects: list[str], deadline: float) -> dict[str, tuple[list | None, str]] | None:
+    """Each project the relay listed; see `_relay_batch` for what a missing key means."""
+    projects = [p for p in projects if _relayable(p)]
+    if not projects:
+        return {}
+    return _relay_batch("listing", {p: p for p in projects}, {"projects": projects},
+                        lambda answer: answer["lists"], _read_list, deadline)
+
+
+def _relay_describes(keys: dict[str, dict], deadline: float) -> dict[str, tuple[bool | None, str]] | None:
+    """`name -> (exists, "")` for each identity the relay answered; see `_relay_batch`."""
+    if not keys:
+        return {}
+    triples = {name: (i["project"], i["location"], i["cluster"]) for name, i in keys.items()
+               if _relayable(i["project"], i["location"], i["cluster"])}
+    if not triples:
+        return {}
+    return _relay_batch("describing", {name: "/".join(t) for name, t in triples.items()},
+                        {"clusters": [list(t) for t in triples.values()]}, lambda answer: answer["gets"],
+                        lambda name, row: (_read_get(*triples[name], row), ""), deadline)
 
 
 def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[list | None, str]:
@@ -413,12 +727,14 @@ def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
 
     (None, outcome) means the list could not be read; ([], "ok") means the project
     genuinely has no clusters. The caller degrades identically either way — PRUNE
-    runs off `_cluster_exists`, not this list, so a bad list can never delete
-    anything — but the outcome is what tells the bootstrap gate, and the snapshot,
+    reads this list only as proof that a cluster exists, and deletes only on a
+    NotFound from the cluster's own lookup (`_read_get` through the relay,
+    `_cluster_exists` on the gcloud fallback), so a bad list can never delete anything — but
+    the outcome is what tells the bootstrap gate, and the snapshot,
     which projects the roster it is about to read actually covers.
     """
     try:
-        r = sandbox_exec.run(
+        r = _run(
             ["gcloud", "container", "clusters", "list", "--project", project,
              "--format=value(name,location)"],
             check=True, timeout=timeout,
@@ -621,7 +937,7 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
     cmd = ["gcloud", "asset", "search-all-resources", f"--scope={container}",
            f"--asset-types={ASSET_TYPE_CLUSTER}", f"--format={ASSET_SEARCH_FORMAT}"]
     try:
-        result = sandbox_exec.run(cmd, check=True, timeout=timeout)
+        result = _run(cmd, check=True, timeout=timeout)
         try:
             assets = json.loads(result.stdout or "[]")
         except ValueError as e:
@@ -632,6 +948,12 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
         if not isinstance(assets, list):
             raise ValueError("asset search did not return a list")
     except subprocess.CalledProcessError as e:
+        if _PROXY_TRUNCATED_MARKER in (e.stderr or ""):
+            # The shim's exit 74 on a cut reply: the cap, not a failed call.
+            log(f"resolving {container} errored ({OUTCOME_UNREACHABLE}; its previous members are carried "
+                f"forward): the credential proxy cut the search output at its cap; the container "
+                f"holds more clusters than one search can return through it")
+            return None, OUTCOME_UNREACHABLE
         outcome = _classify_list_failure(e.stderr or "")
         log(f"resolving {container} through Cloud Asset Inventory failed ({outcome}; its previous "
             f"members are carried forward, no CREATE under them): {(e.stderr or '').strip()}")
@@ -676,7 +998,7 @@ def _resolve_selector(selector: str, timeout: float = LIST_TIMEOUT_SECONDS) -> t
         cmd = ["gcloud", "beta", "monitoring", "metrics-scopes", "describe",
                f"{METRICS_SCOPE_NAME_PREFIX}{value}", f"--format={METRICS_SCOPE_FORMAT}"]
     try:
-        result = sandbox_exec.run(cmd, check=True, timeout=timeout)
+        result = _run(cmd, check=True, timeout=timeout)
         parsed = json.loads(result.stdout or "null")
         members = (_xpn_members(parsed) if kind == SELECTOR_KIND_SHARED_VPC
                    else _monitored_members(parsed))
@@ -743,7 +1065,7 @@ def _project_id_of(number: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
     """
     cmd = ["gcloud", "projects", "describe", number, f"--format={PROJECT_ID_FORMAT}"]
     try:
-        result = sandbox_exec.run(cmd, check=True, timeout=timeout)
+        result = _run(cmd, check=True, timeout=timeout)
         project = (result.stdout or "").strip()
         if not project:
             raise ValueError("projects describe returned no project ID")
@@ -1303,7 +1625,13 @@ def _cluster_exists(project: str, cluster: str, location: str, timeout: float = 
         f"--location={location}", f"--project={project}", "--format=json(status, id)",
     ]
     try:
-        sandbox_exec.run(cmd, check=True, timeout=timeout)
+        # The shim is told the cap less the broker's gcloud run bound (the constants comment at
+        # SHIM_RETRY_DEADLINE_SECONDS), under which no retry fits, so a refusal, held or the
+        # watermark gate's, is logged below with the broker's reason rather than as a timeout.
+        sandbox_exec.run(
+            cmd, check=True, timeout=timeout,
+            remote_env={credential_proxy_client.RETRY_DEADLINE_ENV: str(max(0, timeout - BROKER_GCLOUD_RUN_SECONDS))},
+        )
         return True
     except subprocess.CalledProcessError as e:
         stderr = e.stderr or ""
@@ -1329,6 +1657,9 @@ EXIT_CREATE_PASS_SKIPPED = 3
 # Another reconcile holds the lock. Also distinct from 1: the caller has learned
 # nothing about the roster and should retry rather than count this as a failure.
 EXIT_ALREADY_RUNNING = 4
+# The run created its cap's worth (MAX_CREATES_PER_RUN) and deferred the rest. Nothing
+# failed, so the caller retries next tick without counting it as a failure, as for 4.
+EXIT_CREATES_DEFERRED = 5
 
 RECONCILE_LOCK = ".cluster_agent_reconcile.lock"
 
@@ -1343,7 +1674,10 @@ def _exclusive_run():
     apart. Overlapping runs would call `create_profile` and `delete_profile` against
     the same profile home: interleaved read-modify-writes of `config.yaml` and
     `.env`, or an rmtree under a scaffold in progress. The lock lives here rather
-    than in either caller because it has to cover both.
+    than in either caller because it has to cover both. create_profile and
+    delete_profile also hold a per-profile lock of their own, which is what keeps a
+    `create` run outside the reconcile (by hand in the agent pod, or bench seeding)
+    apart from this run's PRUNE of the same name (#4389).
     """
     path = _hermes_home() / RECONCILE_LOCK
     try:
@@ -1413,6 +1747,7 @@ def reconcile(dry_run: bool = False) -> dict:
         "skipped_error": [],     # liveness check was inconclusive (auth/network/etc.)
         "incomplete": [],        # identity stamped but the scaffold never finished
         "create_failed": [],     # cluster that should have a profile and could not get one
+        "create_deferred": [],   # cluster left for the next run by MAX_CREATES_PER_RUN
         "unmanaged": [],  # kept and listed: project never produced by the scope, retiring, or carried forward
         "retiring": [],          # project the scope dropped whose profiles are being removed
     }
@@ -1448,6 +1783,8 @@ def reconcile(dry_run: bool = False) -> dict:
     management, management_authoritative = _project_source()
     _denied_this_run.clear()
     _api_disabled_this_run.clear()
+    global _relay_unusable_this_run
+    _relay_unusable_this_run = False
     scope, scope_readable, scope_present, containers_known, selectors_known = _load_scope()
     previous = _load_previous_snapshot()
     # An unreadable or absent declaration keeps the exclusions of the last one read. The
@@ -1506,7 +1843,8 @@ def reconcile(dry_run: bool = False) -> dict:
     listing_deadline = time.monotonic() + list_budget
     listings: dict[str, tuple[list | None, str]] = {}
     if management:
-        listings[management] = _list_project(management)
+        relayed = _relay_lists([management], listing_deadline) or {}
+        listings[management] = relayed[management] if management in relayed else _list_project(management)
     groups = _resolve_groups(_container_ids(scope) + _selector_ids(scope), listing_deadline, workers, list_budget)
     searches = {g: r for g, r in groups.items() if _is_container(g)}
     selector_reports = {g: r for g, r in groups.items() if _is_selector(g)}
@@ -1548,6 +1886,18 @@ def reconcile(dry_run: bool = False) -> dict:
     cluster_counts: dict[str, int | None] = {}
     to_list = [e["id"] for e in entries if e["outcome"] is None and e["id"] not in listings]
     listings.update(_list_projects(to_list, listing_deadline, workers, list_budget))
+    # What each project's own `clusters list` named this run, taken before the container
+    # members are filled in below. PRUNE reads it as proof of existence and skips those
+    # describes (#3703). It is never proof of absence: a list can be partial, so a cluster
+    # missing from it is still described, and only a NotFound from that describe deletes.
+    # Asset Inventory rows are left out on purpose: the index lags, and a member project's
+    # describe is the one call that sees an IAM deny on it (the `denied` revision below).
+    seen_by_list: set[tuple[str, str, str]] = {
+        triple
+        for listed, outcome in listings.values()
+        if listed is not None and outcome == OUTCOME_OK
+        for triple in listed
+    }
     for entry in entries:
         # A container member: Asset Inventory named its clusters already.
         if "clusters" in entry and entry["id"] not in listings:
@@ -1589,6 +1939,15 @@ def reconcile(dry_run: bool = False) -> dict:
             if cluster in EXTRA_EXCLUDE:
                 log(f"{cluster} ({proj}/{location}) is skipped by RECONCILE_EXCLUDE, a bare name; "
                     "move it to spec.scope.exclude.clusters, the variable retires next release.")
+                continue
+            # The per-run cap, before the describe a container member costs: a cluster
+            # past it is left for the next run, which finds it still without a profile.
+            # Failed creates do not count (see MAX_CREATES_PER_RUN).
+            if len(report["created"]) >= MAX_CREATES_PER_RUN:
+                if not report["create_deferred"]:
+                    log(f"create cap reached ({MAX_CREATES_PER_RUN} per run, {MAX_CREATES_PER_RUN_ENV}); "
+                        "every further cluster without a profile is deferred to the next run.")
+                report["create_deferred"].append(f"{cluster}/{location}")
                 continue
             if member_only:
                 # Per cluster: the index lags real state by minutes, so a member's cluster the
@@ -1793,7 +2152,8 @@ def reconcile(dry_run: bool = False) -> dict:
     log(f"Reconciling {len(profiles)} managed profile(s){' (dry-run)' if dry_run else ''}.")
     previous_attribution = _previous_attribution(previous)
     unattributed_counts: dict[str, int] = {}
-    # Every profile that will reach the liveness check is described now, `workers` at a
+    # Every profile that will reach the liveness check, and that its project's own list did
+    # not name this run (below), is described now, `workers` at a
     # time under PRUNE's budget, and the loop below reads the answers in profile order, so
     # the log and the report are as they were when the walk was sequential. A policy prune
     # (an excluded cluster) and a scope prune (a retiring project on a clean run) need no
@@ -1813,12 +2173,28 @@ def reconcile(dry_run: bool = False) -> dict:
         and not (identities[name]["project"] not in resolved_ids
                  and lookups_clean and identities[name]["project"] in previously_retiring)
     ]
+    # A cluster its own project's list named this run exists: no describe (#3703). That turns
+    # N describes a tick into roughly the clusters that went away since the last one.
+    listed_alive = [
+        name for name in to_describe
+        if (identities[name]["project"], identities[name]["cluster"], identities[name]["location"]) in seen_by_list
+    ]
+    alive = set(listed_alive)
+    to_describe = [name for name in to_describe if name not in alive]
+    if listed_alive:
+        log(f"{len(listed_alive)} profile(s) are on their project's cluster list this run; "
+            f"describing the other {len(to_describe)}.")
     prune_budget = _prune_budget_seconds(cap, len(to_describe))
-    described = _bounded_map(
-        lambda name, timeout: (_cluster_exists(**identities[name], timeout=timeout), ""),
-        to_describe, time.monotonic() + prune_budget, "describing the cluster of", workers, prune_budget,
-        consequence="inconclusive; the profile is kept",
-    )
+    prune_deadline = time.monotonic() + prune_budget
+    described = _relay_describes({name: identities[name] for name in to_describe}, prune_deadline) or {}
+    rest = [name for name in to_describe if name not in described]
+    if rest:
+        described.update(_bounded_map(
+            lambda name, timeout: (_cluster_exists(**identities[name], timeout=timeout), ""),
+            rest, prune_deadline, "describing the cluster of", workers, prune_budget,
+            consequence="inconclusive; the profile is kept",
+        ))
+    described.update({name: (True, "") for name in listed_alive})
     for name in profiles:
         identity = identities[name]
         if identity is None:
@@ -2062,6 +2438,15 @@ def _format_notification(report: dict) -> str:
             f"  ❌ {len(failed)} cluster(s) could not be given a profile "
             f"(retried next run): {', '.join(f'`{n}`' for n in failed)}."
         )
+    deferred = report.get("create_deferred", [])
+    if deferred:
+        named = ", ".join(f"`{n}`" for n in deferred[:NOTIFY_UNLISTED_LIMIT])
+        rest = len(deferred) - NOTIFY_UNLISTED_LIMIT
+        lines.append(
+            f"  ⏭ {len(deferred)} cluster(s) deferred to the next run by the cap of "
+            f"{MAX_CREATES_PER_RUN} creates per run: {named}"
+            + (f", and {rest} more." if rest > 0 else ".")
+        )
     if report.get("skipped_error"):
         lines.append(
             f"  ⚠️ {len(report['skipped_error'])} profile(s) could not be verified this run "
@@ -2141,8 +2526,9 @@ def main() -> None:
     parser.add_argument(
         "--require-create-pass", action="store_true",
         help="Exit non-zero if the CREATE direction could not run (no management project, or "
-             "its cluster list failed), if it ran and every create failed, if the run raised, or "
-             "if another run holds the lock (4). Off by default: "
+             "its cluster list failed), if it ran and every create failed, if the run raised, "
+             "if another run holds the lock (4), or if the per-run create cap deferred some "
+             "clusters to the next run (5). Off by default: "
              "the cron producer must always exit 0.",
     )
     args = parser.parse_args()
@@ -2166,9 +2552,9 @@ def main() -> None:
             return
 
     log(
-        "Done: created={} failed={} pruned={} kept={} no_identity={} unknown={}.".format(
+        "Done: created={} failed={} deferred={} pruned={} kept={} no_identity={} unknown={}.".format(
             len(report.get("created", [])), len(report.get("create_failed", [])),
-            len(report.get("pruned", [])),
+            len(report.get("create_deferred", [])), len(report.get("pruned", [])),
             len(report.get("kept", [])), len(report.get("skipped_no_identity", [])),
             len(report.get("skipped_error", [])),
         )
@@ -2210,6 +2596,13 @@ def main() -> None:
     if args.require_create_pass and unreconciled:
         log(f"{unreconciled}; the roster is not reconciled.")
         raise SystemExit(EXIT_CREATE_PASS_SKIPPED)
+    # A deferral means the run created its cap's worth, so this is progress, never a
+    # failure: the gate retries without spending an attempt, and the next run's listing
+    # finds the deferred clusters still without a profile.
+    if args.require_create_pass and report.get("create_deferred"):
+        log(f"{len(report['create_deferred'])} cluster(s) deferred to the next run by the cap of "
+            f"{MAX_CREATES_PER_RUN}; the roster is not reconciled yet.")
+        raise SystemExit(EXIT_CREATES_DEFERRED)
 
 
 if __name__ == "__main__":

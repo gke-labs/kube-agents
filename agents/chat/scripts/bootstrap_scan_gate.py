@@ -4,9 +4,9 @@
 
 First-time onboarding needs a full GKE discovery sweep (control plane options,
 node pools, Workload Identity, running workloads): ``bootstrap_handoff.py``
-files one audit card per Cluster Agent and writes their findings to
-``INVENTORY.raw.md``, the sweep card lists the fleet and audits clusters with
-no Cluster Agent, and a second card ranks it all into the short report the user
+files one audit card per Cluster Agent up to the first-run cap and writes their
+findings to ``INVENTORY.raw.md``, the sweep card lists the fleet and audits
+clusters with no Cluster Agent or past the cap, and a second card ranks it all into the short report the user
 receives. The audits are LLM work AND privileged work, and the
 profile this cron runs on can do neither: the Chat Agent's toolsets are
 deliberately stripped to ``mcp-router`` + ``kanban`` (no terminal, no gcloud,
@@ -23,9 +23,10 @@ So this runs as a ``no_agent`` script — a plain subprocess, not bound by the
 Chat Agent's toolset denylist — and files the sweep as a **kanban task assigned
 to** ``platform``, the privileged specialist. The dispatcher spawns that worker
 with its full toolset; the worker lists the fleet, audits any cluster with no
-Cluster Agent, and completes its own card. ``bootstrap_handoff.py``, on this
-job's ticks, files one audit card per Cluster Agent, waits for them, writes the
-raw findings, and files the prioritization card.
+Cluster Agent or past the first-run cap, and completes its own card.
+``bootstrap_handoff.py``, on this job's ticks, files one audit card per Cluster
+Agent up to that cap, waits for them, writes the raw findings, and files the
+prioritization card.
 
 Filing is once-only, and this job owns that guarantee locally: the id of the
 card it filed is recorded in ``.bootstrap_scan_filed``, and while that marker
@@ -122,7 +123,8 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
     "/opt/platform-template/governance/cluster_inventory_audit_sop.md",
 )
 # Present only where per-cluster agents are deployed. When absent, the sweep degrades to
-# a single-agent walk of the fleet; when present, the gate files one audit card per cluster.
+# a single-agent walk of the fleet; when present, the gate files one audit card per Cluster
+# Agent up to the first-run cap, and the sweep audits the rest.
 # Resolved under the data dir rather than hardcoded: `spec.harness.hermes.agentHome` moves
 # the whole tree, and a missing path here silently files the solo sweep.
 RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
@@ -157,6 +159,15 @@ RECONCILE_SETTLE_SECONDS = 30
 # script, because the hourly `cluster-agent-reconcile` job runs it too and the
 # gateway's cron lock is per job id — a lock held here would not keep the two apart.
 RECONCILE_ALREADY_RUNNING = 4
+# `cluster_agent_reconcile.EXIT_CREATES_DEFERRED`: the run created its cap's worth of
+# profiles (BOOTSTRAP_MAX_CREATES_PER_TICK there, 100 by default) and left the rest for
+# the next run, so a fleet too large to scaffold inside the ceiling below arrives in
+# batches, one tick apart, rather than being killed mid-run every tick. Nothing failed,
+# so the attempt is given back as for a held lock.
+RECONCILE_CREATES_DEFERRED = 5
+# How much of the reconcile's stderr a deferral line repeats: its last lines carry the
+# created/deferred counts.
+RECONCILE_STDERR_TAIL_CHARS = 500
 # After this many failed reconciles, AND this much wall clock since the first of them,
 # the sweep proceeds anyway. A reconcile that cannot succeed (no IAM to list clusters)
 # must not hold onboarding shut forever — a solo sweep is a worse report, no report is
@@ -180,7 +191,7 @@ def _reconcile_script(data_dir: Path) -> Path:
     return data_dir / "scripts" / RECONCILE_SCRIPT_NAME
 
 
-def cluster_agents() -> list[dict]:
+def cluster_agents(capped: bool = True) -> list[dict]:
     """The ready Cluster Agents, one ``{name, key, title, cluster_label}`` each.
 
     The gate files one card per entry itself (``bootstrap_handoff``) and lists
@@ -212,6 +223,15 @@ def cluster_agents() -> list[dict]:
     files the sweep, so it must not take the other profiles with it. An entry
     whose stat fails with EACCES or EIO fails ``list_profiles`` itself, below;
     ``list_profiles`` leaves out a dangling symlink.
+
+    At most the first-run cap's entries, the first by profile name (#3702):
+    each entry is a model turn before the user has asked anything, and a
+    cluster past the cap is left to the sweep, the same as one whose profile is
+    not ready. Once the sweep is filed the cap is the one its marker recorded
+    (``bootstrap_handoff.sweep_cluster_cards``), and the entries are only the
+    agents its marker lists as carded (``bootstrap_handoff.carded_keys``), so
+    neither a raised file nor a profile that became ready since can card a
+    cluster the sweep card already gave its worker.
 
     Failing to list the profiles, or to import the readiness rule, returns an
     empty list, which files the solo sweep. Raising would fail the run before
@@ -261,7 +281,25 @@ def cluster_agents() -> list[dict]:
             "title": f"Report cluster inventory: {label}",
             "cluster_label": label,
         })
-    return agents
+    # The first-run cap (#3702): the first so many by profile name, a stable
+    # order across ticks; the rest stay off the roster, so the sweep audits them.
+    agents.sort(key=lambda a: a["name"])
+    if not capped:
+        return agents
+    marker = _data_dir() / SCAN_FILED_MARKER
+    cap = bootstrap_handoff.sweep_cluster_cards(_data_dir(), marker)
+    # A filed sweep's card named the agents it carded; any other ready agent,
+    # one that became ready since or sorts into a slot a failed card left, is
+    # the sweep worker's already.
+    carded = bootstrap_handoff.carded_keys(marker)
+    if carded is not None:
+        agents = [a for a in agents if a["key"] in carded]
+    if len(agents) > cap:
+        sys.stderr.write(
+            f"bootstrap_scan_gate: {len(agents)} Cluster Agents are ready; the first {cap} get audit cards "
+            "and the sweep audits the rest\n"
+        )
+    return agents[:cap]
 
 
 def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
@@ -528,6 +566,20 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
         _record_reconcile_attempt(data_dir, attempts, since)
         return False
 
+    if proc.returncode == RECONCILE_CREATES_DEFERRED:
+        # The run made progress and stopped at its cap; the next tick continues from
+        # the profiles it left. The listing succeeded and a cap's worth of creates did,
+        # so the reconcile can succeed here: the streak ends as it does on exit 0, and
+        # the give-up clock starts over. Carrying the old streak through would let the
+        # IAM-propagation failures a fresh install starts with trip the clock while the
+        # batches were still landing, and file the sweep against a partial roster.
+        _record_reconcile_attempt(data_dir, 0)
+        sys.stderr.write(
+            "bootstrap_scan_gate: reconcile created a batch of Cluster Agents and deferred the rest "
+            f"to the next tick. stderr: {proc.stderr.strip()[-RECONCILE_STDERR_TAIL_CHARS:]}\n"
+        )
+        return False
+
     if proc.returncode != 0:
         sys.stderr.write(
             f"bootstrap_scan_gate: reconcile exited {proc.returncode}; "
@@ -566,14 +618,33 @@ def should_skip(data_dir: Path) -> bool:
     )
 
 
-def _task_body() -> str:
+def _task_body(cap: int | None = None, ready: list[dict] | None = None) -> str:
     multi = _scope_has_other_projects(_data_dir())
     every_cluster = "every cluster the projects in scope have" if multi else "every cluster the project has"
     cannot_list = "a project's clusters" if multi else "the project's clusters"
     lifecycle_holds = "the scope and its exclusions" if multi else "the `RECONCILE_EXCLUDE` opt-out"
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
     cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
-    roster = "\n".join(f"    - `{a['name']}`: {a['cluster_label']}" for a in cluster_agents()) or "    (none)"
+    if ready is None:
+        ready = cluster_agents(capped=False)
+    if cap is None:
+        cap = bootstrap_handoff.first_run_cluster_cards(_data_dir())
+    kept = ready[:cap]
+    roster = "\n".join(f"    - `{a['name']}`: {a['cluster_label']}" for a in kept) or "    (none)"
+    past_cap = ready[len(kept):]
+    past_cap_note = (
+        "**Past the first-run cap.** These clusters have a Cluster Agent but get no card this "
+        "sweep, to keep onboarding's model turns bounded. Audit them yourself in Step 3, like a "
+        "cluster the list does not name, and do not report them as lacking an agent:\n"
+        + "\n".join(f"    - {a['cluster_label']}" for a in past_cap)
+        + "\n\n"
+    ) if past_cap else ""
+    step3_count = (
+        "This fleet is past the first-run cap, so they include at least the clusters the note "
+        "above lists."
+        if past_cap
+        else "On a fleet under the first-run cap there are usually none."
+    )
     return (
         "First-time onboarding discovery sweep. Follow the inventory SOP, reading whichever "
         "of these exists:\n"
@@ -608,9 +679,10 @@ def _task_body() -> str:
         "one that reads as a clean fleet.\n\n"
         f"{_scope_gap_paragraph(_data_dir())}"
         f"{_excluded_clusters_paragraph(_data_dir())}"
-        "**Step 2 — do not fan out; the gate has.** This gate files one audit card per Cluster "
-        "Agent itself, read from the profiles when this card was filed:\n\n"
-        f"{roster}\n\n"
+        "**Step 2 — do not fan out; the gate has.** This gate files the audit cards itself, one "
+        "per Cluster Agent up to the first-run cap, for the agents below, read from the profiles "
+        "when this card was filed:\n\n"
+        f"{roster}\n\n{past_cap_note}"
         "**Do not create cluster cards, and do not look the roster up yourself:** your terminal "
         "runs in a sandbox that has neither `hermes` nor the profiles' configuration. **If the "
         "list above is `(none)`, there are no Cluster Agents: audit every cluster yourself in "
@@ -619,14 +691,15 @@ def _task_body() -> str:
         "**Step 3 — audit the clusters the list does not cover**, following Steps 2 to 4 of the "
         "single-cluster audit SOP (its own numbering) for each, reading whichever of these "
         f"exists:\n{cluster_audit_list}\n\n"
-        "and record each in that SOP's `metadata` shape. Usually there are none.\n\n"
+        f"and record each in that SOP's `metadata` shape. {step3_count}\n\n"
         "**Step 4 — complete this card now. Do not wait for the per-cluster cards, do not write "
         f"`{RAW_INVENTORY_PATH}` or `{INVENTORY_PATH}`, and do not file a ranking card.** The "
         "onboarding gate waits for the per-cluster cards, writes the raw findings from their "
         "`metadata`, and files the ranking card itself. Call `kanban_complete` with a short "
         "factual `result` and this `metadata`: `fleet` — one `{project, cluster, location, "
         "status}` object per cluster Step 1 listed; `clusters` — the Step 3 audits, each in the "
-        "single-cluster SOP's shape (an empty list when every cluster had an agent); `telemetry` — "
+        "single-cluster SOP's shape (an empty list only when no cluster lacked a Cluster Agent and none "
+        "was past the first-run cap); `telemetry` — "
         "the PlatformAgent's `.status.telemetry`, one line; `gaps` — anything you could not do, and why. A cluster you could not reach goes in `gaps`, not "
         "silently out of `fleet`.\n\n"
         "Do not message the user directly — delivery is handled for you."
@@ -672,10 +745,14 @@ def file_scan_task(data_dir: Path) -> str | None:
         sys.stderr.write(f"bootstrap_scan_gate: kanban API unavailable: {e}\n")
         return None
 
+    # Read once each, so the card's roster and the marker's count, cap and
+    # carded list agree: a second listing can fail or see another roster.
+    cap = bootstrap_handoff.first_run_cluster_cards(data_dir)
+    ready = cluster_agents(capped=False)
     cmd = (
         f"create --json --assignee {shlex.quote(SCAN_ASSIGNEE)} "
         f"--idempotency-key {shlex.quote(SCAN_IDEMPOTENCY_KEY)} "
-        f"--body {shlex.quote(_task_body())} "
+        f"--body {shlex.quote(_task_body(cap, ready))} "
         f"{shlex.quote(SCAN_TASK_TITLE)}"
     )
     try:
@@ -691,22 +768,41 @@ def file_scan_task(data_dir: Path) -> str | None:
         )
         return None
 
-    _mark_filed(data_dir, task_id)
+    # An empty listing pins nothing: no `carded=` and no `uncarded=`, so later
+    # ticks card the live roster under the cap, as before the pin. The listing
+    # returns [] both when it failed and when there are no Cluster Agents, and
+    # does not say which; a failed listing pinned as empty would leave every
+    # Cluster Agent uncarded for the whole sweep.
+    _mark_filed(
+        data_dir, task_id, uncarded=max(0, len(ready) - cap), cap=cap,
+        carded=[a["key"] for a in ready[:cap]] if ready else None,
+    )
     sys.stderr.write(f"bootstrap_scan_gate: filed sweep card {task_id}\n")
     return task_id
 
 
-def _mark_filed(data_dir: Path, task_id: str) -> None:
+def _mark_filed(
+    data_dir: Path, task_id: str, uncarded: int = 0, cap: int | None = None, carded: list[str] | None = None
+) -> None:
     """Record the filed card so no later tick files a second one.
 
     Written with the card id and timestamp rather than an empty touch file:
     when someone asks why onboarding is not progressing, this is the file that
-    tells them which card to go and look at.
+    tells them which card to go and look at. ``cap`` is the first-run cap the
+    sweep was filed under; later ticks hold to it rather than re-reading the
+    file (#3702). ``carded`` is the keys of the agents the card listed for
+    cards, and later ticks file for those only; written as a comma-separated
+    list of valid keys, at most FIRST_RUN_CLUSTER_CARDS_MAX, and not at all
+    when none is left, which later ticks read as no pin.
     """
     marker = data_dir / SCAN_FILED_MARKER
+    carded_field = _carded_field(carded or [])
     try:
         marker.write_text(
-            f"task_id={task_id}\nfiled_at={int(time.time())}\n",
+            f"task_id={task_id}\nfiled_at={int(time.time())}\n"
+            + (f"uncarded={uncarded}\n" if uncarded else "")
+            + (f"cap={cap}\n" if cap is not None else "")
+            + (f"carded={carded_field}\n" if carded_field else ""),
             encoding="utf-8",
         )
     except Exception as e:  # noqa: BLE001 - never fail the cron run
@@ -716,6 +812,11 @@ def _mark_filed(data_dir: Path, task_id: str) -> None:
             f"bootstrap_scan_gate: FILED {task_id} but could not write {marker}: {e}. "
             "Duplicate-scan protection has fallen back to the board's idempotency key.\n"
         )
+
+
+def _carded_field(carded: list[str]) -> str:
+    keys = [k for k in carded if bootstrap_handoff.CLUSTER_KEY.match(k)][: bootstrap_handoff.FIRST_RUN_CLUSTER_CARDS_MAX]
+    return ",".join(keys)
 
 
 def main(data_dir: Path | None = None) -> int:
@@ -739,7 +840,12 @@ def main(data_dir: Path | None = None) -> int:
 
 def _hand_off(data_dir: Path, marker: Path) -> None:
     try:
-        bootstrap_handoff.hand_off(data_dir, marker, _parse_task_id, roster=cluster_agents)
+        # The uncapped roster budgets the time limit for a sweep whose marker
+        # pinned nothing: a failed listing at filing still sent the worker to
+        # audit every cluster past the cap.
+        bootstrap_handoff.hand_off(
+            data_dir, marker, _parse_task_id, roster=cluster_agents, full_roster=lambda: cluster_agents(capped=False)
+        )
     except Exception as e:  # noqa: BLE001 - never fail the cron run; the next tick retries
         sys.stderr.write(f"bootstrap_scan_gate: hand-off failed: {e!r}\n")
 

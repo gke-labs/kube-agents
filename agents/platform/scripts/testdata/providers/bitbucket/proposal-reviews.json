@@ -1,0 +1,359 @@
+{
+  "payload": {
+    "number": 9
+  },
+  "responses": [
+    {
+      "values": [
+        {
+          "pull_request": {
+            "type": "pullrequest",
+            "id": 9,
+            "title": "Data 5",
+            "draft": false,
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/9"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra/pull-requests/9"
+              }
+            },
+            "queued": false
+          },
+          "comment": {
+            "id": 893060911,
+            "created_on": "2026-11-02T17:49:33.671001+00:00",
+            "updated_on": "2026-11-02T17:49:33.694599+00:00",
+            "content": {
+              "type": "rendered",
+              "raw": "Looks right to me.",
+              "markup": "markdown",
+              "html": "<p>Looks right to me.</p>"
+            },
+            "user": {
+              "display_name": "Example Maintainer",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/users/%7B0e0e0e0e-0000-4000-8000-000000000001%7D"
+                },
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/%7B0e0e0e0e-0000-4000-8000-000000000001%7D/"
+                }
+              },
+              "type": "user",
+              "uuid": "example-maintainer",
+              "account_id": "712020:00000000-0000-0000-0000-000000000002",
+              "nickname": "Example Maintainer"
+            },
+            "deleted": false,
+            "pending": false,
+            "type": "pullrequest_comment",
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/9/comments/893060911"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra/pull-requests/9/_/diff#comment-893060911"
+              }
+            },
+            "pullrequest": {
+              "type": "pullrequest",
+              "id": 9,
+              "title": "Data 5",
+              "draft": false,
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/9"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra/pull-requests/9"
+                }
+              },
+              "queued": false
+            }
+          }
+        },
+        {
+          "pull_request": {
+            "type": "pullrequest",
+            "id": 9,
+            "title": "Data 5",
+            "draft": false,
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/9"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra/pull-requests/9"
+              }
+            },
+            "queued": false
+          },
+          "approval": {
+            "date": "2026-11-02T17:49:32.313557+00:00",
+            "user": {
+              "display_name": "Example Maintainer",
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/users/%7B0e0e0e0e-0000-4000-8000-000000000001%7D"
+                },
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/%7B0e0e0e0e-0000-4000-8000-000000000001%7D/"
+                }
+              },
+              "type": "user",
+              "uuid": "example-maintainer",
+              "account_id": "712020:00000000-0000-0000-0000-000000000002",
+              "nickname": "Example Maintainer"
+            },
+            "pullrequest": {
+              "type": "pullrequest",
+              "id": 9,
+              "title": "Data 5",
+              "draft": false,
+              "links": {
+                "self": {
+                  "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/9"
+                },
+                "html": {
+                  "href": "https://bitbucket.org/acme/infra/pull-requests/9"
+                }
+              },
+              "queued": false
+            }
+          }
+        },
+        {
+          "pull_request": {
+            "type": "pullrequest",
+            "id": 9,
+            "title": "Data 5",
+            "draft": false,
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/9"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra/pull-requests/9"
+              }
+            },
+            "queued": false
+          },
+          "update": {
+            "state": "OPEN",
+            "draft": false,
+            "title": "Data 5",
+            "description": "Readings data 5.",
+            "reviewers": [],
+            "changes": {},
+            "reason": "",
+            "details": "",
+            "author": {
+              "type": "app_user",
+              "links": {
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                }
+              },
+              "created_on": "2026-11-02T15:08:55.432081+00:00",
+              "display_name": "kube-agents",
+              "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+              "account_id": "712020:00000000-0000-0000-0000-000000000001",
+              "account_status": "active",
+              "kind": "repository_access_token"
+            },
+            "date": "2026-11-02T17:32:48.764629+00:00",
+            "destination": {
+              "branch": {
+                "name": "main"
+              },
+              "commit": {
+                "hash": "54f28412a790",
+                "links": {
+                  "self": {
+                    "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/54f28412a790"
+                  },
+                  "html": {
+                    "href": "https://bitbucket.org/acme/infra/commits/54f28412a790"
+                  }
+                },
+                "type": "commit"
+              },
+              "repository": {
+                "type": "repository",
+                "full_name": "acme/infra",
+                "links": {
+                  "self": {
+                    "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+                  },
+                  "html": {
+                    "href": "https://bitbucket.org/acme/infra"
+                  },
+                  "avatar": {
+                    "href": "https://bitbucket.org/account/example/avatar/"
+                  }
+                },
+                "name": "infra",
+                "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+              }
+            },
+            "source": {
+              "branch": {
+                "name": "acme-data-5-1793640712"
+              },
+              "commit": {
+                "hash": "4ff96700dcc7",
+                "links": {
+                  "self": {
+                    "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/4ff96700dcc7"
+                  },
+                  "html": {
+                    "href": "https://bitbucket.org/acme/infra/commits/4ff96700dcc7"
+                  }
+                },
+                "type": "commit"
+              },
+              "repository": {
+                "type": "repository",
+                "full_name": "acme/infra",
+                "links": {
+                  "self": {
+                    "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+                  },
+                  "html": {
+                    "href": "https://bitbucket.org/acme/infra"
+                  },
+                  "avatar": {
+                    "href": "https://bitbucket.org/account/example/avatar/"
+                  }
+                },
+                "name": "infra",
+                "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+              }
+            },
+            "queued": false
+          }
+        },
+        {
+          "pull_request": {
+            "type": "pullrequest",
+            "id": 9,
+            "title": "Data 5",
+            "draft": false,
+            "links": {
+              "self": {
+                "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/9"
+              },
+              "html": {
+                "href": "https://bitbucket.org/acme/infra/pull-requests/9"
+              }
+            },
+            "queued": false
+          },
+          "update": {
+            "state": "OPEN",
+            "draft": false,
+            "title": "Data 5",
+            "description": "Readings data 5.",
+            "reviewers": [],
+            "changes": {},
+            "reason": "",
+            "details": "",
+            "author": {
+              "type": "app_user",
+              "links": {
+                "avatar": {
+                  "href": "https://bitbucket.org/account/example/avatar/"
+                }
+              },
+              "created_on": "2026-11-02T15:08:55.432081+00:00",
+              "display_name": "kube-agents",
+              "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+              "account_id": "712020:00000000-0000-0000-0000-000000000001",
+              "account_status": "active",
+              "kind": "repository_access_token"
+            },
+            "date": "2026-11-02T17:32:48.617753+00:00",
+            "destination": {
+              "branch": {
+                "name": "main"
+              },
+              "commit": {
+                "hash": "54f28412a790",
+                "links": {
+                  "self": {
+                    "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/54f28412a790"
+                  },
+                  "html": {
+                    "href": "https://bitbucket.org/acme/infra/commits/54f28412a790"
+                  }
+                },
+                "type": "commit"
+              },
+              "repository": {
+                "type": "repository",
+                "full_name": "acme/infra",
+                "links": {
+                  "self": {
+                    "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+                  },
+                  "html": {
+                    "href": "https://bitbucket.org/acme/infra"
+                  },
+                  "avatar": {
+                    "href": "https://bitbucket.org/account/example/avatar/"
+                  }
+                },
+                "name": "infra",
+                "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+              }
+            },
+            "source": {
+              "branch": {
+                "name": "acme-data-5-1793640712"
+              },
+              "commit": {
+                "hash": "4ff96700dcc7",
+                "links": {
+                  "self": {
+                    "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/4ff96700dcc7"
+                  },
+                  "html": {
+                    "href": "https://bitbucket.org/acme/infra/commits/4ff96700dcc7"
+                  }
+                },
+                "type": "commit"
+              },
+              "repository": {
+                "type": "repository",
+                "full_name": "acme/infra",
+                "links": {
+                  "self": {
+                    "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+                  },
+                  "html": {
+                    "href": "https://bitbucket.org/acme/infra"
+                  },
+                  "avatar": {
+                    "href": "https://bitbucket.org/account/example/avatar/"
+                  }
+                },
+                "name": "infra",
+                "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+              }
+            },
+            "queued": false
+          }
+        }
+      ],
+      "pagelen": 50
+    }
+  ]
+}

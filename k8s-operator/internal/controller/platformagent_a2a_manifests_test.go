@@ -26,6 +26,7 @@ import (
 	"net"
 	"path"
 	"reflect"
+	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"slices"
@@ -304,7 +305,7 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	}
 }
 
-// The provisioning payload: four streams, four KV buckets, three starter
+// The provisioning payload: five streams, six KV buckets, four starter
 // topics, the deployment spec's retention numbers verbatim.
 func TestBuildA2AProvisionJob(t *testing.T) {
 	agent := a2aTestAgent()
@@ -328,9 +329,10 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		"TASKS", "a2a.tasks.>", "--max-age=72h", "21474836480",
 		// DIRECTORY: last-value, 1GiB
 		"DIRECTORY", "a2a.agents.>", "--max-msgs-per-subject=1",
-		// TOPICS-STATE: 8-deep, no age, the two state topics
+		// TOPICS-STATE: 8-deep, no age, the state topics
 		"TOPICS-STATE", "--max-msgs-per-subject=8",
-		"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint",
+		"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint",
+		"nats stream edit TOPICS-STATE --subjects=",
 		// TOPICS-JOURNAL: 30d, 5GiB, the journal topic
 		"TOPICS-JOURNAL", "--max-age=720h", "5368709120", "a2a.topics.shared.annotations",
 		// max_bytes discipline
@@ -339,6 +341,8 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		"runtime-state", "session-state", "--max-bucket-size",
 		// feedback: user content, so a max age is its retention
 		"kv add feedback", "--ttl=720h",
+		// people: one hashed key per chat person, so a max age is its retention
+		"kv add people", "--ttl=720h",
 		// Every stream/kv call is a $JS.API request answered on an inbox, and
 		// this principal may only subscribe under _INBOX.provision.> — without
 		// the prefix override every CLI call times out and the Job can never
@@ -538,6 +542,9 @@ func TestEnsureA2ACredsSecretRepairsMissingKeys(t *testing.T) {
 		},
 	}
 
+	if err := ctrl.SetControllerReference(agent, partial, scheme); err != nil {
+		t.Fatal(err)
+	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, partial).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
@@ -720,19 +727,21 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
 	sub := rest[strings.Index(rest, "subscribe"):]
-	var got, gotSub []string
-	for _, line := range strings.Split(pub, "\n") {
-		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
-		if strings.HasPrefix(line, `"`) {
-			got = append(got, strings.Trim(line, `"`))
-		}
+	subDeny := ""
+	if i := strings.Index(sub, "deny"); i >= 0 {
+		sub, subDeny = sub[:i], sub[i:]
 	}
-	for _, line := range strings.Split(sub, "\n") {
-		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
-		if strings.HasPrefix(line, `"`) {
-			gotSub = append(gotSub, strings.Trim(line, `"`))
+	quoted := func(block string) []string {
+		var out []string
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+			if strings.HasPrefix(line, `"`) {
+				out = append(out, strings.Trim(line, `"`))
+			}
 		}
+		return out
 	}
+	got, gotSub, gotSubDeny := quoted(pub), quoted(sub), quoted(subDeny)
 	want := []string{
 		"$JS.API.INFO",
 		"$JS.API.STREAM.INFO.TASKS",
@@ -751,6 +760,7 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+		"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
 		"chat.console.*.in",
 		"_INBOX.console.>",
 	}
@@ -760,6 +770,10 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	wantSub := []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>"}
 	if !reflect.DeepEqual(gotSub, wantSub) {
 		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
+	}
+	// web's subtraction: `a2a.>` covers the verifier's queue group.
+	if want := []string{"a2a.cap.>"}; !reflect.DeepEqual(gotSubDeny, want) {
+		t.Errorf("console subscribe deny-list = %q, want %q", gotSubDeny, want)
 	}
 	// No verb on any KV_* stream, STREAM.INFO included: its subjects_filter
 	// body lists every key. Nor the KV data plane.
@@ -861,8 +875,8 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	}
 
 	role := buildA2AGatewayRole(agent)
-	if len(role.Rules) != 4 {
-		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get, the pinned PlatformAgent get and the pinned home-channel record", len(role.Rules))
+	if len(role.Rules) != 5 {
+		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get, the pinned PlatformAgent get, the pinned home-channel record and the pinned resolved scope", len(role.Rules))
 	}
 	// The owner rule is one verb on one named object — a deployments read
 	// would be a finding.
@@ -1067,6 +1081,7 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{"app": "test-agent-gateway"},
 		{"app": "test-agent-a2a-gateway"},
 		{"app": "test-agent-a2a-verifier"},
+		{"app": "test-agent-a2a-dispatcher"},
 		{labelPartOf: a2aPartOf, "app.kubernetes.io/component": "a2a-session"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "provision"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
@@ -1208,7 +1223,7 @@ func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	if workerEnv != mirror+"/a2a-worker:0.3.0" {
 		t.Errorf("A2A_WORKER_IMAGE %q does not follow the agent image's mirror (or is not rendered)", workerEnv)
 	}
-	callout := buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers[0]
+	callout := buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers[0]
 	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
 		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
 	}
@@ -1671,8 +1686,9 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent, "", 1)
 	verifier := buildA2AVerifierDeployment(agent)
+	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
 
@@ -1681,6 +1697,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		builder string
 		spec    corev1.PodSpec
 	}{
+		{"dispatcher", "buildA2ADispatcherDeployment", dispatcher.Spec.Template.Spec},
 		{"nats", "buildA2ANATSStatefulSet", sts.Spec.Template.Spec},
 		{"provision", "buildA2AProvisionJob", job.Spec.Template.Spec},
 		{"gateway", "buildA2AGatewayDeployment", dep.Spec.Template.Spec},
@@ -1756,8 +1773,9 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent, "", 1)
 	verifier := buildA2AVerifierDeployment(agent)
+	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
 	mcp := buildA2AMCPDeployment(agent)
 
@@ -1806,6 +1824,13 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// ends it would not announce itself. The callout writes nothing, so
 		// traversable is enough.
 		{render: "callout", builder: "buildA2ACalloutDeployment", container: "callout", spec: callout.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// The dispatcher's image is the dispatcher PR's, on the same
+		// distroless static nonroot base as the gateway, callout and
+		// verifier: WorkingDir /home/nonroot, UID 1000 imposed here, and a
+		// binary that writes nothing. Pinned ahead of the image so that PR
+		// builds to it.
+		{render: "dispatcher", builder: "buildA2ADispatcherDeployment", container: a2aDispatcherContainerName, spec: dispatcher.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 		// The third pod on that same distroless static nonroot base, same
 		// shape and same row: WorkingDir /home/nonroot in the image, UID 1000
@@ -1950,7 +1975,7 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-			state, err := r.reconcileA2A(context.Background(), agent)
+			state, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{})
 			if err != nil {
 				t.Fatalf("reconcileA2A: %v", err)
 			}
@@ -2131,13 +2156,16 @@ func remedyRecreateWidth(t *testing.T, message string) int {
 // clean pass run, and require the tree to be empty at the end rather than
 // merely error-free.
 func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
+	// With the dispatcher on, so its objects are rendered and the cleanup
+	// is held to deleting them too.
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
 	failRole := true
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, chartProfileNamespace(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,
@@ -2167,8 +2195,15 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	t.Setenv(a2aAgentDoorEnvVar, "true")
 	t.Setenv(a2aMCPDoorEnvVar, "true")
 
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
+	}
+	// Precondition: the profile namespace's half rendered, so its delete
+	// below proves something.
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher", Namespace: "test-ns-profiles"}, obj); err != nil {
+			t.Fatalf("precondition: the dispatcher's pod-read %T in the profile namespace wasn't rendered: %v", obj, err)
+		}
 	}
 
 	// The render has to have produced what the cleanup is asked to remove.
@@ -2208,6 +2243,13 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		{"gateway Role", &rbacv1.Role{}, "test-agent-a2a-gateway"},
 		{"gateway RoleBinding", &rbacv1.RoleBinding{}, "test-agent-a2a-gateway"},
 		{"gateway ServiceAccount", &corev1.ServiceAccount{}, "test-agent-a2a-gateway"},
+		// The dispatcher, rendered because the image is set above; its Role
+		// is the first the injected failure stops on.
+		{"dispatcher Deployment", &appsv1.Deployment{}, "test-agent-a2a-dispatcher"},
+		{"dispatch ConfigMap", &corev1.ConfigMap{}, "test-agent-a2a-dispatch"},
+		{"dispatcher Role", &rbacv1.Role{}, "test-agent-a2a-dispatcher"},
+		{"dispatcher RoleBinding", &rbacv1.RoleBinding{}, "test-agent-a2a-dispatcher"},
+		{"dispatcher ServiceAccount", &corev1.ServiceAccount{}, "test-agent-a2a-dispatcher"},
 		{"NATS Service", &corev1.Service{}, "test-agent-a2a-nats"},
 		{"NATS config Secret", &corev1.Secret{}, "test-agent-a2a-nats-config"},
 		{"NATS StatefulSet", &appsv1.StatefulSet{}, "test-agent-a2a-nats"},
@@ -2215,6 +2257,15 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		err := cl.Get(ctx, types.NamespacedName{Name: tc.name, Namespace: "test-ns"}, tc.obj)
 		if !errors.IsNotFound(err) {
 			t.Errorf("%s survived the resumed cleanup (err=%v) — the early exit stepped over it", tc.what, err)
+		}
+	}
+
+	// The dispatcher's pod-read Role and binding in the profile namespace,
+	// which carry no owner reference and so need the flip's own delete.
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher", Namespace: "test-ns-profiles"}, obj)
+		if !errors.IsNotFound(err) {
+			t.Errorf("the dispatcher's pod-read %T in the profile namespace survived the cleanup (err=%v)", obj, err)
 		}
 	}
 
@@ -2234,6 +2285,8 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 // StatefulSet sentinel.
 func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
+	// The dispatcher too, so the labelled-kind sweep sees its objects.
+	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
 	scheme := setupScheme()
 	next := a2aTestAgent()
 	today := next.DeepCopy()
@@ -2256,7 +2309,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 	countR := &PlatformAgentReconciler{Client: countCl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, countCl, countR, next)
-	if _, err := countR.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := countR.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	if err := countR.cleanupA2A(ctx, today.DeepCopy()); err != nil {
@@ -2289,7 +2342,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			ctx := context.Background()
 			theCalloutIsServing(t, ctx, cl, r, next)
-			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 				t.Fatalf("render: %v", err)
 			}
 
@@ -2321,9 +2374,9 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 }
 
 // TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender pins Shape 2 of #2216:
-// A render that died on write 7 (after writing the calloutKeys Secret, the
-// TLS Secrets and bundle, and the authMap ConfigMap, before writing the config
-// Secret or StatefulSet), followed by a
+// A render that died on write 8 (after writing the calloutKeys Secret, the
+// task-signing key Secret, the TLS Secrets and bundle, and the authMap
+// ConfigMap, before writing the config Secret or StatefulSet), followed by a
 // cleanup pass that deletes calloutKeys Secret and dies on deleting authMap
 // ConfigMap.
 func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
@@ -2333,7 +2386,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	today.Spec.Mode = nil
 
 	writes := 0
-	stopAt := 7
+	stopAt := 8
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(next.DeepCopy()).
@@ -2357,12 +2410,12 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err == nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err == nil {
 		t.Fatal("render: want injected error, got nil")
 	}
 
 	authMap := &corev1.ConfigMap{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(next), Namespace: next.Namespace}, authMap); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aAuthMapShardName(next, 0), Namespace: next.Namespace}, authMap); err != nil {
 		t.Fatalf("authMap was not created: %v", err)
 	}
 
@@ -2374,7 +2427,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,
 			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-				if _, isCM := obj.(*corev1.ConfigMap); isCM && obj.GetName() == a2aAuthMapName(next) && failAuthMap {
+				if _, isCM := obj.(*corev1.ConfigMap); isCM && obj.GetName() == a2aAuthMapShardName(next, 0) && failAuthMap {
 					return fmt.Errorf("injected: API server error deleting authmap")
 				}
 				return c.Delete(ctx, obj, opts...)
@@ -2385,7 +2438,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	for _, obj := range []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: next.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(next), Namespace: next.Namespace}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(next), Namespace: next.Namespace}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(next, 0), Namespace: next.Namespace}},
 	} {
 		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), obj); err == nil {
 			obj.SetResourceVersion("")
@@ -2454,7 +2507,7 @@ func TestCleanupA2AHaltsBeforeStatefulSetOnPersistentClusterRoleBindingError(t *
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, next)
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 
@@ -2564,7 +2617,7 @@ func TestCleanupA2ASkipsUnownedClusterRoleBindingAndDeletesStatefulSet(t *testin
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, next)
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 
@@ -2611,6 +2664,102 @@ func TestCleanupA2ASkipsUnownedClusterRoleBindingAndDeletesStatefulSet(t *testin
 	// The foreign ClusterRoleBinding must still stand untouched.
 	if err := cl.Get(ctx, types.NamespacedName{Name: crbName}, crb); err != nil {
 		t.Errorf("cleanup pass 2: foreign ClusterRoleBinding was deleted or errored: %v", err)
+	}
+}
+
+// TestAFlipToTodayCompletesAroundAnUnownedDoorObject (#3871): the walk lists
+// both doors' objects whatever the flags say, and one under a door's name that
+// this CR does not own is somebody else's. The flip removes everything that is
+// ours and leaves that object as found, instead of halting at it with the
+// rest of the stack still standing. One unowned object sits in each of the
+// walk's three parts: a door Secret (the pre-bus list), the MCP server's
+// fence (the bus list; never rendered with the MCP door off), and, swapped in
+// after the render, a StatefulSet under the NATS name (the sentinel delete).
+func TestAFlipToTodayCompletesAroundAnUnownedDoorObject(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	t.Setenv(a2aMCPDoorEnvVar, "")
+	scheme := setupScheme()
+	next := a2aTestAgent()
+	today := next.DeepCopy()
+	today.Spec.Mode = nil
+	doorKey := types.NamespacedName{Name: a2aDoorName(next), Namespace: next.Namespace}
+	squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: doorKey.Name, Namespace: doorKey.Namespace},
+		Data: map[string][]byte{"token": []byte("theirs")}}
+	mcpFenceKey := types.NamespacedName{Name: a2aMCPNetpolName(next), Namespace: next.Namespace}
+	mcpFence := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: mcpFenceKey.Name, Namespace: mcpFenceKey.Namespace}}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(next.DeepCopy(), squatter, mcpFence).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, next)
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	stsKey := types.NamespacedName{Name: a2aNATSName(next), Namespace: next.Namespace}
+	rendered := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, stsKey, rendered); err != nil {
+		t.Fatalf("precondition: the NATS StatefulSet was not rendered: %v", err)
+	}
+	// The render owns its StatefulSet; a foreign one under the name can only
+	// exist in its place, so swap it. The gateway Deployment, still owned,
+	// is the sentinel that keeps the walk alive.
+	if err := cl.Delete(ctx, rendered); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: stsKey.Name, Namespace: stsKey.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	natsSvcKey := types.NamespacedName{Name: a2aNATSName(next), Namespace: next.Namespace}
+	if err := cl.Get(ctx, natsSvcKey, &corev1.Service{}); err != nil {
+		t.Fatalf("precondition: the NATS Service was not rendered: %v", err)
+	}
+	quotaKey := types.NamespacedName{Name: a2aSessionQuotaName(next), Namespace: next.Namespace}
+	if err := cl.Get(ctx, quotaKey, &corev1.ResourceQuota{}); err != nil {
+		t.Fatalf("precondition: the session quota was not rendered: %v", err)
+	}
+
+	if err := r.cleanupA2A(ctx, today.DeepCopy()); err != nil {
+		t.Fatalf("an unowned object under a reserved name stopped the flip to today: %v", err)
+	}
+	// Ours went. The Service heads the bus list, so its absence shows the
+	// walk passed the pre-bus list and the door Secret; the session quota
+	// sits after the MCP fence in the bus list, so its absence shows the
+	// walk passed that too.
+	if err := cl.Get(ctx, natsSvcKey, &corev1.Service{}); !errors.IsNotFound(err) {
+		t.Errorf("the NATS Service survived the flip: %v", err)
+	}
+	if err := cl.Get(ctx, quotaKey, &corev1.ResourceQuota{}); !errors.IsNotFound(err) {
+		t.Errorf("the session quota survived the flip: %v", err)
+	}
+	// Theirs stayed, owner-less.
+	got := &corev1.Secret{}
+	if err := cl.Get(ctx, doorKey, got); err != nil {
+		t.Fatalf("the unowned Secret is gone: %v", err)
+	}
+	if string(got.Data["token"]) != "theirs" || len(got.OwnerReferences) != 0 {
+		t.Errorf("the unowned Secret was touched: data=%q owners=%+v", got.Data["token"], got.OwnerReferences)
+	}
+	for _, planted := range []struct {
+		what string
+		key  types.NamespacedName
+		obj  client.Object
+	}{
+		{"MCP fence", mcpFenceKey, &networkingv1.NetworkPolicy{}},
+		{"NATS StatefulSet", stsKey, &appsv1.StatefulSet{}},
+	} {
+		if err := cl.Get(ctx, planted.key, planted.obj); err != nil {
+			t.Errorf("the unowned %s is gone: %v", planted.what, err)
+		} else if refs := planted.obj.GetOwnerReferences(); len(refs) != 0 {
+			t.Errorf("the unowned %s was adopted: owner references %+v", planted.what, refs)
+		}
 	}
 }
 
@@ -2662,11 +2811,11 @@ func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean measures the thing
+// TestCleanupA2ACostsThirteenReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
 // reads still happening one object at a time.
-func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsThirteenReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -2690,7 +2839,7 @@ func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Twelve sentinel Gets and nothing else: no per-object walk, and in
+	// Thirteen sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
@@ -2705,15 +2854,18 @@ func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
 	// fence did, for the console fence's reason (#3653), and 11 -> 12 when
 	// the profile namespace's fence did (#3655: it is the first write of the
 	// fence pass, and carries no owner reference, so a pass that dies after
-	// it leaves it alone); the fences are NetworkPolicies, so those eight
-	// reads come from the cache and only the two Secrets are uncached.
+	// it leaves it alone), and 12 -> 13 when the broker's task-signing key
+	// Secret did (#3889: the broker's reconcile writes it before
+	// reconcileA2A, so a render that dies between them leaves it alone); the
+	// fences are NetworkPolicies, so those eight reads come from the cache
+	// and only the three Secrets are uncached.
 	// Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
 	// only worth having while it costs less than the walk.
-	if gets != 12 {
-		t.Errorf("Gets = %d, want 12 (the sentinels); the per-object walk is running on a no-op", gets)
+	if gets != 13 {
+		t.Errorf("Gets = %d, want 13 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
@@ -2792,7 +2944,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 
 	full := 0
 	unobstructed := &PlatformAgentReconciler{Client: buildClient(next, 0, &full), Scheme: scheme}
-	if _, err := unobstructed.reconcileA2A(context.Background(), next.DeepCopy()); err != nil {
+	if _, err := unobstructed.reconcileA2A(context.Background(), next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("unobstructed render: %v", err)
 	}
 	if full == 0 {
@@ -2806,7 +2958,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			ctx := context.Background()
 
-			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err == nil {
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err == nil {
 				t.Fatal("want the injected error, got nil: the render did not die where this case says it did")
 			}
 
@@ -2959,12 +3111,9 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 // TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall pins the
 // ownership rule the early exit applies to its sentinels, from both sides.
 //
-// The walk refuses to delete anything this CR does not own, and Reconcile
-// returns that refusal before status is written. So if a sentinel counted on
-// presence alone, a NetworkPolicy under a reserved name that this CR does not
-// own would send every reconcile of a today install into the refusal with no
-// phase and no conditions, requeued only by the error path's backoff -- a
-// wedge. The shape is concrete: a
+// The walk leaves anything this CR does not own alone, so a sentinel that
+// counted on presence alone would send every reconcile of a today install
+// through the eleven reads and the walk for nothing. The shape is concrete: a
 // next CR refused on its first reconcile, deleted, and re-created under the
 // same name in today mode holds its predecessor's fences under the old UID
 // until the garbage collector reaps them. A hand-written NetworkPolicy
@@ -2972,10 +3121,14 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 //
 // The sentinel rule is: an object counts only when this CR owns it. The rows
 // below plant each fence under a stale UID and under no owner at all and
-// require the reconcile to go through and leave the object alone; the control
-// plants the same object owned by the CR and requires the walk to remove it
-// (#2197), so a change that stopped the exit seeing owned residue reds here
-// rather than passing as "nothing wedged".
+// require the reconcile to go through, leave the object alone, and never
+// start the walk; the control plants the same object owned by the CR and
+// requires the walk to run and remove it (#2197), so a change that stopped
+// the exit seeing owned residue reds here rather than passing as "nothing
+// wedged". The walk is observed through the one List it makes and the exit
+// never does: the provision Jobs (deleteA2AProvisionJobs). Since the walk
+// skips what this CR does not own, "the object survived" alone would be
+// true with or without the rule.
 func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.T) {
 	staleOwner := metav1.OwnerReference{
 		APIVersion:         agentv1alpha1.GroupVersion.String(),
@@ -3037,11 +3190,19 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 			if owned := metav1.IsControlledBy(planted, agent); owned != tc.owned {
 				t.Fatalf("planted object controlled by the CR = %t, want %t; the row is not the shape it names", owned, tc.owned)
 			}
+			jobLists := 0
+			funcs := ssaApplyInterceptor()
+			funcs.List = func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*batchv1.JobList); ok {
+					jobLists++
+				}
+				return cl.List(ctx, list, opts...)
+			}
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(agent, planted).
 				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-				WithInterceptorFuncs(ssaApplyInterceptor()).
+				WithInterceptorFuncs(funcs).
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
@@ -3049,10 +3210,14 @@ func TestAReservedNameObjectTheCRDoesNotOwnDoesNotWedgeATodayInstall(t *testing.
 
 			for i := 0; i < 2; i++ {
 				if _, err := r.Reconcile(ctx, req); err != nil {
-					t.Fatalf("Reconcile %d of a today CR beside %s: %v\n"+
-						"The early exit counted an object this CR does not own as its own residue, "+
-						"and the walk's ownership refusal wedged the reconcile before status.", i+1, planted.Name, err)
+					t.Fatalf("Reconcile %d of a today CR beside %s: %v", i+1, planted.Name, err)
 				}
+			}
+			if tc.owned && jobLists == 0 {
+				t.Errorf("the walk never ran beside %s, which this CR owns: the exit no longer sees owned residue", planted.Name)
+			}
+			if !tc.owned && jobLists != 0 {
+				t.Errorf("the walk ran %d time(s) beside %s, which this CR does not own: the exit counted it as residue", jobLists, planted.Name)
 			}
 			stored := &agentv1alpha1.PlatformAgent{}
 			if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
@@ -3418,7 +3583,7 @@ func TestSkewPreservesTheAgentBusSurface(t *testing.T) {
 // publishes a card at all today, so the grant this removes had no caller.
 //
 // Both halves of the A5 split are asked, and the agent is the one that matters:
-// it is the container running model output, and its three topic grants are the
+// it is the container running model output, and its four topic grants are the
 // literal list a consolidating wildcard would replace. The bridge is asked too
 // because it is the principal that was holding those grants until A5.
 //
@@ -3571,7 +3736,7 @@ func a2aFullCreds(nibble string, resourceVersion string) *corev1.Secret {
 	for i, key := range a2aCredsKeys {
 		data[key] = []byte(strings.Repeat(nibble, 31) + fmt.Sprintf("%x", i))
 	}
-	return &corev1.Secret{
+	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "test-agent-a2a-nats-creds",
 			Namespace:       "test-ns",
@@ -3579,6 +3744,12 @@ func a2aFullCreds(nibble string, resourceVersion string) *corev1.Secret {
 		},
 		Data: data,
 	}
+	// Controlled by the test agent, as the operator creates it: the operator
+	// refuses a credentials Secret it doesn't own.
+	if err := ctrl.SetControllerReference(a2aTestAgent(), secret, setupScheme()); err != nil {
+		panic(err)
+	}
+	return secret
 }
 
 // a2aPasswordDigestNeedles returns, for one password, every form of it that
@@ -4492,6 +4663,27 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 			}
 		}
 	}
+
+	// The third spelling: provisionIdentity, which the Job authenticates as
+	// since the callout armed, enumerates its CREATE and INFO grants by hand.
+	// Held to the list in both directions, or the Job's create is refused.
+	provisionPublish := provisionIdentity(a2aTestAgent(), a2aTestAgent().Namespace).publish
+	for _, s := range a2aProvisionedStreams {
+		for _, verb := range []string{"CREATE", "INFO"} {
+			want := "$JS.API.STREAM." + verb + "." + s
+			if !slices.Contains(provisionPublish, want) {
+				t.Errorf("provision identity's publish list is missing %q; the Job's %s on %s is refused", want, verb, s)
+			}
+		}
+	}
+	for _, grant := range provisionPublish {
+		for _, verb := range []string{"CREATE", "INFO"} {
+			stream, ok := strings.CutPrefix(grant, "$JS.API.STREAM."+verb+".")
+			if ok && !slices.Contains(a2aProvisionedStreams, stream) {
+				t.Errorf("provision identity holds %q for %q, which a2aProvisionedStreams does not name", grant, stream)
+			}
+		}
+	}
 }
 
 // TestSeedHoldsNoWholesaleJetStreamAPI is a shape check, and only that — it reads
@@ -4505,7 +4697,7 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 // grants PURGE, DELETE, MSG.DELETE, RESTORE and UPDATE on every stream — contains
 // none of them; the web user's test in this file records the same lesson.
 //
-//  1. The publish allow-list is pinned exactly: the three starter topics, the
+//  1. The publish allow-list is pinned exactly: the four starter topics, the
 //     grants a2aSeedJetStreamGrants renders, and seed's own inbox. Any other
 //     entry, in any spelling, is a diff.
 //  2. Every route architecture A3's write-surface enumeration calls an
@@ -4526,6 +4718,7 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	want := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 	}
@@ -4689,7 +4882,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// Verbs no bridge path uses, against every stream the provision script
 	// creates. A named grant only widens the stream it names, so a verb
 	// sampled on TASKS says nothing about the same verb on DIRECTORY.
-	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback"}
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people"}
 	forbiddenVerbs := []string{
 		"$JS.API.STREAM.CREATE.",
 		"$JS.API.STREAM.UPDATE.",
@@ -4713,7 +4906,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// consumer, not a direct get. The directory is the identity plane; the
 	// session registry is the gateway's; cap is the capability envelope's;
 	// and the two topic streams are the agent's since A5.
-	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap", "KV_feedback", "TOPICS-STATE", "TOPICS-JOURNAL"} {
+	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap", "KV_feedback", "KV_people", "TOPICS-STATE", "TOPICS-JOURNAL"} {
 		forbidden = append(forbidden,
 			"$JS.API.STREAM.INFO."+s,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
@@ -4752,6 +4945,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.tasks.session-abc123.t1.events",
 		"a2a.tasks.session-abc123.t1.in",
 		"a2a.tasks."+a2aBridgeAddressee+".t1.in",
@@ -4813,6 +5007,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 
 	wantPublish := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 	}
@@ -4836,7 +5031,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 			"$JS.ACK.TASKS.1.2.3",
 		)
 	}
-	for _, s := range []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback"} {
+	for _, s := range []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people"} {
 		forbidden = append(forbidden,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
 			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
@@ -4947,7 +5142,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
+		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
 		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -4958,6 +5153,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.tasks.*.*.supervisor",
 		"$KV.session-state.>",
 		"$KV.feedback.>",
+		"$KV.people.>",
 		"chat.console.*.out",
 		"chat.notify.reply.agent.>",
 		// The mint, and the whole of it: one token under `root`, which is
@@ -5001,7 +5197,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// Verbs no gateway path uses, against every stream the provision script
 	// creates. A named grant only widens the stream it names, so a verb
 	// sampled on TASKS says nothing about the same verb on DIRECTORY.
-	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback"}
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people"}
 	forbiddenVerbs := []string{
 		"$JS.API.STREAM.CREATE.",
 		"$JS.API.STREAM.UPDATE.",
@@ -5073,6 +5269,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// comment rather than added quietly.
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
 	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
+	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
 	allowedShapes := map[string]bool{
 		"$JS.API.STREAM.INFO." + a2aTasksStream:              true,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>":   true,
@@ -5086,6 +5283,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$JS.API.DIRECT.GET." + kvFeedback + ".>":            true,
 		"$JS.API.CONSUMER.CREATE." + kvFeedback + ".>":       true,
 		"$JS.API.CONSUMER.DELETE." + kvFeedback + ".*":       true,
+		"$JS.API.STREAM.INFO." + kvPeople:                    true,
+		"$JS.API.DIRECT.GET." + kvPeople + ".>":              true,
+		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>":         true,
+		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*":         true,
 	}
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !allowedShapes[grant] {
@@ -5147,6 +5348,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		{"feedbackDesk kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aFeedbackBucket + ".$KV." + a2aFeedbackBucket + ".t1.U1"},
 		{"ExportFeedback ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		{"ExportFeedback watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
+		// gateway people count, over the people bucket.
+		{"tryPeople js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aPeopleBucket},
+		{"peopleDesk.follow WatchAll", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
+		{"peopleDesk.follow watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
+		{"purgePeople ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
 		// The ack the relay's explicit-ack durable publishes, granted
 		// beside the API list rather than in it.
 		{"relay msg.Ack", "$JS.ACK." + a2aTasksStream + ".gateway-relay.1.1.1.1.1"},
@@ -5182,7 +5388,7 @@ func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	known := []string{a2aTasksStream}
-	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket} {
+	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket, a2aPeopleBucket} {
 		dataPlane := "$KV." + bucket + ".>"
 		if !slices.Contains(grants, dataPlane) {
 			t.Errorf("the gateway's publish list has no %q; its JetStream grants name bucket %q, so the two no longer describe one bucket",
@@ -5656,6 +5862,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	consoleStreams := a2aSameVerbsOn(
 		[]string{a2aTasksStream, "DIRECTORY", a2aTopicsStateStream, a2aTopicsJournalStream},
 		"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT")
+	// Plus the profiles' submissions, read by subject and nothing else: no
+	// STREAM.INFO (the same subjects_filter listing) and no consumer verb,
+	// so a browser credential can't pull a profile's queue.
+	consoleStreams[a2aProfileSubmitStream] = []string{"DIRECT.GET"}
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
@@ -5664,6 +5874,8 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 				// The kept answer ratings: the registry's four verbs, for
 				// the same four calls (a2aGatewayJetStreamGrants).
 				a2aKVStreamPrefix + a2aFeedbackBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				// The people count: the same four verbs (a2aGatewayJetStreamGrants).
+				a2aKVStreamPrefix + a2aPeopleBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 				// Minting, and only minting. The grant is
 				// `$KV.cap.root.*` -- the root namespace, one token
 				// deep, so one request id and no reach into the hop
@@ -5797,7 +6009,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"gateway Deployment": buildA2AGatewayDeployment(agent).Spec.Template.Spec,
 		"NATS StatefulSet":   buildA2ANATSStatefulSet(agent, "conf-hash").Spec.Template.Spec,
 		"provision Job":      buildA2AProvisionJob(agent).Spec.Template.Spec,
-		"callout Deployment": buildA2ACalloutDeployment(agent).Spec.Template.Spec,
+		"callout Deployment": buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
 		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
 		"MCP Deployment":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
@@ -6631,10 +6843,8 @@ func TestA2AInjectTokenIsMintedOnceAndKept(t *testing.T) {
 // TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret: a Secret under the
 // rendered name that this agent did not create is not the door's key. The
 // token is the door's only access control, so adopting one would arm the door
-// with a credential its planter holds; and the flag-off removal refuses to
-// delete an unowned object, so a render built on it would wedge every later
-// reconcile. The reconcile fails before the Service is rendered, and the
-// planted Secret is left exactly as it was.
+// with a credential its planter holds. The reconcile fails before the Service
+// is rendered, and the planted Secret is left exactly as it was.
 func TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	scheme := setupScheme()
@@ -7084,7 +7294,7 @@ func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
 	}
 	// The callout too: it is the provision Job's authentication path, and a
 	// quota that refused it would leave the Job's creation held for good.
-	for _, c := range buildA2ACalloutDeployment(agent).Spec.Template.Spec.Containers {
+	for _, c := range buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers {
 		containers = append(containers, container{"callout Deployment", c})
 	}
 	// The verifier too, and it is the one with the sharpest consequence: an
@@ -7146,7 +7356,7 @@ func TestA2AProvisionJobWaitsForTheCallout(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		state, err := r.reconcileA2A(ctx, agent)
+		state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 		if err != nil {
 			t.Fatalf("reconcileA2A %d: %v", i+1, err)
 		}
@@ -7171,7 +7381,7 @@ func TestA2AProvisionJobWaitsForTheCallout(t *testing.T) {
 	}
 
 	reportCalloutServing(t, ctx, cl, agent)
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("reconcileA2A after the callout came up: %v", err)
 	}
@@ -7207,13 +7417,13 @@ func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	// Two pods, one ready, none on the current template: a roll in progress
 	// or wedged at maxUnavailable 0.
 	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 0)
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7975,5 +8185,173 @@ func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
 				t.Errorf("the render asks for %d replicas, want 1", *dep.Spec.Replicas)
 			}
 		})
+	}
+}
+
+// a2aJetStreamCapMargin is the store room the provisioned caps must leave
+// unreserved (#4476). NATS reserves every stream's and bucket's max_bytes against
+// max_file_store when it creates the stream and refuses a create past it, so
+// this is the room a new stream, a raised cap or a recreate has before
+// provisioning starts failing with "insufficient storage".
+const a2aJetStreamCapMargin = int64(2) << 30
+
+// TestProvisionedJetStreamCapsFitTheStore holds the provision script's byte caps,
+// summed, under the server's max_file_store less a2aJetStreamCapMargin, and the
+// store under the bus's claim (#4476). Every create must carry a cap: one without
+// reserves nothing, and then grows into the room every other stream's reservation
+// counted on. Lines the script only prints (an `echo` naming an edit for an
+// operator) are not commands and are skipped; an executed edit that raises a cap
+// re-reserves, so it counts.
+func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
+	agent := a2aTestAgent()
+	// Comment lines go first: bash doesn't continue a comment that ends in `\`, so
+	// joining before dropping them would fold the next command into the comment.
+	// Then one logical line per command line (the creates wrap with `\`), split at
+	// && || ; and | so each create's flags stop at the next command.
+	var kept []string
+	for _, line := range strings.Split(a2aProvisionScript(agent), "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+			kept = append(kept, line)
+		}
+	}
+	script := strings.ReplaceAll(strings.Join(kept, "\n"), "\\\n", " ")
+	separators := regexp.MustCompile(`&&|\|\||;|\|`)
+	var commands []string
+	for _, line := range strings.Split(script, "\n") {
+		commands = append(commands, separators.Split(line, -1)...)
+	}
+
+	// natscli's create spellings, aliases included, and the edits that can raise a cap.
+	// Not `kv create`: that puts a key if it is new, and reserves nothing.
+	creates := regexp.MustCompile(`\b(stream (?:add|create|new)|kv (?:add|new))\s+(\S+)(.*)$`)
+	// Every edit or update, stream or bucket: one this test can't read fails rather
+	// than raising a cap it never sees.
+	edits := regexp.MustCompile(`\b((?:stream|kv) (?:edit|update))\b\s*(\S*)(.*)$`)
+	capOf := func(name, flag, rest string) (int64, bool) {
+		for _, f := range strings.Fields(rest) {
+			if v, ok := strings.CutPrefix(f, flag); ok {
+				n, err := strconv.ParseInt(v, 10, 64)
+				if err != nil || n <= 0 {
+					t.Fatalf("%s: %s%s is not a positive byte count", name, flag, v)
+				}
+				return n, true
+			}
+		}
+		return 0, false
+	}
+	caps := map[string]int64{}
+	created := map[string]bool{}
+	for _, line := range commands {
+		if strings.HasPrefix(strings.TrimSpace(line), "echo ") {
+			continue
+		}
+		if m := creates.FindStringSubmatch(line); m != nil {
+			name, flag := m[2], "--max-bytes="
+			if strings.HasPrefix(m[1], "kv ") {
+				name, flag = "KV_"+name, "--max-bucket-size="
+			}
+			if created[name] {
+				t.Fatalf("%s is created twice in the provision script; which cap holds is not a question this test answers", name)
+			}
+			created[name] = true
+			n, found := capOf(name, flag, m[3])
+			if !found {
+				t.Errorf("%s is created without %s: it reserves nothing, and grows into the room the other caps count on", name, flag)
+			}
+			caps[name] = max(caps[name], n)
+		}
+		if m := edits.FindStringSubmatch(line); m != nil {
+			n, found := capOf(m[2], "--max-bytes=", m[3])
+			if !strings.HasPrefix(m[1], "stream ") || !found {
+				t.Fatalf("unparsed cap-changing command; teach the test: %q", strings.TrimSpace(line))
+			}
+			if n > caps[m[2]] {
+				caps[m[2]] = n
+			}
+		}
+	}
+	// Not vacuous: every provisioned stream and bucket was found and counted.
+	for _, s := range a2aProvisionedStreams {
+		if !created[s] {
+			t.Errorf("no capped create found for %s; the sum below would leave it out", s)
+		}
+	}
+
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	m := regexp.MustCompile(`(?m)^\s*max_file_store:\s*(\d+)\s*$`).FindStringSubmatch(conf)
+	if m == nil {
+		t.Fatal("nats.conf renders no max_file_store")
+	}
+	store, _ := strconv.ParseInt(m[1], 10, 64)
+	// The store has to fit the volume it is on, or the caps' arithmetic is about room
+	// the disk does not have.
+	claim := buildA2ANATSStatefulSet(agent, "").Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]
+	if store > claim.Value() {
+		t.Errorf("max_file_store is %d bytes, more than the bus's %s claim", store, claim.String())
+	}
+
+	var sum int64
+	names := make([]string, 0, len(caps))
+	for name, n := range caps {
+		sum += n
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	if sum > store-a2aJetStreamCapMargin {
+		var b strings.Builder
+		for _, name := range names {
+			fmt.Fprintf(&b, "\n  %-18s %8.3f GiB", name, float64(caps[name])/(1<<30))
+		}
+		t.Errorf("the provisioned caps reserve %.3f GiB of a %.3f GiB store, leaving %.3f GiB, under the %d GiB margin (#4476):%s",
+			float64(sum)/(1<<30), float64(store)/(1<<30), float64(store-sum)/(1<<30), a2aJetStreamCapMargin>>30, b.String())
+	}
+}
+
+// The people reading is read only while the install renders the A2A stack
+// and no chat platform it enables is served through Hermes: Chat or Slack on
+// its legacy consumer, or Teams, which only Hermes serves. The today rows are
+// false through the render gate alone, since a today install has no gateway
+// to read; the Slack and Teams rows test the Hermes reason by itself.
+func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
+	on := ptr.To(true)
+	agent := func(mode string, chat, slack, teams bool) *agentv1alpha1.PlatformAgent {
+		a := a2aTestAgent()
+		a.Spec.Mode = ptr.To(mode)
+		integration := &agentv1alpha1.PlatformAgentIntegrationSpec{}
+		if chat {
+			integration.GoogleChat = &agentv1alpha1.GoogleChatSpec{Enabled: on}
+		}
+		if slack {
+			integration.Slack = &agentv1alpha1.SlackSpec{Enabled: on}
+		}
+		if teams {
+			integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: on}
+		}
+		a.Spec.Integration = integration
+		return a
+	}
+	next, today := string(ModeNext), string(ModeToday)
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  bool
+	}{
+		{"next, Chat only", agent(next, true, false, false), true},
+		{"next, Slack only", agent(next, false, true, false), true},
+		{"next, Chat and Slack: Slack on Hermes", agent(next, true, true, false), false},
+		{"next, Teams", agent(next, false, false, true), false},
+		{"next, no platform", agent(next, false, false, false), true},
+		{"today, Chat", agent(today, true, false, false), false},
+		{"today, no platform: no A2A stack", agent(today, false, false, false), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := peopleReadingEnabled(tc.agent); got != tc.want {
+				t.Fatalf("peopleReadingEnabled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	noIntegration := a2aTestAgent()
+	if teamsEnabled(noIntegration) || !peopleReadingEnabled(noIntegration) {
+		t.Fatal("a CR with no spec.integration: want Teams off and the reading enabled")
 	}
 }

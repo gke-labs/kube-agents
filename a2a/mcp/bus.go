@@ -111,6 +111,10 @@ type NATSBus struct {
 	// (maxTaskReaders); reapDelay is how long a released slot stays taken.
 	readers   chan struct{}
 	reapDelay time.Duration
+
+	// events listens to the console conversations this server knows and
+	// keeps their reports and results.
+	events *Events
 }
 
 // statusRead is one status read in flight: st is its answer once done is
@@ -144,10 +148,14 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to the bus at %s as %s: %w", cfg.URL, cfg.User, err)
 	}
-	b := &NATSBus{client: client, cfg: cfg, now: time.Now, readers: make(chan struct{}, maxTaskReaders), reapDelay: taskConsumerIdle}
+	b := &NATSBus{client: client, cfg: cfg, now: time.Now, readers: make(chan struct{}, maxTaskReaders), reapDelay: taskConsumerIdle,
+		events: NewEvents(client)}
 	b.readBus = b.read
 	return b, nil
 }
+
+// Events is the server's listener on its conversations' posts.
+func (b *NATSBus) Events() *Events { return b.events }
 
 // Close drops the connection.
 func (b *NATSBus) Close() { b.client.Close() }

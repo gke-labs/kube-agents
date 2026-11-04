@@ -147,6 +147,12 @@ mcp_servers:
       GKE_LOCATION: "${GKE_LOCATION}"
       GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
       KUBEAGENTS_SCOPE_FILE: "${KUBEAGENTS_SCOPE_FILE}"
+      # The group size above which the roster counts a shared-role group
+      # instead of naming each agent (agent_roster.summary_threshold; default
+      # 20). spec.deployment.env sets it on the agent container through the
+      # operator's allowlist; unset arrives as the placeholder, which means
+      # the default. Passed so list_agents summarizes where the block does.
+      KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD: "${KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD}"
 
 # Explicitly list platform_toolsets (reserved Hermes key). ONLY the router MCP —
 # no base tool bundle. `mcp-<name>` here maps to `mcp_servers.<name>` above.
@@ -188,6 +194,12 @@ platform_toolsets:
   # Real Google Chat ingress resolves under the `google_chat` platform key; pin
   # it to the delegation surface too so it never falls back to a full base bundle.
   google_chat:
+    - mcp-router
+    - kanban
+    - memory
+  # Microsoft Teams ingress resolves under the `teams` platform key; pin
+  # it to the delegation surface too so it never falls back to a full base bundle.
+  teams:
     - mcp-router
     - kanban
     - memory
@@ -352,6 +364,13 @@ platforms:
       # its input. Teaching an agent to emit Slack mrkdwn directly would defeat
       # both this renderer and format_message.
       rich_blocks: true
+  # Microsoft Teams egress presentation. `enabled` is the operator's to set, from the CR's
+  # spec.integration.teams.
+  teams:
+    typing_status_text: "Kage is thinking…"
+    extra:
+      # Render outbound messages as Adaptive Cards v1.5 JSON when enabled.
+      adaptive_cards: true
 
 # Memory. The built-in MEMORY.md/USER.md store stays off; the
 # `kube_agents_memory` provider (agents/chat/plugins/memory/kube_agents_memory/)

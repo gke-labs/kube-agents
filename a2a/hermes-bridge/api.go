@@ -396,6 +396,10 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// Only a recorded route lets a card's post reach the conversation, so only
 	// then may the terminal keep the ask for those posts to settle (cardsMark).
 	run.routeRecorded.Store(routeErr == nil)
+	// The opening turn only: a follow-up runs in a session that has already
+	// read the report, and the hook this mirrors reads the thread once per
+	// message a person sends, which the opening turn is.
+	prompt = b.attachPushedReport(taskCtx, sessionID, run.origin, prompt)
 
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while
@@ -515,6 +519,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	resp, connectedAt, err := b.sendAPI(taskCtx, req, body)
 	if err != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
+		b.stopCanceledTurn(run, sessionID, err)
 		return "", false
 	}
 	defer resp.Body.Close()
@@ -528,6 +533,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	took := time.Since(connectedAt)
 	if err != nil && taskCtx.Err() != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
+		b.stopCanceledTurn(run, sessionID, err)
 		return "", false
 	}
 	if err != nil {

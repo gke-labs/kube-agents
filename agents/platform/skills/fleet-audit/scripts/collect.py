@@ -68,6 +68,7 @@ import argparse
 import contextlib
 import datetime
 import errno
+import functools
 import hashlib
 import ipaddress
 import json
@@ -77,7 +78,7 @@ import posixpath
 import re
 import shlex
 import stat
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import tempfile
 import time
@@ -99,7 +100,6 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
     :REVISION_DIGEST_CHARS
 ]
 
-SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 # The shared kubeconfig directory is this uid's and closed to every other
 # uid: 0755, so only its owner (and root, which no mode binds) creates
@@ -154,28 +154,23 @@ KUBECONFIG_LINK_NOT_REMOVED_FORMAT = "{path} is a symbolic link, which a kubecon
 KUBECONFIG_REFUSED_RC = 1
 ROOT_UID = 0
 DEFAULT_TIMEOUT_S = 60
-# How many clusters a sweep reads at once. Every check is a kubectl or gcloud
-# the credential proxy runs, and the proxy admits four requests at once under
-# its child memory budget at the operator's default limit
-# (docs/designs/credential-proxy-child-memory-budget.md §2.2: 704 MiB for
-# children over 176 MiB a request). A wider pool only queues the rest at the
-# proxy, where a check still waiting at its 60 s admission bound is refused
-# busy, or hits DEFAULT_TIMEOUT_S here first and reads its cluster as
-# unreachable -- which is the SOPs' cue to retry that cluster by hand, through
-# the same proxy. So the pool is the admitted count, as stall_watch.py's and
-# cluster_agent_reconcile.py's listing pools are; the procedural collectors
-# beside this file carry the same figure and point here.
-MAX_WORKERS = 4
-
-# What `default_run` reports when *it* gave up, following the shell convention
-# for a command killed by `timeout(1)`. It is this collector's own marker and
-# never something a `kubectl` or `gcloud` actually returned, so any branch that
-# reads an exit code as a statement about the cluster has to exclude it first.
-# On 2026-09-06 `kcc-object-wedged` did not: it took `rc != 0` on `kubectl get
-# gcp -A` to mean the API server does not serve the category, and published
-# "Config Connector is not installed on this cluster" about the one cluster in
-# the fleet that runs Config Connector, on the strength of its own timeout.
-TIMEOUT_RC = 124
+# How many clusters a sweep reads at once: broker_admission.sweep_width(),
+# resolved in collect_fleet. Every check is a kubectl or gcloud the credential
+# broker runs, and the broker admits its slot cap or what its child memory
+# budget fits at the container's effective limit, whichever is smaller: 8 at
+# the operator's default 2Gi limit, and on GKE Autopilot without bursting, where
+# the limit is the 2Gi default request; fewer where an override sets a smaller
+# memory request. A wider pool only queues the rest at the broker,
+# where a check still waiting at its 60 s admission bound is refused busy, or
+# hits DEFAULT_TIMEOUT_S here first and reads its cluster as unreachable. So the
+# width is read from the broker (GET /v1/exec/admission): its interactive cap
+# (admitted - 1) less the session cap's headroom for chat, never below four,
+# from six admitted up (the headroom is whole from seven), and at most four or the
+# interactive cap below that; four when the broker can't say
+# (broker_admission.width_for). The procedural collectors beside this
+# file resolve the same width. stall_watch.py's and cluster_agent_reconcile.py's
+# background listing pools stay at four: they share the broker with kanban
+# workers, and their own comments say why.
 
 # A judgement this collector hands the sweep (`audit_report.py`'s
 # `NO_SWEEP_TRIAGE`, which carries the same string). A `netpol-missing` fix
@@ -255,6 +250,8 @@ for _shared_dir in _platform_script_dirs():
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -572,40 +569,23 @@ def log(msg: str) -> None:
     print(f"[collect] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    """One subprocess's outcome, in the shape the manifest records it."""
-
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+# What `default_run` reports when *it* gave up, following the shell convention
+# for a command killed by `timeout(1)`. It is this collector's own marker and
+# never something a `kubectl` or `gcloud` actually returned, so any branch that
+# reads an exit code as a statement about the cluster has to exclude it first.
+# On 2026-09-06 `kcc-object-wedged` did not: it took `rc != 0` on `kubectl get
+# gcp -A` to mean the API server does not serve the category, and published
+# "Config Connector is not installed on this cluster" about the one cluster in
+# the fleet that runs Config Connector, on the strength of its own timeout.
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+Discovery = collector_run.Discovery
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
 
 
 RunFn = Callable[..., Run]
-
-
-def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    """The real subprocess call. Tests inject a fake in its place — every
-    driver function below takes `run` as a parameter rather than calling
-    `subprocess.run` directly, so nothing here needs a live cluster to test.
-    """
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, env=env, timeout=timeout
-        )
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
-        # notwithstanding, and every consumer of `Run` slices and joins it as str.
-        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-
-
-def _text(output: str | bytes | None) -> str:
-    if isinstance(output, bytes):
-        return output.decode(errors="replace")
-    return output or ""
 
 
 # GKE sets `RECONCILING` while work proceeds on a cluster whose
@@ -659,17 +639,6 @@ def target_name(project: str, location: str, name: str) -> str:
     rule. A candidate's `object` stays the bare resource.
     """
     return QUALIFIED_TARGET_SEPARATOR.join([p for p in (project, location) if p] + [name])
-
-
-class Discovery(NamedTuple):
-    projects: list[str]
-    # Set when no project could be resolved at all: an empty fleet is then a
-    # failure to look, and the manifest says so with a top-level `error`.
-    error: str | None
-    # Set when discovery resolved part of the fleet, or the operator narrowed
-    # it with `--project`. `collect_fleet` turns it into a `gate-failed`
-    # target so the loss is a row the document must account for.
-    partial: str | None = None
 
 
 def discover_fleet(base_project: str | None, *, run: RunFn = default_run) -> Discovery:
@@ -1049,11 +1018,13 @@ def run_and_gate(
     A `kubectl get <kinds> ... -o json` list response gates on `.items`
     being a list; a `gcloud ... --format=json(...)` object response has no
     such envelope, so it gates on parsing as an object at all. Both share
-    the same failure mode this function exists to catch: exit 0 with
-    truncated or empty output, which the credential proxy's output cap makes
-    a real possibility, not a theoretical one. That cap is 8 MiB per stream
+    the same failure mode this function exists to catch: truncated or empty
+    output, which the credential proxy's output cap makes a real possibility,
+    not a theoretical one (the shim now exits 74 on a cut reply; an older one
+    exited 0, and the gate holds either way). That cap is 8 MiB per stream
     as the operator deploys it, 4 MiB if `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES`
-    is unset; either way a 16-cluster `-A -o json` dump can reach it.
+    is unset; the multi-kind dumps that reached it are paged now
+    (`paged_and_gate`), and the one-shot reads left here are small.
     """
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     result = run(argv, env=env, timeout=timeout)
@@ -1070,6 +1041,17 @@ def run_and_gate(
     return parsed, result
 
 
+def paged_and_gate(kinds: str, kubeconfig: Path, *, run: RunFn = default_run, timeout: int = DEFAULT_TIMEOUT_S) -> tuple[dict | None, Run]:
+    """`run_and_gate` for a multi-kind dump: the kinds (a kubectl kind list,
+    `"deploy,sts,ds,cronjob,pod"`) read one at a time in pages through
+    `collector_run.paged_dump`, so a cluster of a few hundred nodes no longer
+    meets the credential proxy's output cap in one reply. The gate is the
+    same one: `None` on any page that failed, was cut, or is not a list, never
+    a shorter list from the pages that answered."""
+    env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
+    return paged_dump(kinds.split(","), run=run, env=env, timeout=timeout)
+
+
 class GateFailure(Exception):
     """Raised by a stream's context builder when a required collection
     command fails its gate. `collect_cluster` turns this into
@@ -1081,29 +1063,18 @@ class GateFailure(Exception):
 
 def dump_state(
     kubeconfig: Path, cluster: str, *, project: str = "", location: str = "", run: RunFn = default_run
-) -> tuple[Path, Run, bool]:
-    """`obtainability-audit`'s one dump, behind `run_and_gate`. Kept as its
-    own function (rather than inlined into its context builder) because its
-    fixed dump-to-a-named-file shape predates the multi-collection builder
-    contract and nothing else needs a file on disk — every check reads the
-    parsed dict `run_and_gate` already returns.
-
-    Keyed the way `kubeconfig_path` is, on the whole `(project, cluster,
-    location)` triple. The design's thread-safety rule is that a worker writes
-    only to paths keyed by its own cluster, and it named this file as the
-    example of a name no two threads can collide on — but a cluster name is
-    unique within a project, not across the fleet, and this collector runs
-    several projects at once. Two clusters called `prod` in two projects wrote
-    the same path, and the loser re-read the winner's dump: not a truncated
-    file or a crash, but one cluster's workloads published under the other's
-    name, with a manifest recording a clean rc=0 read.
+) -> tuple[dict | None, Run, bool]:
+    """`obtainability-audit`'s dump, behind the paged gate: `DUMP_COMMAND_KINDS`
+    read one kind at a time (`paged_and_gate`), returned parsed. It used to be
+    written to a `wra_state_<project>_<cluster>_<location>.json` scratch file
+    and read straight back; nothing read the file after that, and a dump that
+    exists only as the parsed dict costs no disk and leaves nothing behind.
+    `cluster`, `project` and `location` are kept for the callers that name
+    the read by them.
     """
-    dump_path = Path(SCRATCH_DIR) / f"wra_state_{project}_{cluster}_{location}.json"
-    parsed, result = run_and_gate(["kubectl", "get", DUMP_COMMAND_KINDS, "-A", "-o", "json"], kubeconfig, run=run)
-    if parsed is not None:
-        dump_path.parent.mkdir(parents=True, exist_ok=True)
-        dump_path.write_text(result.stdout, encoding="utf-8")
-    return dump_path, result, parsed is not None
+    del cluster, project, location
+    parsed, result = paged_and_gate(DUMP_COMMAND_KINDS, kubeconfig, run=run)
+    return parsed, result, parsed is not None
 
 
 def output_digest(text: str) -> str:
@@ -4408,6 +4379,13 @@ COMPLIANCE_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob"
 # either exists or does not.
 _SCALABLE_WORKLOAD_KINDS = ("Deployment", "StatefulSet")
 COMPLIANCE_DUMP_KINDS = "deploy,sts,ds,cronjob,pod"
+# The other built-in kinds compliance-audit reads, each list one paged read per
+# kind (`paged_and_gate`); the two single kinds are spelled the same way so
+# every read takes the same path.
+RBAC_DUMP_KINDS = "clusterroles,roles,clusterrolebindings,rolebindings"
+NETPOL_DUMP_KINDS = "netpol,ns"
+SERVICE_DUMP_KINDS = "svc"
+SERVICEACCOUNT_DUMP_KINDS = "sa"
 _SYSTEM_SA_NAMESPACE_RE_PARTS = (
     "kube-system", "gmp-system", "cnrm-system", "configconnector-operator-system", "krmapihosting-system",
 )
@@ -7997,14 +7975,13 @@ def _record(argv_str: str, result: Run) -> dict:
 
 
 def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
-    dump_path, dump_run, gate_ok = dump_state(
+    dump, dump_run, gate_ok = dump_state(
         kubeconfig, cluster["name"], project=cluster["project"], location=cluster["location"], run=run
     )
     if not gate_ok:
         raise GateFailure(f"dump gate failed (rc={dump_run.rc}): {dump_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
-    dump = json.loads(dump_path.read_text(encoding="utf-8"))
     workloads = normalize_workloads(dump)
-    record = _record(f"KUBECONFIG={kubeconfig} kubectl get {DUMP_COMMAND_KINDS} -A -o json", dump_run)
+    record = _record(paged_command_text(DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig), dump_run)
 
     context = build_context(dump, workloads)
     commands = {spec.slug: record for spec in checks}
@@ -8146,7 +8123,7 @@ AUTOPILOT_ALLOWLIST_KINDS = (
 # pod against an idle hub holding 19 objects: 10-14 seconds.
 #
 # That fits inside 60 comfortably, which is why the check looked fine until it
-# ran for real. The collector sweeps `MAX_WORKERS` clusters at once, and the
+# ran for real. The collector sweeps `max_workers` clusters at once, and the
 # fifteen without Config Connector answer this read in about a tenth of a
 # second, so the hub is the only one that is still working when the rest of
 # its wave are hammering the same pod -- and on 2026-09-06, the first day
@@ -8270,12 +8247,19 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     def gated(argv: list[str]) -> tuple[dict | list | None, Run]:
         return run_and_gate(argv, kubeconfig, run=run)
 
+    def paged(kinds: str) -> tuple[dict | None, Run]:
+        return paged_and_gate(kinds, kubeconfig, run=run)
+
+    def paged_text(kinds: str) -> str:
+        return paged_command_text(kinds.split(","), kubeconfig=kubeconfig)
+
     # Every collection below is gate-checked independently, and a gate
     # failure raises immediately — this stream fails the whole cluster
     # closed on any missing input, the same as a single-dump stream, per
-    # `GateFailure`'s own docstring.
-    workload_argv = ["kubectl", "get", COMPLIANCE_DUMP_KINDS, "-A", "-o", "json"]
-    parsed, result = gated(workload_argv)
+    # `GateFailure`'s own docstring. The built-in kinds are read in pages,
+    # one kind at a time; the CRD and category reads further down keep their
+    # one-shot shape, since an absent CRD is their ordinary answer.
+    parsed, result = paged(COMPLIANCE_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["workloads"] = normalize_compliance_workloads(parsed)
@@ -8310,42 +8294,39 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         for i in parsed.get("items", []) or []
         if i.get("kind") == "Pod"
     ]
-    workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
+    workload_record = _record(paged_text(COMPLIANCE_DUMP_KINDS), result)
     for spec in checks:
         if spec.slug not in _COMPLIANCE_CHECK_SOURCES:
             commands[spec.slug] = workload_record
 
-    rbac_argv = ["kubectl", "get", "clusterroles,roles,clusterrolebindings,rolebindings", "-A", "-o", "json"]
-    parsed, result = gated(rbac_argv)
+    parsed, result = paged(RBAC_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"RBAC dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     items = parsed.get("items", [])
     context["roles"] = [i for i in items if i.get("kind") in ("ClusterRole", "Role")]
     context["clusterrolebindings"] = [i for i in items if i.get("kind") == "ClusterRoleBinding"]
     context["rolebindings"] = [i for i in items if i.get("kind") == "RoleBinding"]
-    record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(rbac_argv)}", result)
+    record = _record(paged_text(RBAC_DUMP_KINDS), result)
     for slug in ("cluster-admin-binding", "wildcard-rbac", "anonymous-rbac-binding"):
         commands[slug] = record
 
-    netpol_argv = ["kubectl", "get", "netpol,ns", "-A", "-o", "json"]
-    parsed, result = gated(netpol_argv)
+    parsed, result = paged(NETPOL_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"NetworkPolicy/Namespace dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     items = parsed.get("items", [])
     context["networkpolicies"] = [i for i in items if i.get("kind") == "NetworkPolicy"]
     context["namespaces"] = [i for i in items if i.get("kind") == "Namespace"]
-    commands["netpol-missing"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(netpol_argv)}", result)
+    commands["netpol-missing"] = _record(paged_text(NETPOL_DUMP_KINDS), result)
 
     # Gated like the reads above rather than treated as optional: every cluster
     # has a Services API, so a failure here is a broken read and not an absent
     # feature, and `check_lb_world_open` reading an empty list would report a
     # cluster clean on a collection it never saw.
-    service_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
-    parsed, result = gated(service_argv)
+    parsed, result = paged(SERVICE_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"Service dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["services"] = parsed.get("items", []) or []
-    commands["lb-world-open"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(service_argv)}", result)
+    commands["lb-world-open"] = _record(paged_text(SERVICE_DUMP_KINDS), result)
 
     # A deliberate exception to "every read above raises": Dataplane V2's
     # `ClusterNetworkPolicy` CRD (§2.6's Do-NOT-flag case, `kubectl get ccnp
@@ -8471,12 +8452,11 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # workload names, and a read narrowed to `default` left it nothing to find
     # -- every named account read as absent, so the check returned no hits on
     # any cluster while its command recorded a clean run.
-    sa_argv = ["kubectl", "get", "sa", "-A", "-o", "json"]
-    parsed, result = gated(sa_argv)
+    parsed, result = paged(SERVICEACCOUNT_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"ServiceAccount dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["serviceaccounts"] = parsed.get("items", [])
-    sa_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(sa_argv)}", result)
+    sa_record = _record(paged_text(SERVICEACCOUNT_DUMP_KINDS), result)
     commands["default-sa-automount"] = sa_record
     commands["unbound-sa-automount"] = sa_record
 
@@ -8572,18 +8552,16 @@ def _collect_ai_security(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpe
     `inference-endpoint-public` alone. Either failing fails the whole
     cluster closed, the same trade-off compliance-audit's several
     independent reads accept."""
-    workload_argv = ["kubectl", "get", COMPLIANCE_DUMP_KINDS, "-A", "-o", "json"]
-    parsed, result = run_and_gate(workload_argv, kubeconfig, run=run)
+    parsed, result = paged_and_gate(COMPLIANCE_DUMP_KINDS, kubeconfig, run=run)
     if parsed is None:
         raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     ai_workloads = normalize_ai_workloads(parsed)
-    workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
+    workload_record = _record(paged_command_text(COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), result)
 
-    svc_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
-    svc_parsed, svc_result = run_and_gate(svc_argv, kubeconfig, run=run)
+    svc_parsed, svc_result = paged_and_gate(SERVICE_DUMP_KINDS, kubeconfig, run=run)
     if svc_parsed is None:
         raise GateFailure(f"service dump gate failed (rc={svc_result.rc}): {svc_result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
-    svc_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(svc_argv)}", svc_result)
+    svc_record = _record(paged_command_text(SERVICE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), svc_result)
 
     context = {"ai_workloads": ai_workloads, "services": svc_parsed.get("items", [])}
     commands = {
@@ -9700,9 +9678,10 @@ def collect_fleet(
     project: str | None = None,
     *,
     run: RunFn = default_run,
-    max_workers: int = MAX_WORKERS,
+    max_workers: int | None = None,
     workspace: Path | None = None,
 ) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     checks = CHECK_TABLES.get(audit_id)
     if not checks:
         raise ValueError(f"no check table for {audit_id!r} yet — see this file's module docstring")

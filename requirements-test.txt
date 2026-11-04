@@ -68,6 +68,13 @@ mcp>=2.3.0
 python-dotenv
 pyyaml
 
+# agents/platform/scripts/task_credential.py verifies the dispatcher's task
+# credentials (Ed25519) for the credential broker's profile role. The broker
+# runs on the Hermes venv, which carries it through hermes-agent's own
+# dependencies; listed here so the test sweep has it without leaning on mcp's
+# transitive pull.
+cryptography
+
 # deploy/docker/check_skill_commands.py and tests/test_skill_inline_commands.py
 # parse SKILL.md with markdown-it-py.
 # The image build runs it under /opt/hermes/.venv, which gets the package from

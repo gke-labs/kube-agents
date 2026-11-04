@@ -21,7 +21,7 @@ from tests.test_workflow_pins_and_fork_guards import WORKFLOWS_DIR, _load, _trig
 _PULL_REQUEST = "pull_request"
 _PATHS_FILTER = "dorny/paths-filter@"
 _TOKEN = "token"
-# Three workflows filter this way today; a sweep that found fewer saw too little.
+# More workflows than this filter this way; a sweep that found fewer saw too little.
 _FILTER_STEPS_FLOOR = 3
 
 

@@ -1508,8 +1508,8 @@ class SanitizerCoverageTest(unittest.TestCase):
         The cases are read out of that file rather than restated here. An
         earlier version of this test asserted a hardcoded list of eight
         framings, which made its name a promise it did not keep: a marker added
-        to the canonical copy tomorrow left it green. `SanitizerMirrorDriftTest`
-        below does the same job for `_is_safe_char`.
+        to the canonical copy tomorrow left it green. `SharedTextFilterTest`
+        below checks that the character filter is the shared module's.
 
         Asserted as "the sanitizer changed it" rather than as a specific
         replacement: `<untrusted_pod_diagnostics>` is covered by the boundary-tag
@@ -1560,49 +1560,21 @@ class SanitizerCoverageTest(unittest.TestCase):
                 )
 
 
-class SanitizerMirrorDriftTest(unittest.TestCase):
-    def test_is_safe_char_matches_the_platform_mcp_server_copy(self):
-        """The two `_is_safe_char` definitions must stay one function.
+class SharedTextFilterTest(unittest.TestCase):
+    def test_the_sanitizer_uses_the_shared_text_filter(self):
+        """One filter for every path to the model: pod diagnostics, issue text, memory text.
 
-        `platform_mcp_server.py` holds the canonical copy; this script mirrors
-        it because importing that module means importing `mcp`,
-        `agent_common_server` and `gke_endpoint` and constructing an MCP
-        server as a side effect. A mirror nobody checks is how the two drift,
-        and a character class stripped on one path but not the other is a hole
-        in whichever side forgot. The Unicode tag block is the standard
-        invisible-ASCII smuggling vector, and an issue body carrying it reaches
-        the same model as a pod log carrying it.
-
-        Compared as parsed syntax rather than as text, so comments and
-        formatting may differ (they do) while the logic may not.
+        The copy this script used to carry drifted from the memory plugin's by three
+        code points; the shared module ends that class of hole.
         """
-        import ast
+        import untrusted_text
 
-        def _definition(path: Path) -> str:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and node.name == "_is_safe_char":
-                    # Strip the docstring: prose is allowed to differ.
-                    body = node.body
-                    if (
-                        body
-                        and isinstance(body[0], ast.Expr)
-                        and isinstance(body[0].value, ast.Constant)
-                        and isinstance(body[0].value.value, str)
-                    ):
-                        body = body[1:]
-                    return "\n".join(ast.dump(n) for n in body)
-            raise AssertionError(f"_is_safe_char not found in {path}")
-
-        here = Path(resolver.__file__).resolve()
-        canonical = here.parents[3] / "scripts" / "platform_mcp_server.py"
-        self.assertTrue(canonical.is_file(), f"expected canonical copy at {canonical}")
-        self.assertEqual(
-            _definition(here),
-            _definition(canonical),
-            "resolver.py's _is_safe_char has drifted from platform_mcp_server.py's; "
-            "update both or neither",
-        )
+        self.assertIs(resolver.untrusted_text, untrusted_text)
+        self.assertFalse(hasattr(resolver, "_is_safe_char"))
+        for ch in ("\u2028", "\u2029", "\u2800", "\u200b", "\U000e0041", "\x9f"):
+            with self.subTest(ch=repr(ch)):
+                self.assertNotIn(ch, resolver.sanitize_untrusted_text(f"a{ch}b"))
+        self.assertEqual(resolver.sanitize_untrusted_text("a\u2028b"), "ab")
 
 
 class RepoValidationTest(unittest.TestCase):

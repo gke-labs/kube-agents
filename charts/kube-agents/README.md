@@ -353,6 +353,11 @@ resolves to that GSA:
 instantiation creates the identity and roles, and the chart values above carry
 the annotated KSA.
 
+`litellm.vertex.sessionAffinity` (off by default) sends each Gemini
+conversation a Vertex `session_id` so a new conversation's first turn can read
+a prompt another conversation warmed:
+[Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching).
+
 #### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
 
 `openai_compatible` routes `model-default` to any server that speaks the OpenAI
@@ -380,7 +385,6 @@ including `/v1`) are required, and the render fails without them. Set
   endpoint and no other.
 - **Egress.** The gateway's `litellm-policy` gets one rule derived from
   `apiBase`:
-
   - An in-cluster Service (`<svc>`, `<svc>.<ns>.svc`, or
     `<svc>.<ns>.svc.cluster.local`; a bare `<svc>` is the release namespace,
     and a two-label host such as `openrouter.ai` is a hostname, not
@@ -449,6 +453,14 @@ kubectl create secret generic sap-aicore -n kubeagents-system \
 helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
   --set litellm.modelProvider=sap --set litellm.envFromSecret=sap-aicore
 ```
+
+#### Upgrade notes: proposal counters become readings
+
+The operator now exports the proposal fields of `kubeagents_platformagent_usage` as readings of the forge: `remediationsMergedTotal`, `remediationsClosedUnmergedTotal`, `proposalsAuthored`, `remediationsOpen`, `proposalHumanTouches` and `proposalsMergedUntouched`. The first reading after the upgrade replaces a count of what the old process saw with the forge's all-time count. The health rules take a fourteen-day window over these readings, so they read that step as fourteen days of outcomes. For two weeks after the upgrade, `proposals_rejected_ratio_14d` and `proposals_merge_rate_14d` are distorted, and the merge rate can read above one. The same step occurs for two weeks after a repository with proposal history enters the managed list.
+
+A reading can also fall: a repository leaves the managed list, or a proposal is deleted. When `proposalsAuthored` falls inside the window, the rules drop both proposal ratios, and `KubeAgentsProposalsRejected` and `KubeAgentsProposalsUnmerged` cannot fire for the fourteen days the fall stays in the window. A proposal that a person closes and reopens does not cause this. The thresholds keep their names and values; `proposalsProposedMin14d` now counts proposals authored in the window.
+
+`status.usage.remediationsAppliedTotal`, which nothing ever wrote, leaves the CRD schema and the operator's export in this release. `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` keep their names but are absent, not 0, until the first reading lands and whenever two polls in a row read none, so a dashboard that read them as counters sees a gap rather than a zero.
 
 #### Upgrade notes: inference-gateway Service rename
 
@@ -619,9 +631,9 @@ On clusters enforcing NetworkPolicy, scrapes are dropped unless admitted: set `p
 When deploying via GitOps tools like ArgoCD, `helm template` passes the destination cluster's discovered API versions by default when connected to the target cluster. If default detection does not pick up your CRDs or if running disconnected templates, explicitly set `platformAgent.serviceMonitor: true` or `platformAgent.vmPodScrape: true` in your Helm values.
 
 `operator.metrics` is the operator's own listener: the manager serves controller-runtime's
-series and every `PlatformAgent`'s `status.usage` and `status.phase` as gauges
+series and every `PlatformAgent`'s `status.usage`, `status.phase` and `status.inference` as gauges
 (`kubeagents_platformagent_usage`, `kubeagents_platformagent_usage_time_seconds`,
-`kubeagents_platformagent_phase`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
+`kubeagents_platformagent_phase`, `kubeagents_platformagent_model`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
 on port `8080` (container port `metrics`), plain HTTP on the pod network.
 `operator.metrics.podMonitoring` renders `<release>-operator-monitoring` over the operator's
 pods, the same tri-state as `platformAgent.podMonitoring`. `operator.metrics.enabled: false`
@@ -649,7 +661,9 @@ the key keeps the rules off; turning them on from such a release needs `--reset-
 defaults and keeps the release's values, or every threshold set; the schema requires the whole
 block and the template says so when it is missing. The rules read the operator's scrape, so
 enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
-render with a message.
+render with a message. The two proposal alerts read the forge's proposal readings, and a fall in
+`proposalsAuthored` (a repository leaving the managed list, or a deleted proposal) silences them for two weeks; see
+[Upgrade notes: proposal counters become readings](#upgrade-notes-proposal-counters-become-readings).
 
 ### Turning telemetry off
 
@@ -826,6 +840,39 @@ predates `spec.storage`. The
 [PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specstorage)
 is canonical for the behaviour.
 
+### Sizing for a fleet (`examples/values-fleet.yaml`)
+
+The defaults fit a fleet of under 10 clusters. `examples/values-fleet.yaml` sets what the chart
+exposes for 25 clusters or more: `operator.resources` at 1Gi, `platformAgent.storage.size` at
+100Gi, `platformAgent.harness.tuning.maxInProgress` at 3, the credential-proxy and
+`agent-api-auth` resource blocks, and two `platformAgent.deployment.env` entries
+(`INCIDENT_WORKLOAD_DEDUP_SECONDS`, `KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its
+reason and what GKE Autopilot without bursting runs it at. It does not size the agent container
+itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
+sandbox, whose `platformAgent.harness.experimental.shellSandbox.resources` it leaves at the
+operator's 2 CPU and 2Gi defaults. The two env names reach the containers that read them;
+`CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
+allowlist, would reach only the credential-proxy and `agent-api-auth` containers, and are left
+out. Pass it beside your own values with `-f charts/kube-agents/examples/values-fleet.yaml`,
+after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
+[fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
+
+### People seen (`platformAgent.telemetry.peopleSeen`)
+
+`platformAgent.telemetry.peopleSeen` is the CR's `spec.telemetry.peopleSeen`. Under
+`spec.mode: next`, the A2A gateway keeps one hashed key and a last-active time per chat person
+for 30 days, and serves the people seen in the last 7 and 30 days as
+`kubeagents_a2a_gateway_people_seen`. Under
+`today` there is no gateway, so the value has no effect.
+It defaults to `true`, which renders no field, and the CRD default (`true`) applies.
+`false` renders the field: the gateway writes no key, purges the bucket at its next start, and
+serves no sample. Set it with `--set platformAgent.telemetry.peopleSeen=false`, or on an
+`install.sh` install with
+`TF_VAR_extra_helm_values='{platformAgent={telemetry={peopleSeen=false}}}'` in `install.env`.
+The render fails on a live install whose CRD predates `spec.telemetry.peopleSeen`. The
+[PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#spectelemetry)
+is canonical for the behaviour.
+
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,
@@ -860,6 +907,19 @@ chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
 does): against a CRD that predates `spec.deployment.credentialProxy`, the API
 server would prune the value silently while the release record kept it, so the
 chart looks up the installed CRD and fails the upgrade instead.
+
+`platformAgent.harness.experimental.shellSandbox.resources` sizes the shell
+container the same way: forwarded to the CR's
+`spec.harness.experimental.shellSandbox.resources` when any key is set and merged
+over the operator's defaults per key, with the
+[`shellSandbox` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#shellsandbox)
+canonical for the defaults and the refusals. The chart fails the render on the
+same shape faults (a key other than `requests`, `limits` and `claims`, a name
+the container does not declare, a quantity it cannot read) and leaves the
+crossed-pair and zero-limit refusals to the operator; the quota preflight counts
+the override, at the defaults when the operator would refuse it (it then renders
+the shell at them), and the same CRD guard fails the upgrade when the installed CRD
+predates the field.
 
 `platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
 `critical`, `warning`, `info` and `drift`, and each key that is set becomes an
@@ -938,6 +998,8 @@ These knobs need context beyond the chart:
   other lands on. It has no default: unset leaves the sandbox on the node's
   standard runtime, and `gvisor` needs the same GKE Sandbox node pool the agent's
   key does.
+- `harness.experimental.shellSandbox.resources` sizes the shell container; see
+  the sizing-override paragraph above.
 - `security.workloadIdentityFederation` needs a Workload Identity pool and
   provider trusting the cluster's OIDC issuer, and one
   `roles/iam.workloadIdentityUser` grant on the agent's GSA. Nothing creates
@@ -1038,10 +1100,10 @@ Exactly one owner creates the broker's KSA, depending on
   does not create it — the **chart** renders it instead, so a default install
   still starts.
 
-### Agent-RBAC admission policies
+### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs two cluster-scoped
-`ValidatingAdmissionPolicy` objects and their bindings, generated from
+`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
 namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
@@ -1049,14 +1111,27 @@ check the rules of a role a binding _references_ — CEL cannot read another
 object — and the content policy only selects manifests carrying the
 `kube-agents/tier` label; see that file's header.
 
-The template checks `.Capabilities.KubeVersion` as well as this value, so on a
+The third, `kube-agents-a2a-gateway-pod`, is generated from
+`k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`. It holds every pod
+the A2A gateway's ServiceAccount creates to the session pod shape: the session
+ServiceAccount, no automount, the session token audiences, no Secret or host
+access, Pod Security "restricted", and exactly the session labels. Where it is
+rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
+signal for operator features that must run only where this policy is installed.
+Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
+
+The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
 renders nothing instead of failing the install. `Chart.yaml` accepts `>=1.29.0-0`,
 so that case is inside the supported range and has to work.
 
 Set `admissionPolicy.enabled=false` for a second kube-agents release in a cluster
 that already has them: the objects are cluster singletons with fixed names, so
-Helm refuses the second install on ownership rather than duplicating them.
+Helm refuses the second install on ownership rather than duplicating them. The
+first release's gateway pod policy also holds the second release's gateway,
+since it derives the install's name from the requester, but the second release's
+operator does not get `A2A_GATEWAY_POD_POLICY`, so features gated on it stay off
+there.
 
 ### Quota preflight
 
@@ -1076,10 +1151,18 @@ since the operator runs the gateway as a single replica whatever the value); the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
 it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
 merged over its footprint entry per key, as the operator renders it, so a raised limit is
-summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
+summed at the raised figure; on GKE Autopilot (a cluster serving the `auto.gke.io` AllowlistedWorkload resource) it is counted at
+the operator's Autopilot requests, 2 CPU and 2Gi, with a CPU request the override does not set
+held to at most one CPU per GiB of the memory request. A cpu or memory limit set alone below the default
+request lowers the counted request to that limit, as the operator does. An override setting only
+`limits.ephemeral-storage` is counted
 as a request of that size too, because the operator renders no ephemeral-storage request and
-the API server defaults it to the limit; a `PlatformAgent` edited by hand after the install is
-outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
+the API server defaults it to the limit. The shell sandbox is counted the same way with
+`platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
+ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own; an
+override the operator refuses (a zero limit, a request above its limit) is counted at the defaults
+the operator renders in its place, because the chart does not fail the render on those. A
+`PlatformAgent` edited by hand after the install is outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
@@ -1087,6 +1170,19 @@ declare it (or a `LimitRange` to default it), and will reject the pod if omitted
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
+With `platformAgent.mode: next` it also counts what that mode adds, from footprint.yaml's
+`nextMode`: NATS and its 40Gi JetStream claim, the two auth callouts, the two capability
+verifiers, the console, the A2A gateway, the provisioning Job (counted although it runs to
+completion, because the operator runs it again whenever its spec changes and about daily once
+its TTL removes it, with the rest of the release standing), and the
+`hermes-bridge` container in each agent pod: at the `api` default, or, when `operator.extraEnv`
+sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less than the agent
+container's size (the operator's fallback under `cli`), raised per key by any readable figure
+in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
+rather than re-implementing it, so it can over-count; it never fails the render on them. The mode is read from the values, so a mode set
+on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
+The session pods a next install spawns on demand are not counted; the operator caps those with
+a `ResourceQuota` of its own.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.
@@ -1098,7 +1194,10 @@ CPU, memory and ephemeral-storage (requests and limits), `pods` (`count/pods`),
 keys, including `services`, `secrets` and other `count/<resource>` entries, are not
 modelled and are skipped rather than guessed at. **Scoped quotas are skipped entirely** —
 a quota with `scopes` or a `scopeSelector` applies to a subset of pods the template cannot
-identify, so comparing the whole release against it would be wrong either way. Every quota
+identify, so comparing the whole release against it would be wrong either way. So is a quota
+a `PlatformAgent` owns: the operator's next-mode session-pod quota (`pods` of `maxSessions`
+plus a headroom), which it puts back on every reconcile, so a printed patch would not stick;
+raise `spec.harness.tuning.maxSessions` instead. Every quota
 that falls short is reported in one failure, so a namespace with two of them takes one
 patch rather than two rounds.
 
@@ -1132,7 +1231,11 @@ under `Recreate` at any value, so that surge is an over-count.
 
 **Where it is silent, and where it is not.** The check needs a cluster to query, so it
 does nothing under `helm template` and nothing in a namespace with no ResourceQuota — a
-clean render in either case is not evidence that a quota fits.
+clean render in either case is not evidence that a quota fits. Its sum still runs there: the
+footprint summary below calls the same template on every render while `quotaPreflight.enabled`
+is on, so an input the sum refuses (an empty `hindsight.postgresql.storage`, a quantity it
+cannot parse, a damaged `footprint.yaml`) stops a quota-less render and `helm template` too,
+and `--set quotaPreflight.enabled=false` lifts the summary with the check.
 
 It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible
 to it. A LimitRange with a per-container `max`, or a `default` that rewrites what the pods
@@ -1158,7 +1261,56 @@ identity without that permission gets `error calling lookup: resourcequotas is
 forbidden` and no install rather than a quiet pass. Grant the permission, or install with
 `--set quotaPreflight.enabled=false`.
 
-### Optional AgentProfiles (`profiles.tse`)
+#### Footprint summary and modeled cost
+
+The install notes end with what the release asks of the cluster and what that costs at list
+price: the total pod CPU and memory requests, the pod count, and the persistent storage over
+its claims, summed exactly as the preflight above sums them (`kube-agents.footprintSummary`
+in `_helpers.tpl` calls the same template), then a monthly figure modeled from us-central1
+GKE Autopilot list prices: the `kube-agents.footprintPrice*` defines in `_helpers.tpl` pin the
+rate per vCPU-hour and per GiB-hour of memory, applied over the `footprintHoursPerMonth`
+billing month, and the rate per GiB-month of balanced persistent disk, with the
+`footprintClusterFeePerMonth` GKE cluster fee on its own line because it is per cluster rather
+than per release. The block is labelled `(modeled from us-central1 list prices, excluding LLM
+tokens)`: the rates are pinned in the chart, not looked up, and are applied to the declared
+requests, so model tokens, Autopilot's per-Pod minimums and request rounding, ephemeral-storage
+requests, node overheads and anything outside the release are not in it, and on a Standard
+cluster the bill is the node pools, which pod requests do not price. Helm prints the notes
+after an install or upgrade, and on `helm install --dry-run` without applying (`helm template`
+renders no notes). `install.sh` applies through Terraform, which shows no notes, so it renders
+the same template in its pre-flight summary and prints the figures the notes carry, for the
+values its generator writes, telling the render the cluster serves the `auto.gke.io`
+AllowlistedWorkload resource unless the generated `cluster_mode` is `standard`, so the
+credential proxy is counted at the operator's Autopilot requests there as the notes count it
+on the cluster; `helm get notes kube-agents -n <namespace>` prints them after the
+apply. It follows
+`quotaPreflight.enabled`, because it shares the preflight's arithmetic and the preflight's
+refusals name that switch as the way round them, but not the preflight's quota gate: it sums
+on every render, a namespace with no ResourceQuota and `helm template` included, so the
+refusals the preflight section lists apply wherever the summary prints. Under
+`spec.mode: next` it says what it leaves out: the A2A workloads, NATS's JetStream claim and
+the session pods, which the
+[install prerequisites](../../docs/site/src/content/docs/install/prerequisites.md) list.
+
+#### Upgrade notes: operator memory floor
+
+`operator.resources.limits.memory` has a floor at its default, 512Mi, and the chart fails the
+render on a smaller limit, naming the key; the preflight, which sums that block, runs the same
+check first, and both skip it when `operator.enabled` is false. Releases up to 0.16.0 shipped
+the Kubebuilder scaffold's 128Mi, and `helm upgrade --reuse-values` renders a new chart against
+the old release's values, defaults included, so an install upgraded that way kept 128Mi and the
+operator was OOM-killed as its cache filled. A hand-run upgrade from such a release uses
+`--reset-then-reuse-values` (Helm 3.14+), which takes the new defaults and keeps the release's
+own overrides; `upgrade.sh` resets the values the same way, so it never meets the floor on the
+old defaults. An explicit limit under 512Mi, in a values file or `extra_helm_values`, fails on
+every path: raise it to 512Mi or more, or drop the key. The operator reads whatever limit is
+rendered through the Downward API and sets its Go soft memory limit to nine tenths of it, so a
+larger cluster raises this one value. On GKE Autopilot the floor still applies. A cluster without
+bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets the limits equal to
+the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
+rendered manifest. A cluster with bursting admits the manifest as rendered.
+
+### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`)
 
 `profiles.tse.enabled` (default `false`) renders the optional `AgentProfile/tse`
 (GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
@@ -1167,6 +1319,18 @@ forbidden` and no install rather than a quiet pass. Grant the permission, or ins
 controlling its `AgentProfile` spec. When bound, the operator passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
 scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+
+`profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
+generic cluster agent: one profile for every cluster in scope, with the
+target named per task by the `project`, `location` and `cluster` parameters.
+Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
+and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
+control its spec. The parameters are fixed, in the persona's order, because
+the design has the worker refuse a task when they differ from the persona's.
+No pod runs it until the profile dispatcher, worker and pool land and the
+operator runs them, though enabling it already gets the profile its
+ServiceAccounts, bus identity and agent card. A cluster that needs its own
+persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
 
 ## Uninstalling
 
@@ -1281,8 +1445,9 @@ helm uninstall kube-agents -n kubeagents-system
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
-  the operator's **golden manifest**
-  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`),
+  the operator's **golden manifests**
+  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and
+  `platformagent-next.yaml` for its `nextMode` section),
   not from `k8s-operator/config/` and not from a live render. Changing the operator's
   resources therefore takes two steps in order — re-bless the goldens
   (`cd k8s-operator && go test ./internal/testing/... -update`), then `make chart-sync`.

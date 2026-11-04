@@ -95,6 +95,11 @@ func WithSideDoors(primary Adapter, doors []DoorSpec, log *slog.Logger) Adapter 
 	return &sideDoorAdapter{primary: primary, doors: doors, log: log}
 }
 
+// Close closes the chat adapters behind the doors (closeAdapter).
+func (s *sideDoorAdapter) Close() {
+	closeAdapter(s.primary)
+}
+
 // doorFor reports which door a conversation belongs to, or nil. The prefix
 // is the whole test, and it is why every door's keys are qualified: see
 // injectConversationKey and a2aConversationKey.
@@ -392,6 +397,15 @@ func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 func (s *sideDoorAdapter) SetHome(admits HomeAdmits, board BoardReader) {
 	if sink, ok := s.primary.(HomeSink); ok {
 		sink.SetHome(admits, board)
+	}
+}
+
+// SetBoardActor hands the board-health card's Retry and Drop route to the
+// primary, the half that draws the card; implemented unconditionally for the
+// same reason as SetProbe.
+func (s *sideDoorAdapter) SetBoardActor(actor BoardActor) {
+	if sink, ok := s.primary.(BoardActSink); ok {
+		sink.SetBoardActor(actor)
 	}
 }
 

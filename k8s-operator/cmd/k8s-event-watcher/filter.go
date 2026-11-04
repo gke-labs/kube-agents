@@ -18,6 +18,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -91,6 +92,11 @@ type filterConfig struct {
 	// node-provision timeout, past which a pod still pending is stuck whatever
 	// the autoscaler last said, and the count backstop applies again.
 	scaleUpHold time.Duration
+	// failedSchedulingMinSpan is how long, by its own first and last
+	// sighting, a FailedScheduling with no autoscaler verdict must have
+	// lasted before the count backstop passes it. Zero turns the check off.
+	// See defaultFailedSchedulingMinSpan.
+	failedSchedulingMinSpan time.Duration
 	// autopilotScaleToZeroHold enables the hold on an Autopilot cluster that has
 	// scaled itself to zero nodes, where GKE's own system pods stay Pending by
 	// design and no autoscaler verdict is ever recorded against them. On by
@@ -117,6 +123,9 @@ type filterThresholds struct {
 	// as a fifth positional argument for the same reason the counts do, and
 	// zero means "the default", as it does for them.
 	scaleUpHold time.Duration
+	// failedSchedulingMinSpan is --failedscheduling-min-span, on the same
+	// terms as settle below: zero means the default, negative turns it off.
+	failedSchedulingMinSpan time.Duration
 	// disableAutopilotScaleToZeroHold switches the Autopilot scale-to-zero hold
 	// off. Phrased as a disable, against the grain of the flag that sets it, so
 	// that the zero value is the shipped default here as it is for every count
@@ -156,6 +165,24 @@ const (
 	// on its own. The value is the issue's decision, chosen over three
 	// (defaultMinCount) to sit past a normal scale-up's first attempts.
 	defaultFailedSchedulingMinCount = 5
+	// defaultFailedSchedulingMinSpan is how long, by its own first and last
+	// sighting, a FailedScheduling with no autoscaler verdict must have lasted
+	// before the count backstop passes it (--failedscheduling-min-span). The count alone climbs in seconds whenever the
+	// cluster churns: a node scale-down cordons and taints a node and deletes
+	// its pods, the scheduler retries the evicted pod's replacement on each
+	// change, and no verdict is ever recorded against it (measured live: count
+	// five three seconds after the first attempt, the pod placed five seconds
+	// later). On the core/v1 recorder (GKE's own schedulers) a pod still stuck
+	// is re-sighted at least every five minutes, the scheduler's
+	// unschedulable-queue flush, so this delays its card to that sighting and
+	// never silences it; on an events.k8s.io/v1 recorder the next sighting is
+	// the series refresh, which at the default count already gates the count
+	// (failedSchedulingStaleAfter). Measured over 30 days on six clusters,
+	// 182 pods with no verdict were Pending for 4s at the median and 65s at
+	// the longest, and every one of the 40 the count alone passed scheduled
+	// inside 65s; two minutes holds all of them with twice the margin. Any
+	// value up to the five-minute flush gives a stuck pod the same worst case.
+	defaultFailedSchedulingMinSpan = 2 * time.Minute
 	// defaultScaleUpHold is cluster-autoscaler's default max-node-provision-time.
 	// A scale-up the autoscaler has not delivered by then is one it has given
 	// up on, so a pod still pending past it is reported on the count.
@@ -181,6 +208,48 @@ const (
 	// whose mark has aged out of the hold. Three flush intervals, so a slow
 	// retry is not mistaken for a stale event.
 	failedSchedulingStaleAfter = 15 * time.Minute
+	// failedSchedulingLogEvery is how long one FailedScheduling decision's log
+	// line stands for a pod before the same decision is logged again. The
+	// scheduler bumps the Event's count on every retry of every Pending pod,
+	// and each bump is a sighting the gate decides, so a line per sighting is
+	// the fleet's Pending pod count times the scheduler's retry rate: seen at
+	// about 12,000 lines in four minutes on a 29-cluster fleet, which was
+	// enough to OOM-kill the node's logging agent. The gate therefore logs a
+	// pod on its first decision, on every change of decision, and again each
+	// time this interval has passed with the decision unchanged, so a pod held
+	// for an hour is in the log every quarter of it; the per-sighting count
+	// stays on k8s_event_watcher_events_filtered_total. The same length as
+	// failedSchedulingStaleAfter: a pod unsighted that long is held as no
+	// longer pending, so the entry that outlives it has nothing to suppress.
+	failedSchedulingLogEvery = failedSchedulingStaleAfter
+	// maxFailedSchedulingLogEntries caps the memo behind that: one entry per
+	// Pending pod across the fleet, about 250 bytes each with its key, so
+	// the cap is about 12 MiB at worst against the watcher's soft memory
+	// limit of half a container (memoryLimitFraction). A full memo keeps
+	// what it holds and remembers nothing new: a pod it has no room for is
+	// logged on every sighting, as every pod was before the memo existed,
+	// until a sweep (below) has made room. It never evicts a live entry,
+	// because under a working set larger than the cap that would re-log
+	// every pod on every sighting and scan the whole memo under the
+	// fleet-wide lock each time, which is the flood this memo exists to
+	// stop, with a scan added. The cost of a fleet over the cap is therefore
+	// one line per sighting for the pods over it, and nothing else; the cap
+	// is set well above the Pending count of the fleets seen so far, since
+	// the protection ends a few hundred pods above it.
+	maxFailedSchedulingLogEntries = 50_000
+	// failedSchedulingLogSweepEvery is the least time between two sweeps of
+	// expired entries out of a full memo. lookup reclaims an expired entry
+	// only when its pod is sighted again, and a pod that scheduled or was
+	// deleted never is, so a full memo sweeps the map once; the interval
+	// bounds that scan to one a minute however many sightings arrive over
+	// the cap. See logFailedSchedulingDecision.
+	failedSchedulingLogSweepEvery = time.Minute
+	// failedSchedulingLogKeySep joins the project, location, cluster,
+	// namespace and UID of a memo key: the cluster's identity rather than
+	// its name, because a GKE name is unique only within its project and
+	// location and a fleet can watch two clusters named alike. A byte no
+	// name can carry, so no field can forge another's boundary.
+	failedSchedulingLogKeySep = "\x00"
 	// noNodesAvailableMessage is kube-scheduler's ErrNoNodesAvailable text,
 	// which it emits only when the cluster has no nodes at all. Every other
 	// FailedScheduling carries a fit error naming the nodes it rejected
@@ -210,6 +279,13 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 	scaleUpHold := th.scaleUpHold
 	if scaleUpHold <= 0 {
 		scaleUpHold = defaultScaleUpHold
+	}
+	failedSchedulingMinSpan := th.failedSchedulingMinSpan
+	switch {
+	case failedSchedulingMinSpan == 0:
+		failedSchedulingMinSpan = defaultFailedSchedulingMinSpan
+	case failedSchedulingMinSpan < 0:
+		failedSchedulingMinSpan = 0
 	}
 	settle := th.settle
 	switch {
@@ -246,6 +322,7 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 		imagePullTransientMinCount: orDefault(th.imagePullTransientMinCount),
 		failedSchedulingMinCount:   failedSchedulingMinCount,
 		scaleUpHold:                scaleUpHold,
+		failedSchedulingMinSpan:    failedSchedulingMinSpan,
 		autopilotScaleToZeroHold:   autopilotScaleToZeroHold,
 		settle:                     settle,
 	}
@@ -302,19 +379,28 @@ func stringSet(xs []string) map[string]struct{} {
 	return out
 }
 
-// filter evaluates triage events using a filterConfig. It keeps no state
-// about events, so one instance serves every cluster's dispatcher; the clock
-// is the only thing it reads besides the event, and only for the
-// FailedScheduling gate.
+// filter evaluates triage events using a filterConfig. One instance serves
+// every cluster's dispatcher. The decisions themselves read nothing but the
+// event and, for the FailedScheduling gate, the clock; the only state is the
+// memo of what that gate last logged per pod (fsLogged) and its sweep clock,
+// which decide whether a decision is written to the log and never what it is.
 type filter struct {
 	cfg filterConfig
 	// now is the clock the FailedScheduling gate ages marks and events
 	// against. nil means time.Now; tests set it.
 	now func() time.Time
+	// fsLogged is the last FailedScheduling decision logged per pod, keyed
+	// by the cluster's identity, namespace and UID and dated by the
+	// watcher's clock when it was logged; fsLastSweep is when a full memo
+	// last swept its expired entries. See logFailedSchedulingDecision.
+	// Written from every cluster's delivery goroutine, hence the lock.
+	fsLogMu     sync.Mutex
+	fsLogged    boundedEntries[filterGate]
+	fsLastSweep time.Time
 }
 
 func newFilter(cfg filterConfig) *filter {
-	return &filter{cfg: cfg}
+	return &filter{cfg: cfg, fsLogged: newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)}
 }
 
 func (f *filter) clock() time.Time {
@@ -358,6 +444,10 @@ const (
 	// gateFailedSchedulingMinCount is a FailedScheduling held on the count
 	// backstop, with no autoscaler verdict on record.
 	gateFailedSchedulingMinCount filterGate = "failedscheduling_min_count"
+	// gateFailedSchedulingMinSpan is a FailedScheduling past the count
+	// backstop whose sightings do not yet span --failedscheduling-min-span,
+	// with no autoscaler verdict on record.
+	gateFailedSchedulingMinSpan filterGate = "failedscheduling_min_span"
 	// gateFailedSchedulingStale is a FailedScheduling the scheduler stopped
 	// re-emitting long enough ago that the pod is no longer pending; see
 	// failedSchedulingStaleAfter.
@@ -516,27 +606,44 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 //     later, while no single object had passed four. The per-object count
 //     damps that burst; the price is a slower card on a cluster without an
 //     autoscaler while the message keeps changing.
+//   - Past the count, the event's own sightings must span
+//     --failedscheduling-min-span. A scale-down drain records no verdict and
+//     drives the count to five in seconds, for a pod placed seconds later.
+//     Zero timestamps fail open, as the settle gate's do; zero turns it off.
 //
-// Not a settle timer: a live event is never delayed by wall-clock time, only
-// by what the autoscaler said or by how often the scheduler has repeated it.
-// Each decision logs one line naming the pod and what decided it, which is
-// what a reader has in the pod log; the gate labels on
-// k8s_event_watcher_events_filtered_total are the same decisions counted.
-func (f *filter) failedSchedulingGate(ev TriageEvent) filterGate {
+// The scale-up hold and the span are measured on the event's own stamps,
+// never on the watcher's clock, so a replay after a restart reads as it did
+// live; the span is the only hold on an event's age with no verdict on record.
+// Each decision is one line naming the pod and what decided it, which is what
+// a reader has in the pod log, written when the decision for that pod is new,
+// has changed, or has stood for failedSchedulingLogEvery, not on every
+// sighting, bar an event with no pod key and a memo with no room, which
+// logFailedSchedulingDecision explains; the gate labels on
+// k8s_event_watcher_events_filtered_total are every sighting's decision
+// counted.
+func (f *filter) failedSchedulingGate(ev TriageEvent) (gate filterGate) {
 	now := f.clock()
+	// Noted, not formatted: most sightings' lines are dropped by the memo
+	// (see logFailedSchedulingDecision), so the formatting waits for the
+	// ones that are written.
+	var lines []notedLine
+	note := func(format string, args ...any) {
+		lines = append(lines, notedLine{format: format, args: args})
+	}
+	defer func() { f.logFailedSchedulingDecision(ev, gate, now, lines) }()
 	if !ev.LastSeen.IsZero() && now.Sub(ev.LastSeen) > failedSchedulingStaleAfter {
-		log.Printf("held %s pod=%s/%s (count=%d): last sighting %s ago, the pod is no longer pending",
+		note("held %s pod=%s/%s (count=%d): last sighting %s ago, the pod is no longer pending",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.LastSeen).Round(time.Second))
 		return gateFailedSchedulingStale
 	}
 	switch ev.ScaleUp.Verdict {
 	case scaleUpDeclined:
 		if !ev.LastSeen.IsZero() && !ev.LastSeen.Truncate(time.Second).After(ev.ScaleUp.At.Truncate(time.Second)) {
-			log.Printf("%s pod=%s/%s (count=%d): cluster-autoscaler declined to scale up %s ago, %s after this sighting; the scheduler has not retried since, falling back to the count backstop",
+			note("%s pod=%s/%s (count=%d): cluster-autoscaler declined to scale up %s ago, %s after this sighting; the scheduler has not retried since, falling back to the count backstop",
 				ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second), ev.ScaleUp.At.Sub(ev.LastSeen).Round(time.Second))
 			break
 		}
-		log.Printf("pass %s pod=%s/%s (count=%d): cluster-autoscaler declined to scale up %s ago, short-circuiting the count backstop",
+		note("pass %s pod=%s/%s (count=%d): cluster-autoscaler declined to scale up %s ago, short-circuiting the count backstop",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second))
 		return gateAccepted
 	case scaleUpTriggered:
@@ -548,24 +655,92 @@ func (f *filter) failedSchedulingGate(ev TriageEvent) filterGate {
 		}
 		sinceMark := sighting.Sub(ev.ScaleUp.At)
 		if sinceMark <= f.cfg.scaleUpHold {
-			log.Printf("held %s pod=%s/%s (count=%d): cluster-autoscaler triggered a scale-up %s ago, %s before this sighting, holding up to %s",
+			note("held %s pod=%s/%s (count=%d): cluster-autoscaler triggered a scale-up %s ago, %s before this sighting, holding up to %s",
 				ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second), max(sinceMark, 0).Round(time.Second), f.cfg.scaleUpHold)
 			return gateScaleUpHold
 		}
-		log.Printf("%s pod=%s/%s (count=%d): the scale-up triggered %s ago was %s old at this sighting, past the %s hold; falling back to the count backstop",
+		note("%s pod=%s/%s (count=%d): the scale-up triggered %s ago was %s old at this sighting, past the %s hold; falling back to the count backstop",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, now.Sub(ev.ScaleUp.At).Round(time.Second), sinceMark.Round(time.Second), f.cfg.scaleUpHold)
 	}
 	if f.cfg.autopilotScaleToZeroHold && autopilotScaleToZero(ev) {
-		log.Printf("held %s pod=%s/%s (count=%d): %q on Autopilot cluster %s with no autoscaler verdict — scaled to zero nodes, not a stuck pod",
+		note("held %s pod=%s/%s (count=%d): %q on Autopilot cluster %s with no autoscaler verdict — scaled to zero nodes, not a stuck pod",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.Message, ev.Cluster)
 		return gateAutopilotScaleToZero
 	}
 	if belowMinCount(ev.Count, f.cfg.failedSchedulingMinCount) {
-		log.Printf("held %s pod=%s/%s (count=%d < %d, no autoscaler verdict on record)",
+		note("held %s pod=%s/%s (count=%d < %d, no autoscaler verdict on record)",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, f.cfg.failedSchedulingMinCount)
 		return gateFailedSchedulingMinCount
 	}
+	if f.cfg.failedSchedulingMinSpan > 0 && !settled(ev, f.cfg.failedSchedulingMinSpan) {
+		note("held %s pod=%s/%s (count=%d, lasted %s < %s, no autoscaler verdict on record)",
+			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.LastSeen.Sub(ev.FirstSeen).Round(time.Second), f.cfg.failedSchedulingMinSpan)
+		return gateFailedSchedulingMinSpan
+	}
 	return gateAccepted
+}
+
+// logFailedSchedulingDecision writes the lines failedSchedulingGate noted for
+// a sighting when the decision is worth a line: the pod's first decision,
+// a decision different from the one last logged for it, or the same decision
+// once failedSchedulingLogEvery has passed since it was last logged. Any
+// other sighting is decided as before and counted on the gate's metric, and
+// is not logged. The memo is dated by the watcher's clock at the line, not by
+// the sighting: the question is how long the log has been quiet about this
+// pod, which a replayed event's own stamps do not answer.
+//
+// An event with no involvedObject UID or namespace names no one pod and is
+// not memoised, so every such sighting is logged; filing two hand-made
+// events under one key would lose the second's line, and the scale-up memo
+// refuses the same key for the same reason (scaleUpMemoKey). A full memo
+// remembers no new pod (see maxFailedSchedulingLogEntries): it sweeps its
+// expired entries at most once per failedSchedulingLogSweepEvery and, if that
+// made no room, writes the lines and keeps nothing.
+//
+// The lines are written after the lock is released: the lock orders the memo,
+// not the log, and a pod's sightings arrive on its cluster's one delivery
+// goroutine, so its lines keep their order without it. Writing under the lock
+// would hold every cluster's delivery goroutine behind one stderr write, on
+// the over-cap path in particular, where every sighting writes.
+func (f *filter) logFailedSchedulingDecision(ev TriageEvent, gate filterGate, now time.Time, lines []notedLine) {
+	if ev.Key.UID != "" && ev.Namespace != "" && !f.rememberFailedSchedulingDecision(ev, gate, now) {
+		return
+	}
+	for _, line := range lines {
+		log.Printf(line.format, line.args...)
+	}
+}
+
+// rememberFailedSchedulingDecision records gate as the decision last logged
+// for the event's pod and reports whether that is worth a line: false when
+// the memo already holds this decision for the pod inside its life, true
+// otherwise, whether or not the memo had room to remember it.
+func (f *filter) rememberFailedSchedulingDecision(ev TriageEvent, gate filterGate, now time.Time) bool {
+	key := strings.Join([]string{ev.Project, ev.Location, ev.Cluster, ev.Namespace, ev.Key.UID}, failedSchedulingLogKeySep)
+	f.fsLogMu.Lock()
+	defer f.fsLogMu.Unlock()
+	last, _, known := f.fsLogged.lookup(key, now)
+	if known && last == gate {
+		return false
+	}
+	if !known && f.fsLogged.full() {
+		if now.Sub(f.fsLastSweep) >= failedSchedulingLogSweepEvery {
+			f.fsLogged.expire(now)
+			f.fsLastSweep = now
+		}
+		if f.fsLogged.full() {
+			return true
+		}
+	}
+	f.fsLogged.store(key, gate, now, now)
+	return true
+}
+
+// notedLine is a log line failedSchedulingGate decided to write, held
+// unformatted until logFailedSchedulingDecision knows whether it will be.
+type notedLine struct {
+	format string
+	args   []any
 }
 
 // autopilotScaleToZero reports whether a FailedScheduling is the one an

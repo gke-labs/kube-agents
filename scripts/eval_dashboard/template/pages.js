@@ -27,8 +27,8 @@
  *   index.html#since=<ISO>&until=<ISO>&cases=a,b&view=gate|agent
  *   run.html#build=<prow build id>
  *   grid.html#since=<ISO>&until=<ISO>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]
- *   cases.html#<case>, or cases.html#sort=worst|domain|name&show=all|blocking|held
- *   trend.html#cases=a,b | trend.html#domain=<domain> [&metric=<judged metric>][&since=<ISO>[&until=<ISO>]]
+ *   cases.html#<case>, or cases.html#sort=worst|domain|name&show=all|blocking|held, or cases.html#view=scenarios[&domain=<domain slug>], or cases.html#view=domains
+ *   trend.html#cases=a,b | trend.html#domain=<domain> [&metric=<judged metric>][&mode=next|today][&since=<ISO>[&until=<ISO>]]
  * The older query form (`?cases=a,b&since=<ISO>&until=<ISO>` before a bare
  * `#gate` or `#agent`; `?build=<id>` on run.html; the same on the Grid and
  * the Cases page) is still read, so a link already posted opens the same
@@ -95,6 +95,12 @@ const PAGE = {
   trendFile: "trend.json",
   pages: { brief: "index.html", run: "run.html", grid: "grid.html", cases: "cases.html", nightly: "nightly.html", trend: "trend.html" },
   titles: { brief: "kube-agents · smoke gate brief", run: "kube-agents · smoke run", grid: "kube-agents · cases by run", cases: "kube-agents · how reliable is each test", nightly: "kube-agents · last night's run", trend: "kube-agents · scores over time on main" },
+  // The Cases page's three views: the team's table, the customer-side
+  // scenarios view (`#view=scenarios`), and the per-domain scorecard
+  // (`#view=domains`); the <title> while each of the last two is up.
+  casesViews: { reliability: "reliability", scenarios: "scenarios", domains: "domains" },
+  scenariosTitle: "kube-agents · what it can do",
+  domainsTitle: "kube-agents · domain coverage",
   // The Grid's window chips, and the one it opens with when the URL names none.
   gridWindows: [["6h", 6 * 3600 * 1000], ["24h", 24 * 3600 * 1000], ["36h", 36 * 3600 * 1000], ["7d", 7 * 24 * 3600 * 1000]],
   gridDefaultWindow: "36h",
@@ -107,6 +113,11 @@ const PAGE = {
   rateWarnMin: 0.75,
   // The words for a case's roster status (render.py's STATUS_* values).
   statusWords: { blocking: "blocking", held_out: "held out", demoted: "demoted", nightly_only: "nightly only", retired: "not in any matrix" },
+  // The scenarios view: the words for a confidence level (render.py's
+  // CONFIDENCE_* values) and for a roster status read from the customer's
+  // side (statusWords above are the team's).
+  confidenceWords: { proven: "Proven", proving: "Proving", in_development: "In development" },
+  scenarioStatusWords: { blocking: "guards every pull request", held_out: "in development", demoted: "in development", nightly_only: "nightly", retired: "in development" },
   // Verdict pill colour by the banner hack/ci-eval-rc.sh prints. NOT RUN is the
   // deploy-failed path: nothing was measured, which is neither a pass nor a
   // judgement on the candidate, so it takes the neutral infra colour.
@@ -360,7 +371,7 @@ function linkCaseIds(values) {
 // `#agent`, the old anchors, still selects that view; a bare case id on
 // the Cases page names its row.
 function linkState() {
-  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "", caseHash: null, sort: null, show: null, window: null, rows: null, domain: null, metric: null };
+  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "", caseHash: null, sort: null, show: null, window: null, rows: null, domain: null, metric: null, mode: null, casesView: null };
   let query, fragment;
   try {
     query = new URLSearchParams(location.search);
@@ -390,8 +401,12 @@ function linkState() {
   // when the page renders.
   const domain = param("domain").trim();
   if (PAGE.caseIdRe.test(domain)) out.domain = domain;
+  // The Cases page's other views (`cases.html#view=scenarios|domains`); the
+  // Brief's `view=` values are its own and read below.
+  out.casesView = [PAGE.casesViews.scenarios, PAGE.casesViews.domains].includes(param("view")) ? param("view") : null;
   const metric = param("metric").trim();
   if (PAGE.metricRe.test(metric)) out.metric = metric;
+  out.mode = pick("mode", TREND_MODES);
   const view = param("view") || location.hash.slice(1);
   out.view = Object.values(PAGE.views).includes(view) ? view : "";
   // A bare fragment that is a case id (`cases.html#<case>`) names the row to
@@ -426,18 +441,23 @@ const caseHref = (name) => `${PAGE.pages.cases}#${enc(name)}`;
 const trendHref = (cases, sinceMs = null, untilMs = null) => `${PAGE.pages.trend}#${scopeParams({ cases, sinceMs, untilMs }).join("&")}`;
 const trendDomainHref = (domain) => `${PAGE.pages.trend}#domain=${enc(domain)}`;
 // The Trend page's own state as a link: the current link with `patch`
-// applied (`cases`, `domain`, `metric`, `sinceMs`, `untilMs`). The page's
+// applied (`cases`, `domain`, `metric`, `mode`, `sinceMs`, `untilMs`). The page's
 // chips write this into the fragment rather than into `ui`: its domain and
 // case titles are same-document navigations, and a chip state that
 // outlived them pinned the view while the URL moved on. One source of
 // truth, and a chip's choice is in a link that can be pasted.
 function trendStateHref(link, patch) {
-  const state = { cases: [...link.cases], domain: link.domain, metric: link.metric, sinceMs: link.sinceMs, untilMs: link.untilMs, ...patch };
+  const state = { cases: [...link.cases], domain: link.domain, metric: link.metric, mode: link.mode, sinceMs: link.sinceMs, untilMs: link.untilMs, ...patch };
   const params = scopeParams({ cases: state.cases, sinceMs: state.sinceMs, untilMs: state.untilMs });
   if (!state.cases.length && state.domain) params.push(`domain=${enc(state.domain)}`);
   if (state.metric) params.push(`metric=${enc(state.metric)}`);
+  if (state.mode) params.push(`mode=${enc(state.mode)}`);
   return `${PAGE.pages.trend}#${params.join("&")}`;
 }
+// The Trend page's own domain and case titles keep the reader's series:
+// the other chips' state stays behind, but a title that switched today's
+// records for next's under the same heading would read as the same series.
+const trendModeHref = (href, link) => (link.mode ? `${href}&mode=${enc(link.mode)}` : href);
 const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 
 /* ---- links out ---- */
@@ -1084,7 +1104,7 @@ function briefHtml(link) {
 
 function footHtml() {
   const generated = parseIso(brief.generated_at);
-  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span>Last night's run: <a href="${PAGE.pages.nightly}">nightly</a></span><span>Scores over time on main: <a href="${PAGE.pages.trend}">trend</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
+  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span>Last night's run: <a href="${PAGE.pages.nightly}">nightly</a></span><span>Scores over time on main: <a href="${PAGE.pages.trend}">trend</a></span><span>What kube-agents can do: <a href="${esc(scenariosHref())}">scenarios</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
 }
 
 /* ---- the PR view ---- */
@@ -1376,7 +1396,23 @@ function caseGroups(cases, sort) {
   return groups;
 }
 
+// The Cases page's view: the team's reliability table, or the customer-side
+// scenarios view, chosen by the URL (`#view=scenarios`); the sub-nav under
+// the top bar links the two, so a switch is a hash change and no reload.
+const casesView = (link) => (link.casesView || PAGE.casesViews.reliability);
+const casesViewHref = (view) => `${PAGE.pages.cases}#view=${view}`;
+const scenariosHref = () => casesViewHref(PAGE.casesViews.scenarios);
+// The scenarios view scoped to one domain, or the whole view for null.
+const SCENARIOS_ALL_DOMAINS = "all";
+const scenariosDomainHref = (slug) => (slug ? `${scenariosHref()}&domain=${enc(slug)}` : scenariosHref());
+function casesSubnav(view) {
+  const item = (key, label) => `<a href="${esc(casesViewHref(key))}"${view === key ? ' class="on"' : ""}>${esc(label)}</a>`;
+  return `<nav class="subnav">${item(PAGE.casesViews.reliability, "How reliable is each test")}${item(PAGE.casesViews.scenarios, "What kube-agents can do")}${item(PAGE.casesViews.domains, "Domain coverage")}</nav>`;
+}
+
 function casesHtml(link) {
+  if (casesView(link) === PAGE.casesViews.scenarios) return scenariosHtml(link);
+  if (casesView(link) === PAGE.casesViews.domains) return domainsHtml();
   const sort = ui.sort || link.sort || "worst";
   const show = ui.show || link.show || "all";
   const all = caseDocs();
@@ -1399,7 +1435,8 @@ function casesHtml(link) {
     ? ` The suite has caught ${plural(catches.product_bugs, "real product bug")}${Number.isInteger(catches.prs_blocked) ? ` and stopped ${plural(catches.prs_blocked, "PR")} from merging` : ""}${catches.ledger ? ` (catch ledger ${issueLink(catches.ledger)})` : ""}.`
     : "";
   const generated = parseIso(brief.generated_at);
-  return `<div class="sec head"><h1>How reliable is each test?</h1><div class="lede">One row per case. Pass rates count only repetitions the grader scored: quota and setup losses are left out, and a run where almost everything failed is charged to the run, not the cases. Blocking means the case is on the admitted roster and can red a PR.</div></div>` +
+  return casesSubnav(PAGE.casesViews.reliability) +
+    `<div class="sec head"><h1>How reliable is each test?</h1><div class="lede">One row per case. Pass rates count only repetitions the grader scored: quota and setup losses are left out, and a run where almost everything failed is charged to the run, not the cases. Blocking means the case is on the admitted roster and can red a PR.</div></div>` +
     `<div class="ctl">sort by ${chip("sort", "worst", `worst ${windows[0]}d`, sort === "worst")}${chip("sort", "domain", "domain", sort === "domain")}${chip("sort", "name", "name", sort === "name")}` +
     `<span class="sep">·</span>show ${chip("show", "all", `all ${counts.all}`, show === "all")}${chip("show", "blocking", `blocking only · ${counts.blocking}`, show === "blocking")}${chip("show", "held", `held out only · ${counts.held}`, show === "held")}</div>` +
     `<table class="cases"><thead><tr><th>Case</th><th>Last ${esc(brief.strip_runs ?? 30)} runs</th><th>${windows[0]}d</th><th>${windows[1]}d</th><th>Nightly ${windows[0]}d</th><th>Nightly ${windows[1]}d</th><th>Status</th><th>Issue</th></tr></thead><tbody>${rows.join("")}</tbody></table>` +
@@ -1662,7 +1699,7 @@ function nightlyBriefHtml() {
   const list = nights();
   const night = list[0];
   let body;
-  if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 9 AM digest.</p>`;
+  if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 11 AM digest.</p>`;
   else {
     const c = night.counts;
     // With a main-b part, each half cut short is named with its own wall
@@ -1815,9 +1852,228 @@ function nightlyHtml(link) {
     nightTimingHtml(link) + nightsListHtml(night) + footHtml();
 }
 
+/* ---- the Cases page's scenarios view (SCHEMA.md: brief.json's domains[], confidence_bar and cases{}.summary / confidence / times / transcript_url) ---- */
+
+// Seconds as a reader says them: "13 s", "2 min 20 s", "1 h 5 min".
+function taskTimeText(s) {
+  if (!Number.isFinite(s) || s < 0) return "—";
+  const whole = Math.round(s);
+  if (whole < 60) return `${whole} s`;
+  const minutes = Math.floor(whole / 60), seconds = whole % 60;
+  if (minutes < 60) return seconds ? `${minutes} min ${seconds} s` : `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} h ${minutes - hours * 60} min`;
+}
+// The lower median of the finite values, or null.
+const lowerMedian = (values) => { const v = values.filter(Number.isFinite).sort((a, b) => a - b); return v.length ? v[Math.floor((v.length - 1) / 2)] : null; };
+const confidenceOf = (c) => (c.confidence && typeof c.confidence === "object" ? c.confidence : { level: "proving", runs: 0, passes: 0, rate: null, full: false, min_runs: null, as_of: null });
+const LEVELS = ["proven", "proving", "in_development"];
+const levelOf = (c) => (LEVELS.includes(confidenceOf(c).level) ? confidenceOf(c).level : "proving");
+const byLevelThenTitle = (a, b) => LEVELS.indexOf(levelOf(a)) - LEVELS.indexOf(levelOf(b)) || String(a.summary.name).localeCompare(String(b.summary.name));
+const timesOf = (c) => (c.times && typeof c.times === "object" ? c.times : {});
+const confidenceBar = () => (brief.confidence_bar && typeof brief.confidence_bar === "object" ? brief.confidence_bar : {});
+const isUnadmitted = (c) => c.status === "held_out" || c.status === "demoted" || c.status === "retired";
+
+function confidenceBadge(c) {
+  const level = levelOf(c);
+  return `<span class="lvl ${esc(level)}">${esc(PAGE.confidenceWords[level])}</span>`;
+}
+
+function scenarioStatusPill(c) {
+  const word = PAGE.scenarioStatusWords[c.status] || PAGE.statusWords[c.status] || String(c.status);
+  const tip = c.status === "demoted" && c.demoted_on ? `demoted from the blocking roster ${c.demoted_on}; the nightly still runs it` : (PAGE.statusWords[c.status] || "");
+  return `<span class="st ${esc(c.status)}"${tipAttr(tip)}>${esc(word)}</span>`;
+}
+
+// A hover note the page draws itself (CSS: [data-tip]), so it shows on
+// every browser the same way; "" draws nothing.
+const tipAttr = (tip) => (tip ? ` data-tip="${esc(tip)}"` : "");
+const etDate = (ms) => (ms == null ? "an unknown day" : fmtParts(ms, { month: "short", day: "numeric" }));
+
+// The record behind the level, in words: how many nightly repetitions of
+// the case at the current build passed and since when, how many more a
+// Proven reading needs, and why an unadmitted or expected-to-fail case
+// reads In development.
+function scenarioRecordHtml(c) {
+  const k = confidenceOf(c);
+  const parts = [];
+  if (k.runs) parts.push(`${k.passes} of ${plural(k.runs, "nightly repetition")} passed in the last ${plural(k.window_days ?? confidenceBar().window_days ?? "", "day")}`);
+  else parts.push(`no nightly repetition at the current build in the last ${plural(confidenceBar().window_days ?? "", "day")}`);
+  const knownGap = Boolean(c.summary && c.summary.expected_fail);
+  // A card held at In development by its status or marker cannot read
+  // Proven however many repetitions come in, so it is not told it can.
+  if (!k.full && Number.isFinite(k.min_runs) && !knownGap && !isUnadmitted(c)) parts.push(`${Math.max(0, k.min_runs - k.runs)} more needed before it can read Proven`);
+  if (knownGap) parts.push("marked expected_fail: a known gap, not yet closed");
+  else if (isUnadmitted(c)) parts.push("not on the roster that guards pull requests");
+  const tip = k.runs ? `repetitions of the nightly eval at the current build, ${etDate(parseIso(k.since))} to ${et(parseIso(k.as_of))}${Number.isFinite(k.min_runs) ? `; Proven needs ${k.min_runs} of them at ${pct(confidenceBar().rate ?? 0)} or better` : ""}` : "";
+  return `<div class="rec"><span class="lbl">Record</span><span${tipAttr(tip)}>${esc(parts.join(" · "))}</span></div>`;
+}
+
+// The two times, each named for what it measures. The detail sits behind
+// a hover: a first reply nobody recorded, and times from the last recorded
+// night when the window's night is not collected yet.
+function scenarioTimesHtml(c) {
+  const t = timesOf(c);
+  const parts = [];
+  if (Number.isFinite(t.turn1_p50_s)) parts.push(`<span${tipAttr(`until the agent's first chat message comes back: median of ${plural(t.n_turn1, "repetition")}, p95 ${taskTimeText(t.turn1_p95_s)}`)}>first reply <b>${esc(taskTimeText(t.turn1_p50_s))}</b></span>`);
+  else if (Number.isFinite(t.agent_p50_s)) parts.push(`<span>first reply <span class="hint"${tipAttr("none of these repetitions recorded a first-reply time")}>not recorded</span></span>`);
+  if (Number.isFinite(t.agent_p50_s)) parts.push(`<span${tipAttr(`the whole run, from the request to the final report, delegations included: median of ${plural(t.n_agent, "repetition")}`)}>task finished <b>${esc(taskTimeText(t.agent_p50_s))}</b></span>`);
+  if (!parts.length) return `<span class="tms"><span class="mut">no timing on record</span></span>`;
+  const when = t.source === "last_night" ? ` · <span class="hint"${tipAttr(`from the last recorded night${t.at ? `, ${et(parseIso(t.at))}` : ""}: no repetition in the current window carries timing yet`)}>older night</span>` : "";
+  return `<span class="tms">${parts.join(" · ")}${when}</span>`;
+}
+
+// One card, folded to its title line (level, pill, title, times) until the
+// reader opens it; the open state survives the poll's re-render
+// (ui.openTables, keyed scenario:<case>).
+function scenarioCard(c) {
+  const s = c.summary;
+  const key = `scenario:${c.name}`;
+  const missing = `<span class="mut">not written in the task yet</span>`;
+  const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">newest passing transcript</a>` : `<span class="mut">no passing run on record</span>`,
+    `<a href="${esc(caseHref(c.name))}">history</a>`, `<a href="${esc(trendHref([c.name]))}">trend</a>`];
+  return `<details class="card" id="scenario-${esc(c.name)}" data-tv="${esc(key)}"${ui.openTables.has(key) ? " open" : ""}>` +
+    `<summary><div class="hd">${confidenceBadge(c)}${scenarioStatusPill(c)}</div><h3>${esc(s.name)}</h3><div class="ft">${scenarioTimesHtml(c)}<span class="more"><span class="open">details ▾</span><span class="close">hide ▴</span></span></div></summary>` +
+    `<p><span class="lbl">The situation</span>${s.prompt ? esc(s.prompt) : missing}</p>` +
+    `<p><span class="lbl">What a good answer does</span>${s.expected_output ? esc(s.expected_output) : missing}</p>` +
+    scenarioRecordHtml(c) + `<div class="links">${links.join("")}</div></details>`;
+}
+
+// Sections in domains.yaml order (brief.domains), then any slug the file
+// does not list, alphabetically, "no domain" among them.
+function scenarioGroups(cases) {
+  const rows = Array.isArray(brief.domains) ? brief.domains.filter((d) => d && typeof d === "object" && typeof d.slug === "string") : [];
+  const byDomain = new Map();
+  for (const c of cases) { if (!byDomain.has(c.domain)) byDomain.set(c.domain, []); byDomain.get(c.domain).push(c); }
+  const groups = [];
+  for (const row of rows) {
+    if (!byDomain.has(row.slug)) continue;
+    groups.push({ slug: row.slug, name: domainWords(row.slug), meaning: typeof row.meaning === "string" ? row.meaning : null, cases: byDomain.get(row.slug) });
+    byDomain.delete(row.slug);
+  }
+  for (const slug of [...byDomain.keys()].sort()) groups.push({ slug, name: domainWords(slug), meaning: slug === DOMAIN_UNKNOWN ? DOMAIN_UNKNOWN_TOOLTIP : null, cases: byDomain.get(slug) });
+  for (const g of groups) g.cases.sort(byLevelThenTitle);
+  return groups;
+}
+
+// One line per section: how many, how many proven, the weakest record, the median task time.
+function scenarioGroupSummary(g) {
+  const proven = g.cases.filter((c) => levelOf(c) === "proven").length;
+  const rated = g.cases.filter((c) => confidenceOf(c).runs > 0 && Number.isFinite(confidenceOf(c).rate));
+  const weakest = rated.length ? rated.reduce((a, b) => (confidenceOf(b).rate < confidenceOf(a).rate ? b : a)) : null;
+  const med = lowerMedian(g.cases.map((c) => timesOf(c).agent_p50_s));
+  const parts = [esc(plural(g.cases.length, "scenario")), `${proven} proven`];
+  if (weakest) parts.push(`weakest ${esc(weakest.summary.name)} (${confidenceOf(weakest).passes}/${confidenceOf(weakest).runs})`);
+  if (med != null) parts.push(`median task time ${esc(taskTimeText(med))}`);
+  return parts.join(" · ");
+}
+
+// How to read the cards: one line per word they use, folded away under the
+// counts so it reads as a note, not as the page.
+function scenarioGlossaryHtml() {
+  const bar = confidenceBar();
+  const ok = Number.isFinite(bar.rate) && Number.isFinite(bar.min_runs) && Number.isFinite(bar.window_days) && Number.isFinite(bar.proving_min_rate);
+  const runs = ok ? bar.min_runs : "the bar's";
+  return `<details class="gloss" data-tv="gloss"${ui.openTables.has("gloss") ? " open" : ""}><summary>How to read the cards</summary><ul>` +
+    `<li><b>Nightly repetition</b>: one run of the scenario in the nightly eval on <code>main</code>, graded pass or fail; a repetition lost to quota or setup is not counted. Each night runs a scenario a few times.</li>` +
+    `<li><b>Proven</b>: ${ok ? `${pct(bar.rate)} or better over the scenario's repetitions in the last ${plural(bar.window_days, "day")} at the current build, at least ${runs} of them` : "the bar holds over the scenario's recent repetitions at the current build"}. ${ok ? pct(bar.rate) : "The rate"} is the same bar that lets a scenario guard every pull request.</li>` +
+    `<li><b>Proving</b>: fewer than ${runs} repetitions at the current build in the window${ok ? `, or ${pct(bar.proving_min_rate)} to ${pct(bar.rate)} over them` : ""}. A new build starts every scenario here; the record fills in night by night.</li>` +
+    `<li><b>In development</b>: ${ok ? `below ${pct(bar.proving_min_rate)}` : "below the proving line"}, or a scenario not yet admitted to the roster, or one marked as a known gap.</li>` +
+    `<li><b>First reply</b>: how long until the agent's first chat message comes back. <b>Task finished</b>: the whole run, from the request to the final report, delegations included. Both are medians over the same repetitions; no target yet.</li>` +
+    `<li><b>Guards every pull request</b>: on the blocking roster. <b>Nightly</b>: runs on <code>main</code> every night only.</li>` +
+    `</ul></details>`;
+}
+
+function scenariosHtml(link) {
+  const every = caseDocs();
+  const cases = every.filter((c) => c.summary && typeof c.summary === "object");
+  const unsummarised = every.length - cases.length;
+  const head = casesSubnav(PAGE.casesViews.scenarios) + `<div class="sec head"><h1>What kube-agents can do</h1>` +
+    `<div class="lede">One card per scenario the evaluation suite runs, by job area: the request the agent gets, what the grader looks for, and how sure the nightly record is. Scenarios run against our seeded test fleet, so cluster names such as <code>seeded-b</code> are the fleet's.</div></div>`;
+  if (!cases.length) {
+    return head + `<div class="sec"><p class="mut">No scenario to show: the checkout this view was rendered from has no <code>bench/tasks</code> for the ${plural(every.length, "case")} on record.</p></div>` + footHtml();
+  }
+  const groups = scenarioGroups(cases);
+  // The filter is the URL's `domain=` alone (linkState); a slug no section has shows every one.
+  const filtered = groups.find((g) => g.slug === link.domain) || null;
+  const shown = filtered ? [filtered] : groups;
+  const counts = { proven: 0, proving: 0, in_development: 0 };
+  for (const c of cases) counts[levelOf(c)] += 1;
+  const chips = [chip("domain", SCENARIOS_ALL_DOMAINS, `all · ${cases.length}`, !filtered)]
+    .concat(groups.map((g) => chip("domain", g.slug, `${g.name} · ${g.cases.length}`, filtered != null && filtered.slug === g.slug, g.meaning || "")));
+  // With nothing Proven yet, say why in one line: the earliest night any
+  // card's current record reaches back to.
+  const starts = cases.map((c) => parseIso(confidenceOf(c).since)).filter((ms) => ms != null);
+  const none = !counts.proven && starts.length ? ` No scenario reads Proven yet: the cards' records at their current builds reach back to ${esc(etDate(Math.min(...starts)))} at the earliest, and a Proven reading needs ${esc(confidenceBar().min_runs ?? "the bar's")} repetitions in the last ${esc(plural(confidenceBar().window_days ?? "", "day"))}.` : "";
+  const totals = `<div class="sec"><p>${esc(plural(cases.length, "scenario"))} in ${esc(plural(groups.length, "domain"))} · <b>${counts.proven}</b> proven · <b>${counts.proving}</b> proving · <b>${counts.in_development}</b> in development.${none} <span class="mut">Click a card for the situation, what a good answer does, its record and its transcript.</span></p>` +
+    `<div class="ctl">domain ${chips.join("")}</div>${scenarioGlossaryHtml()}</div>`;
+  const sections = shown.map((g) => `<div class="sec" id="domain-${esc(g.slug)}"><h2>${esc(g.name)}</h2>${g.meaning ? `<div class="lede">${esc(g.meaning)}</div>` : ""}<div class="dsum">${scenarioGroupSummary(g)}</div><div class="scn">${g.cases.map(scenarioCard).join("")}</div></div>`).join("");
+  const generated = parseIso(brief.generated_at);
+  const foot = `<div class="foot block"><p class="mut">A card is the three fields its task carries (the title, the request, what a good answer does), cut short; the task itself has the full text. The transcript is the newest nightly run in which every repetition passed.${unsummarised ? ` ${plural(unsummarised, "historical case")} with no task on this checkout ${unsummarised === 1 ? "is" : "are"} not shown.` : ""} Data generated ${esc(generated != null ? et(generated) : "unknown")}.</p></div>`;
+  return head + totals + sections + foot + footHtml();
+}
+
+/* ---- the Cases page's domain view (SCHEMA.md: brief.json's scorecard; understudies.py) ---- */
+
+const scorecardDoc = () => (brief.scorecard && typeof brief.scorecard === "object" && Array.isArray(brief.scorecard.domains) ? brief.scorecard : null);
+
+// One understudy in words: its nightly record and the store's verdict.
+function understudyHtml(u, bar) {
+  const record = u.graded ? `${u.passed}/${u.graded} over ${plural(u.nights, "night")}` : "no graded night";
+  const store = u.store && u.store.state === "none" ? "no store record at the current key" : u.store && u.store.state ? `store ${u.store.state}${Number.isInteger(u.store.runs) && u.store.runs ? `, ${u.store.passes}/${u.store.runs}` : ""}` : "";
+  const tip = `nightly record over the last ${plural(bar.nights ?? "", "night")}; the bar is ${pct(bar.rate ?? 0)} over at least ${bar.min_runs ?? ""} graded runs${u.meets_bar ? ", met" : ""}`;
+  return `<div><a href="${esc(caseHref(u.case))}">${esc(u.case)}</a>${u.held_out ? ' <span class="mut">(held out)</span>' : ""} <span class="mut hint"${tipAttr(tip)}>${esc([record, store].filter(Boolean).join(" · "))}</span></div>`;
+}
+
+function domainRow(d, doc) {
+  const seat = d.seats && d.seats.length
+    ? `<span class="pill p-pass">yes</span> <span class="mut">${d.seats.map((c) => `<a href="${esc(caseHref(c))}">${esc(c)}</a>`).join(", ")}</span>`
+    : `<span class="pill p-fail">no</span>${d.held_out ? ` <span class="mut hint"${tipAttr("still runs on the presubmit as a held-out seat, which can red no pull request")}>held out: ${esc(d.held_out)}</span>` : ""}`;
+  const days = d.seats && d.seats.length ? "—"
+    : `${Number.isInteger(d.days_uncovered) ? esc(plural(d.days_uncovered, "day")) : '<span class="mut">start not recorded</span>'}${d.allowlist_issue ? ` · ${issueLink(`#${d.allowlist_issue}`)}` : ""}${Number.isInteger(d.expired_days) ? ` <span class="pill p-fail">exception expired ${esc(plural(d.expired_days, "day"))} ago</span>` : ""}`;
+  const red = !d.nightly_red ? '<span class="mut">not read</span>'
+    : d.nightly_red.open ? `${d.nightly_red.open}${Number.isInteger(d.nightly_red.oldest_days) ? ` <span class="mut">oldest ${esc(plural(d.nightly_red.oldest_days, "day"))}</span>` : ""}` : "0";
+  const ready = d.understudy_ready === true ? '<span class="pill p-pass">yes</span>' : d.understudy_ready === false ? '<span class="pill p-partial">no</span>' : '<span class="mut">store not read</span>';
+  const studies = d.understudies == null ? '<span class="mut">not read</span>'
+    : d.understudies.length ? d.understudies.map((u) => understudyHtml(u, doc.bar || {})).join("") : '<span class="mut">none on the nightly matrix</span>';
+  const owner = d.owner ? `@${esc(d.owner)}${d.backup ? ` <span class="mut">backup @${esc(d.backup)}</span>` : ""}` : '<span class="mut">none on record</span>';
+  return `<tr><td class="nm">${esc(domainWords(d.slug))}</td><td>${owner}</td><td>${seat}</td><td class="num">${days}</td><td class="num">${red}</td><td>${ready}</td><td>${studies}</td></tr>`;
+}
+
+function domainsHtml() {
+  const doc = scorecardDoc();
+  const head = casesSubnav(PAGE.casesViews.domains) + `<div class="sec head"><h1>Domain coverage</h1>` +
+    `<div class="lede">One row per domain in <code>docs/designs/domains.yaml</code>: whether a case on the blocking roster guards it, how long it has gone without one, its open nightly bugs, and the nightly cases ready to stand in when its seat is demoted.</div></div>`;
+  if (!doc) return head + `<div class="sec"><p class="mut">The scorecard was not computed for this refresh (<code>understudies.py</code> did not run or failed); the 11 AM digest and the coverage-gap issues still carry every uncovered domain.</p></div>` + footHtml();
+  const covered = doc.domains.filter((d) => d.seats && d.seats.length).length;
+  const ready = doc.domains.filter((d) => d.understudy_ready === true).length;
+  const rows = doc.domains.map((d) => domainRow(d, doc)).join("");
+  const bar = doc.bar || {};
+  const generated = parseIso(doc.generated_at);
+  return head +
+    `<div class="sec"><p><b>${covered}</b> of ${esc(plural(doc.domains.length, "domain"))} have a presubmit seat · <b>${ready}</b> have an understudy ready.</p>` +
+    `<table class="rel domains"><thead><tr><th>Domain</th><th>Owner</th><th>Presubmit seat</th><th>Days uncovered</th><th>Open nightly-red</th><th>Understudy ready</th><th>Best understudies</th></tr></thead><tbody>${rows}</tbody></table></div>` +
+    `<div class="foot block"><p>An understudy is a case of the domain on the nightly matrix with a <code>verification_spec</code>, not <code>expected_fail</code>, off the roster, ranked as the coverage-gap issue ranks it. <b>Ready</b> means the evidence store reads it <code>would-admit</code>: ${esc(pct(bar.rate ?? 0))} over ${esc(bar.min_runs ?? "")} runs at the current version key. The rest of the seat bar (a recorded red, classified misses, a guarded fixture, deterministic checks) is checked when it is admitted — <a href="${PAGE.rosterUrl}">the admission bar</a>.</p>` +
+    `<p class="mut">Written by <code>scripts/eval_dashboard/understudies.py</code>${generated != null ? ` at ${esc(et(generated))}` : ""}.</p></div>` + footHtml();
+}
+
 /* ---- the Trend page (SCHEMA.md: brief.json's trend block; trend.py) ---- */
 
 const trendDoc = () => (brief.trend && typeof brief.trend === "object" && !Array.isArray(brief.trend) ? brief.trend : null);
+// The series the page draws (trend.py, one series per mode): next, the main
+// nightly's, unless the link asks for today or the store holds no next
+// record. Today's records are the main nightly's from before it moved to
+// next; no job records today mode any more, so they are drawn while
+// they last in the window. The read's own fields and the latency row stay
+// the document's; `has` says which series hold records, for the chips.
+const TREND_MODES = ["next", "today"];
+const TREND_SERIES_FIELDS = { records: 0, metrics: [], default_metric: null, keys: {}, nights: [], cases: {}, domains: {} };
+function trendSeries(full, link) {
+  const nxt = full.next && typeof full.next === "object" && !Array.isArray(full.next) ? full.next : null;
+  const has = { next: !!(nxt && nxt.records), today: !!full.records };
+  const mode = link.mode && has[link.mode] ? link.mode : has.next || !has.today ? "next" : "today";
+  return { mode, has, t: mode === "today" ? full : { ...full, ...TREND_SERIES_FIELDS, ...(nxt || {}) } };
+}
 const trendCases = (t) => (t && t.cases && typeof t.cases === "object" && !Array.isArray(t.cases) ? t.cases : {});
 const trendDomains = (t) => (t && t.domains && typeof t.domains === "object" && !Array.isArray(t.domains) ? t.domains : {});
 const trendNights = (t) => (t && Array.isArray(t.nights) ? t.nights.filter((n) => n && typeof n === "object" && typeof n.id === "string") : []);
@@ -2172,11 +2428,13 @@ function trendStatusHtml(t) {
 }
 
 function trendHtml(link) {
-  const t = trendDoc();
+  const full = trendDoc();
+  const series = full ? trendSeries(full, link) : { mode: "next", has: {}, t: null };
+  const t = series.t;
   const lede = `Every night the nightly tier runs each case against <code>main</code> three times and appends one record per case to the evidence store; this page reads those records back, each night dated by when its record was written. <b>Pass rate is the gate's number</b>: passes over scored repetitions, with the trailing window computed admission reads drawn beside each night. <b>Judged quality is advisory</b> and is never shown as one point: the store carries a mean and its n per night, so the band is the range of nightly means over the last ${esc(t && t.spread_nights || 7)} nights at one version key (a domain's band is the range across its cases). A vertical marker is a night the version key changed, so a step has its explanation next to it. <b>Latency is advisory too</b>: under each card (and over every case above the domain cards), the opening chat turn and the agent run by night, p50 and ${esc(slowName(t, "turn1"))} for the turn, p50 and ${esc(slowName(t, "agent"))} for the run, over the scope's repetitions not lost to infra, from the nightly runs on record (the store carries no timing), beside the ${esc(latencyTarget(t))} s chat-turn target. <a href="${PAGE.scoreDocUrl}">What a score is</a> is written once, in the eval-scorer design.`;
   const head = (title) => `<div class="sec head"><h1>${title}</h1><div class="lede">${lede}</div></div>`;
   if (!t || (!t.source && !t.read_at) || !t.records) {
-    const why = t && t.source ? `<p class="mut">The store <code>${esc(t.source)}</code> was read ${esc(et(parseIso(t.read_at)))} and holds no today-mode record inside its ${esc(t.window_days || "")}-day window yet${t.next && t.next.records ? ` (it holds ${esc(t.next.records)} next-mode record(s), which this page does not draw yet)` : ""}. The first night that records today-mode evidence fills this page.</p>` : "";
+    const why = t && t.source ? `<p class="mut">The store <code>${esc(t.source)}</code> was read ${esc(et(parseIso(t.read_at)))} and holds no next-mode record inside its ${esc(t.window_days || "")}-day window yet. The first night the main nightly records fills this page.</p>` : "";
     return head("Scores over time on main") + trendStatusHtml(t) + why + footHtml();
   }
   const metric = trendMetric(t, link);
@@ -2185,9 +2443,10 @@ function trendHtml(link) {
   const metrics = Array.isArray(t.metrics) ? t.metrics.filter((m) => typeof m === "string") : [];
   const domainNames = Object.keys(domains).sort();
   const ctl = `<div class="ctl">scope ${chip("scope", "", "all domains", !!scope.all)}${domainNames.map((d) => chip("scope", d, domainWords(d), scope.domain === d, domainTooltip(d))).join("")}` +
-    (metrics.length > 1 ? `<span class="sep">·</span>judged metric ${metrics.map((m) => chip("metric", m, m, m === metric)).join("")}` : "") + `</div>`;
+    (metrics.length > 1 ? `<span class="sep">·</span>judged metric ${metrics.map((m) => chip("metric", m, m, m === metric)).join("")}` : "") +
+    (series.has.next && series.has.today ? `<span class="sep">·</span>series ${chip("mode", "next", "next", series.mode === "next", "The main nightly's records")}${chip("mode", "today", "today · retired", series.mode === "today", "Records in today mode: the main nightly's, from before it moved to next. No job records today mode any more, so this series ends at that night and leaves the window after it.")}` : "") + `</div>`;
   const read = parseIso(t.read_at);
-  const readLine = `<p class="mut small">Store <code>${esc(t.source)}</code> read ${esc(read != null ? et(read) : "at an unknown time")} · ${plural(t.records, "record")} over ${plural(trendNights(t).length, "night")} inside the last ${esc(t.window_days)} days · nightly records only (a pull request's run never writes the store).</p>`;
+  const readLine = `<p class="mut small">Store <code>${esc(t.source)}</code> read ${esc(read != null ? et(read) : "at an unknown time")} · ${plural(t.records, `${series.mode}-mode record`)} over ${plural(trendNights(t).length, "night")} inside the last ${esc(t.window_days)} days · nightly records only (a pull request's run never writes the store).</p>`;
   let body = "";
   if (scope.cases) {
     const found = scope.cases.filter((name) => cases[name]);
@@ -2195,7 +2454,7 @@ function trendHtml(link) {
     const range = trendRange([...found.map((name) => cases[name].points || []), ...found.map((name) => timedPoints(latencyPoints(t, "cases", name)))], link);
     body = found.map((name) => {
       const c = cases[name];
-      const footer = trendRecordHtml(c.record) + trendKeyChangesHtml(t, c.key_changes) + `<p class="small"><a href="${esc(caseHref(name))}">this case on the Cases page →</a> · <a href="${esc(trendDomainHref(c.domain))}">${c.domain === DOMAIN_UNKNOWN ? `every case with ${DOMAIN_UNKNOWN_LABEL}` : `its domain, ${esc(domainWords(c.domain))}`} →</a></p>`;
+      const footer = trendRecordHtml(c.record) + trendKeyChangesHtml(t, c.key_changes) + `<p class="small"><a href="${esc(caseHref(name))}">this case on the Cases page →</a> · <a href="${esc(trendModeHref(trendDomainHref(c.domain), link))}">${c.domain === DOMAIN_UNKNOWN ? `every case with ${DOMAIN_UNKNOWN_LABEL}` : `its domain, ${esc(domainWords(c.domain))}`} →</a></p>`;
       return trendCardHtml(t, `<code>${esc(name)}</code>`, esc(domainWords(c.domain)), c.points || [], c.key_changes, metric, range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() }, link, false, footer, `case:${name}`, latencyPoints(t, "cases", name));
     }).join("");
     if (missing.length) body += `<div class="tcard"><h3><code>${missing.map(esc).join("</code>, <code>")}</code></h3><p class="mut">No record in the store for ${missing.length === 1 ? "this case" : "these cases"} inside the window: ${missing.length === 1 ? "it has" : "they have"} not run on a recording night yet, or the name is not a case.</p></div>`;
@@ -2209,7 +2468,7 @@ function trendHtml(link) {
     const domainLatency = latencyPoints(t, "domains", scope.domain);
     const range = trendRange([d.points || [], ...members.map((name) => cases[name].points || []), timedPoints(domainLatency)], link);
     body = trendCardHtml(t, esc(domainWords(scope.domain)), `${plural(members.length, "case")} pooled per night`, d.points || [], d.key_changes, metric, range, link, true, "", `domain:${scope.domain}`, domainLatency) +
-      `<div class="sec"><h2>Each case in ${esc(domainWords(scope.domain))}</h2>${members.map((name) => trendCardHtml(t, `<a href="${esc(trendHref([name]))}"><code>${esc(name)}</code></a>`, "", cases[name].points || [], cases[name].key_changes, metric, range, link, false, trendRecordHtml(cases[name].record), `case:${name}`, latencyPoints(t, "cases", name))).join("")}</div>`;
+      `<div class="sec"><h2>Each case in ${esc(domainWords(scope.domain))}</h2>${members.map((name) => trendCardHtml(t, `<a href="${esc(trendModeHref(trendHref([name]), link))}"><code>${esc(name)}</code></a>`, "", cases[name].points || [], cases[name].key_changes, metric, range, link, false, trendRecordHtml(cases[name].record), `case:${name}`, latencyPoints(t, "cases", name))).join("")}</div>`;
     return head(`${esc(domainWords(scope.domain))} on main`) + trendStatusHtml(t) + ctl + readLine + body + footHtml();
   }
   const allLatency = latencyPoints(t, "all");
@@ -2217,7 +2476,7 @@ function trendHtml(link) {
   // Every case's timing pooled per night, above the domains' cards.
   const allRange = range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() };
   const allRow = `<div class="sec"><h2>Latency, all domains</h2>${trendLatencyRowHtml(t, allLatency, allRange, latencyMarkers(trendMarkers(t, [], link)), "all domains", "all")}${trendLatencyTableHtml(t, allLatency, allRange, "all")}</div>`;
-  body = allRow + domainNames.map((name) => trendCardHtml(t, `<a href="${esc(trendDomainHref(name))}">${esc(domainWords(name))}</a>`, `${plural((domains[name].cases || []).length, "case")} pooled per night`, domains[name].points || [], domains[name].key_changes, metric, range, link, true, "", `domain:${name}`, latencyPoints(t, "domains", name))).join("");
+  body = allRow + domainNames.map((name) => trendCardHtml(t, `<a href="${esc(trendModeHref(trendDomainHref(name), link))}">${esc(domainWords(name))}</a>`, `${plural((domains[name].cases || []).length, "case")} pooled per night`, domains[name].points || [], domains[name].key_changes, metric, range, link, true, "", `domain:${name}`, latencyPoints(t, "domains", name))).join("");
   return head("Scores over time on main") + trendStatusHtml(t) + ctl + readLine + body + footHtml();
 }
 
@@ -2254,22 +2513,30 @@ function onToggle(event) {
 /* ---- clicks on the Grid and the Cases page ---- */
 
 function onClick(event) {
-  const target = event.target.closest("button[data-sort],button[data-show],button[data-window],button[data-rows],button[data-marker],button[data-toggle],button[data-build],button[data-scope],button[data-metric]");
+  const target = event.target.closest("button[data-sort],button[data-show],button[data-window],button[data-rows],button[data-domain],button[data-marker],button[data-toggle],button[data-build],button[data-scope],button[data-metric],button[data-mode]");
   if (!target) return;
   const d = target.dataset;
   if (d.sort) ui.sort = d.sort;
   else if (d.show) ui.show = d.show;
   else if (d.window) ui.window = d.window;
   else if (d.rows) ui.rows = d.rows;
+  else if (d.domain) {
+    // The scenarios view's domain chips navigate, as the Trend page's do:
+    // the fragment is the one source of truth, so a chip's choice is a link
+    // that can be pasted and does not outlive the next navigation.
+    const href = scenariosDomainHref(d.domain === SCENARIOS_ALL_DOMAINS ? null : d.domain);
+    location.hash = href.slice(href.indexOf("#"));
+    return;
+  }
   else if (d.marker) ui.markers[d.marker] = !ui.markers[d.marker];
   else if (d.toggle === "held") ui.showHeld = true;
   else if (d.toggle === "retired") ui.showRetired = true;
   else if (d.toggle === "close") ui.selected = null;
   else if (d.build && d.case) ui.selected = { build: d.build, case: d.case };
-  else if (d.scope != null || d.metric) {
+  else if (d.scope != null || d.metric || d.mode) {
     // The Trend page's chips navigate (trendStateHref); the hashchange
     // re-renders, and a chip that names the current state changes nothing.
-    const href = d.metric ? trendStateHref(linkState(), { metric: d.metric }) : trendStateHref(linkState(), { cases: [], domain: d.scope || null });
+    const href = d.metric ? trendStateHref(linkState(), { metric: d.metric }) : d.mode ? trendStateHref(linkState(), { mode: d.mode }) : trendStateHref(linkState(), { cases: [], domain: d.scope || null });
     location.hash = href.slice(href.indexOf("#"));
     return;
   }
@@ -2321,7 +2588,8 @@ function renderAll(scroll = false) {
   } catch (err) {
     app.innerHTML = `<div class="sec head"><h1>This page could not render.</h1><div class="lede">${esc(String(err && err.message || err))}. The data behind it is <a href="${PAGE.briefFile}">${PAGE.briefFile}</a>.</div></div>`;
   }
-  document.title = PAGE.titles[page];
+  document.title = page === "cases" && casesView(link) === PAGE.casesViews.scenarios ? PAGE.scenariosTitle
+    : page === "cases" && casesView(link) === PAGE.casesViews.domains ? PAGE.domainsTitle : PAGE.titles[page];
   renderFreshness();
   if (focusedHit != null) {
     const again = app.querySelector(`[data-hit="${CSS.escape(focusedHit)}"]`);
@@ -2339,6 +2607,7 @@ function renderAll(scroll = false) {
     const section = document.getElementById("timing");
     if (section) section.scrollIntoView();
   }
+
   if (page === "grid") {
     // First paint: a live window is read from its newest run, a linked
     // incident from its start. Afterwards the reader's position stands.

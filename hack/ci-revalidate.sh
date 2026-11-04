@@ -25,7 +25,7 @@
 # retest at a new base WOULD test a different combination, and reusing the
 # head's verdict means that combination -- and, in a batch, the pulls with
 # each other -- is not tested before the merge, on every retest rather than
-# only when the sticky re-pin wins its race. The nightly eval on main is
+# only when the sticky re-pin (retired since) won its race. The nightly eval on main is
 # what finds a combination that broke, and so is the next full run any pull
 # request starts after it. The second is a green at an EARLIER head from
 # which everything since -- on the pull request's side AND on main's side
@@ -140,7 +140,8 @@
 # only after GitHub confirmed the commenter is a repository admin -- on
 # this build; upstream also honours allowed_github_teams and
 # allow_top_level_owners, and prow/oss/plugins.yaml in oss-test-infra sets
-# neither for the plugin, so widening it there widens who step 0 trusts. A copy of that description under another login -- the sticky
+# neither for the plugin, so widening it there widens who step 0 trusts. A
+# copy of that description under another login -- the retired sticky
 # re-pin's, posted with a workflow token -- is not read as one; the
 # original event is still on the head beside it.
 #
@@ -226,15 +227,15 @@ readonly REVALIDATION_OVERRIDE_CANCEL_PREFIX="Override cancelled by"
 # comment-URL event is always there (#2464's head carries both).
 readonly REVALIDATION_PULL_URL_PREFIX="https://github.com/gke-labs/kube-agents/pull"
 # How many of the newest builds to inspect for a green one. Each costs one
-# gsutil cat (~1s); an active PR rarely stacks this many pushes between
+# gcloud storage cat (~1s); an active PR rarely stacks this many pushes between
 # greens, and a bound keeps the fall-through path seconds long.
 readonly REVALIDATION_HISTORY_LIMIT=20
 # A green from before the job changed what it grades is not a verdict this
 # run could only repeat. EVAL_REVALIDATION_NOT_BEFORE, a UTC time set in the
 # job's env in oss-test-infra (the swap to spec.mode next, or a rollback to
 # today), refuses a green build whose EARLIEST matching success status on
-# GitHub was created before it: the original crier event, which the sticky
-# re-pin's later copies (same build URL) cannot stand in for. GitHub's
+# GitHub was created before it: the original crier event, which the retired
+# sticky re-pin's later copies (same build URL) cannot stand in for. GitHub's
 # time, not the GCS record's, for the trust-surface reason above. Unset or
 # empty, nothing changes; unparsable, an event with no readable time, or a
 # status read stopped at its page cap (the original may lie past it), is a
@@ -242,8 +243,8 @@ readonly REVALIDATION_HISTORY_LIMIT=20
 readonly REVALIDATION_NOT_BEFORE="${EVAL_REVALIDATION_NOT_BEFORE:-}"
 # The status read pages through GitHub's newest-first events (100 a page,
 # following `Link: rel="next"`) up to this many pages. One page is not
-# enough: the sticky re-pin posts a copy on every open head after every
-# merge to main -- about two dozen a day -- so the one Prow-bot event an
+# enough: until it was retired, the sticky re-pin posted a copy on every open
+# head after every merge to main -- about two dozen a day -- so the one Prow-bot event an
 # override binds to is past the first hundred within days, where a green's
 # attestation matches the re-pin copies themselves (they carry the build's
 # URL). Ten pages is a thousand events, some six weeks of re-pins at an
@@ -569,7 +570,7 @@ revalidate_from_green_history() {
 
   local history_dir="${REVALIDATION_HISTORY_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}"
   local listing
-  if ! listing="$(gsutil ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
+  if ! listing="$(gcloud storage ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
     _revalidation_no_green "no finished ${REVALIDATION_JOB_NAME} build for PR #${pull_number} (first run on this PR, or GCS unreadable)"
     return 1
   fi
@@ -598,7 +599,7 @@ revalidate_from_green_history() {
   local build prev_green="" finished_revision="" candidate_parsed candidate_revision
   while read -r build; do
     [ -n "${build}" ] || continue
-    candidate_parsed="$(gsutil cat "${history_dir}/${build}/finished.json" 2>/dev/null | python3 -c '
+    candidate_parsed="$(gcloud storage cat "${history_dir}/${build}/finished.json" 2>/dev/null | python3 -c '
 import json
 import sys
 
@@ -634,7 +635,7 @@ EOF_REVALIDATION_CANDIDATES
   # the same Refs.String() shape as PULL_REFS, so a pull entry may carry a
   # third ":<ref>" field; only the first two are read.
   local started shas prev_base prev_head
-  if ! started="$(gsutil cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
+  if ! started="$(gcloud storage cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
     _revalidation_no_green "green build ${prev_green} of PR #${pull_number} has no readable started.json"
     return 1
   fi
@@ -835,11 +836,11 @@ revalidate_against_green_history() {
     echo "Step 0: full run: EVAL_SKIP_REVALIDATION=1 (escape hatch)"
     return 1
   fi
-  if ! command -v gsutil >/dev/null 2>&1; then
-    echo "Step 0: full run: no gsutil on PATH to read the job history with"
+  if ! command -v gcloud >/dev/null 2>&1; then
+    echo "Step 0: full run: no gcloud on PATH to read the job history with"
     return 1
   fi
-  # Preflighted like gsutil so a missing interpreter logs its own reason
+  # Preflighted like gcloud so a missing interpreter logs its own reason
   # instead of every finished.json silently classifying as not-green.
   if ! command -v python3 >/dev/null 2>&1; then
     echo "Step 0: full run: no python3 on PATH to parse the job records with"
@@ -852,7 +853,7 @@ revalidate_against_green_history() {
   # shell's) cannot narrow a batch to one pull; a serial presubmit names its
   # one pull in PULL_NUMBER and PULL_PULL_SHA.
   # Prow's decoration exports 40-hex SHAs. The ones this run was handed are
-  # held to that shape before any of them reaches gsutil or git, as the
+  # held to that shape before any of them reaches gcloud storage or git, as the
   # recovered ones are: a value shaped like an option would otherwise reach
   # `git diff` as one, and an empty file list reads as an inert delta.
   if [ -n "${PULL_BASE_SHA:-}" ] && ! [[ "${PULL_BASE_SHA}" =~ ${REVALIDATION_SHA_RE} ]]; then

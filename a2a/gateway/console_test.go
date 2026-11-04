@@ -419,11 +419,10 @@ func TestConsoleNoticeIDsDifferAcrossAdapters(t *testing.T) {
 	}
 }
 
-// TestConsoleRunClosesTheConnectionOnCtxCancellation guards Close's doc
-// comment: Run is documented to close the connection itself once ctx is
-// cancelled, so a caller that trusts that and skips an explicit Close does
-// not leak the connection.
-func TestConsoleRunClosesTheConnectionOnCtxCancellation(t *testing.T) {
+// TestConsoleRunLeavesTheConnectionOpenOnCtxCancellation guards Close's doc
+// comment: a cancelled Run stops ingress and leaves the connection open for
+// the relay's stop drain to post on, and Close is what closes it.
+func TestConsoleRunLeavesTheConnectionOpenOnCtxCancellation(t *testing.T) {
 	s := startServer(t)
 	a, err := NewConsoleAdapter(s.ClientURL(), nil, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
 	if err != nil {
@@ -445,8 +444,15 @@ func TestConsoleRunClosesTheConnectionOnCtxCancellation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after ctx cancellation")
 	}
+	if a.closed() {
+		t.Fatal("Run closed the connection on a stop; the relay's drain could no longer post")
+	}
+	if _, err := a.Post("console:tab-1", "after the stop"); err != nil {
+		t.Errorf("Post after the stop: %v", err)
+	}
+	a.Close()
 	if !a.closed() {
-		t.Error("Run returned without closing the connection")
+		t.Error("Close left the connection open")
 	}
 }
 

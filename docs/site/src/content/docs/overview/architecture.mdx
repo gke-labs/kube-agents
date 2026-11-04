@@ -5,7 +5,9 @@ description: How chat messages, cron ticks, and cluster state flow through kube-
 
 import { Aside } from "@astrojs/starlight/components";
 
-Ingress paths converge on the agent pod: user chat, scheduled cron, and the operator itself. Inside the pod, one Hermes gateway hosts co-located profiles: the **Planning Agent** (the `default` profile — the conversational front door and the only chat ingress), the **Platform Agent** (the `platform` profile — the privileged specialist that does the infrastructure work), and read-only per-cluster **[Cluster Agents](/kube-agents/concepts/cluster-agents/)** (`cluster-*` profiles the Platform Agent scaffolds, one per managed GKE cluster). They coordinate through a shared kanban board: the Planning Agent files a card, the gateway's dispatcher spawns the assigned specialist as a worker, and the completion is relayed back into the originating chat thread.
+Ingress paths converge on the agent pod: user chat, scheduled cron, and the operator itself. Under `spec.mode: next`, the first-install default ([the quick start](/kube-agents/install/quickstart-gke/#verify-a-specmode-next-install)), chat enters through the **A2A gateway** and a message bus, and a `hermes-bridge` container in the agent pod turns each bus task into an agent turn. Under `today`, the previous layout kept as the rollback, the Planning Agent's own chat adapters listen instead ([Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)).
+
+Inside the pod, one Hermes gateway hosts co-located profiles: the **Planning Agent** (the `default` profile — the conversational front door and the only chat ingress), the **Platform Agent** (the `platform` profile — the privileged specialist that does the infrastructure work), and read-only per-cluster **[Cluster Agents](/kube-agents/concepts/cluster-agents/)** (`cluster-*` profiles the Platform Agent scaffolds, one per managed GKE cluster). They coordinate through a shared kanban board: the Planning Agent files a card, the gateway's dispatcher spawns the assigned specialist as a worker, and the completion is relayed back into the originating chat thread.
 
 ## Component map
 
@@ -14,13 +16,22 @@ flowchart TB
     subgraph Ingress
         GC[Google Chat]
         SL[Slack]
+        BW[Browser<br/>kubectl port-forward]
         CR[cron jobs.json<br/>gateway ticker]
     end
 
     subgraph Cluster["Kubernetes cluster"]
         OP[k8s-operator<br/>controller manager]
         CRD[PlatformAgent CR]
+        subgraph A2A["A2A stack (spec.mode: next)"]
+            GW[A2A gateway]
+            BUS[(NATS JetStream bus)]
+            AC[auth callout]
+            VF[verifier]
+            CON[A2A console]
+        end
         subgraph Pod["Agent pod (k8s-deployment)"]
+            BR[hermes-bridge]
             CA["Planning Agent<br/>(default profile)"]
             PA["Platform Agent<br/>(platform profile)"]
             CL["Cluster Agents<br/>(cluster-* profiles)"]
@@ -38,8 +49,15 @@ flowchart TB
         OTEL[GKE Managed<br/>OTel + Prometheus]
     end
 
-    GC -->|Pub/Sub subscription| CA
-    SL -->|Socket Mode / bot token| CA
+    GC -->|Pub/Sub subscription| GW
+    SL -->|Socket Mode / bot token| GW
+    BW --> CON
+    CON -->|websocket proxy| BUS
+    GW -->|task| BUS
+    AC -.->|authenticates clients| BUS
+    VF -.->|checks each task| BUS
+    BUS --> BR
+    BR -->|turn on the agent API| CA
     CR -->|scheduled tick| CA
 
     CA -->|kanban card| PA
@@ -47,6 +65,7 @@ flowchart TB
 
     OP -->|reconciles| CRD
     CRD -->|owns| Pod
+    CRD -->|owns under next| A2A
     SEC --> Pod
 
     CA -->|Completions API| LM
@@ -63,9 +82,11 @@ flowchart TB
     MT -->|installation token| GH
 
     Pod -.->|OTel spans| OTEL
-    CA -.->|reply / relayed progress| GC
-    CA -.->|reply / relayed progress| SL
+    GW -.->|reply / relayed progress| GC
+    GW -.->|reply / relayed progress| SL
 ```
+
+The map is a `spec.mode: next` install. The gateway holds Google Chat when it is enabled and Slack otherwise; with both enabled, Slack stays on the Planning Agent's own listener, as every chat platform does under `today`, where the A2A stack is not rendered. [Deployment topology](#deployment-topology) lists the pods each mode runs.
 
 ## The request flows
 
@@ -78,10 +99,10 @@ flowchart TB
 
 1. A user posts in a Google Chat space (or DMs the Slack app).
 2. Google Chat publishes the event to a Pub/Sub topic; Slack routes via Socket Mode. The install's [`chat-pubsub` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/chat-pubsub) sets up the topic and subscription.
-3. The **Planning Agent** (the pod's `default` Hermes profile, image `nousresearch/hermes-agent`) consumes the event through Hermes' bundled Google Chat adapter, patched for credential-free operation by `google_chat_relay_patch.py` (Slack uses `slack_relay_patch.py` in Socket Mode).
+3. Under `spec.mode: next`, the **A2A gateway** consumes the event, posts a status line in the thread (on Google Chat; on Slack the Working… status and the reaction stand in for it), and publishes the message as a task on the bus. The `hermes-bridge` container in the agent pod takes the task and runs it as a turn on the agent's API server, under the **Planning Agent** (the pod's `default` Hermes profile). [How a chat question is answered under `next`](/kube-agents/concepts/chatops/#how-a-chat-question-is-answered-under-next) walks through each hop. Under `today`, and for Slack when Google Chat is also enabled, the Planning Agent consumes the event itself through Hermes' bundled adapter, patched for credential-free operation by `google_chat_relay_patch.py` (Slack uses `slack_relay_patch.py` in Socket Mode).
 4. The Planning Agent holds no infrastructure tools. It reads the available specialists from the roster block injected into each turn (descriptions from each agent's `CAPABILITIES.md`; `list_agents` re-reads it) and files a kanban card with the full request context (`kanban_create`). The originating chat session is auto-subscribed to the card. The two questions the roster answers itself, which GCP projects are in scope and where the host cluster is, get a direct reply and no card.
 5. The gateway's kanban dispatcher spawns the **Platform Agent** (`hermes -p platform chat -q "work kanban task <id>"`), which runs the tool-calling loop: system prompt (`SOUL.md`) + card body + available tools. Cluster reads go through the `gke` MCP server; mutations that touch infra route through the `submit-suggestion` skill (see flow 3) rather than direct `kubectl`. Work scoped to one cluster's live runtime is delegated onward as a nested kanban card to that cluster's read-only [Cluster Agent](/kube-agents/concepts/cluster-agents/) (`SOUL.md §6`).
-6. The worker's `kanban_complete` posts its full `result` back into the same Chat thread (its one-line `summary` only when the `result` adds nothing to it), plus one message for each staged sub-card completion along the way. The gateway delivers those directly rather than through the Planning Agent, so the answer arrives verbatim. Console links are built from the shared templates in `agents/platform/docs/gcp-console-links.md` (inlined in `SOUL.md §5`).
+6. The worker's `kanban_complete` posts its full `result` back into the same Chat thread (its one-line `summary` only when the `result` adds nothing to it), plus one message for each staged sub-card completion along the way. The gateway delivers those directly rather than through the Planning Agent, so the answer arrives verbatim; under `next` the A2A gateway posts them, each progress note as a message of its own. Console links are built from the shared templates in `agents/platform/docs/gcp-console-links.md` (inlined in `SOUL.md §5`).
 
 ### 2. Cron tick → autonomous run
 
@@ -105,13 +126,15 @@ The Planning Agent profile's own job file — [`agents/chat/defaults/cron/jobs.j
 Everything except the LLM (and, for hosted providers, the LLM API endpoint) runs inside your Kubernetes cluster:
 
 - **Namespace**: `kubeagents-system`.
+- **The agent**: three pods, the gateway (`<name>-gateway`, running Hermes), the shell sandbox and the credential broker ([Credential isolation](/kube-agents/reference/credential-isolation/#pod-anatomy)).
+- **The A2A stack**, under `spec.mode: next`, the first-install default: the bus StatefulSet (`<name>-a2a-nats`), two auth callout and two verifier replicas, the A2A gateway, the A2A console, a provisioning Job, and a session pod per `/session` conversation. `hermes-bridge` is a container of the gateway pod rather than a pod. A chart or Terraform install that sets no mode runs `today` and has none of them. [Verify a `spec.mode: next` install](/kube-agents/install/quickstart-gke/#verify-a-specmode-next-install) lists each pod with its expected state.
 - **Node pools**: Autopilot, the shape a fresh install creates, has none to size — Google schedules the operator, Platform Agent, LiteLLM, and Minty, and the sandbox costs no extra nodes. On Standard the default node pool runs everything except the Platform Agent, which runs on the gVisor pool below; `--enable-gvisor=false` puts it back with the others. If you use vLLM, provision a GPU node pool separately.
 - **gVisor node pool** for sandboxed skill execution, Standard only (the `gke-cluster` module's `enable_gvisor_node_pool`). The sandbox is on unless the installer's `--enable-gvisor=false` turns it off, so a Standard install gets this pool; Autopilot ships the `gvisor` RuntimeClass and needs no pool.
 - **Workload Identity** bindings are pre-provisioned by the [`kube-agents-iam` module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/kube-agents-iam) — the Platform Agent gets a configurable permission set (`read-only` or `custom`). See [Security & IAM](/kube-agents/reference/security-and-iam/).
 
 ### Capacity and isolation
 
-The hub footprint (operator, Platform Agent, LiteLLM, Minty) is small and roughly fixed — it doesn't grow with the number of clusters the agent manages, since those are read remotely through the GKE MCP server. What actually drives node capacity:
+The hub footprint (operator, Platform Agent, LiteLLM, Minty) is small and roughly fixed — it doesn't grow with the number of clusters the agent manages, since those are read remotely through the GKE MCP server. Under `next` the A2A stack adds a few small pods to it. What actually drives node capacity:
 
 - **vLLM.** Local inference needs a GPU node pool; hosted LiteLLM does not.
 - **gVisor.** Sandboxed skill execution puts the agent pod under the `gvisor` RuntimeClass, which is the default (`--enable-gvisor=false` turns it off). On Autopilot, the default cluster shape, it costs no extra capacity. On Standard it means a `gvisor-pool` to run the pod on: one `e2-standard-4` per zone, so three nodes on a regional cluster, with no autoscaling.
@@ -131,4 +154,5 @@ For production, prefer a **dedicated cluster** for the harness. The agent GSA ca
 - [Platform Agent](/kube-agents/concepts/platform-agent/) — the persona, safety rails, and MCP wiring.
 - [ChatOps](/kube-agents/concepts/chatops/) — Google Chat and Slack ingress details.
 - [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — how PR-based remediation is enforced.
-- [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md) — the design of record for inter-agent coordination (kanban delegation today; a file-based handover channel as the proposed next step).
+- [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md) — the design of record for inter-agent coordination: a file-based handover channel as its primary topic, still a proposal, and the kanban delegation the profiles use today.
+- [`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md) — the `spec.mode` switch, and what a switch between the modes changes; [Deployment topology](#deployment-topology) above is the inventory of what `next` runs.

@@ -94,8 +94,14 @@ func TestLoadRefuses(t *testing.T) {
 			replaceIn(t, d, ManifestFile, "v1alpha1", "v9")
 		}, "persona.yaml: apiVersion: is \"persona.kube-agents.x-k8s.io/v9\""},
 		{"unknown manifest field", func(t *testing.T, d string) {
-			replaceIn(t, d, ManifestFile, "tier:", "image: registry.example/x:1\ntier:")
+			replaceIn(t, d, ManifestFile, "model:", "image: registry.example/x:1\nmodel:")
 		}, "unknown field \"image\""},
+		{"a tier", func(t *testing.T, d string) {
+			replaceIn(t, d, ManifestFile, "model:", "tier: read\nmodel:")
+		}, "persona.yaml: tier: is not a persona field"},
+		{"an empty tier", func(t *testing.T, d string) {
+			replaceIn(t, d, ManifestFile, "model:", "tier:\nmodel:")
+		}, "persona.yaml: tier: is not a persona field"},
 		{"missing instructions", func(t *testing.T, d string) {
 			_ = os.Remove(filepath.Join(d, InstructionsFile))
 		}, "instructions.md: is missing"},
@@ -293,5 +299,39 @@ func TestLoadImportsInsideThePersona(t *testing.T) {
 		if _, err := Load(dir); !errors.As(err, &invalid) {
 			t.Errorf("%q: want it refused, got %v", line, err)
 		}
+	}
+}
+
+// A tier is its only problem: the rest of a valid manifest still decodes,
+// so no field the file sets correctly is reported as broken.
+func TestATierIsTheOnlyProblem(t *testing.T) {
+	dir := copyExample(t)
+	replaceIn(t, dir, ManifestFile, "model:", "tier: read\nmodel:")
+	_, err := Load(dir)
+	var invalid *InvalidError
+	if !errors.As(err, &invalid) || len(invalid.Problems) != 1 || invalid.Problems[0].Field != "tier" {
+		t.Fatalf("want exactly the tier problem, got %v", err)
+	}
+}
+
+// Beside a tier, the manifest's other problems are still reported, a
+// repeated key among them; a tier nested under a harness's hints is not
+// the manifest's tier.
+func TestATierHidesNoOtherProblem(t *testing.T) {
+	dir := copyExample(t)
+	replaceIn(t, dir, ManifestFile, "model:", "tier: read\nimage: registry.example/x:1\nmodel:")
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "tier: is not a persona field") ||
+		!strings.Contains(err.Error(), `unknown field "image"`) {
+		t.Errorf("a tier beside an unknown field: want both reported, got %v", err)
+	}
+	dir = copyExample(t)
+	replaceIn(t, dir, ManifestFile, "model:", "tier: read\nmodel: a\nmodel:")
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "already set") {
+		t.Errorf("a tier beside a repeated key: want the repeat reported, got %v", err)
+	}
+	dir = copyExample(t)
+	replaceIn(t, dir, ManifestFile, "claude-code:", "claude-code:\n    tier: read")
+	if _, err := Load(dir); err != nil && strings.Contains(err.Error(), "tier: is not a persona field") {
+		t.Errorf("a tier under harness hints was taken for the manifest's: %v", err)
 	}
 }

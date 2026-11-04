@@ -59,6 +59,14 @@ def _no_forge_from_the_shell(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_grader_sha_from_the_shell(monkeypatch):
+    """`bench-gate suite` reads EVAL_GRADER_SHA, which hack/ci-eval-pr.sh
+    exports; a shell that has it would add a key and a line to every suite
+    output the tests compare, the store-unset golden's included."""
+    monkeypatch.delenv("EVAL_GRADER_SHA", raising=False)
+
+
 FIXTURE_RUNS = Path(__file__).parent / "fixtures" / "runs"
 TASKS = Path(__file__).resolve().parents[1] / "tasks"
 
@@ -178,3 +186,22 @@ def write_task(tmp_path: Path):
         return path
 
     return _write
+
+
+def check_passes(task_id: str, check_name: str, report: str) -> bool:
+    """Whether one named ``report_contains`` check of a case passes ``report``.
+
+    The whole check as the verifier grades it, phrases and patterns together,
+    loaded from the case file, so a test that pins a case's wording cannot
+    drift onto a surface or a clause the verifier does not use.
+    """
+    import yaml
+
+    from kube_agents_bench import transcript
+    from kube_agents_bench.verifiers import ReportContainsVerifier
+
+    task = Path(__file__).resolve().parent.parent / "tasks" / task_id / "task.yaml"
+    doc = yaml.safe_load(task.read_text())
+    (check,) = [c for c in doc["verification_spec"] if c.get("name") == check_name]
+    transcript.set(report, [], final_message=report, started_at=1.0)
+    return ReportContainsVerifier(**check["check"]).verify(5.0).status == "pass"

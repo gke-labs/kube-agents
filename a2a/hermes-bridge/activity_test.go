@@ -549,29 +549,34 @@ func TestActivityStatus(t *testing.T) {
 	}
 }
 
+// concurrentStubSleep is how long each stub in the concurrency test sleeps
+// between its two calls. Run together, both terminals land inside twice
+// it; run one after the other they cannot, which is what makes "at once" a
+// tested claim. It is also the margin for everything else in the run (two
+// stub starts, four deliveries, two terminals): under the race detector on
+// a loaded runner that overhead reached 1.6 s, which 1.5 s did not cover.
+const concurrentStubSleep = 3 * time.Second
+
 // Two tasks at once: each delivery lands on the task whose key signed it,
 // never on the other. The stubs overlap by sleeping after their calls.
 func TestActivity_ConcurrentTasksKeepTheirOwnTraces(t *testing.T) {
 	_, url := startServer(t)
-	startBridgeCfg(t, url, hermesStub(t, `
+	startBridgeCfg(t, url, hermesStub(t, fmt.Sprintf(`
 prompt = sys.argv[-1]
 tool = "tool-for-" + prompt
 call(tool, {"which": ord(prompt)}, "call-" + prompt)
-time.sleep(1.5)
+time.sleep(%g)
 call(tool + "-again", {"which": ord(prompt)}, "call2-" + prompt)
 print("answer for " + prompt)
-`), func(c *Config) { c.Concurrency = 2 })
+`, concurrentStubSleep.Seconds())), func(c *Config) { c.Concurrency = 2 })
 	c := gatewayClient(t, url)
 
-	// The two stubs each sleep 1.5 s between their calls; run together both
-	// terminals land well inside twice that, run one after the other they
-	// cannot. The bound is what makes "at once" a tested claim.
 	started := time.Now()
 	submit(t, c, "task-a", "A")
 	submit(t, c, "task-b", "B")
 	ta := waitTerminal(t, c, "task-a")
 	tb := waitTerminal(t, c, "task-b")
-	if elapsed := time.Since(started); elapsed > 3*time.Second {
+	if elapsed := time.Since(started); elapsed > 2*concurrentStubSleep {
 		t.Fatalf("the two tasks did not overlap: both terminals took %s, serial runs would", elapsed)
 	}
 	// The input carries the prompt as a number, since no string value rides

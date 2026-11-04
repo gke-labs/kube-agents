@@ -3,8 +3,9 @@
 # shape rather than a planted object: slot a runs the legacy dataplane with the
 # network policy add-on off, and its namespaces carry default-deny NetworkPolicies
 # that nothing enforces (seeded-reliability, seeded-debug, seeded-capacity,
-# seeded-stall, seeded-token and seeded-headroom, the apiserver-egress-only policy
-# in seeded-deprecation, and default-deny in seeded-shapes and seeded-defaults).
+# seeded-stall, seeded-token, seeded-headroom, seeded-qos and seeded-scaled-zero,
+# the apiserver-egress-only policy in seeded-deprecation, and default-deny in
+# seeded-shapes and seeded-defaults).
 # A dataplane change that turns enforcement on makes every one of those policies
 # take effect at once, which is the break the catalogue entry describes, so the
 # object is the cluster itself and its line is `<cluster>/Cluster/<cluster>`; the

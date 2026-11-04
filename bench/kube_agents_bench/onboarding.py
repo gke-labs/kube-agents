@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 from collections.abc import Callable, Collection
@@ -57,6 +58,7 @@ __all__ = [
     "read_handoff_board",
     "read_items",
     "read_raw_block",
+    "read_raw_coverage",
     "read_scored_report",
     "sandbox_pod",
     "sandbox_shell",
@@ -159,6 +161,21 @@ SANDBOX_PYTHON = "python3"
 RAW_READ = "__ONBOARDING_RAW_BLOCK__"
 # Parser errors carried into the verdict; the rest are counted.
 MAX_PARSER_ERRORS = 5
+
+# The raw report's own text, for the sections the parser does not read: the
+# Coverage table, one row per audit the hand-off compiled with the card that
+# reported it, and the Gaps list. bootstrap_handoff.compose writes both; the
+# phrases below are its gap lines for a cluster the sweep audited itself and
+# for a fleet cluster no audit reported on. The read stops one byte past
+# MAX_RAW_BYTES; a Coverage table that does not end inside it is a failed read.
+RAW_TEXT_PRESENT = "__ONBOARDING_RAW_TEXT_PRESENT__"
+RAW_TEXT_ABSENT = "__ONBOARDING_RAW_TEXT_ABSENT__"
+MAX_RAW_BYTES = 1 << 22
+COVERAGE_HEADING = "## Coverage"
+GAPS_HEADING = "## Gaps"
+COVERAGE_COLUMNS = ("Cluster", "Project", "Location", "Card")
+SWEEP_AUDITED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^()]+?)\): no Cluster Agent card, so the sweep audited it itself$"
+UNREPORTED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^(),]+?), [^()]*\): listed in the fleet but no audit reported on it$"
 
 # The worker's scores (inventory_findings.py: DEFAULT_SCORES_PATH) and the report
 # it wrote, read together so a check can tell which of the batch's findings the
@@ -526,6 +543,83 @@ def read_raw_block(shell: Callable[[str, float], str], timeout: float) -> dict[s
     :func:`sandbox_shell`, a parameter so the tests can run it locally.
     """
     return _payload(shell(raw_command(), timeout), RAW_READ)
+
+
+def raw_text_command() -> str:
+    """The ``sh -c`` line that prints a sentinel, then the raw report's text if there is one."""
+    return (
+        f'f={shlex.quote(RAW_FILE)}; if [ -e "$f" ] || [ -L "$f" ]; then echo {RAW_TEXT_PRESENT}; '
+        f'head -c {MAX_RAW_BYTES + 1} "$f"; else echo {RAW_TEXT_ABSENT}; fi'
+    )
+
+
+def _section(lines: list[str], heading: str) -> list[str] | None:
+    """The lines under ``heading`` up to the next ``## `` heading, or ``None`` when it is
+    absent or does not end inside the read."""
+    start = next((i for i, line in enumerate(lines) if line.strip() == heading), None)
+    if start is None:
+        return None
+    for end in range(start + 1, len(lines)):
+        if lines[end].startswith("## "):
+            return lines[start + 1 : end]
+    return None
+
+
+def parse_raw_coverage(text: str, truncated: bool = False) -> dict[str, Any]:
+    """The Coverage rows and the per-cluster gap lines of a raw report.
+
+    ``"rows"`` is each Coverage row's cluster, project, location and card, or
+    ``None`` with ``"error"`` when the table is missing, malformed, or (for a
+    ``truncated`` read) does not end inside the text. ``"sweep_audited"`` and
+    ``"unreported"`` are the ``[cluster, project]`` pairs the Gaps list names
+    as audited by the sweep itself and as never reported on.
+    """
+    lines = text.splitlines()
+    out: dict[str, Any] = {"rows": None, "sweep_audited": [], "unreported": [], "error": None}
+    coverage = _section(lines, COVERAGE_HEADING)
+    if coverage is None:
+        if truncated:
+            out["error"] = f"the read stopped at {MAX_RAW_BYTES} bytes before the {COVERAGE_HEADING!r} table ended"
+        else:
+            out["error"] = f"there is no {COVERAGE_HEADING!r} section ending in a further heading"
+        return out
+    table = [[c.strip() for c in line.strip().strip("|").split("|")] for line in coverage if line.strip().startswith("|")]
+    if len(table) < 2 or any(col not in table[0] for col in COVERAGE_COLUMNS):
+        out["error"] = f"the {COVERAGE_HEADING!r} table has no header naming {list(COVERAGE_COLUMNS)}"
+        return out
+    at = {col: table[0].index(col) for col in COVERAGE_COLUMNS}
+    rows = []
+    for cells in table[2:]:
+        if len(cells) != len(table[0]):
+            out["error"] = f"a {COVERAGE_HEADING!r} row has {len(cells)} cells, not {len(table[0])}: {cells}"
+            return out
+        rows.append({col.lower(): cells[i] for col, i in at.items()})
+    out["rows"] = rows
+    gaps = _section(lines, GAPS_HEADING) or []
+    for line in gaps:
+        for field, pattern in (("sweep_audited", SWEEP_AUDITED_RE), ("unreported", UNREPORTED_RE)):
+            m = re.match(pattern, line.strip())
+            if m:
+                out[field].append([m.group("cluster"), m.group("project")])
+    return out
+
+
+def read_raw_coverage(shell: Callable[[str, float], str], timeout: float) -> dict[str, Any] | None:
+    """The raw report's Coverage rows and per-cluster gap lines, or ``None`` if the read failed.
+
+    ``"raw"`` is ``absent`` or ``present``; a present file carries what
+    :func:`parse_raw_coverage` makes of it. ``shell`` is :func:`sandbox_shell`,
+    a parameter so the tests can run it locally.
+    """
+    reply = shell(raw_text_command(), timeout)
+    marker = reply.find(RAW_TEXT_PRESENT)
+    if marker < 0:
+        if reply.strip() == RAW_TEXT_ABSENT:
+            return {"raw": "absent", "rows": None, "sweep_audited": [], "unreported": [], "error": None}
+        return None
+    text = reply[marker + len(RAW_TEXT_PRESENT) :].lstrip("\n")
+    truncated = len(text.encode("utf-8", errors="replace")) > MAX_RAW_BYTES
+    return {"raw": "present", **parse_raw_coverage(text, truncated)}
 
 
 def handoff_command() -> str:

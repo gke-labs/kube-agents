@@ -110,6 +110,28 @@ spec:
     - port: 9096
       path: /metrics
       interval: 30s
+---
+{{- /*
+The Kubernetes API proxy's metrics-only listener (kubeProxyMetricsPort in the
+operator): Kubernetes API requests, rejected requests by reason, Secret
+redaction counts, and request latency histograms.
+*/}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-kube-proxy-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-kube-proxy
+      kubeagents.x-k8s.io/component: kube-proxy
+  endpoints:
+    - port: 8444
+      path: /metrics
+      interval: 30s
 {{- end }}
 {{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentServiceMonitor" .) }}
 ---
@@ -262,6 +284,43 @@ spec:
     - port: a2a-metrics
       path: /metrics
       interval: 30s
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.platformAgent.name }}-kube-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.platformAgent.name }}-kube-metrics
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Values.platformAgent.name }}-kube-proxy
+    kubeagents.x-k8s.io/component: kube-proxy
+  ports:
+    - name: kube-metrics
+      port: 8444
+      targetPort: 8444
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.platformAgent.name }}-kube-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.serviceMonitorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-kube-metrics
+  endpoints:
+    - port: kube-metrics
+      path: /metrics
+      interval: 30s
 {{- end }}
 {{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentVMPodScrape" .) }}
 ---
@@ -344,6 +403,26 @@ spec:
       app: {{ .Values.platformAgent.name }}-a2a-gateway
   podMetricsEndpoints:
     - port: a2a-metrics
+      path: /metrics
+      interval: 30s
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ .Values.platformAgent.name }}-kube-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.vmPodScrapeLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-kube-proxy
+      kubeagents.x-k8s.io/component: kube-proxy
+  podMetricsEndpoints:
+    - port: kube-metrics
       path: /metrics
       interval: 30s
 {{- end }}

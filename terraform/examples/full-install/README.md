@@ -1080,6 +1080,7 @@ What each one does that raw Terraform cannot:
 | Asymmetry                                                                                                                                          | Handled by                                                                                                                                                                                                                                                                                                                                                                                     |
 | -------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | KMS key rings and keys can never be deleted, so the next apply 409s                                                                                | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                                                                                                                                                                                                                                                                    |
+| Installs in a project that use the same cluster key share its one grant to the GKE service agent                                                   | `tf-destroy` forgets the grant from state first (`forget_kms`), so the other clusters keep their access to the key; the next apply puts it back in state                                                                                                                                                                                                                                       |
 | Cloud KMS 403s some requests for a few minutes after a project's first enablement, which the same apply (or the installer just before it) performs | `tf-apply` retries an approved apply (`ARGS=-auto-approve`, which the front doors and CI pass) on that message after a wait, untainting a key ring or key the failed attempt created first (`run_apply`, `adopt_kms`); an unapproved apply at a terminal runs once, and its re-run untaints the same way; `KMS_API_PROPAGATION_ATTEMPTS` and `KMS_API_PROPAGATION_WAIT_SECONDS` size the retry |
 | The `PlatformAgent` finalizer strands the CR and hangs the namespace                                                                               | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                                                                                                                                                                                                                                                                  |
 | A `BackupPlan` cannot be deleted while it owns backups                                                                                             | `tf-destroy` purges the plan's backups first                                                                                                                                                                                                                                                                                                                                                   |
@@ -1098,6 +1099,10 @@ Running `terraform destroy` directly still works, but you own the destroy steps
 above yourself — starting with `kubectl delete platformagent <name> -n
 kubeagents-system --wait` while the operator is still running, and setting
 `deletion_protection = false` and applying before the cluster can be removed.
+`tf-destroy` also forgets the KMS key rings and keys and the cluster key's grant
+to the GKE service agent from state first (`forget_kms`). Other installs in the
+project that use the same key need that grant, so a raw destroy must
+`terraform state rm` the keys and the grant as well.
 
 > [!WARNING]
 > Destroying also uninstalls cert-manager when this composition installed it,
@@ -1108,8 +1113,21 @@ kubeagents-system --wait` while the operator is still running, and setting
 > you did not create here.
 
 > [!NOTE]
-> Cloud KMS key rings and crypto keys (for GKE CMEK and optional GitHub minter)
-> cannot be deleted from GCP — `terraform destroy` only removes them from state,
-> and they stay in the project forever. `make tf-apply` imports them back
-> automatically. Applying with bare `terraform apply` after a destroy fails with
-> a 409 until you either import them yourself or choose new key/keyring names.
+> Cloud KMS key rings and crypto keys (for GKE CMEK and the optional GitHub
+> minter) cannot be deleted from GCP, and they stay in the project forever. A
+> raw `terraform destroy` does more than forget them: destroying a crypto key
+> schedules every version of it for destruction, so the key can no longer
+> encrypt and a cluster that uses it cannot read its etcd. `make tf-destroy`
+> (`lifecycle.sh destroy`, which `uninstall.sh` runs) forgets the keys from
+> state first, so they stay usable; a raw destroy needs the `terraform state rm`
+> in the paragraph above. When `make tf-apply` imports them back, which it does
+> automatically, it also restores any cluster key version a raw destroy
+> scheduled, as long as its destruction time has not passed. A minter key with
+> no enabled version stops `make tf-apply` before that step: run
+> `./lifecycle.sh adopt-kms` first, which imports and restores both keys.
+> Applying with bare `terraform apply` after a destroy fails with a 409 until
+> you either import them yourself or choose new key/keyring names. A key you
+> import by hand is not restored: restore and enable each scheduled version
+> with `gcloud kms keys versions restore` and `enable` before its destruction
+> time. See
+> [Full teardown](../../../docs/site/src/content/docs/install/uninstall.md#full-teardown).

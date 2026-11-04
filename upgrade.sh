@@ -269,11 +269,22 @@ on_error() {
   # function it was in, or this script and `main` at top level. $LINENO alone
   # counts from the top of whichever file the command sat in, so a bare line
   # number sent the reader to that line of upgrade.sh instead. Piped through
-  # stdin, bash labels this script's frames `main` or not at all, and $0 is
-  # `bash`; both read as the script by name.
+  # stdin, bash labels this script's frames `main` (bash 5.2), after $0 (bash
+  # 5.3, measured: `bash` for the documented one-liner, `/bin/bash` when the
+  # interpreter is invoked by path, `sh` where that is bash), or not at all
+  # (bash 3.2); all read as the script by name. The $0 of a stdin or -c
+  # script is the shell as invoked, and resolves to the running interpreter,
+  # $BASH; a frame run from a file (`bash ./upgrade.sh`) is labelled $0 on
+  # every bash too, and that $0 is the script, not $BASH, which keeps its
+  # path. A sourced file is never $0, whatever it is named.
   local source_file="${BASH_SOURCE[1]:-}"
   case "$source_file" in
     ""|main) source_file="$UPGRADE_SCRIPT_NAME" ;;
+    "$0")
+      if [ "$(command -v -- "$0" 2>/dev/null || true)" = "$BASH" ]; then
+        source_file="$UPGRADE_SCRIPT_NAME"
+      fi
+      ;;
   esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n${C_RED}${C_BOLD}✗ Upgrade error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}${C_RESET}" >&2
@@ -2336,7 +2347,12 @@ main() {
           "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "${REGION}")" "${PROJECT_ID}")"
         if [ -z "$minter_enabled_version" ]; then
           print_error "The GitHub minter is enabled in the generated configuration, but its KMS signing key has no ENABLED version — the apply would wait on a minter that can never become ready."
-          print_info "Import the App key with install.sh (which runs the import before its apply), or unset GITHUB_APP_ID in install.env to upgrade without the minter."
+          # Guarded: installer_common.sh is the target tree's, and an older
+          # one lacks the helper; the import advice then stands alone.
+          { declare -F print_minter_restore_advice >/dev/null &&
+            print_minter_restore_advice "${KMS_KEY:-$DEFAULT_KMS_KEY}" "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" \
+              "$(derive_kms_location "${REGION}")" "${PROJECT_ID}"; } ||
+            print_info "Import the App key with install.sh (which runs the import before its apply), or unset GITHUB_APP_ID in install.env to upgrade without the minter."
           exit 1
         fi
       fi

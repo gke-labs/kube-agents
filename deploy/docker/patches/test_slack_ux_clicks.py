@@ -345,10 +345,136 @@ class FlagOffIdentityTest(unittest.TestCase):
         self.assertEqual(listeners[1], "plugin_action")
         self.assertEqual(
             listeners[2:],
-            [presenter.CHOICE_ACTION_ID_PATTERN, presenter.LINK_ACTION_ID_PATTERN],
+            [presenter.CHOICE_ACTION_ID_PATTERN, presenter.LINK_ACTION_ID_PATTERN, runtime.BOARD_ACTION_ID_PATTERN],
         )
 
 
+class BoardActionTest(unittest.TestCase):
+    """Retry and Drop on the board-health card: never a turn, the row edited in place."""
+
+    BLOCKS = [
+        {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": [
+            {"type": "text", "text": "2 tasks are stuck and need someone to decide.", "style": {"bold": True}}]}]},
+        {"type": "rich_text", "block_id": "kage_board.text.0", "elements": []},
+        {"type": "actions", "block_id": "kage_board.row.0", "elements": [
+            {"type": "button", "action_id": "kage_board.retry", "value": "t_1"},
+            {"type": "button", "action_id": "kage_board.drop", "value": "t_1"}]},
+        {"type": "rich_text", "block_id": "kage_board.text.1", "elements": []},
+        {"type": "actions", "block_id": "kage_board.row.1", "elements": [
+            {"type": "button", "action_id": "kage_board.retry", "value": "t_2,t_3"},
+            {"type": "button", "action_id": "kage_board.drop", "value": "t_2,t_3"}]},
+    ]
+
+    def setUp(self):
+        runtime._board_tapped.clear()
+        runtime._board_edits.clear()
+        self.requests = []
+        self.answer = [{"id": "t_1", "outcome": "done"}]
+
+        def request(verb, tasks, by):
+            self.requests.append((verb, tasks, by))
+            if isinstance(self.answer, Exception):
+                raise self.answer
+            return self.answer
+
+        patcher = mock.patch.object(runtime, "_board_request", side_effect=request)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        clock = mock.patch.object(runtime.time, "time", return_value=1761570000.0)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def tap(self, adapter, action_id="kage_board.retry", row=0, value="t_1"):
+        async def ack():
+            adapter.acks += 1
+
+        body = {"message": {"ts": MESSAGE_TS, "text": "2 tasks are stuck", "blocks": json.loads(json.dumps(self.BLOCKS))}}
+        action = {"action_id": action_id, "block_id": f"kage_board.row.{row}", "value": value}
+        _run(runtime.board_action(adapter, ack, body, action))
+        return [entry for entry in adapter.log if entry[0] == "chat_update"]
+
+    def ids(self, update):
+        return [b.get("block_id") for b in update["blocks"]]
+
+    def test_retry_unblocks_the_row_and_names_who_and_when(self):
+        adapter = _Adapter()
+        (update,) = self.tap(adapter)
+        self.assertEqual(adapter.kind, runtime.BOARD_KIND)
+        self.assertEqual(self.requests, [("retry", ["t_1"], "Jayanti")])
+        kwargs = update[1]
+        self.assertEqual((kwargs["channel"], kwargs["ts"], kwargs["text"]), (CHANNEL, MESSAGE_TS, "2 tasks are stuck"))
+        self.assertEqual(self.ids(kwargs), [None, "kage_board.text.0", "kage_board.row.0.note", "kage_board.text.1", "kage_board.row.1"])
+        self.assertEqual(kwargs["blocks"][2]["elements"], [
+            {"type": "mrkdwn", "text": "✓ Retrying. Jayanti, <!date^1761570000^{time}|13:00 UTC>"}])
+
+    def test_drop_names_who_and_when_and_acts_on_every_card_in_the_row(self):
+        adapter = _Adapter()
+        (update,) = self.tap(adapter, "kage_board.drop", row=1, value="t_2,t_3")
+        self.assertEqual(self.requests, [("drop", ["t_2", "t_3"], "Jayanti")])
+        self.assertEqual(update[1]["blocks"][-1]["elements"][0]["text"], "Dropped. Jayanti, <!date^1761570000^{time}|13:00 UTC>")
+        self.assertIn("kage_board.row.0", self.ids(update[1]))
+
+    def test_cards_already_moved_say_so_and_lose_the_buttons(self):
+        self.answer = [{"id": "t_1", "outcome": "moved"}]
+        (update,) = self.tap(_Adapter())
+        self.assertNotIn("kage_board.row.0", self.ids(update[1]))
+        self.assertTrue(update[1]["blocks"][2]["elements"][0]["text"].startswith("No longer stuck. Jayanti, "))
+
+    def test_a_tap_that_did_not_land_keeps_the_buttons_and_can_be_tapped_again(self):
+        self.answer = OSError("connection refused")
+        adapter = _Adapter()
+        (update,) = self.tap(adapter)
+        self.assertEqual(self.ids(update[1])[2:4], ["kage_board.row.0.note", "kage_board.row.0"])
+        self.assertEqual(update[1]["blocks"][2]["elements"][0]["text"], "Couldn't retry it just now. Try again.")
+        self.answer = [{"id": "t_1", "outcome": "done"}]
+        self.tap(adapter)
+        self.assertEqual(len(self.requests), 2)
+
+    def test_a_second_tap_on_a_settled_row_does_nothing(self):
+        adapter = _Adapter()
+        self.tap(adapter)
+        self.assertEqual(len(self.tap(adapter)), 1)
+        self.assertEqual(len(self.requests), 1)
+
+    def test_an_unauthorized_tap_or_one_in_an_ignored_channel_does_nothing(self):
+        for adapter in (_Adapter(authorized=False), _Adapter(ignored={CHANNEL})):
+            with self.subTest(adapter=adapter.__dict__.get("authorized")):
+                self.assertEqual(self.tap(adapter), [])
+        self.assertEqual(self.requests, [])
+
+    def test_a_tap_with_no_cards_or_row_is_dropped(self):
+        self.assertEqual(self.tap(_Adapter(), value=""), [])
+        self.assertEqual(self.requests, [])
+
+    def test_a_second_rows_tap_keeps_the_first_rows_edit(self):
+        """Each tap's payload holds the card as it was when tapped; the second edit builds on the first."""
+        adapter = _Adapter()
+        self.tap(adapter)
+        self.answer = [{"id": "t_2", "outcome": "done"}, {"id": "t_3", "outcome": "done"}]
+        updates = self.tap(adapter, "kage_board.drop", row=1, value="t_2,t_3")
+        ids = self.ids(updates[1][1])
+        self.assertEqual(ids, [None, "kage_board.text.0", "kage_board.row.0.note", "kage_board.text.1", "kage_board.row.1.note"])
+    def test_a_row_whose_edit_failed_can_be_tapped_again(self):
+        adapter = _Adapter(fail=("chat_update",))
+        self.tap(adapter)
+        self.answer = [{"id": "t_1", "outcome": "moved"}]
+        adapter.fail = ()
+        (update,) = self.tap(adapter)
+        self.assertEqual(len(self.requests), 2)
+        self.assertTrue(update[1]["blocks"][2]["elements"][0]["text"].startswith("No longer stuck. Jayanti, "))
+    def test_mixed_outcomes(self):
+        # A row is settled only when every card is: a failed one keeps the buttons for a second tap.
+        self.assertEqual(runtime.board_outcome([{"outcome": "done"}, {"outcome": "failed"}]), "failed")
+        self.assertEqual(runtime.board_outcome([{"outcome": "done"}, {"outcome": "moved"}]), "done")
+        self.assertEqual(runtime.board_outcome([{"outcome": "moved"}, {"outcome": "gone"}]), "moved")
+        self.assertEqual(runtime.board_outcome([{"outcome": "failed"}, {"outcome": "gone"}]), "failed")
+        self.assertEqual(runtime.board_outcome([]), "failed")
+
+    def test_the_pattern_matches_the_cards_buttons_only(self):
+        for action_id, matched in (("kage_board.retry", True), ("kage_board.drop", True),
+                                   ("kage_board.delete", False), ("kage.choice.0", False)):
+            with self.subTest(action_id=action_id):
+                self.assertEqual(bool(runtime.BOARD_ACTION_ID_PATTERN.match(action_id)), matched)
 class ActionIdTest(unittest.TestCase):
     def test_choice_pattern_matches_the_presenters_choice_buttons_only(self):
         ids = [

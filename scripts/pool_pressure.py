@@ -43,6 +43,7 @@ Usage:
 import argparse
 import concurrent.futures
 import json
+import ssl
 import os
 import re
 import shutil
@@ -233,6 +234,27 @@ BOSKOS_SERVICE = "svc/boskos"
 BOSKOS_SERVICE_PORT = 80
 BOSKOS_RESOURCE_TYPE = "kube-agents-evals-project"
 BOSKOS_METRIC_PATH = "/metric?type=" + BOSKOS_RESOURCE_TYPE
+# Which project each lease holder has: Boskos keeps one `resources.boskos.k8s.io`
+# object per project in its namespace (name, status.state, status.owner,
+# status.lastUpdate), which /metric aggregates away. Read from inside the
+# cluster through the API server with the pod's own token (--boskos-via
+# http), through kubectl for a hand run, or from `boskos-resources.json`
+# under --from-dir. The job's service account needs the namespace's
+# `boskos-crd-reader` role bound to it (docs/ci-health.md, "A backed-up
+# pool"); until then the read fails and the artifact says so.
+BOSKOS_RESOURCES_API_PATH = "/apis/boskos.k8s.io/v1/namespaces/boskos/resources"
+BOSKOS_RESOURCES_KIND = "resources.boskos.k8s.io"
+BOSKOS_RESOURCES_FILE = "boskos-resources.json"
+IN_CLUSTER_HOST_ENV = "KUBERNETES_SERVICE_HOST"
+IN_CLUSTER_PORT_ENV = "KUBERNETES_SERVICE_PORT"
+IN_CLUSTER_TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+IN_CLUSTER_CA_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+# The summary keys the health bot reads them under (health.POOL_HELD_KEY).
+HELD_KEY = "held"
+HELD_ERROR_KEY = "held_error"
+HELD_KEY_OWNER = "owner"
+HELD_KEY_STATE = "state"
+HELD_KEY_SINCE = "since"
 BOSKOS_IN_CLUSTER_URL = (
     f"http://boskos.{BOSKOS_NAMESPACE}.svc.cluster.local{BOSKOS_METRIC_PATH}"
 )
@@ -1450,6 +1472,87 @@ def fetch_pool_state(
     return Source(value=_pool_state_from(document))
 
 
+def _held_from(document: dict) -> Dict[str, dict]:
+    """{project: {owner, state, since}} for every Boskos resource object
+    with a holder, from a `kubectl get -o json`-shaped list."""
+    held: Dict[str, dict] = {}
+    for item in document.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("metadata") or {}).get("name")
+        status = item.get("status") if isinstance(item.get("status"), dict) else {}
+        owner = status.get("owner")
+        if not name or not owner:
+            continue
+        held[str(name)] = {
+            HELD_KEY_OWNER: str(owner),
+            HELD_KEY_STATE: str(status.get("state") or ""),
+            HELD_KEY_SINCE: str(status.get("lastUpdate") or ""),
+        }
+    return held
+
+
+def _read_in_cluster(path: str) -> Tuple[Optional[dict], Optional[str]]:
+    """One GET against the API server the pod runs under, as the pod."""
+    host, port = os.environ.get(IN_CLUSTER_HOST_ENV), os.environ.get(IN_CLUSTER_PORT_ENV)
+    if not host or not port:
+        return None, "not running in a cluster (no API server in the environment)"
+    try:
+        token = Path(IN_CLUSTER_TOKEN_FILE).read_text(encoding="utf-8").strip()
+        context = ssl.create_default_context(cafile=IN_CLUSTER_CA_FILE)
+    except (OSError, ssl.SSLError) as exc:
+        return None, f"no service-account token or CA: {exc}"
+    request = urllib.request.Request(f"https://{host}:{port}{path}", headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=BOSKOS_TIMEOUT_SECONDS, context=context) as response:
+            return json.loads(response.read().decode("utf-8")), None
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code} from the API server (the pod's service account may lack the boskos-crd-reader role)"
+    except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+        return None, str(exc)
+
+
+def fetch_held(via: str, context: str, from_dir: Optional[str] = None) -> Source:
+    """Which project each Boskos lease holder has right now.
+
+    Separate from fetch_pool_state because /metric cannot answer it: the
+    health bot needs the names to read a project the fleet reconcile holds as
+    being applied rather than drifted. Missing is reported, never defaulted.
+    """
+    if from_dir is not None:
+        payload = Path(from_dir, BOSKOS_RESOURCES_FILE)
+        if not payload.is_file():
+            return Source(error=f"no {BOSKOS_RESOURCES_FILE} under {from_dir}")
+        try:
+            document = json.loads(payload.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return Source(error=f"could not parse {payload}: {exc}")
+        if not isinstance(document, dict):
+            return Source(error=f"{payload} is not a JSON object")
+        return Source(value=_held_from(document))
+    if via == BOSKOS_VIA_NONE:
+        return Source(error="Boskos was not queried (--boskos-via none)")
+    if via == BOSKOS_VIA_HTTP:
+        document, err = _read_in_cluster(BOSKOS_RESOURCES_API_PATH)
+        if err:
+            return Source(error=f"could not list Boskos resources in-cluster: {err}")
+        if not isinstance(document, dict):
+            return Source(error="could not list Boskos resources in-cluster: the API server's answer is not a JSON object")
+        return Source(value=_held_from(document))
+    if shutil.which(KUBECTL_BINARY) is None:
+        return Source(error="kubectl is not on PATH, so Boskos resources cannot be listed")
+    code, out, err = run_cmd([KUBECTL_BINARY, "--context", context, "-n", BOSKOS_NAMESPACE, "get", BOSKOS_RESOURCES_KIND, "-o", "json"], timeout=BOSKOS_TIMEOUT_SECONDS)
+    if code != 0:
+        return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: {(err or '').strip() or f'exit {code}'}")
+    try:
+        document = json.loads(out)
+    except json.JSONDecodeError as exc:
+        return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: not JSON ({exc})")
+    if not isinstance(document, dict):
+        return Source(error=f"kubectl get {BOSKOS_RESOURCES_KIND}: not a JSON object")
+    return Source(value=_held_from(document))
+
+
 def _pool_state_from(document: dict) -> PoolState:
     counts = {
         str(k): int(v)
@@ -2433,6 +2536,7 @@ def measure(
         # takes its own clock after the sweep (fetch_live_queue says why).
         live = fetch_live_queue(window_end if from_dir is not None else None, from_dir)
         pool = fetch_pool_state(boskos_via, context, from_dir)
+    held = fetch_held(boskos_via, context, from_dir) if from_dir is not None or as_of is None else Source(error="not read: --as-of replays a past window")
 
     summary = summarise(
         window_start,
@@ -2444,6 +2548,10 @@ def measure(
         live,
         pool,
     )
+    # Which project each holder has, for the health bot's fixture rule;
+    # None with the reason when the list could not be read.
+    summary[HELD_KEY] = held.value if held.ok else None
+    summary[HELD_ERROR_KEY] = held.error
 
     # Written before the report is printed, and a write that fails is reported
     # rather than raised: the exit code is the verdict, and the tab still shows
