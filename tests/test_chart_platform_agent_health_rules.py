@@ -230,13 +230,15 @@ class HealthRulesRenderTest(unittest.TestCase):
 
         go = _GAUGES_GO.read_text()
         families = set(re.findall(r'usage(?:Time|Phase)?GaugeName\s*=\s*"([a-z_]+)"', go))
-        fields = set(re.findall(r'\{name: "([A-Za-z]+)"', go)) | set(re.findall(r'^\s*\{"([a-zA-Z]+)", func', go, re.M)) | set(re.findall(r'usageExport[A-Za-z]+\s*=\s*"([a-zA-Z]+)"', go)) | set(re.findall(r'usageCreatedTimeField\s*=\s*"([a-zA-Z]+)"', go))
+        fields = set(re.findall(r'\{name: "([A-Za-z0-9]+)"', go)) | set(re.findall(r'^\s*\{"([a-zA-Z0-9]+)", func', go, re.M)) | set(re.findall(r'usageExport[A-Za-z0-9]+\s*=\s*"([a-zA-Z0-9]+)"', go)) | set(re.findall(r'usageCreatedTimeField\s*=\s*"([a-zA-Z0-9]+)"', go))
         self.assertTrue(families and fields)
+        # A field name with a digit is one the pin reads too.
+        self.assertLessEqual({"peopleSeen7d", "peopleSeen30d"}, fields)
         rules = _rules(_render(*_ON))[0]
         exprs = " ".join(r["expr"] for g in rules["spec"]["groups"] for r in g["rules"])
         for family in set(re.findall(r"(kubeagents_platformagent_[a-z_]+)\{", exprs)):
             self.assertIn(family, families, f"{family} is not a family usage_gauges.go declares")
-        for field in set(re.findall(r'field="([A-Za-z]+)"', exprs)):
+        for field in set(re.findall(r'field="([A-Za-z0-9]+)"', exprs)):
             self.assertIn(field, fields, f"field {field} is not one usage_gauges.go exports")
 
     def test_count_summaries_print_whole_numbers(self):

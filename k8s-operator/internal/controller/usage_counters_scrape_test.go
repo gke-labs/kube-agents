@@ -505,17 +505,37 @@ func TestPodUsageSource_APeopleBodyWithoutASampleIsNotPresent(t *testing.T) {
 }
 
 // One window alone is not the people reading: the gateway serves both or
-// neither, so half of it is no reading.
+// neither, so half of it is no reading. A window outside 7d and 30d resolves
+// neither field, beside the 7d sample or alone.
 func TestPodUsageSource_OneWindowAloneIsNotPresent(t *testing.T) {
-	addr := serveBody(t, http.StatusOK, usagePeopleBody(`kubeagents_a2a_gateway_people_seen{window="7d"} 3`))
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageA2AChatCounters, []usageReadingKind{usageReadingPeople})
-	if err != nil {
-		t.Fatalf("Scrape: %v", err)
+	for _, tc := range []struct {
+		name  string
+		lines []string
+	}{
+		{"the 7d window alone", []string{`kubeagents_a2a_gateway_people_seen{window="7d"} 3`}},
+		{"the 7d window beside a 90d one", []string{
+			`kubeagents_a2a_gateway_people_seen{window="7d"} 3`,
+			`kubeagents_a2a_gateway_people_seen{window="90d"} 11`,
+		}},
+		{"a 90d window alone", []string{`kubeagents_a2a_gateway_people_seen{window="90d"} 11`}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := serveBody(t, http.StatusOK, usagePeopleBody(tc.lines...))
+			reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageA2AChatCounters, []usageReadingKind{usageReadingPeople})
+			if err != nil {
+				t.Fatalf("Scrape: %v", err)
+			}
+			if reading.ReadingsPresent[usageReadingPeople] || len(reading.Readings) != 0 {
+				t.Errorf("present %v, readings %v; want no people reading", reading.ReadingsPresent, reading.Readings)
+			}
+			for _, field := range []string{usageExportPeopleSeen7d, usageExportPeopleSeen30d} {
+				if v, ok := reading.Readings[field]; ok {
+					t.Errorf("%s = %d, want it absent", field, v)
+				}
+			}
+			usageCheckA2AChatSamples(t, reading)
+		})
 	}
-	if reading.ReadingsPresent[usageReadingPeople] || len(reading.Readings) != 0 {
-		t.Errorf("present %v, readings %v; want no people reading from the 7d window alone", reading.ReadingsPresent, reading.Readings)
-	}
-	usageCheckA2AChatSamples(t, reading)
 }
 
 // The watcher's body feeds two counters: the injected events, and the triage

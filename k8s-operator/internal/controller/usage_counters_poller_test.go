@@ -159,7 +159,7 @@ type stubUsageSource struct {
 	hook func(addr string)
 }
 
-func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []string, _ []usageReadingKind) (usageReading, error) {
+func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, addr)
 	block := s.blocking[addr]
@@ -191,7 +191,8 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []st
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
 	// set's sample is the pod group's first counter; setSample names the rest.
-	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, Readings: reading.Readings, ReadingsPresent: reading.ReadingsPresent, DataVolume: reading.DataVolume}
+	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume}
+	out.Readings, out.ReadingsPresent = stubReadingsOf(reading, kinds)
 	for i, counter := range counters {
 		value, named := reading.Samples[counter]
 		if !named && i == 0 {
@@ -200,6 +201,28 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []st
 		out.Samples[counter] = value
 	}
 	return out, nil
+}
+
+// stubReadingsOf is the planted readings of the kinds a scrape asked for, as
+// foldUsageBody reads only those: a reading the target's readings column does
+// not name never reaches the poll.
+func stubReadingsOf(reading usageReading, kinds []usageReadingKind) (map[string]int64, map[usageReadingKind]bool) {
+	if reading.Readings == nil && reading.ReadingsPresent == nil {
+		return nil, nil
+	}
+	values := map[string]int64{}
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, kinds...) {
+		if v, ok := reading.Readings[spec.field]; ok {
+			values[spec.field] = v
+		}
+	}
+	present := map[usageReadingKind]bool{}
+	for kind, ok := range reading.ReadingsPresent {
+		if slices.Contains(kinds, kind) {
+			present[kind] = ok
+		}
+	}
+	return values, present
 }
 
 // stubPrimarySample keys the sample set gives, handed out as the first counter
@@ -3942,6 +3965,38 @@ func TestUsagePoller_ARequestedHAInstallReadsItsOnePodsChatListener(t *testing.T
 		}
 	}
 	t.Fatalf("the one gateway pod's chat listener %s is not among the targets: %+v", chatAddr(), targets)
+}
+
+// Each target asks for the readings its listener serves: the A2A gateway the
+// people reading, the broker its two proposal readings, the gateway pod's
+// watcher and chat listeners none.
+func TestUsagePoller_EachTargetAsksForItsListenersReadings(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usagePeopleTestAgent(created, false)
+	h := newUsageHarness(t, agent, usagePeopleObjects(created)...)
+	targets, _, err := h.p.targets(context.Background(), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]usageReadingKind{
+		gatewayAddr(): nil,
+		chatAddr():    nil,
+		a2aAddr():     {usageReadingPeople},
+		brokerAddr():  {usageReadingOutcomes, usageReadingDetails},
+	}
+	got := map[string][]usageReadingKind{}
+	for _, target := range targets {
+		got[target.addr] = target.readings
+	}
+	if len(got) != len(want) {
+		t.Fatalf("targets = %+v, want one at each of %v", targets, want)
+	}
+	for addr, kinds := range want {
+		readings, ok := got[addr]
+		if !ok || !slices.Equal(readings, kinds) {
+			t.Errorf("target %s readings = %v (present %v), want %v", addr, readings, ok, kinds)
+		}
+	}
 }
 
 // usagePeopleTestAgent is a next-mode CR with Chat on and, when slack is set,
