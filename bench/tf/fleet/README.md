@@ -291,7 +291,7 @@ cohort: a key on three clusters and not the fourth would be a drift finding.
 
 `seeded-b`'s lag is derived at apply time (on a create, the newest patch REGULAR itself
 offers one minor behind its default, read by `seeded_b_pin.py`; afterwards the running
-version inside that minor), so the pin re-computes each reconcile instead of rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
+version inside that minor), so the pin re-computes each reconcile instead of rotting. `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
 SOP's master-behind check compares a cluster's master minor against its own channel's
 default, so a channel-less cluster falls out of that comparison entirely and the lag
 would be invisible to the audit it was planted for. The maintenance exclusion above is
