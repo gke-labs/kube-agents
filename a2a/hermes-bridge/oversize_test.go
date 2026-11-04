@@ -12,6 +12,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	natsserver "github.com/nats-io/nats-server/v2/server"
+
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -144,22 +146,25 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 }
 
 // A result artifact the bus refuses carries the refusal into the terminal.
-// The chunk size here is past the bus's 1 MiB default max payload, so the
-// first chunk's envelope is over it, the case lib's publish gate names. The
-// terminal used to read the bare `bus-publish-failed at result`, with the
-// cause only in the bridge log.
+// The test server's max payload is pubFailMaxPayload and the chunk size twice
+// that, so the first chunk's envelope is over it, the case lib's publish gate
+// names. The terminal used to read the bare `bus-publish-failed at result`,
+// with the cause only in the bridge log.
+//
+// The limit is the server's, not the bus default of 1 MiB: an answer past
+// 1 MiB spent 40 s in the chat fold before its first publish on a loaded
+// runner, and the refusal is the same comparison at any limit.
 func TestResultPublishFailureCarriesTheCause(t *testing.T) {
-	const chunk = 2 << 20
-	_, url := startServer(t)
+	const pubFailMaxPayload = 64 << 10
+	const chunk = 2 * pubFailMaxPayload
+	_, url := startServerOpt(t, true, func(o *natsserver.Options) { o.MaxPayload = pubFailMaxPayload })
 	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
 		writeCompletion(w, c.sessionID, strings.Repeat("y", chunk-1))
 	})
 	startAPIBridge(t, url, stub, func(cfg *Config) { cfg.ResultChunkSize = chunk })
 	c := gatewayClient(t, url)
 	submitIn(t, c, "task-pubfail", "ctx-pubfail", "answer at length")
-	// A quarter of the at-cap answer: 22 s measured under the load that
-	// took the at-cap test past 100 s, against terminalWait's 20 s.
-	task := waitTerminalFor(t, c, "task-pubfail", 3*terminalWait)
+	task := waitTerminal(t, c, "task-pubfail")
 	if task.State != lib.StateFailed {
 		t.Fatalf("state = %s, want failed", task.State)
 	}
@@ -168,7 +173,7 @@ func TestResultPublishFailureCarriesTheCause(t *testing.T) {
 	if !strings.HasPrefix(reason, want) {
 		t.Fatalf("reason = %q, want prefix %q", reason, want)
 	}
-	if !strings.Contains(reason, "bus max message size is") {
+	if !strings.Contains(reason, fmt.Sprintf("bus max message size is %d", pubFailMaxPayload)) {
 		t.Errorf("reason does not carry the bus's refusal: %q", reason)
 	}
 }
