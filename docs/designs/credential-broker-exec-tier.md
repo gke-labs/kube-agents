@@ -339,10 +339,10 @@ against the per-replica numbers, as before.
 Until the turn token exists (§4.1), the fleet sweeps run on the shell role, which §12 makes
 interactive. So a sweep sizes inside `interactive_cap × N`, not inside the background share. It
 keeps the session cap free on each replica, because each connection can land on any replica. The
-width is `(interactive_cap − session_cap) × N`, and never below four: five per replica at the
-2 GiB default. When the sweeps become background work, a sweep sizes to the background share
-`B × N` (§4.2), which profile work shares. The route then also reports `B` and the profile share
-`P`, per replica and times N.
+width is `(interactive_cap − session_cap) × N`, and never below four, or the tier's interactive cap
+where that is lower: five per replica at the 2 GiB default. When the sweeps become background
+work, a sweep sizes to the background share `B × N` (§4.2), which profile work shares. The route
+then also reports `B` and the profile share `P`, per replica and times N.
 
 A sweep sized to `admitted × N` would run past its share. The tier numbers are a target, not a
 promise: a replica that is not ready lowers the real number until the rollout ends.
@@ -871,7 +871,7 @@ cache contract.
    as today. The operator sets N. It is not derived from the fleet size and not an autoscaling
    floor (open question 13). The signals for raising it are per replica (§8.1): the background
    admission wait (its p50 above the lowest bucket), refusals by bound (`slot` or `budget`), and
-   CPU throttling, which the admission route (§3.5) also reports for the tier. Raise N while
+   CPU throttling, from the proxy container's cgroup `cpu.stat` (§8.1). Raise N while
    those persist. The implementation changes the slot-wait advice in the site's `observability.md`
    to name this field, beside narrowing the reconcile.
 2. **Per-class metrics and the session-role class first,** on the single pod. They give the

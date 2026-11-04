@@ -152,6 +152,15 @@ class ReadReportTest(unittest.TestCase):
             broker_admission.read_report(self.ENDPOINT)
         self.assertEqual([self.ENDPOINT + "/v1/exec/admission"], [request.full_url for request, _ in self.seen])
 
+    def test_an_explicit_empty_endpoint_wins_over_both_urls_without_a_request(self):
+        environ = {"CREDENTIAL_PROXY_URL": "http://stateful:8080", "CREDENTIAL_PROXY_EXEC_URL": "http://exec:8765"}
+        for endpoint in ("", "  "):
+            with self.subTest(endpoint=endpoint), mock.patch.dict(os.environ, environ), \
+                    mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
+                    self._reading({"admitted": 8}):
+                self.assertIsNone(broker_admission.read_report(endpoint))
+                self.assertEqual([], self.seen)
+
     TIER = {
         "slot_cap": 8, "budget_admits": 9, "admitted": 8, "interactive_cap": 7, "session_cap": 2,
         "replicas": 2, "tier_admitted": 16, "tier_interactive_cap": 14,

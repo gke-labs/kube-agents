@@ -5890,6 +5890,19 @@ class CommandExecutorTest(unittest.TestCase):
             self._report_with_replicas_file(" 2\n"),
         )
 
+    def test_the_tiers_totals_are_the_admitted_count_below_the_slot_cap(self):
+        mib = credential_proxy.MEBIBYTE
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            executor = self.executor(memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib)
+        # The 1Gi budget admits 4 of the 8 slots, so each total is the admitted count's, not the slot cap's.
+        self.assertEqual(
+            {
+                "slot_cap": 8, "budget_admits": 4, "admitted": 4, "interactive_cap": 3, "session_cap": 2,
+                "replicas": 2, "tier_admitted": 8, "tier_interactive_cap": 6,
+            },
+            self._report_with_replicas_file("2", executor),
+        )
+
     def test_a_replica_count_above_the_crs_bound_is_held_to_it(self):
         report = self._report_with_replicas_file("40")
         self.assertEqual(credential_proxy.EXEC_REPLICAS_MAX, report["replicas"])
