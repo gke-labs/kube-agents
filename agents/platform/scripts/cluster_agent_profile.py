@@ -871,7 +871,11 @@ def cmd_stamp_soul(args: argparse.Namespace) -> None:
     home = Path(args.profile_dir)
     identity = read_cluster_identity(home)
     if identity is None:
-        return
+        # The entrypoint has just replaced SOUL.md with the blank template, so a
+        # profile whose config.yaml carries no readable identity is left without
+        # its block. Exit non-zero so the caller says so and does not stamp the
+        # pass as finished; a silent return read as one.
+        raise SystemExit(f"ERROR: {home / 'config.yaml'} has no readable cluster_identity; SOUL.md was not stamped")
     _stamp_soul_identity(home, identity["project"], identity["cluster"], identity["location"])
 
 
