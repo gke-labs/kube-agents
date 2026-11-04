@@ -1076,3 +1076,197 @@ func TestGchatDownWhoseAnswerPatchFailsStillAsksForTheNote(t *testing.T) {
 		t.Errorf("card = %+v", card)
 	}
 }
+
+// gchatRatedClickEvent is the add-on choice click fixture with r's rating
+// buttons at the end of the message's button list.
+func gchatRatedClickEvent(t *testing.T, r gchatRating) *gchatEvent {
+	t.Helper()
+	ev := gchatClickEvent(t)
+	raw, _ := json.Marshal(gchatRatingButtons(r))
+	var buttons []gchatButton
+	if err := json.Unmarshal(raw, &buttons); err != nil {
+		t.Fatal(err)
+	}
+	list := &ev.Message.AccessoryWidgets[0].ButtonList
+	list.Buttons = append(list.Buttons, buttons...)
+	return ev
+}
+
+// checkLinkAndRating checks buttons are the board link, then the two rating
+// buttons with chosen filled ("" for neither).
+func checkLinkAndRating(t *testing.T, buttons []gchatButton, chosen string) {
+	t.Helper()
+	if len(buttons) != 3 {
+		t.Fatalf("buttons = %+v, want the link and two rating", buttons)
+	}
+	if classifyGchatButton(buttons[0]) != gchatButtonLink || buttons[0].Text != "board" || buttons[0].OnClick.OpenLink.URL != "https://x.example/b" {
+		t.Errorf("link = %+v", buttons[0])
+	}
+	if chosen == "" {
+		checkRatingButton(t, buttons[1], "👍", "Good answer", "up")
+		checkRatingButton(t, buttons[2], "👎", "Bad answer", "down")
+		return
+	}
+	checkFilled(t, buttons, chosen)
+}
+
+func TestGchatAnsweredRewriteKeepsTheRatingButtons(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	name, err := a.PostMessage("gchat:dm/spaces/_c2fixtureAA", OutMessage{Text: "fallback", Chat: gchatFeedbackQuestion(), Feedback: "t-root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.classify(gchatRatingEvent(t, "up"))
+	msg, reason := a.classify(gchatClickEvent(t))
+	if reason != "" {
+		t.Fatalf("choice click: %q", reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	if n := relayCallCount(f); n != 3 {
+		t.Fatalf("relay calls = %d, want the post, the rating patch and the rewrite", n)
+	}
+	body := checkPatch(t, f, 2, name)
+	if text, _ := body["text"].(string); !strings.HasSuffix(text, "✓ Test Sender: Look at the first one") {
+		t.Errorf("text = %q, want the answered line last", text)
+	}
+	checkLinkAndRating(t, bodyButtons(t, body), "up")
+}
+
+func TestGchatTypedAnswerRewriteKeepsTheRatingUnfilled(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	conversation := "gchat:dm/spaces/_c2fixtureAA/threads/jhqZwM-35cA"
+	name, err := a.PostMessage(conversation, OutMessage{Text: "fallback", Chat: gchatFeedbackQuestion(), Feedback: "t-root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, reason := a.classify(gchatFixtureEvent(t, "addon-dm-thread-reply.json", nil))
+	if reason != "" || msg.Conversation != conversation {
+		t.Fatalf("typed reply = %+v (%q), want a turn in %s", msg, reason, conversation)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	if n := relayCallCount(f); n != 2 {
+		t.Fatalf("relay calls = %d, want the post and the rewrite", n)
+	}
+	body := checkPatch(t, f, 1, name)
+	if text, _ := body["text"].(string); !strings.Contains(text, "✓ Test Sender: ") {
+		t.Errorf("text = %q, want the answered line", text)
+	}
+	checkLinkAndRating(t, bodyButtons(t, body), "")
+}
+
+func TestGchatClickAfterARestartKeepsTheRatingButtonsAsShown(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	ev := gchatRatedClickEvent(t, gchatRating{task: "t-root", chosen: "down"})
+	msg, reason := a.classify(ev)
+	if reason != "" {
+		t.Fatalf("choice click: %q", reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	if n := relayCallCount(f); n != 1 {
+		t.Fatalf("relay calls = %d, want the rewrite", n)
+	}
+	body := checkPatch(t, f, 0, ev.Message.Name)
+	if text, _ := body["text"].(string); !strings.HasSuffix(text, "✓ Test Sender: Look at the first one") {
+		t.Errorf("text = %q, want the answered line last", text)
+	}
+	checkLinkAndRating(t, bodyButtons(t, body), "down")
+}
+
+func TestGchatMessageButtonsTellTheKindsApartByFunction(t *testing.T) {
+	ev := gchatClickEvent(t)
+	original := ev.Message.AccessoryWidgets[0].ButtonList.Buttons
+	if len(original) != 3 || original[0].Type != "FILLED" || classifyGchatButton(original[2]) != gchatButtonLink {
+		t.Fatalf("fixture buttons = %+v, want a FILLED primary choice, a choice and a link", original)
+	}
+	withRating := func(r gchatRating) gchatMessage {
+		raw, _ := json.Marshal(gchatRatingButtons(r))
+		var rating []gchatButton
+		if err := json.Unmarshal(raw, &rating); err != nil {
+			t.Fatal(err)
+		}
+		m := ev.Message
+		// The rating buttons sit before the link: kinds come from the
+		// function, not the position.
+		buttons := append(append(append([]gchatButton{}, original[:2]...), rating...), original[2])
+		m.AccessoryWidgets = []gchatAccessoryWidget{{}}
+		m.AccessoryWidgets[0].ButtonList.Buttons = buttons
+		return m
+	}
+	links, label, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root"}), 1, "fallback")
+	if len(links) != 1 || links[0].Text != "board" || links[0].URL != "https://x.example/b" {
+		t.Errorf("links = %+v, want the link alone", links)
+	}
+	if label != "Skip" {
+		t.Errorf("label = %q, want the choice at index 1", label)
+	}
+	if rating != (gchatRating{"t-root", ""}) {
+		t.Errorf("rating = %+v, want t-root unchosen", rating)
+	}
+	if _, _, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root", chosen: "down"}), 1, "fallback"); rating != (gchatRating{"t-root", "down"}) {
+		t.Errorf("rating with 👎 FILLED = %+v, want chosen down", rating)
+	}
+}
+
+func TestGchatLaterEditOfAnAnsweredRatedMessageKeepsItsButtons(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	conversation := "gchat:dm/spaces/_c2fixtureAA"
+	name, err := a.PostMessage(conversation, OutMessage{Text: "fallback", Chat: gchatFeedbackQuestion(), Feedback: "t-root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, reason := a.classify(gchatClickEvent(t))
+	if reason != "" {
+		t.Fatalf("choice click: %q", reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	if err := a.EditMessage(conversation, name, OutMessage{Text: "settled"}); err != nil {
+		t.Fatal(err)
+	}
+	body := checkPatch(t, f, 2, name)
+	if text, _ := body["text"].(string); !strings.HasPrefix(text, "settled") || !strings.HasSuffix(text, "✓ Test Sender: Look at the first one") {
+		t.Errorf("edit text = %q, want the new text and the answered line", text)
+	}
+	buttons := bodyButtons(t, body)
+	if len(buttons) != 2 {
+		t.Fatalf("buttons = %+v, want the two rating buttons", buttons)
+	}
+	checkRatingButton(t, buttons[0], "👍", "Good answer", "up")
+	checkRatingButton(t, buttons[1], "👎", "Bad answer", "down")
+}
+
+// The layout the answered rewrite (and a later edit) records carries no
+// rating buttons, so a tap afterwards draws one pair, not two.
+func TestGchatRatingAfterARatedAnsweredRewriteDrawsOnePair(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	conversation := "gchat:dm/spaces/_c2fixtureAA"
+	name, err := a.PostMessage(conversation, OutMessage{Text: "fallback", Chat: gchatFeedbackQuestion(), Feedback: "t-root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.classify(gchatRatingEvent(t, "up"))
+	msg, reason := a.classify(gchatClickEvent(t))
+	if reason != "" {
+		t.Fatalf("choice click: %q", reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	a.classify(gchatRatingEvent(t, "down"))
+	if n := relayCallCount(f); n < 4 {
+		t.Fatalf("relay calls = %d, want the 👎 patch fourth", n)
+	}
+	body := checkPatch(t, f, 3, name)
+	if text, _ := body["text"].(string); !strings.HasSuffix(text, "✓ Test Sender: Look at the first one") {
+		t.Errorf("text = %q, want the answered line last", text)
+	}
+	checkLinkAndRating(t, bodyButtons(t, body), "down")
+
+	if err := a.EditMessage(conversation, name, OutMessage{Text: "settled"}); err != nil {
+		t.Fatal(err)
+	}
+	a.classify(gchatRatingEvent(t, "up"))
+	n := relayCallCount(f)
+	buttons := bodyButtons(t, checkPatch(t, f, n-1, name))
+	if len(buttons) != 2 {
+		t.Fatalf("buttons after the edit and a tap = %+v, want one rating pair", buttons)
+	}
+	checkFilled(t, buttons, "up")
+}
