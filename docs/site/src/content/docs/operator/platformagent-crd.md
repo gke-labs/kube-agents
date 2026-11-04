@@ -25,7 +25,7 @@ spec:
   harness: { ... } # execution environment + framework
   deployment: { ... } # container image, pull policy, containers, volumes
   security: { ... } # service account + Workload Identity
-  telemetry: { ... } # OTLP collector endpoint (optional)
+  telemetry: { ... } # OTLP collector endpoint and the people switch (optional)
   networkPolicy: { ... } # generated egress NetworkPolicy (optional)
   integration: { ... } # Google Chat, Slack, Teams, git forge
   scope: { ... } # projects beyond the management project, and exclusions (optional)
@@ -1052,6 +1052,7 @@ While the value is the default, the composition passes the chart nothing, so the
 ## `spec.telemetry`
 
 - `otlpEndpoint` — the OTLP/HTTP collector **base** URL (no `/v1/traces` suffix; the exporters append their own per-signal path). Up to 2048 characters, `http://` or `https://`.
+- `peopleSeen` — whether the A2A gateway keeps its [people record](/kube-agents/concepts/chatops/#people-seen) under `spec.mode: next`: one hashed key and a last-active time per person who writes on Google Chat, Slack or Discord, kept 30 days after their last turn. Defaults to `true`. `false` writes no key, deletes every key the record holds at the gateway's next start, and the gateway serves no `kubeagents_a2a_gateway_people_seen` sample. Under `today` there is no gateway, and the field has no effect. The chart sets it from `platformAgent.telemetry.peopleSeen`, and refuses to render `false` against a served CRD that lacks the field, because `helm upgrade` does not update CRDs.
 
 Optional, and omitting it is the point: with the field absent the operator discovers an in-cluster collector, falls back to GKE Managed OpenTelemetry when it cannot establish what the cluster has, and disables export altogether when discovery finds no collector (`otlpEndpointSource: None`). Setting it pins the endpoint and suppresses discovery. The full precedence ladder, the discovery order, and the Helm value that drives LiteLLM and the NetworkPolicy alongside this field are on [Deploy → Telemetry](/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 
@@ -1290,7 +1291,7 @@ So each base has one spelling, the one the broker targets and protects. Changing
 
 The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, and what each condition reports, follows.
 
-`usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.remediationsProposedTotal`,
+`usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
 `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
 `usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the six proposal readings are produced by the operator, on the leader and off the reconcile path. Every five
 minutes it reads the credential broker's, the event watcher's, the chat plugin's and, on a `next`
@@ -1347,7 +1348,7 @@ record. Under a served CRD that predates `status.usage` they accumulate in the
 applied. Under a served CRD at a previous schema, which has `status.usage` without the fields added
 later (the two cluster gauges, the proposal readings, `chatMessagesInboundTotal`,
 `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`,
-`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal` and `lastHumanActiveTime`), the first-schema
+`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`), the first-schema
 counters keep landing and the newer fields are probed again every five minutes until this
 release's CRD is applied. `storageStatus.capacityBytes` and `freeBytes` follow the same rule under
 a served CRD that predates them.
