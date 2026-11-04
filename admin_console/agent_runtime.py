@@ -101,8 +101,10 @@ PR_METADATA_SQL = """
 # in this column, and removes the column before it sends the row.
 PR_RESULT_COLUMN = "pr_scan_result"
 PR_RESULT_SQL = "CASE WHEN t.status = 'done' THEN t.result END"
-# A PR or MR URL in the result. The URL must not contain white space.
-PR_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|merge_requests)/\d+")
+# A pull or merge request URL in the result, on any forge the broker serves:
+# GitHub `/pull/<n>`, GitLab `/merge_requests/<n>`, Gitea `/pulls/<n>`, Bitbucket
+# Cloud and Data Center `/pull-requests/<n>`. The URL must not contain white space.
+PR_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|pulls|pull-requests|merge_requests)/\d+")
 
 
 def profiles():
