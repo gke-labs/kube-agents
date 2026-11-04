@@ -22,6 +22,11 @@ import (
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/dispatch"
@@ -371,5 +376,92 @@ func TestABadSeedFileStopsTheDispatcherAtStartup(t *testing.T) {
 		if code := run(env(e)); code != 2 {
 			t.Errorf("%s: run exited %d, want 2 (refused at startup)", name, code)
 		}
+	}
+}
+
+// signalWriter collects a log and closes seen the first time it holds want.
+type signalWriter struct {
+	mu   sync.Mutex
+	buf  strings.Builder
+	want string
+	seen chan struct{}
+	once sync.Once
+}
+
+func (w *signalWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf.Write(p)
+	if strings.Contains(w.buf.String(), w.want) {
+		w.once.Do(func() { close(w.seen) })
+	}
+	return len(p), nil
+}
+
+// A SIGTERM while the process still waits for its first config, or for its
+// first bus connect, is a stop like one while dispatching: serve returns nil
+// (run logs "stopped" at Info and exits 0), not context.Canceled.
+func TestAStopBeforeDispatchingIsACleanStop(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	const ns, name = "kube-agents", "agent-a2a-dispatch"
+	// Nothing listens on port 1: every connect fails and is retried.
+	s := settings{natsURL: "nats://127.0.0.1:1", namespace: ns, configMap: name}
+	cfg := lib.DispatchConfig{Version: "test", Namespace: ns, ProfileNamespace: "kube-agents-profiles", Ceiling: 6,
+		InteractiveReserve: 2, ChildReserve: 2, LeaseSeconds: 3, RenewSeconds: 1, RestartGraceSeconds: 2, AcceptTimeoutSeconds: 1,
+		Profiles: []lib.DispatchProfile{{Name: "tse", Tiers: []string{"read"}, Concurrency: 1, QueueTimeoutSeconds: 60, ActiveDeadlineSeconds: 60,
+			Durables: []lib.DispatchDurable{
+				{Tier: "read", Kind: lib.SubmitKindTop, Name: lib.ProfileDurableName("tse", "read", lib.SubmitKindTop)},
+				{Tier: "read", Kind: lib.SubmitKindChild, Name: lib.ProfileDurableName("tse", "read", lib.SubmitKindChild)}}}}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}, Data: map[string]string{lib.DispatchConfigKey: string(raw)}}
+	for _, tc := range []struct {
+		name string
+		kube *fake.Clientset
+		// stopAt is the log line that says serve is in the wait the stop
+		// lands in; the config wait logs nothing.
+		stopAt string
+	}{
+		{"during the config wait", fake.NewSimpleClientset(), ""},
+		{"during the first connect", fake.NewSimpleClientset(cm), "the bus is not reachable yet"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &signalWriter{want: tc.stopAt, seen: make(chan struct{})}
+			log := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- serve(ctx, log, s, tc.kube) }()
+			if tc.stopAt == "" {
+				time.Sleep(300 * time.Millisecond)
+			} else {
+				select {
+				case <-w.seen:
+				case <-time.After(10 * time.Second):
+					t.Fatalf("serve never reached the connect retry; log:\n%s", w.buf.String())
+				}
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("serve returned %v on a stop, want nil (a clean stop)", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("serve did not return after the stop")
+			}
+		})
+	}
+	// A moved profile namespace cancels the same context, and is still the
+	// error that restarts the process.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(errProfileNamespaceMoved)
+	if err := stopped(ctx, fmt.Errorf("bus connect: %w", ctx.Err())); !errors.Is(err, errProfileNamespaceMoved) {
+		t.Errorf("a moved namespace during the connect: %v, want errProfileNamespaceMoved", err)
 	}
 }

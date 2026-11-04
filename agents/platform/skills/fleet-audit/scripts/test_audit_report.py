@@ -2726,6 +2726,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "upgrade-readiness-watch",
                 "upgrade-readiness-weekly-review",
                 "sa-role-watch",
+                "leeway-watch",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "

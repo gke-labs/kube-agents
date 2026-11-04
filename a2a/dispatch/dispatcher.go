@@ -177,7 +177,7 @@ type Dispatcher struct {
 	started   time.Time
 	active    map[holdKey]*holding
 	offers    map[offerKey]chan lib.DispatchAccept
-	waiting   map[string]waiting
+	waiting   map[holdKey]waiting
 	lastAdmit map[string]time.Time
 	// released is the lease keys of tasks whose final renewal came while no
 	// hold here had them, by when: settled, not failed, when the
@@ -252,7 +252,7 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 		mint: mint, taskKeys: taskKeys, taskMaxLifetime: maxLifetime,
 		active:     map[holdKey]*holding{},
 		offers:     map[offerKey]chan lib.DispatchAccept{},
-		waiting:    map[string]waiting{},
+		waiting:    map[holdKey]waiting{},
 		lastAdmit:  map[string]time.Time{},
 		released:   map[string]time.Time{},
 		verified:   map[holdKey]permit{},
@@ -629,7 +629,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 	if ref != nil {
 		log.Info("submission refused at admission", "reason", ref.reason, "detail", ref.detail)
-		d.clearWaiting(taskID)
+		d.clearWaiting(hk)
 		d.reject(ctx, log, del, hk, ref)
 		return
 	}
@@ -642,24 +642,24 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 				return
 			}
 		}
-		d.noteWaiting(taskID, lib.ProfileDurableName(profile, tier, kind), del.Received(), why)
+		d.noteWaiting(hk, del.Received(), why)
 		log.Debug("over a cap; the submission stays queued", "cap", why)
 		_ = del.Nak(d.cfg.RetryDelay)
 		return
 	}
-	d.offeringWaiting(taskID)
+	d.offeringWaiting(hk)
 	h.cluster = cluster
 
 	rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
 	if err == nil && key != "" {
-		d.clearWaiting(taskID)
+		d.clearWaiting(hk)
 	}
 	if err != nil || key == "" {
 		d.release(h, false)
 		if err != nil {
 			log.Warn("hand-off failed; the submission stays queued", "err", err)
 		} else {
-			d.noteWaiting(taskID, lib.ProfileDurableName(profile, tier, kind), del.Received(), ReasonNoWorker)
+			d.noteWaiting(hk, del.Received(), ReasonNoWorker)
 			log.Info("no worker took the task; the submission stays queued")
 		}
 		if ctx.Err() == nil {
@@ -725,7 +725,7 @@ func (d *Dispatcher) reject(ctx context.Context, log *slog.Logger, del lib.Deliv
 	// A stop leaves the terminal reportAfterStop more to land.
 	defer context.AfterFunc(ctx, func() { time.AfterFunc(reportAfterStop, cancel) })()
 	for {
-		err := d.publishTerminal(pctx, hk.profile, del.Envelope(), lib.StateRejected, ref.reason, ref.detail)
+		err := d.publishTerminal(pctx, hk, del.Envelope(), lib.StateRejected, ref.reason, ref.detail)
 		if err == nil {
 			break
 		}
@@ -1175,7 +1175,7 @@ func deadlineLimit(rec lib.LeaseRecord) time.Duration {
 // to the next instance, whose record says started, and is failed there.
 func (d *Dispatcher) fail(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord, reason, detail string) {
 	for {
-		err := d.publishTerminal(ctx, h.profile, del.Envelope(), lib.StateFailed, reason, detail)
+		err := d.publishTerminal(ctx, h.key(), del.Envelope(), lib.StateFailed, reason, detail)
 		if err == nil {
 			break
 		}

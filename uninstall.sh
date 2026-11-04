@@ -937,6 +937,9 @@ main() {
   # value, and the destroy removes the two serving-project resources in state
   # whichever way the key renders.
   export VERTEX_MANAGE_SERVING_PROJECT=""
+  # The release's upgrade_install switch, likewise: the generator refuses a
+  # misspelt value, and the destroy removes the release however it renders.
+  export HELM_UPGRADE_INSTALL=""
   # The mode, likewise: the generator refuses a value outside the CRD's enum,
   # and the destroy removes the release whichever mode it renders.
   export PLATFORM_AGENT_MODE=""

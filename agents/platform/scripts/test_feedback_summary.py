@@ -44,6 +44,7 @@ CR = {
             "clustersMonitored": 2,
             "chatMessagesInboundTotal": 41,
             "sessionsTotal": 7,
+            "chatSessionsTotal": 4,
             "toolExecutionsTotal": 19127,
             "eventsIngestedTotal": 10,
             "remediationsProposedTotal": 4,
@@ -140,7 +141,7 @@ class RenderTest(unittest.TestCase):
         self.assertIn("kubernetes: v1.33.4-gke.1234000", text)
         self.assertIn("installed: 19 days", text)
         self.assertIn("toolExecutionsTotal: 19127", text)
-        self.assertIn("sessionsTotal: 7", text)
+        self.assertIn("  sessionsTotal: 7\n  chatSessionsTotal: 4\n", text)
         self.assertIn("  remediationsMergedTotal: 1 (as the forge reports)\n", text)
         self.assertIn("  proposalsAuthored: 6 (as the forge reports)\n", text)
         self.assertIn("  remediationsOpen: 2 (as the forge reports)\n", text)
