@@ -39,10 +39,10 @@ RUNNING_MAX_AGE = datetime.timedelta(hours=8)
 DEFAULT_JOB = "pull-kube-agents-smoke-test-gitlab"
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 RESULT_SUCCESS = "SUCCESS"
-# Why a lane's nightlies have not run, said in the digest while none of
-# them has a night on record (ignored from the first night on); drop it
-# when the jobs are enabled.
-NOT_ENABLED_FORGE_JOBS = "their Prow jobs are on hold in GoogleCloudPlatform/oss-test-infra#2755"
+# Why a lane's nightlies are off: the digest says it in place of their
+# nights, so a turned-off job never reads as red or missed. Drop it when
+# the jobs are back.
+FORGE_NIGHTLIES_OFF = "removed from Prow until the Vertex quota is fixed, GoogleCloudPlatform/oss-test-infra#2766"
 # Each forge lane as the Brief titles it, with its jobs: the pull-request
 # job, and the nightlies in the order the section lists them. A job the
 # lane's runs name and this table does not is listed after these.
@@ -56,13 +56,13 @@ LANES = {
         "title": "GHES lane",
         "job": "pull-kube-agents-smoke-test-ghes",
         "nightly_jobs": ("ci-kube-agents-eval-nightly-ghes-next",),
-        "not_enabled": NOT_ENABLED_FORGE_JOBS,
+        "off": FORGE_NIGHTLIES_OFF,
     },
     tiers.TIER_GITLAB_CE: {
         "title": "GitLab CE lane",
         "job": "pull-kube-agents-smoke-test-gitlab-ce",
         "nightly_jobs": ("ci-kube-agents-eval-nightly-gitlab-ce-next",),
-        "not_enabled": NOT_ENABLED_FORGE_JOBS,
+        "off": FORGE_NIGHTLIES_OFF,
     },
 }
 # The digest line on the forge lanes' nightlies (digest_line).
@@ -213,10 +213,9 @@ def _night_label(lane: dict, job: str) -> str:
 
 def digest_line(data: dict | None, now: datetime.datetime) -> str | None:
     """One line for the daily digest on every forge lane's nightlies: last
-    night's result per nightly job (green, red, or none last night), and the
-    jobs with no night on record at all: not enabled yet, with the lane's
-    reason (LANES' ``not_enabled``), or plainly none on record for a lane
-    without one. None without data."""
+    night's result per nightly job (green, red, or none last night); a lane
+    with a reason (LANES' ``off``) as off, with it, whatever its nights; and
+    a job with no night on record. None without data."""
     if not data:
         return None
     parts: list[str] = []
@@ -226,8 +225,8 @@ def digest_line(data: dict | None, now: datetime.datetime) -> str | None:
         for entry in lane_doc["nightly_jobs"]:
             label = _night_label(lane, entry["job"])
             nights = entry["nights"]
-            if not nights:
-                waiting.setdefault(lane.get("not_enabled") or "", []).append(label)
+            if lane.get("off") or not nights:
+                waiting.setdefault(lane.get("off") or "", []).append(label)
                 continue
             started = parse_iso(nights[0].get("started"))
             if started is None or now - started > nightly.LAST_NIGHT_MAX_AGE:
@@ -237,7 +236,7 @@ def digest_line(data: dict | None, now: datetime.datetime) -> str | None:
                 newest = nights[0]
                 parts.append(f"{label} {'green' if newest['green'] else 'red' if newest['result'] else 'no result'}")
     for reason, labels in waiting.items():
-        # A job with a reason is one not enabled yet; one without has run
-        # before, its nights just outside what data.json holds.
-        parts.append(f"{', '.join(labels)} not enabled yet ({reason})" if reason else f"{', '.join(labels)} no night on record")
+        # A job without a reason has run before, its nights just outside
+        # what data.json holds.
+        parts.append(f"{', '.join(labels)} off ({reason})" if reason else f"{', '.join(labels)} no night on record")
     return f"{DIGEST_GLYPH} Forge nightlies: " + nightly.SEP.join(parts)
