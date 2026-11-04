@@ -101,7 +101,9 @@ Four behaviours worth knowing before the first run:
   [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it; the
   installer writes none of them, so an `install.sh`-driven install sets them as `TF_VAR_` lines in
   `install.env` (`TF_VAR_sizing_profile=fleet`), which Terraform reads where the generated tfvars
-  is silent. Pass `--enable-gvisor=false` to run on the standard container runtime.
+  is silent, and keeps them there for every later run: `lifecycle.sh` refuses an apply that would
+  resize a pool no sizing input asked to resize, the shape a lost line would otherwise plan. Pass
+  `--enable-gvisor=false` to run on the standard container runtime.
 - **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
   one where a change made outside that repository is worth reporting, and nothing else here
   reports it. It costs three GCP resources in the install's project — a Log Router sink, a Pub/Sub

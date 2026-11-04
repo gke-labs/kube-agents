@@ -270,6 +270,13 @@ KSA back to the default and re-shares the identity silently, and there is no
 `guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
 GSA's destroy-and-recreate. The `agent_service_account_id` description in
 `variables.tf` carries the limits to read before relying on any of this.
+The Standard pools' sizing inputs (`sizing_profile`, `standard_*`, `gvisor_*`)
+travel the same way, as `TF_VAR_` lines the generator never writes, and the
+lines have to be present on every later `install.sh` and `upgrade.sh` run: a
+lost one resolves the `small` profile, and the apply would recreate every node
+of a larger pool onto it. `guard_node_pool_shape` refuses that apply when no
+sizing input is set; a profile or the pool's own input, set to any value, is
+the resize asked for and goes through.
 The drift audit-log ingress has the same one-default-per-project shape, and
 this one every second install meets, because `ENABLE_DRIFT_DETECTOR` defaults
 to `true`: `drift_pubsub_topic`, `drift_pubsub_subscription` and

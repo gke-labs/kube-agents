@@ -36,7 +36,14 @@
 #      same way; `guard_release_namespace` refuses a move on apply and destroy.
 #      So is the Standard cluster's initial_node_count, which standard_node_count
 #      feeds and a `TF_VAR_standard_node_count` line in install.env reaches;
-#      `guard_standard_node_count` refuses a changed count on apply.
+#      `guard_standard_node_count` refuses a changed count on apply. The two
+#      Standard pools' machine type and boot disk are not ForceNew, but a
+#      change to them recreates every node of the pool in place, and the
+#      sizing inputs that decide them (sizing_profile, standard_*, gvisor_*)
+#      reach the apply as `TF_VAR_` lines too: a lost line resolves the small
+#      profile and shrinks a fleet host's nodes under -auto-approve.
+#      `guard_node_pool_shape` refuses an apply whose resolved shape differs
+#      from the pool in state unless a sizing input names the change.
 #   7. A state left by an interrupted install can hold the cluster's CMEK
 #      entries next to a create_cluster that the retry computes as false, and
 #      the module then plans their destruction. `forget_unmanaged_cluster_kms`
@@ -158,6 +165,15 @@ readonly SCOPE_OVERRIDE_FILE="$SCOPE_RESOLVER_MODULE_DIR/scope_resolver_lifecycl
 # one per mode, plus the index-less autopilot address a state predating the
 # mode switch still carries until its first plan renames it.
 readonly STANDARD_CLUSTER_ADDRESS="module.gke_cluster.google_container_cluster.standard[0]"
+# The gVisor pool, the other resource whose node shape the sizing inputs
+# decide; guard_node_pool_shape reads both.
+readonly GVISOR_POOL_ADDRESS="module.gke_cluster.google_container_node_pool.gvisor[0]"
+# The node_config attributes the sizing inputs set on each pool, spelled as
+# the module's inputs and outputs spell them (<pool>_<attribute>). A change
+# to any of them is an in-place update GKE carries out by recreating every
+# node of the pool.
+NODE_POOL_SHAPE_ATTRS=(machine_type disk_size_gb disk_type)
+readonly NODE_POOL_SHAPE_ATTRS
 CLUSTER_ADDRESSES=(
   "module.gke_cluster.google_container_cluster.autopilot[0]"
   "$STANDARD_CLUSTER_ADDRESS"
@@ -361,19 +377,29 @@ ensure_init() {
 #
 # A variable nobody set and whose default is null -- agent_service_account_id
 # in a hand-written tfvars -- prints as `tostring(null)` (a typed null; older
-# releases print `null`). Callers want "unset", not that spelling: read as a
+# releases print `null`, and an unset number or bool prints `tonumber(null)`
+# or `tobool(null)`). Callers want "unset", not that spelling: read as a
 # name, it made guard_gsa_identity refuse every apply whose tfvars left the
 # variable alone, which is what broke the autopush deploys after #1309.
-tfvar() {
+tfvar() { tf_expr "var.$1"; }
+
+# A gke-cluster module output, by its name. console evaluates an output from
+# the configuration alone when nothing in its expression needs the state,
+# which is how guard_node_pool_shape reads the shape the module resolves from
+# sizing_profile and the explicit inputs without this script carrying a copy
+# of the profile table.
+tf_module_output() { tf_expr "module.gke_cluster.$1"; }
+
+tf_expr() {
   local out value
-  if ! out=$(echo "var.$1" | terraform console 2>&1); then
+  if ! out=$(echo "$1" | terraform console 2>&1); then
     printf '%s\n' "$out" >&2
-    warn "could not evaluate var.$1 (see the terraform error above)"
+    warn "could not evaluate $1 (see the terraform error above)"
     exit 1
   fi
   value=$(printf '%s\n' "$out" | grep -vE "$STATE_LOCK_MESSAGE_PATTERN" | grep -v '^[[:space:]]*$' | tail -1 | tr -d '"')
   case "$value" in
-    null | "tostring(null)") value="" ;;
+    null | "tostring(null)" | "tonumber(null)" | "tobool(null)") value="" ;;
   esac
   printf '%s\n' "$value"
 }
@@ -435,6 +461,21 @@ state_attr() {
 state_number_attr() {
   terraform state show -no-color "$1" 2>/dev/null |
     sed -n "s/^ *$2 *= *\([0-9][0-9]*\) *$/\1/p" | head -1
+}
+
+# The recorded value, string or number, of an attribute inside a resource's
+# first node_config block, for guard_node_pool_shape. Scoped to the block
+# because the cluster resource repeats the names: cluster_autoscaling's
+# auto_provisioning_defaults carries a disk_type of its own, and the
+# node_pool block repeats the whole node_config. state show prints the nested
+# blocks after the attributes, sorted, so the first node_config block is the
+# resource's own.
+node_config_attr() {
+  terraform state show -no-color "$1" 2>/dev/null |
+    awk -v attr="$2" '
+      /^ *node_config \{/ { in_block = 1; next }
+      in_block && $1 == attr && $2 == "=" { gsub(/"/, "", $3); print $3; exit }
+    '
 }
 
 # terraform import configures every provider, and the helm provider here is built
@@ -872,6 +913,54 @@ guard_standard_node_count() {
   warn "that is the default, 1), or set standard_node_count in terraform.tfvars for a hand-driven apply. Resize a live"
   warn "default pool with 'gcloud container clusters resize <cluster> --node-pool default-pool --num-nodes <n>' instead."
   exit 1
+}
+
+# machine_type, disk_size_gb and disk_type on both Standard pools are not
+# ForceNew, but the provider updates them in place by having GKE recreate
+# every node of the pool, and the sizing inputs that decide them reach a live
+# cluster the way standard_node_count does: the installer writes none of them
+# into terraform.tfvars, so they are `TF_VAR_` lines in install.env that every
+# front door sources with `set -a` and applies under -auto-approve. A line
+# lost between runs -- a second operator's clone, a value exported in the
+# shell for the first run only -- resolves the small profile, and the plan for
+# a fleet host is every node of both pools onto e2-standard-4, after which the
+# proxy fits on none of them. The resolved shape is read from the module's
+# outputs, so the profile table lives in the module alone. Refused only when
+# no sizing input names the change: sizing_profile or the pool's own explicit
+# input, set to anything, is the operator asking for the resize, and a blank
+# line counts as unset, as the module reads it. Same shape as
+# guard_standard_node_count.
+guard_node_pool_shape() {
+  load_state
+  local profile="" profile_read=false
+  local pool addr label attr recorded resolved explicit
+  for pool in standard gvisor; do
+    case "$pool" in
+      standard) addr="$STANDARD_CLUSTER_ADDRESS"; label="the default pool" ;;
+      gvisor)   addr="$GVISOR_POOL_ADDRESS";      label="the gVisor pool" ;;
+    esac
+    in_state "$addr" || continue
+    for attr in "${NODE_POOL_SHAPE_ATTRS[@]}"; do
+      recorded=$(node_config_attr "$addr" "$attr")
+      [[ -n "$recorded" ]] || continue
+      resolved=$(tf_module_output "${pool}_${attr}")
+      [[ "$recorded" == "$resolved" ]] && continue
+      explicit=$(tfvar "${pool}_${attr}")
+      [[ -n "$explicit" ]] && continue
+      if [[ "$profile_read" == "false" ]]; then
+        profile=$(tfvar sizing_profile)
+        profile_read=true
+      fi
+      [[ -n "$profile" ]] && continue
+      warn "${pool}_${attr} resolved to '$resolved', but this state's cluster runs $label on '$recorded' ($addr), and no sizing input asks for the change."
+      warn "The sizing inputs reach the apply as TF_VAR_ lines in install.env, which the installer never writes into terraform.tfvars, so a lost"
+      warn "or blanked line resolves the small profile. Applying now would recreate EVERY node of $label onto the resolved shape under"
+      warn "-auto-approve. Put back the line the pool was built with (TF_VAR_sizing_profile=<profile>, or TF_VAR_${pool}_${attr}=${recorded}) to"
+      warn "keep it; to resize deliberately, name the shape you want (TF_VAR_sizing_profile=<profile>, or TF_VAR_${pool}_${attr}=${resolved}),"
+      warn "or set it in terraform.tfvars for a hand-driven apply."
+      exit 1
+    done
+  done
 }
 
 # account_id on google_service_account.agent is ForceNew, and the resource
@@ -1723,6 +1812,7 @@ case "${1:-}" in
     guard_kms_identity
     guard_release_namespace
     guard_standard_node_count
+    guard_node_pool_shape
     guard_pubsub_subscription
     guard_drift_adoption
     forget_unmanaged_cluster_kms
@@ -1787,7 +1877,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,90p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,97p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac
