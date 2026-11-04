@@ -56,7 +56,13 @@ Which request you have decides what you do:
    the audit worker. Run the steps below yourself; do not reach for `hermes cron run`. If the
    audit cannot run in this session (no credentials, a broker that never answers, or a
    `START REFUSED`), call `kanban_block` with the reason; never `kanban_complete` a card as done
-   when no findings and no report were produced (#1876).
+   when no findings and no report were produced (#1876). A card that asks for one stream's run,
+   or names its SOP, is this form whatever it says about the output: "report the findings",
+   "don't change anything", or `Propose only: put the fix in result; do not open a pull request.`
+   Run `start` and `finish` and report the ledger URL. The ledger is the report, not a change; the
+   line forbids a pull request from you, which you never open yourself (where the install's sweep
+   is on, `finish` may still open its remediation pull requests: the install's setting, not your
+   choice). Findings in `result` with no ledger are the audit not done (#4637).
 2. **Trigger the scheduled cron job, or run several or all audits:** never run an audit inline.
    Open `references/on-demand.md` first.
 3. **What an audit found:** run nothing. The
