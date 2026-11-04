@@ -51,6 +51,41 @@ const (
 	gchatRatingDuplicate  = "duplicate delivery of rating tap "
 	gchatRatingUnverified = "a rating tap from an unverified sender"
 	gchatRatingTaken      = "a rating tap, recorded off the pull loop: "
+
+	// The note card a 👎 posts: a cardsV2 message with one text box, in
+	// the rater's thread, private to the rater outside a one-to-one DM.
+	gchatNoteCardID          = "kage.feedback-note"
+	gchatNoteInputName       = "note"
+	gchatNoteInputSingleLine = "SINGLE_LINE"
+	gchatNoteHint            = "Up to %d characters."
+	// gchatNoteCardsMask is the patch mask that replaces a message's cards.
+	gchatNoteCardsMask = "cards_v2"
+	gchatNoteLost      = "The note did not reach me, so the 👎 is kept without it."
+	gchatNoteReplaced  = "This answer's rating changed, so the note was not kept."
+	// gchatCardLink is a link in a card's textParagraph, which takes HTML.
+	gchatCardLink = `<a href="%s">%s</a>`
+	// gchatFeedbackNoteSeenPrefix keys a note card click in the dedupe
+	// ring, apart from a rating tap.
+	gchatFeedbackNoteSeenPrefix = "feedback-note:"
+	gchatPrivateViewerKey       = "privateMessageViewer"
+	// The card JSON keys the note card is drawn with.
+	gchatCardsV2Key       = "cardsV2"
+	gchatCardIDKey        = "cardId"
+	gchatCardKey          = "card"
+	gchatSectionsKey      = "sections"
+	gchatWidgetsKey       = "widgets"
+	gchatTextParagraphKey = "textParagraph"
+	gchatTextInputKey     = "textInput"
+
+	// The reasons a note card click is not a turn, for the pull loop's log.
+	gchatNoteOff        = "a note click with answer feedback off"
+	gchatNoteNoTask     = "a note click with no task"
+	gchatNoteNotDown    = "a note click on a rating other than 👎: "
+	gchatNoteNoEmail    = "note writer has no email"
+	gchatNoteNoMessage  = "note click names no space or no message"
+	gchatNoteDuplicate  = "duplicate delivery of note click "
+	gchatNoteUnverified = "a note click from an unverified sender"
+	gchatNoteTaken      = "a note click, handled off the pull loop"
 )
 
 // gchatButtonKind is what a button on a message does, told apart by its
@@ -236,8 +271,9 @@ func (a *GoogleChatAdapter) postRatedText(conversation string, m OutMessage) (st
 // changes nothing. Otherwise the rating is recorded off the pull loop
 // (Rate carries its own deadline, the relay calls theirs), and then the
 // message is patched with the tapped button filled. A failed write logs and
-// leaves the message as it was. The tap claims no question: a choice click
-// on the message is still a turn.
+// leaves the message as it was. A kept 👎 then asks for a note
+// (askForNote). The tap claims no question: a choice click on the message is
+// still a turn.
 func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 	click := ev.click
 	recorder := a.feedbackRecorder()
@@ -272,11 +308,13 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 		Conversation: conversation, MessageID: message, TaskID: task, Rating: value, Answer: ev.Message.Text}
 	chosen := gchatRating{task: task, chosen: value}
 	// The rewrite runs after this returns: it reads its own copy of the
-	// message, never the event the caller holds.
-	snapshot := &gchatEvent{Message: gchatMessage{Name: message, Text: ev.Message.Text,
-		AccessoryWidgets: cloneGchatWidgets(ev.Message.AccessoryWidgets)}}
+	// message, its space and the rater, never the event the caller holds.
+	snapshot := &gchatEvent{Space: ev.Space, Message: gchatMessage{Name: message, Text: ev.Message.Text,
+		Thread: ev.Message.Thread, AccessoryWidgets: cloneGchatWidgets(ev.Message.AccessoryWidgets)},
+		click: &gchatClick{User: click.User}}
 	a.goRewrite(func() {
-		if _, err := recorder.Rate(rating); err != nil {
+		askKept, err := recorder.Rate(rating)
+		if err != nil {
 			a.log.Warn("gchat: recording a rating failed", "message", message, "taskId", task, "err", err)
 			return
 		}
@@ -284,7 +322,10 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 		if err := a.patchRating(message, a.ratedLayout(snapshot, chosen)); err != nil {
 			a.log.Warn("gchat: filling the tapped rating button failed; the rating is kept", "message", message, "err", err)
 		}
-		// Task 4: a 👎 asks for a note here.
+		// The 👎 is kept whether or not its button filled: ask for a note.
+		if value == FeedbackDown {
+			a.askForNote(snapshot, task, askKept)
+		}
 	})
 	return gchatRatingTaken + value
 }
@@ -354,4 +395,199 @@ func (a *GoogleChatAdapter) patchRating(message string, layout gchatChatLayout) 
 		gchatBodyArg:       gchatLayoutBody(layout),
 	}
 	return a.apiCall([]string{gchatSpacesResource, gchatMessagesResource}, gchatPatchMethod, arguments, nil)
+}
+
+// gchatNoteText is a typed note as kept: trimmed, and cut to the text box's
+// limit in code points, with no ellipsis.
+func gchatNoteText(raw string) string {
+	note := strings.TrimSpace(raw)
+	if runes := []rune(note); len(runes) > feedbackNoteChars {
+		note = string(runes[:feedbackNoteChars])
+	}
+	return note
+}
+
+// gchatNoteAction is the note card's onClick action for task, with params
+// added.
+func gchatNoteAction(task string, params ...map[string]any) map[string]any {
+	parameters := append([]map[string]any{
+		{"key": gchatFeedbackParamTask, "value": task},
+		{"key": gchatFeedbackParamRating, "value": FeedbackDown},
+	}, params...)
+	return map[string]any{"action": map[string]any{"function": gchatFeedbackNoteFunction, "parameters": parameters}}
+}
+
+// gchatNoteCardOf is the note card holding widgets.
+func gchatNoteCardOf(widgets ...map[string]any) map[string]any {
+	return map[string]any{
+		gchatCardIDKey: gchatNoteCardID,
+		gchatCardKey:   map[string]any{gchatSectionsKey: []map[string]any{{gchatWidgetsKey: widgets}}},
+	}
+}
+
+// gchatNoteCard is the note a 👎 on task asks for: the title, the text box,
+// the kept line (naming the question only when askKept), and Send and
+// Cancel.
+func gchatNoteCard(task string, days int, askKept bool) map[string]any {
+	return gchatNoteCardOf(
+		map[string]any{gchatTextParagraphKey: map[string]any{"text": feedbackNoteTitle}},
+		map[string]any{gchatTextInputKey: map[string]any{
+			"name":       gchatNoteInputName,
+			"label":      feedbackNoteLabel,
+			"type":       gchatNoteInputSingleLine,
+			"hintText":   fmt.Sprintf(gchatNoteHint, feedbackNoteChars),
+			"validation": map[string]any{"characterLimit": feedbackNoteChars},
+		}},
+		map[string]any{gchatTextParagraphKey: map[string]any{"text": feedbackKeptText(days, askKept)}},
+		map[string]any{gchatButtonListKey: map[string]any{gchatButtonsKey: []map[string]any{
+			{"text": feedbackNoteSend, "onClick": gchatNoteAction(task)},
+			{"text": feedbackNoteCancel, "onClick": gchatNoteAction(task,
+				map[string]any{"key": gchatFeedbackParamCancel, "value": gchatFeedbackCancelValue})},
+		}}},
+	)
+}
+
+// gchatCollapsedCard is the note card collapsed to one line.
+func gchatCollapsedCard(text string) map[string]any {
+	return gchatNoteCardOf(map[string]any{gchatTextParagraphKey: map[string]any{"text": text}})
+}
+
+// gchatNoteThanks is the line a kept note collapses its card to.
+func gchatNoteThanks() string {
+	return feedbackThanks(fmt.Sprintf(gchatCardLink, feedbackFormURL, feedbackFormURL))
+}
+
+// createCard posts card in space, on thread when set, private to viewer
+// when set.
+func (a *GoogleChatAdapter) createCard(space, thread, viewer string, card map[string]any) (string, error) {
+	body := map[string]any{gchatCardsV2Key: []map[string]any{card}}
+	if viewer != "" {
+		body[gchatPrivateViewerKey] = map[string]any{gchatNameArg: viewer}
+	}
+	message, _, err := a.create(space, thread, body)
+	return message, err
+}
+
+// noteViewer is who the note card on ev is shown to and the thread it goes
+// in: everyone in a one-to-one DM (viewer empty), the clicker alone
+// anywhere else. ok is false in a space whose clicker Chat did not name as
+// a user, where the card would be public.
+func noteViewer(ev *gchatEvent) (viewer, thread string, ok bool) {
+	kind, thread := gchatSurface(ev)
+	if kind == sessionKindDM {
+		return "", thread, true
+	}
+	viewer = ev.click.User.Name
+	return viewer, thread, strings.HasPrefix(viewer, gchatUsersToken)
+}
+
+// askForNote posts the note card under the 👎 the rater on ev just gave
+// task. A threaded private card Chat refuses is posted once more at the top
+// level, still private; a second refusal logs and posts nothing.
+func (a *GoogleChatAdapter) askForNote(ev *gchatEvent, task string, askKept bool) {
+	recorder := a.feedbackRecorder()
+	if recorder == nil {
+		return
+	}
+	viewer, thread, ok := noteViewer(ev)
+	if !ok {
+		a.log.Warn("gchat: the rater has no user name; no note card is posted", "space", ev.Space.Name, "taskId", task)
+		return
+	}
+	card := gchatNoteCard(task, recorder.KeptDays(), askKept)
+	_, err := a.createCard(ev.Space.Name, thread, viewer, card)
+	if err != nil && viewer != "" && thread != "" {
+		a.log.Info("gchat: a private note card in the thread was refused; posting it at the top level", "space", ev.Space.Name, "err", err)
+		_, err = a.createCard(ev.Space.Name, "", viewer, card)
+	}
+	if err != nil {
+		a.log.Warn("gchat: posting the note card failed; the 👎 is kept without a note", "space", ev.Space.Name, "taskId", task, "err", err)
+	}
+}
+
+// feedbackNoteClick takes a click on the note card's Send or Cancel. It is
+// never a turn: it always returns the reason the pull loop logs. A click the
+// gateway cannot read, a redelivery, or one from a sender the recorder does
+// not admit changes nothing. Otherwise, off the pull loop, Cancel collapses
+// the card to the thanks; Send joins the note to the kept 👎 and collapses
+// the card to the thanks, or to gchatNoteReplaced when no 👎 is kept any
+// more. A Send that carries no inputs collapses to gchatNoteLost and keeps
+// no note. Any other failed write leaves the card for another Send.
+func (a *GoogleChatAdapter) feedbackNoteClick(ev *gchatEvent) string {
+	click := ev.click
+	recorder := a.feedbackRecorder()
+	task := strings.TrimSpace(click.Parameters[gchatFeedbackParamTask])
+	value := click.Parameters[gchatFeedbackParamRating]
+	switch {
+	case recorder == nil:
+		return gchatNoteOff
+	case task == "":
+		return gchatNoteNoTask
+	case value != FeedbackDown:
+		return gchatNoteNotDown + strconv.Quote(value)
+	case click.User.Email == "":
+		return gchatNoteNoEmail
+	case ev.Space.Name == "" || ev.Message.Name == "":
+		return gchatNoteNoMessage
+	}
+	id := gchatClickID(ev.Message.Name, click.EventTime)
+	a.mu.Lock()
+	if click.EventTime != "" && a.seenLocked(gchatFeedbackNoteSeenPrefix+id) {
+		a.mu.Unlock()
+		return gchatNoteDuplicate + id
+	}
+	a.mu.Unlock()
+	if !recorder.Admits(gchatBackend, click.User.Email) {
+		return gchatNoteUnverified
+	}
+	kind, thread := gchatSurface(ev)
+	rating := FeedbackRating{Platform: platformGoogleChat, Backend: gchatBackend, Rater: click.User.Email,
+		Conversation: gchatConversationID(ev.Space.Name, thread, kind), TaskID: task, Rating: FeedbackDown}
+	cancel := click.Parameters[gchatFeedbackParamCancel] == gchatFeedbackCancelValue
+	note, present := click.formValue(gchatNoteInputName)
+	snapshot := &gchatEvent{Space: ev.Space, Message: gchatMessage{Name: ev.Message.Name, Thread: ev.Message.Thread},
+		click: &gchatClick{User: click.User}}
+	a.goRewrite(func() {
+		switch {
+		case cancel:
+			a.collapseNoteCard(snapshot, gchatNoteThanks())
+			return
+		case !present:
+			a.log.Warn("gchat: a note Send carried no inputs; the 👎 is kept without a note", "message", snapshot.Message.Name, "taskId", task)
+			a.collapseNoteCard(snapshot, gchatNoteLost)
+			return
+		}
+		err := recorder.Note(rating, gchatNoteText(note))
+		switch {
+		case err == nil:
+			a.collapseNoteCard(snapshot, gchatNoteThanks())
+		case errors.Is(err, errFeedbackNotKept):
+			a.collapseNoteCard(snapshot, gchatNoteReplaced)
+		default:
+			a.log.Warn("gchat: keeping a feedback note failed; the card stays", "message", snapshot.Message.Name, "taskId", task, "err", err)
+		}
+	})
+	return gchatNoteTaken
+}
+
+// collapseNoteCard replaces the note card on ev's message with text. When
+// Chat refuses the patch, text is posted as a new card to the same viewer.
+func (a *GoogleChatAdapter) collapseNoteCard(ev *gchatEvent, text string) {
+	arguments := map[string]any{
+		gchatNameArg:       ev.Message.Name,
+		gchatUpdateMaskArg: gchatNoteCardsMask,
+		gchatBodyArg:       map[string]any{gchatCardsV2Key: []map[string]any{gchatCollapsedCard(text)}},
+	}
+	err := a.apiCall([]string{gchatSpacesResource, gchatMessagesResource}, gchatPatchMethod, arguments, nil)
+	if err == nil {
+		return
+	}
+	viewer, thread, ok := noteViewer(ev)
+	if !ok {
+		a.log.Warn("gchat: collapsing the note card failed and the writer has no user name", "message", ev.Message.Name, "err", err)
+		return
+	}
+	if _, cerr := a.createCard(ev.Space.Name, thread, viewer, gchatCollapsedCard(text)); cerr != nil {
+		a.log.Warn("gchat: collapsing the note card failed", "message", ev.Message.Name, "patchErr", err, "err", cerr)
+	}
 }

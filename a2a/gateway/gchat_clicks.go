@@ -59,11 +59,21 @@ const (
 )
 
 // gchatCommonEvent is commonEventObject of the add-on event object (and
-// `common` of the legacy one): the function a clicked button named and its
-// parameters.
+// `common` of the legacy one): the function a clicked button named, its
+// parameters, and the values of the card's inputs.
 type gchatCommonEvent struct {
 	InvokedFunction string            `json:"invokedFunction"`
 	Parameters      map[string]string `json:"parameters"`
+	// FormInputs is nil when the event carries no formInputs object, and
+	// empty when it carries one with no values.
+	FormInputs map[string]gchatFormInput `json:"formInputs"`
+}
+
+// gchatFormInput is one card input's value in formInputs.
+type gchatFormInput struct {
+	StringInputs struct {
+		Value []string `json:"value"`
+	} `json:"stringInputs"`
 }
 
 // gchatLegacyAction is `action` of the legacy CARD_CLICKED event: the
@@ -114,6 +124,19 @@ type gchatClick struct {
 	Function   string
 	Parameters map[string]string
 	EventTime  string
+	FormInputs map[string]gchatFormInput
+}
+
+// formValue is the value of the card input name, and whether the click
+// carried the card's inputs at all.
+func (c *gchatClick) formValue(name string) (value string, present bool) {
+	if c.FormInputs == nil {
+		return "", false
+	}
+	if v := c.FormInputs[name].StringInputs.Value; len(v) > 0 {
+		value = v[0]
+	}
+	return value, true
 }
 
 // gchatQuestion is a posted message with choice buttons, remembered so its
@@ -302,6 +325,9 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	case gchatFeedbackFunction:
 		// A rating tap is never a turn (gchat_feedback.go).
 		return InboundMessage{}, a.feedbackClick(ev)
+	case gchatFeedbackNoteFunction:
+		// Nor is a click on the note card a 👎 asks for.
+		return InboundMessage{}, a.feedbackNoteClick(ev)
 	case gchatChatFunction:
 	default:
 		return InboundMessage{}, "a click on a button this adapter did not draw (" + strconv.Quote(click.Function) + ")"
@@ -549,7 +575,7 @@ func decodeGchatClick(payload, user, eventTime json.RawMessage, common gchatComm
 	if err := json.Unmarshal(payload, &mp); err != nil {
 		return nil, fmt.Errorf("chat.%s: %w", gchatAddonClickKey, err)
 	}
-	click := &gchatClick{Function: common.InvokedFunction, Parameters: common.Parameters}
+	click := &gchatClick{Function: common.InvokedFunction, Parameters: common.Parameters, FormInputs: common.FormInputs}
 	if len(user) > 0 {
 		_ = json.Unmarshal(user, &click.User)
 	}
@@ -569,7 +595,8 @@ func decodeGchatClick(payload, user, eventTime json.RawMessage, common gchatComm
 // same as one on the add-on layout.
 func decodeGchatLegacyClick(wire *gchatWireEvent) *gchatEvent {
 	click := &gchatClick{User: wire.User, EventTime: wire.EventTime,
-		Function: wire.LegacyCommon.InvokedFunction, Parameters: wire.LegacyCommon.Parameters}
+		Function: wire.LegacyCommon.InvokedFunction, Parameters: wire.LegacyCommon.Parameters,
+		FormInputs: wire.LegacyCommon.FormInputs}
 	if click.Function == "" {
 		click.Function = wire.Action.ActionMethodName
 	}

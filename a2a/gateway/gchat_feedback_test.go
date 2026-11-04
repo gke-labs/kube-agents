@@ -4,9 +4,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
@@ -566,7 +568,8 @@ func TestGchatReRatingReplacesTheFilledButton(t *testing.T) {
 	a.classify(gchatRatingEvent(t, "down"))
 	checkFilled(t, bodyButtons(t, checkPatch(t, f, 0, gchatRatedMessage)), "down")
 	a.classify(gchatRatingEvent(t, "up"))
-	checkFilled(t, bodyButtons(t, checkPatch(t, f, 1, gchatRatedMessage)), "up")
+	// Call 1 is the note card the 👎 asked with.
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, 2, gchatRatedMessage)), "up")
 	if r := a.ratingOf(gchatRatedMessage); r.task != "t-root" || r.chosen != FeedbackUp {
 		t.Errorf("ratingOf = %+v, want t-root up", r)
 	}
@@ -654,5 +657,422 @@ func TestGchatTwoRatersInASpaceKeepTheirOwnRatings(t *testing.T) {
 			t.Errorf("rating %d = %+v", i, r)
 		}
 	}
-	checkFilled(t, bodyButtons(t, checkPatch(t, f, relayCallCount(f)-1, "spaces/AAA/messages/M1")), "down")
+	// The last call is the second rater's note card; the one before it fills
+	// their 👎.
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, relayCallCount(f)-2, "spaces/AAA/messages/M1")), "down")
+}
+
+const gchatNoteCardMessage = "spaces/_c2fixtureAA/messages/CARD1"
+
+// gchatNoteEvent is the add-on click fixture as a click on the note card's
+// Send (or Cancel), on the card's message, with formInputs when non-nil.
+func gchatNoteEvent(t *testing.T, formInputs map[string]any, cancel bool) *gchatEvent {
+	t.Helper()
+	raw, _ := realGchatFixture(t, "addon-dm-button-click.json")
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	params := map[string]any{"task": "t-root", "rating": "down"}
+	if cancel {
+		params["cancel"] = "1"
+	}
+	common := map[string]any{"invokedFunction": "kage.feedback-note", "parameters": params}
+	if formInputs != nil {
+		common["formInputs"] = formInputs
+	}
+	wire["commonEventObject"] = common
+	chat := wire["chat"].(map[string]any)
+	chat["eventTime"] = fmt.Sprintf("2026-10-29T20:02:%02d.000000Z", clickEvents.Add(1))
+	payload := chat["buttonClickedPayload"].(map[string]any)
+	message := payload["message"].(map[string]any)
+	message["name"] = gchatNoteCardMessage
+	delete(message, "accessoryWidgets")
+	out, _ := json.Marshal(wire)
+	ev, err := decodeGchatEvent(base64.StdEncoding.EncodeToString(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+// noteInputs is a formInputs object holding the note box's values.
+func noteInputs(values ...string) map[string]any {
+	return map[string]any{"note": map[string]any{"stringInputs": map[string]any{"value": values}}}
+}
+
+// cardOf is the one card a call body carries under cardsV2, and its one
+// section's widgets.
+func cardOf(t *testing.T, body map[string]any) (map[string]any, []map[string]any) {
+	t.Helper()
+	cards, ok := body["cardsV2"].([]any)
+	if !ok || len(cards) != 1 {
+		t.Fatalf("body = %+v, want one card under cardsV2", body)
+	}
+	card := cards[0].(map[string]any)
+	sections := card["card"].(map[string]any)["sections"].([]any)
+	if len(sections) != 1 {
+		t.Fatalf("card = %+v, want one section", card)
+	}
+	var widgets []map[string]any
+	for _, w := range sections[0].(map[string]any)["widgets"].([]any) {
+		widgets = append(widgets, w.(map[string]any))
+	}
+	return card, widgets
+}
+
+// collapsedText checks that body is the collapsed note card and returns its
+// one line.
+func collapsedText(t *testing.T, body map[string]any) string {
+	t.Helper()
+	card, widgets := cardOf(t, body)
+	if card["cardId"] != "kage.feedback-note" || len(widgets) != 1 {
+		t.Fatalf("card = %+v, want the note card with one widget", card)
+	}
+	text, _ := widgets[0]["textParagraph"].(map[string]any)["text"].(string)
+	return text
+}
+
+// checkNotePatch checks that call i patches the note card on message to
+// one line, and returns the line.
+func checkNotePatch(t *testing.T, f *fakeChatRelay, i int, message string) string {
+	t.Helper()
+	c := f.call(i)
+	if c.method != "patch" || c.arguments["name"] != message || c.arguments["updateMask"] != "cards_v2" {
+		t.Fatalf("call %d = %+v, want a cards_v2 patch of %s", i, c, message)
+	}
+	return collapsedText(t, callBody(t, c))
+}
+
+func recordedNotes(rec *fakeRecorder) []string {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return append([]string{}, rec.notes...)
+}
+
+func TestDecodeGchatFormInputsInBothLayouts(t *testing.T) {
+	ev := gchatNoteEvent(t, noteInputs("x"), false)
+	if v, ok := ev.click.formValue("note"); v != "x" || !ok {
+		t.Errorf("add-on formValue = %q %v, want x true", v, ok)
+	}
+	raw, err := os.ReadFile("testdata/gchat/legacy-dm-button-click.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	wire["common"] = map[string]any{"invokedFunction": "kage.feedback-note",
+		"parameters": map[string]any{"task": "t-root", "rating": "down"}, "formInputs": noteInputs("x")}
+	legacy, _ := json.Marshal(wire)
+	lev, err := decodeGchatEvent(base64.StdEncoding.EncodeToString(legacy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := lev.click.formValue("note"); v != "x" || !ok {
+		t.Errorf("legacy formValue = %q %v, want x true", v, ok)
+	}
+	if v, ok := gchatNoteEvent(t, nil, false).click.formValue("note"); v != "" || ok {
+		t.Errorf("absent formValue = %q %v, want \"\" false", v, ok)
+	}
+	if v, ok := gchatNoteEvent(t, map[string]any{}, false).click.formValue("note"); v != "" || !ok {
+		t.Errorf("empty formValue = %q %v, want \"\" true", v, ok)
+	}
+}
+
+func TestGchatDownRatingPostsTheNoteCardInTheThread(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	callsAtRate := -1
+	rec.onRate = func() { callsAtRate = relayCallCount(f) }
+	a.classify(gchatRatingEvent(t, "down"))
+	if callsAtRate != 0 {
+		t.Errorf("relay calls at Rate = %d, want 0", callsAtRate)
+	}
+	if n := relayCallCount(f); n != 2 {
+		t.Fatalf("relay calls = %d, want the answer patch and the card", n)
+	}
+	checkPatch(t, f, 0, gchatRatedMessage)
+	c := f.call(1)
+	body := callBody(t, c)
+	if c.method != "create" || c.arguments["parent"] != "spaces/_c2fixtureAA" {
+		t.Fatalf("call 1 = %+v, want a create in the DM", c)
+	}
+	if th, _ := body["thread"].(map[string]any); th["name"] != "spaces/_c2fixtureAA/threads/BOT1" {
+		t.Errorf("thread = %+v", body["thread"])
+	}
+	if _, has := body["privateMessageViewer"]; has {
+		t.Errorf("a DM card is private: %+v", body["privateMessageViewer"])
+	}
+	card, widgets := cardOf(t, body)
+	if card["cardId"] != "kage.feedback-note" || len(widgets) != 4 {
+		t.Fatalf("card = %+v, want the note card with four widgets", card)
+	}
+	if text := widgets[0]["textParagraph"].(map[string]any)["text"]; text != "What went wrong?" {
+		t.Errorf("title = %q", text)
+	}
+	input := widgets[1]["textInput"].(map[string]any)
+	if input["name"] != "note" || input["label"] != "Anything else?" || input["type"] != "SINGLE_LINE" ||
+		input["hintText"] != "Up to 500 characters." || input["validation"].(map[string]any)["characterLimit"] != float64(500) {
+		t.Errorf("textInput = %+v", input)
+	}
+	if text := widgets[2]["textParagraph"].(map[string]any)["text"]; text != "Your question and this answer are kept on your install for 30 days so an operator can turn them into a test." {
+		t.Errorf("kept line = %q", text)
+	}
+	raw, _ := json.Marshal(widgets[3]["buttonList"].(map[string]any)["buttons"])
+	var buttons []gchatButton
+	if err := json.Unmarshal(raw, &buttons); err != nil {
+		t.Fatal(err)
+	}
+	if len(buttons) != 2 {
+		t.Fatalf("buttons = %s", raw)
+	}
+	send, cancel := buttons[0], buttons[1]
+	if p := buttonParams(send); send.Text != "Send" || send.OnClick.Action.Function != "kage.feedback-note" ||
+		p["task"] != "t-root" || p["rating"] != "down" || len(p) != 2 {
+		t.Errorf("Send = %+v %v", send, p)
+	}
+	if p := buttonParams(cancel); cancel.Text != "Cancel" || cancel.OnClick.Action.Function != "kage.feedback-note" ||
+		p["task"] != "t-root" || p["rating"] != "down" || p["cancel"] != "1" || len(p) != 3 {
+		t.Errorf("Cancel = %+v %v", cancel, p)
+	}
+}
+
+func TestGchatDownRatingWithNoAskOnRecordSaysOnlyTheAnswerIsKept(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	rec.noAsk = true
+	a.classify(gchatRatingEvent(t, "down"))
+	_, widgets := cardOf(t, callBody(t, f.call(1)))
+	text, _ := widgets[2]["textParagraph"].(map[string]any)["text"].(string)
+	if text != "This answer is kept on your install for 30 days so an operator can turn it into a test." || strings.Contains(text, "Your question") {
+		t.Errorf("kept line = %q", text)
+	}
+}
+
+func TestGchatNoteCardInASpaceIsPrivateToTheRater(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	a.classify(gchatSpaceEvent(gchatRatingEvent(t, "down")))
+	c := f.call(1)
+	body := callBody(t, c)
+	if c.method != "create" || c.arguments["parent"] != "spaces/AAA" {
+		t.Fatalf("call 1 = %+v", c)
+	}
+	if v, _ := body["privateMessageViewer"].(map[string]any); v["name"] != "users/100000000000000000042" {
+		t.Errorf("privateMessageViewer = %+v", body["privateMessageViewer"])
+	}
+	if th, _ := body["thread"].(map[string]any); th["name"] != "spaces/AAA/threads/T1" {
+		t.Errorf("thread = %+v", body["thread"])
+	}
+	if card, _ := cardOf(t, body); card["cardId"] != "kage.feedback-note" {
+		t.Errorf("card = %+v", card)
+	}
+}
+
+func TestGchatRefusedPrivateThreadReplyRetriesAtTheTopLevel(t *testing.T) {
+	const create = "spaces.messages/create"
+	refused := fakeChatAPIError{status: 400, reason: "private message in thread"}
+
+	a, f, _ := newFeedbackGchatAdapter(t)
+	f.queue[create] = []any{refused, map[string]any{"name": "spaces/AAA/messages/CARD1"}}
+	a.classify(gchatSpaceEvent(gchatRatingEvent(t, "down")))
+	if n := relayCallCount(f); n != 3 {
+		t.Fatalf("relay calls = %d, want the patch and two creates", n)
+	}
+	c := f.call(2)
+	body := callBody(t, c)
+	if c.method != "create" {
+		t.Fatalf("call 2 = %+v", c)
+	}
+	if _, has := body["thread"]; has {
+		t.Errorf("retry carries a thread: %+v", body["thread"])
+	}
+	if v, _ := body["privateMessageViewer"].(map[string]any); v["name"] != "users/100000000000000000042" {
+		t.Errorf("retry privateMessageViewer = %+v", body["privateMessageViewer"])
+	}
+
+	a, f, rec := newFeedbackGchatAdapter(t)
+	f.queue[create] = []any{refused, refused}
+	a.classify(gchatSpaceEvent(gchatRatingEvent(t, "down")))
+	if n := relayCallCount(f); n != 3 {
+		t.Errorf("relay calls = %d, want no third create", n)
+	}
+	if got := recordedRatings(rec); len(got) != 1 || got[0].Rating != "down" {
+		t.Errorf("ratings = %+v, want the 👎 kept", got)
+	}
+}
+
+func TestGchatUpRatingPostsNoCard(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	a.classify(gchatRatingEvent(t, "up"))
+	for i := 0; i < relayCallCount(f); i++ {
+		if f.call(i).method == "create" {
+			t.Errorf("call %d is a create: %+v", i, f.call(i))
+		}
+	}
+}
+
+func TestGchatFailedDownWritePostsNoCard(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	rec.rateErr = errFeedbackContended
+	a.classify(gchatRatingEvent(t, "down"))
+	for i := 0; i < relayCallCount(f); i++ {
+		if f.call(i).method == "create" {
+			t.Errorf("call %d is a create: %+v", i, f.call(i))
+		}
+	}
+}
+
+func TestGchatNoteJoinsTheRatingAndCollapsesTheCard(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	msg, reason := a.classify(gchatNoteEvent(t, noteInputs(" the limit is 256Mi "), false))
+	if msg != (InboundMessage{}) || reason == "" {
+		t.Fatalf("classify = %+v %q, want no turn", msg, reason)
+	}
+	want := "sender@example.com t-root  gchat:dm/spaces/_c2fixtureAA/threads/BOT1 the limit is 256Mi"
+	if got := recordedNotes(rec); len(got) != 1 || got[0] != want {
+		t.Errorf("notes = %q\nwant [%q]", got, want)
+	}
+	text := checkNotePatch(t, f, 0, gchatNoteCardMessage)
+	if text != gchatNoteThanks() || !strings.Contains(text, `<a href="https://gke-labs.github.io/kube-agents/feedback">`) ||
+		!strings.Contains(text, "public issue") {
+		t.Errorf("collapsed line = %q", text)
+	}
+}
+
+func TestGchatEmptyNoteIsStillKeptAndThanked(t *testing.T) {
+	for name, inputs := range map[string]map[string]any{"empty value": noteInputs(""), "empty formInputs": {}} {
+		t.Run(name, func(t *testing.T) {
+			a, f, rec := newFeedbackGchatAdapter(t)
+			a.classify(gchatNoteEvent(t, inputs, false))
+			got := recordedNotes(rec)
+			if len(got) != 1 || got[0] != "sender@example.com t-root  gchat:dm/spaces/_c2fixtureAA/threads/BOT1 " {
+				t.Errorf("notes = %q, want one empty note", got)
+			}
+			if text := checkNotePatch(t, f, 0, gchatNoteCardMessage); text != gchatNoteThanks() {
+				t.Errorf("collapsed line = %q", text)
+			}
+		})
+	}
+}
+
+func TestGchatSendWithoutFormInputsSaysTheNoteDidNotArrive(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	a.classify(gchatNoteEvent(t, nil, false))
+	if got := recordedNotes(rec); len(got) != 0 {
+		t.Errorf("notes = %q, want none", got)
+	}
+	if text := checkNotePatch(t, f, 0, gchatNoteCardMessage); text != gchatNoteLost {
+		t.Errorf("collapsed line = %q, want %q", text, gchatNoteLost)
+	}
+}
+
+func TestGchatCancelCollapsesTheCardWithoutANote(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	a.classify(gchatNoteEvent(t, noteInputs("typed then cancelled"), true))
+	if got := recordedNotes(rec); len(got) != 0 {
+		t.Errorf("notes = %q, want none", got)
+	}
+	if text := checkNotePatch(t, f, 0, gchatNoteCardMessage); text != gchatNoteThanks() {
+		t.Errorf("collapsed line = %q", text)
+	}
+}
+
+func TestGchatNoteThatWasNotKeptSaysTheRatingChanged(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	rec.noteErr = errFeedbackNotKept
+	a.classify(gchatNoteEvent(t, noteInputs("x"), false))
+	if text := checkNotePatch(t, f, 0, gchatNoteCardMessage); text != gchatNoteReplaced {
+		t.Errorf("collapsed line = %q, want %q", text, gchatNoteReplaced)
+	}
+
+	a, f, rec = newFeedbackGchatAdapter(t)
+	rec.noteErr = errFeedbackContended
+	a.classify(gchatNoteEvent(t, noteInputs("x"), false))
+	if got := recordedNotes(rec); len(got) != 1 {
+		t.Errorf("notes = %q, want the one attempt", got)
+	}
+	if n := relayCallCount(f); n != 0 {
+		t.Errorf("relay calls = %d, want none: the card stays for another Send", n)
+	}
+}
+
+func TestGchatRefusedCardPatchPostsTheLineAsANewPrivateMessage(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	f.queue["spaces.messages/patch"] = []any{fakeChatAPIError{status: 400, reason: "cannot update"}}
+	a.classify(gchatSpaceEvent(gchatNoteEvent(t, noteInputs("x"), false)))
+	if n := relayCallCount(f); n != 2 {
+		t.Fatalf("relay calls = %d, want the patch and a create", n)
+	}
+	checkNotePatch(t, f, 0, "spaces/AAA/messages/M1")
+	c := f.call(1)
+	body := callBody(t, c)
+	if c.method != "create" || c.arguments["parent"] != "spaces/AAA" {
+		t.Fatalf("call 1 = %+v", c)
+	}
+	if v, _ := body["privateMessageViewer"].(map[string]any); v["name"] != "users/100000000000000000042" {
+		t.Errorf("privateMessageViewer = %+v", body["privateMessageViewer"])
+	}
+	if th, _ := body["thread"].(map[string]any); th["name"] != "spaces/AAA/threads/T1" {
+		t.Errorf("thread = %+v", body["thread"])
+	}
+	if text := collapsedText(t, body); text != gchatNoteThanks() {
+		t.Errorf("line = %q", text)
+	}
+}
+
+func TestGchatRedeliveredSendIsHandledOnce(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	ev := gchatNoteEvent(t, noteInputs("x"), false)
+	a.classify(ev)
+	if _, reason := a.classify(ev); !strings.Contains(reason, "duplicate") {
+		t.Errorf("second reason = %q, want a duplicate", reason)
+	}
+	if got := recordedNotes(rec); len(got) != 1 {
+		t.Errorf("notes = %q, want one", got)
+	}
+	if n := relayCallCount(f); n != 1 {
+		t.Errorf("relay calls = %d, want one patch", n)
+	}
+}
+
+func TestGchatNoteFromAnUnverifiedSenderChangesNothing(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	rec.admit = map[string]bool{}
+	if _, reason := a.classify(gchatNoteEvent(t, noteInputs("x"), false)); reason == "" {
+		t.Error("an unverified note is a turn")
+	}
+	if got := recordedNotes(rec); len(got) != 0 {
+		t.Errorf("notes = %q", got)
+	}
+	if n := relayCallCount(f); n != 0 {
+		t.Errorf("relay calls = %d", n)
+	}
+}
+
+func TestGchatNoteIsCappedAtTheBoxsLimit(t *testing.T) {
+	a, _, rec := newFeedbackGchatAdapter(t)
+	a.classify(gchatNoteEvent(t, noteInputs(strings.Repeat("é", 600)), false))
+	got := recordedNotes(rec)
+	if len(got) != 1 {
+		t.Fatalf("notes = %q", got)
+	}
+	note := strings.TrimPrefix(got[0], "sender@example.com t-root  gchat:dm/spaces/_c2fixtureAA/threads/BOT1 ")
+	if n := utf8.RuneCountInString(note); n != 500 || strings.Contains(note, "…") {
+		t.Errorf("note has %d runes (ellipsis %v), want 500 and none", n, strings.Contains(note, "…"))
+	}
+}
+
+func TestGchatDownWhoseAnswerPatchFailsStillAsksForTheNote(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	f.queue["spaces.messages/patch"] = []any{fakeChatAPIError{status: 404, reason: "not found"}}
+	a.classify(gchatRatingEvent(t, "down"))
+	if got := recordedRatings(rec); len(got) != 1 || got[0].Rating != "down" {
+		t.Errorf("ratings = %+v", got)
+	}
+	if n := relayCallCount(f); n != 2 || f.call(1).method != "create" {
+		t.Fatalf("relay calls = %d, want the failed patch and the card create", n)
+	}
+	if card, _ := cardOf(t, callBody(t, f.call(1))); card["cardId"] != "kage.feedback-note" {
+		t.Errorf("card = %+v", card)
+	}
 }
