@@ -194,6 +194,8 @@ EXEC_FALLBACK_NOTICE = "exec tier not reachable; this command went to the statef
 # The line a malformed exec URL writes, once per process, when the stateful
 # broker takes its place. No "credential proxy" prefix, for the same reason as
 # EXEC_FALLBACK_NOTICE; the reason names the shape, never a network cause.
+# The broker route `execute` sends a command to, under the broker's URL.
+EXEC_ROUTE = "/v1/exec"
 EXEC_URL_IGNORED_NOTICE = "{name} ignored ({reason}); commands go to the stateful broker"
 _exec_url_notice_written = False
 # A connection that closed once the request was sent: the command may have run,
@@ -290,10 +292,11 @@ class BrokerConnection(http.client.HTTPConnection):
         self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
         try:
             super().connect()
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             # The one point where "nothing was sent" is certain. urllib wraps
             # this in a URLError as before, so a caller that reads only that
-            # sees no change.
+            # sees no change. UnicodeError is the resolver's IDNA step refusing
+            # the host (an empty or over-long label), before any lookup.
             raise BrokerUnreachable(str(exc)) from exc
         self.sock.settimeout(None)
 
@@ -352,10 +355,18 @@ def _exec_url_fault(url: str) -> str | None:
         parts.port
     except ValueError:
         return "the port is not a number from 0 to 65535"
+    if parts.query or parts.fragment:
+        # The route is appended to the URL, so it would land in the query or
+        # be cut off with the fragment.
+        return "it has a query or a fragment"
     try:
-        # urlsplit's view drops a tab or newline and keeps a %-escape; the
-        # connection is built from the raw string, so ask it, as execute() will.
-        http.client.HTTPConnection(urllib.request.Request(url.rstrip("/") + "/v1/exec").host)
+        # What execute() builds from the raw string, short of a socket: the
+        # resolver's IDNA step, the connection's host check and the request
+        # line's path check. urlsplit's view drops a tab or newline and keeps
+        # a %-escape, so it can't answer for them.
+        parts.hostname.encode("idna")
+        request = urllib.request.Request(url.rstrip("/") + EXEC_ROUTE)
+        http.client.HTTPConnection(request.host).putrequest("POST", request.selector)
     except (ValueError, http.client.InvalidURL):
         return "not a valid URL"
     return None
@@ -1651,13 +1662,18 @@ def execute(
     while True:
         try:
             request = urllib.request.Request(
-                targets[0].rstrip("/") + "/v1/exec",
+                targets[0].rstrip("/") + EXEC_ROUTE,
                 data=body,
                 headers=headers,
                 method="POST",
             )
         except ValueError as exc:
-            # A URL with no scheme, such as a bare Service name: nothing was sent.
+            # A URL with no scheme, such as a bare Service name: nothing was
+            # sent, so a fallback is safe.
+            if len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
             print(f"credential proxy unavailable: {exc}", file=sys.stderr)
             return 1
         try:
@@ -1697,8 +1713,12 @@ def execute(
             print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
             return 1
         except http.client.InvalidURL as exc:
-            # Raised while the connection is built, before a socket opens:
-            # nothing was sent.
+            # Raised while the connection or the request line is built, before
+            # a socket opens: nothing was sent, so a fallback is safe.
+            if len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
             print(f"credential proxy unavailable: {exc}", file=sys.stderr)
             return 1
         except (http.client.HTTPException, OSError) as exc:

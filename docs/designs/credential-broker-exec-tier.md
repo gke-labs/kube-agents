@@ -240,8 +240,9 @@ was sent, because every relay call is a GET and sending it again is safe; it the
 stateful broker for the rest of the session, and it retries the broker's own busy reply on §4.3's
 schedule. The command path never resends after a send, because a command may have run. A
 malformed `CREDENTIAL_PROXY_EXEC_URL` (not a valid `http://` URL, no host, or a port that is not a number
-from 0 to 65535) is ignored when `CREDENTIAL_PROXY_URL` is set: both callers use the stateful
-broker, and the shim writes one stderr line per process. The sandbox forwards only the variable names in `SANDBOX_FORWARDED_ENV_NAMES`
+from 0 to 65535, or a query or fragment) is ignored when `CREDENTIAL_PROXY_URL` is set: both callers
+use the stateful broker, and the shim writes one stderr line per process. A shape the check does not
+know still falls back in `execute()` when it fails before a byte is sent. The sandbox forwards only the variable names in `SANDBOX_FORWARDED_ENV_NAMES`
 (`deploy/sandbox/entrypoint.sh`), so `CREDENTIAL_PROXY_EXEC_URL` is added there. Without that, the
 shim always takes the fallback and nothing reports it.
 
