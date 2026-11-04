@@ -2523,8 +2523,9 @@ const a2aConfigHashAnnotation = "kubeagents.x-k8s.io/a2a-config-hash"
 // controller stamps out is "<this>-<sts>-0", which handleDeletion reaps by name --
 // so a rename here that is not matched there turns the reap into a silent no-op
 // and leaks the PV on every CR deletion. One spelling, both sites.
+const a2aNATSDataClaim = "data"
+
 const (
-	a2aNATSDataClaim = "data"
 	// a2aNATSStartupScript migrates an existing single-node (R1) JetStream store
 	// directory from /data/jetstream/APP to /data/jetstream/TRUSTED on upgrade
 	// before starting nats-server, preserving streams and KV buckets across the
