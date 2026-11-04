@@ -335,7 +335,7 @@ Read from the workload and RBAC dumps the collector already takes at the top of 
 
 #### 2.15 A LoadBalancer Service publishing a management port to the internet (`lb-world-open`)
 
-Read from a `kubectl get svc -A -o json` the collector takes for this check alone; no extra command.
+Read from the Services read the collector takes for this check alone (a paged `kubectl get --raw` over `/api/v1/services`); no extra command.
 
 `type: LoadBalancer` is an instruction to the cloud provider to put a public address and a forwarding rule in front of some pods, and GKE carries it out without asking what is behind them. Point one at a database and the database is on the internet. Nothing objects: the Service admits, the balancer provisions, `EXTERNAL-IP` fills in, and every check anyone would think to run says the Service is healthy — because it is, and it is doing exactly what the manifest asked. It is one field that does it, and usually a copied one: a Service written `ClusterIP` for local work and promoted to reach it from a laptop, a chart whose `service.type` is set in the values file used for every environment, a datastore moved out of `kube-system` with its Service carried across intact.
 

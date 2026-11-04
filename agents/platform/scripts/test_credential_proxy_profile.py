@@ -136,7 +136,26 @@ class KubectlConfinementTest(unittest.TestCase):
                 self.redirect_refused(["kubectl", "get", "pods", flag], flag.split("=")[0])
 
     def test_an_unlisted_flag_is_refused(self):
-        self.refused(["kubectl", "get", "pods", "--raw", "/api"])
+        self.refused(["kubectl", "get", "pods", "--subresource", "status"])
+
+    def test_a_raw_collection_read_passes_the_flag_table(self):
+        # The value is command_policy's to judge (`kubernetes.raw-path`); the
+        # flag table admits the flag so a profile task can page a large kind.
+        confine(["kubectl", "get", "--raw", "/api/v1/pods?limit=500"], None, TARGET)
+
+    def test_a_raw_endpoint_read_is_refused_in_every_spelling(self):
+        # The rule's exact endpoints (`/metrics`) are the shell role's. The
+        # confinement decodes the path as the rule does, so an encoded
+        # spelling is the same path, and the query does not hide it.
+        for argv in (
+            ["kubectl", "get", "--raw", "/metrics"],
+            ["kubectl", "get", "--raw=/metrics"],
+            ["kubectl", "get", "--raw", "/%6detrics"],
+            ["kubectl", "get", "--raw=/%6Detrics"],
+            ["kubectl", "get", "--raw", "/metrics?watch=true"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn("/metrics", self.refused(argv))
 
     def test_a_flag_after_double_dash_is_the_remote_commands(self):
         # After `--` the words are the command kubectl exec runs in the pod.
@@ -1370,10 +1389,13 @@ class ProfileSlotShareTest(unittest.TestCase):
 
 
 class ProfileRouteTableTest(unittest.TestCase):
-    def test_the_profile_role_reaches_the_exec_route_alone(self):
+    def test_the_profile_role_reaches_exec_and_the_mcp_relay_alone(self):
+        # The MCP relay narrows a profile caller to PROFILE_SERVER_TOOLS inside
+        # its handler (#3658); every other route stays closed to the role.
+        reached = {"/v1/exec", credential_proxy.mcp_policy.MCP_RELAY_PREFIX}
         for prefix, roles in credential_proxy.ROUTE_ROLES:
             with self.subTest(prefix=prefix):
-                self.assertEqual(prefix == "/v1/exec", credential_proxy.CALLER_ROLE_PROFILE in roles)
+                self.assertEqual(prefix in reached, credential_proxy.CALLER_ROLE_PROFILE in roles)
 
     def test_the_shim_and_the_broker_name_one_header(self):
         import credential_proxy_client

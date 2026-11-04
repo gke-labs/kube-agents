@@ -2326,6 +2326,20 @@ class Knobs(Base):
                 self.assertEqual({e["namespace"] for e in self.ledger()["stalls"].values()}, {"checkout", "catalog"})
                 self.assertIn("incomplete listing", self.ledger()["unreadable"][cid("c")])
 
+    def test_a_listing_the_shim_cut_with_exit_74_is_incomplete_not_a_failed_exit(self):
+        # The shipped shim exits 74 on a cut reply; the marker is read before
+        # the exit code, so the ledger names the cut rather than "exited 74".
+        marker = stall_watch.NAMESPACE_LIST_MARKER
+        cut = subprocess.CompletedProcess(
+            args=[], returncode=74, stdout=f"checkout\n{marker}\n{marker}\n",
+            stderr="credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n",
+        )
+        with patch.object(stall_watch, "run_sandbox", return_value=cut):
+            with self.assertRaises(stall_watch.ReadFailed) as raised:
+                stall_watch.list_namespaces("/k/c", frozenset())
+        self.assertIn("incomplete listing", str(raised.exception))
+        self.assertNotIn("exited 74", str(raised.exception))
+
     def test_the_listing_selects_exempt_namespaces_by_the_exact_value(self):
         # The annotation's value is matched by the jsonpath filter and never
         # printed, so " exempt " does not exempt and a newline in a value adds

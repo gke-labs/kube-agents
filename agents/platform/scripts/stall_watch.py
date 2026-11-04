@@ -282,7 +282,8 @@ NAMESPACES_ARGV = (
     "{\"" + NAMESPACE_LIST_MARKER + "\\n\"}",
 )
 #: What the credential proxy client writes to stderr when the broker cut a
-#: reply at its output cap. kubectl's exit code still comes back 0.
+#: reply at its output cap. The shim exits 74 with it (an older one exited as
+#: kubectl did), so the listing reads the marker before the exit code.
 PROXY_TRUNCATED_TEXT = "credential proxy output truncated"
 #: The kind list is filtered to what a cluster serves, from one
 #: `kubectl api-resources` per cluster, so a warning from the report script
@@ -826,12 +827,15 @@ def list_namespaces(kubeconfig: str, excluded: frozenset[str]) -> tuple[list[str
     the exempt annotation, so their open alerts close as excluded rather than
     cleared."""
     r = run_sandbox(list(NAMESPACES_ARGV), timeout=NAMESPACE_LIST_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
-    if r.returncode != 0:
-        raise ReadFailed(f"kubectl get namespaces exited {r.returncode}: {stderr_excerpt(r.stderr)}", r.stderr)
     lines = r.stdout.splitlines()
     # A cut listing would read the namespaces past the cut as deleted and
-    # close their cards as cleared.
-    if PROXY_TRUNCATED_TEXT in (r.stderr or "") or lines.count(NAMESPACE_LIST_MARKER) != NAMESPACE_LIST_MARKERS or lines[-1] != NAMESPACE_LIST_MARKER:
+    # close their cards as cleared. The marker before the exit code: the shim
+    # exits 74 on a cut reply, and the cut is what the ledger should name.
+    if PROXY_TRUNCATED_TEXT in (r.stderr or ""):
+        raise ReadFailed(f"kubectl get namespaces returned an incomplete listing: {stderr_excerpt(r.stderr)}", r.stderr)
+    if r.returncode != 0:
+        raise ReadFailed(f"kubectl get namespaces exited {r.returncode}: {stderr_excerpt(r.stderr)}", r.stderr)
+    if lines.count(NAMESPACE_LIST_MARKER) != NAMESPACE_LIST_MARKERS or lines[-1] != NAMESPACE_LIST_MARKER:
         raise ReadFailed(f"kubectl get namespaces returned an incomplete listing: {stderr_excerpt(r.stderr)}", r.stderr)
     cut = lines.index(NAMESPACE_LIST_MARKER)
     exempt = set(lines[cut + 1 : -1])

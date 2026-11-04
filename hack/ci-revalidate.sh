@@ -118,7 +118,7 @@
 # its own context green can already edit this script to `exit 0` -- its own
 # code IS the job -- and a pull request that edits the revalidation logic
 # touches hack/, which is not inert, so its own run goes full. That argument
-# does NOT cover the CROSS-PR case: the job history under gs://kube-agents-prow
+# does NOT cover the CROSS-PR case: the job history under the log bucket
 # is written by pod utilities that may share the test container's identity,
 # so a hostile pull request's run could conceivably plant a fabricated
 # "green" record under a VICTIM pull request's history path (kube-agents-bot's
@@ -182,8 +182,10 @@ set -euo pipefail
 # below the root (agents/**/*.md is prompt content shipped in the image)
 # must still run the eval.
 readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
-# Where the job history lives and how a human opens a build from the log.
-readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
+# Where the job history lives: the bucket kube-agents owns for the smoke
+# lanes (oss-test-infra, decoration_config.gcs_configuration), not the Prow
+# cluster's default, which Deck renders to anyone.
+readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents"
 # The job whose history and status context step 0 reads: the running job's
 # own name, which Prow exports as JOB_NAME. Every presubmit that runs this
 # script has its own history path and its own status context, so keying the
@@ -193,7 +195,10 @@ readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-lab
 # lines and the tests naming the job that exists.
 readonly REVALIDATION_DEFAULT_JOB_NAME="pull-kube-agents-smoke-test"
 readonly REVALIDATION_JOB_NAME="${JOB_NAME:-${REVALIDATION_DEFAULT_JOB_NAME}}"
-readonly REVALIDATION_SPYGLASS_PREFIX="https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
+# How a human opens a reused build from the log: the Cloud Console's bucket
+# browser, which project readers can open; Deck has no read on this bucket,
+# so its Spyglass page would show nothing.
+readonly REVALIDATION_BUILD_URL_PREFIX="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents"
 # The started.json repos key naming this repository's clone record, and the
 # base ref assumed when the decoration did not export PULL_BASE_REF.
 readonly REVALIDATION_REPO_KEY="gke-labs/kube-agents"
@@ -757,7 +762,7 @@ print("attested")
   # the head is this run's.
   if [ "${prev_head}" = "${cur_head}" ]; then
     echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- this head already passed"
-    echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
+    echo "Reused verdict: ${REVALIDATION_BUILD_URL_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
     echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
     echo "Same head ${cur_head}; base ${prev_base} then, ${cur_base} now -- a head that passed once passes"
     REVALIDATION_REUSED+=("green build ${prev_green} (PR #${pull_number})")
@@ -788,7 +793,7 @@ print("attested")
     && cur_tree="$(git -C "${repo_dir}" rev-parse --verify --quiet "${cur_head}^{tree}" 2>/dev/null)" \
     && [ "${prev_tree}" = "${cur_tree}" ]; then
     echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- this tree already passed"
-    echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
+    echo "Reused verdict: ${REVALIDATION_BUILD_URL_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
     echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
     echo "Same tree ${cur_tree} at head ${prev_head} then, ${cur_head} now; base ${prev_base} then, ${cur_base} now -- a tree that passed once passes"
     REVALIDATION_REUSED+=("green build ${prev_green} (PR #${pull_number})")
@@ -820,7 +825,7 @@ print("attested")
   fi
 
   echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- every change since is inert"
-  echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
+  echo "Reused verdict: ${REVALIDATION_BUILD_URL_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
   echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
   _revalidation_print_delta "head delta" "${prev_head}..${cur_head}" "${head_delta}"
   _revalidation_print_delta "base delta" "${prev_base}..${cur_base}" "${base_delta}"

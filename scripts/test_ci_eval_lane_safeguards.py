@@ -338,6 +338,7 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         unit_cost_hint() { echo 200; }
         profile_begin() { :; }
         run_one_unit() { echo "START $2 rep $3"; sleep 1; echo "END $2 rep $3"; }
+        fence_live_cards() { echo "FENCE $1"; }
         """
     )
 
@@ -373,6 +374,16 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         for start, end in zip(writer_lines[0::2], writer_lines[1::2]):
             self.assertTrue(start.startswith("START ") and end.startswith("END "), writer_lines)
             self.assertEqual(start.split(" ", 1)[1], end.split(" ", 1)[1], writer_lines)
+        # #4425: each second-phase launch fences the cards an earlier unit
+        # left live, once the unit before it has ended; no first-phase one does.
+        fences = [i for i, line in enumerate(lines) if line.startswith("FENCE ")]
+        self.assertEqual([lines[i] for i in fences], ["FENCE " + lines[i].split(" ", 1)[1] for i in writers[0::2]])
+        for fence, start in zip(fences, writers[0::2]):
+            self.assertLess(fence, start)
+        # Fence k comes after writer k-1 has ended, and the first after phase 1.
+        for prev_end, fence in zip(writers[1::2], fences[1:]):
+            self.assertLess(prev_end, fence)
+        self.assertLess(max(others_ended), min(fences))
 
     def test_with_no_requesting_case_there_is_one_phase(self):
         lines = self.run_fanout("")
@@ -513,7 +524,7 @@ class StoppedAsksTest(unittest.TestCase):
         self.assertIn("closes none of them", report)
         call = src.index("\nreport_github_leftovers\n")
         # After both phases of the fan-out have been waited for.
-        self.assertLess(src.index('launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"\n  wait\nfi\n'), call)
+        self.assertLess(src.index('launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}" fence\n  wait\nfi\n'), call)
         self.assertLess(call, src.index("# ─── Per-case verdicts"))
         self.assertLess(src.index("EVAL_RUN_STARTED_AT=\"$(date"), src.index("# 2. Cluster Auth"))
 
