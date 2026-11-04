@@ -281,6 +281,11 @@ _INJECT_REMOTE_PORT = 8099
 # 503 and a respawn finds the new holder. With no Lease, or none readable,
 # the install runs one unelected gateway and the door's Service reaches it.
 _GATEWAY_LEASE_SUFFIX = "-a2a-gateway"
+# The most the harness waits on a 503's Retry-After before it respawns the
+# tunnel: a gateway standby asks for its election's retry period (2s), and a
+# handover leaves the lease with no holder for about that long, so retrying at
+# once would spend the transport budget before the new leader serves.
+_RETRY_AFTER_CAP = 10.0
 _LEASE_READ_TIMEOUT = 15
 # How much of a failed kubectl read's stderr the warning quotes.
 _KUBECTL_STDERR_LOG_CHARS = 300
@@ -613,7 +618,8 @@ def _kubectl_read(args: list[str], what: str, *, missing_ok: bool = False) -> st
     A failure is logged with kubectl's stderr: a forbidden Lease read, say,
     shows up in the run rather than silently forwarding the Service. A
     ``NotFound`` is expected when ``missing_ok`` (no Lease on an unelected
-    install) and logged only at debug.
+    install): it is logged only at debug and returns ``""``, an answer, so a
+    caller can tell it from a read that failed.
     """
     cmd = ["kubectl", *args, "-n", os.environ.get("AGENT_NAMESPACE", _DEFAULT_AGENT_NAMESPACE)]
     context = os.environ.get("AGENT_CLUSTER_CONTEXT")
@@ -630,20 +636,21 @@ def _kubectl_read(args: list[str], what: str, *, missing_ok: bool = False) -> st
         stderr = proc.stderr.strip()[:_KUBECTL_STDERR_LOG_CHARS]
         if missing_ok and "NotFound" in stderr:
             _log.debug("%s not found", what)
-        else:
-            _log.warning("reading %s failed (kubectl exited %d): %s", what, proc.returncode, stderr)
+            return ""
+        _log.warning("reading %s failed (kubectl exited %d): %s", what, proc.returncode, stderr)
         return None
     return proc.stdout
 
 
-def _gateway_door_target(agent_service: str, service: str) -> str:
-    """The port-forward target for a gateway door: the Lease holder's pod, or
-    the door's Service when no Lease names one.
+def _gateway_door_target(agent_service: str, service: str) -> str | None:
+    """The port-forward target for a gateway door: the Lease holder's pod, the
+    door's Service when no Lease names one, or ``None`` when a read failed.
 
     ``AGENT_GATEWAY_LEASE`` overrides the Lease's name (default
-    ``<AGENT_SERVICE_NAME>-a2a-gateway``). Best effort: a Lease that is
-    missing, unreadable or held by nobody leaves the Service, which is what
-    every install that renders no Lease serves the door through.
+    ``<AGENT_SERVICE_NAME>-a2a-gateway``). A Lease that is missing or held by
+    nobody leaves the Service, which is what every install that renders no
+    Lease serves the door through. A read that failed answers nothing about
+    where the door is, so the caller keeps the forward it has.
 
     The holder is taken only if it is one of the pods the door's Service
     selects. The tunnel carries the door's bearer token, and a Lease's
@@ -659,10 +666,14 @@ def _gateway_door_target(agent_service: str, service: str) -> str:
         f"lease {lease}",
         missing_ok=True,
     )
-    holder = (out or "").strip()
+    if out is None:
+        return None
+    holder = out.strip()
     if not holder:
         return fallback
     raw = _kubectl_read(["get", "svc", service, "-o", "jsonpath={.spec.selector}"], f"service {service}'s selector")
+    if raw is None:
+        return None
     try:
         selector = json.loads(raw) if raw else {}
     except ValueError:
@@ -675,7 +686,9 @@ def _gateway_door_target(agent_service: str, service: str) -> str:
         ["get", "pods", "-l", label_selector, "-o", "jsonpath={.items[*].metadata.name}"],
         f"the pods service {service} selects",
     )
-    if holder not in (names or "").split():
+    if names is None:
+        return None
+    if holder not in names.split():
         _log.warning(
             "lease %s names %s, which is not a pod service %s selects; forwarding to the service",
             lease,
@@ -845,6 +858,13 @@ def _ensure_port_forward(
                 _PF_TARGETS.pop(local_port, None)
             _stop_process(proc)
             raise
+
+
+def _wait_retry_after(exc: BaseException) -> None:
+    """Sleep for the Retry-After a transport failure carried, capped."""
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after:
+        time.sleep(min(retry_after, _RETRY_AFTER_CAP))
 
 
 def _owned_forward_target(local_port: int) -> str | None:
@@ -2951,12 +2971,15 @@ class KubeAgentsHarness(AgentHarness):
                 return
             # Resolved on every spawn: after a 503 from a standby or a tunnel
             # dropped with its pod, the lease names where the door is now.
-            tunnel_target[0] = _gateway_door_target(agent_service, service)
+            resolved = _gateway_door_target(agent_service, service)
+            owned = _owned_forward_target(local_port)
+            # A read that failed says nothing about where the door is: keep
+            # the forward this process owns, or the Service if it owns none.
+            tunnel_target[0] = resolved or owned or f"svc/{service}"
             # A tunnel this process already owns on the port (from an earlier
             # exchange) may still go where the lease pointed then; a port that
             # is open says nothing about where, so it is replaced.
-            owned = _owned_forward_target(local_port)
-            if owned is not None and owned != tunnel_target[0]:
+            if resolved is not None and owned is not None and owned != resolved:
                 reset = True
             forward = _reset_port_forward if reset else _ensure_port_forward
             forward(local_port, service=tunnel_target[0], remote_port=_INJECT_REMOTE_PORT)
@@ -3079,6 +3102,7 @@ class KubeAgentsHarness(AgentHarness):
                     )
                     if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
                         raise
+                    _wait_retry_after(exc)
                     try:
                         _tunnel(reset=True)
                     except RuntimeError as pf_exc:
@@ -3249,6 +3273,7 @@ class KubeAgentsHarness(AgentHarness):
                         raise _TransportError(
                             f"the stop could not reach the gateway: {exc}"
                         ) from exc
+                    _wait_retry_after(exc)
                     try:
                         _tunnel(reset=True)
                     except RuntimeError as pf_exc:

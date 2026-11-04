@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,14 @@ const (
 	// own servers do.
 	standbyReadHeaderTimeout = 10 * time.Second
 )
+
+// podNamePattern is a pod's name as Kubernetes allows it (a DNS-1123
+// subdomain), and standbyMaxPodName its length limit. The Lease's holder is a
+// string anyone who can write the Lease sets, and the standby puts it into a
+// command a person is told to copy and run, so only a pod name goes in.
+var podNamePattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
+
+const standbyMaxPodName = 253
 
 // standbyRetryAfter is the 503's Retry-After, in seconds: the election's
 // retry period, about how long a released lease takes to be taken.
@@ -143,6 +152,13 @@ func standbyHandler(namespace, port string, view *LeaseView) http.Handler {
 		if holder == "" {
 			writeJSON(w, http.StatusServiceUnavailable, standbyAnswer{
 				Error: "this gateway replica is the standby, and no replica holds the lease right now; retry in a few seconds",
+			})
+			return
+		}
+		if len(holder) > standbyMaxPodName || !podNamePattern.MatchString(holder) {
+			// Not a pod's name, so not put into a command or the header.
+			writeJSON(w, http.StatusServiceUnavailable, standbyAnswer{
+				Error: "this gateway replica is the standby, and the lease names a holder that isn't a pod name; read the Lease to see who holds it",
 			})
 			return
 		}
