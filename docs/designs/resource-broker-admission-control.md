@@ -95,10 +95,16 @@ Six facts follow:
    grows past the limit afterwards. Only a rule that acts on running processes closes that gap.
 
 Since the Kubernetes API proxy landed, stock `kubectl` runs inside the sandbox shell and reads
-through the Kubernetes API proxy, which streams responses. The memory of fact 2 therefore moves
-from the credential proxy to the shell, whose limit (2 CPU, 2 GiB) the operator fixes. The same
-two listings that killed the credential proxy are expected to kill the shell. The harness measures
-that case before this design is built (§10, step 0).
+through the Kubernetes API proxy, which streams responses. The memory of fact 2 therefore moved
+from the credential proxy to the shell, whose limit (2 CPU, 2 GiB) the operator fixes. Measured on
+a build with the Kubernetes API proxy, the same audit OOMKilled the shell three times in about
+three minutes and sent it into `CrashLoopBackOff`; two `kubectl get deploy,sts,ds,cronjob,pod -A
+-o json` processes held 91 to 95 % of its memory. Every agent's terminal runs in the shell, so each
+kill ends all of them, and no `PlatformAgent` field raises the shell's limit.
+
+**Raising the limits moves the threshold, not the failure.** At the L size (credential proxy
+8 GB, event watcher 4 GB), the credential proxy was OOMKilled by the same two listings on clusters
+of 80,000 Pods (4,272 and 3,238 MiB), and the event watcher by four clusters of 900,000 Events.
 
 ## 3. Goals and non-goals
 
@@ -347,8 +353,8 @@ for everyone.
 
 ## 10. Rollout
 
-0. **Measure.** Run the OOM harness's `proxy` scenario against a build with the Kubernetes API
-   proxy, watching the sandbox shell, to confirm where the `kubectl` memory now lands.
+0. **Measure.** Done: on a build with the Kubernetes API proxy the `kubectl` memory lands in the
+   sandbox shell, which the audit OOMKilled (§2).
 1. **Memory guard** in the sandbox shell and the credential proxy. This alone meets G1 for those
    containers. Acceptance: the harness's `proxy` scenario at the default limits ends with zero
    OOMKills and one guard kill per oversized read.
