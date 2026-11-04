@@ -979,13 +979,22 @@ guard_standard_node_count() {
 guard_node_pool_shape() {
   load_state
   local profile="" profile_recorded="" profile_read=false
-  local pool addr label attr recorded resolved explicit
+  local pool addr label attr recorded resolved explicit gvisor_enabled
   for pool in standard gvisor; do
     case "$pool" in
       standard) addr="$STANDARD_CLUSTER_ADDRESS"; label="the default pool" ;;
       gvisor)   addr="$GVISOR_POOL_ADDRESS";      label="the gVisor pool" ;;
     esac
     in_state "$addr" || continue
+    # A gVisor pool in state whose flag is off is a teardown, not a resize:
+    # the apply destroys it and recreates no node, so its shape is not read.
+    # State first, as guard_pubsub_subscription reads its flags: in_state is
+    # the list in memory, tfvar a console round trip. Assigned rather than
+    # compared inline, for the `set -e` reason given there.
+    if [[ "$pool" == "gvisor" ]]; then
+      gvisor_enabled=$(tfvar enable_gvisor_node_pool)
+      [[ "$gvisor_enabled" == "true" ]] || continue
+    fi
     for attr in "${NODE_POOL_SHAPE_ATTRS[@]}"; do
       recorded=$(node_config_attr "$addr" "$attr")
       [[ -n "$recorded" ]] || continue

@@ -133,6 +133,7 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_stockout_sub='"gke-stockout-alerts-sub"',
                    tfvar_standard_node_count="1",
                    tfvar_sizing_profile="null",
+                   tfvar_enable_gvisor="true",
                    tfvar_pool_shapes=None,
                    module_outputs=None,
                    recorded_outputs=None,
@@ -318,6 +319,9 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"standard_node_count"* ]]; then
         echo '{tfvar_standard_node_count}'
+        exit 0
+    elif [[ "$expr" == *"enable_gvisor_node_pool"* ]]; then
+        echo '{tfvar_enable_gvisor}'
         exit 0
     fi
     echo 'null'
@@ -970,6 +974,22 @@ resource "google_service_account" "agent" {
         )
         self.assertEqual(proc.returncode, 1)
         self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
+
+    def test_guard_node_pool_shape_lets_a_gvisor_pool_being_removed_go(self):
+        """enable_gvisor_node_pool off with the pool still in state is the apply that destroys
+        it, not one that recreates its nodes: the pool's shape is not read, whatever it was
+        built with, and the lost explicit line beside it asks for nothing to be put back."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet"},
+            tfvar_enable_gvisor="false",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
 
     def test_guard_node_pool_shape_refuses_a_kept_profile_whose_shape_changed(self):
         """When medium gets a shape of its own, a host on a kept TF_VAR_sizing_profile=medium
