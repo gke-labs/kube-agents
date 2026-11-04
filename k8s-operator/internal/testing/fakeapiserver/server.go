@@ -324,15 +324,27 @@ func Start(opts Options) *Server {
 
 // Config is a rest.Config for the fake, as a kubeconfig entry for it would
 // be, except that its transport keeps no connection alive between requests.
-// Over a pooled HTTP/1.1 connection, Go's transport (1.27) can leave a body
-// reader that reaches EOF while the body is being closed, which is how
-// client-go ends a 410 stream, parked on the connection, and the next
-// response on the reused connection wakes that reader rather than the one
-// waiting for it; a reflector's re-stream then delivers nothing until the
-// connection idles out. A connection per request leaves nothing to reuse.
-// The cost is one dial per request, which the paged soaks absorb. A test
-// that sets TLS options on this config fails at client construction, since
-// rest.Config refuses them next to a Transport.
+// Over a pooled HTTP/1.1 connection, net/http's transport can wake the wrong
+// reader. When a body is closed while another goroutine's Read of it is
+// returning EOF, which is how client-go's StreamWatcher stops a stream the
+// API server ended with a 410, the transport drains what is left, puts the
+// connection back in the pool, and leaves that Read's end-of-body callback
+// parked on the connection's EOF channel (bodyEOFSignal and eofc in
+// net/http/transport.go's readLoop: the channel is signalled once per
+// response, and the early Close took the signal). The next response on the
+// reused connection signals the channel once more, the parked reader takes
+// it, and the reader of the new response parks in its place until the
+// connection closes, by the idle timeout at the latest; a reflector's
+// re-stream after an expiry delivers nothing for that long. The code is
+// older than Go 1.27.1, where it was traced; this Transport can go once
+// net/http hands the signal to the reader of the response it belongs to.
+// A connection per request leaves nothing to reuse, at one dial per request,
+// which the paged soaks absorb. It fixes the fake's clients only: the
+// watcher's broker route reaches profile clusters over pooled plain HTTP/1.1
+// (clusterprofiles.Broker.ClientConfig) and is open to the same stall. A
+// test that sets a CA, a client certificate, a certificate callback or
+// Insecure on this config fails at client construction, since client-go
+// refuses those next to a Transport.
 func (s *Server) Config() *rest.Config {
 	return &rest.Config{Host: s.URL, Transport: &http.Transport{DisableKeepAlives: true}}
 }
