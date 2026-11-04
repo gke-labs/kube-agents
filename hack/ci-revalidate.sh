@@ -25,7 +25,7 @@
 # retest at a new base WOULD test a different combination, and reusing the
 # head's verdict means that combination -- and, in a batch, the pulls with
 # each other -- is not tested before the merge, on every retest rather than
-# only when the sticky re-pin wins its race. The nightly eval on main is
+# only when the sticky re-pin (retired since) won its race. The nightly eval on main is
 # what finds a combination that broke, and so is the next full run any pull
 # request starts after it. The second is a green at an EARLIER head from
 # which everything since -- on the pull request's side AND on main's side
@@ -140,7 +140,8 @@
 # only after GitHub confirmed the commenter is a repository admin -- on
 # this build; upstream also honours allowed_github_teams and
 # allow_top_level_owners, and prow/oss/plugins.yaml in oss-test-infra sets
-# neither for the plugin, so widening it there widens who step 0 trusts. A copy of that description under another login -- the sticky
+# neither for the plugin, so widening it there widens who step 0 trusts. A
+# copy of that description under another login -- the retired sticky
 # re-pin's, posted with a workflow token -- is not read as one; the
 # original event is still on the head beside it.
 #
@@ -238,8 +239,8 @@ readonly REVALIDATION_HISTORY_LIMIT=20
 # run could only repeat. EVAL_REVALIDATION_NOT_BEFORE, a UTC time set in the
 # job's env in oss-test-infra (the swap to spec.mode next, or a rollback to
 # today), refuses a green build whose EARLIEST matching success status on
-# GitHub was created before it: the original crier event, which the sticky
-# re-pin's later copies (same build URL) cannot stand in for. GitHub's
+# GitHub was created before it: the original crier event, which the retired
+# sticky re-pin's later copies (same build URL) cannot stand in for. GitHub's
 # time, not the GCS record's, for the trust-surface reason above. Unset or
 # empty, nothing changes; unparsable, an event with no readable time, or a
 # status read stopped at its page cap (the original may lie past it), is a
@@ -247,8 +248,8 @@ readonly REVALIDATION_HISTORY_LIMIT=20
 readonly REVALIDATION_NOT_BEFORE="${EVAL_REVALIDATION_NOT_BEFORE:-}"
 # The status read pages through GitHub's newest-first events (100 a page,
 # following `Link: rel="next"`) up to this many pages. One page is not
-# enough: the sticky re-pin posts a copy on every open head after every
-# merge to main -- about two dozen a day -- so the one Prow-bot event an
+# enough: until it was retired, the sticky re-pin posted a copy on every open
+# head after every merge to main -- about two dozen a day -- so the one Prow-bot event an
 # override binds to is past the first hundred within days, where a green's
 # attestation matches the re-pin copies themselves (they carry the build's
 # URL). Ten pages is a thousand events, some six weeks of re-pins at an

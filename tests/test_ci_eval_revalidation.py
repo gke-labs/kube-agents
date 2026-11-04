@@ -554,7 +554,7 @@ class RevalidationTest(unittest.TestCase):
     # ── the same head passes whatever main did ──────────────────────────────
 
     def test_a_green_at_this_head_is_reused_whatever_main_did_since(self):
-        """The retest Tide starts because main moved, serial or batch: the
+        """The retest Tide started because main moved, serial or batch: the
         base delta c1..c5 touches code.py, which the inert rule would refuse,
         and the same-head rule does not look at it."""
         self._plant_history([("200", True, self.c1, self.c3)])
@@ -690,7 +690,7 @@ class RevalidationTest(unittest.TestCase):
     # ── an admin /override at this head is a verdict too ────────────────────
 
     def test_an_admin_override_at_this_head_is_reused_whatever_main_did(self):
-        """The retest Tide starts after main moves, for a pull request an
+        """The retest Tide started after main moved, for a pull request an
         admin overrode: the only green on the head is the override plugin's
         status, and the reuse needs no passed build in GCS -- the history is
         read first and yields nothing, then the override holds."""
@@ -835,8 +835,8 @@ class RevalidationTest(unittest.TestCase):
         self.assertEqual([], list(self.artifacts.iterdir()))
 
     def test_an_override_survives_the_retest_tide_started_and_aborted(self):
-        """#2464's history: override, then Tide's retest posts pending, then
-        the trigger plugin aborts it with a failure status. The override is
+        """#2464's history: override, then Tide's retest posted pending, then
+        the trigger plugin aborted it with a failure status. The override is
         older than both and still the verdict -- nothing withdrew it."""
         self._plant_statuses(
             self.c3,
@@ -995,8 +995,8 @@ class RevalidationTest(unittest.TestCase):
         self.assertEqual(proc.stdout.count("Step 0: full run:"), 1)
 
     def test_an_override_behind_days_of_re_pins_is_still_found(self):
-        """The sticky re-pin posts a copy on this head after every merge to
-        main, newest first, so the one Prow-bot event is soon past the first
+        """The retired sticky re-pin posted a copy on this head after every
+        merge to main, newest first, so the one Prow-bot event is soon past the first
         hundred; the read follows GitHub's next-page link until it finds it."""
         pins = [
             self._override_event(creator="github-actions[bot]", when=f"2026-10-{7 + i // 24:02d}T{i % 24:02d}:00:00Z")

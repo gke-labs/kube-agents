@@ -952,6 +952,20 @@
 # inject lane only (api-lane-exclusions.txt).
 ./tasks/chat-reply-under-pushed-report/task.yaml
 
+# A question naming one seeded cluster reaches that cluster's Cluster Agent
+# when the roster block counts the Cluster Agents instead of naming them
+# (#4432): the front door finds the assignee through list_agents' filter.
+# The counted block needs KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD set below the
+# install's Cluster Agent count, which no CI install does yet, so here the
+# block names every agent and the lookup is never called. What the nightly
+# grades is that the card's assignee was seeded-a's agent (kanban_create's
+# arguments, which the inject trace carries) and that the answer named its
+# namespaces; the worker_agents check is set aside on the inject lane, and
+# the lookup route is guarded only once an eval install sets the threshold.
+# deployer: noop, read-only, reads seeded-a through its own agent, one
+# front-door turn plus the card round trip: +3 units.
+./tasks/chat-routing-named-cluster-under-summarized-roster/task.yaml
+
 # The front door routes "which namespaces exist in this cluster?" to the host
 # cluster's agent (or platform) without asking which cluster (#3286).
 # deployer: noop, read-only, one front-door turn plus the card round trip:
@@ -1154,16 +1168,6 @@
 # autoops-warning-event-triage; hinted at that case's 900s until the nightly
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
-
-# An alert-policy question is answered from Cloud Monitoring through the
-# broker (#3467): the planted policy is named, reported disabled, and read
-# with `monitoring policies list|describe`, not from the audit log. Its own
-# stack plants one disabled policy in the install's project, which needs
-# roles/monitoring.alertPolicyEditor on the runners (#3632, granted on every
-# pool project). Red on main, three greens on the fix, on a dev install.
-# Nightly from its first merge. A unit killed between apply and destroy
-# leaves its policy behind; the sweep for those is #3797.
-./tasks/monitoring-alert-policy-read/task.yaml
 
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its

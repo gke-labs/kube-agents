@@ -59,6 +59,7 @@ cluster-agent-crashloop-debug
 cluster-agent-crashloop-misleading-symptom
 cluster-agent-crashloop-evidence-chain
 incident-triage-oom-event-probe
+monitoring-alert-policy-read
 agent-kanban-smoke
 vcs-spent-branch-reuse
 compliance-rbac-overgrant

@@ -148,6 +148,7 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         # key, and every installer-written install.env assigns it, empty or not.
         out = self._run(self._env(mode="next"))
         self.assertIn("Set SLACK_HOME_CHANNEL in install.env", out)
+        self.assertIn("Or pick the channel on the app's Home tab", out)
         self.assertNotIn("--slack-home-channel", out)
         self.assertNotIn("Invite the app to the home channel", out)
 

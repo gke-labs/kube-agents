@@ -49,6 +49,9 @@ const (
 	// record: they arrived in one release, the two kept fields changing from
 	// counters to readings, and a CRD serves all six or none of the four new.
 	usageNewerFieldReadings = "the six proposal readings"
+	// usageNewerFieldPeople names the two people readings' shared pruning
+	// record: they arrived in one release and a CRD serves both or neither.
+	usageNewerFieldPeople = "the two people readings"
 	// usageNewerFieldLastHumanActive is lastHumanActiveTime's pruning record
 	// key, the status field's name.
 	usageNewerFieldLastHumanActive = "lastHumanActiveTime"
@@ -118,10 +121,11 @@ const (
 // sessionsTotal, chatSessionsTotal, toolExecutionsBlockedTotal,
 // brokerFailuresTotal, chatTurnsErroredTotal, backgroundTasksGaveUpTotal,
 // negativeFeedbackTotal, lastActiveTime and lastHumanActiveTime on every
-// PlatformAgent, the two cluster gauges and the six proposal readings, from
-// the broker's, the watcher's, the chat plugin's and the A2A gateway's
-// metrics listeners, as a manager Runnable on the leader, off the reconcile
-// path. docs/designs/usage-counters-producer.md is the design; the rules the
+// PlatformAgent, the two cluster gauges, the six proposal readings and the
+// two people readings (peopleSeen7d, peopleSeen30d), from the broker's, the
+// watcher's, the chat plugin's and the A2A gateway's metrics listeners, as a
+// manager Runnable on the leader, off the reconcile path.
+// docs/designs/usage-counters-producer.md is the design; the rules the
 // counters follow are in usage_counters_fold.go, the scrape in
 // usage_counters_scrape.go. This file is the loop and the two
 // objects it writes: the ConfigMap that holds the document, first, and the
@@ -154,11 +158,12 @@ type UsageCounterPoller struct {
 	// memory, like streaks: a leader change delays the clear by one streak and
 	// never advances it.
 	gatewayMisses map[string]int
-	// readingMisses counts, per CR and per proposal reading, the consecutive
-	// polls in which no broker body carried that reading: the broker
+	// readingMisses counts, per CR and per reading, the consecutive polls in
+	// which no body of the reading's target carried it: the target
 	// unreadable, or read without the reading's series. The cluster gauges'
 	// rule, one streak per reading, because a warming sweep serves the
-	// outcomes without the details. In memory, like gatewayMisses.
+	// outcomes without the details, and the people reading's target is the
+	// A2A gateway rather than the broker. In memory, like gatewayMisses.
 	readingMisses map[string]map[usageReadingKind]int
 
 	// cursor is the namespace/name of the last CR a poll finished. The next
@@ -196,13 +201,14 @@ func (t usageTarget) streakKey() usageStreakKey {
 	return usageStreakKey{uid: t.uid, port: t.port}
 }
 
-// usageTarget is a running pod whose listener the poll reads, and the counters
-// its body feeds.
+// usageTarget is a running pod whose listener the poll reads, the counters
+// its body feeds, and the readings it serves, none for most.
 type usageTarget struct {
 	uid      types.UID
 	name     string
 	created  time.Time
 	counters []string
+	readings []usageReadingKind
 	port     string
 	addr     string
 }
@@ -296,10 +302,15 @@ func (p *UsageCounterPoller) noteGatewayReading(agent *agentv1alpha1.PlatformAge
 	return p.gatewayMisses[key] >= usageScrapeFailureEventStreak
 }
 
-// noteBrokerReadings records, per reading, whether this poll's broker bodies
-// carried it for the CR, and returns each reading's run of misses: a reading
-// read ends its run.
-func (p *UsageCounterPoller) noteBrokerReadings(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod) map[usageReadingKind]int {
+// noteReadings records, per reading, whether this poll's bodies carried it for
+// the CR, and returns each reading's run of misses: a reading read ends its
+// run. The people reading is not counted, and any run it had is dropped,
+// while peopleReadingEnabled is false (no A2A stack, or a chat platform on
+// Hermes): its kind is then absent from the map returned, and
+// usageReadingsForPoll clears its fields without a miss. With the gate open,
+// a poll that reads no A2A gateway body, its pod missing or unreadable, is a
+// miss like any other.
+func (p *UsageCounterPoller) noteReadings(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod) map[usageReadingKind]int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	key := usagePollKey(agent)
@@ -311,6 +322,10 @@ func (p *UsageCounterPoller) noteBrokerReadings(agent *agentv1alpha1.PlatformAge
 	}
 	misses := map[usageReadingKind]int{}
 	for _, kind := range usageReadingKinds {
+		if kind == usageReadingPeople && !peopleReadingEnabled(agent) {
+			delete(p.readingMisses[key], kind)
+			continue
+		}
 		read := slices.ContainsFunc(scraped, func(s usageScrapedPod) bool { return s.ReadingsPresent[kind] })
 		if read {
 			delete(p.readingMisses[key], kind)
@@ -492,7 +507,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	scraped := make([]usageScrapedPod, 0, len(targets))
 	var failing []usageScrapeFailure
 	for _, target := range targets {
-		reading, err := p.source.Scrape(ctx, target.addr, target.counters)
+		reading, err := p.source.Scrape(ctx, target.addr, target.counters, target.readings)
 		if err != nil {
 			if ctx.Err() != nil {
 				// A poll cut short by shutdown, a leader change, or the poll
@@ -537,7 +552,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	watcherDown := p.noteGatewayReading(cached, gatewayRead)
 	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, watcherDown)
 	volume, volumeKnown := usageDataVolumeForPoll(cached, scraped, gatewayRead, watcherDown)
-	readings, readingsKnown := usageReadingsForPoll(scraped, p.noteBrokerReadings(cached, scraped))
+	readings, readingsKnown := usageReadingsForPoll(cached, scraped, p.noteReadings(cached, scraped))
 	// The scrape and ConfigMap causes are not recorded here: both are standing
 	// failures that would each spend one of the CR's event-bucket tokens every
 	// poll, and two per poll drains the bucket and starves one of them. They are
@@ -622,22 +637,24 @@ func usageClusterGaugesForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usa
 	return reading, reading != nil
 }
 
-// usageReadingsForPoll is the proposal readings this poll projects, by status
-// field, and which readings it projects at all, on the cluster gauges' rules
-// with one streak per reading (misses, from noteBrokerReadings). known false
-// for a reading is a poll that says nothing about its fields: no broker body
+// usageReadingsForPoll is the readings this poll projects, by status field,
+// and which readings it projects at all, on the cluster gauges' rules with
+// one streak per reading (misses, from noteReadings). known false for a
+// reading is a poll that says nothing about its fields: no body of its target
 // carried it, for fewer polls in a row than the event streak, so the fields
 // keep their last values. known true with nil values clears the reading's
-// fields to absent: no broker body has carried it for the event streak. known
-// true with values is the largest of each field across the broker bodies
-// that carried the reading; the broker is one pod by design, so the rule is
-// for form. A zero is a reading, and is written as one.
-func usageReadingsForPoll(scraped []usageScrapedPod, misses map[usageReadingKind]int) (values map[string]*int64, known map[usageReadingKind]bool) {
+// fields to absent: no body has carried it for the event streak, or, for the
+// people reading, peopleReadingEnabled is false. known true with values is
+// the largest of each field across the bodies that carried the reading: the
+// broker is one pod by design, and every A2A gateway replica counts from the
+// one shared bucket. A zero is a reading, and is written as one.
+func usageReadingsForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod, misses map[usageReadingKind]int) (values map[string]*int64, known map[usageReadingKind]bool) {
 	values = map[string]*int64{}
 	known = map[usageReadingKind]bool{}
+	peopleOpen := peopleReadingEnabled(agent)
 	for _, s := range scraped {
 		for _, spec := range usageReadingSpecs {
-			if !s.ReadingsPresent[spec.reading] {
+			if !s.ReadingsPresent[spec.reading] || (spec.reading == usageReadingPeople && !peopleOpen) {
 				continue
 			}
 			known[spec.reading] = true
@@ -651,6 +668,9 @@ func usageReadingsForPoll(scraped []usageScrapedPod, misses map[usageReadingKind
 		if !known[kind] && misses[kind] >= usageScrapeFailureEventStreak {
 			known[kind] = true
 		}
+	}
+	if !peopleOpen {
+		known[usageReadingPeople] = true
 	}
 	return values, known
 }
@@ -672,8 +692,22 @@ func usageReadingStatusField(u *agentv1alpha1.AgentUsageStatus, field string) **
 		return &u.ProposalHumanTouches
 	case usageExportProposalsMergedUntouched:
 		return &u.ProposalsMergedUntouched
+	case usageExportPeopleSeen7d:
+		return &u.PeopleSeen7d
+	case usageExportPeopleSeen30d:
+		return &u.PeopleSeen30d
 	}
 	return nil
+}
+
+// usageReadingRecord is the newer-fields record a reading's fields share: the
+// people readings arrived at a later release than the six proposal readings,
+// so a served CRD can carry the six and prune the pair.
+func usageReadingRecord(kind usageReadingKind) string {
+	if kind == usageReadingPeople {
+		return usageNewerFieldPeople
+	}
+	return usageNewerFieldReadings
 }
 
 // usageGaugeFields is a reading as the status carries it: nil pointers for
@@ -740,19 +774,21 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 	groups := []struct {
 		selector  map[string]string
 		counters  []string
+		readings  []usageReadingKind
 		container string
 		port      string
 		read      bool
 		// podRead narrows read to the pods whose container serves the port.
 		podRead func(*corev1.Pod) bool
 	}{
-		{gatewayPodSelector(agent), usageGatewayCounters, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent), everyPod},
-		{gatewayPodSelector(agent), usageChatCounters, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
+		{gatewayPodSelector(agent), usageGatewayCounters, nil, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent), everyPod},
+		{gatewayPodSelector(agent), usageChatCounters, nil, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
 		// The A2A gateway, a pod a next-mode install runs and a today install
 		// does not: the chat counter again, from the gateway that owns Chat
-		// ingress there. The selector matches no pod elsewhere.
-		{a2aGatewayPodSelector(agent), usageA2AChatCounters, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod},
-		{credentialProxySelector(agent), usageBrokerCounters, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
+		// ingress there, and the people reading. The selector matches no pod
+		// elsewhere.
+		{a2aGatewayPodSelector(agent), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod},
+		{credentialProxySelector(agent), usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails}, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
 	}
 	live := map[string]bool{}
 	var targets []usageTarget
@@ -804,6 +840,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 				name:     pod.Name,
 				created:  pod.CreationTimestamp.Time,
 				counters: group.counters,
+				readings: group.readings,
 				port:     group.port,
 				addr:     net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port))),
 			})
@@ -1188,11 +1225,12 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 // carries everything accumulated since. A difference in a newer field alone, a
 // gauge or a later counter, is likewise skipped while the newer-fields record
 // is fresh, the served CRD at a previous schema, so the first counters that
-// CRD serves keep landing every poll. The proposal readings follow the gauges'
-// rule, per reading: a field of a reading readingsKnown names is written as
-// readings holds it, nil included, and differs in either direction; a
-// reading readingsKnown does not name leaves its fields as they are. No
-// reading moves lastActiveTime or lastHumanActiveTime.
+// CRD serves keep landing every poll. The proposal readings and the people
+// readings, each under its own record, follow the gauges' rule, per reading:
+// a field of a reading readingsKnown names is written as readings holds it,
+// nil included, and differs in either direction; a reading readingsKnown does
+// not name leaves its fields as they are. No reading moves lastActiveTime or
+// lastHumanActiveTime.
 func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument, gauges *usageClusterGauges, gaugesKnown bool, readings map[string]*int64, readingsKnown map[usageReadingKind]bool) error {
 	tool := doc.Totals[usageCounterToolExecutions]
 	events := doc.Totals[usageCounterEventsIngested]
@@ -1210,13 +1248,16 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// The first-schema counters are in every served CRD that has status.usage;
 	// the gauges, the chat counter, the blocked counter, the failures
 	// counter, the errored counter, the background-tasks counter, the
-	// feedback counter, the chat sessions and the proposal readings arrived
-	// later, each at its own release, and a CRD at a previous schema prunes
-	// some or all of them, so a difference in one of them alone waits while
-	// that field's record is fresh rather than re-patching every poll, and
-	// the others keep landing.
+	// feedback counter, the chat sessions, the proposal readings and the
+	// people readings arrived later, each at its own release, and a CRD at a
+	// previous schema prunes some or all of them, so a difference in one of
+	// them alone waits while that field's record is fresh rather than
+	// re-patching every poll, and the others keep landing.
 	gaugesPruned := p.newerFieldPruned(agent, usageNewerFieldGauges)
-	readingsPruned := p.newerFieldPruned(agent, usageNewerFieldReadings)
+	readingRecordPruned := map[string]bool{
+		usageNewerFieldReadings: p.newerFieldPruned(agent, usageNewerFieldReadings),
+		usageNewerFieldPeople:   p.newerFieldPruned(agent, usageNewerFieldPeople),
+	}
 	chatPruned := p.newerFieldPruned(agent, usageCounterChatMessagesInbound)
 	blockedPruned := p.newerFieldPruned(agent, usageCounterToolExecutionsBlocked)
 	failuresPruned := p.newerFieldPruned(agent, usageCounterBrokerFailures)
@@ -1230,7 +1271,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
 	readingsMoved := false
 	for _, spec := range usageReadingSpecs {
-		if field := usageReadingStatusField(usage, spec.field); field != nil && readingsKnown[spec.reading] && !readingsPruned && !usageGaugeEqual(*field, readings[spec.field]) {
+		if field := usageReadingStatusField(usage, spec.field); field != nil && readingsKnown[spec.reading] && !readingRecordPruned[usageReadingRecord(spec.reading)] && !usageGaugeEqual(*field, readings[spec.field]) {
 			readingsMoved = true
 		}
 	}
@@ -1273,9 +1314,9 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 		usage.ClustersRegistered = wantRegistered
 		usage.ClustersMonitored = wantMonitored
 	}
-	// The readings written as values, the ones whose echo says whether the
-	// served CRD carries them.
-	written := map[string]int64{}
+	// The readings written as values, by record, the ones whose echo says
+	// whether the served CRD carries them.
+	written := map[string]map[string]int64{}
 	for _, spec := range usageReadingSpecs {
 		field := usageReadingStatusField(usage, spec.field)
 		if field == nil || !readingsKnown[spec.reading] {
@@ -1283,7 +1324,11 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 		}
 		*field = readings[spec.field]
 		if *field != nil {
-			written[spec.field] = **field
+			record := usageReadingRecord(spec.reading)
+			if written[record] == nil {
+				written[record] = map[string]int64{}
+			}
+			written[record][spec.field] = **field
 		}
 	}
 	if err := p.r.Status().Patch(ctx, agent, client.MergeFrom(base)); err != nil {
@@ -1303,14 +1348,17 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if gauges != nil {
 		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldGauges, usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored))
 	}
-	if len(written) > 0 {
+	for _, record := range []string{usageNewerFieldReadings, usageNewerFieldPeople} {
+		if len(written[record]) == 0 {
+			continue
+		}
 		echoed := true
-		for name, want := range written {
+		for name, want := range written[record] {
 			if got := *usageReadingStatusField(&agent.Status.Usage, name); got == nil || *got != want {
 				echoed = false
 			}
 		}
-		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldReadings, echoed)
+		p.noteNewerFieldEcho(ctx, agent, record, echoed)
 	}
 	if chat > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterChatMessagesInbound, agent.Status.Usage.ChatMessagesInboundTotal == chat)

@@ -12,7 +12,7 @@
 #                         and reports the ones a person made outside git
 #
 # CREDENTIAL_PROXY_ROLE selects which of them start, because they no longer all
-# run in the same pod. It is the same variable and the same three values
+# run in the same pod. It is the same variable and the same four values
 # credential_proxy.py's resolve_role() reads; this script decides which
 # processes to launch and that function decides which halves of the runtime to
 # serve. `broker` is the credential pod: Envoy and the credential runtime, which
@@ -22,7 +22,9 @@
 # the Hermes gateway on the same loopback. None of those is a credential path
 # the agent container can drive, which is the point of the split. `combined` is
 # the sidecar arrangement and stays the default so an image paired with an older
-# operator behaves as it did.
+# operator behaves as it did. `exec` is the exec tier's pod
+# (docs/designs/credential-broker-exec-tier.md): Envoy and the credential
+# runtime, as in `broker`, and no watcher or detector.
 #
 # They differ in how their failure is treated. Envoy and the credential runtime
 # are the container's reason to exist: if either dies the agent loses every
@@ -59,7 +61,7 @@ readonly SIGNAL_EXIT_BASE=128
 # defaulted here. Two defaults that have to agree is a way for them not to.
 export CREDENTIAL_PROXY_ROLE="${CREDENTIAL_PROXY_ROLE:-combined}"
 case "${CREDENTIAL_PROXY_ROLE}" in
-  combined | broker | api-proxy) ;;
+  combined | broker | api-proxy | exec) ;;
   *)
     echo "start-services: unknown CREDENTIAL_PROXY_ROLE=${CREDENTIAL_PROXY_ROLE}" >&2
     exit 1
@@ -105,6 +107,12 @@ readonly KV_DAEMON_URL="http://${KV_DAEMON_HOST}:${KV_DAEMON_PORT}"
 # the turn, so an event offered while the gateway boots would rest on the
 # daemon's retries, which give up after a bounded wait.
 readonly AGENT_GATEWAY_URL="http://127.0.0.1:8642"
+
+# The address every listener in the baked Envoy config binds, which start_envoy
+# rebinds to the address the operator passes (0.0.0.0 in the broker Pod, so the
+# Pod IP answers). Named so the rewrite and the check that it reached every
+# listener read the same literal.
+readonly ENVOY_LOOPBACK_ADDRESS=127.0.0.1
 
 # How long to wait for that daemon to start listening before launching the
 # detector anyway. This container is a native sidecar, so it starts before the
@@ -396,9 +404,9 @@ clamp_at_least DRIFT_SHORT_EXIT_ALERT_COUNT
 # may spend up to 56s (50s drain plus lease release calls), leaving this drain
 # about 4s; resizing it is tracked in #3407. An older operator's `combined`
 # sidecar keeps the 30s default, which 15s fits. The standalone broker pod
-# (CREDENTIAL_PROXY_ROLE=broker) starts no watcher or detector, so only the
-# runtime drain below runs there. The poll is whole seconds: the drain is
-# bounded by the settle, not by how often it is checked.
+# (CREDENTIAL_PROXY_ROLE=broker) and the exec pod (exec) start no watcher or
+# detector, so only the runtime drain below runs there. The poll is whole
+# seconds: the drain is bounded by the settle, not by how often it is checked.
 readonly SHUTDOWN_DRAIN_SECONDS=15
 readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
 # The credential runtime's own drain budget. In the combined role the runtime
@@ -753,12 +761,39 @@ start_credential_runtime() {
   runtime_pid=$!
 }
 
+# How many times `address: <needle>` occurs in a file, counting occurrences
+# rather than lines so that two listeners written on one line count as two.
+count_listener_addresses() {
+  local file=$1 needle=$2
+  { grep -o -F "address: ${needle}" "${file}" || true; } | wc -l
+}
+
+# Render the baked Envoy config with every listener rebound from loopback to
+# the given address, into the given path, and refuse a render that left any
+# listener behind. The config carries two listeners, the credentialed one and
+# the readiness probe's; a render that moved one and not the other would start
+# an Envoy whose probe, or whose callers, reach a port bound to loopback in a
+# Pod nothing else can reach, which reads as a hang or as never Ready. So the
+# check is a count: as many listener lines name the address afterwards as
+# named loopback before, and at least one did.
+render_envoy_config() {
+  local source=$1 rendered=$2 address=$3
+  local expected rewritten
+  sed "s|address: ${ENVOY_LOOPBACK_ADDRESS//./\\.}|address: ${address}|" "${source}" >"${rendered}"
+  expected=$(count_listener_addresses "${source}" "${ENVOY_LOOPBACK_ADDRESS}")
+  rewritten=$(count_listener_addresses "${rendered}" "${address}")
+  if [[ "${expected}" -eq 0 || "${rewritten}" -ne "${expected}" ]]; then
+    echo "start-services: rewrote ${rewritten} of ${expected} Envoy listener addresses from ${ENVOY_LOOPBACK_ADDRESS} to ${address}; refusing to start Envoy with a listener still bound to loopback" >&2
+    return 1
+  fi
+}
+
 start_envoy() {
   # The baked config binds 127.0.0.1, which is the access control for as long as
   # the broker is a sidecar in the agent's Pod. When the operator puts the broker
-  # in a Pod of its own the listener has to accept the Pod IP, and the config is
-  # baked into the image rather than rendered by the operator -- so the one line
-  # that has to differ is substituted here rather than by shipping two configs
+  # in a Pod of its own the listeners have to accept the Pod IP, and the config
+  # is baked into the image rather than rendered by the operator -- so the lines
+  # that have to differ are substituted here rather than by shipping two configs
   # that would drift. The value is checked against a character class first: it
   # reaches sed, and sed would happily accept a replacement carrying its own
   # delimiter or newline.
@@ -769,11 +804,7 @@ start_envoy() {
       exit 1
     fi
     local rendered=/tmp/envoy-credential-proxy.yaml
-    sed "s|address: 127\.0\.0\.1|address: ${CREDENTIAL_PROXY_ENVOY_ADDRESS}|" \
-      "${envoy_config}" >"${rendered}"
-    # A substitution that silently matched nothing would leave the broker bound
-    # to loopback in a Pod nothing else can reach, which reads as a hang.
-    grep -q "address: ${CREDENTIAL_PROXY_ENVOY_ADDRESS}" "${rendered}"
+    render_envoy_config "${envoy_config}" "${rendered}" "${CREDENTIAL_PROXY_ENVOY_ADDRESS}" || exit 1
     envoy_config="${rendered}"
   fi
   /usr/local/bin/envoy --config-path "${envoy_config}" --log-level info &
@@ -1173,9 +1204,10 @@ start_credential_runtime
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "api-proxy" ]]; then
   start_envoy
 fi
-if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" ]]; then
+if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" && "${CREDENTIAL_PROXY_ROLE}" != "exec" ]]; then
   # The same guard as the watcher, and for the same reason: both post to the
-  # Session KV server on this pod's loopback, which the broker pod does not run.
+  # Session KV server on this pod's loopback, which the broker and exec pods do
+  # not run.
   start_event_watcher
   start_drift_detector
 fi

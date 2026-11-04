@@ -96,6 +96,7 @@ from credential_proxy_client import (  # noqa: F401  (re-export)
     CLASS_LABEL,
     CONTEXT_FLAG,
     END_OF_FLAGS,
+    EXEC_ROLE,
     KUBECONFIG_FLAG,
     ClusterTarget,
     kubectl_context_flag,
@@ -108,7 +109,9 @@ LOGGER = logging.getLogger("credential-proxy")
 # its read-only token. Named in the log when a context clone presents none.
 FORGE_READ_TOKEN_KEY = vcs_broker.FORGE_READ_TOKEN_KEY
 # The process roles `resolve_role` accepts (CREDENTIAL_PROXY_ROLE), and the
-# ones that run the credential broker and so the readings sweep.
+# ones that run the credential broker and so the readings sweep. It also
+# accepts EXEC_ROLE, the exec tier's role from credential_proxy_client: a
+# broker with N replicas, so it runs no sweep and is not in BROKER_ROLES.
 ROLE_COMBINED = "combined"
 ROLE_BROKER = "broker"
 ROLE_API_PROXY = "api-proxy"
@@ -786,7 +789,8 @@ HEALTHZ_PATH = "/healthz"
 # What the broker admits at once, for the sandbox's fleet sweeps to size their
 # worker pools by (`broker_admission.sweep_width`). Read-only: the slot cap, the
 # count the child memory budget fits at this container's effective limit, the
-# smaller of the two, and the session role's own cap. Only the broker knows the
+# smaller of the two, the interactive cap inside it, and the session role's own
+# cap. Only the broker knows the
 # effective limit: on GKE Autopilot without bursting it is the memory request,
 # rewritten after the operator rendered the pod.
 ADMISSION_PATH = "/v1/exec/admission"
@@ -847,12 +851,14 @@ METRICS_CONNECTION_DEADLINE_SECONDS = 10
 # exists; a probe caught in a burst that way reads as not ready. (The TCP
 # listeners share the constant; there a full queue drops the SYN and the
 # client stalls until it retries.) The stdlib's 5 is smaller than one sweep's
-# command slots. Envoy's default per-cluster connection ceiling is 1024, the
+# command slots. Envoy's per-cluster connection ceiling for the credentialed
+# route (max_connections in deploy/shared/envoy-credential-proxy.yaml) is the
 # most it can hold open to the broker at once, so a queue of that size leaves
-# Envoy's own breaker, never this queue, as what refuses first. listen()
-# clamps it to net.core.somaxconn: 4096 on a recent Linux kernel, 1024 inside
-# a gVisor sandbox, so the queue is at most this size and never less.
-LISTEN_BACKLOG = 1024
+# Envoy's own breaker, never this queue, as what refuses first; the test holds
+# this constant at or above that number. listen() clamps it to net.core.somaxconn: 4096
+# on a recent Linux kernel, 1024 inside a gVisor sandbox, so the queue is at
+# most this size and never less.
+LISTEN_BACKLOG = 4096
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what
@@ -1395,6 +1401,8 @@ CALLER_ROLE_PROFILE = "profile"
 # The scope publisher Job. The exec route only, gcloud only, and within it the
 # five lookups scope_policy names, each on an argument scope.json declares or an
 # earlier lookup returned.
+# An exec pod refuses it (_exec_pod_refuses): a scope command reads its member
+# window, which lives on the stateful broker.
 CALLER_ROLE_SCOPE = "scope"
 
 # The TokenReview user.extra key under which the API server names the Pod a
@@ -1425,11 +1433,13 @@ CALLER_ROLES = (
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
-# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session role is
-# narrowed to the two CLIs that reach a cluster read-only. Today the route
-# carries exactly those two, so this check stands behind the route's own
-# refusal: widening the route never widens a session.
+# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session and
+# profile roles are narrowed to the two CLIs that reach a cluster read-only,
+# and the shell and scope roles are narrowed to `gcloud` (the sandbox runs
+# stock `kubectl` against `kube-proxy`, so `/usr/local/bin/credential-proxy-exec`
+# in the sandbox cannot bypass `kube-proxy`).
 ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
+    CALLER_ROLE_SHELL: frozenset({"gcloud"}),
     CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
     CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"}),
     CALLER_ROLE_SCOPE: frozenset({"gcloud"}),
@@ -1572,6 +1582,15 @@ SESSION_KUBECTL_VALUE_FLAGS: frozenset[str] = frozenset({
     "--output", "--sort-by", "--container", "--tail", "--since", "--since-time",
     "--limit-bytes", "--chunk-size", "--limit", "--for", "--types", "--verbs",
     "--api-group", "--template",
+    # A paged collection read. Its value is judged by command_policy's
+    # `kubernetes.raw-path` rule downstream, the same gate the shell's raw
+    # reads pass: a relative collection path on an allowlisted kind, on `get`.
+    # The rule's exact endpoints (`/metrics`, `KUBECTL_RAW_ENDPOINTS`) are
+    # not a session's: the rule takes no role, so `_session_value_refused`
+    # refuses a `--raw` whose decoded path names one, and the API server's
+    # own metrics stay the shell role's, as they were when `--raw` was
+    # refused here by name.
+    command_policy.KUBECTL_RAW_FLAG,
 })
 # Verbs a session may not run even though they are reads: both wait by
 # default (`rollout status` watches until the rollout completes, `wait` until
@@ -1606,6 +1625,19 @@ def _session_output_permitted(value: str) -> bool:
     return value in SESSION_KUBECTL_OUTPUT_FORMATS or value.startswith(SESSION_KUBECTL_OUTPUT_PREFIXES)
 
 
+def _session_value_refused(name: str, value: str) -> bool:
+    """Whether a value-taking flag on the session allowlist carries a value
+    the allowlist does not admit: an output format that reads a file on the
+    broker, or a `--raw` whose percent-decoded path is one of the raw-path
+    rule's exact endpoints (`/metrics`), decoded as the rule decodes it so an
+    encoded spelling is the same path here."""
+    if name == "--output":
+        return not _session_output_permitted(value)
+    if name == command_policy.KUBECTL_RAW_FLAG:
+        return command_policy.kubectl_raw_endpoint(value) is not None
+    return False
+
+
 def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
     """The first kubectl flag a session caller may not pass, or None.
 
@@ -1624,7 +1656,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
         token = tokens[index]
         index += 1
         if pending is not None:
-            if pending == "--output" and not _session_output_permitted(token):
+            if _session_value_refused(pending, token):
                 return pending
             pending = None
             continue
@@ -1636,7 +1668,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
                 continue
             if name in SESSION_KUBECTL_VALUE_FLAGS:
                 if separator:
-                    if name == "--output" and not _session_output_permitted(value):
+                    if _session_value_refused(name, value):
                         return name
                 else:
                     pending = name
@@ -1657,7 +1689,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
                 if attached.startswith("="):
                     attached = attached[1:]
                 if attached:
-                    if long_name == "--output" and not _session_output_permitted(attached):
+                    if _session_value_refused(long_name, attached):
                         return long_name
                 else:
                     pending = long_name
@@ -1699,8 +1731,8 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # rather than /v1/exec's roles. A sweep run under any other role is refused
     # here and falls back to four (broker_admission.sweep_width).
     (ADMISSION_PATH, (CALLER_ROLE_SHELL,)),
-    # The profile role reaches this route and no other: the Cloud API relay,
-    # the MCP relay, the watcher and Pub/Sub routes all stay closed to it.
+    # The profile role reaches this route and the MCP relay's profile set: the
+    # Cloud API relay, the watcher and Pub/Sub routes all stay closed to it.
     # The scope role reaches it alone too (scope_policy).
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE)),
     # The feedback form verb: the sandbox's one way to file a report about
@@ -1715,8 +1747,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # The remote MCP relay belongs to the gateway, where Hermes runs the
     # mcp-remote children; the sandbox has no MCP client. Session pods are not
     # admitted here yet: that is a new read path for them, argued in the change
-    # that wires them, not by default.
-    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),
+    # that wires them, not by default. Profile workers are, for a task in hand
+    # and only for mcp_policy.PROFILE_SERVER_TOOLS (_handle_mcp_relay, #3658).
+    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),
     # The watchers' Google calls: theirs alone. The Hermes container beside
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
@@ -1843,6 +1876,21 @@ def required_roles(path: str) -> tuple[str, ...]:
         if path.startswith(prefix):
             return roles
     return ()
+
+
+def exec_pod_serves(method: str, path: str) -> bool:
+    """Whether an exec pod serves ``method`` on ``path``.
+
+    The routes docs/designs/credential-broker-exec-tier.md §12 gives the exec
+    tier: the command route, the Cloud API relay's reads, the admission route
+    and the readiness probe. The metrics listener is a server of its own and
+    does not pass through here. Everything else is the stateful broker's.
+    A POST to the Cloud API relay passes too: the relay refuses it by policy
+    and writes the audit line, as the stateful broker does (do_POST).
+    """
+    if method == "POST":
+        return path == "/v1/exec" or path.startswith(API_RELAY_PREFIX)
+    return path in (HEALTHZ_PATH, ADMISSION_PATH) or path.startswith(API_RELAY_PREFIX)
 
 
 # How long a managed-repository allowlist read is reused.
@@ -3343,10 +3391,13 @@ class SessionSlots:
 
     Only ``role`` is counted; every other role passes through to the pool
     unchanged. A caller at the bound is refused immediately with
-    CommandSlotUnavailable, which the exec route already answers as busy, so
-    the shim prints why and the model reports it rather than retrying. The
-    profile and scope roles have instances of their own (``profile_slots``,
-    ``scope_slots``).
+    CommandSlotUnavailable, which the exec route already answers as busy with
+    this instance's ``bound`` in the reply. The shim retries a busy reply only
+    under the pool's bounds (``RETRYABLE_BUSY_BOUNDS``), never ``session`` or
+    ``scope``, so a caller at its own cap prints why and the model reports it
+    rather than retrying; ``profile`` is a share of the pool, which another
+    replica can admit, so that one is retried. The profile and scope roles
+    have instances of their own (``profile_slots``, ``scope_slots``).
     """
 
     def __init__(
@@ -4218,27 +4269,20 @@ AGENT_API_FREE_TEXT_BODY_KEYS = (
     "system_prompt",
     "system_message",
 )
-
-
-class _BridgeSessionDbs:
-    """The state.db connections one request's bridge-session checks share,
-    opened on first use and closed with the request."""
-
-    def __init__(self, workspace_root: str | Path | None = None) -> None:
-        self.workspace_root = workspace_root
-        self._stack = contextlib.ExitStack()
-        self._connections: list[sqlite3.Connection] | None = None
-
-    def connections(self) -> list[sqlite3.Connection]:
-        if self._connections is None:
-            self._connections = AgentAPIProxyHandler._open_bridge_session_dbs(self._stack, self.workspace_root)
-        return self._connections
-
-    def __enter__(self) -> "_BridgeSessionDbs":
-        return self
-
-    def __exit__(self, *exc: Any) -> None:
-        self._stack.close()
+# Request headers Hermes reads a session id or key from.
+AGENT_API_SESSION_HEADERS = ("X-Hermes-Session-Id", "X-Hermes-Session-Key")
+# Session ids the A2A bridge owns start with this (`a2a-<contextId>`). A request
+# naming one is refused on the prefix alone; a child of one is found in state.db.
+AGENT_API_BRIDGE_SESSION_PREFIX = "a2a-"
+# How long one statement against a state.db waits on a writer's lock before it
+# fails. The first such failure ends that file's visit, so a request pays this
+# at most once per locked file, not once per candidate id. Hermes holds short
+# write transactions; two seconds outlasts them without stalling a request
+# behind a stuck one.
+AGENT_API_STATE_DB_BUSY_TIMEOUT_SECONDS = 2.0
+# How many parent links the child walk follows before it stops. A chain this
+# long is a cycle the `seen` set missed or a corrupt file, not a real lineage.
+AGENT_API_SESSION_PARENT_WALK_LIMIT = 256
 
 
 class AgentAPIProxyHandler(BaseHTTPRequestHandler):
@@ -4279,19 +4323,20 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         self._proxy()
 
     def _proxy(self) -> None:
-        with _BridgeSessionDbs(self.workspace_root) as dbs:
-            self._proxy_with(dbs)
-
-    def _proxy_with(self, dbs: "_BridgeSessionDbs") -> None:
         supplied = self.headers.get("Authorization", "")
         expected = f"Bearer {self.external_key}"
         if not hmac.compare_digest(supplied, expected):
             self._drain_request_body()
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
-        if self._targets_bridge_session(
-            self.path, self.headers, workspace_root=self.workspace_root, dbs=dbs
-        ):
+        # The bridge-session refusal runs in two halves. What the request line
+        # and headers say on their own (a literal `a2a-*`) is answered before the
+        # body is read; what they, and the body, name in a state.db is looked up
+        # once, after the body, in _names_bridge_session_child. One pass per
+        # request, one file open at a time, and every handle closed before the
+        # upstream turn below, which can stream for minutes.
+        refused, candidates = self._bridge_session_candidates(self.path, self.headers)
+        if refused:
             self._drain_request_body()
             self.send_error(HTTPStatus.FORBIDDEN)
             return
@@ -4312,9 +4357,13 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             return
         body = self.rfile.read(content_length) if content_length else None
-        if body and self._targets_bridge_session(
-            self.path, self.headers, body=body, workspace_root=self.workspace_root, dbs=dbs
-        ):
+        if body:
+            refused, body_candidates = self._bridge_session_body_candidates(body)
+            if refused:
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            candidates |= body_candidates
+        if self._names_bridge_session_child(candidates, self.workspace_root):
             self.send_error(HTTPStatus.FORBIDDEN)
             return
         headers = {
@@ -4377,27 +4426,140 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         drain_request_body(self, self.max_request_bytes)
 
     @classmethod
-    def _is_bridge_session_id(
-        cls,
-        raw_session_id: Any,
-        workspace_root: str | Path | None = None,
-        connections: list[sqlite3.Connection] | None = None,
-    ) -> bool:
+    def _collect_session_id(cls, raw_session_id: Any, candidates: set[str]) -> bool:
+        """Normalise one session id the way Hermes reads it and file it for lookup.
+
+        Returns True when the id is a bridge session's on its face
+        (AGENT_API_BRIDGE_SESSION_PREFIX, after every layer of percent-encoding
+        is removed), which refuses the request with no state.db read. Any other
+        non-empty id goes into `candidates` for _names_bridge_session_child.
+        """
         val = str(raw_session_id or "").strip()
         while (unquoted := urllib.parse.unquote(val)) != val:
             val = unquoted
         sid = val.strip()
         if not sid:
             return False
-        if sid.lower().startswith("a2a-"):
+        if sid.lower().startswith(AGENT_API_BRIDGE_SESSION_PREFIX):
             return True
-        if connections is not None:
-            return any(cls._descends_from_bridge_session(conn, sid) for conn in connections)
-        with contextlib.ExitStack() as stack:
-            return any(
-                cls._descends_from_bridge_session(conn, sid)
-                for conn in cls._open_bridge_session_dbs(stack, workspace_root)
+        candidates.add(sid)
+        return False
+
+    @classmethod
+    def _bridge_session_candidates(cls, path: str, headers: Any) -> tuple[bool, set[str]]:
+        """What the request line and headers say about bridge sessions, read without a state.db.
+
+        `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
+        through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
+        headers, request-body session ids, and `state.db` child continuations
+        on the external proxy stops a holder of `API_SERVER_EXTERNAL_KEY` from
+        running a turn in a bridge-owned `a2a-<contextId>` session and
+        inheriting its `session_kv` caller identity.
+
+        Returns `(refused, candidates)`: refused when a session header or a path
+        segment names an `a2a-*` session literally; candidates are the other
+        session ids the headers and the `/api/sessions/<id>` segment carry, for
+        _names_bridge_session_child to test once the body's are known too.
+        """
+        candidates: set[str] = set()
+        for header in AGENT_API_SESSION_HEADERS:
+            raw_values = (
+                headers.get_all(header, [])
+                if hasattr(headers, "get_all")
+                else [headers.get(header, "")]
             )
+            for raw_val in raw_values:
+                if cls._collect_session_id(raw_val, candidates):
+                    return True, candidates
+        raw_path = urllib.parse.urlsplit(path).path
+        while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
+            raw_path = unquoted
+        normalized = posixpath.normpath(raw_path.replace("\\", "/"))
+        raw_segments = [seg for seg in normalized.split("/") if seg]
+        segments = [seg.lower() for seg in raw_segments]
+        for idx, seg in enumerate(segments):
+            if seg.startswith(AGENT_API_BRIDGE_SESSION_PREFIX):
+                return True, candidates
+            if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
+                if idx + 1 < len(raw_segments) and cls._collect_session_id(raw_segments[idx + 1], candidates):
+                    return True, candidates
+        return False, candidates
+
+    @classmethod
+    def _bridge_session_body_candidates(cls, body: bytes) -> tuple[bool, set[str]]:
+        """What a request body says about bridge sessions, read without a state.db.
+
+        Returns `(refused, candidates)`: refused when a body that is not JSON
+        carries `a2a-`, when a named session-id key holds a non-string, when
+        there are more short strings than the check reads, or when any checked
+        string is an `a2a-*` id literally; candidates are the rest, for
+        _names_bridge_session_child.
+        """
+        candidates: set[str] = set()
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            unquoted_body = urllib.parse.unquote_to_bytes(body).lower()
+            return AGENT_API_BRIDGE_SESSION_PREFIX.encode() in unquoted_body, candidates
+        if not isinstance(parsed, dict):
+            return False, candidates
+        named = [parsed[key] for key in AGENT_API_SESSION_BODY_KEYS if parsed.get(key) is not None]
+        if any(not isinstance(value, str) for value in named):
+            return True, candidates
+        # Any other top-level string short enough to be a session id is
+        # checked too, so a field the harness reads an id from doesn't
+        # need to be named here first.
+        checked = set(named) | {
+            value
+            for key, value in parsed.items()
+            if key not in AGENT_API_SESSION_BODY_KEYS
+            and key not in AGENT_API_FREE_TEXT_BODY_KEYS
+            and isinstance(value, str)
+            and len(value) <= AGENT_API_SESSION_ID_MAX_LEN
+        }
+        if len(checked) > AGENT_API_MAX_CHECKED_BODY_STRINGS:
+            return True, candidates
+        for value in checked:
+            if cls._collect_session_id(value, candidates):
+                return True, candidates
+        return False, candidates
+
+    @classmethod
+    def _names_bridge_session_child(
+        cls, session_ids: set[str], workspace_root: str | Path | None = None
+    ) -> bool:
+        """True when any of the ids is a state.db child of an `a2a-*` session.
+
+        The root state.db and every profile's are visited one at a time: open,
+        test every id, close. The peak is one open database per in-flight
+        request whatever the fleet size, each file is opened once per request,
+        and nothing stays open when this returns. Holding all of them for the
+        request's lifetime ran the broker out of file descriptors at a few
+        hundred profiles, because the upstream turn can stream for minutes.
+
+        A file that cannot be read (locked past the busy timeout, no sessions
+        table, not a database) is skipped on its first database error rather
+        than once per id, so a stuck writer costs a request one timeout per
+        such file. Only an `sqlite3.Error` is the file's condition: an id that
+        cannot be bound at all is that id's answer (not a child), and the
+        file's other ids are still tested, so one unbindable decoy in a body
+        cannot hide the real child beside it. Skipping is the answer an
+        unopenable file has always had here; whether it should refuse instead
+        is the door owner's call, not this function's.
+        """
+        if not session_ids:
+            return False
+        for db_path in cls._bridge_session_dbs(workspace_root):
+            conn = cls._open_bridge_session_db(db_path)
+            if conn is None:
+                continue
+            with contextlib.closing(conn):
+                try:
+                    if any(cls._descends_from_bridge_session(conn, sid) for sid in session_ids):
+                        return True
+                except sqlite3.Error as exc:
+                    LOGGER.debug("could not inspect %s for bridge sessions: %s", db_path, exc)
+        return False
 
     @classmethod
     def _bridge_session_dbs(cls, workspace_root: str | Path | None = None) -> list[Path]:
@@ -4415,113 +4577,47 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         return [db_path for db_path in db_paths if db_path.is_file()]
 
     @classmethod
-    def _open_bridge_session_dbs(
-        cls, stack: contextlib.ExitStack, workspace_root: str | Path | None = None
-    ) -> list[sqlite3.Connection]:
-        connections = []
-        for db_path in cls._bridge_session_dbs(workspace_root):
-            try:
-                connections.append(
-                    stack.enter_context(
-                        contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0))
-                    )
-                )
-            except Exception as exc:
-                LOGGER.debug("could not open %s: %s", db_path, exc)
-        return connections
+    def _open_bridge_session_db(cls, db_path: Path) -> sqlite3.Connection | None:
+        """Open one state.db read-only, or None when it cannot be opened; the caller closes it."""
+        try:
+            return sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True, timeout=AGENT_API_STATE_DB_BUSY_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            LOGGER.debug("could not open %s: %s", db_path, exc)
+            return None
 
     @staticmethod
     def _descends_from_bridge_session(conn: sqlite3.Connection, sid: str) -> bool:
+        """Walk `sid`'s parent chain in one state.db; True when it reaches an `a2a-*` session.
+
+        An `sqlite3.Error` propagates: it is the file's condition, not this
+        id's, and _names_bridge_session_child answers it once for the file.
+        Any other error binding the id is the id's own (a lone surrogate from
+        a JSON `\\udXXX` escape cannot be encoded, and no stored id equals
+        it): the answer is False for this id and nothing else, so the caller
+        goes on to the next id instead of giving up on the file.
+        """
         cur = sid
         seen = {cur}
-        try:
-            for _ in range(256):
+        for _ in range(AGENT_API_SESSION_PARENT_WALK_LIMIT):
+            try:
                 row = conn.execute(
                     "SELECT parent_session_id FROM sessions WHERE id = ?",
                     (cur,),
                 ).fetchone()
-                parent = str(row[0] or "").strip() if row else ""
-                if not parent or parent in seen:
-                    return False
-                if parent.lower().startswith("a2a-"):
-                    return True
-                seen.add(parent)
-                cur = parent
-        except Exception as exc:
-            LOGGER.debug("could not inspect a state.db for session %s: %s", sid, exc)
-        return False
-
-    @classmethod
-    def _targets_bridge_session(
-        cls,
-        path: str,
-        headers: Any,
-        body: bytes | None = None,
-        workspace_root: str | Path | None = None,
-        dbs: "_BridgeSessionDbs | None" = None,
-    ) -> bool:
-        """Return True when an external request names an `a2a-*` bridge session or child.
-
-        `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
-        through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
-        headers, request-body session ids, and `state.db`
-        child continuations on the external proxy stops a holder of
-        `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
-        `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
-        """
-        if dbs is None:
-            with _BridgeSessionDbs(workspace_root) as own:
-                return cls._targets_bridge_session(path, headers, body, workspace_root, own)
-        for header in ("X-Hermes-Session-Id", "X-Hermes-Session-Key"):
-            raw_values = (
-                headers.get_all(header, [])
-                if hasattr(headers, "get_all")
-                else [headers.get(header, "")]
-            )
-            for raw_val in raw_values:
-                if cls._is_bridge_session_id(raw_val, connections=dbs.connections()):
-                    return True
-        raw_path = urllib.parse.urlsplit(path).path
-        while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
-            raw_path = unquoted
-        normalized = posixpath.normpath(raw_path.replace("\\", "/"))
-        raw_segments = [seg for seg in normalized.split("/") if seg]
-        segments = [seg.lower() for seg in raw_segments]
-        for idx, seg in enumerate(segments):
-            if seg.startswith("a2a-"):
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                LOGGER.debug("a candidate session id could not be bound: %s", type(exc).__name__)
+                return False
+            parent = str(row[0] or "").strip() if row else ""
+            if not parent or parent in seen:
+                return False
+            if parent.lower().startswith(AGENT_API_BRIDGE_SESSION_PREFIX):
                 return True
-            if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
-                if idx + 1 < len(raw_segments) and cls._is_bridge_session_id(
-                    raw_segments[idx + 1], connections=dbs.connections()
-                ):
-                    return True
-        if body:
-            try:
-                parsed = json.loads(body)
-            except Exception:
-                unquoted_body = urllib.parse.unquote_to_bytes(body).lower()
-                if b"a2a-" in unquoted_body:
-                    return True
-            else:
-                if isinstance(parsed, dict):
-                    named = [parsed[key] for key in AGENT_API_SESSION_BODY_KEYS if parsed.get(key) is not None]
-                    if any(not isinstance(value, str) for value in named):
-                        return True
-                    # Any other top-level string short enough to be a session id is
-                    # checked too, so a field the harness reads an id from doesn't
-                    # need to be named here first.
-                    candidates = set(named) | {
-                        value
-                        for key, value in parsed.items()
-                        if key not in AGENT_API_SESSION_BODY_KEYS
-                        and key not in AGENT_API_FREE_TEXT_BODY_KEYS
-                        and isinstance(value, str)
-                        and len(value) <= AGENT_API_SESSION_ID_MAX_LEN
-                    }
-                    if len(candidates) > AGENT_API_MAX_CHECKED_BODY_STRINGS:
-                        return True
-                    if any(cls._is_bridge_session_id(value, connections=dbs.connections()) for value in candidates):
-                        return True
+            seen.add(parent)
+            cur = parent
         return False
 
     @staticmethod
@@ -5749,6 +5845,14 @@ class ExecutionResult:
     # The caller's connection closed while the command ran, and the command was
     # killed for it. There is nobody to answer; the handler logs and returns.
     abandoned: bool = False
+    # How much of stdout the caller receives, in UTF-8 bytes, and the per-stream
+    # cap it was held to. Answered with `truncated` so a caller that was cut can
+    # say how much it kept and page the rest, rather than only that it was cut.
+    stdout_bytes: int = 0
+    output_limit: int = 0
+    # Whether the cut fell on stdout. `truncated` covers either stream; the
+    # shim's non-zero exit is for a cut payload, not for cut diagnostics.
+    stdout_truncated: bool = False
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
@@ -7479,6 +7583,9 @@ class _CapturedOutput:
     truncated: bool
     timed_out: bool
     abandoned: bool
+    # Whether the cut fell on stdout: the caller's payload, as against its
+    # diagnostics. `truncated` covers either stream.
+    stdout_truncated: bool = False
     # The child's own peak resident set from the rusage its reap returned, in
     # bytes; None when the reap did not go through `_reap` (already reaped).
     peak_rss_bytes: int | None = None
@@ -7695,6 +7802,7 @@ def _capture_output(
     deadline = time.monotonic() + timeout
     outputs: dict[Any, bytearray] = {process.stdout: bytearray(), process.stderr: bytearray()}
     truncated = False
+    stdout_truncated = False
     pending = memoryview(stdin) if stdin else None
     written = 0
     stopped = False
@@ -7719,7 +7827,7 @@ def _capture_output(
 
         Returns (timed_out, abandoned).
         """
-        nonlocal truncated, written
+        nonlocal truncated, stdout_truncated, written
         if not watch_caller and caller is not None:
             with contextlib.suppress(KeyError, ValueError):
                 selector.unregister(caller)
@@ -7777,6 +7885,8 @@ def _capture_output(
                     buffer += data[:room]
                 if len(data) > room:
                     truncated = True
+                    if stream is process.stdout:
+                        stdout_truncated = True
         return False, False
 
     try:
@@ -7828,6 +7938,7 @@ def _capture_output(
         abandoned=abandoned,
         peak_rss_bytes=getattr(process, REAPED_PEAK_RSS_ATTRIBUTE, None),
         stopped=stopped,
+        stdout_truncated=stdout_truncated,
     )
 
 
@@ -10789,6 +10900,11 @@ class CommandExecutor:
             truncated=captured.truncated or stdout_cut or stderr_cut,
             timed_out=captured.timed_out,
             abandoned=captured.abandoned and not drained,
+            # Text that decoded cleanly is the captured bytes, measured once;
+            # only a cut re-decode is re-encoded to be measured.
+            stdout_bytes=len(stdout_text.encode("utf-8")) if stdout_cut else len(captured.stdout),
+            output_limit=self.max_output_bytes,
+            stdout_truncated=captured.stdout_truncated or stdout_cut,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -12018,9 +12134,40 @@ def _busy_phrase(exc: CommandSlotUnavailable) -> str:
     return "refused under resource pressure" if isinstance(exc, ResourcePressure) else "queued too long"
 
 
+def mcp_relay_decision(
+    principal: Principal | None, server_name: str, message: dict[str, Any] | None
+) -> tuple[command_policy.Decision, frozenset[str] | None]:
+    """The MCP relay's decision for one message, and the tools its caller is offered.
+
+    The second value narrows a ``tools/list`` reply: None for the table's own
+    set, or a profile worker's set (empty for a server outside it, so a later
+    change to the decision can't hand a profile worker the table's list).
+
+    A profile worker (#3658) reaches the relay only inside a task: a warm pod
+    between tasks holds no task credential, so it gets no reads. With one, it
+    is held to mcp_policy.PROFILE_SERVER_TOOLS. Everyone else gets the table.
+    """
+    if principal is None or principal.role != CALLER_ROLE_PROFILE:
+        return mcp_policy.evaluate(server_name, message), None
+    offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())
+    if principal.task is None:
+        return (
+            command_policy.Decision(
+                allowed=False,
+                rule_id=RULE_TASK_CREDENTIAL,
+                message="Profile workers reach MCP servers only with a task credential.",
+            ),
+            offered,
+        )
+    return mcp_policy.evaluate_for_profile(server_name, message), offered
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
+    # resolve_role()'s answer, set by serve(). On EXEC_ROLE the handler serves
+    # only the routes exec_pod_serves names.
+    broker_role: str = ROLE_COMBINED
     # The session role's bounded share of the command pool, installed by main
     # beside the executor; None (the route tests' stand-ins) means unbounded.
     session_slots: "SessionSlots | None" = None
@@ -12087,9 +12234,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     workspaces: object | None = None
     # Named `vcs` rather than `vcs_broker`: a class attribute of that name does
     # not shadow the module inside a method, but it reads as though it does.
-    # Unlike `workspaces` this is never None on a running broker -- version
-    # control is not behind a switch, because it is the only way the sandbox
-    # reaches a repository at all.
+    # Unlike `workspaces` it is not behind a switch, because it is the only way
+    # the sandbox reaches a repository at all. It is None on an exec pod, which
+    # answers /v1/vcs/* with 404 (exec_pod_serves), and on no other broker.
     vcs: vcs_broker.VcsBroker | None = None
     # Set by _repository_is_permitted on a refusal: the status it answered.
     repository_refusal_status: HTTPStatus | None = None
@@ -12273,12 +12420,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return False
 
     def _admission_report(self) -> dict[str, int | None]:
-        """The four numbers ADMISSION_PATH answers with, and nothing else of the
-        budget's internals."""
+        """The five numbers ADMISSION_PATH answers with, and nothing else of the
+        budget's internals. `interactive_cap` is what interactive work, the
+        shell's sweeps included, may hold at once (`class_cap`), which a sweep
+        sizes itself inside (`broker_admission.width_for`)."""
         return {
             "slot_cap": self.executor.max_concurrent_commands,
             "budget_admits": self.executor.requests_the_budget_admits(),
             "admitted": self.executor.admitted_requests(),
+            "interactive_cap": self.executor.class_cap(CLASS_INTERACTIVE),
             "session_cap": getattr(self.session_slots, "limit", DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS),
         }
 
@@ -12289,10 +12439,44 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": SHUTDOWN_ERROR, **fields})
         return True
 
+    def _exec_pod_refuses(self, method: str, principal: Principal | None) -> bool:
+        """On an exec pod, answer a request it does not serve and return True.
+
+        After authentication and the route's role check, so an exec pod answers
+        an unknown route as the stateful broker does: 401 to a caller it cannot
+        identify, 403 to a caller whose role the route does not admit, then the
+        same 404 body. The scope role's commands are refused with the role refusal's
+        shape, because the member window they read is on the stateful pod.
+        """
+        if self.broker_role != EXEC_ROLE:
+            return False
+        if not exec_pod_serves(method, self.path):
+            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            return True
+        if principal is not None and principal.role == CALLER_ROLE_SCOPE:
+            LOGGER.warning(
+                "refused a scope command on an exec pod path=%s",
+                _sanitize_for_logging(self.path),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "error": (
+                        "scope commands are not available on the exec broker; "
+                        "send them to the stateful broker"
+                    ),
+                    "code": "CALLER_ROLE_FORBIDDEN",
+                },
+            )
+            return True
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path != HEALTHZ_PATH and self._authenticated() is None:
             return
         if self._refused_while_draining("GET"):
+            return
+        if self._exec_pod_refuses("GET", None):
             return
         if self.path == ADMISSION_PATH:
             self._json(HTTPStatus.OK, self._admission_report())
@@ -12400,6 +12584,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if principal is None:
             return
         if self._refused_while_draining("POST"):
+            return
+        if self._exec_pod_refuses("POST", principal):
             return
         if self.path.startswith(API_RELAY_PREFIX):
             # Reaches the relay so that the refusal is the policy's
@@ -12600,8 +12786,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "rule": RULE_CALLER_KUBECTL_FLAG,
                     "message": (
                         f"The {principal.role} caller may pass only kubectl's inspection flags; {refused_flag} "
-                        "is not one of them (file inputs, file-backed output formats and streaming flags are "
-                        "not available to a session)."
+                        "is not one of them (file inputs, file-backed output formats, streaming flags and the "
+                        "API server's own endpoints under --raw are not available to a session)."
                     ),
                 },
             )
@@ -12882,6 +13068,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "stderr": result.stderr,
                     "durationMs": result.duration_ms,
                     "truncated": result.truncated,
+                    # Beside `truncated`: how much of stdout survived the cap,
+                    # and the cap. The shim prints both on a cut, so a caller
+                    # knows how much it holds and that the rest is to be paged.
+                    "bytesWritten": result.stdout_bytes,
+                    "limit": result.output_limit,
+                    "stdoutTruncated": result.stdout_truncated,
                     "timedOut": result.timed_out,
                 }
                 # Only `get-credentials` fills this, and only when the caller
@@ -13301,7 +13493,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         message = mcp_policy.parse(self.rfile.read(content_length))
-        decision = mcp_policy.evaluate(server_name, message)
+        decision, offered = mcp_relay_decision(principal, server_name, message)
         if not decision.allowed:
             LOGGER.warning("mcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
             reply = mcp_policy.refusal(message, decision) if entry is not None else None
@@ -13386,7 +13578,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             and decision.rule_id == mcp_policy.METHOD_TOOLS_LIST
             and upstream.status < HTTPStatus.MULTIPLE_CHOICES
         ):
-            filtered = mcp_policy.filter_tools_list(server_name, upstream.body)
+            filtered = mcp_policy.filter_tools_list(server_name, upstream.body, offered)
             if filtered is None:
                 refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
             else:
@@ -14781,13 +14973,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         either bound is the one that would take the container over its memory limit.
         `error` is the key the shim prints, so the agent reads why rather than
         a bare exit 1, and `code` lets a caller tell "busy, retry" from a
-        failure. A queue refusal is the 503 it has always been; the gate's is
-        a 429 with Retry-After in the header and the body, under its own code,
-        so a caller can back off for the interval rather than retry at once.
+        failure. A queue refusal is the 503 it has always been, and `bound`
+        names what held the request, so the shim retries a pool bound (another
+        replica, or a moment later, can admit it) and reports a caller's own
+        cap (`session`, `scope`) instead. The gate's refusal is a 429 with
+        Retry-After in the header and the body, under its own code, so a
+        caller can back off for the interval rather than retry at once.
         Counted here, once per route that answers it, under the bound the
-        exception carries.
+        exception carries; the 503 names it to the caller too, so the shim can
+        tell a bound another exec replica may not hold from one it will.
         """
         bound = getattr(exc, "bound", ADMISSION_BOUND_OTHER)
+        if bound not in ADMISSION_BOUNDS:
+            bound = ADMISSION_BOUND_OTHER
         self.metrics.record_refusal(bound, getattr(exc, "klass", CLASS_INTERACTIVE))
         if isinstance(exc, ResourcePressure):
             self._json(
@@ -14957,13 +15155,15 @@ def resolve_role() -> str:
     ``combined`` is the sidecar deployment and the default: one container is
     both the credential broker and the agent-API front door, because both ends
     are on the same loopback. Splitting the broker into its own Pod splits
-    those two roles across two containers in two Pods.
+    those two roles across two containers in two Pods. ``exec`` is the exec
+    tier's pod (docs/designs/credential-broker-exec-tier.md §12): the broker
+    with no relays, serving the exec routes only (exec_pod_serves).
     """
     role = os.getenv("CREDENTIAL_PROXY_ROLE", ROLE_COMBINED).strip().lower() or ROLE_COMBINED
-    if role not in {ROLE_COMBINED, ROLE_BROKER, ROLE_API_PROXY}:
+    if role not in {ROLE_COMBINED, ROLE_BROKER, ROLE_API_PROXY, EXEC_ROLE}:
         raise RuntimeError(
             f"unsupported CREDENTIAL_PROXY_ROLE {role!r}; "
-            "expected 'combined', 'broker' or 'api-proxy'"
+            f"expected 'combined', 'broker', 'api-proxy' or {EXEC_ROLE!r}"
         )
     return role
 
@@ -15133,6 +15333,7 @@ def serve(args: argparse.Namespace) -> None:
         start_agent_api_proxy().serve_forever()
         return
 
+    CredentialProxyHandler.broker_role = role
     # Decided before anything credentialed starts, so a misconfigured
     # deployment fails at boot rather than on the first request.
     CredentialProxyHandler.authenticator = build_authenticator()
@@ -15213,23 +15414,30 @@ def serve(args: argparse.Namespace) -> None:
     )
     for (host, path), branch in CredentialProxyHandler.pinned_bases.items():
         LOGGER.info("pinned base repository=https://%s/%s branch=%s", host, path, branch)
-    CredentialProxyHandler.workspaces = build_workspace_store(
-        executor,
-        base_branch=CredentialProxyHandler.base_branch,
-        pinned_bases=CredentialProxyHandler.pinned_bases,
-    )
-    CredentialProxyHandler.vcs = build_vcs_broker(
-        executor,
-        base_branch=CredentialProxyHandler.base_branch,
-        pinned_bases=CredentialProxyHandler.pinned_bases,
-    )
+    # An exec pod answers 404 on /v1/workspace/* and /v1/vcs/* (exec_pod_serves),
+    # so it builds neither: no workspace sweep, and no forge asked at each
+    # replica's start what a credential reaches.
+    if role != EXEC_ROLE:
+        CredentialProxyHandler.workspaces = build_workspace_store(
+            executor,
+            base_branch=CredentialProxyHandler.base_branch,
+            pinned_bases=CredentialProxyHandler.pinned_bases,
+        )
+        CredentialProxyHandler.vcs = build_vcs_broker(
+            executor,
+            base_branch=CredentialProxyHandler.base_branch,
+            pinned_bases=CredentialProxyHandler.pinned_bases,
+        )
     # What the gate's soft watermark reclaims: idle content workspaces (the
     # store's own idle rule, run now rather than on the next verb) and vcs
     # scratch no request of this process holds (the vcs broker swept a dead
-    # process's at start). The store is None with content passing off.
-    reclaimers: list[Callable[[], int]] = [CredentialProxyHandler.vcs.reclaim_orphan_scratch]
+    # process's at start). The store is None with content passing off, and an
+    # exec pod has neither.
+    reclaimers: list[Callable[[], int]] = []
     if CredentialProxyHandler.workspaces is not None:
-        reclaimers.insert(0, CredentialProxyHandler.workspaces.reclaim_idle)
+        reclaimers.append(CredentialProxyHandler.workspaces.reclaim_idle)
+    if CredentialProxyHandler.vcs is not None:
+        reclaimers.append(CredentialProxyHandler.vcs.reclaim_orphan_scratch)
     gate.set_reclaimers(reclaimers)
     if role in BROKER_ROLES:
         start_readings_sweep(executor, CredentialProxyHandler.vcs)
@@ -15238,84 +15446,89 @@ def serve(args: argparse.Namespace) -> None:
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
     CredentialProxyHandler.api_relay = GoogleApiRelay()
     LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
-    CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
-    CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
-    if CredentialProxyHandler.platform_pubsub_subscriptions:
-        LOGGER.info(
-            "platform Pub/Sub relay enabled subscriptions=%d",
-            len(CredentialProxyHandler.platform_pubsub_subscriptions),
+    # An exec pod serves commands and Cloud API reads and nothing else (§12 of
+    # credential-broker-exec-tier.md), so it starts none of the event relays:
+    # no Pub/Sub, Google Chat, Slack or Teams consumer competes with the
+    # stateful broker for their subscriptions and sockets.
+    if role != EXEC_ROLE:
+        CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
+        CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
+        if CredentialProxyHandler.platform_pubsub_subscriptions:
+            LOGGER.info(
+                "platform Pub/Sub relay enabled subscriptions=%d",
+                len(CredentialProxyHandler.platform_pubsub_subscriptions),
+            )
+        CredentialProxyHandler.slack_max_request_bytes = int(
+            os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
         )
-    CredentialProxyHandler.slack_max_request_bytes = int(
-        os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
-    )
-    chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
-    chat_subscription, a2a_subscription = chat_relay_subscriptions(chat_project)
-    if chat_project and chat_subscription:
-        CredentialProxyHandler.chat_relay = GoogleChatRelay(
-            chat_project, chat_subscription
-        )
-        LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
-    # The A2A gateway's relay instance on the same topic and credential;
-    # armed independently so an install can run either consumer alone.
-    if chat_project and a2a_subscription:
-        CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(
-            chat_project, a2a_subscription
-        )
-        LOGGER.info(
-            "A2A Google Chat relay enabled project=%s subscription=<redacted>", chat_project
-        )
-    slack_bot_tokens = os.getenv("SLACK_BOT_TOKEN", "").strip()
-    slack_app_token = os.getenv("SLACK_APP_TOKEN", "").strip()
-    if slack_bot_tokens and slack_app_token:
-        def initialize_slack_relay() -> None:
-            while (
-                CredentialProxyHandler.slack_relay is None
-                and not CredentialProxyHandler.shutting_down.is_set()
-            ):
-                try:
-                    relay = SlackRelay(
-                        slack_bot_tokens,
-                        slack_app_token,
-                        max_file_bytes=int(
-                            os.getenv(
-                                "SLACK_RELAY_MAX_FILE_BYTES", str(20 * 1024 * 1024)
-                            )
-                        ),
-                    )
-                except Exception as exc:
-                    LOGGER.error(
-                        "Slack relay initialization failed; retrying type=%s",
-                        type(exc).__name__,
-                    )
-                    time.sleep(30)
-                else:
-                    CredentialProxyHandler.slack_relay = relay
-                    # Published before the check, and the drain sets the flag
-                    # before it reads the relay, so one of the two closes a
-                    # relay that connects while the broker drains.
-                    if CredentialProxyHandler.draining.is_set():
-                        relay.stop_intake()
-                        break
-                    LOGGER.info(
-                        "Slack relay enabled workspaces=%d",
-                        len(relay.bootstrap()),
-                    )
+        chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
+        chat_subscription, a2a_subscription = chat_relay_subscriptions(chat_project)
+        if chat_project and chat_subscription:
+            CredentialProxyHandler.chat_relay = GoogleChatRelay(
+                chat_project, chat_subscription
+            )
+            LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
+        # The A2A gateway's relay instance on the same topic and credential;
+        # armed independently so an install can run either consumer alone.
+        if chat_project and a2a_subscription:
+            CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(
+                chat_project, a2a_subscription
+            )
+            LOGGER.info(
+                "A2A Google Chat relay enabled project=%s subscription=<redacted>", chat_project
+            )
+        slack_bot_tokens = os.getenv("SLACK_BOT_TOKEN", "").strip()
+        slack_app_token = os.getenv("SLACK_APP_TOKEN", "").strip()
+        if slack_bot_tokens and slack_app_token:
+            def initialize_slack_relay() -> None:
+                while (
+                    CredentialProxyHandler.slack_relay is None
+                    and not CredentialProxyHandler.shutting_down.is_set()
+                ):
+                    try:
+                        relay = SlackRelay(
+                            slack_bot_tokens,
+                            slack_app_token,
+                            max_file_bytes=int(
+                                os.getenv(
+                                    "SLACK_RELAY_MAX_FILE_BYTES", str(20 * 1024 * 1024)
+                                )
+                            ),
+                        )
+                    except Exception as exc:
+                        LOGGER.error(
+                            "Slack relay initialization failed; retrying type=%s",
+                            type(exc).__name__,
+                        )
+                        time.sleep(30)
+                    else:
+                        CredentialProxyHandler.slack_relay = relay
+                        # Published before the check, and the drain sets the flag
+                        # before it reads the relay, so one of the two closes a
+                        # relay that connects while the broker drains.
+                        if CredentialProxyHandler.draining.is_set():
+                            relay.stop_intake()
+                            break
+                        LOGGER.info(
+                            "Slack relay enabled workspaces=%d",
+                            len(relay.bootstrap()),
+                        )
 
-        threading.Thread(target=initialize_slack_relay, daemon=True).start()
-    teams_app_id = os.getenv("TEAMS_APP_ID", "").strip()
-    teams_app_password = os.getenv("TEAMS_APP_PASSWORD", "").strip()
-    teams_tenant_id = os.getenv("TEAMS_TENANT_ID", "").strip() or None
-    if teams_app_id and teams_app_password:
-        CredentialProxyHandler.teams_relay = TeamsRelay(
-            app_id=teams_app_id,
-            app_password=teams_app_password,
-            tenant_id=teams_tenant_id,
-        )
-        LOGGER.info(
-            "Teams relay enabled app_id=%s tenant=%s",
-            teams_app_id,
-            teams_tenant_id or "common",
-        )
+            threading.Thread(target=initialize_slack_relay, daemon=True).start()
+        teams_app_id = os.getenv("TEAMS_APP_ID", "").strip()
+        teams_app_password = os.getenv("TEAMS_APP_PASSWORD", "").strip()
+        teams_tenant_id = os.getenv("TEAMS_TENANT_ID", "").strip() or None
+        if teams_app_id and teams_app_password:
+            CredentialProxyHandler.teams_relay = TeamsRelay(
+                app_id=teams_app_id,
+                app_password=teams_app_password,
+                tenant_id=teams_tenant_id,
+            )
+            LOGGER.info(
+                "Teams relay enabled app_id=%s tenant=%s",
+                teams_app_id,
+                teams_tenant_id or "common",
+            )
     if role == ROLE_COMBINED:
         api_server = start_agent_api_proxy()
         threading.Thread(target=api_server.serve_forever, daemon=True).start()

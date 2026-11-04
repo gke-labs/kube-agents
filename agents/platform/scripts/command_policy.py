@@ -45,6 +45,7 @@ This is a gate on argv, not the impersonation boundary.
 from __future__ import annotations
 
 import difflib
+import re
 from dataclasses import dataclass
 
 
@@ -810,6 +811,122 @@ _GCLOUD_FOURTH_WORD_VERBS = frozenset(
 # The one rule whose refusal carries a render flag (``local_render``).
 KUBERNETES_READ_ONLY_RULE = "kubernetes.read-only"
 
+# `kubectl get --raw <path>` sends the path to the API server as it stands,
+# which is how the fleet collectors page a large kind 500 objects at a time
+# (collector_run.paged_list) instead of one `-A -o json` dump the broker's
+# output cap cuts. It is also the one read whose target the verb table above
+# cannot see: a raw path can name a subresource (`/proxy`, `/exec`, `/log`),
+# a single Secret, or an absolute URL. So the flag is held to one shape: a
+# relative collection path on an allowlisted kind, with the list verb's own
+# query keys and nothing else, on `get` alone. Checked once the verb has
+# passed the read table, so a refused raw read names this rule rather than
+# passing as a `get`, and a write carrying `--raw` is still refused as a write.
+KUBERNETES_RAW_PATH_RULE = "kubernetes.raw-path"
+KUBECTL_RAW_FLAG = "--raw"
+# The list verb's paging and selection parameters. `watch` is not here (it
+# holds a broker slot until the deadline), nor is anything a subresource takes.
+KUBECTL_RAW_QUERY_KEYS = frozenset(
+    {"limit", "continue", "labelSelector", "fieldSelector", "resourceVersion", "resourceVersionMatch"}
+)
+# The collections a raw read may page, as canonical cluster-wide paths; a
+# namespaced spelling (`/api/v1/namespaces/<ns>/pods`) is admitted when its
+# cluster-wide form is here. These are the kinds the fleet collectors and the
+# upgrade reports page through (collector_run.LIST_KINDS names each with its
+# group and version, and test_collector_run holds the two tables together).
+# `secrets` is never added: a raw read bypasses nothing else, and that is the
+# one kind whose body is a credential.
+KUBECTL_RAW_COLLECTIONS: frozenset[str] = frozenset(
+    {
+        "/api/v1/events",
+        "/api/v1/limitranges",
+        "/api/v1/namespaces",
+        "/api/v1/nodes",
+        "/api/v1/persistentvolumeclaims",
+        "/api/v1/persistentvolumes",
+        "/api/v1/pods",
+        "/api/v1/resourcequotas",
+        "/api/v1/serviceaccounts",
+        "/api/v1/services",
+        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
+        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
+        "/apis/apps/v1/daemonsets",
+        "/apis/apps/v1/deployments",
+        "/apis/apps/v1/replicasets",
+        "/apis/apps/v1/statefulsets",
+        "/apis/autoscaling/v2/horizontalpodautoscalers",
+        "/apis/batch/v1/cronjobs",
+        "/apis/batch/v1/jobs",
+        "/apis/discovery.k8s.io/v1/endpointslices",
+        # The metrics API's two collections: capacity-obtainability's SKILL.md
+        # reads node usage through `kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes`.
+        "/apis/metrics.k8s.io/v1beta1/nodes",
+        "/apis/metrics.k8s.io/v1beta1/pods",
+        "/apis/networking.k8s.io/v1/ingresses",
+        "/apis/networking.k8s.io/v1/networkpolicies",
+        "/apis/policy/v1/poddisruptionbudgets",
+        "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
+        "/apis/rbac.authorization.k8s.io/v1/clusterroles",
+        "/apis/rbac.authorization.k8s.io/v1/rolebindings",
+        "/apis/rbac.authorization.k8s.io/v1/roles",
+        "/apis/storage.k8s.io/v1/storageclasses",
+    }
+)
+# Read-only endpoints that are not collections and that shipped skills name
+# verbatim: gke-upgrades reads the API server's own metrics through
+# `kubectl get --raw /metrics`. Admitted as exact paths, with no query, so the
+# rule keeps every other non-collection path (`/proxy`, `/exec`, `/logs`,
+# `/healthz` verbosity switches) closed. They are the shell role's: this
+# rule takes no role, so the broker's session walker and the profile
+# confinement refuse a `--raw` that names one (`kubectl_raw_endpoint`) before
+# the rule reads it.
+KUBECTL_RAW_ENDPOINTS: frozenset[str] = frozenset({"/metrics"})
+# One path segment as Kubernetes names resources and namespaces: lowercase
+# DNS-label characters, so `..`, an empty segment (`//`), a backslash, a
+# percent sign left after decoding, a scheme or a host all fail to match.
+_RAW_SEGMENT = r"[a-z0-9][a-z0-9-]*"
+_RAW_GROUP = r"[a-z0-9][a-z0-9.-]*"
+_RAW_VERSION = r"v[0-9]+(?:(?:alpha|beta)[0-9]+)?"
+_RAW_PATH_RE = re.compile(
+    rf"^(?P<prefix>/api/v1|/apis/{_RAW_GROUP}/{_RAW_VERSION})"
+    rf"(?:/namespaces/{_RAW_SEGMENT})?/(?P<resource>{_RAW_SEGMENT})$"
+)
+# What a selector or a continue token is made of once percent-decoded: label
+# and field selectors (`a.b/c!=d,e in (f,g)`), a resource version, a
+# base64 token. Nothing that re-shapes a URL.
+_RAW_QUERY_VALUE_RE = re.compile(r"^[A-Za-z0-9 _.,=:!/+()*-]*$")
+# The widest decimal an int64 `limit` can be (`metav1.ListOptions.Limit`); a
+# longer value is refused before `int()` reads it, because Python 3.11 raises
+# on a string past `sys.int_info.default_max_str_digits` and this policy
+# never raises.
+_RAW_LIMIT_MAX_DIGITS = 19
+# A percent-escape in a raw path or query, decoded here rather than by
+# `urllib.parse`: the conformance suite holds this module to imports that
+# cannot reach a file or a socket (tests/conformance, C3), and `urllib` is on
+# its list. The decoder below is `unquote` for the one job it has here: bytes
+# from each `%XX`, UTF-8 with replacement for what does not decode.
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_PERCENT = "%"
+_PERCENT_ESCAPE_BASE = 16
+_PERCENT_DECODE_ENCODING = "utf-8"
+_PERCENT_DECODE_ERRORS = "replace"
+# The query string's separators, as `urllib.parse.parse_qsl` reads them: `&`
+# between pairs, `=` between a key and its value, `+` for a space.
+_QUERY_PAIR_SEPARATOR = "&"
+_QUERY_KEY_VALUE_SEPARATOR = "="
+_QUERY_PLUS = "+"
+_QUERY_SPACE = " "
+# What separates a raw value's path from its query.
+_RAW_QUERY_SEPARATOR = "?"
+_RAW_SHAPE = (
+    "kubectl get --raw reads one API collection: a relative /api/v1/<resource> or "
+    "/apis/<group>/<version>/<resource> path, optionally under /namespaces/<name>, on a "
+    "kind the fleet collectors page through, with only the list query keys "
+    + ", ".join(sorted(KUBECTL_RAW_QUERY_KEYS))
+    + "; or exactly "
+    + ", ".join(sorted(KUBECTL_RAW_ENDPOINTS))
+    + "."
+)
+
 
 def _gcloud_has_flags_file(argv: list[str]) -> str | None:
     """Return '--flags-file' if found in argv, or None otherwise.
@@ -1263,6 +1380,131 @@ def _kubectl_refuses_identity_change(argv: list[str]) -> str | None:
     return None
 
 
+def _kubectl_raw_values(argv: list[str]) -> list[str | None]:
+    """Every value given to `--raw`, in order; None for a `--raw` with none.
+
+    Every token is read, as _kubectl_refuses_identity_change reads them: a
+    `--` does not end the scan, because pflag takes the next argv element as
+    a value-taking flag's value even when it is `--`, so in
+    `kubectl get -n -- --raw /api/v1/secrets` the `--` is the namespace and
+    the `--raw` after it is parsed as the flag. A scan that stopped there
+    saw no `--raw` and the read ran unjudged. `get` gives a real `--` no
+    meaning either (a `--raw` after one is a resource name kubectl cannot
+    resolve), so reading past it refuses nothing that would have run.
+    """
+    values: list[str | None] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        name, separator, value = token.partition("=")
+        if name == KUBECTL_RAW_FLAG:
+            if separator:
+                values.append(value)
+            elif index + 1 < len(argv):
+                values.append(argv[index + 1])
+                index += 1
+            else:
+                values.append(None)
+        index += 1
+    return values
+
+
+def _percent_decode(text: str) -> str:
+    """`urllib.parse.unquote` without the import: every `%XX` becomes its byte,
+    the rest is UTF-8, and a sequence that is not valid UTF-8 decodes with
+    replacement characters, as `unquote` does."""
+    if _PERCENT not in text:
+        return text
+    raw = bytearray()
+    index = 0
+    for match in _PERCENT_ESCAPE_RE.finditer(text):
+        raw += text[index:match.start()].encode(_PERCENT_DECODE_ENCODING)
+        raw.append(int(match.group()[len(_PERCENT):], _PERCENT_ESCAPE_BASE))
+        index = match.end()
+    raw += text[index:].encode(_PERCENT_DECODE_ENCODING)
+    return raw.decode(_PERCENT_DECODE_ENCODING, _PERCENT_DECODE_ERRORS)
+
+
+def _query_pairs(query: str) -> list[tuple[str, str]]:
+    """`urllib.parse.parse_qsl(query, keep_blank_values=True)` without the
+    import: pairs split on `&`, a pair without `=` is a key with an empty
+    value, an empty pair is skipped, and `+` then `%XX` decode in both halves."""
+    pairs: list[tuple[str, str]] = []
+    for pair in query.split(_QUERY_PAIR_SEPARATOR):
+        if not pair:
+            continue
+        key, _, item = pair.partition(_QUERY_KEY_VALUE_SEPARATOR)
+        pairs.append((
+            _percent_decode(key.replace(_QUERY_PLUS, _QUERY_SPACE)),
+            _percent_decode(item.replace(_QUERY_PLUS, _QUERY_SPACE)),
+        ))
+    return pairs
+
+
+def kubectl_raw_endpoint(value: str) -> str | None:
+    """The exact endpoint in KUBECTL_RAW_ENDPOINTS a `--raw` value names once
+    its path is percent-decoded, or None when it names a collection or nothing
+    the rule knows. The query is not read: `/metrics?watch=true` names
+    `/metrics`, and the rule refuses the query on its own. The broker's
+    session walker and the profile confinement keep the endpoints to the shell
+    role through this reader, so `/%6detrics` is `/metrics` to all three."""
+    path, _, _ = value.partition(_RAW_QUERY_SEPARATOR)
+    decoded = _percent_decode(path)
+    return decoded if decoded in KUBECTL_RAW_ENDPOINTS else None
+
+
+def _kubectl_raw_path_problem(value: str | None) -> str | None:
+    """Why one `--raw` value is not a paged collection read, or None when it is."""
+    if value is None:
+        return "--raw was given no path"
+    path, _, query = value.partition(_RAW_QUERY_SEPARATOR)
+    decoded = _percent_decode(path)
+    if decoded in KUBECTL_RAW_ENDPOINTS:
+        return None if not query else f"{decoded} takes no query"
+    match = _RAW_PATH_RE.fullmatch(decoded)
+    if match is None:
+        return f"{decoded!r} is not a relative collection path"
+    collection = f"{match.group('prefix')}/{match.group('resource')}"
+    if collection not in KUBECTL_RAW_COLLECTIONS:
+        return f"{collection} is not a collection a raw read may page"
+    seen: set[str] = set()
+    for key, item in _query_pairs(query):
+        if key not in KUBECTL_RAW_QUERY_KEYS:
+            return f"query key {key!r} is not a list parameter"
+        if key in seen:
+            return f"query key {key!r} is repeated"
+        seen.add(key)
+        if not _RAW_QUERY_VALUE_RE.fullmatch(item):
+            return f"query value for {key!r} carries characters a selector or token does not"
+        if key == "limit" and not (
+            item.isdigit() and len(item) <= _RAW_LIMIT_MAX_DIGITS and int(item) > 0
+        ):
+            return f"limit is not a positive integer of at most {_RAW_LIMIT_MAX_DIGITS} digits"
+    return None
+
+
+def _kubectl_raw_refusal(argv: list[str], verb: tuple[str, ...]) -> Decision | None:
+    """The raw-path refusal for argv, or None when it carries no `--raw` or a
+    permitted one. Every occurrence is judged: kubectl resolves a repeated
+    flag last-wins, and a permitted first value must not vouch for the second."""
+    values = _kubectl_raw_values(argv)
+    if not values:
+        return None
+    if verb[:1] != ("get",):
+        problem = f"--raw is admitted on get alone, not on {' '.join(verb)}"
+    else:
+        problem = next((p for p in map(_kubectl_raw_path_problem, values) if p is not None), None)
+    if problem is None:
+        return None
+    return Decision(
+        allowed=False,
+        rule_id=KUBERNETES_RAW_PATH_RULE,
+        message=f"{_RAW_SHAPE} Refused: {problem}. {_ACTION_BOUNDARY_NOTICE}",
+        verb_tuple=verb,
+        offending_flag=KUBECTL_RAW_FLAG,
+    )
+
+
 def _kubectl_refuses_file_write(argv: list[str]) -> str | None:
     """Return the offending sidecar-filesystem-writing flag, or None."""
     for token in argv[1:]:
@@ -1581,7 +1823,10 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
                 verb_tuple=verb,
             )
         if verb in KUBECTL_READ_VERBS or verb[:1] in KUBECTL_READ_VERBS:
-            return _ALLOWED
+            # A read verb's `--raw` is the one target the verb table cannot
+            # see; a write's is refused with the write, below.
+            raw_refusal = _kubectl_raw_refusal(argv, verb)
+            return _ALLOWED if raw_refusal is None else raw_refusal
         return Decision(
             allowed=False,
             rule_id=KUBERNETES_READ_ONLY_RULE,

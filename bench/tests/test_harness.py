@@ -1894,6 +1894,10 @@ def no_cluster_exec(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return scripts
 
 
+def _is_purge(script: str) -> bool:
+    return harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script
+
+
 def test_delegated_work_is_awaited_before_the_result_is_returned(
     stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
@@ -3009,7 +3013,7 @@ def test_a_status_turn_gateway_storm_is_infrastructure_not_an_answer(
     port = stub_agent.server_address[1]
     assert recorded_pf_resets == [port] * (harness._MAX_TRANSPORT_FAILURES - 1)
     # The filed card's state is still cleared, even though nothing is graded.
-    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    purges = [s for s in no_cluster_exec if _is_purge(s)]
     assert len(purges) == 1
     assert _TASK_ID in purges[0]
 
@@ -3047,7 +3051,7 @@ def test_a_status_turn_429_storm_is_infrastructure_not_an_answer(
     assert len(stub_agent.requests) == 1 + harness._MAX_TRANSPORT_FAILURES
     port = stub_agent.server_address[1]
     assert recorded_pf_resets == [port] * (harness._MAX_TRANSPORT_FAILURES - 1)
-    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    purges = [s for s in no_cluster_exec if _is_purge(s)]
     assert len(purges) == 1
     assert _TASK_ID in purges[0]
 
@@ -3186,7 +3190,7 @@ def test_a_status_turn_502_with_rate_limit_is_infra_without_retrying(
     assert result.has_errors()
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert len(stub_agent.requests) == 2
-    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    purges = [s for s in no_cluster_exec if _is_purge(s)]
     assert len(purges) == 1
     assert _TASK_ID in purges[0]
 
@@ -3790,7 +3794,7 @@ def test_a_cards_state_is_cleared_once_its_artifacts_are_read(
 
     KubeAgentsHarness().run("Find the root cause.")
 
-    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    purges = [s for s in no_cluster_exec if _is_purge(s)]
     assert len(purges) == 1
     assert _TASK_ID in purges[0]
     assert harness._ATTACHMENTS_DIR in purges[0]
@@ -3805,7 +3809,7 @@ def test_a_cards_board_rows_are_deleted_with_its_state(
 
     KubeAgentsHarness().run("Find the root cause.")
 
-    (purge,) = [s for s in no_cluster_exec if "rm -rf" in s]
+    (purge,) = [s for s in no_cluster_exec if _is_purge(s)]
     assert harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in purge
     assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID])))
 
@@ -3867,12 +3871,20 @@ def _purge_card(
         kb.execute("INSERT INTO kanban_worker_children VALUES (?, ?, 0)", (tid, attributed_to))
 
 
-def _run_purge(root: Path, roots: list[str], fanned_out: list[str] = ()) -> list[str]:
-    """The in-pod script on the harness's own argv, pointed at a temporary tree."""
-    argv = harness._purge_argv(roots, fanned_out)
+def _run_purge(
+    root: Path, roots: list[str], fanned_out: list[str] = (), *, floor: int | None = None, busy: str = ""
+) -> list[str]:
+    """The in-pod script on the harness's own argv, pointed at a temporary tree.
+
+    ``busy`` replaces the lock wait, for a test that holds the write lock.
+    """
+    argv = harness._purge_argv(roots, fanned_out, floor)
     paths = [worker_trajectory.DATA_ROOT, harness._ATTACHMENTS_DIR, harness._LOGS_DIR]
     local = [str(root), str(root / "attachments"), str(root / "logs")]
     argv = [local[paths.index(a)] if a in paths else a for a in argv]
+    argv = [str(root / "logs") + a[len(harness._LOGS_DIR):] if a.startswith(harness._LOGS_DIR + "/") else a for a in argv]
+    if busy:
+        argv[1] = busy
     proc = subprocess.run(
         [sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, *argv], capture_output=True, text=True, check=True,
     )
@@ -3963,6 +3975,226 @@ def test_the_purge_holds_no_fan_out_for_a_card_that_cannot_run(tmp_path: Path) -
     assert not {r[0] for r in kb.execute("SELECT id FROM tasks")} & {"t_parent", "t_c1", "t_blocked", "t_follow"}
 
 
+_FLOOR = 1_700_000_000
+
+
+def _stamp(kb: sqlite3.Connection, created: dict[str, int]) -> None:
+    """Give the board hermes' ``tasks.created_at`` and stamp the given cards."""
+    kb.execute("ALTER TABLE tasks ADD COLUMN created_at INTEGER")
+    for tid, at in created.items():
+        kb.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (at, tid))
+    kb.commit()
+
+
+def _card_files(root: Path, *tids: str) -> None:
+    (root / "logs").mkdir(exist_ok=True)
+    for tid in tids:
+        (root / "attachments" / tid).mkdir(parents=True)
+        (root / "logs" / f"{tid}.log").write_text(f"{tid}'s transcript")
+
+
+def _has_files(root: Path, tid: str) -> bool:
+    return (root / "attachments" / tid).is_dir() or (root / "logs" / f"{tid}.log").exists()
+
+
+def test_the_purge_leaves_a_root_created_before_the_run_started(tmp_path: Path) -> None:
+    """A front-door ``kanban_create`` can hand back a live card by its ``idempotency_key`` (#4591).
+
+    The result looks like a create, so the card is among the run's roots; its
+    ``created_at`` before the run's start floor says it is someone else's. The
+    card it fanned out stays with it.
+    """
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_sweep", "done")
+    _purge_card(kb, "t_sweep_kid", "done", creator="t_sweep", attributed_to="t_sweep")
+    _purge_card(kb, "t_mine", "done")
+    _purge_card(kb, "t_edge", "done")
+    _stamp(kb, {"t_sweep": _FLOOR - 1, "t_sweep_kid": _FLOOR - 1, "t_mine": _FLOOR + 5, "t_edge": _FLOOR})
+    _card_files(tmp_path, "t_sweep", "t_mine", "t_edge")
+
+    out = _run_purge(tmp_path, ["t_sweep", "t_mine", "t_edge"], ["t_sweep_kid"], floor=_FLOOR)
+
+    assert out == ["foreign t_sweep", "foreign t_sweep_kid", "purged"]
+    on_board = {r[0] for r in kb.execute("SELECT id FROM tasks")}
+    assert {"t_sweep", "t_sweep_kid"} <= on_board and not {"t_mine", "t_edge"} & on_board
+    assert kb.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = 't_sweep'").fetchone() == (1,)
+    assert (tmp_path / "attachments" / "t_sweep").is_dir() and (tmp_path / "logs" / "t_sweep.log").exists()
+    # A card stamped in the floor's own second is the run's: hermes truncates both.
+    assert not _has_files(tmp_path, "t_mine") and not _has_files(tmp_path, "t_edge")
+
+
+def test_the_purge_takes_every_root_when_the_pod_clock_was_not_read(tmp_path: Path) -> None:
+    """No floor: the roots are taken as given, files included, as before #4591."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_old", "done")
+    _stamp(kb, {"t_old": _FLOOR - 1})
+    _card_files(tmp_path, "t_old")
+
+    assert _run_purge(tmp_path, ["t_old"]) == ["purged"]
+    assert kb.execute("SELECT COUNT(*) FROM tasks WHERE id = 't_old'").fetchone() == (0,)
+    assert not _has_files(tmp_path, "t_old")
+
+
+def test_a_purge_that_cannot_check_the_floor_still_clears_the_roots_files(tmp_path: Path) -> None:
+    """With a floor but no board to check it against, the run's own report must not outlive it."""
+    _card_files(tmp_path, "t_1")
+    (tmp_path / "kanban.db").write_text("not a database")
+
+    out = _run_purge(tmp_path, ["t_1"], floor=_FLOOR)
+
+    assert len(out) == 1 and out[0].startswith("rows kept: ")
+    assert not _has_files(tmp_path, "t_1")
+
+
+def test_a_floored_purge_whose_script_never_ran_clears_the_roots_files_from_the_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No python, or the exec timed out: nothing sorted the roots, so the shell clears them."""
+    scripts: list[str] = []
+    replies = iter(["", "", "purged\n"])
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or next(replies))
+
+    harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
+    assert len(scripts) == 2 and _is_purge(scripts[0])
+    marker = harness._shell_quote(harness._purge_sorted_marker(["t_1"]))
+    assert scripts[1].startswith(f"if [ -e {marker} ]") and f"rm -rf {harness._ATTACHMENTS_DIR}" in scripts[1]
+
+    # A script that ran sorted the roots itself: no second exec.
+    harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
+    assert len(scripts) == 3
+
+
+def test_a_purge_whose_board_step_fails_still_clears_the_runs_files(tmp_path: Path) -> None:
+    """The floor checked, the write lock not taken: the run's own files still go, an older root's stay."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_old", "done")
+    _purge_card(kb, "t_mine", "done")
+    _stamp(kb, {"t_old": _FLOOR - 1, "t_mine": _FLOOR})
+    _card_files(tmp_path, "t_old", "t_mine")
+    holder = sqlite3.connect(tmp_path / "kanban.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        out = _run_purge(tmp_path, ["t_old", "t_mine"], floor=_FLOOR, busy="0")
+    finally:
+        holder.execute("ROLLBACK")
+
+    assert out[0] == "foreign t_old" and out[1].startswith("rows kept: ")
+    assert _has_files(tmp_path, "t_old") and not _has_files(tmp_path, "t_mine")
+
+
+def test_the_pod_clock_read_is_the_floor_or_none(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # "²" is a digit to str.isdigit() and not to int(): it must not raise out of run().
+    replies = iter(["1700000000\n", "", "Error from server\n", "\u00b2\n"])
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: next(replies))
+    assert harness._pod_clock() == _FLOOR
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        assert harness._pod_clock() is None
+        assert harness._pod_clock() is None
+        assert harness._pod_clock() is None
+    assert caplog.text.count("could not read the agent pod's clock") == 3
+
+
+def _clocked_pod(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> tuple[list[str], list[int]]:
+    """An agent pod whose clock reads ``_FLOOR``; returns the scripts and, per clock read, the turns sent."""
+    scripts: list[str] = []
+    turns_before_clock: list[int] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        scripts.append(script)
+        if script == harness._POD_CLOCK_SCRIPT:
+            turns_before_clock.append(len(stub_agent.requests))
+            return f"{_FLOOR}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    return scripts, turns_before_clock
+
+
+def test_the_pod_clock_is_read_before_the_agent_and_floors_the_purge(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scripts, turns_before_clock = _clocked_pod(monkeypatch, stub_agent)
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    assert turns_before_clock == [0]
+    (purge,) = [s for s in scripts if _is_purge(s)]
+    floored = harness._purge_argv([_TASK_ID], floor=_FLOOR)
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in floored))
+
+
+def test_a_transport_exhausted_run_floors_its_purge_too(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The paths that purge without settling carry the floor as well."""
+    scripts, _ = _clocked_pod(monkeypatch, stub_agent)
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset(range(2, 2 + harness._MAX_TRANSPORT_FAILURES))
+    stub_agent.fail_on_status = 429
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    (purge,) = [s for s in scripts if _is_purge(s)]
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))
+
+
+def test_an_infra_status_turn_floors_its_purge_too(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    recorded_pf_resets: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A status turn the endpoint marks infrastructure purges at once, with the floor."""
+    scripts, _ = _clocked_pod(monkeypatch, stub_agent)
+    stub_agent.turns = [_create_turn(), _show_turn("done")]
+    stub_agent.fail_on = frozenset({2})
+    stub_agent.fail_on_status = 502
+    stub_agent.fail_headers = {"X-Hermes-Failure-Reason": "rate_limit"}
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert len(stub_agent.requests) == 2
+    (purge,) = [s for s in scripts if _is_purge(s)]
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))
+
+
+def test_an_unfloored_purge_clears_the_runs_files_from_the_shell_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no floor every root is the run's own, so its files go even if python never starts."""
+    scripts: list[str] = []
+    # Both scripts ran ("purged"), so the floored one needs no shell fallback.
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "purged\n")
+    harness._purge_card_state(["t_1"], 5.0)
+    harness._purge_card_state(["t_1"], 5.0, floor=1_700_000_000)
+    unfloored, floored = scripts
+    assert unfloored.index(f"rm -rf {harness._ATTACHMENTS_DIR}") < unfloored.index("-c ")
+    # With a floor a root may not be the run's, so only the script may delete its files.
+    assert "rm -rf" not in floored
+
+
+def test_a_root_older_than_the_floor_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It may be an earlier repetition's leftover, which nothing purges now."""
+    monkeypatch.setattr(
+        harness, "_agent_shell", lambda script, timeout: "foreign t_old\nforeign t_adopted\npurged\n"
+    )
+    with caplog.at_level("INFO", logger="kube_agents_bench.harness"):
+        harness._purge_card_state(["t_old", "t_new"], 5.0, ["t_adopted"], floor=1_700_000_000)
+    warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warned) == 1 and "t_old" in warned[0] and "t_adopted" not in warned[0]
+    assert any("t_adopted" in r.getMessage() for r in caplog.records if r.levelname == "INFO")
+
+
 def test_a_purge_that_cannot_reach_the_board_is_a_warning(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -3992,16 +4224,17 @@ def test_settle_purges_the_cards_the_workers_fanned_out(
         ]},
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
-    calls: list[tuple[list[str], list[str]]] = []
+    calls: list[tuple[list[str], list[str], int | None]] = []
     monkeypatch.setattr(
-        harness, "_purge_card_state", lambda ids, to, fanned_out=(): calls.append((list(ids), list(fanned_out)))
+        harness, "_purge_card_state",
+        lambda ids, to, fanned_out=(), floor=None: calls.append((list(ids), list(fanned_out), floor)),
     )
 
     res = harness.AgentResult(output="ok", trajectory=[{"name": "kanban_create"}])
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"], floor=1700000000)
 
-    # The run's own card is taken as given; the fan-out is checked against hermes' record.
-    assert calls == [(["t_1"], ["t_child", "t_grandchild"])]
+    # The run's own card is checked against the floor; the fan-out against hermes' record.
+    assert calls == [(["t_1"], ["t_child", "t_grandchild"], 1700000000)]
 
 
 def test_artifacts_are_read_before_the_card_state_is_purged(
@@ -4013,27 +4246,33 @@ def test_artifacts_are_read_before_the_card_state_is_purged(
     KubeAgentsHarness().run("Find the root cause.")
 
     kinds = [
-        "purge" if "rm -rf" in s else "board" if board.BOARD_PRESENT in s else "read"
+        "purge" if _is_purge(s) else "board" if board.BOARD_PRESENT in s else
+        "clock" if s == harness._POD_CLOCK_SCRIPT else "read"
         for s in no_cluster_exec
     ]
-    # The board read of the one poll (unanswered here, so the status turn
-    # follows), then three reads: the artifact listing, the card's worker log
-    # (for the worker_commands check), then the workers' session stores (for
-    # the worker trajectory); the purge comes after all of them.
-    assert kinds == ["board", "read", "read", "read", "purge"]
-    assert harness._LOGS_DIR in no_cluster_exec[2]
-    assert worker_trajectory.CAPTURE_PRESENT in no_cluster_exec[3]
+    # The pod clock at the run's start, the board read of the one poll
+    # (unanswered here, so the status turn follows), then three reads: the
+    # artifact listing, the card's worker log (for the worker_commands check),
+    # then the workers' session stores (for the worker trajectory); the purge
+    # comes after all of them.
+    assert kinds == ["clock", "board", "read", "read", "read", "purge"]
+    assert harness._LOGS_DIR in no_cluster_exec[3]
+    assert worker_trajectory.CAPTURE_PRESENT in no_cluster_exec[4]
 
 
-def test_a_run_that_delegates_nothing_touches_no_pod(
+def test_a_run_that_delegates_nothing_reads_nothing_and_purges_nothing(
     stub_agent: _StubAgentServer, no_cluster_exec: list[str]
 ) -> None:
-    """No card means no artifacts and nothing to clear, so no exec at all."""
+    """No card means no artifacts and nothing to clear: the only exec is the run-start clock read.
+
+    The clock is read before the agent is invoked, when nobody knows yet
+    whether it will file a card (:func:`harness._pod_clock`).
+    """
     stub_agent.turns = [_turn(_text("No delegation needed; the answer is 42."))]
 
     result = KubeAgentsHarness().run("What is six times seven?")
 
-    assert no_cluster_exec == []
+    assert no_cluster_exec == [harness._POD_CLOCK_SCRIPT]
     assert not result.has_errors()
 
 
@@ -4412,7 +4651,8 @@ def test_a_question_wake_missing_its_answer_errors_without_planting(
     result = KubeAgentsHarness().run(_REPLAY_PROMPT.replace("answer: seeded-b\n", ""))
 
     assert result.errors == [f"{card_wake.QUESTION_DIRECTIVE} prompt is missing answer"]
-    assert scripts == []
+    # Only the run-start clock read: nothing planted.
+    assert scripts == [harness._POD_CLOCK_SCRIPT]
     assert stub_agent.requests == []
 
 
@@ -4463,7 +4703,8 @@ def test_a_card_wake_refuses_an_unknown_transport(
     result = KubeAgentsHarness().run(_REPLAY_PROMPT)
 
     assert result.errors == ["AGENT_TRANSPORT must be one of ['api', 'inject'], got 'smoke-signal'"]
-    assert scripts == []
+    # Only the run-start clock read: nothing planted.
+    assert scripts == [harness._POD_CLOCK_SCRIPT]
     assert stub_agent.requests == []
 
 
@@ -5615,3 +5856,148 @@ def test_pending_first_rate_limited_triage_sorted_after_moving_cards() -> None:
     # Default without is_terminal treats triage as pending (backwards compatibility)
     ordered_default = harness._pending_first(task_ids, statuses)
     assert ordered_default == task_ids
+
+
+def test_the_stall_archive_spares_a_card_created_before_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The front door's create handed it back by its key: its worker is someone else's to stop."""
+    archived: list[str] = []
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._shell_quote(harness._CREATED_BEFORE_SCRIPT) in script:
+            return "t_old\nlisted\n"
+        if "kanban archive" in script:
+            tid = next(t for t in ("t_old", "t_new") if f"'{t}'" in script)
+            archived.append(tid)
+            return f"Archived {tid}\n"
+        return "listed\n"
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    harness._archive_stalled_cards(["t_old", "t_new"], 5.0, floor=_FLOOR)
+    assert archived == ["t_new"]
+
+
+def test_the_stall_archive_archives_everything_when_the_board_is_unread(monkeypatch: pytest.MonkeyPatch) -> None:
+    archived: list[str] = []
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._shell_quote(harness._CREATED_BEFORE_SCRIPT) in script:
+            return ""
+        if "kanban archive" in script:
+            archived.append(next(t for t in ("t_old", "t_new") if f"'{t}'" in script))
+            return "Archived\n"
+        return "listed\n"
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    harness._archive_stalled_cards(["t_old", "t_new"], 5.0, floor=_FLOOR)
+    assert archived == ["t_old", "t_new"]
+
+
+def test_the_created_before_script_reads_the_board(tmp_path: Path) -> None:
+    kb = sqlite3.connect(tmp_path / "kanban.db")
+    kb.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, created_at INTEGER)")
+    kb.executemany("INSERT INTO tasks VALUES (?, ?)", [("t_old", _FLOOR - 1), ("t_same", _FLOOR), ("t_new", _FLOOR + 5)])
+    kb.commit()
+    proc = subprocess.run(
+        [
+            sys.executable, "-c", harness._CREATED_BEFORE_SCRIPT, str(tmp_path), str(_FLOOR),
+            str(harness._PURGE_BUSY_TIMEOUT_SECONDS), harness._CREATED_BEFORE_DONE_MARKER,
+            "t_old", "t_same", "t_new", "t_gone",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    assert proc.stdout.splitlines() == ["t_old", harness._CREATED_BEFORE_DONE_MARKER]
+
+
+def test_settle_floors_its_stall_archive(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: None)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+    monkeypatch.setattr(harness, "_purge_card_state", lambda *a, **k: None)
+    seen: list[tuple[list[str], int | None]] = []
+    monkeypatch.setattr(
+        harness, "_archive_stalled_cards", lambda ids, to, floor=None: seen.append((list(ids), floor))
+    )
+    harness.KubeAgentsHarness._settle(
+        harness.AgentResult(output="ok", trajectory=[]), [], ["t_1"], stalled=["t_1"], floor=_FLOOR
+    )
+    assert seen == [(["t_1"], _FLOOR)]
+
+
+def test_a_card_already_done_on_the_first_read_floors_its_purge(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``if not outstanding`` settle: the opening turn already shows the card done."""
+    scripts, _ = _clocked_pod(monkeypatch, stub_agent)
+    done = _turn(
+        *_call("kanban_create", {"title": "t", "assignee": "cluster"}, {"ok": True, "task_id": _TASK_ID, "status": "ready"}, "c1"),
+        *_call("kanban_show", {"task_id": _TASK_ID}, {"task": {"id": _TASK_ID, "status": "done", "result": _RCA_RESULT}, "runs": []}, "c2"),
+        _text("done already"),
+    )
+    stub_agent.turns = [done]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    (purge,) = [s for s in scripts if _is_purge(s)]
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))
+
+
+def test_a_completed_purge_leaves_no_sorted_marker(tmp_path: Path) -> None:
+    kb = _purge_board(tmp_path)
+    _stamp(kb, {"t_done": _FLOOR})
+    _card_files(tmp_path, "t_done")
+    _run_purge(tmp_path, ["t_done"], floor=_FLOOR)
+    assert not list((tmp_path / "logs").glob(harness._PURGE_SORTED_PREFIX + "*"))
+
+
+def test_a_purge_cut_off_mid_board_step_leaves_the_sorted_marker(tmp_path: Path) -> None:
+    """The exec times out after the roots were sorted: the marker stops the shell fallback undoing that."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_old", "done")
+    _purge_card(kb, "t_mine", "done")
+    _stamp(kb, {"t_old": _FLOOR - 1, "t_mine": _FLOOR})
+    _card_files(tmp_path, "t_mine", "t_old")
+    argv = harness._purge_argv(["t_mine", "t_old"], floor=_FLOOR)
+    argv[0], argv[5], argv[6] = str(tmp_path), str(tmp_path / "attachments"), str(tmp_path / "logs")
+    marker = tmp_path / "logs" / Path(harness._purge_sorted_marker(["t_mine"])).name
+    argv[7] = str(marker)
+    holder = sqlite3.connect(tmp_path / "kanban.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            subprocess.run([sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, *argv], capture_output=True, timeout=3)
+    finally:
+        holder.execute("ROLLBACK")
+    assert marker.exists()
+    assert not _has_files(tmp_path, "t_mine") and _has_files(tmp_path, "t_old")
+
+
+def test_the_shell_fallback_clears_the_roots_only_without_the_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(harness, "_ATTACHMENTS_DIR", str(tmp_path / "attachments"))
+    monkeypatch.setattr(harness, "_LOGS_DIR", str(tmp_path / "logs"))
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "")
+    harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
+    fallback = scripts[1]
+    marker = Path(harness._purge_sorted_marker(["t_1"]))
+
+    _card_files(tmp_path, "t_1")
+    marker.write_text("")
+    subprocess.run(["sh", "-c", fallback], check=True)
+    assert _has_files(tmp_path, "t_1") and not marker.exists()
+
+    subprocess.run(["sh", "-c", fallback], check=True)
+    assert not _has_files(tmp_path, "t_1")
+
+
+def test_the_sorted_marker_is_this_processs_alone(tmp_path: Path) -> None:
+    """Each repetition is its own process: another's marker, live or stale, must not pass for this one's."""
+    probe = "import kube_agents_bench.harness as h; print(h._purge_sorted_marker(['t_1']))"
+    others = {
+        subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True).stdout.strip()
+        for _ in range(2)
+    }
+    mine = harness._purge_sorted_marker(["t_1"])
+    assert len(others) == 2 and mine not in others
+    assert all(m.endswith("-t_1") for m in {*others, mine})
