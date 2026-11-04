@@ -30,8 +30,9 @@ Three admission decisions, each a function the dispatcher patch
   over ``worker_rss_cap_mib`` (SIGTERM, grace, SIGKILL, then the descendants
   that outlived it) and blocks its card with kind ``capacity``.
 * :func:`refuse_overdue_ready` blocks a ready card that has waited past
-  ``queue_bound_seconds`` for a slot the tick could not give it, for memory or
-  for an exhausted slot budget, with the same kind. Never a card the tick
+  ``queue_bound_seconds`` for a slot the tick could not give it, for memory,
+  for an exhausted slot budget or for a slot held for the other class of
+  card, with the same kind. Never a card the tick
   skipped for a reason of its own: unassigned, not a profile, respawn-guarded,
   per-profile capped.
 
@@ -710,8 +711,9 @@ def refuse_overdue_ready(conn, result: Any, *, limited_by_capacity: bool,
                          now: Optional[float] = None, engine=None) -> list:
     """Block, with kind ``capacity``, the ready cards this tick left waiting past the bound.
 
-    Only when ``limited_by_capacity`` holds: the tick was memory-limited or its
-    slot budget was exhausted. A card the tick skipped for a reason of its own
+    Only when ``limited_by_capacity`` holds: the tick was memory-limited, its
+    slot budget was exhausted, or the sibling kanban_priority patch's per-class
+    reservation held a row back. A card the tick skipped for a reason of its own
     (``EXCLUDED_ID_FIELDS``, ``EXCLUDED_TUPLE_FIELDS``, or :func:`_own_reason`
     for a row the loop never reached) is never refused. The wait is measured
     from the card's last entry into the ready lane. Returns the ids blocked,
@@ -766,9 +768,10 @@ def _group_members(pid: int, *, proc_root: str) -> list:
 
     The dispatcher starts a worker as a session leader, so its group id is
     its pid, and what the worker forks without a session of its own stays in
-    the group. A terminal tool's subprocess gets a session of its own and is
-    outside this pass; the pressure guard, which reads the whole container,
-    still counts it.
+    the group: the ssh client of a terminal command among them, which the
+    terminal backend starts with a plain ``Popen``. Only a child that starts
+    a session of its own escapes this pass, and the pressure guard, which
+    reads the whole container, still counts it.
     """
     members: list = []
     try:
@@ -788,7 +791,7 @@ def _stop_worker(engine, pid: int, claim_lock: str, signal_fn, *, proc_root: str
 
     ``_terminate_reclaimed_worker`` sends SIGTERM, waits a short grace and
     sends SIGKILL if the worker stays; ``terminated`` in its result says
-    whether the worker is gone. Then two sweeps, because a worker's
+    whether the worker is gone. Then two sweeps, because a worker's tool
     subprocesses hold the memory as much as the worker does: the descendants
     snapshotted before the SIGTERM, each checked by start time so a reused pid
     is not mistaken for one, and the live members of the worker's process

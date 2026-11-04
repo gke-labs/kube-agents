@@ -870,10 +870,9 @@ class RssCapTest(unittest.TestCase):
 
     def test_the_workers_process_group_is_swept_for_a_child_forked_in_the_grace(self):
         """A child forked into the worker's group after the descendants snapshot
-        (an in-process fork; a terminal tool's subprocess gets a session of its
-        own) is reparented when the worker dies, so the parent-field walk no
-        longer finds it; its process group still names the worker, and that
-        pass kills it."""
+        (the ssh client of a terminal command, say) is reparented when the
+        worker dies, so the parent-field walk no longer finds it; its process
+        group still names the worker, and that pass kills it."""
         tree = FakeTree()
         self.addCleanup(tree.close)
         tree.process(1, ppid=0, rss_kib=1)

@@ -254,9 +254,10 @@ SIGKILL if it stays, and a result that says whether the worker is gone. Then two
 worker's tool subprocesses hold the memory as much as the worker does: the descendants snapshotted
 before the SIGTERM, each checked by start time so a reused pid is not mistaken for one, and the live
 members of the worker's process group, which is how a child forked into the group during the grace
-is caught (the dispatcher starts a worker as a session leader, so the group is its pid; a terminal
-tool's subprocess gets a session of its own and is outside both sweeps, where the pressure guard
-still counts it). A worker the ladder could not signal keeps its card and is measured again next
+is caught (the dispatcher starts a worker as a session leader, so the group is its pid, and the ssh
+client of a terminal command, started with a plain `Popen`, stays in it; only a child that starts a
+session of its own after the snapshot escapes both sweeps, and the pressure guard still counts it).
+A worker the ladder could not signal keeps its card and is measured again next
 tick, so a card is never blocked under a live worker the dispatcher cannot stop; a worker with a
 SIGKILL delivered is treated as gone, whatever the first probe said, so the block is never lost to a
 later tick that finds the pid gone. Then, in one write transaction, its card is blocked with `block_task(..., kind="capacity")`
@@ -444,7 +445,8 @@ on every pull request.
   `/proc` sum, in that order of preference, with and without a `memory.stat` to subtract; the
   classification arithmetic at 2,048 and 4,096 MiB; the headroom cap; the RSS walk over a fixture
   `/proc` tree with a reparented child, a reused pid and a child left in the process group; a
-  worker that survives the ladder; the exclusions of the pass by queue age and its clock over every
+  worker the ladder cannot signal, one still seen by the probe after a delivered SIGKILL, and one
+  that dies between the poll and the SIGKILL; the exclusions of the pass by queue age and its clock over every
   lane-entry event; `fail_closed` on and off; the reason text's shape; the `capacity` kind through
   `block_task` and `_route_block`; and the verifier's drive of the patched dispatcher over a fixture
   tree, run again against the image's tree in the build.

@@ -1254,6 +1254,13 @@ def real_half() -> None:
     dispatch = (HERMES / applier.DISPATCH_RELATIVE).read_text()
     for marker in applier.DISPATCH_MARKERS:
         check(f"the installed dispatcher carries {marker!r}", marker in dispatch)
+    # The queue clock's event kinds are a copy of what the pinned release
+    # writes when a card returns to ready; a release that renames one would
+    # otherwise measure that lane re-entry from the card's creation.
+    db_text = (HERMES / applier.DB_RELATIVE).read_text()
+    for kind in KA.READY_ENTRY_EVENT_KINDS:
+        check(f"the installed release writes the {kind!r} event the queue clock reads",
+              f'"{kind}"' in db_text or f'"{kind}"' in dispatch)
 
     def configure(config: dict) -> None:
         KA._ENGINE.config = lambda: config
