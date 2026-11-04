@@ -61,9 +61,15 @@ cannot redact becomes a 502, or on a watch ends the stream with an `ERROR` event
 `pkg/k8sapiproxy/cache.go` provides an optional HTTP response cache (`CacheConfig`, `CacheStore`,
 `CacheStatsProvider`, and the default `MemoryCacheStore`). By default, `cmd/k8s-api-proxy` enables a
 64 MiB in-memory cache (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTES`; `0` disables the cache)
-with a 2 MiB per-entry limit (`--cache-max-entry-bytes` / `KUBE_PROXY_CACHE_MAX_ENTRY_BYTES`), a 10s
-TTL for resource `get` and `list` responses (`--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL`),
-and a 15m TTL for discovery responses (`--cache-discovery-ttl` / `KUBE_PROXY_CACHE_DISCOVERY_TTL`).
+with a 2 MiB per-entry limit (`--cache-max-entry-bytes` / `KUBE_PROXY_CACHE_MAX_ENTRY_BYTES`), a `0s`
+default TTL for resource `get` and `list` responses (`DefaultResourceCacheTTL`, configured via
+`--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL`), and a `15m` default TTL for discovery
+responses (`DefaultDiscoveryCacheTTL`, configured via `--cache-discovery-ttl` /
+`KUBE_PROXY_CACHE_DISCOVERY_TTL`). With the `0s` default resource TTL, the proxy coalesces concurrent
+in-flight resource `GET` and `LIST` requests without post-flight storage across per-pod
+`MemoryCacheStore` replicas. Operators and embedders can set `--cache-resource-ttl` /
+`KUBE_PROXY_CACHE_RESOURCE_TTL` or `CacheConfig.DefaultResourceTTL` when they use a shared
+`CacheStore` or `sessionAffinity`.
 Health and metrics discovery paths (`/healthz`, `/livez`, `/readyz`, `/metrics`), watches,
 subresources, and dry-run writes are never cached. Concurrent cache misses coalesce into one
 upstream request, `Secret` payloads are redacted before cache storage, non-dry-run mutations and

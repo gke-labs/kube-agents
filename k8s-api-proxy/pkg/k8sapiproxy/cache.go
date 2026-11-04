@@ -28,7 +28,10 @@ const (
 	// DefaultCacheMaxEntryBytes is the default maximum size of a single cached response body (2 MiB).
 	DefaultCacheMaxEntryBytes int64 = 2 << 20
 	// DefaultResourceCacheTTL is the default TTL for cached resource get and list responses.
-	DefaultResourceCacheTTL = 10 * time.Second
+	// It defaults to 0 so per-pod MemoryCacheStore replicas never return non-monotonic state across consecutive kubectl get calls.
+	// The proxy still coalesces concurrent in-flight GET and LIST requests when the TTL is 0.
+	// Set --cache-resource-ttl (KUBE_PROXY_CACHE_RESOURCE_TTL) or CacheConfig.DefaultResourceTTL with a shared CacheStore or sessionAffinity to cache resource responses after a flight.
+	DefaultResourceCacheTTL time.Duration = 0
 	// DefaultDiscoveryCacheTTL is the default TTL for cached discovery responses.
 	DefaultDiscoveryCacheTTL = 15 * time.Minute
 
@@ -112,7 +115,7 @@ type CacheConfig struct {
 	// directly to the caller without full buffering.
 	MaxEntryBytes int64
 	// DefaultResourceTTL is the default TTL for resource get and list responses;
-	// DefaultResourceCacheTTL when <= 0.
+	// DefaultResourceCacheTTL (0s, which coalesces in-flight requests without post-flight storage) when <= 0.
 	DefaultResourceTTL time.Duration
 	// DefaultDiscoveryTTL is the default TTL for discovery responses;
 	// DefaultDiscoveryCacheTTL when <= 0.
@@ -731,21 +734,23 @@ func (c *responseCache) fetchAndPopulate(
 	}
 
 	cleanHeaders := sanitizeCachedHeaders(resp.Header)
-	now := c.now()
-	encoded, err := encodeCachedResponse(cachedResponseMeta{
-		StatusCode: resp.StatusCode,
-		Header:     cleanHeaders,
-		StoredAt:   now.UnixNano(),
-		FreshTTL:   int64(freshTTL),
-	}, rawBody)
-	if err == nil {
-		if setErr := c.store.Set(req.Context(), key, encoded, storeTTL); setErr == nil {
-			if sp, ok := c.store.(CacheStatsProvider); ok {
-				st := sp.Stats()
-				c.metrics.setCacheOccupancy(st.Bytes, st.Entries)
-			}
-			if info != nil && info.IsResourceRequest {
-				c.recordScopeKey(clusterID, info, key, now, storeTTL)
+	if storeTTL > 0 && freshTTL > 0 {
+		now := c.now()
+		encoded, err := encodeCachedResponse(cachedResponseMeta{
+			StatusCode: resp.StatusCode,
+			Header:     cleanHeaders,
+			StoredAt:   now.UnixNano(),
+			FreshTTL:   int64(freshTTL),
+		}, rawBody)
+		if err == nil {
+			if setErr := c.store.Set(req.Context(), key, encoded, storeTTL); setErr == nil {
+				if sp, ok := c.store.(CacheStatsProvider); ok {
+					st := sp.Stats()
+					c.metrics.setCacheOccupancy(st.Bytes, st.Entries)
+				}
+				if info != nil && info.IsResourceRequest {
+					c.recordScopeKey(clusterID, info, key, now, storeTTL)
+				}
 			}
 		}
 	}

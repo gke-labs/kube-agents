@@ -169,7 +169,7 @@ func TestHandlerCustomCacheStoreAndFailOpen(t *testing.T) {
 	custom := &faultyCacheStore{inner: NewMemoryCacheStore(DefaultCacheMaxBytes)}
 	h, upstream := newTestHandler(t, Config{
 		Policy: Policy{Mode: ModeReadWrite, RedactSecrets: true},
-		Cache:  &CacheConfig{Store: custom},
+		Cache:  &CacheConfig{Store: custom, DefaultResourceTTL: 10 * time.Second},
 	})
 
 	// Healthy custom store caches on miss and serves from cache on hit.
@@ -255,8 +255,9 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 		Logger:        slog.New(slog.DiscardHandler),
 		Metrics:       metrics,
 		Cache: &CacheConfig{
-			Store: store,
-			Now:   clock,
+			Store:              store,
+			DefaultResourceTTL: 10 * time.Second,
+			Now:                clock,
 		},
 	})
 	if err != nil {
@@ -567,7 +568,7 @@ func TestHandlerCacheAcceptAndClusterIsolation(t *testing.T) {
 
 	h, _ := newTestHandler(t, Config{
 		Upstream: upstream,
-		Cache:    &CacheConfig{},
+		Cache:    &CacheConfig{DefaultResourceTTL: 10 * time.Second},
 	})
 
 	// 1. Accept: Table vs Accept: application/json do not collide.
@@ -818,7 +819,7 @@ func TestHandlerCacheSecretRedactionAndMutationInvalidation(t *testing.T) {
 		Upstream: upstream,
 		Policy:   Policy{Mode: ModeReadWrite, RedactSecrets: true},
 		Metrics:  metrics,
-		Cache:    &CacheConfig{Store: store},
+		Cache:    &CacheConfig{Store: store, DefaultResourceTTL: 10 * time.Second},
 	})
 
 	// 1. Secret redaction before cache storage and isolation across Secret, PartialObjectMetadata, and Table views.
@@ -1499,8 +1500,9 @@ func TestHandlerCacheForcedRefreshTooLargeEvictsStaleEntry(t *testing.T) {
 		h, _ := newTestHandler(t, Config{
 			Upstream: upstream,
 			Cache: &CacheConfig{
-				Store:         store,
-				MaxEntryBytes: maxEntry,
+				Store:              store,
+				MaxEntryBytes:      maxEntry,
+				DefaultResourceTTL: 10 * time.Second,
 			},
 		})
 
@@ -1623,5 +1625,122 @@ func TestNormalizeAcceptEncodingQualityAndOutboundHeader(t *testing.T) {
 	rec2 := serve(h, reqRejectGzip)
 	if rec2.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec2.Body.String(), `"enc":""`) {
 		t.Fatalf("gzip;q=0 got status=%q body=%s, want miss with empty outbound Accept-Encoding", rec2.Header().Get(headerCacheStatus), rec2.Body.String())
+	}
+}
+
+func TestHandlerDefaultConfigZeroResourceTTLCoalescesAndCachesDiscovery(t *testing.T) {
+	if DefaultResourceCacheTTL != 0 {
+		t.Fatalf("DefaultResourceCacheTTL = %v, want 0", DefaultResourceCacheTTL)
+	}
+	if DefaultDiscoveryCacheTTL != 15*time.Minute {
+		t.Fatalf("DefaultDiscoveryCacheTTL = %v, want 15m", DefaultDiscoveryCacheTTL)
+	}
+
+	store := &countingGetStore{
+		MemoryCacheStore: NewMemoryCacheStore(DefaultCacheMaxBytes),
+		allSeen:          make(chan struct{}),
+		target:           4,
+	}
+	releasePods := make(chan struct{})
+	var discoveryCalls atomic.Int32
+	var podCalls atomic.Int32
+
+	upstream := &fakeUpstream{
+		handler: func(_ string, req *http.Request) (*http.Response, error) {
+			if req.URL.Path == "/api" {
+				n := discoveryCalls.Add(1)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{headerContentType: []string{contentTypeJSON}},
+					Body:       io.NopCloser(strings.NewReader(`{"kind":"APIVersions","versions":["v1"],"call":` + strconv.Itoa(int(n)) + `}`)),
+					Request:    req,
+				}, nil
+			}
+			n := podCalls.Add(1)
+			if n == 1 {
+				<-releasePods
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{headerContentType: []string{contentTypeJSON}},
+				Body:       io.NopCloser(strings.NewReader(`{"kind":"PodList","apiVersion":"v1","call":` + strconv.Itoa(int(n)) + `}`)),
+				Request:    req,
+			}, nil
+		},
+	}
+
+	h, _ := newTestHandler(t, Config{
+		Upstream: upstream,
+		Cache:    &CacheConfig{Store: store},
+	})
+
+	// 1. Discovery GET /api caches in MemoryCacheStore for 15m (1st call miss, 2nd call hit).
+	recDisc1 := serve(h, httptest.NewRequest(http.MethodGet, "/api", nil))
+	if recDisc1.Code != http.StatusOK || recDisc1.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		t.Fatalf("first GET /api code=%d status=%q, want 200 and miss", recDisc1.Code, recDisc1.Header().Get(headerCacheStatus))
+	}
+	recDisc2 := serve(h, httptest.NewRequest(http.MethodGet, "/api", nil))
+	if recDisc2.Code != http.StatusOK || recDisc2.Header().Get(headerCacheStatus) != cacheStatusHit {
+		t.Fatalf("second GET /api code=%d status=%q, want 200 and hit", recDisc2.Code, recDisc2.Header().Get(headerCacheStatus))
+	}
+	if got := discoveryCalls.Load(); got != 1 {
+		t.Fatalf("discoveryCalls = %d, want 1", got)
+	}
+	if st := store.Stats(); st.Entries != 1 {
+		t.Fatalf("after discovery caching Stats().Entries = %d, want 1", st.Entries)
+	}
+
+	// 2. Two concurrent GET /api/v1/namespaces/default/pods calls coalesce in flight.
+	var recPod1, recPod2 *httptest.ResponseRecorder
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		recPod1 = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	}()
+	go func() {
+		defer wg.Done()
+		recPod2 = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	}()
+
+	<-store.allSeen
+	time.Sleep(15 * time.Millisecond)
+	close(releasePods)
+	wg.Wait()
+
+	if got := podCalls.Load(); got != 1 {
+		t.Fatalf("concurrent podCalls = %d, want 1", got)
+	}
+	var misses, coalesced int
+	for _, rec := range []*httptest.ResponseRecorder{recPod1, recPod2} {
+		if rec.Code != http.StatusOK {
+			t.Fatalf("concurrent pod GET code = %d, want 200", rec.Code)
+		}
+		switch rec.Header().Get(headerCacheStatus) {
+		case cacheStatusMiss:
+			misses++
+		case cacheStatusCoalesced:
+			coalesced++
+			if age := rec.Header().Get(headerAge); age != "0" {
+				t.Errorf("coalesced Age = %q, want 0", age)
+			}
+		default:
+			t.Errorf("unexpected Cache-Status = %q", rec.Header().Get(headerCacheStatus))
+		}
+	}
+	if misses != 1 || coalesced != 1 {
+		t.Fatalf("misses=%d coalesced=%d, want 1 and 1", misses, coalesced)
+	}
+
+	// 3. Subsequent sequential GET /api/v1/namespaces/default/pods goes upstream and is not stored.
+	recPod3 := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	if recPod3.Code != http.StatusOK || recPod3.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		t.Fatalf("sequential pod GET code=%d status=%q, want 200 and miss", recPod3.Code, recPod3.Header().Get(headerCacheStatus))
+	}
+	if got := podCalls.Load(); got != 2 {
+		t.Fatalf("total podCalls = %d, want 2", got)
+	}
+	if st := store.Stats(); st.Entries != 1 {
+		t.Fatalf("store.Stats().Entries = %d, want 1 (only discovery entry stored)", st.Entries)
 	}
 }
