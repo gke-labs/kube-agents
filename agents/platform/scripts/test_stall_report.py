@@ -689,9 +689,30 @@ class Main(unittest.TestCase):
         self.assertEqual([o["kind"] for o in objects], ["deployments", "gateways"])
         self.assertEqual(events, [{"kind": "events"}])
 
+    def test_a_listing_the_shim_cut_with_exit_74_is_a_warning_the_same_way(self):
+        """The credential-proxy shim exits 74 on a cut reply (the counts after
+        its marker); the cut kind is still skipped with a warning and the
+        other kinds still count."""
+        cut = '{"apiVersion":"v1","kind":"List","items":[{"kind":"Pod","metadata":{"name":"a'
+
+        def fake_kubectl(args):
+            if args[1] == "pods":
+                return 74, cut, "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n"
+            if args[1] == "events":
+                return 0, '{"items":[]}', ""
+            return 0, '{"items":[{"kind":"Deployment","metadata":{"name":"web"}}]}', ""
+
+        with patch.object(stall_report, "run_kubectl", side_effect=fake_kubectl):
+            with redirect_stderr(io.StringIO()) as err:
+                objects, events = stall_report.collect(NAMESPACE, "deployments,pods,replicasets")
+        self.assertEqual([o["metadata"]["name"] for o in objects], ["web", "web"])
+        self.assertIn("warning: credential proxy output truncated at 8388608 bytes", err.getvalue())
+        self.assertIn(f"warning: pods in {NAMESPACE} not scanned; its objects are missing from the count", err.getvalue())
+
     def test_collect_keeps_the_other_kinds_when_one_listing_is_cut(self):
-        """The sandbox's kubectl is the credential-proxy shim, which returns the
-        prefix of an over-cap reply with exit 0 and a stderr note."""
+        """The sandbox's kubectl is the credential-proxy shim, which returned
+        the prefix of an over-cap reply with exit 0 and a stderr note; it now
+        exits 74, and this is the older shim's shape."""
         cut = '{"apiVersion":"v1","kind":"List","items":[{"kind":"Pod","metadata":{"name":"a'
 
         def fake_kubectl(args):

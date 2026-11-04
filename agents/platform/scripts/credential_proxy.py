@@ -1582,6 +1582,15 @@ SESSION_KUBECTL_VALUE_FLAGS: frozenset[str] = frozenset({
     "--output", "--sort-by", "--container", "--tail", "--since", "--since-time",
     "--limit-bytes", "--chunk-size", "--limit", "--for", "--types", "--verbs",
     "--api-group", "--template",
+    # A paged collection read. Its value is judged by command_policy's
+    # `kubernetes.raw-path` rule downstream, the same gate the shell's raw
+    # reads pass: a relative collection path on an allowlisted kind, on `get`.
+    # The rule's exact endpoints (`/metrics`, `KUBECTL_RAW_ENDPOINTS`) are
+    # not a session's: the rule takes no role, so `_session_value_refused`
+    # refuses a `--raw` whose decoded path names one, and the API server's
+    # own metrics stay the shell role's, as they were when `--raw` was
+    # refused here by name.
+    command_policy.KUBECTL_RAW_FLAG,
 })
 # Verbs a session may not run even though they are reads: both wait by
 # default (`rollout status` watches until the rollout completes, `wait` until
@@ -1616,6 +1625,19 @@ def _session_output_permitted(value: str) -> bool:
     return value in SESSION_KUBECTL_OUTPUT_FORMATS or value.startswith(SESSION_KUBECTL_OUTPUT_PREFIXES)
 
 
+def _session_value_refused(name: str, value: str) -> bool:
+    """Whether a value-taking flag on the session allowlist carries a value
+    the allowlist does not admit: an output format that reads a file on the
+    broker, or a `--raw` whose percent-decoded path is one of the raw-path
+    rule's exact endpoints (`/metrics`), decoded as the rule decodes it so an
+    encoded spelling is the same path here."""
+    if name == "--output":
+        return not _session_output_permitted(value)
+    if name == command_policy.KUBECTL_RAW_FLAG:
+        return command_policy.kubectl_raw_endpoint(value) is not None
+    return False
+
+
 def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
     """The first kubectl flag a session caller may not pass, or None.
 
@@ -1634,7 +1656,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
         token = tokens[index]
         index += 1
         if pending is not None:
-            if pending == "--output" and not _session_output_permitted(token):
+            if _session_value_refused(pending, token):
                 return pending
             pending = None
             continue
@@ -1646,7 +1668,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
                 continue
             if name in SESSION_KUBECTL_VALUE_FLAGS:
                 if separator:
-                    if name == "--output" and not _session_output_permitted(value):
+                    if _session_value_refused(name, value):
                         return name
                 else:
                     pending = name
@@ -1667,7 +1689,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
                 if attached.startswith("="):
                     attached = attached[1:]
                 if attached:
-                    if long_name == "--output" and not _session_output_permitted(attached):
+                    if _session_value_refused(long_name, attached):
                         return long_name
                 else:
                     pending = long_name
@@ -5822,6 +5844,14 @@ class ExecutionResult:
     # The caller's connection closed while the command ran, and the command was
     # killed for it. There is nobody to answer; the handler logs and returns.
     abandoned: bool = False
+    # How much of stdout the caller receives, in UTF-8 bytes, and the per-stream
+    # cap it was held to. Answered with `truncated` so a caller that was cut can
+    # say how much it kept and page the rest, rather than only that it was cut.
+    stdout_bytes: int = 0
+    output_limit: int = 0
+    # Whether the cut fell on stdout. `truncated` covers either stream; the
+    # shim's non-zero exit is for a cut payload, not for cut diagnostics.
+    stdout_truncated: bool = False
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
@@ -7552,6 +7582,9 @@ class _CapturedOutput:
     truncated: bool
     timed_out: bool
     abandoned: bool
+    # Whether the cut fell on stdout: the caller's payload, as against its
+    # diagnostics. `truncated` covers either stream.
+    stdout_truncated: bool = False
     # The child's own peak resident set from the rusage its reap returned, in
     # bytes; None when the reap did not go through `_reap` (already reaped).
     peak_rss_bytes: int | None = None
@@ -7768,6 +7801,7 @@ def _capture_output(
     deadline = time.monotonic() + timeout
     outputs: dict[Any, bytearray] = {process.stdout: bytearray(), process.stderr: bytearray()}
     truncated = False
+    stdout_truncated = False
     pending = memoryview(stdin) if stdin else None
     written = 0
     stopped = False
@@ -7792,7 +7826,7 @@ def _capture_output(
 
         Returns (timed_out, abandoned).
         """
-        nonlocal truncated, written
+        nonlocal truncated, stdout_truncated, written
         if not watch_caller and caller is not None:
             with contextlib.suppress(KeyError, ValueError):
                 selector.unregister(caller)
@@ -7850,6 +7884,8 @@ def _capture_output(
                     buffer += data[:room]
                 if len(data) > room:
                     truncated = True
+                    if stream is process.stdout:
+                        stdout_truncated = True
         return False, False
 
     try:
@@ -7901,6 +7937,7 @@ def _capture_output(
         abandoned=abandoned,
         peak_rss_bytes=getattr(process, REAPED_PEAK_RSS_ATTRIBUTE, None),
         stopped=stopped,
+        stdout_truncated=stdout_truncated,
     )
 
 
@@ -10862,6 +10899,11 @@ class CommandExecutor:
             truncated=captured.truncated or stdout_cut or stderr_cut,
             timed_out=captured.timed_out,
             abandoned=captured.abandoned and not drained,
+            # Text that decoded cleanly is the captured bytes, measured once;
+            # only a cut re-decode is re-encoded to be measured.
+            stdout_bytes=len(stdout_text.encode("utf-8")) if stdout_cut else len(captured.stdout),
+            output_limit=self.max_output_bytes,
+            stdout_truncated=captured.stdout_truncated or stdout_cut,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -12715,8 +12757,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "rule": RULE_CALLER_KUBECTL_FLAG,
                     "message": (
                         f"The {principal.role} caller may pass only kubectl's inspection flags; {refused_flag} "
-                        "is not one of them (file inputs, file-backed output formats and streaming flags are "
-                        "not available to a session)."
+                        "is not one of them (file inputs, file-backed output formats, streaming flags and the "
+                        "API server's own endpoints under --raw are not available to a session)."
                     ),
                 },
             )
@@ -12997,6 +13039,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "stderr": result.stderr,
                     "durationMs": result.duration_ms,
                     "truncated": result.truncated,
+                    # Beside `truncated`: how much of stdout survived the cap,
+                    # and the cap. The shim prints both on a cut, so a caller
+                    # knows how much it holds and that the rest is to be paged.
+                    "bytesWritten": result.stdout_bytes,
+                    "limit": result.output_limit,
+                    "stdoutTruncated": result.stdout_truncated,
                     "timedOut": result.timed_out,
                 }
                 # Only `get-credentials` fills this, and only when the caller

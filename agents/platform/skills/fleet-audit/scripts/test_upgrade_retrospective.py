@@ -40,6 +40,32 @@ os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 # no test here reaches the network or depends on the host's broker.
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
 import upgrade_retrospective as ur  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
+
+# The collector pages its kinds through `kubectl get --raw`; FakeFleet below
+# still answers the one-shot dump by kind, and the adapter feeds the real
+# paging from it (test_collector_run.paged_dump_over). The test that asserts
+# the paged argv itself patches the real `paged_dump` back in.
+_PAGED_DUMP = mock.patch.object(ur, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 ur.fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
@@ -383,6 +409,43 @@ class OperationsTest(unittest.TestCase):
         ops, error = ur.list_operations(PROJECT, SINCE, run=lambda argv, **kw: run_of(1, "", "denied"))
         self.assertEqual(ops, [])
         self.assertIn("rc=1", error)
+
+    def test_paged_json_words_a_failed_page_with_its_rc_or_the_readers_reason(self):
+        """A page that exited non-zero is worded as `run_json` words it, the command being
+        the page that failed rather than the read's kind list; one that exited 0 and
+        still failed quotes the paged reader's own text for what was wrong with it."""
+        cr = ur.collector_run
+        events_page = "kubectl get --raw '/api/v1/events?limit=500&fieldSelector=type%3DWarning'"
+        items, error = ur.paged_json("events", {"fieldSelector": "type=Warning"}, run=lambda argv, **kw: run_of(1, "", "denied"), timeout=5, env=None)
+        self.assertEqual((items, error), (None, f"{events_page} rc=1: denied"))
+        for stdout, reason in (("{not json", cr.PAGE_NOT_JSON_TEXT), ("", cr.PAGE_EMPTY_TEXT), ('{"kind": "Status"}', cr.PAGE_NOT_A_LIST_TEXT)):
+            with self.subTest(stdout=stdout):
+                items, error = ur.paged_json("events", {"fieldSelector": "type=Warning"}, run=lambda argv, **kw: run_of(0, stdout, ""), timeout=5, env=None)
+                self.assertEqual((items, error), (None, f"{events_page} failed: {reason}"))
+
+    def test_paged_json_names_the_page_that_failed_not_the_kind_list(self):
+        """The real paging: when the jobs page of the two-kind `owners` read fails, the
+        error names that page (`replicasets,jobs` says nothing about which kind failed,
+        and a failed read's command is recorded nowhere else); when a pods continue
+        page fails, the error names that page with its token elided."""
+
+        def jobs_denied(argv, **kw):
+            if argv[3].startswith("/apis/batch/v1/jobs?"):
+                return ur.Run(argv, 1, "", "denied", 0.01)
+            return ur.Run(argv, 0, json.dumps({"metadata": {}, "items": []}), "", 0.01)
+
+        def second_pods_page_cut(argv, **kw):
+            if "continue=" in argv[3]:
+                return ur.Run(argv, 74, '{"items": [{"metadata": {"na', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)", 0.01)
+            return ur.Run(argv, 0, json.dumps({"metadata": {"continue": "eyJ2IjoibWV0YS5rOHMuaW8vdjEiLCJydiI6MTIzNDU2Nzg5LCJzdGFydCI6ImRlZmF1bHQvd2ViLTdkOWY4YjZjNWQtcTJ4N3pcdTAwMDAifQ"}, "items": [{"metadata": {"name": "a"}}]}), "", 0.01)
+
+        with mock.patch.object(ur, "paged_dump", _shared_run_tests.cr.paged_dump):
+            items, error = ur.paged_json("replicasets,jobs", None, run=jobs_denied, timeout=5, env=None)
+            self.assertEqual((items, error), (None, "kubectl get --raw '/apis/batch/v1/jobs?limit=500' rc=1: denied"))
+            items, error = ur.paged_json("pods", None, run=second_pods_page_cut, timeout=5, env=None)
+        self.assertIsNone(items)
+        self.assertTrue(error.startswith("kubectl get --raw '/api/v1/pods?limit=500&continue=…' rc=74: credential proxy output truncated"), error)
+        self.assertNotIn("eyJ2", error)
 
 
 def symptoms_of(name, reads=None, ops=None, window=SINCE):
@@ -4612,7 +4675,7 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertTrue(seeded["what_failed"])
         self.assertEqual([e.split(":")[0] for e in seeded["read_errors"]], ["events"])
         self.assertEqual([s for s in seeded["what_failed"] if s["category"] == "event"], [])
-        self.assertIn(f"- {SEEDED}: events: kubectl get events rc=1", ur.render_report(result).split(ur.INFO_FAILED_READS)[1])
+        self.assertIn(f"- {SEEDED}: events: kubectl get --raw '/api/v1/events?limit=500&fieldSelector=type%3DWarning' rc=1", ur.render_report(result).split(ur.INFO_FAILED_READS)[1])
 
     def test_failed_cluster_listing_is_a_failed_read(self):
         result, _ = self.collect(FakeFleet(list_rc=1))
@@ -4850,8 +4913,8 @@ class ChecksRunTest(unittest.TestCase):
         self.assertIn("UPGRADE_MASTER OR UPGRADE_NODES", operations)
         self.assertIn("endTime>=2026-09-24T18:00:00Z OR status!=DONE", operations)
         pods = by_check[ur.CHECK_BROKE_WORKLOAD]
-        self.assertEqual(pods, f"KUBECONFIG={self.tmp.name}/.kubeconfigs/kubeconfig_{PROJECT}_seeded-a_{LOCATION}.yaml kubectl get pods -A -o json")
-        self.assertTrue(by_check[ur.CHECK_NODE_BROKEN].endswith(" kubectl get nodes -o json"))
+        self.assertEqual(pods, f"KUBECONFIG={self.tmp.name}/.kubeconfigs/kubeconfig_{PROJECT}_seeded-a_{LOCATION}.yaml {ur.paged_command_text(['pods'])}")
+        self.assertTrue(by_check[ur.CHECK_NODE_BROKEN].endswith(" " + ur.paged_command_text(["nodes"])))
         for check in (ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES):
             self.assertEqual(by_check[check], pods)
         self.assertEqual([check for check, _ in ur.CHECK_READS], [ur.CHECK_OPERATION_FAILED, ur.CHECK_BROKE_WORKLOAD, ur.CHECK_NODE_BROKEN, ur.CHECK_SYMPTOM_TENTATIVE, ur.CHECK_SYMPTOM_UNCLASSIFIED, ur.CHECK_SYMPTOM_PREDATES, ur.CHECK_LOG_VOLUME])
@@ -4882,8 +4945,8 @@ class ChecksRunTest(unittest.TestCase):
             self.assertEqual(list(by_check), [check for check, _ in ur.CHECK_READS])
             self.assertTrue(by_check[ur.CHECK_OPERATION_FAILED].startswith("gcloud container operations list"))
             # A full run refreshes every fleet cluster's pods, so the checks that read pods name that read.
-            self.assertIn(" kubectl get pods -A -o json", by_check[ur.CHECK_SYMPTOM_TENTATIVE])
-            self.assertIn(" kubectl get nodes -o json", by_check[ur.CHECK_NODE_BROKEN])
+            self.assertIn(" " + ur.paged_command_text(["pods"]), by_check[ur.CHECK_SYMPTOM_TENTATIVE])
+            self.assertIn(" " + ur.paged_command_text(["nodes"]), by_check[ur.CHECK_NODE_BROKEN])
 
     def test_an_unchanged_cluster_whose_recheck_read_failed_drops_the_checks_it_backs(self):
         self.collect()
@@ -5013,7 +5076,7 @@ class ManifestTest(unittest.TestCase):
         unclassified = next(c for c in seeded["candidates"] if c["check"] == ur.CHECK_SYMPTOM_UNCLASSIFIED)
         self.assertEqual((unclassified["namespace"], unclassified["object"]), ("seeded-stall", "Deployment/inventory-api"))
         self.assertEqual(unclassified["impact"], ur.UNCLASSIFIED_MITIGATION_TEXT)
-        self.assertTrue(unclassified["command"].endswith(" kubectl get pods -A -o json"))
+        self.assertTrue(unclassified["command"].endswith(" " + ur.paged_command_text(["pods"])))
         budget = next(c for c in seeded["candidates"] if c["object"] == "PodDisruptionBudget/inference-server")
         self.assertEqual((budget["check"], budget["severity"], budget["namespace"]), (ur.CHECK_BROKE_WORKLOAD, ur.MANIFEST_SEVERITY_MAJOR, "seeded-capacity"))
         self.assertIn(f"Mitigate before: {ur.BUDGET_DOWNSTREAM_MITIGATE_BEFORE}", budget["impact"])
@@ -5141,7 +5204,7 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(candidate["persistence"], ["persists since 2026-10-08T18:00:00Z, 2 review(s)", "persists since 2026-10-08T18:00:00Z, 2 review(s)"])
         self.assertNotIn("not_recheckable", candidate)
         self.assertTrue(candidate["excerpt"].startswith(f"guard {ur.guard_id(SEEDED, 2, INFERENCE)} persists since 2026-10-08T18:00:00Z, 2 review(s): "))
-        self.assertTrue(candidate["command"].endswith(" kubectl get pods -A -o json"))
+        self.assertTrue(candidate["command"].endswith(" " + ur.paged_command_text(["pods"])))
         # `finish` spells the set the way the ledger spells ids: derived, then clipped; the id is the
         # first run's finding id, so the finding is held, not resolved and refiled.
         held_id = self.audit_report.published_id(held)
@@ -5284,8 +5347,8 @@ class ManifestTest(unittest.TestCase):
             seeded = next(c for c in json.loads(Path(second["manifest_path"]).read_text())["clusters"] if c["name"] == SEEDED)
             commands = {c["check"]: c["command"] for c in seeded["commands"]}
             self.assertTrue(commands[ur.CHECK_OPERATION_FAILED].startswith("gcloud container operations list"))
-            self.assertIn(" kubectl get pods -A -o json", commands[ur.CHECK_BROKE_WORKLOAD])
-            self.assertIn(" kubectl get nodes -o json", commands[ur.CHECK_NODE_BROKEN])
+            self.assertIn(" " + ur.paged_command_text(["pods"]), commands[ur.CHECK_BROKE_WORKLOAD])
+            self.assertIn(" " + ur.paged_command_text(["nodes"]), commands[ur.CHECK_NODE_BROKEN])
             # A read that ran and failed is the gap `coverage_gaps` names: the four pod checks leave
             # `checks_run`, the read is the limitation, and the run is partial.
             third, _ = self.collect(FakeFleet(kubectl_fail=[("seeded-a", "pods")]), now=datetime(2026, 10, 22, 18, 0, tzinfo=timezone.utc))
@@ -6008,7 +6071,7 @@ class ManifestTest(unittest.TestCase):
 
         def run(argv, **kwargs):
             result = fleet(argv, **kwargs)
-            if argv[0] == "kubectl" and argv[2] == ur.KUBECTL_READS[-1][1][2]:
+            if argv[0] == "kubectl" and argv[2] == ur.KUBECTL_READS[-1][1]:
                 state["spent"] = True
             return result
 
@@ -6074,8 +6137,8 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual((gemma["reviewed"], gemma["answered"], gemma["partial"]), (False, [], list(ur.CORE_READS)))
         # The read the deadline fell inside carries the budget as its error, the hang's own text after
         # it, so the operator reads a spent budget rather than a hung API server.
-        self.assertTrue(any(e.startswith("pods: kubectl get pods rc=124: " + ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) + "; timed out") for e in gemma["read_errors"]), gemma["read_errors"])
-        self.assertTrue(any(e.startswith("nodes: kubectl get nodes rc=124: " + ur.BUDGET_READ_TEXT.format(seconds=1)) for e in gemma["read_errors"]), gemma["read_errors"])
+        self.assertTrue(any(e.startswith("pods: kubectl get --raw '/api/v1/pods?limit=500' rc=124: " + ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) + "; timed out") for e in gemma["read_errors"]), gemma["read_errors"])
+        self.assertTrue(any(e.startswith("nodes: kubectl get --raw '/api/v1/nodes?limit=100' rc=124: " + ur.BUDGET_READ_TEXT.format(seconds=1)) for e in gemma["read_errors"]), gemma["read_errors"])
         self.assertEqual((result["deferred"], result["budget_spent"]), ([SEEDED], True))
         manifest = json.loads(Path(result["manifest_path"]).read_text())
         entry = next(c for c in manifest["clusters"] if c["name"] == GEMMA)
@@ -6085,6 +6148,42 @@ class ManifestTest(unittest.TestCase):
         self.assertTrue(manifest["partial"])
         self.assertEqual(ur.load_json(self.home / ur.LEDGER_FILENAME, {})["clusters"][GEMMA]["partial_read"], "2026-10-08T18:00:00Z")
         self.audit_report.cross_check_manifest(self.document_from(manifest), manifest)
+
+    def test_the_cluster_reads_are_paged_raw_reads_with_the_events_selector(self):
+        """The real paging, not the adapter: every read in KUBECTL_READS is one
+        `kubectl get --raw` collection read per kind, the Warning-events field
+        selector rides on the events pages, a pods continue token is followed,
+        and a page the shim cut (exit 74) fails that read alone, named by rc."""
+        issued = []
+
+        def run(argv, *, timeout=None, env=None):
+            # Each page's Run carries the argv that ran, as `default_run`'s does: the
+            # error names the failing page from it.
+            issued.append(argv)
+            path, _, query = argv[3].partition("?")
+            if path == "/api/v1/pods" and "continue=" not in query:
+                return ur.Run(argv, 0, json.dumps({"metadata": {"continue": "more"}, "items": [{"metadata": {"name": "a", "namespace": "ns", "managedFields": [{}]}}]}), "", 0.01)
+            if path == "/apis/apps/v1/replicasets":
+                return ur.Run(argv, 74, '{"items": [{"metadata": {"na', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)", 0.01)
+            return ur.Run(argv, 0, json.dumps({"metadata": {}, "items": []}), "", 0.01)
+
+        with mock.patch.object(ur, "paged_dump", _shared_run_tests.cr.paged_dump):
+            reads, errors = ur.read_cluster(Path(self.tmp.name) / "kc.yaml", run=run)
+        paths = [a[3] for a in issued]
+        self.assertTrue(all(a[:3] == ["kubectl", "get", "--raw"] for a in issued))
+        self.assertIn("/api/v1/events?limit=500&fieldSelector=type%3DWarning", paths)
+        self.assertIn("/api/v1/pods?limit=500&continue=more", paths)
+        self.assertIn("/api/v1/nodes?limit=100", paths)
+        self.assertEqual(["a"], [p["metadata"]["name"] for p in reads["pods"]])
+        self.assertNotIn("managedFields", reads["pods"][0]["metadata"])
+        self.assertEqual([], reads["owners"])
+        self.assertEqual(1, len(errors))
+        # The error names the replicasets page, not the read's kind list, which would not say
+        # which of the two kinds' pages failed.
+        self.assertTrue(errors[0].startswith("owners: kubectl get --raw '/apis/apps/v1/replicasets?limit=500' rc=74: credential proxy output truncated"), errors[0])
+        self.assertNotIn("replicasets,jobs", errors[0])
+        # The jobs page is never asked once the replicasets page failed.
+        self.assertNotIn("/apis/batch/v1/jobs?limit=500", paths)
 
     def test_a_cut_last_read_counts_the_review_and_the_recheck_as_cut(self):
         # When the deadline falls inside the last read a review or a re-check makes, no later read is
@@ -6098,7 +6197,8 @@ class ManifestTest(unittest.TestCase):
         # The last read is an Info-only one (endpoint slices), so the review stays complete on its core
         # reads; the cut is still counted and named under "Reads that failed".
         self.assertEqual((result["budget_spent"], result["budget"]["cut"], result["budget"]["cut_rechecks"], review["partial"]), (True, 1, 0, []))
-        self.assertEqual([e for e in review["read_errors"] if ur.BUDGET_PREFIX_FORMAT.format(seconds=1) in e], [f"{last}: kubectl get {ur.KUBECTL_READS[-1][1][2]} rc=124: " + ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) + "; timed out"])
+        last_page = ur.failed_page_text(ur.collector_run.list_argv(ur.KUBECTL_READS[-1][1]))
+        self.assertEqual([e for e in review["read_errors"] if ur.BUDGET_PREFIX_FORMAT.format(seconds=1) in e], [f"{last}: {last_page} rc=124: " + ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) + "; timed out"])
         self.assertTrue(any(ur.BUDGET_CUT_TEXT.format(seconds=1, given=1) in line for line in result["failed_reads"]), result["failed_reads"])
         # The next run re-checks the cluster for its guards; the re-check's one read cut the same way
         # counts as a re-check cut mid-read, not as a hung read.
@@ -6575,6 +6675,20 @@ class ReadsTellTheShimTheirDeadlineTest(unittest.TestCase):
         self.assertEqual(("/outer", expected), (inherited["KUBECONFIG"], inherited[name]))
         self.assertEqual(("/k", expected), (given["KUBECONFIG"], given[name]))
         self.assertEqual("0", expected, "the cap admits no retry")
+
+
+class RecordedReadsUnderTheCommandCapTest(unittest.TestCase):
+    def test_every_recorded_read_passes_the_validator_at_the_longest_path(self):
+        """`draft` copies each read's recorded command into `checks_run`, which `finish` refuses
+        over `MAX_COMMAND_CHARS`; held at the longest kubeconfig path the platform profile makes."""
+        with mock.patch.object(ur, "kubeconfig_dir", return_value=PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = ur.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        self.assertTrue(str(kubeconfig).startswith(str(PLATFORM_PROFILE_KUBECONFIG_DIR)), kubeconfig)
+        for name, kinds, query in ur.KUBECTL_READS:
+            with self.subTest(read=name):
+                text = ur.paged_command_text(kinds.split(","), query=query, kubeconfig=kubeconfig)
+                self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+                self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", ur.CHECK_NODE_BROKEN))
 
 
 if __name__ == "__main__":
