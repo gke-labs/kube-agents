@@ -2165,8 +2165,10 @@ class VcsBroker:
         token is what proves the call, this is what proves the proposal. The
         forge must answer `proposal-view` for the number with the same url, an
         open state, a creation time inside CLAIM_WINDOW_SECONDS, and as author
-        the account this credential acts as. Anything else is a 409; the
-        answer is the forge's, never the caller's. The repository was held to
+        the account this credential acts as. Anything else the forge answers
+        is a 409; the answer is the forge's, never the caller's. A forge that
+        must name its account and cannot raises IdentityUnknown, whose code
+        names the missing identity. The repository was held to
         the managed list by the route before this ran. The route spent the
         token before this ran, so a transient forge failure on either read
         (CLAIM_TRANSIENT_CODES) is asked once more before it is answered.
@@ -2174,10 +2176,10 @@ class VcsBroker:
         url = payload.get("url")
         number = validate_number(payload.get("number"))
         bound = self._bind(payload)
-        try:
-            viewer = _once_more_if_transient("whoami", lambda: self._viewer(bound))
-        except IdentityUnknown:
-            viewer = ""
+        # IdentityUnknown is not transient, so the wrapper raises it as it came:
+        # refused with its own code, which names the fix, as the other two
+        # `_viewer` callers are. The token is spent either way.
+        viewer = _once_more_if_transient("whoami", lambda: self._viewer(bound))
         view = (
             _once_more_if_transient(
                 "proposal-view",

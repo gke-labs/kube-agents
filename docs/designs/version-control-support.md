@@ -877,7 +877,7 @@ durable: a bundle and a tar, never a tree the broker keeps.
 
 That is a constraint on what the verbs may be, not just a description of them.
 It is why `publish` carries `baseRevision` instead of remembering what `clone`
-served, and why nothing in the table takes an identifier the broker minted. It
+served, and why no verb in the table but `proposal-claim` takes an identifier the broker minted. It
 is also why the routes take no lock at all. Each request gets a fresh directory
 under the broker's own scratch volume, named from a counter rather than from
 anything the caller sent, and deletes it on the way out; two requests share
@@ -901,8 +901,10 @@ number the caller sends. The claim answers 200 with `{url, number, title}` when
 the forge confirms the proposal: open, at that url, authored by this
 credential, and created inside the window. It answers 404 `CLAIM_UNKNOWN` for a
 token that is unknown, already burned or expired, or whose `url` does not
-match. It answers 409 `CLAIM_NOT_CONFIRMED` when the forge check fails, and 403
-when the repository is no longer on the managed list. A forge failure that
+match. It answers 409 `CLAIM_NOT_CONFIRMED` when the forge check fails, 502
+`FORGE_IDENTITY_UNKNOWN` when the forge cannot name the credential's account and
+no `identity` is configured, and 403 when the repository is no longer on the
+managed list. A forge failure that
 persists after the one retry answers the forge's own code, and the token is
 spent either way. The `shell` role can call
 it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.

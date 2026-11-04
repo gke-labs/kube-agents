@@ -15049,6 +15049,7 @@ class ProposalClaimRouteTest(unittest.TestCase):
         self.claimed = []
         self.refuse = False
         self.create_fails = False
+        self.nameless = False
 
     def _create(self, payload):
         if self.create_fails:
@@ -15061,6 +15062,8 @@ class ProposalClaimRouteTest(unittest.TestCase):
 
     def _claim(self, payload):
         self.claimed.append(dict(payload))
+        if self.nameless:
+            raise providers.IdentityUnknown("bitbucket")
         if self.refuse:
             raise providers.WorkspaceError(
                 "the forge does not say this install just opened it", status=409, code="CLAIM_NOT_CONFIRMED"
@@ -15198,6 +15201,22 @@ class ProposalClaimRouteTest(unittest.TestCase):
         self.assertEqual("CLAIM_NOT_CONFIRMED", answer["code"])
         self.assertFalse(any(token in line for line in logs.output), logs.output)
         self.refuse = False
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual(1, len(self.claimed))
+
+    def test_a_claim_on_a_forge_that_cannot_name_its_account_answers_its_own_code(self):
+        token = self._created_token()
+        self.nameless = True
+        status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("FORGE_IDENTITY_UNKNOWN", answer["code"])
+        self.assertIn("Configure the forge's identity", answer["error"])
+        self.assertIn(
+            ("proposal-claim", credential_proxy.TOOL_STATUS_ERROR, "github"), self.metrics._vcs
+        )
+        # Burned before the check, as every claim is.
+        self.nameless = False
         status, _ = self._post("proposal-claim", {"url": self.URL, "claim": token})
         self.assertEqual(HTTPStatus.NOT_FOUND, status)
         self.assertEqual(1, len(self.claimed))

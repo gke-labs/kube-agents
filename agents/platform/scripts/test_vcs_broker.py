@@ -2433,6 +2433,19 @@ class CollaborationTest(unittest.TestCase):
             broker.proposal_claim(dict(self.CLAIM))
         self.assertEqual(409, caught.exception.status)
 
+    def test_proposal_claim_on_a_forge_that_cannot_name_its_account_answers_identity_unknown(self):
+        # Not a 409: the forge gave no verdict, and the code names the fix.
+        broker, recorder = self.broker(self._claim_node())
+        whoami = mock.Mock(side_effect=providers.IdentityUnknown("bitbucket"))
+        with mock.patch.object(broker, "_viewer", whoami):
+            with self.assertRaises(providers.IdentityUnknown) as caught:
+                broker.proposal_claim(dict(self.CLAIM))
+        self.assertEqual(502, caught.exception.status)
+        self.assertEqual("FORGE_IDENTITY_UNKNOWN", caught.exception.fields.get("code"))
+        self.assertIn("Configure the forge's identity", str(caught.exception))
+        self.assertEqual(1, whoami.call_count, "not retried as transient")
+        self.assertEqual([], recorder.calls, "no proposal-view after the refusal")
+
     BAD_GATEWAY = subprocess.CompletedProcess(["gh"], 1, "", "gh: Bad Gateway (HTTP 502)")
 
     def test_proposal_claim_asks_the_forge_once_more_after_a_transient_failure(self):
