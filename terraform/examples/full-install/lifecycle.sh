@@ -1177,7 +1177,8 @@ guard_minter_key() {
     reason="does not exist yet"
   elif [[ -z "$(head -1 <<<"$versions")" ]]; then
     reason="has no ENABLED version"
-    # A failed query leaves scheduled empty, and the import advice below stands.
+    # A failed query leaves its list empty: a failed scheduled query moves on
+    # to the DISABLED one, and a failed DISABLED query keeps the import advice.
     scheduled=$(gcloud kms keys versions list --key "$key" --keyring "$keyring" \
       --location "$location" --project "$project" \
       --filter='state=DESTROY_SCHEDULED' --format='value(name)' 2>/dev/null) || scheduled=""
@@ -1208,7 +1209,7 @@ guard_minter_key() {
     warn "Its versions are disabled, as a restore leaves them."
     warn "Enable each version with gcloud rather than re-importing the key, then apply again:"
     warn "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
-    warn "If a version was disabled on purpose, for example a revoked App key, import the new App key into a new Cloud KMS key instead."
+    warn "If a version was disabled on purpose, for example a revoked App key, import the new App key into this key and set githubMinter.kms.keyVersion to its version in extra_helm_values instead."
   else
     warn "Import the GitHub App private key before applying (see https://github.com/abcxyz/github-token-minter),"
     warn "or set enable_github_minter = false in terraform.tfvars."

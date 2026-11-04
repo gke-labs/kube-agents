@@ -974,7 +974,10 @@ resource "google_service_account" "agent" {
                     "gcloud kms keys versions enable <version> --key github-token-minter-key --keyring github-token-minter-keyring --location us-central1 --project test-project",
                     proc.stderr,
                 )
-                self.assertIn("If a version was disabled on purpose", proc.stderr)
+                self.assertIn(
+                    "import the new App key into this key and set githubMinter.kms.keyVersion to its version in extra_helm_values instead.",
+                    proc.stderr,
+                )
                 self.assertNotIn("versions restore", proc.stderr)
                 self.assertNotIn("adopt-kms", proc.stderr)
                 self.assertNotIn("Import the GitHub App private key before applying", proc.stderr)
