@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr/funcr"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -376,6 +378,8 @@ type usageHarness struct {
 	pruningErrored    bool
 	pruningBackground bool
 	pruningFeedback   bool
+	// pruningChatSessions is a CRD serving all but chatSessionsTotal.
+	pruningChatSessions bool
 	// pruningStorage makes the fake behave like a served CRD from before
 	// status.storageStatus carried its byte fields.
 	pruningStorage bool
@@ -392,8 +396,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningChatSessions) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"chatSessionsTotal":null}}}`
 				if h.pruningReadings {
 					strip = `{"status":{"usage":{` + usageTestReadingsNulls + `}}}`
 				}
@@ -417,6 +421,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				}
 				if h.pruningFeedback {
 					strip = `{"status":{"usage":{"negativeFeedbackTotal":null}}}`
+				}
+				if h.pruningChatSessions {
+					strip = `{"status":{"usage":{"chatSessionsTotal":null}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -459,6 +466,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			}
 			if isAgent && (h.pruningGauges || h.pruningFeedback) {
 				pa.Status.Usage.NegativeFeedbackTotal = 0
+			}
+			if isAgent && (h.pruningGauges || h.pruningChatSessions) {
+				pa.Status.Usage.ChatSessionsTotal = 0
 			}
 			if err == nil && isAgent && h.pruningStorage {
 				stored := pa.DeepCopy()
@@ -1578,6 +1588,145 @@ func TestUsagePoller_TheSessionsStatusSeedsTheChatHalfAndFloorsTheSum(t *testing
 	}
 	if reason := usageDocumentInvalid(doc(5, 2), cm, agent, usageClock(2)); reason == "" {
 		t.Fatal("a pair summing below the status was accepted")
+	}
+}
+
+// chatSessionsTotal is the chat half alone, beside the pair's sum, and
+// publishes as its own usage gauge row.
+func TestUsagePoller_ProjectsTheChatHalfAsChatSessionsTotal(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 10)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 20)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 13)
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 25)
+	h.poll(10)
+	status := h.status()
+	if status.SessionsTotal != 8 || status.ChatSessionsTotal != 5 {
+		t.Fatalf("after 3 triage and 5 chat sessions: sessionsTotal %d chatSessionsTotal %d, want 8 and 5", status.SessionsTotal, status.ChatSessionsTotal)
+	}
+	if status.LastHumanActiveTime != nil {
+		t.Fatalf("a chat session alone moved lastHumanActiveTime: %v", status.LastHumanActiveTime)
+	}
+	if status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(10)) {
+		t.Fatalf("the sessions did not move lastActiveTime: %v", status.LastActiveTime)
+	}
+	agent := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKey{Namespace: usageTestNamespace, Name: usageTestAgentName}, agent); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	g := newUsageGauges(prometheus.NewRegistry())
+	g.publishUsage(agent)
+	if got := testutil.ToFloat64(g.usage.WithLabelValues(agent.Namespace, agent.Name, usageStatusFieldChatSessions)); got != 5 {
+		t.Fatalf("usage gauge chatSessionsTotal = %v, want 5", got)
+	}
+	// The chat half alone moves lastActiveTime, as sessionsTotal does, and
+	// still not lastHumanActiveTime.
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 26)
+	h.poll(15)
+	status = h.status()
+	if status.ChatSessionsTotal != 6 || status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(15)) || status.LastHumanActiveTime != nil {
+		t.Fatalf("after one more chat session: chatSessionsTotal %d lastActiveTime %v lastHumanActiveTime %v, want 6, minute 15, nil", status.ChatSessionsTotal, status.LastActiveTime, status.LastHumanActiveTime)
+	}
+}
+
+// A status carrying chatSessionsTotal splits the seed: the chat half takes
+// it, clamped to the total, the triage half the rest. A status without it
+// seeds as before, the whole total in the chat half.
+func TestUsageStatusSeed_AStatusWithChatSessionsSplitsTheHalves(t *testing.T) {
+	for _, tc := range []struct{ total, chat, wantChat, wantTriage int64 }{
+		{8, 5, 5, 3}, {8, 9, 8, 0}, {8, 0, 8, 0}, {0, 3, 0, 0},
+	} {
+		agent := &agentv1alpha1.PlatformAgent{}
+		agent.Status.Usage.SessionsTotal, agent.Status.Usage.ChatSessionsTotal = tc.total, tc.chat
+		seed := usageStatusSeed(agent, time.Now()).Totals
+		if seed[usageCounterSessionsChat] != tc.wantChat || seed[usageCounterSessionsTriage] != tc.wantTriage {
+			t.Errorf("total %d chat %d: seed chat=%d triage=%d, want %d/%d", tc.total, tc.chat, seed[usageCounterSessionsChat], seed[usageCounterSessionsTriage], tc.wantChat, tc.wantTriage)
+		}
+	}
+	agent := &agentv1alpha1.PlatformAgent{}
+	agent.Status.Usage.SessionsTotal, agent.Status.Usage.ChatSessionsTotal = usageTotalCeiling+1, 3
+	if seed := usageStatusSeed(agent, time.Now()).Totals; seed[usageCounterSessionsChat] != 0 || seed[usageCounterSessionsTriage] != 0 {
+		t.Errorf("an absurd sessionsTotal seeded chat=%d triage=%d, want 0/0", seed[usageCounterSessionsChat], seed[usageCounterSessionsTriage])
+	}
+}
+
+// Under a split seed the read-back holds the chat half to its own status as
+// well as the pair's sum to the total; without chatSessionsTotal the sum
+// alone is held, as before.
+func TestUsageDocumentInvalid_TheChatHalfIsHeldToItsStatusUnderASplitSeed(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Status.Usage.SessionsTotal = 8
+	agent.Status.Usage.ChatSessionsTotal = 5
+	stamp := metav1.NewTime(usageClock(1))
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{UID: agent.UID}}}}
+	doc := func(chat, triage int64) *usageDocument {
+		totals := usageZeroTotals()
+		totals[usageCounterSessionsChat] = chat
+		totals[usageCounterSessionsTriage] = triage
+		return &usageDocument{Version: usageDocumentVersion, AgentUID: string(agent.UID), FirstRecorded: stamp, Totals: totals, Pods: map[string]*usagePodEntry{}}
+	}
+	if reason := usageDocumentInvalid(doc(4, 4), cm, agent, usageClock(2)); reason != "a total is below the status it projects to" {
+		t.Errorf("a chat half below chatSessionsTotal: reason %q, want the below-status refusal", reason)
+	}
+	if reason := usageDocumentInvalid(doc(5, 2), cm, agent, usageClock(2)); reason != "a total is below the status it projects to" {
+		t.Errorf("a pair summing below sessionsTotal: reason %q, want the below-status refusal", reason)
+	}
+	for _, d := range []struct{ chat, triage int64 }{{5, 3}, {6, 3}} {
+		if reason := usageDocumentInvalid(doc(d.chat, d.triage), cm, agent, usageClock(2)); reason != "" {
+			t.Errorf("doc chat %d triage %d was refused: %s", d.chat, d.triage, reason)
+		}
+	}
+	agent.Status.Usage.ChatSessionsTotal = 0
+	if reason := usageDocumentInvalid(doc(5, 3), cm, agent, usageClock(2)); reason != "" {
+		t.Errorf("without chatSessionsTotal a pair summing to the status was refused: %s", reason)
+	}
+}
+
+// A served CRD from before chatSessionsTotal prunes it alone: its absence is
+// its own record, named for the field, sessionsTotal keeps landing, the gauge
+// row is held back, and a poll with it alone behind does not re-patch while
+// the record is fresh.
+func TestUsagePoller_ChatSessionsTotalHasItsOwnPruningRecord(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruningChatSessions = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 1)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 1)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 3)
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 4)
+	h.poll(10)
+	if status := h.status(); status.SessionsTotal != 5 || status.ChatSessionsTotal != 0 {
+		t.Fatalf("status under a CRD without chatSessionsTotal: %+v, want sessionsTotal 5 and no chatSessionsTotal", status)
+	}
+	if !h.p.newerFieldPruned(agent, usageStatusFieldChatSessions) || h.p.newerFieldPruned(agent, usageCounterSessionsChat) {
+		t.Fatal("the absence of chatSessionsTotal was not recorded against its own field name")
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the absence of chatSessionsTotal was recorded as the counters' pruning")
+	}
+	patches := h.patches
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with chatSessionsTotal alone behind re-patched the status while its record was fresh")
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKey{Namespace: usageTestNamespace, Name: usageTestAgentName}, stored); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	held := h.r.heldUsageFields(stored)
+	if !held[usageStatusFieldChatSessions] || held[usageStatusFieldSessions] {
+		t.Fatalf("held fields %v, want chatSessionsTotal held and sessionsTotal published", held)
 	}
 }
 

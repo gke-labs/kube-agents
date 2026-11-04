@@ -5183,6 +5183,14 @@ write_tfvars_from_state() {
     print_error "VERTEX_MANAGE_SERVING_PROJECT='${vertex_manage_serving_project}' is neither true nor false. Fix it in install.env."
     return 1
   fi
+  # The same again: read as off, a misspelt value leaves the release's
+  # upgrade_install off, and the apply it was set to rescue fails with the
+  # "cannot re-use a name" it was set to prevent, naming nothing (#4108).
+  local helm_upgrade_install="${HELM_UPGRADE_INSTALL:-$DEFAULT_HELM_UPGRADE_INSTALL}"
+  if ! is_bool_spelling "$helm_upgrade_install"; then
+    print_error "HELM_UPGRADE_INSTALL='${helm_upgrade_install}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
   # The mode, for the MODEL_MAX_TOKENS reason: upgrade.sh and the Day-2 menu
   # regenerate from install.env without install.sh's check, and the variable's
   # validation would otherwise refuse it at plan, naming neither the key nor
@@ -5432,6 +5440,10 @@ write_tfvars_from_state() {
     fi
     echo ""
     echo "enable_gke_backup_plan = $(hcl_bool "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}")"
+    echo ""
+    # Read from install.env (or the environment) only: no flag or interview
+    # question sets it, so install.sh exports nothing over it. See the variable.
+    echo "helm_upgrade_install = $(hcl_bool "$helm_upgrade_install")"
     echo ""
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."
