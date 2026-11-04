@@ -34,7 +34,7 @@ variable "gitops_repo" {
   default     = ""
 }
 
-# The marker hack/ci-eval-pr.sh reads (BENCH_GITOPS_WRITE_MARKER): declaring
+# The marker hack/ci-eval-pr.sh reads (BENCH_GITOPS_WRITE_VARIABLE): declaring
 # this variable makes it mint the unit a write token for gitops_repo
 # (contents, pull requests and issues write, on that repository only) and pass
 # the token's file here. A name of its own, so no other stack gets the token.

@@ -60,7 +60,8 @@ class _Harness(unittest.TestCase):
                 _constant("LEDGER_RESET_MINT_ATTEMPTS"),
                 _constant("LEDGER_RESET_MINT_RETRY_DELAY"),
                 _constant("AGENT_PULLS_RESET_PERMISSIONS"),
-                _constant("BENCH_GITOPS_WRITE_MARKER"),
+                _constant("BENCH_GITOPS_WRITE_VARIABLE"),
+                _constant("BENCH_GITOPS_WRITE_MARKER_RE"),
                 _constant("KCC_FLEET_SLOT"),
                 _constant("KCC_EVAL_CONTEXT_ACCOUNT"),
                 _function("fleet_context_value"),
@@ -243,6 +244,10 @@ class GitopsWriteTokenTest(_Harness):
         reader = self._task("reader", "prebuilt/reader", 'variable "gitops_repo" {\n  type = string\n}\n')
         # gitops-fix-cycle's own variable, with another contract: not the marker.
         other = self._task("other", "prebuilt/other", 'variable "gitops_token_file" {\n  type = string\n}\n')
+        # A comment that quotes the marker declares nothing.
+        quoted = self._task("quoted", "prebuilt/quoted", '# Unlike a writing stack, this one has no\n# variable "bench_gitops_write_token_file" {}\nvariable "gitops_repo" {\n  type = string\n}\n')
+        # An indented declaration still counts.
+        indented = self._task("indented", "prebuilt/indented", '  variable  "bench_gitops_write_token_file"{\n  type = string\n}\n')
         noop = self._task("noop", "", "")
         proc = self._run(
             f"""\
@@ -250,9 +255,13 @@ class GitopsWriteTokenTest(_Harness):
             stack_writes_gitops "{reader}" && echo "READER=yes" || echo "READER=no"
             stack_writes_gitops "{noop}" && echo "NOOP=yes" || echo "NOOP=no"
             stack_writes_gitops "{other}" && echo "OTHER=yes" || echo "OTHER=no"
+            stack_writes_gitops "{quoted}" && echo "QUOTED=yes" || echo "QUOTED=no"
+            stack_writes_gitops "{indented}" && echo "INDENTED=yes" || echo "INDENTED=no"
             """
         )
         self.assertIn("OTHER=no", proc.stdout)
+        self.assertIn("QUOTED=no", proc.stdout)
+        self.assertIn("INDENTED=yes", proc.stdout)
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("WRITER=yes", proc.stdout)
         self.assertIn("READER=no", proc.stdout)

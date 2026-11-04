@@ -227,7 +227,7 @@ def _variables():
 
 def test_the_stack_declares_the_variable_the_runner_mints_for():
     runner = (REPO / "hack" / "ci-eval-pr.sh").read_text()
-    declared = re.search(r"^BENCH_GITOPS_WRITE_MARKER='variable \"([a-z_]+)\"'$", runner, re.M).group(1)
+    declared = re.search(r'^BENCH_GITOPS_WRITE_VARIABLE="([a-z_]+)"$', runner, re.M).group(1)
     assert declared == "bench_gitops_write_token_file"
     assert declared in _variables()
     # gitops-fix-cycle's variable, with another contract, is not the marker.

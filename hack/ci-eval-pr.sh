@@ -1233,8 +1233,11 @@ AGENT_PULLS_RESET_PERMISSIONS='{"pull_requests":"write","contents":"write","issu
 # token's file as TF_VAR_bench_gitops_write_token_file
 # (start_gitops_write_token), with the other inputs of a writing stack
 # (export_writing_stack_inputs). Only a file name reaches the stack, so the
-# token is never on argv or in tofu's state.
-BENCH_GITOPS_WRITE_MARKER='variable "bench_gitops_write_token_file"'
+# token is never on argv or in tofu's state. The declaration counts only on a
+# line of its own (BENCH_GITOPS_WRITE_MARKER_RE), so a comment that quotes it
+# earns no token.
+BENCH_GITOPS_WRITE_VARIABLE="bench_gitops_write_token_file"
+BENCH_GITOPS_WRITE_MARKER_RE="^[[:space:]]*variable[[:space:]]+\"${BENCH_GITOPS_WRITE_VARIABLE}\"[[:space:]]*\\{"
 # The seeded slot whose cluster runs Config Connector
 # (bench/tf/fleet/config-connector.tf), and the Google service account with no
 # project role that the fleet creates there for an eval stack's
@@ -1398,14 +1401,14 @@ stop_ledger_token_renewal() { # <file>
   unset BENCH_GITHUB_TOKEN_FILE
 }
 
-# True when the case's stack declares BENCH_GITOPS_WRITE_MARKER: the stack
+# True when the case's stack declares BENCH_GITOPS_WRITE_VARIABLE: the stack
 # writes to the leased GitOps repository, and its unit gets a write token.
 # Read from the stack's own files, as the seeded-cluster reuse is, so a stack
 # says what it needs in one place.
 stack_writes_gitops() { # <task.yaml, relative to BENCH_DIR>
   local stack
   stack="$(task_stack "${BENCH_DIR}/$1")"
-  [ -n "${stack}" ] && grep -qsF "${BENCH_GITOPS_WRITE_MARKER}" "${BENCH_DIR}/tf/${stack}"/*.tf
+  [ -n "${stack}" ] && grep -qsE "${BENCH_GITOPS_WRITE_MARKER_RE}" "${BENCH_DIR}/tf/${stack}"/*.tf
 }
 
 # The write token for a stack that writes to the leased GitOps repository:
