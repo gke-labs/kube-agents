@@ -177,7 +177,7 @@ BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 #: The verb that opens a change proposal, and the record `call()` writes to stderr
 #: when the broker answers it with one: a single compact JSON object on its own
 #: line, `{"kube-agents.event": "proposal-opened", "proposal": {url, number,
-#: title, claim}}`. Every caller that opens a pull request or merge request -- `vcs.py`,
+#: title, claim, repo}}`. Every caller that opens a pull request or merge request -- `vcs.py`,
 #: submit-suggestion, the fleet audit -- reaches the broker through `call()`, so
 #: this is the one place that knows a proposal was opened, with the forge's own
 #: url. The agent pod's `pr_opened` plugin (agents/platform/plugins/pr_opened)

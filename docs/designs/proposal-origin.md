@@ -240,8 +240,8 @@ holds as it stands.
   key (with the platform) and its write for `k8s-evt-*` sessions at the first inject; the parent
   walk for continuations; the `proposals_opened` table and the endpoint the hook writes it
   through; the stamped-insert endpoint for cards; the drift backlog's `drift` stamp; the per-job-id origin table the `cronjob` handler writes.
-- **Board patch** (`deploy/docker/patches/`, beside `kanban_priority.py`): the card's `origin`
-  and `origin_platform` columns written at insert from the creating turn's session record, run
+- **Board patch** (`deploy/docker/patches/`, beside `kanban_priority.py`): the card's origin and
+  platform, a row of the side table `kanban_task_origins` written at insert from the creating turn's session record, run
   context or dashboard, the worker's and the child's inheritance, and the insert-only stamp a
   trusted writer passes.
 - **Credential broker** (`agents/platform/scripts/credential_proxy.py`) and `vcs_client`: the

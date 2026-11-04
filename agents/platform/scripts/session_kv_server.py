@@ -1290,7 +1290,8 @@ DRIFT_BACKLOG_CARD_CREATED_BY = "drift-detector"
 DRIFT_BACKLOG_CARD_STATUS = "blocked"
 # The card's board stamp is `drift` (docs/designs/proposal-origin.md §2.1),
 # written here, in the board, once the create returns the id, through the same
-# `INSERT OR IGNORE` the board route uses. Not a ticket in the subprocess's
+# `INSERT OR IGNORE` the board's insert-time stamp uses when it redeems a stamp
+# ticket, so the first stamp wins either way. Not a ticket in the subprocess's
 # environment: Hermes reloads `$HERMES_HOME/.env` with override on, so a value
 # planted there would replace it. The subprocess has no turn, so its insert
 # leaves the card unstamped and this stamp lands; a dedupe hit on a card that
