@@ -352,6 +352,12 @@ def _exec_url_fault(url: str) -> str | None:
         parts.port
     except ValueError:
         return "the port is not a number from 0 to 65535"
+    try:
+        # urlsplit's view drops a tab or newline and keeps a %-escape; the
+        # connection is built from the raw string, so ask it, as execute() will.
+        http.client.HTTPConnection(urllib.request.Request(url.rstrip("/") + "/v1/exec").host)
+    except (ValueError, http.client.InvalidURL):
+        return "not a valid URL"
     return None
 
 

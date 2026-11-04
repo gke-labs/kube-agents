@@ -2124,6 +2124,9 @@ class TestExecUrlShape(unittest.TestCase):
         "no host": "http://",
         "a port out of range": "http://broker:99999",
         "a bracketed host that is not IPv6": "http://[::1",
+        "a space in the host": "http://bro ker:8765",
+        "a tab in the host": "http://bro\tker:8765",
+        "an escaped tab in the host": "http://bro%09ker:8765",
     }
 
     def resolve(self, exec_url, stateful=STATEFUL):
