@@ -118,3 +118,17 @@ func TestSetHomeNoticeNeedsNoUserLookup(t *testing.T) {
 		t.Fatalf("%d tasks, want none: a failed users.info let the typed /sethome through as a turn", n)
 	}
 }
+
+// TestSetHomeNoticeWithoutAnAdmissionRuleIsATurn: an adapter the gateway has
+// handed no admission rule answers nothing; the typed command is the turn
+// it was, for the gateway to admit or refuse.
+func TestSetHomeNoticeWithoutAnAdmissionRuleIsATurn(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	if _, ok := a.inbound(context.Background(), slackMsg("im", "D1", "U1", "/sethome", "100.1", "")); !ok {
+		t.Fatal("with no admission rule the typed /sethome was not a turn")
+	}
+	if len(api.posted) != 0 {
+		t.Fatalf("posts = %+v, want none", api.posted)
+	}
+}
