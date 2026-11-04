@@ -637,6 +637,8 @@ def fake_full_fleet(monkeypatch, names):
     monkeypatch.setattr(cli.Fleet, "credentials", lambda self, name: None)
     monkeypatch.setattr(cli, "kwok_node_count", lambda fleet, name: cli.DEFAULT_NODES)
     monkeypatch.setattr(cli, "workload_namespace_count", lambda fleet, name: cli.DEFAULT_NAMESPACES)
+    monkeypatch.setattr(cli, "workload_deployment_count", lambda fleet, name: cli.DEFAULT_DEPLOYMENTS)
+    monkeypatch.setattr(cli, "real_node_count", lambda fleet, name: cli.FULL_REAL_NODES)
     monkeypatch.setattr(cli, "run", lambda cmd, **kw: calls.append(cmd) or "")
     monkeypatch.setattr(cli, "load_cluster", lambda fleet, name, a: calls.append(["load", name]))
     return calls
@@ -656,6 +658,22 @@ def test_fleet_load_resizes_then_loads_each_named_cluster_once(monkeypatch, tmp_
     assert all(c[c.index("--num-nodes") + 1] == "12" for c in resizes(calls))
     assert sorted(c[1] for c in loads) == ["oom-01", "oom-02"]
     assert max(calls.index(c) for c in resizes(calls)) < calls.index(loads[0])  # every resize precedes the first load
+
+
+def test_fleet_load_refuses_fewer_deployments(monkeypatch, tmp_path):
+    args = cli.parse(["--project", "p", "--out", str(tmp_path), "--deployments", "5", "fleet", "load", "--names", "oom-01"])
+    calls = fake_full_fleet(monkeypatch, ["oom-01"])
+    with pytest.raises(SystemExit, match="--deployments 5"):
+        cli.fleet_load(args)
+    assert calls == []
+
+
+def test_fleet_load_grows_only_a_real_pool_below_its_size(monkeypatch, tmp_path):
+    args = cli.parse(["--project", "p", "--out", str(tmp_path), "--nodes", "2000", "fleet", "load", "--names", "oom-01,oom-02"])
+    calls = fake_full_fleet(monkeypatch, ["oom-01", "oom-02"])
+    monkeypatch.setattr(cli, "real_node_count", lambda fleet, name: {"oom-01": 12, "oom-02": cli.FULL_REAL_NODES}[name])
+    cli.fleet_load(args)
+    assert [(c[4], c[c.index("--num-nodes") + 1]) for c in resizes(calls)] == [("oom-02", "8")]
 
 
 def test_fleet_load_refuses_fewer_namespaces(monkeypatch, tmp_path):

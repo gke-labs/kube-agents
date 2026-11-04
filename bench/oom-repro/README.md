@@ -100,10 +100,11 @@ uv run python -m kube_agents_bench.oom_repro --host-context <context> watcher --
 
 `events` keeps the Events-only clusters' namespace count (150 by default), because `fleet load` does
 not grow them: leave `--namespaces` off the two `events` commands. `fleet load` takes the full
-clusters by name, only grows their node and namespace counts, and resizes each real node pool to
-one `e2-standard-8` per 250 KWOK nodes, at least six: twelve per full cluster at 3,000 nodes. The
-evidence fleet used `--prefix kwok-`. The credential proxy's L kill came at about 80,000 Pods per
-cluster and the shell's at 86,000 to 89,000.
+clusters by name, only grows their node, namespace and Deployment counts, and grows each real node
+pool to one `e2-standard-8` per 250 KWOK nodes, at least six: twelve per full cluster at 3,000
+nodes. It leaves a real node pool of that size or larger as it is. The evidence fleet used
+`--prefix kwok-`. The credential proxy's L kill came at about 80,000 Pods per cluster and the
+shell's at 86,000 to 89,000.
 
 ## What you need
 

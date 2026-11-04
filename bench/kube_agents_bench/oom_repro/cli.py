@@ -132,6 +132,9 @@ REAL_NODE_POOL = "default-pool"
 NAMES_SEPARATOR = ","
 MACHINE_TYPE_FORMAT = "value(config.machineType)"
 NAMESPACE_OBJECT_PREFIX = "namespace/"
+DEPLOYMENT_OBJECT_PREFIX = "deployment.apps/"
+# GKE labels each real node with its pool; KWOK nodes carry fixtures.NODE_POOLS instead.
+NODE_POOL_LABEL = "cloud.google.com/gke-nodepool"
 EVENTS_MACHINE_TYPE = "e2-standard-4"
 EVENTS_REAL_NODES = 2
 NODE_DISK_GB = "50"
@@ -407,6 +410,18 @@ def workload_namespace_count(fleet: Fleet, cluster: str) -> int:
     return sum(1 for n in fleet.kubectl(cluster, "get", "namespaces", "-o", "name").split() if n.startswith(prefix))
 
 
+def workload_deployment_count(fleet: Fleet, cluster: str) -> int:
+    # Every workload namespace holds the same Deployments, so the distinct names are the count per namespace.
+    prefix = DEPLOYMENT_OBJECT_PREFIX + fixtures.DEPLOYMENT_PREFIX
+    names = fleet.kubectl(cluster, "get", "deployments", "-A", "-o", "name").split()
+    return len({n for n in names if n.startswith(prefix)})
+
+
+def real_node_count(fleet: Fleet, cluster: str) -> int:
+    selector = f"{NODE_POOL_LABEL}={REAL_NODE_POOL}"
+    return len(fleet.kubectl(cluster, "get", "nodes", "-l", selector, "-o", "name").split())
+
+
 def pool_machine_type(fleet: Fleet, cluster: str) -> str:
     return run(["gcloud", "container", "node-pools", "describe", REAL_NODE_POOL, "--cluster", cluster,
                 "--zone", fleet.zone, "--project", fleet.project, "--format", MACHINE_TYPE_FORMAT]).strip()
@@ -424,12 +439,14 @@ def load_targets(requested: str, existing: list[str]) -> list[str]:
 def fleet_load(args: argparse.Namespace) -> None:
     """Bring the named fleet clusters up to --nodes KWOK nodes and the workload size given.
 
-    It only grows a cluster: KWOK nodes and namespaces above the size given would stay, sized for
-    fewer real nodes, so a smaller --nodes or --namespaces than the cluster has is refused. A smaller
+    It only grows a cluster: KWOK nodes, namespaces and Deployments above the size given would stay,
+    sized for fewer real nodes, so a smaller --nodes, --namespaces or --deployments than the cluster
+    has is refused, and a real node pool already at its size or above it is left as it is. A smaller
     --replicas scales the Deployments down.
     """
     fleet = Fleet(args)
     names = load_targets(args.names, fleet.names())
+    grow = []
     for name in names:
         machine = pool_machine_type(fleet, name)
         if machine != FULL_MACHINE_TYPE:
@@ -442,10 +459,16 @@ def fleet_load(args: argparse.Namespace) -> None:
         if spaces > args.namespaces:
             raise SystemExit(f"{name} has {spaces} workload namespaces, more than --namespaces {args.namespaces}; "
                              "fleet load only grows")
+        deployments = workload_deployment_count(fleet, name)
+        if deployments > args.deployments:
+            raise SystemExit(f"{name} has {deployments} Deployments per workload namespace, more than --deployments "
+                             f"{args.deployments}; fleet load only grows")
+        if real_node_count(fleet, name) < real_nodes(args.nodes):
+            grow.append(name)
     with pool(len(names)) as workers:
         list(workers.map(lambda n: run(["gcloud", "container", "clusters", "resize", n, "--node-pool", REAL_NODE_POOL,
                                         "--num-nodes", str(real_nodes(args.nodes)), "--zone", fleet.zone,
-                                        "--project", fleet.project, "-q"]), names))
+                                        "--project", fleet.project, "-q"]), grow))
     with pool(len(names)) as workers:
         list(workers.map(lambda n: load_cluster(fleet, n, args), names))
 
