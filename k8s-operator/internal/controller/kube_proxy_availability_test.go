@@ -62,6 +62,13 @@ func TestKubeProxyRollsOneReplicaAtATimeWithoutSurge(t *testing.T) {
 	if len(spread) != 1 || spread[0].WhenUnsatisfiable != corev1.ScheduleAnyway {
 		t.Fatalf("topologySpreadConstraints = %#v, want one ScheduleAnyway constraint", spread)
 	}
+	// Without pod-template-hash the old and new ReplicaSets' pods count
+	// together mid-roll, so the spread would skew against the replacement.
+	if spread[0].MaxSkew != 1 || spread[0].TopologyKey != "kubernetes.io/hostname" ||
+		!reflect.DeepEqual(spread[0].MatchLabelKeys, []string{"pod-template-hash"}) {
+		t.Errorf("spread = maxSkew %d, topologyKey %q, matchLabelKeys %v; want 1, kubernetes.io/hostname, [pod-template-hash]",
+			spread[0].MaxSkew, spread[0].TopologyKey, spread[0].MatchLabelKeys)
+	}
 	sel, err := labels.ValidatedSelectorFromSet(spread[0].LabelSelector.MatchLabels)
 	if err != nil {
 		t.Fatal(err)
