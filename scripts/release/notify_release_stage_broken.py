@@ -33,8 +33,9 @@ eval's RED verdict alone is no stage failure, but `STALL_NIGHTS` of them in
 a row cut no staging tag and stall the release chain; that opens one
 `ci:release-stalled` issue with a row per night (the run, the candidate
 commit, the eval build the step-5 log links), adds a row each later RED
-night, and closes on the next run whose eval passed. A stage-failure night
-leaves it alone.
+night, and closes on the next run whose eval passed. A night that fails on a
+stage before the eval passes leaves it alone, and a `skip_promotion` night,
+which skips the eval, neither counts nor ends the streak.
 
 Two bounds on what a green run may close. A run being re-run leaves
 `status=completed`, so the newest run by number is read whatever its status,
@@ -109,6 +110,7 @@ from eval_dashboard.post_health import SPACE_ENV, TOKEN_ENV, Sender  # noqa: E40
 from github_api import is_refusal, log  # noqa: E402
 from notify_broken_main import FAILING_CONCLUSIONS, decide, newest_reporting_run, reporting_history  # noqa: E402
 from notify_flaky_check import GitHubAPI as FlakyGitHubAPI  # noqa: E402
+from poll_rc_eval_verdict import VERDICT_LINE_FORMAT, VERDICT_RED  # noqa: E402
 
 # The release workflows, by the `name:` each declares, which is how the
 # Actions API lists them. `test_notify_release_stage_broken.py` holds this
@@ -310,8 +312,9 @@ NOT_CONFIGURED = "chat not configured: set CI_HEALTH_CHAT_SPACE and CI_HEALTH_CH
 # cuts no staging tag and leaves the GA scheduler nothing to publish. This
 # many settled-RED nights of `EVAL_PIPELINE` in a row, with no green run and
 # no stage failure between, open one issue; each later RED night adds its
-# row; the next run that passes the eval closes it. A stage-failure night
-# leaves it alone: the stage issue covers that night.
+# row; the next run that passes the eval closes it. A night that fails on a
+# stage before the eval passes leaves it alone: the stage issue covers that
+# night.
 STALL_NIGHTS = 2
 STALL_LABEL = "ci:release-stalled"
 STALL_LABEL_COLOR = "b60205"
@@ -340,7 +343,16 @@ ISSUE_URL = "https://github.com/{repo}/issues/{number}"
 # What `poll_rc_eval_verdict.py` prints into the step-5 log once it has a
 # settled RED: the Prow build id and its Spyglass link. An empty build id
 # prints no link, and reads as unavailable.
-_RED_VERDICT_LINE_RE = re.compile(r"^verdict=red settled=true build_id=(\S+) (\S+)$")
+# The pattern is built from the poller's own format, so a change to the line
+# there changes what is read here.
+VERDICT_SETTLED = "true"
+_LINE_FIELD = "FIELDPLACEHOLDER"
+_LINE_FIELD_RE = r"(\S+)"
+_RED_VERDICT_LINE_RE = re.compile(
+    "^"
+    + re.escape(VERDICT_LINE_FORMAT.format(verdict=VERDICT_RED, settled=VERDICT_SETTLED, build_id=_LINE_FIELD, url=_LINE_FIELD)).replace(_LINE_FIELD, _LINE_FIELD_RE)
+    + "$"
+)
 JOB_PASSED = "success"
 # The outcome word of the stalled-chain half of a reconcile, and how it is
 # joined to the stage half's when both wrote.
@@ -452,6 +464,11 @@ def red_verdict_night(jobs: list) -> bool:
 def eval_passed(jobs: list) -> bool:
     """True when the eval wait ran and passed: the verdict was GREEN."""
     return any(is_eval_wait(job) and job.get("conclusion") == JOB_PASSED for job in jobs)
+
+
+def eval_skipped(jobs: list) -> bool:
+    """True when the run has an eval wait and it was skipped."""
+    return any(is_eval_wait(job) and job.get("conclusion") == JOB_SKIPPED for job in jobs)
 
 
 def failing_job(jobs: list) -> dict | None:
@@ -1069,10 +1086,12 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
     `closed`.
 
     A settled-RED night counts the RED nights in a row behind it, newest
-    first, and stops at the first run that is not one (green, or red on a
-    stage) or that the open issue already stamps; jobs are read only that
-    far. A run whose eval passed closes the issue, whatever happened to the
-    run after the gate. A stage-failure night leaves it alone.
+    first, passing over a `skip_promotion` night (green, step 5 skipped),
+    and stops at the first run that is not one (green, or red on a stage)
+    or that the open issue already stamps; jobs are read only that far. A
+    run whose eval passed closes the issue, whatever happened to the run
+    after the gate. A night that fails on a stage before the eval passes
+    leaves it alone.
     """
     name, workflow_id = workflow["name"], workflow["id"]
     if decision["kind"] == "green":
@@ -1107,12 +1126,27 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
         post(sender, CHAT_MOVING.format(run_number=current["run_number"], url=ISSUE_URL.format(repo=api.repo, number=issue["number"])), dry_run, environ)
         return "closed"
 
+    if issue is None:
+        # Before the walk, so a stall a person closed costs one listing a
+        # sweep rather than a job list per night.
+        for closed in api.issues_for_workflow(workflow_id, ISSUE_CLOSED, STALL_LABEL, stall_marker):
+            if current["id"] in {run_id for run_id, _ in stamped_attempts(closed.get("body"), _STALL_STAMP_RE)}:
+                log(f"{name}: run #{current['run_number']} is recorded on closed #{closed['number']}; someone dealt with it")
+                return NOTHING
+
     stamped_ids = {run_id for run_id, _ in stamped}
     new = []
     for run in [current, *reporting_history(runs, current)]:
-        if run["id"] in stamped_ids or run["conclusion"] not in FAILING_CONCLUSIONS:
+        if run["id"] in stamped_ids:
             break
         jobs = jobs_for(run)
+        # A `skip_promotion` night re-tests a candidate already through the
+        # promotion path and skips step 5: it says nothing about the gate,
+        # so it neither counts nor ends the streak.
+        if run["conclusion"] not in FAILING_CONCLUSIONS:
+            if eval_skipped(jobs):
+                continue
+            break
         if not red_verdict_night(jobs):
             break
         new.append((run, jobs))
@@ -1138,10 +1172,6 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
     if len(new) < STALL_NIGHTS:
         log(f"{name}: {len(new)} settled-RED night{'' if len(new) == 1 else 's'} in a row; {STALL_NIGHTS} open the stalled-chain issue")
         return NOTHING
-    for closed in api.issues_for_workflow(workflow_id, ISSUE_CLOSED, STALL_LABEL, stall_marker):
-        if attempt_of(current) in stamped_attempts(closed.get("body"), _STALL_STAMP_RE):
-            log(f"{name}: run #{current['run_number']} is recorded on closed #{closed['number']}; someone dealt with it")
-            return NOTHING
     rows = [stall_row(api.repo, stall_details(api, run, jobs)) for run, jobs in new]
     api.ensure_label(STALL_LABEL, STALL_LABEL_COLOR, STALL_LABEL_DESCRIPTION)
     created = api.create_issue(

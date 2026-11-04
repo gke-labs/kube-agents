@@ -198,6 +198,11 @@ def staging_github(runs=STAGING_RUNS, open_issues=(), closed_issues=(), logs=Non
         stall_issues_path("open"): [],
         stall_issues_path("closed"): [],
     }
+    # The green nights behind #29 ran the eval and passed it, as #26 did;
+    # the stall walk reads the one that ends a RED streak, to tell it from a
+    # `skip_promotion` night.
+    for green in STAGING_RUNS["workflow_runs"][2:]:
+        responses[jobs_path(green["id"])] = STAGING_26_JOBS
     default_logs = {STEP1_JOB: fixture("staging-30-step1.log"), E2E_JOB: fixture("staging-30-e2e.log")}
     return FakeGitHub(responses, logs if logs is not None else default_logs)
 
@@ -958,6 +963,12 @@ def night(number, day, sha, eval_log=True, run_conclusion="failure", **conclusio
     return run, jobs, logs
 
 
+def skip_promotion_night(number, day, sha):
+    """A `skip_promotion` night: the matrix ran and passed, step 5 was
+    skipped, the run concluded success."""
+    return night(number, day, sha, eval_log=False, run_conclusion="success", **{EVAL_STAGE: "skipped", ROLLBACK_LEG: "success"})
+
+
 def eval_job_id(number):
     return night_run_id(number) * 100 + [job["name"] for job in STAGING_26_JOBS["jobs"]].index(EVAL_STAGE)
 
@@ -1069,14 +1080,26 @@ class StalledChainTest(unittest.TestCase):
         self.assertTrue(chat.posted[1].startswith("✅ release chain moving again: run #33 passed the gate"), chat.posted)
 
     def test_a_green_run_whose_eval_did_not_run_leaves_the_stalled_issue_open(self):
-        """A promotion run with `skip_pipeline` concludes success with step 5
-        skipped: no candidate passed the gate, so nothing moved."""
-        skipped = night(33, 3, SHA_33, eval_log=False, run_conclusion="success", **{EVAL_STAGE: "skipped", ROLLBACK_LEG: "success"})
+        """A `skip_promotion` night re-tests a candidate already through the
+        promotion path: the matrix runs, step 5 is skipped, and the run
+        concludes success. No candidate passed the gate, so nothing moved."""
+        skipped = skip_promotion_night(33, 3, SHA_33)
         github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), skipped, open_stall=[self._open_issue()])
         outcome, err = reconcile(github)
         self.assertEqual(outcome, "nothing")
         self.assertEqual(github.writes, [])
         self.assertIn("did not pass the release-candidate eval", err)
+
+    def test_a_skipped_promotion_night_between_two_red_nights_does_not_break_the_streak(self):
+        """The `skip_promotion` night neither counts nor ends the streak: the
+        chain is as stalled after it as before it."""
+        github = stalled_github(night(31, 1, SHA_31), skip_promotion_night(32, 2, SHA_32), night(33, 3, SHA_33))
+        outcome, err = reconcile(github)
+        self.assertEqual(outcome, "stall-opened", err)
+        payload = github.writes[1][2]
+        self.assertEqual(payload["title"], STALL_TITLE_2)
+        self.assertIn(f"<!-- release-stalled runs={night_run_id(33)}:1,{night_run_id(31)}:1 -->", payload["body"])
+        self.assertEqual([row[:12] for row in rows_of(payload["body"])], ["| 2026-11-03", "| 2026-11-01"])
 
     def test_a_stage_broken_night_between_two_red_nights_neither_opens_nor_counts(self):
         broken = night(32, 2, SHA_32, eval_log=False, **{E2E_SHORT: "failure", EVAL_STAGE: "skipped"})
@@ -1133,6 +1156,25 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(github.writes, [])
         self.assertEqual(chat.posted, [])
         self.assertIn("closed #3999", err)
+
+    def test_a_closed_stalled_issue_stamping_attempt_1_is_not_filed_again_for_a_red_attempt_2(self):
+        """The closed-issue guard matches the run, as the open path does: a
+        re-run of a night someone already dealt with is the same night."""
+        closed = self._open_issue(3999, state="closed")
+        run, jobs, logs = night(32, 2, SHA_32)
+        github = stalled_github(night(31, 1, SHA_31), (dict(run, run_attempt=2), jobs, logs), closed_stall=[closed])
+        chat = FakeChat()
+        outcome, err = reconcile(github, chat)
+        self.assertEqual(outcome, "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+        self.assertIn("closed #3999", err)
+
+    def test_the_poller_verdict_line_format_is_what_the_notifier_parses(self):
+        line = notifier.VERDICT_LINE_FORMAT.format(verdict="red", settled="true", build_id=build_of(40), url=SPYGLASS + build_of(40))
+        self.assertEqual(notifier.extract_red_verdict_build(f"2026-11-04T07:48:02.0Z {line}\n"), (build_of(40), SPYGLASS + build_of(40)))
+        green = notifier.VERDICT_LINE_FORMAT.format(verdict="green", settled="true", build_id=build_of(40), url=SPYGLASS)
+        self.assertIsNone(notifier.extract_red_verdict_build(green))
 
     def test_a_stalled_issue_is_never_mistaken_for_the_stage_issue(self):
         """Its own label and marker kind: the stage issue's listing does not

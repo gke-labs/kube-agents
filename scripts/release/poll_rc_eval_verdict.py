@@ -175,6 +175,10 @@ VERDICT_RED = "red"
 VERDICT_NOT_RUN = "not_run"
 VERDICT_TIMEOUT = "timeout"
 VERDICT_NEVER_RAN = "never_ran"
+# The line printed into the step-5 job log on the way out.
+# `scripts/release/notify_release_stage_broken.py` imports it and reads the
+# build id and link of a settled RED back out of the log.
+VERDICT_LINE_FORMAT = "verdict={verdict} settled={settled} build_id={build_id} {url}"
 
 # Exit codes, one per verdict. Distinct so a workflow can tell "the release is
 # bad" from "the eval lane is broken" without parsing the summary, and none of
@@ -803,7 +807,7 @@ def main(argv=None):
 
     url = spyglass_url(base) or ""
     settled = "true" if _SETTLED[verdict] else "false"
-    print(f"verdict={verdict} settled={settled} build_id={build_id or ''} {url}".rstrip(), flush=True)
+    print(VERDICT_LINE_FORMAT.format(verdict=verdict, settled=settled, build_id=build_id or "", url=url).rstrip(), flush=True)
 
     _write_kv(
         outputs_path,
