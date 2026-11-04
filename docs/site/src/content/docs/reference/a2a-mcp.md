@@ -19,6 +19,8 @@ If a ServiceAccount or Secret of those names already exists and the `PlatformAge
 
 ## Connecting a client
 
+To connect Antigravity or another local MCP host through the workstation bridge, which reads the token and opens the port-forward itself, follow [Using kube-agents from Antigravity](/kube-agents/install/antigravity-mcp/). A client that talks to the server directly connects as below.
+
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 
 ```bash
