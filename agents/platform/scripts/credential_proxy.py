@@ -3796,7 +3796,9 @@ class SessionSlots:
 class InFlight:
     """The requests the broker is serving, for the drain to wait on.
 
-    Counted per request in CredentialProxyHandler.handle_one_request. An open
+    Counted per request in CredentialProxyHandler.parse_request, from the
+    request line's arrival to the answer (handle_one_request's finally), so
+    a kept-open connection idle between requests is not in flight. An open
     route or a long poll (_refused_while_draining) leaves the count as soon as
     its path is known, so the drain does not wait out a pull that would answer
     nothing.
@@ -15365,6 +15367,16 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         self.rfile = _CountingReader(self.rfile)
 
     def parse_request(self) -> bool:
+        # Counted in flight from here, once the request line has arrived,
+        # until the answer is written (handle_one_request's finally), for the
+        # broker's drain (install_shutdown_handler). Not from
+        # handle_one_request's entry: a kept-open connection waits there for
+        # its next request line for up to KEEPALIVE_IDLE_SECONDS, longer than
+        # the drain, and counted from there it would hold every stop for a
+        # request that never came. _refused_while_draining lets a long poll or
+        # a watch out of the count once its path is known.
+        self._counted_in_flight = True
+        self.in_flight.enter()
         # Where this request's body starts in the stream, and how long it
         # said it was: None when it cannot be framed (a Transfer-Encoding,
         # which no route reads, or a length that is not a number), which
@@ -15414,11 +15426,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         self.end_headers()
 
     def handle_one_request(self) -> None:
-        # Counted in flight from here until its answer is written, for the
-        # broker's drain (install_shutdown_handler); _refused_while_draining
-        # lets a long poll or a watch out of the count once its path is known.
-        self._counted_in_flight = True
-        self.in_flight.enter()
+        # The request is counted in flight by parse_request, once its request
+        # line has arrived, and left in the finally below once its answer is
+        # written, for the broker's drain (install_shutdown_handler).
         # A peer that resets the connection while its request is being read,
         # or before an error page is on the wire, is a debug line and a closed
         # connection, as on the metrics listener; the exception would

@@ -10186,20 +10186,32 @@ class GracefulDrainTest(unittest.TestCase):
                 handler._leave_in_flight()  # what handle_one_request does once answered
                 self.assertEqual(0, in_flight.wait_idle(time.monotonic()))
 
-    def test_a_request_is_in_flight_until_it_is_answered(self):
+    def test_a_request_is_in_flight_from_its_request_line_until_it_is_answered(self):
+        # Counted once the request line has arrived (parse_request), not from
+        # handle_one_request's entry, where a kept-open connection waits for
+        # its next request line; left once the answer is written, a reset
+        # mid-answer included.
         in_flight = CredentialProxyHandler.in_flight
         seen = []
         handler, _ = self._handler("/v1/exec")
         for raised in (None, OSError("reset")):
             with self.subTest(raised=raised):
                 def answer(_self, raised=raised):
-                    seen.append(in_flight.wait_idle(time.monotonic()))
+                    # What the stdlib does before it dispatches to a route:
+                    # the request line read, then parsed with its headers.
+                    seen.append(("before the request line", in_flight.wait_idle(time.monotonic())))
+                    _self.raw_requestline = b"POST /v1/exec HTTP/1.1\r\n"
+                    _self.rfile = credential_proxy._CountingReader(io.BytesIO(b"Host: broker\r\n\r\n"))
+                    self.assertTrue(_self.parse_request())
+                    seen.append(("after the request line", in_flight.wait_idle(time.monotonic())))
                     if raised:
                         raise raised
 
                 with mock.patch.object(credential_proxy.BaseHTTPRequestHandler, "handle_one_request", answer):
                     handler.handle_one_request()
-                self.assertEqual(1, seen[-1])
+                self.assertEqual(
+                    [("before the request line", 0), ("after the request line", 1)], seen[-2:]
+                )
                 self.assertEqual(0, in_flight.wait_idle(time.monotonic()))
 
     def test_in_flight_wakes_the_waiter_when_the_last_request_leaves(self):
@@ -15914,6 +15926,33 @@ class KeepAliveTest(_CredentialedUnixServer):
         # Still open: the next request is answered on the same socket too.
         self.send(sock, "GET", "/healthz")
         self.assertEqual(200, self.response(sock)[0])
+
+    def test_a_kept_open_connection_waiting_for_a_request_is_not_in_flight(self):
+        # The broker's drain waits on the in-flight count
+        # (install_shutdown_handler). A kept-open connection idle between
+        # requests sits in handle_one_request waiting for a request line, for
+        # up to KEEPALIVE_IDLE_SECONDS; counted from there, every drain would
+        # wait its whole window for a request that never came. The count
+        # starts at the request line and ends with the answer.
+        in_flight = credential_proxy.InFlight()
+        with mock.patch.object(CredentialProxyHandler, "in_flight", in_flight):
+            answered = self.connect()
+            self.send(answered, "GET", "/healthz")
+            self.assertEqual(200, self.response(answered)[0])
+            silent = self.connect()
+            time.sleep(_RESET_SETTLE_SECONDS)
+            # Both connections are open, neither is in flight: one answered
+            # and waiting for its next request, one that has sent nothing.
+            self.assertEqual(0, in_flight.wait_idle(time.monotonic() + _CLOSE_WAIT_SECONDS))
+            # A request line with its headers still to come is in flight.
+            answered.sendall(b"GET /healthz HTTP/1.1\r\n")
+            deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+            while in_flight.wait_idle(time.monotonic()) == 0 and time.monotonic() < deadline:
+                time.sleep(_DRIP_INTERVAL_SECONDS)
+            self.assertEqual(1, in_flight.wait_idle(time.monotonic()))
+            answered.sendall(b"Host: broker\r\n\r\n")
+            self.assertEqual(200, self.response(answered)[0])
+            self.assertEqual(0, in_flight.wait_idle(time.monotonic() + _CLOSE_WAIT_SECONDS))
 
     def test_an_http_1_0_client_is_answered_and_closed(self):
         sock = self.connect()
