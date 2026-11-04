@@ -63,19 +63,38 @@ FLEET_SCALE_CLUSTER_FORMAT = "cluster-{index:04d}"
 ROSTER_ENV_NAMES = (
     "GKE_CLUSTER_NAME", "GKE_PROJECT_ID", "GKE_LOCATION", "GCP_PROJECT_ID",
     "KUBEAGENTS_SCOPE_FILE", "PLATFORM_AGENT_HOME",
+    "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD",
 )
 # The one description every scaffolded Cluster Agent shares.
 CLUSTER_ROLE = "One cluster's runtime state.\n"
 
 
-def _render_roster(base: Path, env: dict[str, str]) -> str | None:
-    """render(base) with ROSTER_ENV_NAMES cleared and env applied on top."""
+@contextmanager
+def _roster_env(env: dict[str, str]):
+    """ROSTER_ENV_NAMES cleared and env applied on top, for the block.
+
+    Every render and format_roster call in this file goes through it, so a
+    shell that exports one of the names (a developer trying the counted
+    form, the agent container) cannot reach the assertions.
+    """
     from unittest import mock
 
     clean = {k: v for k, v in os.environ.items() if k not in ROSTER_ENV_NAMES}
     clean.update(env)
     with mock.patch.dict(os.environ, clean, clear=True):
+        yield
+
+
+def _render_roster(base: Path | None, env: dict[str, str]) -> str | None:
+    """render(base) under _roster_env(env); ``None`` is the module's PROFILES_BASE."""
+    with _roster_env(env):
         return agent_roster.render(base)
+
+
+def _render_filtered(query: str, base: Path | None, env: dict[str, str]) -> str | None:
+    """render_filtered(query, base) under _roster_env(env)."""
+    with _roster_env(env):
+        return agent_roster.render_filtered(query, base)
 
 
 def _write_cluster_profile(base: Path, name: str, project: str, cluster: str, location: str) -> None:
@@ -129,7 +148,7 @@ class TestDiscovery(unittest.TestCase):
             # SOUL.md is the fallback when no CAPABILITIES.md exists.
             (base / "cluster-a" / "SOUL.md").write_text("# Title\n\nRead-only cluster diagnostics.\n")
 
-            out = agent_roster.render()
+            out = _render_roster(None, {})
             self.assertIn("- platform: Fleet + GitOps write path.", out)
             self.assertIn("- cluster-a: Read-only cluster diagnostics.", out)
             self.assertNotIn("default", out)
@@ -159,7 +178,7 @@ class TestDiscovery(unittest.TestCase):
                 "model: x\ncluster_identity:\n  project: my-proj\n  cluster: ka-today-2\n"
                 "  location: northamerica-northeast1\ncontext_file_max_chars: 100000\n"
             )
-            out = agent_roster.render()
+            out = _render_roster(None, {})
             self.assertIn(
                 f"- {name} (the ka-today-2 cluster agent; project my-proj, location northamerica-northeast1): "
                 "Read-only cluster diagnostics.",
@@ -172,7 +191,7 @@ class TestDiscovery(unittest.TestCase):
             for n, c in (("cluster-a", "alpha"), ("cluster-b", "beta")):
                 (base / n / "CAPABILITIES.md").write_text("Shared template.")
                 (base / n / "config.yaml").write_text(f"cluster_identity:\n  cluster: {c}\n")
-            out = agent_roster.render()
+            out = _render_roster(None, {})
             self.assertIn("  - cluster-a (the alpha cluster agent)\n", out)
             self.assertIn("  - cluster-b (the beta cluster agent)\n", out)
 
@@ -186,7 +205,7 @@ class TestDiscovery(unittest.TestCase):
             (base / "p4" / "config.yaml").write_text("cluster_identity:\n  project: x\nother: y\n  cluster: nope\n")
             for n in ("p1", "p2", "p3", "p4"):
                 (base / n / "CAPABILITIES.md").write_text(f"role {n}")
-            out = agent_roster.render()
+            out = _render_roster(None, {})
             for n in ("p1", "p2", "p3", "p4"):
                 self.assertIn(f"- {n}: role {n}", out)
             self.assertNotIn("cluster agent", out)
@@ -194,7 +213,7 @@ class TestDiscovery(unittest.TestCase):
     def test_empty_when_no_specialists(self):
         with TemporaryDirectory() as tmp:
             self._with_profiles(tmp, ["default"])
-            self.assertIn("No specialist agents", agent_roster.render())
+            self.assertIn("No specialist agents", _render_roster(None, {}))
 
     def test_an_explicit_base_overrides_the_module_default(self):
         # The injecting plugin passes its own resolved path rather than relying
@@ -204,7 +223,7 @@ class TestDiscovery(unittest.TestCase):
             (base / "platform").mkdir(parents=True)
             (base / "platform" / "CAPABILITIES.md").write_text("Fleet work.")
             agent_roster.PROFILES_BASE = Path(tmp) / "does-not-exist"
-            self.assertIn("- platform: Fleet work.", agent_roster.render(base))
+            self.assertIn("- platform: Fleet work.", _render_roster(base, {}))
 
 
 class TestSharedRoleGrouping(unittest.TestCase):
@@ -234,7 +253,7 @@ class TestSharedRoleGrouping(unittest.TestCase):
     def test_shared_description_stated_once(self):
         with TemporaryDirectory() as tmp:
             self._fleet(tmp)
-            out = agent_roster.render()
+            out = _render_roster(None, {})
 
             # The expensive part — the repeated blob — appears exactly once...
             self.assertEqual(out.count(self.FLEET), 1)
@@ -245,7 +264,7 @@ class TestSharedRoleGrouping(unittest.TestCase):
     def test_unique_specialist_kept_inline_and_ordered_first(self):
         with TemporaryDirectory() as tmp:
             self._fleet(tmp)
-            out = agent_roster.render()
+            out = _render_roster(None, {})
 
             # A one-off specialist stays on a single `- name: desc` line.
             self.assertIn("- platform: Fleet + GitOps write path.", out)
@@ -256,7 +275,7 @@ class TestSharedRoleGrouping(unittest.TestCase):
     def test_grouping_shrinks_the_roster(self):
         with TemporaryDirectory() as tmp:
             self._fleet(tmp)
-            grouped = agent_roster.render()
+            grouped = _render_roster(None, {})
 
         # Compare against what the un-grouped one-line-per-agent form would cost.
         ungrouped = "\n".join(
@@ -275,7 +294,7 @@ class TestSharedRoleGrouping(unittest.TestCase):
                 (base / name).mkdir(parents=True)
             agent_roster.PROFILES_BASE = base
 
-            out = agent_roster.render()
+            out = _render_roster(None, {})
 
             self.assertIn("- mystery-a: (no description provided)", out)
             self.assertIn("- mystery-b: (no description provided)", out)
@@ -311,7 +330,7 @@ class TestDiscoveryDegradesOnIOError(unittest.TestCase):
             agent_roster.PROFILES_BASE = base
 
             with self._locked(base / "broken"):
-                out = agent_roster.render()
+                out = _render_roster(None, {})
 
             # The healthy specialist still routes; the unreadable one is listed
             # without a description rather than taking down the whole roster.
@@ -329,14 +348,14 @@ class TestDiscoveryDegradesOnIOError(unittest.TestCase):
             agent_roster.PROFILES_BASE = base
 
             with self._locked(base):
-                self.assertIsNone(agent_roster.render())
+                self.assertIsNone(_render_roster(None, {}))
 
     def test_missing_profiles_base_returns_empty_roster(self):
         # A directory that is absent, unlike one that cannot be read, is a fact:
         # pathlib's is_dir() swallows ENOENT, so this is a genuinely empty fleet.
         with TemporaryDirectory() as tmp:
             agent_roster.PROFILES_BASE = Path(tmp) / "does-not-exist"
-            self.assertIn("No specialist agents", agent_roster.render())
+            self.assertIn("No specialist agents", _render_roster(None, {}))
 
 
 class TestHostAndScopeSections(unittest.TestCase):
@@ -769,7 +788,8 @@ class TestHostAndScopeSections(unittest.TestCase):
         # specialist list #3264 shaped, with no host or scope text.
         with TemporaryDirectory() as tmp:
             base = self._fleet(tmp)
-            out = agent_roster.format_roster(agent_roster.discover(base))
+            with _roster_env({}):
+                out = agent_roster.format_roster(agent_roster.discover(base))
         self.assertNotIn("Host Cluster Identity", out)
         self.assertIn("(the kcc-gitops-hub cluster agent; project gca-gke-2025, location us-east1-c)", out)
 
@@ -1450,8 +1470,8 @@ class TestFilter(unittest.TestCase):
             _write_cluster_profile(base, "cluster-p-b-us", "p", "b", "us")
             _age(base)
             with mock.patch.object(Path, "is_dir", autospec=True, side_effect=flaky):
-                degraded = agent_roster.render_filtered("b", base)
-            clean = agent_roster.render_filtered("b", base)
+                degraded = _render_filtered("b", base, {})
+            clean = _render_filtered("b", base, {})
         _forget()
         self.assertEqual(degraded, agent_roster.FILTER_UNREAD.format(query="b", total=1))
         self.assertIn("cluster-p-b-us (the b cluster agent", clean)
@@ -1466,7 +1486,7 @@ class TestFilter(unittest.TestCase):
             _age(base)
             _render_roster(base, {})
             with _counting_reads() as counts:
-                out = agent_roster.render_filtered("b", base)
+                out = _render_filtered("b", base, {})
             self.assertEqual(counts["reads"].call_count, 0)
         _forget()
         self.assertIn("cluster-p-b-us (the b cluster agent", out)
