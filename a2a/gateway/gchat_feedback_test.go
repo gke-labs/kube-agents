@@ -486,8 +486,14 @@ func TestGchatRatingNeverRestoresAnsweredChoices(t *testing.T) {
 		t.Fatalf("choice click: %q", reason)
 	}
 	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	// The event's copy predates the answered rewrite: no line, choices.
 	a.classify(gchatRatingEvent(t, "up"))
-	buttons := bodyButtons(t, checkPatch(t, f, 2, name))
+	body := checkPatch(t, f, 2, name)
+	answered := callBody(t, f.call(1))["text"].(string)
+	if text, _ := body["text"].(string); text != answered || !strings.HasSuffix(text, "✓ Test Sender: Look at the first one") {
+		t.Errorf("text = %q, want the answered rewrite's %q, ending with its line", text, answered)
+	}
+	buttons := bodyButtons(t, body)
 	for _, b := range buttons {
 		if classifyGchatButton(b) == gchatButtonChoice {
 			t.Errorf("the tap restored a choice: %+v", b)
@@ -497,6 +503,62 @@ func TestGchatRatingNeverRestoresAnsweredChoices(t *testing.T) {
 		t.Fatalf("buttons = %+v, want the link and two rating", buttons)
 	}
 	checkFilled(t, buttons, "up")
+}
+
+// An edit of an answered question that lays out no choices keeps the line;
+// a later tap redraws that edit, not the layout the answer first put on.
+func TestGchatRatingAfterAnEditOfTheAnswerRedrawsTheEdit(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	conversation := "gchat:dm/spaces/_c2fixtureAA"
+	name, err := a.PostMessage(conversation, OutMessage{Text: "fallback", Chat: gchatFeedbackQuestion(), Feedback: "t-root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, reason := a.classify(gchatClickEvent(t))
+	if reason != "" {
+		t.Fatalf("choice click: %q", reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	if err := a.EditMessage(conversation, name, OutMessage{Text: "Settled: prod-eu."}); err != nil {
+		t.Fatal(err)
+	}
+	edited := callBody(t, f.call(2))["text"].(string)
+	if !strings.HasPrefix(edited, "Settled: prod-eu.") || !strings.HasSuffix(edited, "✓ Test Sender: Look at the first one") {
+		t.Fatalf("edit text = %q, want the new text and the line", edited)
+	}
+	a.classify(gchatRatingEvent(t, "down"))
+	body := checkPatch(t, f, 3, name)
+	if body["text"] != edited {
+		t.Errorf("text = %q, want the edit's %q", body["text"], edited)
+	}
+	buttons := bodyButtons(t, body)
+	if len(buttons) != 2 {
+		t.Fatalf("buttons = %+v, want the two rating buttons alone", buttons)
+	}
+	checkFilled(t, buttons, "down")
+}
+
+// The rewrite runs after classify returns, so it reads its own copy of the
+// message: a caller that changes the event afterwards changes nothing.
+func TestGchatRatingPatchReadsItsOwnCopyOfTheMessage(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	ev := gchatRatingEvent(t, "up")
+	text := ev.Message.Text
+	rec.onRate = func() {
+		ev.Message.Text = "changed"
+		buttons := ev.Message.AccessoryWidgets[0].ButtonList.Buttons
+		buttons[2].Text = "changed"
+		buttons[0].OnClick.Action.Parameters[0].Value = "changed"
+	}
+	a.classify(ev)
+	body := checkPatch(t, f, 0, gchatRatedMessage)
+	if body["text"] != text {
+		t.Errorf("text = %q, want %q", body["text"], text)
+	}
+	buttons := bodyButtons(t, body)
+	if len(buttons) != 5 || buttons[2].Text != "board" || buttonParams(buttons[0])["reply"] != "Look at the first one: prod-eu" {
+		t.Errorf("buttons = %+v, want the event's as classified", buttons)
+	}
 }
 
 func TestGchatReRatingReplacesTheFilledButton(t *testing.T) {

@@ -157,8 +157,12 @@ type gchatUX struct {
 	waiting map[string]bool
 	// answered marks a question whose answer has been taken, and lines
 	// holds the line an answered message shows, which a later edit keeps.
-	answered     map[string]bool
-	lines        map[string]string
+	answered map[string]bool
+	lines    map[string]string
+	// shown is the layout the answered rewrite put on the message, set
+	// with lines, so a rating tap redraws the record rather than the
+	// event's copy (gchat_feedback.go, ratedLayout).
+	shown        map[string]gchatChatLayout
 	answeredRing []string
 	// rated is the rating buttons each rated answer carries, by message
 	// name (gchat_feedback.go), and ratedOrder its ring.
@@ -169,7 +173,8 @@ type gchatUX struct {
 func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 	if a.ux == nil {
 		a.ux = &gchatUX{questions: map[string]gchatQuestion{}, open: map[string]string{}, pending: map[string]gchatPendingClick{},
-			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{}, rated: map[string]gchatRating{}}
+			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{},
+			shown: map[string]gchatChatLayout{}, rated: map[string]gchatRating{}}
 	}
 	return a.ux
 }
@@ -193,6 +198,11 @@ func (a *GoogleChatAdapter) trackQuestion(name, conversation string, m *chatmsg.
 		// before a restart is not), would patch its stale snapshot of the
 		// text over this layout once verified.
 		ux.forgetClicksLocked(name)
+		if ux.answered[name] {
+			// The edit kept the answered line (answeredLayout); this is
+			// what the message shows now.
+			ux.shown[name] = layout
+		}
 		if _, ok := ux.questions[name]; ok {
 			ux.dropQuestionLocked(name)
 			forget(&ux.questionsOrder, name)
@@ -228,6 +238,7 @@ func (a *GoogleChatAdapter) forgetAnswer(name string) {
 func (ux *gchatUX) forgetAnswerLocked(name string) {
 	delete(ux.answered, name)
 	delete(ux.lines, name)
+	delete(ux.shown, name)
 	forget(&ux.answeredRing, name)
 }
 
@@ -434,7 +445,7 @@ func (a *GoogleChatAdapter) InboundVerified(conversation, messageID string, veri
 	}
 	ux.answered[p.message] = true
 	line := defangGchatControls(fmt.Sprintf(answeredLine, p.clicker, p.label))
-	remember(&ux.answeredRing, p.message, func(k string) { delete(ux.answered, k); delete(ux.lines, k) })
+	remember(&ux.answeredRing, p.message, func(k string) { delete(ux.answered, k); delete(ux.lines, k); delete(ux.shown, k) })
 	ux.dropQuestionLocked(p.message)
 	forget(&ux.questionsOrder, p.message)
 	a.mu.Unlock()
@@ -459,6 +470,7 @@ func (a *GoogleChatAdapter) rewriteAnswered(conversation, messageID string, layo
 		a.mu.Lock()
 		if ux := a.uxLocked(); ux.answered[messageID] {
 			ux.lines[messageID] = line
+			ux.shown[messageID] = layout
 		}
 		a.mu.Unlock()
 		return

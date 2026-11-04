@@ -271,13 +271,17 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 	rating := FeedbackRating{Platform: platformGoogleChat, Backend: gchatBackend, Rater: click.User.Email,
 		Conversation: conversation, MessageID: message, TaskID: task, Rating: value, Answer: ev.Message.Text}
 	chosen := gchatRating{task: task, chosen: value}
+	// The rewrite runs after this returns: it reads its own copy of the
+	// message, never the event the caller holds.
+	snapshot := &gchatEvent{Message: gchatMessage{Name: message, Text: ev.Message.Text,
+		AccessoryWidgets: cloneGchatWidgets(ev.Message.AccessoryWidgets)}}
 	a.goRewrite(func() {
 		if _, err := recorder.Rate(rating); err != nil {
 			a.log.Warn("gchat: recording a rating failed", "message", message, "taskId", task, "err", err)
 			return
 		}
 		a.rememberRating(message, chosen)
-		if err := a.patchRating(message, a.ratedLayout(ev, chosen)); err != nil {
+		if err := a.patchRating(message, a.ratedLayout(snapshot, chosen)); err != nil {
 			a.log.Warn("gchat: filling the tapped rating button failed; the rating is kept", "message", message, "err", err)
 		}
 		// Task 4: a 👎 asks for a note here.
@@ -286,18 +290,25 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 }
 
 // ratedLayout is the layout a rating tap patches message ev to, with r's
-// buttons at the end: (a) a remembered question not yet answered keeps its
-// own layout; (b) an answered one takes the event's text and its link
-// buttons only, so a tap never restores the choices the answer removed; (c)
-// any other message, one from before a restart, takes the event's text and
-// its choice and link buttons, in the event's order.
+// buttons at the end. The adapter's record wins when it has one: (a) a
+// remembered question not yet answered keeps its own layout; (b) an
+// answered one keeps the layout its answer put on it, the answered line
+// included (ux.shown), and, while that rewrite has not landed, takes the
+// event's text and its link buttons only, so a tap never restores the
+// choices the answer removed; (c) any other message, one from before a
+// restart, takes the event's text and its choice and link buttons, in the
+// event's order.
 func (a *GoogleChatAdapter) ratedLayout(ev *gchatEvent, r gchatRating) gchatChatLayout {
 	a.mu.Lock()
 	ux := a.uxLocked()
 	answered := ux.answered[ev.Message.Name]
+	shown, recorded := ux.shown[ev.Message.Name]
 	q, remembered := ux.questions[ev.Message.Name]
 	a.mu.Unlock()
-	if remembered && !answered {
+	switch {
+	case answered && recorded:
+		return gchatChatLayout{Text: shown.Text, Widgets: gchatWithRating(shown.Widgets, r)}
+	case remembered && !answered:
 		return gchatChatLayout{Text: q.layout.Text, Widgets: gchatWithRating(q.layout.Widgets, r)}
 	}
 	var buttons []map[string]any
@@ -314,6 +325,25 @@ func (a *GoogleChatAdapter) ratedLayout(ev *gchatEvent, r gchatRating) gchatChat
 		widgets = []map[string]any{{gchatButtonListKey: map[string]any{gchatButtonsKey: buttons}}}
 	}
 	return gchatChatLayout{Text: ev.Message.Text, Widgets: gchatWithRating(widgets, r)}
+}
+
+// cloneGchatWidgets is a deep copy of decoded accessory widgets: no slice
+// in it shares a backing array with widgets.
+func cloneGchatWidgets(widgets []gchatAccessoryWidget) []gchatAccessoryWidget {
+	if widgets == nil {
+		return nil
+	}
+	out := make([]gchatAccessoryWidget, len(widgets))
+	for i, w := range widgets {
+		buttons := make([]gchatButton, len(w.ButtonList.Buttons))
+		for j, b := range w.ButtonList.Buttons {
+			params := b.OnClick.Action.Parameters
+			b.OnClick.Action.Parameters = append(params[:0:0], params...)
+			buttons[j] = b
+		}
+		out[i].ButtonList.Buttons = buttons
+	}
+	return out
 }
 
 // patchRating patches message to layout.
