@@ -39,6 +39,7 @@ and the controls would still look present in the file that no longer decides.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
 import repo_ref
@@ -68,9 +69,11 @@ __all__ = [
     "ForgeUnsupported",
     "IdentityUnknown",
     "LabelsUnsupported",
+    "QuotaReading",
     "StubForge",
     "WorkspaceError",
     "listing",
+    "quota_reading",
 ]
 
 # The verbs a forge may serve, plus the ones the broker serves for every forge.
@@ -136,6 +139,39 @@ def tally_with_open(tally: dict[str, Any]) -> dict[str, Any]:
     """
     tally["open"] = max(tally[TALLY_TOTAL] - tally["merged"] - tally["closed"], 0)
     return tally
+
+@dataclass(frozen=True)
+class QuotaReading:
+    """What one forge answer said of the credential's request quota.
+
+    `reset_at` is when the quota refills, in seconds since the epoch. A field
+    the answer did not carry, or carried malformed, is None; a reading whose
+    `remaining` is None says nothing a caller can pace on, and reads as unknown.
+    """
+
+    limit: int | None
+    remaining: int | None
+    reset_at: float | None
+
+
+def _quota_number(headers: Mapping[str, Any], name: str) -> int | None:
+    value = str(headers.get(name) or "").strip()
+    return int(value) if value.isascii() and value.isdigit() else None
+
+
+def quota_reading(
+    headers: Mapping[str, Any], limit: str, remaining: str, reset: str
+) -> QuotaReading | None:
+    """The reading three headers give (lower-case names, `reset` in epoch
+    seconds), or None when the answer carried none of them."""
+    reset_at = _quota_number(headers, reset)
+    reading = QuotaReading(
+        _quota_number(headers, limit),
+        _quota_number(headers, remaining),
+        None if reset_at is None else float(reset_at),
+    )
+    return None if reading == QuotaReading(None, None, None) else reading
+
 
 class ForgeUnsupported(WorkspaceError):
     """This host is not one this install has a credential and a client for."""
@@ -312,6 +348,18 @@ class Forge:
         login; with `identity_required`, the broker refuses that.
         """
         return self.identity.strip() or None
+
+    @staticmethod
+    def quota_from_headers(headers: Mapping[str, Any]) -> QuotaReading | None:
+        """The request quota one answer's headers (lower-case names) report.
+
+        None when this forge reports none the code knows how to read, which
+        is the default: a forge declares its own headers rather than having
+        names guessed for it. Static, so the broker hands it to the HTTP
+        transport it builds, as it hands `whoami_route`, and the transport
+        keeps the latest reading (`HttpTransport.quota`).
+        """
+        return None
 
     def refuse_labels(self, verb: str, payload: Mapping[str, Any]) -> None:
         """Refuse a label field on a forge that has no labels. No call is made.

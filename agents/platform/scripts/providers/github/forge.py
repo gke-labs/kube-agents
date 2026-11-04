@@ -27,7 +27,16 @@ from urllib.parse import quote
 
 import repo_ref
 
-from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing, TALLY_TOTAL, tally_with_open
+from ..base import (
+    COLLABORATION_VERBS,
+    Forge,
+    QuotaReading,
+    WorkspaceError,
+    listing,
+    quota_reading,
+    TALLY_TOTAL,
+    tally_with_open,
+)
 from ..credentials import (
     BrokeredCredential,
     Credential,
@@ -64,6 +73,16 @@ MAX_ISSUE_PAGES = 10
 
 # `repos/{r}/collaborators/{login}/permission` values that mean "may write".
 WRITE_PERMISSIONS = frozenset({"admin", "write", "maintain"})
+
+# The headers GitHub reports the credential's request quota in, on every REST
+# answer, a refusal included (`reset` in epoch seconds), and the one that names
+# which quota they describe. Only `core` is read: search and GraphQL each spend
+# a quota of their own, and the readings sweep paces its searches separately.
+RATE_LIMIT_HEADER = "x-ratelimit-limit"
+RATE_REMAINING_HEADER = "x-ratelimit-remaining"
+RATE_RESET_HEADER = "x-ratelimit-reset"
+RATE_RESOURCE_HEADER = "x-ratelimit-resource"
+CORE_RESOURCE = "core"
 
 # How many of a pull request's commits GitHub serves: the endpoint stops there,
 # however long the branch. GitLab's and Gitea's commit readers stop at the same
@@ -152,6 +171,19 @@ class GitHubForge(Forge):
     labels = True
     search_routes = frozenset({SEARCH_PATH})
     COMMIT_CAP = COMMIT_CAP
+
+    @staticmethod
+    def quota_from_headers(headers: Mapping[str, Any]) -> QuotaReading | None:
+        """The `core` quota an answer reports, on github.com and GHES alike.
+
+        An answer that names another resource (`search`, `graphql`) says
+        nothing of `core`, and is not read; one that names none is read as
+        `core`, which is what GitHub reports on a REST route that does not say.
+        """
+        resource = str(headers.get(RATE_RESOURCE_HEADER) or "").strip().lower()
+        if resource and resource != CORE_RESOURCE:
+            return None
+        return quota_reading(headers, RATE_LIMIT_HEADER, RATE_REMAINING_HEADER, RATE_RESET_HEADER)
 
     def __init__(
         self,

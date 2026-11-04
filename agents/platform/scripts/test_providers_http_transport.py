@@ -464,6 +464,137 @@ class WhoamiTest(unittest.TestCase):
             transport(opener, whoami_route=("user", "username")).whoami()
 
 
+FORGES = {cls.name: cls for cls in providers.AVAILABLE}
+GITHUB_CORE = {
+    "X-RateLimit-Limit": "5000",
+    "X-RateLimit-Remaining": "4321",
+    "X-RateLimit-Reset": "1767225600",
+    "X-RateLimit-Resource": "core",
+}
+
+
+def refusal_with(status: int, headers: dict) -> urllib.error.HTTPError:
+    message = http.client.HTTPMessage()
+    for name, value in headers.items():
+        message[name] = value
+    return urllib.error.HTTPError(f"{BASE}/x", status, "refused", message, io.BytesIO(b'{"message": "no"}'))
+
+
+class QuotaTest(unittest.TestCase):
+    """#4615: the transport keeps the quota the forge's headers report."""
+
+    def quota_transport(self, opener, forge="github"):
+        return transport(opener, quota_from_headers=FORGES[forge].quota_from_headers)
+
+    def test_a_success_answer_records_the_quota(self):
+        sender = self.quota_transport(Opener(_Response(b"{}", headers=GITHUB_CORE)))
+        self.assertIsNone(sender.quota())
+        sender.api("GET", "repos/acme/infra/pulls/1")
+        self.assertEqual(providers.QuotaReading(5000, 4321, 1767225600.0), sender.quota())
+
+    def test_a_refusal_records_the_quota_it_carried(self):
+        spent = {**GITHUB_CORE, "X-RateLimit-Remaining": "0"}
+        sender = self.quota_transport(Opener(refusal_with(403, spent)))
+        with self.assertRaises(WorkspaceError):
+            sender.api("GET", "repos/acme/infra/pulls/1")
+        self.assertEqual(providers.QuotaReading(5000, 0, 1767225600.0), sender.quota())
+
+    def test_an_answer_with_no_quota_headers_records_nothing(self):
+        sender = self.quota_transport(Opener(_Response(b"{}"), refusal(404, {"message": "Not Found"})))
+        sender.api("GET", "user")
+        with self.assertRaises(WorkspaceError):
+            sender.api("GET", "user")
+        self.assertIsNone(sender.quota())
+
+    def test_an_answer_with_no_quota_headers_keeps_the_reading_before(self):
+        sender = self.quota_transport(Opener(_Response(b"{}", headers=GITHUB_CORE), _Response(b"{}")))
+        sender.api("GET", "user")
+        sender.api("GET", "user")
+        self.assertEqual(4321, sender.quota().remaining)
+
+    def test_malformed_values_read_as_unknown_fields(self):
+        headers = {"X-RateLimit-Limit": "lots", "X-RateLimit-Remaining": "-3", "X-RateLimit-Reset": "12"}
+        sender = self.quota_transport(Opener(_Response(b"{}", headers=headers)))
+        sender.api("GET", "user")
+        self.assertEqual(providers.QuotaReading(None, None, 12.0), sender.quota())
+
+    def test_a_github_answer_for_another_resource_is_not_read(self):
+        search = {**GITHUB_CORE, "X-RateLimit-Remaining": "3", "X-RateLimit-Resource": "search"}
+        sender = self.quota_transport(
+            Opener(_Response(b"{}", headers=GITHUB_CORE), _Response(b"{}", headers=search))
+        )
+        sender.api("GET", "user")
+        sender.api("GET", "search/issues")
+        self.assertEqual(4321, sender.quota().remaining, "the search quota overwrote the core one")
+
+    def test_no_reader_means_no_quota(self):
+        sender = transport(Opener(_Response(b"{}", headers=GITHUB_CORE)))
+        sender.api("GET", "user")
+        self.assertIsNone(sender.quota())
+
+    def test_a_reader_that_raises_never_fails_the_call(self):
+        def broken(headers):
+            raise KeyError("x")
+
+        sender = transport(Opener(_Response(b'{"ok": 1}', headers=GITHUB_CORE)), quota_from_headers=broken)
+        self.assertEqual({"ok": 1}, sender.api("GET", "user"))
+        self.assertIsNone(sender.quota())
+
+    def test_the_cli_transport_knows_no_quota(self):
+        self.assertIsNone(providers.CliTransport(mock.Mock(), "gh").quota())
+
+    def test_the_broker_hands_its_http_transport_the_forges_reader(self):
+        class _Counted(_HttpForge):
+            quota_from_headers = staticmethod(FORGES["gitlab"].quota_from_headers)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        opener = Opener(_Response(b"{}", headers={"RateLimit-Remaining": "7"}))
+        broker = vcs_broker.VcsBroker(Path(tmp.name), git_runner=lambda *a, **k: None, http_opener=opener)
+        built = broker._transport(_Counted(), "acme/infra")
+        built.api("GET", "user")
+        self.assertEqual(providers.QuotaReading(None, 7, None), built.quota())
+
+
+class ForgeQuotaHeadersTest(unittest.TestCase):
+    """Each forge reads the quota headers it documents, and only those."""
+
+    def test_github_reads_its_core_rate_limit_headers(self):
+        read = FORGES["github"].quota_from_headers
+        lower = {name.lower(): value for name, value in GITHUB_CORE.items()}
+        self.assertEqual(providers.QuotaReading(5000, 4321, 1767225600.0), read(lower))
+        unnamed = {k: v for k, v in lower.items() if k != "x-ratelimit-resource"}
+        self.assertEqual(providers.QuotaReading(5000, 4321, 1767225600.0), read(unnamed))
+        for resource in ("search", "graphql", "code_search"):
+            with self.subTest(resource=resource):
+                self.assertIsNone(read({**lower, "x-ratelimit-resource": resource}))
+        self.assertIsNone(read({}))
+        self.assertIsNone(read({"ratelimit-remaining": "5"}), "GitLab's spelling is not GitHub's")
+
+    def test_gitlab_reads_its_ratelimit_headers(self):
+        read = FORGES["gitlab"].quota_from_headers
+        self.assertEqual(
+            providers.QuotaReading(2000, 1999, 1767225600.0),
+            read({"ratelimit-limit": "2000", "ratelimit-remaining": "1999", "ratelimit-reset": "1767225600"}),
+        )
+        self.assertEqual(providers.QuotaReading(None, 12, None), read({"ratelimit-remaining": "12"}))
+        self.assertIsNone(read({}))
+        self.assertIsNone(read({"x-ratelimit-remaining": "5"}), "GitHub's spelling is not GitLab's")
+
+    def test_gitea_and_bitbucket_report_no_quota(self):
+        everything = {
+            "x-ratelimit-limit": "5000",
+            "x-ratelimit-remaining": "1",
+            "x-ratelimit-reset": "1767225600",
+            "ratelimit-limit": "5000",
+            "ratelimit-remaining": "1",
+            "ratelimit-reset": "1767225600",
+        }
+        for name in ("gitea", "bitbucket", "bitbucket-datacenter"):
+            with self.subTest(forge=name):
+                self.assertIsNone(FORGES[name].quota_from_headers(everything))
+
+
 class _HttpForge(providers.Forge):
     name = "httpforge"
     hosts = ("forge.example.test",)
