@@ -182,10 +182,10 @@ MAX_INVARIANT_ITEMS = 20
 MAX_REPORT_CHARS = 8500
 # The other findings' header, under the stuck tasks when both are present.
 REPORT_HEADER = "kanban board health: attention required"
-# A full data volume, in the Session KV server's words: from its warn line, every
-# board write is at risk, and at 100% each one fails with a bare "disk I/O
-# error". session_kv_server.py imports these for its home-channel warning, so
-# the two say the same line at the same figure.
+# A full data volume: from the warn line, every board write is at risk, and at
+# 100% each one fails with a bare "disk I/O error". session_kv_server.py imports
+# these for its home-channel warning, so the two say the same line at the same
+# figure.
 DATA_VOLUME_WARN_PERCENT = 90
 DATA_VOLUME_WARNING = (
     "The agent's data volume is {percent}% full ({used:.1f} of {total:.1f} GiB). "
@@ -894,9 +894,10 @@ def data_volume_percent(total: int, free: int) -> int:
     return (total - free) * PERCENT // total
 
 
-def data_volume_warning(total: int, free: int) -> str:
-    """DATA_VOLUME_WARNING for a volume of `total` bytes with `free` left."""
-    return DATA_VOLUME_WARNING.format(
+def data_volume_text(template: str, total: int, free: int) -> str:
+    """`template` (DATA_VOLUME_WARNING, or another text with its `percent`,
+    `used` and `total` fields) for a volume of `total` bytes with `free` left."""
+    return template.format(
         percent=data_volume_percent(total, free), used=(total - free) / BYTES_PER_GIB, total=total / BYTES_PER_GIB
     )
 
@@ -907,7 +908,7 @@ def data_volume_line(home: Path) -> str | None:
     usage = data_volume_usage(home)
     if usage is None or data_volume_percent(*usage) < DATA_VOLUME_WARN_PERCENT:
         return None
-    return data_volume_warning(*usage)
+    return data_volume_text(DATA_VOLUME_WARNING, *usage)
 
 
 def is_disk_full_error(exc: BaseException, home: Path) -> bool:

@@ -1591,7 +1591,7 @@ def init_db() -> None:
                 """
             )
             # One row: whether the data volume warning has been posted for the
-            # current crossing. On this database rather than in memory so that a
+            # current crossing, kept until the all-clear is. On this database rather than in memory so that a
             # restart while the volume is still full does not post it again, and
             # on this database rather than the data volume, which is the one that
             # is full.
@@ -2823,11 +2823,7 @@ def check_data_volume() -> None:
     warned = _data_volume_warned()
     if warned:
         if percent < DATA_VOLUME_REARM_PERCENT:
-            message = DATA_VOLUME_CLEARED.format(
-                percent=percent,
-                used=(total - free) / kanban_board_health.BYTES_PER_GIB,
-                total=total / kanban_board_health.BYTES_PER_GIB,
-            )
+            message = kanban_board_health.data_volume_text(DATA_VOLUME_CLEARED, total, free)
             logger.info(message)
             # Re-armed only after the all-clear is delivered, for the reason
             # the warning's flag is set only after it is.
@@ -2836,7 +2832,7 @@ def check_data_volume() -> None:
         return
     if percent < kanban_board_health.DATA_VOLUME_WARN_PERCENT:
         return
-    message = kanban_board_health.data_volume_warning(total, free)
+    message = kanban_board_health.data_volume_text(kanban_board_health.DATA_VOLUME_WARNING, total, free)
     logger.warning(message)
     # Set only after the post is delivered. A process killed during the send
     # (a pod roll) then posts at the next check instead of never.
