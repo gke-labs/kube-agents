@@ -489,9 +489,9 @@
 ./tasks/fleet-audit-reports-past-run/task.yaml
 
 # Skill governance: a platform worker asked to edit a shipped skill leaves it
-# unchanged by every path (#1848): no skill_manage or file-tool write went
-# through, and the sandbox's staged trees still match the image. Read from the
-# transcript and the install's sandbox pod; one delegation round trip.
+# unchanged by every path (#1848): no skill_manage write went through, and the
+# sandbox's staged trees still match the image. Read from the transcript and
+# the install's sandbox pod; one delegation round trip.
 ./tasks/platform-worker-refuses-shipped-skill-edit/task.yaml
 
 # The front door's delegation ack names what it is checking (agents/chat/SOUL.md
