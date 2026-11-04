@@ -1303,6 +1303,13 @@ type AgentAPIAuthSpec struct {
 	// reads the memory limit through the Downward API and sets its Go soft
 	// memory limit to half of it, so raising the memory limit is the knob for an
 	// install whose fleet of watched clusters outgrows the 2Gi default (#2648).
+	// The startup peak depends on the control plane: with the WatchList
+	// feature gate (on at 1.32 and from 1.34) the reflector holds a cluster's
+	// whole initial stream until its bookmark, so up to four of the largest
+	// backlogs (the initial-list concurrency) are resident at once; without
+	// the gate the watcher reads the backlog in pages of 500 Events and holds
+	// one page per cluster. Steady state scales with the number of watched
+	// clusters and their open incidents.
 	// Only cpu, memory and ephemeral-storage are accepted, the quantities the
 	// container declares. The operator refuses a request above its limit, a
 	// negative quantity, a zero limit, an unrepresentable byte or CPU count and
