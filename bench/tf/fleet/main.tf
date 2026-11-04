@@ -229,7 +229,7 @@ resource "google_project_iam_member" "pool_state_readers" {
 # Inside the lag minor the pin is the running version, so the patch does not
 # move: a pin at REGULAR's newest patch put seeded-b back on the channel's
 # list every morning, and the upgrades cases that read seeded-b for a patch
-# REGULAR has moved past never saw one (#4222). A provider upgrade is a
+# REGULAR has moved past never saw one. A provider upgrade is a
 # manual upgrade in GKE's sense, which the exclusion does not gate; the
 # channel rule above does. So when a cluster below the lag minor runs a
 # patch REGULAR does not carry, the script steps it first instead of asking
@@ -531,8 +531,9 @@ resource "google_container_cluster" "seeded_b" {
   resource_labels          = local.held_cluster_labels
   deletion_protection      = false
 
-  # REGULAR's own newest previous-minor patch, or the hold when the running
-  # patch is one REGULAR does not carry: the comment above the data source.
+  # REGULAR's own newest previous-minor patch on a create; the running
+  # version once the cluster is in that minor, listed by REGULAR or not;
+  # the comment above the data source has the rest.
   min_master_version = local.lagging_version
   release_channel {
     channel = "REGULAR"
@@ -602,9 +603,9 @@ resource "google_container_node_pool" "seeded_b_default" {
   # at the next REGULAR minor roll the master moves and the pool does not,
   # which is upgrade SOP 3.2 `pool-skew` -- exactly one minor behind with
   # autoUpgrade true, severity minor -- and even without a minor roll the
-  # same asymmetry leaks at patch level, because GKE auto-upgrades the pool
-  # to the channel's default patch while the pin pushes the master to the
-  # freshest patch of the minor, which 3.2 flags as patch-only drift.
+  # same asymmetry leaks at patch level, because GKE's own patch
+  # auto-upgrade may move the master in its window while a frozen pool
+  # waits for node auto-upgrade, which 3.2 flags as patch-only drift.
   # Either would be an undeclared finding on a fleet whose whole premise is
   # that a correct audit's findings are known in advance. Driving both from
   # local.lagging_version keeps them equal at steady state; the pool

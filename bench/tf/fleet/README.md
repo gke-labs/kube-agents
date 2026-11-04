@@ -107,7 +107,10 @@ found below the lag minor on such a patch, the script steps it first, to the new
 REGULAR patch of that minor above the running one if there is one, else holds it at the
 running version, and the apply after that step does the minor bump, one minor per apply
 (GKE's control-plane rule), so a master the hold left two minors behind reaches the
-target over two applies.
+target over two applies. That is also the ordinary path at a REGULAR minor roll when
+`seeded-b` sits on a patch REGULAR has dropped: the roll takes two reconciles, the step
+and then the bump, and `minor_behind_channel_default` reads `version-laggard` as drifted
+for the day between them.
 While a hold lasts the master may run a patch newer than any REGULAR patch of its minor,
 and after a minor roll the lag is two minors, not one: `hack/fleet-fixture-state.py` reads
 `version-laggard` as drifted on either (`not_ahead_of_channel`,
@@ -286,9 +289,9 @@ so the regular family's rollout never waits on the lag. The key is on every clus
 this stack because the drift audit's label-keys facet compares label keys across the
 cohort: a key on three clusters and not the fourth would be a drift finding.
 
-`seeded-b`'s lag is derived at apply time (the newest patch REGULAR itself offers one
-minor behind its default, read by `seeded_b_pin.py`), so the pin re-computes each
-reconcile instead of rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
+`seeded-b`'s lag is derived at apply time (on a create, the newest patch REGULAR itself
+offers one minor behind its default, read by `seeded_b_pin.py`; afterwards the running
+version inside that minor), so the pin re-computes each reconcile instead of rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
 SOP's master-behind check compares a cluster's master minor against its own channel's
 default, so a channel-less cluster falls out of that comparison entirely and the lag
 would be invisible to the audit it was planted for. The maintenance exclusion above is
