@@ -696,7 +696,7 @@ func (d *Dispatcher) reject(ctx context.Context, log *slog.Logger, del lib.Deliv
 	// A stop leaves the terminal reportAfterStop more to land.
 	defer context.AfterFunc(ctx, func() { time.AfterFunc(reportAfterStop, cancel) })()
 	for {
-		err := d.publishTerminal(pctx, hk.profile, del.Envelope(), lib.StateRejected, ref.reason, ref.detail)
+		err := d.publishTerminal(pctx, hk, del.Envelope(), lib.StateRejected, ref.reason, ref.detail)
 		if err == nil {
 			break
 		}
@@ -1070,7 +1070,7 @@ func deadlineLimit(rec lib.LeaseRecord) time.Duration {
 // to the next instance, whose record says started, and is failed there.
 func (d *Dispatcher) fail(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord, reason, detail string) {
 	for {
-		err := d.publishTerminal(ctx, h.profile, del.Envelope(), lib.StateFailed, reason, detail)
+		err := d.publishTerminal(ctx, h.key(), del.Envelope(), lib.StateFailed, reason, detail)
 		if err == nil {
 			break
 		}
