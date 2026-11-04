@@ -1,0 +1,135 @@
+# FIXTURE_NOT_READY — scripts/validate_bench_cases.py. No pool project runs
+# Config Connector (provisioning-kcc-cluster-without-crds-stops relies on
+# that), so the stack below has no cluster to plant on. The entry moves to
+# hack/eval/nightly-cases.txt when a pool project carries a Config Connector
+# cluster in the audited fleet.
+#
+# WHAT THIS GRADES. That a fix of a pool whose declaration Config Connector
+# does not apply says so in the ledger. The stockout collector reads Config
+# Connector on each cluster it sweeps (`kcc_health.py`) and records the
+# unready objects as `kcc_unready`; `finish` matches the finding's own object
+# to them and adds a last paragraph to the fix, of any kind
+# (audit_report.disclose_stalled_kcc_remediations). A manifest fix of the
+# planted file keeps the paragraph for that file; any other fix gets one that
+# names the planted file, which `finish` finds in the repository's Config
+# Connector index. A live run's worker named a file it never wrote, so its
+# fix degraded to manual: that case grades the same way. The graded phrases are the
+# note's first sentence and the object as the note names it, so the worker's
+# own words cannot pass the check.
+#
+# RED AND BROKEN. When `finish` writes no note, the phrase is absent even
+# when the fix edits the planted file. The finding_ids objective tells a red
+# from a broken run: if it fails too, the stockout finding on the pool was
+# never filed and the run proves nothing.
+#
+# THE PLANT (prebuilt/kcc-stalled-declaration). One ContainerNodePool for the
+# seeded pinned-inference-pool, in the namespace eval-kcc-stalled on the
+# cluster that runs Config Connector, whose clusterRef names a ContainerCluster
+# the namespace does not hold: Config Connector stops at DependencyNotFound
+# with Ready=False and makes no GCP call. When Config Connector runs in
+# namespaced mode, the plant first creates a ConfigConnectorContext in that
+# namespace with the service account in kcc_google_service_account (it needs
+# no IAM role), because no controller watches a namespace without one. The same declaration, committed to
+# the GitOps repository at clusters/<seeded-a>/provisioning/pinned-inference-pool.yaml,
+# is the file the SOP's fix for the capped, single-zone pool edits. The
+# teardown closes the pull request the run opened on that file (only from the
+# audit's branch for that path, and only when the file is the stack's),
+# deletes the file, the object, the context and the namespace, and the plant does the same when it
+# fails. bench/tests/test_kcc_stalled_declaration_stack.py holds the plant to
+# the note finish writes for it.
+#
+# Isolation class: one namespace on the Config Connector cluster, one file on
+# the GitOps repository's default branch, read-only fleet sweep, GitOps-repo
+# write (the ledger).
+id: fleet-audit-manifest-fix-names-stalled-config-connector
+name: A stockout fix of a pool whose declaration Config Connector is not applying says so in the ledger
+prompt: >-
+  Run the fleet stockout prevention and capacity audit, following the
+  stockout-prevention SOP.
+expected_output: >-
+  The ledger issue carries a finding on pinned-inference-pool. Its fix, of
+  any kind, ends with a paragraph that says Config Connector is not applying
+  this file, names the ContainerNodePool in eval-kcc-stalled and its
+  DependencyNotFound reason, and the ledger row names the planted declaration
+  clusters/<seeded-a>/provisioning/pinned-inference-pool.yaml (as the fix's
+  file, or in the paragraph when the fix is not a manifest fix of that file). Nothing on
+  the clusters is changed. The closing response is the SOP's one line,
+  carrying the ledger URL in full.
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/kcc-stalled-declaration"
+  teardown: true
+  # Only what this case sets. The harness gives project_id, and, because the
+  # stack declares bench_gitops_write_token_file, also the narrowed GitOps
+  # write token file, gitops_repo (owner/name), kcc_cluster_name,
+  # kcc_cluster_location and kcc_google_service_account, once a pool carries
+  # a Config Connector cluster. Each value below is repeated in the stack's
+  # variables.tf and in the checks below; change one and change all.
+  variables:
+    kcc_namespace: "eval-kcc-stalled"
+    seeded_slot: "a"
+    seeded_pool: "pinned-inference-pool"
+
+validated: false
+
+domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: dshnayder
+
+# The pool the declaration names is the hpa-saturated role's.
+fixtures:
+  - hpa-saturated
+
+verification_spec:
+  # The deciding check: the first sentence of `finish`'s note
+  # (audit_report.KCC_STALLED_NOTE_MARK), the object as the note names it,
+  # and the planted declaration's file, which the row names either as the
+  # manifest fix's file or in the paragraph ("The declaration is ...").
+  - name: the-fix-says-config-connector-is-not-applying-its-file
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: body
+      required_phrases:
+        - "**Config Connector is not applying this file.**"
+        - "`ContainerNodePool eval-kcc-stalled/pinned-inference-pool`"
+        - "/provisioning/pinned-inference-pool.yaml`"
+  # Tells a red from a broken run: the stockout finding on the pool was filed.
+  - name: a-finding-was-filed-against-the-planted-pool
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: stockout-prevention
+      scope: finding_ids
+      required_phrases: ["pinned-inference-pool"]
+  # The audit is read-only, and the note tells the reader to correct the
+  # declaration, never to change the live object. The ambient kubeconfig points at the Config
+  # Connector cluster (the stack's cluster_name output).
+  - name: the-stalled-object-was-not-changed
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: resource_property
+      kind: containernodepool
+      resource_name: pinned-inference-pool
+      namespace: eval-kcc-stalled
+      path: spec.autoscaling.maxNodeCount
+      op: eq
+      value: 1
+  - name: the-planted-cap-survived-the-audit
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: hpa-saturated
+      kind: horizontalpodautoscaler
+      resource_name: inference-server
+      namespace: seeded-capacity
+      path: spec.maxReplicas
+      op: eq
+      value: 10

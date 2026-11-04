@@ -259,6 +259,10 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
+# The Config Connector read that `main` adds to the manifest: this stream's
+# `manifest` fixes can edit Config Connector declarations, and `finish` says so
+# on a fix whose object Config Connector does not apply.
+import kcc_health  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -596,6 +600,9 @@ def not_running_entry(c: dict, project: str) -> dict:
         "has_nap": bool((c.get("autoscaling") or {}).get("enableNodeAutoprovisioning")),
         "outcome": UNREACHABLE_OUTCOME,
         "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
+        # GKE's status, so `finish` does not count this cluster as one that
+        # may run Config Connector (`audit_report.kcc_health`).
+        kcc_health.CLUSTER_STATUS_FIELD: c.get("status") or "",
     }
 
 
@@ -773,7 +780,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     result = run(
         [
             "gcloud", "container", "clusters", "list", "--project", project,
-            "--format", "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations)",
+            "--format", "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations,addonsConfig.configConnectorConfig.enabled)",
         ]
     )
     if result.rc != 0:
@@ -809,6 +816,8 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
             # The zones auto-created node pools land in -- see `cluster_zone_span`.
             "locations": c.get("locations") or [],
             "autoprovisioning_locations": (c.get("autoscaling") or {}).get("autoprovisioningLocations") or [],
+            # Read first by the Config Connector read after the sweep.
+            kcc_health.ADDON_FIELD: kcc_health.addon_enabled(c),
         }
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
@@ -2346,6 +2355,9 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         "commands": [{"check": slug, **record} for slug, record in commands.items()],
         "candidates": candidates,
     }
+    if cluster.get(kcc_health.ADDON_FIELD):
+        # Read first by the Config Connector read after the sweep.
+        entry[kcc_health.ADDON_FIELD] = True
     if not_applicable:
         entry["checks_not_applicable"] = not_applicable
     if unevaluated:
@@ -2650,13 +2662,45 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
     }
 
 
+def swept_kubeconfig(entry: dict) -> Path:
+    """The kubeconfig `fetch_credentials` wrote for a `collected` entry, so
+    the Config Connector read (`kcc_health`) does not fetch it again."""
+    return kubeconfig_path(str(entry.get("project") or ""), str(entry.get("name") or "").rpartition("/")[2], str(entry.get("location") or ""))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--project", help="audit only this project (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else every project the credential can see")
     fleet_scope_args.add_scope_arguments(parser)
+    kcc_health.add_flag(parser)
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
+    # The Config Connector reads below end inside a budget measured from here.
+    started = time.monotonic()
     manifest = collect_fleet(args.project)
+    # With `--config-connector` (`kcc_health.FLAG`), which the SOP command
+    # passes, or while an audit run of this stream is in flight, so the read
+    # does not depend on the model copying the flag; a chat fleet question
+    # with no run in flight does not read. The manifest says which
+    # (`kcc_health.READ_STAMP_FIELD`).
+    reason = kcc_health.read_reason(args.config_connector, AUDIT_ID)
+    manifest[kcc_health.READ_STAMP_FIELD] = reason
+    if reason:
+        # After the sweep, in a new pool of the sweep's size: one Config Connector
+        # read (discovery, then paged list requests per container kind,
+        # `kcc_health.CONTAINER_KINDS`, `kcc_health.read_objects`) per collected
+        # cluster, as `kcc_unready` or `kcc_unread` on its entry, with the
+        # kubeconfig the sweep fetched for that cluster (`fetch_credentials`).
+        # The reads end inside the collector's time budget
+        # (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
+        with ThreadPoolExecutor(max_workers=broker_admission.sweep_width()) as pool:
+            kcc_health.annotate_manifest(
+                manifest,
+                deadline=kcc_health.run_deadline(started),
+                mapper=pool.map,
+                kubeconfig_for=swept_kubeconfig,
+                kinds=kcc_health.CONTAINER_KINDS,
+            )
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0
 

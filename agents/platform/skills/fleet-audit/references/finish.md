@@ -44,6 +44,18 @@ goes in neither `checks_run` nor `checks_not_applicable` but in that target's `l
 keeps the run partial and leaves open every finding that check filed there. `finish` rejects the
 slug anywhere else.
 
+The compliance collector, and the drift, patch readiness and stockout collectors with
+`--config-connector` or while this run is in flight, also give `kcc_unready`, the Config Connector
+objects whose `Ready` condition is `False`, to a cluster that serves a kind they read: any Config
+Connector kind for compliance, `ContainerCluster` or `ContainerNodePool` for the other three. A
+cluster whose read failed, also at the discovery, gets `kcc_unread` with the reason. You copy
+neither into the document. `finish` reads them: any fix whose finding's own object is among them
+gets a last paragraph that starts "**Config Connector is not applying this file.**" (it names the
+declaring file when the fix is not a manifest fix of it) or, when `finish` finds no single
+declaration, "**Config Connector is not applying the declaration of this object.**". The fix keeps
+its kind. Do not write either paragraph yourself, and do not copy it from an earlier ledger:
+`finish` removes it and writes it again from this run's manifest.
+
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one

@@ -45,6 +45,11 @@ class ExecTierContractTest(unittest.TestCase):
                 "Replica count in pods",
                 f"mounted at `{client.EXEC_REPLICAS_FILE}`; `{client.EXEC_REPLICAS_FILE_ENV}` names that path",
             ),
+            (
+                "Replica count in pods",
+                f"adds `{client.ADMISSION_REPLICAS_KEY}`, `{client.ADMISSION_TIER_ADMITTED_KEY}` and "
+                f"`{client.ADMISSION_TIER_INTERACTIVE_CAP_KEY}` to its report",
+            ),
             ("Busy reply", f'"{client.BUSY_BOUND_KEY}": "<bound>"'),
             ("Busy reply", f"`{client.ADMISSION_BOUND_BACKGROUND}` is the background cap"),
             ("Busy reply", f"`{client.ADMISSION_BOUND_DRAINING}` is a replica that is stopping"),
