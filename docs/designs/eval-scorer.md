@@ -173,7 +173,7 @@ tripped still blocks at rung 1, an errored phrase check still blocks at rung 2, 
 passes or fails on the checks the transport can see, with the set-aside names in its reason. When
 no objective check remains the repetition is `not_applicable` — a fifth outcome beside `infra`,
 `blocked`, `pass` and `fail`, outside every rate — and a case with no scored repetition and at
-least one such is **not graded on transport** (the `Rung` member and the build-log word are both
+least one such is **not graded on transport** (the `Rung` member and the verdict word are both
 `NOT_GRADED_ON_TRANSPORT`), never a collapse and never infrastructure. Three edges: a scoreless
 record is not re-read, and without the marker it is a crashed scoring pass on any transport; a record on the api
 transport never carries the marker, and `test_scoring.py` grades every captured api record, under

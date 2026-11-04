@@ -90,6 +90,16 @@ scan](#the-pool-state-scan)); the tick reads them for the `fixture_drift` and
 `workflow_dispatch` of the same workflow is the on-demand refresh button
 (its `fixture_state_scan` input also runs both scans).
 
+The smoke lanes log to `gs://kube-agents-evals-presubmit-logs`, a bucket kube-agents owns, not
+the Prow cluster's default: Deck's service account has no read on it, so the Prow run page shows
+no files to anyone (this Prow has no login, and the lanes grade a public repository with a
+model in the loop). The collector reads it with its own identity, and each lane's old
+archive alongside until that leaves the window; the pool-pressure check and step 0's verdict reuse
+read the new bucket only, so a green from before the move is not reused and the pool gauge's window
+fills over its first week. A run in that bucket records where it lives (`runs[].gcs_base`), and
+the dashboard's and the health bot's build links open that directory in the Cloud Console for a
+project reader; a run in the old bucket keeps its Prow link, which still renders it.
+
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
 for an incident (`until` on the recovery message), `view=agent` for the
@@ -607,7 +617,8 @@ a not-evaluated run, a lost pod and a deadline kill.
   counts;
 - a table of the failed cases — result as `passed / total reps`, and how many
   other pull requests the case is failing on right now;
-- the check's reason for a case that looks like the pull request's;
+- no grading text: the check's reason and the agent's words stay on the
+  dashboard's run page, behind the link, since the pull request is public;
 - how many cases passed, the run's wall clock and pool project, and links: the
   build log, `run.html#build=<build id>` on the dashboard, and the incident
   brief when there is an incident.
@@ -682,8 +693,8 @@ Ran 128 min before the node went away · build log
 
 While `health.json`'s condition is `lost_pods` the box adds "part of a
 build-cluster event: N runs on M PRs" (below the 8-run event bar, "one of N
-runs on M PRs that lost their build node") and the incident brief link. Prow's
-build-log page shows the pod's events. Setup deaths and conflicted merges stay
+runs on M PRs that lost their build node") and the incident brief link. The
+build's `podinfo.json` in its bucket shows the pod's events. Setup deaths and conflicted merges stay
 silent; the build log says which it was.
 
 The third is a run Prow killed at the job deadline with no verdict (#1894),
