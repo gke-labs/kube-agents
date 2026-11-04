@@ -466,8 +466,21 @@ The Kubernetes API proxy is one Go process. As for the event watcher, layer 1 do
 because stopping the process is the failure. It needs a bound inside the process:
 
 - **An in-flight limit.** A weighted semaphore in front of the reverse proxy refuses a request
-  past the limit with `429` and `Retry-After`. The initial limit is 64 at the 512Mi limit: (512 MiB −
-  about 100 MiB of memory kept between bursts) / about 3.6 MiB per stream is about 110, halved for margin. The 3.6 MiB comes from unpaged `curl` lists; paged `kubectl` traffic holds a page per stream, so the limit is measured again with `kubectl` traffic before it ships. The limit follows the live memory limit, as N does in §8.
+  past the limit with `429` and `Retry-After`. The initial limit is 24 at the 512Mi limit. It is
+  measured with paged traffic, as `kubectl` sends it (pages of 500 Pods, about 3.7 MB each, with
+  `continue` tokens), from N threads in the shell:
+
+  | Paged readers | In flight | kube-proxy memory  | Throughput           |
+  | ------------- | --------- | ------------------ | -------------------- |
+  | 20            | 16 to 20  | 119 to 157 MiB     | 232 MB/s, no errors  |
+  | 64            | 43 to 48  | 428 MiB, OOMKilled | 232 MB/s, 128 errors |
+  | 128 and 192   | —         | OOMKilled 4 times  | 56 and 18 MB/s       |
+
+  A paged stream holds about 7 to 9 MiB, about two pages, which is more than an unpaged stream
+  (about 3.6 MiB). (512 MiB − about 60 MiB) / 9 MiB is about 50, halved for margin. Throughput
+  peaks by 20 streams, so the limit costs no throughput. The limit follows the live memory limit
+  and the page size, as N does in §8.
+
 - **A Go memory limit.** `GOMEMLIMIT` at about 80 % of the container limit (400MiB at 512Mi) makes
   the Go runtime collect and return memory before the kernel acts.
 - **A settable limit.** The proxy's resources become a `PlatformAgent` field, like the credential
