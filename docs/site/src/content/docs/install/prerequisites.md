@@ -113,7 +113,7 @@ constraining ephemeral storage additionally requires every container to declare 
 a `LimitRange` to default it), as the chart README explains. Under `spec.mode: next`,
 NATS adds a 40 GiB JetStream persistent volume claim (bringing the total to 5 claims
 totalling 142 GiB of `requests.storage`), and the operator renders a namespace-wide
-`ResourceQuota` on `pods` of `maxSessions + 16` (26 pods by default, from
+`ResourceQuota` on `pods` of `maxSessions + 17` (27 pods by default, from
 `spec.harness.tuning.maxSessions: 10`), sized for the session pods plus the rest
 of the release; anything else you run in the namespace counts against it. The claims
 are also disks: on GKE's default `standard-rwo` class they are balanced persistent

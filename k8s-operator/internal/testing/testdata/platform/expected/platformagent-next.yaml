@@ -4474,7 +4474,7 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "26"
+    pods: "27"
 status: {}
 ---
 apiVersion: v1
