@@ -320,6 +320,15 @@ class _Repository:
     def scope(self) -> tuple[str, str]:
         return (self.host, self.path.casefold())
 
+    @property
+    def quota_key(self) -> tuple[str, str]:
+        """The forge host and which of its quotas this repository spends
+        (`Forge.quota_scope`): per owner on GitHub, the whole host elsewhere.
+        Not per repository: below the floor, every repository would still
+        spend a proposal's calls each sweep."""
+        ask = getattr(self.forge, "quota_scope", None)
+        return (self.host, ask(self.path) if callable(ask) else "")
+
 
 def _host(forge: Any) -> str:
     return forge.hosts[0] if forge.hosts else forge.name
@@ -386,12 +395,13 @@ class ReadingsSweep:
         # minute's searches went out, and how the sweep waits for the next.
         self._searches: dict[str, deque] = {}
         self._sleep = sleep if sleep is not None else self._stop.wait
-        # Per forge host, when step 2 may go on: the epoch second the forge
-        # said its quota resets, set when the quota was at the floor or a
-        # step-2 call was rate-limited. Kept across sweeps, since each sweep
-        # binds a fresh transport that knows no quota until it calls.
+        # Per forge host and quota scope (`_Repository.quota_key`), when step
+        # 2 may go on: the epoch second the forge said its quota resets, set
+        # when the quota was at the floor or a step-2 call was rate-limited.
+        # Kept across sweeps, since each sweep binds a fresh transport that
+        # knows no quota until it calls.
         self._wall = wall_clock
-        self._paused: dict[str, float] = {}
+        self._paused: dict[tuple[str, str], float] = {}
 
     # ---- the timer -----------------------------------------------------
 
@@ -751,42 +761,44 @@ class ReadingsSweep:
         return unread
 
     def _quota_stopped(self, bound: _Repository) -> bool:
-        """Whether step 2 stops for `bound`'s host: paused until a reset that
+        """Whether step 2 stops for `bound`'s quota: paused until a reset that
         has not passed, or the quota its transport last reported at the floor.
 
-        At the floor with a reset to come, the host is paused until then, so
+        At the floor with a reset to come, the quota is paused until then, so
         later sweeps skip step 2 before their fresh transport has called.
         """
-        until = self._paused.get(bound.host)
+        key = bound.quota_key
+        until = self._paused.get(key)
         if until is not None:
             if self._wall() < until:
                 return True
-            del self._paused[bound.host]
+            del self._paused[key]
         reading = _known_quota(bound.transport)
         if reading is None:
             return False
         floor = quota_floor(reading.limit)
         if reading.remaining > floor:
             return False
-        self._pause(bound.host, reading, f"remaining={reading.remaining} floor={floor}")
+        self._pause(bound.quota_key, reading, f"remaining={reading.remaining} floor={floor}")
         return True
 
     def _pause_if_spent(self, bound: _Repository) -> None:
         """After a rate-limited step-2 call: when the quota reads spent, pause
-        the host until its reset, rather than failing again every pass. A
+        that quota until its reset, rather than failing again every pass. A
         throttle with quota left (a secondary limit) pauses nothing."""
         reading = _known_quota(bound.transport)
         if reading is not None and reading.remaining == 0:
-            self._pause(bound.host, reading, "rate-limited, remaining=0")
+            self._pause(bound.quota_key, reading, "rate-limited, remaining=0")
 
-    def _pause(self, host: str, reading: Any, why: str) -> None:
+    def _pause(self, key: tuple[str, str], reading: Any, why: str) -> None:
         reset_at = reading.reset_at
-        if reset_at is None or reset_at <= self._wall() or self._paused.get(host) == reset_at:
+        if reset_at is None or reset_at <= self._wall() or self._paused.get(key) == reset_at:
             return
-        self._paused[host] = reset_at
+        self._paused[key] = reset_at
+        host, scope = key
         LOGGER.info(
             "proposal readings: per-proposal reads paused for %s until the forge's quota resets in %ds (%s)",
-            host,
+            f"{host} ({scope})" if scope else host,
             int(reset_at - self._wall()),
             why,
         )

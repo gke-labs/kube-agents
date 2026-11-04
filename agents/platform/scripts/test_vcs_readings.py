@@ -247,7 +247,11 @@ def install_commit():
 
 class Harness:
     def __init__(
-        self, forges: dict[str, FakeForge], interval=vcs_readings.VCS_READINGS_TTL_SECONDS, app_credential=None
+        self,
+        forges: dict[str, FakeForge],
+        interval=vcs_readings.VCS_READINGS_TTL_SECONDS,
+        app_credential=None,
+        wall_clock=None,
     ):
         self.forges = forges
         self.metrics = FakeMetrics()
@@ -260,7 +264,7 @@ class Harness:
             clock=self.clock,
             interval=interval,
             app_credential=app_credential,
-            wall_clock=self.clock,
+            wall_clock=wall_clock or self.clock,
         )
 
     def last(self):
@@ -712,6 +716,7 @@ class ReadingsSweepTest(unittest.TestCase):
 
 GiteaForge = next(cls for cls in providers.AVAILABLE if cls.name == "gitea")
 GitHubForge = next(cls for cls in providers.AVAILABLE if cls.name == "github")
+GitLabForge = next(cls for cls in providers.AVAILABLE if cls.name == "gitlab")
 GITEA_PAGE_CLAMP = 50
 
 
@@ -1168,6 +1173,68 @@ class QuotaPacingTest(unittest.TestCase):
         harness.sweep.run_once()
         self.assertEqual(3 * PER_PROPOSAL, forge.detail_calls())
         self.assertIsNotNone(harness.last()[1])
+
+    def test_one_github_owners_spent_quota_pauses_only_that_owners_repositories(self):
+        # The sweep token is minted per owner, from that owner's installation.
+        spent = proposals_forge(3, QuotaReading(QUOTA_LIMIT, 10, QUOTA_RESET))
+        healthy = proposals_forge(3)
+        for forge in (spent, healthy):
+            forge.quota_scope = GitHubForge.quota_scope
+        harness = Harness(
+            {"fake:github.com/acme/infra": spent, "fake:github.com/zeta/apps": healthy}, interval=WIDE
+        )
+        with self.assertLogs(LOGGER_NAME, level="INFO"):
+            harness.sweep.run_once()
+        self.assertEqual(0, spent.detail_calls())
+        self.assertEqual(3 * PER_PROPOSAL, healthy.detail_calls())
+        self.assertEqual(["quota_floor"], harness.metrics.failures)
+
+        # The next sweep: still only the spent owner is paused.
+        spent.quota = None
+        spent.calls.clear()
+        healthy.proposals[1]["updated"] = "2027-01-01T00:00:00Z"
+        healthy.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(0, spent.detail_calls())
+        self.assertEqual(PER_PROPOSAL, healthy.detail_calls())
+
+    def test_a_gitlab_hosts_spent_quota_pauses_every_repository_on_it(self):
+        spent = proposals_forge(3, QuotaReading(QUOTA_LIMIT, 10, QUOTA_RESET))
+        other = proposals_forge(3)
+        for forge in (spent, other):
+            forge.hosts = ("gitlab.example.com",)
+            forge.quota_scope = GitLabForge.quota_scope
+        harness = Harness(
+            {"fake:gitlab.example.com/acme/a": spent, "fake:gitlab.example.com/zeta/b": other}, interval=WIDE
+        )
+        with self.assertLogs(LOGGER_NAME, level="INFO"):
+            harness.sweep.run_once()
+        self.assertEqual(0, spent.detail_calls())
+        self.assertEqual(0, other.detail_calls(), "one static token, one quota for the host")
+        self.assertEqual(["quota_floor", "quota_floor"], harness.metrics.failures)
+
+    def test_the_reset_is_compared_against_the_wall_clock_not_the_monotonic_one(self):
+        wall = FakeClock()
+        wall.now = 1_767_225_600.0
+        reset = wall.now + 900
+        forge = proposals_forge(3, QuotaReading(QUOTA_LIMIT, 10, reset))
+        harness = Harness({REPO: forge}, interval=WIDE, wall_clock=wall)
+        with self.assertLogs(LOGGER_NAME, level="INFO"):
+            harness.sweep.run_once()
+        self.assertEqual(0, forge.detail_calls())
+
+        # Far along the monotonic clock, but the wall clock is short of the reset.
+        forge.quota = None
+        harness.clock.now += 10 * reset
+        forge.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(0, forge.detail_calls())
+
+        # The wall clock passes the reset; the monotonic one does not move.
+        wall.now = reset
+        forge.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(3 * PER_PROPOSAL, forge.detail_calls())
 
     def test_a_throttle_with_quota_left_pauses_nothing(self):
         forge = proposals_forge(3)
