@@ -1054,6 +1054,38 @@ class StalledChainTest(unittest.TestCase):
         self.assertTrue(patch["body"].endswith(STALL_FOOTER))
         self.assertEqual(chat.posted, [])
 
+    def test_two_red_runs_on_one_utc_date_are_one_night_and_open_nothing(self):
+        """A hand dispatch beside the scheduled run, both RED on the same
+        date: one night, short of `STALL_NIGHTS`."""
+        github = stalled_github(night(31, 1, SHA_31), night(32, 1, SHA_32))
+        chat = FakeChat()
+        outcome, err = reconcile(github, chat)
+        self.assertEqual(outcome, "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+        self.assertIn("1 settled-RED night in a row", err)
+
+    def test_two_red_runs_on_one_date_and_one_on_the_next_open_with_two_nights_and_stamp_all_three(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 1, SHA_32), night(33, 2, SHA_33))
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "stall-opened")
+        payload = github.writes[1][2]
+        self.assertEqual(payload["title"], STALL_TITLE_2)
+        self.assertIn(f"<!-- release-stalled runs={night_run_id(33)}:1,{night_run_id(32)}:1,{night_run_id(31)}:1 -->", payload["body"])
+        self.assertEqual([row[:12] for row in rows_of(payload["body"])], ["| 2026-11-02", "| 2026-11-01", "| 2026-11-01"])
+        self.assertEqual(chat.posted, [f"{STALL_TITLE_2} — https://github.com/{REPO}/issues/4001"])
+
+    def test_a_second_red_run_on_a_counted_night_adds_its_row_without_a_comment_or_a_new_count(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), night(33, 2, SHA_33), open_stall=[self._open_issue()])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "stall-updated")
+        self.assertEqual([(w[0], w[1]) for w in github.writes], [("PATCH", f"/repos/{REPO}/issues/4001")])
+        patch = github.writes[0][2]
+        self.assertEqual(patch["title"], STALL_TITLE_2)
+        self.assertIn(f"<!-- release-stalled runs={night_run_id(33)}:1,{night_run_id(32)}:1,{night_run_id(31)}:1 -->", patch["body"])
+        self.assertEqual([row[:12] for row in rows_of(patch["body"])], ["| 2026-11-02", "| 2026-11-02", "| 2026-11-01"])
+        self.assertEqual(chat.posted, [])
+
     def test_a_red_verdict_night_already_stamped_is_not_added_twice(self):
         github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), open_stall=[self._open_issue()])
         chat = FakeChat()
