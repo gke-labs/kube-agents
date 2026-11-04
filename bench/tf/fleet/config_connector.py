@@ -13,7 +13,7 @@ gateway_status.py does: from Application Default Credentials, then from
 `gcloud auth print-access-token`. It sends one server-side apply, and it tries
 again inside one wait window while the API answers 404, because the add-on can
 install the CRD some minutes after the cluster update is done, and while the
-API answers 5xx or does not answer, because a failed run taints the resource
+API answers 429 or 5xx or does not answer, because a failed run taints the resource
 and the next reconcile then plans a replace. Standard library only: the reconcile
 image has python3 and gcloud, and kubectl is not promised. It exits non-zero,
 with the API's answer, on any other failure, so the apply fails and does not
@@ -64,6 +64,9 @@ REQUEST_TIMEOUT_SECONDS = 30
 NOT_FOUND = 404
 # An answer at or above this is the API server's own failure, tried again.
 SERVER_ERROR_FLOOR = 500
+# The API server's priority and fairness limit: a busy control plane, tried
+# again.
+TOO_MANY_REQUESTS = 429
 # What apply() returns for an attempt to try again: the CRD is not there, or
 # the API server failed or did not answer.
 APPLIED = 0
@@ -103,7 +106,8 @@ def manifest(name: str, mode: str, labels: dict) -> dict:
 
 def apply(host: str, token: str, context: ssl.SSLContext, body: dict) -> tuple[int, str]:
     """Sends the apply once. Returns (APPLIED, "") on success, and (RETRY,
-    why) while the CRD is missing, the API answers 5xx or nothing answers;
+    why) while the CRD is missing, the API answers 429 or 5xx, or nothing
+    answers;
     exits on any other answer."""
     query = urllib.parse.urlencode({"fieldManager": FIELD_MANAGER, "force": "true"})
     path = OBJECT_PATH.format(name=body["metadata"]["name"])
@@ -117,7 +121,7 @@ def apply(host: str, token: str, context: ssl.SSLContext, body: dict) -> tuple[i
     except urllib.error.HTTPError as exc:
         if exc.code == NOT_FOUND:
             return RETRY, "the ConfigConnector CRD is not on the cluster yet"
-        if exc.code >= SERVER_ERROR_FLOOR:
+        if exc.code >= SERVER_ERROR_FLOOR or exc.code == TOO_MANY_REQUESTS:
             return RETRY, f"PATCH {path} answered {exc.code}"
         raise SystemExit(f"{LOG_PREFIX}: PATCH {path} answered {exc.code}: {exc.read().decode(errors='replace')}")
     except (urllib.error.URLError, OSError) as exc:

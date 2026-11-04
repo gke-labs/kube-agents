@@ -123,6 +123,14 @@ class ConfigConnectorApplyTest(unittest.TestCase):
         self.assertEqual(slept.call_count, 4)
         self.assertIn("trying again", err)
 
+    def test_a_rate_limit_is_tried_again_in_the_window(self):
+        api = FakeApi(429, 429)
+        code, slept, err = _run(api)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(api.requests), 3)
+        self.assertEqual(slept.call_count, 2)
+        self.assertIn("429", err)
+
     def test_a_server_error_still_there_at_the_deadline_fails_the_apply(self):
         api = FakeApi(*([502] * 100))
         code, _, err = _run(api)
