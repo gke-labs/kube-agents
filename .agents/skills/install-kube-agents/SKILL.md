@@ -385,8 +385,9 @@ outlives the report. Relay it to the operator in either of the last two cases.
 
 Chat is opt-in and both platforms default off, and a non-interactive run with no
 `--enable-google-chat` or `--enable-slack` selects "None" — so the common agent-driven install
-has no chat and the operator has no way to reach the agent unless you give them one. The
-installer prints it at the chat-configuration step and again when it finishes, under
+has no chat and the operator has no way to reach the agent unless you give them one. Under
+`spec.mode: next` the `PlatformAgent` carries the `NoChatPlatform` condition, which says where the
+findings go instead. The installer prints the way in at the chat-configuration step and again when it finishes, under
 `--- [Talking to the Agent from a Terminal] ---`, with the cluster, region, project and namespace
 already substituted. Relay those two commands verbatim (plus the `Web Console` `kubectl port-forward`
 command and `http://localhost:8080` URL when `--enable-web-console` was enabled):
@@ -406,7 +407,8 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
   reached via the `kubectl port-forward svc/kube-agents-web-console -n kubeagents-system 8080:8080`
   command the installer prints.)
 - Say what the operator does not get until they enable a platform: scheduled reports and
-  alert-driven triage are delivered to chat only, and the first-run inventory report waits on a
+  alert-driven triage reach chat only; meanwhile the audit reports stay in the report store on the
+  data volume and the triage runs on the board (the `NoChatPlatform` condition says so), and the first-run inventory report waits on a
   human connecting over chat — read it with
   `kubectl exec platform-agent-shell-0 -n kubeagents-system -c shell -- cat /opt/data/INVENTORY.md`
   (the report is on the shell sandbox pod, not the agent pod).
