@@ -148,7 +148,10 @@ The rules that keep this safe:
   how-far-from-now time token. If the model's answer repeats one of those values (say it answers
   `kill 4821` after reading `pid 4821`), a later run would get the old number back. So the proxy checks each answer before
   saving it, and if it repeats any of those values, it doesn't save it. That request just goes to
-  the model next time, which is always safe.
+  the model next time, which is always safe. Short numbers (under 4 digits, like `generation: 1` or
+  `replicas: 3`) aren't swapped at all: they're usually the same in every run, and the dry run
+  showed that swapping them marked about one answer in eight unsaveable just for containing a `1`
+  (`2>&1`, "revision 1").
 - **Hermes' recent-work digest is dropped from the key.** Every card view ends with
   `## Recent work by @<assignee>`, the assignee's last five runs on other cards, so the first
   card read differs between otherwise identical runs. The same block leaks earlier repetitions'

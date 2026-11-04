@@ -59,13 +59,18 @@ class IdentifierTest(unittest.TestCase):
 
     def test_keyed_numbers_in_text(self):
         self.assertEqual(
-            norm('resourceVersion: "48213"\ngeneration: 7\npid 4821\n"run_id": 12, "id": 99'),
+            norm('resourceVersion: "48213"\ngeneration: 7012\npid 4821\n"run_id": 1203, "id": 9901'),
             'resourceVersion: "⟦NUM_1⟧"\ngeneration: ⟦NUM_2⟧\npid ⟦NUM_5⟧\n"run_id": ⟦NUM_3⟧, "id": ⟦NUM_4⟧',
         )
 
     def test_keyed_numbers_in_structure(self):
-        out = normalizer.Normalizer(NOW, False).walk({"metadata": {"resourceVersion": "48213", "generation": 3}})
+        out = normalizer.Normalizer(NOW, False).walk({"metadata": {"resourceVersion": "48213", "generation": 3104}})
         self.assertEqual(out, {"metadata": {"generation": "⟦NUM_1⟧", "resourceVersion": "⟦NUM_2⟧"}})
+
+    def test_short_keyed_numbers_stay_literal(self):
+        out = normalizer.Normalizer(NOW, False).walk({"metadata": {"generation": 1, "observedGeneration": 1, "id": 99}})
+        self.assertNotIn("⟦NUM", json.dumps(out, ensure_ascii=False))
+        self.assertEqual(norm("generation: 7\npid 42\n\"run_id\": 12"), "generation: 7\npid 42\n\"run_id\": 12")
 
     def test_state_stays_literal(self):
         text = "restartCount: 4\nreplicas: 3\nversion 1.30.5-gke.1014001\nzone us-central1-a\nscore 0.82"
@@ -344,19 +349,25 @@ class FingerprintTest(unittest.TestCase):
 
 class AnswerMappingTest(unittest.TestCase):
     def test_answer_swaps_whole_tokens_but_never_bare_numbers(self):
-        normalized = normalizer.normalize_request(request("task t_11111111 pid 99"), NOW)
+        normalized = normalizer.normalize_request(request("task t_11111111 pid 9921"), NOW)
         mapping = normalized.mapping
-        self.assertEqual(mapping.apply_to_answer("kanban_show(t_11111111) row 99"), "kanban_show(⟦TASK_1⟧) row 99")
+        self.assertEqual(mapping.apply_to_answer("kanban_show(t_11111111) row 9921"), "kanban_show(⟦TASK_1⟧) row 9921")
         self.assertEqual(mapping.apply_to_answer("xt_11111111"), "xt_11111111")
-        self.assertTrue(mapping.answer_repeats_bare_number("kill 99"))
-        self.assertFalse(mapping.answer_repeats_bare_number("kill 990"))
+        self.assertTrue(mapping.answer_repeats_bare_number("kill 9921"))
+        self.assertFalse(mapping.answer_repeats_bare_number("kill 99210"))
 
     def test_repeated_number_uses_token_boundaries(self):
-        mapping = normalizer.normalize_request(request("generation: 1"), NOW).mapping
-        for answer in ("upgrade to 1.31", "use gemini-2.5-pro", "pool node-pool-1", "api v2", "--replicas=-1"):
+        mapping = normalizer.normalize_request(request("resourceVersion: 4821"), NOW).mapping
+        for answer in ("upgrade to 4821.31", "use model-4821-pro", "pool node-pool-4821", "api v4821", "--offset=-4821"):
             self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
-        for answer in ("kill 1", "generation is 1."):
+        for answer in ("kill 4821", "resourceVersion is 4821."):
             self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
+
+    def test_short_keyed_numbers_never_mark_an_answer(self):
+        # generation: 1 stays literal, so an answer full of 1s is still storable.
+        mapping = normalizer.normalize_request(request("generation: 1\nobservedGeneration: 1\nreplicas: 3"), NOW).mapping
+        for answer in ("kubectl get deploy -o yaml 2>&1", "revision 1", "generation=1", "2/2 ready", "kill 1"):
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
 
 
 if __name__ == "__main__":

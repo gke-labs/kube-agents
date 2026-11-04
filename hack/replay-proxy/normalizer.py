@@ -59,6 +59,12 @@ OPAQUE_CLASS = "OPAQUE"
 # Keys whose numeric value is a per-run counter or row id.
 KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "resourceVersion", "generation", "observedGeneration")
 NUMBER_CLASS = "NUM"
+# A keyed number is swapped only when it has at least this many digits. Small
+# values (`generation: 1`, `replicas: 3`) are usually the same in every run, so
+# swapping them gains no matches, and once swapped every `1` or `3` in an
+# answer (`2>&1`, "revision 1") would mark that answer unstorable. Long values
+# (resourceVersion, pids, row ids) differ per run and are still swapped.
+MIN_SWAPPED_NUMBER_DIGITS = 4
 DIGITS_RE = re.compile(r"^\d+$")
 KEYED_NUMBER_TEXT_RE = re.compile(
     r"(?<![A-Za-z0-9_])(resourceVersion|observedGeneration|generation|run_id|pid|PID|id)"
@@ -285,7 +291,7 @@ class Normalizer:
         if key is not None and TIME_KEY_RE.match(key) and self.epoch_value(obj) is not None:
             return self.epoch_token(str(obj), self.epoch_value(obj))
         if key in KEYED_NUMBER_KEYS and self.is_number(obj):
-            return self.mapping.placeholder(NUMBER_CLASS, str(obj))
+            return self.keyed_number(str(obj))
         if key in AGE_KEYS and isinstance(obj, str) and AGE_FULL_RE.match(obj):
             return self.age(obj)
         if isinstance(obj, str):
@@ -319,6 +325,12 @@ class Normalizer:
             return False
         return isinstance(value, int) or (isinstance(value, str) and bool(DIGITS_RE.match(value)))
 
+    def keyed_number(self, value: str) -> str:
+        """Swap a keyed number for a placeholder, unless it is short (see MIN_SWAPPED_NUMBER_DIGITS)."""
+        if len(value) < MIN_SWAPPED_NUMBER_DIGITS:
+            return value
+        return self.mapping.placeholder(NUMBER_CLASS, value)
+
     def opaque(self, value: Any) -> str:
         whole = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
         return self.mapping.placeholder(OPAQUE_CLASS, whole)
@@ -338,8 +350,8 @@ class Normalizer:
         for cls, pattern, group in ID_CLASSES:
             text = self.sub_group(pattern, group, lambda v, c=cls: self.mapping.placeholder(c, v), text)
         text = self.timestamps(text)
-        text = self.sub_group(KEYED_NUMBER_TEXT_RE, 3, lambda v: self.mapping.placeholder(NUMBER_CLASS, v), text)
-        text = self.sub_group(PID_PROSE_RE, 3, lambda v: self.mapping.placeholder(NUMBER_CLASS, v), text)
+        text = self.sub_group(KEYED_NUMBER_TEXT_RE, 3, self.keyed_number, text)
+        text = self.sub_group(PID_PROSE_RE, 3, self.keyed_number, text)
         text = KEYED_EPOCH_TEXT_RE.sub(self.keyed_epoch, text)
         if not self.keep_ips:
             text = IPV4_RE.sub(self.ip, text)
