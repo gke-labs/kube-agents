@@ -12445,6 +12445,7 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
         self.board = os.path.join(tempfile.mkdtemp(), "kanban.db")
         with sqlite3.connect(self.board) as conn:
             conn.execute("CREATE TABLE tasks (id TEXT, session_id TEXT, assignee TEXT, title TEXT, status TEXT)")
+            conn.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT, payload TEXT, created_at REAL)")
         board = patch.object(session_kv_server, "KANBAN_DB_PATH", self.board)
         board.start()
         self.addCleanup(board.stop)
@@ -12547,6 +12548,41 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
         self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
         self.assertEqual({session for _, session in self.reservations()}, {"k8s-evt-2", "k8s-evt-3"})
 
+    def _settle_with_pull_request(self, session_id, opened_at):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES (?, ?, 'platform', 'Open GitOps PR for prod/Pod/x (BackOff) on gke-1', 'done')",
+                (f"t-{session_id}", session_id),
+            )
+            conn.execute(
+                "INSERT INTO task_events VALUES (?, 'pr_opened', '{}', ?)", (f"t-{session_id}", opened_at)
+            )
+
+    def test_a_card_that_opened_its_pull_request_after_the_forge_read_keeps_its_reservation(self):
+        """The read did not see that pull request, so only the reservation counts it."""
+        self.decide("k8s-evt-1", "api-0")
+        real = session_kv_server._open_triage_pull_request_branches
+
+        def read_then_open(timeout):
+            branches = real(timeout)
+            # T1's card opens its pull request and settles after this read.
+            self._settle_with_pull_request("k8s-evt-1", time.time() + 1)
+            return branches
+
+        with patch.object(session_kv_server, "_open_triage_pull_request_branches", read_then_open):
+            self.assertIs(self.decide("k8s-evt-2", "web-2")[0], True)
+            self.assertIs(self.decide("k8s-evt-3", "web-3")[0], False)
+
+    def test_a_card_whose_pull_request_opened_before_the_forge_read_is_released(self):
+        """The read saw it: open, it counts there; merged or closed, nothing counts it."""
+        self.decide("k8s-evt-1", "api-0")
+        self.decide("k8s-evt-2", "web-2")
+        self._settle_with_pull_request("k8s-evt-1", time.time() - 60)
+        self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
+        self.assertNotIn("k8s-evt-1", {session for _, session in self.reservations()})
+
     def test_a_reservation_past_the_backstop_is_released(self):
         import sqlite3
 
@@ -12636,9 +12672,9 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
         once, with the board read between them slowed, reserve two branches."""
         real = session_kv_server._settled_triage_pull_request_sessions
 
-        def slow(session_ids):
+        def slow(session_ids, listed_at):
             time.sleep(0.05)
-            return real(session_ids)
+            return real(session_ids, listed_at)
 
         results = []
         with patch.object(session_kv_server, "_settled_triage_pull_request_sessions", slow):

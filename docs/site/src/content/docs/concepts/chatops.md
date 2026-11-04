@@ -698,7 +698,7 @@ platformAgent:
 
 A triage whose pull request would pass the limit still runs, but its report asks for a reply, as without the setting, and a note in the alert's thread says that the limit held its pull request back. An incident whose branch already has a pull request is not held: its card revises that pull request. If the open pull requests cannot be counted, because the forge fails or does not answer in time, the triage is held the same way, with a note that says so. As with the switch, the agent ignores the variable in its own `.env` file.
 
-The limit counts triage pull requests only: the open pull requests whose branch starts with `platform-agent/incident-`, plus each triage routed to open one whose pull request does not exist yet. A pull request opened by a reply does not count. A routed triage stops counting when its pull request opens (it then counts as open), when its pull-request card is `done` or `archived`, or after 24 hours. A card that is `blocked`, or waits behind a blocked triage card, keeps counting until then, because it can still open its pull request.
+The limit counts triage pull requests only: the open pull requests whose branch starts with `platform-agent/incident-`, plus each triage routed to open one whose pull request does not exist yet. The count goes by that branch prefix alone, so a pull request opened by a reply counts only when its branch takes the prefix. A routed triage stops counting when its pull request opens (it then counts as open), when its pull-request card is `done` or `archived`, or after 24 hours. A card that is `blocked`, or waits behind a blocked triage card, keeps counting until then, because it can still open its pull request.
 
 ## First-run onboarding
 

@@ -3296,9 +3296,12 @@ def _open_triage_pull_request_branches(timeout: float) -> Optional[Set[str]]:
     return result
 
 
-def _settled_triage_pull_request_sessions(session_ids: Sequence[str]) -> Set[str]:
-    """Those of ``session_ids`` whose pull-request card is done or archived.
+def _settled_triage_pull_request_sessions(session_ids: Sequence[str], listed_at: float) -> Set[str]:
+    """Those of ``session_ids`` whose pull-request card is done or archived, and
+    opened no pull request after ``listed_at``, when the forge list was read.
 
+    A card that opened one after that read keeps its reservation: the read did
+    not see the pull request, so the reservation is what still counts it.
     Best-effort: a board that cannot be read settles none, so their
     reservations hold until the backstop.
     """
@@ -3309,9 +3312,17 @@ def _settled_triage_pull_request_sessions(session_ids: Sequence[str]) -> Set[str
     try:
         with closing(_read_only(_kanban_db_path())) as conn:
             rows = conn.execute(
-                f"SELECT DISTINCT session_id FROM tasks WHERE session_id IN ({marks}) "
-                f"AND assignee = ? AND title LIKE ? AND status IN ({statuses})",
-                (*session_ids, INCIDENT_PR_ASSIGNEE, f"{TRIAGE_PR_CARD_TITLE_PREFIX}%", *TRIAGE_PR_CARD_SETTLED_STATUSES),
+                f"SELECT DISTINCT t.session_id FROM tasks t WHERE t.session_id IN ({marks}) "
+                f"AND t.assignee = ? AND t.title LIKE ? AND t.status IN ({statuses}) "
+                "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = ? AND e.created_at >= ?)",
+                (
+                    *session_ids,
+                    INCIDENT_PR_ASSIGNEE,
+                    f"{TRIAGE_PR_CARD_TITLE_PREFIX}%",
+                    *TRIAGE_PR_CARD_SETTLED_STATUSES,
+                    PR_OPENED_EVENT_KIND,
+                    listed_at,
+                ),
             ).fetchall()
     except Exception as exc:
         logger.warning(f"Could not read the board for the triage pull-request cards: {exc!r}")
@@ -3331,7 +3342,8 @@ def _claim_triage_pull_request(session_id: str, payload: Dict[str, Any], limit: 
     branch = _incident_branch(session_id, payload)
     # Read before the lock, so a slow forge does not hold the other starts.
     # A pull request that opens after this read is still counted, through
-    # the reservation that routed it.
+    # the reservation that routed it (_settled_triage_pull_request_sessions).
+    listed_at = time.time()
     open_branches = _open_triage_pull_request_branches(TRIAGE_PR_COUNT_TIMEOUT_S)
     if open_branches is None and TRIAGE_PR_UNCOUNTED_AT_LIMIT:
         logger.warning(f"Triage {session_id} files no pull-request card: the open triage pull requests could not be counted")
@@ -3341,7 +3353,7 @@ def _claim_triage_pull_request(session_id: str, payload: Dict[str, Any], limit: 
             with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=LEDGER_WRITE_TIMEOUT_S)) as conn:
                 now = time.time()
                 rows = conn.execute("SELECT branch, session_id, reserved_at FROM triage_pr_reservations").fetchall()
-                settled = _settled_triage_pull_request_sessions([row[1] for row in rows])
+                settled = _settled_triage_pull_request_sessions([row[1] for row in rows], listed_at)
                 released = [
                     (row[0], row[1])
                     for row in rows
