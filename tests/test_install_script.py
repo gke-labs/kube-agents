@@ -1405,18 +1405,25 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
 
     def test_both_installers_name_the_restore_before_their_import_advice(self):
         """install.sh and upgrade.sh refuse a minter key with no ENABLED version; the
-        restore advice comes first, and their own import advice only when it returns 1."""
+        restore advice comes first, and their own import advice only when it returns 1.
+        Anchored on each refusal's own error line: install.sh calls the helper at
+        earlier gates too, and the first call says nothing about this refusal."""
+        refusal = "ENABLED version — the apply would wait"
         for script, advice in (
             (_INSTALL_SH, 'print_info "Fix the App key import'),
             (_REPO_ROOT / "upgrade.sh", 'print_info "Import the App key with install.sh'),
         ):
             with self.subTest(script=script.name):
                 text = script.read_text()
-                call = text.index("print_minter_restore_advice ")
-                self.assertLess(call, text.index(advice))
-                self.assertIn(" ||\n", text[call : text.index(advice)])
-        # upgrade.sh sources the target tree's helpers, which may predate this one.
-        self.assertIn("declare -F print_minter_restore_advice", (_REPO_ROOT / "upgrade.sh").read_text())
+                self.assertEqual(text.count(refusal), 1)
+                start = text.index(refusal)
+                block = text[start : text.index(advice, start)]
+                call = 'print_minter_restore_advice "'
+                self.assertIn(call, block)
+                self.assertIn(" ||\n", block[block.index(call) :])
+                if script.name == "upgrade.sh":
+                    # upgrade.sh sources the target tree's helpers, which may predate this one.
+                    self.assertIn("declare -F print_minter_restore_advice", block)
 
     def test_validate_non_interactive_minter_config(self):
         """validate_non_interactive_minter_config enforces intent-driven validation."""
