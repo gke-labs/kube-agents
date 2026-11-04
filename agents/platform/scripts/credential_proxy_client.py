@@ -47,6 +47,21 @@ BROKER_CONNECT_TIMEOUT_SECONDS = 10.0
 # runtime does not attach an execution/chmod hint that misleads the agent
 # into seeking local file workarounds for a policy boundary (#2179).
 EXIT_SECURITY_POLICY_BLOCKED = getattr(os, "EX_NOPERM", 77)
+# Exit code returned when the broker cut the command's output at its per-stream
+# cap. 74 is EX_IOERR from sysexits.h ("input/output error"): the command may
+# well have exited 0, but what the caller holds is a partial payload, and a
+# partial `-o json` dump read as success is the false all-clear this code
+# exists to prevent. Scripts that already gate on the stderr marker below see
+# the same marker; the exit code is what the model's own kubectl sees.
+EXIT_OUTPUT_TRUNCATED = getattr(os, "EX_IOERR", 74)
+# The stderr line a cut command gets. Its prefix is what every reader matches
+# (`PROXY_TRUNCATED_MARKER` in the collectors); the counts after it say how
+# much of stdout was kept and the cap it was held to, when the broker said.
+OUTPUT_TRUNCATED_MARKER = "credential proxy output truncated"
+OUTPUT_TRUNCATED_COUNTS = " at {limit} bytes (kept {kept} bytes of stdout; exit {code})"
+# The cut fell on stderr alone: stdout is whole, so the exit code is the
+# command's own and only the diagnostics are short.
+OUTPUT_TRUNCATED_STDERR_ONLY = " (stderr only; stdout is complete)"
 # The `policy verb:` line is read by the agent runtime one line at a time, so a
 # verb word (an argv token) must not carry a line break or a quote.
 _VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
@@ -78,6 +93,11 @@ EXEC_ROLE = "exec"
 EXEC_URL_ENV = "CREDENTIAL_PROXY_EXEC_URL"
 EXEC_REPLICAS_FILE_ENV = "CREDENTIAL_PROXY_EXEC_REPLICAS_FILE"
 EXEC_REPLICAS_FILE = "/etc/credential-proxy-exec-tier/replicas"
+# The keys the admission route adds for the whole tier when the replicas file
+# holds a count (§3.5); `broker_admission` sizes a sweep by them.
+ADMISSION_REPLICAS_KEY = "replicas"
+ADMISSION_TIER_ADMITTED_KEY = "tier_admitted"
+ADMISSION_TIER_INTERACTIVE_CAP_KEY = "tier_interactive_cap"
 BUSY_BOUND_KEY = "bound"
 ADMISSION_BOUND_DRAINING = "draining"
 ADMISSION_BOUND_BACKGROUND = "background"
@@ -1650,8 +1670,12 @@ def execute(
 
     sys.stdout.write(payload.get("stdout", ""))
     sys.stderr.write(payload.get("stderr", ""))
-    if payload.get("truncated"):
-        print("credential proxy output truncated", file=sys.stderr)
+    truncated = bool(payload.get("truncated"))
+    # The exit code is for a cut payload. A broker older than the field says
+    # only that a stream was cut, and that is read as the payload.
+    stdout_cut = bool(payload.get("stdoutTruncated", truncated))
+    if truncated:
+        print(_truncated_marker(payload, stdout_cut), file=sys.stderr)
     generated = payload.get("kubeconfig")
     if generated and os.environ.get("KUBE_PROXY_URL", "").strip():
         generated = rewrite_kubeconfig_for_kube_proxy(generated)
@@ -1671,7 +1695,23 @@ def execute(
         except OSError as exc:
             print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
             return 1
+    if stdout_cut:
+        # Whatever the command itself exited: a cut payload is not the
+        # command's answer, and exit 0 on one is what a caller reads as success.
+        return EXIT_OUTPUT_TRUNCATED
     return int(payload.get("exitCode", 1))
+
+
+def _truncated_marker(payload: dict, stdout_cut: bool) -> str:
+    """The stderr line for a cut reply: the bare marker when the broker gave no
+    counts (one older than the fields), the counts after it otherwise, and the
+    stderr-only form when the payload is whole and the cut fell on stderr."""
+    if not stdout_cut:
+        return OUTPUT_TRUNCATED_MARKER + OUTPUT_TRUNCATED_STDERR_ONLY
+    kept, limit = payload.get("bytesWritten"), payload.get("limit")
+    if isinstance(kept, int) and isinstance(limit, int) and not isinstance(kept, bool) and not isinstance(limit, bool):
+        return OUTPUT_TRUNCATED_MARKER + OUTPUT_TRUNCATED_COUNTS.format(limit=limit, kept=kept, code=EXIT_OUTPUT_TRUNCATED)
+    return OUTPUT_TRUNCATED_MARKER
 
 
 class WorkspaceUnavailable(RuntimeError):

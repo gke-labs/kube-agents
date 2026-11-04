@@ -3,7 +3,7 @@
 **Status:** implemented 2026-10-29. Epic: gke-labs/kube-agents#4120, Workstreams 1
 and 2. Owner of the producer side: [`usage-counters-producer.md`](usage-counters-producer.md), which
 this document amends; the rows there for `remediationsMergedTotal` and
-`remediationsClosedUnmergedTotal` point here. [`human-interaction-readings.md`](human-interaction-readings.md) (proposed) generalises the readings slot of section 6 to a target per reading. Workstream 3, who started each proposal, is
+`remediationsClosedUnmergedTotal` point here. [`human-interaction-readings.md`](human-interaction-readings.md) generalises the readings slot of section 6 to a target per reading. Workstream 3, who started each proposal, is
 [`proposal-origin.md`](proposal-origin.md) (proposed): it leaves the `proposal-create` count here
 exact and adds nine per-origin readings taken in the agent pod through the readings slot of §6.
 
@@ -380,6 +380,10 @@ series in one body.
   implementing pull request.
 - A field the install's CRD does not carry takes the existing pruning record path with its own
   record name.
+
+The slot now carries a target and a presence rule per reading kind, and
+[`human-interaction-readings.md`](human-interaction-readings.md) adds the `people` kind, read from
+the A2A gateway.
 
 Fields, in `AgentUsageStatus`:
 

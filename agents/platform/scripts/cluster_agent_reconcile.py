@@ -155,7 +155,8 @@ ASSET_TYPE_CLUSTER = "container.googleapis.com/Cluster"
 # The two fields the resolver reads, projected so a container of thousands of clusters
 # stays far below the credential proxy's output cap; full-fidelity JSON is ~1 KB a row.
 ASSET_SEARCH_FORMAT = "json(name,location)"
-# The credential proxy's stderr note when it cut a stream at its output cap.
+# The credential proxy's stderr note when it cut a stream at its output cap; the
+# shim exits 74 with it, so the note is read before the exit code.
 _PROXY_TRUNCATED_MARKER = "truncated"
 # Regional clusters render as .../locations/<L>/clusters/<C>, zonal ones as
 # .../zones/<Z>/clusters/<C>; a parser written to one shape drops the other (design §4).
@@ -947,6 +948,12 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
         if not isinstance(assets, list):
             raise ValueError("asset search did not return a list")
     except subprocess.CalledProcessError as e:
+        if _PROXY_TRUNCATED_MARKER in (e.stderr or ""):
+            # The shim's exit 74 on a cut reply: the cap, not a failed call.
+            log(f"resolving {container} errored ({OUTCOME_UNREACHABLE}; its previous members are carried "
+                f"forward): the credential proxy cut the search output at its cap; the container "
+                f"holds more clusters than one search can return through it")
+            return None, OUTCOME_UNREACHABLE
         outcome = _classify_list_failure(e.stderr or "")
         log(f"resolving {container} through Cloud Asset Inventory failed ({outcome}; its previous "
             f"members are carried forward, no CREATE under them): {(e.stderr or '').strip()}")

@@ -1554,15 +1554,15 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	}
 	// Default gateway cap 10 + the fixed headroom for the rest of the
 	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 26 {
-		t.Fatalf("default quota = %d, want 26 (cap 10 + headroom 16)", pods.Value())
+	if pods.Value() != 27 {
+		t.Fatalf("default quota = %d, want 27 (cap 10 + headroom 17)", pods.Value())
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 18 {
-		t.Fatalf("tuned quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
+	if pods.Value() != 19 {
+		t.Fatalf("tuned quota = %d, want 19 (cap 2 + headroom 17)", pods.Value())
 	}
 }
 
@@ -8304,5 +8304,54 @@ func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
 		}
 		t.Errorf("the provisioned caps reserve %.3f GiB of a %.3f GiB store, leaving %.3f GiB, under the %d GiB margin (#4476):%s",
 			float64(sum)/(1<<30), float64(store)/(1<<30), float64(store-sum)/(1<<30), a2aJetStreamCapMargin>>30, b.String())
+	}
+}
+
+// The people reading is read only while the install renders the A2A stack
+// and no chat platform it enables is served through Hermes: Chat or Slack on
+// its legacy consumer, or Teams, which only Hermes serves. The today rows are
+// false through the render gate alone, since a today install has no gateway
+// to read; the Slack and Teams rows test the Hermes reason by itself.
+func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
+	on := ptr.To(true)
+	agent := func(mode string, chat, slack, teams bool) *agentv1alpha1.PlatformAgent {
+		a := a2aTestAgent()
+		a.Spec.Mode = ptr.To(mode)
+		integration := &agentv1alpha1.PlatformAgentIntegrationSpec{}
+		if chat {
+			integration.GoogleChat = &agentv1alpha1.GoogleChatSpec{Enabled: on}
+		}
+		if slack {
+			integration.Slack = &agentv1alpha1.SlackSpec{Enabled: on}
+		}
+		if teams {
+			integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: on}
+		}
+		a.Spec.Integration = integration
+		return a
+	}
+	next, today := string(ModeNext), string(ModeToday)
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  bool
+	}{
+		{"next, Chat only", agent(next, true, false, false), true},
+		{"next, Slack only", agent(next, false, true, false), true},
+		{"next, Chat and Slack: Slack on Hermes", agent(next, true, true, false), false},
+		{"next, Teams", agent(next, false, false, true), false},
+		{"next, no platform", agent(next, false, false, false), true},
+		{"today, Chat", agent(today, true, false, false), false},
+		{"today, no platform: no A2A stack", agent(today, false, false, false), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := peopleReadingEnabled(tc.agent); got != tc.want {
+				t.Fatalf("peopleReadingEnabled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	noIntegration := a2aTestAgent()
+	if teamsEnabled(noIntegration) || !peopleReadingEnabled(noIntegration) {
+		t.Fatal("a CR with no spec.integration: want Teams off and the reading enabled")
 	}
 }

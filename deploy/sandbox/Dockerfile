@@ -83,9 +83,19 @@ RUN apt-get update && \
 # k9s did not come across: it is a full-screen terminal UI, and every command
 # here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
 # could not run even if a skill asked for it. Nothing in agents/ does.
-ARG KUBECTL_VERSION=1.32.3
-ARG KUBECTL_SHA256_AMD64=ab209d0c5134b61486a0486585604a616a5bb2fc07df46d304b3c95817b2d79f
-ARG KUBECTL_SHA256_ARM64=6c2c91e760efbf3fa111a5f0b99ba8975fb1c58bb3974eca88b6134bcf3717e2
+# kubectl 1.34 is the floor, not a preference: the kube-proxy kubeconfigs
+# (entrypoint.sh write_kube_proxy_kubeconfig) name the cluster in the server
+# URL's path, `${KUBE_PROXY_URL}/clusters/<ctx>`, and `kubectl get --raw`
+# before 1.34 replaced that path with the raw path (client-go's
+# `Request.RequestURI` set `pathPrefix = locator.Path`; since v0.34.0 it goes
+# through `AbsPath`, which prepends the server's path). On 1.32 every paged
+# collection read (collector_run.paged_list) reached the proxy's default
+# cluster, whatever cluster its kubeconfig named, and nothing failed.
+# smoke-test.sh section 5 proves the path survives with the installed binary,
+# and tests/test_sandbox_kubectl_pin.py holds the pin at or above the floor.
+ARG KUBECTL_VERSION=1.34.13
+ARG KUBECTL_SHA256_AMD64=b4bb494e9466a7a94bb851414548bc0d3e2f8da90757e6eccc3371e648648591
+ARG KUBECTL_SHA256_ARM64=66e8283d52d9bc1f9c0e9daade7c971cd20db5a379306862897dfb25395f3e03
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) KUBECTL_SHA256="${KUBECTL_SHA256_AMD64}" ;; \
