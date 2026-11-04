@@ -65,6 +65,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `upgrade-readiness-weekly-review` | Platform Agent | `0 6 * * 6` | Weekly, Saturday 06:00 | yes | `upgrade_readiness_review.py` |
 | `upgrade-readiness-weekly-brief` | Platform Agent | `0 7 * * 6` | Weekly, Saturday 07:00 | yes | Write this week's upgrade readiness brief. Read the SOP at '/opt/data/profiles/platform/governance/upgrade_... |
 | `sa-role-watch` | Platform Agent | `25 * * * *` | Hourly at :25 | yes | `sa_role_watch.py` |
+| `leeway-watch` | Platform Agent | `30 8 * * *` | Daily 08:30 | yes | `leeway_watch.py` |
 | `chat-delivery-watch` | Platform Agent | `*/30 * * * *` | Every 30 minutes | yes | `chat_delivery_watch.py` |
 
 <!-- prettier-ignore-end -->

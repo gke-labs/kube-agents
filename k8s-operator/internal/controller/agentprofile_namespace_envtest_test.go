@@ -612,7 +612,7 @@ func TestTheIdentityMapRendersProfilesOnlyWithTheProfileNamespace(t *testing.T) 
 		t.Helper()
 		_, _ = r.reconcileA2A(ctx, agent, homeChannelRecord{})
 		var cm corev1.ConfigMap
-		if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapName(agent)}, &cm); err != nil {
+		if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapShardName(agent, 0)}, &cm); err != nil {
 			t.Fatalf("the identity map was not rendered: %v", err)
 		}
 		for _, v := range cm.Data {
@@ -647,7 +647,7 @@ func TestTheIdentityMapRendersProfilesOnlyWithTheProfileNamespace(t *testing.T) 
 		t.Errorf("reconcileA2A = %v, want the namespace read's error", err)
 	}
 	var cm corev1.ConfigMap
-	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapName(agent)}, &cm); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapShardName(agent, 0)}, &cm); err != nil {
 		t.Fatal(err)
 	}
 	kept := false

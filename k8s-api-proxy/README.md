@@ -7,8 +7,13 @@ with credentials the sandbox never holds. So far it has the policy (`pkg/k8sapip
 and the HTTP handler around it (`handler.go`), which authenticates through a pluggable
 `CallerAuthenticator`, removes the caller's credentials (including a bearer token in
 `Sec-WebSocket-Protocol`), impersonation, `Audit-ID` and `Connection`-named headers, and forwards
-through a pluggable `UpstreamTransport`. `pkg/upstream` implements the transport, and nothing
-implements the authenticator yet or serves or deploys the handler.
+through a pluggable `UpstreamTransport`. `NewTokenReviewAuthenticator` (`auth.go`) is the
+`CallerAuthenticator`: it accepts a bearer token that a TokenReview on the host cluster finds
+valid for the configured audience, from a username on an allowlist, and caches each acceptance
+or refusal for ten seconds by default. The audience should be one the API server does not accept,
+so a token sent to the proxy cannot be used against the API server directly; the operator picks
+it. A review that fails is a 503 rather than a 401. `pkg/upstream` implements the transport, and
+nothing serves or deploys the handler yet.
 
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
 `gke_` ID, to the API server through the pod's service account. Any other `gke_` cluster is reached
@@ -23,9 +28,9 @@ seconds. An IP endpoint is verified against the cluster's own CA and never the s
 The handler hands one `AuditEvent` per request to an `AuditSink` (`audit.go`) when the request
 ends, so a watch or an `exec` session is recorded when it closes. The event holds the caller, the
 cluster, the API server's classification of the request, the outcome (`forwarded`,
-`unauthenticated`, `refused` with its reason, `upstream_error`, `canceled` when the caller gives
-up, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be written),
-the status and the duration. An upgraded session that breaks off after its 101 is recorded as
+`unauthenticated`, `auth_unavailable` when the TokenReview fails, `refused` with its reason,
+`upstream_error`, `canceled` when the caller gives up, or `aborted` when a response fails
+mid-copy otherwise or an upgrade's 101 cannot be written), the status and the duration. An upgraded session that breaks off after its 101 is recorded as
 `forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
 puts no body, query or credential in it, but an authentication or transport error is recorded as
 returned. The caller never sees that error, because it can name the upstream. A Secret response

@@ -193,6 +193,10 @@ type flags struct {
 	snapshotInterval       time.Duration
 	gatewayURL             string
 	gatewayWait            time.Duration
+	// fleetShapeInterval is how often the fleet's shape (nodes, controllers,
+	// pods) is measured and published as the fleet gauges (fleetshape.go);
+	// 0 measures nothing and leaves the gauges at 0.
+	fleetShapeInterval time.Duration
 }
 
 // parseFlags reads command-line arguments into the flags struct.
@@ -243,6 +247,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.DurationVar(&f.snapshotInterval, "snapshot-interval", 30*time.Second, "How often to persist the dedup cache when --dedup-persist is set. 0 = only on shutdown.")
 	fs.StringVar(&f.gatewayURL, "gateway-url", "", "Base URL of the agent gateway the daemon starts triage turns on. When set, events are not watched until it answers or --gateway-wait passes. Empty = do not wait.")
 	fs.DurationVar(&f.gatewayWait, "gateway-wait", defaultGatewayWait, "Longest time to wait for --gateway-url to answer before watching events anyway.")
+	fs.DurationVar(&f.fleetShapeInterval, "fleet-shape-interval", defaultFleetShapeInterval, "How often the fleet's shape is measured and published as the k8s_event_watcher_fleet_* gauges: every watched cluster's node count from its GKE description, and its pods, Deployments, StatefulSets, DaemonSets and CronJobs counted as one-item metadata-only lists (limit=1, Accept PartialObjectMetadataList) plus the server's remainingItemCount. Eight clusters at a time, 5s per call. 0 = off (the gauges stay at 0).")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -351,6 +356,9 @@ func (f *flags) validate() error {
 	}
 	if f.initialListConcurrency < 0 {
 		return errors.New("--initial-list-concurrency must be >= 0 (0 = no bound)")
+	}
+	if f.fleetShapeInterval < 0 {
+		return errors.New("--fleet-shape-interval must be >= 0 (0 = off)")
 	}
 	if strings.HasSuffix(f.gatewayURL, "/") {
 		return fmt.Errorf("--gateway-url must not end with '/' (got %q)", f.gatewayURL)
@@ -1362,6 +1370,17 @@ func realMain(argv []string) error {
 	if f.profilesDir != "" && f.profilesRescan > 0 {
 		log.Printf("k8s-event-watcher: re-reading %s every %s for profiles added, retried or removed (--profiles-rescan)", f.profilesDir, f.profilesRescan)
 		go runProfileReload(ctx, set, f.profilesDir, f.profilesRescan)
+	}
+
+	// The fleet's shape, measured now and every --fleet-shape-interval over
+	// the running set, so a cluster a rescan adds or removes is in or out of
+	// the next reading (see fleetshape.go). After the clusters are started
+	// and not before the gateway wait: the gauges are a reading of the fleet,
+	// not of the watcher's readiness, and a standby's reading is as true as
+	// the leader's.
+	if f.fleetShapeInterval > 0 {
+		log.Printf("k8s-event-watcher: measuring the fleet's shape now and every %s (--fleet-shape-interval)", f.fleetShapeInterval)
+		go runFleetShapeLoop(ctx, newFleetShapeProbe(set.clusters, m), f.fleetShapeInterval)
 	}
 
 	// Refuse to sit there watching nothing. Individual informers deliberately
