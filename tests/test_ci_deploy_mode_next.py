@@ -310,7 +310,7 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
         """The a2a step pushes from inside itself because `images:` cannot be
         conditional; the list must not have grown to include them."""
         config = yaml.safe_load(text(_CLOUDBUILD))
-        self.assertEqual(config["images"], ["$_PLATFORM_URI", "$_PROXY_URI", "$_SANDBOX_URI", "$_OPERATOR_URI"])
+        self.assertEqual(config["images"], ["$_PLATFORM_URI", "$_PROXY_URI", "$_SANDBOX_URI", "$_OPERATOR_URI", "$_KUBE_PROXY_URI"])
         for name in _A2A_SUBSTITUTIONS:
             self.assertEqual(config["substitutions"][name], "")
 

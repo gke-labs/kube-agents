@@ -2856,10 +2856,11 @@ class ResourcePressureRouteTest(unittest.TestCase):
         )
         stub_dir = root / "bin"
         stub_dir.mkdir()
-        stub = stub_dir / "kubectl"
-        stub.write_text("#!/bin/bash\necho pods\n", encoding="utf-8")
-        stub.chmod(0o755)
-        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+        for exe in ("kubectl", "gcloud"):
+            stub = stub_dir / exe
+            stub.write_text("#!/bin/bash\necho pods\n", encoding="utf-8")
+            stub.chmod(0o755)
+            CredentialProxyHandler.executor.executables[exe] = str(stub)
         CredentialProxyHandler.max_request_bytes = 65536
         self.cgroup = root / "cgroup"
         self.cgroup.mkdir()
@@ -2911,7 +2912,7 @@ class ResourcePressureRouteTest(unittest.TestCase):
     def test_a_shell_caller_at_the_hard_watermark_is_answered_429_with_retry_after(self):
         self.as_role(credential_proxy.CALLER_ROLE_SHELL)
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-            status, headers, body = self.post({"argv": ["kubectl", "get", "pods"]})
+            status, headers, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
         self.assertEqual(429, status)
         self.assertEqual("11", headers["Retry-After"])
         self.assertEqual(
@@ -2936,7 +2937,7 @@ class ResourcePressureRouteTest(unittest.TestCase):
         self.assertNotIn("Retry-After", headers)
         self.set_memory_percent(50)
         self.as_role(credential_proxy.CALLER_ROLE_SHELL)
-        status, _, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        status, _, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
         self.assertEqual(200, status, body)
 
     def test_a_vcs_verb_at_the_hard_watermark_is_answered_429_before_its_body_is_read(self):
@@ -3766,10 +3767,10 @@ class SessionSlotCapTest(unittest.TestCase):
         )
         stub_dir = Path(temp_dir.name) / "bin"
         stub_dir.mkdir()
-        stub = stub_dir / "kubectl"
-        stub.write_text("#!/bin/bash\nsleep 2\necho pods\n", encoding="utf-8")
+        stub = stub_dir / "gcloud"
+        stub.write_text("#!/bin/bash\nsleep 2\necho projects\n", encoding="utf-8")
         stub.chmod(0o755)
-        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+        CredentialProxyHandler.executor.executables["gcloud"] = str(stub)
         CredentialProxyHandler.max_request_bytes = 65536
         CredentialProxyHandler.enforce_read_only = True
         CredentialProxyHandler.session_slots = credential_proxy.SessionSlots(1)
@@ -3789,7 +3790,7 @@ class SessionSlotCapTest(unittest.TestCase):
         def post_as(role):
             request = urllib.request.Request(
                 f"http://127.0.0.1:{server.server_port}/v1/exec",
-                data=json.dumps({"argv": ["kubectl", "get", "pods"]}).encode("utf-8"),
+                data=json.dumps({"argv": ["gcloud", "projects", "list"]}).encode("utf-8"),
                 headers={"Content-Type": "application/json", "X-Test-Role": role},
                 method="POST",
             )
@@ -3872,7 +3873,9 @@ class SessionRoleExecutableTest(unittest.TestCase):
             (credential_proxy.CALLER_ROLE_SESSION, "gcloud", True),
             (credential_proxy.CALLER_ROLE_SESSION, "git", False),
             (credential_proxy.CALLER_ROLE_SESSION, "gh", False),
-            (credential_proxy.CALLER_ROLE_SHELL, "git", True),
+            (credential_proxy.CALLER_ROLE_SHELL, "gcloud", True),
+            (credential_proxy.CALLER_ROLE_SHELL, "kubectl", False),
+            (credential_proxy.CALLER_ROLE_SHELL, "git", False),
             ("", "gh", True),
         ):
             with self.subTest(role=role, executable=executable):
@@ -3890,9 +3893,10 @@ class SessionRoleExecutableTest(unittest.TestCase):
 
     def test_the_role_check_stands_behind_the_route(self):
         # Widen the route the way the git-routing tests do and the session is
-        # still held to its two CLIs, with the rule the shim prints, while the
-        # shell runs what the route now carries. This is what the role check
-        # buys once the route list and the session list are the same two names.
+        # still held to its two CLIs (and the shell to gcloud), with the rule
+        # the shim prints, while a roleless caller runs what the route now
+        # carries. This is what the role check buys once the route list and the
+        # session list are the same two names.
         routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
         with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
@@ -3901,7 +3905,13 @@ class SessionRoleExecutableTest(unittest.TestCase):
             self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
             self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
             self.assertIn("session", body["message"])
-            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["git", "status"]})
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "pods"]})
+            self.assertEqual(403, status)
+            self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+            self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
+            self.assertIn("shell", body["message"])
+            status, body = self.post_as("", {"argv": ["git", "status"]})
             self.assertEqual(200, status, body)
 
     def test_a_read_from_a_session_runs(self):
@@ -4007,8 +4017,14 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
         self.assertIn("--output", body["message"])
 
-    def test_the_shell_still_passes_a_file_argument_to_kubectl(self):
-        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "-f", "x.yaml"]})
+    def test_the_shell_is_refused_kubectl_while_the_roleless_caller_passes_a_file_argument(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self.post_as(
+                credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "-f", "x.yaml"]}
+            )
+        self.assertEqual(403, status)
+        self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
+        status, body = self.post_as("", {"argv": ["kubectl", "get", "-f", "x.yaml"]})
         self.assertEqual(200, status, body)
 
 
@@ -17897,6 +17913,166 @@ class ApiRelayQueryStrippingTest(unittest.TestCase):
         )
 
 
+class KubeProxyClientTest(unittest.TestCase):
+    """Tests for kubeconfig rewriting and context registration with k8s-api-proxy."""
+
+    CONTEXT = "gke_demo-project_us-central1_cluster-a"
+
+    def test_rewrite_kubeconfig_for_kube_proxy(self):
+        raw = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n"
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "KUBE_PROXY_URL": "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443",
+                    "KUBE_PROXY_CA_FILE": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+                    "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/secrets/kubeagents/credential-proxy/token",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                credential_proxy_client,
+                "_default_kubeconfig_candidates",
+                return_value=[],
+            ),
+        ):
+            rewritten = credential_proxy_client.rewrite_kubeconfig_for_kube_proxy(raw)
+
+        self.assertIn(
+            f"server: https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443/clusters/{self.CONTEXT}",
+            rewritten,
+        )
+        self.assertIn(
+            "certificate-authority: /var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+            rewritten,
+        )
+        self.assertIn(
+            "tokenFile: /var/run/secrets/kubeagents/credential-proxy/token",
+            rewritten,
+        )
+        self.assertEqual(self.CONTEXT, credential_proxy_client.read_current_context(rewritten))
+
+    def test_merge_context_into_default_kubeconfig_preserves_current_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfig"
+            kc.write_text(
+                "apiVersion: v1\nkind: Config\ncurrent-context: in-cluster\n"
+                "clusters:\n- name: in-cluster\n  cluster:\n    server: https://platform-agent-kube-proxy:8443/clusters/in-cluster\n"
+                "contexts:\n- name: in-cluster\n  context:\n    cluster: in-cluster\n    user: kube-proxy-caller\n"
+                "users:\n- name: kube-proxy-caller\n  user:\n    tokenFile: /var/run/secrets/kubeagents/credential-proxy/token\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "KUBE_PROXY_URL": "https://platform-agent-kube-proxy:8443",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    credential_proxy_client,
+                    "_default_kubeconfig_candidates",
+                    return_value=[kc],
+                ),
+            ):
+                credential_proxy_client.merge_context_into_default_kubeconfig(self.CONTEXT)
+            updated = kc.read_text(encoding="utf-8")
+            self.assertIn(
+                f"https://platform-agent-kube-proxy:8443/clusters/{self.CONTEXT}",
+                updated,
+            )
+            self.assertEqual("in-cluster", credential_proxy_client.read_current_context(updated))
+
+    def test_execute_get_credentials_with_default_sandbox_kubeconfig_merges_without_overwriting_current_context(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kc = root / ".kubeconfig"
+            kc.write_text(
+                "apiVersion: v1\nkind: Config\ncurrent-context: in-cluster\n"
+                "clusters:\n- name: in-cluster\n  cluster:\n    server: https://platform-agent-kube-proxy:8443/clusters/in-cluster\n"
+                "contexts:\n- name: in-cluster\n  context:\n    cluster: in-cluster\n    user: kube-proxy-caller\n"
+                "users:\n- name: kube-proxy-caller\n  user:\n    tokenFile: /var/run/secrets/kubeagents/credential-proxy/token\n",
+                encoding="utf-8",
+            )
+            token_path = root / "token"
+            token_path.write_text("projected-jwt", encoding="utf-8")
+
+            fake_resp = io.StringIO(
+                json.dumps(
+                    {
+                        "exitCode": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "kubeconfig": (
+                            "apiVersion: v1\nkind: Config\n"
+                            f"current-context: {self.CONTEXT}\n"
+                            f"clusters:\n- name: {self.CONTEXT}\n  cluster:\n    server: https://203.0.113.10\n"
+                            f"contexts:\n- name: {self.CONTEXT}\n  context:\n    cluster: {self.CONTEXT}\n    user: {self.CONTEXT}\n"
+                            f"users:\n- name: {self.CONTEXT}\n  user:\n    exec:\n      command: gke-gcloud-auth-plugin\n"
+                        ),
+                    }
+                )
+            )
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "KUBE_PROXY_URL": "https://platform-agent-kube-proxy:8443",
+                        "KUBECONFIG": str(kc),
+                        "HERMES_HOME": str(root),
+                        "CREDENTIAL_PROXY_TOKEN_FILE": str(token_path),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    credential_proxy_client,
+                    "_default_kubeconfig_candidates",
+                    return_value=[kc],
+                ),
+                mock.patch.object(
+                    credential_proxy_client,
+                    "open_broker_request",
+                    return_value=contextlib.nullcontext(fake_resp),
+                ),
+            ):
+                rc = credential_proxy_client.execute(
+                    "http://127.0.0.1:8080",
+                    [
+                        "gcloud",
+                        "container",
+                        "clusters",
+                        "get-credentials",
+                        "fleet-01",
+                        "--region=us-central1",
+                        "--project=my-proj",
+                    ],
+                )
+            self.assertEqual(0, rc)
+            updated_default = kc.read_text(encoding="utf-8")
+            self.assertEqual(
+                "in-cluster",
+                credential_proxy_client.read_current_context(updated_default),
+            )
+            self.assertIn(
+                f"https://platform-agent-kube-proxy:8443/clusters/{self.CONTEXT}",
+                updated_default,
+            )
+            per_cluster = (
+                root / ".kubeconfigs" / "kubeconfig_demo-project_cluster-a_us-central1.yaml"
+            )
+            self.assertTrue(per_cluster.is_file())
+            self.assertEqual(
+                self.CONTEXT,
+                credential_proxy_client.read_current_context(
+                    per_cluster.read_text(encoding="utf-8")
+                ),
+            )
+
+
 class FeedbackRouteTest(_ExecRouteServer):
     """`POST /v1/feedback/submit`: the sandbox's one way to file a kube-agents report.
 
@@ -18887,6 +19063,202 @@ class TeamsRelayTest(unittest.TestCase):
 
             with self.assertRaises(RuntimeError):
                 relay._get_access_token()
+
+    def test_ensure_kube_proxy_context_for_argv_registers_fleet_context_without_get_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            default_kc = Path(tmpdir) / ".kubeconfig"
+            default_kc.write_text(
+                credential_proxy_client.build_kube_proxy_kubeconfig(
+                    "gke_host-proj_us-central1_host-cluster",
+                    proxy_url="https://agent-kube-proxy:8443",
+                    ca_file="/etc/ca.crt",
+                    token_file="/etc/token",
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                        "KUBE_PROXY_CA_FILE": "/etc/ca.crt",
+                        "CREDENTIAL_PROXY_TOKEN_FILE": "/etc/token",
+                        "KUBECONFIG": str(default_kc),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    credential_proxy_client,
+                    "_default_kubeconfig_candidates",
+                    return_value=[default_kc],
+                ),
+            ):
+                credential_proxy_client.ensure_kube_proxy_context_for_argv(
+                    ["kubectl", "--context=gke_fleet-proj_us-east1_fleet-cluster", "get", "nodes"]
+                )
+            merged = default_kc.read_text(encoding="utf-8")
+            self.assertIn("current-context: gke_host-proj_us-central1_host-cluster", merged)
+            self.assertIn(
+                "server: https://agent-kube-proxy:8443/clusters/gke_fleet-proj_us-east1_fleet-cluster",
+                merged,
+            )
+
+    def test_ensure_kube_proxy_context_for_argv_concurrent_calls_preserve_all_contexts(self):
+        import yaml
+
+        for _ in range(5):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                default_kc = Path(tmpdir) / ".kubeconfig"
+                default_kc.write_text(
+                    credential_proxy_client.build_kube_proxy_kubeconfig(
+                        "gke_host-proj_us-central1_host-cluster",
+                        proxy_url="https://agent-kube-proxy:8443",
+                        ca_file="/etc/ca.crt",
+                        token_file="/etc/token",
+                    ),
+                    encoding="utf-8",
+                )
+                barrier = threading.Barrier(8)
+                errors: list[BaseException] = []
+
+                def worker(idx: int) -> None:
+                    try:
+                        barrier.wait(timeout=5)
+                        credential_proxy_client.ensure_kube_proxy_context_for_argv(
+                            [
+                                "kubectl",
+                                f"--context=gke_fleet-proj_us-east1_cluster-{idx}",
+                                "get",
+                                "nodes",
+                            ]
+                        )
+                    except BaseException as exc:  # pragma: no cover
+                        errors.append(exc)
+
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                            "KUBE_PROXY_CA_FILE": "/etc/ca.crt",
+                            "CREDENTIAL_PROXY_TOKEN_FILE": "/etc/token",
+                            "KUBECONFIG": str(default_kc),
+                        },
+                        clear=False,
+                    ),
+                    mock.patch.object(
+                        credential_proxy_client,
+                        "_default_kubeconfig_candidates",
+                        return_value=[default_kc],
+                    ),
+                ):
+                    threads = [
+                        threading.Thread(target=worker, args=(i,)) for i in range(8)
+                    ]
+                    for t in threads:
+                        t.start()
+                    for t in threads:
+                        t.join(timeout=10)
+
+                self.assertEqual([], errors)
+                parsed = yaml.safe_load(default_kc.read_text(encoding="utf-8"))
+                cluster_names = {c["name"] for c in parsed["clusters"]}
+                context_names = {c["name"] for c in parsed["contexts"]}
+                for i in range(8):
+                    expected = f"gke_fleet-proj_us-east1_cluster-{i}"
+                    self.assertIn(expected, cluster_names)
+                    self.assertIn(expected, context_names)
+
+    def test_ensure_kube_proxy_context_for_argv_skips_kubeconfig_flag_and_repairs_tampered_entries(self):
+        import yaml
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            default_kc = Path(tmpdir) / ".kubeconfig"
+            initial = credential_proxy_client.build_kube_proxy_kubeconfig(
+                "gke_host-proj_us-central1_host-cluster",
+                proxy_url="https://agent-kube-proxy:8443",
+                ca_file="/etc/ca.crt",
+                token_file="/etc/token",
+            )
+            default_kc.write_text(initial, encoding="utf-8")
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "KUBE_PROXY_URL": "https://agent-kube-proxy:8443",
+                        "KUBE_PROXY_CA_FILE": "/etc/ca.crt",
+                        "CREDENTIAL_PROXY_TOKEN_FILE": "/etc/token",
+                        "KUBECONFIG": str(default_kc),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    credential_proxy_client,
+                    "_default_kubeconfig_candidates",
+                    return_value=[default_kc],
+                ),
+            ):
+                # 1. Explicit --kubeconfig is a no-op on the default kubeconfig.
+                credential_proxy_client.ensure_kube_proxy_context_for_argv(
+                    [
+                        "kubectl",
+                        "--kubeconfig=/tmp/other",
+                        "--context=gke_fleet-proj_us-east1_skipped",
+                        "get",
+                        "nodes",
+                    ]
+                )
+                self.assertEqual(initial, default_kc.read_text(encoding="utf-8"))
+
+                # 2. Existing entry pointing at wrong server or carrying an exec plugin is repaired.
+                tampered_ctx = "gke_fleet-proj_us-east1_tampered"
+                default_kc.write_text(
+                    yaml.safe_dump(
+                        {
+                            "apiVersion": "v1",
+                            "kind": "Config",
+                            "current-context": "gke_host-proj_us-central1_host-cluster",
+                            "clusters": [
+                                {
+                                    "name": tampered_ctx,
+                                    "cluster": {
+                                        "server": "https://evil.example.com",
+                                        "certificate-authority": "/etc/ca.crt",
+                                    },
+                                }
+                            ],
+                            "users": [
+                                {
+                                    "name": credential_proxy_client.KUBE_PROXY_USER_NAME,
+                                    "user": {"exec": {"command": "/bin/sh"}},
+                                }
+                            ],
+                            "contexts": [
+                                {
+                                    "name": tampered_ctx,
+                                    "context": {
+                                        "cluster": tampered_ctx,
+                                        "user": credential_proxy_client.KUBE_PROXY_USER_NAME,
+                                    },
+                                }
+                            ],
+                        },
+                        sort_keys=False,
+                    ),
+                    encoding="utf-8",
+                )
+                credential_proxy_client.ensure_kube_proxy_context_for_argv(
+                    ["kubectl", f"--context={tampered_ctx}", "get", "nodes"]
+                )
+                repaired = yaml.safe_load(default_kc.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    "https://agent-kube-proxy:8443/clusters/gke_fleet-proj_us-east1_tampered",
+                    repaired["clusters"][0]["cluster"]["server"],
+                )
+                self.assertEqual(
+                    [{"name": credential_proxy_client.KUBE_PROXY_USER_NAME, "user": {"tokenFile": "/etc/token"}}],
+                    repaired["users"],
+                )
 
 
 if __name__ == "__main__":

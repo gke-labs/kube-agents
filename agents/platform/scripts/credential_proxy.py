@@ -1427,11 +1427,13 @@ CALLER_ROLES = (
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
-# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session role is
-# narrowed to the two CLIs that reach a cluster read-only. Today the route
-# carries exactly those two, so this check stands behind the route's own
-# refusal: widening the route never widens a session.
+# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session and
+# profile roles are narrowed to the two CLIs that reach a cluster read-only,
+# and the shell and scope roles are narrowed to `gcloud` (the sandbox runs
+# stock `kubectl` against `kube-proxy`, so `/usr/local/bin/credential-proxy-exec`
+# in the sandbox cannot bypass `kube-proxy`).
 ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
+    CALLER_ROLE_SHELL: frozenset({"gcloud"}),
     CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
     CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"}),
     CALLER_ROLE_SCOPE: frozenset({"gcloud"}),
