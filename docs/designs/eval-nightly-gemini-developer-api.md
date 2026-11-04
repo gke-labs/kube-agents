@@ -167,14 +167,14 @@ to blocking once the repairs are done and verified. It is kept out of the hourly
 until that flip.
 
 The scan runs as `eval-dashboard-publisher`. Reading the key's metadata needs
-`roles/serviceusage.apiKeysViewer` on the project, and listing the secret's versions needs
-`roles/secretmanager.viewer` on the secret; neither is in `roles/iam.securityReviewer`. The
-project-level role joins `POOL_STATE_READER_ROLES`, which the fleet stack grants and its
-reconcile delivers (section 6.2 of the pool doc), because every project-level reader role takes
-that path and a test holds the list equal. The secret-level role is granted by the key script
-beside the runners' accessor, since it is per resource, as the minter key's sweeper grant is. Until
-the reconcile has run, the scan reports the finding as not checked, which the lease-silent phase
-absorbs.
+`roles/serviceusage.apiKeysViewer` and listing the secret's versions needs
+`roles/secretmanager.viewer`; neither is in `roles/iam.securityReviewer`. Both join
+`POOL_STATE_READER_ROLES`, which the fleet stack grants at project level and its reconcile
+delivers (section 6.2 of the pool doc): the verifier's own test requires every gcloud surface a
+check reads to name a project-level pool-state reader role, so a secret-level grant alone would
+not satisfy it. The key script grants the bot `roles/secretmanager.viewer` on the secret as well,
+so a project repaired before the reconcile still scans. Until the reconcile has run on a project,
+the scan reports the finding there as not checked, which the lease-silent phase absorbs.
 
 ### 5. The deploy
 
@@ -285,3 +285,6 @@ tracks the move, beside the last Vertex night's.
   read is fine; a reusable summariser is a follow-on).
 - Whether `generativelanguage.googleapis.com` must be enabled for the key to be created, or only
   for it to be used; enable it regardless.
+
+Implementation plan:
+[`docs/superpowers/plans/2026-11-04-eval-nightly-gemini-developer-api.md`](../superpowers/plans/2026-11-04-eval-nightly-gemini-developer-api.md).
