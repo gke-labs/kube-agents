@@ -58,16 +58,20 @@ OPAQUE_CLASS = "OPAQUE"
 
 # Keys whose numeric value is a per-run counter or row id.
 KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "resourceVersion", "generation", "observedGeneration")
+# Any key ending in this is a run id too (`current_run_id`, `parent_run_id`).
+RUN_ID_SUFFIX = "_run_id"
 NUMBER_CLASS = "NUM"
-# A keyed number is swapped only when it has at least this many digits. Small
-# values (`generation: 1`, `replicas: 3`) are usually the same in every run, so
-# swapping them gains no matches, and once swapped every `1` or `3` in an
-# answer (`2>&1`, "revision 1") would mark that answer unstorable. Long values
-# (resourceVersion, pids, row ids) differ per run and are still swapped.
-MIN_SWAPPED_NUMBER_DIGITS = 4
+# A swapped number with at least this many digits counts as repeated wherever an
+# answer has it as a whole token (`kill 4821`). A shorter one counts only next
+# to its key (`generation: 1`, `run_id=190`, `pid 42`): a bare `1` in an answer
+# (`2>&1`, "revision 1") is almost never the swapped value, and treating it as
+# one marked about one answer in seven unstorable in the dev-install dry run.
+MIN_STANDALONE_REPEAT_DIGITS = 4
+SHORT_NUMBER_KEYS = r"(?:resourceVersion|observedGeneration|generation|run_id|run|pid|PID|id)"
+SHORT_NUMBER_KEY_GAP = r"(?:\s+(?:is|was|now|of)\s+|\W{0,4})"
 DIGITS_RE = re.compile(r"^\d+$")
 KEYED_NUMBER_TEXT_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(resourceVersion|observedGeneration|generation|run_id|pid|PID|id)"
+    r"(?<![A-Za-z0-9_])(resourceVersion|observedGeneration|generation|[A-Za-z0-9]*_?run_id|pid|PID|id)"
     r"(\\?[\"']?\s*[:=]\s*\\?[\"']?)(\d+)\b"
 )
 # `pid 4821`, as a process listing or a sentence names one.
@@ -101,20 +105,18 @@ DASH_RULE_RE = re.compile(r"^[\s-]+$")
 # Timestamps become how far they are from the request time, unnumbered:
 # whether a certificate expired is what matters, not which second it did.
 TIME_CLASS = "TIME"
-NOW_WINDOW_SECONDS = 60
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
 DAYS_PER_MONTH_BUCKET = 30
 DAYS_PER_YEAR_BUCKET = 365
 TIME_BUCKETS = (
-    (SECONDS_PER_HOUR, "minutes"),
     (SECONDS_PER_DAY, "hours"),
     (SECONDS_PER_DAY * DAYS_PER_MONTH_BUCKET, "days"),
     (SECONDS_PER_DAY * DAYS_PER_YEAR_BUCKET, "months"),
 )
 TIME_BUCKET_BEYOND = "years"
-TIME_NOW = "now"
+TIME_WITHIN_HOUR = "within_hour"
 TIME_PAST_PREFIX = "past_"
 TIME_FUTURE_PREFIX = "future_"
 UTC_ZONE = "Z"
@@ -140,6 +142,7 @@ LS_DATE_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) {1,2}(?:(\d{2}):
 EPOCH_FULL_RE = re.compile(r"^(1[6-9]\d{8})(\d{3})?(?:\.\d+)?$")
 TIME_KEY_PATTERN = (
     r"(?:[A-Za-z0-9_]*_at|[A-Za-z0-9]*[a-z](?:At|Time|Timestamp|Date)|time|timestamp|ts|date"
+    r"|expires|expiry|expiration|deadline"
     r"|[A-Za-z0-9_]*_(?:time|timestamp|ts|date))"
 )
 TIME_KEY_RE = re.compile(r"^" + TIME_KEY_PATTERN + r"$")
@@ -216,8 +219,11 @@ def time_bucket(when: float, now: float) -> str:
     """The placeholder for a timestamp: how far from `now` it is, and which way."""
     delta = now - when
     distance = abs(delta)
-    if distance < NOW_WINDOW_SECONDS:
-        name = TIME_NOW
+    if distance < SECONDS_PER_HOUR:
+        # One token for the whole hour around `now`, in either direction: run-to-run
+        # timing jitter (a card read 50 s or 70 s after it was claimed) must not
+        # flip the key, and the dev-install dry run lost most of its matches there.
+        name = TIME_WITHIN_HOUR
     else:
         span = next((label for limit, label in TIME_BUCKETS if distance < limit), TIME_BUCKET_BEYOND)
         name = (TIME_PAST_PREFIX if delta > 0 else TIME_FUTURE_PREFIX) + span
@@ -268,7 +274,14 @@ class Mapping:
 
     def answer_repeats_bare_number(self, text: str) -> bool:
         """Whether an answer repeats a swapped value that cannot be restored."""
-        return any(re.search(NUMBER_BEFORE + re.escape(v) + NUMBER_AFTER, text) for v in self.bare_numbers)
+        for value in self.bare_numbers:
+            if len(value) >= MIN_STANDALONE_REPEAT_DIGITS:
+                pattern = NUMBER_BEFORE + re.escape(value) + NUMBER_AFTER
+            else:
+                pattern = r"(?<![A-Za-z0-9_])" + SHORT_NUMBER_KEYS + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER
+            if re.search(pattern, text):
+                return True
+        return False
 
 
 def age_unit(value: str) -> str:
@@ -290,7 +303,7 @@ class Normalizer:
             return self.opaque(obj)
         if key is not None and TIME_KEY_RE.match(key) and self.epoch_value(obj) is not None:
             return self.epoch_token(str(obj), self.epoch_value(obj))
-        if key in KEYED_NUMBER_KEYS and self.is_number(obj):
+        if (key in KEYED_NUMBER_KEYS or (key or "").endswith(RUN_ID_SUFFIX)) and self.is_number(obj):
             return self.keyed_number(str(obj))
         if key in AGE_KEYS and isinstance(obj, str) and AGE_FULL_RE.match(obj):
             return self.age(obj)
@@ -326,9 +339,7 @@ class Normalizer:
         return isinstance(value, int) or (isinstance(value, str) and bool(DIGITS_RE.match(value)))
 
     def keyed_number(self, value: str) -> str:
-        """Swap a keyed number for a placeholder, unless it is short (see MIN_SWAPPED_NUMBER_DIGITS)."""
-        if len(value) < MIN_SWAPPED_NUMBER_DIGITS:
-            return value
+        """Swap a keyed number (any length) for a placeholder."""
         return self.mapping.placeholder(NUMBER_CLASS, value)
 
     def opaque(self, value: Any) -> str:

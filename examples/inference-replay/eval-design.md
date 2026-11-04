@@ -126,7 +126,9 @@ The rules that keep this safe:
   past or the future can be the whole finding (an expired certificate, a CronJob that hasn't run for
   a month). So timestamps, both dates and epoch seconds, become a token for roughly how far from now
   they are ("minutes ago", "days ago", "in the future", and so on), and an expired certificate never
-  matches a valid one. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
+  matches a valid one. Anything within an hour of now, before or after, is one token, so
+  run-to-run timing jitter (a card read 50 or 70 seconds after it was claimed) doesn't change the
+  key. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
   `timestamp`); any other 10-digit number, like `memory: 1717986918`, isn't read as a time. IP
   addresses stay as they are whenever the request mentions a network range (like `10.0.0.0/16`),
   because then which range an IP falls in can matter.
@@ -148,10 +150,10 @@ The rules that keep this safe:
   how-far-from-now time token. If the model's answer repeats one of those values (say it answers
   `kill 4821` after reading `pid 4821`), a later run would get the old number back. So the proxy checks each answer before
   saving it, and if it repeats any of those values, it doesn't save it. That request just goes to
-  the model next time, which is always safe. Short numbers (under 4 digits, like `generation: 1` or
-  `replicas: 3`) aren't swapped at all: they're usually the same in every run, and the dry run
-  showed that swapping them marked about one answer in eight unsaveable just for containing a `1`
-  (`2>&1`, "revision 1").
+  the model next time, which is always safe. A short swapped number (under 4 digits, like
+  `generation: 1` or a kanban `run_id: 190`) only counts as repeated next to its key
+  (`generation=1`, "the run_id is 190"): the dev-install dry run showed that counting any bare `1`
+  (`2>&1`, "revision 1") marked about one answer in seven unsaveable.
 - **Hermes' recent-work digest is dropped from the key.** Every card view ends with
   `## Recent work by @<assignee>`, the assignee's last five runs on other cards, so the first
   card read differs between otherwise identical runs. The same block leaks earlier repetitions'

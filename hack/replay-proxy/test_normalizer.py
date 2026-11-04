@@ -67,10 +67,25 @@ class IdentifierTest(unittest.TestCase):
         out = normalizer.Normalizer(NOW, False).walk({"metadata": {"resourceVersion": "48213", "generation": 3104}})
         self.assertEqual(out, {"metadata": {"generation": "⟦NUM_1⟧", "resourceVersion": "⟦NUM_2⟧"}})
 
-    def test_short_keyed_numbers_stay_literal(self):
-        out = normalizer.Normalizer(NOW, False).walk({"metadata": {"generation": 1, "observedGeneration": 1, "id": 99}})
-        self.assertNotIn("⟦NUM", json.dumps(out, ensure_ascii=False))
-        self.assertEqual(norm("generation: 7\npid 42\n\"run_id\": 12"), "generation: 7\npid 42\n\"run_id\": 12")
+    def test_short_keyed_numbers_are_swapped(self):
+        # Kanban run ids are short counters that differ per run (190 vs 202).
+        self.assertEqual(norm('"run_id": "190"'), norm('"run_id": "202"'))
+        self.assertIn("⟦NUM_1⟧", norm("generation: 7"))
+
+    def test_timing_jitter_within_the_hour_does_not_change_the_key(self):
+        # A card read 50 s or 70 s after it was claimed must give the same key.
+        self.assertEqual(norm('"created_at": %d' % (NOW - 50)), norm('"created_at": %d' % (NOW - 70)))
+        self.assertEqual(norm('"created_at": %d' % (NOW + 20)), norm('"created_at": %d' % (NOW - 20)))
+        self.assertNotEqual(norm('"created_at": %d' % (NOW - 50)), norm('"created_at": %d' % (NOW - 3 * 3600)))
+
+    def test_any_run_id_key_is_swapped(self):
+        self.assertEqual(norm('"current_run_id": 190'), norm('"current_run_id": 200'))
+        out = normalizer.Normalizer(NOW, False).walk({"current_run_id": 190, "parent_run_id": 7})
+        self.assertNotIn("190", json.dumps(out))
+
+    def test_expires_is_a_time_key(self):
+        self.assertEqual(norm('"expires": 1793759016'), norm('"expires": 1793759100'))
+        self.assertIn("⟦TIME_", norm('"expires": 1793759016'))
 
     def test_state_stays_literal(self):
         text = "restartCount: 4\nreplicas: 3\nversion 1.30.5-gke.1014001\nzone us-central1-a\nscore 0.82"
@@ -127,10 +142,10 @@ class AgeTest(unittest.TestCase):
 
 class TimeTest(unittest.TestCase):
     def test_iso_buckets(self):
-        self.assertEqual(norm("2026-11-03T11:58:00Z"), "⟦TIME_past_minutes⟧")
+        self.assertEqual(norm("2026-11-03T11:58:00Z"), "⟦TIME_within_hour⟧")
         self.assertEqual(norm("2026-11-03T06:00:00+00:00"), "⟦TIME_past_hours⟧")
         self.assertEqual(norm("2026-10-20 08:00"), "⟦TIME_past_days⟧")
-        self.assertEqual(norm("2026-11-03T12:00:10.123Z"), "⟦TIME_now⟧")
+        self.assertEqual(norm("2026-11-03T12:00:10.123Z"), "⟦TIME_within_hour⟧")
         self.assertEqual(norm("2027-06-01T00:00:00Z"), "⟦TIME_future_months⟧")
 
     def test_expired_and_valid_certificates_do_not_match(self):
@@ -178,7 +193,7 @@ class TimeTest(unittest.TestCase):
         self.assertTrue(normalized.mapping.answer_repeats_bare_number("sleep until 1793440000"))
 
     def test_ls_l_dates(self):
-        self.assertEqual(norm("-rw-r--r-- 1 root root 12 Nov  3 11:40 a.txt"), "-rw-r--r-- 1 root root 12 ⟦TIME_past_minutes⟧ a.txt")
+        self.assertEqual(norm("-rw-r--r-- 1 root root 12 Nov  3 11:40 a.txt"), "-rw-r--r-- 1 root root 12 ⟦TIME_within_hour⟧ a.txt")
         self.assertEqual(norm("drwxr-xr-x 2 root root 4096 Jan 15  2025 old"), "drwxr-xr-x 2 root root 4096 ⟦TIME_past_years⟧ old")
 
     def test_rfc1123_and_openssl_dates(self):
@@ -366,8 +381,10 @@ class AnswerMappingTest(unittest.TestCase):
     def test_short_keyed_numbers_never_mark_an_answer(self):
         # generation: 1 stays literal, so an answer full of 1s is still storable.
         mapping = normalizer.normalize_request(request("generation: 1\nobservedGeneration: 1\nreplicas: 3"), NOW).mapping
-        for answer in ("kubectl get deploy -o yaml 2>&1", "revision 1", "generation=1", "2/2 ready", "kill 1"):
+        for answer in ("kubectl get deploy -o yaml 2>&1", "revision 1", "2/2 ready", "kill 1", "replicas 3"):
             self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+        for answer in ("generation=1", "observedGeneration: 1", "the generation is 1"):
+            self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
 
 
 if __name__ == "__main__":
