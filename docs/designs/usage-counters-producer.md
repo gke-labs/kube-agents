@@ -13,9 +13,11 @@ serves `kubeagents_tool_invocations_total`, `kubeagents_vcs_requests_total` and
 `kubeagents_broker_execution_failures_total` on its metrics-only listener, and the event watcher serves `k8s_event_watcher_events_injected_total` and `k8s_event_watcher_triage_sessions_total` on the gateway
 pod's `agent-api-auth` sidecar, and the `chat_metrics` plugin serves
 `kubeagents_chat_messages_inbound_total`, `kubeagents_chat_sessions_total`, `kubeagents_chat_turns_errored_total`, `kubeagents_kanban_tasks_gave_up_total`, `kubeagents_chat_feedback_negative_total` and the `kubeagents_proposals_opened` gauge on the `platform-agent` container, all for the
-managed-Prometheus collector.
+managed-Prometheus collector. The poller this document describes does not read the
+`kubeagents_proposals_opened` gauge yet: the next pull request of
+[`proposal-origin.md`](proposal-origin.md) turns it into status readings (§2.3 there).
 
-This document settles how the operator turns those series into the status fields: a poller
+This document settles how the operator turns the other series into the status fields: a poller
 that runs on the leader off the reconcile path, scrapes the three endpoints over a NetworkPolicy
 rule that admits the operator's pods and nothing else new, accumulates per-pod deltas into
 totals it keeps beside their baseline in a ConfigMap, so the counters stay monotonic across pod,
