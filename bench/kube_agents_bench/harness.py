@@ -1496,8 +1496,9 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # held to its own floor: a card the run's front door handed back by its key is
 # foreign to the run and still owed by the purge that kept it. A retried purge's
 # files go only with its rows: the purge that owed it already cleared its own
-# roots', and a card it kept keeps them. A file whose ids are not card ids, or
-# whose times are not whole numbers, is dropped unread. Two scripts retrying the same file at once each take the write
+# roots', and a card it kept keeps them. A file that cannot be read for any
+# reason, or whose ids are not card ids or times not whole numbers, is dropped
+# unread; a first-owed time in the future counts as now. Two scripts retrying the same file at once each take the write
 # lock in turn, so the second finds the rows gone; a card both keep is owed twice,
 # which costs a second look.
 #
@@ -1576,8 +1577,8 @@ for name in names:
         with open(path) as f:
             g = json.load(f)
         floor = None if g["floor"] is None else whole(g["floor"])
-        group = (card_ids(g["roots"]), card_ids(g["fanned"]), floor, whole(g["first"]), path)
-    except (OSError, ValueError, KeyError, TypeError):
+        group = (card_ids(g["roots"]), card_ids(g["fanned"]), floor, min(whole(g["first"]), NOW), path)
+    except Exception:
         drop(path)
         continue
     if NOW - group[3] > MAX_AGE:
@@ -1876,7 +1877,8 @@ def _log_retried(lines: list[str], mine: Collection[str] = ()) -> list[str]:
             "is still on the board, its summary can reach a later run's role-history digest",
             ", ".join(abandoned), _PURGE_PENDING_MAX_AGE_SECONDS,
         )
-    return [t for t in _purge_marked(lines, _PURGE_PENDING_MARKER) if t not in mine]
+    owed = [*_purge_marked(lines, _PURGE_KEPT_MARKER), *_purge_marked(lines, _PURGE_PENDING_MARKER)]
+    return [t for t in dict.fromkeys(owed) if t not in mine]
 
 
 def _retry_pending_purges(timeout: float) -> None:

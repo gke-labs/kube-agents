@@ -4191,6 +4191,8 @@ def test_a_root_an_earlier_purge_still_keeps_is_owed_not_foreign(
         {"roots": ["t_1"], "fanned": ["t 2"], "floor": None, "first": 2_000_000_000},
         {"roots": ["t_1"], "fanned": [], "floor": "1700000000", "first": 2_000_000_000},
         ["t_1"],
+        # Deep enough for RecursionError, which is no ValueError.
+        pytest.param("[" * 1_000_000, id="nested"),
     ],
 )
 def test_an_owed_purge_that_is_not_card_ids_and_whole_times_is_dropped_unread(tmp_path: Path, body: Any) -> None:
@@ -4199,10 +4201,32 @@ def test_an_owed_purge_that_is_not_card_ids_and_whole_times_is_dropped_unread(tm
     _card_files(tmp_path, "t_1")
     pending = tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name
     pending.mkdir()
-    (pending / f"x{harness._PURGE_PENDING_SUFFIX}").write_text(json.dumps(body))
+    (pending / f"x{harness._PURGE_PENDING_SUFFIX}").write_text(body if isinstance(body, str) else json.dumps(body))
 
     assert _run_purge(tmp_path, []) == ["purged"]
     assert _owed(tmp_path) == [] and _has_files(tmp_path, "t_1")
+
+
+def test_an_owed_purge_stamped_in_the_future_still_ages_out(tmp_path: Path) -> None:
+    """A first-owed time ahead of the pod's clock counts as now, so the 24 h limit still runs."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_x", "running")
+    kb.commit()
+    _owe(tmp_path, ["t_x"], first=10_000_000_000_000_000_000)
+
+    assert _run_purge(tmp_path, []) == ["kept t_x", "pending t_x", "purged"]
+    (owed,) = _owed(tmp_path)
+    assert owed["first"] <= int(time.time())
+
+
+def test_a_retried_card_kept_but_not_re_owed_is_still_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The volume refused the re-owe, so no ``pending`` line: ``kept`` alone still says it is on the board."""
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "kept t_x\npurged\n")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._retry_pending_purges(5.0)
+    assert "cards t_x, left by an earlier run's purge, are still on the board" in caplog.text
 
 
 def test_an_owed_purge_keeps_every_id_the_harness_accepts(tmp_path: Path) -> None:
