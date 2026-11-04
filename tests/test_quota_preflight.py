@@ -886,6 +886,8 @@ class PreflightDecisionTest(unittest.TestCase):
             ("not a string", [{"name": "A2A_MCP_DOOR", "value": True}]),
             ("last of two", [{"name": "A2A_MCP_DOOR", "value": "false"},
                              {"name": "A2A_MCP_DOOR", "value": "true"}]),
+            ("a $(VAR) reference the kubelet expands", [{"name": "DOOR", "value": "true"},
+                                                        {"name": "A2A_MCP_DOOR", "value": "$(DOOR)"}]),
         ):
             with self.subTest(name):
                 self._assert_counts(self._flagged_delta(env), mcp)
@@ -925,6 +927,7 @@ class PreflightDecisionTest(unittest.TestCase):
         for name, env in (
             ("empty", [{"name": "A2A_DISPATCHER_IMAGE", "value": ""}]),
             ("blank, which the operator trims", [{"name": "A2A_DISPATCHER_IMAGE", "value": "   "}]),
+            ("tab and newline", [{"name": "A2A_DISPATCHER_IMAGE", "value": "\t\n"}]),
             ("no value", [{"name": "A2A_DISPATCHER_IMAGE"}]),
             ("a null value", [{"name": "A2A_DISPATCHER_IMAGE", "value": None}]),
             ("last of two", [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"},
@@ -1720,6 +1723,35 @@ class QuotaPreflightTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "missing footprint must fail render")
         self.assertIn("footprint.yaml is missing or unreadable", res.stderr)
+
+    @unittest.skipUnless(_HELM, "helm is not installed")
+    def test_a_missing_or_unreadable_flagged_pods_file_fails_a_next_render(self) -> None:
+        """Like footprint.yaml: without flagged-pods.yaml the flagged pods would count as none."""
+        for name, damage in (
+            ("missing", lambda f: f.unlink()),
+            ("unreadable", lambda f: f.write_text("pods: [unclosed\n")),
+            ("no pods list", lambda f: f.write_text("pod: []\n")),
+        ):
+            with self.subTest(name):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                chart = pathlib.Path(tmp.name) / "kube-agents"
+                shutil.copytree(_CHART, chart)
+                (chart / "values.schema.json").unlink(missing_ok=True)
+                (chart / "templates" / "zz-probe.yaml").write_text(_PROBE_TEMPLATE)
+                damage(chart / "files" / "flagged-pods.yaml")
+                with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+                    yaml.safe_dump({"probe": {"emitRequirements": True}}, fh)
+                    values_path = fh.name
+                self.addCleanup(lambda p=values_path: pathlib.Path(p).unlink(missing_ok=True))
+                res = subprocess.run(
+                    [_HELM, "template", "test-release", str(chart), "-f", values_path,
+                     "--set", "platformAgent.mode=next"] + _REQUIRED_HARNESS,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(res.returncode, 0, "a damaged flagged-pods.yaml must fail the render")
+                self.assertIn("flagged-pods.yaml is missing or unreadable", res.stderr)
 
     def test_the_bypass_flag_gates_the_whole_check(self) -> None:
         """`quotaPreflight.enabled=false` is the only remedy offered to a deployer without

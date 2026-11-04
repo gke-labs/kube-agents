@@ -44,8 +44,10 @@ type a2aFlaggedPod struct {
 // (TestTheChartCountsEveryFlaggedPod holds the two equal, in sizes too).
 //
 // A feature that adds a standing pod behind a flag goes here, and leaves when
-// it's on by default: from then on the goldens render it, so the headroom and
-// footprint.yaml count it already. Profile work
+// it's on by default: from then on the goldens render it and footprint.yaml
+// counts it. The session quota's headroom is a hand-set constant
+// (a2aQuotaHeadroom), so the same change raises it by the workload's replicas,
+// or the quota comes out short. Profile work
 // doesn't: the warm workers and the Job-mode pods run in the profile
 // namespace, under the pod quota the operator derives for it from the warm
 // pools and the profile ceiling, not in this namespace or its quota.

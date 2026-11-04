@@ -2808,18 +2808,23 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          operator.extraEnv sets its flag, so no golden renders it and footprint.yaml has no
          entry for it. An entry's flag is read as the operator reads it, the last setting
          winning: enabledWhen "true" takes only that value, nonBlank any value that isn't blank.
-         A setting the chart cannot read -- a valueFrom, a non-string value -- counts as on;
-         none, null or another literal leaves it out. Each rolls Recreate at its replicas,
+         A setting the chart cannot read -- a valueFrom, a non-string value, a string holding
+         a $(VAR) reference the kubelet expands -- counts as on; none, null or another literal
+         leaves it out. A missing or unreadable file fails the render, as footprint.yaml does. Each rolls Recreate at its replicas,
          so it sizes no surge. */ -}}
   {{- if $next -}}
-    {{- $flagged := (.Files.Get "files/flagged-pods.yaml" | fromYaml).pods | default list -}}
+    {{- $flaggedFile := .Files.Get "files/flagged-pods.yaml" | fromYaml -}}
+    {{- if not (kindIs "slice" (index $flaggedFile "pods")) -}}
+      {{- fail "quota preflight: flagged-pods.yaml is missing or unreadable in the chart, so the pods the operator renders behind a flag cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $flagged := index $flaggedFile "pods" -}}
     {{- range $w := $flagged -}}
       {{- $on := false -}}
       {{- range $e := ($.Values.operator.extraEnv | default list) -}}
         {{- if eq (toString (index ($e | default dict) "name")) $w.env -}}
           {{- $v := index $e "value" -}}
           {{- $literal := ternary (eq (toString $v) "true") (ne (trim (toString $v)) "") (eq (toString $w.enabledWhen) "true") -}}
-          {{- $on = or (hasKey $e "valueFrom") (and (hasKey $e "value") (not (kindIs "string" $v)) (not (kindIs "invalid" $v))) (and (kindIs "string" $v) $literal) -}}
+          {{- $on = or (hasKey $e "valueFrom") (and (hasKey $e "value") (not (kindIs "string" $v)) (not (kindIs "invalid" $v))) (and (kindIs "string" $v) (or $literal (contains "$(" $v))) -}}
         {{- end -}}
       {{- end -}}
       {{- if $on -}}

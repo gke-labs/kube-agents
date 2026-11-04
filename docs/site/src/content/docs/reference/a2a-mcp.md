@@ -17,6 +17,8 @@ The server is rendered only while the operator runs with `A2A_MCP_DOOR=true`, an
 
 If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)). Unset the flag and all of it is removed, the token included.
 
+Its pod adds one to the namespace's session pod quota, and the chart's quota check counts it when `operator.extraEnv` sets the flag ([Prerequisites](/kube-agents/install/prerequisites/)).
+
 ## Connecting a client
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:

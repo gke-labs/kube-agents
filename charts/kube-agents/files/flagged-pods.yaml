@@ -11,8 +11,8 @@
 #
 # enabledWhen: "true" means the operator takes only that exact value;
 # nonBlank means any value that isn't empty or whitespace. A setting the chart
-# can't read (a valueFrom, a non-string value) counts as on. Each rolls
-# Recreate, so it sizes no surge. (The key isn't "on": YAML 1.1 reads that key
+# can't read (a valueFrom, a non-string value, a $(VAR) reference) counts as
+# on. Each rolls Recreate, so it sizes no surge. (The key isn't "on": YAML 1.1 reads that key
 # as a boolean.)
 #
 # Profile workers aren't here: they run in the profile namespace, under the pod

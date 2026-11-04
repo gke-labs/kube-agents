@@ -1462,6 +1462,10 @@ helm uninstall kube-agents -n kubeagents-system
   `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
+- `files/flagged-pods.yaml` is hand-kept: the pods the operator renders only behind an
+  `operator.extraEnv` flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
+  (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`
+  differ, so edit both together.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
   the operator's **golden manifests**
   (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and
