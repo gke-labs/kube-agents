@@ -204,7 +204,7 @@ func (d *Dispatcher) stopStreamRead() {
 // canceled, tombstoned as a refusal, never run.
 func (d *Dispatcher) stopQueued(ctx context.Context, log *slog.Logger, del lib.Delivery, hk holdKey) {
 	log.Info("stopped before it was handed out; canceling it")
-	d.clearWaiting(hk.taskID)
+	d.clearWaiting(hk)
 	d.endUnstarted(ctx, log, del, hk, lib.StateCanceled, &refusal{ReasonStopped, "stopped by the conversation before it started"})
 }
 

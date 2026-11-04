@@ -86,7 +86,7 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 		queued = now
 	}
 	if wait, _ := d.breakers.wait(prof.Name, tier, now, d.inFlight(prof.Name, tier),
-		d.olderWaiting(prof.Name, tier, hk.taskID, queued)); wait {
+		d.olderWaiting(hk, queued)); wait {
 		return nil, errHeldBack
 	}
 	target, bad := taskTarget(env, prof, snap.Namespace)

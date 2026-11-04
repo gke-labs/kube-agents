@@ -353,6 +353,11 @@ resolves to that GSA:
 instantiation creates the identity and roles, and the chart values above carry
 the annotated KSA.
 
+`litellm.vertex.sessionAffinity` (off by default) sends each Gemini
+conversation a Vertex `session_id` so a new conversation's first turn can read
+a prompt another conversation warmed:
+[Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching).
+
 #### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
 
 `openai_compatible` routes `model-default` to any server that speaks the OpenAI
@@ -851,6 +856,22 @@ allowlist, would reach only the credential-proxy and `agent-api-auth` containers
 out. Pass it beside your own values with `-f charts/kube-agents/examples/values-fleet.yaml`,
 after applying `crds/` on an existing install ([Notes](#notes)). The tier thresholds, the per-pod sum and the host-cluster shapes are on the
 [fleet sizing page](https://gke-labs.github.io/kube-agents/deploy/fleet-sizing/).
+
+### People seen (`platformAgent.telemetry.peopleSeen`)
+
+`platformAgent.telemetry.peopleSeen` is the CR's `spec.telemetry.peopleSeen`. Under
+`spec.mode: next`, the A2A gateway keeps one hashed key and a last-active time per chat person
+for 30 days, and serves the people seen in the last 7 and 30 days as
+`kubeagents_a2a_gateway_people_seen`. Under
+`today` there is no gateway, so the value has no effect.
+It defaults to `true`, which renders no field, and the CRD default (`true`) applies.
+`false` renders the field: the gateway writes no key, purges the bucket at its next start, and
+serves no sample. Set it with `--set platformAgent.telemetry.peopleSeen=false`, or on an
+`install.sh` install with
+`TF_VAR_extra_helm_values='{platformAgent={telemetry={peopleSeen=false}}}'` in `install.env`.
+The render fails on a live install whose CRD predates `spec.telemetry.peopleSeen`. The
+[PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#spectelemetry)
+is canonical for the behaviour.
 
 ### Agent runtime knobs
 

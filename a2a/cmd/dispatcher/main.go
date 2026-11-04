@@ -166,7 +166,7 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 	}()
 	go func() { _ = store.WatchConfigMap(ctx, kube, s.namespace, s.configMap, lib.DispatchConfigKey) }()
 	if err := store.WaitForConfig(ctx, configWait); err != nil {
-		return err
+		return stopped(ctx, err)
 	}
 	profileNS := store.Config().ProfileNamespace
 	pool := dispatch.NewPodPool(ctx, kube, profileNS, log)
@@ -179,7 +179,7 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 			lib.WithNATSOptions(append(s.auth, nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))...))
 	})
 	if err != nil {
-		return fmt.Errorf("bus connect: %w", err)
+		return stopped(ctx, fmt.Errorf("bus connect: %w", err))
 	}
 	defer client.Close()
 	pr.setBus(func() bool { return client.Conn().IsConnected() })
@@ -195,6 +195,21 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 	pr.setDispatcher(d.Ready)
 	log.Info("dispatching", "configmap", s.configMap, "profileNamespace", profileNS)
 	if err := d.Run(ctx); err != nil {
+		return err
+	}
+	if cause := context.Cause(ctx); errors.Is(cause, errProfileNamespaceMoved) {
+		return cause
+	}
+	return nil
+}
+
+// stopped is err from a wait before dispatching starts (the config, the
+// first connect), or nil if the wait ended on a stop: a SIGTERM there ends
+// the process as cleanly as one while dispatching, where Run returns nil. A
+// moved profile namespace cancels the same context and stays the error it
+// is.
+func stopped(ctx context.Context, err error) error {
+	if !errors.Is(err, context.Canceled) {
 		return err
 	}
 	if cause := context.Cause(ctx); errors.Is(cause, errProfileNamespaceMoved) {

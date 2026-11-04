@@ -138,17 +138,13 @@ func (d *Dispatcher) inFlight(profile, tier string) bool {
 	return false
 }
 
-// olderWaiting reports whether a submission of profile at tier other than
-// taskID, queued before queued, is waiting here.
-func (d *Dispatcher) olderWaiting(profile, tier, taskID string, queued time.Time) bool {
-	durables := map[string]bool{
-		lib.ProfileDurableName(profile, tier, lib.SubmitKindTop):   true,
-		lib.ProfileDurableName(profile, tier, lib.SubmitKindChild): true,
-	}
+// olderWaiting reports whether another submission of hk's profile and tier
+// (either kind), queued before queued, is waiting here.
+func (d *Dispatcher) olderWaiting(hk holdKey, queued time.Time) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for id, w := range d.waiting {
-		if id != taskID && durables[w.durable] && w.queued.Before(queued) {
+	for k, w := range d.waiting {
+		if k != hk && k.profile == hk.profile && k.tier == hk.tier && w.queued.Before(queued) {
 			return true
 		}
 	}
