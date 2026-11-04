@@ -83,8 +83,7 @@ func (e *PolicyError) Error() string {
 	return e.Message
 }
 
-// InClusterID names the cluster the proxy runs in. A path with no /clusters/{id} prefix and
-// no configured default targets it.
+// InClusterID names the cluster the proxy runs in, as /clusters/in-cluster/... addresses it.
 const InClusterID = "in-cluster"
 
 const (
@@ -209,9 +208,10 @@ func NewRequestInfoFactory() *request.RequestInfoFactory {
 }
 
 // SplitClusterPath validates u's path and splits off its /clusters/{id} prefix, returning
-// the target cluster and the API server path. A path without the prefix is refused: every
-// kubeconfig the sandbox builds names /clusters/<context>, so a request without one is a
-// client that dropped its server's base path (kubectl before 1.34 does on `get --raw`,
+// the target cluster and the API server path. A path without the prefix is refused, with
+// no default cluster to fall back to: every kubeconfig the sandbox builds names
+// /clusters/<context>, so a request without one comes from a server URL configured
+// without it or a client that dropped it (kubectl before 1.34 does on `get --raw`,
 // #4739), and serving it from a default cluster answered a fleet read with the host's
 // data. Encoded separators, dot segments, empty segments, backslashes and control
 // characters are refused rather than cleaned, so the path the policy classifies is the
@@ -250,7 +250,7 @@ func SplitClusterPath(u *url.URL) (clusterID, apiPath string, err *PolicyError) 
 		return segments[1], "/" + strings.Join(segments[2:], "/"), nil
 	}
 
-	return "", "", invalidRoute("name a cluster: /clusters/<context>/... (this request's path has no /clusters/ prefix, so its client dropped the kubeconfig server's base path)")
+	return "", "", invalidRoute("name a cluster: /clusters/<context>/... (this request's path has no /clusters/ prefix: either the server URL was configured without one, or the client dropped it, as kubectl before 1.34 does on `get --raw`)")
 }
 
 // Policy decides which requests reach the API server.

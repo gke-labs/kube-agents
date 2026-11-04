@@ -412,7 +412,7 @@ Generic agent sandboxes such as NVIDIA OpenShell (`v0.1.2`) isolate agent proces
 `kube-proxy` does not replace generic sandboxes. Instead, it serves as the Kubernetes-aware backend for OpenShell in two ways:
 
 1. **Explicit `tls: skip` proxy endpoint (zero changes to OpenShell)**:
-   - Run `k8s-api-proxy` outside the OpenShell sandbox (on the host or in the cluster) and configure the sandbox `kubeconfig` `server:` to point to `https://<kube-proxy>:8443`.
+   - Run `k8s-api-proxy` outside the OpenShell sandbox (on the host or in the cluster) and configure the sandbox `kubeconfig` `server:` to point to `https://<kube-proxy>:8443/clusters/<context>`. The proxy refuses a path that names no cluster (section 3).
    - In the OpenShell sandbox policy, add a `network_policies` rule for the `kube-proxy` endpoint with `tls: skip` so `kubectl` connects to `kube-proxy` over TLS directly while `kube-proxy` enforces `RequestInfoFactory` verb policy, `Secret` redaction, and upstream GKE authentication.
 2. **OpenShell `SupervisorMiddleware` gRPC adapter**:
    - OpenShell defines a `SupervisorMiddleware` gRPC service (`AuthorizeRequest` and `TransformResponse` in `proto/openshell/sandbox.proto`) for external L7 inspection.
