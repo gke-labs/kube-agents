@@ -92,6 +92,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    gcloud_key_version="",
                    gcloud_scheduled_version="",
                    gcloud_scheduled_fail=False,
+                   gcloud_disabled_version="",
+                   gcloud_disabled_fail=False,
                    gcloud_kms_fail=False,
                    gcloud_kms_error="ERROR: permission denied",
                    gcloud_kms_notice="",
@@ -133,6 +135,13 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                 scheduled_clause = (
                     'if [[ "$*" == *"kms keys versions list"* && "$*" == *"state=DESTROY_SCHEDULED"* ]]; then\n'
                     f"    {scheduled_behavior}\nfi\n")
+            # The guard's third list, DISABLED versions, asked only when none is scheduled.
+            if gcloud_disabled_version or gcloud_disabled_fail:
+                disabled_behavior = ("exit 1" if gcloud_disabled_fail
+                                     else f"echo '{gcloud_disabled_version}'; exit 0")
+                scheduled_clause += (
+                    'if [[ "$*" == *"kms keys versions list"* && "$*" == *"state=DISABLED"* ]]; then\n'
+                    f"    {disabled_behavior}\nfi\n")
             gcloud.write_text(f"""#!/usr/bin/env bash
 set -e
 {scheduled_clause}if [[ "$*" == *"kms keys versions list"* ]]; then
@@ -945,6 +954,55 @@ resource "google_service_account" "agent" {
         self.assertIn("The key is still in Terraform state", proc.stderr)
         self.assertIn("gcloud kms keys versions restore <version> --key github-token-minter-key", proc.stderr)
         self.assertNotIn("adopt-kms", proc.stderr)
+
+    def test_guard_minter_key_names_the_enable_when_versions_are_only_disabled(self):
+        """A restore leaves a version DISABLED until it is enabled: the guard names the
+        gcloud enable, in state or out of it, not a re-import."""
+        for state_list in ("", "module.github_minter[0].google_kms_crypto_key.minter"):
+            with self.subTest(state_list=state_list):
+                proc = self._run_guard(
+                    "guard_minter_key",
+                    tfvar_enable_minter='"true"',
+                    gcloud_key_version="",
+                    gcloud_disabled_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/1",
+                    state_list=state_list,
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("has no ENABLED version.", proc.stderr)
+                self.assertIn("Its versions are disabled, as a restore leaves them.", proc.stderr)
+                self.assertIn(
+                    "gcloud kms keys versions enable <version> --key github-token-minter-key --keyring github-token-minter-keyring --location us-central1 --project test-project",
+                    proc.stderr,
+                )
+                self.assertIn("If a version was disabled on purpose", proc.stderr)
+                self.assertNotIn("versions restore", proc.stderr)
+                self.assertNotIn("adopt-kms", proc.stderr)
+                self.assertNotIn("Import the GitHub App private key before applying", proc.stderr)
+
+    def test_guard_minter_key_names_the_restore_when_versions_are_scheduled_and_disabled(self):
+        """Scheduled versions need the restore first; its advice already names the enable."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_scheduled_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/2",
+            gcloud_disabled_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/1",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Its versions are scheduled for destruction", proc.stderr)
+        self.assertNotIn("Its versions are disabled", proc.stderr)
+
+    def test_guard_minter_key_keeps_the_import_advice_when_the_disabled_query_fails(self):
+        """If the DISABLED list fails, nothing says a version can be enabled, so the import advice stands."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_disabled_fail=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Import the GitHub App private key before applying", proc.stderr)
+        self.assertNotIn("Its versions are disabled", proc.stderr)
 
     def test_guard_minter_key_keeps_the_import_advice_when_the_scheduled_query_fails(self):
         """If the second list fails, nothing says the versions are restorable, so the import advice stands."""

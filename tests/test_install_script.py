@@ -1382,11 +1382,47 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         cmd = (
             f"{_SOURCE_INSTALLER_COMMON}"
             'kms_key_scheduled_version() { echo ""; }; '
+            'kms_key_disabled_version() { echo ""; }; '
             'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
         )
         proc = self._run_install_func(cmd)
         self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
         self.assertNotIn("scheduled for destruction", proc.stdout + proc.stderr)
+        self.assertNotIn("disabled", proc.stdout + proc.stderr)
+
+    def test_print_minter_restore_advice_names_the_enable_for_disabled_versions(self):
+        """A restore leaves a version DISABLED until it is enabled: the helper names
+        gcloud's enable, not a re-import, and returns 0."""
+        cmd = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            'kms_key_scheduled_version() { echo ""; }; '
+            "kms_key_disabled_version() { echo 1; }; "
+            'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
+        )
+        proc = self._run_install_func(cmd)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=0", proc.stdout, out)
+        self.assertIn("Its versions are disabled, as a restore leaves them.", out)
+        self.assertIn(
+            "gcloud kms keys versions enable <version> --key minter-key --keyring minter-ring --location us-central1 --project p1",
+            out,
+        )
+        self.assertIn("If a version was disabled on purpose, for example a revoked App key, import a new key instead.", out)
+        self.assertNotIn("versions restore", out)
+
+    def test_print_minter_restore_advice_names_the_restore_when_versions_are_also_disabled(self):
+        """Scheduled versions need the restore first; its advice already names the enable."""
+        cmd = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            "kms_key_scheduled_version() { echo 2; }; "
+            "kms_key_disabled_version() { echo 1; }; "
+            'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
+        )
+        proc = self._run_install_func(cmd)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=0", proc.stdout, out)
+        self.assertIn("Its versions are scheduled for destruction", out)
+        self.assertNotIn("Its versions are disabled", out)
 
     def test_kms_key_scheduled_version_asks_for_destroy_scheduled_versions(self):
         """The query filters on DESTROY_SCHEDULED, and a failing gcloud reads as none."""
@@ -1400,6 +1436,21 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             f"{_SOURCE_INSTALLER_COMMON}"
             "gcloud() { return 1; }; "
             'echo "v=[$(kms_key_scheduled_version minter-key minter-ring us-central1 p1)]"'
+        )
+        self.assertIn("v=[]", self._run_install_func(fails).stdout)
+
+    def test_kms_key_disabled_version_asks_for_disabled_versions(self):
+        """The query filters on DISABLED, and a failing gcloud reads as none."""
+        asks = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            'gcloud() { case "$*" in *"state=DISABLED"*) echo 1 ;; *) echo wrong ;; esac; }; '
+            'echo "v=[$(kms_key_disabled_version minter-key minter-ring us-central1 p1)]"'
+        )
+        self.assertIn("v=[1]", self._run_install_func(asks).stdout)
+        fails = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            "gcloud() { return 1; }; "
+            'echo "v=[$(kms_key_disabled_version minter-key minter-ring us-central1 p1)]"'
         )
         self.assertIn("v=[]", self._run_install_func(fails).stdout)
 
@@ -1460,6 +1511,21 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertIn("rc=1", proc4b.stdout, out4b)
         self.assertIn("Its versions are scheduled for destruction", out4b)
         self.assertNotIn("for automated import, or pre-import", out4b)
+
+        # 4c. The same, but a restore left the key's versions DISABLED -> the
+        # enable is named instead of the import, and the run still stops.
+        cmd4c = (
+            f'{_SOURCE_INSTALLER_COMMON}'
+            'kms_key_enabled_version() { echo ""; }; '
+            'kms_key_scheduled_version() { echo ""; }; '
+            'kms_key_disabled_version() { echo 1; }; '
+            'rc=0; validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org" || rc=$?; echo "rc=$rc"'
+        )
+        proc4c = self._run_install_func(cmd4c)
+        out4c = proc4c.stdout + proc4c.stderr
+        self.assertIn("rc=1", proc4c.stdout, out4c)
+        self.assertIn("Its versions are disabled", out4c)
+        self.assertNotIn("for automated import, or pre-import", out4c)
 
         # 5. App ID provided with org and existing KMS key version (AOT path) -> succeeds
         cmd5 = (
@@ -5044,6 +5110,18 @@ class MissingPemAgainstKmsTest(unittest.TestCase):
         combined = proc.stdout + proc.stderr
         self.assertIn("Its versions are scheduled for destruction", combined)
         self.assertIn("gcloud kms keys versions restore <version> --key github-token-minter-key", combined)
+        self.assertNotIn("the import still needs that file", combined)
+
+    def test_a_missing_pem_names_the_enable_when_the_key_versions_are_disabled(self):
+        """A key a restore left DISABLED needs an enable, not the PEM again."""
+        proc = self._resolve(
+            "/tmp/never-existed-12345.pem", "",
+            overrides='kms_key_scheduled_version() { echo ""; }; kms_key_disabled_version() { echo 1; }; ',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("Its versions are disabled", combined)
+        self.assertIn("gcloud kms keys versions enable <version> --key github-token-minter-key", combined)
         self.assertNotIn("the import still needs that file", combined)
 
     def test_an_overridden_keyring_and_key_are_what_kms_is_asked_about(self):
