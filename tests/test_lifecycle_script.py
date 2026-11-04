@@ -137,6 +137,7 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_pool_shapes=None,
                    module_outputs=None,
                    recorded_outputs=None,
+                   state_show_by_address=None,
                    output_stderr_noise="",
                    output_stub=None,
                    console_fail_var="",
@@ -189,6 +190,11 @@ fi
                 f"        {name}) echo '{answer}'; exit 0 ;;" for name, answer in pool_shapes.items())
             module_output_case = "\n".join(
                 f"        {name}) echo '{answer}'; exit 0 ;;" for name, answer in outputs.items())
+            # Quoted: a state address carries `[0]`, a bracket expression in
+            # an unquoted case pattern.
+            state_show_case = "\n".join(
+                f"        \"{addr}\") cat << 'EOF'\n{text}\nEOF\n        exit 0 ;;"
+                for addr, text in (state_show_by_address or {}).items())
 
             # What `terraform output -raw <name>` answers: the root outputs the
             # last apply recorded in state. A name not in recorded_outputs gets
@@ -225,6 +231,11 @@ if [[ "$cmd" == "state" && "${{2:-}}" == "list" ]]; then
 EOF
     exit 0
 elif [[ "$cmd" == "state" && "${{2:-}}" == "show" ]]; then
+    # The address is the last argument (`state show -no-color <addr>`). One
+    # named in state_show_by_address gets its own text; any other gets state_show.
+    case "${{@: -1}}" in
+{state_show_case}
+    esac
     cat << 'EOF'
 {state_show}
 EOF
@@ -959,6 +970,94 @@ resource "google_service_account" "agent" {
         self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
         self.assertIn("TF_VAR_gvisor_machine_type=n2-standard-8", proc.stderr)
 
+    # The host the fleet sizing guide's `mode: next` row describes, as the
+    # installer builds it: both pools on the small profile, the gVisor pool's
+    # machine type set beside it by an explicit TF_VAR_gvisor_machine_type line,
+    # and the last apply's two root outputs recording that.
+    _SMALL_STANDARD_SHAPE = ("e2-standard-4", 100, "pd-balanced")
+    _SMALL_GVISOR_SHAPE_EXPLICIT_MACHINE = ("n2-standard-8", 100, "pd-balanced")
+    _FLEET_OUTPUTS = {**_FLEET_STANDARD_OUTPUTS, **_FLEET_GVISOR_OUTPUTS}
+    _SMALL_HOST_RECORDED_OUTPUTS = {"sizing_profile": "small",
+                                    "node_pool_shape_inputs": "gvisor_machine_type"}
+
+    def _small_host_state(self):
+        return {
+            self._STANDARD_ADDRESS: self._standard_cluster_state(*self._SMALL_STANDARD_SHAPE),
+            self._GVISOR_ADDRESS: self._gvisor_pool_state(*self._SMALL_GVISOR_SHAPE_EXPLICIT_MACHINE),
+        }
+
+    def test_guard_node_pool_shape_refuses_a_lost_explicit_line_beside_a_changed_profile(self):
+        """That host upsized to the fleet profile from a shell or clone without the gVisor
+        line: the changed profile names the default pool's resize, which goes through, and
+        nothing about the gVisor pool's machine type, which the last apply recorded as an
+        explicit input; the apply that would recreate the gVisor pool's nodes onto the
+        profile's n2-standard-4 is refused with the line to put back."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=f"{self._STANDARD_ADDRESS}\n{self._GVISOR_ADDRESS}",
+            state_show_by_address=self._small_host_state(),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_OUTPUTS,
+            recorded_outputs=self._SMALL_HOST_RECORDED_OUTPUTS,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "gvisor_machine_type resolved to 'n2-standard-4', but this state's cluster runs the gVisor pool on 'n2-standard-8'",
+            proc.stderr)
+        self.assertIn("a shape the last apply set", proc.stderr)
+        self.assertIn("through TF_VAR_gvisor_machine_type", proc.stderr)
+        self.assertIn("Put back TF_VAR_gvisor_machine_type=n2-standard-8", proc.stderr)
+        self.assertNotIn("standard_machine_type resolved", proc.stderr)
+
+    def test_guard_node_pool_shape_passes_a_changed_profile_beside_a_kept_explicit_line(self):
+        """The same upsizing with the gVisor line still in place: the profile names the resize
+        of every attribute it decides, the default pool's and the gVisor disk's, and the
+        explicit machine type resolves to the shape in state, so nothing is refused."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=f"{self._STANDARD_ADDRESS}\n{self._GVISOR_ADDRESS}",
+            state_show_by_address=self._small_host_state(),
+            tfvar_sizing_profile='"fleet"',
+            tfvar_pool_shapes={"gvisor_machine_type": '"n2-standard-8"'},
+            module_outputs={**self._FLEET_OUTPUTS, "gvisor_machine_type": '"n2-standard-8"'},
+            recorded_outputs=self._SMALL_HOST_RECORDED_OUTPUTS,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_refuses_a_recorded_explicit_line_before_reading_the_profile(self):
+        """A kept profile beside a lost explicit line the last apply recorded: the refusal names
+        the recorded line rather than the profile, which is read only for an attribute no
+        explicit input decided."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet",
+                              "node_pool_shape_inputs": "gvisor_machine_type"},
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("a shape the last apply set", proc.stderr)
+        self.assertNotIn("the profile the last apply recorded", proc.stderr)
+
+    def test_guard_node_pool_shape_lets_a_dropped_explicit_line_go_when_the_shape_matches(self):
+        """An explicit line dropped once the profile renders the same shape asks for no change:
+        the resolved shape is the recorded one, so no output is consulted and the next apply
+        records the input as unset."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet",
+                              "node_pool_shape_inputs": "gvisor_machine_type gvisor_disk_size_gb"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
     def test_guard_node_pool_shape_reads_the_recorded_profile_past_stderr_noise(self):
         """The same lost explicit line beside a kept profile, with terraform output writing a
         TF_LOG line to stderr before the value it prints: the recorded profile is the value
@@ -1007,7 +1106,8 @@ resource "google_service_account" "agent" {
 
     def test_guard_node_pool_shape_fails_closed_when_the_recorded_profile_cannot_be_read(self):
         """A terraform output that fails for any reason but a missing output is the backend's
-        failure, and the guard refuses rather than reading it as a first setting."""
+        failure, and the guard refuses rather than reading it as a first setting. The first
+        output read is the recorded inputs, so that is the read the refusal names."""
         proc = self._run_guard(
             "guard_node_pool_shape",
             state_list=self._STANDARD_ADDRESS,
@@ -1017,7 +1117,7 @@ resource "google_service_account" "agent" {
             output_stub="echo 'Error: Failed to load state: storage: object does not exist' >&2; exit 1",
         )
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("could not read output sizing_profile", proc.stderr)
+        self.assertIn("could not read output node_pool_shape_inputs", proc.stderr)
         self.assertIn("Failed to load state", proc.stderr)
 
     def test_guard_node_pool_shape_passes_a_resize_the_explicit_input_names(self):

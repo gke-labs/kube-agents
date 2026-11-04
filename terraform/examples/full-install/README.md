@@ -275,13 +275,18 @@ travel the same way, as `TF_VAR_` lines the generator never writes, and the
 lines have to be present on every later `install.sh` and `upgrade.sh` run: a
 lost one resolves the `small` profile, and the apply would recreate every node
 of a larger pool onto it. `guard_node_pool_shape` refuses that apply unless a
-sizing input asks for the change: the pool's own input, set to any value, or
-a profile other than the one the last apply recorded (the `sizing_profile`
-output). A profile kept beside a lost explicit line asks for nothing, so that
-apply is refused too. An install applied before that output existed plans it
-once, `+ sizing_profile = "<profile>"` under `Changes to Outputs` and nothing
+sizing input asks for the change: the pool's own input, set to any value, or,
+for an attribute no explicit input decided at the last apply, a profile other
+than the one that apply recorded. Two root outputs carry what the last apply
+decided them with: `sizing_profile`, and `node_pool_shape_inputs`, the
+explicit inputs that were set. A profile kept beside a lost explicit line asks
+for nothing, and a changed profile asks nothing about an attribute an explicit
+line set, so both of those applies are refused until the line is back or the
+pool's input names the shape. An install applied before the two outputs
+existed plans them once, `+ sizing_profile = "<profile>"` and
+`+ node_pool_shape_inputs = "<names>"` under `Changes to Outputs` and nothing
 else, which `-detailed-exitcode` reports as 2 and `./upgrade.sh --plan` as
-drift, until the next apply records it.
+drift, until the next apply records them.
 The drift audit-log ingress has the same one-default-per-project shape, and
 this one every second install meets, because `ENABLE_DRIFT_DETECTOR` defaults
 to `true`: `drift_pubsub_topic`, `drift_pubsub_subscription` and

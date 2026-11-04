@@ -44,8 +44,10 @@
 #      profile and shrinks a fleet host's nodes under -auto-approve.
 #      `guard_node_pool_shape` refuses an apply whose resolved shape differs
 #      from the pool in state unless a sizing input names the change: the
-#      pool's own explicit input, or a profile other than the one the last
-#      apply recorded (a root output), since a kept profile names none.
+#      pool's own explicit input, or, for an attribute no explicit input
+#      decided at the last apply, a profile other than the one that apply
+#      recorded (two root outputs), since a kept profile names none and a
+#      changed one names nothing about an attribute an explicit line set.
 #   7. A state left by an interrupted install can hold the cluster's CMEK
 #      entries next to a create_cluster that the retry computes as false, and
 #      the module then plans their destruction. `forget_unmanaged_cluster_kms`
@@ -974,11 +976,18 @@ guard_standard_node_count() {
 # not an opt-in: kept beside a lost explicit line it names no change and the
 # resolved shape is the profile's own, so the same lost-line case would walk
 # through; and the same holds when a later release gives a profile a new
-# shape. A blank line counts as unset, as the module reads it. Same shape as
+# shape. Nor is a changed profile an opt-in for an attribute an explicit
+# line decided: the profile names the shape of what a profile decides, and
+# the explicit line, lost in the same run, is the case above with a profile
+# change beside it. The composition records which inputs were set at the
+# last apply as a second root output, and an attribute recorded there whose
+# input is now unset is refused before the profile is consulted. A blank
+# line counts as unset, as the module reads it. Same shape as
 # guard_standard_node_count.
 guard_node_pool_shape() {
   load_state
   local profile="" profile_recorded="" profile_read=false
+  local inputs_recorded="" inputs_read=false
   local pool addr label attr recorded resolved explicit gvisor_enabled
   for pool in standard gvisor; do
     case "$pool" in
@@ -1002,6 +1011,21 @@ guard_node_pool_shape() {
       [[ "$recorded" == "$resolved" ]] && continue
       explicit=$(tfvar "${pool}_${attr}")
       [[ -n "$explicit" ]] && continue
+      # Read once, as the profile below is: an input the last apply had set
+      # and this run has not is the lost line itself, whatever the profile.
+      if [[ "$inputs_read" == "false" ]]; then
+        inputs_recorded=$(tf_recorded_output node_pool_shape_inputs)
+        inputs_read=true
+      fi
+      if [[ " $inputs_recorded " == *" ${pool}_${attr} "* ]]; then
+        warn "${pool}_${attr} resolved to '$resolved', but this state's cluster runs $label on '$recorded' ($addr), a shape the last apply set"
+        warn "through TF_VAR_${pool}_${attr}, and no such line reaches this run. A sizing_profile other than the recorded one names the shape of"
+        warn "what a profile decides, not of an attribute an explicit line decided, so it does not ask for this change. Applying now would"
+        warn "recreate EVERY node of $label onto the resolved shape under -auto-approve. Put back TF_VAR_${pool}_${attr}=${recorded} in"
+        warn "install.env to keep it; to resize deliberately, name the shape you want (TF_VAR_${pool}_${attr}=${resolved}), or set it in"
+        warn "terraform.tfvars for a hand-driven apply."
+        exit 1
+      fi
       if [[ "$profile_read" == "false" ]]; then
         profile=$(tfvar sizing_profile)
         [[ -n "$profile" ]] && profile_recorded=$(tf_recorded_output sizing_profile)
@@ -1938,7 +1962,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,99p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,101p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

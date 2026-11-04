@@ -102,8 +102,9 @@ Four behaviours worth knowing before the first run:
   installer writes none of them, so an `install.sh`-driven install sets them as `TF_VAR_` lines in
   `install.env` (`TF_VAR_sizing_profile=fleet`), which Terraform reads where the generated tfvars
   is silent, and keeps them there for every later run: `lifecycle.sh` refuses an apply that would
-  resize a pool no sizing input asked to resize (the pool's own explicit input, or a profile other
-  than the one the last apply recorded), the shape a lost line would otherwise plan. Pass
+  resize a pool no sizing input asked to resize (the pool's own explicit input, or, for an attribute
+  no explicit input decided at the last apply, a profile other than the one that apply recorded),
+  the shape a lost line would otherwise plan. Pass
   `--enable-gvisor=false` to run on the standard container runtime.
 - **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
   one where a change made outside that repository is worth reporting, and nothing else here

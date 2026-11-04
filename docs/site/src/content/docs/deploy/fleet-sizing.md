@@ -126,8 +126,9 @@ default pool keeps `standard_node_count` nodes per zone and does not autoscale.
 The installer writes none of these inputs, so set them as `TF_VAR_` lines in `install.env` and
 keep the lines there for every later run. A lost profile line resolves the small profile, and a
 lost explicit line the profile's shape. The composition's `lifecycle.sh` refuses an apply that
-would resize a pool unless a sizing input asks for it: the pool's own input, or a profile other
-than the one the last apply recorded. A machine type changed outside Terraform shows as drift on the next plan, so change it
+would resize a pool unless a sizing input asks for it: the pool's own input, or a changed profile
+for an attribute the profile decided at the last apply. A changed profile asks nothing about an
+attribute an explicit line set, so that line stays beside it. A machine type changed outside Terraform shows as drift on the next plan, so change it
 through the inputs, or add pools beside the managed ones.
 
 Resize or add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
