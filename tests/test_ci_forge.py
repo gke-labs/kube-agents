@@ -264,6 +264,12 @@ class ForgeScriptTest(unittest.TestCase):
             "host=ghes.eval.internal", "enterprise-version=3.17.0", "block-project-ssh-keys=TRUE", "startup-script=", "tls-crt=", "tls-key=", "ca-crt=",
         ):
             self.assertIn(flag, create)
+        # The registry helper writes its config to /var before the pull: Container-Optimized OS mounts /root
+        # read-only, and without the config docker pulls the proxy image unauthenticated and is refused.
+        startup = (self.gstate / "startup-script").read_text()
+        self.assertIn("export DOCKER_CONFIG=/var/", startup)
+        self.assertLess(startup.index("export DOCKER_CONFIG="), startup.index("docker-credential-gcr configure-docker"))
+        self.assertLess(startup.index("docker-credential-gcr configure-docker"), startup.index('docker pull "$IMAGE"'))
         # Readiness from the serial console, the key out of metadata, then one curl from a pod in the host cluster, with the CA.
         self.assertTrue(self.calls_of("get-serial-port-output forge-ghes"))
         self.assertTrue(self.calls_of("compute instances remove-metadata forge-ghes --zone=us-central1-a"))
