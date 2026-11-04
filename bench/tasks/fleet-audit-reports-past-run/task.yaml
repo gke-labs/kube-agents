@@ -59,8 +59,11 @@ verification_spec:
       # `Q=.../report_query.py + 1 command`, and the query behind the
       # assignment is on no line the check sees. With it, the check reads
       # each tagged `terminal` and `execute_code` call as typed, beside the
-      # rendered rows. The pattern never matches a result, and no forbidden
-      # pattern is set, so it opens no window and grades nothing by itself.
+      # rendered rows. The default read takes a logged card's calls beside its
+      # rows too; this switch also makes a capture with no readable tagged
+      # call `error`, not a fail on the rows alone. The pattern never matches
+      # a result, and no forbidden pattern is set, so it opens no window and
+      # grades nothing by itself.
       after_result_pattern: "(?!)"
       # The skill's query script, whichever way it was invoked. Directly: by
       # relative path as the SKILL.md writes it, or by absolute path, with or

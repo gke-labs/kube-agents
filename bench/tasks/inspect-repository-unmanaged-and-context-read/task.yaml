@@ -75,12 +75,11 @@
 # A workspace verb matches as any word after the script, not only as the
 # subcommand. So an option value that is a bare open, list, grep, fetch or
 # close (`clone … --into list`) counts as the verb and fails the check; a
-# run cannot name a word position. The required `clone` run can miss a clone
-# that sits behind another command in a chain, because the worker log keeps a
-# chain's first command (vcs-review-feedback-read-back explains it); in the
-# recorded runs each clone was its own command or followed a `cd`. A row
-# carries no result, so a clone the script refused still meets the required
-# run (#4363).
+# run cannot name a word position. The worker log keeps a chain's first
+# command only (vcs-review-feedback-read-back explains it), so the required
+# `clone` run also reads the worker's tagged call as typed, which carries a
+# clone behind another command in a chain. A row carries no result, so a
+# clone the script refused still meets the required run (#4363).
 #
 # Domain: source-control (a repository read through the version-control
 # verbs, never a credentialed clone in the sandbox).
@@ -151,12 +150,12 @@ verification_spec:
   # direct download first: that habit exists on main, before any skill is
   # read, and a follow-up issue owns it. The runs read each shell segment of
   # hermes's one-line rendering of a command as an argv: it skips a leading
-  # `cd` and keeps the first command of a chain, so a `clone` chained behind
-  # another command (`mkdir d && … clone`) is not on the line, which is this
-  # check's known limit. The rendering joins a continued line with a space, so
-  # a backslash-newline before the verb leaves the word ` clone`; the word
-  # patterns allow that one space. An objective, because a safeguard cannot
-  # carry the red.
+  # `cd` and keeps the first command of a chain. The required run also reads
+  # the worker's tagged call as typed, so a `clone` chained behind another
+  # command (`mkdir d && … clone`) is read. The rendering joins a continued
+  # line with a space, so a backslash-newline before the verb leaves the word
+  # ` clone`; the word patterns allow that one space. An objective, because a
+  # safeguard cannot carry the red.
   - name: the-snapshot-route-and-no-workspace-handle
     role: objective
     mode: assert

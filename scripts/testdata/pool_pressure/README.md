@@ -135,6 +135,8 @@ full.
 BUILD=2092660728946233344
 PR=961
 NAME=worst-queue-stall   # what the build is for, not its ID; see the tables above
+# The builds in the tables predate the lanes' move to gs://kube-agents-evals-presubmit-logs
+# (2026-11); a build from after it lives there, under the same path.
 BASE="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/${PR}/pull-kube-agents-smoke-test/${BUILD}"
 
 gcloud storage cat "${BASE}/prowjob.json" | python3 -c 'import json,sys
@@ -158,7 +160,8 @@ The build ID encodes the time the pod started (`build_id >> 22` plus the
 Twitter-snowflake epoch), so it is enough on its own to find a build from a
 given day; `pool_pressure.py` uses that to prefilter. The PR number comes from
 the flat index at
-`gs://kube-agents-prow/pr-logs/directory/pull-kube-agents-smoke-test/<build_id>.txt`,
+`gs://kube-agents-evals-presubmit-logs/pr-logs/directory/pull-kube-agents-smoke-test/<build_id>.txt`
+(the lanes' bucket; the tables' builds have theirs under `gs://kube-agents-prow`),
 whose body is the full artifact path.
 
 Nothing here is sensitive, on the strength of the content rather than the

@@ -27,7 +27,7 @@
  *   index.html#since=<ISO>&until=<ISO>&cases=a,b&view=gate|agent
  *   run.html#build=<prow build id>
  *   grid.html#since=<ISO>&until=<ISO>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]
- *   cases.html#<case>, or cases.html#sort=worst|domain|name&show=all|blocking|held, or cases.html#view=scenarios[&domain=<domain slug>]
+ *   cases.html#<case>, or cases.html#sort=worst|domain|name&show=all|blocking|held, or cases.html#view=scenarios[&domain=<domain slug>], or cases.html#view=domains
  *   trend.html#cases=a,b | trend.html#domain=<domain> [&metric=<judged metric>][&mode=next|today][&since=<ISO>[&until=<ISO>]]
  * The older query form (`?cases=a,b&since=<ISO>&until=<ISO>` before a bare
  * `#gate` or `#agent`; `?build=<id>` on run.html; the same on the Grid and
@@ -83,6 +83,12 @@ const PAGE = {
   // The lede prints it verbatim, so it is shape-checked and not only typed.
   poolDayRe: /^\d{4}-\d{2}-\d{2}$/,
   spyglass: "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents",
+  // Where a run that records its build directory (gcs_base) links: the smoke
+  // lanes' bucket is not Deck-readable, so Spyglass shows nothing for it,
+  // while a project reader opens the directory in the Console's bucket
+  // browser and a transcript as an object.
+  gcsBrowser: "https://console.cloud.google.com/storage/browser/",
+  gcsObject: "https://storage.cloud.google.com/",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
@@ -95,10 +101,12 @@ const PAGE = {
   trendFile: "trend.json",
   pages: { brief: "index.html", run: "run.html", grid: "grid.html", cases: "cases.html", nightly: "nightly.html", trend: "trend.html" },
   titles: { brief: "kube-agents · smoke gate brief", run: "kube-agents · smoke run", grid: "kube-agents · cases by run", cases: "kube-agents · how reliable is each test", nightly: "kube-agents · last night's run", trend: "kube-agents · scores over time on main" },
-  // The Cases page's two views: the team's table, and the customer-side
-  // scenarios view (`#view=scenarios`); its <title> while that view is up.
-  casesViews: { reliability: "reliability", scenarios: "scenarios" },
+  // The Cases page's three views: the team's table, the customer-side
+  // scenarios view (`#view=scenarios`), and the per-domain scorecard
+  // (`#view=domains`); the <title> while each of the last two is up.
+  casesViews: { reliability: "reliability", scenarios: "scenarios", domains: "domains" },
   scenariosTitle: "kube-agents · what it can do",
+  domainsTitle: "kube-agents · domain coverage",
   // The Grid's window chips, and the one it opens with when the URL names none.
   gridWindows: [["6h", 6 * 3600 * 1000], ["24h", 24 * 3600 * 1000], ["36h", 36 * 3600 * 1000], ["7d", 7 * 24 * 3600 * 1000]],
   gridDefaultWindow: "36h",
@@ -399,9 +407,9 @@ function linkState() {
   // when the page renders.
   const domain = param("domain").trim();
   if (PAGE.caseIdRe.test(domain)) out.domain = domain;
-  // The Cases page's second view (`cases.html#view=scenarios`); the Brief's
-  // `view=` values are its own and read below.
-  out.casesView = param("view") === PAGE.casesViews.scenarios ? PAGE.casesViews.scenarios : null;
+  // The Cases page's other views (`cases.html#view=scenarios|domains`); the
+  // Brief's `view=` values are its own and read below.
+  out.casesView = [PAGE.casesViews.scenarios, PAGE.casesViews.domains].includes(param("view")) ? param("view") : null;
   const metric = param("metric").trim();
   if (PAGE.metricRe.test(metric)) out.metric = metric;
   out.mode = pick("mode", TREND_MODES);
@@ -462,10 +470,15 @@ const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 
 const prText = (pr) => (pr == null ? "no PR" : `PR #${pr}`);
 const prLink = (pr) => (pr == null ? prText(pr) : `<a href="${PAGE.prUrl}/${esc(pr)}">${esc(prText(pr))}</a>`);
-const buildUrl = (run) => (run.pr == null ? null : `${PAGE.spyglass}/${enc(run.pr)}/${PAGE.job}/${enc(run.build)}`);
+// A run that records where it lives (gcs_base) links there; a record from
+// before the field keeps the Spyglass link under the old bucket.
+const gcsPath = (base) => String(base).replace(/^gs:\/\//, "").replace(/\/+$/, "");
+const buildUrl = (run) => (run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null ? null : `${PAGE.spyglass}/${enc(run.pr)}/${PAGE.job}/${enc(run.build)}`);
 const transcriptUrl = (run, kase, n = 1) => {
+  const rel = `artifacts/eval_${enc(kase)}_rep${enc(n)}.log`;
+  if (run.gcs_base) return `${PAGE.gcsObject}${gcsPath(run.gcs_base)}/${rel}`;
   const base = buildUrl(run);
-  return base ? `${base}/artifacts/eval_${enc(kase)}_rep${enc(n)}.log` : null;
+  return base ? `${base}/${rel}` : null;
 };
 // The repetition whose reason and quote a case row shows (classify.py's
 // rep_n); rep 1, as the pages always linked, when the row names none.
@@ -1006,8 +1019,9 @@ function releasesHtml() {
 /* ---- the GitLab lane (SCHEMA.md: brief.json's gitlab block) ---- */
 // The lane's runs are nobody's gate verdict: tier gitlab (tiers.py) keeps
 // them out of every count above, so this section is the only place they
-// show. Each row links Spyglass under the lane's own job name.
-const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
+// show. Each row links the build where it lives (log_url for a night,
+// gcs_base for a run that records it), else Spyglass under the lane's own job name.
+const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
 function laneRow(run) {
   const url = laneBuildUrl(run);
   const build = url ? `<a href="${esc(url)}" rel="noopener">${esc(run.build)}</a>` : esc(run.build);
@@ -1405,11 +1419,12 @@ const SCENARIOS_ALL_DOMAINS = "all";
 const scenariosDomainHref = (slug) => (slug ? `${scenariosHref()}&domain=${enc(slug)}` : scenariosHref());
 function casesSubnav(view) {
   const item = (key, label) => `<a href="${esc(casesViewHref(key))}"${view === key ? ' class="on"' : ""}>${esc(label)}</a>`;
-  return `<nav class="subnav">${item(PAGE.casesViews.reliability, "How reliable is each test")}${item(PAGE.casesViews.scenarios, "What kube-agents can do")}</nav>`;
+  return `<nav class="subnav">${item(PAGE.casesViews.reliability, "How reliable is each test")}${item(PAGE.casesViews.scenarios, "What kube-agents can do")}${item(PAGE.casesViews.domains, "Domain coverage")}</nav>`;
 }
 
 function casesHtml(link) {
   if (casesView(link) === PAGE.casesViews.scenarios) return scenariosHtml(link);
+  if (casesView(link) === PAGE.casesViews.domains) return domainsHtml();
   const sort = ui.sort || link.sort || "worst";
   const show = ui.show || link.show || "all";
   const all = caseDocs();
@@ -2010,6 +2025,50 @@ function scenariosHtml(link) {
   return head + totals + sections + foot + footHtml();
 }
 
+/* ---- the Cases page's domain view (SCHEMA.md: brief.json's scorecard; understudies.py) ---- */
+
+const scorecardDoc = () => (brief.scorecard && typeof brief.scorecard === "object" && Array.isArray(brief.scorecard.domains) ? brief.scorecard : null);
+
+// One understudy in words: its nightly record and the store's verdict.
+function understudyHtml(u, bar) {
+  const record = u.graded ? `${u.passed}/${u.graded} over ${plural(u.nights, "night")}` : "no graded night";
+  const store = u.store && u.store.state === "none" ? "no store record at the current key" : u.store && u.store.state ? `store ${u.store.state}${Number.isInteger(u.store.runs) && u.store.runs ? `, ${u.store.passes}/${u.store.runs}` : ""}` : "";
+  const tip = `nightly record over the last ${plural(bar.nights ?? "", "night")}; the bar is ${pct(bar.rate ?? 0)} over at least ${bar.min_runs ?? ""} graded runs${u.meets_bar ? ", met" : ""}`;
+  return `<div><a href="${esc(caseHref(u.case))}">${esc(u.case)}</a>${u.held_out ? ' <span class="mut">(held out)</span>' : ""} <span class="mut hint"${tipAttr(tip)}>${esc([record, store].filter(Boolean).join(" · "))}</span></div>`;
+}
+
+function domainRow(d, doc) {
+  const seat = d.seats && d.seats.length
+    ? `<span class="pill p-pass">yes</span> <span class="mut">${d.seats.map((c) => `<a href="${esc(caseHref(c))}">${esc(c)}</a>`).join(", ")}</span>`
+    : `<span class="pill p-fail">no</span>${d.held_out ? ` <span class="mut hint"${tipAttr("still runs on the presubmit as a held-out seat, which can red no pull request")}>held out: ${esc(d.held_out)}</span>` : ""}`;
+  const days = d.seats && d.seats.length ? "—"
+    : `${Number.isInteger(d.days_uncovered) ? esc(plural(d.days_uncovered, "day")) : '<span class="mut">start not recorded</span>'}${d.allowlist_issue ? ` · ${issueLink(`#${d.allowlist_issue}`)}` : ""}${Number.isInteger(d.expired_days) ? ` <span class="pill p-fail">exception expired ${esc(plural(d.expired_days, "day"))} ago</span>` : ""}`;
+  const red = !d.nightly_red ? '<span class="mut">not read</span>'
+    : d.nightly_red.open ? `${d.nightly_red.open}${Number.isInteger(d.nightly_red.oldest_days) ? ` <span class="mut">oldest ${esc(plural(d.nightly_red.oldest_days, "day"))}</span>` : ""}` : "0";
+  const ready = d.understudy_ready === true ? '<span class="pill p-pass">yes</span>' : d.understudy_ready === false ? '<span class="pill p-partial">no</span>' : '<span class="mut">store not read</span>';
+  const studies = d.understudies == null ? '<span class="mut">not read</span>'
+    : d.understudies.length ? d.understudies.map((u) => understudyHtml(u, doc.bar || {})).join("") : '<span class="mut">none on the nightly matrix</span>';
+  const owner = d.owner ? `@${esc(d.owner)}${d.backup ? ` <span class="mut">backup @${esc(d.backup)}</span>` : ""}` : '<span class="mut">none on record</span>';
+  return `<tr><td class="nm">${esc(domainWords(d.slug))}</td><td>${owner}</td><td>${seat}</td><td class="num">${days}</td><td class="num">${red}</td><td>${ready}</td><td>${studies}</td></tr>`;
+}
+
+function domainsHtml() {
+  const doc = scorecardDoc();
+  const head = casesSubnav(PAGE.casesViews.domains) + `<div class="sec head"><h1>Domain coverage</h1>` +
+    `<div class="lede">One row per domain in <code>docs/designs/domains.yaml</code>: whether a case on the blocking roster guards it, how long it has gone without one, its open nightly bugs, and the nightly cases ready to stand in when its seat is demoted.</div></div>`;
+  if (!doc) return head + `<div class="sec"><p class="mut">The scorecard was not computed for this refresh (<code>understudies.py</code> did not run or failed); the 11 AM digest and the coverage-gap issues still carry every uncovered domain.</p></div>` + footHtml();
+  const covered = doc.domains.filter((d) => d.seats && d.seats.length).length;
+  const ready = doc.domains.filter((d) => d.understudy_ready === true).length;
+  const rows = doc.domains.map((d) => domainRow(d, doc)).join("");
+  const bar = doc.bar || {};
+  const generated = parseIso(doc.generated_at);
+  return head +
+    `<div class="sec"><p><b>${covered}</b> of ${esc(plural(doc.domains.length, "domain"))} have a presubmit seat · <b>${ready}</b> have an understudy ready.</p>` +
+    `<table class="rel domains"><thead><tr><th>Domain</th><th>Owner</th><th>Presubmit seat</th><th>Days uncovered</th><th>Open nightly-red</th><th>Understudy ready</th><th>Best understudies</th></tr></thead><tbody>${rows}</tbody></table></div>` +
+    `<div class="foot block"><p>An understudy is a case of the domain on the nightly matrix with a <code>verification_spec</code>, not <code>expected_fail</code>, off the roster, ranked as the coverage-gap issue ranks it. <b>Ready</b> means the evidence store reads it <code>would-admit</code>: ${esc(pct(bar.rate ?? 0))} over ${esc(bar.min_runs ?? "")} runs at the current version key. The rest of the seat bar (a recorded red, classified misses, a guarded fixture, deterministic checks) is checked when it is admitted — <a href="${PAGE.rosterUrl}">the admission bar</a>.</p>` +
+    `<p class="mut">Written by <code>scripts/eval_dashboard/understudies.py</code>${generated != null ? ` at ${esc(et(generated))}` : ""}.</p></div>` + footHtml();
+}
+
 /* ---- the Trend page (SCHEMA.md: brief.json's trend block; trend.py) ---- */
 
 const trendDoc = () => (brief.trend && typeof brief.trend === "object" && !Array.isArray(brief.trend) ? brief.trend : null);
@@ -2541,7 +2600,8 @@ function renderAll(scroll = false) {
   } catch (err) {
     app.innerHTML = `<div class="sec head"><h1>This page could not render.</h1><div class="lede">${esc(String(err && err.message || err))}. The data behind it is <a href="${PAGE.briefFile}">${PAGE.briefFile}</a>.</div></div>`;
   }
-  document.title = page === "cases" && casesView(link) === PAGE.casesViews.scenarios ? PAGE.scenariosTitle : PAGE.titles[page];
+  document.title = page === "cases" && casesView(link) === PAGE.casesViews.scenarios ? PAGE.scenariosTitle
+    : page === "cases" && casesView(link) === PAGE.casesViews.domains ? PAGE.domainsTitle : PAGE.titles[page];
   renderFreshness();
   if (focusedHit != null) {
     const again = app.querySelector(`[data-hit="${CSS.escape(focusedHit)}"]`);

@@ -30,6 +30,10 @@ SKIP = "eval-dashboard refresh skipped:"
 _SCRUB = (
     "EVAL_DASHBOARD_TARGET",
     "EVAL_DASHBOARD_PR_GLOB",
+    "EVAL_DASHBOARD_PR_GLOB_PREVIOUS",
+    "EVAL_DASHBOARD_GITLAB_PR_GLOB",
+    "EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS",
+    "EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX",
     "EVAL_DASHBOARD_NIGHTLY_PREFIX",
     "EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX",
     "EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX",
@@ -276,6 +280,47 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         log = artifacts / "eval-dashboard-refresh.log"
         self.assertIn("refusing to publish an empty dashboard", log.read_text())
+
+    def test_the_previous_archive_rides_as_a_second_pr_glob_until_disabled(self):
+        """The smoke lanes moved buckets; the old archives' runs stay in the
+        window, so both globs of each lane reach collect.py by default, and
+        an empty *_PREVIOUS knob drops the old one."""
+        stubs = self.tmp / "stubs"
+        stubs.mkdir()
+        write_stub(stubs, "gcloud", "exit 1\n")
+        argv_log = self.tmp / "collect-argv.log"
+        recording_python(stubs, argv_log)
+        run_script(env={"EVAL_DASHBOARD_TARGET": "gs://fake-dashboards/evals/", "JOB_TYPE": "periodic"}, path_prepend=str(stubs))
+        argv = collect_argv(argv_log)
+        globs = [argv[i + 1] for i, a in enumerate(argv) if a == "--pr-glob"]
+        self.assertEqual(
+            globs,
+            [
+                "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*",
+                "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*",
+            ],
+        )
+        lane_globs = [argv[i + 1] for i, a in enumerate(argv) if a == "--gitlab-pr-glob"]
+        self.assertEqual(
+            lane_globs,
+            [
+                "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*",
+                "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*",
+            ],
+        )
+        argv_log.unlink()
+        run_script(
+            env={
+                "EVAL_DASHBOARD_TARGET": "gs://fake-dashboards/evals/",
+                "JOB_TYPE": "periodic",
+                "EVAL_DASHBOARD_PR_GLOB_PREVIOUS": "",
+                "EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS": "",
+            },
+            path_prepend=str(stubs),
+        )
+        argv = collect_argv(argv_log)
+        self.assertEqual(argv.count("--pr-glob"), 1)
+        self.assertEqual(argv.count("--gitlab-pr-glob"), 1)
 
     def test_a_failing_gcloud_storage_source_hits_the_floor_not_the_bucket(self):
         """gs:// end to end with a gcloud that always fails: the prior

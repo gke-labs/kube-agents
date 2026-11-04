@@ -166,7 +166,9 @@ verification_spec:
         # rendering of each command, which drops a redirect, puts a heredoc
         # on one line and shows a chain as its first command only. With it,
         # the check reads each tagged `terminal` and `execute_code` call as
-        # typed. The pattern never matches a result, and no forbidden
+        # typed, and makes a capture with no readable tagged call `error`
+        # (the default read takes a logged card's calls beside its rows
+        # too). The pattern never matches a result, and no forbidden
         # pattern is set, so it opens no window and grades nothing by
         # itself. The required pattern: a write marker and the path in one
         # command (a redirect, tee, cp, mv, install, or a Python write).

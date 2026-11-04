@@ -151,7 +151,9 @@ def _seconds(directive: str, field: str, value: str | None, default: float, ceil
 def main(argv: list[str] | None = None) -> int:
     """Print the case id (its directory) of every task file given whose
     prompt is a stopped ask, one per line: the list hack/ci-eval-pr.sh runs
-    in its second phase. An unreadable task file is an error."""
+    in its second phase on the inject lane. An unreadable task file is an
+    error. (The script reads the ``writes_alone`` cases itself, with a plain
+    YAML load, since a presubmit grades with the base commit's bench.)"""
     for task in sys.argv[1:] if argv is None else argv:
         doc = yaml.safe_load(Path(task).read_text(encoding="utf-8")) or {}
         if is_stopped_ask(str(doc.get("prompt") or "")):

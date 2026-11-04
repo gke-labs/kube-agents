@@ -183,6 +183,20 @@ for _bool_var in ENABLE_GKE_BACKUP_PLAN ENABLE_GVISOR HERMES_DASHBOARD_ENABLED W
   esac
 done
 
+# HELM_UPGRADE_INSTALL is no install.sh flag: it reaches the tfvars generator
+# through the environment, which refuses a spelling that is neither true nor
+# false. That refusal comes after the teardown, so it is checked here first.
+if [ -n "${HELM_UPGRADE_INSTALL:-}" ]; then
+  case "$(canonical_bool "$HELM_UPGRADE_INSTALL")" in
+    true | false) ;;
+    *)
+      echo "::error title=HELM_UPGRADE_INSTALL is not a boolean::'${HELM_UPGRADE_INSTALL}' is neither true nor false, and the installer's tfvars generator refuses it, after the teardown. Refusing before the teardown rather than after. Set HELM_UPGRADE_INSTALL on this GitHub environment to true or false."
+      echo "==> HELM_UPGRADE_INSTALL='${HELM_UPGRADE_INSTALL}' is not a boolean." >&2
+      INSTALL_REFUSAL_STATUS=1
+      ;;
+  esac
+fi
+
 # install.sh refuses --enable-slack without both tokens when there is no tty,
 # which is this job. Its own guard runs after the Secret-recovery loop, which
 # can read them off a live install -- but this script has just destroyed that

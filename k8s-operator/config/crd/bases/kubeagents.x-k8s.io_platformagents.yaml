@@ -60,6 +60,13 @@ spec:
                             reads the memory limit through the Downward API and sets its Go soft
                             memory limit to half of it, so raising the memory limit is the knob for an
                             install whose fleet of watched clusters outgrows the 2Gi default (#2648).
+                            The startup peak depends on the control plane: with the WatchList
+                            feature gate (on at 1.32 and from 1.34) the reflector holds a cluster's
+                            whole initial stream until its bookmark, so up to four of the largest
+                            backlogs (the initial-list concurrency) are resident at once; without
+                            the gate the watcher reads the backlog in pages of 500 Events and holds
+                            one page per cluster. Steady state scales with the number of watched
+                            clusters and their open incidents.
                             Only cpu, memory and ephemeral-storage are accepted, the quantities the
                             container declares. The operator refuses a request above its limit, a
                             negative quantity, a zero limit, an unrepresentable byte or CPU count and
@@ -1179,10 +1186,16 @@ spec:
                             Resources overrides the credential-proxy container's requests and limits.
                             Each key set here replaces the operator's default for that key and the
                             rest keep their defaults, unlike spec.deployment.resources, which replaces
-                            the agent container's block wholesale: a CR that sets only limits.memory
-                            keeps the default 500m CPU request, 1 CPU limit and 8Gi ephemeral-storage
-                            limit. The broker sizes how many commands it admits at once from the
-                            memory limit, so raising the limit is the one knob for an install whose
+                            the agent container's block wholesale: a CR that sets only limits.memory,
+                            at or above the default memory request, keeps the default requests (500m
+                            CPU and 1Gi, or 2 CPU and 2Gi on GKE Autopilot, where Autopilot without
+                            bursting clamps the limits to the requests), the 2 CPU limit and the 8Gi
+                            ephemeral-storage limit. A cpu or memory limit set without its request,
+                            below the default request, lowers that request to the limit. On
+                            Autopilot a CPU request the CR does not set is held to at most one CPU
+                            per GiB of the memory request. The broker sizes how many commands it
+                            admits at once from the memory limit, so raising the limit is the one
+                            knob for an install whose
                             fleet outgrows the default; the ephemeral-storage limit bounds the content
                             workspace the broker clones into; the proxy's state emptyDir (sizeLimit
                             5Gi) grows by whatever the limit is raised above the 8Gi default, and
@@ -1198,8 +1211,7 @@ spec:
                             memory high-water series give the figure.
                             Only cpu, memory and ephemeral-storage
                             are accepted, the quantities the container declares. The operator
-                            refuses a memory limit below what admits two commands at once, a limits
-                            entry set alone below the default request it would cross, a request
+                            refuses a memory limit below what admits two commands at once, a request
                             above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
                             pod declares no resourceClaims. A refused override, including an edit of
                             one that was valid, renders the proxy Deployment at the operator's
@@ -10599,7 +10611,11 @@ spec:
                             AllowedUsers is a list of allowed member IDs. If not present, all users will be allowed.
                             A plain ID (U...) is a member of the install's own workspace. Under mode next, an entry
                             T...:U... (a workspace ID, a colon, a member ID) admits that member of another workspace
-                            in a Slack Connect channel; nothing else admits one, an absent list included.
+                            in a Slack Connect channel; nothing else admits one, an absent list included. With the
+                            list absent, every member of the install's own workspace is allowed, guest accounts
+                            included. Under mode next the same list decides who may move the home channel from the
+                            app's Home tab, except that a guest account of the workspace never moves it, listed or
+                            not.
                           items:
                             type: string
                           type: array
@@ -11741,6 +11757,16 @@ spec:
                       maxLength: 2048
                       pattern: ^$|^https?://[^\s]+$
                       type: string
+                    peopleSeen:
+                      default: true
+                      description: |-
+                        PeopleSeen keeps one hashed key and a last-active time per verified
+                        chat person in the gateway's people bucket, for 30 days after their
+                        last turn, and serves the people seen in the last 7 and 30 days as
+                        kubeagents_a2a_gateway_people_seen. Next mode only. False writes no
+                        key, deletes every key the bucket holds at the gateway's next start,
+                        and serves no sample.
+                      type: boolean
                   type: object
               required:
                 - harness
@@ -11830,6 +11856,24 @@ spec:
                         ready.
                       format: int32
                       type: integer
+                  type: object
+                inference:
+                  description: |-
+                    Inference reports the Platform Agent's default model, as the install's LiteLLM
+                    config states it. The key is absent until the operator reads the config; an
+                    empty object means the config states no default model; a read that fails keeps
+                    what is there; the key is absent while the served CRD predates it.
+                  properties:
+                    model:
+                      description: |-
+                        Model is the model name after the provider, as typed, or the resource id alone
+                        for a resource reference.
+                      type: string
+                    provider:
+                      description: |-
+                        Provider is the LiteLLM provider slug, the text before the first "/" of the
+                        default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
+                      type: string
                   type: object
                 lastReconcileTime:
                   description:
@@ -12024,6 +12068,21 @@ spec:
                         else moves.
                       format: int64
                       type: integer
+                    chatSessionsTotal:
+                      description: |-
+                        ChatSessionsTotal is the chat half of SessionsTotal: the chat
+                        conversations the gateway opened a session for (the session_store
+                        plugin's kubeagents_chat_sessions_total on a today install, that plus
+                        the A2A gateway's kubeagents_a2a_gateway_sessions_total on a next
+                        install), without the event watcher's triage sessions. A re-seed from
+                        a status that carries no chatSessionsTotal (an install with triage
+                        sessions and no chat yet, or a served CRD that holds the field back)
+                        seeds those triage sessions into the chat half, and the counter keeps
+                        them. Read every five minutes and kept monotonic the same way as
+                        ToolExecutionsTotal. Moves LastActiveTime, as SessionsTotal does; does
+                        not move LastHumanActiveTime. Absent while the served CRD predates it.
+                      format: int64
+                      type: integer
                     chatTurnsErroredTotal:
                       description: |-
                         ChatTurnsErroredTotal is the cumulative count of synchronous chat turns
@@ -12139,6 +12198,28 @@ spec:
                         reacted to already did.
                       format: int64
                       type: integer
+                    peopleSeen7d:
+                      description: |-
+                        PeopleSeen7d is the A2A gateway's count now of the distinct people who
+                        wrote on the chat platform it serves within the last 7 days:
+                        kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
+                        across gateway pods. A reading, not an accumulation: it falls as a
+                        person's last message ages out of the window. A 0 is a reading. Absent
+                        until the first reading, after two polls in a row without one, while a
+                        chat platform the install enables is served through Hermes (Google Chat
+                        or Slack on their legacy consumers, or Teams), and while the served CRD
+                        predates the field. Moves neither LastActiveTime nor
+                        LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    peopleSeen30d:
+                      description: |-
+                        PeopleSeen30d is PeopleSeen7d over 30 days:
+                        kubeagents_a2a_gateway_people_seen under window 30d, the largest reading
+                        across gateway pods. A 0 is a reading. Absent on the same terms as
+                        PeopleSeen7d. Moves neither LastActiveTime nor LastHumanActiveTime.
+                      format: int64
+                      type: integer
                     proposalHumanTouches:
                       description: |-
                         ProposalHumanTouches is the forge's count now of the events people
@@ -12235,8 +12316,8 @@ spec:
                         delivered (its k8s_event_watcher_triage_sessions_total; a session
                         whose inject was filtered, suppressed or failed is not counted) plus
                         the chat conversations the gateway opened a session for (the session_store
-                        plugin's kubeagents_chat_sessions_total on a today install, the A2A
-                        gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+                        plugin's kubeagents_chat_sessions_total on a today install, that plus the
+                        A2A gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
                         chat conversation that resumes after the session store's retention
                         window (seven days by default) counts again. Read every five minutes
                         and kept monotonic across restarts, like toolExecutionsTotal.

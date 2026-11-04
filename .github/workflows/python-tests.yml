@@ -19,6 +19,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # Cap @actions/cache's wait on one cache segment so a restore the service
+  # refuses costs a step about a minute, not the default ten. The rule, the
+  # trade-off and the test that holds it: .agents/rules/github_actions.md,
+  # "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
 permissions:
   contents: read
 
@@ -194,11 +201,18 @@ jobs:
       # !cancelled() rather than success(): a shard with a red file still
       # hands its coverage and its failing-file list to the join, which is
       # where the required check decides.
+      #
+      # The run attempt is in the name so that a re-run shard's upload cannot
+      # hide behind its earlier attempt's. With one name per shard, the join's
+      # download keeps the artifact with the highest ID, and IDs do not follow
+      # upload order: on 2026-10-31 a join read a re-run shard's red first
+      # attempt instead of its green second one. The join keeps each shard's
+      # latest attempt with scripts/coverage_shard_attempts.py.
       - name: Upload this shard's coverage
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: python-coverage-shard-${{ matrix.shard }}
+          name: python-coverage-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             .coverage-data/.coverage
             .coverage-data/failed-files.txt
@@ -301,6 +315,11 @@ jobs:
         with:
           pattern: python-coverage-shard-*
           path: .coverage-data
+
+      # After "Re-run failed jobs" the download holds a re-run shard from two
+      # attempts. Keep the latest of each, under the name coverage-merge reads.
+      - name: Keep each shard's latest attempt
+        run: python3 scripts/coverage_shard_attempts.py .coverage-data
 
       # COVERAGE_STRICT=1: fail when any shard's sweep had a failing file. The
       # target also fails when a shard's directory, data or failing-file list

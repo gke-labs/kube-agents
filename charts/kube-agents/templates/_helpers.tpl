@@ -772,9 +772,9 @@ Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
 renders no max_tokens) and reasoningEffort (optional; empty or absent renders
 no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
 neither key), which only openai_compatible passes, and the optional
-dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds
-and numRetries. Every optional input renders nothing when unset, so the default
-render is unchanged.
+dropParams, fallback (a dict of modelName and reasoningEffort), timeoutSeconds,
+numRetries and retryAfterSeconds. Every optional input renders nothing when
+unset, so the default render is unchanged.
 callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
@@ -885,6 +885,29 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 {{- end -}}
 {{- $timeout := int (.timeoutSeconds | default 0) -}}
 {{- $numRetries := int (.numRetries | default 0) -}}
+{{- $retryAfter := int (.retryAfterSeconds | default 0) -}}
+{{- if and (gt $retryAfter 0) (le $numRetries 0) -}}
+{{- fail (printf "litellm.fallback.retryAfterSeconds %d is set without litellm.fallback.numRetries; the pause is between retries the router does not make" $retryAfter) -}}
+{{- end -}}
+{{- /*
+  The retries are a silent hold on the caller's stream, (numRetries + 1)
+  pauses long: LiteLLM sleeps before each retry and once more after the last
+  failure. The Platform and Cluster Agents drop a stream with no first chunk
+  for stale_timeout_seconds (120s in agents/platform/config.yaml and
+  agents/cluster/config.yaml) and retry blind, never seeing the 429, so the
+  hold plus the model's time to first chunk has to fit under that bound on
+  every install, not only the eval's. The allowance is what is left for the
+  first chunk at the eval's pair (2 x 20s); the Platform Agent overlay's own
+  measurement puts 1% of worker calls above 60s to first chunk.
+  tests/test_litellm_reasoning_fallback.py pins the refusal and
+  tests/test_ci_deploy_litellm_vertex.py holds the bound equal to the overlays.
+*/}}
+{{- $workerStaleSeconds := 120 -}}
+{{- $firstChunkAllowanceSeconds := 60 -}}
+{{- $gatewayHoldSeconds := mul (add $numRetries 1) $retryAfter -}}
+{{- if and (gt $retryAfter 0) (gt (add $gatewayHoldSeconds $firstChunkAllowanceSeconds) $workerStaleSeconds) -}}
+{{- fail (printf "litellm.fallback.numRetries %d with retryAfterSeconds %d holds a rate-limited call %ds at the gateway; with %ds for the model's first chunk that crosses the agents' %ds stale-stream bound (stale_timeout_seconds), and the agent would drop the stream before it sees the 429" $numRetries $retryAfter $gatewayHoldSeconds $firstChunkAllowanceSeconds $workerStaleSeconds) -}}
+{{- end -}}
 {{- $primaries := list "model-default" "hermes-agent" .model -}}
 {{- if and $fallbackName (has $fallbackName $primaries) -}}
 {{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}
@@ -952,7 +975,7 @@ litellm_settings:
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
 */}}
-{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) }}
+{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) }}
 router_settings:
   {{- if $fallbackName }}
   fallbacks:
@@ -965,6 +988,16 @@ router_settings:
   {{- end }}
   {{- if gt $numRetries 0 }}
   num_retries: {{ $numRetries }}
+  {{- end }}
+  {{- /*
+    The shortest pause before a retry. LiteLLM's own pause is an exponential
+    backoff from 0.5s, so without this a 429 from a per-minute quota is
+    retried inside the same closed minute. LiteLLM also clamps the pause to
+    MAX_RETRY_DELAY (8s unless the environment says otherwise); the Deployment
+    raises that to this value when it is above 8, in templates/litellm.yaml.
+  */}}
+  {{- if gt $retryAfter 0 }}
+  retry_after: {{ $retryAfter }}
   {{- end }}
   {{- if $claude }}
   default_litellm_params:
@@ -1929,7 +1962,12 @@ persistentvolumeclaims and requests.storage. Keys outside that set (services, se
 count/<resource>) are not modelled, and are skipped rather than guessed at.
 
 Inert when lookup returns empty — `helm template` without a cluster, or a namespace with no
-ResourceQuota at all.
+ResourceQuota at all. The comparison is inert there; the sum is not: NOTES.txt prints
+kube-agents.footprintSummary while quotaPreflight.enabled is on, and that calls
+kube-agents.quotaRequirements on every render, so an input the sum refuses (an empty
+hindsight.postgresql.storage, a quantity parseBytes or parseCpuMillis cannot read, a damaged
+footprint.yaml) stops a quota-less render and `helm template` too, with the same
+`quotaPreflight.enabled=false` as the way round it.
 
 It is NOT inert when the installing identity cannot read ResourceQuotas. Helm's `lookup`
 swallows a NotFound and returns nothing; every other API error, a 403 on
@@ -2049,8 +2087,8 @@ these have passed.
 The credential proxy's footprint entry with platformAgent.deployment.credentialProxy.resources
 merged over it, per key, as resolveCredentialProxyResources does in the operator
 (k8s-operator/internal/controller/credential_proxy_manifests.go): a key the override
-carries replaces that number, a key it omits keeps footprint.yaml's -- with one exception
-that follows the API server rather than the operator. The operator renders a CPU and a
+carries replaces that number, a key it omits keeps footprint.yaml's -- with the exceptions below. The first
+follows the API server rather than the operator. The operator renders a CPU and a
 memory request explicitly, so an override that raises only the limit leaves the request where
 the operator put it. It renders no ephemeral-storage request at all: the 8Gi request in
 footprint.yaml is the API server defaulting an absent request to the limit
@@ -2059,8 +2097,12 @@ override's limit, so `limits: {ephemeral-storage: 10Gi}` alone is a 10Gi request
 it at 8Gi would pass a quota the pod is then refused on. kube-agents.workloadResources
 applies the request-follows-limit rule to every key, which is right for a chart workload
 whose requests the values own and wrong for the two the operator renders, so it is not
-reused here. Takes (dict "workload" <footprint entry> "override" <resources block>) and
-returns the entry's six numbers and pod count as JSON.
+reused here. Like the operator, a cpu or memory limit set alone below the request lowers
+the request to the limit. When "autopilot" is set, the requests start from the operator's
+Autopilot requests instead of footprint.yaml's, and a CPU request the override does not set
+is held to at most one CPU per GiB of the memory request. Takes (dict "workload" <footprint entry>
+"override" <resources block> "autopilot" <"true" or "">) and returns the entry's six numbers
+and pod count as JSON.
 */}}
 {{- define "kube-agents.credentialProxyFootprint" -}}
 {{- include "kube-agents.credentialProxyResourcesCheck" .override -}}
@@ -2143,6 +2185,13 @@ returns the entry's six numbers and pod count as JSON.
 {{- $cpuReq := $workload.cpuMillisRequest | default 0 | int64 -}}
 {{- $cpuLim := $workload.cpuMillisLimit | default 0 | int64 -}}
 {{- $memReq := $workload.memoryBytesRequest | default 0 | int64 -}}
+{{- /* On Autopilot the operator's default requests are the Autopilot pair, not the
+       Standard pair footprint.yaml was summed from. */ -}}
+{{- if .autopilot -}}
+{{- $autopilotRequests := (include "kube-agents.credentialProxyDefaults" . | fromJson).autopilotRequests -}}
+{{- $cpuReq = include "kube-agents.parseCpuMillis" $autopilotRequests.cpu | int64 -}}
+{{- $memReq = include "kube-agents.parseBytes" $autopilotRequests.memory | int64 -}}
+{{- end -}}
 {{- $memLim := $workload.memoryBytesLimit | default 0 | int64 -}}
 {{- $ephReq := $workload.ephemeralStorageBytesRequest | default 0 | int64 -}}
 {{- $ephLim := $workload.ephemeralStorageBytesLimit | default 0 | int64 -}}
@@ -2168,6 +2217,26 @@ returns the entry's six numbers and pod count as JSON.
 {{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "ephemeral-storage") "fallback" "") -}}
 {{- $ephReq = include "kube-agents.parseBytes" . | int64 -}}
 {{- end -}}
+{{- /* A cpu or memory limit set without its request, below the default request, takes the
+       request down with it, as resolveCredentialProxyResources does in the operator. */ -}}
+{{- if and (include "kube-agents.declaredQuantity" (dict "value" (index $lim "cpu") "fallback" "")) (not (include "kube-agents.declaredQuantity" (dict "value" (index $req "cpu") "fallback" ""))) (gt $cpuLim 0) (lt $cpuLim $cpuReq) -}}
+{{- $cpuReq = $cpuLim -}}
+{{- end -}}
+{{- if and (include "kube-agents.declaredQuantity" (dict "value" (index $lim "memory") "fallback" "")) (not (include "kube-agents.declaredQuantity" (dict "value" (index $req "memory") "fallback" ""))) (gt $memLim 0) (lt $memLim $memReq) -}}
+{{- $memReq = $memLim -}}
+{{- end -}}
+{{- /* On Autopilot a CPU request the override does not set stays at or under one CPU per
+       GiB of the memory request, the band's floor, as the operator holds it. */ -}}
+{{- if and .autopilot (not (include "kube-agents.declaredQuantity" (dict "value" (index $req "cpu") "fallback" ""))) -}}
+{{- /* floor(bytes x 1000 / 2^30), split so the product cannot overflow. */ -}}
+{{- $bandMilli := add (mul (div $memReq 1073741824) 1000) (div (mul (mod $memReq 1073741824) 1000) 1073741824) | int64 -}}
+{{- /* Rounded down to a multiple of 250m, 250m at least: Autopilot rounds a CPU request up
+       to one, as the operator holds it. */ -}}
+{{- $bandMilli = max (mul (div $bandMilli 250) 250) 250 | int64 -}}
+{{- if gt $cpuReq $bandMilli -}}
+{{- $cpuReq = $bandMilli -}}
+{{- end -}}
+{{- end -}}
 {{- dict
       "cpuMillisRequest" $cpuReq "cpuMillisLimit" $cpuLim
       "memoryBytesRequest" $memReq "memoryBytesLimit" $memLim
@@ -2188,12 +2257,34 @@ tests/test_credential_proxy_sizing_parity.py holds them equal, the floor to the 
 the broker's declared copies; each side's own test holds its copy to its formula. Change all
 sides together.
 The defaults carry no ephemeral-storage request because the operator renders none.
+autopilotRequests are the requests on GKE Autopilot (credentialProxyAutopilotCPURequest and
+credentialProxyAutopilotMemoryRequest), where the limits are clamped to the requests and only
+the request buys CPU; the quota preflight counts them where kube-agents.gkeAutopilot holds.
 */}}
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
       "requests" (dict "cpu" "500m" "memory" "1Gi")
-      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "8Gi")
+      "autopilotRequests" (dict "cpu" "2" "memory" "2Gi")
+      "limits" (dict "cpu" "2" "memory" "2Gi" "ephemeral-storage" "8Gi")
    | toJson -}}
+{{- end }}
+
+{{/*
+Whether the cluster is GKE Autopilot: it serves auto.gke.io's AllowlistedWorkload, the
+resource the operator's isGKEAutopilot probes, at any served version, as the operator
+accepts it. helm template without --api-versions sees no cluster and answers no, which
+only the quota preflight (a live cluster) reads anyway.
+*/}}
+{{- define "kube-agents.gkeAutopilot" -}}
+{{- $autopilot := false -}}
+{{- range .Capabilities.APIVersions -}}
+{{- if and (hasPrefix "auto.gke.io/" .) (hasSuffix "/AllowlistedWorkload" .) -}}
+{{- $autopilot = true -}}
+{{- end -}}
+{{- end -}}
+{{- if $autopilot -}}
+true
+{{- end -}}
 {{- end }}
 
 {{- /* The agent-api-auth sidecar's defaults, the agentAPIAuth* constants in
@@ -2423,6 +2514,18 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          whole template exists to prevent. An absent value means the operator's own
          default of 1; an explicit 0 means 0, and the CRD allows it. */ -}}
   {{- $agentReplicas := include "kube-agents.replicaCount" (((.Values.platformAgent.deployment | default dict).availability | default dict).replicas) | int64 -}}
+  {{- /* platformAgent.mode: next renders the A2A stack beside the today-mode one, and
+         footprint.yaml's nextMode holds exactly what it adds (the generator refuses a
+         next-mode golden whose today-mode part differs). The mode is read from the values,
+         as platform-agent-cr.yaml writes it: a mode set on the CR by hand while this stays
+         null is not seen here. */ -}}
+  {{- $next := dict -}}
+  {{- if eq (toString (.Values.platformAgent.mode | default "")) "next" -}}
+    {{- $next = (index $footprint "nextMode") | default dict -}}
+    {{- if not $next -}}
+      {{- fail "quota preflight: platformAgent.mode is next but footprint.yaml has no nextMode section, so the A2A stack cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+  {{- end -}}
   {{- $base := (index $op "agentPod" "base") | default dict -}}
   {{- $podReqCpu := $base.cpuMillisRequest | default 0 | int64 -}}
   {{- $podLimCpu := $base.cpuMillisLimit | default 0 | int64 -}}
@@ -2529,6 +2632,77 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" ($dash.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
   {{- end -}}
 
+  {{- /* Next mode's hermes-bridge is another container of the agent pod, so like the
+         dashboard it scales with the agent's replicas and adds no pod. The operator sizes it
+         from its own env (a2aRenderedBridgeResources), which this chart sets through
+         operator.extraEnv. The chart does not re-implement that reader -- its JSON decoding,
+         refusal rules and valueFrom are the operator's -- it bounds it from above. With
+         neither A2A_BRIDGE_EXECUTOR nor A2A_BRIDGE_RESOURCES set, the bridge is the api
+         default (hermesBridge). With either set, in any form, it is counted at no less than
+         the agent container's size (hermesBridgeCli), the operator's fallback under cli; and
+         an A2A_BRIDGE_RESOURCES whose figures read cleanly as quantities can only raise that,
+         per key, never lower it, since a value the operator refuses falls back. Nothing here
+         fails the render: a figure it cannot read is left out, and the agent-size floor
+         stands. Over-counting is this preflight's direction of error. */ -}}
+  {{- $bridge := index ($next.agentPod | default dict) "hermesBridge" -}}
+  {{- if $next -}}
+    {{- $overridden := false -}}
+    {{- $bridgeResources := "" -}}
+    {{- range $e := (.Values.operator.extraEnv | default list) -}}
+      {{- $name := toString (index ($e | default dict) "name") -}}
+      {{- if or (eq $name "A2A_BRIDGE_EXECUTOR") (eq $name "A2A_BRIDGE_RESOURCES") -}}
+        {{- $overridden = true -}}
+      {{- end -}}
+      {{- if and (eq $name "A2A_BRIDGE_RESOURCES") (kindIs "string" (index $e "value")) -}}
+        {{- $bridgeResources = index $e "value" -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if $overridden -}}
+      {{- $bridge = deepCopy (index $next.agentPod "hermesBridgeCli" | default dict) -}}
+      {{- with $bridgeResources -}}
+        {{- $parsed := fromJson . -}}
+        {{- if not (hasKey $parsed "Error") -}}
+          {{- /* The CRD's quantity grammar, as agentAPIAuthResourcesCheck holds an override
+                 to: parseCpuMillis and parseBytes read every form it admits, so a figure
+                 that matches never reaches their fail. A JSON number arrives as a float,
+                 which toString may print with an exponent; the grammar admits that too. */ -}}
+          {{- $quantity := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+          {{- $requested := index $parsed "requests" -}}
+          {{- if not (kindIs "map" $requested) -}}{{- $requested = dict -}}{{- end -}}
+          {{- range $side := list "limits" "requests" -}}
+            {{- $list := index $parsed $side -}}
+            {{- if kindIs "map" $list -}}
+              {{- range $key, $field := dict "cpu" "cpuMillis" "memory" "memoryBytes" "ephemeral-storage" "ephemeralStorageBytes" -}}
+                {{- $raw := trimPrefix "+" (trim (toString (index $list $key))) -}}
+                {{- if regexMatch $quantity $raw -}}
+                  {{- $n := 0 -}}
+                  {{- if eq $key "cpu" -}}{{- $n = include "kube-agents.parseCpuMillis" $raw | int64 -}}{{- else -}}{{- $n = include "kube-agents.parseBytes" $raw | int64 -}}{{- end -}}
+                  {{- /* A limit also floors the request: the API server defaults an omitted
+                         request to its limit. */ -}}
+                  {{- $targets := list (printf "%sRequest" $field) -}}
+                  {{- if eq $side "limits" -}}{{- $targets = list (printf "%sLimit" $field) (printf "%sRequest" $field) -}}{{- end -}}
+                  {{- range $target := $targets -}}
+                    {{- if or (ne $side "limits") (eq $target (printf "%sLimit" $field)) (not (hasKey $requested $key)) -}}
+                      {{- $_ := set $bridge $target (max (index $bridge $target | default 0 | int64) $n) -}}
+                    {{- end -}}
+                  {{- end -}}
+                {{- end -}}
+              {{- end -}}
+            {{- end -}}
+          {{- end -}}
+        {{- end -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- with $bridge -}}
+    {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" (.cpuMillisRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" (.cpuMillisLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" (.memoryBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" (.memoryBytesLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" (.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" (.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
+  {{- end -}}
+
   {{- /* satMul/satAdd: the pod sum times the replica count is where an admitted
          override most easily passes int64 -- a figure under 2^63 doubles over it at
          two replicas -- so both the multiply and the accumulation saturate. */ -}}
@@ -2575,15 +2749,18 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          override at the defaults the operator then renders. An
          ephemeral-storage limit set alone is counted as a request of that size too: the
          operator renders no ephemeral-storage request and the API server defaults it to
-         the limit. The agent-api-auth sidecar has a sizing override too, but it is a
+         the limit. On GKE Autopilot the proxy's helper runs without an override too,
+         because the operator requests more there than footprint.yaml records. The
+         agent-api-auth sidecar has a sizing override too, but it is a
          container of the agent pod, so its delta is added to agentPod above rather than
          counted here. */ -}}
   {{- $proxyOverride := (((.Values.platformAgent.deployment | default dict).credentialProxy | default dict).resources) | default dict -}}
   {{- $sandboxOverride := ((((.Values.platformAgent.harness | default dict).experimental | default dict).shellSandbox | default dict).resources) | default dict -}}
+  {{- $proxyAutopilot := include "kube-agents.gkeAutopilot" . -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
-      {{- if and (eq $key "credentialProxy") $proxyOverride -}}
-        {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride) | fromJson -}}
+      {{- if and (eq $key "credentialProxy") (or $proxyOverride $proxyAutopilot) -}}
+        {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride "autopilot" $proxyAutopilot) | fromJson -}}
       {{- end -}}
       {{- if and (eq $key "shellSandbox") $sandboxOverride -}}
         {{- $workload = include "kube-agents.shellSandboxFootprint" (dict "workload" $workload "override" $sandboxOverride) | fromJson -}}
@@ -2598,6 +2775,37 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
       {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
     {{- end -}}
+  {{- end -}}
+
+  {{- /* Next mode's own workloads: NATS, the auth callouts, the verifiers, the console,
+         the A2A gateway and the provisioning Job, each a total over its replicas, plus the
+         JetStream claim. None has a sizing override in the chart. An entry marked `surges`
+         (the callouts and verifiers, which roll RollingUpdate with maxUnavailable 0) sizes
+         the patch's surge room by one of its pods: with LiteLLM off, the chart's own
+         workloads may leave less room than a callout needs to roll. */ -}}
+  {{- range $key, $workload := $next -}}
+    {{- if and (ne $key "agentPod") (ne $key "storage") -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.replicaCount" $workload.pods | int64)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($workload.cpuMillisRequest | default 0 | int64)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($workload.cpuMillisLimit | default 0 | int64)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($workload.memoryBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($workload.memoryBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $pods := $workload.pods | default 0 | int64 -}}
+      {{- if and $workload.surges (gt $pods (int64 0)) -}}
+        {{- $surgeCpuReq = max $surgeCpuReq (div ($workload.cpuMillisRequest | default 0 | int64) $pods) -}}
+        {{- $surgeCpuLim = max $surgeCpuLim (div ($workload.cpuMillisLimit | default 0 | int64) $pods) -}}
+        {{- $surgeMemReq = max $surgeMemReq (div ($workload.memoryBytesRequest | default 0 | int64) $pods) -}}
+        {{- $surgeMemLim = max $surgeMemLim (div ($workload.memoryBytesLimit | default 0 | int64) $pods) -}}
+        {{- $surgeEphReq = max $surgeEphReq (div ($workload.ephemeralStorageBytesRequest | default 0 | int64) $pods) -}}
+        {{- $surgeEphLim = max $surgeEphLim (div ($workload.ephemeralStorageBytesLimit | default 0 | int64) $pods) -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- with $next.storage -}}
+    {{- $reqPvc = add $reqPvc (.persistentVolumeClaims | default 0 | int64) -}}
+    {{- $reqStorage = add $reqStorage (.storageBytesRequest | default 0 | int64) -}}
   {{- end -}}
 
   {{- /* Claims are release-scoped rather than per-replica, so they are not multiplied. */ -}}
@@ -2644,7 +2852,18 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
   {{- $spec := index $quota "spec" | default dict -}}
   {{- $scopes := index $spec "scopes" -}}
   {{- $scopeSelector := index $spec "scopeSelector" -}}
-  {{- if or $scopes $scopeSelector -}}
+  {{- /* A quota a PlatformAgent owns is the operator's next-mode session-pod bound
+         (pods: maxSessions plus a headroom, buildA2ASessionQuota), which it puts back on every
+         reconcile (server-side apply), so a patch printed against it would be reverted and the
+         upgrade refused again. Its size is spec.harness.tuning.maxSessions's to raise, and the
+         headroom's to cover the release (gke-labs#3848), not this check's to diagnose. */ -}}
+  {{- $operatorOwned := false -}}
+  {{- range $ref := (index ($quota.metadata | default dict) "ownerReferences" | default list) -}}
+    {{- if and (eq (toString $ref.kind) "PlatformAgent") (hasPrefix "kubeagents.x-k8s.io/" (toString $ref.apiVersion)) -}}
+      {{- $operatorOwned = true -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if or $scopes $scopeSelector $operatorOwned -}}
     {{- /* Scoped quota: it applies to a subset of pods this template cannot identify, so
            comparing the whole release against it would be wrong in both directions. */ -}}
   {{- else -}}
@@ -2811,6 +3030,90 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- if gt (len $quotaReports) 0 -}}
   {{- fail (printf "%s\n\nor bypass this check with --set quotaPreflight.enabled=false" (join "\n\n" $quotaReports)) -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+Footprint summary: what the release asks of the cluster, and a modeled monthly cost.
+
+kube-agents.footprintSummary prints the totals kube-agents.quotaRequirements returns (the
+requests, as the preflight sums them) with a monthly cost modeled from us-central1 GKE
+Autopilot list prices. NOTES.txt prints it on every install and upgrade that leaves
+quotaPreflight.enabled on (a dry run included; `helm template` renders no notes), with no
+quota gate: the preflight sums only when lookup finds a ResourceQuota, this sums on every
+render, so the refusals inside quotaRequirements reach a quota-less namespace and `helm
+template` through it (the doc block above quotaRequirements says which), and
+install.sh's pre-flight summary renders the same template through a throwaway chart holding
+this file and a one-line probe (print_footprint_summary in
+scripts/installer/installer_common.sh), passing --api-versions for the Autopilot resource
+kube-agents.gkeAutopilot probes unless its tfvars say a Standard cluster, so the installer
+prints the figures the notes carry (its Terraform apply shows no notes; `helm get notes`
+does, after the apply). The
+rates below are pinned list prices rather than a lookup, and they are applied to the declared
+requests, so the figure is a model: it excludes model tokens, Autopilot's per-Pod minimums and
+request rounding, ephemeral-storage requests, node-level overheads and anything outside the
+release; on a Standard cluster the bill is the node pools, which pod requests do not price. The
+per-cluster GKE fee is given on its own line because it is not per release. The text is
+display-only; nothing decides on it. tests/test_footprint_summary.py pins the figures against
+the formula.
+*/}}
+{{- define "kube-agents.footprintPriceRegion" -}}
+us-central1
+{{- end }}
+
+{{- /* GKE Autopilot general-purpose list prices in that region: per vCPU-hour, per GiB-hour of
+       memory, and per GiB-month of balanced persistent disk (pd-balanced, GKE's default
+       StorageClass; SSD-backed, but not the pd-ssd class, which costs more). */ -}}
+{{- define "kube-agents.footprintPriceCpuPerVcpuHour" -}}
+0.0445
+{{- end }}
+
+{{- define "kube-agents.footprintPriceMemoryPerGiBHour" -}}
+0.0049225
+{{- end }}
+
+{{- define "kube-agents.footprintPriceBalancedDiskPerGiBMonth" -}}
+0.10
+{{- end }}
+
+{{- /* The hours Google bills a month at, so the hourly rates become a monthly figure. */ -}}
+{{- define "kube-agents.footprintHoursPerMonth" -}}
+730
+{{- end }}
+
+{{- /* The GKE cluster management fee, per cluster and per month. */ -}}
+{{- define "kube-agents.footprintClusterFeePerMonth" -}}
+73
+{{- end }}
+
+{{- define "kube-agents.footprintSummary" -}}
+{{- $r := include "kube-agents.quotaRequirements" . | fromJson -}}
+{{- $bytesPerGiB := 1073741824.0 -}}
+{{- $millisPerCore := 1000.0 -}}
+{{- $cores := divf (float64 $r.requestsCpu) $millisPerCore -}}
+{{- $memoryGiB := divf (float64 $r.requestsMemory) $bytesPerGiB -}}
+{{- $diskGiB := divf (float64 $r.requestsStorage) $bytesPerGiB -}}
+{{- $cpuRate := include "kube-agents.footprintPriceCpuPerVcpuHour" . | float64 -}}
+{{- $memoryRate := include "kube-agents.footprintPriceMemoryPerGiBHour" . | float64 -}}
+{{- $diskRate := include "kube-agents.footprintPriceBalancedDiskPerGiBMonth" . | float64 -}}
+{{- $hours := include "kube-agents.footprintHoursPerMonth" . | float64 -}}
+{{- $clusterFee := include "kube-agents.footprintClusterFeePerMonth" . | float64 -}}
+{{- $cpuCost := mulf $cores $cpuRate $hours -}}
+{{- $memoryCost := mulf $memoryGiB $memoryRate $hours -}}
+{{- $diskCost := mulf $diskGiB $diskRate -}}
+{{- $total := addf $cpuCost $memoryCost $diskCost -}}
+Release footprint (pod requests, as the quota preflight sums them):
+  CPU requests:        {{ printf "%.3f" $cores }} cores
+  Memory requests:     {{ printf "%.2f" $memoryGiB }} GiB
+  Pods:                {{ int64 $r.pods }}
+  Persistent storage:  {{ printf "%.0f" $diskGiB }} GiB over {{ int64 $r.persistentVolumeClaims }} claims (balanced persistent disk on GKE's default StorageClass)
+Modeled monthly cost on GKE Autopilot (modeled from {{ include "kube-agents.footprintPriceRegion" . }} list prices, excluding LLM tokens):
+  CPU:      {{ printf "%.3f" $cores }} cores x ${{ include "kube-agents.footprintPriceCpuPerVcpuHour" . }}/vCPU-hour x {{ include "kube-agents.footprintHoursPerMonth" . }} hours = ${{ printf "%.2f" $cpuCost }}
+  Memory:   {{ printf "%.2f" $memoryGiB }} GiB x ${{ include "kube-agents.footprintPriceMemoryPerGiBHour" . }}/GiB-hour x {{ include "kube-agents.footprintHoursPerMonth" . }} hours = ${{ printf "%.2f" $memoryCost }}
+  Disk:     {{ printf "%.0f" $diskGiB }} GiB x ${{ include "kube-agents.footprintPriceBalancedDiskPerGiBMonth" . }}/GiB-month = ${{ printf "%.2f" $diskCost }}
+  Total:    ${{ printf "%.2f" $total }}/month, plus the ${{ printf "%.2f" $clusterFee }}/month GKE cluster fee (per cluster, noted separately)
+{{- if eq (toString .Values.platformAgent.mode) "next" }}
+  Not counted: the session pods (one per delegation or /session conversation, up to maxSessions at once); the install prerequisites page sizes them. The spec.mode next workloads, the NATS bus and its 40 GiB JetStream claim among them, are in the figures above.
+{{- end }}
 {{- end }}
 
 {{- define "kube-agents.quotaPreflight" -}}

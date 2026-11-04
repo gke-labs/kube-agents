@@ -10,17 +10,22 @@ admitted count, read from `GET /v1/exec/admission`, rather than a constant.
 
 The count differs by install. At the operator's default 2Gi limit the budget
 fits 9 and the slot cap of 8 binds. On GKE Autopilot without bursting the limit
-is the 1Gi memory request, and the budget fits 4. Only the broker sees the
-effective limit, so only the broker can say.
+is the memory request, 2Gi by default, so the same holds; an override with a
+smaller request fits fewer. Only the broker sees the effective limit, so only
+the broker can say.
 
-`sweep_width` leaves the session role's cap free (two by default; the broker
-reports it) when the broker admits six or more, so a sweep doesn't take every
-slot a live chat read would queue behind, and
-otherwise reads at most four wide, today's width. The headroom never takes the
-width below four either, so no install sweeps slower than it did. This doesn't coordinate sweeps that run at the same time: each
-sizes its own pool, and the broker admits in arrival order, so live reads still
-queue behind all of them. Putting live reads first takes priority admission in
-the broker, which is separate work.
+A sweep's checks are interactive work at the broker, like the shell's own
+commands and the session pods' reads, and interactive work may hold at most
+the broker's interactive cap (`admitted − 1`; credential-broker-exec-tier.md
+§4.2), which the broker reports as `interactive_cap`. `sweep_width` sizes
+inside that cap: it leaves the session role's cap free (two by default; the
+broker reports it) when the broker admits seven or more, so a sweep doesn't
+take every admission a live chat read would wait for (at six the floor of four
+leaves one), and otherwise reads at most four wide, or the interactive cap where
+that is lower. The headroom never takes the width below four, so only a pod
+whose interactive cap is under four sweeps narrower than four. This doesn't coordinate sweeps that
+run at the same time: each sizes its own pool, and they share the interactive
+cap with the live reads.
 
 A broker that predates the route, or any failure to read it, gives today's
 width of four.
@@ -45,7 +50,7 @@ FALLBACK_WIDTH = 4
 # used when the report doesn't carry one.
 CHAT_HEADROOM = 2
 # The admitted count at or above which the headroom is taken; below it the
-# width stays at most FALLBACK_WIDTH, so no install sweeps slower than before.
+# width stays at most FALLBACK_WIDTH, or the interactive cap where that is lower.
 HEADROOM_FROM = 6
 # The admission read's socket timeout: urllib applies it to the connect and to
 # each blocking read, not to the exchange as a whole. The broker client's own
@@ -62,14 +67,17 @@ _OPENER = urllib.request.build_opener(credential_proxy_client._NoRedirect())
 _cached_width: int | None = None
 
 
-def width_for(admitted: int, headroom: int = CHAT_HEADROOM) -> int:
-    """The sweep width for a broker that admits ``admitted`` commands at once
+def width_for(admitted: int, headroom: int = CHAT_HEADROOM, interactive_cap: int | None = None) -> int:
+    """The sweep width for a broker that admits ``admitted`` commands at once,
+    lets interactive work hold ``interactive_cap`` of them (None: a broker that
+    predates the field, where the sweep sizes against ``admitted`` as before),
     and keeps ``headroom`` for a chat session's reads."""
-    floor = max(1, min(FALLBACK_WIDTH, admitted))
+    ceiling = admitted if interactive_cap is None else min(admitted, interactive_cap)
+    floor = max(1, min(FALLBACK_WIDTH, ceiling))
     if admitted >= HEADROOM_FROM:
         # Never below today's width, however large a session cap the broker
         # reports: the headroom only takes from what this change added.
-        return max(floor, admitted - headroom)
+        return max(floor, ceiling - headroom)
     return floor
 
 
@@ -79,9 +87,10 @@ def _positive_int(value: object) -> int | None:
     return value
 
 
-def read_report(endpoint: str | None = None) -> tuple[int, int] | None:
-    """The broker's admitted count and session cap, or None when they can't be
-    read. A report without a usable session cap gives CHAT_HEADROOM."""
+def read_report(endpoint: str | None = None) -> tuple[int, int, int | None] | None:
+    """The broker's admitted count, session cap and interactive cap, or None
+    when they can't be read. A report without a usable session cap gives
+    CHAT_HEADROOM; one without a usable interactive cap gives None."""
     endpoint = (endpoint if endpoint is not None else os.environ.get("CREDENTIAL_PROXY_URL", "")).strip()
     if not endpoint:
         return None
@@ -108,7 +117,11 @@ def read_report(endpoint: str | None = None) -> tuple[int, int] | None:
     admitted = _positive_int(report.get("admitted"))
     if admitted is None:
         return None
-    return admitted, _positive_int(report.get("session_cap")) or CHAT_HEADROOM
+    return (
+        admitted,
+        _positive_int(report.get("session_cap")) or CHAT_HEADROOM,
+        _positive_int(report.get("interactive_cap")),
+    )
 
 
 def sweep_width() -> int:
