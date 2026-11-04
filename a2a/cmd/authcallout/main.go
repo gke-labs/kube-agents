@@ -93,6 +93,17 @@ const (
 	// grantTTLJitter, one layer down.
 	reconnectJitter    = 500 * time.Millisecond
 	reconnectJitterTLS = 2 * time.Second
+
+	// tokenReviewQPS and tokenReviewBurst are the client-go rate limit the
+	// TokenReview client runs under, raised from client-go's defaults of 5
+	// and 10. The callout decides calloutWorkers (authcallout) connections
+	// at once per replica, each one a TokenReview, and a fleet reconnecting
+	// together arrives as a burst; at the defaults the limiter itself
+	// queued requests past the server's first-ping timer (#4332). Fifty a
+	// second is well under what one API server sustains on this endpoint,
+	// and a hundred absorbs one reconnecting fleet's burst.
+	tokenReviewQPS   = 50
+	tokenReviewBurst = 100
 )
 
 func main() {
@@ -194,7 +205,7 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("in-cluster config: %w", err)
 	}
-	clientset, err := kubernetes.NewForConfig(restCfg)
+	clientset, err := kubernetes.NewForConfig(withTokenReviewLimits(restCfg))
 	if err != nil {
 		return fmt.Errorf("building the Kubernetes client: %w", err)
 	}
@@ -317,6 +328,15 @@ func run(log *slog.Logger) error {
 		return errors.New("the bus connection ended and will not recover in this process; " +
 			"restarting to re-read the callout credential")
 	}
+}
+
+// withTokenReviewLimits sets the client-go rate limit the TokenReview client
+// runs under; see tokenReviewQPS. The same client serves the identity-map
+// informer, whose traffic is a watch and does not count against it.
+func withTokenReviewLimits(cfg *rest.Config) *rest.Config {
+	cfg.QPS = tokenReviewQPS
+	cfg.Burst = tokenReviewBurst
+	return cfg
 }
 
 // connectToBus dials as the callout's own statically-authenticated user. It

@@ -68,7 +68,10 @@ On losing the lease, or on SIGTERM, it stops in this order:
    only after it renders, which the relay ack-after-render change (#4183) put on `main`.
 4. **The loops:** reap and sweep stop.
 
-Then it releases the lease.
+Then it releases the lease, if a fresh read still names it as the holder. A gateway whose term
+followed a crash and is ending inside the relay's AckWait leaves the lease to expire instead: the
+dead holder's events may still be pending, and a lease that still names a holder makes the next
+leader hold its relay too.
 
 ### Handover
 
@@ -136,6 +139,20 @@ paused before writing. The counter and the record are separate keys, and nothing
 atomic. A write that slips through that gap lands on a record the new leader hasn't written
 yet. The new leader's own next write to that record is conditional on its revision, so it
 re-reads the record and carries on from what the deposed leader left.
+
+The task index widens that gap a little. A task-index write is fenced by its session record's term,
+but the index is a third key, so the write isn't conditional on the record's revision: a deposed
+index write can land even after the new leader has written the session record. And the counter
+itself can be broken by hand. Deleted, or set below the terms the records carry, it would let terms
+restart beneath them, so the gateway refuses to start a term over a deleted counter and refuses
+every write to a record whose term is above its own, naming the counter in both errors. Either needs
+a hand fix: the counter set to at least the highest term a record carries.
+
+A write the fence refuses means a newer term has started, so the gateway steps down there, as it
+does on a lost lease, without waiting to see the lease move. The exceptions are a write refused by
+a record above a counter reset by hand, and one whose counter can't be read again to tell a reset
+from a new term: no newer term is known to exist there, and stepping down would only hand the same
+refusal to the next replica.
 
 The election's identity is the pod name. client-go lets a process whose identity matches the
 current holder renew without waiting, so a container restarting in its own pod re-takes the lease
@@ -301,7 +318,11 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    `realMain`'s work gated on the lease; the step-down order and budget above, with the relay's
    drain bounded at 5s on the lost-lease path; the relay's delayed
    bind after any start that follows a crash, a takeover from an expired lease or a same-pod
-   restart; release on SIGTERM. Tests on an embedded server
+   restart; release on SIGTERM; and stepping down on a write the fence refuses. A replica that
+   stops leading exits, and its restarted container waits as a standby. The election runs only
+   when the gateway is given its Lease (`A2A_GATEWAY_LEASE`, with `POD_NAME` as the identity),
+   which step 4 renders with the Role; without it the gateway runs unelected at term 0, as
+   before. Tests on an embedded server
    with two gateways: one acts, the other doesn't; the lease moves and the work follows; a crash
    takeover renders the dead leader's held events before newer ones.
    Rolling back from this step needs nothing: a gateway without the election writes at term 0,

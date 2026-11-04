@@ -2420,6 +2420,35 @@ kms_key_enabled_version() {
       --filter='state=ENABLED' --format='value(name.basename())' 2>/dev/null || true; } | head -1
 }
 
+# The basename of the first DESTROY_SCHEDULED version of a Cloud KMS key, or
+# nothing: what any destroy of the key leaves (a raw `terraform destroy`, or an
+# apply with enable_github_minter = false), and what a restore can still undo
+# until the destruction time. Every failure reads as "none".
+kms_key_scheduled_version() {
+  local key="$1" keyring="$2" location="$3" project="$4"
+  { gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+      --location "$location" --project "$project" \
+      --filter='state=DESTROY_SCHEDULED' --format='value(name.basename())' 2>/dev/null || true; } | head -1
+}
+
+# For a minter key with no ENABLED version: when its versions are scheduled for
+# destruction, prints how to restore them and returns 0; otherwise prints
+# nothing and returns 1, so the caller's import advice stands. The advice is
+# gcloud's restore and enable, which work whether or not the key is in
+# Terraform state: the next apply's adopt_kms imports a key that is out of it.
+# A lifecycle.sh adopt-kms run would need this install's checkout and state
+# backend, which install.sh and upgrade.sh do not have in hand at this point.
+print_minter_restore_advice() {
+  local key="$1" keyring="$2" location="$3" project="$4"
+  [ -n "$(kms_key_scheduled_version "$key" "$keyring" "$location" "$project")" ] || return 1
+  print_info "Its versions are scheduled for destruction, as a destroy of the key leaves them."
+  print_info "Restore them rather than re-importing the key; a restore works only until their destruction time."
+  print_info "Restore and enable each version with gcloud, then re-run:"
+  print_info "  gcloud kms keys versions restore <version> --key $key --keyring $keyring --location $location --project $project"
+  print_info "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
+  return 0
+}
+
 # ─── terraform.tfvars Generation ──────────────────────────────────────────────
 # HCL string literal with backslashes and double quotes escaped.
 hcl_str() {
@@ -5020,7 +5049,9 @@ write_tfvars_from_state() {
       enable_github_minter="true"
     else
       print_warning "GitHub minter deferred: its KMS signing key has no ENABLED version, no App private key PEM is at hand (GITHUB_PEM_PATH), and a minter deployed without the key never passes readiness."
-      print_info "Provide the PEM via --github-pem-path (or pre-import the key into Cloud KMS: https://github.com/abcxyz/github-token-minter) and re-run — the next run adds the minter to the existing install."
+      print_minter_restore_advice "${KMS_KEY:-$DEFAULT_KMS_KEY}" "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" \
+        "$(derive_kms_location "${REGION}")" "${PROJECT_ID}" ||
+        print_info "Provide the PEM via --github-pem-path (or pre-import the key into Cloud KMS: https://github.com/abcxyz/github-token-minter) and re-run — the next run adds the minter to the existing install."
     fi
   fi
 
@@ -5181,6 +5212,14 @@ write_tfvars_from_state() {
   local vertex_manage_serving_project="${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
   if ! is_bool_spelling "$vertex_manage_serving_project"; then
     print_error "VERTEX_MANAGE_SERVING_PROJECT='${vertex_manage_serving_project}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
+  # The same again: read as off, a misspelt value leaves the release's
+  # upgrade_install off, and the apply it was set to rescue fails with the
+  # "cannot re-use a name" it was set to prevent, naming nothing (#4108).
+  local helm_upgrade_install="${HELM_UPGRADE_INSTALL:-$DEFAULT_HELM_UPGRADE_INSTALL}"
+  if ! is_bool_spelling "$helm_upgrade_install"; then
+    print_error "HELM_UPGRADE_INSTALL='${helm_upgrade_install}' is neither true nor false. Fix it in install.env."
     return 1
   fi
   # The mode, for the MODEL_MAX_TOKENS reason: upgrade.sh and the Day-2 menu
@@ -5432,6 +5471,10 @@ write_tfvars_from_state() {
     fi
     echo ""
     echo "enable_gke_backup_plan = $(hcl_bool "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}")"
+    echo ""
+    # Read from install.env (or the environment) only: no flag or interview
+    # question sets it, so install.sh exports nothing over it. See the variable.
+    echo "helm_upgrade_install = $(hcl_bool "$helm_upgrade_install")"
     echo ""
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."

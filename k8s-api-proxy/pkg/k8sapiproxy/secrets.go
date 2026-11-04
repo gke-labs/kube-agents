@@ -130,12 +130,15 @@ func rewriteSecretRequest(h http.Header, info *request.RequestInfo) *secretRedac
 // 502 Status, or on a watch ends the stream with an ERROR event: a body that is not JSON, an
 // encoding other than gzip, an object of an unexpected kind, or a body over
 // maxSecretResponseBytes. It passes the cause of each such refusal to onRefuse, which on a watch
-// runs when the stream ends.
-func redactSecretResponse(resp *http.Response, plan *secretRedaction, onRefuse func(error)) {
+// runs when the stream ends. It reports whether it redacted resp rather than replacing it; a
+// watch that ends with an ERROR event later still counts as redacted.
+func redactSecretResponse(resp *http.Response, plan *secretRedaction, onRefuse func(error)) bool {
 	if err := redactSecretBody(resp, plan, onRefuse); err != nil {
 		onRefuse(err)
 		replaceWithStatus(resp, err)
+		return false
 	}
+	return true
 }
 
 func redactSecretBody(resp *http.Response, plan *secretRedaction, onRefuse func(error)) error {

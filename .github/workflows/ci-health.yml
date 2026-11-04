@@ -29,8 +29,10 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #   A. Collect runs as github-actions@kube-agents-prow. It is the only
 #      account with a read grant on gs://kube-agents-prow (the OSS Prow
 #      project's bucket; the grant cannot be copied from here). It reads the
-#      archive, the nightly's own bucket gs://kube-agents-evals-nightly-logs
-#      and the watched periodics' gs://kube-agents-periodic-logs (both
+#      archive there, the smoke lanes' own bucket
+#      gs://kube-agents-evals-presubmit-logs, the nightly's own bucket
+#      gs://kube-agents-evals-nightly-logs and the watched periodics'
+#      gs://kube-agents-periodic-logs (all three
 #      kube-agents-owned; it holds objectViewer on each, and whichever
 #      account replaces it needs the same), the eval evidence store
 #      gs://kube-agents-evals-bench (objectViewer, for the Trend page;
@@ -215,12 +217,18 @@ env:
   # stops the step before collect.py runs), and the freshness-badge
   # threshold written into data.json (this job's 15m cadence with slack for
   # ~2 missed ticks).
-  PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
+  PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
+  # The archive the lane wrote before it moved buckets (2026-11), read
+  # alongside until its runs leave the SINCE_DAYS window; empty or delete it
+  # then (the collect step passes it only when it is set).
+  PR_GLOB_PREVIOUS: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
   # The GitLab lane (kube-agents#2394): the forge-grading cases of the
   # catalogue against a pool project's GitLab repository, collected
   # as tier gitlab with a watermark
   # of its own and shown in the Brief's "GitLab lane" section only.
-  GITLAB_PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*
+  GITLAB_PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*
+  # Its archive before the move, read alongside for the same window.
+  GITLAB_PR_GLOB_PREVIOUS: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*
   NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/
   # The nightly's writers periodic, a job of a night split across jobs, in
   # the same bucket. Until it has run the prefix holds no objects,
@@ -362,12 +370,19 @@ jobs:
           # attempt (header). Seed once by hand and the next tick is
           # incremental.
           if ! gcloud storage cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
-            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
+            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-evals-presubmit-logs, gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
             exit 1
           fi
+          # The old archives ride only while their knobs are set, as in
+          # hack/ci-dashboard-refresh.sh: an empty glob would be a listing
+          # that fails, and the refusal below.
+          previous=()
+          [ -n "$PR_GLOB_PREVIOUS" ] && previous+=(--pr-glob "$PR_GLOB_PREVIOUS")
+          [ -n "$GITLAB_PR_GLOB_PREVIOUS" ] && previous+=(--gitlab-pr-glob "$GITLAB_PR_GLOB_PREVIOUS")
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
             --pr-glob "$PR_GLOB" \
             --gitlab-pr-glob "$GITLAB_PR_GLOB" \
+            "${previous[@]}" \
             --nightly-prefix "$NIGHTLY_PREFIX" \
             --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
             --nightly-main-b-prefix "$NIGHTLY_MAIN_B_PREFIX" \

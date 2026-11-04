@@ -134,7 +134,7 @@ def test_settle_records_the_commands_before_purging(monkeypatch):
 
     def fake_shell(script, timeout):
         calls.append(script)
-        return _LOG if "head -c" in script and ".log" in script else ""  # rm -rf script gets ""
+        return _LOG if "head -c" in script and ".log" in script else ""  # the purge gets ""
 
     monkeypatch.setattr(harness, "_agent_shell", fake_shell)
     result = AgentResult(output="answer", trajectory=[])
@@ -143,7 +143,7 @@ def test_settle_records_the_commands_before_purging(monkeypatch):
     rows = result.metadata["worker_commands"]
     assert [r["command"] for r in rows][0].endswith("vcs.py clone acme/infra")
     # The purge is the last agent-pod call, after the log was read.
-    assert "rm -rf" in calls[-1]
+    assert harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in calls[-1]
 
 
 def test_a_stalled_card_is_archived_after_its_transcript_is_read_and_before_the_purge(
@@ -169,7 +169,7 @@ def test_a_stalled_card_is_archived_after_its_transcript_is_read_and_before_the_
     assert "'t_2'" in calls[archive[0]] and "'t_1'" not in calls[archive[0]]
     read = next(i for i, s in enumerate(calls) if "head -c" in s)
     assert read < archive[0] < len(calls) - 1
-    assert "rm -rf" in calls[-1]
+    assert harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in calls[-1]
     assert "archived stalled card t_2" in caplog.text
     assert "could not archive" not in caplog.text
 

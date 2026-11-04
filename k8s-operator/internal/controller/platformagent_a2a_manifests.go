@@ -115,6 +115,7 @@ const (
 	a2aRuntimeStateBucket  = "runtime-state"
 	a2aSessionStateBucket  = "session-state"
 	a2aFeedbackBucket      = "feedback"
+	a2aPeopleBucket        = "people"
 	a2aKVStreamPrefix      = "KV_"
 
 	// a2aProfileSubmitStream holds the profiles' submissions, every subject
@@ -592,6 +593,9 @@ const (
 	// slack.answerFeedback=false, carried to the gateway (a2a/gateway's
 	// envSlackAnswerFeedback): no rating buttons, nothing kept.
 	a2aSlackAnswerFeedbackEnvVar = "A2A_SLACK_ANSWER_FEEDBACK"
+	// telemetry.peopleSeen=false, carried to the gateway (a2a/gateway's
+	// envPeopleSeen): no per-person key, the people bucket purged at start.
+	a2aPeopleSeenEnvVar = "A2A_PEOPLE_SEEN"
 	// The shortest Slack channel id a2aSlackHomeChannel takes: the prefix
 	// letter and at least two characters after it, as the gateway checks.
 	a2aSlackMinChannelIDLen = 3
@@ -1415,6 +1419,30 @@ func legacySlackConsumer(agent *agentv1alpha1.PlatformAgent) bool {
 	return slackEnabled(agent) && !a2aSlackArmed(agent)
 }
 
+// teamsEnabled is the enabled test for Teams, which only Hermes serves: the
+// A2A gateway has no Teams backend, so an enabled Teams is always on Hermes.
+func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Integration == nil {
+		return false
+	}
+	teams := agent.Spec.Integration.Teams
+	return teams != nil && teams.Enabled != nil && *teams.Enabled
+}
+
+// peopleReadingEnabled reports whether the usage poller reads the A2A
+// gateway's people reading for the install: only while the install renders
+// the A2A stack (a2aStackRendering, the gate the gateway Deployment renders
+// under), since an install with no gateway has nothing to read, and only
+// while no chat platform it enables is served through Hermes, since the
+// gateway counts only the people who write through it, and a count beside a
+// Hermes-served platform would say nobody wrote while that platform's users
+// were writing. The legacy Chat term is already implied by the render gate
+// today (a next install arms Chat on the A2A door, never on its legacy
+// consumer); it stays so the function states the design's rule in full.
+func peopleReadingEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	return a2aStackRendering(agent) && !legacyChatConsumer(agent) && !legacySlackConsumer(agent) && !teamsEnabled(agent)
+}
+
 // slackEnabled is the enabled test the Slack render sites make, in one place.
 // The status interfaces list still spells it inline, as it does Chat's.
 func slackEnabled(agent *agentv1alpha1.PlatformAgent) bool {
@@ -1630,10 +1658,10 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 // than as seed, and provisionIdentity enumerates the same objects for itself
 // rather than from this slice. So the refusal the pair describes is provision's
 // to hit now; seed keeps the scoped grant because the hand-applied seed tooling
-// still connects with it. Nothing yet binds that third spelling to this list.
+// still connects with it. The same test holds that third spelling to this list.
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
-	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback",
+	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people",
 	"KV_PROFILE_LEASES", "PROFILE_SUBMITS",
 }
 
@@ -1899,6 +1927,13 @@ func a2aAgentJetStreamGrants() []string {
 //     reads, and the watcher's CONSUMER.CREATE and CONSUMER.DELETE for the
 //     export's key list. Put and Delete are publishes on $KV.feedback.>.
 //
+//   - KV_people, one hashed key per chat person (a2a/gateway/people.go): the
+//     same four verbs -- STREAM.INFO to bind it and read its max age at
+//     start, DIRECT.GET held to match feedback's grant set (the desk reads
+//     through its watch, not by key), and the watcher's CONSUMER.CREATE and
+//     CONSUMER.DELETE for the desk's watch and the purge's key list. Put and
+//     Delete are publishes on $KV.people.>.
+//
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
 // --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
@@ -1980,6 +2015,7 @@ func a2aAgentJetStreamGrants() []string {
 func a2aGatewayJetStreamGrants() []string {
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
 	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
+	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
@@ -1993,6 +2029,10 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + kvFeedback + ".>",
 		"$JS.API.CONSUMER.CREATE." + kvFeedback + ".>",
 		"$JS.API.CONSUMER.DELETE." + kvFeedback + ".*",
+		"$JS.API.STREAM.INFO." + kvPeople,
+		"$JS.API.DIRECT.GET." + kvPeople + ".>",
+		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>",
+		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*",
 	}
 }
 
@@ -2825,7 +2865,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 	}}
 }
 
-// a2aProvisionScript is the provisioning payload: the five streams, five KV
+// a2aProvisionScript is the provisioning payload: the five streams, six KV
 // buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
@@ -3136,6 +3176,14 @@ $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --re
 # at their caps (ask, answer and note, about 22KB) and more at a typical
 # size; past it the write is refused, and the rating is counted but not kept.
 $NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas=1 --storage=file --max-bucket-size=67108864 --ttl=720h
+
+# people: one hashed key and a last-put time per chat person the gateway has
+# seen (a2a/gateway/people.go). The max age is the retention: NATS deletes a
+# person 30 days after their last turn, and the gateway counts nobody in a
+# bucket without one. Only the gateway's user reads or writes its records
+# (provision and seed can list its keys). 32MiB holds about a hundred thousand
+# entries; past it the put is refused, and the count under-counts.
+$NATS kv info people        >/dev/null 2>&1 || $NATS kv add people --history=1 --replicas=1 --storage=file --max-bucket-size=33554432 --ttl=720h
 # PROFILE_LEASES: each profile task's liveness lease, written only by the
 # dispatcher (lib.ProfileLeaseBucket; contract on #3655). No TTL: the
 # dispatcher reads expiry from each record, so a restarted one can still read
@@ -3739,10 +3787,10 @@ const defaultA2AMaxSessions = 10
 // and the scope publisher's, one at a time and only while it runs, since a
 // finished pod counts against no quota), rollout surge doubling a
 // Deployment for a moment, and the gateway's count-then-create overshoot. Fifteen covered roughly ten standing pods plus
-// surge; the console server made it eleven, hence sixteen. If the base
-// install grows again, raise this before anything user-visible starts failing
-// admission.
-const a2aQuotaHeadroom = 16
+// surge; the console server made it eleven, hence sixteen, and the
+// kube-proxy's second replica seventeen. If the base install grows again,
+// raise this before anything user-visible starts failing admission.
+const a2aQuotaHeadroom = 17
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
@@ -4948,6 +4996,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}}},
 	}
 	env = append(env, backendEnv...)
+	// The people record is on unless the install turns it off, whatever
+	// backend is armed; only the off is rendered, so an install that never
+	// set the field keeps the gateway's env, and its pod, as they were.
+	if agent.Spec.Telemetry != nil && agent.Spec.Telemetry.PeopleSeen != nil && !*agent.Spec.Telemetry.PeopleSeen {
+		env = append(env, corev1.EnvVar{Name: a2aPeopleSeenEnvVar, Value: strconv.FormatBool(false)})
+	}
 	env = append(env, []corev1.EnvVar{
 		// Always on (see a2aConsoleDoorEnvVar): the gateway starts
 		// on the console door when the install configures no chat

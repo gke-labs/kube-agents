@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/nats-io/nkeys"
+	"k8s.io/client-go/rest"
 )
 
 // setRequiredEnv sets every variable run reads before the reserved principal
@@ -113,5 +114,15 @@ func TestTheCalloutRefusesToStartWithoutAShardCount(t *testing.T) {
 				t.Fatalf("run() = %v, want a refusal naming %s", err, envAuthMapShards)
 			}
 		})
+	}
+}
+
+// The TokenReview client runs under the raised rate limit, not client-go's
+// 5 QPS / 10 burst defaults: at those a replica deciding sixteen connections
+// at once is throttled by its own client before the API server is asked.
+func TestTheTokenReviewClientRunsUnderTheRaisedRateLimit(t *testing.T) {
+	cfg := withTokenReviewLimits(&rest.Config{})
+	if cfg.QPS != 50 || cfg.Burst != 100 {
+		t.Fatalf("TokenReview client limits = %v QPS / %d burst, want 50 / 100", cfg.QPS, cfg.Burst)
 	}
 }

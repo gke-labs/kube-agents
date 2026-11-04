@@ -3033,6 +3033,28 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("enable_github_minter = true", dest.read_text())
 
+    def test_minter_deferred_names_the_restore_for_scheduled_versions(self):
+        # A key whose versions a destroy scheduled: the generator still defers,
+        # but names the restore instead of asking for the PEM again.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            env = {
+                "API_SERVER_KEY": "k",
+                "GITOPS_ORG": "org",
+                "GITOPS_REPO": "repo",
+                "GITHUB_APP_ID": "42",
+            }
+            proc = self._run(
+                'print_info() { echo "INFO: $*"; }; print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"', env=env, kms_versions="",
+                gcloud_extra_cases="  *\"state=DESTROY_SCHEDULED\"*) printf '2'; exit 0 ;;\n",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("enable_github_minter = false", dest.read_text())
+            out = proc.stdout + proc.stderr
+            self.assertIn("Its versions are scheduled for destruction", out)
+            self.assertNotIn("Provide the PEM via --github-pem-path", out)
+
     def test_tfvars_recovery_refuses_a_foreign_kube_context(self):
         # A stale context pointing at some other install must not donate that
         # environment's credentials: recovery skips, and the generator fails
@@ -3097,6 +3119,83 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn("enable_pubsub_platform       = true", content)
             self.assertIn("enable_stockout_investigator = true", content)
+
+    def test_tfvars_generation_includes_helm_upgrade_install(self):
+        """HELM_UPGRADE_INSTALL reaches the composition's helm_upgrade_install.
+
+        Off unless install.env (or the environment) says otherwise, because
+        upgrade_install also adopts a release this install's state does not
+        own (#4108). The key has no flag and no interview question, so the
+        generator's own fallback is the only default it has.
+        """
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"',
+                env={"API_SERVER_KEY": "k"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("helm_upgrade_install = false\n", dest.read_text())
+
+            for spelling in ("true", "True", "yes", "1"):
+                with self.subTest(spelling=spelling):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"',
+                        env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": spelling},
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn("helm_upgrade_install = true\n", dest.read_text())
+
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"',
+                env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": "false"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("helm_upgrade_install = false\n", dest.read_text())
+
+    def test_tfvars_refuse_a_helm_upgrade_install_spelling_that_is_neither_true_nor_false(self):
+        # Read as off, a typo leaves upgrade_install off on the environment it
+        # was set to rescue, and the apply fails as before naming nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("ture", "enabled", "t", " "):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"HELM_UPGRADE_INSTALL='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn("is neither true nor false", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a misspelt switch")
+
+    def test_helm_upgrade_install_reaches_the_kube_agents_release(self):
+        """The tfvars key is inert unless main.tf hands it to the release."""
+        composition = _REPO_ROOT / "terraform" / "examples" / "full-install"
+        main_tf = (composition / "main.tf").read_text()
+        release = main_tf.split('resource "helm_release" "kube_agents" {', 1)[1]
+        release = release.split("\n}\n", 1)[0]
+        self.assertIsNotNone(
+            re.search(r"(?m)^  upgrade_install\s*=\s*var\.helm_upgrade_install\s*$", release),
+            "helm_release.kube_agents does not set upgrade_install = var.helm_upgrade_install",
+        )
+        # With upgrade_install on and version unset, the provider's plan reads the
+        # installed release's version from the cluster: a from-nothing install
+        # cannot plan, and a chart version change fails the apply (#4108).
+        self.assertIsNotNone(
+            re.search(
+                r'(?m)^  version\s*=\s*yamldecode\(file\("\$\{path\.module\}/\.\./\.\./\.\./charts/kube-agents/Chart\.yaml"\)\)\.version\s*$',
+                release,
+            ),
+            "helm_release.kube_agents does not pin version to the chart's Chart.yaml version",
+        )
+        variables_tf = (composition / "variables.tf").read_text()
+        block = variables_tf.split('variable "helm_upgrade_install" {', 1)[1].split("\n}\n", 1)[0]
+        self.assertIsNotNone(
+            re.search(r"(?m)^\s*default\s*=\s*false\s*$", block),
+            "helm_upgrade_install must default to false",
+        )
 
     def test_tfvars_carries_namespace_identity_and_cmek_names(self):
         # Every one of these used to be a fixed name the generator never wrote,
@@ -5984,6 +6083,7 @@ _FOOTPRINT_READ_SUBTREES = (
     "operator.resources", "litellm.resources", "githubMinter.resources", "webConsole.resources",
     "hindsight.api.resources", "hindsight.postgresql.resources",
     "platformAgent.deployment.credentialProxy.resources",
+    "platformAgent.deployment.kubeProxy.resources",
     "platformAgent.deployment.agentAPIAuth.resources",
     "platformAgent.harness.experimental.shellSandbox.resources",
 )
@@ -6341,24 +6441,26 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
-        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console:
-        # the settings the tfvars carry reached the render.
-        self.assertIn("Persistent storage:  410 GiB over 5 claims", proc.stdout)
-        self.assertIn("Pods:                12", proc.stdout)
+        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console,
+        # and, since the tfvars say next, the NATS bus's 40Gi JetStream claim and the
+        # next-mode pods the preflight now sums: the settings the tfvars carry reached
+        # the render.
+        self.assertIn("Persistent storage:  450 GiB over 6 claims", proc.stdout)
+        self.assertIn("Pods:                22", proc.stdout)
         # The tfvars say autopilot, so the credential proxy is counted at the operator's
         # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
         # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
-        self.assertIn("CPU requests:        4.400 cores", proc.stdout)
-        self.assertIn("Memory requests:     10.59 GiB", proc.stdout)
+        self.assertIn("CPU requests:        5.300 cores", proc.stdout)
+        self.assertIn("Memory requests:     12.28 GiB", proc.stdout)
         standard = self._run(
             f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
             tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
         )
         self.assertIn("rc=0", standard.stdout, standard.stderr)
-        self.assertIn("CPU requests:        2.900 cores", standard.stdout)
-        self.assertIn("Memory requests:     9.59 GiB", standard.stdout)
+        self.assertIn("CPU requests:        3.800 cores", standard.stdout)
+        self.assertIn("Memory requests:     11.28 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
-        self.assertIn("Not counted: the spec.mode next workloads", proc.stdout)
+        self.assertIn("Not counted: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
         # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
         with tempfile.TemporaryDirectory() as tmp:

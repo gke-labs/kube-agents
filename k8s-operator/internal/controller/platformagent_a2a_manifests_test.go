@@ -26,6 +26,7 @@ import (
 	"net"
 	"path"
 	"reflect"
+	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"slices"
@@ -304,7 +305,7 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	}
 }
 
-// The provisioning payload: five streams, five KV buckets, four starter
+// The provisioning payload: five streams, six KV buckets, four starter
 // topics, the deployment spec's retention numbers verbatim.
 func TestBuildA2AProvisionJob(t *testing.T) {
 	agent := a2aTestAgent()
@@ -340,6 +341,8 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		"runtime-state", "session-state", "--max-bucket-size",
 		// feedback: user content, so a max age is its retention
 		"kv add feedback", "--ttl=720h",
+		// people: one hashed key per chat person, so a max age is its retention
+		"kv add people", "--ttl=720h",
 		// Every stream/kv call is a $JS.API request answered on an inbox, and
 		// this principal may only subscribe under _INBOX.provision.> — without
 		// the prefix override every CLI call times out and the Job can never
@@ -1551,15 +1554,15 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	}
 	// Default gateway cap 10 + the fixed headroom for the rest of the
 	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 26 {
-		t.Fatalf("default quota = %d, want 26 (cap 10 + headroom 16)", pods.Value())
+	if pods.Value() != 27 {
+		t.Fatalf("default quota = %d, want 27 (cap 10 + headroom 17)", pods.Value())
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 18 {
-		t.Fatalf("tuned quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
+	if pods.Value() != 19 {
+		t.Fatalf("tuned quota = %d, want 19 (cap 2 + headroom 17)", pods.Value())
 	}
 }
 
@@ -4660,6 +4663,27 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 			}
 		}
 	}
+
+	// The third spelling: provisionIdentity, which the Job authenticates as
+	// since the callout armed, enumerates its CREATE and INFO grants by hand.
+	// Held to the list in both directions, or the Job's create is refused.
+	provisionPublish := provisionIdentity(a2aTestAgent(), a2aTestAgent().Namespace).publish
+	for _, s := range a2aProvisionedStreams {
+		for _, verb := range []string{"CREATE", "INFO"} {
+			want := "$JS.API.STREAM." + verb + "." + s
+			if !slices.Contains(provisionPublish, want) {
+				t.Errorf("provision identity's publish list is missing %q; the Job's %s on %s is refused", want, verb, s)
+			}
+		}
+	}
+	for _, grant := range provisionPublish {
+		for _, verb := range []string{"CREATE", "INFO"} {
+			stream, ok := strings.CutPrefix(grant, "$JS.API.STREAM."+verb+".")
+			if ok && !slices.Contains(a2aProvisionedStreams, stream) {
+				t.Errorf("provision identity holds %q for %q, which a2aProvisionedStreams does not name", grant, stream)
+			}
+		}
+	}
 }
 
 // TestSeedHoldsNoWholesaleJetStreamAPI is a shape check, and only that — it reads
@@ -4858,7 +4882,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// Verbs no bridge path uses, against every stream the provision script
 	// creates. A named grant only widens the stream it names, so a verb
 	// sampled on TASKS says nothing about the same verb on DIRECTORY.
-	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback"}
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people"}
 	forbiddenVerbs := []string{
 		"$JS.API.STREAM.CREATE.",
 		"$JS.API.STREAM.UPDATE.",
@@ -4882,7 +4906,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// consumer, not a direct get. The directory is the identity plane; the
 	// session registry is the gateway's; cap is the capability envelope's;
 	// and the two topic streams are the agent's since A5.
-	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap", "KV_feedback", "TOPICS-STATE", "TOPICS-JOURNAL"} {
+	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap", "KV_feedback", "KV_people", "TOPICS-STATE", "TOPICS-JOURNAL"} {
 		forbidden = append(forbidden,
 			"$JS.API.STREAM.INFO."+s,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
@@ -5007,7 +5031,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 			"$JS.ACK.TASKS.1.2.3",
 		)
 	}
-	for _, s := range []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback"} {
+	for _, s := range []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people"} {
 		forbidden = append(forbidden,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
 			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
@@ -5118,7 +5142,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
+		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
 		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -5129,6 +5153,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.tasks.*.*.supervisor",
 		"$KV.session-state.>",
 		"$KV.feedback.>",
+		"$KV.people.>",
 		"chat.console.*.out",
 		"chat.notify.reply.agent.>",
 		// The mint, and the whole of it: one token under `root`, which is
@@ -5172,7 +5197,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// Verbs no gateway path uses, against every stream the provision script
 	// creates. A named grant only widens the stream it names, so a verb
 	// sampled on TASKS says nothing about the same verb on DIRECTORY.
-	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback"}
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people"}
 	forbiddenVerbs := []string{
 		"$JS.API.STREAM.CREATE.",
 		"$JS.API.STREAM.UPDATE.",
@@ -5244,6 +5269,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// comment rather than added quietly.
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
 	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
+	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
 	allowedShapes := map[string]bool{
 		"$JS.API.STREAM.INFO." + a2aTasksStream:              true,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>":   true,
@@ -5257,6 +5283,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$JS.API.DIRECT.GET." + kvFeedback + ".>":            true,
 		"$JS.API.CONSUMER.CREATE." + kvFeedback + ".>":       true,
 		"$JS.API.CONSUMER.DELETE." + kvFeedback + ".*":       true,
+		"$JS.API.STREAM.INFO." + kvPeople:                    true,
+		"$JS.API.DIRECT.GET." + kvPeople + ".>":              true,
+		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>":         true,
+		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*":         true,
 	}
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !allowedShapes[grant] {
@@ -5318,6 +5348,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		{"feedbackDesk kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aFeedbackBucket + ".$KV." + a2aFeedbackBucket + ".t1.U1"},
 		{"ExportFeedback ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		{"ExportFeedback watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
+		// gateway people count, over the people bucket.
+		{"tryPeople js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aPeopleBucket},
+		{"peopleDesk.follow WatchAll", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
+		{"peopleDesk.follow watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
+		{"purgePeople ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
 		// The ack the relay's explicit-ack durable publishes, granted
 		// beside the API list rather than in it.
 		{"relay msg.Ack", "$JS.ACK." + a2aTasksStream + ".gateway-relay.1.1.1.1.1"},
@@ -5353,7 +5388,7 @@ func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	known := []string{a2aTasksStream}
-	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket} {
+	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket, a2aPeopleBucket} {
 		dataPlane := "$KV." + bucket + ".>"
 		if !slices.Contains(grants, dataPlane) {
 			t.Errorf("the gateway's publish list has no %q; its JetStream grants name bucket %q, so the two no longer describe one bucket",
@@ -5839,6 +5874,8 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 				// The kept answer ratings: the registry's four verbs, for
 				// the same four calls (a2aGatewayJetStreamGrants).
 				a2aKVStreamPrefix + a2aFeedbackBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				// The people count: the same four verbs (a2aGatewayJetStreamGrants).
+				a2aKVStreamPrefix + a2aPeopleBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 				// Minting, and only minting. The grant is
 				// `$KV.cap.root.*` -- the root namespace, one token
 				// deep, so one request id and no reach into the hop
@@ -8148,5 +8185,173 @@ func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
 				t.Errorf("the render asks for %d replicas, want 1", *dep.Spec.Replicas)
 			}
 		})
+	}
+}
+
+// a2aJetStreamCapMargin is the store room the provisioned caps must leave
+// unreserved (#4476). NATS reserves every stream's and bucket's max_bytes against
+// max_file_store when it creates the stream and refuses a create past it, so
+// this is the room a new stream, a raised cap or a recreate has before
+// provisioning starts failing with "insufficient storage".
+const a2aJetStreamCapMargin = int64(2) << 30
+
+// TestProvisionedJetStreamCapsFitTheStore holds the provision script's byte caps,
+// summed, under the server's max_file_store less a2aJetStreamCapMargin, and the
+// store under the bus's claim (#4476). Every create must carry a cap: one without
+// reserves nothing, and then grows into the room every other stream's reservation
+// counted on. Lines the script only prints (an `echo` naming an edit for an
+// operator) are not commands and are skipped; an executed edit that raises a cap
+// re-reserves, so it counts.
+func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
+	agent := a2aTestAgent()
+	// Comment lines go first: bash doesn't continue a comment that ends in `\`, so
+	// joining before dropping them would fold the next command into the comment.
+	// Then one logical line per command line (the creates wrap with `\`), split at
+	// && || ; and | so each create's flags stop at the next command.
+	var kept []string
+	for _, line := range strings.Split(a2aProvisionScript(agent), "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+			kept = append(kept, line)
+		}
+	}
+	script := strings.ReplaceAll(strings.Join(kept, "\n"), "\\\n", " ")
+	separators := regexp.MustCompile(`&&|\|\||;|\|`)
+	var commands []string
+	for _, line := range strings.Split(script, "\n") {
+		commands = append(commands, separators.Split(line, -1)...)
+	}
+
+	// natscli's create spellings, aliases included, and the edits that can raise a cap.
+	// Not `kv create`: that puts a key if it is new, and reserves nothing.
+	creates := regexp.MustCompile(`\b(stream (?:add|create|new)|kv (?:add|new))\s+(\S+)(.*)$`)
+	// Every edit or update, stream or bucket: one this test can't read fails rather
+	// than raising a cap it never sees.
+	edits := regexp.MustCompile(`\b((?:stream|kv) (?:edit|update))\b\s*(\S*)(.*)$`)
+	capOf := func(name, flag, rest string) (int64, bool) {
+		for _, f := range strings.Fields(rest) {
+			if v, ok := strings.CutPrefix(f, flag); ok {
+				n, err := strconv.ParseInt(v, 10, 64)
+				if err != nil || n <= 0 {
+					t.Fatalf("%s: %s%s is not a positive byte count", name, flag, v)
+				}
+				return n, true
+			}
+		}
+		return 0, false
+	}
+	caps := map[string]int64{}
+	created := map[string]bool{}
+	for _, line := range commands {
+		if strings.HasPrefix(strings.TrimSpace(line), "echo ") {
+			continue
+		}
+		if m := creates.FindStringSubmatch(line); m != nil {
+			name, flag := m[2], "--max-bytes="
+			if strings.HasPrefix(m[1], "kv ") {
+				name, flag = "KV_"+name, "--max-bucket-size="
+			}
+			if created[name] {
+				t.Fatalf("%s is created twice in the provision script; which cap holds is not a question this test answers", name)
+			}
+			created[name] = true
+			n, found := capOf(name, flag, m[3])
+			if !found {
+				t.Errorf("%s is created without %s: it reserves nothing, and grows into the room the other caps count on", name, flag)
+			}
+			caps[name] = max(caps[name], n)
+		}
+		if m := edits.FindStringSubmatch(line); m != nil {
+			n, found := capOf(m[2], "--max-bytes=", m[3])
+			if !strings.HasPrefix(m[1], "stream ") || !found {
+				t.Fatalf("unparsed cap-changing command; teach the test: %q", strings.TrimSpace(line))
+			}
+			if n > caps[m[2]] {
+				caps[m[2]] = n
+			}
+		}
+	}
+	// Not vacuous: every provisioned stream and bucket was found and counted.
+	for _, s := range a2aProvisionedStreams {
+		if !created[s] {
+			t.Errorf("no capped create found for %s; the sum below would leave it out", s)
+		}
+	}
+
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	m := regexp.MustCompile(`(?m)^\s*max_file_store:\s*(\d+)\s*$`).FindStringSubmatch(conf)
+	if m == nil {
+		t.Fatal("nats.conf renders no max_file_store")
+	}
+	store, _ := strconv.ParseInt(m[1], 10, 64)
+	// The store has to fit the volume it is on, or the caps' arithmetic is about room
+	// the disk does not have.
+	claim := buildA2ANATSStatefulSet(agent, "").Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]
+	if store > claim.Value() {
+		t.Errorf("max_file_store is %d bytes, more than the bus's %s claim", store, claim.String())
+	}
+
+	var sum int64
+	names := make([]string, 0, len(caps))
+	for name, n := range caps {
+		sum += n
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	if sum > store-a2aJetStreamCapMargin {
+		var b strings.Builder
+		for _, name := range names {
+			fmt.Fprintf(&b, "\n  %-18s %8.3f GiB", name, float64(caps[name])/(1<<30))
+		}
+		t.Errorf("the provisioned caps reserve %.3f GiB of a %.3f GiB store, leaving %.3f GiB, under the %d GiB margin (#4476):%s",
+			float64(sum)/(1<<30), float64(store)/(1<<30), float64(store-sum)/(1<<30), a2aJetStreamCapMargin>>30, b.String())
+	}
+}
+
+// The people reading is read only while the install renders the A2A stack
+// and no chat platform it enables is served through Hermes: Chat or Slack on
+// its legacy consumer, or Teams, which only Hermes serves. The today rows are
+// false through the render gate alone, since a today install has no gateway
+// to read; the Slack and Teams rows test the Hermes reason by itself.
+func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
+	on := ptr.To(true)
+	agent := func(mode string, chat, slack, teams bool) *agentv1alpha1.PlatformAgent {
+		a := a2aTestAgent()
+		a.Spec.Mode = ptr.To(mode)
+		integration := &agentv1alpha1.PlatformAgentIntegrationSpec{}
+		if chat {
+			integration.GoogleChat = &agentv1alpha1.GoogleChatSpec{Enabled: on}
+		}
+		if slack {
+			integration.Slack = &agentv1alpha1.SlackSpec{Enabled: on}
+		}
+		if teams {
+			integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: on}
+		}
+		a.Spec.Integration = integration
+		return a
+	}
+	next, today := string(ModeNext), string(ModeToday)
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  bool
+	}{
+		{"next, Chat only", agent(next, true, false, false), true},
+		{"next, Slack only", agent(next, false, true, false), true},
+		{"next, Chat and Slack: Slack on Hermes", agent(next, true, true, false), false},
+		{"next, Teams", agent(next, false, false, true), false},
+		{"next, no platform", agent(next, false, false, false), true},
+		{"today, Chat", agent(today, true, false, false), false},
+		{"today, no platform: no A2A stack", agent(today, false, false, false), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := peopleReadingEnabled(tc.agent); got != tc.want {
+				t.Fatalf("peopleReadingEnabled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	noIntegration := a2aTestAgent()
+	if teamsEnabled(noIntegration) || !peopleReadingEnabled(noIntegration) {
+		t.Fatal("a CR with no spec.integration: want Teams off and the reading enabled")
 	}
 }

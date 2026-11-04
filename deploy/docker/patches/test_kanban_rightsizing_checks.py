@@ -181,6 +181,17 @@ class OwnEntriesTest(RuleTestCase):
         self.assertIsNone(err)
         self.assertLess(result.index(krc.HEADING), result.index(kvc.EVIDENCE_HEADING))
 
+    def test_both_sections_go_above_a_trailing_step_line(self):
+        kvc._calls[CHILD] = [{"command": "kubectl get hpa -n web", "exit_code": 0, "output": "api-server 60%", "ran_at": "t"}]
+        claim = {"claim": "An HPA targets it.", "command": "kubectl get hpa -n web", "excerpt": "api-server 60%"}
+        err, result, _ = kvc.apply_completion_rules(
+            CHILD, {krc.PARAM: [HPA_ENTRY], kvc.PARAM: [claim]}, "**Answer.**\n\n[next: lower api-server's request]", {},
+            connect=self.connect)
+        self.assertIsNone(err)
+        self.assertTrue(result.startswith("**Answer.**\n\n" + krc.HEADING))
+        self.assertLess(result.index(krc.HEADING), result.index(kvc.EVIDENCE_HEADING))
+        self.assertTrue(result.endswith("```\n\n[next: lower api-server's request]"), result)
+
     def test_a_field_past_the_cap_is_refused(self):
         long = {**HPA_ENTRY, "dependency": "x" * (krc.MAX_FIELD_CHARS + 1)}
         [reason] = self.rule(CHILD, [long])[0]

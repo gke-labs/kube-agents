@@ -543,13 +543,17 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 			Value: credentialProxyTokenMountPath + "/token",
 		})
+		env = append(env,
+			corev1.EnvVar{Name: "KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
+			corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCACertFile},
+		)
 	}
 	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
 		env = append(env,
 			corev1.EnvVar{Name: envGKEProjectID, Value: harness.ProjectID},
 			corev1.EnvVar{Name: envGKEClusterName, Value: harness.ClusterName},
 			corev1.EnvVar{Name: envGKELocation, Value: harness.Location},
-			corev1.EnvVar{Name: envKubeContextName, Value: fmt.Sprintf("gke_%s_%s_%s", harness.ProjectID, harness.Location, harness.ClusterName)},
+			corev1.EnvVar{Name: envKubeContextName, Value: hostClusterContextName(agent)},
 		)
 	}
 
@@ -777,6 +781,16 @@ func buildShellSandboxVolumes(agent *agentv1alpha1.PlatformAgent, authorizedKeys
 		// mount, not what is behind it.
 		Name:         shellSandboxHermesHomeVolume,
 		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(shellSandboxHermesHomeSizeLimit))}},
+	}, {
+		Name: kubeProxyCAVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName:  kubeProxyTLSSecretName(agent),
+				DefaultMode: ptr.To(int32(0444)),
+				Items:       []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+				Optional:    ptr.To(true),
+			},
+		},
 	}, buildShellSandboxCredentialProxyTokenVolume(), buildGitopsStateVolume(agent)}
 	return volumes
 }
@@ -1005,6 +1019,11 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 				ReadOnly:  true,
 			},
 			{
+				Name:      kubeProxyCAVolumeName,
+				MountPath: kubeProxyCAMountPath,
+				ReadOnly:  true,
+			},
+			{
 				// The one file in the delivery set the image cannot
 				// carry: SETTINGS.md is per-install, rendered by the
 				// operator from the CR, and six skills read it by
@@ -1102,6 +1121,18 @@ func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsIPs [
 		Ports: []networkingv1.NetworkPolicyPort{{
 			Protocol: &tcp,
 			Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
+		}},
+	})
+
+	egress = append(egress, networkingv1.NetworkPolicyEgressRule{
+		// The Kubernetes API proxy in a pod of its own. Stock kubectl in the
+		// sandbox connects over HTTPS on port 8443.
+		To: []networkingv1.NetworkPolicyPeer{{
+			PodSelector: &metav1.LabelSelector{MatchLabels: kubeProxySelector(agent)},
+		}},
+		Ports: []networkingv1.NetworkPolicyPort{{
+			Protocol: &tcp,
+			Port:     ptr.To(intstr.FromInt32(kubeProxyPort)),
 		}},
 	})
 

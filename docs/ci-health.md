@@ -90,6 +90,16 @@ scan](#the-pool-state-scan)); the tick reads them for the `fixture_drift` and
 `workflow_dispatch` of the same workflow is the on-demand refresh button
 (its `fixture_state_scan` input also runs both scans).
 
+The smoke lanes log to `gs://kube-agents-evals-presubmit-logs`, a bucket kube-agents owns, not
+the Prow cluster's default: Deck's service account has no read on it, so the Prow run page shows
+no files to anyone (this Prow has no login, and the lanes grade a public repository with a
+model in the loop). The collector reads it with its own identity, and each lane's old
+archive alongside until that leaves the window; the pool-pressure check and step 0's verdict reuse
+read the new bucket only, so a green from before the move is not reused and the pool gauge's window
+fills over its first week. A run in that bucket records where it lives (`runs[].gcs_base`), and
+the dashboard's and the health bot's build links open that directory in the Cloud Console for a
+project reader; a run in the old bucket keeps its Prow link, which still renders it.
+
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
 for an incident (`until` on the recovery message), `view=agent` for the
@@ -238,7 +248,7 @@ forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only 
 nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
 section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
-history or digest line. The GHES lane (`pull-kube-agents-smoke-test-ghes`, its two nightlies; `docs/ci-pool-projects.md` 5.8) is not collected yet: its runs show in Prow only until the dashboard reads a lane per forge.
+history or digest line. The GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`, their two nightlies each; `docs/ci-pool-projects.md` 5.8) are not collected yet: their runs show in Prow only until the dashboard reads a lane per forge.
 
 ## Hysteresis
 
@@ -492,7 +502,7 @@ wait is a fixed 24-hour figure that is not in the run data.
 
 Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
-(the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
+(the GitOps stale-pull-request sweep, hourly) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
@@ -516,13 +526,13 @@ names none.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs
-every ten minutes and this tick reads its latest finished build every fifteen,
-so the unit is the check, not the build (one sweep build in three is never
-read), and one failed check followed by a clean one is a flap. The sweep's note
-waits until two consecutive checks have failed; the reconciles' first failed
-build is the news. Any project's failure fails a sweep run, so a per-project
-threshold could never fire before the run's; the per-project counts name, in
-the message, the projects that failed in this check and the ones before it.
+hourly and this tick reads its latest finished build every fifteen minutes, so
+every build is read and counted once, and one failed build followed by a clean
+one is a flap. The sweep's note waits until two consecutive checks have failed;
+the reconciles' first failed build is the news. Any project's failure fails a
+sweep run, so a per-project threshold could never fire before the run's; the
+per-project counts name, in the message, the projects that failed in this check
+and the ones before it.
 The counts are `periodics_streaks` in `health.json`, advanced once per newly
 read build and carried across ticks; a failed build that did not reach a
 project (busy) keeps its count, and a clean build clears every count. A tick
@@ -530,7 +540,7 @@ that could not fetch the previous `health.json` has no counts to carry, so it
 notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
-build is older than its stale window (an hour for the sweep, 36 hours for the
+build is older than its stale window (two hours for the sweep, 36 hours for the
 daily reconcile; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
@@ -607,7 +617,8 @@ a not-evaluated run, a lost pod and a deadline kill.
   counts;
 - a table of the failed cases — result as `passed / total reps`, and how many
   other pull requests the case is failing on right now;
-- the check's reason for a case that looks like the pull request's;
+- no grading text: the check's reason and the agent's words stay on the
+  dashboard's run page, behind the link, since the pull request is public;
 - how many cases passed, the run's wall clock and pool project, and links: the
   build log, `run.html#build=<build id>` on the dashboard, and the incident
   brief when there is an incident.
@@ -682,8 +693,8 @@ Ran 128 min before the node went away · build log
 
 While `health.json`'s condition is `lost_pods` the box adds "part of a
 build-cluster event: N runs on M PRs" (below the 8-run event bar, "one of N
-runs on M PRs that lost their build node") and the incident brief link. Prow's
-build-log page shows the pod's events. Setup deaths and conflicted merges stay
+runs on M PRs that lost their build node") and the incident brief link. The
+build's `podinfo.json` in its bucket shows the pod's events. Setup deaths and conflicted merges stay
 silent; the build log says which it was.
 
 The third is a run Prow killed at the job deadline with no verdict (#1894),
