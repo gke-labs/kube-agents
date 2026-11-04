@@ -191,11 +191,11 @@ BROKER_URL_ENV = "CREDENTIAL_PROXY_URL"
 # shim's own (cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE) or a broker
 # refusal look like the cluster's (CONNECTIVITY_FAILURE_RE).
 EXEC_FALLBACK_NOTICE = "exec tier not reachable; this command went to the stateful broker"
+# The broker route `execute` sends a command to, under the broker's URL.
+EXEC_ROUTE = "/v1/exec"
 # The line a malformed exec URL writes, once per process, when the stateful
 # broker takes its place. No "credential proxy" prefix, for the same reason as
 # EXEC_FALLBACK_NOTICE; the reason names the shape, never a network cause.
-# The broker route `execute` sends a command to, under the broker's URL.
-EXEC_ROUTE = "/v1/exec"
 EXEC_URL_IGNORED_NOTICE = "{name} ignored ({reason}); commands go to the stateful broker"
 _exec_url_notice_written = False
 # A connection that closed once the request was sent: the command may have run,
@@ -311,10 +311,11 @@ def exec_endpoints() -> tuple[str | None, str | None]:
     The exec tier when the operator set a well-formed URL, with the stateful
     broker as the fallback; else the stateful broker alone, as before the exec
     tier. A malformed URL is ignored with one stderr line (`_exec_url_fault`).
-    `execute` falls back only when no connection to the exec tier could be
-    made (`BrokerUnreachable`): then no request reached a broker, and nothing
-    ran. `ApiSession` also falls back after a dropped connection, because its
-    relay calls are GETs, which are safe to send again.
+    `execute` falls back only on a failure before a byte was sent (no
+    connection to the exec tier, or a URL it could not build a request from):
+    then no request reached a broker, and nothing ran. `ApiSession` also falls
+    back after a dropped connection, because its relay calls are GETs, which
+    are safe to send again.
     """
     # Spelled out, not BROKER_URL_ENV: tests/conformance/test_C_enforcement.py
     # (C1) pins that the shim reads this name, across the module boundary to
@@ -355,7 +356,7 @@ def _exec_url_fault(url: str) -> str | None:
         parts.port
     except ValueError:
         return "the port is not a number from 0 to 65535"
-    if parts.query or parts.fragment:
+    if "?" in url or "#" in url:
         # The route is appended to the URL, so it would land in the query or
         # be cut off with the fragment.
         return "it has a query or a fragment"
@@ -366,7 +367,10 @@ def _exec_url_fault(url: str) -> str | None:
         # a %-escape, so it can't answer for them.
         parts.hostname.encode("idna")
         request = urllib.request.Request(url.rstrip("/") + EXEC_ROUTE)
-        http.client.HTTPConnection(request.host).putrequest("POST", request.selector)
+        connection = http.client.HTTPConnection(request.host)
+        # urllib sends its own Host header, which http.client encodes as latin-1.
+        connection.putrequest("POST", request.selector, skip_host=True)
+        connection.putheader("Host", request.host)
     except (ValueError, http.client.InvalidURL):
         return "not a valid URL"
     return None
@@ -1712,9 +1716,11 @@ def execute(
                 continue
             print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
             return 1
-        except http.client.InvalidURL as exc:
-            # Raised while the connection or the request line is built, before
-            # a socket opens: nothing was sent, so a fallback is safe.
+        except (http.client.InvalidURL, UnicodeEncodeError) as exc:
+            # Raised while the connection, the request line or the Host header
+            # is built, before a socket opens: nothing was sent, so a fallback
+            # is safe. A reply is decoded, never encoded, so a UnicodeEncodeError
+            # here is the request's own.
             if len(targets) > 1:
                 print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
                 targets = targets[1:]
@@ -2377,7 +2383,15 @@ def _connection_errors() -> tuple[type[BaseException], ...]:
         import requests
     except ImportError:
         return (ConnectionError,)
-    return (requests.exceptions.ConnectionError, ConnectionError)
+    # The URL errors are raised while the request is prepared, before a byte is
+    # sent, so moving to the fallback is as safe as for a connection error.
+    return (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.InvalidURL,
+        requests.exceptions.MissingSchema,
+        requests.exceptions.InvalidSchema,
+        ConnectionError,
+    )
 
 
 def read_stdin_if_requested(argv: list[str]) -> str | None:

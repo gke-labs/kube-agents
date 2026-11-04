@@ -2133,6 +2133,9 @@ class TestExecUrlShape(unittest.TestCase):
         "a space in the path": "http://broker:8765/a b",
         "a query": "http://broker:8765?x=1",
         "a fragment": "http://broker:8765#f",
+        "an empty query": "http://broker:8765?",
+        "an empty fragment": "http://broker:8765#",
+        "a host that is not latin-1": "http://brok\u00e9r\u4e2d:8765",
     }
 
     def resolve(self, exec_url, stateful=STATEFUL):
@@ -2247,6 +2250,7 @@ class TestExecPreSendFallback(unittest.TestCase):
             "a space in the host": "http://bro ker:8765",
             "a space in the path": "http://broker:8765/a b",
             "an empty label in the host": "http://name..svc:8765",
+            "a host that is not latin-1": "http://brok\u00e9r\u4e2d:8765",
         }.items():
             with self.subTest(name):
                 code, calls, stderr = self.run_with(url)
@@ -2326,6 +2330,27 @@ class TestApiSessionExecTier(unittest.TestCase):
                 patch("sys.stderr", new=io.StringIO()):
             credential_proxy_client.ApiSession(http=http_).get(self.URL)
         self.assertTrue(http_.calls[0].startswith(self.STATEFUL + credential_proxy_client.API_RELAY_PREFIX), http_.calls)
+
+    def test_a_url_requests_refuses_before_sending_moves_the_relay_to_the_fallback(self):
+        """A host `requests` refuses while it prepares the request (a leading
+        `*`) is raised before a byte is sent, like a connection error."""
+        try:
+            import requests
+        except ImportError:
+            self.skipTest("requests is not installed")
+        http_ = requests.Session()
+        calls = []
+
+        def get(url, **kwargs):
+            calls.append(url)
+            if url.startswith(self.STATEFUL):
+                return "upstream-response"
+            return requests.Session.get(http_, url, **kwargs)
+
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_EXEC_URL": "http://*.svc:8765"}), \
+                patch.object(http_, "get", side_effect=get), patch("sys.stderr", new=io.StringIO()):
+            self.assertEqual("upstream-response", credential_proxy_client.ApiSession(http=http_).get(self.URL))
+        self.assertEqual(["*.svc:8765", "stateful:8765"], [urllib.parse.urlsplit(url).netloc for url in calls])
 
     def test_an_unreachable_exec_tier_falls_back_once_and_stays_there(self):
         http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
