@@ -116,12 +116,13 @@ operator's default resources: a 2 GiB memory request and an 8 GiB limit (`resolv
 [`manifest_helpers.go`](../../k8s-operator/internal/controller/manifest_helpers.go)). Read inside
 the container on the development install on 2026-11-04:
 
-| Counter                                                   | Reads                                                | Means                                                                             |
-| --------------------------------------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------- |
-| `/sys/fs/cgroup/memory.max`, `memory.current` (cgroup v2) | absent                                               | the sandbox mounts cgroup v1 only                                                 |
-| `/sys/fs/cgroup/memory/memory.usage_in_bytes` (cgroup v1) | 836,599,808 bytes while `kubectl top` showed 787 MiB | within 2% of the kubelet's view: the one counter that tracks the container        |
-| `/sys/fs/cgroup/memory/memory.limit_in_bytes`             | 10.25 GiB                                            | the sandbox's virtual memory, not the container's 8 GiB limit                     |
-| `/proc/meminfo` `MemTotal`                                | 10.25 GiB                                            | the same virtual memory; `MemAvailable` is that figure less what the sandbox uses |
+| Counter                                                   | Reads                                                | Means                                                                                        |
+| --------------------------------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `/sys/fs/cgroup/memory.max`, `memory.current` (cgroup v2) | absent                                               | the sandbox mounts cgroup v1 only                                                            |
+| `/sys/fs/cgroup/memory/memory.usage_in_bytes` (cgroup v1) | 836,599,808 bytes while `kubectl top` showed 787 MiB | within 2% of the kubelet's view: the one counter that tracks the container                   |
+| `/sys/fs/cgroup/memory/memory.limit_in_bytes`             | 10.25 GiB                                            | the sandbox's virtual memory, not the container's 8 GiB limit                                |
+| `/sys/fs/cgroup/memory/memory.stat`                       | absent                                               | no inactive file cache to subtract there; the working-set subtraction applies on a runc node |
+| `/proc/meminfo` `MemTotal`                                | 10.25 GiB                                            | the same virtual memory; `MemAvailable` is that figure less what the sandbox uses            |
 
 ### The eviction fires at the request
 
