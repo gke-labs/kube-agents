@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 import credential_proxy
 import watcher_policy
@@ -33,6 +34,14 @@ CLUSTER = {
     "legacyAbac": {"enabled": True},
 }
 EVENT_GAP_S = 0.3
+# For the peer that stops reading its stream: the window the broker gives
+# it, how long a test waits for the broker to act, the handler thread's
+# logging settle after the close, and the API server's chunk, written until
+# the broker closes its side.
+SHORT_IDLE_S = 0.5
+CLOSE_WAIT_S = 5
+SETTLE_S = 0.5
+UNREAD_STREAM_CHUNK = b"a" * (64 * 1024)
 # Captured before any test points the seam at a fake.
 REAL_K8S_CONNECTION = CredentialProxyHandler._watcher_k8s_connection
 
@@ -42,6 +51,7 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         owner = self
         self.google_requests = []
         self.k8s_requests = []
+        self.stream_unread = False
 
         class Google(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -73,6 +83,20 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
 
             def do_GET(self):  # noqa: N802
                 owner.k8s_requests.append((self.path, dict(self.headers)))
+                if owner.stream_unread:
+                    # A stream wider than any socket buffer, for the peer
+                    # that stops reading it: written until the broker
+                    # closes its side of the upstream connection.
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    try:
+                        while True:
+                            self.wfile.write(UNREAD_STREAM_CHUNK)
+                            self.wfile.flush()
+                    except OSError:
+                        return
                 if "watch=true" in self.path:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -279,6 +303,34 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         body = response.read()
         self.assertEqual(["e1", "e2"], [json.loads(line)["object"]["metadata"]["name"] for line in body.splitlines()])
         connection.close()
+
+    def test_a_watcher_that_stops_reading_its_stream_is_logged_as_the_peers_stall_not_an_upstream_failure(self):
+        # The request read deadline leaves KEEPALIVE_IDLE_SECONDS on the
+        # socket for the whole request, so the relay's write to a watcher
+        # that stops reading for the window ends with a TimeoutError. That
+        # is the broker's own peer, not the API server: the line says so
+        # and names the request, the upstream-failure line that names the
+        # API server is not written, and the cached address stands.
+        self.stream_unread = True
+        path = "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?watch=true"
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", SHORT_IDLE_S):
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=CLOSE_WAIT_S) as unread:
+                    unread.sendall(f"GET {path} HTTP/1.1\r\nHost: broker\r\nAuthorization: Bearer watcher-token\r\n\r\n".encode("ascii"))
+                    deadline = time.monotonic() + CLOSE_WAIT_S
+                    while not any("not read by the peer" in line for line in logs.output):
+                        if time.monotonic() > deadline:
+                            self.fail(f"the cut stream was not logged: {logs.output}")
+                        time.sleep(0.1)
+                time.sleep(SETTLE_S)  # the handler thread finishes logging after the close
+        cut = [line for line in logs.output if "not read by the peer" in line]
+        self.assertEqual(1, len(cut), logs.output)
+        self.assertTrue(cut[0].startswith("WARNING:") and "type=TimeoutError" in cut[0], cut[0])
+        self.assertIn("request_id=", cut[0])
+        self.assertFalse(any("upstream failed" in line for line in logs.output), logs.output)
+        self.assertFalse(any("Traceback" in line for line in logs.output), logs.output)
+        self.assertTrue(any("watcher k8s forwarded" in line for line in logs.output), logs.output)
+        self.assertIn(("kagents-dev", "us-east4", "fleet-a"), CredentialProxyHandler.watcher_endpoints)
 
     def test_a_get_carrying_a_body_on_the_cloud_passthrough_announces_its_close(self):
         # The Cloud API passthrough writes its response without _json, and a

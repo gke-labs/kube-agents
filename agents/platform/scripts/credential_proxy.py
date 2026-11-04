@@ -920,6 +920,11 @@ ENVOY_CONFIG_PATHS: tuple[Path, ...] = tuple(
 # The Unix socket the broker serves behind Envoy, as the config's clusters
 # name it; a cluster to any other address is not a client of the broker.
 ENVOY_BROKER_SOCKET_PATH = "/var/run/credential-proxy/backend.sock"
+# The one leading run normpath keeps: a path that begins with exactly two
+# slashes, which POSIX lets an implementation resolve apart from the root
+# and Linux, so the kernel Envoy's connect() goes through, does not. It is
+# collapsed to one before a pipe path is compared (_normalised_pipe_path).
+ENVOY_PIPE_DOUBLED_ROOT = "//"
 # Envoy's per-cluster connection ceiling when a cluster's circuit_breakers
 # set none.
 ENVOY_DEFAULT_MAX_CONNECTIONS = 1024
@@ -1731,11 +1736,25 @@ def envoy_broker_connection_ceiling(config: Any) -> int | None:
     return total if found and total > 0 else None
 
 
+def _normalised_pipe_path(path: str) -> str:
+    """A pipe's path as the kernel resolves it, for comparing with ENVOY_BROKER_SOCKET_PATH.
+
+    normpath collapses a doubled slash and a ``.`` segment anywhere but at
+    the start, where it keeps exactly two slashes (ENVOY_PIPE_DOUBLED_ROOT);
+    Linux reads that run as the root, so it is collapsed here too.
+    """
+    normalised = os.path.normpath(path)
+    if normalised.startswith(ENVOY_PIPE_DOUBLED_ROOT):
+        normalised = normalised[1:]
+    return normalised
+
+
 def _cluster_forwards_to_broker(cluster: Mapping[str, Any]) -> bool:
     """Whether any endpoint of a parsed Envoy cluster is the broker's socket.
 
-    The pipe's path is compared normalised: a doubled slash or a ``.``
-    segment names the same socket to the kernel, and so to Envoy.
+    The pipe's path is compared normalised (_normalised_pipe_path): a
+    doubled slash, leading or not, or a ``.`` segment names the same socket
+    to the kernel, and so to Envoy.
     """
     endpoints = _mapping(cluster.get("load_assignment")).get("endpoints")
     for locality in endpoints if isinstance(endpoints, list) else ():
@@ -1743,7 +1762,7 @@ def _cluster_forwards_to_broker(cluster: Mapping[str, Any]) -> bool:
         for lb_endpoint in lb_endpoints if isinstance(lb_endpoints, list) else ():
             address = _mapping(_mapping(_mapping(lb_endpoint).get("endpoint")).get("address"))
             path = _mapping(address.get("pipe")).get("path")
-            if isinstance(path, str) and os.path.normpath(path) == ENVOY_BROKER_SOCKET_PATH:
+            if isinstance(path, str) and _normalised_pipe_path(path) == ENVOY_BROKER_SOCKET_PATH:
                 return True
     return False
 
@@ -4932,6 +4951,17 @@ class _RequestReadDeadline:
         # inside it, and the response is on the wire in part either way.
         self._response_started = True
         super().end_headers()
+
+    def handle_expect_100(self) -> bool:
+        # The stdlib's parse_request answers `Expect: 100-continue` with an
+        # interim 100 through end_headers, before the route runs and before
+        # a body byte is read. That is not the response: a body that then
+        # stalls is a request stalled before its response, so the flag the
+        # interim write set is cleared, and only the route's own end_headers
+        # sets it.
+        continued = super().handle_expect_100()
+        self._response_started = False
+        return continued
 
     def setup(self) -> None:
         super().setup()
@@ -14807,8 +14837,24 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (ConnectionError, TimeoutError, OSError) as exc:
+                    # The downstream side: the watcher closed, or stopped
+                    # reading its stream for the connection's window
+                    # (KEEPALIVE_IDLE_SECONDS, the socket's timeout). Not
+                    # the API server's failure, which the catch below would
+                    # name it as: the stream is cut and the connection
+                    # closes, and the cached address stands.
+                    LOGGER.warning(
+                        "watcher k8s response not read by the peer; cut mid-stream request_id=%s type=%s bytes=%d",
+                        request_id,
+                        type(exc).__name__,
+                        sent,
+                    )
+                    self.close_connection = True
+                    break
                 sent += len(chunk)
             LOGGER.info("watcher k8s closed request_id=%s bytes=%d", request_id, sent)
         except (OSError, http.client.HTTPException) as exc:

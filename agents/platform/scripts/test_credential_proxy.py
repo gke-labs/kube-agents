@@ -11131,7 +11131,11 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
                 credential_proxy.serve(types.SimpleNamespace())
                 started.assert_called_once_with(max_threads=expected)
                 proxy.serve_forever.assert_called_once_with()
-        self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.door_thread_cap_from_env())
+        # Under a clean environment, not the invoking shell's: a host that
+        # exports the variable would otherwise fail this line with the code right.
+        with mock.patch.dict(os.environ):
+            os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+            self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.door_thread_cap_from_env())
         self.addCleanup(setattr, credential_proxy.ThreadCap, "max_threads", credential_proxy.ThreadCap.max_threads)
         with mock.patch.object(credential_proxy, "resolve_role", return_value="combined"), \
                 mock.patch.object(credential_proxy, "thread_cap_from_env", return_value=4160), \
@@ -16239,6 +16243,34 @@ class KeepAliveTest(_CredentialedUnixServer):
             any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output
         )
 
+    def test_a_body_that_stalls_after_expect_100_continue_is_logged_as_stalled_not_as_a_cut_response(self):
+        # Under HTTP/1.1 the stdlib answers `Expect: 100-continue` with an
+        # interim 100 from parse_request, through end_headers, before the
+        # route runs and before a body byte is read. That interim write is
+        # not the response: a body that then never comes is a request that
+        # stalled before its response, named with the bytes that arrived,
+        # not "response stalled: the peer stopped reading it", which would
+        # send an operator to the wrong side of the connection.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            sock = self.connect()
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                self.send(sock, "POST", "/v1/exec", self.SHELL, [f"Content-Length: {_STALLED_BODY_LENGTH}", "Expect: 100-continue"])
+                interim = b""
+                while not interim.endswith(b"\r\n\r\n"):
+                    byte = sock.recv(1)
+                    self.assertNotEqual(b"", byte, "closed before the interim response")
+                    interim += byte
+                self.assertEqual(b"HTTP/1.1 100 Continue\r\n\r\n", interim)
+                self.assertTrue(self.closed_by_server(sock), "the stalled connection was not closed")
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+        stalled = [line for line in logs.output if "request stalled" in line]
+        self.assertEqual(1, len(stalled), logs.output)
+        self.assertTrue(stalled[0].startswith("WARNING:"), stalled[0])
+        self.assertIn("requestline=POST /v1/exec HTTP/1.1 ", stalled[0])
+        self.assertGreater(int(re.search(r"received_bytes=(\d+)", stalled[0]).group(1)), 0, stalled[0])
+        self.assertFalse(any("response stalled" in line for line in logs.output), logs.output)
+        self.assertFalse(any("closed idle" in line for line in logs.output), logs.output)
+
     def test_a_peer_that_drips_its_request_head_is_closed_at_the_window_and_logged_as_stalled(self):
         # One deadline for the request line, the headers and the body
         # together, so a peer that sends a byte inside every per-read timeout
@@ -16701,6 +16733,12 @@ def _proto_json_uint32(value):
     return _UNREADABLE
 
 
+def _as_the_kernel_resolves(path):
+    """A pipe path with every doubled slash and `.` segment collapsed, the
+    leading run included (normpath keeps exactly two there; Linux does not)."""
+    return "/" + os.path.normpath(path).lstrip("/") if path.startswith("/") else os.path.normpath(path)
+
+
 def _ceiling_summed_by_hand(config):
     """The rule the broker derives its cap by, written out: per cluster whose
     pipe is the broker's socket (the path normalised, as the kernel reads
@@ -16714,7 +16752,7 @@ def _ceiling_summed_by_hand(config):
     total = 0
     for cluster in config["static_resources"]["clusters"]:
         paths = [
-            os.path.normpath(str(endpoint["endpoint"]["address"].get("pipe", {}).get("path")))
+            _as_the_kernel_resolves(str(endpoint["endpoint"]["address"].get("pipe", {}).get("path")))
             for locality in cluster["load_assignment"]["endpoints"]
             for endpoint in locality["lb_endpoints"]
         ]
@@ -17118,12 +17156,32 @@ class ThreadCapDefaultTest(unittest.TestCase):
         # kernel, so Envoy connects to the broker through it; the cluster
         # counts, where a string comparison would read 1024 for the runtime
         # cluster against a breaker of 4096.
-        for spelling in ("/var/run/credential-proxy//backend.sock", "/var/run/credential-proxy/./backend.sock"):
+        # The leading run too: normpath keeps a path that begins with exactly
+        # two slashes, and Linux reads it as the root all the same, so the
+        # runtime cluster spelt that way counts (where it was passed over
+        # without a line, the probe's cluster having matched).
+        spellings = (
+            "/var/run/credential-proxy//backend.sock",
+            "/var/run/credential-proxy/./backend.sock",
+            "//var/run/credential-proxy/backend.sock",
+            "///var/run/credential-proxy/backend.sock",
+        )
+        for spelling in spellings:
             with self.subTest(spelling=spelling):
                 text = _TWO_CLUSTER_ENVOY_CONFIG.replace("path: /var/run/credential-proxy/backend.sock\n", f"path: {spelling}\n", 1)
                 path, derived, config = self._derived(text)
                 self.assertEqual(_TWO_CLUSTER_CEILING, derived)
                 self.assertEqual(_ceiling_summed_by_hand(config), derived)
+            with self.subTest(spelling=spelling, clusters="both"):
+                # As the only spelling of the socket: read, with no
+                # "names no cluster" warning and no fallback to 1024.
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("path: /var/run/credential-proxy/backend.sock\n", f"path: {spelling}\n")
+                with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                    path, derived, config = self._derived(text)
+                self.assertEqual(_TWO_CLUSTER_CEILING, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        self.assertEqual("/var/run/credential-proxy/backend.sock", credential_proxy._normalised_pipe_path("//var/run/credential-proxy/./backend.sock"))
+        self.assertEqual("relative/backend.sock", credential_proxy._normalised_pipe_path("relative//backend.sock"))
         self.assertFalse(credential_proxy._cluster_forwards_to_broker(
             {"load_assignment": {"endpoints": [{"lb_endpoints": [{"endpoint": {"address": {"pipe": {"path": "/var/run/credential-proxy/other.sock"}}}}]}]}}
         ))
