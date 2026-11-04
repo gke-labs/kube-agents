@@ -83,6 +83,14 @@ class IdentifierTest(unittest.TestCase):
         out = normalizer.Normalizer(NOW, False).walk({"current_run_id": 190, "parent_run_id": 7})
         self.assertNotIn("190", json.dumps(out))
 
+    def test_heartbeat_events_are_left_out_of_the_key(self):
+        def card(events):
+            return norm(json.dumps({"task": {"id": "t_11111111", "status": "running"}, "events": events}))
+        claimed = {"kind": "claimed", "payload": None}
+        beat = {"kind": "heartbeat", "payload": None}
+        self.assertEqual(card([claimed]), card([claimed, beat, beat]))
+        self.assertNotEqual(card([claimed]), card([claimed, {"kind": "completed", "payload": None}]))
+
     def test_expires_is_a_time_key(self):
         self.assertEqual(norm('"expires": 1793759016'), norm('"expires": 1793759100'))
         self.assertIn("⟦TIME_", norm('"expires": 1793759016'))

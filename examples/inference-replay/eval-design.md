@@ -485,7 +485,7 @@ When runs replay, the three runs of a case are no longer independent. And becaus
 passing runs, a case a pull request didn't touch will pass on replay. So the "all three runs failed"
 rule can only be triggered by the parts of a run that ran live. That's what we want for a pull
 request that didn't cause the failure. But it raises three things the eval crew needs to decide
-before stage 2 of the rollout:
+before stage 3 of the rollout (turning replay on):
 
 - **Comparisons with `main` get biased.** Two checks compare a pull request with `main`'s numbers
   from the nightly: the overall pass rate (advisory for now, until `EVAL_AGGREGATE_ARMED` is set),
@@ -519,26 +519,42 @@ before stage 2 of the rollout:
    each miss with the closest earlier request, and since we kept the cleaned-up text, we can test a
    new normalizer rule on the same week of data without redeploying anything.
 
-   Exact matches will undercount. In shadow mode every model answer is a fresh live answer, so two
-   runs rarely match exactly after the model's first reply, while under replay those replies would
-   be the saved ones. So the script also reports a **simulated** estimate that ignores the model's
-   own replies when comparing requests, and that's the number to read. It assumes the same tool
-   calls would have returned the same results. To check that assumption, run a few cases with real
-   record and replay (as in "Measurements") and compare their real hit rate with what the simulated
-   estimate predicts for the same cases.
+   Shadow mode's numbers are a floor, not the answer. In shadow mode every model answer is a fresh
+   live answer, while under replay it would be the saved one. That changes more than the answer
+   itself:
+   - the next request contains the live answer, so exact matches stop after the model's first
+     reply. The **simulated** estimate ignores the model's own replies to get past this;
+   - in a multi-agent run, one agent's answer becomes another agent's input: the card text the
+     platform agent writes is what the Cluster Agent reads. Under replay that text would match;
+     in shadow mode it's worded differently every run;
+   - an agent's live answer can pick a different action (open a different skill, call a different
+     tool), and the result of that action differs too. Under replay the saved action would run
+     and return the same result.
+
+   The dev-install dry run (2026-11-04, `gemini-4-argon`, four phases standing in for a nightly,
+   two builds of one pull request and a second pull request) showed how big the gap is: the
+   simulated estimate was 12%, ignoring other agents' kanban text as well raised it to 22%, and most
+   of the remaining misses were tool results after a differently chosen action. Real record and
+   replay of the same cases, in "Measurements", reused 46–100%. So the deciding measurement is
+   **calibration**: record a set of cases, replay them for real, and report the real hit rate and
+   whether every verdict matched. It needs a replay switch in the proxy that is off by default and
+   only used on a dev install.
 
    Shadow mode also checks that hits would be safe, not just how many there are. For each request
    it logs a hash of the model's live answer, and once the run is done, whether that run passed. For
    every match, the script compares the two cleaned-up requests and lists what the normalizer
    swapped to make them match, by type. If two matching requests got answers that led to different
    results, or a swap hid something that looks like real state, that's a collision. A reviewed
-   collision report is the bar for stage 2. This stage needs no shared cache and no new permissions
+   collision report is a bar for stage 3. This stage needs no shared cache and no new permissions
    inside the cluster.
 
-2. **Turn on replay for pull requests**, once the collision report from shadow mode has been reviewed,
-   the eval crew has decided the three gate questions above, and #1730 is fixed (or they're happy with
-   stripping the recent-work section from the key).
-3. **Look at polling.** If shadow mode shows most of the remaining misses come from the `sleep 60`
+2. **Calibrate with real replay on a dev install**: the same cases recorded and then replayed for
+   real, several times, reporting the real hit rate and whether each verdict matched the recording.
+   This is the number the decision rests on.
+3. **Turn on replay for pull requests**, once calibration shows it's worth it, the collision report
+   from shadow mode has been reviewed, the eval crew has decided the three gate questions above, and
+   #1730 is fixed (or they're happy with stripping the recent-work section from the key).
+4. **Look at polling.** If shadow mode shows most of the remaining misses come from the `sleep 60`
    polling loop, fix the polling rather than the cache.
 
 ## Open questions
@@ -550,7 +566,7 @@ before stage 2 of the rollout:
 - **Should the judge be cached too?** When a whole run is replayed, the judge gets exactly the same
   input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
 - **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We
-  need to check the two options and pick one before stage 2.
+  need to check the two options and pick one before stage 3.
 - **How big does the cache get, and when do entries expire?** Answers recorded for an old version of
   a prompt can never be hit again, so entries should expire by age. Expiry also limits one thing the
   key can't see: a model update on the provider's side (Vertex) doesn't change our requests or our

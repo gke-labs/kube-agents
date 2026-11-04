@@ -60,6 +60,12 @@ OPAQUE_CLASS = "OPAQUE"
 KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "resourceVersion", "generation", "observedGeneration")
 # Any key ending in this is a run id too (`current_run_id`, `parent_run_id`).
 RUN_ID_SUFFIX = "_run_id"
+# Kanban card history: heartbeat entries are liveness pings on a timer, so how
+# many a card has depends on timing alone. They are left out of the key (the
+# forwarded request is unchanged); every other event stays.
+EVENTS_KEY = "events"
+EVENT_KIND_KEY = "kind"
+HEARTBEAT_KIND = "heartbeat"
 NUMBER_CLASS = "NUM"
 # A swapped number with at least this many digits counts as repeated wherever an
 # answer has it as a whole token (`kill 4821`). A shorter one counts only next
@@ -310,6 +316,8 @@ class Normalizer:
         if isinstance(obj, str):
             return self.text(obj)
         if isinstance(obj, list):
+            if key == EVENTS_KEY:
+                obj = [v for v in obj if not (isinstance(v, dict) and v.get(EVENT_KIND_KEY) == HEARTBEAT_KIND)]
             return [self.walk_dict(v, True) if key == TOOL_CALLS_KEY and isinstance(v, dict) else self.walk(v) for v in obj]
         if isinstance(obj, dict):
             return self.walk_dict(obj, False)
