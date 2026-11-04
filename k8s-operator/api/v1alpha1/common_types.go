@@ -1304,7 +1304,7 @@ type CredentialProxyExecSpec struct {
 	// count the pods read and does not restart them. The operator does not
 	// derive the count from the fleet size. Above 0 the agent's name must be
 	// at most 36 characters, so the tier's objects fit a 63-character name;
-	// a longer one is refused, and the tier is not rendered.
+	// a longer one is refused, the tier is not rendered, and Degraded says so.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=32

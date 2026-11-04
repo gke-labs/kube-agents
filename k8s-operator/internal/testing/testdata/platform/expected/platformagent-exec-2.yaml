@@ -1712,6 +1712,7 @@ spec:
       kubeagents.x-k8s.io/component: credential-proxy-exec-tier
   strategy:
     rollingUpdate:
+      maxSurge: 0
       maxUnavailable: 1
     type: RollingUpdate
   template:

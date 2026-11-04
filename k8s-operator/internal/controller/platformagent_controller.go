@@ -3165,6 +3165,11 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 		return err
 	}
 	objs = append(objs, proxy)
+	// The exec tier is derived from this render, copied before the apply: the
+	// apply decodes the server's merged object into proxy, which carries
+	// fields other managers set on the broker, such as a rollout restart's
+	// annotation, and the tier would take them as its own.
+	execBase := proxy.DeepCopy()
 	// The budget after the Deployment whose pods it selects, as the callout's
 	// and the verifier's are.
 	objs = append(objs, buildCredentialProxyPDB(agent))
@@ -3189,7 +3194,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
 	}
-	return r.reconcileCredentialProxyExecTier(ctx, agent, proxy, profiles)
+	return r.reconcileCredentialProxyExecTier(ctx, agent, execBase, profiles)
 }
 
 // applyCredentialProxyDeployment applies the broker's Deployment, recreating it
@@ -4437,6 +4442,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	proxyResourcesRefusal, _ := credentialProxyResourcesRefusal(agent)
 	agentAPIAuthRefusal, _ := agentAPIAuthResourcesRefusal(agent)
 	sandboxResourcesRefusal, _ := shellSandboxResourcesRefusal(agent)
+	execRefusal := ValidateCredentialProxyExec(agent, nil)
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
@@ -4509,6 +4515,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonInvalidShellSandboxResources
 		degradedMsg = fmt.Sprintf(invalidShellSandboxResourcesMsgFmt, sandboxResourcesRefusal)
+	} else if len(execRefusal) > 0 {
+		// The exec tier's refusal, after the three above for the same reason:
+		// the tier is not rendered and every command goes to the stateful
+		// broker, so Ready and the phase keep what the workload says.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonInvalidCredentialProxyExec
+		degradedMsg = fmt.Sprintf(invalidCredentialProxyExecMsgFmt, execRefusal[0].Detail)
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg

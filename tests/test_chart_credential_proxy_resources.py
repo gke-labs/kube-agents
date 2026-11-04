@@ -75,47 +75,9 @@ class SchemaDeclaresTheKeyTest(unittest.TestCase):
         self.assertEqual(node["properties"]["replicas"], {"type": "integer", "minimum": 0, "maximum": 32})
 
 
-@unittest.skipUnless(_HELM, "helm is not installed")
-class CredentialProxyExecReplicasRenderTest(unittest.TestCase):
-    """spec.deployment.credentialProxy.exec.replicas is written only above 0."""
+class _RenderCR:
+    """The CR template rendered with helm, shared by the render tests below."""
 
-    _EXEC = "platformAgent.deployment.credentialProxy.exec.replicas"
-
-    def _render(self, sets):
-        args = [_HELM, "template", "r", str(_CHART), "-s", _CR_TEMPLATE, *_REQUIRED]
-        for item in sets:
-            args += ["--set", item]
-        return subprocess.run(args, capture_output=True, text=True)
-
-    def _cr(self, sets):
-        res = self._render(sets)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        docs = [d for d in yaml.safe_load_all(res.stdout) if d and d.get("kind") == "PlatformAgent"]
-        self.assertEqual(len(docs), 1, res.stdout)
-        return docs[0]
-
-    def test_zero_writes_no_block(self):
-        cr = self._cr([f"{self._EXEC}=0"])
-        self.assertNotIn("credentialProxy", cr["spec"]["deployment"])
-
-    def test_a_positive_count_is_forwarded(self):
-        cr = self._cr([f"{self._EXEC}=2"])
-        self.assertEqual(cr["spec"]["deployment"]["credentialProxy"], {"exec": {"replicas": 2}})
-
-    def test_a_count_beside_a_resources_override_writes_both(self):
-        cr = self._cr([f"{self._EXEC}=3", f"{_VALUE_PATH}.limits.memory=3Gi"])
-        self.assertEqual(cr["spec"]["deployment"]["credentialProxy"],
-                         {"resources": {"limits": {"memory": "3Gi"}}, "exec": {"replicas": 3}})
-
-    def test_the_schema_refuses_a_count_out_of_range(self):
-        for value in ("33", "-1"):
-            res = self._render([f"{self._EXEC}={value}"])
-            self.assertNotEqual(res.returncode, 0, value)
-            self.assertIn("exec/replicas", res.stderr, value)
-
-
-@unittest.skipUnless(_HELM, "helm is not installed")
-class CredentialProxyResourcesRenderTest(unittest.TestCase):
     def _render_cr(self, sets=(), expect_failure=False, values=None):
         args = [_HELM, "template", "r", str(_CHART), "-s", _CR_TEMPLATE, *_REQUIRED]
         for item in sets:
@@ -132,6 +94,35 @@ class CredentialProxyResourcesRenderTest(unittest.TestCase):
         self.assertEqual(len(docs), 1, res.stdout)
         return docs[0]
 
+
+@unittest.skipUnless(_HELM, "helm is not installed")
+class CredentialProxyExecReplicasRenderTest(_RenderCR, unittest.TestCase):
+    """spec.deployment.credentialProxy.exec.replicas is written only above 0."""
+
+    _EXEC = "platformAgent.deployment.credentialProxy.exec.replicas"
+
+    def test_zero_writes_no_block(self):
+        cr = self._render_cr([f"{self._EXEC}=0"])
+        self.assertNotIn("credentialProxy", cr["spec"]["deployment"])
+
+    def test_a_positive_count_is_forwarded(self):
+        cr = self._render_cr([f"{self._EXEC}=2"])
+        self.assertEqual(cr["spec"]["deployment"]["credentialProxy"], {"exec": {"replicas": 2}})
+
+    def test_a_count_beside_a_resources_override_writes_both(self):
+        cr = self._render_cr([f"{self._EXEC}=3", f"{_VALUE_PATH}.limits.memory=3Gi"])
+        self.assertEqual(cr["spec"]["deployment"]["credentialProxy"],
+                         {"resources": {"limits": {"memory": "3Gi"}}, "exec": {"replicas": 3}})
+
+    def test_the_schema_refuses_a_count_out_of_range(self):
+        for value in ("33", "-1"):
+            res = self._render_cr([f"{self._EXEC}={value}"], expect_failure=True)
+            self.assertNotEqual(res.returncode, 0, value)
+            self.assertIn("exec/replicas", res.stderr, value)
+
+
+@unittest.skipUnless(_HELM, "helm is not installed")
+class CredentialProxyResourcesRenderTest(_RenderCR, unittest.TestCase):
     def test_default_render_writes_no_credential_proxy_block(self):
         cr = self._render_cr()
         self.assertNotIn("credentialProxy", cr["spec"]["deployment"])
