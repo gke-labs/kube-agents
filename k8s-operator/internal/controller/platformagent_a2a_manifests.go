@@ -2270,7 +2270,7 @@ accounts {
       { service: "$JS.API.CONSUMER.CREATE.>", accounts: [ APP, CONSOLE ] }
       { service: "$JS.API.CONSUMER.INFO.>", accounts: [ APP, CONSOLE ] }
       { service: "$JS.API.CONSUMER.MSG.NEXT.>", accounts: [ APP, CONSOLE ], response_type: stream }
-      { service: "$JS.API.CONSUMER.DELETE.>", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.API.CONSUMER.DELETE.>", accounts: [ APP ] }
       { service: "$JS.API.DIRECT.GET.>", accounts: [ APP, CONSOLE ] }
       { service: "$JS.ACK.TASKS.>", accounts: [ APP ] }
       { service: "$JS.FC.>", accounts: [ APP ] }
@@ -2318,7 +2318,6 @@ accounts {
       { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.>" } }
       { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
       { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
-      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.DELETE.>" } }
       { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
       { stream: { account: TRUSTED, subject: "a2a.tasks.>" } }
       { stream: { account: TRUSTED, subject: "a2a.agents.>" } }
@@ -2517,13 +2516,13 @@ func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secr
 // a2aConfigRolloutHash and rides the pod template — the agent Deployment's
 // config-hash mechanism — so a changed render rolls the server instead of
 // silently diverging from it.
+// a2aConfigHashAnnotation carries the bus's config hash on its pod template.
+const a2aConfigHashAnnotation = "kubeagents.x-k8s.io/a2a-config-hash"
+
 // a2aNATSDataClaim is the StatefulSet's volumeClaimTemplate name. The claim the
 // controller stamps out is "<this>-<sts>-0", which handleDeletion reaps by name --
 // so a rename here that is not matched there turns the reap into a silent no-op
 // and leaks the PV on every CR deletion. One spelling, both sites.
-// a2aConfigHashAnnotation carries the bus's config hash on its pod template.
-const a2aConfigHashAnnotation = "kubeagents.x-k8s.io/a2a-config-hash"
-
 const (
 	a2aNATSDataClaim = "data"
 	// a2aNATSStartupScript migrates an existing single-node (R1) JetStream store

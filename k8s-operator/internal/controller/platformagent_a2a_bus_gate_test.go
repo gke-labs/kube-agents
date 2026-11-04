@@ -116,7 +116,7 @@ func getCallout(t *testing.T, ctx context.Context, cl client.Client, agent *agen
 func busConfigHash(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) string {
 	t.Helper()
 	sts := &appsv1.StatefulSet{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: buildA2ANATSStatefulSet(agent, "").Name, Namespace: agent.Namespace}, sts); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
 		t.Fatalf("get bus StatefulSet: %v", err)
 	}
 	return sts.Spec.Template.Annotations[a2aConfigHashAnnotation]
@@ -128,7 +128,7 @@ func busConfigHash(t *testing.T, ctx context.Context, cl client.Client, agent *a
 func putTheBusOnAPreviousConfig(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) {
 	t.Helper()
 	sts := &appsv1.StatefulSet{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: buildA2ANATSStatefulSet(agent, "").Name, Namespace: agent.Namespace}, sts); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
 		t.Fatalf("get bus StatefulSet: %v", err)
 	}
 	sts.Spec.Template.Annotations[a2aConfigHashAnnotation] = "previous"
@@ -136,7 +136,7 @@ func putTheBusOnAPreviousConfig(t *testing.T, ctx context.Context, cl client.Cli
 		t.Fatalf("put the bus on a previous config hash: %v", err)
 	}
 	cfg := &corev1.Secret{}
-	key := client.ObjectKeyFromObject(buildA2ANATSConfigSecret(agent, a2aFullCreds("a", "1"), a2aTestCalloutKeys(t)))
+	key := types.NamespacedName{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}
 	if err := cl.Get(ctx, key, cfg); err != nil {
 		t.Fatalf("get bus config Secret: %v", err)
 	}
@@ -149,7 +149,7 @@ func putTheBusOnAPreviousConfig(t *testing.T, ctx context.Context, cl client.Cli
 func busConfigText(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) string {
 	t.Helper()
 	cfg := &corev1.Secret{}
-	key := client.ObjectKeyFromObject(buildA2ANATSConfigSecret(agent, a2aFullCreds("a", "1"), a2aTestCalloutKeys(t)))
+	key := types.NamespacedName{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}
 	if err := cl.Get(ctx, key, cfg); err != nil {
 		t.Fatalf("get bus config Secret: %v", err)
 	}

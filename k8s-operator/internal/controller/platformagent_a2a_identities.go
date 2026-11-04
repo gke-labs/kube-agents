@@ -1160,6 +1160,10 @@ func consoleIdentity() a2aIdentity {
 // Separated from console so that its inbox prefix (_INBOX.console-mcp.>) and
 // its publish surface are distinct from the browser's: it holds the console
 // read surface and chat.console.*.in, and does not hold chat.console.*.confirm.
+//
+// STATIC, as the console credential it replaces for this server was: it
+// authenticates with a password from the creds Secret. Moving it onto the
+// callout with a projected token is not part of the account split.
 func consoleMCPIdentity() a2aIdentity {
 	return a2aIdentity{
 		user:    a2aConsoleMCPUser,

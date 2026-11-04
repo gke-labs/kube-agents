@@ -1079,8 +1079,8 @@ func TestJetStreamStoreMigrationFromAPPToTRUSTED(t *testing.T) {
 	bridgePW := string(creds.Data["bridge-password"])
 
 	// Build a pre-upgrade config in which APP holds `jetstream: enabled` (by
-	// renaming TRUSTED -> OLD_APP_JS in the rendered config, then renaming APP
-	// -> LEGACY_APP and OLD_APP_JS -> APP so seed and gateway provision
+	// renaming TRUSTED -> OLD_JS in the rendered config, then renaming APP
+	// -> LEGACY_APP and OLD_JS -> APP so seed and gateway provision
 	// directly under `/data/jetstream/APP`).
 	legacyConf := strings.Replace(conf, "  TRUSTED {\n    jetstream: enabled", "  OLD_JS {\n    jetstream: enabled", 1)
 	legacyConf = strings.ReplaceAll(legacyConf, "account: TRUSTED", "account: OLD_JS")
