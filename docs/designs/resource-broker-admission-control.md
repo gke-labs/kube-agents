@@ -74,7 +74,7 @@ Single `kubectl` children measured at the XL size, where nothing was killed:
 | `get pods -A -o json`                                                               | 90,000      | 5,610 MiB       |
 | `gcloud logging read …`                                                             | —           | 289 MiB         |
 
-Five facts follow:
+Six facts follow:
 
 1. **The cost of one call varies by a factor of 100.** A `kubectl get node X` uses about 45 MiB;
    a fleet-wide list uses 1 to 5.6 GiB. A limit on calls per minute does not bound memory: two
@@ -88,6 +88,11 @@ Five facts follow:
    sent the same two listings after each restart, until `CrashLoopBackOff`.
 5. **The resource broker cannot tell capabilities apart.** Every command in the reproduction came
    from the shell's ServiceAccount. An audit, a chat question and a triage card look the same.
+6. **Admission on current memory stops the crash loop, not the first kill.** On a build with the
+   credential proxy's watermark gate, the same scenario OOMKilled the proxy once, 90 s after the
+   audit started. The gate then refused 68 calls with `429` and 19 with `503`, and no second kill
+   followed. The gate reads memory when it admits a call; a `kubectl` child admitted at low memory
+   grows past the limit afterwards. Only a rule that acts on running processes closes that gap.
 
 Since the Kubernetes API proxy landed, stock `kubectl` runs inside the sandbox shell and reads
 through the Kubernetes API proxy, which streams responses. The memory of fact 2 therefore moves
