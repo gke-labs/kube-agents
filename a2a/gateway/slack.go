@@ -1597,6 +1597,9 @@ func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageE
 		if threadTS == "" {
 			threadTS = m.TimeStamp
 		}
+		if s.answerSetHome(m.User, slackConversationID(m.ChannelType, m.Channel, threadTS), text) {
+			return InboundMessage{}, false
+		}
 		return InboundMessage{
 			Conversation: slackConversationID(m.ChannelType, m.Channel, threadTS),
 			Kind:         "dm",
@@ -1650,6 +1653,9 @@ func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageE
 	// thread on every reply, so a restart or an expired mark changes nothing.
 	botRooted := isReply && parentUserID != "" && parentUserID == s.botUserID
 	if isReply && !mentioned && !botRooted && !s.isSessionThread(ctx, m.Channel, threadTS) {
+		return InboundMessage{}, false
+	}
+	if s.answerSetHome(m.User, slackConversationID(m.ChannelType, m.Channel, threadTS), text) {
 		return InboundMessage{}, false
 	}
 	return InboundMessage{

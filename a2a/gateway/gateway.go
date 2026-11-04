@@ -44,8 +44,8 @@ const sessionKindGroup = "group"
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
 
 // feedbackCommandNotice answers a bare "/feedback", the gateway's second slash
-// command (docs/designs/chat-feedback-command.md; the third, a typed
-// "/sethome" on Slack, is the adapter's HomeNotice): where a report about
+// command (docs/designs/chat-feedback-command.md; a typed "/sethome" on Slack
+// is the Slack adapter's own, answered before the turn reaches here): where a report about
 // kube-agents itself goes, what one needs, and how to have the agent write
 // one up. Deterministic and model-free, like every gateway affordance; the
 // two links are chattext's, shared with the personas. "/feedback <text>" is
@@ -1008,14 +1008,6 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// (chattext.IsFeedbackCommand, IsFeedbackSummaryCommand).
 	feedbackRest, feedbackCmd := chattext.IsFeedbackCommand(msg.Text)
 	bareFeedback := feedbackCmd && feedbackRest == ""
-	// A typed "/sethome" is answered in place on Slack, where the home
-	// channel moves from the Home tab; with no HomeNoticer on the adapter
-	// stack, or no answer for this conversation, the text goes on as the
-	// turn it was.
-	setHomeNotice := ""
-	if noticer, ok := g.adapter.(HomeNoticer); ok && backend == slackBackend && chattext.IsSetHomeCommand(msg.Text) {
-		setHomeNotice = noticer.HomeNotice(rec.Key)
-	}
 	summaryFeedback := feedbackCmd && chattext.IsFeedbackSummaryCommand(msg.Text)
 	// An explicit cancel from a backend that can express one is read before
 	// the text is read at all: it is not an ask, and a program must never
@@ -1044,11 +1036,6 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		}
 	}
 	switch {
-	case msg.Intent == "" && setHomeNotice != "":
-		// Answered without touching the record's task state, as the bare
-		// "/feedback" is: not a steer, not a stop, not a new task.
-		g.log.Info("sethome notice", "conversation", rec.Key)
-		g.post(rec.Key, setHomeNotice)
 	case msg.Intent == "" && bareFeedback:
 		// Answered without touching the record's task state: not a steer,
 		// not a stop, not a new task.
@@ -1919,9 +1906,10 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	return true
 }
 
-// sessionCommand resolves the first of the slash commands the gateway owns
-// (a bare /feedback, and on Slack a typed /sethome, are answered inline in
-// routeTurn):
+// sessionCommand resolves the first of the two slash commands the gateway
+// owns (the other, a bare /feedback, is answered inline in routeTurn; a
+// typed /sethome on Slack never reaches the gateway, the Slack adapter
+// answers it):
 // "/session" marks the conversation session-routed, "/session <text>" marks
 // it and runs <text> as the first turn, "/session off" releases the
 // incarnation and re-homes to the default addressee. Deterministic, like

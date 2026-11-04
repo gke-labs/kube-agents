@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 	"regexp"
 	"strings"
 	"time"
@@ -138,11 +139,11 @@ func (s *SlackAdapter) homeForView() string {
 	return p.channel
 }
 
-// HomeNotice answers a typed "/sethome" (gateway.HomeNoticer): the Home tab
+// homeNotice answers a typed "/sethome" (answerSetHome): the Home tab
 // panel's state, read as the panel draws it (a move made seconds ago shows
 // over the lagging file), then where the channel moves and who may move it.
 // Fixed text, no Slack call, no model.
-func (s *SlackAdapter) HomeNotice(string) string {
+func (s *SlackAdapter) homeNotice() string {
 	if !s.homePickArmed() {
 		return slackHomeLineNotArmed + " " + slackHomeNoticeNoSet
 	}
@@ -151,6 +152,28 @@ func (s *SlackAdapter) HomeNotice(string) string {
 		state = fmt.Sprintf(slackHomeNoticeHome, home)
 	}
 	return state + " " + slackHomeNoticeMove
+}
+
+// answerSetHome answers a typed "/sethome" or "/hermes sethome"
+// (chattext.IsSetHomeCommand) from an admitted member in the thread it was
+// typed in, before the text becomes a turn: nothing downstream sees it, so no
+// task starts, no open question is marked answered, no home is learned from
+// it and no asker is noted. A member the allowlist does not admit, or one
+// whose admission cannot be decided, is not answered here; the text goes on
+// and the gateway's own admission refuses it as it refuses any turn.
+func (s *SlackAdapter) answerSetHome(member, conversation, text string) bool {
+	if !chattext.IsSetHomeCommand(text) {
+		return false
+	}
+	admitted, decided := s.homeAdmitted(member)
+	if !decided || !admitted {
+		return false
+	}
+	s.log.Info("slack: sethome notice", "member", member, "conversation", conversation)
+	if _, err := s.Post(conversation, s.homeNotice()); err != nil {
+		s.log.Warn("slack: sethome notice not posted", "conversation", conversation, "err", err)
+	}
+	return true
 }
 
 // homeChannelBlocks draws the Home channel panel: the picker and the line

@@ -128,9 +128,9 @@ const (
 	slashSessionWord  = "session"
 	slashOffWord      = "off"
 	slashFeedbackWord = "feedback"
-	// slashSetHomeWord is the third, Slack only: Hermes's own "/sethome", and
-	// the typed "/hermes sethome" its legacy plugin used to unwrap, which the
-	// A2A gateway answers in place under mode next (IsSetHomeCommand).
+	// slashSetHomeWord is Hermes's own "/sethome", and the typed "/hermes
+	// sethome" its legacy plugin used to unwrap, which the Slack adapter
+	// answers itself under mode next (IsSetHomeCommand).
 	slashSetHomeWord = "sethome"
 	slashHermesWord  = "hermes"
 	// slashFeedbackSummaryWord is the one argument the gateway answers itself:
@@ -184,8 +184,8 @@ func IsFeedbackSummaryCommand(text string) bool {
 // IsSetHomeCommand reports whether the turn asks to set the home channel the
 // Hermes way: "/sethome" (bare or with text after it, since Hermes's own took
 // none) or "/hermes sethome", case-insensitively. Not part of IsCommand: the
-// gateway answers it in place on Slack only, and every other reader of a
-// turn's text treats it as the turn it was.
+// Slack adapter answers it itself before the text becomes a turn, and every
+// other reader of a turn's text treats it as the turn it was.
 func IsSetHomeCommand(text string) bool {
 	if _, ok := slashWord(text, slashSetHomeWord); ok {
 		return true

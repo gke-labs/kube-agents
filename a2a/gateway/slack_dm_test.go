@@ -77,15 +77,6 @@ func startSlackDMRig(t *testing.T) *slackDMRig {
 // Config tweak (nil: none), for the session route and its cap.
 func startSlackDMRigWith(t *testing.T, spawn spawner, tweak func(*Config)) *slackDMRig {
 	t.Helper()
-	return startSlackDMRigWithAdapter(t, spawn, tweak, func(a *slackEventAdapter, _ string) Adapter { return a })
-}
-
-// startSlackDMRigWithAdapter is startSlackDMRigWith with the Adapter the
-// gateway is handed chosen by wrap, which also gets the bus URL: for a case
-// that hides the Slack adapter's optional extensions, or builds the stack
-// main.go builds around it (sethome_notice_test.go).
-func startSlackDMRigWithAdapter(t *testing.T, spawn spawner, tweak func(*Config), wrap func(*slackEventAdapter, string) Adapter) *slackDMRig {
-	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -125,7 +116,7 @@ func startSlackDMRigWithAdapter(t *testing.T, spawn spawner, tweak func(*Config)
 	if tweak != nil {
 		tweak(cfg)
 	}
-	g, err := New(Options{Client: client, Adapter: wrap(adapter, url), Config: cfg, Backend: slackBackend, Spawner: spawn, Logger: slog.Default()})
+	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: slackBackend, Spawner: spawn, Logger: slog.Default()})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

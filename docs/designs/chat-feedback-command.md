@@ -234,7 +234,7 @@ its issue is closed afterwards.
 ### 6. Documentation and tests
 
 - `docs/site/src/content/docs/concepts/chatops.md`: the "What carries over" row reads two
-  commands (three on Slack since `/sethome` is answered there too); a `/feedback` section beside `/session` with the gateway's answer and the
+  commands; a `/feedback` section beside `/session` with the gateway's answer and the
   agent's flow, and what a `BLOCKED` filing looks like.
 - `docs/site/src/content/docs/reference/security-and-iam.md` and
   `reference/credential-isolation.md`: the feedback verb joins the list of what the sandbox

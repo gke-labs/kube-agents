@@ -289,18 +289,6 @@ func (s *sideDoorAdapter) ShowsTaskStatus(conversation string) bool {
 	return ok && shower.ShowsTaskStatus(conversation)
 }
 
-// HomeNotice answers for the primary's own conversations; a door has no home
-// channel to speak of and answers "".
-func (s *sideDoorAdapter) HomeNotice(conversation string) string {
-	if s.doorFor(conversation) != nil {
-		return ""
-	}
-	if noticer, ok := s.primary.(HomeNoticer); ok {
-		return noticer.HomeNotice(conversation)
-	}
-	return ""
-}
-
 func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if s.doorFor(conversation) != nil {
 		return

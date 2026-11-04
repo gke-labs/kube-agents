@@ -2,8 +2,7 @@ package gateway
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -14,17 +13,10 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// HomeNotice makes the generic fake a HomeNoticer, so a test can show the
-// gateway does not answer a typed /sethome on a backend that is not Slack.
-func (a *fakeAdapter) HomeNotice(string) string { return a.homeNotice }
-
-// plainAdapter hides every optional extension of the adapter it wraps: the
-// gateway sees an Adapter and nothing more.
-type plainAdapter struct{ Adapter }
-
 // TestSetHomeNoticeAnswersATypedSethomeOnSlack: a typed /sethome or
-// /hermes sethome on Slack is answered in place by the adapter's notice,
-// whatever the task state, and starts no task and steers none.
+// /hermes sethome from an admitted member is answered by the Slack adapter
+// in the thread it was typed in, before the text becomes a turn: no task
+// starts, a running task is neither steered nor stopped.
 func TestSetHomeNoticeAnswersATypedSethomeOnSlack(t *testing.T) {
 	d := startSlackDMRig(t)
 	// Not armed: the field decides.
@@ -38,9 +30,8 @@ func TestSetHomeNoticeAnswersATypedSethomeOnSlack(t *testing.T) {
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: homeTestRecord, Namespace: homeTestNamespace}, Data: map[string]string{homeRecordKeySlack: "C0HOME1"}}
 	d.adapter.SetHomeLearner(k8sfake.NewSimpleClientset(cm), homeTestNamespace, homeTestRecord, homeTestImage, dir)
 	writeHomeFile(t, dir, "C0HOME1\n")
-	d.adapter.SetHome(func(string) (bool, bool) { return true, false }, func(context.Context) (*lib.Board, error) { return &lib.Board{}, nil })
 	d.adapter.events <- slackMsg("im", "D1", "U1", "/hermes sethome", "100.2", "")
-	d.awaitPost(t, "the notice naming the home", "D1", "100.2", fmt.Sprintf(slackHomeNoticeHome, "C0HOME1")+" "+slackHomeNoticeMove)
+	d.awaitPost(t, "the notice naming the home", "D1", "100.2", "Home channel now: `C0HOME1`")
 	// In a thread with a running task: the notice posts there and the task
 	// is neither steered nor stopped.
 	d.adapter.events <- slackMsg("im", "D1", "U1", "how is the fleet", "101.1", "")
@@ -52,80 +43,63 @@ func TestSetHomeNoticeAnswersATypedSethomeOnSlack(t *testing.T) {
 	}
 }
 
-// TestSetHomeNoticeStaysOffOtherBackends: on a backend that is not Slack a
-// typed /sethome is the turn it was, HomeNoticer or not.
-func TestSetHomeNoticeStaysOffOtherBackends(t *testing.T) {
-	r := startRig(t)
-	r.adapter.homeNotice = "a notice the gateway must not post here"
-	conv := "discord:g1/sethome-3"
-	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "sh-3", Text: "/sethome", TopLevel: true}
-	waitFor(t, "the turn", func() bool { return messagesOn(t, r, "platform") == 1 })
-	if shown(r, r.adapter.homeNotice)() {
-		t.Fatal("the notice posted on a backend that is not Slack")
+// TestSetHomeNoticeLearnsNoHomeAndAdmitsByTheList: a first top-level
+// "@bot /sethome" in a channel on an armed learner with no home learns
+// nothing and gets the notice; a member the list does not admit gets no
+// notice and starts no task.
+func TestSetHomeNoticeLearnsNoHomeAndAdmitsByTheList(t *testing.T) {
+	d := startSlackDMRig(t)
+	dir := t.TempDir()
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: homeTestRecord, Namespace: homeTestNamespace}}
+	cs := k8sfake.NewSimpleClientset(cm)
+	d.adapter.SetHomeLearner(cs, homeTestNamespace, homeTestRecord, homeTestImage, dir)
+	writeHomeFile(t, dir, "")
+	d.adapter.events <- slackMsg("channel", "C0NEW2", "U1", "<@UBOT> /sethome", "200.1", "")
+	d.awaitPost(t, "the no-home notice in the channel thread", "C0NEW2", "200.1", slackHomeLineNoHome)
+	if data, _ := cs.CoreV1().ConfigMaps(homeTestNamespace).Get(context.Background(), homeTestRecord, metav1.GetOptions{}); len(data.Data) != 0 {
+		t.Fatalf("the typed /sethome learned a home: %v", data.Data)
 	}
-}
-
-// TestSetHomeNoticeFallsThroughWithoutTheExtension: on Slack, an adapter
-// without HomeNotice passes a typed /sethome on as the turn it was; nothing
-// is dropped.
-func TestSetHomeNoticeFallsThroughWithoutTheExtension(t *testing.T) {
-	d := startSlackDMRigWithAdapter(t, nil, nil, func(a *slackEventAdapter, _ string) Adapter { return plainAdapter{a} })
-	d.adapter.events <- slackMsg("im", "D1", "U1", "/sethome", "100.1", "")
-	d.awaitTasks(t, 1)
-	for _, p := range d.posts() {
-		if strings.Contains(p.text, slackHomeNoticeNoSet) || strings.Contains(p.text, slackHomeNoticeMove) {
-			t.Fatalf("a notice posted with no HomeNoticer on the adapter: %q", p.text)
-		}
-	}
-}
-
-// TestSetHomeNoticeReachesThroughTheProductionStack: the deployed gateway
-// drives the Slack adapter through a MultiAdapter beside the console (cmd/
-// gateway/main.go), so the extension is read through the mux for the
-// conversation's backend; a typed /sethome still gets the notice and no task.
-func TestSetHomeNoticeReachesThroughTheProductionStack(t *testing.T) {
-	d := startSlackDMRigWithAdapter(t, nil, nil, func(a *slackEventAdapter, url string) Adapter {
-		console, err := NewConsoleAdapter(url, nil, slog.Default())
-		if err != nil {
-			t.Fatalf("console adapter: %v", err)
-		}
-		t.Cleanup(console.Close)
-		m, err := NewMultiAdapter(slackBackend, "console", map[string]Adapter{slackBackend: a, "console": console}, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return m
-	})
-	d.adapter.events <- slackMsg("im", "D1", "U1", "/sethome", "100.1", "")
-	d.awaitPost(t, "the notice through the mux", "D1", "100.1", slackHomeLineNotArmed+" "+slackHomeNoticeNoSet)
 	if n := len(d.tasks(t)); n != 0 {
-		t.Fatalf("%d tasks, want none: the typed /sethome became a turn through the production stack", n)
+		t.Fatalf("%d tasks, want none", n)
+	}
+	// A member the list does not admit: the text goes on as a turn, which
+	// the gateway's own admission refuses; no notice, no task.
+	before := len(d.posts())
+	d.adapter.events <- slackMsg("im", "D2", "U2", "/sethome", "201.1", "")
+	waitFor(t, "the gateway to refuse the turn", func() bool { return len(d.posts()) > before })
+	for _, p := range d.posts()[before:] {
+		if p.channel == "D2" && (p.text == toMrkdwn(slackHomeLineNotArmed+" "+slackHomeNoticeNoSet) || p.text == toMrkdwn(slackHomeLineNoHome+" "+slackHomeNoticeMove)) {
+			t.Fatalf("a member the list does not admit got the notice: %q", p.text)
+		}
+	}
+	if n := len(d.tasks(t)); n != 0 {
+		t.Fatalf("%d tasks, want none", n)
 	}
 }
 
-// TestSetHomeNoticeReachesThroughTheSideDoorStack: with a door armed the
-// deployed stack is the side-door wrapper over the mux; the extension is
-// still asked for the Slack conversation and the notice posts.
-func TestSetHomeNoticeReachesThroughTheSideDoorStack(t *testing.T) {
-	d := startSlackDMRigWithAdapter(t, nil, nil, func(a *slackEventAdapter, url string) Adapter {
-		console, err := NewConsoleAdapter(url, nil, slog.Default())
-		if err != nil {
-			t.Fatalf("console adapter: %v", err)
-		}
-		t.Cleanup(console.Close)
-		m, err := NewMultiAdapter(slackBackend, "console", map[string]Adapter{slackBackend: a, "console": console}, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		door, err := NewInjectAdapter("127.0.0.1:0", injectTestToken, injectTestGrace, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return WithSideDoors(m, []DoorSpec{InjectDoorSpec(door)}, nil)
-	})
-	d.adapter.events <- slackMsg("im", "D1", "U1", "/hermes sethome", "100.1", "")
-	d.awaitPost(t, "the notice through the side door and the mux", "D1", "100.1", slackHomeLineNotArmed+" "+slackHomeNoticeNoSet)
-	if n := len(d.tasks(t)); n != 0 {
-		t.Fatalf("%d tasks, want none: the typed /hermes sethome became a turn through the side-door stack", n)
+// TestSetHomeNoticeLeavesAnOpenQuestionOpen: a typed /sethome in a thread
+// whose task has a question open is answered in the thread and is no
+// answer to the question: it stays open and its card is not rewritten.
+func TestSetHomeNoticeLeavesAnOpenQuestionOpen(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	a.SetHome(func(string) (bool, bool) { return true, false }, func(context.Context) (*lib.Board, error) { return &lib.Board{}, nil })
+	conv := "slack:C1/40.0"
+	a.noteQuestion(conv, slackQuestion{channel: "C1", ts: "50.0", text: "Which one?", blocks: json.RawMessage(uxQuestionBlocks)})
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "<@UBOT> /sethome", "55.0", "40.0")); ok {
+		t.Fatal("a typed /sethome in the question's thread became a turn")
+	}
+	if n := len(api.posted); n != 1 || api.posted[0].thread != "40.0" || !strings.Contains(api.posted[0].text, slackHomeNoticeNoSet) {
+		t.Fatalf("posts = %+v, want the notice in the thread", api.posted)
+	}
+	a.mu.Lock()
+	_, open := a.uxLocked().questions[conv]
+	a.mu.Unlock()
+	if !open || len(api.updated) != 0 {
+		t.Fatalf("question open %v, card rewrites %d; want the question untouched", open, len(api.updated))
+	}
+	// A plain reply in the same thread is the turn a /sethome is not.
+	if _, ok := a.inbound(context.Background(), slackMsg("channel", "C1", "U1", "<@UBOT> B", "56.0", "40.0")); !ok {
+		t.Fatal("a plain mentioned reply in the thread was not a turn")
 	}
 }
