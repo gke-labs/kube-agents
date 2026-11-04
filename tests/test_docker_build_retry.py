@@ -60,7 +60,8 @@ def _failure_gate(step_id):
 
 
 def _uses_retried_action(step):
-    return str(step.get("uses", "")).startswith(_RETRIED_ACTIONS)
+    # GitHub resolves action owners and names case-insensitively.
+    return str(step.get("uses", "")).lower().startswith(_RETRIED_ACTIONS)
 
 
 def check_retries(steps, exempt=_EXEMPT_STEPS):
@@ -219,6 +220,10 @@ class CheckerTest(unittest.TestCase):
         steps = copy.deepcopy(self._good())
         problems, _ = check_retries(steps, exempt=frozenset({"Build"}))
         self.assertTrue(problems)
+
+    def test_capitalised_uses_is_still_a_network_step(self):
+        steps = [{"name": "B", "uses": "Docker/build-push-action@abc"}]
+        self.assertTrue(check_retries(steps, exempt=frozenset())[0])
 
     def test_retry_uses_different_action(self):
         self.assertTrue(
