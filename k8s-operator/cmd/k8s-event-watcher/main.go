@@ -636,8 +636,11 @@ type dispatcher struct {
 	// scaleUps carries cluster-autoscaler's verdict on a pod from the event that
 	// records it to the FailedScheduling events it qualifies. Per-cluster for
 	// the same reason; pod UIDs are unique across clusters regardless.
-	scaleUps  *scaleUpMemo
-	settles   *settleMemo
+	scaleUps *scaleUpMemo
+	settles  *settleMemo
+	// owners fills an admitted Pod event's controller_ref from the Pod's
+	// owner (ownerResolver); nil sends the field empty, as before.
+	owners    *ownerResolver
 	injector  *injector
 	metrics   *metrics
 	mode      string // "per-incident" or "shared"
@@ -829,8 +832,8 @@ var podTemplateHashPodPattern = regexp.MustCompile(`^(.*?)-[4-9bcdf]{8,10}-[a-z0
 // named workloads held, whoever creates objects on the watched cluster. The
 // daemon keys every non-Pod object by its exact name because its row is a
 // database row, not a series; the label departs from it there and nowhere
-// else. The watcher sets no controller reference on its events (watcher.go),
-// so the name is what there is to fold.
+// else. The label is set before the owner lookup (ownerResolver), so it
+// folds by name only.
 func workloadOf(ev TriageEvent) string {
 	if !strings.EqualFold(ev.KindOfObject, kindPod) {
 		if _, ok := namedWorkloadKinds[strings.ToLower(ev.KindOfObject)]; ok {
@@ -977,6 +980,11 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "ok").Inc()
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 		d.dedup.BindObject(ev.Key, ev.Message, ev.Namespace, ev.KindOfObject, ev.Name, ev.FirstSeen, ev.Count)
+	}
+	// Looked up only for an event the filter and dedup admitted, so a
+	// cluster's event stream costs one Pod read per incident, not per event.
+	if ev.ControllerRef == "" && ev.KindOfObject == kindPod {
+		ev.ControllerRef = d.owners.ControllerRef(ctx, ev.Namespace, ev.Name, ev.Key.UID)
 	}
 	payload := InjectPayload{
 		Kind:         injectKindEvent,

@@ -246,7 +246,9 @@ deliver whatever arrived meanwhile, and a window restored on one of them would a
 oversize batch again when it is redelivered, at every deadline. On a profile cluster the join's
 read goes through the same broker, which relays a named read only for the kinds in its table
 (`WATCHER_NAMED_READS` in `agents/platform/scripts/watcher_policy.py`): built-in declarative kinds and
-the six GitOps sync objects the agent can read itself, never a Secret. A record of any other kind
+the six GitOps sync objects the agent can read itself, never a Secret. A named Pod is relayed only as its
+owner projection, for the event watcher, so the join's full read of a Pod is refused under
+`kubernetes.watcher.accept`. A Pod record, like a record of a kind outside the table,
 comes out `failed`, with the broker's rule in the lookup error, and so without the `reconciled`
 judgement: a GitOps-managed object of an unlisted kind (a Flux HelmRelease, say) is reported without
 "since reconciled by" even when its controller has already put it back. The credential behind

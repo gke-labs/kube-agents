@@ -21,9 +21,10 @@
 // is 410 Gone, and injects the faults a reflector has to live through: 429s
 // with Retry-After on the first requests, and the expiry of every open watch.
 //
-// The event watcher reads Events only; Nodes and Pods are served, at the
-// sizes the issue of fleet scale names, for the collectors that page through
-// them, which have no Go consumer here yet.
+// The event watcher reads Events, and one named Pod's metadata for its owner
+// lookup, which this fake answers 404 (the Pod reads as having no owner);
+// Nodes and Pods are served, at the sizes the issue of fleet scale names, for
+// the collectors that page through them, which have no Go consumer here yet.
 //
 // What it does not do: selectors beyond `reason=<value>` on Events (every other request sees every object), namespaced
 // paths (the three resources are served at the cluster scope only), writes
