@@ -854,13 +854,29 @@ inject_target() {
   fi
   rm -f "${err}"
   if [ -n "${holder}" ]; then
-    selector="$(k get svc "${INJECT_NAME}" -o "go-template=${SELECTOR_TEMPLATE}" 2>/dev/null || true)"
-    selector="${selector%,}"
-    if [ -n "${selector}" ] && k get pods -l "${selector}" -o name 2>/dev/null | grep -qxF "pod/${holder}"; then
+    local pods
+    # A pod's name and nothing else: the holder is a free string, and one
+    # with a newline would pass grep -F below as two patterns.
+    case "${holder}" in
+      *[!a-z0-9.-]*)
+        note "lease ${A2A_GATEWAY_NAME} names a holder that isn't a pod name; forwarding to svc/${INJECT_NAME}" >&2
+        echo "svc/${INJECT_NAME}"
+        return 0
+        ;;
+    esac
+    if ! selector="$(k_read get svc "${INJECT_NAME}" -o "go-template=${SELECTOR_TEMPLATE}")"; then
+      note "reading svc/${INJECT_NAME}'s selector failed; forwarding to the service" >&2
+    elif [ -z "${selector}" ]; then
+      # An empty selector would list every pod in the namespace.
+      note "svc/${INJECT_NAME} has no selector; forwarding to the service" >&2
+    elif ! pods="$(k_read get pods -l "${selector%,}" -o name)"; then
+      note "listing the pods svc/${INJECT_NAME} selects failed; forwarding to the service" >&2
+    elif printf '%s\n' "${pods}" | grep -qxF "pod/${holder}"; then
       echo "pod/${holder}"
       return 0
+    else
+      note "lease ${A2A_GATEWAY_NAME} names ${holder}, which is not a pod svc/${INJECT_NAME} selects; forwarding to the service" >&2
     fi
-    note "lease ${A2A_GATEWAY_NAME} names ${holder}, which is not a pod svc/${INJECT_NAME} selects; forwarding to the service" >&2
   fi
   echo "svc/${INJECT_NAME}"
 }

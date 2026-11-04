@@ -466,6 +466,8 @@ FAKE_KUBECTL = textwrap.dedent(
             if kind == "platformagent":
                 obj = s["cr"]
                 out = json.dumps(obj) if fmt == "json" else jsonpath(obj, fmt[len("jsonpath="):])
+            elif kind == "pods" and "-l" in rest and s["scenario"].get("pods_forbidden"):
+                sys.stderr.write('Error from server (Forbidden): pods is forbidden\n'); rc = 1
             elif kind == "pods" and "-l" in rest:
                 # The pods a label selector picks, by name: the selector's
                 # pairs must all be on the pod.
@@ -1105,6 +1107,29 @@ class PortForwardTest(RoundTripTest):
 
         result, _, _ = self.run_sim(healthy_next_state(), **self.tunnel_env())
         self.assertNotIn("reading lease", result.stderr)
+
+    def test_a_failed_pod_list_is_said_and_not_blamed_on_the_holder(self) -> None:
+        gateway_pods = [{"name": "platform-agent-a2a-gateway-7d9f-abcde", "labels": {"app": "platform-agent-a2a-gateway"}}]
+        state = healthy_next_state(labelled_pods=gateway_pods, pods_forbidden=True)
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "platform-agent-a2a-gateway-7d9f-abcde"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env(), ROLLBACK_POLL_SECONDS="0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("listing the pods svc/platform-agent-a2a-inject selects failed", result.stderr)
+        self.assertNotIn("which is not a pod", result.stderr)
+
+    def test_a_holder_that_is_not_a_pod_name_is_not_trusted(self) -> None:
+        gateway_pods = [{"name": "gw-a", "labels": {"app": "platform-agent-a2a-gateway"}}]
+        state = healthy_next_state(labelled_pods=gateway_pods)
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "gw-a\nanything"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("isn't a pod name", result.stderr)
 
     def test_a_lease_holder_outside_the_inject_service_is_not_trusted(self) -> None:
         # The tunnel carries the door's token: a Lease naming a pod the inject

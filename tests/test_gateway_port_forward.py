@@ -36,7 +36,12 @@ case "$1 $2" in
     fi
     cat "${FAKE_DIR}/holder" ;;
   "get svc") printf 'app=platform-agent-a2a-gateway,' ;;
-  "get pods") cat "${FAKE_DIR}/pods" ;;
+  "get pods")
+    if [ -e "${FAKE_DIR}/pods_forbidden" ]; then
+      echo 'Error from server (Forbidden): pods is forbidden: cannot list resource "pods"' >&2
+      exit 1
+    fi
+    cat "${FAKE_DIR}/pods" ;;
   port-forward*)
     echo "$2" >>"${FAKE_DIR}/forwards"
     echo "$$" >>"${FAKE_DIR}/pids"
@@ -142,6 +147,30 @@ class GatewayPortForwardTest(unittest.TestCase):
         self.proc.send_signal(signal.SIGTERM)
         _, stderr = self.proc.communicate(timeout=10)
         self.assertNotIn(b"failed", stderr)
+
+    def test_a_failed_pod_list_is_said_once_not_blamed_on_the_holder(self) -> None:
+        # A caller without list on pods: the Service, and the read that
+        # failed named, once, not every poll.
+        (self.dir / "holder").write_text("gw-a")
+        (self.dir / "pods_forbidden").write_text("")
+        self.start()
+        self.wait_for(["svc/platform-agent-a2a-inject"], START_WAIT_SECONDS)
+        polls = self.calls("get lease")
+        deadline = time.monotonic() + MOVE_WAIT_SECONDS
+        while time.monotonic() < deadline and self.calls("get lease") < polls + 2:
+            time.sleep(0.2)
+        assert self.proc is not None
+        self.proc.send_signal(signal.SIGTERM)
+        _, stderr = self.proc.communicate(timeout=10)
+        self.assertEqual(stderr.count(b"listing the pods svc/platform-agent-a2a-inject selects failed"), 1, stderr)
+        self.assertIn(b"Forbidden", stderr)
+        self.assertNotIn(b"which is not a pod", stderr)
+
+    def test_a_holder_that_is_not_a_pod_name_gets_the_service(self) -> None:
+        # A newline would pass grep -F as two patterns, gw-a among them.
+        (self.dir / "holder").write_text("gw-a\nanything")
+        self.start()
+        self.wait_for(["svc/platform-agent-a2a-inject"], START_WAIT_SECONDS)
 
     def test_a_holder_the_service_does_not_select_gets_the_service(self) -> None:
         (self.dir / "holder").write_text("some-other-pod")

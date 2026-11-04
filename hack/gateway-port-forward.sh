@@ -76,18 +76,40 @@ read_holder() {
 }
 
 # The target for a holder: its pod, if the door's Service selects it, or the
-# Service.
+# Service. Says why on stderr when it falls back, unless the second argument
+# is "quiet": a poll re-checking a holder it already warned about.
 target_for() {
-  local holder="$1" selector
-  if [ -n "${holder}" ]; then
-    selector="$(k get svc "${DOOR_SERVICE}" -o "go-template=${SELECTOR_TEMPLATE}" 2>/dev/null || true)"
-    selector="${selector%,}"
-    if [ -n "${selector}" ] && k get pods -l "${selector}" -o name 2>/dev/null | grep -qxF "pod/${holder}"; then
-      echo "pod/${holder}"
-      return 0
-    fi
-    echo "lease ${LEASE} names ${holder}, which is not a pod svc/${DOOR_SERVICE} selects; using the service" >&2
+  local holder="$1" quiet="${2:-}" selector pods err
+  if [ -z "${holder}" ]; then
+    echo "svc/${DOOR_SERVICE}"
+    return 0
   fi
+  say() { [ "${quiet}" = "quiet" ] || echo "$*" >&2; }
+  # A pod's name and nothing else: the holder is a free string, and one with
+  # a newline would pass grep -F below as two patterns.
+  case "${holder}" in
+    *[!a-z0-9.-]*)
+      say "lease ${LEASE} names a holder that isn't a pod name; using svc/${DOOR_SERVICE}"
+      echo "svc/${DOOR_SERVICE}"
+      return 0
+      ;;
+  esac
+  err="$(mktemp)"
+  if ! selector="$(k get svc "${DOOR_SERVICE}" -o "go-template=${SELECTOR_TEMPLATE}" 2>"${err}")"; then
+    say "reading svc/${DOOR_SERVICE}'s selector failed; using the service: $(tr '\n' ' ' <"${err}")"
+  elif [ -z "${selector}" ]; then
+    # An empty selector would list every pod in the namespace.
+    say "svc/${DOOR_SERVICE} has no selector; using the service"
+  elif ! pods="$(k get pods -l "${selector%,}" -o name 2>"${err}")"; then
+    say "listing the pods svc/${DOOR_SERVICE} selects failed; using the service: $(tr '\n' ' ' <"${err}")"
+  elif printf '%s\n' "${pods}" | grep -qxF "pod/${holder}"; then
+    rm -f "${err}"
+    echo "pod/${holder}"
+    return 0
+  else
+    say "lease ${LEASE} names ${holder}, which is not a pod svc/${DOOR_SERVICE} selects; using the service"
+  fi
+  rm -f "${err}"
   echo "svc/${DOOR_SERVICE}"
 }
 
@@ -116,8 +138,12 @@ while true; do
     if [ "${now_holder}" = "${holder}" ] && [ "${target}" = "pod/${holder}" ]; then
       continue
     fi
+    # The same holder re-checked (the last answer was the Service) has
+    # already been warned about.
+    quiet=""
+    [ "${now_holder}" = "${holder}" ] && quiet="quiet"
     holder="${now_holder}"
-    now="$(target_for "${holder}")"
+    now="$(target_for "${holder}" "${quiet}")"
     if [ "${now}" != "${target}" ]; then
       echo "the lease moved to ${now}; restarting the port-forward" >&2
       kill "${pf_pid}" 2>/dev/null || true
