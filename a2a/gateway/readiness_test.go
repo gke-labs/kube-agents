@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ReadyzPath answers the readiness it is given, both ways, with the reason
@@ -141,4 +142,37 @@ func TestFeedbackRetriesStartOnceTheRelayBinds(t *testing.T) {
 	}
 	withFeedbackBucket(t, time.Hour)(&Config{NATSURL: url})
 	waitFor(t, "answer feedback to turn on once its bucket exists", func() bool { return g.feedback.Load() != nil })
+}
+
+// The people bucket comes from the same provision Job as TASKS, so its
+// retries start once the relay binds too, as feedback's do.
+func TestPeopleRetriesStartOnceTheRelayBinds(t *testing.T) {
+	old := peopleRetryInterval
+	peopleRetryInterval = 10 * time.Millisecond // 30 retries: 300ms
+	t.Cleanup(func() { peopleRetryInterval = old })
+	g, url, ctx := newUnprovisionedGateway(t)
+	go func() { _ = g.Run(ctx) }()
+
+	time.Sleep(time.Duration(peopleRetries+20) * peopleRetryInterval)
+	provision(t, url)
+	waitFor(t, "the relay to bind", func() bool { ready, _ := g.Readiness(); return ready })
+	if g.people.Load() != nil {
+		t.Fatal("the people count is on before its bucket exists")
+	}
+	createPeopleBucket(t, url, jetstream.KeyValueConfig{History: 1, TTL: time.Hour})
+	waitFor(t, "the people count to turn on once its bucket exists", func() bool { return g.people.Load() != nil })
+}
+
+// A start after a crash holds the bind back on purpose; readiness says so
+// rather than blaming the stream, and turns ready once the held bind lands.
+func TestReadinessNamesAHeldBackBind(t *testing.T) {
+	g, url, ctx := newUnprovisionedGateway(t)
+	provision(t, url)
+	go func() { _ = g.RunWith(ctx, RunOptions{RelayBindDelay: 2 * time.Second}) }()
+	waitFor(t, "the bind to be held back", func() bool { return g.relayHeldBack.Load() })
+	ready, reason := g.Readiness()
+	if ready || !strings.Contains(reason, "held back after a crash start") || strings.Contains(reason, "waiting for stream") {
+		t.Fatalf("Readiness while held back = %v %q", ready, reason)
+	}
+	waitFor(t, "the held-back bind to land", func() bool { r, _ := g.Readiness(); return r })
 }

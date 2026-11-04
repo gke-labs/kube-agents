@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 	"google.golang.org/api/pubsub/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -706,7 +707,12 @@ func TestAckDeadlinePreflight(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := ackDeadlinePreflight(context.Background(), tc.read, tc.budget)
+			deadline, got := ackDeadlinePreflight(context.Background(), tc.read, tc.budget)
+			if want, err := tc.read(context.Background()); err == nil && deadline != want {
+				t.Errorf("ackDeadlinePreflight(...) deadline = %s, want the %s it read", deadline, want)
+			} else if err != nil && deadline != 0 {
+				t.Errorf("ackDeadlinePreflight(...) deadline = %s after a failed probe, want 0", deadline)
+			}
 			if (got != "") != tc.wantLine {
 				t.Fatalf("ackDeadlinePreflight(...) = %q, want a line=%v", got, tc.wantLine)
 			}
@@ -892,6 +898,318 @@ func TestNewSubscriberDefaultsMaxMessages(t *testing.T) {
 	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, 0, defaultBatchJoinBudget)
 	if sub.maxMessages != defaultMaxMessages {
 		t.Errorf("maxMessages = %d, want %d", sub.maxMessages, defaultMaxMessages)
+	}
+	if sub.window != defaultMaxMessages {
+		t.Errorf("window = %d, want the ceiling %d", sub.window, defaultMaxMessages)
+	}
+}
+
+// sizedMessage is a message with the size its serialized form would have on
+// the relay, declared rather than carried: the cap arithmetic is what the
+// capped source models, and 20 MiB of real padding would buy nothing.
+type sizedMessage struct {
+	msg  receivedMessage
+	size int64
+}
+
+// oversizeRefusal is the error the generated client returns for the broker's
+// refusal: a 502 whose raw body carries the broker's code.
+func oversizeRefusal() error {
+	return fmt.Errorf("pull sub: %w", &googleapi.Error{Code: http.StatusBadGateway, Body: `{"error":"the upstream answer could not be relayed","code":"UPSTREAM_UNRELAYABLE"}`})
+}
+
+// cappedSource models the credential broker's watcher relay in front of a
+// subscription: a pull whose answer would serialize past capBytes is refused
+// with the relay's 502, and Pub/Sub, which had already delivered the batch to
+// the broker, holds it under its lease for leasePulls further pulls before it
+// is available again. During the lease, trickle hands out one message per
+// pull, the way a live subscription keeps receiving audit entries while a
+// refused batch sits leased. Every delivery is counted per ack id, so a test
+// can assert that nothing was handed out twice. Each pull also advances the
+// clock the loop reads, by clockStep, so a test can drive the time-keyed hold.
+type cappedSource struct {
+	fakeSource
+	capBytes   int64
+	leasePulls int
+
+	queue     []sizedMessage
+	leased    []sizedMessage
+	leaseLeft int
+	trickle   []sizedMessage
+
+	windows    []int64
+	refusals   int
+	deliveries map[string]int
+
+	now       time.Time
+	clockStep time.Duration
+
+	// stopAfter cancels the loop once this many pulls have been made, so the
+	// test can read the source without racing the goroutine running Run.
+	stopAfter int
+	stop      context.CancelFunc
+}
+
+func newCappedSource(capBytes int64, stopAfter int, stop context.CancelFunc) *cappedSource {
+	return &cappedSource{
+		capBytes:   capBytes,
+		leasePulls: 1,
+		deliveries: map[string]int{},
+		now:        time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC),
+		clockStep:  time.Minute,
+		stopAfter:  stopAfter,
+		stop:       stop,
+	}
+}
+
+func (c *cappedSource) clock() time.Time { return c.now }
+
+func (c *cappedSource) enqueue(prefix string, n int, size int64) {
+	for i := 0; i < n; i++ {
+		c.queue = append(c.queue, sizedMessage{
+			msg:  receivedMessage{AckID: fmt.Sprintf("%s-%03d", prefix, i), Data: []byte(notKubernetesEntry)},
+			size: size,
+		})
+	}
+}
+
+func (c *cappedSource) Pull(ctx context.Context, maxMessages int64) ([]receivedMessage, error) {
+	c.pulls++
+	c.now = c.now.Add(c.clockStep)
+	c.windows = append(c.windows, maxMessages)
+	if c.stopAfter > 0 && c.pulls >= c.stopAfter {
+		c.stop()
+	}
+	if len(c.leased) > 0 {
+		if c.leaseLeft == 0 {
+			c.queue = append(c.leased, c.queue...)
+			c.leased = nil
+		} else {
+			c.leaseLeft--
+			if len(c.trickle) > 0 {
+				c.queue = append(c.queue, c.trickle[0])
+				c.trickle = c.trickle[1:]
+			}
+		}
+	}
+	n := int(maxMessages)
+	if n > len(c.queue) {
+		n = len(c.queue)
+	}
+	batch := c.queue[:n]
+	var total int64
+	for _, m := range batch {
+		total += m.size
+	}
+	c.queue = c.queue[n:]
+	if total > c.capBytes {
+		c.refusals++
+		c.leased = append([]sizedMessage(nil), batch...)
+		c.leaseLeft = c.leasePulls
+		return nil, oversizeRefusal()
+	}
+	out := make([]receivedMessage, 0, n)
+	for _, m := range batch {
+		c.deliveries[m.msg.AckID]++
+		out = append(out, m.msg)
+	}
+	return out, nil
+}
+
+// runCapped runs a subscriber over source until the source stops it, with the
+// loop's clock and hold set for the test, and returns the log it wrote.
+func runCapped(t *testing.T, ctx context.Context, source *cappedSource, hold time.Duration) (*subscriber, string) {
+	t.Helper()
+	var buf syncBuffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	sub := newSubscriber(source, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
+	sub.idleWait = time.Millisecond
+	sub.now = source.clock
+	sub.refusalHold = hold
+
+	done := make(chan error, 1)
+	go func() { done <- sub.Run(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop after the pulls were observed")
+	}
+	return sub, buf.String()
+}
+
+func assertDeliveredOnce(t *testing.T, source *cappedSource, want int) {
+	t.Helper()
+	if len(source.acked) != want {
+		t.Errorf("acked %d message(s), want %d", len(source.acked), want)
+	}
+	for ackID, n := range source.deliveries {
+		if n != 1 {
+			t.Errorf("message %s delivered %d time(s), want once", ackID, n)
+		}
+	}
+	if len(source.deliveries) != want {
+		t.Errorf("%d distinct message(s) delivered, want %d", len(source.deliveries), want)
+	}
+}
+
+const (
+	// The issue's fixture: 100 messages totalling 20 MiB against the relay's
+	// 16 MiB cap.
+	fixtureMessages    = 100
+	fixtureMessageSize = 200 * 1024
+	fixtureRelayCap    = 16 * 1024 * 1024
+	// A hold of three of the source's one-minute pulls: long enough to cover
+	// the leased pull, short enough that the restore is observed.
+	fixtureHold = 3 * time.Minute
+)
+
+// The issue's acceptance line, rewritten for the adaptive window: the fixture
+// batch is drained within three pulls of the one refused pull, with no message
+// delivered twice, and the window returns to the ceiling once the backlog is
+// gone and the hold has passed.
+//
+// The refused pull strands its batch for one ack deadline, which this source
+// models as one pull: the pull right after the refusal comes back empty. The
+// window must hold at 50 through that empty pull rather than restore to 100,
+// or the next deadline would see the same oversize pull refused again.
+func TestRunDrainsAnOversizeBacklogByHalvingTheWindow(t *testing.T) {
+	// Enough pulls to see the refusal, the leased empty pull, the two batches
+	// that fit, the empty pull that restores the window, and one pull at the
+	// restored ceiling.
+	const pullsToObserve = 6
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source := newCappedSource(fixtureRelayCap, pullsToObserve, cancel)
+	source.enqueue("ack", fixtureMessages, fixtureMessageSize)
+
+	sub, out := runCapped(t, ctx, source, fixtureHold)
+
+	wantWindows := []int64{100, 50, 50, 50, 50, 100}
+	if fmt.Sprint(source.windows) != fmt.Sprint(wantWindows) {
+		t.Errorf("pull windows = %v, want %v", source.windows, wantWindows)
+	}
+	if source.refusals != 1 {
+		t.Errorf("refused pulls = %d, want 1", source.refusals)
+	}
+	assertDeliveredOnce(t, source, fixtureMessages)
+	if sub.window != defaultMaxMessages {
+		t.Errorf("window after the drain = %d, want the ceiling %d", sub.window, defaultMaxMessages)
+	}
+	for _, want := range []string{"window halved to 50 of max-messages=100", "window restored to max-messages=100"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// A live subscription keeps receiving entries while the refused batch sits
+// under its lease, so the pulls in between are not all empty: one delivers a
+// new message, the next is empty. An empty pull is therefore no proof that the
+// refused batch has come back, and a window restored on it would ask for the
+// same oversize batch again at the next deadline, forever. The hold has to be
+// time-keyed: here the lease is two pulls, a message arrives during the first,
+// and the window stays at 50 until the hold has passed and the backlog is gone.
+func TestRunHoldsTheWindowThroughArrivalsDuringTheLease(t *testing.T) {
+	// The refusal, two leased pulls (one with an arrival, one empty), the two
+	// batches that fit, the empty pull that restores, and one at the ceiling.
+	const pullsToObserve = 7
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source := newCappedSource(fixtureRelayCap, pullsToObserve, cancel)
+	source.enqueue("ack", fixtureMessages, fixtureMessageSize)
+	source.leasePulls = 2
+	source.trickle = []sizedMessage{{msg: receivedMessage{AckID: "late-000", Data: []byte(notKubernetesEntry)}, size: 1024}}
+
+	sub, _ := runCapped(t, ctx, source, fixtureHold)
+
+	wantWindows := []int64{100, 50, 50, 50, 50, 50, 100}
+	if fmt.Sprint(source.windows) != fmt.Sprint(wantWindows) {
+		t.Errorf("pull windows = %v, want %v", source.windows, wantWindows)
+	}
+	if source.refusals != 1 {
+		t.Errorf("refused pulls = %d, want 1: the window was restored while the refused batch was still leased", source.refusals)
+	}
+	assertDeliveredOnce(t, source, fixtureMessages+1)
+	if sub.window != defaultMaxMessages {
+		t.Errorf("window after the drain = %d, want the ceiling %d", sub.window, defaultMaxMessages)
+	}
+}
+
+// The floor: a refusal at a window of one leaves it at one, because a single
+// message always fits under the relay's cap and no smaller pull exists.
+func TestShrinkWindowFloorsAtOne(t *testing.T) {
+	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, 4, defaultBatchJoinBudget)
+	for _, want := range []int64{2, 1, 1, 1} {
+		sub.shrinkWindow(oversizeRefusal(), time.Now())
+		if sub.window != want {
+			t.Fatalf("window = %d, want %d", sub.window, want)
+		}
+	}
+}
+
+// Only the relay's refusal shrinks the window: a permission error, a plain
+// transport failure, any other status, and a 502 that does not carry the
+// broker's over-cap code leave it where it was.
+func TestShrinkWindowIgnoresOtherErrors(t *testing.T) {
+	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
+	for _, err := range []error{
+		errors.New("permission denied"),
+		&googleapi.Error{Code: http.StatusServiceUnavailable, Body: `{"code":"UPSTREAM_UNRELAYABLE"}`},
+		&googleapi.Error{Code: http.StatusForbidden},
+		&googleapi.Error{Code: http.StatusBadGateway},
+		&googleapi.Error{Code: http.StatusBadGateway, Body: `{"error":"connection reset","code":"API_RELAY_FAILED"}`},
+		fmt.Errorf("pull sub: %w", &googleapi.Error{Code: http.StatusTooManyRequests}),
+	} {
+		sub.shrinkWindow(err, time.Now())
+		if sub.window != defaultMaxMessages {
+			t.Errorf("window = %d after %v, want %d", sub.window, err, defaultMaxMessages)
+		}
+	}
+	sub.shrinkWindow(oversizeRefusal(), time.Now())
+	if sub.window != defaultMaxMessages/2 {
+		t.Errorf("window = %d after a wrapped refusal, want %d", sub.window, defaultMaxMessages/2)
+	}
+}
+
+// An empty pull restores the window only once the hold has passed since the
+// refusal; before that the refused batch may still be under its lease or its
+// retry backoff, whatever the pulls in between delivered.
+func TestRestoreWindowHoldsUntilTheRefusedBatchCanBeBack(t *testing.T) {
+	refused := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
+	sub.refusalHold = fixtureHold
+	sub.shrinkWindow(oversizeRefusal(), refused)
+	for _, early := range []time.Duration{0, time.Second, fixtureHold - time.Second} {
+		sub.restoreWindow(refused.Add(early))
+		if sub.window != defaultMaxMessages/2 {
+			t.Fatalf("window = %d on an empty pull %s after the refusal, want %d", sub.window, early, defaultMaxMessages/2)
+		}
+	}
+	sub.restoreWindow(refused.Add(fixtureHold))
+	if sub.window != defaultMaxMessages {
+		t.Fatalf("window = %d once the hold passed, want %d", sub.window, defaultMaxMessages)
+	}
+}
+
+// The hold is the subscription's own deadline plus the longest retry backoff
+// when the startup probe read one, and the API ceilings on both when it did
+// not: a shorter hold than the real redelivery time is the loop this exists
+// to prevent, a longer one costs a few smaller pulls.
+func TestSetAckDeadlineSizesTheHold(t *testing.T) {
+	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
+	if sub.refusalHold != pubsubMaxAckDeadline+pubsubMaxRetryBackoff {
+		t.Errorf("default hold = %s, want %s", sub.refusalHold, pubsubMaxAckDeadline+pubsubMaxRetryBackoff)
+	}
+	sub.setAckDeadline(0)
+	if sub.refusalHold != pubsubMaxAckDeadline+pubsubMaxRetryBackoff {
+		t.Errorf("hold after an unread deadline = %s, want the default", sub.refusalHold)
+	}
+	sub.setAckDeadline(60 * time.Second)
+	if sub.refusalHold != 60*time.Second+pubsubMaxRetryBackoff {
+		t.Errorf("hold for a 60s deadline = %s, want %s", sub.refusalHold, 60*time.Second+pubsubMaxRetryBackoff)
 	}
 }
 

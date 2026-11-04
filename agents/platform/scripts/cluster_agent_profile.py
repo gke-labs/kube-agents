@@ -23,16 +23,19 @@ import re
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import EndpointDecision, endpoint_decision
 from profile_scaffold import (
     HERMES_BIN,
+    PROFILE_LOCKS_DIRNAME,  # noqa: F401 - re-exported for this script's tests
     backfill_cron_file,
     ensure_profile,
     is_scaffolded,
     overlay_template,
+    profile_lock,
     profiles_base,
 )
 
@@ -396,6 +399,63 @@ def _push_sandbox_layout(name: str) -> None:
             "the next container start retries it")
 
 
+def _remove_sandbox_layout(name: str) -> None:
+    """Remove a deleted profile's home from the shell sandbox (#4389).
+
+    The inverse of _push_sandbox_layout, through the same script over the same
+    SSH hop: the mirror's ``--remove-profile`` mode, which refuses a name that
+    still has anything under this pod's profiles/. delete_profile calls it under
+    the profile's lock, after the home here is gone, so no scaffold of the same
+    name can be between those two steps.
+
+    Never fatal, for the reason the push is not: a sandbox that is down leaves a
+    stale skeleton, which costs disk and nothing else.
+    """
+    if not SANDBOX_MIRROR.is_file():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(SANDBOX_MIRROR),
+             "--agent-home", str(HERMES_HOME), "--skeleton-only", "--remove-profile", name,
+             "--wait", "30"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=SANDBOX_MIRROR_TIMEOUT_SECONDS,
+        )
+        log(f"{name}: removed the profile layout from the shell sandbox")
+    except Exception as e:  # noqa: BLE001 - no sandbox, or a sandbox that is down
+        log(f"{name}: could not remove the profile layout from the shell sandbox ({e}); "
+            "its directory stays there until somebody removes it")
+
+
+def profile_lock_root() -> Path:
+    """The data root this script's profile locks live under: HERMES_HOME, which is
+    the data volume itself wherever this script runs (the chat roster, the CLI)."""
+    return HERMES_HOME
+
+
+@contextmanager
+def _profile_lock(name: str):
+    """Hold this profile name's lock; yield whether it is held.
+
+    The reconcile's own lock keeps two reconciles apart, but not a reconcile's
+    PRUNE from a `create` or `delete` of the same name run some other way: by
+    hand in the agent pod, or by bench seeding (the model cannot run this script;
+    the sandbox carries a stub at its path). A delete that removed the sandbox
+    home after such a create had pushed it would take the kubeconfig the create
+    then fetched into it. Blocking: a scaffold is bounded
+    by its own timeouts, and the other side waits it out rather than racing it.
+    An unopenable lock yields False, and the caller decides what that forbids.
+    kanban_workspace_gc's stale-home sweep holds the same lock (profile_scaffold.profile_lock).
+    """
+    def report(e):
+        log(f"{name}: could not open the profile lock ({e}); a create refuses, a delete leaves the sandbox home")
+
+    with profile_lock(profile_lock_root(), name, on_error=report) as held:
+        yield held
+
+
 def _endpoint_bullets(decision: EndpointDecision | None) -> str:
     """The decision as `- key: value` bullets for USER.md, or "" with none.
 
@@ -495,7 +555,17 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     for field, value in (("project", project), ("cluster", cluster), ("location", location)):
         _validate(value, field)
     name = profile_name(project, cluster, location)
+    with _profile_lock(name) as locked:
+        if not locked:
+            # Refused rather than run unlocked: a delete of this name that does hold the
+            # lock could remove the sandbox home this scaffold is about to push and fetch
+            # its kubeconfig into. The reconcile retries a failed scaffold on its next run.
+            raise SystemExit(f"ERROR: could not take the profile lock for '{name}'; not scaffolding it")
+        return _create_profile(project, cluster, location, name)
 
+
+def _create_profile(project: str, cluster: str, location: str, name: str) -> str:
+    """create_profile's steps, run under the profile's lock."""
     if not TEMPLATE_DIR.is_dir():
         raise SystemExit(f"ERROR: cluster template dir not found: {TEMPLATE_DIR}")
 
@@ -699,12 +769,24 @@ def cmd_create(args: argparse.Namespace) -> None:
 
 
 def delete_profile(name: str) -> None:
-    """Deregister a Hermes profile and remove its home directory.
+    """Deregister a Hermes profile and remove its home, here and in the shell sandbox.
 
     Tolerant of an already-absent profile (the ``hermes profile delete`` failure is
     logged, then the home is cleaned up regardless). Shared by the ``delete`` CLI
     subcommand and the reconcile engine.
+
+    Under the profile's lock, so a scaffold of the same name runs wholly before or
+    wholly after it. The sandbox home goes last and only while the lock is held and
+    the home here is gone: without the lock it stays, since a stale skeleton costs
+    disk and a removed live one costs a profile its kubeconfig (#4389).
     """
+    with _profile_lock(name) as locked:
+        _delete_profile(name)
+        if locked and not os.path.lexists(profile_home(name)):
+            _remove_sandbox_layout(name)
+
+
+def _delete_profile(name: str) -> None:
     home = profile_home(name)
     try:
         # Stays in the agent pod: `hermes` needs the profiles on the data PVC and
@@ -789,7 +871,11 @@ def cmd_stamp_soul(args: argparse.Namespace) -> None:
     home = Path(args.profile_dir)
     identity = read_cluster_identity(home)
     if identity is None:
-        return
+        # The entrypoint has just replaced SOUL.md with the blank template, so a
+        # profile whose config.yaml carries no readable identity is left without
+        # its block. Exit non-zero so the caller says so and does not stamp the
+        # pass as finished; a silent return read as one.
+        raise SystemExit(f"ERROR: {home / 'config.yaml'} has no readable cluster_identity; SOUL.md was not stamped")
     _stamp_soul_identity(home, identity["project"], identity["cluster"], identity["location"])
 
 

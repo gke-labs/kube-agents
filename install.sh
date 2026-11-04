@@ -5914,7 +5914,8 @@ validate_non_interactive_minter_config() {
 
   if [ -z "$pem_path" ]; then
     print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but no ENABLED KMS key exists in ${keyring}/${key} and no --github-pem-path was provided."
-    print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
+    print_minter_restore_advice "$key" "$keyring" "$kms_loc" "$project_id" ||
+      print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
     print_info "To install without the token minter, omit --github-app-id."
     return 1
   fi
@@ -5962,8 +5963,10 @@ resolve_missing_pem_against_kms() {
   fi
 
   print_error "GitHub App private key PEM file does not exist: '${PARAM_GITHUB_PEM_PATH}'."
-  print_info "Cloud KMS key ${pem_keyring}/${pem_key} has no ENABLED version, so the import still needs that file."
-  print_info "Point --github-pem-path at the downloaded key, or clear GITHUB_PEM_PATH from install.env to install without the token minter."
+  print_minter_restore_advice "$pem_key" "$pem_keyring" "$pem_kms_loc" "$project_id" || {
+    print_info "Cloud KMS key ${pem_keyring}/${pem_key} has no ENABLED version, so the import still needs that file."
+    print_info "Point --github-pem-path at the downloaded key, or clear GITHUB_PEM_PATH from install.env to install without the token minter."
+  }
   return 1
 }
 
@@ -8511,6 +8514,16 @@ main() {
       echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
     fi
   fi
+  # What the release asks of the cluster and what that costs at list price,
+  # rendered from the chart's own template over the tfvars just written, so
+  # the figures are the ones the chart's notes carry for the values the
+  # generator wrote (extra_helm_values is outside the render, and the helper
+  # says so when one is set). The apply goes through Terraform, which shows
+  # no notes, so this is where the front door prints them; `helm get notes`
+  # does after the apply. On the dry run too: the number is the point of
+  # previewing.
+  echo -e "  • ${C_CYAN}Cluster Footprint & Modeled Cost:${C_RESET}"
+  print_footprint_summary "$repo_dir" "$tfvars_file"
   echo -e "${C_CYAN}${C_BOLD}"
   draw_separator
   echo -e "${C_RESET}"
@@ -8718,7 +8731,9 @@ main() {
     "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "$region")" "$project_id")"
   if grep -q '^enable_github_minter = true$' "$tfvars_file" 2>/dev/null && [ -z "$minter_enabled_version" ]; then
     print_error "The GitHub minter is enabled in the generated configuration, but its KMS signing key still has no ENABLED version — the apply would wait on a minter that can never become ready."
-    print_info "Fix the App key import (see the messages above) and re-run, or unset GITHUB_APP_ID to install without the minter."
+    print_minter_restore_advice "${KMS_KEY:-$DEFAULT_KMS_KEY}" "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" \
+      "$(derive_kms_location "$region")" "$project_id" ||
+      print_info "Fix the App key import (see the messages above) and re-run, or unset GITHUB_APP_ID to install without the minter."
     exit 1
   fi
 

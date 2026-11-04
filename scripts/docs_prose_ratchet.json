@@ -2,31 +2,15 @@
   "concepts/autonomous-watchdogs.md": {
     "long-sentence": 36
   },
-  "concepts/chatops.md": {
-    "long-paragraph": 33,
-    "long-sentence": 83
-  },
   "concepts/cluster-agents.md": {
     "long-paragraph": 4,
     "long-sentence": 10
   },
-  "concepts/declarative-workflow.md": {
-    "long-paragraph": 17,
-    "long-sentence": 31
-  },
   "concepts/governance-sops.md": {
     "long-sentence": 16
   },
-  "concepts/inference-gateway.md": {
-    "long-paragraph": 9,
-    "long-sentence": 18
-  },
   "concepts/observability.md": {
     "long-sentence": 24
-  },
-  "concepts/skills.md": {
-    "long-paragraph": 2,
-    "long-sentence": 3
   },
   "deploy/kustomize.md": {
     "long-paragraph": 2,
@@ -68,7 +52,7 @@
   },
   "install/slack-app.md": {
     "long-paragraph": 3,
-    "long-sentence": 3
+    "long-sentence": 2
   },
   "install/uninstall.md": {
     "long-paragraph": 3,
@@ -106,7 +90,7 @@
     "banned-word": 1,
     "antithesis": 1,
     "long-paragraph": 16,
-    "long-sentence": 42
+    "long-sentence": 41
   },
   "reference/cron-jobs.md": {
     "banned-word": 1,

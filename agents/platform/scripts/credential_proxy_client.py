@@ -12,6 +12,8 @@ import re
 import stat
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -93,6 +95,30 @@ AUDIT_BROKER_TIER = "broker_tier"
 AUDIT_CLASS = "class"
 AUDIT_BROKER_POD = "broker_pod"
 
+# The shim's own names for exec-tier routing; not part of the contract above.
+# The stateful broker's URL, which an exec-role call falls back on when the exec
+# tier cannot be reached, and every other call uses. The exec URL is plain http,
+# as the broker's Service is: only `BrokerConnection` bounds the connect and
+# tells "nothing was sent" apart.
+BROKER_URL_ENV = "CREDENTIAL_PROXY_URL"
+# A refusal at admission, before the command starts: HTTP 503 with this code.
+# Only these are retried, and only under a bound in RETRYABLE_BUSY_BOUNDS.
+BUSY_CODE = "CREDENTIAL_PROXY_BUSY"
+BUSY_STATUS = 503
+# The one line a fallback writes. No "credential proxy" prefix and no low-level
+# cause: kubectl's failure classifiers read the whole stderr, and either would
+# make a real cluster connection failure after the fallback look like the
+# shim's own (cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE) or a broker
+# refusal look like the cluster's (CONNECTIVITY_FAILURE_RE).
+EXEC_FALLBACK_NOTICE = "exec tier not reachable; this command went to the stateful broker"
+# A connection that closed once the request was sent: the command may have run,
+# so it is never sent again. The `credential proxy error` prefix marks the line
+# as the shim's own for kubectl's failure classifiers.
+_DROPPED_LINE = "credential proxy error: the connection dropped {cause}; the command may have run"
+# The least read time a relay fallback is worth sending with; less, and the
+# caller's budget is already spent, so the error is raised instead.
+RELAY_FALLBACK_MIN_SECONDS = 1.0
+
 # Where a `get-credentials` that named no destination leaves its file:
 # `$HERMES_HOME/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
 # the convention agents/platform/AGENTS.md ("Cluster Credentials") teaches and
@@ -100,6 +126,12 @@ AUDIT_BROKER_POD = "broker_pod"
 # one that convention spells as `${HERMES_HOME:-/opt/data}`.
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_DIR_NAME = ".kubeconfigs"
+DEFAULT_KUBE_PROXY_CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
+KUBE_PROXY_USER_NAME = "kube-proxy-caller"
+SANDBOX_HERMES_UID = 1001
+SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
+SANDBOX_SHARED_KUBECONFIG_PATH = Path("/opt/data/.kubeconfig")
 # What a workspace `open` labels itself with, so the broker's log can say who
 # holds a slot when the store is full: the kanban card first, the session
 # otherwise. The grammar mirrors `content_workspace.CALLER_LABEL_RE`; a value
@@ -171,8 +203,38 @@ class BrokerConnection(http.client.HTTPConnection):
 
     def connect(self) -> None:
         self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
-        super().connect()
+        try:
+            super().connect()
+        except OSError as exc:
+            # The one point where "nothing was sent" is certain. urllib wraps
+            # this in a URLError as before, so a caller that reads only that
+            # sees no change.
+            raise BrokerUnreachable(str(exc)) from exc
         self.sock.settimeout(None)
+
+
+class BrokerUnreachable(OSError):
+    """No connection to the broker could be made, so no request reached it."""
+
+
+def exec_endpoints() -> tuple[str | None, str | None]:
+    """The broker an exec-role call goes to, and the one it falls back on.
+
+    The exec tier when the operator set its URL, with the stateful broker as
+    the fallback; else the stateful broker alone, as before the exec tier.
+    `execute` falls back only when no connection to the exec tier could be
+    made (`BrokerUnreachable`): then no request reached a broker, and nothing
+    ran. `ApiSession` also falls back after a dropped connection, because its
+    relay calls are GETs, which are safe to send again.
+    """
+    # Spelled out, not BROKER_URL_ENV: tests/conformance/test_C_enforcement.py
+    # (C1) pins that the shim reads this name, across the module boundary to
+    # the operator and the gateway that set it.
+    stateful = os.getenv("CREDENTIAL_PROXY_URL")
+    exec_url = os.getenv(EXEC_URL_ENV, "").strip()
+    if exec_url:
+        return exec_url, stateful or None
+    return stateful, None
 
 
 class _BrokerHTTPHandler(urllib.request.HTTPHandler):
@@ -197,7 +259,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # A private opener rather than urllib.request.install_opener: this module is
 # imported by github_token_refresh and the two relay patches, and a global
 # opener would strip the total timeouts their own urlopen calls rely on.
-_BROKER_OPENER = urllib.request.build_opener(_BrokerHTTPHandler, _NoRedirect())
+# No proxy from the environment: the broker is an in-cluster Service, and a
+# proxy in between would make every connect succeed, so a broker that cannot
+# be reached could not be told apart from one that dropped the request.
+_BROKER_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _BrokerHTTPHandler, _NoRedirect()
+)
 
 
 def open_broker_request(request: urllib.request.Request):
@@ -755,6 +822,253 @@ def implicit_kubectl_context(argv: list[str]) -> str:
     return shell_context() or ""
 
 
+def build_kube_proxy_kubeconfig(
+    context: str,
+    proxy_url: str | None = None,
+    ca_file: str | None = None,
+    token_file: str | None = None,
+) -> str:
+    """Build a kubeconfig document that routes `context` through `k8s-api-proxy`."""
+    import yaml
+
+    resolved_url = (proxy_url or os.environ.get("KUBE_PROXY_URL", "")).strip().rstrip("/")
+    resolved_ca = (
+        ca_file
+        or os.environ.get("KUBE_PROXY_CA_FILE", "")
+        or DEFAULT_KUBE_PROXY_CA_FILE
+    ).strip()
+    resolved_token = (
+        token_file
+        or os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+        or DEFAULT_KUBE_PROXY_TOKEN_FILE
+    ).strip()
+    doc = {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": [
+            {
+                "name": context,
+                "cluster": {
+                    "server": f"{resolved_url}/clusters/{context}",
+                    "certificate-authority": resolved_ca,
+                },
+            }
+        ],
+        "users": [
+            {
+                "name": KUBE_PROXY_USER_NAME,
+                "user": {
+                    "tokenFile": resolved_token,
+                },
+            }
+        ],
+        "contexts": [
+            {
+                "name": context,
+                "context": {
+                    "cluster": context,
+                    "user": KUBE_PROXY_USER_NAME,
+                },
+            }
+        ],
+        "current-context": context,
+    }
+    return yaml.safe_dump(doc, sort_keys=False)
+
+
+def _caller_default_kubeconfig_path() -> Path:
+    """Return the default kubeconfig path for the active sandbox user."""
+    if os.geteuid() == SANDBOX_HERMES_UID:
+        return SANDBOX_HERMES_KUBECONFIG_PATH
+    return SANDBOX_SHARED_KUBECONFIG_PATH
+
+
+def _default_kubeconfig_candidates() -> list[Path]:
+    """Return the default kubeconfig files to update when a cluster context is registered."""
+    return [_caller_default_kubeconfig_path(), SANDBOX_SHARED_KUBECONFIG_PATH]
+
+
+def _is_default_sandbox_kubeconfig(path: str | Path) -> bool:
+    """Return True when `path` is one of the sandbox default multi-context kubeconfigs."""
+    return Path(path) in _default_kubeconfig_candidates()
+
+
+def _merge_context_into_kubeconfig_file(
+    path: Path,
+    context: str,
+    proxy_url: str,
+    ca_file: str,
+    token_file: str,
+) -> None:
+    import fcntl
+    import yaml
+
+    try:
+        if not path.parent.is_dir():
+            return
+        lock_path = path.with_name(f".{path.name}.lock")
+        lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        lock_fd = os.open(lock_path, lock_flags, 0o600)
+    except OSError:
+        return
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            if path.is_symlink() or not path.is_file():
+                return
+            st = path.stat()
+            if st.st_uid != os.geteuid() or st.st_nlink != 1:
+                return
+            doc = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, yaml.YAMLError, RecursionError):
+            return
+        if not isinstance(doc, dict):
+            return
+        expected_server = f"{proxy_url}/clusters/{context}"
+        existing_clusters = list(doc.get("clusters") or [])
+        existing_contexts = list(doc.get("contexts") or [])
+        existing_users = list(doc.get("users") or [])
+        has_cluster = any(
+            isinstance(c, dict)
+            and c.get("name") == context
+            and isinstance(c.get("cluster"), dict)
+            and c["cluster"].get("server") == expected_server
+            and c["cluster"].get("certificate-authority") == ca_file
+            for c in existing_clusters
+        )
+        has_context = any(
+            isinstance(c, dict)
+            and c.get("name") == context
+            and isinstance(c.get("context"), dict)
+            and c["context"].get("cluster") == context
+            and c["context"].get("user") == KUBE_PROXY_USER_NAME
+            for c in existing_contexts
+        )
+        has_user = any(
+            isinstance(u, dict)
+            and u.get("name") == KUBE_PROXY_USER_NAME
+            and u.get("user") == {"tokenFile": token_file}
+            for u in existing_users
+        )
+        if has_cluster and has_context and has_user:
+            return
+        clusters = [
+            c for c in existing_clusters if isinstance(c, dict) and c.get("name") != context
+        ]
+        clusters.append(
+            {
+                "name": context,
+                "cluster": {
+                    "server": expected_server,
+                    "certificate-authority": ca_file,
+                },
+            }
+        )
+        doc["clusters"] = clusters
+        users = [
+            u
+            for u in existing_users
+            if isinstance(u, dict) and u.get("name") != KUBE_PROXY_USER_NAME
+        ]
+        users.append(
+            {
+                "name": KUBE_PROXY_USER_NAME,
+                "user": {"tokenFile": token_file},
+            }
+        )
+        doc["users"] = users
+        contexts = [
+            c for c in existing_contexts if isinstance(c, dict) and c.get("name") != context
+        ]
+        contexts.append(
+            {
+                "name": context,
+                "context": {
+                    "cluster": context,
+                    "user": KUBE_PROXY_USER_NAME,
+                },
+            }
+        )
+        doc["contexts"] = contexts
+        try:
+            _replace_file(path, yaml.safe_dump(doc, sort_keys=False))
+        except OSError:
+            pass
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
+def merge_context_into_default_kubeconfig(context: str) -> None:
+    """Register `context` in the default kubeconfig while preserving `current-context`."""
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
+    if not proxy_url:
+        return
+    ca_file = (
+        os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_KUBE_PROXY_CA_FILE
+    ).strip()
+    token_file = (
+        os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+        or DEFAULT_KUBE_PROXY_TOKEN_FILE
+    ).strip()
+    seen: set[Path] = set()
+    for path in _default_kubeconfig_candidates():
+        if path in seen:
+            continue
+        seen.add(path)
+        _merge_context_into_kubeconfig_file(
+            path, context, proxy_url, ca_file, token_file
+        )
+
+
+def ensure_kube_proxy_context_for_argv(argv: list[str]) -> None:
+    """Register a `--context=gke_...` flag's cluster in the active kubeconfig before `kubectl` runs."""
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
+    if not proxy_url:
+        return
+    normalized = argv if (argv and argv[0] == "kubectl") else ["kubectl", *argv]
+    if names_kubeconfig_flag(normalized):
+        return
+    flag = kubectl_context_flag(normalized)
+    target = parse_gke_context(flag) if flag else None
+    if target is None:
+        return
+    merge_context_into_default_kubeconfig(target.context_name)
+    env_kc = os.environ.get("KUBECONFIG", "").strip()
+    if env_kc and os.pathsep not in env_kc:
+        candidate = Path(env_kc)
+        if candidate not in _default_kubeconfig_candidates():
+            ca_file = (
+                os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_KUBE_PROXY_CA_FILE
+            ).strip()
+            token_file = (
+                os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+                or DEFAULT_KUBE_PROXY_TOKEN_FILE
+            ).strip()
+            _merge_context_into_kubeconfig_file(
+                candidate, target.context_name, proxy_url, ca_file, token_file
+            )
+
+
+def rewrite_kubeconfig_for_kube_proxy(generated: str) -> str:
+    """Rewrite a `get-credentials` kubeconfig to route through `k8s-api-proxy`."""
+    proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip()
+    if not proxy_url:
+        return generated
+    context = read_current_context(generated)
+    target = parse_gke_context(context) if context else None
+    if target is None:
+        return generated
+    merge_context_into_default_kubeconfig(target.context_name)
+    return build_kube_proxy_kubeconfig(target.context_name, proxy_url=proxy_url)
+
+
 def land_implicit_kubeconfig(generated: str) -> None:
     """File a context-less get-credentials' kubeconfig, and say how to use it.
 
@@ -782,7 +1096,9 @@ def land_implicit_kubeconfig(generated: str) -> None:
     except OSError as exc:
         written = False
         print(f"credential proxy: could not write {path}: {exc}", file=sys.stderr)
-    pinned = record_shell_context(target.context_name)
+    pinned = False
+    if not os.environ.get("KUBE_PROXY_URL", "").strip():
+        pinned = record_shell_context(target.context_name)
     lines = ["credential proxy: no --kubeconfig or KUBECONFIG was given."]
     if written:
         lines.append(f"  Credentials for {target.context_name} are in {path}.")
@@ -906,14 +1222,77 @@ def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None
         stripped.append(argument)
         index += 1
     if destination is None and not task_mode():
-        destination = os.environ.get("KUBECONFIG", "").strip() or None
+        env_kc = os.environ.get("KUBECONFIG", "").strip()
+        if env_kc and not (
+            os.environ.get("KUBE_PROXY_URL", "").strip()
+            and _is_default_sandbox_kubeconfig(env_kc)
+        ):
+            destination = env_kc
     return stripped, Path(destination) if destination else None
+
+
+def _busy_reply(exc: urllib.error.HTTPError) -> dict | None:
+    """The JSON body of a refusal, or None when it has none.
+
+    The proxy's own errors are JSON, but the error can also come from whatever
+    sits between shim and proxy: an Envoy restarting mid-request answers 503
+    with an HTML body. The body is read once and kept on the error, because a
+    retry decision and the message printed after it both need it.
+    """
+    exc.shim_dropped = False
+    try:
+        payload = json.load(exc)
+    except (ValueError, TypeError):
+        exc.shim_payload = None
+        return None
+    except (http.client.HTTPException, OSError):
+        # The connection closed while the refusal's body was read.
+        exc.shim_payload = None
+        exc.shim_dropped = True
+        return None
+    exc.shim_payload = payload if isinstance(payload, dict) else None
+    if exc.shim_payload is None or exc.shim_payload.get("code") != BUSY_CODE:
+        return None
+    return exc.shim_payload
+
+
+def _exec_refused(exc: urllib.error.HTTPError, busy: dict | None) -> int:
+    """Print a refusal from `/v1/exec` the way the agent reads it, and its exit code."""
+    payload = busy if busy is not None else getattr(exc, "shim_payload", None)
+    if payload is None:
+        # A traceback here would turn a transient sidecar blip into a shim
+        # crash the agent cannot read.
+        print(
+            f"credential proxy error (HTTP {exc.code}): non-JSON response",
+            file=sys.stderr,
+        )
+        return 1
+    if payload.get("code") == "SECURITY_POLICY_BLOCKED":
+        print(
+            payload.get("message", "Command blocked for security reasons."),
+            file=sys.stderr,
+        )
+        print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
+        # The verb the policy resolved and whether this was a local render:
+        # the agent runtime's refusal stop reads these two lines.
+        if payload.get("verb"):
+            # Each word is an argv token the agent chose; keep it to one line
+            # and to the characters a verb or resource name is made of.
+            words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
+            print(f"policy verb: {' '.join(words)}", file=sys.stderr)
+        if payload.get("local_render"):
+            print("policy render: local", file=sys.stderr)
+        return EXIT_SECURITY_POLICY_BLOCKED
+    print(payload.get("error", str(exc)), file=sys.stderr)
+    return 1
 
 
 def execute(
     endpoint: str,
     argv: list[str],
     stdin: str | None = None,
+    *,
+    fallback: str | None = None,
 ) -> int:
     # No `cwd`. The broker resolves a path against its own filesystem, and it
     # has no view of this one — so a directory sent from here would name either
@@ -956,7 +1335,10 @@ def execute(
             flag_pinned = names_kubeconfig_flag(argv)
             argv = resolve_kubeconfig_flags(argv)
             kubeconfig = "" if in_task else os.environ.get("KUBECONFIG", "").strip()
-            if kubeconfig:
+            if kubeconfig and not (
+                os.environ.get("KUBE_PROXY_URL", "").strip()
+                and _is_default_sandbox_kubeconfig(kubeconfig)
+            ):
                 context = kubeconfig_context(kubeconfig)
             elif argv[0] == "kubectl" and not flag_pinned and not in_task:
                 context = implicit_kubectl_context(argv)
@@ -987,55 +1369,75 @@ def execute(
         # hide the real fault, which is a broken token projection.
         print(f"credential proxy token unavailable: {exc}", file=sys.stderr)
         return 1
-    request = urllib.request.Request(
-        endpoint.rstrip("/") + "/v1/exec",
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with open_broker_request(request) as response:
-            payload = json.load(response)
-    except urllib.error.HTTPError as exc:
-        # The proxy's own errors are JSON, but the error can also come from
-        # whatever sits between shim and proxy — an Envoy restarting mid-request
-        # answers 503 with an HTML body, and a traceback here turns a transient
-        # sidecar blip into a shim crash the agent cannot read.
+    targets = [endpoint] + ([fallback] if fallback and fallback != endpoint else [])
+    retried = False
+    while True:
+        # The same bytes, `requestId` included, to whichever broker this round
+        # reaches: a fallback or a retry is the same request again.
         try:
-            payload = json.load(exc)
-        except (ValueError, TypeError):
-            print(
-                f"credential proxy error (HTTP {exc.code}): non-JSON response",
-                file=sys.stderr,
+            request = urllib.request.Request(
+                targets[0].rstrip("/") + "/v1/exec",
+                data=body,
+                headers=headers,
+                method="POST",
             )
+        except ValueError as exc:
+            # A URL with no scheme, such as a bare Service name: nothing was sent.
+            print(f"credential proxy unavailable: {exc}", file=sys.stderr)
             return 1
-        if payload.get("code") == "SECURITY_POLICY_BLOCKED":
-            print(
-                payload.get("message", "Command blocked for security reasons."),
-                file=sys.stderr,
-            )
-            print(f"policy rule: {payload.get('rule', 'unknown')}", file=sys.stderr)
-            # The verb the policy resolved and whether this was a local render:
-            # the agent runtime's refusal stop reads these two lines.
-            if payload.get("verb"):
-                # Each word is an argv token the agent chose; keep it to one line
-                # and to the characters a verb or resource name is made of.
-                words = (_VERB_WORD_SAFE_RE.sub("_", str(w))[:_VERB_WORD_MAX] for w in payload["verb"])
-                print(f"policy verb: {' '.join(words)}", file=sys.stderr)
-            if payload.get("local_render"):
-                print("policy render: local", file=sys.stderr)
-            return EXIT_SECURITY_POLICY_BLOCKED
-        print(payload.get("error", str(exc)), file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
-        return 1
+        try:
+            with open_broker_request(request) as response:
+                payload = json.load(response)
+            break
+        except urllib.error.HTTPError as exc:
+            reply = _busy_reply(exc)
+            if getattr(exc, "shim_dropped", False):
+                print(_DROPPED_LINE.format(cause="while the refusal was read"), file=sys.stderr)
+                return 1
+            if (
+                reply is not None
+                and fallback is not None
+                and exc.code == BUSY_STATUS
+                and not retried
+                and isinstance(reply.get(BUSY_BOUND_KEY), str)
+                and reply.get(BUSY_BOUND_KEY) in RETRYABLE_BUSY_BOUNDS
+            ):
+                # Refused at admission, before the command started, under a
+                # bound another replica may not be at: one retry on a new
+                # connection. Only with exec routing on: with no exec tier, or
+                # a named endpoint, the one stateful pod would refuse again,
+                # and the command path stays as it was. A fallback is not a
+                # retry (nothing ran), so this is the one retry whichever
+                # broker answered.
+                retried = True
+                exc.close()
+                continue
+            return _exec_refused(exc, reply)
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, BrokerUnreachable) and len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
+            print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
+            return 1
+        except http.client.InvalidURL as exc:
+            # Raised while the connection is built, before a socket opens:
+            # nothing was sent.
+            print(f"credential proxy unavailable: {exc}", file=sys.stderr)
+            return 1
+        except (http.client.HTTPException, OSError) as exc:
+            # The request was sent and the connection dropped: the command may
+            # have run, so it is never sent again.
+            print(_DROPPED_LINE.format(cause=f"after the request was sent ({exc!r})"), file=sys.stderr)
+            return 1
 
     sys.stdout.write(payload.get("stdout", ""))
     sys.stderr.write(payload.get("stderr", ""))
     if payload.get("truncated"):
         print("credential proxy output truncated", file=sys.stderr)
     generated = payload.get("kubeconfig")
+    if generated and os.environ.get("KUBE_PROXY_URL", "").strip():
+        generated = rewrite_kubeconfig_for_kube_proxy(generated)
     if implicit_destination and generated:
         if in_task:
             report_task_kubeconfig(generated)
@@ -1511,34 +1913,107 @@ class ApiSession:
     """
 
     def __init__(self, endpoint: str | None = None, http=None) -> None:
-        endpoint = endpoint or os.environ.get("CREDENTIAL_PROXY_URL", "")
+        # A named endpoint is used as given. Otherwise the relay is an exec-tier
+        # route, with the stateful broker as the fallback (`exec_endpoints`).
+        fallback = None
+        if not endpoint:
+            endpoint, fallback = exec_endpoints()
         if not endpoint:
             raise RuntimeError(
-                "CREDENTIAL_PROXY_URL is not set; the credential broker is the only "
+                f"{BROKER_URL_ENV} is not set; the credential broker is the only "
                 "path from here to a Google API"
             )
         self._endpoint = endpoint.rstrip("/")
+        self._fallback = fallback.rstrip("/") if fallback else None
+        # Fleet collectors share one session across a thread pool.
+        self._lock = threading.Lock()
         if http is None:
             import requests
 
             http = requests.Session()
+            # No proxy from the environment, as for the broker opener: through
+            # a proxy every connect succeeds, and the fallback would never fire.
+            http.trust_env = False
         self._http = http
 
-    def relay_url(self, url: str) -> str:
+    def relay_url(self, url: str, endpoint: str | None = None) -> str:
         """The broker URL that stands for `url`; the query is kept where it was."""
         parsed = urllib.parse.urlsplit(url)
-        relayed = f"{self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
+        relayed = f"{endpoint or self._endpoint}{API_RELAY_PREFIX}{parsed.netloc}{parsed.path}"
         if parsed.query:
             relayed += f"?{parsed.query}"
         return relayed
 
     def get(self, url: str, *, params=None, timeout=None):
-        return self._http.get(
-            self.relay_url(url),
-            params=params,
-            headers=authorization_headers(),
-            timeout=timeout,
-        )
+        caller_timeout = timeout
+        started = time.monotonic()
+        with self._lock:
+            endpoint, exec_attempt = self._endpoint, self._fallback is not None
+        if exec_attempt:
+            # The exec tier gets the shim's connect bound, as `BrokerConnection`
+            # gives it, whatever the caller's timeout; the read keeps the
+            # caller's. A missing egress peer hangs the dial rather than
+            # refusing it.
+            timeout = _exec_connect_bound(timeout)
+        try:
+            return self._http.get(
+                self.relay_url(url, endpoint),
+                params=params,
+                headers=authorization_headers(),
+                timeout=timeout,
+            )
+        except _connection_errors() as exc:
+            with self._lock:
+                if self._endpoint == endpoint and self._fallback is not None:
+                    # The first reader to fail moves the session. Every relay
+                    # call is a GET, so sending it again is safe even when the
+                    # error came after the request left, and the rest of the
+                    # session stays on the stateful broker: a missing exec
+                    # Service would otherwise cost each read its connect bound.
+                    self._endpoint, self._fallback = self._fallback, None
+                    print(f"{EXEC_FALLBACK_NOTICE} for the Cloud API relay ({exc})", file=sys.stderr)
+                moved = self._endpoint != endpoint
+            if not moved:
+                raise
+            # The caller sized its timeout for one attempt; the fallback gets
+            # what the exec attempt left of it.
+            left = _time_left(caller_timeout, time.monotonic() - started)
+            if left is False:
+                raise
+            return self.get(url, params=params, timeout=left)
+
+
+def _exec_connect_bound(timeout):
+    """A `requests` timeout whose connect part is at most the shim's connect bound."""
+    if isinstance(timeout, tuple):
+        connect, read = timeout
+    else:
+        connect, read = timeout, timeout
+    bound = BROKER_CONNECT_TIMEOUT_SECONDS if connect is None else min(connect, BROKER_CONNECT_TIMEOUT_SECONDS)
+    return (bound, read)
+
+
+def _time_left(timeout, spent: float):
+    """`timeout` less `spent` seconds of read time, or False when too little is left."""
+    if timeout is None:
+        return None
+    if isinstance(timeout, tuple):
+        connect, read = timeout
+        if read is None:
+            return timeout
+        left = read - spent
+        return (connect, left) if left >= RELAY_FALLBACK_MIN_SECONDS else False
+    left = timeout - spent
+    return left if left >= RELAY_FALLBACK_MIN_SECONDS else False
+
+
+def _connection_errors() -> tuple[type[BaseException], ...]:
+    """The errors a `requests` session raises when the relay cannot be reached."""
+    try:
+        import requests
+    except ImportError:
+        return (ConnectionError,)
+    return (requests.exceptions.ConnectionError, ConnectionError)
 
 
 def read_stdin_if_requested(argv: list[str]) -> str | None:
@@ -1560,10 +2035,12 @@ def read_stdin_if_requested(argv: list[str]) -> str | None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    # No default: a named endpoint is used as given, with no exec routing and
+    # no fallback, and an unnamed one is resolved by `exec_endpoints`.
     parser.add_argument(
         "--endpoint",
-        default=os.getenv("CREDENTIAL_PROXY_URL"),
-        required=os.getenv("CREDENTIAL_PROXY_URL") is None,
+        default=None,
+        required=exec_endpoints()[0] is None,
     )
     parser.add_argument(
         "executable",
@@ -1574,17 +2051,23 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--ensure-kubectl-context":
+        ensure_kube_proxy_context_for_argv(["kubectl", *sys.argv[2:]])
+        raise SystemExit(0)
     invoked_as = os.path.basename(sys.argv[0])
+    fallback = None
     if invoked_as in set(SUPPORTED_EXECUTABLES):
-        endpoint = os.getenv("CREDENTIAL_PROXY_URL")
+        endpoint, fallback = exec_endpoints()
         if endpoint is None:
-            print("CREDENTIAL_PROXY_URL is not configured", file=sys.stderr)
+            print(f"{BROKER_URL_ENV} is not configured", file=sys.stderr)
             raise SystemExit(1)
         argv = [invoked_as, *sys.argv[1:]]
         stdin = read_stdin_if_requested(argv)
     else:
         args = parse_args()
         endpoint = args.endpoint
+        if endpoint is None:
+            endpoint, fallback = exec_endpoints()
         argv = [args.executable, *args.arguments]
         stdin = read_stdin_if_requested(argv)
     raise SystemExit(
@@ -1592,5 +2075,6 @@ if __name__ == "__main__":
             endpoint,
             argv,
             stdin=stdin,
+            fallback=fallback,
         )
     )

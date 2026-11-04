@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -244,17 +245,23 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("gateway", "err", err)
 		return err
 	}
-	if notifier := chatNotifier(cfg, backendAdapter, gw.Conversations, log); notifier != nil {
-		// The home source is wired before the route starts: Start's boot
-		// line reads it, and nothing writes it after.
-		armHomeLearn(cfg, backendAdapter, notifier, log)
-		defer runNotifier(ctx, notifier, client)()
+	// lead is all of the gateway's work: the chat.notify routes and Run.
+	// Under the election it runs only while this replica holds the lease.
+	lead := func(ctx context.Context, opts gateway.RunOptions) error {
+		if notifier := chatNotifier(cfg, backendAdapter, gw.Conversations, log); notifier != nil {
+			// The home source is wired before the route starts: Start's boot
+			// line reads it, and nothing writes it after.
+			armHomeLearn(cfg, backendAdapter, notifier, log)
+			defer runNotifier(ctx, notifier, client)()
+		}
+		// The console's route runs whenever the console does: a card filed
+		// from a console turn reports back into its conversation as a notify
+		// frame.
+		consoleNotifier := gateway.NewConsoleNotifier(console, log)
+		consoleNotifier.SetConversations(gw.Conversations(console))
+		defer runNotifier(ctx, consoleNotifier, client)()
+		return gw.RunWith(ctx, opts)
 	}
-	// The console's route runs whenever the console does: a card filed from
-	// a console turn reports back into its conversation as a notify frame.
-	consoleNotifier := gateway.NewConsoleNotifier(console, log)
-	consoleNotifier.SetConversations(gw.Conversations(console))
-	defer runNotifier(ctx, consoleNotifier, client)()
 
 	log.Info("a2a gateway starting",
 		"nats", cfg.NATSURL,
@@ -263,8 +270,41 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"a2aDoor", cfg.A2ADoorArmed(),
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
-		"idleTTL", cfg.IdleTTL.String())
-	return serve(ctx, cfg, gw.Metrics(), gw.Readiness, log, gw.Run)
+		"idleTTL", cfg.IdleTTL.String(),
+		"elected", cfg.Elected())
+	if !cfg.Elected() {
+		return serve(ctx, cfg, gw.Metrics(), gw.Readiness, log, func(ctx context.Context) error {
+			return lead(ctx, gateway.RunOptions{})
+		})
+	}
+	election, err := gatewayElection(cfg, log)
+	if err != nil {
+		log.Error("gateway election", "err", err)
+		return err
+	}
+	return serve(ctx, cfg, gw.Metrics(), gw.Readiness, log, func(ctx context.Context) error {
+		return election.Run(ctx, gw, lead)
+	})
+}
+
+// gatewayElection is the campaign for the gateway's Lease, through the pod's
+// own ServiceAccount.
+func gatewayElection(cfg *gateway.Config, log *slog.Logger) (gateway.Election, error) {
+	rc, err := rest.InClusterConfig()
+	if err != nil {
+		return gateway.Election{}, fmt.Errorf("the election is configured (lease %s) but there is no in-cluster config: %w", cfg.GatewayLease, err)
+	}
+	cs, err := kubernetes.NewForConfig(rc)
+	if err != nil {
+		return gateway.Election{}, fmt.Errorf("the election's Kubernetes client: %w", err)
+	}
+	return gateway.Election{
+		Client:    cs,
+		Namespace: cfg.Namespace,
+		Lease:     cfg.GatewayLease,
+		Identity:  cfg.PodName,
+		Log:       log,
+	}, nil
 }
 
 // gatewayNATSOptions is how the gateway's user dials, the gateway's own
@@ -369,10 +409,10 @@ func runNotifier(ctx context.Context, n *gateway.Notifier, client *lib.Client) f
 }
 
 // serve is realMain's last step: the metrics listener beside the gateway,
-// then the gateway until ctx is done. run is gw.Run and readiness
-// gw.Readiness; they are parameters so a test can reach this step without a
-// bus and see that a metrics listener which cannot start leaves its ALERT
-// line and does not stop the gateway.
+// then the gateway until ctx is done. run is the gateway's work (lead, or the
+// election that runs it) and readiness is gw.Readiness; they are parameters so
+// a test can reach this step without a bus and see that a metrics listener
+// which cannot start leaves its ALERT line and does not stop the gateway.
 func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, readiness func() (bool, string), log *slog.Logger, run func(context.Context) error) error {
 	startMetricsListener(ctx, cfg, metrics, readiness, log)
 	if err := run(ctx); err != nil && ctx.Err() == nil {

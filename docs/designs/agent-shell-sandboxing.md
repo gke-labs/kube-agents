@@ -119,6 +119,7 @@ version-control abstraction lands.
 | The shims themselves           | [`deploy/docker/Dockerfile`](../../deploy/docker/Dockerfile) — symlinks under `/opt/credential-proxy/bin`                                                                                                                                                                             |
 | Its command policy             | `/etc/credential-proxy/policy.json`, from `CREDENTIAL_PROXY_POLICY`                                                                                                                                                                                                                   |
 | Proxy placement and federation | [`credential_proxy_manifests.go`](../../k8s-operator/internal/controller/credential_proxy_manifests.go), `buildCredentialProxyEnv` in [`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go)                                               |
+| The Kubernetes API proxy       | [`kube-proxy.md`](kube-proxy.md) — [`k8s-api-proxy/`](../../k8s-api-proxy/) and [`kube_proxy_manifests.go`](../../k8s-operator/internal/controller/kube_proxy_manifests.go)                                                                                                           |
 | The STS credential file        | [`agents/platform/scripts/wif_credentials.py`](../../agents/platform/scripts/wif_credentials.py)                                                                                                                                                                                      |
 | The isolation contract         | [`docs/credential-isolation-design.md`](../credential-isolation-design.md)                                                                                                                                                                                                            |
 | The Session KV store           | [`agents/platform/scripts/session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py), SQLite under `/var/lib/kube-agents/session/`                                                                                                                                    |
@@ -1399,7 +1400,11 @@ scaffolded later, so a cluster onboarded at 3am does not wait for a pod restart 
 directories. The scaffold passes `--profile <name>` and pushes that home plus the machine
 home and `profiles/platform`, the two roots the sandbox creates bare; the start pushes
 every home. Re-sending every home on every scaffold made onboarding N clusters
-cost O(N²) (#3701). Nothing about it is ordered against the sandbox starting: the Deployment and
+cost O(N²) (#3701). A profile delete runs it the other way: `--remove-profile <name>`
+removes that home from the sandbox once the agent pod's copy is gone, over the same
+SSH hop, and refuses a name that still has anything under the agent pod's `profiles/`.
+Create and delete hold a per-profile lock, so a delete cannot remove the sandbox home a
+concurrent scaffold of the same name has just pushed (#4389). Nothing about it is ordered against the sandbox starting: the Deployment and
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 
@@ -1665,8 +1670,8 @@ worker on the default profile sends and is silent — the root is matched by val
 a data root with a `profiles` component in its own path is not read as a profile; a name
 that is not one component is refused with a line on stderr; a well-formed name with no
 home here is a profile the mirror has not
-delivered yet, so the wrapper says so and falls back to the cwd. `sandbox_mirror.py` runs
-on the agent pod's start and when a profile is scaffolded, and a card dispatched inside
+delivered yet, so the wrapper says so and falls back to the cwd. `sandbox_mirror.py` pushes
+the layout on the agent pod's start and when a profile is scaffolded, and a card dispatched inside
 that window would otherwise fail the same way with nothing beside the failure to say why.
 Nothing evaluates the value; every use is a quoted expansion.
 
@@ -2171,8 +2176,11 @@ from the test fleet now that cron runs have a working directory of their own. A 
 is listed before the pod's profile list is read, so a profile scaffolded between the two
 reads is never taken for stale; only cluster-prefixed names go, only when the pod lists the
 platform profile, and only under a profiles root that `find -P` reports as a real directory,
-by one `rm` per home as the model's account, which owns the homes; a home whose `rm` fails
-is named in one chat bullet each night until it goes. The listing runs as
+by one `rm` per home as the model's account, which owns the homes, each under that
+profile's lock, the one `create_profile` and `delete_profile` hold (#4389): taken without
+blocking, from the pod's last-moment recheck through the `rm`, so a name being scaffolded
+right then is left for the next night. A home whose `rm` fails is named in one chat bullet
+each night until it goes. The listing runs as
 `hermes`, the default principal, because its output is believed, under the sandbox's own
 `workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
 name cannot forge a row.
@@ -2858,13 +2866,13 @@ bounds what stays on the volume, not what a clone transiently writes.
 
 The agent-facing surface for all of it is the `inspect-repository` skill, which is the thing a
 list of protocol verbs does not give you: without a skill naming the capability, the agent has
-no way to know that reading somebody else's code is still possible. Its `clone` subcommand
-pages the listing, batches the reads and writes the files into a scratch directory; what lands
-is source with no repository around it, which is the same property the write path has for the
-same reason. Its `open`/`grep`/`fetch`/`close` sequence is for repositories too large to copy,
-and the handle rather than a directory is what travels between the agent's turns. On a broker
-that has not been armed, `clone` falls back to the leased checkout and says `"mode":
-"directory"`; the handle subcommands say they cannot serve the request instead of pretending.
+no way to know that reading somebody else's code is still possible. Its `clone` command takes
+one revision through the broker's stateless `snapshot` verb (`/v1/vcs/snapshot`) and unpacks it
+into a scratch directory; what lands is source with no repository around it, which is the same
+property the write path has for the same reason. A repository over the snapshot ceiling is
+refused whole, and `--prefix` takes part of it. With no broker, `clone` falls back to
+the leased checkout and says `"mode": "directory"`. A broker older than the verb is an error that
+names the image to roll forward, because the sandbox's `git` has no transport for that checkout.
 
 What content-passing does not remove is the volume itself. The clone path still needs it, so
 the mount stays until the last skill has migrated and directory mode is deleted; the

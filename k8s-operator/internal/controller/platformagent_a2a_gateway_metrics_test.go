@@ -427,7 +427,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -445,7 +445,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := gchatTestAgent("next", true)
 		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -458,7 +458,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -478,7 +478,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -490,7 +490,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		t.Setenv(a2aAgentDoorEnvVar, "")
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
-		state, err := r.reconcileA2A(ctx, agent)
+		state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 		if err != nil || !state.gatewayHeld {
 			t.Fatalf("precondition: want a held gateway (state=%+v err=%v)", state, err)
 		}
@@ -508,13 +508,13 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
 		assertA2AGatewayFence(t, ctx, cl, agent)
 		t.Setenv(a2aInjectBackendEnvVar, "")
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		dep := &appsv1.Deployment{}
@@ -538,7 +538,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -558,7 +558,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		gatewayKey := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
 		r.APIReader = cl
 		r.Client = staleDeploymentClient{Client: cl, key: gatewayKey}
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		dep := &appsv1.Deployment{}
@@ -580,7 +580,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -590,7 +590,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		state, err := r.reconcileA2A(ctx, agent)
+		state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 		if err != nil || !state.gatewayHeld {
 			t.Fatalf("precondition: want a held pass (state=%+v err=%v)", state, err)
 		}
@@ -608,7 +608,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -643,7 +643,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -732,7 +732,7 @@ func TestTheA2AGatewayFenceIsAppliedOncePerPass(t *testing.T) {
 	want := []string{"fence", "deployment"}
 	for _, pass := range []string{"first render", "running install"} {
 		applies = nil
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatalf("%s: reconcileA2A: %v", pass, err)
 		}
 		if !reflect.DeepEqual(applies, want) {

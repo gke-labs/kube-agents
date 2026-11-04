@@ -1,7 +1,6 @@
 # The Credential Broker Scales Out: an Exec Tier Beside One Stateful Broker
 
-> **STATUS — proposal; not implemented.** The first measurement run is in §8.3. 16 and 32 clusters and the exec tier are not measured yet.
-> Nothing is built. This document proposes how the credential broker grows past one pod. It is
+> **STATUS — proposal; partly implemented.** Priority admission by class (§4.2) runs on the broker; the exec tier is not built. The first measurement run is in §8.3. 16 and 32 clusters and the exec tier are not measured yet. This document proposes how the credential broker grows past one pod. It is
 > meant to replace [`credential-proxy-single-pod.md`](credential-proxy-single-pod.md) once the
 > measurements in §8 exist and the design is reviewed. Issue: #4082. Partner: the sizing tiger
 > team (#3753).
@@ -42,7 +41,7 @@ TODAY: one pod does everything
   chat relays, workspace,  ──────────┘      │   relays, workspace, vcs/forge,   │
   vcs/forge, watchers                       │   watchers                        │
                                             └───────────────────────────────────┘
-                                              ▲ the 8 slots and 1 CPU are shared by
+                                              ▲ the 8 slots and 2 CPU are shared by
                                                 every caller, with no priority
 
 
@@ -92,13 +91,24 @@ and each caller routes to the right one.**
 
 - Slot cap: `DEFAULT_MAX_CONCURRENT_COMMANDS = 8` (`credential_proxy.py:261`). The operator pins
   it, and a CR cannot override it (`platformagent_manifests.go:82`).
-- Child memory budget: (limit − 320 MiB) / 176 MiB per request. That gives 9 at the 2 GiB default
-  and 4 on Autopilot without bursting (limit clamped to the 1 GiB request). The smaller of the
-  two numbers binds.
+- Child memory budget: (limit − 320 MiB) / 176 MiB per request. That gives 9 at the 2 GiB default,
+  on Autopilot without bursting too (limit clamped to the 2 GiB Autopilot request). The smaller of
+  the two numbers binds.
 - Session role: its own cap of 2, refused at once and not queued (`credential_proxy.py:322`).
-- Admission is one arrival-order queue with a 60 s timeout, then `503 CREDENTIAL_PROXY_BUSY`
-  (`_admit`, `credential_proxy.py:6354`).
-- **No priority.** A caller authenticates with a projected ServiceAccount token. The broker
+- Admission is one queue with a 60 s timeout, then `503 CREDENTIAL_PROXY_BUSY` (`_admit`).
+  Inside it the classes of §4.2 apply: the profile and `scope` roles are background, and every
+  other role is interactive.
+- Since #4333, in front of that queue: the resource watermark gate (`ResourceWatermarkGate`).
+  From the soft watermark of live cgroup memory or scratch disk the queue admits one command at
+  a time; from the hard watermark a background caller is answered at once with
+  `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and `Retry-After: 5..30`, and the session role keeps
+  one slot up to a ceiling. The gate reads its own class from the role, narrower than §4.2's: the
+  session role alone is interactive to it, because the shell role still carries its sweeps until
+  the turn token (§4.1) can tell them from chat turns. Under the clamp §4.2's class caps hold
+  for everything but the session's reserve, which stands above the interactive cap: the shell's
+  sweep can hold that cap when the clamp arrives, and the admission it keeps for background
+  work holds nothing while the clamp admits background work one at a time.
+- **No priority inside the shell role.** A caller authenticates with a projected ServiceAccount token. The broker
   learns the workload and a role (shell, chat, a2a-chat, session, watcher, mcp) from it. The
   `caller` field of `Principal` is always `None` (`credential_proxy.py:2182`). Background work
   reaches the broker as the shell role, the same as an interactive command:
@@ -109,7 +119,7 @@ and each caller routes to the right one.**
     the hourly reconcile run through `sandbox_exec` and then the shim. `sandbox_exec` also runs
     the platform MCP server's interactive tools (`platform_mcp_server.py:590`).
 
-  **The broker cannot tell interactive work from background work today.**
+  **The broker cannot tell the shell's interactive work from its background work today.**
 
 ### 2.2 What blocks more replicas [doc, `credential-proxy-single-pod.md` §2 and §3]
 
@@ -224,7 +234,11 @@ example a Service with no endpoints). No request reached a broker then, so nothi
 same reason as §4.3's retry. A failed connect can take the shim's whole connect bound, 10 s
 (`BROKER_CONNECT_TIMEOUT_SECONDS`): a missing egress peer hangs the dial rather than refusing it.
 So the shim writes one stderr line on each fallback, and §5's `broker_tier` audit field is the
-check: exec-role commands on `stateful` while replicas > 0 mean the exec path is broken. The sandbox forwards only the variable names in `SANDBOX_FORWARDED_ENV_NAMES`
+check: exec-role commands on `stateful` while replicas > 0 mean the exec path is broken. The Cloud
+API relay client (`ApiSession`) also falls back on a connection error that comes after the request
+was sent, because every relay call is a GET and sending it again is safe; it then stays on the
+stateful broker for the rest of the session, and it retries no busy reply. The command path never
+resends after a send, because a command may have run. The sandbox forwards only the variable names in `SANDBOX_FORWARDED_ENV_NAMES`
 (`deploy/sandbox/entrypoint.sh`), so `CREDENTIAL_PROXY_EXEC_URL` is added there. Without that, the
 shim always takes the fallback and nothing reports it.
 
@@ -256,12 +270,12 @@ shim always takes the fallback and nothing reports it.
   per-replica series, and the `toolExecutionsTotal` usage counter, would miss it.
 
 - Resources per replica, on every cluster mode: requests 2 CPU / 2 GiB, limits 2 CPU / 2 GiB.
-  Today's broker requests 500m CPU / 1 GiB with limits 1 CPU / 2 GiB [code,
-  `credential_proxy_manifests.go:140-149`]. The 2 GiB request is the minimum from §4.2, and the
-  2-CPU limit follows step 0 (§9). The CPU request equals the limit, so the scheduler reserves
-  the 2 cores that §8.4's CPU term plans with. On Autopilot without bursting the operator already
-  sets limits equal to requests, so the same values hold there. The slot cap and the memory
-  budget stay per replica.
+  The 2 GiB request is the minimum from §4.2, and the 2-CPU limit follows step 0. The replica's
+  CPU request equals its limit, so the scheduler reserves the 2 cores that §8.4's CPU term plans
+  with. On Autopilot without bursting, Autopilot sets limits equal to requests, so the same
+  values hold there. The slot cap and the memory budget stay per replica. For comparison, before
+  step 0 the broker requested 500m CPU / 1 GiB with limits 1 CPU / 2 GiB. Step 0 (§9) raised
+  its limit to 2 CPU and, on Autopilot only, its requests to 2 CPU / 2 GiB.
 - A NetworkPolicy target for the exec tier: ingress on 8765 from the sandbox, from session pods
   only under the cluster-view flag (the condition the stateful broker has today), and the metrics
   port from GMP. The egress rules that select the broker's pod labels also need the exec tier as a
@@ -454,8 +468,9 @@ caller presents, and nothing the caller can set alone changes it.
   and the fleet audits, the watches and the reconcile need nothing from their callers. Until then
   the shell role counts as interactive (the next bullets).
 - A request is `interactive` only with a claim minted outside the sandbox: a session pod's own
-  token (the session role), or a short-lived turn token that the agent's gateway mints for a chat
-  turn. The sandbox session receives the turn token at its start, the way it receives
+  token (the session role; on `main` since #4333 as `INTERACTIVE_ROLES` in the watermark gate,
+  which reserves one slot for it under the hard watermark), or a short-lived turn token that the
+  agent's gateway mints for a chat turn. The sandbox session receives the turn token at its start, the way it receives
   `HERMES_PROFILE_HOME`, so it needs an `AcceptEnv` entry and the session-command path. #3889's
   per-task credentials have the same shape, and the turn token can be one of them.
 - A profile-role request (#4257) is `background` by default, like the shell role once the turn
@@ -480,8 +495,7 @@ caller presents, and nothing the caller can set alone changes it.
 
 - Background work may hold at most `B = admitted − R` of a replica's admissions, where `admitted`
   is the smaller of the slot cap and what the memory budget admits. The proposal is `R = 2`:
-  6 of 8 at the 2 GiB default, and 2 of 4 on Autopilot at a 1 GiB request, without the 2 GiB
-  minimum below. The reserve is budget room as well
+  6 of 8 at the 2 GiB default, on every cluster mode. The reserve is budget room as well
   as slots, so a background child cannot take the memory an interactive request needs. This is
   like the session cap of 2 today, but it reserves capacity instead of only limiting it.
 - Interactive work may hold at most `I = admitted − 1`, so one admission is always free for
@@ -494,10 +508,10 @@ caller presents, and nothing the caller can set alone changes it.
   place, because the reserve already protects interactive work.
 - Inside a class the order stays arrival order. Interactive requests go ahead of queued background
   requests, within the cap.
-- Without a minimum, Autopilot's clamp to a 1 GiB request would make the budget admit 4, and
-  `B = 2`. When the tier is on, each exec replica requests at least 2 GiB (§3.3). On Autopilot
-  the limit then equals that request, so the budget admits 9, the slot cap holds it to 8, and
-  `B = 6` on every cluster mode.
+- On Autopilot without bursting the limit equals the request. The broker's Autopilot default
+  request is 2 GiB, so the budget admits 9 and the slot cap holds it to 8. A CR that lowers the
+  memory request to 1 GiB would make the budget admit 4, and `B = 2`. So when the tier is on,
+  each exec replica requests at least 2 GiB (§3.3), and `B = 6` on every cluster mode.
 - A background request held at `B` waits up to 60 s, as today's queue does, and is then refused
   with the bound `background` (§4.3).
 - The memory budget applies to both classes as it does today.
@@ -514,7 +528,12 @@ There is no shared queue. Each replica runs §4.2 on its own share of the traffi
 
 - The shim opens one connection per call, and kube-proxy balances per connection [measured, spike:
   69/51 over two pods]. So each replica gets about 1/N of each class.
-- New: the shim retries a `503 CREDENTIAL_PROXY_BUSY` once. The retry is a new connection, so it
+- New: while exec routing is on (§12, "Shim retry"), the shim retries a
+  `503 CREDENTIAL_PROXY_BUSY` once. Without exec routing there is one stateful pod, which would
+  refuse again. It would wait out a `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` for its
+  `Retry-After` before that retry, since the broker drew the interval to spread a sweep's workers
+  and a retry at once undoes it; today the shim prints the refusal, whose text names the interval,
+  and retries nothing on it. The retry is a new connection, so it
   reaches another replica with probability (N−1)/N: half the time at 2 replicas. It does not
   retry a dropped connection (`BrokerDisconnected`), because the command may have run.
   `CREDENTIAL_PROXY_BUSY` is raised only at admission, before the command starts, so a retry
@@ -630,7 +649,7 @@ with an agent image that has the #3933 fix (`f8fc7905`) and the broker at 1 CPU 
 | Baseline, one pod | 2, 8, 16, 32 clusters, with a fleet audit that really runs                                                         | Where waits and refusals start, and the sweep's share                                     | 2 and 8 measured, 3 runs each (#4242); 16 and 32 not yet                                                            |
 | Mixed concurrency | 8, 10, 12, 15 interactive questions during a sweep; interactive command time under a background `gcloud` sweep     | Interactive waits and run time behind background work, today and with §4 (the nice value) | Questions measured at 8 clusters, 3 runs each, without a parallel sweep (#4242); command time under a sweep not yet |
 | Vertical control  | Broker CPU at 2 cores at 8 clusters (`bench/scale/broker-proxy-raised.yaml` on #4242); #4107 ran 4 CPU at 2 and 16 | CPU-bound or slot-bound                                                                   | Measured, 1 run (#4242)                                                                                             |
-| Autopilot         | One point at the 1 GiB clamp (budget admits 4)                                                                     | The worst default                                                                         | Not yet                                                                                                             |
+| Autopilot         | One point at the 2 CPU / 2 GiB Autopilot default (budget admits 9, slot cap 8)                                     | No burst above the requests                                                               | Not yet                                                                                                             |
 | Mode              | One baseline point in `spec.mode: today`                                                                           | Phase 1 covered `next` only                                                               | Not yet                                                                                                             |
 | Exec tier         | 1, 2 and 3 replicas at 16 and 32 clusters                                                                          | #4082 "Done when": the chosen shape at two or more sizes                                  | Not yet; needs the tier                                                                                             |
 | `kubectl` split   | The baseline points again with #4128's switch on                                                                   | The broker sized without the `kubectl` share, and the k8s-api-proxy's own load            | Not yet; needs #4128                                                                                                |
@@ -739,23 +758,28 @@ cache contract.
 ## 9. Rollout
 
 0. **Phase 0, useful at one replica:**
-   - **Raise the broker's CPU limit (#4106)** to at least 2 cores, the exec replica's limit
-     (§3.3). It is the first limit measured (§2.3), and it costs one value in the operator. On
-     Autopilot without bursting the limit equals the request, so raising the limit alone does
-     nothing there: the operator raises the broker's CPU request with its limit, and the footprint
-     and the quota preflight count that.
-     Because it is one operator value, it is the fastest single relief for current installs.
-   - **Graceful shutdown.** Today `serve()` runs `serve_forever()` with no SIGTERM handler, and
-     the Deployment sets no `terminationGracePeriodSeconds` and no `preStop`, so a pod stop drops
-     the commands in flight. The broker gets a SIGTERM handler that stops admitting (new requests
-     get a 503 with the new bound `draining`, which §4.3's retry sends to another replica) and
+   - **Raise the broker's CPU limit (#4106)** to 2 cores, the exec replica's limit (§3.3). It is
+     the first limit measured (§2.3). On Autopilot without bursting the limit equals the request,
+     so raising the limit alone does nothing there: the operator requests 2 CPU / 2 GiB on
+     Autopilot (it detects the cluster type), and the quota preflight counts that pair where the
+     cluster serves the `auto.gke.io` AllowlistedWorkload resource. On Standard the requests stay 500m / 1 GiB and the broker bursts
+     to the limit: a 2-CPU request has to fit on one node before the single, `Recreate` broker
+     can start, and a one-node default pool with the agent pods on it has no 2 cores free.
+   - **Graceful shutdown.** Before this step `serve()` ran `serve_forever()` with no SIGTERM
+     handler, and the Deployment set no `terminationGracePeriodSeconds` and no `preStop`, so a pod
+     stop dropped the commands in flight. The broker gets a SIGTERM handler that stops admitting (new requests
+     get a 503 with the new bound `draining`, which §4.3's retry sends to another replica while
+     exec routing is on) and
      drains the commands in flight. The drain depends
      on the Deployment:
      - On the single pod, which keeps `Recreate`, Kubernetes ends the old pod before it starts
        the new one, so every route is down while the pod drains. There the drain is short and
        bounded: it finishes commands for up to 30 s, then ends the rest. The pod drains its relays
        in the same window, and its `terminationGracePeriodSeconds` is 45 s, so the kubelet does
-       not kill it before the drain and the exit end, and events are not lost.
+       not kill it before the drain and the exit end. Chat receipts still unsettled go back to
+       Pub/Sub; Slack and Teams events the gateway did not pull before the exit end with the
+       process, and the Slack count is logged. This half is implemented (`install_shutdown_handler`
+       in `credential_proxy.py`, the broker role only).
      - On the exec tier, `RollingUpdate` keeps another replica serving, so the drain is long: a
        `terminationGracePeriodSeconds` longer than the longest command it admits. A
        PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or more; at 1
@@ -871,20 +895,23 @@ on: the sandbox restarts with the variable before an exec replica is ready.
 ## 12. Implementation contract
 
 The names and shapes that the implementation shares. The operator, the broker, the shim and the
-chart will use these exact values; on `main` today, none of them does yet. A Python block in `credential_proxy_client.py` holds the broker's
-and the shim's copies, and `test_exec_tier_contract.py` checks that they match this section.
+chart use these exact values. The broker's priority admission (§4.2) uses the classes, the
+`background` bound and the nice value. The shim uses the caller URL, the busy reply's `bound` and
+the retried bounds. The other items arrive with the changes that need them. A Python block in
+`credential_proxy_client.py` holds the broker's and the shim's copies, and
+`test_exec_tier_contract.py` checks that they match this section.
 
 | Item                  | Value                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | CR field              | `spec.deployment.credentialProxy.exec.replicas` (`Exec *CredentialProxyExecSpec`, `Replicas *int32`): an integer from 0 to 32; unset and 0 both mean off. At 0 the operator renders no exec workload and sets no exec URL. Each replica requests and is limited to 2 CPU and 2 GiB (§3.3); there is no override field. The bound 32 covers §8.4's mean-basis estimate for 1,000 clusters without the cache (about 28); larger fleets need the cache before default on (§9), and a later release can raise the bound.                                                            |
-| Workload names        | Deployment, Service and PodDisruptionBudget `<agent>-credential-proxy-exec-tier`; ConfigMap `<agent>-credential-proxy-exec-tier-replicas`. Port 8765 for requests, 8766 for metrics. Not `credential-proxy-exec`, which is the shim's client binary in the images. The Service name and the `app` label must fit in 63 characters, so with the tier on, an agent's name is at most 36 characters (63 minus the 27-character suffix); the operator refuses a longer name when `exec.replicas` is above 0.                                                                        |
+| Workload names        | Deployment, Service and PodDisruptionBudget `<agent>-credential-proxy-exec-tier`; ConfigMap `<agent>-credential-proxy-exec-tier-replicas`. Port 8765 for requests, 8766 for metrics, 8768 for the readiness probe. Not `credential-proxy-exec`, which is the shim's client binary in the images. The Service name and the `app` label must fit in 63 characters, so with the tier on, an agent's name is at most 36 characters (63 minus the 27-character suffix); the operator refuses a longer name when `exec.replicas` is above 0.                                          |
 | Labels                | `app: <agent>-credential-proxy-exec-tier` and `kubeagents.x-k8s.io/component: credential-proxy-exec-tier`. Not the stateful broker's labels, and no `kubeagents.x-k8s.io/has-credential-proxy`.                                                                                                                                                                                                                                                                                                                                                                                 |
 | Broker role           | `CREDENTIAL_PROXY_ROLE=exec`. An exec pod runs the broker and Envoy only: no watchers and no relays.                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Exec routes           | `POST /v1/exec`, `GET /v1/gcp/…`, `GET /v1/exec/admission`, `/healthz` and metrics. Every other route answers 404 on an exec pod. The `scope` role's `/v1/exec` call is refused there with 403 `CALLER_ROLE_FORBIDDEN`, because its member window lives on the stateful pod.                                                                                                                                                                                                                                                                                                    |
 | Caller URL            | `CREDENTIAL_PROXY_EXEC_URL`, the exec Service's URL, for the sandbox, session pods and profile workers; the A2A gateway reads it from `A2A_CREDENTIAL_PROXY_EXEC_URL`. Unset at 0 replicas, so callers use `CREDENTIAL_PROXY_URL`. The scope publisher Job keeps `CREDENTIAL_PROXY_URL`. The fleet audit's admission client (`broker_admission.py`) reads `CREDENTIAL_PROXY_URL`; the capacity change (§3.5) points it at the exec URL.                                                                                                                                         |
 | Replica count in pods | The ConfigMap's key `replicas`, mounted at `/etc/credential-proxy-exec-tier/replicas`; `CREDENTIAL_PROXY_EXEC_REPLICAS_FILE` names that path. A scale change rewrites the ConfigMap and does not restart the pods.                                                                                                                                                                                                                                                                                                                                                              |
 | Busy reply            | HTTP 503 `{"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "bound": "<bound>", "error": "…"}`. The bounds are `slot`, `budget`, `refresh-lock`, `session`, `profile`, `scope`, `background`, `draining` and `other`; `background` is the background cap `B` (§4.2) after the 60 s wait; `draining` is a replica that is stopping (§9 step 0). `scope` is the scope publisher role's refusal, not a capacity bound, so the shim does not retry it.                                                                                                                            |
-| Shim retry            | Once, on a new connection, for the bounds `slot`, `budget`, `background`, `draining` and `profile`; never for the others, and never after a dropped connection.                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Shim retry            | Once, on a new connection, for the bounds `slot`, `budget`, `background`, `draining` and `profile`; never for the others, and never after a dropped connection. Only while exec routing is on: `CREDENTIAL_PROXY_EXEC_URL` and `CREDENTIAL_PROXY_URL` are both set, and the command names no endpoint. Without it there is one stateful pod, which would refuse again.                                                                                                                                                                                                          |
 | Connect fallback      | When a connection to `CREDENTIAL_PROXY_EXEC_URL` cannot be made, the shim sends the request to `CREDENTIAL_PROXY_URL` and writes one stderr line.                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | Classes               | `interactive` and `background`; the metric label is `class`, on the admission wait, the refusals and the command duration. The profile and `scope` roles are background. Every other slot-taking role is interactive: the session role, the MCP role, and the shell role (its vcs and forge routes too) until the turn token exists (§4.1). Interactive work is held at `admitted − 1`, so one admission stays free for background work. Background children run at nice 10, set on their process group right after they start. The reserve `R = 2` and the caps are constants. |
 | Audit fields          | `broker_tier` (`exec` or `stateful`), `class` and `broker_pod` on each tool-execution record. §5's `requestId` and caller name are fields of their own, outside `principal`.                                                                                                                                                                                                                                                                                                                                                                                                    |

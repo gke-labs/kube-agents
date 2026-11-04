@@ -1813,7 +1813,7 @@ class PeriodicNote(unittest.TestCase):
         # A previous health.json without counts yet (the first tick after the
         # counts ship); a tick with none at all is the test below.
         first = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)}, prev={})
-        self.assertEqual(first["periodics"], {}, "one failed ten-minute run is not news")
+        self.assertEqual(first["periodics"], {}, "one failed sweep run is not news")
         self.assertEqual(first["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {"kube-agents-evals-3": 1}, "runs": 1})
         second = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=5), passed=False, build="101", artifact=fail)}, prev=first, now=T0 + timedelta(minutes=15))
         self.assertIn(self.SWEEP, second["periodics"], "two in a row is")
@@ -1832,7 +1832,7 @@ class PeriodicNote(unittest.TestCase):
         self.assertEqual(blind["periodics_streaks"][self.SWEEP]["runs"], 1)
 
     def test_an_overdue_job_is_stale_and_no_readings_is_no_note(self):
-        stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=2))})
+        stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=3))})
         self.assertEqual(stale["periodics"][self.SWEEP]["verdict"], "STALE")
         blind = self.judge(None)
         self.assertEqual((blind["periodics"], blind["periodics_read"]), ({}, []))

@@ -40,7 +40,9 @@ import subprocess
 import sys
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO, Tuple
 
-SUMMARY_MAX_LINES = 40
+# Independent of the gateway's usageSummaryMaxLines: this block has lines the
+# gateway's lacks.
+SUMMARY_MAX_LINES = 41
 SUMMARY_TITLE = "kube-agents usage & feedback summary"
 TASK_WINDOW_DAYS = 14
 RECENT_TASKS_SHOWN = 5
@@ -108,6 +110,7 @@ USAGE_COUNTERS: Tuple[str, ...] = (
     "clustersMonitored",
     "chatMessagesInboundTotal",
     "sessionsTotal",
+    "chatSessionsTotal",
     "toolExecutionsTotal",
     "eventsIngestedTotal",
     "remediationsProposedTotal",

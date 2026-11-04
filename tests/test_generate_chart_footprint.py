@@ -346,7 +346,7 @@ class ExtractFootprintTest(unittest.TestCase):
         cls.op = cls.data["operatorRendered"]
 
     def test_shape(self):
-        for key in ("agentPod", "shellSandbox", "credentialProxy", "storage"):
+        for key in ("agentPod", "shellSandbox", "credentialProxy", "kubeProxy", "storage"):
             self.assertIn(key, self.op)
         self.assertIn("base", self.op["agentPod"])
         self.assertIn("dashboard", self.op["agentPod"])
