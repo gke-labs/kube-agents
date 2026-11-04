@@ -894,8 +894,10 @@ IDLE_CLOSE_LOG_PREFIX = "Request timed out"
 # broker already does through its command, session, profile and scope slots
 # rather than refusing ahead of them. The config is read from the copy the
 # credential-proxy image carries beside the broker, or the repository's when
-# running from source; with neither readable, the fallback is Envoy's default
-# for the one cluster the shipped config has.
+# running from source; the shipped config declares 4096 on the credentialed
+# route's cluster and 64 on the readiness probe's, so the derived cap is 4160
+# there. With neither readable, the fallback is Envoy's default for one
+# cluster.
 MAX_THREADS_ENV = "CREDENTIAL_PROXY_MAX_THREADS"
 ENVOY_CONFIG_PATH = Path("/etc/envoy/envoy-credential-proxy.yaml")
 # This file sits three directories under the repository root

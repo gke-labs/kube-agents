@@ -226,8 +226,8 @@ a fixed `{"status":"ok"}` body, under the same sixteen-connection cap and
 ten-second deadline as the metrics listener, so that a probe an operator
 points at the broker directly reads it as alive while the credentialed
 listener is at its thread cap; the operator's readiness probe reads `/healthz`
-through Envoy instead, and the broker's NetworkPolicy opens the port to no
-pod, so only a kubelet probe reaches it. The metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
+through Envoy's health listener on 8768 instead (below), and the broker's
+NetworkPolicy opens the port to no pod, so only a kubelet probe reaches it. The metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
 set by the operator) serves Prometheus series whose label values are
 static enums and closed vocabularies, holds no route, credential or policy,
 answers at most sixteen connections at a time and cuts each off ten seconds
@@ -267,7 +267,8 @@ three refusals remove the Pod from the Service. That ceiling is declared rather 
 inherited: `circuit_breakers.thresholds` on both priorities, 4096 connections, 1024 pending
 requests and 4096 requests, where Envoy's default is 1024 of each; the broker's listen
 backlog (`LISTEN_BACKLOG`) is sized to the same 4096 so that the breaker, never the queue,
-refuses first. The health listener routes `/healthz` alone to a `credential_health` cluster
+refuses first, and the runtime's thread cap is derived from the same thresholds at startup
+(`CREDENTIAL_PROXY_MAX_THREADS`, below), so the breaker refuses before the cap too. The health listener routes `/healthz` alone to a `credential_health` cluster
 on the same Unix socket, behind a breaker of 64, so ready still means the broker answers and
 no watch can mark the Pod unready; any other path on it is a 404. The Service and the
 NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
@@ -729,7 +730,8 @@ Separately, the content routes raise the request-body cap to twice the
 total-payload limit, and the listener is threaded with one connection per
 thread up to `CREDENTIAL_PROXY_MAX_THREADS` (by default the sum of Envoy's
 connection ceilings to the broker's socket, read from the Envoy config shipped
-beside the broker, 1024 for a cluster that sets none; a connection past it is
+beside the broker: 4160 as shipped, the credentialed route's 4096 and the
+probe's 64, and 1024 for a cluster that sets none; a connection past it is
 answered `503` with `Retry-After` and closed), a bound on connections that
 is no bound on heap in practice, so peak heap on those routes is roughly
 concurrency times that figure: the bodies

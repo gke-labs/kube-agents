@@ -16373,7 +16373,8 @@ class ThreadCapTest(_CredentialedUnixServer):
         for server_class in (credential_proxy.ThreadingUnixHTTPServer, credential_proxy.ThreadingTCPHTTPServer):
             self.assertTrue(issubclass(server_class, credential_proxy.ThreadCap), server_class)
         # With no Envoy config readable, the cap is Envoy's own default for
-        # the one cluster the shipped config has.
+        # one cluster; the shipped config, which declares its ceilings,
+        # derives more (ThreadCapDefaultTest).
         self.assertEqual(1024, credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS)
         self.assertEqual(credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS, credential_proxy.FALLBACK_MAX_THREADS)
         self.assertEqual(_SMALL_THREAD_CAP, self.server.connection_cap)
