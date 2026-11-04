@@ -80,7 +80,10 @@ const (
 	homeChannelRecordIDMax     = 32
 	homeChannelRecordMalformed = "<not a channel id>"
 
-	// The refusal vocabulary the gateway writes into slack.refused.
+	// The refusal vocabulary the gateway writes into slack.refused, its
+	// homeRefused* constants in a2a/gateway/slack_home_channel.go;
+	// TestHomeChannelRefusedReasonsMatchTheGatewaysVocabulary fails when this
+	// map and those words differ.
 	homeChannelRefusedShared        = "shared"
 	homeChannelRefusedArchived      = "archived"
 	homeChannelRefusedNotMember     = "not-member"
