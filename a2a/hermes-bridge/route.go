@@ -361,7 +361,9 @@ type sessionOrigin struct {
 
 // backendOrigins maps the gateway door a task came through
 // (authority.requester.backend) to the session's origin. A chat door's
-// platform is its chat metrics label.
+// platform is the ledger's platform label: Google Chat and Slack are spelled
+// as the chat metrics labels spell them, and Discord, which has no chat
+// metrics label, keeps its backend name.
 var backendOrigins = map[string]sessionOrigin{
 	backendGchat:     {Origin: originChat, Platform: originPlatformGooglechat},
 	backendSlack:     {Origin: originChat, Platform: backendSlack},
