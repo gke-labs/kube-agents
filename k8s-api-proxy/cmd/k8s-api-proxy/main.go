@@ -24,6 +24,7 @@ import (
 const (
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
 	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
+	metricsPortFlag         = "metrics-port"
 
 	// otelShutdownTimeout bounds the flush of buffered spans on exit.
 	otelShutdownTimeout = 5 * time.Second
@@ -69,7 +70,7 @@ func envIntOrDefault(key string, fallback int) int {
 
 func startMetricsListener(ctx context.Context, port int, metrics *k8sapiproxy.Metrics, logger *slog.Logger) {
 	if port == 0 {
-		logger.Info("metrics listener disabled: " + metricsPortEnv + " resolved to 0")
+		logger.Info("metrics listener disabled: --" + metricsPortFlag + " resolved to 0 (its default comes from " + metricsPortEnv + ")")
 		return
 	}
 	srv, err := k8sapiproxy.NewMetricsServer(port, metrics, logger)
@@ -110,7 +111,7 @@ func main() {
 
 	var (
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
-		metricsPort              = flag.Int("metrics-port", envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
+		metricsPort              = flag.Int(metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
 		tlsCertFile              = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
 		tlsKeyFile               = flag.String("tls-key-file", envOrDefault("KUBE_PROXY_TLS_KEY_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"), "TLS server private key PEM file")
 		modeRaw                  = flag.String("mode", envOrDefault("KUBE_PROXY_MODE", string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
