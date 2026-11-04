@@ -119,8 +119,9 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
 `FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
 window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
-cap on the profiles one Cluster Agent reconcile run creates, and the `KAGE_SLACK_UX` flag —
-but only as literal values; all `valueFrom` sources are rejected. One name goes to the shell Pod
+cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
+roster count, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
+are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false` before it reaches that Pod. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
