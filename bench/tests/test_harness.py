@@ -4125,6 +4125,21 @@ def test_a_kept_card_is_owed_and_the_next_run_deletes_it_once_it_settles(tmp_pat
     assert not _has_files(tmp_path, "t_c1")
 
 
+def test_an_owed_card_the_next_runs_front_door_hands_back_is_still_owed(tmp_path: Path) -> None:
+    """Each purge keeps its own floor: older than the run is foreign to it, not to the purge that kept it."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_x", "running")
+    _stamp(kb, {"t_x": _FLOOR - 1})
+    assert _run_purge(tmp_path, ["t_x"]) == ["kept t_x", "pending t_x", "purged"]
+
+    kb.execute("UPDATE tasks SET status = 'done' WHERE id = 't_x'")
+    kb.commit()
+    # The next run's create returned t_x by its idempotency key, so it is among that run's roots.
+    assert _run_purge(tmp_path, ["t_x"], floor=_FLOOR) == ["foreign t_x", "purged"]
+    assert kb.execute("SELECT COUNT(*) FROM tasks WHERE id = 't_x'").fetchone() == (0,)
+    assert _owed(tmp_path) == []
+
+
 def test_a_purge_whose_board_step_failed_is_retried_under_its_own_rules(tmp_path: Path) -> None:
     """The retry keeps the failed purge's floor and creator check: a stranger's card is still left alone."""
     kb = _purge_board(tmp_path)

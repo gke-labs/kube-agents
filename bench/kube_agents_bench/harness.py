@@ -1480,8 +1480,10 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # Every run of the script, the harness's pre-run retry included
 # (:func:`_retry_pending_purges`), takes those purges on after its own, through
 # the same rules, and writes what it still keeps as a new file with the old one's
-# first-owed time; one owed longer than ``MAX_AGE`` is printed ``abandoned <id>``
-# and dropped. Two scripts retrying the same file at once each take the write
+# first-owed time (the old file goes only once the new one is written); one owed
+# longer than ``MAX_AGE`` is printed ``abandoned <id>`` and dropped. Each purge is
+# held to its own floor: a card the run's front door handed back by its key is
+# foreign to the run and still owed by the purge that kept it. Two scripts retrying the same file at once each take the write
 # lock in turn, so the second finds the rows gone; a card both keep is owed twice,
 # which costs a second look.
 #
@@ -1523,7 +1525,7 @@ def mark_sorted(on):
         pass
 def owe(owed_roots, owed_fanned, floor, first):
     if not owed_roots + owed_fanned:
-        return
+        return True
     name = uuid.uuid4().hex
     tmp = os.path.join(PENDING, "." + name)
     try:
@@ -1532,9 +1534,10 @@ def owe(owed_roots, owed_fanned, floor, first):
             json.dump({"roots": owed_roots, "fanned": owed_fanned, "floor": floor, "first": first}, f)
         os.replace(tmp, os.path.join(PENDING, name + SUFFIX))
     except OSError:
-        return
+        return False
     for tid in owed_roots + owed_fanned:
         print("%s %s" % (LEFT, tid))
+    return True
 def still_owed():
     for g in groups[1:]:
         for tid in g[0] + g[1]:
@@ -1563,18 +1566,18 @@ for name in names:
 kb, older, failed = None, set(), None
 try:
     kb = sqlite3.connect("%s/kanban.db" % ROOT, timeout=BUSY, isolation_level=None)
-    for g in groups:
+    for i, g in enumerate(groups):
         if g[2] is None:
             continue
         for tid in g[0]:
             r = kb.execute("SELECT created_at FROM tasks WHERE id = ?", (tid,)).fetchone()
             if r is not None and r[0] is not None and int(r[0]) < g[2]:
-                older.add(tid)
+                older.add((i, tid))
 except sqlite3.Error as exc:
     failed = exc
-for g in groups:
+for i, g in enumerate(groups):
     for tid in g[0]:
-        if tid in older:
+        if (i, tid) in older:
             print("%s %s" % (FOREIGN, tid))
         else:
             unlink(tid)
@@ -1588,7 +1591,7 @@ if failed is not None:
 order, seen = [], set()
 for i, g in enumerate(groups):
     for tid in g[0]:
-        if tid not in older and tid not in seen:
+        if (i, tid) not in older and tid not in seen:
             seen.add(tid)
             order.append((tid, i))
 own = set(seen)
@@ -1653,9 +1656,7 @@ try:
     for tid in gone:
         unlink(tid)
     for i, g in enumerate(groups):
-        if i in left:
-            owe(left[i], [], None, g[3])
-        if g[4]:
+        if (owe(left[i], [], None, g[3]) if i in left else True) and g[4]:
             drop(g[4])
     print(DONE)
 except sqlite3.Error as exc:
