@@ -933,6 +933,18 @@ lost. Move them to `platformAgent.deployment.env` first. A re-tag to a chart wit
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives
 the buckets, the defaults and a sizing method.
 
+`platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
+`backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,
+`failedSchedulingMinSpan`, `scaleUpHold`, `settle`, `quietAfter` and `autopilotScaleToZeroHold`.
+Each key that is set becomes a `WATCHER_<NAME>` entry in the CR's `spec.deployment.env`, for example
+`failedSchedulingMinSpan` becomes `WATCHER_FAILEDSCHEDULING_MIN_SPAN`. The operator passes it to the
+container that runs the watcher. A key that is not set keeps the watcher's default. The schema checks
+the shape of each value: a Go duration, a count or a boolean. A value that the watcher cannot read
+keeps its default, and the container log names it. The conflict rules are the same as for
+`alertDailyLimits`. The
+[watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
+gives each setting's meaning and default.
+
 #### PlatformAgent annotations
 
 `platformAgent.annotations` is copied onto the CR's `metadata.annotations`, and

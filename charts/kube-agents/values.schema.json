@@ -1030,6 +1030,104 @@
                 }
               }
             },
+            "eventWatcher": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "dedupWindow": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(0|([0-9]{1,18}(\\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$",
+                      "not": {
+                        "pattern": "^(0|(0{1,18}(\\.0{1,3})?(ns|us|ms|s|m|h)){1,16})$"
+                      }
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "backoffMinCount": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                },
+                "imagePullTransientMinCount": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                },
+                "failedSchedulingMinCount": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                },
+                "failedSchedulingMinSpan": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(0|([0-9]{1,18}(\\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$"
+                    },
+                    {
+                      "type": "integer",
+                      "const": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "scaleUpHold": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(0|([0-9]{1,18}(\\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$"
+                    },
+                    {
+                      "type": "integer",
+                      "const": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "settle": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(0|([0-9]{1,18}(\\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$"
+                    },
+                    {
+                      "type": "integer",
+                      "const": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "quietAfter": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(0|([0-9]{1,18}(\\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$"
+                    },
+                    {
+                      "type": "integer",
+                      "const": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "autopilotScaleToZeroHold": {
+                  "type": ["boolean", "null"]
+                }
+              }
+            },
             "credentialProxy": {
               "type": "object",
               "additionalProperties": false,

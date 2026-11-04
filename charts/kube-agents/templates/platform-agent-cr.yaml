@@ -346,6 +346,38 @@ spec:
     {{- end }}
     {{- end }}
     {{- /*
+      The event watcher's settings in deployment.eventWatcher come next, as
+      WATCHER_<NAME>, with the same rules as the alert ceilings above. The
+      operator merges spec.deployment.env into the agent-api-auth container,
+      where deploy/shared/start-services.sh reads each variable and passes it
+      to the watcher as a flag. A number goes through int64 for the reason
+      above; a duration string and a boolean go through toString.
+    */}}
+    {{- $eventWatcher := .Values.platformAgent.deployment.eventWatcher | default dict }}
+    {{- range $setting := list
+          (list "dedupWindow" "WATCHER_DEDUP_WINDOW")
+          (list "backoffMinCount" "WATCHER_BACKOFF_MIN_COUNT")
+          (list "imagePullTransientMinCount" "WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT")
+          (list "failedSchedulingMinCount" "WATCHER_FAILEDSCHEDULING_MIN_COUNT")
+          (list "failedSchedulingMinSpan" "WATCHER_FAILEDSCHEDULING_MIN_SPAN")
+          (list "scaleUpHold" "WATCHER_SCALEUP_HOLD")
+          (list "settle" "WATCHER_SETTLE")
+          (list "quietAfter" "WATCHER_QUIET_AFTER")
+          (list "autopilotScaleToZeroHold" "WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD") }}
+    {{- $key := index $setting 0 }}
+    {{- $name := index $setting 1 }}
+    {{- $setValue := index $eventWatcher $key }}
+    {{- if and (not (kindIs "invalid" $setValue)) (hasKey $userValueFromNames $name) }}
+    {{- fail (printf "platformAgent.deployment.eventWatcher.%s is set, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and the watcher keeps its default. Remove the valueFrom entry or the key." $key $name) }}
+    {{- end }}
+    {{- if and (not (kindIs "invalid" $setValue)) (not (hasKey $userEnvNames $name)) }}
+    {{- if or (kindIs "float64" $setValue) (kindIs "int" $setValue) (kindIs "int64" $setValue) }}
+    {{- $setValue = $setValue | int64 }}
+    {{- end }}
+    {{- $env = append $env (dict "name" $name "value" ($setValue | toString)) }}
+    {{- end }}
+    {{- end }}
+    {{- /*
       litellm.redaction.enabled hands the gateway's rule file to the agent pod
       as well: below the env block, one read-only projection of the
       redaction.yaml key out of the gateway's ConfigMap, at the fixed path the
