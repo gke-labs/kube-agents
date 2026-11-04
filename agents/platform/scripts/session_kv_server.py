@@ -1614,6 +1614,16 @@ def init_db() -> None:
                 )
                 """
             )
+            # A reservation is written before its triage starts, and a process
+            # that died in between leaves it with no turn behind it and nothing
+            # else to release it, as the fold anchors below. A triage that
+            # started keeps its reservation: its card may still open the pull
+            # request.
+            conn.execute(
+                "DELETE FROM triage_pr_reservations WHERE session_id NOT IN "
+                "(SELECT session_id FROM intercepted_events WHERE triage_state = ?)",
+                (TRIAGE_STATE_STARTED,),
+            )
             # A fold anchor is written as an intent, before its background task
             # runs, so a process that died in between (OOM, SIGKILL, a crash)
             # leaves a row anchoring its workload with no triage behind it and
@@ -3265,6 +3275,9 @@ def _open_triage_pull_request_branches(timeout: float) -> Optional[Set[str]]:
 
             branches: Set[str] = set()
             for repo in gitops_workspace.get_managed_repos():
+                # A fork's proposal names its own repository in `sourceRepo`;
+                # only a branch on this repository is the install's.
+                here = "/".join(repo.casefold().split("/")[-2:])
                 for page in range(1, TRIAGE_PR_LIST_MAX_PAGES + 1):
                     listing = forge.call(
                         "proposal-list",
@@ -3273,7 +3286,12 @@ def _open_triage_pull_request_branches(timeout: float) -> Optional[Set[str]]:
                         retry_transient=True,
                     )
                     for proposal in listing.get("proposals") or []:
-                        source = proposal.get("source") if isinstance(proposal, dict) else None
+                        if not isinstance(proposal, dict):
+                            continue
+                        source = proposal.get("source")
+                        source_repo = str(proposal.get("sourceRepo") or "").casefold()
+                        if source_repo and "/".join(source_repo.split("/")[-2:]) != here:
+                            continue
                         if isinstance(source, str) and source.startswith(INCIDENT_PR_BRANCH_PREFIX):
                             branches.add(source)
                     if not listing.get("truncated"):

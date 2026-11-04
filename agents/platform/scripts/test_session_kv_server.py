@@ -12430,7 +12430,7 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
                 raise self.pages
             page = payload["page"]
             return {
-                "proposals": [{"source": source} for source in self.pages[page - 1]],
+                "proposals": [p if isinstance(p, dict) else {"source": p} for p in self.pages[page - 1]],
                 "truncated": page < len(self.pages),
             }
 
@@ -12497,6 +12497,17 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
         self.assertEqual(self.reservations(), {(self.branch("k8s-evt-1", "api-0"), "k8s-evt-1")})
         verb, payload, repo = self.forge_calls[0]
         self.assertEqual((verb, payload["state"], repo), ("proposal-list", "open", "acme/gitops"))
+
+    def test_a_forks_branch_with_the_prefix_is_not_counted(self):
+        """Only a branch on the managed repository is the install's; a fork's
+        proposal names its own repository in sourceRepo."""
+        self.pages = [[
+            {"source": self.PREFIX + "a-1111aaaa", "sourceRepo": "stranger/gitops"},
+            {"source": self.PREFIX + "b-2222bbbb", "sourceRepo": "stranger/gitops"},
+            {"source": self.PREFIX + "c-3333cccc", "sourceRepo": "ACME/gitops"},
+        ]]
+        self.assertEqual(self.decide("k8s-evt-1", "api-0"), (True, None))
+        self.assertIs(self.decide("k8s-evt-2", "web-2")[0], False)
 
     def test_at_the_limit_the_triage_gets_the_default_query_and_the_note(self):
         # Two open triage pull requests; the third proposal is not a triage's.
@@ -12582,6 +12593,21 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
         self._settle_with_pull_request("k8s-evt-1", time.time() - 60)
         self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
         self.assertNotIn("k8s-evt-1", {session for _, session in self.reservations()})
+
+    def test_a_restart_releases_the_reservations_whose_triage_never_started(self):
+        """A process that died between the claim and the start leaves a row
+        nothing else releases; a triage that started keeps its row."""
+        self.decide("k8s-evt-1", "api-0")
+        self.decide("k8s-evt-2", "web-2")
+        row_id = session_kv_server.record_intercepted_event(
+            cluster="gke-1", namespace="prod", workload="web-2", object_uid="u2", object_kind="Pod",
+            reason="BackOff", message="restarting", severity="Warning", occurrences=1, notified=True,
+            session_id="k8s-evt-2",
+        )
+        session_kv_server.mark_triage_state(row_id, session_kv_server.TRIAGE_STATE_STARTED)
+        session_kv_server.init_db()
+        self.assertEqual({session for _, session in self.reservations()}, {"k8s-evt-2"})
+        self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
 
     def test_a_reservation_past_the_backstop_is_released(self):
         import sqlite3
