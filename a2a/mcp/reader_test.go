@@ -322,30 +322,64 @@ func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
 }
 
 // waitConsumerPending waits until the TASKS stream's one consumer counts n
-// messages pending.
+// messages pending, and fails the test if it does not.
 func waitConsumerPending(t *testing.T, ctx context.Context, js jetstream.JetStream, n uint64) {
 	t.Helper()
+	if err := consumerPending(ctx, js, n); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// consumerPending is waitConsumerPending's wait. A watch's consumer with no
+// pull outstanding is reaped after taskConsumerIdle, and from then on no count
+// can arrive, so a listing with no consumer, or one that fails, ends the wait
+// with that cause rather than running out the context.
+func consumerPending(ctx context.Context, js jetstream.JetStream, n uint64) error {
 	s, err := js.Stream(ctx, lib.TasksStream)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 	for {
 		names := s.ConsumerNames(ctx)
+		found := 0
 		for name := range names.Name() {
+			found++
 			c, err := s.Consumer(ctx, name)
 			if err != nil {
 				continue
 			}
 			info, err := c.Info(ctx)
 			if err == nil && info.NumPending == n {
-				return
+				return nil
 			}
+		}
+		if err := names.Err(); err != nil {
+			return fmt.Errorf("listing the %s consumers: %w", lib.TasksStream, err)
+		}
+		if found == 0 {
+			return fmt.Errorf("the watch's consumer on %s is gone, reaped after %s with no pull outstanding, before it counted %d messages pending",
+				lib.TasksStream, taskConsumerIdle, n)
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatalf("the consumer never counted %d messages pending", n)
+			return fmt.Errorf("the consumer never counted %d messages pending: %w", n, ctx.Err())
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+// A consumer reaped before it counts names the reap, not a count that never
+// came.
+func TestConsumerPendingNamesAReapedConsumer(t *testing.T) {
+	_, js := testBus(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := consumerPending(ctx, js, 1)
+	if err == nil || !strings.Contains(err.Error(), "reaped after") {
+		t.Fatalf("err = %v, want the reap named", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("the wait ran out its context instead of ending on the empty listing")
 	}
 }
 
