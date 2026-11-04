@@ -153,6 +153,25 @@ class ReplayTest(ProxyTestCase):
         self.assertEqual(body["usage"]["prompt_tokens"], 1000)
         self.assertTrue(self.lines(1, out)[0]["served"])
 
+    def test_a_miss_is_compared_with_the_most_alike_of_conversations_sharing_its_opening(self):
+        # Every worker conversation opens the same way, so the miss must be shown
+        # against the sibling whose next message is most like this one.
+        cards = (
+            "card: list the namespaces on cluster alpha",
+            "card: check kube-system pods on cluster beta and report restarts with reasons",
+            "card: design a training cluster with eight GPUs in us-central1",
+            "card: open a pull request bumping the node pool version",
+        )
+        self.record(*(chat("t_11111111", stream=False, extra_messages=({"role": "user", "content": c},)) for c in cards))
+        recorded = {line["fingerprint"] for line in self.lines(len(cards), self.record_out)}
+        _, port, out = self.replay()
+        changed = ({"role": "user", "content": "card: check kube-system pods on cluster beta and report restart counts"},)
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=changed), port=port)
+        miss = self.lines(1, out)[0]["miss"]
+        self.assertIn(miss["closest_fingerprint"], recorded)
+        self.assertEqual((miss["matched_messages"], miss["index"]), (1, 1))
+        self.assertIn("cluster beta", miss["saved_snippet"])
+
     def test_a_miss_goes_live_is_not_recorded_and_says_where_it_differed(self):
         extra = ({"role": "user", "content": "first turn"},)
         self.record(chat("t_11111111", stream=False, extra_messages=extra))

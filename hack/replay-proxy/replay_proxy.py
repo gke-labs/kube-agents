@@ -104,6 +104,8 @@ SIGNATURE_AFTER_CHARS = 32
 SIGNATURE_COLLAPSE_RE = re.compile(r"[0-9a-f]{6,}|\d+")
 SIGNATURE_DIGITS = "#"
 SIGNATURE_SEPARATOR = " -> "
+# The score of a saved message that could not be compared (missing or unscrubbable).
+UNRANKED = -1.0
 DEFAULT_REDACTOR_PATH = "/app/scrubbers/redactor.py"
 DEFAULT_TRANSCRIPT_RULES_PATH = "/app/scrubbers/worker_transcript.py"
 UNSET = ""
@@ -568,9 +570,11 @@ class ShadowProxy:
         if self.index_empty:
             return {F.MISS_ROLE: F.MISS_ROLE_NO_CACHE}
         hashes = entry[F.DIAG_MESSAGE_HASHES]
-        closest, matched = self.index.closest(entry[F.DIAG_SETTINGS_HASH], hashes)
-        if closest is None:
+        candidates, matched = self.index.candidates(entry[F.DIAG_SETTINGS_HASH], hashes)
+        if not candidates:
             return {F.MISS_ROLE: F.MISS_ROLE_SETTINGS, F.MISS_MATCHED_MESSAGES: 0}
+        current = self._scrubbed_message(diag_walked[matched]) if matched < len(hashes) else None
+        closest, saved = self._most_alike(candidates, matched, current)
         block: Dict[str, Any] = {
             F.MISS_CLOSEST_FINGERPRINT: closest.get(replay_cache.ENTRY_FINGERPRINT),
             F.MISS_MATCHED_MESSAGES: matched,
@@ -581,12 +585,22 @@ class ShadowProxy:
         roles = entry[F.ROLES]
         block[F.MISS_INDEX] = matched
         block[F.MISS_ROLE] = roles[matched] if matched < len(roles) else ""
-        current = self._scrubbed_message(diag_walked[matched])
-        saved_hashes = closest.get(replay_cache.ENTRY_DIAG_MESSAGE_HASHES) or []
-        saved = self.cache.load_message(saved_hashes[matched]) if matched < len(saved_hashes) else None
         if current is not None:
             block.update(diff_snippets(saved, current))
         return block
+
+    def _most_alike(
+        self, candidates: List[Dict[str, Any]], index: int, current: Optional[str]
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Of saved entries sharing a prefix, the one whose message at `index` is most like `current`, and that message."""
+        best: Tuple[float, Dict[str, Any], Optional[str]] = (UNRANKED, candidates[0], None)
+        for candidate in candidates:
+            hashes = candidate.get(replay_cache.ENTRY_DIAG_MESSAGE_HASHES) or []
+            text = self.cache.load_message(hashes[index]) if index < len(hashes) else None
+            score = replay_cache.similarity(text, current) if text is not None and current is not None else UNRANKED
+            if score > best[0] or best[2] is None and text is not None:
+                best = (score, candidate, text)
+        return best[1], best[2]
 
     def log(self, entry: Dict[str, Any]) -> None:
         line = json.dumps(entry, sort_keys=True, separators=(",", ":"))

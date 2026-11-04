@@ -13,6 +13,7 @@ and serves it in the shape an OpenAI-compatible client expects.
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import threading
@@ -48,6 +49,8 @@ CHUNK_OBJECT = "chat.completion.chunk"
 ASSISTANT_ROLE = "assistant"
 DEFAULT_FINISH_REASON = "stop"
 SSE_DONE_EVENT = b"data: [DONE]\n\n"
+# Distinct next messages kept per prefix for a miss to be compared against.
+MAX_PREFIX_CANDIDATES = 64
 
 
 def _walk(value: Any, fn, key: Optional[str] = None, in_tool_call: bool = False) -> Any:
@@ -143,29 +146,48 @@ class AnswerCache:
 
 
 class PrefixIndex:
-    """Saved entries by diag-settings-hash-rooted prefix of their diag message hashes."""
+    """Saved entries by diag-settings-hash-rooted prefix of their diag message hashes.
+
+    Many saved requests can share a prefix (every worker conversation opens the
+    same way), so each prefix keeps one entry per distinct next message, up to
+    MAX_PREFIX_CANDIDATES: the caller picks the one whose next message is most
+    like the current request's.
+    """
 
     def __init__(self, entries: Iterator[Dict[str, Any]]):
-        self.by_prefix: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        self.by_prefix: Dict[Tuple[str, ...], Dict[str, Dict[str, Any]]] = {}
         for entry in entries:
             hashes = entry.get(ENTRY_DIAG_MESSAGE_HASHES) or []
             root = (str(entry.get(ENTRY_DIAG_SETTINGS_HASH) or ""),)
             for length in range(len(hashes) + 1):
-                self.by_prefix.setdefault(root + tuple(hashes[:length]), entry)
+                group = self.by_prefix.setdefault(root + tuple(hashes[:length]), {})
+                following = hashes[length] if length < len(hashes) else ""
+                if following not in group and len(group) < MAX_PREFIX_CANDIDATES:
+                    group[following] = entry
 
-    def closest(self, diag_settings_hash: str, diag_hashes: List[str]) -> Tuple[Optional[Dict[str, Any]], int]:
-        """The saved entry sharing the longest prefix, and how many messages match (settings first)."""
+    def candidates(self, diag_settings_hash: str, diag_hashes: List[str]) -> Tuple[List[Dict[str, Any]], int]:
+        """The saved entries sharing the longest prefix, one per distinct next message, and the prefix length."""
         root = (diag_settings_hash,)
         best = self.by_prefix.get(root)
         if best is None:
-            return None, 0
+            return [], 0
         matched = 0
         for length in range(1, len(diag_hashes) + 1):
             found = self.by_prefix.get(root + tuple(diag_hashes[:length]))
             if found is None:
                 break
             best, matched = found, length
-        return best, matched
+        return list(best.values()), matched
+
+    def closest(self, diag_settings_hash: str, diag_hashes: List[str]) -> Tuple[Optional[Dict[str, Any]], int]:
+        """The first saved entry sharing the longest prefix, and how many messages match (settings first)."""
+        found, matched = self.candidates(diag_settings_hash, diag_hashes)
+        return (found[0] if found else None), matched
+
+
+def similarity(saved: str, current: str) -> float:
+    """How alike two messages are, by the words they share (order ignored, so it is linear in their size)."""
+    return difflib.SequenceMatcher(None, saved.split(), current.split(), autojunk=False).quick_ratio()
 
 
 def served_id(fingerprint: str) -> str:
