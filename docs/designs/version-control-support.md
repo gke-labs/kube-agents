@@ -902,7 +902,9 @@ the forge confirms the proposal: open, at that url, authored by this
 credential, and created inside the window. It answers 404 `CLAIM_UNKNOWN` for a
 token that is unknown, already burned or expired, or whose `url` does not
 match. It answers 409 `CLAIM_NOT_CONFIRMED` when the forge check fails, and 403
-when the repository is no longer on the managed list. The `shell` role can call
+when the repository is no longer on the managed list. A forge failure that
+persists after the one retry answers the forge's own code, and the token is
+spent either way. The `shell` role can call
 it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 
 | Verb                                 | Request                                                              | Response                                                                                 |
@@ -911,7 +913,7 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`                        |
 | `snapshot`                           | `{repository, ref?, paths?}`                                         | `{forge, repo, role, ref, revision, size, archiveBase64, history: "none"}`               |
 | `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                        |
-| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal, forge, repo, claim}`                                                         |
+| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal, forge, repo, claim?}`                                                        |
 | `proposal-claim`                     | `{claim, url}`                                                       | `{url, number, title}`                                                                   |
 | `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                          |
 | `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                                             |

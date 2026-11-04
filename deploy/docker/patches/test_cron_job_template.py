@@ -195,7 +195,6 @@ class RunOriginTest(unittest.TestCase):
             self.assertFalse(self._record_as("a1b2c3", ("chat", "slack")))
 
 
-
 class PinTest(unittest.TestCase):
     def test_the_origins_are_the_session_kv_servers(self):
         # session_kv_server imports FastAPI, which these tests do not carry, so
