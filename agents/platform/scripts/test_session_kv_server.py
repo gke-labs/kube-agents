@@ -2639,6 +2639,92 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.assertIsNone(session_kv_server._proposal_state("https://github.com/acme/fleet/issues/7", 5))
             forge.call.assert_not_called()
 
+    # What each forge the broker serves (providers/registry.py AVAILABLE)
+    # answers `proposal-create` with (providers/*/translate.py and the provider
+    # tests' fixtures): the forge, its configured host, the url, the repository
+    # the fold asks the forge about, and the number.
+    FORGE_PROPOSAL_URLS = (
+        ("github", "github.com", "https://github.com/acme/fleet/pull/7", "https://github.com/acme/fleet", 7, "acme/fleet"),
+        (
+            "gitlab",
+            "gitlab.example.com",
+            "https://gitlab.example.com/group/sub/fleet/-/merge_requests/7",
+            "https://gitlab.example.com/group/sub/fleet",
+            7,
+            "group/sub/fleet",
+        ),
+        ("gitea", "gitea.example.com", "https://gitea.example.com/acme/fleet/pulls/7", "https://gitea.example.com/acme/fleet", 7, "acme/fleet"),
+        (
+            "bitbucket",
+            "bitbucket.org",
+            "https://bitbucket.org/acme/fleet/pull-requests/7/_/diff#comment-42",
+            "https://bitbucket.org/acme/fleet",
+            7,
+            "acme/fleet",
+        ),
+        (
+            "bitbucket-datacenter",
+            "bitbucket.example.com",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/7/overview",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet",
+            7,
+            "ACME/fleet",
+        ),
+    )
+
+    def test_the_forge_is_asked_about_a_pull_request_on_every_forge_the_broker_serves(self):
+        forge = MagicMock()
+        forge.call.return_value = {"proposal": {"state": "open"}}
+        with patch.dict(sys.modules, {"forge": forge}):
+            for provider, _host, url, repository, number, _path in self.FORGE_PROPOSAL_URLS:
+                with self.subTest(provider=provider):
+                    forge.call.reset_mock()
+                    self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+                    forge.call.assert_called_once_with(
+                        "proposal-view", {"number": number}, repository, retry_transient=True
+                    )
+
+    def test_the_repository_read_from_each_forges_url_is_one_the_broker_resolves_to_that_forge(self):
+        import providers
+        from providers import registry as registry_module
+
+        forges = [{"provider": "github", "host": "github.com"}] + [
+            {"provider": provider, "host": host, "tokenPath": "/nonexistent/token", "allowedPaths": []}
+            for provider, host, *_rest in self.FORGE_PROPOSAL_URLS
+            if provider != "github"
+        ]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "forges.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"forges": forges}, handle)
+        registry = providers.Registry({"forges": registry_module.load_forge_entries(path)})
+        self.assertEqual(
+            sorted(cls.name for cls in providers.AVAILABLE),
+            sorted(provider for provider, *_rest in self.FORGE_PROPOSAL_URLS),
+            "a forge the broker serves has no url shape here",
+        )
+        for provider, _host, url, repository, _number, repo_path in self.FORGE_PROPOSAL_URLS:
+            with self.subTest(provider=provider):
+                match = session_kv_server.PROPOSAL_URL_RE.match(url)
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group(1), repository)
+                resolved, repo = registry.resolve(match.group(1))
+                self.assertEqual(resolved.name, provider)
+                self.assertEqual(repo, repo_path)
+
+    def test_an_incidents_fix_pull_request_is_found_on_every_forge_and_an_issue_is_not(self):
+        issue = "https://gitea.example.com/acme/fleet/issues/7"
+        cards = [(f"t-{provider}", f"sess-{provider}", url) for provider, _host, url, *_rest in self.FORGE_PROPOSAL_URLS]
+        self._board(cards=cards + [("t-issue", "sess-issue", issue)])
+        for provider, _host, url, *_rest in self.FORGE_PROPOSAL_URLS:
+            with self.subTest(provider=provider):
+                self.assertEqual(session_kv_server._incident_pull_request_urls(f"sess-{provider}"), [url])
+        self.assertEqual(session_kv_server._incident_pull_request_urls("sess-issue"), [])
+        for not_a_proposal in (issue, "https://bitbucket.org/acme/fleet/issues/7", "https://github.com/acme/fleet/commit/7"):
+            with self.subTest(url=not_a_proposal):
+                self.assertIsNone(session_kv_server.PROPOSAL_URL_RE.match(not_a_proposal))
+
     def test_an_abandoned_forge_call_cannot_hold_a_restart(self):
         release = threading.Event()
         forge = MagicMock()
