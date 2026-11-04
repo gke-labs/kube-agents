@@ -16472,6 +16472,10 @@ def _ceiling_summed_by_hand(config):
 
 _ENVOY_HTTP_PROTOCOL_OPTIONS = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions"
 _ENVOY_DURATION_SECONDS = re.compile(r"^(\d+(?:\.\d+)?)s$")
+# Deep enough for pyyaml's composer to raise RecursionError on the default
+# recursion limit (it does at a tenth of this); yaml-cpp, which Envoy reads
+# the same file with, has no such limit.
+_NESTED_PAST_THE_RECURSION_LIMIT = 10000
 
 
 def _assert_every_broker_cluster_idles_under(case, config):
@@ -16590,6 +16594,44 @@ class ThreadCapDefaultTest(unittest.TestCase):
             os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
                 self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.thread_cap_from_env())
+
+    def test_a_config_the_parser_or_the_walk_cannot_read_is_passed_over_not_a_crash(self):
+        # The derivation is fail-safe: whatever the parse or the walk raises,
+        # the path is passed over for the next and the start takes the
+        # fallback, never a crash loop. Two shapes the YAMLError guard did not
+        # cover: a document nested past pyyaml's recursion limit, and a
+        # superscript in a quoted count, which str.isdigit admits and int
+        # refuses (Envoy reads neither as a count; the broker reads its
+        # default of 1024 for the superscript and passes the document over).
+        import yaml
+        nested = "[" * _NESTED_PAST_THE_RECURSION_LIMIT + "]" * _NESTED_PAST_THE_RECURSION_LIMIT + "\n"
+        with self.assertRaises(RecursionError):
+            yaml.safe_load(nested)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        unparsable = Path(tmp.name) / "nested.yaml"
+        unparsable.write_text(nested, encoding="utf-8")
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.default_max_threads(paths=(unparsable,)))
+        self.assertTrue(any("RecursionError" in line and "not read for the thread cap" in line for line in logs.output), logs.output)
+        expected = _ceiling_summed_by_hand(yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8")))
+        with mock.patch.dict(os.environ), mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (unparsable, _ENVOY_CONFIG)):
+            os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertEqual(expected, credential_proxy.thread_cap_from_env())
+        superscript = "\u00b2"
+        self.assertTrue(superscript.isdigit() and not superscript.isdecimal())
+        self.assertEqual(credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS, credential_proxy._connection_count(superscript))
+        text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f'            max_connections: "{superscript}"\n', 1)
+        path, derived, config = self._derived(text)
+        self.assertEqual(credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS + 64, derived)
+        # Nothing the walk raises leaves the derivation either.
+        with (
+            mock.patch.object(credential_proxy, "envoy_broker_connection_ceiling", side_effect=TypeError("unforeseen shape")),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.default_max_threads(paths=(path,)))
+        self.assertTrue(any("TypeError" in line and "not read for the thread cap" in line for line in logs.output), logs.output)
 
     def test_the_default_priority_threshold_is_the_ceiling_not_the_largest_listed(self):
         # Envoy keeps a breaker per priority and applies its default to a

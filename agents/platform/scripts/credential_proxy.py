@@ -1554,7 +1554,14 @@ def default_max_threads(paths: Sequence[Path] | None = None) -> int:
 
 
 def _envoy_ceiling_from_text(text: str, path: Path) -> int | None:
-    """envoy_broker_connection_ceiling over a config's text; None, with a WARNING, when it cannot be read."""
+    """envoy_broker_connection_ceiling over a config's text; None, with a WARNING, when it cannot be read.
+
+    Fail-safe: nothing the parse or the walk raises leaves this function. The
+    derivation runs at the start of every broker and agent API door, and a
+    config Envoy itself starts on (yaml-cpp has no recursion limit to hit and
+    reads a count the broker could not) must not keep the broker from
+    starting; the path is passed over for the next, or the fallback.
+    """
     try:
         import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
     except ImportError:
@@ -1565,7 +1572,14 @@ def _envoy_ceiling_from_text(text: str, path: Path) -> int | None:
     except yaml.YAMLError as exc:
         LOGGER.warning("%s does not parse as YAML (%s); not read for the thread cap", path, exc)
         return None
-    ceiling = envoy_broker_connection_ceiling(config)
+    except Exception as exc:  # a RecursionError on a nested document, or anything else the parser raises
+        LOGGER.warning("%s could not be parsed (%s: %s); not read for the thread cap", path, type(exc).__name__, exc)
+        return None
+    try:
+        ceiling = envoy_broker_connection_ceiling(config)
+    except Exception as exc:  # a shape the walk did not foresee; the fallback, not a crash loop
+        LOGGER.warning("%s could not be walked (%s: %s); not read for the thread cap", path, type(exc).__name__, exc)
+        return None
     if ceiling is None:
         LOGGER.warning(
             "%s names no cluster to %s; not read for the thread cap", path, ENVOY_BROKER_SOCKET_PATH
@@ -1623,9 +1637,10 @@ def _connection_count(value: Any) -> int:
     """A threshold's max_connections, or Envoy's default when it is unset or not a count.
 
     A quoted count (``"4096"``) is a count: Envoy's proto-JSON reading of a
-    UInt32Value accepts a digit string, so the breaker runs at it.
+    UInt32Value accepts a digit string, so the breaker runs at it. Decimal
+    digits only: ``str.isdigit`` admits a superscript, which ``int`` refuses.
     """
-    if isinstance(value, str) and value.isdigit():
+    if isinstance(value, str) and value.isdecimal():
         value = int(value)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return ENVOY_DEFAULT_MAX_CONNECTIONS
