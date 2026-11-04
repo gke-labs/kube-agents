@@ -201,6 +201,35 @@ func TestOwnerResolver_TheMemoIsPerPodNotPerUID(t *testing.T) {
 	}
 }
 
+// The namespace and name come from the event's author. One that is not a
+// single path segment is not read at all, so it cannot steer the GET to
+// another object, and it starts no backoff.
+func TestOwnerResolver_ANameThatIsNotOnePathSegmentIsNotRead(t *testing.T) {
+	s, o := newPodMetaResolver(t, map[string]string{
+		"/api/v1/namespaces/b/pods/y":   podMetaBody(``, `{"kind":"StatefulSet","name":"other","controller":true}`),
+		"/api/v1/namespaces/ns/pods/ok": podMetaBody(``, `{"kind":"Job","name":"j","controller":true}`),
+	})
+	for _, tc := range []struct{ namespace, name string }{
+		{"ns", "x/../../../b/pods/y"},
+		{"ns", "x/../../configmaps/y"},
+		{"ns", ".."},
+		{"ns", "."},
+		{"ns", "a%2Fb"},
+		{"..", "y"},
+		{"ns/../b", "y"},
+	} {
+		if got := o.ControllerRef(context.Background(), tc.namespace, tc.name, "uid"); got != "" {
+			t.Errorf("ControllerRef(%q, %q) = %q; want empty", tc.namespace, tc.name, got)
+		}
+	}
+	if n := s.count(); n != 0 {
+		t.Fatalf("requests = %d; want 0, no read for a name that is not one path segment", n)
+	}
+	if got := o.ControllerRef(context.Background(), "ns", "ok", "uid-ok"); got != "Job/j" {
+		t.Fatalf("ControllerRef after the refusals = %q; want Job/j, no backoff", got)
+	}
+}
+
 func TestOwnerResolver_ASlowAPIServerIsEmptyAfterTheTimeout(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

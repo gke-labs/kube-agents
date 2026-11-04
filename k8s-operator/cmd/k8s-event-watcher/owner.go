@@ -25,6 +25,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apipath "k8s.io/apimachinery/pkg/api/validation/path"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -121,7 +122,7 @@ type podMeta struct {
 // A lookup that fails is not remembered, so the next event for the Pod asks
 // again; one that answers, including "no controller", is.
 func (o *ownerResolver) ControllerRef(ctx context.Context, namespace, name, uid string) string {
-	if o == nil || o.client == nil || namespace == "" || name == "" {
+	if o == nil || o.client == nil || !isPathSegment(namespace) || !isPathSegment(name) {
 		return ""
 	}
 	now := o.now()
@@ -155,6 +156,17 @@ func (o *ownerResolver) ControllerRef(ctx context.Context, namespace, name, uid 
 		o.mu.Unlock()
 	}
 	return ref
+}
+
+// isPathSegment reports whether s can stand as one segment of the request
+// path: not empty, and no "/", "%", "." or "..", as client-go's
+// Request.Name() and the broker's NAME grammar require. The namespace and name
+// come from the event's involvedObject, which its author writes, and AbsPath
+// cleans "..", so a name such as "x/../../configmaps/y" would otherwise read
+// another object. A name that fails reads as no owner, with no request and no
+// backoff.
+func isPathSegment(s string) bool {
+	return s != "" && len(apipath.IsValidPathSegmentName(s)) == 0
 }
 
 func (o *ownerResolver) lookup(ctx context.Context, namespace, name string) (string, error) {

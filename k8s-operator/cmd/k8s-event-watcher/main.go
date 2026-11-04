@@ -1092,8 +1092,8 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 // the alert's thread and onto its card, the card alone where no thread is
 // routed (session_kv_server, _inject_followup). What the watcher
 // knows is silence, and the payload says so: the object was not read back,
-// since the broker's watcher route serves no pods, and a deleted pod and a
-// recovered one both go quiet. One per incident, held on the dedup entry so
+// since the broker's watcher route serves of a pod only its owner, never its
+// state, and a deleted pod and a recovered one both go quiet. One per incident, held on the dedup entry so
 // it survives a restart with the entry; an inject that fails is retried on
 // the next sweep. Dry-run prints the payload as Dispatch does.
 func (d *dispatcher) Sweep(ctx context.Context) {
