@@ -7,6 +7,8 @@ not shapes invented to match the parser. Both APIs were the reason those two
 checks stayed prose-only, so a hand-written fixture would re-create exactly the
 problem converting them was meant to solve."""
 
+import contextlib
+import io
 import json
 import os
 import shlex
@@ -208,6 +210,23 @@ class EnumerateClustersTest(unittest.TestCase):
             clusters, not_running = fs.enumerate_clusters("acme", run=lambda argv, **kwargs: run_of(0, json.dumps(listing)))
         self.assertEqual([c["name"] for c in clusters], ["ka-today"])
         self.assertEqual(not_running, [])
+
+    def test_a_cluster_with_the_config_connector_add_on_is_marked_and_read_first(self):
+        """Stockout has the least time left of the three, so its add-on
+        clusters are read first, as drift and patch readiness mark theirs."""
+        listing = [
+            {"name": "hub", "location": "us-central1", "status": "RUNNING", "addonsConfig": {"configConnectorConfig": {"enabled": True}}},
+            {"name": "edge", "location": "us-central1", "status": "RUNNING"},
+        ]
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            return run_of(0, json.dumps(listing))
+
+        clusters, _ = fs.enumerate_clusters("acme", run=run)
+        self.assertIn("addonsConfig.configConnectorConfig.enabled", issued[0][-1])
+        self.assertEqual({c["name"]: c.get(fs.kcc_health.ADDON_FIELD) for c in clusters}, {"hub": True, "edge": False})
 
     def test_reads_the_control_plane_version(self):
         clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "currentMasterVersion": "1.35.3-gke.1200"}])
@@ -1712,6 +1731,12 @@ class CollectClusterTest(unittest.TestCase):
         entry = self.run_with(dump_items=[cc])
         self.assertEqual(entry["outcome"], "collected")
         self.assertEqual(entry["candidates"], [])
+
+    def test_a_collected_add_on_cluster_carries_the_marker(self):
+        entry = self.run_with(cluster={**self.CLUSTER, fs.kcc_health.ADDON_FIELD: True})
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertIs(entry[fs.kcc_health.ADDON_FIELD], True)
+        self.assertNotIn(fs.kcc_health.ADDON_FIELD, self.run_with())
 
     def test_get_credentials_failure_is_unreachable(self):
         def run(argv, **kwargs):
@@ -3659,6 +3684,14 @@ class PrepareKubeconfigTest(unittest.TestCase):
             self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o755, False, [".kubeconfigs"]))
 
 
+class NotRunningClusterStatusTest(unittest.TestCase):
+    def test_a_cluster_that_is_not_running_carries_its_status(self):
+        """`finish` must not count a STOPPING cluster as one that may run
+        Config Connector (`audit_report.kcc_health`)."""
+        entry = fs.not_running_entry({"name": "going", "location": "us-central1", "status": "STOPPING"}, "acme")
+        self.assertEqual(entry["cluster_status"], "STOPPING")
+
+
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
     """The declared scope the agent carries from the platform_control fleet_scope
     tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
@@ -3722,6 +3755,79 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         entry = {"name": fs.UNENUMERATED_PROJECTS_TARGET, "error": note}
         self.assertTrue(fs._only_a_scope_note(entry, None))
         self.assertFalse(fs._only_a_scope_note({"name": fs.UNENUMERATED_PROJECTS_TARGET, "error": "`gcloud projects list` rc=1: boom"}, None))
+
+    def test_main_prints_the_sweep_when_the_time_budget_is_spent(self):
+        """The Config Connector reads stop at the collector's time budget, and
+        the manifest of the sweep prints with `kcc_unread` on each entry."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "RUN_DEADLINE_S", 0):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fs.main(["--config-connector"])
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("time budget", entry["kcc_unread"])
+
+    def test_main_reads_no_config_connector_without_the_flag(self):
+        """The chat route runs this collector without `--config-connector`:
+        only `finish` uses the read, so nothing reads it there."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "annotate_manifest") as annotate:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fs.main([])
+        annotate.assert_not_called()
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertNotIn("kcc_unread", entry)
+        self.assertNotIn("kcc_unready", entry)
+
+    def test_main_reads_config_connector_while_an_audit_run_is_in_flight(self):
+        """The live run never passed `--config-connector`. The read must not
+        depend on the model copying the flag: while `start`'s in-flight note
+        of this stream is there, `main` reads without it, and the manifest
+        says why (`config_connector_read`)."""
+        import contextlib as _contextlib  # noqa: PLC0415
+        import io as _io  # noqa: PLC0415
+        import tempfile as _tempfile  # noqa: PLC0415
+        from unittest import mock as _mock  # noqa: PLC0415
+
+        def run(argv, scratch, note):
+            manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1",
+                                       "outcome": "collected", "candidates": []}]}
+            if note:
+                Path(scratch, f"inflight_{fs.AUDIT_ID}.json").write_text("{}", encoding="utf-8")
+            out = _io.StringIO()
+            with _mock.patch.dict(os.environ, {"FLEET_AUDIT_SCRATCH_DIR": scratch}), _mock.patch.object(
+                fs, "collect_fleet", return_value=manifest
+            ), _mock.patch.object(fs.kcc_health, "annotate_manifest") as annotate:
+                with _contextlib.redirect_stdout(out), _contextlib.redirect_stderr(_io.StringIO()):
+                    fs.main(argv)
+            return annotate.called, json.loads(out.getvalue())["config_connector_read"]
+
+        for argv, note, expected in (([], True, (True, "in-flight")), ([], False, (False, False)),
+                                     (["--config-connector"], False, (True, "flag"))):
+            with self.subTest(argv=argv, note=note), _tempfile.TemporaryDirectory() as scratch:
+                self.assertEqual(run(argv, scratch, note), expected)
+
+    def test_main_adds_the_config_connector_read_before_it_prints(self):
+        """A stockout fix can edit a `ContainerNodePool` declaration, so `main`
+        puts `kcc_health`'s keys on the manifest `finish` reads."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        def annotate(found, *, mapper, deadline, **kwargs):
+            self.assertGreater(deadline, 0)
+            # Only the kinds this stream's findings can own: from the agent, all
+            # ~230 kinds do not fit the time budget.
+            self.assertEqual(kwargs["kinds"], fs.kcc_health.CONTAINER_KINDS)
+            self.assertEqual(kwargs["kubeconfig_for"](found["clusters"][0]), fs.kubeconfig_path("acme", "hub", "us-central1"))
+            found["clusters"][0]["kcc_unread"] = "".join(mapper(lambda entry: entry["name"], found["clusters"]))
+
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "annotate_manifest", side_effect=annotate):
+            with contextlib.redirect_stdout(out):
+                fs.main(["--config-connector"])
+        self.assertEqual(json.loads(out.getvalue())["clusters"][0]["kcc_unread"], "acme/us-central1/hub")
 
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the three flags main parses reach the
