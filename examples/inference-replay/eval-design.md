@@ -126,8 +126,8 @@ The rules that keep this safe:
   past or the future can be the whole finding (an expired certificate, a CronJob that hasn't run for
   a month). So timestamps, both dates and epoch seconds, become a token for roughly how far from now
   they are ("minutes ago", "days ago", "in the future", and so on), and an expired certificate never
-  matches a valid one. Anything within an hour of now, before or after, is one token, so
-  run-to-run timing jitter (a card read 50 or 70 seconds after it was claimed) doesn't change the
+  matches a valid one. Anything in the last hour is one token and anything in the next hour
+  another, so run-to-run timing jitter (a card read 50 or 70 seconds after it was claimed) doesn't change the
   key. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
   `timestamp`); any other 10-digit number, like `memory: 1717986918`, isn't read as a time. IP
   addresses stay as they are whenever the request mentions a network range (like `10.0.0.0/16`),

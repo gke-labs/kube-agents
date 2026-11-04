@@ -75,7 +75,8 @@ class IdentifierTest(unittest.TestCase):
     def test_timing_jitter_within_the_hour_does_not_change_the_key(self):
         # A card read 50 s or 70 s after it was claimed must give the same key.
         self.assertEqual(norm('"created_at": %d' % (NOW - 50)), norm('"created_at": %d' % (NOW - 70)))
-        self.assertEqual(norm('"created_at": %d' % (NOW + 20)), norm('"created_at": %d' % (NOW - 20)))
+        # Inside the hour the side still counts: expired 20 minutes ago is not valid for 20 more.
+        self.assertNotEqual(norm('"expires": %d' % (NOW + 20 * 60)), norm('"expires": %d' % (NOW - 20 * 60)))
         self.assertNotEqual(norm('"created_at": %d' % (NOW - 50)), norm('"created_at": %d' % (NOW - 3 * 3600)))
 
     def test_any_run_id_key_is_swapped(self):
@@ -150,10 +151,10 @@ class AgeTest(unittest.TestCase):
 
 class TimeTest(unittest.TestCase):
     def test_iso_buckets(self):
-        self.assertEqual(norm("2026-11-03T11:58:00Z"), "⟦TIME_within_hour⟧")
+        self.assertEqual(norm("2026-11-03T11:58:00Z"), "⟦TIME_past_within_hour⟧")
         self.assertEqual(norm("2026-11-03T06:00:00+00:00"), "⟦TIME_past_hours⟧")
         self.assertEqual(norm("2026-10-20 08:00"), "⟦TIME_past_days⟧")
-        self.assertEqual(norm("2026-11-03T12:00:10.123Z"), "⟦TIME_within_hour⟧")
+        self.assertEqual(norm("2026-11-03T12:00:10.123Z"), "⟦TIME_future_within_hour⟧")
         self.assertEqual(norm("2027-06-01T00:00:00Z"), "⟦TIME_future_months⟧")
 
     def test_expired_and_valid_certificates_do_not_match(self):
@@ -201,7 +202,7 @@ class TimeTest(unittest.TestCase):
         self.assertTrue(normalized.mapping.answer_repeats_bare_number("sleep until 1793440000"))
 
     def test_ls_l_dates(self):
-        self.assertEqual(norm("-rw-r--r-- 1 root root 12 Nov  3 11:40 a.txt"), "-rw-r--r-- 1 root root 12 ⟦TIME_within_hour⟧ a.txt")
+        self.assertEqual(norm("-rw-r--r-- 1 root root 12 Nov  3 11:40 a.txt"), "-rw-r--r-- 1 root root 12 ⟦TIME_past_within_hour⟧ a.txt")
         self.assertEqual(norm("drwxr-xr-x 2 root root 4096 Jan 15  2025 old"), "drwxr-xr-x 2 root root 4096 ⟦TIME_past_years⟧ old")
 
     def test_rfc1123_and_openssl_dates(self):

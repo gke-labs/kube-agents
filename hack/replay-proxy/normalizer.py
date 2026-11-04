@@ -226,13 +226,14 @@ def time_bucket(when: float, now: float) -> str:
     delta = now - when
     distance = abs(delta)
     if distance < SECONDS_PER_HOUR:
-        # One token for the whole hour around `now`, in either direction: run-to-run
-        # timing jitter (a card read 50 s or 70 s after it was claimed) must not
-        # flip the key, and the dev-install dry run lost most of its matches there.
-        name = TIME_WITHIN_HOUR
+        # One token for the hour on each side of `now`: run-to-run timing jitter (a
+        # card read 50 s or 70 s after it was claimed) must not flip the key, and the
+        # dev-install dry run lost most of its matches there. The side stays, so a
+        # certificate that expired 20 minutes ago never matches one valid for 20 more.
+        span = TIME_WITHIN_HOUR
     else:
         span = next((label for limit, label in TIME_BUCKETS if distance < limit), TIME_BUCKET_BEYOND)
-        name = (TIME_PAST_PREFIX if delta > 0 else TIME_FUTURE_PREFIX) + span
+    name = (TIME_PAST_PREFIX if delta >= 0 else TIME_FUTURE_PREFIX) + span
     return f"{OPEN}{TIME_CLASS}_{name}{CLOSE}"
 
 
