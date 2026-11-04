@@ -596,7 +596,7 @@ def test_fleet_load_refuses_a_cluster_that_is_not_full(monkeypatch, tmp_path):
     args = cli.parse(["--project", "p", "--out", str(tmp_path), "fleet", "load", "--names", "oom-03"])
     monkeypatch.setattr(cli.Fleet, "names", lambda self: ["oom-01", "oom-03"])
     monkeypatch.setattr(cli, "pool_machine_type", lambda fleet, name: "e2-standard-4")
-    with pytest.raises(SystemExit, match="Events-only"):
+    with pytest.raises(SystemExit, match="full clusters only"):
         cli.fleet_load(args)
 
 
@@ -674,6 +674,16 @@ def test_fleet_load_grows_only_a_real_pool_below_its_size(monkeypatch, tmp_path)
     monkeypatch.setattr(cli, "real_node_count", lambda fleet, name: {"oom-01": 12, "oom-02": cli.FULL_REAL_NODES}[name])
     cli.fleet_load(args)
     assert [(c[4], c[c.index("--num-nodes") + 1]) for c in resizes(calls)] == [("oom-02", "8")]
+
+
+def test_fleet_load_refuses_an_events_only_cluster_on_the_full_machine_type(monkeypatch, tmp_path):
+    args = cli.parse(["--project", "p", "--out", str(tmp_path), "fleet", "load", "--names", "oom-03"])
+    calls = fake_full_fleet(monkeypatch, ["oom-01", "oom-03"])
+    monkeypatch.setattr(cli, "kwok_node_count", lambda fleet, name: 0)
+    monkeypatch.setattr(cli, "workload_deployment_count", lambda fleet, name: 0)
+    with pytest.raises(SystemExit, match="Events-only"):
+        cli.fleet_load(args)
+    assert calls == []
 
 
 def test_fleet_load_refuses_fewer_namespaces(monkeypatch, tmp_path):
