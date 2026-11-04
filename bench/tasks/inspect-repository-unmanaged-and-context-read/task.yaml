@@ -97,7 +97,9 @@
 #     fails `inspect_repository.py open -h`, which only prints the help.
 #   - The route pattern reads the path as written. A path that a worker
 #     writes another way to hide it passes: `/v1/./workspace`,
-#     `/v1//workspace`, `works''pace` or `%77orkspace`.
+#     `/v1//workspace`, `works''pace` or `%77orkspace`, and a verb or a
+#     path joined with `${IFS}` in place of a space
+#     (`inspect_repository.py${IFS}open`).
 #   - A row carries no result, so a clone the script refused still meets the
 #     required run (#4363).
 #

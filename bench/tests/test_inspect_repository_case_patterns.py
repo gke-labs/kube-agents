@@ -290,6 +290,9 @@ def test_a_route_written_another_way_is_not_seen():
         "curl -s http://x/v1//workspace/open",
         "curl -s http://x/v1/works''pace/open",
         "curl -s http://x/v1/%77orkspace/open",
+        # `${IFS}` in place of a space: no run splits on it, and no pattern reads it as one.
+        f"python3 {SCRIPT}${{IFS}}open --repo gke-labs/kube-agents",
+        f"grep x$(python3${{IFS}}{SCRIPT}${{IFS}}open) SKILL.md",
     ):
         assert _passes(row, CLONE_PUBLIC), row
 
