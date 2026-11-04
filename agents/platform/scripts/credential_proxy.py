@@ -96,6 +96,7 @@ from credential_proxy_client import (  # noqa: F401  (re-export)
     CLASS_LABEL,
     CONTEXT_FLAG,
     END_OF_FLAGS,
+    EXEC_ROLE,
     KUBECONFIG_FLAG,
     ClusterTarget,
     kubectl_context_flag,
@@ -108,7 +109,9 @@ LOGGER = logging.getLogger("credential-proxy")
 # its read-only token. Named in the log when a context clone presents none.
 FORGE_READ_TOKEN_KEY = vcs_broker.FORGE_READ_TOKEN_KEY
 # The process roles `resolve_role` accepts (CREDENTIAL_PROXY_ROLE), and the
-# ones that run the credential broker and so the readings sweep.
+# ones that run the credential broker and so the readings sweep. It also
+# accepts EXEC_ROLE, the exec tier's role from credential_proxy_client: a
+# broker with N replicas, so it runs no sweep and is not in BROKER_ROLES.
 ROLE_COMBINED = "combined"
 ROLE_BROKER = "broker"
 ROLE_API_PROXY = "api-proxy"
@@ -1398,6 +1401,8 @@ CALLER_ROLE_PROFILE = "profile"
 # The scope publisher Job. The exec route only, gcloud only, and within it the
 # five lookups scope_policy names, each on an argument scope.json declares or an
 # earlier lookup returned.
+# An exec pod refuses it (_exec_pod_refuses): a scope command reads its member
+# window, which lives on the stateful broker.
 CALLER_ROLE_SCOPE = "scope"
 
 # The TokenReview user.extra key under which the API server names the Pod a
@@ -1848,6 +1853,21 @@ def required_roles(path: str) -> tuple[str, ...]:
         if path.startswith(prefix):
             return roles
     return ()
+
+
+def exec_pod_serves(method: str, path: str) -> bool:
+    """Whether an exec pod serves ``method`` on ``path``.
+
+    The routes docs/designs/credential-broker-exec-tier.md §12 gives the exec
+    tier: the command route, the Cloud API relay's reads, the admission route
+    and the readiness probe. The metrics listener is a server of its own and
+    does not pass through here. Everything else is the stateful broker's.
+    A POST to the Cloud API relay passes too: the relay refuses it by policy
+    and writes the audit line, as the stateful broker does (do_POST).
+    """
+    if method == "POST":
+        return path == "/v1/exec" or path.startswith(API_RELAY_PREFIX)
+    return path in (HEALTHZ_PATH, ADMISSION_PATH) or path.startswith(API_RELAY_PREFIX)
 
 
 # How long a managed-repository allowlist read is reused.
@@ -12074,6 +12094,9 @@ def _busy_phrase(exc: CommandSlotUnavailable) -> str:
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
+    # resolve_role()'s answer, set by serve(). On EXEC_ROLE the handler serves
+    # only the routes exec_pod_serves names.
+    broker_role: str = ROLE_COMBINED
     # The session role's bounded share of the command pool, installed by main
     # beside the executor; None (the route tests' stand-ins) means unbounded.
     session_slots: "SessionSlots | None" = None
@@ -12140,9 +12163,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     workspaces: object | None = None
     # Named `vcs` rather than `vcs_broker`: a class attribute of that name does
     # not shadow the module inside a method, but it reads as though it does.
-    # Unlike `workspaces` this is never None on a running broker -- version
-    # control is not behind a switch, because it is the only way the sandbox
-    # reaches a repository at all.
+    # Unlike `workspaces` it is not behind a switch, because it is the only way
+    # the sandbox reaches a repository at all. It is None on an exec pod, which
+    # answers /v1/vcs/* with 404 (exec_pod_serves), and on no other broker.
     vcs: vcs_broker.VcsBroker | None = None
     # Set by _repository_is_permitted on a refusal: the status it answered.
     repository_refusal_status: HTTPStatus | None = None
@@ -12345,10 +12368,44 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": SHUTDOWN_ERROR, **fields})
         return True
 
+    def _exec_pod_refuses(self, method: str, principal: Principal | None) -> bool:
+        """On an exec pod, answer a request it does not serve and return True.
+
+        After authentication and the route's role check, so an exec pod answers
+        an unknown route as the stateful broker does: 401 to a caller it cannot
+        identify, 403 to a caller whose role the route does not admit, then the
+        same 404 body. The scope role's commands are refused with the role refusal's
+        shape, because the member window they read is on the stateful pod.
+        """
+        if self.broker_role != EXEC_ROLE:
+            return False
+        if not exec_pod_serves(method, self.path):
+            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            return True
+        if principal is not None and principal.role == CALLER_ROLE_SCOPE:
+            LOGGER.warning(
+                "refused a scope command on an exec pod path=%s",
+                _sanitize_for_logging(self.path),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "error": (
+                        "scope commands are not available on the exec broker; "
+                        "send them to the stateful broker"
+                    ),
+                    "code": "CALLER_ROLE_FORBIDDEN",
+                },
+            )
+            return True
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path != HEALTHZ_PATH and self._authenticated() is None:
             return
         if self._refused_while_draining("GET"):
+            return
+        if self._exec_pod_refuses("GET", None):
             return
         if self.path == ADMISSION_PATH:
             self._json(HTTPStatus.OK, self._admission_report())
@@ -12456,6 +12513,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if principal is None:
             return
         if self._refused_while_draining("POST"):
+            return
+        if self._exec_pod_refuses("POST", principal):
             return
         if self.path.startswith(API_RELAY_PREFIX):
             # Reaches the relay so that the refusal is the policy's
@@ -14844,9 +14903,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         Retry-After in the header and the body, under its own code, so a
         caller can back off for the interval rather than retry at once.
         Counted here, once per route that answers it, under the bound the
-        exception carries.
+        exception carries; the 503 names it to the caller too, so the shim can
+        tell a bound another exec replica may not hold from one it will.
         """
         bound = getattr(exc, "bound", ADMISSION_BOUND_OTHER)
+        if bound not in ADMISSION_BOUNDS:
+            bound = ADMISSION_BOUND_OTHER
         self.metrics.record_refusal(bound, getattr(exc, "klass", CLASS_INTERACTIVE))
         if isinstance(exc, ResourcePressure):
             self._json(
@@ -15016,13 +15078,15 @@ def resolve_role() -> str:
     ``combined`` is the sidecar deployment and the default: one container is
     both the credential broker and the agent-API front door, because both ends
     are on the same loopback. Splitting the broker into its own Pod splits
-    those two roles across two containers in two Pods.
+    those two roles across two containers in two Pods. ``exec`` is the exec
+    tier's pod (docs/designs/credential-broker-exec-tier.md §12): the broker
+    with no relays, serving the exec routes only (exec_pod_serves).
     """
     role = os.getenv("CREDENTIAL_PROXY_ROLE", ROLE_COMBINED).strip().lower() or ROLE_COMBINED
-    if role not in {ROLE_COMBINED, ROLE_BROKER, ROLE_API_PROXY}:
+    if role not in {ROLE_COMBINED, ROLE_BROKER, ROLE_API_PROXY, EXEC_ROLE}:
         raise RuntimeError(
             f"unsupported CREDENTIAL_PROXY_ROLE {role!r}; "
-            "expected 'combined', 'broker' or 'api-proxy'"
+            f"expected 'combined', 'broker', 'api-proxy' or {EXEC_ROLE!r}"
         )
     return role
 
@@ -15192,6 +15256,7 @@ def serve(args: argparse.Namespace) -> None:
         start_agent_api_proxy().serve_forever()
         return
 
+    CredentialProxyHandler.broker_role = role
     # Decided before anything credentialed starts, so a misconfigured
     # deployment fails at boot rather than on the first request.
     CredentialProxyHandler.authenticator = build_authenticator()
@@ -15272,23 +15337,30 @@ def serve(args: argparse.Namespace) -> None:
     )
     for (host, path), branch in CredentialProxyHandler.pinned_bases.items():
         LOGGER.info("pinned base repository=https://%s/%s branch=%s", host, path, branch)
-    CredentialProxyHandler.workspaces = build_workspace_store(
-        executor,
-        base_branch=CredentialProxyHandler.base_branch,
-        pinned_bases=CredentialProxyHandler.pinned_bases,
-    )
-    CredentialProxyHandler.vcs = build_vcs_broker(
-        executor,
-        base_branch=CredentialProxyHandler.base_branch,
-        pinned_bases=CredentialProxyHandler.pinned_bases,
-    )
+    # An exec pod answers 404 on /v1/workspace/* and /v1/vcs/* (exec_pod_serves),
+    # so it builds neither: no workspace sweep, and no forge asked at each
+    # replica's start what a credential reaches.
+    if role != EXEC_ROLE:
+        CredentialProxyHandler.workspaces = build_workspace_store(
+            executor,
+            base_branch=CredentialProxyHandler.base_branch,
+            pinned_bases=CredentialProxyHandler.pinned_bases,
+        )
+        CredentialProxyHandler.vcs = build_vcs_broker(
+            executor,
+            base_branch=CredentialProxyHandler.base_branch,
+            pinned_bases=CredentialProxyHandler.pinned_bases,
+        )
     # What the gate's soft watermark reclaims: idle content workspaces (the
     # store's own idle rule, run now rather than on the next verb) and vcs
     # scratch no request of this process holds (the vcs broker swept a dead
-    # process's at start). The store is None with content passing off.
-    reclaimers: list[Callable[[], int]] = [CredentialProxyHandler.vcs.reclaim_orphan_scratch]
+    # process's at start). The store is None with content passing off, and an
+    # exec pod has neither.
+    reclaimers: list[Callable[[], int]] = []
     if CredentialProxyHandler.workspaces is not None:
-        reclaimers.insert(0, CredentialProxyHandler.workspaces.reclaim_idle)
+        reclaimers.append(CredentialProxyHandler.workspaces.reclaim_idle)
+    if CredentialProxyHandler.vcs is not None:
+        reclaimers.append(CredentialProxyHandler.vcs.reclaim_orphan_scratch)
     gate.set_reclaimers(reclaimers)
     if role in BROKER_ROLES:
         start_readings_sweep(executor, CredentialProxyHandler.vcs)
@@ -15297,84 +15369,89 @@ def serve(args: argparse.Namespace) -> None:
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
     CredentialProxyHandler.api_relay = GoogleApiRelay()
     LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
-    CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
-    CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
-    if CredentialProxyHandler.platform_pubsub_subscriptions:
-        LOGGER.info(
-            "platform Pub/Sub relay enabled subscriptions=%d",
-            len(CredentialProxyHandler.platform_pubsub_subscriptions),
+    # An exec pod serves commands and Cloud API reads and nothing else (§12 of
+    # credential-broker-exec-tier.md), so it starts none of the event relays:
+    # no Pub/Sub, Google Chat, Slack or Teams consumer competes with the
+    # stateful broker for their subscriptions and sockets.
+    if role != EXEC_ROLE:
+        CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
+        CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
+        if CredentialProxyHandler.platform_pubsub_subscriptions:
+            LOGGER.info(
+                "platform Pub/Sub relay enabled subscriptions=%d",
+                len(CredentialProxyHandler.platform_pubsub_subscriptions),
+            )
+        CredentialProxyHandler.slack_max_request_bytes = int(
+            os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
         )
-    CredentialProxyHandler.slack_max_request_bytes = int(
-        os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
-    )
-    chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
-    chat_subscription, a2a_subscription = chat_relay_subscriptions(chat_project)
-    if chat_project and chat_subscription:
-        CredentialProxyHandler.chat_relay = GoogleChatRelay(
-            chat_project, chat_subscription
-        )
-        LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
-    # The A2A gateway's relay instance on the same topic and credential;
-    # armed independently so an install can run either consumer alone.
-    if chat_project and a2a_subscription:
-        CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(
-            chat_project, a2a_subscription
-        )
-        LOGGER.info(
-            "A2A Google Chat relay enabled project=%s subscription=<redacted>", chat_project
-        )
-    slack_bot_tokens = os.getenv("SLACK_BOT_TOKEN", "").strip()
-    slack_app_token = os.getenv("SLACK_APP_TOKEN", "").strip()
-    if slack_bot_tokens and slack_app_token:
-        def initialize_slack_relay() -> None:
-            while (
-                CredentialProxyHandler.slack_relay is None
-                and not CredentialProxyHandler.shutting_down.is_set()
-            ):
-                try:
-                    relay = SlackRelay(
-                        slack_bot_tokens,
-                        slack_app_token,
-                        max_file_bytes=int(
-                            os.getenv(
-                                "SLACK_RELAY_MAX_FILE_BYTES", str(20 * 1024 * 1024)
-                            )
-                        ),
-                    )
-                except Exception as exc:
-                    LOGGER.error(
-                        "Slack relay initialization failed; retrying type=%s",
-                        type(exc).__name__,
-                    )
-                    time.sleep(30)
-                else:
-                    CredentialProxyHandler.slack_relay = relay
-                    # Published before the check, and the drain sets the flag
-                    # before it reads the relay, so one of the two closes a
-                    # relay that connects while the broker drains.
-                    if CredentialProxyHandler.draining.is_set():
-                        relay.stop_intake()
-                        break
-                    LOGGER.info(
-                        "Slack relay enabled workspaces=%d",
-                        len(relay.bootstrap()),
-                    )
+        chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
+        chat_subscription, a2a_subscription = chat_relay_subscriptions(chat_project)
+        if chat_project and chat_subscription:
+            CredentialProxyHandler.chat_relay = GoogleChatRelay(
+                chat_project, chat_subscription
+            )
+            LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
+        # The A2A gateway's relay instance on the same topic and credential;
+        # armed independently so an install can run either consumer alone.
+        if chat_project and a2a_subscription:
+            CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(
+                chat_project, a2a_subscription
+            )
+            LOGGER.info(
+                "A2A Google Chat relay enabled project=%s subscription=<redacted>", chat_project
+            )
+        slack_bot_tokens = os.getenv("SLACK_BOT_TOKEN", "").strip()
+        slack_app_token = os.getenv("SLACK_APP_TOKEN", "").strip()
+        if slack_bot_tokens and slack_app_token:
+            def initialize_slack_relay() -> None:
+                while (
+                    CredentialProxyHandler.slack_relay is None
+                    and not CredentialProxyHandler.shutting_down.is_set()
+                ):
+                    try:
+                        relay = SlackRelay(
+                            slack_bot_tokens,
+                            slack_app_token,
+                            max_file_bytes=int(
+                                os.getenv(
+                                    "SLACK_RELAY_MAX_FILE_BYTES", str(20 * 1024 * 1024)
+                                )
+                            ),
+                        )
+                    except Exception as exc:
+                        LOGGER.error(
+                            "Slack relay initialization failed; retrying type=%s",
+                            type(exc).__name__,
+                        )
+                        time.sleep(30)
+                    else:
+                        CredentialProxyHandler.slack_relay = relay
+                        # Published before the check, and the drain sets the flag
+                        # before it reads the relay, so one of the two closes a
+                        # relay that connects while the broker drains.
+                        if CredentialProxyHandler.draining.is_set():
+                            relay.stop_intake()
+                            break
+                        LOGGER.info(
+                            "Slack relay enabled workspaces=%d",
+                            len(relay.bootstrap()),
+                        )
 
-        threading.Thread(target=initialize_slack_relay, daemon=True).start()
-    teams_app_id = os.getenv("TEAMS_APP_ID", "").strip()
-    teams_app_password = os.getenv("TEAMS_APP_PASSWORD", "").strip()
-    teams_tenant_id = os.getenv("TEAMS_TENANT_ID", "").strip() or None
-    if teams_app_id and teams_app_password:
-        CredentialProxyHandler.teams_relay = TeamsRelay(
-            app_id=teams_app_id,
-            app_password=teams_app_password,
-            tenant_id=teams_tenant_id,
-        )
-        LOGGER.info(
-            "Teams relay enabled app_id=%s tenant=%s",
-            teams_app_id,
-            teams_tenant_id or "common",
-        )
+            threading.Thread(target=initialize_slack_relay, daemon=True).start()
+        teams_app_id = os.getenv("TEAMS_APP_ID", "").strip()
+        teams_app_password = os.getenv("TEAMS_APP_PASSWORD", "").strip()
+        teams_tenant_id = os.getenv("TEAMS_TENANT_ID", "").strip() or None
+        if teams_app_id and teams_app_password:
+            CredentialProxyHandler.teams_relay = TeamsRelay(
+                app_id=teams_app_id,
+                app_password=teams_app_password,
+                tenant_id=teams_tenant_id,
+            )
+            LOGGER.info(
+                "Teams relay enabled app_id=%s tenant=%s",
+                teams_app_id,
+                teams_tenant_id or "common",
+            )
     if role == ROLE_COMBINED:
         api_server = start_agent_api_proxy()
         threading.Thread(target=api_server.serve_forever, daemon=True).start()

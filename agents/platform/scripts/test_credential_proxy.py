@@ -19326,5 +19326,375 @@ class TeamsRelayTest(unittest.TestCase):
                 )
 
 
+
+class ResolveRoleTest(unittest.TestCase):
+    """The values CREDENTIAL_PROXY_ROLE may take, the exec tier's among them."""
+
+    def test_each_known_role_is_accepted(self):
+        for raw, role in (
+            ("combined", "combined"), ("broker", "broker"), ("api-proxy", "api-proxy"),
+            (credential_proxy_client.EXEC_ROLE, "exec"), (" EXEC ", "exec"), ("", "combined"),
+        ):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_ROLE": raw}):
+                self.assertEqual(role, credential_proxy.resolve_role())
+
+    def test_an_unknown_role_is_refused_with_the_exec_role_named(self):
+        for raw in ("stateful", "execute", "bogus"):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_ROLE": raw}):
+                with self.assertRaisesRegex(RuntimeError, r"unsupported CREDENTIAL_PROXY_ROLE .*'exec'"):
+                    credential_proxy.resolve_role()
+
+
+class ExecPodRefusesTest(unittest.TestCase):
+    """The exec pod's gate, asked directly: which routes pass and how the scope role is refused."""
+
+    def _handler(self, path, broker_role=credential_proxy_client.EXEC_ROLE):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = path
+        handler.broker_role = broker_role
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        return handler
+
+    @staticmethod
+    def _principal(role):
+        return credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role
+        )
+
+    def test_the_exec_routes_pass(self):
+        for method, path in (
+            ("POST", "/v1/exec"),
+            ("GET", credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x"),
+            # Reaches the relay, which refuses it by policy and audits it.
+            ("POST", credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x"),
+            ("GET", credential_proxy.ADMISSION_PATH),
+            ("GET", credential_proxy.HEALTHZ_PATH),
+        ):
+            with self.subTest(method=method, path=path):
+                handler = self._handler(path)
+                self.assertFalse(handler._exec_pod_refuses(method, self._principal(credential_proxy.CALLER_ROLE_SHELL)))
+                self.assertEqual([], handler.replies)
+
+    def test_the_exec_routes_on_another_method_answer_404(self):
+        for method, path in (
+            ("GET", "/v1/exec"),
+            ("POST", credential_proxy.ADMISSION_PATH),
+        ):
+            with self.subTest(method=method, path=path):
+                handler = self._handler(path)
+                self.assertTrue(handler._exec_pod_refuses(method, None))
+                self.assertEqual([(HTTPStatus.NOT_FOUND, {"status": "not_found"})], handler.replies)
+
+    def test_the_scope_role_is_refused_on_an_exec_pod(self):
+        handler = self._handler("/v1/exec")
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            self.assertTrue(handler._exec_pod_refuses("POST", self._principal(credential_proxy.CALLER_ROLE_SCOPE)))
+        status, payload = handler.replies[0]
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("CALLER_ROLE_FORBIDDEN", payload["code"])
+        self.assertIn("stateful broker", payload["error"])
+
+    def test_the_other_roles_reach_the_command_route_on_an_exec_pod(self):
+        for role in (
+            credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_SESSION,
+            credential_proxy.CALLER_ROLE_PROFILE, "",
+        ):
+            with self.subTest(role=role):
+                handler = self._handler("/v1/exec")
+                self.assertFalse(handler._exec_pod_refuses("POST", self._principal(role)))
+                self.assertEqual([], handler.replies)
+
+    def test_no_other_broker_role_gates(self):
+        for broker_role in ("combined", "broker"):
+            with self.subTest(broker_role=broker_role):
+                handler = self._handler("/v1/workspace/open", broker_role=broker_role)
+                self.assertFalse(handler._exec_pod_refuses("POST", self._principal(credential_proxy.CALLER_ROLE_SCOPE)))
+                self.assertEqual([], handler.replies)
+
+
+class ExecPodRouteGateTest(unittest.TestCase):
+    """Routes over HTTP on an exec pod: the exec routes are served and the rest answer 404.
+
+    Each route handler is replaced by one that answers 200 and names itself,
+    so a 404 here is the gate's and not a handler's. The same requests on a
+    combined broker are the control: there none of them answers 404.
+    """
+
+    _HANDLERS = (
+        "_handle_api_relay", "_handle_watcher_gcp", "_handle_platform_pubsub", "_handle_watcher_k8s",
+        "_handle_mcp_relay", "_handle_slack_post", "_handle_teams_post", "_handle_chat_post",
+        "_handle_forge_refresh", "_handle_workspace_post", "_handle_vcs_post", "_handle_feedback_post",
+    )
+    _GCP_PATH = credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x"
+    _NOT_SERVED = (
+        ("GET", "/v1/chat/events"),
+        ("GET", "/v1/chat/slack/events"),
+        ("GET", "/v1/chat/a2a/events"),
+        ("GET", "/v1/chat/teams/events"),
+        ("GET", credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + "x"),
+        ("GET", credential_proxy.watcher_policy.WATCHER_K8S_PREFIX + "x"),
+        ("GET", credential_proxy.watcher_policy.PLATFORM_PUBSUB_PREFIX + "x"),
+        ("GET", credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "x"),
+        ("POST", credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "x"),
+        ("POST", credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + "x"),
+        ("POST", credential_proxy.watcher_policy.WATCHER_K8S_PREFIX + "x"),
+        ("POST", credential_proxy.watcher_policy.PLATFORM_PUBSUB_PREFIX + "x"),
+        ("POST", "/v1/chat/api"),
+        ("POST", "/v1/chat/slack/api"),
+        ("POST", "/v1/chat/teams/api"),
+        ("POST", "/v1/forge/refresh"),
+        ("POST", "/v1/github/refresh"),
+        ("POST", "/v1/workspace/open"),
+        ("POST", "/v1/vcs/probe"),
+        ("POST", feedback_broker.ROUTE),
+    )
+
+    def setUp(self):
+        for name in self._HANDLERS:
+            def reached(handler, *args, _name=name, **kwargs):
+                handler._json(HTTPStatus.OK, {"reached": _name})
+            patcher = mock.patch.object(CredentialProxyHandler, name, reached)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, value in (
+            ("authenticator", credential_proxy.NullAuthenticator()), ("profile_gate", None),
+            ("max_request_bytes", 65536), ("chat_relay", None), ("a2a_chat_relay", None),
+            ("slack_relay", None), ("teams_relay", None),
+            # The admission route reads the executor; set here, not left by an earlier test.
+            ("executor", types.SimpleNamespace(
+                max_concurrent_commands=8, requests_the_budget_admits=lambda: 9, admitted_requests=lambda: 8,
+                class_cap=lambda klass: 7,
+            )),
+            ("session_slots", None),
+        ):
+            patcher = mock.patch.object(CredentialProxyHandler, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def _request(self, method, path, broker_role):
+        with mock.patch.object(CredentialProxyHandler, "broker_role", broker_role):
+            connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+            try:
+                body = b"{}" if method == "POST" else None
+                connection.request(method, path, body=body, headers={"Content-Type": "application/json"})
+                response = connection.getresponse()
+                return response.status, response.read()
+            finally:
+                connection.close()
+
+    def test_every_other_route_answers_404_on_an_exec_pod(self):
+        for method, path in self._NOT_SERVED:
+            with self.subTest(method=method, path=path):
+                status, body = self._request(method, path, credential_proxy_client.EXEC_ROLE)
+                self.assertEqual(HTTPStatus.NOT_FOUND, status)
+                self.assertEqual({"status": "not_found"}, json.loads(body))
+
+    def test_the_same_routes_are_served_on_a_combined_broker(self):
+        for method, path in self._NOT_SERVED:
+            with self.subTest(method=method, path=path):
+                status, _ = self._request(method, path, "combined")
+                self.assertNotEqual(HTTPStatus.NOT_FOUND, status)
+
+    def test_the_exec_routes_are_served_on_an_exec_pod(self):
+        exec_role = credential_proxy_client.EXEC_ROLE
+        status, body = self._request("GET", credential_proxy.HEALTHZ_PATH, exec_role)
+        self.assertEqual((HTTPStatus.OK, {"status": "ok"}), (status, json.loads(body)))
+        status, body = self._request("GET", self._GCP_PATH, exec_role)
+        self.assertEqual((HTTPStatus.OK, {"reached": "_handle_api_relay"}), (status, json.loads(body)))
+        # A write attempt reaches the relay too, so its refusal is the policy's and is audited.
+        status, body = self._request("POST", self._GCP_PATH, exec_role)
+        self.assertEqual((HTTPStatus.OK, {"reached": "_handle_api_relay"}), (status, json.loads(body)))
+        # A body with no argv: the route parsed it, so the gate let it through.
+        status, body = self._request("POST", "/v1/exec", exec_role)
+        self.assertEqual(HTTPStatus.BAD_REQUEST, status)
+        self.assertIn("argv", json.loads(body)["error"])
+        status, body = self._request("GET", credential_proxy.ADMISSION_PATH, exec_role)
+        self.assertEqual(HTTPStatus.OK, status)
+        report = json.loads(body)
+        self.assertEqual(
+            (8, 9, 8, 7), (report["slot_cap"], report["budget_admits"], report["admitted"], report["interactive_cap"])
+        )
+
+    def test_an_unknown_caller_gets_401_before_the_gate(self):
+        class Refuses:
+            authenticates = True
+
+            def authenticate(self, headers):
+                raise credential_proxy.AuthenticationError("no token")
+
+        with mock.patch.object(CredentialProxyHandler, "authenticator", Refuses()):
+            for method, path in (("POST", "/v1/workspace/open"), ("GET", "/v1/chat/events")):
+                with self.subTest(method=method, path=path):
+                    status, _ = self._request(method, path, credential_proxy_client.EXEC_ROLE)
+                    self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
+
+    def test_a_scope_token_is_refused_on_an_exec_pod_and_served_on_the_broker(self):
+        class Scope:
+            authenticates = True
+
+            def authenticate(self, headers):
+                return credential_proxy.Principal(workload="scope-publisher", role=credential_proxy.CALLER_ROLE_SCOPE)
+
+        with mock.patch.object(CredentialProxyHandler, "authenticator", Scope()):
+            status, body = self._request("POST", "/v1/exec", credential_proxy_client.EXEC_ROLE)
+            self.assertEqual(HTTPStatus.FORBIDDEN, status)
+            self.assertEqual("CALLER_ROLE_FORBIDDEN", json.loads(body)["code"])
+            status, _ = self._request("POST", "/v1/exec", "broker")
+            self.assertNotEqual(HTTPStatus.FORBIDDEN, status)
+
+
+class BusyReplyNamesItsBoundTest(unittest.TestCase):
+    """The busy answer carries `bound`, the same value the refusal counter records."""
+
+    def _busy(self, bound):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.metrics = credential_proxy.ProxyMetrics()
+        handler.replies = []
+        handler._json = lambda status, payload: handler.replies.append((status, payload))
+        handler._busy(credential_proxy.CommandSlotUnavailable("held", bound=bound))
+        return handler
+
+    def test_each_bound_is_named_in_the_reply_and_the_counter(self):
+        for bound in (
+            credential_proxy.ADMISSION_BOUND_SLOT, credential_proxy.ADMISSION_BOUND_BUDGET,
+            credential_proxy.ADMISSION_BOUND_REFRESH_LOCK, credential_proxy.ADMISSION_BOUND_SESSION,
+            credential_proxy.ADMISSION_BOUND_PROFILE, credential_proxy_client.ADMISSION_BOUND_DRAINING,
+            credential_proxy_client.ADMISSION_BOUND_BACKGROUND, credential_proxy.ADMISSION_BOUND_OTHER,
+        ):
+            with self.subTest(bound=bound):
+                handler = self._busy(bound)
+                self.assertEqual(
+                    [(HTTPStatus.SERVICE_UNAVAILABLE,
+                      {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY",
+                       credential_proxy_client.BUSY_BOUND_KEY: bound, "error": "held"})],
+                    handler.replies,
+                )
+                self.assertIn(
+                    f'{credential_proxy.ADMISSION_REFUSALS_METRIC}{{bound="{bound}",class="interactive"}} 1',
+                    handler.metrics.render(),
+                )
+
+    def test_an_unknown_bound_is_named_other(self):
+        handler = self._busy("text a caller wrote")
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_OTHER, handler.replies[0][1]["bound"])
+        self.assertIn(
+            f'{credential_proxy.ADMISSION_REFUSALS_METRIC}{{bound="other",class="interactive"}} 1',
+            handler.metrics.render(),
+        )
+
+
+class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
+    """`serve` on the exec role starts no relay, and keeps the Cloud API relay and the metrics listener."""
+
+    class _Stop(Exception):
+        pass
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.policy_path = Path(self.tmp.name) / "policy.json"
+        self.policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+        for name, value in (
+            ("broker_role", "combined"), ("api_relay", None), ("chat_relay", None),
+            ("workspaces", None), ("vcs", None),
+            ("a2a_chat_relay", None), ("slack_relay", None), ("teams_relay", None),
+            ("watcher_subscription", ""), ("platform_pubsub_subscriptions", frozenset()),
+        ):
+            patcher = mock.patch.object(CredentialProxyHandler, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _serve(self, role):
+        owner = self
+        bound = []
+        thread_targets = []
+
+        def stop(server):
+            bound.append(server)
+            raise owner._Stop
+
+        class FakeThread:
+            def __init__(self, *args, target=None, **kwargs):
+                thread_targets.append(getattr(target, "__name__", ""))
+
+            def start(self):
+                pass
+
+        args = types.SimpleNamespace(
+            policy=str(self.policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket=str(Path(self.tmp.name) / "backend.sock"),
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(self.tmp.name) / "state"),
+            metrics_port=9466,
+        )
+        environment = {
+            "CREDENTIAL_PROXY_ROLE": role,
+            "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
+            "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
+            "WATCHER_PUBSUB_SUBSCRIPTION": "projects/p/subscriptions/drift",
+            "GOOGLE_CHAT_PROJECT_ID": "p",
+            "GOOGLE_CHAT_SUBSCRIPTION_NAME": "chat",
+            "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "a2a-chat",
+            "SLACK_BOT_TOKEN": "xoxb-test",
+            "SLACK_APP_TOKEN": "xapp-test",
+            "TEAMS_APP_ID": "app",
+            "TEAMS_APP_PASSWORD": "password",
+        }
+        relays = {name: mock.MagicMock() for name in ("GoogleChatRelay", "SlackRelay", "TeamsRelay")}
+        pubsub = mock.MagicMock(return_value=frozenset({"projects/p/subscriptions/plugin"}))
+        metrics_listener = mock.MagicMock()
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.multiple(credential_proxy, **relays), \
+                    mock.patch.object(credential_proxy, "platform_pubsub_subscriptions", pubsub), \
+                    mock.patch.object(credential_proxy, "start_metrics_listener", metrics_listener), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                    mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
+                with self.assertRaises(self._Stop):
+                    credential_proxy.serve(args)
+        finally:
+            for server in bound:
+                server.server_close()
+        return relays, pubsub, metrics_listener, thread_targets
+
+    def test_an_exec_pod_starts_no_relay(self):
+        relays, pubsub, metrics_listener, thread_targets = self._serve(credential_proxy_client.EXEC_ROLE)
+        for name, relay in relays.items():
+            with self.subTest(relay=name):
+                relay.assert_not_called()
+        pubsub.assert_not_called()
+        self.assertNotIn("initialize_slack_relay", thread_targets)
+        self.assertEqual("", CredentialProxyHandler.watcher_subscription)
+        self.assertIsNone(CredentialProxyHandler.chat_relay)
+        self.assertIsNone(CredentialProxyHandler.teams_relay)
+        self.assertIsNotNone(CredentialProxyHandler.api_relay)
+        self.assertEqual(credential_proxy_client.EXEC_ROLE, CredentialProxyHandler.broker_role)
+        metrics_listener.assert_called_once_with("127.0.0.1", 9466)
+        # No workspace store and no VCS broker, so no forge is asked at start what a credential reaches.
+        self.assertIsNone(CredentialProxyHandler.workspaces)
+        self.assertIsNone(CredentialProxyHandler.vcs)
+        self.assertNotIn("<lambda>", thread_targets)
+
+    def test_the_stateful_broker_starts_them(self):
+        relays, pubsub, metrics_listener, thread_targets = self._serve("broker")
+        self.assertEqual(2, relays["GoogleChatRelay"].call_count)
+        relays["TeamsRelay"].assert_called_once()
+        pubsub.assert_called_once()
+        self.assertIn("initialize_slack_relay", thread_targets)
+        self.assertEqual("projects/p/subscriptions/drift", CredentialProxyHandler.watcher_subscription)
+        self.assertIsNotNone(CredentialProxyHandler.vcs)
+        self.assertEqual("broker", CredentialProxyHandler.broker_role)
+        metrics_listener.assert_called_once_with("127.0.0.1", 9466)
+
+
 if __name__ == "__main__":
     unittest.main()
