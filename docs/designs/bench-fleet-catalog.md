@@ -94,13 +94,13 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Thirty-seven fixtures: thirty-four across the four cluster slots and three project-scoped. Three
+Thirty-eight fixtures: thirty-five across the four cluster slots and three project-scoped. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the thirteen seeded namespaces `seeded-debug`,
 `seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-qos`, `seeded-stall`, `seeded-shapes`, `seeded-defaults` and `seeded-scaled-zero`, plus both
-defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
-configuration outlier. Slot `b` is the held-back control plane, and also carries the
+defect node pools. Slot `c` carries GKE-level defects only and no workloads at all: it is the
+configuration outlier, on its control plane and on its default pool. Slot `b` is the held-back control plane, and also carries the
 upgrade-readiness drain defects, which belong with the cluster whose subject is upgrading. Slot
 `d` is the exception to "the defect is something planted in a cluster": there, the cluster's own
 shape is the fixture.
@@ -130,6 +130,7 @@ its roles are never published.
 | `world-open-ingress`            | project | 0   | `world-open-2379-<prefix>`, tcp:2379 open to the internet on `world-open-<prefix>`, a VM with an external IP in `var.zone`; nothing listens on 2379, and a deny rule blocks tcp:22 and tcp:3389                                   |
 | `version-laggard`               | b       | 0   | Control plane one minor behind the REGULAR channel default                                                                                                                                                                        |
 | `drift-outlier`                 | c       | 1   | Master authorized networks absent, where a, b and d carry an open block                                                                                                                                                           |
+| `drift-pool-outlier`            | c       | 1   | `default-pool` on a 50 GB boot disk with `kubeletConfig.cpuCfsQuota` false, where every other pool runs 20 GB and no kubelet block; the pool-level outlier the `boot-disk` and `kubelet-config` facets read                       |
 | `drift-peer-a`                  | a       | 1   | Nothing planted: slot `a`'s master authorized networks on with the open block, one of the majority `drift-outlier` is outvoted by                                                                                                 |
 | `drift-peer-b`                  | b       | 1   | Nothing planted: slot `b`'s master authorized networks on with the open block, one of the majority `drift-outlier` is outvoted by                                                                                                 |
 | `drift-peer-d`                  | d       | 1   | Nothing planted: slot `d`'s master authorized networks on with the open block, one of the majority `drift-outlier` is outvoted by                                                                                                 |
@@ -174,7 +175,7 @@ neither is going to be obvious from a slug.
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
 `seeded-role=idle-batch` on the idle pool's taint, and `bench/tf/fleet/defects-b.tf`
-`seeded-role=no-surge` on the no-surge pool's — so three of the thirty-four roles are called one
+`seeded-role=no-surge` on the no-surge pool's — so three of the thirty-five roles are called one
 thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -270,7 +271,7 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Thirty-two of the thirty-four are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+Thirty-two of the thirty-five are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
 `declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the five
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
@@ -282,7 +283,7 @@ API deprecation, zonal skew, the upgrade-failure shapes and the stall watch betw
 applies; the caller's first run is a Job the apply itself waits on, so its audit trail
 exists before the apply returns.
 
-`drift-outlier` waits a day. The drift SOP excludes a cluster whose `createTime` is under
+`drift-outlier` and `drift-pool-outlier` wait a day. The drift SOP excludes a cluster whose `createTime` is under
 24 hours old from every cohort, so on apply day the `(standard, seeded)` cohort has zero
 members — and §2.4's floor, a cohort of fewer than three clusters produces no findings
 ever, would floor it out with any two of the four still new. Adding slot `d` to a project whose
