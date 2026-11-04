@@ -38,7 +38,7 @@ from pathlib import Path
 
 import cluster_agent_reconcile as rec
 import scope_policy
-from credential_proxy_client import EXIT_SECURITY_POLICY_BLOCKED
+from credential_proxy_client import EXIT_SECURITY_POLICY_BLOCKED, RETRY_DEADLINE_ENV
 
 # The Job's environment, which the operator renders for it. The scope file is the
 # reconcile's own variable, rendered from the same `<name>-config` ConfigMap.
@@ -243,9 +243,12 @@ def broker_run(argv: list[str], *, check: bool, timeout: float) -> subprocess.Co
     catches up (SCOPE_ARGUMENT_REFUSAL_LINE, SCOPE_ARGUMENT_UNDECLARED_PREFIX), inside the
     same timeout; one still refused when the wait ends sets `gave_up`. A probe or a
     project-number lookup refused the same way is not retried; it sets `probe_refused`. Both
-    are for build_document.
+    are for build_document. The client is told the retry deadline the lookups' cap leaves
+    (cluster_agent_reconcile.SHIM_RETRY_DEADLINE_SECONDS, which admits no retry), as
+    `sandbox_exec.run` is told it under the reconciler's own `_run`.
     """
     env = {k: v for k, v in os.environ.items() if k not in CLIENT_DROPPED_ENV}
+    env[RETRY_DEADLINE_ENV] = str(rec.SHIM_RETRY_DEADLINE_SECONDS)
     deadline = time.monotonic() + timeout
     shape = scope_policy.match_shape(argv)
     source_lookup = shape is not None and shape[0] in SCOPE_ARGUMENT_SOURCE_SHAPES

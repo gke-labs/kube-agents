@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -91,9 +91,11 @@ trend line rather than for a merge decision.
 
 `infrastructure` selects the deployer. `deployer: noop` provisions nothing and costs the
 presubmit seconds rather than a cluster; `deployer: tofu` names a stack under `bench/tf/`
-and costs a multi-minute provision on every pull request. `hack/ci-eval-pr.sh` reads
-`infrastructure.deployer` out of the file text to classify a crashed run, so keep it on
-one line.
+and costs what that stack takes to apply and destroy on every pull request, minutes for a
+cluster and seconds for a single alert policy. `task_stack` in `hack/ci-eval-pr.sh` reads
+`infrastructure.stack` out of the file text for the infra lock and the nightly halves, so
+keep it on one line; `bench-gate` reads `deployer` through a YAML parse
+(`bench/kube_agents_bench/cases.py`) to classify a crashed run.
 
 `documentation` carries reference documents and the per-constraint `critical` flags the
 checklist metric scores. It is judged, not exact.
@@ -137,6 +139,12 @@ declared outcome, and passing every repetition reds the job until the marker is 
 defaults to `false`, a case for your own change never carries it, and it must be a bare YAML
 boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
+
+`writes_alone` is for a case that requests no pull request but whose wrong answer may open one
+the reply never names: the lane runs it alone in its second phase and marks the write
+safeguard's window exclusive, so any write in the window is charged to it
+(`bench/kube_agents_bench/lane.py`). A bare YAML boolean, `false` by default; devops-bench
+ignores the key.
 
 `tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
 first-turn greeting, a reply that names a command. `bench-gate`'s rung 3 otherwise reads an empty
@@ -580,7 +588,7 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
-written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
+written as a mention or not a login, an `expected_fail:`, `tool_calls_optional:` or `writes_alone:`
 that is not a bare YAML boolean, a `resource_property` or `fleet_resource_property` check that
 compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
 `op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts

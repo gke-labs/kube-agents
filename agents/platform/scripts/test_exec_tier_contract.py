@@ -65,6 +65,21 @@ class ExecTierContractTest(unittest.TestCase):
     def test_the_nice_value_is_the_contract_s(self):
         self.assertRegex(_row("Classes"), rf"\bnice {client.BACKGROUND_NICE}\b")
 
+    def test_the_retry_schedule_is_the_contract_s(self):
+        row = _row("Shim retry")
+        retries = client.CREDENTIAL_PROXY_CLIENT_MAX_RETRIES
+        for phrase in (
+            f"Up to {retries} times ({retries + 1} attempts)",
+            f"inside {client.RETRY_DEADLINE_SECONDS:g} s of the first send",
+            f"the shorter deadline a caller names in `{client.RETRY_DEADLINE_ENV}`",
+            f"Retry-After held between {client.RETRY_BACKOFF_BASE_SECONDS:g} s and "
+            f"{client.RETRY_AFTER_CAP_SECONDS:g} s",
+            f"{client.RETRY_BACKOFF_BASE_SECONDS:g}·{client.RETRY_BACKOFF_GROWTH}^k capped at "
+            f"{client.RETRY_BACKOFF_CAP_SECONDS:g} s",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, row)
+
     def test_the_retried_bounds_are_the_contract_s(self):
         self.assertEqual(set(client.RETRYABLE_BUSY_BOUNDS), _bounds(_row("Shim retry")))
         bounds = _bounds(_row("Busy reply").split("The bounds are", 1)[1].split(";", 1)[0])

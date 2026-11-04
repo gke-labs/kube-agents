@@ -21,6 +21,7 @@ func setRequiredEnv(t *testing.T) {
 	seed, _ := kp.Seed()
 	t.Setenv(envNamespace, "kubeagents-system")
 	t.Setenv(envAuthMapName, "agent-a2a-authmap")
+	t.Setenv(envAuthMapShards, "1")
 	t.Setenv(envAudience, "kube-agents-bus")
 	t.Setenv(envIssuerSeed, string(seed))
 }
@@ -82,3 +83,35 @@ func TestTheCalloutStartsPastTheGuardWithReservedPrincipals(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+// The callout refuses to start without the shard count, or with one that is
+// not a count: a guess of one would watch one name and serve part of a map.
+func TestTheCalloutRefusesToStartWithoutAShardCount(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cases := map[string]*string{
+		"missing": nil,
+		"empty":   ptr(""),
+		"zero":    ptr("0"),
+		"words":   ptr("two"),
+	}
+	for name, value := range cases {
+		t.Run(name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("KUBERNETES_SERVICE_HOST", "")
+			t.Setenv(envReservedPrincipals, "callout,gateway,bridge,seed,web,console,sys")
+			t.Setenv(envReservedAddressees, "platform")
+			if value == nil {
+				t.Setenv(envAuthMapShards, "")
+				if err := os.Unsetenv(envAuthMapShards); err != nil {
+					t.Fatalf("Unsetenv: %v", err)
+				}
+			} else {
+				t.Setenv(envAuthMapShards, *value)
+			}
+			err := run(log)
+			if err == nil || !strings.Contains(err.Error(), envAuthMapShards) {
+				t.Fatalf("run() = %v, want a refusal naming %s", err, envAuthMapShards)
+			}
+		})
+	}
+}
