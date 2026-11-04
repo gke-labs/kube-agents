@@ -95,9 +95,9 @@ _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "con
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
-# request: the merge-blocking presubmit (in a Tide batch), the main nightly's
-# three parts and the GitLab next nightly; the
-# today-mode GitLab nightly and a made-up job stand for every other Prow run.
+# request: the merge-blocking presubmit (in a batch Tide ran), the main
+# nightly's three parts and the GitLab and GHES next nightlies; the today-mode
+# GitLab nightly and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-nightly",
@@ -310,7 +310,7 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
         """The a2a step pushes from inside itself because `images:` cannot be
         conditional; the list must not have grown to include them."""
         config = yaml.safe_load(text(_CLOUDBUILD))
-        self.assertEqual(config["images"], ["$_PLATFORM_URI", "$_PROXY_URI", "$_SANDBOX_URI", "$_OPERATOR_URI"])
+        self.assertEqual(config["images"], ["$_PLATFORM_URI", "$_PROXY_URI", "$_SANDBOX_URI", "$_OPERATOR_URI", "$_KUBE_PROXY_URI"])
         for name in _A2A_SUBSTITUTIONS:
             self.assertEqual(config["substitutions"][name], "")
 

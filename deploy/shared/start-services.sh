@@ -108,6 +108,12 @@ readonly KV_DAEMON_URL="http://${KV_DAEMON_HOST}:${KV_DAEMON_PORT}"
 # daemon's retries, which give up after a bounded wait.
 readonly AGENT_GATEWAY_URL="http://127.0.0.1:8642"
 
+# The address every listener in the baked Envoy config binds, which start_envoy
+# rebinds to the address the operator passes (0.0.0.0 in the broker Pod, so the
+# Pod IP answers). Named so the rewrite and the check that it reached every
+# listener read the same literal.
+readonly ENVOY_LOOPBACK_ADDRESS=127.0.0.1
+
 # How long to wait for that daemon to start listening before launching the
 # detector anyway. This container is a native sidecar, so it starts before the
 # platform-agent container the daemon runs in, and the detector's startup check
@@ -755,12 +761,39 @@ start_credential_runtime() {
   runtime_pid=$!
 }
 
+# How many times `address: <needle>` occurs in a file, counting occurrences
+# rather than lines so that two listeners written on one line count as two.
+count_listener_addresses() {
+  local file=$1 needle=$2
+  { grep -o -F "address: ${needle}" "${file}" || true; } | wc -l
+}
+
+# Render the baked Envoy config with every listener rebound from loopback to
+# the given address, into the given path, and refuse a render that left any
+# listener behind. The config carries two listeners, the credentialed one and
+# the readiness probe's; a render that moved one and not the other would start
+# an Envoy whose probe, or whose callers, reach a port bound to loopback in a
+# Pod nothing else can reach, which reads as a hang or as never Ready. So the
+# check is a count: as many listener lines name the address afterwards as
+# named loopback before, and at least one did.
+render_envoy_config() {
+  local source=$1 rendered=$2 address=$3
+  local expected rewritten
+  sed "s|address: ${ENVOY_LOOPBACK_ADDRESS//./\\.}|address: ${address}|" "${source}" >"${rendered}"
+  expected=$(count_listener_addresses "${source}" "${ENVOY_LOOPBACK_ADDRESS}")
+  rewritten=$(count_listener_addresses "${rendered}" "${address}")
+  if [[ "${expected}" -eq 0 || "${rewritten}" -ne "${expected}" ]]; then
+    echo "start-services: rewrote ${rewritten} of ${expected} Envoy listener addresses from ${ENVOY_LOOPBACK_ADDRESS} to ${address}; refusing to start Envoy with a listener still bound to loopback" >&2
+    return 1
+  fi
+}
+
 start_envoy() {
   # The baked config binds 127.0.0.1, which is the access control for as long as
   # the broker is a sidecar in the agent's Pod. When the operator puts the broker
-  # in a Pod of its own the listener has to accept the Pod IP, and the config is
-  # baked into the image rather than rendered by the operator -- so the one line
-  # that has to differ is substituted here rather than by shipping two configs
+  # in a Pod of its own the listeners have to accept the Pod IP, and the config
+  # is baked into the image rather than rendered by the operator -- so the lines
+  # that have to differ are substituted here rather than by shipping two configs
   # that would drift. The value is checked against a character class first: it
   # reaches sed, and sed would happily accept a replacement carrying its own
   # delimiter or newline.
@@ -771,11 +804,7 @@ start_envoy() {
       exit 1
     fi
     local rendered=/tmp/envoy-credential-proxy.yaml
-    sed "s|address: 127\.0\.0\.1|address: ${CREDENTIAL_PROXY_ENVOY_ADDRESS}|" \
-      "${envoy_config}" >"${rendered}"
-    # A substitution that silently matched nothing would leave the broker bound
-    # to loopback in a Pod nothing else can reach, which reads as a hang.
-    grep -q "address: ${CREDENTIAL_PROXY_ENVOY_ADDRESS}" "${rendered}"
+    render_envoy_config "${envoy_config}" "${rendered}" "${CREDENTIAL_PROXY_ENVOY_ADDRESS}" || exit 1
     envoy_config="${rendered}"
   fi
   /usr/local/bin/envoy --config-path "${envoy_config}" --log-level info &

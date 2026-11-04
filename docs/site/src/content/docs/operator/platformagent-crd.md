@@ -716,7 +716,7 @@ The credential broker is a Deployment of its own, never a container of this Pod,
 Abstracts the pod/deployment configuration. The controller synthesises a `Deployment` from these plus the workspace ConfigMaps. Available fields:
 
 - `image` — container image repository.
-- `tag` — image tag. Applies only when `image` is set without a tag or digest, falling back to `latest` there; when `image` is omitted, the operator's default platform-agent version applies instead.
+- `tag` — image tag. Applies only when `image` is set without a tag or digest, falling back to `latest` there; when `image` is omitted, the operator's default platform-agent version applies instead. The credential broker's image is derived from the same repository and tag, and a pinned one must be at least as new as the operator. The operator reads the broker's readiness on a health listener (port 8768) that older broker images do not open, so a broker Pod running one never becomes Ready.
 - `imagePullPolicy` — one of `Always`, `Never`, `IfNotPresent`. Default `IfNotPresent`.
 - `imagePullSecrets` — Secrets in the agent's namespace holding registry credentials, as
   `- name: <secret>` entries. Referenced, not created: each must exist before the pod is
@@ -902,7 +902,7 @@ spec:
 - `sharedVpcHosts` and `metricsScopes` — project IDs of Shared VPC host projects, and of the scoping projects of Cloud Monitoring Metrics Scopes. Neither is a Resource Manager container: each is resolved on every run to the projects it reaches, and those projects then take the `projects` path above. [`spec.scope.sharedVpcHosts` and `spec.scope.metricsScopes`](#specscopesharedvpchosts-and-specscopemetricsscopes) has the lookups, the roles they need, and how a monitored project the scope names by number reads.
 - `maxProjects` — the most projects the reconcile lists per run, the management project included, 1 to 5000, 100 by default: explicit projects, selector members and container members fill it in that fixed order, and a project past it reads `over-cap` (profiles kept, nothing created).
 
-  The reconcile lists with four workers at every cap and sizes its listing budget from it, 300 seconds per default cap's worth of projects, and the bootstrap gate's ceiling on the reconcile follows the budget, so an estate of a few hundred projects declares the number it has rather than reading half of itself `over-cap`; the snapshot records the cap in force under `maxProjects`.
+  The reconcile lists with four workers at every cap and sizes its listing budget from it, 300 seconds per default cap's worth of projects, and the bootstrap gate's ceiling on the reconcile follows the budget, so an estate of a few hundred projects declares the number it has rather than reading half of itself `over-cap`; the snapshot records the cap in force under `maxProjects`. Each run creates at most 100 profiles and leaves the rest to the next run, so a wide scope onboards in batches a run apart rather than against that ceiling; `BOOTSTRAP_MAX_CREATES_PER_TICK` under [`spec.deployment.env`](#specdeployment) sets the number.
 
   The Terraform composition refuses a plan whose explicit projects and selector members exceed it, while a selector is declared or the cap is below its default, and renders the same value here from its `scope.max_projects` (`SCOPE_MAX_PROJECTS` in `install.env`). A CR edited by hand takes the value directly. The 100-entry cap on each declared list is unchanged: a hand-written list past a hundred entries is the shape folders exist for.
 
@@ -1173,7 +1173,7 @@ The operator projects the admitted channel (`homeChannel` when set, else the rec
 
 It admits a recorded channel under policy `auto` when the value is a channel id and no refusal is recorded beside it, and clears `HomeChannelUnset` then. Otherwise the condition says why: the policy is `manual`, the recorded value is not a channel id, or the gateway refused the channel (archived, shared through Slack Connect, the app not a member). A hand edit of the record carries the same trust as the field, and the gateway checks the channel before each post: one Slack refuses is recorded as refused, the condition names it, and the next mention replaces it.
 
-`manual` turns the learn off. A set `homeChannel` wins; the learned channel stays in the record, so clearing the field returns to it. To forget it, delete the ConfigMap: the operator re-creates it empty and the next mention learns again.
+`manual` turns the learn off. A set `homeChannel` wins; the learned channel stays in the record, so clearing the field returns to it. An allowed member moves the learned channel from the app's Home tab; the record keeps who moved it and when, and picking the previous channel there moves it back. To forget it, delete the ConfigMap: the operator re-creates it empty and the next mention learns again.
 
 **The home channel.** Under `next` the gateway also carries `homeChannel` and posts the agent's proactive messages into that channel and nowhere else, as new threads there or as replies on them. Those are the alerts, the scheduled reports, and the fleet audit's Block Kit report card without its buttons. It must be a channel ID (`C...`, or `G...` for a private channel). With it unset and no learned channel admitted, or with it malformed, the agent posts nothing to Slack unprompted; unset with no learned channel admitted, the CR carries the `HomeChannelUnset` condition.
 
@@ -1289,7 +1289,7 @@ So each base has one spelling, the one the broker targets and protects. Changing
 
 ## `status`
 
-The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, and what each condition reports, follows.
+The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, where `inference` comes from, and what each condition reports, follows.
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
 `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
@@ -1330,6 +1330,22 @@ sweep.
 
 The operator also serves every counter, cluster gauge, proposal reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
+`inference.provider` and `inference.model` are the install's default model, the one LiteLLM serves
+under `model-default`. The operator reads the LiteLLM config ConfigMap the `litellm` Deployment
+mounts, or, with no such Deployment, the newest `litellm-config` or `litellm-config-*` ConfigMap
+that carries `config.yaml`. It takes the `litellm_params.model` of the `model_list` entry named
+`model-default`, or the first provider-qualified entry when no entry has that name, and splits it at
+its first `/`. A Vertex AI endpoint path (`projects/…`) or a Bedrock ARN keeps its resource id only,
+so no project id, region or account id is written; every other name is kept as typed, an
+organisation prefix such as `meta-llama/` included.
+
+The pair is written whole or not at all. Both fields are absent when the namespace has no LiteLLM
+config, when the `litellm` Deployment mounts none, or when the default model has no provider or no
+name. A Deployment that mounts none leaves any remaining `litellm-config*` ConfigMaps unread, and a
+`model-default` entry with a malformed model does not fall back to another entry. A read that fails keeps the last pair. The
+Ready status update writes the block, and a change to the ConfigMap or to the `litellm`
+Deployment's pod template re-reads it within a reconcile.
+
 `usage.activeInterfaces` is `dashboard` unless `harness.hermes.dashboardEnabled` is `false`, plus
 `googlechat`, `slack` and `teams` for each `integration` entry with `enabled: true`. It is resolved
 from the spec on every reconcile and written by the Ready status update when it changes; a pass that
@@ -1341,6 +1357,7 @@ operator notices from the write's echo, stops treating the missing field as a ch
 minutes at a time, and lands it once this release's CRD is applied: within five minutes on a quiet
 install, at once when the Ready status update next writes for any other reason. The other status
 writers carry the field through as they read it, so a pass that ends `Degraded` lands nothing new.
+`inference` follows the same rule under a served CRD that predates it.
 
 The counters and the two times land through the poller above, which consults the same five-minute
 record. Under a served CRD that predates `status.usage` they accumulate in the
@@ -1364,7 +1381,7 @@ These condition types appear in `conditions`; only `Ready` is always present:
 | `BusProvisioned`        | Under `mode: next`, from the first pass that sees the bus provisioning Job complete, whichever phase that pass ends on; kept through the Job's later re-runs and removed with the stack when the mode flips to `today`                                                                                                                                                                                                                                                    | `status: True`, `Reason: ProvisionJobComplete`. The record that lets `Ready` stop counting the Job: the finished Job is removed by its 24 h TTL and rendered again, and a spec edit renders a new one under a new digest, and neither re-run should flip a Ready install to `Provisioning` for the minute it takes. Until this condition exists the Job counts, so an install upgraded from an operator that never counted the Job (one that could read `Ready` over an unprovisioned bus) does not inherit a completion nobody saw. The message names the Job that first provisioned the bus. A re-run that fails is still reported as `A2AProvisionFailed`.                                                                                                                                                                                                                                        |
 | `EventWatcher`          | Only while `eventWatcher.enabled` is `false`                                                                                                                                                                                                                                                                                                                                                                                                                              | `status: False`, `Reason: DisabledBySpec`. The emergency stop is still pressed and no cluster events are reaching the agent.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `DataVolumeNearlyFull`  | While the operator has a reading of the data volume                                                                                                                                                                                                                                                                                                                                                                                                                       | `True` (`NearlyFull`) from 90% used, back to `False` (`HasSpace`) only below 85%, so a volume at the line does not flap. A full volume fails every task-board and session write with a bare `disk I/O error`, so this is the early warning. It does not change `phase` or `Ready`, since the agent still answers. The message carries the figures from when the status last changed; `storageStatus.freeBytes` is current to within a hundredth of the volume. The reading comes from the event watcher, so with the watcher disabled or unreachable the condition is absent. The Session KV server in the agent container makes the same check and posts one warning to the home channel per crossing.                                                                                                                                                                                              |
-| `HomeChannelUnset`      | Under `mode: next`, while the A2A gateway holds a chat backend (Google Chat, or Slack with Google Chat off) whose `homeChannel` is empty (on Slack: and no learned channel is admitted)                                                                                                                                                                                                                                                                                   | `status: True`, `Reason: NoHomeChannel`. The gateway arms proactive posts only on a home channel, so every alert, drift report and scheduled report is dropped, while replies in a conversation still arrive. Not `Degraded`, and `Ready` is unaffected: chat works, and an install may want no proactive posts. The message names the field and its `install.env` key. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the `next` stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel` to clear it, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel ([`spec.integration`](#specintegration) says when the learned channel is admitted).                                                                     |
+| `HomeChannelUnset`      | Under `mode: next`, while the A2A gateway holds a chat backend (Google Chat, or Slack with Google Chat off) whose `homeChannel` is empty (on Slack: and no learned channel is admitted)                                                                                                                                                                                                                                                                                   | `status: True`, `Reason: NoHomeChannel`. The gateway arms proactive posts only on a home channel, so every alert, drift report and scheduled report is dropped, while replies in a conversation still arrive. Not `Degraded`, and `Ready` is unaffected: chat works, and an install may want no proactive posts. The message names the field and its `install.env` key. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the `next` stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).                                                                        |
 | `A2AMCPServer`          | Under `mode: next` with the operator's `A2A_MCP_DOOR` flag on, while a ServiceAccount named `<agent>-a2a-mcp` or a Secret named `<agent>-a2a-mcp-token` exists that this PlatformAgent does not control                                                                                                                                                                                                                                                                   | `status: True`, `Reason: UnownedServiceAccount` or `UnownedTokenSecret`. Both names are reserved: an account somebody else created would run the MCP server as whatever Workload Identity it carries, and a foreign Secret would arm it with their credential. So the server is not rendered; a server and Service rendered earlier are removed, while the fence and the operator's own token stay. For an unowned account the broker's caller list and `CREDENTIAL_PROXY_MCP_CALLERS` do not name it. `Ready` is unaffected. The message names the object. Delete it; the condition clears on the next periodic pass, within 15 minutes. A controller reference is not a remedy: the operator would adopt the object as it is, annotations and contents included.                                                                                                                                   |
 | `ScopeResolved`         | Under `mode: next`, while `spec.scope` declares a folder, organization, Shared VPC host or Metrics Scope                                                                                                                                                                                                                                                                                                                                                                  | A Job named `<agent>-scope-publisher-<suffix>` (shortened for long names) resolves those members into the `<agent>-resolved-scope` ConfigMap 15 minutes after each start, or at once for a new membership when no run is active. `True`, `Resolved`: a lookup answered within twice the sum of 15 minutes and 5 minutes per started 100 of `maxProjects` (40 minutes at the default). `False` reasons: `Missing`, no readable result yet. `Stale`, no lookup answered within that bound. `HashMismatch`, the result predates the membership. `TooLarge`, the members did not fit. `Error`, read the Job's log. `UnownedServiceAccount`, somebody else owns `<agent>-scope-publisher`; delete it; it clears within 15 minutes. `ScopeRoleNotConferred`, the install has no `kube-agents-a2a-gateway-pod` admission policy from the chart, which the broker's scope role needs. `Ready` is unaffected. |
 | `VolumesDropped`        | Only after a pass that rendered the Pod template around a `hostPath` on `spec.deployment.extraVolumes` or `.sidecarVolumes`                                                                                                                                                                                                                                                                                                                                               | `status: True`, `Reason: HostPathVolumeDropped`. The render leaves the named `hostPath` entries and every mount naming them out of the Pod template the operator applies, and the message lists them by field and index. Not `Degraded`: the Pod runs without them. [What `VolumesDropped` reports](#what-volumesdropped-reports) says which passes write it and which leave it as it stands. Remove the entries to clear it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -1735,21 +1752,32 @@ force-syncs either way.
 A `cluster-*` profile's `config.yaml` is never force-synced: it carries the `cluster_identity`
 stamp the cluster reconciler matches the profile to its cluster by, and an overwrite would strip
 it. It is back-filled from the cluster template instead, on the same fill-only terms — keys the
-template declares and the live file has lost are restored at the next start, and `cluster_identity`
+template declares and the live file has lost are restored on a pass, and `cluster_identity`
 and every value the file already holds are left alone, except the retired `memory.provider` key,
-which the entrypoint drops. The persona files and `skills/` beside it still force-sync.
+which the entrypoint drops.
+
+A cluster profile takes these steps, the persona copy, the `skills/` replace, the shared plugin
+refresh, the back-fill and the repairs below, on a pass. A pass runs only when the profile's
+`.scaffold-stamp` does not match the image: the first start on a new image, a start after a pass
+that warned, or one after the stamp was deleted.
+
+The entrypoint hashes what a pass reads from the image once per start and stamps each cluster
+profile it refreshed without a warning. On a same-image restart a stamped profile is left as it
+is, hand edits included. Delete `profiles/cluster-*/.scaffold-stamp` to send a profile through
+the pass on the next start. Without the stamp script every profile is refreshed and none is
+stamped.
 
 The remote MCP server entries inside both of these files do follow the image (see
 [the config reference](/kube-agents/reference/config/)). The back-fill recurses only through
 mappings and a server's `args` is a list, so it would otherwise stay as the image that scaffolded
 the profile spelled it for the life of the volume.
 
-At every start the entrypoint repairs it in each cluster profile's `config.yaml`, and in the
-platform profile's when it is the front door: for a server the template routes through the
-credential proxy's MCP relay (`gke` and `developer_knowledge`), the whole `args` list and the
-`MCP_REMOTE_BEARER_FILE` entry in its `env` become the template's, so a hand edit to either is
-reverted at the next start; for any other remote server the image ships, only the `User-Agent`
-header value is set. Nothing else in the file is changed.
+The entrypoint repairs it in each cluster profile's `config.yaml` on a pass through the profile,
+and in the platform profile's at every start when it is the front door: for a server the template
+routes through the credential proxy's MCP relay (`gke` and `developer_knowledge`), the whole
+`args` list and the `MCP_REMOTE_BEARER_FILE` entry in its `env` become the template's, so a hand
+edit to either is reverted at the next pass or start; for any other remote server the image
+ships, only the `User-Agent` header value is set. Nothing else in the file is changed.
 
 The `plugins.enabled` list follows the image for the same reason: it is a list, so the back-fill
 never enters it. In the `default`, `platform` and every cluster profile it gains the names the

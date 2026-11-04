@@ -161,6 +161,14 @@ type slackHome struct {
 	tallyUp, tallyDown int
 	tallyErr           error
 	tallyAt            time.Time
+	// pending is the last move made from the Home tab, drawn while the
+	// projected file lags it; picks is each member's last pick outcome
+	// (slack_home_pick.go).
+	pending *slackHomePending
+	// moves counts Home tab moves; a move's wait for the projected file is
+	// superseded once the count has moved past its own.
+	moves uint64
+	picks map[string]slackHomePickStatus
 }
 
 var _ HomeSink = (*SlackAdapter)(nil)
@@ -216,6 +224,7 @@ func (s *SlackAdapter) publishHome(member string, republish bool) {
 			board = &lib.Board{Error: err.Error()}
 		}
 		blocks := s.homeBlocks(board, s.waitingOn(member), time.Now())
+		blocks = append(blocks, s.homeChannelBlocks(member)...)
 		view.Blocks = slack.Blocks{BlockSet: append(blocks, s.homeFeedback()...)}
 	}
 	if _, err := s.api.PublishView(member, view, ""); err != nil {
@@ -350,6 +359,11 @@ func (s *SlackAdapter) pruneViewersLocked(now time.Time) {
 	for m, at := range s.home.viewers {
 		if now.Sub(at) > slackHomeViewerTTL {
 			delete(s.home.viewers, m)
+		}
+	}
+	for m, st := range s.home.picks {
+		if now.Sub(st.at) > slackHomeViewerTTL {
+			delete(s.home.picks, m)
 		}
 	}
 }

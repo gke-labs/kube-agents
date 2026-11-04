@@ -10,6 +10,7 @@ contract fails the test, so the publisher cannot ship a call the real broker ref
 
 import io
 import json
+import random
 import subprocess
 import sys
 import tempfile
@@ -214,6 +215,9 @@ class BrokerRunTest(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], 12)
         self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
         self.assertNotIn("KUBECONFIG", kwargs["env"])
+        # The lookups' cap admits no shim retry; the client is told so, as the reconciler's own
+        # sandbox hop tells it.
+        self.assertEqual(str(rec.SHIM_RETRY_DEADLINE_SECONDS), kwargs["env"][pub.RETRY_DEADLINE_ENV])
 
     def test_a_failure_raises_with_the_broker_stderr_for_the_lookups_to_classify(self):
         error, _ = self._run(subprocess.CompletedProcess([], 1, "", DENIED_STDERR))

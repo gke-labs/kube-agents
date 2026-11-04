@@ -313,6 +313,14 @@ func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 			if _, exists := obj.Data["leader_elect.py"]; exists {
 				obj.Data["leader_elect.py"] = "<OMITTED_FOR_TESTS>"
 			}
+		case *corev1.Secret:
+			if strings.HasSuffix(obj.Name, "-kube-proxy-tls") {
+				for _, key := range []string{"ca.crt", "tls.crt", "tls.key"} {
+					if _, exists := obj.Data[key]; exists {
+						obj.Data[key] = []byte("<REDACTED_FOR_TESTS>")
+					}
+				}
+			}
 		}
 
 		yamlBytes, err := yaml.Marshal(res)

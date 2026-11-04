@@ -1,6 +1,6 @@
 # Producing the PlatformAgent Usage Counters
 
-**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships. [`proposal-outcome-readings.md`](proposal-outcome-readings.md) replaced the event-counted `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` rows below on 2026-10-29: both fields are now readings the broker's sweep takes from the forge, outside the counter fold, and they no longer move `lastActiveTime`. The rows here point at that design, which owns them. The same change removed `remediationsAppliedTotal` from the schema. [`human-interaction-readings.md`](human-interaction-readings.md) (Workstream 4 of the epic that produced the proposal readings) added `chatSessionsTotal`, the A2A gateway's `people` bucket and its `kubeagents_a2a_gateway_people_seen` series in its first pull request; the operator's `people` reading follows. It also records how a maintainer reads these across installs, which the section of that name below carries. [`install-model-reading.md`](install-model-reading.md) (proposed; Workstream 6 of the same epic) would add `status.inference` (the install's provider and default model) beside this block, with an info gauge and a summary line.
+**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships. [`proposal-outcome-readings.md`](proposal-outcome-readings.md) replaced the event-counted `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` rows below on 2026-10-29: both fields are now readings the broker's sweep takes from the forge, outside the counter fold, and they no longer move `lastActiveTime`. The rows here point at that design, which owns them. The same change removed `remediationsAppliedTotal` from the schema. [`human-interaction-readings.md`](human-interaction-readings.md) (Workstream 4 of the epic that produced the proposal readings) added `chatSessionsTotal`, the A2A gateway's `people` bucket and its `kubeagents_a2a_gateway_people_seen` series in its first pull request; the operator's `people` reading follows. It also records how a maintainer reads these across installs, which the section of that name below carries. [`install-model-reading.md`](install-model-reading.md) (implemented 2026-11-02; Workstream 6 of the same epic) added `status.inference` (the install's provider and default model) beside this block, with an info gauge and a summary line.[`proposal-origin.md`](proposal-origin.md) (proposed; Workstream 3 of the same epic) would add nine `proposalsFrom<Origin>` readings beside `remediationsProposedTotal`, counted in the agent pod per trusted origin and read through the readings slot, with one summary line.
 
 ## Summary
 
@@ -509,6 +509,15 @@ through `| default dict`, so a `helm upgrade --reuse-values` from a release that
 key renders with the listener off rather than aborting. The kustomize base leaves the
 listener off, as before: nothing on that path scrapes it.
 
+A fourth family, `kubeagents_platformagent_model`, serves `status.inference` from the same
+reconcile, at the same site as the other three: an info gauge at `1`, one sample per agent, with the two
+agent labels and two string labels, `provider` and `model`, the pair as the status holds it. It
+lives in `k8s-operator/internal/controller/inference_status.go` beside the reader that fills the
+block, not in `usage_gauges.go`, because its label values are not a closed set. When the pair
+changes the agent's old sample is deleted before the new one is set, there is no sample while
+either field is empty, and the delete path that drops the agent's other samples drops this one.
+[`install-model-reading.md`](install-model-reading.md) owns the block and the gauge.
+
 A gauge of a counter is a departure from the producers' families, which are counters, and it
 is deliberate: the samples are a copy of the status, which already folded restarts out, so a
 collector reads the same monotonic totals the status holds and a `rate()` over them is the
@@ -666,6 +675,15 @@ commands and no triage, not a value chosen; closing it would mean authenticating
 which the collector's scrape does not do either. The scrape is therefore not the grant the
 alternatives section refuses, a workload describing its own activity: it is a reader of counts
 the workload can withhold or nudge, never write.
+
+`status.inference`, beside `status.usage` and outside its "static enums and integer counts"
+contract, holds two short strings, the provider slug and the model name, which the operator reads
+from the install's own LiteLLM config ConfigMap; the status, the model gauge's labels and the
+summary carry them as read. The one transformation is the resource-reference rule: a Vertex AI
+endpoint path (`projects/…`) or a Bedrock ARN keeps its resource id only, so a project id, a
+region or an account id never reaches the status, the label or the summary. Every other name,
+a self-hosted deployment name included, is kept as typed, and no allowlist applies
+([`install-model-reading.md`](install-model-reading.md), sections 2.1 and 2.4).
 
 One more residual sits in the peer selector. The chart renders the CR into the operator's
 namespace, and above one replica the agent's Role would hold `get` and `patch` on every pod there,
