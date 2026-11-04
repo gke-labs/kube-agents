@@ -190,7 +190,8 @@ turns it off.
 triage card, no share of the daily alert ceiling. Their clusters stay in scope, so the agent still
 reads them when asked; [`spec.scope.exclude`](#specscope) is what hides a cluster. Each rule sets one
 or more of `cluster`, `namespace`, `reason`, `kind` and `name`, and matches an event when every part
-it sets matches. `reason` also matches the family the watcher groups a reason in, so
+it sets matches. `reason` and `kind` are matched without regard to case, and `reason` also matches
+the family the watcher groups a reason in, so
 `CrashLoopBackOff` covers kubelet's `BackOff` events for a restarting container. `name` takes a
 trailing `*` as a prefix, since pod names carry generated suffixes.
 

@@ -30,8 +30,8 @@ RULES = [
     {"namespace": "payments"},
     {"reason": "FailedScheduling", "cluster": {"clusterName": "batch"}},
     {"cluster": {"projectId": "p", "location": "us-central1", "clusterName": "staging-a"}},
+    {"cluster": {"projectId": "example.com:my-project", "clusterName": "batch"}},
     {"namespace": "shop", "kind": "Pod", "name": "inventory-api-*"},
-    {"namespace": "shop", "name": "*"},
 ]
 
 
@@ -101,6 +101,13 @@ class EventWatcherBlockRenderTest(unittest.TestCase):
             [{"kind": "pods/status"}],
             [{"namespaces": ["payments"]}],
             [{"namespace": "payments"}] * 65,
+            [{"namespace": "shop", "name": "*"}],
+            [{"name": "Payments-*"}],
+            [{"reason": "<Back&Off>"}],
+            [{"cluster": {"clusterName": "a" * 64}}],
+            [{"cluster": {"projectId": "p" + "a" * 128, "clusterName": "batch"}}],
+            [{"cluster": {"projectId": "Example.com:my-project", "clusterName": "batch"}}],
+            [{"cluster": {"location": "US-Central1", "clusterName": "batch"}}],
         ):
             with self.subTest(bad=bad):
                 proc = self._render("-f", self._values_file(bad))

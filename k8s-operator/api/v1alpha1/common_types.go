@@ -667,6 +667,9 @@ type EventWatcherSpec struct {
 
 // EventWatcherAlertExcludeRule is one alertExclude entry. Every part is
 // optional, and the rule matches an event when every part it sets matches.
+// Each string part has a length bound and a pattern of characters that JSON
+// writes as themselves, so the whole list, which reaches the watcher as one
+// environment value, stays well under the kernel's 128 KiB limit on one.
 // There is no label selector: an event carries its own labels, not the
 // labels of the object it is about.
 // +kubebuilder:validation:XValidation:rule="has(self.cluster) || has(self.namespace) || has(self.reason) || has(self.kind) || (has(self.name) && self.name != '*')",message="an alertExclude rule sets at least one of cluster, namespace, reason, kind or name (a bare * is not enough): a rule with none would silence every alert, and enabled: false is the emergency stop"
@@ -681,12 +684,12 @@ type EventWatcherAlertExcludeRule struct {
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
-	// Reason limits the rule to one event reason. It matches the event's reason
-	// or the family the watcher groups it in, so CrashLoopBackOff also matches
-	// kubelet's BackOff events for a restarting container, and ImagePullBackOff
-	// matches ErrImagePull.
-	// +kubebuilder:validation:MinLength=1
+	// Reason limits the rule to one event reason, matched without regard to
+	// case. It matches the event's reason or the family the watcher groups it
+	// in, so CrashLoopBackOff also matches kubelet's BackOff events for a
+	// restarting container, and ImagePullBackOff matches ErrImagePull.
 	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^[A-Za-z][-_.A-Za-z0-9]*$`
 	// +optional
 	Reason string `json:"reason,omitempty"`
 
@@ -699,10 +702,10 @@ type EventWatcherAlertExcludeRule struct {
 
 	// Name limits the rule to events about one object, by its name. A trailing
 	// * makes the rest a prefix, since a pod's name carries generated suffixes:
-	// payments-api-* matches every pod of that Deployment.
-	// +kubebuilder:validation:MinLength=1
+	// payments-api-* matches every pod of that Deployment. A bare * is written
+	// by leaving name out.
 	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^[^*]*\*?$`
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][-.a-z0-9]*\*?$`
 	// +optional
 	Name string `json:"name,omitempty"`
 }
@@ -711,16 +714,22 @@ type EventWatcherAlertExcludeRule struct {
 // A projectId or location the event does not carry is not compared: the
 // watcher's own cluster has neither until its Cluster Agent profile exists.
 type EventWatcherAlertExcludeCluster struct {
-	// ProjectID is the cluster's Google Cloud project.
+	// ProjectID is the cluster's Google Cloud project, plain (my-project) or
+	// domain-scoped (example.com:my-project).
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^([a-z0-9.-]+:)?[a-z][-a-z0-9]*$`
 	// +optional
 	ProjectID string `json:"projectId,omitempty"`
 
 	// Location is the cluster's region or zone.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][-a-z0-9]*$`
 	// +optional
 	Location string `json:"location,omitempty"`
 
 	// ClusterName is the cluster's name.
-	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	ClusterName string `json:"clusterName"`
 }
 

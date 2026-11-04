@@ -107,6 +107,33 @@ func TestNoAlertExcludeKeepsTheDeploymentEnvEntry(t *testing.T) {
 	}
 }
 
+// The largest list the CRD admits renders far under the kernel's 128 KiB limit
+// on one environment string (MAX_ARG_STRLEN); past it, the agent-api-auth
+// container could not start at all. Every string part is at its length bound,
+// in characters its pattern admits and JSON writes as themselves.
+func TestTheLargestAlertExcludeListFitsOneEnvString(t *testing.T) {
+	const maxArgStrlen = 128 * 1024
+	rule := agentv1alpha1.EventWatcherAlertExcludeRule{
+		Cluster: &agentv1alpha1.EventWatcherAlertExcludeCluster{
+			ProjectID:   strings.Repeat("a", 100) + ":p" + strings.Repeat("a", 26),
+			Location:    strings.Repeat("a", 63),
+			ClusterName: strings.Repeat("a", 63),
+		},
+		Namespace: strings.Repeat("a", 63),
+		Reason:    "R" + strings.Repeat("a", 127),
+		Kind:      "K" + strings.Repeat("a", 62),
+		Name:      strings.Repeat("a", 252) + "*",
+	}
+	agent := agentWithAlertExclude(slices.Repeat([]agentv1alpha1.EventWatcherAlertExcludeRule{rule}, 64)...)
+	got := alertExcludeEnv(agent)
+	if len(got) != 1 {
+		t.Fatalf("want one WATCHER_ALERT_EXCLUDE, got %d", len(got))
+	}
+	if n := len(got[0]); n >= maxArgStrlen/2 {
+		t.Errorf("the largest admitted list renders %d bytes; want well under %d", n, maxArgStrlen)
+	}
+}
+
 // The name is the one start-services.sh reads and passes to the watcher.
 func TestAlertExcludeEnvMatchesStartServices(t *testing.T) {
 	script, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "shared", "start-services.sh"))
@@ -147,12 +174,17 @@ func TestAlertExcludeSchemaRulesEnvtest(t *testing.T) {
 		rules   []rule
 		message string
 	}{
-		"empty rule":           {[]rule{{Namespace: "payments"}, {}}, "sets at least one of cluster, namespace, reason, kind or name"},
-		"bare wildcard name":   {[]rule{{Name: "*"}}, "sets at least one of cluster, namespace, reason, kind or name"},
-		"star inside a name":   {[]rule{{Name: "api-*-x"}}, "spec.harness.eventWatcher.alertExclude[0].name"},
-		"cluster with no name": {[]rule{{Cluster: &agentv1alpha1.EventWatcherAlertExcludeCluster{ProjectID: "p"}}}, "clusterName"},
-		"bad namespace":        {[]rule{{Namespace: "Payments"}}, "spec.harness.eventWatcher.alertExclude[0].namespace"},
-		"too many rules":       {slices.Repeat([]rule{{Namespace: "payments"}}, 65), "must have at most 64 items"},
+		"empty rule":                 {[]rule{{Namespace: "payments"}, {}}, "sets at least one of cluster, namespace, reason, kind or name"},
+		"bare wildcard name":         {[]rule{{Name: "*"}}, "sets at least one of cluster, namespace, reason, kind or name"},
+		"star inside a name":         {[]rule{{Name: "api-*-x"}}, "spec.harness.eventWatcher.alertExclude[0].name"},
+		"cluster with no name":       {[]rule{{Cluster: &agentv1alpha1.EventWatcherAlertExcludeCluster{ProjectID: "p"}}}, "clusterName"},
+		"bad namespace":              {[]rule{{Namespace: "Payments"}}, "spec.harness.eventWatcher.alertExclude[0].namespace"},
+		"too many rules":             {slices.Repeat([]rule{{Namespace: "payments"}}, 65), "must have at most 64 items"},
+		"long cluster name":          {[]rule{{Cluster: &agentv1alpha1.EventWatcherAlertExcludeCluster{ClusterName: strings.Repeat("a", 64)}}}, "clusterName"},
+		"long project":               {[]rule{{Cluster: &agentv1alpha1.EventWatcherAlertExcludeCluster{ProjectID: "p" + strings.Repeat("a", 128), ClusterName: "batch"}}}, "projectId"},
+		"escaped reason":             {[]rule{{Reason: "<Back&Off>"}}, "spec.harness.eventWatcher.alertExclude[0].reason"},
+		"upper-case name":            {[]rule{{Name: "Payments-*"}}, "spec.harness.eventWatcher.alertExclude[0].name"},
+		"wildcard with another part": {[]rule{{Namespace: "shop", Name: "*"}}, "spec.harness.eventWatcher.alertExclude[0].name"},
 	}
 	for name, tc := range refused {
 		t.Run("refused/"+name, func(t *testing.T) {
@@ -170,8 +202,8 @@ func TestAlertExcludeSchemaRulesEnvtest(t *testing.T) {
 			Cluster:   &agentv1alpha1.EventWatcherAlertExcludeCluster{ProjectID: "p", Location: "us-central1", ClusterName: "batch"},
 			Namespace: "shop", Reason: "CrashLoopBackOff", Kind: "Pod", Name: "inventory-api-*",
 		}},
-		"wildcard with another part": {{Namespace: "shop", Name: "*"}},
-		"64 rules":                   slices.Repeat([]rule{{Namespace: "payments"}}, 64),
+		"64 rules":              slices.Repeat([]rule{{Namespace: "payments"}}, 64),
+		"domain-scoped project": {{Cluster: &agentv1alpha1.EventWatcherAlertExcludeCluster{ProjectID: "example.com:my-project", ClusterName: "batch"}}},
 	}
 	for name, rules := range admitted {
 		t.Run("admitted/"+name, func(t *testing.T) {

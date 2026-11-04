@@ -9338,6 +9338,9 @@ spec:
                             description: |-
                               EventWatcherAlertExcludeRule is one alertExclude entry. Every part is
                               optional, and the rule matches an event when every part it sets matches.
+                              Each string part has a length bound and a pattern of characters that JSON
+                              writes as themselves, so the whole list, which reaches the watcher as one
+                              environment value, stays well under the kernel's 128 KiB limit on one.
                               There is no label selector: an event carries its own labels, not the
                               labels of the object it is about.
                             properties:
@@ -9346,17 +9349,22 @@ spec:
                                 properties:
                                   clusterName:
                                     description: ClusterName is the cluster's name.
-                                    minLength: 1
+                                    maxLength: 63
+                                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                     type: string
                                   location:
                                     description:
                                       Location is the cluster's region or
                                       zone.
+                                    maxLength: 63
+                                    pattern: ^[a-z0-9][-a-z0-9]*$
                                     type: string
                                   projectId:
-                                    description:
-                                      ProjectID is the cluster's Google Cloud
-                                      project.
+                                    description: |-
+                                      ProjectID is the cluster's Google Cloud project, plain (my-project) or
+                                      domain-scoped (example.com:my-project).
+                                    maxLength: 128
+                                    pattern: ^([a-z0-9.-]+:)?[a-z][-a-z0-9]*$
                                     type: string
                                 required:
                                   - clusterName
@@ -9372,10 +9380,10 @@ spec:
                                 description: |-
                                   Name limits the rule to events about one object, by its name. A trailing
                                   * makes the rest a prefix, since a pod's name carries generated suffixes:
-                                  payments-api-* matches every pod of that Deployment.
+                                  payments-api-* matches every pod of that Deployment. A bare * is written
+                                  by leaving name out.
                                 maxLength: 253
-                                minLength: 1
-                                pattern: ^[^*]*\*?$
+                                pattern: ^[a-z0-9][-.a-z0-9]*\*?$
                                 type: string
                               namespace:
                                 description:
@@ -9386,12 +9394,12 @@ spec:
                                 type: string
                               reason:
                                 description: |-
-                                  Reason limits the rule to one event reason. It matches the event's reason
-                                  or the family the watcher groups it in, so CrashLoopBackOff also matches
-                                  kubelet's BackOff events for a restarting container, and ImagePullBackOff
-                                  matches ErrImagePull.
+                                  Reason limits the rule to one event reason, matched without regard to
+                                  case. It matches the event's reason or the family the watcher groups it
+                                  in, so CrashLoopBackOff also matches kubelet's BackOff events for a
+                                  restarting container, and ImagePullBackOff matches ErrImagePull.
                                 maxLength: 128
-                                minLength: 1
+                                pattern: ^[A-Za-z][-_.A-Za-z0-9]*$
                                 type: string
                             type: object
                             x-kubernetes-validations:
