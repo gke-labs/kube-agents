@@ -1,6 +1,6 @@
 # Proposal origin: which feature opened each pull request
 
-**Status:** implemented in two pull requests, 2026-11-04: the first carries the origin record, the
+**Status:** implemented, 2026-11-04: the first pull request landed the origin record, the
 claim token, the ledger and its series (2.1, 2.2); the second the operator's origins reading, the
 nine fields, their gauges and the summary line (2.3, 2.4). Proposed 2026-11-03. Workstream 3 of the
 telemetry epic that asked who starts the agent's pull requests. It follows the second pull request
