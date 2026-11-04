@@ -480,6 +480,23 @@ class RemoveProfileOnDisk(unittest.TestCase):
         self.assertEqual(result, {"removed": ["cluster-b"], "left": ["cluster-a"], "refused": []})
         self.assertFalse(os.path.lexists(self.sandbox / "profiles" / "cluster-b"))
 
+    def test_a_home_whose_name_holds_a_line_break_is_still_reported_left(self):
+        # Reported by position, not by path: a \r or \n in a name cannot split the
+        # reply into rows that match nothing and so read as removed.
+        if os.geteuid() == 0:
+            self.skipTest("root removes a read-only directory's contents anyway")
+        odd = "cluster-odd\rname"
+        home = self.sandbox / "profiles" / odd
+        sealed = home / "sealed"
+        sealed.mkdir(parents=True)
+        (sealed / "file").write_text("x")
+        sealed.chmod(0o500)
+        self.addCleanup(sealed.chmod, 0o700)
+        code, result = self.batch(odd)
+        self.assertEqual(code, sm.EXIT_RETRY)
+        self.assertEqual(result, {"removed": [], "left": [odd], "refused": []})
+        self.assertTrue(home.is_dir())
+
     def test_a_name_still_on_the_agent_side_is_refused_by_name_and_the_rest_go(self):
         self.assertEqual(self.mirror(), sm.EXIT_OK)
         import shutil

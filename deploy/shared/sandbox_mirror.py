@@ -684,13 +684,17 @@ def remove_profile_homes(ssh: list[str], remote_root: str, homes: list[str]) -> 
     """
     paths = [f"{remote_root}/{home}" for home in homes]
     targets = " ".join(shlex.quote(p) for p in paths)
+    # Survivors come back as their 1-based position in the argument list, never
+    # as their path: a name holding a line break would otherwise split into rows
+    # that match nothing and read as removed.
     result = remote(
         ssh,
-        f"rm -rf -- {targets}; for t in {targets}; do "
-        "if [ -e \"$t\" ] || [ -L \"$t\" ]; then printf 'left %s\\n' \"$t\"; fi; done; exit 0",
+        f"rm -rf -- {targets}; i=0; for t in {targets}; do i=$((i+1)); "
+        "if [ -e \"$t\" ] || [ -L \"$t\" ]; then printf 'left %d\\n' \"$i\"; fi; done; exit 0",
     )
-    left_paths = {line[len("left "):] for line in result.stdout.splitlines() if line.startswith("left ")}
-    left = [home for home, path in zip(homes, paths) if path in left_paths]
+    left_at = {int(line[len("left "):]) for line in result.stdout.split("\n")
+               if line.startswith("left ") and line[len("left "):].isdigit()}
+    left = [home for n, home in enumerate(homes, start=1) if n in left_at]
     removed = [home for home in homes if home not in left]
     if removed:
         log(f"removed {len(removed)} deleted profile home(s) from the sandbox: {', '.join(removed)}")

@@ -58,6 +58,15 @@ SANDBOX_MIRROR = Path(
 # Comfortably past the mirror's own `--wait 30` plus one SSH round trip per
 # cluster profile, so this timeout only fires when the mirror itself is stuck.
 SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
+# A prune's batch (#4574): how many names delete_profiles holds locks for at once.
+# Each held lock is an open file until its chunk's sandbox removal is done, the
+# descriptor lesson of #4628; a prune larger than this runs in several chunks,
+# each still one mirror start and one SSH hop.
+DELETE_BATCH_MAX = 50
+# sandbox_mirror.REMOVE_RESULT_PREFIX: the line --remove-profile prints with each
+# name's outcome. Spelled here because that script is run, not imported;
+# test_cluster_agent_profile holds the two equal.
+MIRROR_REMOVE_RESULT_PREFIX = "remove-result: "
 ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
 ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
@@ -459,17 +468,6 @@ def _remove_sandbox_layout(name: str) -> None:
     except Exception as e:  # noqa: BLE001 - no sandbox, or a sandbox that is down
         log(f"{name}: could not remove the profile layout from the shell sandbox ({e}); "
             "its directory stays there until somebody removes it")
-
-
-# A prune's batch (#4574): how many names delete_profiles holds locks for at once.
-# Each held lock is an open file until its chunk's sandbox removal is done, the
-# descriptor lesson of #4628; a prune larger than this runs in several chunks,
-# each still one mirror start and one SSH hop.
-DELETE_BATCH_MAX = 50
-# sandbox_mirror.REMOVE_RESULT_PREFIX: the line --remove-profile prints with each
-# name's outcome. Spelled here because that script is run, not imported;
-# test_cluster_agent_profile holds the two equal.
-MIRROR_REMOVE_RESULT_PREFIX = "remove-result: "
 
 
 def _remove_sandbox_layouts(names: list[str]) -> dict[str, str]:
