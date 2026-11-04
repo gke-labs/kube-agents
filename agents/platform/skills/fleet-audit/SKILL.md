@@ -60,9 +60,9 @@ Which request you have decides what you do:
    or names its SOP, is this form whatever it says about the output: "report the findings",
    "don't change anything", or `Propose only: put the fix in result; do not open a pull request.`
    Run `start` and `finish` and report the ledger URL. The ledger is the report, not a change; the
-   line forbids a pull request from you, which you never open yourself (where the install's sweep
-   is on, `finish` may still open its remediation pull requests: the install's setting, not your
-   choice). Findings in `result` with no ledger are the audit not done (#4637).
+   line forbids a pull request, so on such a card pass `--no-promote` to `finish`: the ledger
+   publishes and the automatic sweep opens nothing on that run (the fixes wait for `/remediate`).
+   Findings in `result` with no ledger are the audit not done (#4637).
 2. **Trigger the scheduled cron job, or run several or all audits:** never run an audit inline.
    Open `references/on-demand.md` first.
 3. **What an audit found:** run nothing. The
@@ -103,11 +103,12 @@ Run every script by its full path. A kanban worker starts in its card's workspac
    ```bash
    /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <findings_path> \
      [--repo "<owner>/<repo>"] [--manifest-file <path> | --no-collector-manifest "<why>"] \
-     [--decline-fix <finding-id> "<why>" ...] [--scheduled]
+     [--decline-fix <finding-id> "<why>" ...] [--no-promote] [--scheduled]
    ```
 
    Pass `--scheduled` only when the cron prompt tells you to; never on a run a person asked for
-   (`references/finish.md`).
+   (`references/finish.md`). Pass `--no-promote` when the card says not to open a pull request: the
+   ledger still publishes, no automatic remediation pull request opens on that run.
 
    Exit 0 published. Exit 2 (`FINDINGS REJECTED`) published nothing and kept the run yours: fix
    what the message names and run `finish` again, never `start`. A `BROKER UNAVAILABLE` exit 2 is

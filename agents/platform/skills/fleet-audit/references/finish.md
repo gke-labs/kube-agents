@@ -11,8 +11,14 @@ Part of the `fleet-audit` skill (`/opt/data/profiles/platform/skills/fleet-audit
   [--repo "<owner>/<repo>"] \
   [--manifest-file <path> | --no-collector-manifest "<why>"] \
   [--decline-fix <finding-id> "<why>" ...] \
+  [--no-promote] \
   [--scheduled]
 ```
+
+Pass `--no-promote` when the card that asked for the run says not to open a pull request (the
+Planning Agent's propose-only line). The ledger publishes as on any run; the automatic remediation
+sweep opens nothing on that run, and the ledger lists those fixes under "Awaiting `/remediate`" with
+the reason. The install's own switch (`KUBEAGENTS_AUDIT_AUTO_PROMOTE`) is not changed.
 
 Pass `--scheduled` only when the cron prompt tells you to: it says that the run is a scheduled run,
 and only a scheduled run can get `silent_ok: true` (see [The clean run](clean-run.md#the-clean-run)). Do not

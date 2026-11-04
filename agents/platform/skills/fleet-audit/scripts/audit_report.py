@@ -2328,6 +2328,38 @@ def auto_promotion_enabled() -> bool:
         value = os.environ.get(AUTO_PROMOTE_ENV, "")
     return value.strip().lower() != AUTO_PROMOTE_OFF
 
+
+# The run's own waiver of the sweep: `finish --no-promote`. A card that carries
+# the Planning Agent's propose-only line ("do not open a pull request") still
+# publishes its ledger, which is the report, and the worker passes this flag
+# so the automatic sweep opens nothing on that run. The install's switch above
+# is untouched; a `/remediate` still opens what it names.
+NO_PROMOTE_FLAG = "--no-promote"
+SWEEP_WAIVED_REASON = (
+    "the automatic sweep was withheld on this run: the request asked for no pull "
+    f"request (`finish {NO_PROMOTE_FLAG}`)"
+)
+SWEEP_OFF_ON_INSTALL_REASON = (
+    f"the automatic sweep is off on this install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`)"
+)
+_SWEEP_WAIVED = False
+
+
+def set_sweep_waived(waived: bool) -> None:
+    """Record whether this `finish` carries the per-run waiver; set once per command."""
+    global _SWEEP_WAIVED
+    _SWEEP_WAIVED = bool(waived)
+
+
+def sweep_enabled_for_run() -> bool:
+    """The install's switch, less this run's waiver."""
+    return auto_promotion_enabled() and not _SWEEP_WAIVED
+
+
+def sweep_off_reason() -> str:
+    """Why no automatic pull request opened, in the ledger's words: the waiver names the run, else the install."""
+    return SWEEP_WAIVED_REASON if _SWEEP_WAIVED else SWEEP_OFF_ON_INSTALL_REASON
+
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
 # `finish` reads it when `--manifest-file` names one; every constant below is
 # unused on a run without it.
@@ -12599,8 +12631,8 @@ def _render_withheld(
     if off:
         out += [
             "",
-            f"{len(off)} finding(s) qualify for an automatic remediation {noun}, and the automatic "
-            f"sweep is off on this install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`), so none was "
+            f"{len(off)} finding(s) qualify for an automatic remediation {noun}, and "
+            f"{sweep_off_reason()}, so none was "
             "opened without a request. Comment `/remediate <finding-id>` to open any of them.",
             "",
             *rows(off),
@@ -13690,8 +13722,7 @@ def render_stale_close_comment(
         "",
         resolution
         or (
-            f"If the finding comes back: the automatic remediation sweep is off on this "
-            f"install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`), so nothing is re-proposed "
+            f"If the finding comes back: {sweep_off_reason()}, so nothing is re-proposed "
             "without a request; `/remediate <finding-id>` re-opens it on this same branch."
             if sweep_off
             else f"If the finding comes back: a finding graded `{UNVOUCHED_PROMOTION_FLOOR}`, "
@@ -19992,9 +20023,9 @@ def _handle_finish_dry_run(
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
     triage_reasons = triage_markers(findings, manifest)
-    sweep_on = auto_promotion_enabled()
+    sweep_on = sweep_enabled_for_run()
     if not sweep_on:
-        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: the automatic sweep opens nothing; only `/remediate` requests open a {noun}.")
+        log(f"{sweep_off_reason()}: the automatic sweep opens nothing; only `/remediate` requests open a {noun}.")
     plan = promotion_candidates(
         findings,
         {},
@@ -21306,7 +21337,9 @@ def _plan_remediation_files(
         listing_refusal = str(exc)
         log(f"WARNING: {listing_refusal}; this run opens, syncs and closes no proposal.")
         remediation_prs = []
-    sweep_on = auto_promotion_enabled() and listing_refusal is None
+    sweep_on = sweep_enabled_for_run() and listing_refusal is None
+    if not sweep_on and listing_refusal is None:
+        log(f"{sweep_off_reason()}: the automatic sweep opens nothing; only `/remediate` requests open a proposal.")
     # The last point before anything is published. A fix the sweep would open
     # and the worker did not write is refused until it is written or declined
     # by name with a reason: refused once, a worker re-ran `finish` unchanged
@@ -22005,6 +22038,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # `--scheduled`; an on-demand run does not, so its `silent_ok` is always
     # False and the person who asked gets an answer.
     scheduled = bool(getattr(args, "scheduled", False))
+    set_sweep_waived(getattr(args, "no_promote", False))
     data = load_findings(args.findings_file, audit_id, command="finish")
     stale_since = findings_predate_run(args.findings_file, audit_id)
     if stale_since:
@@ -23884,6 +23918,17 @@ def build_parser() -> argparse.ArgumentParser:
             "The run is a scheduled run: the cron prompt passes this flag. Only a "
             "scheduled run can get silent_ok true. Do not pass it on a run a person "
             "asked for."
+        ),
+    )
+    finish_parser.add_argument(
+        NO_PROMOTE_FLAG,
+        dest="no_promote",
+        action="store_true",
+        help=(
+            "Publish the ledger and open no automatic remediation pull request on this "
+            "run. Pass it when the card says not to open a pull request (the Planning "
+            "Agent's propose-only line); the ledger says the fixes await `/remediate`. "
+            "The install's switch is not changed."
         ),
     )
     finish_parser.add_argument(
