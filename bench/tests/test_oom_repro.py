@@ -189,7 +189,7 @@ def test_defaults_and_names_match_the_operator_source():
     assert cli.PROXY_CONTAINER == const(proxy, "credentialProxyContainerName")
     assert cli.WATCHER_CONTAINER == const(auth, "agentAPIAuthContainerName")
     assert 'agent.Name + "-shell"' in shell and cli.SHELL_CONTAINER == const(shell, "shellSandboxContainerName")
-    assert 'agent.Name + "-gateway"' in proxy and cli.GATEWAY_SELECTOR == f"app={cli.PLATFORM_AGENT}-gateway"
+    assert 'podLabels["app"] = agent.Name + "-gateway"' in auth and cli.GATEWAY_SELECTOR == f"app={cli.PLATFORM_AGENT}-gateway"
     assert cli.SHELL_SELECTOR == f"app={cli.PLATFORM_AGENT}-shell"
     assert 'agent.Name + "-credential-proxy"' in proxy
     assert cli.PROXY_SELECTOR == f"app={cli.PLATFORM_AGENT}-credential-proxy"
