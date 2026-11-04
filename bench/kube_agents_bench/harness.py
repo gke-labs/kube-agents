@@ -166,6 +166,7 @@ from kube_agents_bench.parsing import (
     RATE_LIMIT_REASON_PREFIX as _RATE_LIMIT_REASON_PREFIX,
     STATUS_TOOL,
     _INFRA_FAILURE_REASONS,
+    _TASK_ID_RE,
     _json_object,
     delegated_task_ids,
     delivered_results,
@@ -420,9 +421,12 @@ _PURGE_PENDING_SUFFIX = ".json"
 _PURGE_PENDING_MAX_AGE_SECONDS = 24 * 60 * 60
 # What an id read back from a pending file must look like before the purge
 # joins it to a path or prints it: anything with a shell on the volume can
-# write there, and an empty id or one holding ``/`` or ``..`` would widen a
-# delete to other cards' files.
-_PURGE_PENDING_ID = r"[A-Za-z0-9_-]+"
+# write there. The harness's own id grammar, so no id it owes is refused;
+# that grammar has no ``/``, and an id of dots alone is refused, since ``..``
+# or ``.`` would widen a delete to other cards' files. The run's own ids are
+# held to the same rule before they reach a path (:data:`_PATH_COMPONENTS`).
+_PURGE_PENDING_ID = _TASK_ID_RE.pattern
+_PATH_COMPONENTS = frozenset({".", ".."})
 # The hermes CLI in the agent pod, for when it is not on the exec shell's PATH.
 _HERMES_BIN_FALLBACK = "/opt/hermes/.venv/bin/hermes"
 # What ``hermes kanban archive <id>`` prints on success. A refusal goes to
@@ -1550,7 +1554,7 @@ def owe(owed_roots, owed_fanned, floor, first):
         print("%s %s" % (LEFT, tid))
     return True
 def card_ids(v):
-    if not isinstance(v, list) or not all(isinstance(t, str) and CARD.fullmatch(t) for t in v):
+    if not isinstance(v, list) or not all(isinstance(t, str) and CARD.fullmatch(t) and t.strip(".") for t in v):
         raise ValueError(v)
     return v
 def whole(v):
@@ -1761,7 +1765,9 @@ def _purge_card_state(
     off), so a run left on the board hands the next run of the same case its
     predecessor's summary in the worker's first ``kanban_show`` (#1730).
     """
-    fanned_out = [t for t in fanned_out if t not in task_ids]
+    # Joined to paths below, by the script and the shell alike.
+    task_ids = [t for t in task_ids if t not in _PATH_COMPONENTS]
+    fanned_out = [t for t in fanned_out if t not in task_ids and t not in _PATH_COMPONENTS]
     if not task_ids:
         return
     # With no floor every root is the run's own, so its files go from the shell

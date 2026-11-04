@@ -4186,6 +4186,8 @@ def test_a_root_an_earlier_purge_still_keeps_is_owed_not_foreign(
         {"roots": [""], "fanned": [], "floor": None, "first": 0},
         {"roots": [""], "fanned": [], "floor": None, "first": 2_000_000_000},
         {"roots": ["../attachments"], "fanned": [], "floor": None, "first": 2_000_000_000},
+        {"roots": [".."], "fanned": [], "floor": None, "first": 2_000_000_000},
+        {"roots": ["t_1"], "fanned": ["."], "floor": None, "first": 2_000_000_000},
         {"roots": ["t_1"], "fanned": ["t 2"], "floor": None, "first": 2_000_000_000},
         {"roots": ["t_1"], "fanned": [], "floor": "1700000000", "first": 2_000_000_000},
         ["t_1"],
@@ -4201,6 +4203,58 @@ def test_an_owed_purge_that_is_not_card_ids_and_whole_times_is_dropped_unread(tm
 
     assert _run_purge(tmp_path, []) == ["purged"]
     assert _owed(tmp_path) == [] and _has_files(tmp_path, "t_1")
+
+
+def test_an_owed_purge_keeps_every_id_the_harness_accepts(tmp_path: Path) -> None:
+    """Held to the harness's own id grammar: an id with ``.`` or ``:`` is owed, not dropped with its file."""
+    kb = _purge_board(tmp_path)
+    for tid in ("t_a.b", "t_c:d"):
+        _purge_card(kb, tid, "running")
+    kb.commit()
+    _owe(tmp_path, ["t_a.b", "t_c:d"], first=int(time.time()))
+
+    assert _run_purge(tmp_path, []) == ["kept t_a.b", "kept t_c:d", "pending t_a.b", "pending t_c:d", "purged"]
+
+
+def test_an_owed_dot_dot_id_is_dropped_even_with_a_row_to_delete(tmp_path: Path) -> None:
+    """Were it taken, deleting its row would unlink ``attachments/..``: the whole kanban tree, board included."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "..", "done")
+    kb.commit()
+    _card_files(tmp_path, "t_1")
+    _owe(tmp_path, [".."], first=int(time.time()))
+    (tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name / f"..{harness._PURGE_PENDING_SUFFIX}").rename(
+        tmp_path / "logs" / Path(harness._PURGE_PENDING_DIR).name / f"dots{harness._PURGE_PENDING_SUFFIX}"
+    )
+
+    assert _run_purge(tmp_path, []) == ["purged"]
+    assert _has_files(tmp_path, "t_1") and (tmp_path / "kanban.db").exists()
+    assert kb.execute("SELECT COUNT(*) FROM tasks WHERE id = '..'").fetchone() == (1,)
+
+
+def test_the_runs_own_ids_never_reach_a_path_as_a_bare_dot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_TASK_ID_RE`` admits ``..``; joined to the attachments directory it would name its parent."""
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "purged\n")
+    harness._purge_card_state(["..", "."], 5.0)
+    assert scripts == []
+    harness._purge_card_state(["t_1", ".."], 5.0, ["."])
+    (purge,) = scripts
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv(["t_1"])))
+
+
+def test_the_owe_script_leaves_no_temp_file_when_its_write_fails(tmp_path: Path) -> None:
+    """``mv`` failing (a full or read-only volume) must not strand a ``.<hex>`` file the retry never reads."""
+    pending = tmp_path / "pending"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "mv").write_text("#!/bin/sh\nexit 1\n")
+    (bin_dir / "mv").chmod(0o755)
+    script = harness._owe_script(["t_1"], [], None).replace(harness._PURGE_PENDING_DIR, str(pending))
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+    proc = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, env=env)
+    assert harness._PURGE_PENDING_PRESENT not in proc.stdout
+    assert list(pending.iterdir()) == []
 
 
 def test_a_marker_with_no_id_is_skipped() -> None:
