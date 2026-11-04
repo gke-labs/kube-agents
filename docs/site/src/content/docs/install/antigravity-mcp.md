@@ -155,13 +155,13 @@ Use the kube-agents send_message tool to ask: Which GKE clusters do you manage, 
 
 The answer names the conversation and its token, quotes any gateway notices, and gives the turn's task and its answer. If the turn filed cards, the reports they posted while the call waited follow under **Card reports on this turn**. Each is quoted as the reporting agent's text. A later message on the same `conversation` continues it; the default conversation is `default`.
 
-A card's report can take minutes. Pass a larger `wait_timeout_seconds` (up to 300) for card work. When the wait ends first, the answer says the turn is still running and gives its task as `<addressee>/<task-id>`.
+`wait_timeout_seconds` (default 150, at most 300) bounds the wait for the turn itself. When the wait ends first, the answer says the turn is still running and gives its task as `<addressee>/<task-id>`. Once the turn ends, the call waits about 15 seconds more for card reports and then returns, whatever the wait setting, so a card that takes longer is not in the answer.
 
-**`task_control`** follows that task. `get` with `task_id` reads its state and answer, and `wait_timeout_seconds` waits for it to finish. `stop` stops a conversation's running task: pass `conversation`, or a `task_id` the bridge started in this session. If the host cancels a running `send_message` call, the bridge sends the stop for you.
+**`task_control`** follows that task. `get` with `task_id` reads its state and answer, and `wait_timeout_seconds` waits for it to finish. `stop` stops a conversation's running task: pass `conversation`, or a `task_id` the bridge started in this session and is still running. A stop ends the turn; a card the turn already filed can still finish. If the host cancels a running `send_message` call, the bridge sends the stop for you.
 
 The other tools are `read_topics` (the install's standing topics and agent cards) and `manage_session` (named conversations and `/session` workers). There is also `discover_deployments`, which rescans your kubeconfig, and `connect_deployment`, which connects to a named install. `inspect_pr` fetches a pull request the agent filed and writes its diff to local files. The [MCP server reference](/kube-agents/reference/a2a-mcp/#the-tools) describes what each one does in the cluster.
 
-Card reports that arrive after a `send_message` call returns are not shown by this bridge, which does not offer the server's `poll_events` tool. For card work, pass a long `wait_timeout_seconds` so the reports arrive within the call.
+Card reports that arrive after a `send_message` call returns are not shown by this bridge, which does not offer the server's `poll_events` tool. A question the install hands to a card, which is common for anything that reads a cluster, then comes back as a short acknowledgement such as "checking namespaces on the host cluster." A later `status` message on the same conversation lists the cards and whether each is done, but not what they found.
 
 ## Troubleshooting
 
