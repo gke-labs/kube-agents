@@ -14,6 +14,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -27,6 +28,7 @@ func gatewayLeaseKey(agent *agentv1alpha1.PlatformAgent) types.NamespacedName {
 // create to a name, so a create grant would be a grant on every Lease name in
 // the namespace; the operator creates it instead.
 func TestTheGatewayRoleGrantsOnlyGetAndUpdateOnItsLease(t *testing.T) {
+	t.Setenv(a2aGatewayElectionEnvVar, "true")
 	agent := a2aTestAgent()
 	var leaseRules int
 	for _, rule := range buildA2AGatewayRole(agent).Rules {
@@ -52,6 +54,7 @@ func TestTheGatewayRoleGrantsOnlyGetAndUpdateOnItsLease(t *testing.T) {
 // from the downward API, so a container restarting in its pod re-takes its
 // lease at once.
 func TestTheGatewayIsGivenItsLeaseAndPodName(t *testing.T) {
+	t.Setenv(a2aGatewayElectionEnvVar, "true")
 	agent := a2aTestAgent()
 	dep := buildA2AGatewayDeployment(agent)
 	env := map[string]string{}
@@ -186,6 +189,7 @@ func TestForgettingAnAgentForgetsItsLease(t *testing.T) {
 // TestTheGatewayLeaseFollowsTheMode: a reconcile under mode next creates the
 // Lease, and the flip to today removes it with the rest of the stack.
 func TestTheGatewayLeaseFollowsTheMode(t *testing.T) {
+	t.Setenv(a2aGatewayElectionEnvVar, "true")
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 	cl := fake.NewClientBuilder().
@@ -219,6 +223,143 @@ func TestTheGatewayLeaseFollowsTheMode(t *testing.T) {
 	}
 	if err := cl.Get(ctx, gatewayLeaseKey(agent), &coordinationv1.Lease{}); !errors.IsNotFound(err) {
 		t.Fatalf("the gateway Lease outlived the flip to today: %v", err)
+	}
+	// The teardown's deletion isn't one to hold back: flipping back to
+	// next is a first install for the Lease.
+	if _, seen := r.gatewayLeaseSeen.Load(gatewayLeaseKey(agent)); seen {
+		t.Error("the flip to today left the Lease remembered, so a flip back would hold its recreate")
+	}
+}
+
+// TestTheElectionIsOffByDefault: without A2A_GATEWAY_ELECTION=true on the
+// operator, nothing changes for an install: no Lease, no grant on one, and
+// no election env, so the gateway runs unelected.
+func TestTheElectionIsOffByDefault(t *testing.T) {
+	t.Setenv(a2aGatewayElectionEnvVar, "")
+	agent := a2aTestAgent()
+	for _, rule := range buildA2AGatewayRole(agent).Rules {
+		for _, group := range rule.APIGroups {
+			if group == "coordination.k8s.io" {
+				t.Errorf("a Lease grant with the election off: %+v", rule)
+			}
+		}
+	}
+	for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "A2A_GATEWAY_LEASE" || e.Name == "POD_NAME" {
+			t.Errorf("election env %s with the election off", e.Name)
+		}
+	}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	if err := cl.Get(context.Background(), gatewayLeaseKey(agent), &coordinationv1.Lease{}); !errors.IsNotFound(err) {
+		t.Fatalf("a Lease with the election off: %v", err)
+	}
+}
+
+// TestAHeldBackRecreateRequeuesTheReconcile: nothing else wakes the pass
+// that recreates a deleted Lease, so the reconcile asks to come back: by the
+// end of the hold, or at the latest on the pending stack's own requeue,
+// which several early returns take.
+func TestAHeldBackRecreateRequeuesTheReconcile(t *testing.T) {
+	t.Setenv(a2aGatewayElectionEnvVar, "true")
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, gatewayLeaseHold: 5 * time.Second}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	if err := cl.Delete(ctx, buildA2AGatewayLease(agent)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RequeueAfter <= 0 || res.RequeueAfter > max(r.gatewayLeaseHold, a2aPendingRequeue) {
+		t.Fatalf("requeue after a deletion = %s, want within %s", res.RequeueAfter, max(r.gatewayLeaseHold, a2aPendingRequeue))
+	}
+}
+
+// TestOnlyALeaseDeletionWakesAReconcile: the gateway renews its Lease every
+// two seconds, and a reconcile per renewal would re-apply every object of
+// every install that often.
+func TestOnlyALeaseDeletionWakesAReconcile(t *testing.T) {
+	lease := buildA2AGatewayLease(a2aTestAgent())
+	if a2aGatewayLeaseEvents.Update(event.UpdateEvent{ObjectOld: lease, ObjectNew: lease}) {
+		t.Error("a renewal (an update) wakes a reconcile")
+	}
+	if a2aGatewayLeaseEvents.Create(event.CreateEvent{Object: lease}) {
+		t.Error("a create wakes a reconcile")
+	}
+	if !a2aGatewayLeaseEvents.Delete(event.DeleteEvent{Object: lease}) {
+		t.Error("a deletion doesn't wake a reconcile, so the Lease is never recreated")
+	}
+}
+
+// TestAnUnlabelledLeaseOfOursIsRelabelled: a Lease under the gateway's name
+// that the label-scoped cache can't see, controlled by this PlatformAgent,
+// gets the label back; one controlled by anything else is left alone.
+func TestAnUnlabelledLeaseOfOursIsRelabelled(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.UID = "agent-uid"
+	ours := buildA2AGatewayLease(agent)
+	delete(ours.Labels, a2aGatewayLeaseLabel)
+	if err := ctrl.SetControllerReference(agent, ours, setupScheme()); err != nil {
+		t.Fatal(err)
+	}
+	r, cl := leaseReconciler(t, agent, ours)
+	if err := r.adoptA2AGatewayLease(context.Background(), agent, gatewayLeaseKey(agent)); err != nil {
+		t.Fatal(err)
+	}
+	live := &coordinationv1.Lease{}
+	if err := cl.Get(context.Background(), gatewayLeaseKey(agent), live); err != nil {
+		t.Fatal(err)
+	}
+	if live.Labels[a2aGatewayLeaseLabel] != "true" {
+		t.Errorf("our Lease wasn't relabelled: %v", live.Labels)
+	}
+
+	other := a2aTestAgent()
+	other.UID = "other-uid"
+	foreign := buildA2AGatewayLease(other)
+	delete(foreign.Labels, a2aGatewayLeaseLabel)
+	if err := ctrl.SetControllerReference(other, foreign, setupScheme()); err != nil {
+		t.Fatal(err)
+	}
+	r, cl = leaseReconciler(t, agent, foreign)
+	if err := r.adoptA2AGatewayLease(context.Background(), agent, gatewayLeaseKey(agent)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(context.Background(), gatewayLeaseKey(agent), live); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := live.Labels[a2aGatewayLeaseLabel]; ok {
+		t.Error("another controller's Lease was relabelled")
+	}
+	if _, seen := r.gatewayLeaseSeen.Load(gatewayLeaseKey(agent)); seen {
+		t.Error("another controller's Lease counted as seen, so it could start a held-back recreate")
 	}
 }
 

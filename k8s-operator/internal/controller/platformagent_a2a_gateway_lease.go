@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -11,7 +12,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -23,6 +27,16 @@ import (
 // Role gets only get and update on that one object; because the gateway can't
 // recreate it, the operator watches it and recreates it after a deletion.
 const (
+	// a2aGatewayElectionEnvVar, set to "true" in the operator's own
+	// environment, switches the election on: the Lease, the gateway's grant
+	// on it and the gateway's election env. Off by default. With the
+	// election on, the gateway needs the API server to keep leading, so a
+	// control-plane outage longer than its renew deadline (a zonal
+	// cluster's control-plane upgrade) stops it until the API server is
+	// back; the default flips once that trade-off is decided. CI and the
+	// live runs turn it on.
+	a2aGatewayElectionEnvVar = "A2A_GATEWAY_ELECTION"
+
 	// a2aGatewayLeaseEnvVar names the Lease to the gateway, and
 	// a2aGatewayPodNameEnvVar carries its identity there, the pod's name.
 	a2aGatewayLeaseEnvVar   = "A2A_GATEWAY_LEASE"
@@ -36,11 +50,31 @@ const (
 
 	// a2aGatewayLeaseRecreateHold is how long the operator waits after it
 	// sees the Lease gone before creating it again: the gateway's lease
-	// duration. A Lease recreated with no holder can be taken on a
+	// duration, electionLeaseDuration in a2a/gateway/election.go, which
+	// changes with it. A Lease recreated with no holder can be taken on a
 	// standby's next retry, while the old leader keeps acting until its
 	// renewal gives up, so the wait lets it step down first.
 	a2aGatewayLeaseRecreateHold = 20 * time.Second
 )
+
+// a2aGatewayLeaseEvents lets only a Lease's deletion wake a reconcile. The
+// gateway renews its Lease every two seconds, each renewal an update, and a
+// reconcile per renewal would re-apply every object of every next install
+// that often. Nothing in an update concerns the operator: it never writes
+// the spec, and a Lease that loses its label is a delete to the
+// label-scoped informer.
+var a2aGatewayLeaseEvents = predicate.Funcs{
+	CreateFunc:  func(event.CreateEvent) bool { return false },
+	UpdateFunc:  func(event.UpdateEvent) bool { return false },
+	DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	GenericFunc: func(event.GenericEvent) bool { return false },
+}
+
+// a2aGatewayElectionEnabled reports whether the operator was deployed with
+// the election switched on. Anything but an explicit "true" is off.
+func a2aGatewayElectionEnabled() bool {
+	return os.Getenv(a2aGatewayElectionEnvVar) == "true"
+}
 
 // a2aGatewayLeaseName is the Lease's fixed name, the gateway's own: the eval
 // harness, the rollback script and hack/gateway-port-forward.sh read the
@@ -59,8 +93,12 @@ func buildA2AGatewayLease(agent *agentv1alpha1.PlatformAgent) *coordinationv1.Le
 }
 
 // a2aGatewayLeaseEnv is the gateway container's election env: the Lease's
-// name, and the pod's name from the downward API.
+// name, and the pod's name from the downward API. Nothing when the election
+// is off, and the gateway runs unelected.
 func a2aGatewayLeaseEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if !a2aGatewayElectionEnabled() {
+		return nil
+	}
 	return []corev1.EnvVar{
 		{Name: a2aGatewayLeaseEnvVar, Value: a2aGatewayLeaseName(agent)},
 		{Name: a2aGatewayPodNameEnvVar, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
@@ -108,12 +146,54 @@ func (r *PlatformAgentReconciler) ensureA2AGatewayLease(ctx context.Context, age
 		return 0, err
 	}
 	withCommonLabels(lease, agent)
-	if err := r.Create(ctx, lease); err != nil && !errors.IsAlreadyExists(err) {
+	err = r.Create(ctx, lease)
+	if errors.IsAlreadyExists(err) {
+		// The cache, which sees only labelled Leases, said missing and the
+		// API server says it exists: a Lease under this name without the
+		// label (made by hand, or left from before it). Ours is relabelled
+		// so the cache and the delete watch see it again; anyone else's is
+		// left alone and the gateway campaigns on it as it is.
+		return 0, r.adoptA2AGatewayLease(ctx, agent, key)
+	}
+	if err != nil {
 		return 0, fmt.Errorf("failed to create the A2A gateway Lease %s: %w", key, err)
 	}
 	r.gatewayLeaseSeen.Store(key, true)
 	r.gatewayLeaseGoneAt.Delete(key)
 	return 0, nil
+}
+
+// adoptA2AGatewayLease relabels a Lease under the gateway's name that the
+// cache can't see, when this PlatformAgent controls it. It is read live,
+// since the cache holds only labelled Leases. One controlled by something
+// else is reported and left as it is, and not counted as seen, so it never
+// starts a held-back recreate.
+func (r *PlatformAgentReconciler) adoptA2AGatewayLease(ctx context.Context, agent *agentv1alpha1.PlatformAgent, key types.NamespacedName) error {
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	live := &coordinationv1.Lease{}
+	if err := reader.Get(ctx, key, live); err != nil {
+		return fmt.Errorf("failed to read the A2A gateway Lease %s: %w", key, err)
+	}
+	owner := metav1.GetControllerOf(live)
+	if owner == nil || owner.UID != agent.UID {
+		logf.FromContext(ctx).Info("a Lease under the A2A gateway's name is not this PlatformAgent's; leaving it as it is",
+			"lease", key.String())
+		return nil
+	}
+	patch := client.MergeFrom(live.DeepCopy())
+	if live.Labels == nil {
+		live.Labels = map[string]string{}
+	}
+	live.Labels[a2aGatewayLeaseLabel] = "true"
+	if err := r.Patch(ctx, live, patch); err != nil {
+		return fmt.Errorf("failed to relabel the A2A gateway Lease %s: %w", key, err)
+	}
+	r.gatewayLeaseSeen.Store(key, true)
+	r.gatewayLeaseGoneAt.Delete(key)
+	return nil
 }
 
 // forgetA2AGatewayLease drops what this process remembers about an agent's

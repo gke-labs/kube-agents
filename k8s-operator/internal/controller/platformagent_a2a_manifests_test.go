@@ -875,8 +875,8 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	}
 
 	role := buildA2AGatewayRole(agent)
-	if len(role.Rules) != 6 {
-		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get, the pinned PlatformAgent get, the pinned home-channel record, the pinned election Lease and the pinned resolved scope", len(role.Rules))
+	if len(role.Rules) != 5 {
+		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get, the pinned PlatformAgent get, the pinned home-channel record and the pinned resolved scope", len(role.Rules))
 	}
 	// The owner rule is one verb on one named object — a deployments read
 	// would be a finding.
@@ -2156,9 +2156,10 @@ func remedyRecreateWidth(t *testing.T, message string) int {
 // clean pass run, and require the tree to be empty at the end rather than
 // merely error-free.
 func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
-	// With the dispatcher on, so its objects are rendered and the cleanup
-	// is held to deleting them too.
+	// With the dispatcher and the gateway's election on, so their objects
+	// are rendered and the cleanup is held to deleting them too.
 	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	t.Setenv(a2aGatewayElectionEnvVar, "true")
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
