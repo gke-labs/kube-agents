@@ -4521,7 +4521,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		// broker, so Ready and the phase keep what the workload says.
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonInvalidCredentialProxyExec
-		degradedMsg = fmt.Sprintf(invalidCredentialProxyExecMsgFmt, execRefusal[0].Detail)
+		degradedMsg = fmt.Sprintf(invalidExecTierReplicasMsgFmt, execRefusal[0].Detail)
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg

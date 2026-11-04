@@ -76,7 +76,7 @@ const (
 	credentialProxyExecTierMaxAgentName       = validation.DNS1035LabelMaxLength - len(credentialProxyExecTierSuffix)
 	credentialProxyExecTierNameRefusalFmt     = "the agent's name %q is %d characters; with spec.deployment.credentialProxy.exec.replicas above 0 it must be at most %d, so <name>%s fits the 63-character Service name and label value. Rename the agent, or set exec.replicas to 0"
 	conditionReasonInvalidCredentialProxyExec = "InvalidCredentialProxyExec"
-	invalidCredentialProxyExecMsgFmt          = "Invalid spec.deployment.credentialProxy.exec.replicas (%s); the exec tier is not rendered, and every command goes to the stateful broker until it is corrected"
+	invalidExecTierReplicasMsgFmt             = "Invalid spec.deployment.credentialProxy.exec.replicas (%s); the exec tier is not rendered, and every command goes to the stateful broker until it is corrected"
 )
 
 // credentialProxyExecTierEnvDropped names the broker env the exec tier does
