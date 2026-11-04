@@ -3033,6 +3033,28 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("enable_github_minter = true", dest.read_text())
 
+    def test_minter_deferred_names_the_restore_for_scheduled_versions(self):
+        # A key whose versions a destroy scheduled: the generator still defers,
+        # but names the restore instead of asking for the PEM again.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            env = {
+                "API_SERVER_KEY": "k",
+                "GITOPS_ORG": "org",
+                "GITOPS_REPO": "repo",
+                "GITHUB_APP_ID": "42",
+            }
+            proc = self._run(
+                'print_info() { echo "INFO: $*"; }; print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"', env=env, kms_versions="",
+                gcloud_extra_cases="  *\"state=DESTROY_SCHEDULED\"*) printf '2'; exit 0 ;;\n",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("enable_github_minter = false", dest.read_text())
+            out = proc.stdout + proc.stderr
+            self.assertIn("Its versions are scheduled for destruction", out)
+            self.assertNotIn("Provide the PEM via --github-pem-path", out)
+
     def test_tfvars_recovery_refuses_a_foreign_kube_context(self):
         # A stale context pointing at some other install must not donate that
         # environment's credentials: recovery skips, and the generator fails
@@ -6419,24 +6441,26 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
-        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console:
-        # the settings the tfvars carry reached the render.
-        self.assertIn("Persistent storage:  410 GiB over 5 claims", proc.stdout)
-        self.assertIn("Pods:                13", proc.stdout)
+        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console,
+        # and, since the tfvars say next, the NATS bus's 40Gi JetStream claim and the
+        # next-mode pods the preflight now sums: the settings the tfvars carry reached
+        # the render.
+        self.assertIn("Persistent storage:  450 GiB over 6 claims", proc.stdout)
+        self.assertIn("Pods:                21", proc.stdout)
         # The tfvars say autopilot, so the credential proxy is counted at the operator's
         # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
         # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
-        self.assertIn("CPU requests:        4.500 cores", proc.stdout)
-        self.assertIn("Memory requests:     10.84 GiB", proc.stdout)
+        self.assertIn("CPU requests:        5.200 cores", proc.stdout)
+        self.assertIn("Memory requests:     12.03 GiB", proc.stdout)
         standard = self._run(
             f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
             tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
         )
         self.assertIn("rc=0", standard.stdout, standard.stderr)
-        self.assertIn("CPU requests:        3.000 cores", standard.stdout)
-        self.assertIn("Memory requests:     9.84 GiB", standard.stdout)
+        self.assertIn("CPU requests:        3.700 cores", standard.stdout)
+        self.assertIn("Memory requests:     11.03 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
-        self.assertIn("Not counted: the spec.mode next workloads", proc.stdout)
+        self.assertIn("Not counted: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
         # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
         with tempfile.TemporaryDirectory() as tmp:

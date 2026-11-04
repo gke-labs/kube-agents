@@ -346,7 +346,9 @@ What the operator renders per profile, as built (amended 10/6):
   shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
   ask the metadata server for the broker's Workload Identity token). The broker gives them a
   role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
-  route only, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist.
+  route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist, and,
+  with a task credential, the MCP relay for Developer Knowledge's two document reads alone
+  (`mcp_policy.PROFILE_SERVER_TOOLS`).
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key

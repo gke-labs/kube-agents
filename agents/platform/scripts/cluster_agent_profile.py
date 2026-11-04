@@ -97,6 +97,32 @@ SOUL_SECTION_1_ANCHOR = "---\n\n## 1. Core Truths"
 # a minute per cluster on a busy broker.
 CONNECTIVITY_PROBE_REQUEST_TIMEOUT = "5s"
 CONNECTIVITY_PROBE_TIMEOUT_SECONDS = 45
+# The shim retries a broker refusal on its own (credential_proxy_client, keeping
+# a retry's admission wait, not its run, inside a deadline the caller may
+# shorten). The probe's bound is shorter than one admission wait, let alone a
+# one-shot kubectl's 60 s run after it (the broker's --kubectl-timeout-seconds
+# default), so a retry could only end in the probe's own kill, with the
+# refusal's text, the one line the probe exists to log, unread. The probe tells
+# the shim its bound less the run bound, under which no retry fits, and a
+# refused probe logs the refusal at once. The variable's name is spelled here
+# rather than imported from credential_proxy_client (test_cluster_agent_profile.py
+# holds the two equal): the image entrypoint's cluster loop runs this script at
+# gateway start-up, and tests/test_docker_entrypoint.py stages it with the three
+# modules it imports, so a new import here is a loop that silently stops stamping.
+SHIM_RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
+BROKER_KUBECTL_RUN_SECONDS = 60
+PROBE_SHIM_RETRY_DEADLINE_SECONDS = max(0, CONNECTIVITY_PROBE_TIMEOUT_SECONDS - BROKER_KUBECTL_RUN_SECONDS)
+# The credential fetch in step 3 is a gcloud, which the broker bounds at 300 s
+# (its --timeout-seconds default), under a 60 s cap: one admission wait at
+# most, so a held refusal cannot reach a retry, but the broker's resource
+# watermark gate refuses at once with a 5 to 30 s Retry-After and the shim's
+# 170 s default admits three or four such waits, so without the deadline about
+# half the draws carry the fetch past its cap and the scaffold exits on
+# "timed out" where the refusal's reason is the line to read. Same rule, same
+# answer: the cap less the run bound, under which no retry fits.
+CREDENTIAL_FETCH_TIMEOUT_SECONDS = 60
+BROKER_GCLOUD_RUN_SECONDS = 300
+CREDENTIAL_FETCH_SHIM_RETRY_DEADLINE_SECONDS = max(0, CREDENTIAL_FETCH_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
 # What kubectl prints when it never reached the API server, as opposed to an
 # answer it did not like (401, 403, NotFound). The endpoint remedy is about
 # reaching the server, so it is offered only for the first kind.
@@ -112,13 +138,17 @@ CONNECTIVITY_FAILURE_RE = re.compile(
 # ... Connection refused", "credential proxy: kubeconfig is unreadable") are
 # the shim or the broker, not the cluster's list. Matched on the shim's
 # prefixes, not the words: preflight's cap text mentions "the credential
-# proxy's admission wait" and is a real timeout.
+# proxy's admission wait" and is a real timeout. Only the shim's terminal
+# lines are here, the ones after which it exits without running kubectl: its
+# "credential proxy busy ... retrying" line is followed by the admitted
+# attempt's own stderr, so a command refused once and then failing to reach
+# the endpoint still earns the remedy.
 # "Error from server" fronts every answer the API server gave, a degraded
 # etcd's "request timed out" included: the server was reached, so the list is
 # not what stands in the way whatever words follow.
 NOT_A_CONNECTION_FAILURE_RE = re.compile(
     r"credential proxy( token)? unavailable|credential proxy error|credential proxy:|"
-    r"Error from server",
+    r"credential proxy throttled|Error from server",
     re.IGNORECASE,
 )
 
@@ -514,7 +544,10 @@ def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision 
         # cost one misleading line in the scaffold log.
         completed = sandbox_exec.run(
             argv,
-            remote_env={"KUBECONFIG": str(kubeconfig)},
+            remote_env={
+                "KUBECONFIG": str(kubeconfig),
+                SHIM_RETRY_DEADLINE_ENV: str(PROBE_SHIM_RETRY_DEADLINE_SECONDS),
+            },
             local_env=_run_env({"KUBECONFIG": str(kubeconfig)}),
             timeout=CONNECTIVITY_PROBE_TIMEOUT_SECONDS,
             principal=sandbox_exec.TERMINAL_PRINCIPAL,
@@ -673,8 +706,11 @@ def _create_profile(project: str, cluster: str, location: str, name: str) -> str
                 f"--location={location}", f"--project={project}",
                 *endpoint_flags,
             ],
-            check=True, timeout=60,
-            remote_env={"KUBECONFIG": str(kubeconfig)},
+            check=True, timeout=CREDENTIAL_FETCH_TIMEOUT_SECONDS,
+            remote_env={
+                "KUBECONFIG": str(kubeconfig),
+                SHIM_RETRY_DEADLINE_ENV: str(CREDENTIAL_FETCH_SHIM_RETRY_DEADLINE_SECONDS),
+            },
             local_env=env,
             principal=sandbox_exec.TERMINAL_PRINCIPAL,
         )

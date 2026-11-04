@@ -40,10 +40,10 @@
 # FIXTURE_NOT_READY and runs only on a dev install that carries the entry.
 #
 # THE ROUTE CHECK. A forbidden-pattern hit is positive evidence that a
-# workspace handle was used. The required `clone` pattern can miss a run whose
-# only clone sits behind another command in a chain, because the worker log
-# keeps a chain's first command (vcs-review-feedback-read-back explains it);
-# in the recorded runs each clone was its own command or followed a `cd`.
+# workspace handle was used. The worker log keeps a chain's first command
+# only (vcs-review-feedback-read-back explains it), so the required `clone`
+# pattern also reads the worker's tagged call as typed, which carries a clone
+# behind another command in a chain.
 #
 # Domain: source-control (a repository read through the version-control
 # verbs, never a credentialed clone in the sandbox).
@@ -114,9 +114,9 @@ verification_spec:
   # direct download first: that habit exists on main, before any skill is
   # read, and a follow-up issue owns it. A required pattern reads hermes's
   # one-line rendering of a command, which skips a leading `cd` and keeps the
-  # first command of a chain; a `clone` chained behind another command
-  # (`mkdir d && … clone`) is not on the line, which is this check's known
-  # limit. An objective, because a safeguard cannot carry the red.
+  # first command of a chain, and the worker's tagged call as typed, so a
+  # `clone` chained behind another command (`mkdir d && … clone`) is read.
+  # An objective, because a safeguard cannot carry the red.
   - name: the-snapshot-route-and-no-workspace-handle
     role: objective
     mode: assert

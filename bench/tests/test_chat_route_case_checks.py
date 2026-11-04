@@ -402,8 +402,9 @@ def test_required_checks_read_the_command_as_typed_not_the_rendered_row(case, na
     check = _check(case, name)
     assert check[AS_TYPED] == "(?!)", "the switch opens no window and reads the calls as typed"
     assert _verdict(WorkerCommandsVerifier(**check), [row], [typed])
-    # The row alone is what the check read before the switch: the collector
-    # is behind the chain or on the joined line, so the same run failed.
+    # The collector is behind the chain or on the joined line, so the row alone
+    # names no run. Without the switch the required check still reads the
+    # logged card's typed call beside the row (#4620).
     without = {k: v for k, v in check.items() if k != AS_TYPED}
-    assert not _verdict(WorkerCommandsVerifier(**without), [row], [typed])
+    assert _verdict(WorkerCommandsVerifier(**without), [row], [typed])
 
