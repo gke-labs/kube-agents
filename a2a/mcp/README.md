@@ -106,4 +106,6 @@ What it keeps is live only. Lost:
 
 `poll_events` reads a conversation's kept frames: `conversation` or `conversation_token` as for `send_message`, `since` (a cursor; 0 for everything kept), and `wait_seconds` (up to 60) to wait for a frame newer than `since`. A name must be one the server knows; an unknown name is refused rather than created. A token the server hadn't heard of is listened to from that call on. It returns the frames newer than `since` in cursor order, the new cursor, how many were dropped, and whether any dropped frame was newer than `since`. An updated report comes back under a new cursor. One cursor counts across all conversations, so a cursor stays valid when a conversation's listener goes and comes back; a `since` past the server's cursor, as after a restart, reads from 0.
 
+The workstation bridge (`kube-agents-mcp`) offers `poll_events` too and forwards it here. It takes the `conversation_token` and `since` a `send_message` answer gives, as written. Given its own conversation alias or console token instead, it sends the alias, the name its `send_message` sent the turns under, since its console tokens are not this server's. It clamps `wait_seconds` to 60.
+
 The swarm view's pending events come from this buffer in a later change.

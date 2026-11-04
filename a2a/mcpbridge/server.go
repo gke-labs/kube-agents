@@ -1129,10 +1129,7 @@ func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMess
 		if s.host != nil {
 			text, err = s.host.HandlePollEvents(ctx, s, rawArgs)
 		} else {
-			return CallToolResult{
-				Content: []TextContent{{Type: contentTypeText, Text: fmt.Sprintf("Unknown tool %q", name)}},
-				IsError: true,
-			}
+			text, err = s.handlePollEvents(ctx, rawArgs)
 		}
 	default:
 		return CallToolResult{
@@ -1957,6 +1954,35 @@ func (s *Server) handleReadTopics(ctx context.Context, rawArgs json.RawMessage) 
 		return "", err
 	}
 	txt, _, _, err := sess.callRemoteTool(ctx, ToolReadTopics, rawArgs, CallMetaFromContext(ctx), s.store.Snapshot(), nil)
+	return txt, err
+}
+
+// handlePollEvents forwards poll_events to the in-cluster server when no host integration reads
+// the events itself. The conversation is resolved as task_control resolves its own, without
+// minting one, to the alias the bridge's send_message sends turns under; a conversation_token
+// (the server's token, as a send_message answer reports it) goes as is (serverPollEventsArgs).
+func (s *Server) handlePollEvents(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	var args struct {
+		Conversation      string `json:"conversation"`
+		ConversationToken string `json:"conversation_token"`
+	}
+	if len(rawArgs) > 0 {
+		_ = json.Unmarshal(rawArgs, &args)
+	}
+	conversation := ""
+	if strings.TrimSpace(args.ConversationToken) == "" {
+		conversation = s.ReadOnlyConversationFor(ctx, args.Conversation).Alias
+	}
+	// Unreadable arguments are refused here, before the connect, naming the bridge's argument.
+	fwd, err := serverPollEventsArgs(rawArgs, conversation)
+	if err != nil {
+		return "", err
+	}
+	sess, err := s.ensureConnected(ctx)
+	if err != nil {
+		return "", err
+	}
+	txt, _, _, err := sess.callRemoteTool(ctx, ToolPollEvents, fwd, CallMetaFromContext(ctx), s.store.Snapshot(), nil)
 	return txt, err
 }
 

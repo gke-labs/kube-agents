@@ -251,3 +251,67 @@ func (s *Server) upstreamArgs(ctx context.Context, toolName string, rawArgs json
 	}
 	return rawArgs, nil
 }
+
+// maxPollWaitSeconds is the in-cluster server's ceiling on poll_events' wait (a2a/mcp
+// maxPollSeconds); the server refuses a longer one.
+const maxPollWaitSeconds = 60
+
+// serverPollEventsArgs translates the bridge's poll_events arguments to the in-cluster server's
+// (a2a/mcp pollEventsArgs). conversation_token, the server's own token as a send_message answer
+// reports it, goes as is and conversation is dropped; otherwise conversation is the alias the
+// bridge resolved (the name the bridge's send_message sent the turn under). The bridge's own
+// console tokens are not the server's, so one never goes as conversation_token. since is a
+// non-negative whole number (a numeric string is read as its number); wait_seconds is read as
+// send_message's wait is (parseWaitSeconds) and clamped to 0..maxPollWaitSeconds. Any other
+// argument is dropped.
+func serverPollEventsArgs(raw json.RawMessage, conversation string) (json.RawMessage, error) {
+	args := map[string]any{}
+	if len(raw) > 0 {
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		_ = dec.Decode(&args)
+	}
+	if args == nil {
+		args = map[string]any{}
+	}
+	fwd := map[string]any{}
+	token, _ := args["conversation_token"].(string)
+	if token = strings.TrimSpace(token); token != "" {
+		fwd["conversation_token"] = token
+	} else if conversation = strings.TrimSpace(conversation); conversation != "" {
+		fwd["conversation"] = conversation
+	}
+	if v, ok := args["since"]; ok && v != nil {
+		var s string
+		switch v := v.(type) {
+		case json.Number:
+			s = v.String()
+		case string:
+			s = strings.TrimSpace(v)
+		default:
+			return nil, fmt.Errorf("invalid since %v: want the cursor an earlier answer reported", v)
+		}
+		since, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid since %q: want the cursor an earlier answer reported", s)
+		}
+		fwd["since"] = since
+	}
+	if v, ok := args["wait_seconds"]; ok && v != nil {
+		if n, isNum := v.(json.Number); isNum {
+			v = n.String()
+		}
+		wait, err := parseWaitSeconds(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid wait_seconds %v: want a number of seconds, 0 to %d", v, maxPollWaitSeconds)
+		}
+		switch {
+		case wait < 0:
+			wait = 0
+		case wait > maxPollWaitSeconds:
+			wait = maxPollWaitSeconds
+		}
+		fwd["wait_seconds"] = int(wait)
+	}
+	return json.Marshal(fwd)
+}
