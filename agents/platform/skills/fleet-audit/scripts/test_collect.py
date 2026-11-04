@@ -4971,11 +4971,7 @@ def kcc_crd_line(kind):
 
 def is_kcc_read(argv):
     """Whether `argv` is a step of `kcc_health.read_objects`."""
-    return (
-        argv[:2] == ["kubectl", "api-resources"]
-        or argv[:3] == ["kubectl", "get", "--raw"]
-        or argv[:3] == ["kubectl", "config", "view"]
-    )
+    return argv[:2] == ["kubectl", "api-resources"] or argv[:3] == ["kubectl", "get", "--raw"]
 
 
 def serve_kcc(argv, kcc_items):
@@ -4986,9 +4982,6 @@ def serve_kcc(argv, kcc_items):
     (`KCC_DEFAULT_KIND` when it holds none). A callable: the discovery names
     `KCC_DEFAULT_KIND`, and the callable answers that kind's list request.
     """
-    if argv[1] == "config":
-        # A kubeconfig that names the API server directly.
-        return Run(argv, 0, "https://10.0.0.1", "", 0.05)
     if argv[1] == "api-resources":
         if kcc_items is None:
             return Run(argv, 0, "deployments   deploy   apps/v1   true   Deployment   get,list   all\n", "", 0.05)
@@ -7946,8 +7939,6 @@ class TestComplianceCollectCluster(unittest.TestCase):
             self.issued.append(list(argv))
             if "get-credentials" in argv:
                 return Run(argv, 0, "", "", 0.05)
-            if argv[:3] == ["kubectl", "config", "view"]:
-                return serve_kcc(argv, kcc_items)
             if argv[:2] == ["kubectl", "api-resources"]:
                 return serve_kcc(argv, kcc_items if not callable(kcc_items) else (lambda kind_argv: kcc_items(kind_argv, **kwargs)))
             if argv[:2] == ["kubectl", "get"]:
