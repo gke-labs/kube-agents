@@ -414,7 +414,7 @@ class ClosestByTextRulesTest(unittest.TestCase):
         rep, _ = report(lines, texts=analyze_shadow.StoredText(write_store(texts)))
         self.assertEqual(rep["top_misses"][0]["closest_request_id"], f"n{count - 1}")
 
-    def test_an_unreadable_stored_file_leaves_the_miss_unranked(self):
+    def test_an_unreadable_stored_file_is_skipped_and_the_readable_one_ranked(self):
         root = write_store(self.TEXTS)
         with open(os.path.join(root, "requests", "x.json"), "wb") as handle:
             handle.write(b"\xff\xfe{")
@@ -422,7 +422,8 @@ class ClosestByTextRulesTest(unittest.TestCase):
         lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
                  line("x", 1.5, "nightly", "n", "X", ["s", "w", "tx"]),
                  presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
-        self.assertEqual(report(lines, texts=texts)[0]["top_misses"][0]["closest_request_id"], "n1")
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_request_id"], miss["closest_by"]), ("n1", "text"))
 
     def test_an_unreadable_newest_copy_does_not_hide_an_older_readable_one(self):
         # n_new carries the same next message as n_old but its text was never
@@ -477,7 +478,34 @@ class ClosestByTextRulesTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             analyze_shadow.main([write(lines), "--store", root])
         self.assertIn("closest request ranked by text for 1 of 1 misses", out.getvalue())
-        self.assertIn("(nightly, by text)", out.getvalue())
+        self.assertRegex(out.getvalue(), r"\(nightly, by text 0\.\d+\)")
+
+    def test_no_shared_word_is_no_match(self):
+        # The only candidate with text shares no word with the miss: no text match, whatever its recency.
+        texts = analyze_shadow.StoredText(write_store({
+            "n1": ["sys", "work", "alpha beta gamma"], "p1": ["sys", "work", "delta epsilon zeta"]}))
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]), presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_by"], miss["unranked_reason"], miss["closest_score"]),
+                         ("earliest", "no_shared_words", None))
+
+    def test_an_empty_next_message_is_not_ranked(self):
+        # Two empty messages would score a perfect 1.0 against each other.
+        texts = analyze_shadow.StoredText(write_store({"n1": ["sys", "work", ""], "p1": ["sys", "work", ""]}))
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]), presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_by"], miss["unranked_reason"]), ("earliest", "own_text_empty"))
+
+    def test_a_text_pick_carries_its_score(self):
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        lines = [line("x", 1, "nightly", "n", "X", ["s", "w", "tx"]), presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual(miss["closest_by"], "text")
+        self.assertGreater(miss["closest_score"], 0.5)
+
+    def test_an_empty_store_path_is_refused(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            analyze_shadow.main([write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--store", ""])
 
     def test_a_store_without_blobs_is_refused(self):
         root = write_store(self.TEXTS)
