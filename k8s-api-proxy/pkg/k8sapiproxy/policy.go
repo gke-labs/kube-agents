@@ -208,12 +208,15 @@ func NewRequestInfoFactory() *request.RequestInfoFactory {
 	}
 }
 
-// SplitClusterPath validates u's path and splits off an optional /clusters/{id} prefix,
-// returning the target cluster and the API server path. A path without the prefix targets
-// defaultClusterID, or InClusterID when that is empty. Encoded separators, dot segments,
-// empty segments, backslashes and control characters are refused rather than cleaned, so
-// the path the policy classifies is the path the API server receives.
-func SplitClusterPath(u *url.URL, defaultClusterID string) (clusterID, apiPath string, err *PolicyError) {
+// SplitClusterPath validates u's path and splits off its /clusters/{id} prefix, returning
+// the target cluster and the API server path. A path without the prefix is refused: every
+// kubeconfig the sandbox builds names /clusters/<context>, so a request without one is a
+// client that dropped its server's base path (kubectl before 1.34 does on `get --raw`,
+// #4739), and serving it from a default cluster answered a fleet read with the host's
+// data. Encoded separators, dot segments, empty segments, backslashes and control
+// characters are refused rather than cleaned, so the path the policy classifies is the
+// path the API server receives.
+func SplitClusterPath(u *url.URL) (clusterID, apiPath string, err *PolicyError) {
 	if u == nil || !strings.HasPrefix(u.Path, "/") {
 		return "", "", invalidRoute("path must start with '/'")
 	}
@@ -247,11 +250,7 @@ func SplitClusterPath(u *url.URL, defaultClusterID string) (clusterID, apiPath s
 		return segments[1], "/" + strings.Join(segments[2:], "/"), nil
 	}
 
-	clusterID = strings.TrimSpace(defaultClusterID)
-	if clusterID == "" {
-		clusterID = InClusterID
-	}
-	return clusterID, u.Path, nil
+	return "", "", invalidRoute("name a cluster: /clusters/<context>/... (this request's path has no /clusters/ prefix, so its client dropped the kubeconfig server's base path)")
 }
 
 // Policy decides which requests reach the API server.

@@ -34,14 +34,17 @@ func TestSplitClusterPath(t *testing.T) {
 	tests := []struct {
 		name        string
 		target      string
-		defaultID   string
 		wantCluster string
 		wantPath    string
 		wantErr     bool
 	}{
-		{name: "default cluster", target: "/api/v1/pods", defaultID: gkeHost, wantCluster: gkeHost, wantPath: "/api/v1/pods"},
-		{name: "no default is in-cluster", target: "/api/v1/pods", wantCluster: InClusterID, wantPath: "/api/v1/pods"},
-		{name: "gke prefix", target: "/clusters/" + gkeFleet + "/api/v1/namespaces/default/pods", defaultID: gkeHost, wantCluster: gkeFleet, wantPath: "/api/v1/namespaces/default/pods"},
+		// No prefix is refused (#4739): kubectl before 1.34 drops the kubeconfig server's
+		// /clusters/<ctx> base path on `get --raw`, and a default cluster answered that
+		// fleet read with the host's data.
+		{name: "no prefix", target: "/api/v1/pods", wantErr: true},
+		{name: "no prefix, discovery", target: "/apis/metrics.k8s.io/v1beta1/nodes", wantErr: true},
+		{name: "no prefix, root", target: "/", wantErr: true},
+		{name: "gke prefix", target: "/clusters/" + gkeFleet + "/api/v1/namespaces/default/pods", wantCluster: gkeFleet, wantPath: "/api/v1/namespaces/default/pods"},
 		{name: "in-cluster prefix", target: "/clusters/in-cluster/apis/apps/v1/deployments", wantCluster: InClusterID, wantPath: "/apis/apps/v1/deployments"},
 		{name: "domain-scoped gke prefix", target: "/clusters/gke_example.com:proj_us-central1_c/api/v1/pods", wantCluster: "gke_example.com:proj_us-central1_c", wantPath: "/api/v1/pods"},
 		{name: "kind prefix", target: "/clusters/kind-dev.1/version", wantCluster: "kind-dev.1", wantPath: "/version"},
@@ -68,7 +71,7 @@ func TestSplitClusterPath(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse %q: %v", tc.target, err)
 			}
-			cluster, apiPath, perr := SplitClusterPath(u, tc.defaultID)
+			cluster, apiPath, perr := SplitClusterPath(u)
 			if tc.wantErr {
 				if perr == nil {
 					t.Fatalf("accepted (cluster=%q, path=%q)", cluster, apiPath)
@@ -86,10 +89,10 @@ func TestSplitClusterPath(t *testing.T) {
 			}
 		})
 	}
-	if _, _, perr := SplitClusterPath(&url.URL{Path: "api"}, ""); perr == nil {
+	if _, _, perr := SplitClusterPath(&url.URL{Path: "api"}); perr == nil {
 		t.Error("accepted a relative path")
 	}
-	if _, _, perr := SplitClusterPath(nil, ""); perr == nil {
+	if _, _, perr := SplitClusterPath(nil); perr == nil {
 		t.Error("accepted a nil URL")
 	}
 }

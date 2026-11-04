@@ -197,7 +197,6 @@ const (
 type Config struct {
 	Authenticator            CallerAuthenticator
 	Upstream                 UpstreamTransport
-	DefaultClusterID         string
 	Mode                     Mode
 	RedactSecrets            bool
 	AllowUpgradeSubresources bool
@@ -232,13 +231,11 @@ sequenceDiagram
 
 ### 3. URL routing and multi-cluster addressing
 
-`kube-proxy` serves both single-cluster and multi-cluster requests from one listener:
+Every request names its cluster in the path: `/clusters/{clusterID}/{k8s-path...}`.
 
-- **Explicit cluster prefix**: `/clusters/{clusterID}/{k8s-path...}`
-  - `{clusterID}` is the keyword `in-cluster`, a GKE context name matching `^gke_[a-z0-9-]+_[a-z0-9-]+_[a-z0-9-]+\z`, or a `kind-<cluster>` context name.
-  - `pkg/k8sapiproxy` extracts `{clusterID}` and rewrites `req.URL.Path` to `/{k8s-path...}` before running `RequestInfoFactory`.
-- **Default cluster root**: `/{k8s-path...}` (any path not starting with `/clusters/`)
-  - Routes to `Config.DefaultClusterID` (set from `KUBE_PROXY_DEFAULT_CLUSTER` or `KUBE_CONTEXT_NAME`, or `in-cluster` when unset).
+- `{clusterID}` is the keyword `in-cluster`, a GKE context name matching `^gke_[a-z0-9-]+_[a-z0-9-]+_[a-z0-9-]+\z`, or a `kind-<cluster>` context name.
+- `pkg/k8sapiproxy` extracts `{clusterID}` and rewrites `req.URL.Path` to `/{k8s-path...}` before running `RequestInfoFactory`.
+- A path that doesn't start with `/clusters/` is refused with `400 Bad Request`, naming the shape it needs. There is no default cluster. Every kubeconfig the sandbox builds already points each context at `/clusters/<context>`, the host's included, so the only requests without the prefix come from a client that dropped its server's base path. kubectl before 1.34 does that on `kubectl get --raw`, and a default cluster used to answer those fleet reads with the host's data and no error ([#4739](https://github.com/gke-labs/kube-agents/issues/4739)).
 
 Before parsing the path, `pkg/k8sapiproxy` rejects any request whose raw path contains `.` or `..` segments, empty internal segments (`//`), or percent-encoded slashes (`%2f`, `%2F`) with `400 Bad Request`. This guarantees that `RequestInfoFactory` and the upstream `kube-apiserver` interpret the URL path identically.
 

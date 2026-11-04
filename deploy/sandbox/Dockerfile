@@ -83,9 +83,14 @@ RUN apt-get update && \
 # k9s did not come across: it is a full-screen terminal UI, and every command
 # here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
 # could not run even if a skill asked for it. Nothing in agents/ does.
-ARG KUBECTL_VERSION=1.32.3
-ARG KUBECTL_SHA256_AMD64=ab209d0c5134b61486a0486585604a616a5bb2fc07df46d304b3c95817b2d79f
-ARG KUBECTL_SHA256_ARM64=6c2c91e760efbf3fa111a5f0b99ba8975fb1c58bb3974eca88b6134bcf3717e2
+# kubectl 1.35: the fleet runs GKE 1.35 and 1.36, inside kubectl's one-minor skew,
+# and from 1.34 `kubectl get --raw` keeps the kubeconfig server's /clusters/<context>
+# base path, which the k8s-api-proxy routes by (#4739). check_kubectl_base_path.py
+# below fails the build for a kubectl that drops it.
+ARG KUBECTL_VERSION=1.35.10
+ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
+ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
+COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) KUBECTL_SHA256="${KUBECTL_SHA256_AMD64}" ;; \
@@ -98,6 +103,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/libexec/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
     echo "${KUBECTL_SHA256}  /usr/local/libexec/kubectl" | sha256sum -c - && \
     chmod 0755 /usr/local/libexec/kubectl && \
+    python3 -I /tmp/check_kubectl_base_path.py /usr/local/libexec/kubectl && \
+    rm /tmp/check_kubectl_base_path.py && \
     printf '%s\n' \
       '#!/bin/sh' \
       'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
