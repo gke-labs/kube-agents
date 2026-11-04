@@ -293,6 +293,7 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 		{"manual is named before a malformed record", "", "manual", record(map[string]string{homeChannelRecordSlackKey: "D0DM"}), "", "", true, []string{"manual"}, []string{"not a channel id"}},
 		{"recorded channel the gateway refused", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordRefusedKey: "archived"}), "", "", true, []string{"C0LEARNED", "archived", "replaces it"}, nil},
 		{"recorded channel refused as malformed", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordRefusedKey: "malformed"}), "", "", true, []string{"C0LEARNED", "not a channel id"}, nil},
+		{"recorded group DM refused as a direct message", "", "", record(map[string]string{homeChannelRecordSlackKey: "G0MPIM", homeChannelRecordRefusedKey: "direct-message"}), "", "", true, []string{"G0MPIM", "direct or group direct message"}, []string{"does not know", "not a channel id"}},
 		{"refused candidate, known reason", "", "", record(map[string]string{homeChannelRecordRefusedKey: "shared"}), "", "", true, []string{"refused", "Slack Connect"}, nil},
 		{"refused candidate, unknown reason is not echoed", "", "", record(map[string]string{homeChannelRecordRefusedKey: strings.Repeat("x", 40000)}), "", "", true, []string{"refused", "does not know"}, nil},
 		{"malformed learned id", "", "", record(map[string]string{homeChannelRecordSlackKey: "D0DM"}), "", "", true, []string{"not a channel id"}, nil},

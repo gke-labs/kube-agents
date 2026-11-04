@@ -81,11 +81,12 @@ const (
 	homeChannelRecordMalformed = "<not a channel id>"
 
 	// The refusal vocabulary the gateway writes into slack.refused.
-	homeChannelRefusedShared    = "shared"
-	homeChannelRefusedArchived  = "archived"
-	homeChannelRefusedNotMember = "not-member"
-	homeChannelRefusedMalformed = "malformed"
-	homeChannelRefusedUnknown   = "a reason this operator does not know"
+	homeChannelRefusedShared        = "shared"
+	homeChannelRefusedArchived      = "archived"
+	homeChannelRefusedNotMember     = "not-member"
+	homeChannelRefusedMalformed     = "malformed"
+	homeChannelRefusedDirectMessage = "direct-message"
+	homeChannelRefusedUnknown       = "a reason this operator does not know"
 
 	// The HomeChannelUnset sentences that follow the base message
 	// (homeChannelUnsetMessageFormat) for Slack, at most one per message.
@@ -99,10 +100,11 @@ const (
 // homeChannelRefusedReasons maps the gateway's refusal vocabulary to the
 // sentence the condition carries; any other value reads as an unknown reason.
 var homeChannelRefusedReasons = map[string]string{
-	homeChannelRefusedShared:    "the channel is shared with another workspace (Slack Connect)",
-	homeChannelRefusedArchived:  "the channel is archived",
-	homeChannelRefusedNotMember: "the app is not a member of the channel",
-	homeChannelRefusedMalformed: "the recorded value is not a channel id",
+	homeChannelRefusedShared:        "the channel is shared with another workspace (Slack Connect)",
+	homeChannelRefusedArchived:      "the channel is archived",
+	homeChannelRefusedNotMember:     "the app is not a member of the channel",
+	homeChannelRefusedMalformed:     "the recorded value is not a channel id",
+	homeChannelRefusedDirectMessage: "the channel is a direct or group direct message",
 }
 
 // homeChannelRecord is what the operator read from the record ConfigMap.
