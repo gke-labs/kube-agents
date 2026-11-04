@@ -10,13 +10,17 @@ module assembles that block from three sources and nothing else:
 * the gateway pod, through one ``kubectl exec`` for each (optional): the session-kv
   task feed on its loopback port, rolled up to counts and durations, and the
   inference gateway's Prometheus text for token, spend and latency figures;
-* ``kubectl version`` and the gateway's ConfigMap for the Kubernetes version and
-  the model name (optional).
+* ``kubectl version`` for the Kubernetes version (optional); the model name is
+  the resource's ``status.inference``, and the gateway's ConfigMap whenever the
+  status has no ``inference`` key (optional): under an operator older than the
+  field, before this operator's first Ready write (so for a CR Degraded since it
+  was created), and under a served CRD that prunes the field.
 
 The block carries static enums, version strings, integer counters and durations.
 No cluster name, project id, namespace, task title, summary, result or error text
 reaches it: the task roll-up reads status and timestamps only, and ``main`` refuses
-to print a block in which any identifier read from the resource appears. Every
+to print a block in which any identifier read from the resource appears outside
+the ``model:`` line, which is printed by design. Every
 optional source that fails prints as ``unavailable``; the block never exceeds
 SUMMARY_MAX_LINES so a reader can check all of it before pasting.
 
@@ -163,11 +167,74 @@ COMPLETION_QUANTILES: Tuple[float, float] = (0.5, 0.95)
 PROMETHEUS_LINE = re.compile(r'^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>(?:[^"}]|"(?:[^"\\]|\\.)*")*)\})?\s+(?P<value>\S+)')
 PROMETHEUS_LABEL = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:[^"\\]|\\.)*)"')
 LITELLM_MODEL_LINE = re.compile(r"^\s*model:\s*['\"]?(?P<model>[A-Za-z0-9_./:@+-]+)", re.MULTILINE)
-#: A model given as a resource path (``vertex_ai/projects/<id>/locations/<region>/endpoints/<n>``)
-#: names a project and a region between its first segment and its last; the block
-#: prints the provider and the last segment only, so neither reaches it and the
-#: audit does not refuse a block over a project the spec also names.
+#: The environment lines, in the order the block prints them; the gateway's
+#: usageSummaryEnvironmentKeys verbatim.
+ENVIRONMENT_KEYS: Tuple[str, ...] = ("version", "mode", "model", "kubernetes", "installed", "interfaces")
+#: ``status.inference``: the operator's reading of the install's default model.
+INFERENCE_STATUS_KEY = "inference"
+INFERENCE_PROVIDER_FIELD = "provider"
+INFERENCE_MODEL_FIELD = "model"
+#: The model line's start; the audit runs over the block without this one line.
+MODEL_LINE_PREFIX = "  model: "
+#: The model_list entry whose model is the install's default (the operator's agentModelName).
+LITELLM_DEFAULT_MODEL_ALIAS = "model-default"
+#: The ``model_name: model-default`` line, quoted or bare, at any indent.
+LITELLM_DEFAULT_NAME_LINE = re.compile(
+    rf"^[ \t]*(?:-[ \t]+)?model_name:[ \t]*(?P<q>['\"]?){re.escape(LITELLM_DEFAULT_MODEL_ALIAS)}(?P=q)[ \t]*(?:#[^\n]*)?$",
+    re.MULTILINE,
+)
+#: The same line followed, within its entry (indented lines that open no new
+#: list item), by ``litellm_params:`` and that block's ``model:``, quoted or
+#: bare, captured possibly empty.
+#:
+#: Two valid YAML shapes are not read: an entry with ``litellm_params:`` before
+#: ``model_name:``, and an entry with a nested ``- `` list line between the name
+#: line and ``litellm_params:``. Each prints ``unavailable`` with no fallback. No
+#: config the repository renders uses either: the chart's
+#: ``kube-agents.litellmConfig``, the kustomize ``litellm/base`` and
+#: ``overlays/anthropic`` configs, and the ``examples/litellm-*`` configs all put
+#: the name line first. This path runs whenever the status has no
+#: ``inference`` key: under an operator older than ``status.inference``, before
+#: this operator's first Ready write (so for a CR Degraded since it was
+#: created), and under a served CRD that prunes the field.
+#:
+#: A hand-edited config can hit further divergences from the operator's Go
+#: parser: a flow-style entry (``- {model_name: model-default, litellm_params:
+#: {model: gemini/x}}``) reads ``unavailable`` here and the pair in Go; a nested
+#: mapping under ``litellm_params`` whose own ``model:`` key precedes the real
+#: one reads the nested value here; a ``#`` inside an unquoted value
+#: (``hosted_vllm/acme#v2``) is truncated at the ``#`` here and kept in Go; an
+#: unquoted value with a space (``gemini/flash 2``) reads the text before the
+#: space here and is malformed in Go; and two entries both named
+#: ``model-default``, the first in params-first order, read the second here and
+#: the first in Go.
+LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
+    LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
+    r"(?:(?:[ \t]+(?![ \t-])[^\n]*)?\n)*?"
+    r"[ \t]+litellm_params:[ \t]*(?:#[^\n]*)?\n"
+    r"(?:(?:[ \t]+(?![ \t-])(?!model:)[^\n]*)?\n)*?"
+    r"[ \t]+model:[ \t]*(?P<mq>['\"]?)(?P<model>[^'\"\s#]*)(?P=mq)",
+    re.MULTILINE,
+)
+#: A CRLF line end, normalised to LF before the LiteLLM regexes run: MULTILINE ``$``
+#: and the ``\n`` the entry pattern spells match only before LF.
+CRLF_LINE_END = "\r\n"
+LF_LINE_END = "\n"
+#: A LiteLLM model is ``<provider>/<name>``, split at the first separator.
 MODEL_SEGMENT_SEPARATOR = "/"
+#: A name that starts with this is a Vertex AI endpoint path
+#: (``projects/<id>/locations/<region>/endpoints/<n>``): only its last segment is kept.
+MODEL_RESOURCE_PATH_PREFIX = "projects/"
+#: The shortest full path, ``projects/<p>/locations/<l>/<kind>/<id>``, in segments.
+MODEL_RESOURCE_PATH_MIN_SEGMENTS = 6
+#: Where a full path carries its ``locations`` segment.
+MODEL_RESOURCE_PATH_LOCATIONS_INDEX = 2
+MODEL_RESOURCE_PATH_LOCATIONS = "locations"
+#: A name segment that starts with this is a Bedrock ARN: only its resource id is kept.
+MODEL_ARN_PREFIX = "arn:"
+MODEL_ARN_FIELD_SEPARATOR = ":"
+#: A full ARN's field count: ``arn:partition:service:region:account:resource``.
+MODEL_ARN_FIELDS = 6
 FEEDBACK_TEMPLATE: Tuple[str, ...] = (
     "feedback:",
     "  Rating: [ 👍 / 👎 / 😐 ]",
@@ -322,20 +389,106 @@ def histogram_quantiles(samples: Iterable[Sample], family: str, quantiles: Seque
     return tuple(results)
 
 
-def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
-    """The first provider-qualified model the gateway routes to, as ``provider/name``.
+def trim_model_name(name: str) -> str:
+    """The name after the provider, with a resource reference cut to its resource id.
 
-    A resource path keeps its provider and its last segment only: the segments
-    between them name a project and a region.
+    A reference must have its full shape, or the name is malformed and ``""``
+    comes back. A Vertex AI path needs ``projects/<p>/locations/<l>/<kind>/<id>``
+    at least and keeps the text after its last ``/``. A name with a segment that
+    starts with ``arn:`` needs six ``:`` fields from there
+    (``arn:partition:service:region:account:resource``) with a non-empty resource
+    part, and keeps the text after the resource part's last ``/``, or, without
+    one, the text after its last ``:``. So no project id, region or account id is
+    printed. Every other name is kept as typed.
+    """
+    segments = name.split(MODEL_SEGMENT_SEPARATOR)
+    if name.startswith(MODEL_RESOURCE_PATH_PREFIX):
+        if (
+            len(segments) < MODEL_RESOURCE_PATH_MIN_SEGMENTS
+            or segments[MODEL_RESOURCE_PATH_LOCATIONS_INDEX] != MODEL_RESOURCE_PATH_LOCATIONS
+        ):
+            return ""
+        return segments[-1]
+    for index, segment in enumerate(segments):
+        if not segment.startswith(MODEL_ARN_PREFIX):
+            continue
+        arn = MODEL_SEGMENT_SEPARATOR.join(segments[index:])
+        fields = arn.split(MODEL_ARN_FIELD_SEPARATOR, MODEL_ARN_FIELDS - 1)
+        if len(fields) < MODEL_ARN_FIELDS or not fields[-1]:
+            return ""
+        resource = fields[-1]
+        if MODEL_SEGMENT_SEPARATOR in resource:
+            return resource.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]
+        return resource.rsplit(MODEL_ARN_FIELD_SEPARATOR, 1)[-1]
+    return name
+
+
+def _valid_provider(provider: str) -> bool:
+    """A provider slug: not empty, no whitespace, and not itself a bare ARN or Vertex AI path."""
+    return (
+        bool(provider)
+        and not any(c.isspace() for c in provider)
+        and not provider.startswith(MODEL_ARN_PREFIX)
+        and MODEL_ARN_FIELD_SEPARATOR not in provider
+        and provider != MODEL_RESOURCE_PATH_PREFIX.rstrip(MODEL_SEGMENT_SEPARATOR)
+    )
+
+
+def split_model(litellm_model: str) -> Optional[str]:
+    """``provider/name`` with both sides non-empty after trimming, else None (malformed).
+
+    Whitespace on either side is malformed: the line must stay one line.
+    """
+    if litellm_model.endswith(MODEL_SEGMENT_SEPARATOR):
+        return None
+    provider, found, name = litellm_model.partition(MODEL_SEGMENT_SEPARATOR)
+    if not found or not _valid_provider(provider):
+        return None
+    name = trim_model_name(name)
+    if not name or any(c.isspace() for c in name):
+        return None
+    return f"{provider}{MODEL_SEGMENT_SEPARATOR}{name}"
+
+
+def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
+    """The install's default model as the gateway's config states it, as ``provider/name``.
+
+    The operator's rule, ported: the entry named ``model-default`` answers when
+    it exists, and a malformed model there is None with no fallback; only when
+    no entry carries that name does the first well-formed provider-qualified
+    ``model:`` line answer.
     """
     if not config_yaml:
         return None
+    config_yaml = config_yaml.replace(CRLF_LINE_END, LF_LINE_END)
+    if LITELLM_DEFAULT_NAME_LINE.search(config_yaml):
+        entry = LITELLM_DEFAULT_ENTRY_MODEL.search(config_yaml)
+        return split_model(entry.group("model")) if entry else None
+    # The scan reads every ``model:`` line, while the operator's parser reads only
+    # ``model_list[].litellm_params.model``: a ``model:`` key elsewhere in the
+    # config can answer here and not in the operator. A CRLF config reads the
+    # same as LF: the line ends are normalised above.
     for match in LITELLM_MODEL_LINE.finditer(config_yaml):
-        model = match.group("model")
-        if MODEL_SEGMENT_SEPARATOR in model:
-            provider, _, path = model.partition(MODEL_SEGMENT_SEPARATOR)
-            return f"{provider}{MODEL_SEGMENT_SEPARATOR}{path.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]}"
+        model = split_model(match.group("model"))
+        if model:
+            return model
     return None
+
+
+def model_from_status(status: Mapping[str, Any]) -> Optional[str]:
+    """``provider/model`` from ``status.inference``; UNAVAILABLE when the key is
+    present without both fields (the operator's definite negative); None when the
+    key is absent (an operator older than the field, no Ready write yet, or a
+    served CRD that prunes it)."""
+    if INFERENCE_STATUS_KEY not in status:
+        return None
+    inference = status.get(INFERENCE_STATUS_KEY)
+    if not isinstance(inference, Mapping):
+        return UNAVAILABLE
+    provider, model = inference.get(INFERENCE_PROVIDER_FIELD), inference.get(INFERENCE_MODEL_FIELD)
+    if isinstance(provider, str) and isinstance(model, str) and provider and model:
+        return f"{provider}{MODEL_SEGMENT_SEPARATOR}{model}"
+    return UNAVAILABLE
 
 
 # --- the roll-up ----------------------------------------------------------------
@@ -410,6 +563,21 @@ def audit(text: str, identifiers: Iterable[str]) -> List[str]:
     return leaked
 
 
+def _without_model_line(text: str) -> str:
+    """The block less its first ``model:`` line, the one line printed by design.
+
+    A deployment name can carry a spec identifier as a segment
+    (``hosted_vllm/acme/llama-8b`` beside an ``org`` of ``acme``); the line is
+    never the reason a block is refused, and every other line stays audited.
+    """
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if line.startswith(MODEL_LINE_PREFIX):
+            del lines[index]
+            break
+    return "\n".join(lines)
+
+
 # --- rendering ------------------------------------------------------------------
 
 def _duration(seconds: float) -> str:
@@ -457,13 +625,19 @@ def render(snapshot: Snapshot) -> str:
     spec, status = cr.get("spec") or {}, cr.get("status") or {}
     usage = status.get("usage") or {}
     lines: List[str] = ["```", f"{SUMMARY_TITLE} ({now.strftime('%Y-%m-%d')})", "environment:"]
-    lines.append(f"  version: {(spec.get('deployment') or {}).get('tag') or UNKNOWN}")
-    lines.append(f"  mode: {spec.get('mode') or DEFAULT_MODE}")
-    lines.append(f"  model: {model_from_litellm_config(snapshot.litellm_config) or UNAVAILABLE}")
-    lines.append(f"  kubernetes: {_server_version(snapshot.server_version)}")
-    lines.append(f"  installed: {_install_age(cr, now)}; ready: {_ready(cr)}")
+    model = model_from_status(status)
+    if model is None:
+        model = model_from_litellm_config(snapshot.litellm_config) or UNAVAILABLE
     interfaces = usage.get("activeInterfaces") or []
-    lines.append(f"  interfaces: {', '.join(sorted(str(i) for i in interfaces)) or NONE}")
+    environment = {
+        "version": (spec.get("deployment") or {}).get("tag") or UNKNOWN,
+        "mode": spec.get("mode") or DEFAULT_MODE,
+        "model": model,
+        "kubernetes": _server_version(snapshot.server_version),
+        "installed": f"{_install_age(cr, now)}; ready: {_ready(cr)}",
+        "interfaces": ", ".join(sorted(str(i) for i in interfaces)) or NONE,
+    }
+    lines.extend(f"  {key}: {environment[key]}" for key in ENVIRONMENT_KEYS)
     lines.append("usage:")
     for counter in USAGE_COUNTERS:
         value = usage.get(counter)
@@ -622,7 +796,12 @@ def collect(options: Options) -> Snapshot:
             server_version = json.loads(raw_version)
         except ValueError:
             server_version = None
-    litellm_config = _litellm_config(options)
+    # The ConfigMap is the fallback for a status with no ``inference`` key (an
+    # operator older than the field, no Ready write yet, or a served CRD that
+    # prunes it); with the key present the listing would be fetched and thrown
+    # away, so it is not made.
+    status = cr.get("status") if isinstance(cr.get("status"), Mapping) else {}
+    litellm_config = None if INFERENCE_STATUS_KEY in status else _litellm_config(options)
     tasks: Optional[Sequence[Mapping[str, Any]]] = None
     truncated = False
     metrics: Optional[str] = None
@@ -677,7 +856,7 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
     if missing and options.in_pod:
         detail = "; ".join(f"{name}: {snapshot.source_reasons.get(name, REASON_EXEC)}" for name in missing)
         print(f"feedback-summary: could not be read: {detail}", file=stderr)
-    leaked = audit(text, snapshot.identifiers)
+    leaked = audit(_without_model_line(text), snapshot.identifiers)
     if leaked:
         print(f"feedback-summary: refused to print: the block names {', '.join(leaked)}", file=stderr)
         return EXIT_LEAK

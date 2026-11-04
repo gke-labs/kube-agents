@@ -203,11 +203,12 @@ lets the budget admit more, up to the slot cap, and lowering it cannot OOM while
 such a limit at reconcile, and the webhook refuses it at apply where it is enabled. The output term is
 the worst case, a request holding its full capped output, which a listing never does; charging
 captured bytes instead of the cap would roughly double the concurrency and is the refinement to
-measure first if four proves tight. One install in this repository does raise it: the smoke
-pipeline's (`hack/ci-deploy.sh`, `EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT`), whose lanes of Platform
-Agents fanning Cluster Agents out over the seeded fleet queued behind four slots to median
-waits of 8 to 22 s and a longest wait inside the refusal bound, so it runs the proxy at 2Gi,
-where the budget admits nine and the slot cap binds again.
+measure first if four proves tight. One install in this repository raised it while the default
+was 1Gi: the smoke pipeline's (`hack/ci-deploy.sh`, `EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT`), whose
+lanes of Platform Agents fanning Cluster Agents out over the seeded fleet queued behind four
+slots to median waits of 8 to 22 s and a longest wait inside the refusal bound, so it ran the
+proxy at 2Gi, where the budget admits nine and the slot cap binds again. The default is now 2Gi
+too, and the pipeline keeps the figure as a pin.
 
 ### 2.3 Waiting, refusing, and the degenerate case
 

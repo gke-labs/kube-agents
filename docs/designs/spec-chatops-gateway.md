@@ -606,7 +606,7 @@ with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <tex
 refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
 stripped before the gateway reads the text, and in a channel thread the next message needs the
 mention too: the adapter forwards an unmentioned reply only once a task has started there (or under the bot's own post), and
-the ack says so. In a Slack DM the next message has to be in the same thread (the Slack
+the ack says so. In a Slack or Google Chat DM the next message has to be in the same thread (the
 adapter's conversation keys), and the ack says that instead. The way back is answered even on an install whose spawner has since been disarmed, so a
 record left session-routed by a rollback can always re-home. It is a debugging and opt-in door for the transition,
 not the taught interface. The default flips when the delegation primitive lands: the session's request to
@@ -1458,21 +1458,21 @@ and drops; in a DM (measured) it equals `text` with nothing stripped and no ment
 annotation — a typed `@app` there is plain text to Chat, and is delivered verbatim.
 
 **Conversation keys.** `gchat:spaces/AAA/threads/BBB` for a message in a threaded
-space — the canonical example above. In a DM space, top-level messages share one conversation,
-`gchat:dm/spaces/AAA`, answered top-level, and a message typed inside an existing thread is
-a side thread, its own conversation `gchat:dm/spaces/AAA/threads/BBB`, answered in that
-thread. This is the main-flow and side-thread rule of the Hermes Google Chat adapter that
-`today` runs.
-Chat attaches a thread to every DM message, the one it auto-created for a top-level message
-included, so the thread name cannot tell them apart; Chat's `message.threadReply` flag does
-(true only for a reply in a thread, per the Chat API `Message` resource; measured: the
-captured in-thread DM reply carries it and the top-level DMs omit it). Hermes infers the
-split from a persisted per-thread inbound count instead, and the gateway keeps no count.
-The two differ on one case: the first reply into a thread Hermes has counted no inbound
-message in, such as the thread under a bot-posted report, is main flow to Hermes
-(`cron-report-relay.md`, "The first reply into a report's thread") and a side thread here. A record minted under the thread-less key before side threads existed still
-parses and posts top-level, and `openDirect` returns that key, so an unsolicited post to a
-DM lands top-level. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
+space — the canonical example above. In a DM space every message a user sends keys the
+thread Chat attached to it, `gchat:dm/spaces/AAA/threads/BBB`, top-level or reply, and is answered in that thread. A reply
+typed in the thread continues it, and two top-level asks are two conversations: the DM rule of
+[the Slack adapter](#the-slack-adapter-added-94). Chat attaches a thread to every DM message,
+the one it auto-created for a top-level message included, so the thread name cannot tell a
+top-level ask from a reply; Chat's `message.threadReply` flag does (true only for a reply in a
+thread, per the Chat API `Message` resource; measured: the captured in-thread DM reply carries
+it and the top-level DMs omit it). The adapter reads it to mark a top-level ask
+`InboundMessage.TopLevel`, and it decides nothing about the key. The Hermes Google Chat adapter
+that `today` runs keeps its main-flow and side-thread rule, inferred from a persisted per-thread
+inbound count (`cron-report-relay.md`, "The first reply into a report's thread"), so the two
+modes differ on every top-level DM. The design is
+[`gchat-dm-thread-per-ask.md`](gchat-dm-thread-per-ask.md). A record minted under the
+thread-less key `gchat:dm/spaces/AAA` still parses and posts top-level, and `openDirect`
+returns that key, so an unsolicited post to a DM lands top-level. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
 `GROUP_CHAT`, binds the whole space as one conversation, `gchat:space/spaces/AAA`;
 anything that is not positively a DM is read as a group, since a space misread as a DM
 would bind every thread in it to one session — the honest reading of "a space is
@@ -1765,10 +1765,11 @@ redelivered click is a duplicate like a redelivered message, and a click or repl
 sender the gateway drops changes
 nothing. A remembered question binds its click to the conversation it was posted in; the
 event's surface binds only a click on one the adapter does not remember. A question posted
-to the home channel (chat.notify) has no conversation at post time, so its click binds to the
-thread the post is in, in the kind the event names (its buttons carry a mark that says it is a
-home card's, so the binding survives a restart), and a typed reply in its thread does not answer
-it; its buttons do. A
+to the home channel (chat.notify) has no conversation at post time, so its click binds by the
+same surface rule as a typed message, to the thread the event names, in the kind the event
+names, or, where the adapter clears the thread (an unthreaded space, a click event with no
+thread name), to the shared space, as a typed message there does, so the binding survives a restart without any mark, and a typed reply in its thread
+does not answer it; its buttons do. A
 rewrite that fails posts the line in the conversation instead. The questions and answers
 are held in the process: after a restart a question keeps its buttons until clicked, the click
 is still a turn, and the rewrite reads the message the event carries, its text, its link
@@ -1851,8 +1852,8 @@ thread is the session in a DM as in a channel. So `stop`, a status question and
 `/session` act on the thread they are typed in. A `stop` or a status question typed at
 the top of the DM is a conversation with nothing running in it, so it starts no task
 and its reply says to send it in the question's thread instead; the adapter marks such
-a message top-level (`InboundMessage.TopLevel`, set only for a top-level DM), and the
-gateway keys the where-to-send-it reply on that mark. A `stop` in a thread with
+a message top-level (`InboundMessage.TopLevel`, set for a top-level Slack or Google Chat
+DM), and the gateway keys the where-to-send-it reply on that mark. A `stop` in a thread with
 nothing running gets "nothing is running": the plain reply when the conversation has
 never run a task (a question refused at the session cap, say), and otherwise one that
 adds that if the agent filed a card, that card keeps working until it finishes, since

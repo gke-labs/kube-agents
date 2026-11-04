@@ -563,7 +563,7 @@ func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m 
 	if err != nil {
 		return "", "", gchatLayoutError(err, false)
 	}
-	a.trackQuestion(message, conversation, landed, m.Chat, layout)
+	a.trackQuestion(message, conversation, m.Chat, layout)
 	return message, landed, nil
 }
 
@@ -596,28 +596,28 @@ func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMes
 	if _, _, ok := gchatSpaceThread(conversation); !ok {
 		return fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
 	}
-	return a.editLaidOut(conversation, "", messageID, m)
+	return a.editLaidOut(conversation, messageID, m)
 }
 
 // EditNotifyMessage is EditMessage for the chat.notify route's home posts
 // (notifyChatEditor): the message, on thread in space, edited in place. A
 // question it carries stays bound to no conversation, as a home post's is
-// (createLaidOut), and to thread, so its click binds to the thread in the
-// kind the click's event names.
+// (createLaidOut), so its click binds to the thread the click's event names
+// (classifyClick).
 func (a *GoogleChatAdapter) EditNotifyMessage(space, thread, messageID string, m OutMessage) error {
 	if !gchatIsSpaceName(space) {
 		return fmt.Errorf("gchat: not a space name: %q", space)
 	}
-	return a.editLaidOut("", thread, messageID, m)
+	return a.editLaidOut("", messageID, m)
 }
 
 // editLaidOut patches messageID to m, laid out when m carries a chat
 // message and as text otherwise, and tracks the question it opens or closes
-// under conversation, or under thread for a home post. A re-ask whose
+// under conversation, or under no conversation for a home post. A re-ask whose
 // layout is refused forgets the earlier answer, since the notifier's text
 // edit follows and must not carry the answer's line; one that fails with the
 // message left as it was keeps the answer the message still shows.
-func (a *GoogleChatAdapter) editLaidOut(conversation, thread, messageID string, m OutMessage) error {
+func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMessage) error {
 	layout := gchatChatLayout{Text: toGchatText(m.Text)}
 	asks := m.Chat != nil && len(m.Chat.Choices) > 0
 	if m.Chat != nil {
@@ -645,7 +645,7 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, thread, messageID string, 
 		}
 		return err
 	}
-	a.trackQuestion(messageID, conversation, thread, m.Chat, layout)
+	a.trackQuestion(messageID, conversation, m.Chat, layout)
 	return nil
 }
 
@@ -1207,6 +1207,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 		Kind:         kind,
 		AuthorID:     sender.Email,
 		MessageID:    ev.Message.Name,
+		TopLevel:     kind == sessionKindDM && thread != "" && !ev.Message.ThreadReply,
 		Text:         text,
 	}
 	a.noteTypedAnswer(msg, sender)
@@ -1430,7 +1431,7 @@ func (g *Gateway) resolveA2AGooglePrincipal(authorID string) string {
 // gchatConversationID mints the session key for one inbound message. space is
 // the Chat space resource name ("spaces/AAA"), thread the thread resource name
 // ("spaces/AAA/threads/BBB", empty when the message binds the whole space),
-// kind "dm" or "group". A DM side thread keeps the DM prefix, so the key
+// kind "dm" or "group". A DM thread keeps the DM prefix, so the key
 // says what the record's Kind says.
 func gchatConversationID(space, thread, kind string) string {
 	switch {
@@ -1454,9 +1455,8 @@ func gchatSpaceThread(conversation string) (space, thread string, ok bool) {
 		return rest, "", true
 	}
 	if rest, found := strings.CutPrefix(conversation, gchatDMKeyPrefix); found {
-		// A DM binds the whole space (top-level messages, and the
-		// thread-less key every pre-side-thread record carries) or one
-		// side thread.
+		// A DM binds the whole space (the thread-less key legacy
+		// records carry) or one thread.
 		if gchatIsSpaceName(rest) {
 			return rest, "", true
 		}

@@ -313,7 +313,7 @@ HERMES_SSH=(ssh "${SSH_OPTS[@]}" hermes@127.0.0.1)
 check "the same key opens a hermes session" "hermes" "$("${HERMES_SSH[@]}" whoami 2>&1)"
 check "hermes gets the forwarded proxy URL too" "http://127.0.0.1:9999" \
   "$("${HERMES_SSH[@]}" 'echo "$CREDENTIAL_PROXY_URL"' 2>&1)"
-check "hermes gets the wrapper PATH too" "/opt/credential-proxy/bin/kubectl" \
+check "hermes gets stock kubectl on PATH" "/usr/local/bin/kubectl" \
   "$("${HERMES_SSH[@]}" 'command -v kubectl' 2>&1)"
 
 # The property the whole account exists for: nothing the model leaves behind
@@ -910,11 +910,11 @@ check_absent "and none fell back to a connection of its own" "disabling multiple
 ssh "${SSH_OPTS[@]}" -o "ControlPath=$CONTROL_PATH" -O exit agent@127.0.0.1 2>/dev/null
 
 echo
-echo "== 5. credential-proxy wrappers =="
-for cli in kubectl gcloud; do
-  check "$cli resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/$cli" \
-    "$("${SSH[@]}" "command -v $cli" 2>&1)"
-done
+echo "== 5. credential-proxy wrappers and stock kubectl =="
+check "gcloud resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/gcloud" \
+  "$("${SSH[@]}" "command -v gcloud" 2>&1)"
+check "kubectl resolves to stock kubectl in /usr/local/bin" "/usr/local/bin/kubectl" \
+  "$("${SSH[@]}" "command -v kubectl" 2>&1)"
 # Non-login is the shape of every command the agent sends, and the case that
 # reads no /etc/profile. This is the check that caught the original bug: PATH
 # arrived and CREDENTIAL_PROXY_URL did not, so the wrappers resolved and then
@@ -928,16 +928,16 @@ check "and into a login session" "http://127.0.0.1:9999" \
 # path gets a 401 from every wrapper rather than a connection error.
 check "CREDENTIAL_PROXY_TOKEN_FILE crosses too" "/var/run/secrets/kubeagents/credential-proxy/token" \
   "$("${SSH[@]}" 'echo "$CREDENTIAL_PROXY_TOKEN_FILE"' 2>&1)"
-check "the wrapper dispatches rather than refusing to start" "credential proxy" \
-  "$("${SSH[@]}" 'kubectl version 2>&1' 2>&1)"
-check "leeway report dispatches cluster reads through the kubectl wrapper" "credential proxy" \
+check "the gcloud wrapper dispatches rather than refusing to start" "credential proxy" \
+  "$("${SSH[@]}" 'gcloud version 2>&1' 2>&1)"
+check "leeway report dispatches cluster reads through stock kubectl" "kubectl get nodes" \
   "$("${SSH[@]}" 'leeway report --clusters p/l/c' 2>&1)"
 check "the wrappers are on PATH" "/opt/credential-proxy/bin:" \
   "$("${SSH[@]}" 'echo "$PATH"' 2>&1)"
 # A login shell runs /etc/profile, which overwrites PATH wholesale; profile.d is
 # what puts the wrappers back. Both paths, because only one of them is sshd's.
-check "PATH survives /etc/profile in a login shell" "/opt/credential-proxy/bin/kubectl" \
-  "$("${SSH[@]}" 'bash -l -c "command -v kubectl"' 2>&1)"
+check "PATH survives /etc/profile in a login shell" "/opt/credential-proxy/bin/gcloud" \
+  "$("${SSH[@]}" 'bash -l -c "command -v gcloud"' 2>&1)"
 
 echo
 echo "== 5b. the version-control skill's local git =="
