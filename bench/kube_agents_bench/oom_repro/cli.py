@@ -442,7 +442,8 @@ def fleet_load(args: argparse.Namespace) -> None:
     It only grows a cluster: KWOK nodes, namespaces and Deployments above the size given would stay,
     sized for fewer real nodes, so a smaller --nodes, --namespaces or --deployments than the cluster
     has is refused, and a real node pool already at its size or above it is left as it is. A smaller
-    --replicas scales the Deployments down.
+    --replicas scales the Deployments down. An Events-only cluster, with workload namespaces but no KWOK
+    nodes or Deployments, is refused.
     """
     fleet = Fleet(args)
     names = load_targets(args.names, fleet.names())
@@ -450,7 +451,7 @@ def fleet_load(args: argparse.Namespace) -> None:
     for name in names:
         machine = pool_machine_type(fleet, name)
         if machine != FULL_MACHINE_TYPE:
-            raise SystemExit(f"{name} runs {machine}, not {FULL_MACHINE_TYPE}: an Events-only cluster is not grown")
+            raise SystemExit(f"{name} runs {machine}, not {FULL_MACHINE_TYPE}: fleet load grows full clusters only")
         fleet.credentials(name)  # serially: get-credentials writes one shared kubeconfig
         have = kwok_node_count(fleet, name)
         if have > args.nodes:
@@ -463,6 +464,9 @@ def fleet_load(args: argparse.Namespace) -> None:
         if deployments > args.deployments:
             raise SystemExit(f"{name} has {deployments} Deployments per workload namespace, more than --deployments "
                              f"{args.deployments}; fleet load only grows")
+        if spaces and not have and not deployments:
+            raise SystemExit(f"{name} has workload namespaces but no KWOK nodes or Deployments: an Events-only "
+                             "cluster is not grown")
         if real_node_count(fleet, name) < real_nodes(args.nodes):
             grow.append(name)
     with pool(len(names)) as workers:
