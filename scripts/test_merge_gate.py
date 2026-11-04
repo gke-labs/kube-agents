@@ -532,6 +532,41 @@ def node(number, labels, auto_merge=False, queue_entry=None, contexts=(), timeli
     }
 
 
+class PullsQueryTest(unittest.TestCase):
+    """The open-PR query pages small enough to answer, and reads every page."""
+
+    def test_the_page_size_is_below_the_size_that_timed_out(self):
+        # The sweep 504'd at 50; the fix is a smaller page, not more retries.
+        self.assertLess(gate.PULLS_PAGE_SIZE, 50)
+        self.assertGreaterEqual(gate.PULLS_PAGE_SIZE, 1)
+
+    def test_the_query_graphql_pulls_sends_asks_for_the_page_size(self):
+        # Drives the call site, so a page key that regressed to a literal is caught.
+        api = FakeAPI()
+        with mock.patch.object(gate, "PULLS_PAGE_SIZE", 13):
+            gate.graphql_pulls(api)
+        self.assertIn("first: 13, after: $after", api.queries[0])
+
+    def test_every_page_is_read_and_the_cursor_is_followed(self):
+        class PagingAPI:
+            def __init__(self):
+                self.repo = REPO
+                self.afters = []
+
+            def graphql(self, query, variables):
+                self.afters.append(variables["after"])
+                if variables["after"] is None:
+                    page = {"pageInfo": {"hasNextPage": True, "endCursor": "CURSOR1"}, "nodes": [node(1, APPROVED)]}
+                else:
+                    page = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [node(2, APPROVED)]}
+                return {"repository": {"pullRequests": page}}
+
+        api = PagingAPI()
+        pulls = gate.graphql_pulls(api)
+        self.assertEqual([pull["number"] for pull in pulls], [1, 2])
+        self.assertEqual(api.afters, [None, "CURSOR1"])
+
+
 class RollupTest(unittest.TestCase):
     def test_statuses_read_in_rest_form_and_check_runs_are_skipped(self):
         check_run = {"__typename": "CheckRun", "name": "cla/google", "status": "COMPLETED", "conclusion": "SUCCESS"}
