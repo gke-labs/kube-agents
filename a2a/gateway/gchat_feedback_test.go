@@ -1264,9 +1264,42 @@ func TestGchatRatingAfterARatedAnsweredRewriteDrawsOnePair(t *testing.T) {
 	}
 	a.classify(gchatRatingEvent(t, "up"))
 	n := relayCallCount(f)
+	edited := bodyButtons(t, checkPatch(t, f, n-2, name))
+	if len(edited) != 2 {
+		t.Fatalf("buttons on the edit = %+v, want one rating pair", edited)
+	}
+	checkFilled(t, edited, "down")
 	buttons := bodyButtons(t, checkPatch(t, f, n-1, name))
 	if len(buttons) != 2 {
 		t.Fatalf("buttons after the edit and a tap = %+v, want one rating pair", buttons)
 	}
 	checkFilled(t, buttons, "up")
+}
+
+// A rewrite after a restart puts the rating it drew from the event's copy on
+// record, so a later edit keeps the buttons and the filled one.
+func TestGchatEditAfterARestartRewriteKeepsTheRatingAsShown(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	ev := gchatRatedClickEvent(t, gchatRating{task: "t-root", chosen: "down"})
+	msg, reason := a.classify(ev)
+	if reason != "" {
+		t.Fatalf("choice click: %q", reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	if err := a.EditMessage(msg.Conversation, ev.Message.Name, OutMessage{Text: "settled"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := relayCallCount(f); n != 2 {
+		t.Fatalf("relay calls = %d, want the rewrite and the edit", n)
+	}
+	body := checkPatch(t, f, 1, ev.Message.Name)
+	if text, _ := body["text"].(string); !strings.HasPrefix(text, "settled") || !strings.HasSuffix(text, "✓ Test Sender: Look at the first one") {
+		t.Errorf("edit text = %q, want the new text and the answered line", text)
+	}
+	// The edit names no links, so the rating pair is all it carries.
+	buttons := bodyButtons(t, body)
+	if len(buttons) != 2 {
+		t.Fatalf("buttons = %+v, want the two rating buttons", buttons)
+	}
+	checkFilled(t, buttons, "down")
 }

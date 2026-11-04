@@ -503,8 +503,11 @@ func (a *GoogleChatAdapter) InboundVerified(conversation, messageID string, veri
 		// button. A message it does not remember (posted before a restart)
 		// keeps the buttons the click's event showed.
 		rating := a.ratingOf(p.message)
-		if rating.task == "" {
+		if rating.task == "" && p.rating.task != "" {
+			// On record from here, so a later edit keeps the buttons as
+			// drawn (answeredLayout).
 			rating = p.rating
+			a.rememberRating(p.message, rating)
 		}
 		layout := gchatAnsweredLayout(gchatChatLayout{Text: p.text}, p.links, rating, line)
 		a.rewriteAnswered(conversation, p.message, layout, line)
