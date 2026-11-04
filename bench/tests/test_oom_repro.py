@@ -531,6 +531,139 @@ def test_create_cluster_gives_gcloud_its_own_kubeconfig(monkeypatch, tmp_path):
     args = cli.parse(["--project", "p", "--out", str(tmp_path), "fleet", "create", "--clusters", "1"])
     envs = []
     monkeypatch.setattr(cli, "run", lambda cmd, env=None, **kw: envs.append((cmd, env)) or "")
-    cli.create_cluster(cli.Fleet(args), "oom-01", 100, events_only=False)
+    cli.create_cluster(cli.Fleet(args), "oom-01", 100, events_only=False, kwok_nodes=args.nodes)
     create_env = next(env for cmd, env in envs if "create" in cmd and "clusters" in cmd)
     assert create_env["KUBECONFIG"].endswith("create-oom-01.kubeconfig")
+
+
+def test_sizes_carry_the_default_and_l_limits_for_every_scenario_container():
+    assert cli.SIZES["default"] == cli.DEFAULT_LIMITS
+    assert cli.SIZES["L"] == {"credentialProxy": {"cpu": "8", "memory": "8G"},
+                              "agentAPIAuth": {"cpu": "2", "memory": "4G"},
+                              "shellSandbox": {"cpu": "8", "memory": "8G"}}
+    assert set(cli.SIZES["L"]) == set(cli.RESOURCE_PATHS)
+
+
+def test_limits_for_follows_the_size_argument(tmp_path):
+    args = cli.parse(["--host-context", "c", "--out", str(tmp_path), "proxy", "--size", "L"])
+    assert cli.limits_for(args.size, "shellSandbox") == {"cpu": "8", "memory": "8G"}
+    assert cli.limits_for("default", "agentAPIAuth") == {"cpu": "1", "memory": "2Gi"}
+
+
+def test_real_nodes_grow_with_the_kwok_node_count():
+    assert cli.real_nodes(1500) == 6
+    assert cli.real_nodes(1501) == 7
+    assert cli.real_nodes(3000) == 12
+
+
+def test_parse_takes_a_size_and_fleet_load_requires_names(tmp_path):
+    assert cli.parse(["--host-context", "c", "--out", str(tmp_path), "watcher"]).size == "default"
+    with pytest.raises(SystemExit):
+        cli.parse(["--host-context", "c", "--out", str(tmp_path), "proxy", "--size", "XXL"])
+    with pytest.raises(SystemExit):
+        cli.parse(["--project", "p", "--out", str(tmp_path), "fleet", "load"])
+    args = cli.parse(["--project", "p", "--out", str(tmp_path), "fleet", "load", "--names", "oom-01,oom-02"])
+    assert args.names == "oom-01,oom-02"
+
+
+def test_load_targets_refuses_names_outside_the_fleet():
+    assert cli.load_targets("oom-01,oom-02", ["oom-01", "oom-02", "oom-03"]) == ["oom-01", "oom-02"]
+    with pytest.raises(SystemExit):
+        cli.load_targets("oom-01,kwok-09", ["oom-01", "oom-02"])
+    with pytest.raises(SystemExit):
+        cli.load_targets(",", ["oom-01"])
+
+
+def test_fleet_preset_matches_the_fleet_values_file():
+    from pathlib import Path
+    values = yaml.safe_load((Path(__file__).resolve().parents[2] / "charts" / "kube-agents" / "examples" /
+                             "values-fleet.yaml").read_text())
+    found = {}
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("credentialProxy", "agentAPIAuth") and isinstance(value, dict) and "resources" in value:
+                    found[key] = value["resources"]["limits"]
+                walk(value)
+    walk(values)
+    assert cli.SIZES["fleet"]["credentialProxy"] == found["credentialProxy"]
+    assert cli.SIZES["fleet"]["agentAPIAuth"] == {**cli.DEFAULT_LIMITS["agentAPIAuth"], **found["agentAPIAuth"]}
+    assert cli.SIZES["fleet"]["shellSandbox"] == cli.DEFAULT_LIMITS["shellSandbox"]
+    assert set(cli.SIZES["fleet"]) == set(cli.RESOURCE_PATHS)
+
+
+def test_fleet_load_refuses_a_cluster_that_is_not_full(monkeypatch, tmp_path):
+    args = cli.parse(["--project", "p", "--out", str(tmp_path), "fleet", "load", "--names", "oom-03"])
+    monkeypatch.setattr(cli.Fleet, "names", lambda self: ["oom-01", "oom-03"])
+    monkeypatch.setattr(cli, "pool_machine_type", lambda fleet, name: "e2-standard-4")
+    with pytest.raises(SystemExit, match="Events-only"):
+        cli.fleet_load(args)
+
+
+def test_fleet_load_refuses_to_shrink(monkeypatch, tmp_path):
+    args = cli.parse(["--project", "p", "--out", str(tmp_path), "--nodes", "1500", "fleet", "load", "--names", "oom-01"])
+    monkeypatch.setattr(cli.Fleet, "names", lambda self: ["oom-01"])
+    monkeypatch.setattr(cli, "pool_machine_type", lambda fleet, name: cli.FULL_MACHINE_TYPE)
+    monkeypatch.setattr(cli.Fleet, "credentials", lambda self, name: None)
+    monkeypatch.setattr(cli, "kwok_node_count", lambda fleet, name: 3000)
+    with pytest.raises(SystemExit, match="only grows"):
+        cli.fleet_load(args)
+
+
+def test_scenario_sets_the_limits_of_the_size_argument(monkeypatch, tmp_path):
+    import contextlib
+    import threading
+    host = FakeHost()
+    monkeypatch.setattr(cli, "Host", lambda args: host)
+    monkeypatch.setattr(cli, "Recorder", FakeRecorder)
+    monkeypatch.setattr(cli, "report", lambda out, recorder, strict=True: None)
+
+    @contextlib.contextmanager
+    def fake_lease(h, note):
+        yield threading.Event()
+
+    monkeypatch.setattr(cli, "lease", fake_lease)
+    args = cli.parse(["--host-context", "c", "--out", str(tmp_path), "proxy", "--size", "L", "--seconds", "0"])
+    cli.scenario(args, "shellSandbox", "shell", "app=x", lambda h, b, l: None)
+    assert host.patches[0] == [{"op": "add", "path": "/spec/harness", "value": {"experimental": {"shellSandbox": {
+        "resources": {"limits": cli.SIZES["L"]["shellSandbox"]}}}}}]
+
+
+def test_fleet_load_resizes_then_loads_each_named_cluster_once(monkeypatch, tmp_path):
+    args = cli.parse(["--project", "p", "--out", str(tmp_path), "--nodes", "3000", "--namespaces", "300",
+                      "fleet", "load", "--names", "oom-01,oom-01,oom-02"])
+    calls, loaded = [], []
+    monkeypatch.setattr(cli.Fleet, "names", lambda self: ["oom-01", "oom-02", "oom-03"])
+    monkeypatch.setattr(cli, "pool_machine_type", lambda fleet, name: cli.FULL_MACHINE_TYPE)
+    monkeypatch.setattr(cli.Fleet, "credentials", lambda self, name: None)
+    monkeypatch.setattr(cli, "kwok_node_count", lambda fleet, name: 1500)
+    monkeypatch.setattr(cli, "workload_namespace_count", lambda fleet, name: 150)
+    monkeypatch.setattr(cli, "run", lambda cmd, **kw: calls.append(cmd) or "")
+    monkeypatch.setattr(cli, "load_cluster", lambda fleet, name, a: loaded.append(name))
+    cli.fleet_load(args)
+    resized = sorted(c[4] for c in calls if c[:4] == ["gcloud", "container", "clusters", "resize"])
+    assert resized == ["oom-01", "oom-02"]
+    assert all(c[c.index("--num-nodes") + 1] == "12" for c in calls if "resize" in c)
+    assert sorted(loaded) == ["oom-01", "oom-02"]
+
+
+def test_fleet_load_refuses_fewer_namespaces(monkeypatch, tmp_path):
+    args = cli.parse(["--project", "p", "--out", str(tmp_path), "--nodes", "3000", "fleet", "load", "--names", "oom-01"])
+    monkeypatch.setattr(cli.Fleet, "names", lambda self: ["oom-01"])
+    monkeypatch.setattr(cli, "pool_machine_type", lambda fleet, name: cli.FULL_MACHINE_TYPE)
+    monkeypatch.setattr(cli.Fleet, "credentials", lambda self, name: None)
+    monkeypatch.setattr(cli, "kwok_node_count", lambda fleet, name: 3000)
+    monkeypatch.setattr(cli, "workload_namespace_count", lambda fleet, name: 300)
+    with pytest.raises(SystemExit, match="namespaces"):
+        cli.fleet_load(args)
+
+
+def test_create_cluster_sizes_the_real_pool_from_the_kwok_nodes(monkeypatch, tmp_path):
+    args = cli.parse(["--project", "p", "--out", str(tmp_path), "fleet", "create", "--clusters", "1"])
+    calls = []
+    monkeypatch.setattr(cli, "run", lambda cmd, **kw: calls.append(cmd) or "")
+    fleet = cli.Fleet(args)
+    cli.create_cluster(fleet, "oom-01", 100, events_only=False, kwok_nodes=3000)
+    cli.create_cluster(fleet, "oom-03", 101, events_only=True, kwok_nodes=3000)
+    nodes = [c[c.index("--num-nodes") + 1] for c in calls if "clusters" in c and "create" in c]
+    assert nodes == ["12", str(cli.EVENTS_REAL_NODES)]
