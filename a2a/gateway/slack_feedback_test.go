@@ -309,7 +309,7 @@ func TestSlackDownRatingOpensTheNoteAndKeepsTheExchange(t *testing.T) {
 		t.Fatalf("views = %+v, want the note modal opened on the tap's trigger", api.views)
 	}
 	view, _ := json.Marshal(api.views[0])
-	for _, want := range []string{slackFeedbackTitle, slackFeedbackLabel, `"optional":true`, "Your question and this answer are kept on your install for 30 days", slackFeedbackSubmit, slackFeedbackClose} {
+	for _, want := range []string{feedbackNoteTitle, feedbackNoteLabel, `"optional":true`, "Your question and this answer are kept on your install for 30 days", feedbackNoteSend, feedbackNoteCancel} {
 		if !strings.Contains(string(view), want) {
 			t.Errorf("modal lacks %q: %s", want, view)
 		}
