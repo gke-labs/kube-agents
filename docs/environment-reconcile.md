@@ -49,7 +49,10 @@ ensures the drift report focuses on out-of-band changes to infrastructure.
 An install whose state predates this capability (it is published as an `image_tag`
 Terraform output) falls back to the running cluster tag and notes this in the job log;
 the first subsequent atomic reconcile records the tag into state, after which all plans
-are clean.
+are clean. The `sizing_profile` output, which `lifecycle.sh`'s node-pool shape guard reads,
+has the same shape: an environment whose state predates it plans that one output addition
+and nothing else, which the report opens an issue for, until the next reconcile records it
+and the clean plan closes the issue.
 
 ## Deploying and reconciling long-lived environments
 

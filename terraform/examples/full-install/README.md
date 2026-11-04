@@ -278,7 +278,10 @@ of a larger pool onto it. `guard_node_pool_shape` refuses that apply unless a
 sizing input asks for the change: the pool's own input, set to any value, or
 a profile other than the one the last apply recorded (the `sizing_profile`
 output). A profile kept beside a lost explicit line asks for nothing, so that
-apply is refused too.
+apply is refused too. An install applied before that output existed plans it
+once, `+ sizing_profile = "<profile>"` under `Changes to Outputs` and nothing
+else, which `-detailed-exitcode` reports as 2 and `./upgrade.sh --plan` as
+drift, until the next apply records it.
 The drift audit-log ingress has the same one-default-per-project shape, and
 this one every second install meets, because `ENABLE_DRIFT_DETECTOR` defaults
 to `true`: `drift_pubsub_topic`, `drift_pubsub_subscription` and
