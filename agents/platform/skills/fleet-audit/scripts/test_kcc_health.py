@@ -59,6 +59,19 @@ def is_discovery(argv):
     return argv[:2] == ["kubectl", "api-resources"]
 
 
+# A kubeconfig that names the API server directly, so the list paths carry
+# no prefix.
+DIRECT_SERVER = "https://10.0.0.1"
+
+
+def is_server_read(argv):
+    return argv[:3] == ["kubectl", "config", "view"]
+
+
+def server_answer(server=DIRECT_SERVER):
+    return kcc_health.Result(0, server, "")
+
+
 def serve_kcc(argv, answer):
     """The Config Connector read of one cluster, from one `answer`.
 
@@ -69,6 +82,8 @@ def serve_kcc(argv, answer):
     """
     absent = answer.rc != 0 and "doesn't have a resource type" in answer.stderr
     items = json.loads(answer.stdout)["items"] if answer.rc == 0 and answer.stdout.startswith("{") else []
+    if is_server_read(argv):
+        return server_answer()
     if is_discovery(argv):
         if absent:
             return kcc_health.Result(0, "deployments   deploy   apps/v1   true   Deployment   get,list   all\n", "")
@@ -95,6 +110,8 @@ class FakeRun:
         self.timeouts = []
 
     def __call__(self, argv, *, env=None, timeout=None):
+        if is_server_read(argv):
+            return server_answer()
         self.calls.append((list(argv), (env or {}).get("KUBECONFIG", "")))
         self.timeouts.append(timeout)
         if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
@@ -261,6 +278,10 @@ class ReadObjectsTest(unittest.TestCase):
         urls = []
 
         def run(argv, *, env=None, timeout=None):
+
+            if is_server_read(argv):
+
+                return server_answer()
             if is_discovery(argv):
                 return kcc_health.Result(0, crd_line("PubSubTopic", group="pubsub.cnrm.cloud.google.com") + "\n", "")
             urls.append(argv[3])
@@ -276,8 +297,57 @@ class ReadObjectsTest(unittest.TestCase):
         self.assertEqual(len(urls), 3)
         self.assertTrue(all(f"limit={kcc_health.KIND_PAGE_LIMIT}" in url for url in urls))
 
+    def paged_read(self, server):
+        """A two-page list of one kind through a kubeconfig whose server URL
+        read answers `server`; the read and the `--raw` paths it asked for."""
+        pages = {"": ("t1", ["one"]), "t1": ("", ["two"])}
+        raws = []
+
+        def run(argv, *, env=None, timeout=None):
+            if is_server_read(argv):
+                return server
+            if is_discovery(argv):
+                return kcc_health.Result(0, crd_line("PubSubTopic", group="pubsub.cnrm.cloud.google.com") + "\n", "")
+            raws.append(argv[3])
+            after = urllib.parse.parse_qs(argv[3].partition("?")[2]).get("continue", [""])[0]
+            token, names = pages[after]
+            items = [{"kind": "PubSubTopic", "metadata": {"name": name}} for name in names]
+            return kcc_health.Result(0, json.dumps({"items": items, "metadata": {"continue": token}}), "")
+
+        return kcc_health.read_objects(Path("k"), run=run, deadline=time.monotonic() + 60, workers=1), raws
+
+    def test_through_the_kube_proxy_every_list_keeps_the_cluster_prefix(self):
+        """Live defect: kubectl drops the server URL's path from an absolute
+        `--raw` path, so through the kube-proxy a bare `/apis/...` read the
+        proxy's default cluster, not this one. Every page keeps the prefix."""
+        server = kcc_health.Result(
+            0, "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443/clusters/acme_us-central1_hub/", ""
+        )
+        read, raws = self.paged_read(server)
+        self.assertEqual(read.status, kcc_health.READ_LISTED)
+        self.assertEqual(len(raws), 2)
+        for raw in raws:
+            self.assertTrue(raw.startswith("/clusters/acme_us-central1_hub/apis/pubsub.cnrm.cloud.google.com/"), raw)
+
+    def test_a_direct_server_lists_the_bare_path(self):
+        read, raws = self.paged_read(kcc_health.Result(0, "https://1.2.3.4", ""))
+        self.assertEqual(read.status, kcc_health.READ_LISTED)
+        self.assertTrue(all(raw.startswith("/apis/pubsub.cnrm.cloud.google.com/") for raw in raws), raws)
+
+    def test_no_server_url_makes_the_cluster_unread_and_reads_nothing(self):
+        """With no prefix the read could go to another cluster, so it stops:
+        never the bare path."""
+        for server in (kcc_health.Result(1, "", "error: no context"), kcc_health.Result(0, "", "")):
+            with self.subTest(rc=server.rc):
+                read, raws = self.paged_read(server)
+                self.assertEqual(read.status, kcc_health.READ_FAILED)
+                self.assertEqual(raws, [])
+                self.assertIn("kcc_unread", kcc_health.read_fields(read))
+
     def test_a_repeated_continue_token_makes_the_read_unknown(self):
         def run(argv, *, env=None, timeout=None):
+            if is_server_read(argv):
+                return server_answer()
             if is_discovery(argv):
                 return kcc_health.Result(0, crd_line("PubSubTopic", group="pubsub.cnrm.cloud.google.com") + "\n", "")
             return kcc_health.Result(0, json.dumps({"items": [], "metadata": {"continue": "same"}}), "")
@@ -289,6 +359,10 @@ class ReadObjectsTest(unittest.TestCase):
         calls = []
 
         def run(argv, *, env=None, timeout=None):
+
+            if is_server_read(argv):
+
+                return server_answer()
             calls.append(argv)
             return serve_kcc(argv, listing(STALLED_TOPIC, BLOCKED_CLUSTER, READY_POOL))
 
@@ -305,6 +379,10 @@ class ReadObjectsTest(unittest.TestCase):
         bare = {key: value for key, value in STALLED_TOPIC.items() if key != "kind"}
 
         def run(argv, *, env=None, timeout=None):
+
+            if is_server_read(argv):
+
+                return server_answer()
             if is_discovery(argv):
                 return kcc_health.Result(0, crd_line("PubSubTopic") + "\n", "")
             return listing(bare)
@@ -317,6 +395,10 @@ class ReadObjectsTest(unittest.TestCase):
         kinds = [f"Kind{n}" for n in range(3 * kcc_health.proxy_slots())]
 
         def run(argv, *, env=None, timeout=None):
+
+            if is_server_read(argv):
+
+                return server_answer()
             if is_discovery(argv):
                 return kcc_health.Result(0, "".join(crd_line(kind) + "\n" for kind in kinds), "")
             with lock:
@@ -340,6 +422,8 @@ class ReadObjectsTest(unittest.TestCase):
         ):
             with self.subTest(status=status):
                 def run(argv, *, env=None, timeout=None):
+                    if is_server_read(argv):
+                        return server_answer()
                     if is_discovery(argv):
                         return kcc_health.Result(0, crd_line("PubSubTopic") + "\n" + crd_line("ComputeFirewall") + "\n", "")
                     if argv[3].partition("?")[0].endswith("pubsubtopics"):
@@ -359,6 +443,10 @@ class ReadObjectsTest(unittest.TestCase):
         partial = "error: unable to retrieve the complete list of server APIs: metrics.k8s.io/v1beta1: the server is currently unable to handle the request"
 
         def run(argv, *, env=None, timeout=None):
+
+            if is_server_read(argv):
+
+                return server_answer()
             if is_discovery(argv):
                 return kcc_health.Result(1, crd_line("PubSubTopic") + "\n", partial)
             return listing(STALLED_TOPIC)
@@ -383,6 +471,10 @@ class ReadObjectsTest(unittest.TestCase):
         kinds = [f"Kind{n}" for n in range(12)]
 
         def run(argv, *, env=None, timeout=None):
+
+            if is_server_read(argv):
+
+                return server_answer()
             with lock:
                 running[0] += 1
                 running[1] = max(running[1], running[0])
@@ -426,6 +518,10 @@ class ReadObjectsTest(unittest.TestCase):
         served = ("ContainerCluster", "ContainerNodePool", "PubSubTopic", "ComputeFirewall")
 
         def run(argv, *, env=None, timeout=None):
+
+            if is_server_read(argv):
+
+                return server_answer()
             calls.append(argv)
             if is_discovery(argv):
                 return kcc_health.Result(0, "".join(
@@ -450,6 +546,8 @@ class ReadObjectsTest(unittest.TestCase):
         """Config Connector runs there, but serves no container kind: no object
         a drift, patch readiness or stockout note can name, so neither key."""
         def run(argv, *, env=None, timeout=None):
+            if is_server_read(argv):
+                return server_answer()
             if is_discovery(argv):
                 return kcc_health.Result(0, crd_line("PubSubTopic") + "\n", "")
             return listing()
@@ -460,6 +558,8 @@ class ReadObjectsTest(unittest.TestCase):
 
     def test_a_kind_that_went_away_after_the_discovery_is_skipped(self):
         def run(argv, *, env=None, timeout=None):
+            if is_server_read(argv):
+                return server_answer()
             if is_discovery(argv):
                 return kcc_health.Result(0, crd_line("PubSubTopic") + "\n" + crd_line("ComputeFirewall") + "\n", "")
             if argv[3].endswith("pubsubtopics"):
@@ -556,6 +656,8 @@ class AnnotateManifestTest(unittest.TestCase):
 
     def test_a_read_that_raises_is_unknown_and_keeps_the_manifest(self):
         def run(argv, *, env=None, timeout=None):
+            if is_server_read(argv):
+                return server_answer()
             raise RuntimeError("boom")
 
         manifest = {"clusters": [self.manifest()["clusters"][0]]}
@@ -777,6 +879,10 @@ class AnnotateManifestTest(unittest.TestCase):
         kinds = [f"Kind{n}" for n in range(6)]
 
         def run(argv, *, env=None, timeout=None):
+
+            if is_server_read(argv):
+
+                return server_answer()
             with lock:
                 running[0] += 1
                 running[1] = max(running[1], running[0])
@@ -853,6 +959,10 @@ class DeadlineTest(unittest.TestCase):
         timeouts = []
 
         def run(argv, *, env=None, timeout=None):
+
+            if is_server_read(argv):
+
+                return server_answer()
             step = "gcloud" if argv[0] == "gcloud" else ("crd" if is_discovery(argv) else "kind")
             timeouts.append((step, timeout))
             if deadline is not None:

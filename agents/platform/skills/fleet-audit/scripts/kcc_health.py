@@ -14,7 +14,8 @@ the collectors do the reading. This module is the one read they share
 server's discovery once (`kubectl api-resources`, which needs no RBAC grant) to
 find the Config Connector kinds (a group that ends in `.cnrm.cloud.google.com`,
 in the `gcp` category), then lists each kind in pages (`kubectl get --raw
-/apis/<group>/<version>/<plural>?limit=500`, `KIND_PAGE_LIMIT`), with no more requests in flight in
+<prefix>/apis/<group>/<version>/<plural>?limit=500`, `KIND_PAGE_LIMIT`, where
+<prefix> is the kubeconfig server URL's path, `server_prefix`), with no more requests in flight in
 the process than the credential broker admits (`proxy_slots`), and puts
 the result on that cluster's manifest entry. `kubectl get gcp -A` does the same work one kind after another, and
 through the credential proxy its 230 requests took longer than the read's
@@ -126,6 +127,13 @@ KCC_GROUP_SUFFIX = ".cnrm.cloud.google.com"
 # requests. `-o wide` adds the verbs and the categories; `--no-headers` leaves
 # one resource per line.
 DISCOVERY_ARGV = ("kubectl", "api-resources", "-o", "wide", "--no-headers")
+# The kubeconfig's server URL, which prints no credential. A `--raw` read
+# takes an absolute path and kubectl drops the server URL's own path from it,
+# so through the install's kube-proxy (`https://<proxy>/clusters/<context>`)
+# a bare `/apis/...` goes to the proxy's default cluster, not this one. Each
+# list request therefore starts with the server URL's path (`server_prefix`).
+SERVER_ARGV = ("kubectl", "config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}")
+SERVER_TIMEOUT_S = 30
 # The kinds the drift, patch readiness and stockout collectors read: their
 # findings are on `Cluster/` and `NodePool/` objects, and a finding's note
 # names only its own object, so no other kind can change a note. From the
@@ -476,10 +484,22 @@ def discovery_argv() -> list[str]:
     return list(DISCOVERY_ARGV)
 
 
-def kind_argv(kind: KccKind, after: str = "") -> list[str]:
+def server_argv() -> list[str]:
+    """The read of the kubeconfig's server URL (`SERVER_ARGV`)."""
+    return list(SERVER_ARGV)
+
+
+def server_prefix(server: str) -> str:
+    """The path of the kubeconfig's server URL, with no trailing slash: empty
+    for a direct API server, `/clusters/<context>` through the kube-proxy."""
+    return urllib.parse.urlsplit(server.strip()).path.rstrip("/")
+
+
+def kind_argv(kind: KccKind, after: str = "", prefix: str = "") -> list[str]:
     """One page of a kind's cluster-wide list, with no discovery: at most
-    `KIND_PAGE_LIMIT` objects, from the `continue` token `after` when given."""
-    url = f"/apis/{kind.group}/{kind.version}/{kind.plural}?limit={KIND_PAGE_LIMIT}"
+    `KIND_PAGE_LIMIT` objects, from the `continue` token `after` when given,
+    under the server URL's path `prefix` (`server_prefix`)."""
+    url = f"{prefix}/apis/{kind.group}/{kind.version}/{kind.plural}?limit={KIND_PAGE_LIMIT}"
     if after:
         url += "&continue=" + urllib.parse.quote(after, safe="")
     return ["kubectl", "get", "--raw", url]
@@ -569,6 +589,17 @@ def read_objects(
     except a kind whose CRD went away after the discovery.
     """
     timeout_s = max(int(deadline - clock()), 0)
+    # The server URL first: with no path to put before each list request,
+    # a `--raw` read could go to another cluster, so the read stops here.
+    server = _with_proxy_slot(run, server_argv(), kubeconfig, SERVER_TIMEOUT_S, deadline, clock)
+    if server is None:
+        return KccRead(READ_TIMED_OUT, [], f"the server URL read did not start: {NO_SLOT_DETAIL}", 0, timeout_s)
+    if server.rc == TIMEOUT_RC:
+        return KccRead(READ_TIMED_OUT, [], "the server URL read did not finish", 0, timeout_s)
+    if server.rc != 0 or not server.stdout.strip():
+        why = f"exited {server.rc} ({_excerpt(server.stderr)})" if server.rc != 0 else "gave no server URL"
+        return KccRead(READ_FAILED, [], f"the kubeconfig's server URL read {why}", 0, timeout_s)
+    prefix = server_prefix(server.stdout)
     found = _with_proxy_slot(run, discovery_argv(), kubeconfig, DISCOVERY_TIMEOUT_S, deadline, clock)
     if found is None:
         return KccRead(READ_TIMED_OUT, [], f"the discovery did not start: {NO_SLOT_DETAIL}", 0, timeout_s)
@@ -586,7 +617,7 @@ def read_objects(
         items: list = []
         after = ""
         while True:
-            result = _with_proxy_slot(run, kind_argv(kind, after), kubeconfig, KIND_READ_TIMEOUT_S, deadline, clock)
+            result = _with_proxy_slot(run, kind_argv(kind, after, prefix), kubeconfig, KIND_READ_TIMEOUT_S, deadline, clock)
             if result is None:
                 return READ_TIMED_OUT, [], f"{kind.plural}.{kind.group}: {NO_SLOT_DETAIL}"
             if result.rc == TIMEOUT_RC:
