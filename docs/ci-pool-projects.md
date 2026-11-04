@@ -41,6 +41,12 @@ gcloud services enable \
 
 This list and `REQUIRED_APIS` in `scripts/verify_ci_pool_project.py` must agree — the verifier fails a project for an API this block does not mention, and passes one that is missing an API only this block names.
 
+### 1.1 Vertex session routing (`LLM_SESSION_ID`)
+
+`hack/ci-deploy.sh` turns on the gateway's session-affinity hook (`litellm.vertex.sessionAffinity`), which sends a `session_id` on every Gemini request so that conversations sharing a prompt land on the same few Vertex replicas and read its prefix from cache. Vertex honours `session_id` only on a project carrying the `LLM_SESSION_ID` visibility label on `aiplatform.googleapis.com`. The Vertex team sets it on request; no `gcloud` command or Terraform resource reaches it, so neither the provisioning script nor the verifier touches it. `kube-agents-evals` and `kube-agents-evals-2` through `-40` carried it on 2026-11-02.
+
+A project without it still passes every eval: Vertex accepts the field and ignores it, so the run routes as if the hook were off and only its cache reads are lower. To check a project, send four `generateContent` requests to `gemini-3.1-pro-preview` on `global`, a few seconds apart, with one `session_id`, the same system instruction of several thousand tokens, and a different first user message each time. With the label, `usageMetadata.cachedContentTokenCount` on the second to fourth covers most of the system instruction; without it, they mostly read zero. About one check in five misses on a labelled project, so repeat a check that reads zero before asking for the label.
+
 ## 2. Host GKE Cluster (`platform-agent-host`)
 
 A long-lived GKE cluster hosting the Platform Agent and evaluation infrastructure:
