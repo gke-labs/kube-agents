@@ -87,6 +87,20 @@ const credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- 
 // the Deployment's scale if that reopens.
 const credentialProxyPDBMaxUnavailable = 1
 
+// credentialProxyTerminationGraceSeconds is how long the kubelet waits between
+// SIGTERM and SIGKILL for the broker pod. Kubernetes defaults it to 30s, which
+// is shorter than the broker's drain: on SIGTERM it refuses new requests and
+// gives those in flight up to 30s to finish (SHUTDOWN_DRAIN_SECONDS in
+// agents/platform/scripts/credential_proxy.py), ends the commands still
+// running and waits up to 5s for their answers, then hands its Chat receipts
+// back; the entrypoint waits up to 40s for that (BROKER_RUNTIME_DRAIN_SECONDS
+// in deploy/shared/start-services.sh) before it stops Envoy. The pod keeps
+// Recreate, so every route is down while it drains; the drain is bounded so
+// that stays short. An idle broker exits after its 3s settle window
+// (SHUTDOWN_SETTLE_SECONDS), as before, so this lengthens nothing when there is
+// no work in flight.
+const credentialProxyTerminationGraceSeconds int64 = 45
+
 const (
 	// Where the federated token and the ADC config derived from it live. Both
 	// are inside the proxy container's mount namespace and nowhere else — that
@@ -565,6 +579,9 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           saName,
 					AutomountServiceAccountToken: ptr.To(false),
+					// See credentialProxyTerminationGraceSeconds: covers the
+					// broker's drain on SIGTERM.
+					TerminationGracePeriodSeconds: ptr.To(credentialProxyTerminationGraceSeconds),
 					// The same UID and group the agent image ships, because the
 					// credential runtime and the agent are built from it. What
 					// used to separate this process from the sandbox's was a
@@ -674,10 +691,19 @@ func buildCredentialProxyContainerForPlugins(agent *agentv1alpha1.PlatformAgent,
 			// The runtime's metrics-only listener, for the chart's PodMonitoring
 			// (see credentialProxyMetricsPort).
 			{Name: credentialProxyMetricsPortName, ContainerPort: credentialProxyMetricsPort},
+			// Envoy's health listener, for the readinessProbe alone (see
+			// credentialProxyHealthPort).
+			{Name: credentialProxyHealthPortName, ContainerPort: credentialProxyHealthPort},
 		},
+		// On the health listener, not the credentialed one, so that the
+		// fleet's open watches cannot fill the breaker the probe goes
+		// through (credentialProxyHealthPort). No livenessProbe: the start
+		// script supervises both processes and restarts the runtime in
+		// place, and a probe-driven restart would drop every open watch and
+		// the broker's workspace state.
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
-				Path: "/healthz", Port: intstr.FromString("cred-proxy"),
+				Path: "/healthz", Port: intstr.FromString(credentialProxyHealthPortName),
 			}},
 			InitialDelaySeconds: 5,
 			PeriodSeconds:       10,

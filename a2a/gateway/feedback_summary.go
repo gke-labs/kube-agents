@@ -31,7 +31,9 @@ import (
 // refuses a block that does.
 
 const (
-	usageSummaryTitle    = "kube-agents usage & feedback summary"
+	usageSummaryTitle = "kube-agents usage & feedback summary"
+	// usageSummaryMaxLines is independent of the script's SUMMARY_MAX_LINES:
+	// the script's block has lines this one lacks.
 	usageSummaryMaxLines = 40
 	hoursPerDay          = 24
 	//: The task roll-up's window, as the script's; the gateway clamps it to
@@ -93,9 +95,9 @@ const (
 // : The script's USAGE_COUNTERS verbatim.
 var usageSummaryCounters = []string{
 	"clustersRegistered", "clustersMonitored", "chatMessagesInboundTotal", "sessionsTotal",
-	"toolExecutionsTotal", "eventsIngestedTotal", "remediationsProposedTotal", "remediationsMergedTotal",
-	"proposalsAuthored", "remediationsOpen", "remediationsClosedUnmergedTotal", "proposalHumanTouches",
-	"proposalsMergedUntouched",
+	"chatSessionsTotal", "toolExecutionsTotal", "eventsIngestedTotal", "remediationsProposedTotal",
+	"remediationsMergedTotal", "proposalsAuthored", "remediationsOpen", "remediationsClosedUnmergedTotal",
+	"proposalHumanTouches", "proposalsMergedUntouched",
 }
 
 // : The fields the broker reads off the forge rather than counts: absent means

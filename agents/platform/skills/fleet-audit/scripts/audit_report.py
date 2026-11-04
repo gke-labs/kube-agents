@@ -1941,7 +1941,8 @@ PDB_NAME_LINE = (
 # the pattern's own braces are flow-mapping characters.
 PDB_NAME_SLOT = "{name}"
 # How many times one `finish` tries to take the snapshot for its repository
-# questions: the Config Connector scan, then planning.
+# questions, all within the first question that needs it, so a refusal that a
+# retry clears (a 403 during a credential refresh) costs no question its answer.
 PROBE_OPEN_ATTEMPTS = 2
 # How many narrow snapshots one `finish` asks for once the whole tree is over
 # the broker's snapshot ceiling, refused ones included. Each one is a broker
@@ -17054,9 +17055,9 @@ class _RepositoryProbe:
     def broker(self) -> RepositorySnapshot | None:
         import vcs_client
 
-        # Asked twice at most: once for the Config Connector scan and once
-        # more at planning, so one refused snapshot does not end generation.
-        if self._snapshot is None and self._attempts < PROBE_OPEN_ATTEMPTS:
+        # Every attempt is made inside the first call that needs the snapshot,
+        # so the question that asked is answered from a retry that worked.
+        while self._snapshot is None and self._attempts < PROBE_OPEN_ATTEMPTS:
             self._attempts += 1
             self.unavailable = ""
             try:
@@ -17111,8 +17112,7 @@ class _RepositoryProbe:
         if not content_mode():
             return (self.root / path).exists()
         # Every finding in one cluster tree asks about the same ancestors. Only
-        # an answer the snapshot gave is kept: a default yes taken while there
-        # was none would outlive a retry that took one.
+        # an answer the snapshot gave is kept; a default yes is not cached.
         if path in self._paths:
             answer, self.unanswered = self._paths[path]
             return answer
@@ -22385,10 +22385,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # a failed `finish` does not leave its snapshot on the disk.
     atexit.register(probe.close)
     if content_mode() and any(_kcc_candidate(finding) for finding in findings):
-        # The probe's snapshot is the scan's, and a failed one is retried once
-        # on the probe's count: the backstop keeps its retry, and planning,
-        # which fails safe without the snapshot, takes none.
-        snap = probe.broker() or probe.broker()
+        # The probe's snapshot is the scan's; `broker` makes its retry itself.
+        snap = probe.broker()
         if snap is None and probe.narrow:
             # The scan reads every declaration in the tree, which no narrow
             # snapshot holds.
@@ -22412,7 +22410,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             "Connector declaration holds, so it would be reverted on the next "
             "reconcile; it is published as manual, naming the file to change."
         )
-    # After the Config Connector scan, which keeps both of the probe's opens.
+    # After the Config Connector scan, whose one call may use both of the
+    # probe's attempts.
     # A new file in a Kustomize root that its kustomization does not list
     # renders nothing, so the fix publishes as `manual` and names the
     # `resources:` line to add. The worker cannot fix this in one file, so

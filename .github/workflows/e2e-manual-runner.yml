@@ -101,6 +101,13 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  # Cap @actions/cache's wait on one cache segment so a restore the service
+  # refuses costs a step about a minute, not the default ten. The rule, the
+  # trade-off and the test that holds it: .agents/rules/github_actions.md,
+  # "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
 jobs:
   run-e2e:
     name: Run E2E (${{ inputs.test_suite }} on ${{ inputs.github_environment }})

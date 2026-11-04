@@ -46,6 +46,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -114,6 +115,7 @@ const (
 	a2aRuntimeStateBucket  = "runtime-state"
 	a2aSessionStateBucket  = "session-state"
 	a2aFeedbackBucket      = "feedback"
+	a2aPeopleBucket        = "people"
 	a2aKVStreamPrefix      = "KV_"
 
 	// a2aProfileSubmitStream holds the profiles' submissions, every subject
@@ -591,6 +593,9 @@ const (
 	// slack.answerFeedback=false, carried to the gateway (a2a/gateway's
 	// envSlackAnswerFeedback): no rating buttons, nothing kept.
 	a2aSlackAnswerFeedbackEnvVar = "A2A_SLACK_ANSWER_FEEDBACK"
+	// telemetry.peopleSeen=false, carried to the gateway (a2a/gateway's
+	// envPeopleSeen): no per-person key, the people bucket purged at start.
+	a2aPeopleSeenEnvVar = "A2A_PEOPLE_SEEN"
 	// The shortest Slack channel id a2aSlackHomeChannel takes: the prefix
 	// letter and at least two characters after it, as the gateway checks.
 	a2aSlackMinChannelIDLen = 3
@@ -1629,10 +1634,10 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 // than as seed, and provisionIdentity enumerates the same objects for itself
 // rather than from this slice. So the refusal the pair describes is provision's
 // to hit now; seed keeps the scoped grant because the hand-applied seed tooling
-// still connects with it. Nothing yet binds that third spelling to this list.
+// still connects with it. The same test holds that third spelling to this list.
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
-	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback",
+	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people",
 	"KV_PROFILE_LEASES", "PROFILE_SUBMITS",
 }
 
@@ -1898,6 +1903,13 @@ func a2aAgentJetStreamGrants() []string {
 //     reads, and the watcher's CONSUMER.CREATE and CONSUMER.DELETE for the
 //     export's key list. Put and Delete are publishes on $KV.feedback.>.
 //
+//   - KV_people, one hashed key per chat person (a2a/gateway/people.go): the
+//     same four verbs -- STREAM.INFO to bind it and read its max age at
+//     start, DIRECT.GET held to match feedback's grant set (the desk reads
+//     through its watch, not by key), and the watcher's CONSUMER.CREATE and
+//     CONSUMER.DELETE for the desk's watch and the purge's key list. Put and
+//     Delete are publishes on $KV.people.>.
+//
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
 // --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
@@ -1979,6 +1991,7 @@ func a2aAgentJetStreamGrants() []string {
 func a2aGatewayJetStreamGrants() []string {
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
 	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
+	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
@@ -1992,6 +2005,10 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + kvFeedback + ".>",
 		"$JS.API.CONSUMER.CREATE." + kvFeedback + ".>",
 		"$JS.API.CONSUMER.DELETE." + kvFeedback + ".*",
+		"$JS.API.STREAM.INFO." + kvPeople,
+		"$JS.API.DIRECT.GET." + kvPeople + ".>",
+		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>",
+		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*",
 	}
 }
 
@@ -2824,7 +2841,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 	}}
 }
 
-// a2aProvisionScript is the provisioning payload: the five streams, five KV
+// a2aProvisionScript is the provisioning payload: the five streams, six KV
 // buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
@@ -3135,6 +3152,14 @@ $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --re
 # at their caps (ask, answer and note, about 22KB) and more at a typical
 # size; past it the write is refused, and the rating is counted but not kept.
 $NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas=1 --storage=file --max-bucket-size=67108864 --ttl=720h
+
+# people: one hashed key and a last-put time per chat person the gateway has
+# seen (a2a/gateway/people.go). The max age is the retention: NATS deletes a
+# person 30 days after their last turn, and the gateway counts nobody in a
+# bucket without one. Only the gateway's user reads or writes its records
+# (provision and seed can list its keys). 32MiB holds about a hundred thousand
+# entries; past it the put is refused, and the count under-counts.
+$NATS kv info people        >/dev/null 2>&1 || $NATS kv add people --history=1 --replicas=1 --storage=file --max-bucket-size=33554432 --ttl=720h
 # PROFILE_LEASES: each profile task's liveness lease, written only by the
 # dispatcher (lib.ProfileLeaseBucket; contract on #3655). No TTL: the
 # dispatcher reads expiry from each record, so a restarted one can still read
@@ -4947,6 +4972,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}}},
 	}
 	env = append(env, backendEnv...)
+	// The people record is on unless the install turns it off, whatever
+	// backend is armed; only the off is rendered, so an install that never
+	// set the field keeps the gateway's env, and its pod, as they were.
+	if agent.Spec.Telemetry != nil && agent.Spec.Telemetry.PeopleSeen != nil && !*agent.Spec.Telemetry.PeopleSeen {
+		env = append(env, corev1.EnvVar{Name: a2aPeopleSeenEnvVar, Value: strconv.FormatBool(false)})
+	}
 	env = append(env, []corev1.EnvVar{
 		// Always on (see a2aConsoleDoorEnvVar): the gateway starts
 		// on the console door when the install configures no chat
@@ -5364,15 +5395,24 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			profiles = nil
 		}
 	}
-	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent, profiles)
+	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}
-	if err := ctrl.SetControllerReference(agent, authMap, r.Scheme); err != nil {
-		return state, err
+	// Every shard, in index order, then the shards the previous render had
+	// and this one does not. The callout serves a new version only once it
+	// holds every shard of it, so a pass that dies between two applies
+	// leaves the callout on the previous version, not on half of this one.
+	for _, authMap := range authMaps {
+		if err := ctrl.SetControllerReference(agent, authMap, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, authMap); err != nil {
+			return state, fmt.Errorf("failed to apply the A2A identity map shard %s: %w", authMap.Name, err)
+		}
 	}
-	if err := r.applyManaged(ctx, agent, authMap); err != nil {
-		return state, fmt.Errorf("failed to apply the A2A identity map: %w", err)
+	if err := r.pruneA2AAuthMapShards(ctx, agent, len(authMaps)); err != nil {
+		return state, fmt.Errorf("failed to prune stale A2A identity map shards: %w", err)
 	}
 	state.AuthMapVersion = authMapVersion
 
@@ -5405,7 +5445,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// connection, so a bus standing up without it accepts only the static
 	// users and refuses everything else — and refuses it as an Authorization
 	// Violation, which reads exactly like a credential problem.
-	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public)
+	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public, len(authMaps))
 	if err != nil {
 		return state, err
 	}
@@ -6323,8 +6363,12 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// In reconcileA2A the keys Secret is created first and acts as the
 		// sentinel covering the map; deleting the map first ensures that if a
 		// cleanup pass dies on the map delete, the keys Secret is still standing
-		// to prevent the next pass from early-exiting.
-		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// to prevent the next pass from early-exiting. This entry is shard 0,
+		// which every render has; the shards above it, whose count this list
+		// cannot know, and the unsharded object releases before sharding
+		// rendered go in deleteA2AAuthMapShards, which cleanupA2A runs before
+		// this walk for the same sentinel reason.
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(agent, 0), Namespace: agent.Namespace}}, r.a2aReader()},
 		// The task-signing key, before the keys Secret for the same reason
 		// as the map: the keys Secret is the sentinel.
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
@@ -6334,6 +6378,50 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// ServiceAccount is an Owns() kind, so this read is cached and free.
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
 	}
+}
+
+// pruneA2AAuthMapShards deletes what the identity map's render no longer
+// produces: the unsharded object a release before sharding rendered, and every
+// shard at or past this pass's count.
+func (r *PlatformAgentReconciler) pruneA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent, shards int) error {
+	return r.deleteA2AAuthMapObjects(ctx, agent, a2aAuthMapShardNames(agent, shards))
+}
+
+// deleteA2AAuthMapShards removes every identity-map object, the unsharded
+// legacy one and every shard, for the flip to today and the CR's deletion.
+// Shard 0 is also a walk entry (a2aPreBusTeardown), which finds it gone.
+func (r *PlatformAgentReconciler) deleteA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	return r.deleteA2AAuthMapObjects(ctx, agent, nil)
+}
+
+// deleteA2AAuthMapObjects deletes every identity-map ConfigMap this CR owns
+// except the names in keep. Found by label rather than by walking the names
+// up from the count: every identity-map object, legacy or shard, carries
+// a2aLabels(agent, a2aAuthMapComponent), and a walk that stopped at the first
+// absent name would stop for good at the gap one failed delete leaves,
+// stranding every shard above it. One uncached List through a2aReader, for
+// the reason every ConfigMap read here is uncached; an object under one of
+// these labels that this CR does not own is left to its owner.
+func (r *PlatformAgentReconciler) deleteA2AAuthMapObjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent, keep []string) error {
+	var cms corev1.ConfigMapList
+	if err := r.a2aReader().List(ctx, &cms, client.InNamespace(agent.Namespace), client.MatchingLabels(a2aLabels(agent, a2aAuthMapComponent))); err != nil {
+		return err
+	}
+	for i := range cms.Items {
+		cm := &cms.Items[i]
+		if slices.Contains(keep, cm.Name) {
+			continue
+		}
+		if !metav1.IsControlledBy(cm, agent) {
+			logf.FromContext(ctx).V(1).Info("skipping unowned A2A object under a reserved name",
+				"kind", fmt.Sprintf("%T", cm), "namespace", cm.Namespace, "name", cm.Name)
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, cm)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // a2aBusTeardown returns the namespaced NATS bus objects (Service, NetworkPolicy fences,
@@ -6584,6 +6672,14 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// Its objects are written after the keys Secret, so a render that dies
 	// partway leaves a sentinel too.
 	if err := r.removeScopePublisher(ctx, agent); err != nil {
+		return err
+	}
+
+	// Then the identity map's shards, before the walk that deletes the
+	// callout keys Secret covering them (the sentinel argument on the walk's
+	// authmap entry). A callout still running keeps serving its last map when
+	// the objects go, so deleting them ahead of its Deployment costs nothing.
+	if err := r.deleteA2AAuthMapShards(ctx, agent); err != nil {
 		return err
 	}
 

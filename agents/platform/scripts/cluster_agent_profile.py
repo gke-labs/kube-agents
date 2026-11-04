@@ -17,7 +17,6 @@
 #     this script only manages profile lifecycle + name resolution, not dispatch.
 
 import argparse
-import fcntl
 import hashlib
 import os
 import re
@@ -31,10 +30,12 @@ import sandbox_exec
 from gke_endpoint import EndpointDecision, endpoint_decision
 from profile_scaffold import (
     HERMES_BIN,
+    PROFILE_LOCKS_DIRNAME,  # noqa: F401 - re-exported for this script's tests
     backfill_cron_file,
     ensure_profile,
     is_scaffolded,
     overlay_template,
+    profile_lock,
     profiles_base,
 )
 
@@ -60,11 +61,6 @@ ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
 ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
 PROFILES_BASE = profiles_base(HERMES_HOME)
-# One lock file per profile name under $HERMES_HOME/<this>, held by create_profile and
-# delete_profile so the two never interleave on the same name (_profile_lock). Beside
-# profiles/ rather than in it: a dot-directory there is skipped by every lister, but it is
-# still a home path.
-PROFILE_LOCKS_DIRNAME = ".profile-locks"
 
 # Files/dirs from the template to overlay onto the created profile home.
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
@@ -433,6 +429,12 @@ def _remove_sandbox_layout(name: str) -> None:
             "its directory stays there until somebody removes it")
 
 
+def profile_lock_root() -> Path:
+    """The data root this script's profile locks live under: HERMES_HOME, which is
+    the data volume itself wherever this script runs (the chat roster, the CLI)."""
+    return HERMES_HOME
+
+
 @contextmanager
 def _profile_lock(name: str):
     """Hold this profile name's lock; yield whether it is held.
@@ -445,18 +447,13 @@ def _profile_lock(name: str):
     then fetched into it. Blocking: a scaffold is bounded
     by its own timeouts, and the other side waits it out rather than racing it.
     An unopenable lock yields False, and the caller decides what that forbids.
+    kanban_workspace_gc's stale-home sweep holds the same lock (profile_scaffold.profile_lock).
     """
-    locks = HERMES_HOME / PROFILE_LOCKS_DIRNAME
-    try:
-        locks.mkdir(parents=True, exist_ok=True)
-        handle = open(locks / f"{name}.lock", "w")  # noqa: SIM115 - closed below
-    except OSError as e:
+    def report(e):
         log(f"{name}: could not open the profile lock ({e}); a create refuses, a delete leaves the sandbox home")
-        yield False
-        return
-    with handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        yield True
+
+    with profile_lock(profile_lock_root(), name, on_error=report) as held:
+        yield held
 
 
 def _endpoint_bullets(decision: EndpointDecision | None) -> str:
@@ -874,7 +871,11 @@ def cmd_stamp_soul(args: argparse.Namespace) -> None:
     home = Path(args.profile_dir)
     identity = read_cluster_identity(home)
     if identity is None:
-        return
+        # The entrypoint has just replaced SOUL.md with the blank template, so a
+        # profile whose config.yaml carries no readable identity is left without
+        # its block. Exit non-zero so the caller says so and does not stamp the
+        # pass as finished; a silent return read as one.
+        raise SystemExit(f"ERROR: {home / 'config.yaml'} has no readable cluster_identity; SOUL.md was not stamped")
     _stamp_soul_identity(home, identity["project"], identity["cluster"], identity["location"])
 
 

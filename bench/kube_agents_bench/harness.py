@@ -1333,24 +1333,198 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
         )
 
 
-def _purge_card_state(task_ids: list[str], timeout: float) -> None:
-    """Delete the attachments and worker log of every card this run filed.
+# Deletes the given cards' rows from the board, mirroring hermes'
+# ``kanban_db._delete_task_relations`` plus ``task_attachments`` and the
+# children patch's ``kanban_worker_children``, in one ``BEGIN IMMEDIATE``
+# transaction: the dispatcher's claim is a write too, so a card cannot start
+# running between its status read and its delete.
+#
+# The run's own cards come first and are taken as given. A fan-out card after
+# them is taken only when its ``created`` event names a card already taken as
+# its ``creator_task_id``: hermes writes that event only for a create that
+# made the card, so a card a worker's ``kanban_create`` handed back by its
+# ``idempotency_key`` (which ``kanban_worker_children`` attributes when it is
+# under a minute old) is printed ``foreign <id>`` and left alone, files
+# included. A taken card is kept, printed ``kept <id>``, files included, while
+# it or the card that filed it runs (a worker would write to, or read, a
+# deleted row) and while a fan-out card of its creator
+# or of its own can still run (``LIVE``) and is not a ``task_links`` follow-up:
+# ``kanban_fanout_reaper`` finds an overdue running fan-out card only through
+# its creator's row and a sibling's attribution row, and skips follow-ups.
+#
+# Raw ``sqlite3`` rather than ``hermes kanban archive --rm``: that is two cold
+# hermes starts, over a minute in the sandboxed container, and its ``archived``
+# event is one the gateway's notifier delivers to the card's subscribers.
+# Everything the harness also knows is passed in (:func:`_purge_argv`), so the
+# markers it parses are spelled once.
+_PURGE_ROWS_SCRIPT = r"""
+import json, os, shutil, sqlite3, sys
+ROOT, BUSY = sys.argv[1], float(sys.argv[2])
+KEPT, FOREIGN, DONE, ATTACHMENTS, LOGS = sys.argv[3:8]
+rest = [a for a in sys.argv[9:] if a]
+roots, fanned = rest[:int(sys.argv[8])], rest[int(sys.argv[8]):]
+BY_TASK = ("task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")
+LIVE = ("todo", "scheduled", "ready", "running")
+try:
+    kb = sqlite3.connect("%s/kanban.db" % ROOT, timeout=BUSY, isolation_level=None)
+    kb.execute("BEGIN IMMEDIATE")
+    tables = {r[0] for r in kb.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    children = "kanban_worker_children" in tables
+    held = set()
+    if children:
+        held = {r[0] for r in kb.execute(
+            "SELECT DISTINCT c.creator_id FROM kanban_worker_children c JOIN tasks t ON t.id = c.child_id "
+            "WHERE t.status IN (%s) AND NOT EXISTS (SELECT 1 FROM task_links l "
+            "WHERE l.parent_id = c.creator_id AND l.child_id = c.child_id)" % ",".join("?" * len(LIVE)),
+            LIVE,
+        )}
+    taken, gone = set(roots), []
+    for tid in roots + fanned:
+        row = kb.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+        if row is None:
+            continue
+        if tid not in taken:
+            ev = kb.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created' ORDER BY id LIMIT 1",
+                (tid,),
+            ).fetchone()
+            try:
+                made = json.loads(ev[0] or "{}") if ev else {}
+            except ValueError:
+                made = {}
+            if not isinstance(made, dict) or made.get("creator_task_id") not in taken:
+                print("%s %s" % (FOREIGN, tid))
+                continue
+            taken.add(tid)
+        creator, creator_status = None, None
+        if children:
+            r = kb.execute(
+                "SELECT c.creator_id, t.status FROM kanban_worker_children c "
+                "LEFT JOIN tasks t ON t.id = c.creator_id WHERE c.child_id = ?", (tid,)
+            ).fetchone()
+            creator, creator_status = (r[0], r[1]) if r else (None, None)
+        if row[0] == "running" or creator_status == "running" or tid in held or creator in held:
+            print("%s %s" % (KEPT, tid))
+            continue
+        if tid not in roots:
+            gone.append(tid)
+        kb.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (tid, tid))
+        for table in BY_TASK:
+            if table in tables:
+                kb.execute("DELETE FROM %s WHERE task_id = ?" % table, (tid,))
+        if children:
+            kb.execute(
+                "DELETE FROM kanban_worker_children WHERE creator_id = ? OR child_id = ?", (tid, tid)
+            )
+        kb.execute("DELETE FROM tasks WHERE id = ?", (tid,))
+    kb.execute("COMMIT")
+    for tid in gone:
+        shutil.rmtree(os.path.join(ATTACHMENTS, tid), ignore_errors=True)
+        try:
+            os.remove(os.path.join(LOGS, tid + ".log"))
+        except OSError:
+            pass
+    print(DONE)
+except sqlite3.Error as exc:
+    print("rows kept: %s" % exc)
+"""
+# How long the purge waits on hermes' write lock, as the capture's read does
+# (``worker_trajectory`` ``SQLITE_BUSY_TIMEOUT``).
+_PURGE_BUSY_TIMEOUT_SECONDS = 10
+# What the purge prints before each card it kept or left alone as not the
+# run's, and once it committed.
+_PURGE_KEPT_MARKER = "kept"
+_PURGE_FOREIGN_MARKER = "foreign"
+_PURGE_DONE_MARKER = "purged"
+
+
+def _purge_argv(task_ids: list[str], fanned_out: Sequence[str] = ()) -> list[str]:
+    """:data:`_PURGE_ROWS_SCRIPT`'s arguments, in the order it reads them."""
+    return [
+        worker_trajectory.DATA_ROOT,
+        str(_PURGE_BUSY_TIMEOUT_SECONDS),
+        _PURGE_KEPT_MARKER,
+        _PURGE_FOREIGN_MARKER,
+        _PURGE_DONE_MARKER,
+        _ATTACHMENTS_DIR,
+        _LOGS_DIR,
+        str(len(task_ids)),
+        *task_ids,
+        *fanned_out,
+    ]
+
+
+def _purge_card_state(task_ids: list[str], timeout: float, fanned_out: Sequence[str] = ()) -> None:
+    """Delete the attachments, worker log and board rows of every card this run filed.
 
     The agent pod outlives the run, so without this each finished task leaves
     its report and its worker transcript on disk for the next run to find --
     which is how a repeat of a task reads back the previous attempt's answer
-    instead of doing the work. Scoped to cards this harness delegated, so it
-    cannot touch anything the run did not create.
+    instead of doing the work. Scoped to cards this run filed: ``task_ids`` are
+    the harness's own, and a card in ``fanned_out`` (in walk order, creators
+    first) goes only when hermes recorded one of them as its creator.
+
+    The board rows go too (:data:`_PURGE_ROWS_SCRIPT`): every card view ends
+    with a "Recent work by @<assignee>" digest of that profile's last completed
+    runs on other cards (``kanban_db._ctx_role_history``, no switch to turn it
+    off), so a run left on the board hands the next run of the same case its
+    predecessor's summary in the worker's first ``kanban_show`` (#1730).
     """
+    fanned_out = [t for t in fanned_out if t not in task_ids]
     if not task_ids:
         return
     listing = " ".join(_shell_quote(t) for t in task_ids)
+    args = " ".join(_shell_quote(a) for a in _purge_argv(task_ids, fanned_out))
     script = (
         f"for t in {listing}; do "
         f'  rm -rf {_ATTACHMENTS_DIR}/"$t" {_LOGS_DIR}/"$t".log; '
-        "done"
+        "done; "
+        f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
+        f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
+        f'"$PY" -c {_shell_quote(_PURGE_ROWS_SCRIPT)} {args}'
     )
-    _agent_shell(script, timeout)
+    out = _agent_shell(script, timeout)
+    lines = out.splitlines()
+
+    def marked(marker: str) -> list[str]:
+        return [line.split()[1] for line in lines if line.startswith(marker + " ")]
+
+    if kept := marked(_PURGE_KEPT_MARKER):
+        _log.warning(
+            "cards %s were still running, or in a fan-out with a card that can still run (follow-ups "
+            "aside), and stay on the board; the next run's role-history digest can show their "
+            "summaries", ", ".join(kept),
+        )
+    if foreign := marked(_PURGE_FOREIGN_MARKER):
+        _log.info(
+            "left cards %s on the board: attributed to the run's workers, but not created by them",
+            ", ".join(foreign),
+        )
+    if _PURGE_DONE_MARKER not in lines:
+        _log.warning(
+            "could not delete the board rows of cards %s; the next run's role-history digest can "
+            "show their summaries (%s)", ", ".join([*task_ids, *fanned_out]),
+            out[:_LOG_EXCERPT_CHARS] or "no output",
+        )
+
+
+def _fanned_out_closure(
+    awaited: list[str], captured: worker_trajectory.WorkerCapture | None
+) -> list[str]:
+    """Every card ``awaited``'s workers filed, recursively, from the capture's walk, creators first.
+
+    Only ``fanned_out`` edges (``kanban_worker_children``, who filed whom): the
+    walk also follows ``task_links``, which can reach a card someone else filed,
+    and the purge deletes what it is given.
+    """
+    edges: dict[str, list[str]] = {}
+    for card in ((captured.summary.get("cards") if captured else None) or []):
+        if isinstance(card, dict):
+            edges[str(card.get("task") or "")] = [str(c) for c in card.get("fanned_out") or []]
+    out = list(dict.fromkeys(awaited))
+    for tid in out:
+        out.extend(c for c in edges.get(tid, []) if c not in out)
+    return out[len(set(awaited)):]
 
 
 def _worker_token_buckets(
@@ -3919,7 +4093,9 @@ class KubeAgentsHarness(AgentHarness):
                 if infra_reason:
                     break
 
-        _purge_card_state(awaited, _EXEC_TIMEOUT)
+        # The cards the workers fanned out too: a Cluster Agent profile
+        # outlives the run, and its digest would carry their summaries forward.
+        _purge_card_state(awaited, _EXEC_TIMEOUT, _fanned_out_closure(awaited, captured))
 
         if infra_reason and trajectory_clean and logs_clean and not agent_acted:
             _mark_result_infra_failure(

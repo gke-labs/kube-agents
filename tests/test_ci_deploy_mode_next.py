@@ -95,9 +95,9 @@ _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "con
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
-# request: the merge-blocking presubmit (in a Tide batch), the main nightly's
-# three parts and the GitLab next nightly; the
-# today-mode GitLab nightly and a made-up job stand for every other Prow run.
+# request: the merge-blocking presubmit (in a batch Tide ran), the main
+# nightly's three parts and the GitLab and GHES next nightlies; the today-mode
+# GitLab nightly and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-nightly",
@@ -105,6 +105,7 @@ _NEXT_LANE_JOB_NAMES = (
     "ci-kube-agents-eval-nightly-writers",
     "ci-kube-agents-eval-nightly-gitlab-next",
     "ci-kube-agents-eval-nightly-ghes-next",
+    "ci-kube-agents-eval-nightly-gitlab-ce-next",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
 )
@@ -309,7 +310,7 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
         """The a2a step pushes from inside itself because `images:` cannot be
         conditional; the list must not have grown to include them."""
         config = yaml.safe_load(text(_CLOUDBUILD))
-        self.assertEqual(config["images"], ["$_PLATFORM_URI", "$_PROXY_URI", "$_SANDBOX_URI", "$_OPERATOR_URI"])
+        self.assertEqual(config["images"], ["$_PLATFORM_URI", "$_PROXY_URI", "$_SANDBOX_URI", "$_OPERATOR_URI", "$_KUBE_PROXY_URI"])
         for name in _A2A_SUBSTITUTIONS:
             self.assertEqual(config["substitutions"][name], "")
 
@@ -866,14 +867,30 @@ class TasksBudgetSizingTest(unittest.TestCase):
         block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.DOTALL)
         self.assertIsNotNone(block, "MODE_NEXT_ENV_ARGS is not filled under EVAL_MODE_NEXT=1")
         assert block is not None
-        self.assertIn('--set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
-        self.assertIn('--set-string "platformAgent.deployment.env[3].value=false"', block.group(1))
+        self.assertIn('--set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
+        self.assertIn('--set-string "platformAgent.deployment.env[4].value=false"', block.group(1))
         self.assertIn('--set "profiles.tse.enabled=true"', block.group(1))
         self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
         root = _CI_DEPLOY.parent.parent
         self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())
         self.assertIn("KUBEAGENTS_AUDIT_AUTO_PROMOTE", (root / "deploy/sandbox/entrypoint.sh").read_text())
         self.assertIn('AUTO_PROMOTE_ENV = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "agents/platform/skills/fleet-audit/scripts/audit_report.py").read_text())
+
+    def test_every_lane_turns_the_brokers_readings_sweep_off(self) -> None:
+        """#4611: the eval projects share one GitHub App installation, and the
+        readings sweep's hourly budget is sized for one install per installation,
+        so concurrent lanes drained its quota. Every lane's install sets the
+        broker's switch, at the env index just before the next lane's own, and
+        the broker reads that exact name and value."""
+        script = _CI_DEPLOY.read_text()
+        self.assertIn('--set-string "platformAgent.deployment.env[3].name=CREDENTIAL_PROXY_VCS_READINGS"', script)
+        self.assertIn('--set-string "platformAgent.deployment.env[3].value=off"', script)
+        block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.DOTALL)
+        assert block is not None
+        self.assertNotIn("CREDENTIAL_PROXY_VCS_READINGS", block.group(1), "set on every lane, not the next lane alone")
+        broker = (_CI_DEPLOY.parent.parent / "agents/platform/scripts/credential_proxy.py").read_text()
+        self.assertIn('VCS_READINGS_ENV = "CREDENTIAL_PROXY_VCS_READINGS"', broker)
+        self.assertIn('VCS_READINGS_OFF = "off"', broker)
 
     def test_the_first_change_carries_the_mode_and_the_sized_max_sessions_before_the_first_job_wait(self) -> None:
         consts = constants()

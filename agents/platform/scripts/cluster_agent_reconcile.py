@@ -209,6 +209,26 @@ PRUNE_SECONDS_PER_DESCRIBE = 3
 # container can resolve to thousands of projects, a chat message has a size ceiling, and
 # a message the platform drops for its size takes the created/pruned summary with it.
 NOTIFY_UNLISTED_LIMIT = 8
+# The most profiles one run creates; the rest are deferred to the next run and listed under
+# `create_deferred`. The bootstrap gate runs this script under a ceiling
+# (RECONCILE_TIMEOUT_SECONDS there), and a fleet whose missing profiles cannot all be
+# scaffolded inside it would otherwise be killed mid-run on every tick, leaving half-built
+# homes and no progress; under `--require-create-pass` a run that deferred exits
+# EXIT_CREATES_DEFERRED so the gate asks again next tick. Only a create that succeeded
+# counts: a failed one costs the run its time but not a place in the batch, so a cluster
+# sorted behind a hundred failing ones is still attempted, as every cluster was before the
+# cap, and a deferral always means the run made its cap's worth of progress. The hourly
+# producer takes the same cap, so a scope widening onboards that many clusters an hour. Read
+# from the agent container's environment (`spec.deployment.env` carries it); anything but a
+# positive integer reads as the default.
+MAX_CREATES_PER_RUN_ENV = "BOOTSTRAP_MAX_CREATES_PER_TICK"
+MAX_CREATES_PER_RUN_DEFAULT = 100
+try:
+    MAX_CREATES_PER_RUN = int(os.environ.get(MAX_CREATES_PER_RUN_ENV) or MAX_CREATES_PER_RUN_DEFAULT)
+except ValueError:
+    MAX_CREATES_PER_RUN = MAX_CREATES_PER_RUN_DEFAULT
+if MAX_CREATES_PER_RUN < 1:
+    MAX_CREATES_PER_RUN = MAX_CREATES_PER_RUN_DEFAULT
 VIA_MANAGEMENT = "management"
 VIA_EXPLICIT = "explicit"
 # Two caps (design §3): the CRD caps each declared list at 100, and the declared
@@ -1595,6 +1615,9 @@ EXIT_CREATE_PASS_SKIPPED = 3
 # Another reconcile holds the lock. Also distinct from 1: the caller has learned
 # nothing about the roster and should retry rather than count this as a failure.
 EXIT_ALREADY_RUNNING = 4
+# The run created its cap's worth (MAX_CREATES_PER_RUN) and deferred the rest. Nothing
+# failed, so the caller retries next tick without counting it as a failure, as for 4.
+EXIT_CREATES_DEFERRED = 5
 
 RECONCILE_LOCK = ".cluster_agent_reconcile.lock"
 
@@ -1682,6 +1705,7 @@ def reconcile(dry_run: bool = False) -> dict:
         "skipped_error": [],     # liveness check was inconclusive (auth/network/etc.)
         "incomplete": [],        # identity stamped but the scaffold never finished
         "create_failed": [],     # cluster that should have a profile and could not get one
+        "create_deferred": [],   # cluster left for the next run by MAX_CREATES_PER_RUN
         "unmanaged": [],  # kept and listed: project never produced by the scope, retiring, or carried forward
         "retiring": [],          # project the scope dropped whose profiles are being removed
     }
@@ -1873,6 +1897,15 @@ def reconcile(dry_run: bool = False) -> dict:
             if cluster in EXTRA_EXCLUDE:
                 log(f"{cluster} ({proj}/{location}) is skipped by RECONCILE_EXCLUDE, a bare name; "
                     "move it to spec.scope.exclude.clusters, the variable retires next release.")
+                continue
+            # The per-run cap, before the describe a container member costs: a cluster
+            # past it is left for the next run, which finds it still without a profile.
+            # Failed creates do not count (see MAX_CREATES_PER_RUN).
+            if len(report["created"]) >= MAX_CREATES_PER_RUN:
+                if not report["create_deferred"]:
+                    log(f"create cap reached ({MAX_CREATES_PER_RUN} per run, {MAX_CREATES_PER_RUN_ENV}); "
+                        "every further cluster without a profile is deferred to the next run.")
+                report["create_deferred"].append(f"{cluster}/{location}")
                 continue
             if member_only:
                 # Per cluster: the index lags real state by minutes, so a member's cluster the
@@ -2363,6 +2396,15 @@ def _format_notification(report: dict) -> str:
             f"  ❌ {len(failed)} cluster(s) could not be given a profile "
             f"(retried next run): {', '.join(f'`{n}`' for n in failed)}."
         )
+    deferred = report.get("create_deferred", [])
+    if deferred:
+        named = ", ".join(f"`{n}`" for n in deferred[:NOTIFY_UNLISTED_LIMIT])
+        rest = len(deferred) - NOTIFY_UNLISTED_LIMIT
+        lines.append(
+            f"  ⏭ {len(deferred)} cluster(s) deferred to the next run by the cap of "
+            f"{MAX_CREATES_PER_RUN} creates per run: {named}"
+            + (f", and {rest} more." if rest > 0 else ".")
+        )
     if report.get("skipped_error"):
         lines.append(
             f"  ⚠️ {len(report['skipped_error'])} profile(s) could not be verified this run "
@@ -2442,8 +2484,9 @@ def main() -> None:
     parser.add_argument(
         "--require-create-pass", action="store_true",
         help="Exit non-zero if the CREATE direction could not run (no management project, or "
-             "its cluster list failed), if it ran and every create failed, if the run raised, or "
-             "if another run holds the lock (4). Off by default: "
+             "its cluster list failed), if it ran and every create failed, if the run raised, "
+             "if another run holds the lock (4), or if the per-run create cap deferred some "
+             "clusters to the next run (5). Off by default: "
              "the cron producer must always exit 0.",
     )
     args = parser.parse_args()
@@ -2467,9 +2510,9 @@ def main() -> None:
             return
 
     log(
-        "Done: created={} failed={} pruned={} kept={} no_identity={} unknown={}.".format(
+        "Done: created={} failed={} deferred={} pruned={} kept={} no_identity={} unknown={}.".format(
             len(report.get("created", [])), len(report.get("create_failed", [])),
-            len(report.get("pruned", [])),
+            len(report.get("create_deferred", [])), len(report.get("pruned", [])),
             len(report.get("kept", [])), len(report.get("skipped_no_identity", [])),
             len(report.get("skipped_error", [])),
         )
@@ -2511,6 +2554,13 @@ def main() -> None:
     if args.require_create_pass and unreconciled:
         log(f"{unreconciled}; the roster is not reconciled.")
         raise SystemExit(EXIT_CREATE_PASS_SKIPPED)
+    # A deferral means the run created its cap's worth, so this is progress, never a
+    # failure: the gate retries without spending an attempt, and the next run's listing
+    # finds the deferred clusters still without a profile.
+    if args.require_create_pass and report.get("create_deferred"):
+        log(f"{len(report['create_deferred'])} cluster(s) deferred to the next run by the cap of "
+            f"{MAX_CREATES_PER_RUN}; the roster is not reconciled yet.")
+        raise SystemExit(EXIT_CREATES_DEFERRED)
 
 
 if __name__ == "__main__":

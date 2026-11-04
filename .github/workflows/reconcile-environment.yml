@@ -321,6 +321,7 @@ jobs:
           SLACK_ALLOW_ALL_USERS: ${{ vars.SLACK_ALLOW_ALL_USERS }}
           ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
           ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
+          HELM_UPGRADE_INSTALL: ${{ vars.HELM_UPGRADE_INSTALL }}
           ENABLE_PUBSUB_PLATFORM: ${{ vars.ENABLE_PUBSUB_PLATFORM }}
           ENABLE_STOCKOUT_INVESTIGATOR: ${{ vars.ENABLE_STOCKOUT_INVESTIGATOR }}
           # Unset leaves the key out of install.env and the shipped default (true)
