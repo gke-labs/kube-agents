@@ -88,14 +88,24 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 from credential_proxy_client import (  # noqa: F401  (re-export)
     ADMISSION_BOUND_BACKGROUND,
     ADMISSION_BOUND_DRAINING,
+    ADMISSION_REPLICAS_KEY,
+    ADMISSION_TIER_ADMITTED_KEY,
+    ADMISSION_TIER_INTERACTIVE_CAP_KEY,
     API_RELAY_PREFIX,
+    AUDIT_BROKER_POD,
+    AUDIT_BROKER_TIER,
+    AUDIT_CLASS,
     BACKGROUND_NICE,
+    BROKER_TIER_EXEC,
+    BROKER_TIER_STATEFUL,
     BUSY_BOUND_KEY,
     CLASS_BACKGROUND,
     CLASS_INTERACTIVE,
     CLASS_LABEL,
     CONTEXT_FLAG,
     END_OF_FLAGS,
+    EXEC_REPLICAS_FILE,
+    EXEC_REPLICAS_FILE_ENV,
     EXEC_ROLE,
     KUBECONFIG_FLAG,
     ClusterTarget,
@@ -790,10 +800,15 @@ HEALTHZ_PATH = "/healthz"
 # worker pools by (`broker_admission.sweep_width`). Read-only: the slot cap, the
 # count the child memory budget fits at this container's effective limit, the
 # smaller of the two, the interactive cap inside it, and the session role's own
-# cap. Only the broker knows the
-# effective limit: on GKE Autopilot without bursting it is the memory request,
-# rewritten after the operator rendered the pod.
+# cap; on an exec pod, also the tier's totals (`exec_tier_replicas`). Only the
+# broker knows the effective limit: on GKE Autopilot without bursting it is the
+# memory request, rewritten after the operator rendered the pod.
 ADMISSION_PATH = "/v1/exec/admission"
+# The largest exec-tier replica count the report multiplies by: the CR field's
+# bound (credential-broker-exec-tier.md §12). A larger count in the replicas
+# file is held to it.
+EXEC_REPLICAS_MAX = 32
+EXEC_REPLICAS_RE = re.compile(r"[0-9]+")
 # Requests that keep serving while the broker drains (SHUTDOWN_DRAIN_SECONDS),
 # by method and path: the health probe; a relay's settle routes, so the
 # gateway's acks for pulls already answered land; and the event pulls. Slack's
@@ -1891,6 +1906,28 @@ def exec_pod_serves(method: str, path: str) -> bool:
     if method == "POST":
         return path == "/v1/exec" or path.startswith(API_RELAY_PREFIX)
     return path in (HEALTHZ_PATH, ADMISSION_PATH) or path.startswith(API_RELAY_PREFIX)
+
+
+def exec_tier_replicas() -> int | None:
+    """The exec tier's replica count from the file the operator mounts, or None.
+
+    Read on each call, because a scale change rewrites the ConfigMap and does
+    not restart the pod (§3.5). A file that is absent (as on the stateful pod),
+    cannot be read or holds no positive integer gives None, with a debug line
+    only, because the admission route reads it on each request.
+    """
+    path = os.environ.get(EXEC_REPLICAS_FILE_ENV) or EXEC_REPLICAS_FILE
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        LOGGER.debug("could not read the exec tier's replica count path=%s: %s", path, type(exc).__name__)
+        return None
+    replicas = int(text) if EXEC_REPLICAS_RE.fullmatch(text) else 0
+    if replicas < 1:
+        LOGGER.debug("the exec tier's replica count is not a positive integer path=%s", path)
+        return None
+    return min(replicas, EXEC_REPLICAS_MAX)
 
 
 # How long a managed-repository allowlist read is reused.
@@ -11547,6 +11584,18 @@ class JsonLineFormatter(logging.Formatter):
         return json.dumps(payload, default=str, separators=(",", ":"))
 
 
+def broker_tier_of(role: str) -> str:
+    """The `broker_tier` audit field of a broker process in ``role``."""
+    return BROKER_TIER_EXEC if role == EXEC_ROLE else BROKER_TIER_STATEFUL
+
+
+@functools.lru_cache(maxsize=None)
+def _broker_pod() -> str:
+    """This broker's pod name, for the `broker_pod` audit field. Kubernetes
+    sets a pod's hostname to its name. Read once for the life of the process."""
+    return socket.gethostname()
+
+
 def _tool_audit(
     status: str,
     request_id: str,
@@ -11558,12 +11607,15 @@ def _tool_audit(
     duration_ms: int | None = None,
     rule: str | None = None,
     pod: str = "",
+    broker_tier: str,
+    klass: str,
 ) -> dict[str, Any]:
     """The `audit` mapping of one tool-execution record.
 
     Only identifiers and outcomes: the request id, the verified principal, the
     tool and subcommand as the metrics label them (a closed vocabulary, never the
-    argv), the outcome and, where there is one, the exit code, the duration and
+    argv), the outcome, the broker's tier (`broker_tier_of`), the admission class,
+    this broker's pod and, where there is one, the exit code, the duration and
     the policy rule. No argument, path, stdin or output is ever here, so there is
     nothing in the record for a `--token` to leak through.
     """
@@ -11574,6 +11626,9 @@ def _tool_audit(
         "tool": tool,
         "subcommand": subcommand,
         "status": status,
+        AUDIT_BROKER_TIER: broker_tier,
+        AUDIT_CLASS: klass,
+        AUDIT_BROKER_POD: _broker_pod(),
     }
     if pod:
         # The caller's pod, from the TokenReview's pod-name extra: every
@@ -12420,17 +12475,26 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return False
 
     def _admission_report(self) -> dict[str, int | None]:
-        """The five numbers ADMISSION_PATH answers with, and nothing else of the
-        budget's internals. `interactive_cap` is what interactive work, the
-        shell's sweeps included, may hold at once (`class_cap`), which a sweep
-        sizes itself inside (`broker_admission.width_for`)."""
-        return {
+        """The five per-replica numbers ADMISSION_PATH answers with, and nothing
+        else of the budget's internals. `interactive_cap` is what interactive
+        work, the shell's sweeps included, may hold at once (`class_cap`), which
+        a sweep sizes itself inside (`broker_admission.width_for`). When the exec
+        tier's replicas file holds a count, the report adds it and the tier's
+        admitted count and interactive cap, each the per-replica one times the
+        count; the per-replica numbers stay as they are."""
+        report = {
             "slot_cap": self.executor.max_concurrent_commands,
             "budget_admits": self.executor.requests_the_budget_admits(),
             "admitted": self.executor.admitted_requests(),
             "interactive_cap": self.executor.class_cap(CLASS_INTERACTIVE),
             "session_cap": getattr(self.session_slots, "limit", DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS),
         }
+        replicas = exec_tier_replicas()
+        if replicas is not None:
+            report[ADMISSION_REPLICAS_KEY] = replicas
+            report[ADMISSION_TIER_ADMITTED_KEY] = report["admitted"] * replicas
+            report[ADMISSION_TIER_INTERACTIVE_CAP_KEY] = report["interactive_cap"] * replicas
+        return report
 
     def _refused_while_shutting_down(self, **fields: Any) -> bool:
         """Answer a Chat event pull 503 SHUTDOWN_ERROR while the stop is under way."""
@@ -12708,7 +12772,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)
 
         def audit(status: str, **fields: Any) -> dict[str, Any]:
-            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod, **fields)}
+            return {
+                AUDIT_EXTRA_KEY: _tool_audit(
+                    status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod,
+                    broker_tier=broker_tier_of(self.broker_role), klass=admission_class(principal.role), **fields,
+                )
+            }
 
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
@@ -14299,8 +14368,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         def audit(status: str) -> dict[str, Any]:
             return {
+                # Interactive: the class of the request slot below.
                 AUDIT_EXTRA_KEY: _tool_audit(
-                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND
+                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND,
+                    broker_tier=broker_tier_of(self.broker_role), klass=CLASS_INTERACTIVE,
                 )
             }
 
