@@ -86,6 +86,14 @@ entries:
     measure: 2
     detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
     issue: 4341
+  # The kube-proxy that fronts the sandbox's kubectl declares cpu and memory
+  # but no ephemeral-storage figures.
+  - workload: "golden Deployment/platformagent-kube-proxy"
+    container: kube-proxy
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
   # The shell sandbox and its image-tree init container.
   - workload: "golden StatefulSet/platformagent-shell"
     container: prepare-image-trees

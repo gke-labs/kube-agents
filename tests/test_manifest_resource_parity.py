@@ -125,11 +125,12 @@ CHART_WORKLOAD_PREFIX = f"{SOURCE_CHART} "
 # The pods and containers rendered when this was written (2026-11-02): the
 # chart's hindsight-api, litellm, controller-manager, github-token-minter,
 # web-console, hindsight-postgresql and cr-cleanup; each of nine goldens' shell
-# StatefulSet, credential-proxy and gateway Deployments; the kustomize manager,
-# litellm, hindsight api and postgres and inference-replay. A count under the
-# floor means a source has gone blind, not that the tree got smaller.
+# StatefulSet and credential-proxy, gateway and kube-proxy Deployments; the
+# kustomize manager, litellm, hindsight api and postgres and inference-replay.
+# A count under the floor means a source has gone blind, not that the tree got
+# smaller.
 MIN_CHART_PODS = 7
-MIN_GOLDEN_PODS = 27
+MIN_GOLDEN_PODS = 36
 MIN_KUSTOMIZE_PODS = 5
 MIN_CONTAINERS = 40
 
