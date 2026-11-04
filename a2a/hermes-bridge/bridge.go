@@ -434,6 +434,10 @@ type Bridge struct {
 	// when the fold returns against the publish window finalizeResult opens
 	// after it, without an answer whose fold is slow enough to time.
 	chatPart func(answer string) (lib.Part, bool)
+	// responseCap bounds the API executor's answer read, apiResponseCap by
+	// default; a field so a test can put an answer exactly at the cap
+	// without reading, folding and publishing 8 MiB under the race detector.
+	responseCap int
 
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
@@ -490,6 +494,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.deliver = b.handle
 	b.resultPublish = b.publishResult
 	b.chatPart = resultChatPart
+	b.responseCap = apiResponseCap
 	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
 		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
 	}

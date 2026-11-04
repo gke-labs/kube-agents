@@ -58,20 +58,15 @@ func TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed(t *testing.T) {
 	}
 }
 
-// atCapTerminalWait is the at-cap test's own terminal budget. An answer of
-// apiResponseCap bytes takes about 10 s to
-// its terminal under the race detector on an idle machine (0.6 s to read and
-// parse, 6.4 s in the chat fold scanning one 8 MiB line, 3 s publishing the
-// result chunks; 1.3 s without -race), so the shared terminalWait is crossed
-// on a busy CI runner at a two-fold slowdown, and 58 s to 132 s was
-// measured with the module's packages sharing four starved cores, a
-// thirteen-fold slowdown at worst; the budget is eighteen-fold on the idle
-// figure. The task deadline bounds only the HTTP turn, and the fold runs
-// before finalizeResult opens its publish window, so this budget is the one
-// that decides while the chunks publish inside finalizePublishTimeout; a run
-// that ends failed with bus-publish-failed instead crossed that window, and
-// this budget is not the one to raise.
-const atCapTerminalWait = 180 * time.Second
+// atCapAnswerBytes is the cap the at-cap test runs the bridge at, two result
+// chunks. The boundary is the same comparison at any cap, and the chat fold
+// and the result publish scale with the answer: at apiResponseCap's 8 MiB the
+// answer took about 10 s to its terminal under the race detector on an idle
+// machine, and on a loaded runner it outran finalizePublishTimeout, so the
+// task ended with no terminal at all. TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed
+// keeps the default cap, which reads and refuses but never folds or
+// publishes.
+const atCapAnswerBytes = 512 << 10
 
 // resultPublishCall is what the at-cap test's hooks record: when the
 // bridge's chat fold returned, and the deadline of the context resultPublish
@@ -82,13 +77,13 @@ type resultPublishCall struct {
 	hasDeadline bool
 }
 
-// The boundary's other side: an answer of exactly apiResponseCap bytes is
-// read whole and completes, so the one-byte look-ahead refuses nothing the
-// cap admits.
+// The boundary's other side: an answer of exactly the cap is read whole and
+// completes, so the one-byte look-ahead refuses nothing the cap admits. The
+// bridge runs at atCapAnswerBytes here, not apiResponseCap.
 //
-// The same answer is the one whose chat fold costs enough to matter, so the
-// test also checks where finalizeResult runs it: before the publish window
-// opens, not inside it. The chatPart hook records when the fold returned,
+// At the production cap the chat fold costs enough to matter, so the test
+// also checks where finalizeResult runs it: before the publish window opens,
+// not inside it. The chatPart hook records when the fold returned,
 // the resultPublish hook the deadline of the context it was entered with,
 // and the window opened finalizePublishTimeout before that deadline. Both
 // run on the finalizer's goroutine, in that order, so the fold's time rides
@@ -98,7 +93,8 @@ type resultPublishCall struct {
 func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	_, url := startServer(t)
 	published := make(chan resultPublishCall, 1)
-	startAPIBridgeHooked(t, url, newAPIStub(t, completionOfSize(t, apiResponseCap)), nil, func(b *Bridge) {
+	startAPIBridgeHooked(t, url, newAPIStub(t, completionOfSize(t, atCapAnswerBytes)), nil, func(b *Bridge) {
+		b.responseCap = atCapAnswerBytes
 		var foldedAt time.Time
 		fold := b.chatPart
 		b.chatPart = func(answer string) (lib.Part, bool) {
@@ -118,7 +114,7 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	}, func(net.Addr) bool { return true })
 	c := gatewayClient(t, url)
 	submitIn(t, c, "task-atcap", "ctx-atcap", "write something large")
-	task := waitTerminalFor(t, c, "task-atcap", atCapTerminalWait)
+	task := waitTerminalFor(t, c, "task-atcap", 3*terminalWait)
 	if task.State != lib.StateCompleted {
 		reason := ""
 		if task.FinalMessage != nil && len(task.FinalMessage.Parts) > 0 {
