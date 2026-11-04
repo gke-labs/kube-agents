@@ -39,9 +39,9 @@ The session id is therefore the thread key, and `session_metadata` records the `
 
 #### Limiting the open triage pull requests
 
-With `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true` and `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` above `0` (chart: `platformAgent.deployment.incidentMaxOpenPullRequests`; `0`, negative or not a number is no limit), `_attempt_triage_start` asks `_triage_pull_request_decision` before it builds the query, for an event triage only. `_claim_triage_pull_request` counts the branches that start with `INCIDENT_PR_BRANCH_PREFIX` and have an open proposal on the forge (`proposal-list` on each managed repository, `TRIAGE_PR_LIST_MAX_PAGES` pages of 100 at most, within `TRIAGE_PR_COUNT_TIMEOUT_S`, 10 s), plus the branches in `triage_pr_reservations`. The count and the reservation are made under one lock, so triages that start together count each other before any pull request exists. Under the limit, or when the incident's own branch is already counted (its card revises that pull request), the branch is reserved and the query is `_build_agent_query_with_pull_request`. At the limit, `_build_agent_query` gets `open_pull_request=False` and writes the default query, and once the turn starts the alert's thread gets `TRIAGE_PR_CAP_NOTE`; with no thread the note is only logged. A count the forge does not answer (an error, the timeout, too many pages) is held the same way with `TRIAGE_PR_UNCOUNTED_NOTE` (`TRIAGE_PR_UNCOUNTED_AT_LIMIT`). No text the model reads changes: the held triage gets the query an install without the opt-in gets.
+With `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true` and `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` above `0` (chart: `platformAgent.deployment.incidentMaxOpenPullRequests`; `0`, negative or not a number is no limit), `_attempt_triage_start` asks `_triage_pull_request_decision` before it builds the query, for an event triage only. `_claim_triage_pull_request` counts the branches that start with `INCIDENT_PR_BRANCH_PREFIX` and have an open proposal on the forge (`proposal-list` on each managed repository, `TRIAGE_PR_LIST_MAX_PAGES` pages of 100 at most, within `TRIAGE_PR_COUNT_TIMEOUT_S`, 10 s), plus the branches in `triage_pr_reservations`. The forge is read before the lock, and the reservations are read and written under it, so triages that start together count each other before any pull request exists. Under the limit, or when the incident's own branch is already counted (its card revises that pull request), the branch is reserved and the query is `_build_agent_query_with_pull_request`. At the limit, `_build_agent_query` gets `open_pull_request=False` and writes the default query, and once the turn starts `TRIAGE_PR_CAP_NOTE` is posted where `_triage_not_started` posts its notice: in the alert's thread, or under the alert's quoted first line when it has no thread. With no chat platform the note is only logged. A count the forge does not answer (an error, the timeout, too many pages) is held the same way with `TRIAGE_PR_UNCOUNTED_NOTE` (`TRIAGE_PR_UNCOUNTED_AT_LIMIT`). No text the model reads changes: the held triage gets the query an install without the opt-in gets.
 
-A reservation is released when its branch shows an open proposal (it then counts as open), when the incident's `Open GitOps PR for …` card assigned to `platform` is `done` or `archived`, after `TRIAGE_PR_RESERVATION_MAX_S` (24 h) for a card that was never filed, and when the triage does not start (`_triage_not_started`). Pull requests opened by a reply's `apply` use `submit-suggestion`'s own branch names and are not counted.
+There is one reservation per triage and branch. It is released when its branch shows an open proposal (it then counts as open), when that triage's `Open GitOps PR for …` card assigned to `platform` is `done` or `archived`, when the triage does not start (`_triage_not_started`), and after `TRIAGE_PR_RESERVATION_MAX_S` (24 h). The last covers a card never filed, and a card that is `blocked` or held in `todo` behind a blocked triage card: such a card can still open its pull request, so it keeps counting until it settles or the 24 hours pass. Under the watcher's `--mode=shared`, where every incident shares one session, the first settled card releases every reservation. Pull requests opened by a reply's `apply` use `submit-suggestion`'s own branch names and are not counted.
 
 ### Daily Alert Ceiling
 
@@ -585,9 +585,10 @@ The branches triages were routed to open a pull request on, which count against 
 
 ```sql
 CREATE TABLE triage_pr_reservations(
-  branch TEXT PRIMARY KEY,        -- platform-agent/incident-<incident>
-  session_id TEXT NOT NULL,       -- the triage that reserved it last
-  reserved_at REAL NOT NULL       -- epoch seconds
+  branch TEXT NOT NULL,           -- platform-agent/incident-<incident>
+  session_id TEXT NOT NULL,       -- the triage that reserved it
+  reserved_at REAL NOT NULL,      -- epoch seconds
+  PRIMARY KEY (branch, session_id)
 );
 ```
 

@@ -358,10 +358,12 @@ TRIAGE_PR_LIST_MAX_PAGES = 10
 TRIAGE_PR_COUNT_TIMEOUT_S = 10.0
 # A branch a triage was routed to open counts from the routing on, before its
 # pull request exists: a node failure breaks many pods at once, and their
-# diagnoses finish minutes later. The reservation ends when the branch shows
-# an open pull request (counted as open from then), when the incident's
-# pull-request card (title TRIAGE_PR_CARD_TITLE_PREFIX) is done or archived, or
-# after TRIAGE_PR_RESERVATION_MAX_S, for a card that was never filed.
+# diagnoses finish minutes later. One reservation per triage and branch. It
+# ends when the branch shows an open pull request (counted as open from then),
+# when the triage's pull-request card (title TRIAGE_PR_CARD_TITLE_PREFIX) is
+# done or archived, when the triage does not start, or after
+# TRIAGE_PR_RESERVATION_MAX_S: for a card never filed, and for a card blocked,
+# or held behind a blocked triage card, that long.
 TRIAGE_PR_RESERVATION_MAX_S = 86400
 TRIAGE_PR_CARD_TITLE_PREFIX = "Open GitOps PR for "
 TRIAGE_PR_CARD_SETTLED_STATUSES = ("done", "archived")
@@ -373,13 +375,11 @@ TRIAGE_PR_UNCOUNTED_AT_LIMIT = True
 # Posted in the alert's thread when the limit holds a triage's pull request back.
 TRIAGE_PR_CAP_NOTE = (
     "ℹ️ **No automatic Pull Request for this incident.** This install already has {count} triage Pull Requests "
-    "open or being opened, and its limit is {limit}. The triage report in this thread proposes the fix and says "
-    "how to open it."
+    "open or being opened, and its limit is {limit}. The triage report proposes the fix and says how to open it."
 )
 TRIAGE_PR_UNCOUNTED_NOTE = (
     "ℹ️ **No automatic Pull Request for this incident.** The open triage Pull Requests could not be counted "
-    "against this install's limit of {limit}. The triage report in this thread proposes the fix and says how "
-    "to open it."
+    "against this install's limit of {limit}. The triage report proposes the fix and says how to open it."
 )
 # The profile that holds the GitOps write path. The triage card goes to a
 # Cluster Agent, whose persona forbids `submit-suggestion`, so the pull request
@@ -1607,9 +1607,10 @@ def init_db() -> None:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS triage_pr_reservations (
-                    branch      TEXT PRIMARY KEY,
+                    branch      TEXT NOT NULL,
                     session_id  TEXT NOT NULL,
-                    reserved_at REAL NOT NULL
+                    reserved_at REAL NOT NULL,
+                    PRIMARY KEY (branch, session_id)
                 )
                 """
             )
@@ -3328,25 +3329,28 @@ def _claim_triage_pull_request(session_id: str, payload: Dict[str, Any], limit: 
     reserved.
     """
     branch = _incident_branch(session_id, payload)
+    # Read before the lock, so a slow forge does not hold the other starts.
+    # A pull request that opens after this read is still counted, through
+    # the reservation that routed it.
+    open_branches = _open_triage_pull_request_branches(TRIAGE_PR_COUNT_TIMEOUT_S)
+    if open_branches is None and TRIAGE_PR_UNCOUNTED_AT_LIMIT:
+        logger.warning(f"Triage {session_id} files no pull-request card: the open triage pull requests could not be counted")
+        return TRIAGE_PR_UNCOUNTED_NOTE.format(limit=limit)
     with _TRIAGE_PR_CLAIM_LOCK:
-        open_branches = _open_triage_pull_request_branches(TRIAGE_PR_COUNT_TIMEOUT_S)
-        if open_branches is None and TRIAGE_PR_UNCOUNTED_AT_LIMIT:
-            logger.warning(f"Triage {session_id} files no pull-request card: the open triage pull requests could not be counted")
-            return TRIAGE_PR_UNCOUNTED_NOTE.format(limit=limit)
         try:
             with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=LEDGER_WRITE_TIMEOUT_S)) as conn:
                 now = time.time()
                 rows = conn.execute("SELECT branch, session_id, reserved_at FROM triage_pr_reservations").fetchall()
                 settled = _settled_triage_pull_request_sessions([row[1] for row in rows])
                 released = [
-                    row[0]
+                    (row[0], row[1])
                     for row in rows
                     if (open_branches is not None and row[0] in open_branches)
                     or row[1] in settled
                     or now - float(row[2]) >= TRIAGE_PR_RESERVATION_MAX_S
                 ]
-                conn.executemany("DELETE FROM triage_pr_reservations WHERE branch = ?", [(b,) for b in released])
-                counted = set(open_branches or ()) | {row[0] for row in rows if row[0] not in released}
+                conn.executemany("DELETE FROM triage_pr_reservations WHERE branch = ? AND session_id = ?", released)
+                counted = set(open_branches or ()) | {row[0] for row in rows if (row[0], row[1]) not in released}
                 if branch not in counted and len(counted) >= limit:
                     conn.commit()
                     logger.info(
@@ -3356,7 +3360,7 @@ def _claim_triage_pull_request(session_id: str, payload: Dict[str, Any], limit: 
                     return TRIAGE_PR_CAP_NOTE.format(count=len(counted), limit=limit)
                 conn.execute(
                     "INSERT INTO triage_pr_reservations (branch, session_id, reserved_at) VALUES (?, ?, ?) "
-                    "ON CONFLICT(branch) DO UPDATE SET session_id = excluded.session_id, reserved_at = excluded.reserved_at",
+                    "ON CONFLICT(branch, session_id) DO UPDATE SET reserved_at = excluded.reserved_at",
                     (branch, session_id, now),
                 )
                 conn.commit()
@@ -3370,7 +3374,7 @@ def _claim_triage_pull_request(session_id: str, payload: Dict[str, Any], limit: 
 
 
 def _release_triage_pull_request(session_id: str) -> None:
-    """Drop the session's reservation; for a triage that did not start. Best-effort."""
+    """Drop the session's reservations; for a triage that did not start. Best-effort."""
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=LEDGER_WRITE_TIMEOUT_S)) as conn:
             conn.execute("DELETE FROM triage_pr_reservations WHERE session_id = ?", (session_id,))
@@ -3395,13 +3399,20 @@ def _triage_pull_request_decision(start: _TriageStart) -> tuple[Optional[bool], 
 
 
 def _post_triage_pull_request_note(start: _TriageStart, note: str) -> None:
-    """Post ``note`` in the alert's thread; with no thread, log it."""
+    """Post ``note`` where _triage_not_started posts its notice: in the alert's
+    thread, or with no thread under the alert's first line, quoted. With no
+    chat platform, log it."""
     notice = start.notice
-    if notice is None or not notice.thread_id:
-        logger.info(f"Triage {start.session_id} has no thread for its pull-request limit note")
+    if notice is None:
+        logger.info(f"Triage {start.session_id} has no chat for its pull-request limit note: {note}")
         return
-    chat_id = _thread_chat_id(notice.platform, notice.thread_id)
-    if not _send_to_chat(notice.platform, note, chat_id, notice.thread_id):
+    if notice.thread_id:
+        chat_id = _thread_chat_id(notice.platform, notice.thread_id)
+        sent = _send_to_chat(notice.platform, note, chat_id, notice.thread_id)
+    else:
+        quoted = notice.alert.splitlines()[0] if notice.alert else ""
+        sent = _send_to_chat(notice.platform, f"{note}\n> {quoted}" if quoted else note)
+    if not sent:
         logger.error(f"Pull-request limit note for {start.session_id} was not delivered to '{notice.platform}'")
 
 

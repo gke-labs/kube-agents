@@ -12465,10 +12465,11 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
         return session_kv_server._incident_branch(session_id, self.payload(name))
 
     def reservations(self):
+        """{(branch, session_id)} of the rows in triage_pr_reservations."""
         import sqlite3
 
         with sqlite3.connect(temp_db_path) as conn:
-            return dict(conn.execute("SELECT branch, session_id FROM triage_pr_reservations").fetchall())
+            return set(conn.execute("SELECT branch, session_id FROM triage_pr_reservations").fetchall())
 
     def test_no_limit_unset_zero_negative_or_garbage_changes_nothing(self):
         for value in (None, "0", "-3", "many"):
@@ -12479,7 +12480,7 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
                     os.environ[self.LIMIT] = value
                 self.assertEqual(self.decide("k8s-evt-1", "api-0"), (None, None))
         self.assertEqual(self.forge_calls, [])
-        self.assertEqual(self.reservations(), {})
+        self.assertEqual(self.reservations(), set())
 
     def test_the_limit_needs_the_opt_in_and_an_event(self):
         with patch.dict(os.environ, {self.OPEN: "false"}, clear=False):
@@ -12492,7 +12493,7 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
     def test_under_the_limit_the_branch_is_reserved_and_the_pull_request_card_filed(self):
         self.pages = [[self.PREFIX + "other-0123abcd", "feature/unrelated"]]
         self.assertEqual(self.decide("k8s-evt-1", "api-0"), (True, None))
-        self.assertEqual(self.reservations(), {self.branch("k8s-evt-1", "api-0"): "k8s-evt-1"})
+        self.assertEqual(self.reservations(), {(self.branch("k8s-evt-1", "api-0"), "k8s-evt-1")})
         verb, payload, repo = self.forge_calls[0]
         self.assertEqual((verb, payload["state"], repo), ("proposal-list", "open", "acme/gitops"))
 
@@ -12503,7 +12504,7 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
         self.assertIs(open_pull_request, False)
         self.assertEqual(note, session_kv_server.TRIAGE_PR_CAP_NOTE.format(count=2, limit=2))
         self.assertIn("This install already has 2 triage Pull Requests open or being opened, and its limit is 2.", note)
-        self.assertEqual(self.reservations(), {})
+        self.assertEqual(self.reservations(), set())
 
     def test_a_burst_counts_its_own_reservations(self):
         """No pull request exists yet when a node failure breaks many pods at once."""
@@ -12520,14 +12521,14 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
         # count; a new session for the same coordinates reuses the branch.
         self.pages = [[self.PREFIX + "b-2222bbbb"]]
         self.assertEqual(self.decide("k8s-evt-10", "api-0"), (True, None))
-        self.assertEqual(self.reservations()[mine], "k8s-evt-10")
+        self.assertEqual(self.reservations(), {(mine, "k8s-evt-9"), (mine, "k8s-evt-10")})
         self.assertIs(self.decide("k8s-evt-3", "web-3")[0], False)
 
     def test_a_reservation_whose_pull_request_opened_is_counted_once(self):
         self.decide("k8s-evt-1", "api-0")
         self.pages = [[self.branch("k8s-evt-1", "api-0")]]
         self.assertEqual(self.decide("k8s-evt-2", "web-2"), (True, None))
-        self.assertNotIn(self.branch("k8s-evt-1", "api-0"), self.reservations())
+        self.assertNotIn(self.branch("k8s-evt-1", "api-0"), {branch for branch, _ in self.reservations()})
 
     def test_a_settled_pull_request_card_releases_its_reservation(self):
         import sqlite3
@@ -12544,7 +12545,7 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
                 ],
             )
         self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
-        self.assertEqual(set(self.reservations().values()), {"k8s-evt-2", "k8s-evt-3"})
+        self.assertEqual({session for _, session in self.reservations()}, {"k8s-evt-2", "k8s-evt-3"})
 
     def test_a_reservation_past_the_backstop_is_released(self):
         import sqlite3
@@ -12565,7 +12566,7 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
                 open_pull_request, note = self.decide("k8s-evt-1", "api-0")
                 self.assertIs(open_pull_request, False)
                 self.assertEqual(note, session_kv_server.TRIAGE_PR_UNCOUNTED_NOTE.format(limit=2))
-        self.assertEqual(self.reservations(), {})
+        self.assertEqual(self.reservations(), set())
 
     def test_with_the_uncounted_switch_off_an_uncounted_forge_counts_reservations_only(self):
         self.pages = RuntimeError("forge down")
@@ -12622,8 +12623,45 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
 
     def test_a_triage_that_does_not_start_releases_its_reservation(self):
         send, _ = self._run_start(self.start("k8s-evt-1", "api-0"), [_http_error(401)])
-        self.assertEqual(self.reservations(), {})
+        self.assertEqual(self.reservations(), set())
         send.assert_not_called()
+
+    def test_a_triage_that_does_not_start_keeps_another_triages_reservation_on_its_branch(self):
+        self.decide("k8s-evt-1", "api-0")
+        self._run_start(self.start("k8s-evt-2", "api-0"), [_http_error(401)])
+        self.assertEqual(self.reservations(), {(self.branch("k8s-evt-1", "api-0"), "k8s-evt-1")})
+
+    def test_triages_that_start_together_count_each_other(self):
+        """The reservations are read and written under one lock: four starts at
+        once, with the board read between them slowed, reserve two branches."""
+        real = session_kv_server._settled_triage_pull_request_sessions
+
+        def slow(session_ids):
+            time.sleep(0.05)
+            return real(session_ids)
+
+        results = []
+        with patch.object(session_kv_server, "_settled_triage_pull_request_sessions", slow):
+            threads = [
+                threading.Thread(target=lambda i=i: results.append(self.decide(f"k8s-evt-{i}", f"web-{i}")[0]))
+                for i in range(4)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(sorted(results), [False, False, True, True])
+        self.assertEqual(len(self.reservations()), 2)
+
+    def test_with_no_thread_the_note_quotes_the_alert(self):
+        self.pages = [[self.PREFIX + "a-1111aaaa", self.PREFIX + "b-2222bbbb"]]
+        notice = session_kv_server._TriageNotice("googlechat", "", "⚠️ Warning: BackOff prod/api-0\nsecond line")
+        send, _ = self._run_start(self.start("k8s-evt-1", "api-0", notice=notice), [_answered(), _answered()])
+        send.assert_called_once()
+        self.assertEqual(
+            send.call_args.args,
+            ("googlechat", session_kv_server.TRIAGE_PR_CAP_NOTE.format(count=2, limit=2) + "\n> ⚠️ Warning: BackOff prod/api-0"),
+        )
 
     def test_the_pvc_dotenv_cannot_set_the_limit(self):
         with tempfile.NamedTemporaryFile("wb", suffix=".env", delete=False) as f:

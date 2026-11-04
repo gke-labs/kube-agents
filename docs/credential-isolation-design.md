@@ -118,7 +118,7 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 `FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
 `FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
-window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
+window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch and its `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` limit, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
 cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
 roster count, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
 are rejected. One name goes to the shell Pod
