@@ -467,9 +467,11 @@ FIXTURE_NOT_READY = {
         "both paths, so no CI tier can run it; run it by hand against such an install"
     ),
     "incident-triage-open-pr-reminder": (
-        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env "
-        "(INCIDENT_WORKLOAD_DEDUP_SECONDS on, which is its default) and a GitOps repository "
-        "declaring eval-pr-reminder-workload; every CI eval install leaves "
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env, "
+        "INCIDENT_WORKLOAD_DEDUP_SECONDS set shorter than the fix pull request takes to open (150, "
+        "as hack/ci-deploy.sh sets it; on the hour default the stack's recurrence lands inside the "
+        "window and folds with no pull request on its row, which the objective check fails) and a "
+        "GitOps repository declaring eval-pr-reminder-workload; every CI eval install leaves "
         "INCIDENT_TRIAGE_OPEN_PULL_REQUEST off and no pool *-infra repository declares it, so no CI "
         "tier can run it; run it by hand against such an install"
     ),
