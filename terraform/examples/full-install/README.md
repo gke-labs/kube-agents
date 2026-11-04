@@ -274,9 +274,11 @@ The Standard pools' sizing inputs (`sizing_profile`, `standard_*`, `gvisor_*`)
 travel the same way, as `TF_VAR_` lines the generator never writes, and the
 lines have to be present on every later `install.sh` and `upgrade.sh` run: a
 lost one resolves the `small` profile, and the apply would recreate every node
-of a larger pool onto it. `guard_node_pool_shape` refuses that apply when no
-sizing input is set; a profile or the pool's own input, set to any value, is
-the resize asked for and goes through.
+of a larger pool onto it. `guard_node_pool_shape` refuses that apply unless a
+sizing input asks for the change: the pool's own input, set to any value, or
+a profile other than the one the last apply recorded (the `sizing_profile`
+output). A profile kept beside a lost explicit line asks for nothing, so that
+apply is refused too.
 The drift audit-log ingress has the same one-default-per-project shape, and
 this one every second install meets, because `ENABLE_DRIFT_DETECTOR` defaults
 to `true`: `drift_pubsub_topic`, `drift_pubsub_subscription` and

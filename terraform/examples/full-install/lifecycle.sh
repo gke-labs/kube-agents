@@ -43,7 +43,9 @@
 #      reach the apply as `TF_VAR_` lines too: a lost line resolves the small
 #      profile and shrinks a fleet host's nodes under -auto-approve.
 #      `guard_node_pool_shape` refuses an apply whose resolved shape differs
-#      from the pool in state unless a sizing input names the change.
+#      from the pool in state unless a sizing input names the change: the
+#      pool's own explicit input, or a profile other than the one the last
+#      apply recorded (a root output), since a kept profile names none.
 #   7. A state left by an interrupted install can hold the cluster's CMEK
 #      entries next to a create_cluster that the retry computes as false, and
 #      the module then plans their destruction. `forget_unmanaged_cluster_kms`
@@ -239,6 +241,11 @@ readonly HELM_UNINSTALL_TIMEOUT="10m"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
 readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
+# What `terraform output -raw <name>` prints when the state records other
+# outputs but not that one: the shape of a state from before the output was
+# declared. tf_recorded_output reads it as "not recorded"; a state with no
+# output at all exits 0 and prints nothing, which reads the same way.
+readonly OUTPUT_NOT_RECORDED_PATTERN='Output "[^"]*" not found|could not be found in the state'
 # The drift-pubsub module's three resources. Unlike the stockout trio they are
 # NOT adopted -- guard_drift_adoption refuses an apply that would import them,
 # and says there why. Their names are read from the composition's
@@ -402,6 +409,28 @@ tf_expr() {
     null | "tostring(null)" | "tonumber(null)" | "tobool(null)") value="" ;;
   esac
   printf '%s\n' "$value"
+}
+
+# A root output of this composition as the last apply recorded it, by name.
+# Root outputs persist in state where a module's do not, which is how
+# guard_node_pool_shape reads the sizing_profile the pools were last applied
+# under. Empty when the state does not record the output (one from before it
+# was declared, or one with no output at all); any other failure is the
+# backend's and fatal, as tf_expr's is, so a profile is never read as a
+# first setting because the state could not be read.
+tf_recorded_output() {
+  local out
+  if out=$(terraform output -no-color -raw "$1" 2>&1); then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if grep -qE "$OUTPUT_NOT_RECORDED_PATTERN" <<<"$out"; then
+    printf '\n'
+    return 0
+  fi
+  printf '%s\n' "$out" >&2
+  warn "could not read output $1 from the state (see the terraform error above)"
+  exit 1
 }
 
 # The state list is read once and matched in memory. Piping it straight into
@@ -925,14 +954,19 @@ guard_standard_node_count() {
 # shell for the first run only -- resolves the small profile, and the plan for
 # a fleet host is every node of both pools onto e2-standard-4, after which the
 # proxy fits on none of them. The resolved shape is read from the module's
-# outputs, so the profile table lives in the module alone. Refused only when
-# no sizing input names the change: sizing_profile or the pool's own explicit
-# input, set to anything, is the operator asking for the resize, and a blank
-# line counts as unset, as the module reads it. Same shape as
+# outputs, so the profile table lives in the module alone. Refused unless a
+# sizing input asks for the change: the pool's own explicit input, set to
+# anything (the module resolves the attribute to it), or sizing_profile set
+# to a profile other than the one the last apply recorded, which the
+# composition keeps as a root output for this read. A profile merely set is
+# not an opt-in: kept beside a lost explicit line it names no change and the
+# resolved shape is the profile's own, so the same lost-line case would walk
+# through; and the same holds when a later release gives a profile a new
+# shape. A blank line counts as unset, as the module reads it. Same shape as
 # guard_standard_node_count.
 guard_node_pool_shape() {
   load_state
-  local profile="" profile_read=false
+  local profile="" profile_recorded="" profile_read=false
   local pool addr label attr recorded resolved explicit
   for pool in standard gvisor; do
     case "$pool" in
@@ -949,15 +983,21 @@ guard_node_pool_shape() {
       [[ -n "$explicit" ]] && continue
       if [[ "$profile_read" == "false" ]]; then
         profile=$(tfvar sizing_profile)
+        [[ -n "$profile" ]] && profile_recorded=$(tf_recorded_output sizing_profile)
         profile_read=true
       fi
-      [[ -n "$profile" ]] && continue
+      [[ -n "$profile" && "$profile" != "$profile_recorded" ]] && continue
       warn "${pool}_${attr} resolved to '$resolved', but this state's cluster runs $label on '$recorded' ($addr), and no sizing input asks for the change."
+      if [[ -n "$profile" ]]; then
+        warn "sizing_profile is '$profile', the profile the last apply recorded, so it names no change: the shape in state came from a"
+        warn "TF_VAR_${pool}_${attr} line that is no longer set beside it, or from a profile this version renders differently."
+      fi
       warn "The sizing inputs reach the apply as TF_VAR_ lines in install.env, which the installer never writes into terraform.tfvars, so a lost"
-      warn "or blanked line resolves the small profile. Applying now would recreate EVERY node of $label onto the resolved shape under"
-      warn "-auto-approve. Put back the line the pool was built with (TF_VAR_sizing_profile=<profile>, or TF_VAR_${pool}_${attr}=${recorded}) to"
-      warn "keep it; to resize deliberately, name the shape you want (TF_VAR_sizing_profile=<profile>, or TF_VAR_${pool}_${attr}=${resolved}),"
-      warn "or set it in terraform.tfvars for a hand-driven apply."
+      warn "or blanked profile line resolves the small profile, and a lost explicit line the profile's shape. Applying now would"
+      warn "recreate EVERY node of $label onto the resolved shape under -auto-approve. Put back the line the pool was built with"
+      warn "(TF_VAR_sizing_profile=<profile>, or TF_VAR_${pool}_${attr}=${recorded}) to keep it; to resize deliberately, name the shape you want"
+      warn "(TF_VAR_${pool}_${attr}=${resolved}, or a TF_VAR_sizing_profile other than the one the last apply recorded), or set it in"
+      warn "terraform.tfvars for a hand-driven apply."
       exit 1
     done
   done
@@ -1877,7 +1917,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,97p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,99p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

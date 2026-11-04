@@ -18,6 +18,17 @@ output "image_tag" {
   value       = var.image_tag
 }
 
+# The profile the Standard pools were last applied under, for lifecycle.sh's
+# guard_node_pool_shape. A root output persists in state where the module's
+# does not, so the guard can tell a profile the operator changed, which asks
+# for the resize it plans, from one kept beside a lost explicit TF_VAR_ line,
+# which asks for nothing. Resolved by the module: small when sizing_profile is
+# unset or "".
+output "sizing_profile" {
+  description = "Sizing profile the Standard cluster's node pools were last applied under (small, medium or fleet); small when sizing_profile is unset or \"\"."
+  value       = module.gke_cluster.sizing_profile
+}
+
 output "cluster_location" {
   description = "Region the cluster runs in"
   value       = module.gke_cluster.cluster_location
