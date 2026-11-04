@@ -837,6 +837,23 @@ type TuningSpec struct {
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`
 
+	// Admission is the memory admission the kanban dispatcher applies to its own
+	// workers, board-wide like MaxInProgress: the pod memory budget it classifies
+	// pressure against, the resident-memory cap one running worker may reach, how
+	// long a ready card may wait on memory or a full board before it is refused, and
+	// what a tick does when it cannot read memory at all. Past the budget the
+	// dispatcher refuses rather than spawns: the card is blocked with kind
+	// "capacity" and a reason that names the figures, so the thread that filed it is
+	// told it is throttled instead of losing the worker to an eviction. Unset, every
+	// field takes the operator's default, and the budget is the agent container's
+	// memory request (spec.deployment.resources, 2Gi unless set).
+	//
+	// The block is rendered into the managed scope whatever this field says, so the
+	// dispatcher never runs without one: an install that sets nothing runs the
+	// defaults, and removing a field here puts its default back.
+	// +optional
+	Admission *AdmissionSpec `json:"admission,omitempty"`
+
 	// MaxSessions caps how many A2A session pods run concurrently, install-wide.
 	// It only means something under mode: next - a today install renders neither
 	// the gateway that spawns session pods nor this bound. "Delegate:" makes pod
@@ -1017,6 +1034,88 @@ const (
 	DefaultProfileAcceptTimeoutSeconds   = 10
 	DefaultProfileMaxTaskDeadlineSeconds = 21600
 )
+
+// AdmissionSpec is the memory admission the kanban dispatcher applies to its own
+// workers. The operator renders the four values as kanban.admission.* in the
+// managed scope, defaults applied, on every install.
+//
+// It exists because the pod's own limits do not protect it. The agent container
+// runs under GKE Sandbox, where the kernel the container sees reports the
+// sandbox's virtual memory rather than the cgroup's, so Hermes' upstream
+// memory guard, which reads /proc/meminfo, never fires there. And the kubelet
+// evicts a pod under node pressure once its usage passes its memory REQUEST,
+// long before the limit would stop it: the gateway pod was evicted three times
+// at 3.1 to 3.5 GiB against a 2Gi request. The dispatcher therefore reads the
+// container's cgroup usage and counts it against a budget sized from the
+// request, which is what makes its guard fire before the eviction does.
+type AdmissionSpec struct {
+	// MemoryBudgetMiB is the pod memory budget, in MiB, the dispatcher
+	// classifies memory pressure against before it spawns a worker: on every
+	// tick it reads the container's cgroup memory usage and counts it against
+	// this figure. Absent means the agent container's resolved memory request
+	// in MiB (2048 at the operator's default resources), so a CR that raises
+	// the request raises the budget with it.
+	//
+	// The classification is Hermes' own (gateway/memory_status.py): with less
+	// than 15% of the budget, or 128 MiB, left the tick spawns at most one
+	// worker; with less than 5%, or 64 MiB, left it spawns none. A card the
+	// tick cannot spawn waits, and is refused after QueueBoundSeconds. Set the
+	// budget below the request to keep headroom for the gateway's own growth,
+	// or above it, up to the limit, on a node pool where eviction is not the
+	// risk; past the limit the OOM killer, not this budget, is what stops a
+	// worker.
+	// +kubebuilder:validation:Minimum=512
+	// +kubebuilder:validation:Maximum=65536
+	// +optional
+	MemoryBudgetMiB *int32 `json:"memoryBudgetMiB,omitempty"`
+
+	// WorkerRssCapMiB is the most resident memory, in MiB, one running
+	// worker's process tree may hold: the worker and every descendant, its MCP
+	// proxies included. A worker past it is stopped (SIGTERM, a grace period,
+	// then SIGKILL) and its card is blocked with kind "capacity" and a reason
+	// that names the figure and the cap, so the thread that filed it is told.
+	// Absent means 1536.
+	//
+	// The default is three and a half times the 430 MiB a worker measured on
+	// a live install: a fleet-wide audit that holds a large listing fits, and
+	// one worker cannot take the whole of the default budget by itself. A
+	// worker stopped here has done nothing a retry would fix; the reason it
+	// leaves on the card offers a smaller scope instead.
+	// +kubebuilder:validation:Minimum=256
+	// +kubebuilder:validation:Maximum=65536
+	// +optional
+	WorkerRssCapMiB *int32 `json:"workerRssCapMiB,omitempty"`
+
+	// QueueBoundSeconds is how long a ready card may wait, in seconds, on ticks
+	// that could not spawn it because of memory pressure or an exhausted slot
+	// budget before it is blocked with kind "capacity" instead of left in the
+	// queue. A card that waits for another reason is not touched: one that is
+	// unassigned, not spawnable, held by the respawn guard or by a per-profile
+	// cap stays ready. Absent means 120.
+	//
+	// Two minutes is 24 ticks at the 5s dispatch interval: long enough for a
+	// worker that is finishing to give its slot back, short enough that the
+	// thread that filed the card hears it is throttled, with its options,
+	// before it would have given up waiting for an answer.
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	QueueBoundSeconds *int32 `json:"queueBoundSeconds,omitempty"`
+
+	// FailClosed is what a tick does when it cannot read the memory counters
+	// at all: true spawns nothing on that tick and logs why; false keeps
+	// Hermes' upstream behaviour, where an unreadable sample imposes no
+	// restriction. Absent means true.
+	//
+	// Closed is the default because the counters go unreadable on exactly the
+	// installs the budget exists for: a sandbox runtime that hides the cgroup
+	// files is also the one that hides the pressure, and an open tick there
+	// spawns into the eviction the budget was meant to prevent. Set it false
+	// only to diagnose a dispatcher that spawns nothing and logs the read
+	// failure.
+	// +optional
+	FailClosed *bool `json:"failClosed,omitempty"`
+}
 
 // AgentLimits bounds a single agent run. Both limits exist because they fail the same
 // way — the run stops mid-task without calling a terminal kanban tool, which the

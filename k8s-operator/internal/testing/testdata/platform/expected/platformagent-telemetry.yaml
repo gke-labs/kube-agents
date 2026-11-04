@@ -339,6 +339,11 @@ data:
       cron_mode: approve
     display: {}
     kanban:
+      admission:
+        fail_closed: true
+        memory_budget_mib: 2048
+        queue_bound_seconds: 120
+        worker_rss_cap_mib: 1536
       max_in_progress: 6
     model:
       api_key: none

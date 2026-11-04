@@ -358,7 +358,7 @@ Helm install, set the block in your values file.
 
 Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
-`maxInProgress`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
+`maxInProgress` and the dispatcher's memory `admission`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
 `profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
 `maxSessions` renders `10`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`; all three are
 inert under `mode: today`.
@@ -388,11 +388,28 @@ below. Set it on the CR to raise or lower that. Either way the value is pinned i
 at `/etc/hermes`, so it applies over whatever the agent's own `config.yaml` says, and removing the
 field puts the default back.
 
+**`admission` is pinned the same way.** On every tick the dispatcher reads `kanban.admission` from
+the managed scope and counts the container's cgroup memory usage against a budget. Past it the
+dispatcher refuses a card rather than spawn a worker: the card is blocked with kind `capacity` and a
+reason that names the figures, so the thread that filed it is told it is throttled. The budget is
+the request, not the limit, because the kubelet evicts the pod under node pressure once its usage
+passes the request. Under GKE Sandbox the limit the container can read is the sandbox's, not the
+cgroup's, so Hermes' own `/proc/meminfo` guard never fires there.
+
+Unset, `memoryBudgetMiB` is the agent container's memory request in MiB (`spec.deployment.resources`,
+`2048` at the default `2Gi`), so raising the request raises the budget. `workerRssCapMiB` (`1536`)
+stops a running worker whose process tree passes it and blocks its card the same way.
+`queueBoundSeconds` (`120`) refuses a ready card that memory pressure or a full board has held for
+that long. `failClosed` (`true`) makes a tick that cannot read the memory counters spawn nothing.
+[PlatformAgent fields](/kube-agents/operator/platformagent-fields/) lists the bounds.
+
 ```yaml
 spec:
   harness:
     tuning:
       maxInProgress: 8 # board-wide; raises the operator's default of 6
+      admission:
+        memoryBudgetMiB: 3072 # the dispatcher's budget; defaults to the container's memory request
       platform:
         apiMaxRetries: 8
         maxTurns: 200
@@ -569,7 +586,7 @@ The cap counts running cards, not resident processes, and one case makes those d
 waiting on work it fanned out is discounted, or it would hold the slot its own children need
 ([`kanban_scheduling.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_scheduling.py)).
 Peak memory is therefore the cap plus however many coordinators are waiting, held down by the
-dispatcher's memory-pressure guard rather than by this number.
+dispatcher's memory admission ([`tuning.admission`](#specharnesstuning)) rather than by this number.
 
 ### `spec.harness.experimental`
 

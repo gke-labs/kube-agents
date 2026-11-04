@@ -1096,6 +1096,18 @@ platformAgent:
       # maxSessions caps the A2A session pods a "next" install runs at once;
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
+      # admission is the memory admission the kanban dispatcher applies to its
+      # own workers, board-wide: past the budget it refuses a card rather than
+      # spawn a worker, blocking the card with kind "capacity" and telling its
+      # thread. memoryBudgetMiB defaults to the agent container's memory request
+      # in MiB (2048 at the default 2Gi), workerRssCapMiB to 1536,
+      # queueBoundSeconds to 120 and failClosed to true; the operator renders
+      # the block with those defaults when nothing is set here.
+      # admission:
+      #   memoryBudgetMiB: 3072
+      #   workerRssCapMiB: 1536
+      #   queueBoundSeconds: 120
+      #   failClosed: true
       # profiles sizes AgentProfile work on a "next" install: ceiling is the most
       # profile tasks running at once across every profile (default: maxInProgress,
       # 6 unless set), childReserve the share of it kept for child tasks (default
