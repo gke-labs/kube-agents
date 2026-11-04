@@ -480,7 +480,8 @@ type PlatformAgentReconciler struct {
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
 	// the proposal readings as one (usageNewerFieldReadings), the two people
-	// readings as one (usageNewerFieldPeople), lastHumanActiveTime, and each
+	// readings as one (usageNewerFieldPeople), the nine origin readings as one
+	// (usageNewerFieldOrigins), lastHumanActiveTime, and each
 	// counter after the first schema by its name -- the last poll in which the usage counters poller wrote the field
 	// and it came back absent: a served CRD at a previous schema, which has
 	// the first-schema counters and not every later field. A record per field

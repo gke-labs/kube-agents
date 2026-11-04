@@ -10,7 +10,8 @@ counter under one verb and status into remediationsProposedTotal, and its
 proposal readings (the gauges the readings sweep sets, vcs_readings.py) into the
 proposal fields of status.usage, and the chat plugin's inbound-message
 counter over its platform label into chatMessagesInboundTotal, and into sessionsTotal the watcher's
-triage-sessions counter, the chat plugin's sessions counter and the A2A gateway's. Each series name, the status label
+triage-sessions counter, the chat plugin's sessions counter and the A2A gateway's, and the chat
+plugin's proposals ledger gauge, by origin, into the nine proposalsFrom fields. Each series name, the status label
 key the broker writes and the operator filters on, and each counted outcome
 value is a constant on the producer's side and a second copy on the operator's,
 and a rename on either side would freeze a status counter silently: the scrape
@@ -172,6 +173,20 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         # operator has no name for.
         helpers = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "manifest_helpers.go"
         self.assertEqual({_go_const(helpers, "interfaceGoogleChat"), _go_const(helpers, "interfaceSlack"), _go_const(helpers, "interfaceTeams"), "api"}, labels)
+
+    def test_the_chat_plugins_proposals_ledger_family_and_origins_are_the_ones_the_poller_reads(self):
+        """The origins reading selects the ledger gauge's samples by origin; a rename of
+        the family, the label or one origin on either side would leave the reading
+        absent with every suite green."""
+        self.assertEqual(_py_const("PROPOSALS_OPENED_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "proposalsOpenedSeries"))
+        self.assertEqual(_py_const("ORIGIN_LABEL", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "proposalsOriginLabel"))
+        self.assertEqual(_py_const("PLATFORM_LABEL", _CHAT_METRICS_PY), "platform")
+        match = re.search(r"^ORIGINS = \(([^)]*)\)", _CHAT_METRICS_PY.read_text(), re.M)
+        self.assertIsNotNone(match, "ORIGINS not found")
+        plugin = re.findall(r'"([a-z]+)"', match.group(1))
+        operator = re.findall(r'^\s*proposalOrigin[A-Z]\w*\s*=\s*"([a-z]+)"', _SCRAPE_GO.read_text(), re.M)
+        self.assertEqual(plugin, operator)
+        self.assertEqual(len(plugin), 9)
 
     def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))
