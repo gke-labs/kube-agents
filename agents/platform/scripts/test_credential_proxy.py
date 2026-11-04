@@ -5,6 +5,7 @@ import http.client
 import io
 import json
 import logging
+import math
 import os
 from dataclasses import replace
 import queue
@@ -179,11 +180,12 @@ class AgentAPIProxyTest(unittest.TestCase):
                     self.wfile.write(f"{len(second):x}\r\n".encode("ascii") + second + b"\r\n0\r\n\r\n")
                     self.wfile.flush()
                     return
-                body = b"proxied"
+                body = b"a" * _UNREAD_RESPONSE_BYTES if self.path == "/big" else b"proxied"
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                with contextlib.suppress(OSError):  # the cut-response test's door closes mid-body
+                    self.wfile.write(body)
 
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("Content-Length", "0"))
@@ -292,6 +294,29 @@ class AgentAPIProxyTest(unittest.TestCase):
         )
         self.assertFalse(any(line.startswith("INFO:") for line in logs.output), logs.output)
         self.assertTrue(any(line.startswith("DEBUG:") and "closed idle" in line for line in logs.output), logs.output)
+
+    def test_a_peer_that_stops_reading_a_proxied_body_is_logged_as_a_cut_response_not_an_upstream_failure(self):
+        # The door's connection carries the same socket timeout as the
+        # credentialed handler's, so a peer that stops reading a proxied body
+        # for the window ends the write with a TimeoutError. That is the
+        # downstream side, not "PlatformAgent API upstream request failed"
+        # with a traceback, which the one catch around the relay loop would
+        # otherwise say of it; the upstream here answers in full.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                with socket.create_connection(("127.0.0.1", self.proxy.server_port), timeout=_CLOSE_WAIT_SECONDS) as unread:
+                    unread.sendall(b"GET /big HTTP/1.1\r\nHost: door\r\nAuthorization: Bearer external-secret\r\n\r\n")
+                    deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+                    while not any("not read by the peer" in line for line in logs.output):
+                        if time.monotonic() > deadline:
+                            self.fail(f"the cut response was not logged: {logs.output}")
+                        time.sleep(0.1)
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread finishes logging after the close
+        cut = [line for line in logs.output if "not read by the peer" in line]
+        self.assertEqual(1, len(cut), logs.output)
+        self.assertTrue(cut[0].startswith("WARNING:") and "type=TimeoutError" in cut[0], cut[0])
+        self.assertFalse(any("upstream request failed" in line for line in logs.output), logs.output)
+        self.assertFalse(any("Traceback" in line for line in logs.output), logs.output)
 
     def _seed_state_db_sessions(self, rows, profile=None):
         import sqlite3
@@ -16143,9 +16168,56 @@ class KeepAliveTest(_CredentialedUnixServer):
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
             self.assertTrue(credential_proxy._log_socket_timeout(stalled, "Socket timed out: %r", (TimeoutError(),)))
         self.assertTrue(any("request stalled" in line for line in logs.output), logs.output)
+        # With the response's headers flushed, the same report is the peer
+        # that stopped reading the body: the response was cut, not stalled
+        # before it was written.
+        cut = types.SimpleNamespace(raw_requestline=b"GET /h", requestline="GET /h HTTP/1.1", _request_stream=None, _response_started=True)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertTrue(credential_proxy._log_socket_timeout(cut, "Socket timed out: %r", (TimeoutError(),)))
+        self.assertTrue(any("response stalled" in line and "requestline=GET /h HTTP/1.1" in line for line in logs.output), logs.output)
+        self.assertFalse(any("request stalled" in line for line in logs.output), logs.output)
         # send_error's report, the stdlib's other log_error call, is not one.
         self.assertFalse(credential_proxy._log_socket_timeout(idle, "code %d, message %s", (404, "Not Found")))
         self.assertFalse(credential_proxy._log_socket_timeout(idle, credential_proxy.IDLE_CLOSE_LOG_PREFIX + ": %r", ()))
+
+    def test_a_peer_that_stops_reading_a_relayed_body_is_logged_as_a_cut_response_not_a_stalled_request(self):
+        # The relay routes write their body after _end_headers with no
+        # handler of their own, under the socket timeout the request read
+        # deadline set, so a peer that stops reading for the window ends the
+        # write with the TimeoutError the stdlib reports through log_error.
+        # That is the response cut mid-body, and the line says so and names
+        # the request, rather than the "request stalled before its response"
+        # the same report is sorted into when nothing was written; and the
+        # next request on the connection, were there one, starts clean. The
+        # upstream is stubbed at _relay_fetch with a body wider than the
+        # socket's buffers; the peer sends its request and reads nothing.
+        relayed = credential_proxy.ApiRelayResponse(status=200, content_type="application/octet-stream", body=b"a" * _UNREAD_RESPONSE_BYTES)
+        allowed = credential_proxy.command_policy.Decision(allowed=True, rule_id="test.relay", message="")
+        with (
+            mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS),
+            mock.patch.object(CredentialProxyHandler, "api_relay", object()),
+            mock.patch.object(CredentialProxyHandler, "_relay_authorization", return_value="Bearer broker"),
+            mock.patch.object(CredentialProxyHandler, "_relay_fetch", return_value=relayed),
+            mock.patch.object(credential_proxy.api_policy, "evaluate", return_value=allowed),
+            mock.patch.object(credential_proxy.api_policy, "response_projection", return_value=None),
+        ):
+            sock = self.connect()
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                self.send(sock, "GET", "/v1/gcp/container.googleapis.com/v1/projects/p/locations/l/clusters", self.SHELL)
+                deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+                while not any("response stalled" in line for line in logs.output):
+                    if time.monotonic() > deadline:
+                        self.fail(f"the cut response was not logged: {logs.output}")
+                    time.sleep(0.1)
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread finishes logging after the close
+        cut = [line for line in logs.output if "response stalled" in line]
+        self.assertEqual(1, len(cut), logs.output)
+        self.assertTrue(cut[0].startswith("WARNING:"), cut[0])
+        self.assertIn("requestline=GET /v1/gcp/container.googleapis.com/v1/projects/p/locations/l/clusters HTTP/1.1", cut[0])
+        self.assertFalse(any("request stalled" in line for line in logs.output), logs.output)
+        self.assertFalse(any("closed idle" in line for line in logs.output), logs.output)
+        self.assertTrue(any("api forwarded" in line for line in logs.output), logs.output)
+        self.assertFalse(any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output)
 
     def test_a_request_that_stalls_mid_body_is_logged_as_stalled_not_idle(self):
         # The same socket timeout ends the idle wait and a body that stops
@@ -16416,6 +16488,46 @@ class ThreadCapTest(_CredentialedUnixServer):
         self.assertIn("0 refused since the last line, 0 answered 503 with Retry-After and 0 closed unanswered", released[0])
         pairs[0][1].close()  # the parked drain reads EOF and gives its slot back
 
+    def test_a_refusal_whose_thread_cannot_start_is_counted_unanswered_on_its_own_line(self):
+        # The line that counts a refusal is written once the refusal thread
+        # has started, or failed to: a start that fails (RuntimeError: can't
+        # start new thread, the regime the cap sits beside) is counted as
+        # closed unanswered on that line. Counted before the start, the first
+        # refusal of an episode would be flushed as answered and then added
+        # to the next line as unanswered, which with no further refusals
+        # reads `0 refused, -1 answered, 1 closed unanswered` on the release.
+        server = self.server
+        ours, peer = socket.socketpair()
+        self.addCleanup(peer.close)
+        self.addCleanup(ours.close)
+        real_start = threading.Thread.start
+
+        def failing_start(thread):
+            if thread.name == "thread-cap-refusal":
+                raise RuntimeError("can't start new thread")
+            return real_start(thread)
+
+        with mock.patch.object(threading.Thread, "start", failing_start), \
+                mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", 0):
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                server.refuse_connection(ours)
+                server.connection_released()
+        peer.settimeout(_CLOSE_WAIT_SECONDS)
+        self.assertEqual(b"", peer.recv(1), "a refusal with no thread to answer on is closed at once")
+        self.assertTrue(any("closed unanswered type=RuntimeError" in line for line in logs.output), logs.output)
+        alerts = [line for line in logs.output if "ALERT connection refused" in line]
+        self.assertEqual(1, len(alerts), logs.output)
+        self.assertIn("1 refused since the last line, 0 answered 503 with Retry-After on a refusal thread and 1 closed unanswered", alerts[0])
+        released = [line for line in logs.output if "thread cap released" in line]
+        self.assertEqual(1, len(released), logs.output)
+        self.assertIn("0 refused since the last line, 0 answered 503 with Retry-After and 0 closed unanswered", released[0])
+        # The refusal slot the failed start took is back: every one of them can be taken.
+        taken = [server._refusal_slots.acquire(blocking=False) for _ in range(credential_proxy.THREAD_CAP_REFUSAL_THREADS)]
+        for was_taken in taken:
+            if was_taken:
+                server._refusal_slots.release()
+        self.assertTrue(all(taken), taken)
+
     def test_a_slot_is_given_back_when_the_handler_thread_fails_to_start(self):
         # The slot is taken on the accept loop before the handler thread is
         # started; a start that fails (RuntimeError: can't start new thread)
@@ -16539,14 +16651,66 @@ def yaml_value(text):
     return yaml.safe_load(text)
 
 
+# proto-JSON's reading of the two fields a threshold carries, written from
+# protobuf's rules rather than from the walk under test. An enum field takes
+# its value's name, its number, or a string spelling its number; a value
+# outside the enum fails Envoy's validation, and any other shape fails the
+# load. A UInt32Value takes a JSON number with no fraction or a string
+# spelling one, from 0 to 2**32 - 1; anything else fails the load (Envoy
+# 1.39.1, --mode validate, on each shape the tests below name). pyyaml's
+# integers are Envoy's: yaml-cpp converts a scalar with the base left to its
+# prefix, so both read 010 as 8 and 0x10 as 16, which Envoy's /clusters page
+# shows.
+_PROTO_ENUM_NAMES = {"DEFAULT": 0, "HIGH": 1}
+_UINT32_MAX = 2**32 - 1
+_UNREADABLE = object()
+_DECIMAL_DIGITS = re.compile(r"[0-9]+\Z")
+
+
+def _proto_json_enum(value):
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return _UNREADABLE
+    if isinstance(value, str):
+        if value in _PROTO_ENUM_NAMES:
+            return _PROTO_ENUM_NAMES[value]
+        if not _DECIMAL_DIGITS.match(value):
+            return _UNREADABLE
+        value = int(value)
+    if isinstance(value, int) and value in _PROTO_ENUM_NAMES.values():
+        return value
+    return _UNREADABLE
+
+
+def _proto_json_uint32(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return _UNREADABLE
+    if isinstance(value, str):
+        if not _DECIMAL_DIGITS.match(value):
+            return _UNREADABLE
+        value = int(value)
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value) or int(value) != value:
+            return _UNREADABLE
+        value = int(value)
+    if isinstance(value, int) and 0 <= value <= _UINT32_MAX:
+        return value
+    return _UNREADABLE
+
+
 def _ceiling_summed_by_hand(config):
     """The rule the broker derives its cap by, written out: per cluster whose
     pipe is the broker's socket (the path normalised, as the kernel reads
-    it), the max_connections of the first threshold at the DEFAULT priority
-    (spelt DEFAULT or 0, as proto-JSON reads an enum, or left out or null),
-    a quoted digit string or a whole-number float read as the integer, 1024
-    for a cluster with no such threshold or a threshold that sets no count
-    or one that is not a count; summed."""
+    it), the breaker Envoy runs at the DEFAULT priority: the count of the
+    first threshold whose priority proto-JSON reads as DEFAULT, 1024 when it
+    sets none or there is none. When any threshold in the list has a
+    priority or a count proto-JSON would not read, the cluster is read in
+    the direction that never refuses a connection Envoy carries: the largest
+    count readable anywhere in the list, or 1024, when that is above the
+    DEFAULT reading. Summed."""
     total = 0
     for cluster in config["static_resources"]["clusters"]:
         paths = [
@@ -16557,19 +16721,15 @@ def _ceiling_summed_by_hand(config):
         if "/var/run/credential-proxy/backend.sock" not in paths:
             continue
         thresholds = cluster.get("circuit_breakers", {}).get("thresholds") or []
-        at_default = [
-            t for t in thresholds
-            if t.get("priority") is None or t.get("priority") == "DEFAULT"
-            or (type(t.get("priority")) is int and t.get("priority") == 0)
-        ] or [{}]
-        count = at_default[0].get("max_connections", 1024)
-        if isinstance(count, str) and count.isdecimal():
-            count = int(count)
-        if isinstance(count, float) and count.is_integer():
-            count = int(count)
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            count = 1024
-        total += count
+        readings = [
+            (_proto_json_enum(t.get("priority")), _proto_json_uint32(t.get("max_connections")))
+            for t in thresholds
+        ]
+        at_default = [count for priority, count in readings if priority == 0]
+        envoy = at_default[0] if at_default and isinstance(at_default[0], int) else 1024
+        if any(priority is _UNREADABLE or count is _UNREADABLE for priority, count in readings):
+            envoy = max([envoy, 1024] + [count for _, count in readings if isinstance(count, int)])
+        total += envoy
     return total
 
 
@@ -16727,7 +16887,10 @@ class ThreadCapDefaultTest(unittest.TestCase):
         self.assertIsNone(credential_proxy._connection_count(superscript))
         text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f'            max_connections: "{superscript}"\n', 1)
         path, derived, config = self._derived(text)
-        self.assertEqual(credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS + 64, derived)
+        # Not a count, so the cluster is read as the largest count declared
+        # beside it, the HIGH threshold's 4096 (the fail-toward-larger rule).
+        self.assertEqual(4096 + 64, derived)
+        self.assertEqual(_ceiling_summed_by_hand(config), derived)
         # Nothing the walk raises leaves the derivation either.
         with (
             mock.patch.object(credential_proxy, "envoy_broker_connection_ceiling", side_effect=TypeError("unforeseen shape")),
@@ -16765,12 +16928,22 @@ class ThreadCapDefaultTest(unittest.TestCase):
     def test_a_quoted_max_connections_is_a_count_and_a_word_is_not(self):
         # Envoy's proto-JSON reading of a UInt32Value accepts "4096", so the
         # breaker runs at it and the cap has to as well; a value that is not
-        # a count is Envoy's default, as an unset one is.
-        for value, expected in (('"4096"', 4096), ("'64'", 64), ('"lots"', 1024), ('"-1"', 1024), ("true", 1024)):
+        # a count is warned about and the cluster read as the largest count
+        # declared beside it (the HIGH threshold's 4096 here), or Envoy's
+        # default when the unreadable threshold is alone.
+        for value, expected in (('"4096"', 4096), ("'64'", 64), ('"lots"', 4096), ('"-1"', 4096), ("true", 4096)):
             with self.subTest(value=value):
                 text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {value}\n", 1)
                 path, derived, config = self._derived(text)
                 self.assertEqual(expected + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        alone = "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: lots\n"
+        runtime_breaker = (
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n"
+            "            max_connections: 4096\n          - priority: HIGH\n            max_connections: 4096\n"
+        )
+        path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_breaker, alone))
+        self.assertEqual(1024 + 64, derived)
 
     def test_a_numeric_or_null_priority_is_the_priority_envoy_reads(self):
         # proto-JSON, which Envoy reads the config through, takes an enum by
@@ -16801,42 +16974,136 @@ class ThreadCapDefaultTest(unittest.TestCase):
     def test_a_priority_or_a_count_envoy_would_not_read_is_a_warning_naming_the_cluster(self):
         # A spelling that is neither a RoutingPriority's name nor its number
         # (a lower-case name, a bool, a float, a number past the enum) is a
-        # config Envoy would not load; the threshold is passed over with a
-        # WARNING rather than silently, as is a max_connections that is not
-        # a count. The warning names the cluster and the value, so the
-        # divergence from Envoy's reading is visible at startup.
+        # config Envoy would not load, as is a max_connections that is not
+        # a count (a word, a fraction, a bool, a negative, one past UInt32).
+        # Each is a WARNING naming the cluster and the value, so the
+        # divergence from Envoy's reading is visible at startup, and the
+        # cluster is then read in the direction that costs nothing: the
+        # largest count declared in its list when that is above the DEFAULT
+        # reading (here the HIGH threshold's 4096 beside the unread one, or
+        # the unread threshold's own readable count), else Envoy's default.
+        runtime_breaker = (
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n"
+            "            max_connections: 4096\n          - priority: HIGH\n            max_connections: 4096\n"
+        )
         runtime_default = "          - priority: DEFAULT\n            max_connections: 4096\n"
         for priority in ("default", "true", "0.0", "2"):
             with self.subTest(priority=priority), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
                 text = _TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_default, f"          - priority: {priority}\n            max_connections: 4096\n")
                 path, derived, config = self._derived(text)
-                self.assertEqual(1024 + 64, derived)
+                self.assertEqual(4096 + 64, derived)
                 self.assertEqual(_ceiling_summed_by_hand(config), derived)
             self.assertTrue(
-                any("credential_runtime" in line and "priority" in line and "not read for the thread cap" in line for line in logs.output),
+                any("credential_runtime" in line and "priority" in line and "not a RoutingPriority" in line for line in logs.output),
                 logs.output,
             )
+            self.assertTrue(any("largest count declared, 4096, is read for the thread cap rather than 1024" in line for line in logs.output), logs.output)
             self.assertIsNone(credential_proxy._routing_priority(yaml_value(priority)))
-        for count in ("lots", "4096.5", "true", "-1", '"-1"'):
-            with self.subTest(count=count), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+        for count in ("lots", "4096.5", "true", "-1", '"-1"', "4294967296"):
+            with self.subTest(count=count, beside="HIGH at 4096"), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
                 text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {count}\n", 1)
                 path, derived, config = self._derived(text)
-                self.assertEqual(1024 + 64, derived)
+                self.assertEqual(4096 + 64, derived)
                 self.assertEqual(_ceiling_summed_by_hand(config), derived)
             self.assertTrue(
                 any("credential_runtime" in line and "max_connections" in line and "not a count" in line for line in logs.output),
                 logs.output,
             )
+            with self.subTest(count=count, beside="nothing"), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                alone = f"      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: {count}\n"
+                path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_breaker, alone))
+                self.assertEqual(1024 + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+            self.assertFalse(any("largest count declared" in line for line in logs.output), logs.output)
         # A threshold that sets no count is Envoy's default without a
         # warning: that is a config Envoy loads, and the reading agrees.
         with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
             path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", ""))
         self.assertEqual(1024 + 64, derived)
 
+    def test_a_quoted_digit_priority_is_the_number_envoy_reads(self):
+        # pyyaml keeps a quoted scalar a string, and so does Envoy's YAML
+        # loader; proto-JSON, given a string that is not an enum value's
+        # name, reads the number it spells. Envoy 1.39.1 loads
+        # `priority: "0"` and its /clusters page shows the DEFAULT breaker at
+        # that threshold's count, so the cap has to read it the same way
+        # rather than fall to 1024 under a breaker of 4096; `"2"` fails
+        # Envoy's enum validation and is not a priority here either.
+        runtime_default = "          - priority: DEFAULT\n            max_connections: 4096\n"
+        cases = {
+            '          - priority: "0"\n            max_connections: 4096\n': 4096,
+            "          - priority: '1'\n            max_connections: 4096\n": 1024,
+            '          - priority: HIGH\n            max_connections: 64\n          - priority: "0"\n            max_connections: 2048\n': 2048,
+        }
+        for threshold, runtime_ceiling in cases.items():
+            with self.subTest(threshold=threshold), self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_default, threshold))
+                self.assertEqual(runtime_ceiling + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        self.assertEqual(0, credential_proxy._routing_priority("0"))
+        self.assertEqual(1, credential_proxy._routing_priority("1"))
+        for value in ("2", "-0", "0.0", "", " 0"):
+            self.assertIsNone(credential_proxy._routing_priority(value), value)
+
+    def test_a_count_is_bounded_by_uint32_and_an_integer_is_read_as_envoy_reads_it(self):
+        # max_connections is a UInt32Value: Envoy 1.39.1 refuses to load
+        # 4294967296 (`integer out of range`) and loads 4294967295, so the
+        # first is not a count and the second is. An integer pyyaml read
+        # from the file needs no re-reading: yaml-cpp converts a scalar with
+        # the base left to its prefix, so Envoy's /clusters page shows 010 as
+        # a breaker of 8, 0x10 as 16 and 08 (a string to pyyaml, a decimal
+        # to proto-JSON) as 8, each as the walk reads it.
+        cases = (("4294967295", 4294967295), ("010", 8), ("0x10", 16), ("08", 8))
+        for value, expected in cases:
+            with self.subTest(value=value), self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {value}\n", 1)
+                path, derived, config = self._derived(text)
+                self.assertEqual(expected + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        self.assertEqual(2**32 - 1, credential_proxy._connection_count(2**32 - 1))
+        self.assertEqual(2**32 - 1, credential_proxy._connection_count(str(2**32 - 1)))
+        for value in (2**32, str(2**32), float(2**32)):
+            self.assertIsNone(credential_proxy._connection_count(value), value)
+
+    def test_a_threshold_the_walk_cannot_read_errs_above_envoys_breaker_not_below(self):
+        # The two ways of being wrong are not alike: a cap above Envoy's
+        # breaker never fires, since Envoy refuses first, while a cap below
+        # it refuses with the broker's own 503 connections Envoy would have
+        # carried. So a threshold whose priority or count the walk cannot
+        # read makes the cluster's ceiling the largest count declared in its
+        # list, or 1024, whichever is larger, and the warning says which
+        # reading was taken; a spelling the walk did not foresee then costs
+        # a cap that does nothing rather than a 503 storm.
+        runtime_breaker = (
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n"
+            "            max_connections: 4096\n          - priority: HIGH\n            max_connections: 4096\n"
+        )
+        self.assertIn(runtime_breaker, _TWO_CLUSTER_ENVOY_CONFIG)
+        cases = (
+            ("      circuit_breakers:\n        thresholds:\n          - priority: bogus\n            max_connections: 4096\n", 4096, "largest count declared, 4096, is read for the thread cap rather than 1024"),
+            ("      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: 2048\n"
+             "          - priority: bogus\n            max_connections: 8192\n", 8192, "largest count declared, 8192, is read for the thread cap rather than 2048"),
+            ("      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: 2048\n"
+             "          - priority: bogus\n            max_connections: 1\n", 2048, None),
+            ("      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: lots\n"
+             "          - priority: HIGH\n            max_connections: 512\n", 1024, None),
+        )
+        for breaker, runtime_ceiling, taken in cases:
+            with self.subTest(breaker=breaker), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_breaker, breaker))
+                self.assertEqual(runtime_ceiling + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+            if taken is None:
+                self.assertFalse(any("largest count declared" in line for line in logs.output), logs.output)
+            else:
+                self.assertTrue(any("credential_runtime" in line and taken in line for line in logs.output), logs.output)
+
     def test_a_whole_number_float_count_is_the_count_envoy_reads(self):
         # proto-JSON reads 4096.0 into a UInt32Value as 4096, so the breaker
-        # runs at it; the cap reads it the same way, and a fraction is not a count.
-        for value, expected in (("4096.0", 4096), ("64.0", 64), ("4096.5", 1024)):
+        # runs at it; the cap reads it the same way, and a fraction is not a
+        # count: the cluster is then read as the largest count declared
+        # beside it, the HIGH threshold's 4096.
+        for value, expected in (("4096.0", 4096), ("64.0", 64), ("4096.5", 4096)):
             with self.subTest(value=value):
                 text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {value}\n", 1)
                 path, derived, config = self._derived(text)

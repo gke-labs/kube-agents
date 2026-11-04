@@ -923,13 +923,21 @@ ENVOY_BROKER_SOCKET_PATH = "/var/run/credential-proxy/backend.sock"
 # Envoy's per-cluster connection ceiling when a cluster's circuit_breakers
 # set none.
 ENVOY_DEFAULT_MAX_CONNECTIONS = 1024
+# The largest count a threshold's max_connections can carry: it is a
+# UInt32Value, and proto-JSON refuses a config with one past this, so Envoy
+# does not start on it (_connection_count).
+ENVOY_MAX_CONNECTIONS_LIMIT = 2**32 - 1
 # The routing priority a route runs at unless it names another, and the one
 # a circuit-breaker threshold applies to when it names none. Envoy keeps a
 # breaker per priority; the shipped routes set none, so DEFAULT's is the
 # ceiling in force, whatever a HIGH threshold beside it says. Envoy reads the
-# config through proto-JSON, which takes an enum by its name or its number,
-# so a threshold's priority is one of these four spellings or the config is
-# one Envoy would not load (_routing_priority).
+# config through proto-JSON, which takes an enum by its name, its number, or
+# a string carrying its number (a quoted "0" is DEFAULT), so a threshold's
+# priority is one of those spellings or the config is one Envoy would not
+# load (_routing_priority). A threshold the walk cannot read either way is
+# read in the direction that costs nothing: the largest count the cluster
+# declares (envoy_broker_connection_ceiling), since a cap above Envoy's
+# breaker never fires and one below it refuses connections Envoy carries.
 ENVOY_DEFAULT_PRIORITY = "DEFAULT"
 ENVOY_ROUTING_PRIORITIES: Mapping[str, int] = {ENVOY_DEFAULT_PRIORITY: 0, "HIGH": 1}
 FALLBACK_MAX_THREADS = ENVOY_DEFAULT_MAX_CONNECTIONS
@@ -1451,11 +1459,36 @@ class ThreadCap(ConnectionCap):
         super().__init__(*args, cap=cap, **kwargs)
 
     def refuse_connection(self, request: Any) -> None:
-        # The refusal thread's slot is taken before the count, so the line
-        # written below says how this refusal ends: answered on a thread of
-        # its own, or closed unanswered because THREAD_CAP_REFUSAL_THREADS
-        # refusals are already waiting on their peers.
+        # How the refusal ends is settled before it is counted, so the one
+        # line that counts it says how it ended: answered on a refusal
+        # thread of its own, or closed unanswered, because
+        # THREAD_CAP_REFUSAL_THREADS refusals are already waiting on their
+        # peers or because the refusal thread could not be started. Counted
+        # first, a thread start that then failed would leave the refusal
+        # counted as answered on one line and as unanswered on the next.
         answered = self._refusal_slots.acquire(blocking=False)
+        if not answered:
+            LOGGER.debug(
+                "thread cap refusal closed unanswered: %d refusals already waiting on their peers",
+                THREAD_CAP_REFUSAL_THREADS,
+            )
+            self.shutdown_request(request)
+        else:
+            try:
+                threading.Thread(
+                    target=self._deliver_refusal, args=(request,), daemon=True, name="thread-cap-refusal"
+                ).start()
+            except RuntimeError as exc:
+                # The slot was taken and the answer not written: the refusal
+                # is closed, and counted, as unanswered.
+                self._refusal_slots.release()
+                answered = False
+                LOGGER.debug("thread cap refusal closed unanswered type=%s", type(exc).__name__)
+                self.shutdown_request(request)
+        self._count_refusal(answered)
+
+    def _count_refusal(self, answered: bool) -> None:
+        """Count one refusal that ended as ``answered`` says, and write the ALERT line when one is due."""
         now = time.monotonic()
         with self._refused_lock:
             self._refused += 1
@@ -1466,41 +1499,22 @@ class ThreadCap(ConnectionCap):
                 self._refused_logged_at is None
                 or now - self._refused_logged_at >= THREAD_CAP_LOG_INTERVAL_SECONDS
             )
-            if due:
-                refused, unanswered = self._refused, self._refused_unanswered
-                self._refused = self._refused_unanswered = 0
-                self._refused_logged_at = now
-        if due:
-            LOGGER.warning(
-                "ALERT connection refused: %d connections hold a thread (%s); %d refused since "
-                "the last line, %d answered 503 with Retry-After on a refusal thread and %d closed "
-                "unanswered with %d refusals already waiting on their peers",
-                self.connection_cap,
-                MAX_THREADS_ENV,
-                refused,
-                refused - unanswered,
-                unanswered,
-                THREAD_CAP_REFUSAL_THREADS,
-            )
-        if not answered:
-            LOGGER.debug(
-                "thread cap refusal closed unanswered: %d refusals already waiting on their peers",
-                THREAD_CAP_REFUSAL_THREADS,
-            )
-            self.shutdown_request(request)
-            return
-        try:
-            threading.Thread(
-                target=self._deliver_refusal, args=(request,), daemon=True, name="thread-cap-refusal"
-            ).start()
-        except RuntimeError as exc:
-            # Counted as unanswered on the next line: the slot was taken and
-            # the answer not written.
-            self._refusal_slots.release()
-            with self._refused_lock:
-                self._refused_unanswered += 1
-            LOGGER.debug("thread cap refusal closed unanswered type=%s", type(exc).__name__)
-            self.shutdown_request(request)
+            if not due:
+                return
+            refused, unanswered = self._refused, self._refused_unanswered
+            self._refused = self._refused_unanswered = 0
+            self._refused_logged_at = now
+        LOGGER.warning(
+            "ALERT connection refused: %d connections hold a thread (%s); %d refused since "
+            "the last line, %d answered 503 with Retry-After on a refusal thread and %d closed "
+            "unanswered with %d refusals already waiting on their peers or no thread to answer on",
+            self.connection_cap,
+            MAX_THREADS_ENV,
+            refused,
+            refused - unanswered,
+            unanswered,
+            THREAD_CAP_REFUSAL_THREADS,
+        )
 
     def _deliver_refusal(self, request: Any) -> None:
         """Write THREAD_CAP_REFUSAL, wait for the peer's close, close; on a thread of its own."""
@@ -1651,12 +1665,18 @@ def envoy_broker_connection_ceiling(config: Any) -> int | None:
     at another priority is not read: the shipped routes run at DEFAULT, and
     a route that named HIGH would draw on a pool this does not count. The
     priority and the count are read as Envoy's proto-JSON reads them
-    (_routing_priority, _connection_count), and a value neither reads, a
+    (_routing_priority, _connection_count). A value neither reads, a
     priority that is not a RoutingPriority or a max_connections that is not
-    a count, is a WARNING naming the cluster, so a reading that diverges from
-    Envoy's is visible at startup rather than silent. None
-    when no cluster forwards to the socket, or the sum is zero, so the
-    caller can say so rather than cap at nothing.
+    a count, is a WARNING naming the cluster, and the cluster is then read
+    in the direction that costs nothing: the largest count declared anywhere
+    in its thresholds, or Envoy's default, whichever is larger. The two
+    errors are not alike: a cap above Envoy's breaker never fires, since
+    Envoy refuses first, while a cap below it refuses with the broker's own
+    503 connections Envoy would have carried. So a spelling this walk did
+    not foresee costs a cap that does nothing rather than one that refuses,
+    and the WARNING says which reading was taken. None when no cluster
+    forwards to the socket, or the sum is zero, so the caller can say so
+    rather than cap at nothing.
     """
     clusters = _mapping(_mapping(config).get("static_resources")).get("clusters")
     total = 0
@@ -1669,31 +1689,44 @@ def envoy_broker_connection_ceiling(config: Any) -> int | None:
         found = True
         name = cluster.get("name")
         thresholds = _mapping(cluster.get("circuit_breakers")).get("thresholds")
-        ceiling = ENVOY_DEFAULT_MAX_CONNECTIONS
+        # The DEFAULT priority's count as Envoy reads it (None until a
+        # threshold at that priority is met), the largest count read
+        # anywhere in the list, and whether a threshold was not read.
+        ceiling: int | None = None
+        largest = ENVOY_DEFAULT_MAX_CONNECTIONS
+        unread = False
         for threshold in (thresholds if isinstance(thresholds, list) else ()):
             threshold = _mapping(threshold)
+            declared = threshold.get("max_connections")
+            count = _connection_count(declared)
+            if count is None and declared is not None:
+                LOGGER.warning(
+                    "Envoy cluster %s: max_connections %r is not a count Envoy would read",
+                    name, declared,
+                )
+                unread = True
+            elif count is not None:
+                largest = max(largest, count)
             priority = _routing_priority(threshold.get("priority"))
             if priority is None:
                 LOGGER.warning(
-                    "Envoy cluster %s: threshold priority %r is not a RoutingPriority Envoy would read; "
-                    "the threshold is not read for the thread cap",
+                    "Envoy cluster %s: threshold priority %r is not a RoutingPriority Envoy would read",
                     name, threshold.get("priority"),
                 )
+                unread = True
                 continue
-            if priority != default_priority:
-                continue
-            declared = threshold.get("max_connections")
-            count = _connection_count(declared)
-            if count is None:
-                if declared is not None:
-                    LOGGER.warning(
-                        "Envoy cluster %s: max_connections %r is not a count Envoy would read; "
-                        "Envoy's default of %d is read for the thread cap",
-                        name, declared, ENVOY_DEFAULT_MAX_CONNECTIONS,
-                    )
-                count = ENVOY_DEFAULT_MAX_CONNECTIONS
-            ceiling = count
-            break
+            if priority == default_priority and ceiling is None:
+                ceiling = ENVOY_DEFAULT_MAX_CONNECTIONS if count is None else count
+        if ceiling is None:
+            ceiling = ENVOY_DEFAULT_MAX_CONNECTIONS
+        if unread and largest > ceiling:
+            LOGGER.warning(
+                "Envoy cluster %s: a threshold was not read as Envoy reads it, so the largest count "
+                "declared, %d, is read for the thread cap rather than %d: a cap above Envoy's breaker "
+                "never fires, one below it refuses connections Envoy carries",
+                name, largest, ceiling,
+            )
+            ceiling = largest
         total += ceiling
     return total if found and total > 0 else None
 
@@ -1719,15 +1752,22 @@ def _routing_priority(value: Any) -> int | None:
     """A threshold's priority as Envoy reads it: the RoutingPriority's number, or None for a value it would not load.
 
     Absent or null is DEFAULT. proto-JSON reads an enum by its name or its
-    number, so ``DEFAULT`` and ``0`` are one priority and ``HIGH`` and ``1``
-    the other (ENVOY_ROUTING_PRIORITIES). A bool is not a number here (pyyaml
-    reads ``true`` as one), a lower-case name is not the name, and a float is
-    neither; Envoy loads none of them.
+    number, and a string that is not a name as the number it spells, so
+    ``DEFAULT``, ``0`` and a quoted ``"0"`` are one priority and ``HIGH``,
+    ``1`` and ``"1"`` the other (ENVOY_ROUTING_PRIORITIES); Envoy 1.39 runs
+    the breaker at a threshold spelt ``priority: "0"``. A bool is not a
+    number here (pyyaml reads ``true`` as one), a lower-case name is not the
+    name, a float is neither, and a number past the enum fails Envoy's
+    validation; Envoy loads none of them.
     """
     if value is None:
         return ENVOY_ROUTING_PRIORITIES[ENVOY_DEFAULT_PRIORITY]
     if isinstance(value, str):
-        return ENVOY_ROUTING_PRIORITIES.get(value)
+        if value in ENVOY_ROUTING_PRIORITIES:
+            return ENVOY_ROUTING_PRIORITIES[value]
+        if not value.isdecimal():
+            return None
+        value = int(value)
     if isinstance(value, int) and not isinstance(value, bool) and value in ENVOY_ROUTING_PRIORITIES.values():
         return value
     return None
@@ -1740,14 +1780,18 @@ def _connection_count(value: Any) -> int | None:
     (``"4096"``) and a float with no fractional part (``4096.0``) as the
     integer, so the breaker runs at either; both are counts here. Decimal
     digits only for the string: ``str.isdigit`` admits a superscript, which
-    ``int`` refuses. A bool, a negative, a fraction, a word and an unset
-    value are None, and the caller reads Envoy's default for each.
+    ``int`` refuses. A bool, a negative, a fraction, a word, a value past
+    ENVOY_MAX_CONNECTIONS_LIMIT (proto-JSON refuses it, and Envoy does not
+    start) and an unset value are None. An integer pyyaml read from the
+    file is Envoy's reading of it: both read ``010`` as octal 8 and
+    ``0x10`` as 16 (yaml-cpp converts a scalar with the base left to the
+    number's prefix), so no integer needs re-reading here.
     """
     if isinstance(value, str) and value.isdecimal():
         value = int(value)
     if isinstance(value, float) and value.is_integer():
         value = int(value)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= ENVOY_MAX_CONNECTIONS_LIMIT:
         return None
     return value
 
@@ -4870,9 +4914,24 @@ class _RequestReadDeadline:
     arms it again with the drain's own window (drain_request_body). A
     handler built without a socket (the route tests' stand-ins assign their
     own rfile) has no stream to arm, and both calls do nothing.
+
+    The same socket timeout bounds a route's direct writes, so a peer that
+    stops reading a response for the window ends it with the same
+    TimeoutError the stdlib reports through log_error. ``_response_started``
+    says which side stalled: False until the handler flushes a response's
+    status line and headers (end_headers), True from then until the next
+    request; the handlers clear it before each request line, with
+    raw_requestline, and _log_socket_timeout reads it.
     """
 
     _request_stream: _DeadlineSocketIO | None = None
+    _response_started = False
+
+    def end_headers(self) -> None:
+        # Set before the flush: a flush the peer does not read times out
+        # inside it, and the response is on the wire in part either way.
+        self._response_started = True
+        super().end_headers()
 
     def setup(self) -> None:
         super().setup()
@@ -4928,8 +4987,11 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # closes; every served response here says `Connection: close`, so a
         # kept-open connection is only ever one that has not sent a request.
         # raw_requestline is emptied first so that log_error can tell that
-        # idle close from a request that stalled (_log_socket_timeout).
+        # idle close from a request that stalled, and _response_started so
+        # that it can tell either from a response the peer stopped reading
+        # (_log_socket_timeout).
         self.raw_requestline = b""
+        self._response_started = False
         self._arm_request_read_deadline()
         try:
             super().handle_one_request()
@@ -5051,8 +5113,21 @@ class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             # the end of the body, which holds a streamed turn (SSE) until it
             # finishes. read1 returns what has arrived.
             while chunk := response.read1(64 * 1024):
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (ConnectionError, TimeoutError, OSError) as exc:
+                    # The downstream side: the peer closed, or stopped
+                    # reading for the connection's window
+                    # (KEEPALIVE_IDLE_SECONDS, the socket's timeout). Not
+                    # an upstream failure, and no traceback: the response
+                    # is cut and the connection closes.
+                    LOGGER.warning(
+                        "PlatformAgent API response not read by the peer; cut mid-response type=%s",
+                        type(exc).__name__,
+                    )
+                    self.close_connection = True
+                    break
         except (ConnectionError, TimeoutError, OSError, http.client.HTTPException):
             LOGGER.warning("PlatformAgent API upstream request failed", exc_info=True)
             if not response_started:
@@ -11976,7 +12051,12 @@ def _log_socket_timeout(handler: BaseHTTPRequestHandler, message: str, args: tup
     hit while waiting for a request that never began: the idle close at
     KEEPALIVE_IDLE_SECONDS, a connection ending as a peer's EOF does, and a
     debug line rather than an access-log-shaped INFO line per idle
-    connection. Otherwise a request, or part of one, arrived and stalled
+    connection. With the response's status line and headers already flushed
+    (_response_started, which _RequestReadDeadline sets in end_headers and
+    the handlers clear before each request line), the same timeout bounded
+    a route's direct write of its body, and the peer stopped reading it:
+    the response is cut, and the warning says so and names the request.
+    Otherwise a request, or part of one, arrived and stalled
     before its response was on the wire; it went unanswered, and is a warning
     naming it, with the bytes of it that arrived. requestline is the stdlib's
     copy of the request line, caller text, sanitised as log_message sanitises
@@ -11990,7 +12070,14 @@ def _log_socket_timeout(handler: BaseHTTPRequestHandler, message: str, args: tup
     kind = type(args[0]).__name__
     stream = getattr(handler, "_request_stream", None)
     received = stream.received if stream is not None else 0
-    if getattr(handler, "raw_requestline", b"") or received:
+    if getattr(handler, "_response_started", False):
+        LOGGER.warning(
+            "response stalled: the peer stopped reading it, and the connection closes with it cut "
+            "requestline=%s type=%s",
+            *_sanitized_log_args((getattr(handler, "requestline", ""),)),
+            kind,
+        )
+    elif getattr(handler, "raw_requestline", b"") or received:
         LOGGER.warning(
             "request stalled before its response requestline=%s received_bytes=%d type=%s",
             *_sanitized_log_args((getattr(handler, "requestline", ""),)),
@@ -15598,11 +15685,13 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         # never resets either, is cleared for the same reason: a request
         # that stalls inside its line would otherwise be logged under the
         # previous request's. raw_requestline is emptied for log_error,
-        # which reads it to tell the idle close from a request that stalled
-        # (_log_socket_timeout).
+        # which reads it to tell the idle close from a request that stalled,
+        # and _response_started, which tells either from a response the peer
+        # stopped reading (_log_socket_timeout).
         self.path = ""
         self.requestline = ""
         self.raw_requestline = b""
+        self._response_started = False
         self._arm_request_read_deadline()
         try:
             super().handle_one_request()
