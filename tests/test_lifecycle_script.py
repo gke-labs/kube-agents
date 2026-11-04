@@ -136,6 +136,7 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_pool_shapes=None,
                    module_outputs=None,
                    recorded_outputs=None,
+                   output_stderr_noise="",
                    output_stub=None,
                    console_fail_var="",
                    apply_stub="exit 0",
@@ -194,11 +195,15 @@ fi
             # before the output was declared gives; output_stub replaces the
             # whole branch for the other shapes (a state with no outputs at all
             # exits 0 and prints nothing; a backend failure exits 1 otherwise).
+            # output_stderr_noise is written to stderr first, on every answer:
+            # what TF_LOG in the operator's shell, or a provider warning, adds
+            # to a read that still exits 0.
             recorded_output_case = "\n".join(
                 f"        {name}) echo '{answer}'; exit 0 ;;"
                 for name, answer in (recorded_outputs or {}).items())
+            noise = f"echo '{output_stderr_noise}' >&2\n    " if output_stderr_noise else ""
             if output_stub is None:
-                output_stub = f"""name="${{@: -1}}"
+                output_stub = f"""{noise}name="${{@: -1}}"
     case "$name" in
 {recorded_output_case}
     esac
@@ -949,6 +954,22 @@ resource "google_service_account" "agent" {
             proc.stderr)
         self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
         self.assertIn("TF_VAR_gvisor_machine_type=n2-standard-8", proc.stderr)
+
+    def test_guard_node_pool_shape_reads_the_recorded_profile_past_stderr_noise(self):
+        """The same lost explicit line beside a kept profile, with terraform output writing a
+        TF_LOG line to stderr before the value it prints: the recorded profile is the value
+        alone, so the profile still names no change and the apply is still refused."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet"},
+            output_stderr_noise="2026-11-04T08:00:00.000Z [INFO]  Terraform version: 1.15.8",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
 
     def test_guard_node_pool_shape_refuses_a_kept_profile_whose_shape_changed(self):
         """When medium gets a shape of its own, a host on a kept TF_VAR_sizing_profile=medium

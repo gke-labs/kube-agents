@@ -418,17 +418,29 @@ tf_expr() {
 # was declared, or one with no output at all); any other failure is the
 # backend's and fatal, as tf_expr's is, so a profile is never read as a
 # first setting because the state could not be read.
+#
+# stderr is captured apart from the value rather than merged into it, as
+# guard_minter_key reads gcloud: `-raw` prints the value alone on stdout, and
+# anything Terraform writes to stderr on a read that still exits 0 -- TF_LOG
+# set in the operator's shell, a provider or backend warning -- would
+# otherwise be read back as part of the recorded profile, which the guard
+# compares whole, so a kept profile would read as a changed one and the
+# refusal it exists for would be skipped.
 tf_recorded_output() {
-  local out
-  if out=$(terraform output -no-color -raw "$1" 2>&1); then
+  local out err_file read_rc=0 read_err
+  err_file=$(mktemp)
+  out=$(terraform output -no-color -raw "$1" 2>"$err_file") || read_rc=$?
+  read_err=$(cat "$err_file")
+  rm -f "$err_file"
+  if [[ $read_rc -eq 0 ]]; then
     printf '%s\n' "$out"
     return 0
   fi
-  if grep -qE "$OUTPUT_NOT_RECORDED_PATTERN" <<<"$out"; then
+  if grep -qE "$OUTPUT_NOT_RECORDED_PATTERN" <<<"$read_err"; then
     printf '\n'
     return 0
   fi
-  printf '%s\n' "$out" >&2
+  printf '%s\n' "$read_err" >&2
   warn "could not read output $1 from the state (see the terraform error above)"
   exit 1
 }
