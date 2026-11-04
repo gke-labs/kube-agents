@@ -358,6 +358,10 @@ SINCE_DAYS_RE = re.compile(r"^(\d+)d?$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 REPORT_DATE_FORMAT = "%Y-%m-%d"
 
+# Neither cap holds more than one broker admission wait and one run, so a read reaches the
+# shim with a retry deadline under which no retry fits: collector_run.default_run derives it
+# from the cap for every read, inherited environment or a `{**os.environ, "KUBECONFIG": ...}`
+# built at the read alike.
 GCLOUD_TIMEOUT_S = 120
 KUBECTL_TIMEOUT_S = 120
 # How many clusters a sweep reads at once is broker_admission.sweep_width(),

@@ -3130,6 +3130,7 @@ class ExecRouteCapacityTest(unittest.TestCase):
 
         self.assertEqual(503, status)
         self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_OTHER, body["bound"])
         self.assertIn("limit of 8 concurrent commands and this request waited 60s without reaching a free slot", body["error"])
 
     def test_the_vcs_route_holds_its_slot_until_the_response_is_written(self):
@@ -3342,6 +3343,26 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertEqual(503, status)
         self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
         self.assertIn("limit of 8 concurrent commands and this request waited 60s without reaching a free slot", body["error"])
+        # `bound` is what the shim reads to decide whether to retry; one raised
+        # without a bound is `other`, which it does not retry.
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_OTHER, body["bound"])
+
+    def test_a_slot_refusal_names_its_bound_in_the_busy_reply(self):
+        @contextlib.contextmanager
+        def slots_full(caller=None, klass=None):
+            raise credential_proxy.CommandSlotUnavailable(
+                "limit of 8 concurrent commands and this request waited 60s without reaching a free slot",
+                bound=credential_proxy.ADMISSION_BOUND_SLOT,
+            )
+            yield  # pragma: no cover -- makes this a generator, as a context manager needs
+
+        with mock.patch.object(CredentialProxyHandler.executor, "request_slot", slots_full):
+            status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+
+        self.assertEqual(503, status)
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, body[credential_proxy.BUSY_BOUND_KEY])
+        self.assertIn(body["bound"], credential_proxy_client.RETRYABLE_BUSY_BOUNDS)
 
     def test_a_caller_that_hangs_up_while_queued_is_logged_with_what_it_waited_for(self):
         # The exec route's abandon line carries the hang-up's own text, as
@@ -3824,6 +3845,10 @@ class SessionSlotCapTest(unittest.TestCase):
         self.assertEqual(503, results["second"][0], results["second"])
         self.assertEqual("CREDENTIAL_PROXY_BUSY", results["second"][1]["code"])
         self.assertIn("session", results["second"][1]["error"])
+        # The session cap is the caller's own limit: the reply says so, and the
+        # shim does not retry it.
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_SESSION, results["second"][1]["bound"])
+        self.assertNotIn(results["second"][1]["bound"], credential_proxy_client.RETRYABLE_BUSY_BOUNDS)
         self.assertEqual(200, results["shell"][0], results["shell"])
 
 
@@ -18876,6 +18901,7 @@ class ScopeExecRouteTest(unittest.TestCase):
             status, body = self.scope({"argv": SCOPE_ASSET_SEARCH})
         self.assertEqual(503, status, body)
         self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_SCOPE, body["bound"])
         self.assertFalse(self.calls.exists())
 
 
