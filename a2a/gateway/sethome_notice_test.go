@@ -103,3 +103,18 @@ func TestSetHomeNoticeLeavesAnOpenQuestionOpen(t *testing.T) {
 		t.Fatal("a plain mentioned reply in the thread was not a turn")
 	}
 }
+
+// TestSetHomeNoticeNeedsNoUserLookup: under allow-all, the documented
+// default, a users.info that fails changes nothing: admission is the
+// gateway's own rule on the author, so the notice posts and no task starts.
+func TestSetHomeNoticeNeedsNoUserLookup(t *testing.T) {
+	d := startSlackDMRigWith(t, nil, func(c *Config) {
+		c.SlackAllowedUsers = nil
+		c.SlackAllowAllUsers = true
+	})
+	d.adapter.events <- slackMsg("im", "D1", "U1", "/sethome", "100.1", "")
+	d.awaitPost(t, "the notice with users.info down", "D1", "100.1", slackHomeNoticeNoSet)
+	if n := len(d.tasks(t)); n != 0 {
+		t.Fatalf("%d tasks, want none: a failed users.info let the typed /sethome through as a turn", n)
+	}
+}

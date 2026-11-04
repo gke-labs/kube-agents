@@ -62,7 +62,7 @@ const (
 	slackHomePickGuest           = "Only a member of this workspace can move the home channel."
 	slackHomePickNoMemberCheck   = "Could not check your account with Slack; pick again."
 
-	// The answer to a typed "/sethome" (HomeNotice): the panel's state in one
+	// The answer to a typed "/sethome" (answerSetHome): the panel's state in one
 	// sentence (the panel's own lines for no home and not armed), then where
 	// the channel moves and who may move it. The id is plain: the reply goes
 	// through the backend's markdown, which escapes a <#C…> mention; the
@@ -155,24 +155,35 @@ func (s *SlackAdapter) homeNotice() string {
 }
 
 // answerSetHome answers a typed "/sethome" or "/hermes sethome"
-// (chattext.IsSetHomeCommand) from an admitted member in the thread it was
+// (chattext.IsSetHomeCommand) from an admitted author in the thread it was
 // typed in, before the text becomes a turn: nothing downstream sees it, so no
 // task starts, no open question is marked answered, no home is learned from
-// it and no asker is noted. A member the allowlist does not admit, or one
-// whose admission cannot be decided, is not answered here; the text goes on
-// and the gateway's own admission refuses it as it refuses any turn.
-func (s *SlackAdapter) answerSetHome(member, conversation, text string) bool {
+// it and no asker is noted. Admission is the gateway's own rule for an
+// inbound message (the SetHome closure) on the author foreignSender already
+// settled, so it needs no Slack call and cannot be undecided: an author the
+// rule does not admit is not answered here, and the gateway refuses the
+// turn as it refuses any. The post runs off the event pump (goSession), which
+// only enqueues.
+func (s *SlackAdapter) answerSetHome(author, conversation, text string) bool {
 	if !chattext.IsSetHomeCommand(text) {
 		return false
 	}
-	admitted, decided := s.homeAdmitted(member)
-	if !decided || !admitted {
+	s.home.mu.Lock()
+	admits := s.home.admits
+	s.home.mu.Unlock()
+	if admits == nil {
 		return false
 	}
-	s.log.Info("slack: sethome notice", "member", member, "conversation", conversation)
-	if _, err := s.Post(conversation, s.homeNotice()); err != nil {
-		s.log.Warn("slack: sethome notice not posted", "conversation", conversation, "err", err)
+	if admitted, _ := admits(author); !admitted {
+		return false
 	}
+	s.log.Info("slack: sethome notice", "author", author, "conversation", conversation)
+	notice := s.homeNotice()
+	s.goSession(func() {
+		if _, err := s.Post(conversation, notice); err != nil {
+			s.log.Warn("slack: sethome notice not posted", "conversation", conversation, "err", err)
+		}
+	})
 	return true
 }
 

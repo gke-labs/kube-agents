@@ -378,12 +378,18 @@ judgment, like all model output, is never an authorization signal: the gateway's
 verification runs before dispatch exactly as before, and the `authority` block is stamped at
 ingress as before (advisory today; see "Requester identity on the bus").
 
-The gateway owns a second slash command, `/feedback` (added 10/19). A typed `@bot /sethome` (or `/hermes sethome`) on Slack is the Slack adapter's own: `answerSetHome` answers an admitted member in the thread with the Home tab panel's state and where the home channel moves, before the text becomes a turn, so no task starts, no question is marked answered and no home is learned from it; a member the list does not admit is refused as any turn is. Bare, it answers
+The gateway owns a second slash command, `/feedback` (added 10/19). Bare, it answers
 deterministically with the two places a kube-agents report goes, the issue tracker and the
 public feedback form, and starts no task; with text after it, the gateway passes the message
 through as typed, and the Planning Agent composes the report and asks for a yes before the
 platform worker files it through the credential broker. The command, the persona flow and the
 broker verb are designed in [`chat-feedback-command.md`](chat-feedback-command.md). `/feedback summary` (added 2026-10-21) is the one text form the gateway answers itself: the install's identifier-free usage and feedback summary, from the `PlatformAgent` resource and the gateway's task records, with no task started (part 7 of the same document).
+
+A typed `@bot /sethome` (or `/hermes sethome`) on Slack is the Slack adapter's own, not a gateway
+command: `answerSetHome` answers an author the gateway's own admission rule admits, in the thread, with
+the Home tab panel's state and where the home channel moves, before the text becomes a turn, so no task
+starts, no question is marked answered and no home is learned from it; the post runs off the event
+pump. An author the rule does not admit is refused as any turn is.
 
 Delegation on a human's behalf keeps the human's bound, and the gateway is where it is kept.
 A session does not mint a child task itself: it asks the gateway to, over the same local
