@@ -13841,11 +13841,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _handle_watcher_k8s(self) -> None:
         """`GET /v1/k8s/<project>/<location>/<cluster>/<path>`: a fleet API server read.
 
-        The event watcher's list and watch of events and its one-item
-        metadata-only count lists, and the drift detector's read of one named
-        object, on the broker's credential. `watcher_policy.evaluate_k8s` is
-        the table. A watch is streamed through as the API server sends it;
-        everything else is streamed too, with the Cloud API relay's deadline
+        The event watcher's list and watch of events, its one-item
+        metadata-only count lists and its read of one named Pod's metadata,
+        and the drift detector's read of one named object, on the broker's
+        credential. `watcher_policy.evaluate_k8s` is the table. A watch is
+        streamed through as the API server sends it. A Pod's metadata is read
+        whole and relayed as its projection (`project_pod_metadata`).
+        Everything else is streamed too, with the Cloud API relay's deadline
         on each read.
         """
         request_id = str(uuid.uuid4())

@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -201,10 +202,10 @@ func TestOwnerResolver_TheMemoIsPerPodNotPerUID(t *testing.T) {
 	}
 }
 
-// The namespace and name come from the event's author. One that is not a
-// single path segment is not read at all, so it cannot steer the GET to
-// another object, and it starts no backoff.
-func TestOwnerResolver_ANameThatIsNotOnePathSegmentIsNotRead(t *testing.T) {
+// The namespace and name come from the event's author. One a Pod cannot have
+// is not read at all, so it cannot steer the GET to another object or draw a
+// refusal from the broker, and it starts no backoff.
+func TestOwnerResolver_ANameAPodCannotHaveIsNotRead(t *testing.T) {
 	s, o := newPodMetaResolver(t, map[string]string{
 		"/api/v1/namespaces/b/pods/y":   podMetaBody(``, `{"kind":"StatefulSet","name":"other","controller":true}`),
 		"/api/v1/namespaces/ns/pods/ok": podMetaBody(``, `{"kind":"Job","name":"j","controller":true}`),
@@ -217,13 +218,20 @@ func TestOwnerResolver_ANameThatIsNotOnePathSegmentIsNotRead(t *testing.T) {
 		{"ns", "a%2Fb"},
 		{"..", "y"},
 		{"ns/../b", "y"},
+		{"ns", "web 0"},
+		{"ns", "web#0"},
+		{"ns", "Web-0"},
+		{"ns", strings.Repeat("a", 254)},
+		{strings.Repeat("n", 64), "y"},
+		{"", "y"},
+		{"ns", ""},
 	} {
 		if got := o.ControllerRef(context.Background(), tc.namespace, tc.name, "uid"); got != "" {
 			t.Errorf("ControllerRef(%q, %q) = %q; want empty", tc.namespace, tc.name, got)
 		}
 	}
 	if n := s.count(); n != 0 {
-		t.Fatalf("requests = %d; want 0, no read for a name that is not one path segment", n)
+		t.Fatalf("requests = %d; want 0, no read for a name a Pod cannot have", n)
 	}
 	if got := o.ControllerRef(context.Background(), "ns", "ok", "uid-ok"); got != "Job/j" {
 		t.Fatalf("ControllerRef after the refusals = %q; want Job/j, no backoff", got)

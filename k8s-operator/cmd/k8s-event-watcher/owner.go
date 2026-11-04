@@ -25,7 +25,7 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apipath "k8s.io/apimachinery/pkg/api/validation/path"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -122,7 +122,7 @@ type podMeta struct {
 // A lookup that fails is not remembered, so the next event for the Pod asks
 // again; one that answers, including "no controller", is.
 func (o *ownerResolver) ControllerRef(ctx context.Context, namespace, name, uid string) string {
-	if o == nil || o.client == nil || !isPathSegment(namespace) || !isPathSegment(name) {
+	if o == nil || o.client == nil || !isPodKey(namespace, name) {
 		return ""
 	}
 	now := o.now()
@@ -158,15 +158,16 @@ func (o *ownerResolver) ControllerRef(ctx context.Context, namespace, name, uid 
 	return ref
 }
 
-// isPathSegment reports whether s can stand as one segment of the request
-// path: not empty, and no "/", "%", "." or "..", as client-go's
-// Request.Name() and the broker's NAME grammar require. The namespace and name
-// come from the event's involvedObject, which its author writes, and AbsPath
-// cleans "..", so a name such as "x/../../configmaps/y" would otherwise read
-// another object. A name that fails reads as no owner, with no request and no
-// backoff.
-func isPathSegment(s string) bool {
-	return s != "" && len(apipath.IsValidPathSegmentName(s)) == 0
+// isPodKey reports whether namespace and name are ones a Pod can have: a DNS
+// label and a DNS subdomain, as the API server validates them. The two come
+// from the event's involvedObject, which its author writes. AbsPath cleans
+// "..", so a name such as "x/../../configmaps/y" would otherwise read another
+// object, and a name the broker's NAME grammar refuses (a space, a "#", past
+// 253 characters) would get a 403 and pause the cluster's lookups. Both
+// grammars are subsets of the broker's, so a key that passes is one the broker
+// admits. A key that fails reads as no owner, with no request and no backoff.
+func isPodKey(namespace, name string) bool {
+	return len(validation.IsDNS1123Label(namespace)) == 0 && len(validation.IsDNS1123Subdomain(name)) == 0
 }
 
 func (o *ownerResolver) lookup(ctx context.Context, namespace, name string) (string, error) {
