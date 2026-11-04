@@ -15582,10 +15582,12 @@ def serve(args: argparse.Namespace) -> None:
             if relay is not None
         ],
         executor=executor,
-        # Only the standalone broker pod drains: the operator gives it the grace
-        # period for one (credentialProxyTerminationGraceSeconds), and the
-        # sidecar roles' pods keep the short stop.
-        drain_seconds=SHUTDOWN_DRAIN_SECONDS if role == ROLE_BROKER else 0,
+        # The standalone broker pod and the exec tier's pods drain: the operator
+        # gives each the grace period for one
+        # (credentialProxyTerminationGraceSeconds), and an exec pod that stops
+        # mid-rollout must finish the commands it
+        # admitted. The sidecar roles' pods keep the short stop.
+        drain_seconds=SHUTDOWN_DRAIN_SECONDS if role in (ROLE_BROKER, EXEC_ROLE) else 0,
     )
     server.serve_forever()
     LOGGER.info("credential proxy stopped")

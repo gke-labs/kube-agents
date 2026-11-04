@@ -844,7 +844,7 @@ cache contract.
        not kill it before the drain and the exit end. Chat receipts still unsettled go back to
        Pub/Sub; Slack and Teams events the gateway did not pull before the exit end with the
        process, and the Slack count is logged. This half is implemented (`install_shutdown_handler`
-       in `credential_proxy.py`, the broker role only).
+       in `credential_proxy.py`, the broker and exec roles).
      - On the exec tier, `RollingUpdate` keeps another replica serving, so the drain is long: a
        `terminationGracePeriodSeconds` longer than the longest command it admits. A
        PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or more; at 1

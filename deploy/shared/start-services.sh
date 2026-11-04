@@ -418,17 +418,17 @@ readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
 # shutdown, because terminate() returning is PID 1 exiting. Ten seconds is the
 # window plus margin, inside a 30s default grace with the Envoy kill after it.
 # In the api-proxy role the runtime installs no handler and exits on the
-# signal, so the wait there is one poll. The broker role drains longer and
-# waits BROKER_RUNTIME_DRAIN_SECONDS instead (below).
+# signal, so the wait there is one poll. The broker and exec roles drain longer
+# and wait BROKER_RUNTIME_DRAIN_SECONDS instead (below).
 readonly RUNTIME_DRAIN_SECONDS=10
-# The standalone broker pod's runtime drains longer: it refuses new requests and
-# gives those in flight up to credential_proxy.py's own SHUTDOWN_DRAIN_SECONDS
-# (30s from the signal, the 3s settle inside it), then ends the commands still
-# running, waits its SHUTDOWN_END_WAIT_SECONDS (5s) for their answers, and hands
-# the Chat receipts back (SHUTDOWN_NACK_TIMEOUT_SECONDS, 2s, per relay; two
-# relays). Forty seconds holds those 39s and one poll
-# (tests/test_credential_proxy_drain_budget.py), inside the 45s
-# terminationGracePeriodSeconds the operator gives the broker pod
+# The standalone broker pod's runtime, and an exec pod's, drains longer: it
+# refuses new requests and gives those in flight up to credential_proxy.py's own
+# SHUTDOWN_DRAIN_SECONDS (30s from the signal, the 3s settle inside it), then
+# ends the commands still running, waits its SHUTDOWN_END_WAIT_SECONDS (5s) for
+# their answers, and hands the Chat receipts back
+# (SHUTDOWN_NACK_TIMEOUT_SECONDS, 2s, per relay; two relays). Forty seconds
+# holds those 39s and one poll (tests/test_credential_proxy_drain_budget.py),
+# inside the 45s terminationGracePeriodSeconds the operator gives the broker pod
 # (credentialProxyTerminationGraceSeconds), Envoy's kill after it.
 readonly BROKER_RUNTIME_DRAIN_SECONDS=40
 
@@ -700,7 +700,9 @@ terminate() {
 
   # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS and drain_runtime.
   local runtime_budget="${RUNTIME_DRAIN_SECONDS}"
-  [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" ]] || runtime_budget="${BROKER_RUNTIME_DRAIN_SECONDS}"
+  case "${CREDENTIAL_PROXY_ROLE}" in
+    broker | exec) runtime_budget="${BROKER_RUNTIME_DRAIN_SECONDS}" ;;
+  esac
   [[ -z "${runtime_pid}" ]] || drain_runtime "${runtime_budget}" "${runtime_pid}"
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
 }
