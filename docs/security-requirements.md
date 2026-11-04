@@ -81,7 +81,7 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
 - GitHub access uses short-lived, repository-scoped installation tokens.
 - Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
-- The current command proxy supports `gcloud` and `kubectl`. Additional CLIs require explicit proxy support. The Google relays are the other non-CLI interfaces, each confined by a code table and bound to one caller role: the read-only Google Cloud REST relay, `GET /v1/gcp/<host>/<path>`, admitted per host and path by `agents/platform/scripts/api_policy.py` and open to the shell role only ([`designs/gcp-api-relay.md`](designs/gcp-api-relay.md)); the watchers' routes, the GKE read and the drift subscription under `/v1/watcher/gcp/` and Kubernetes events and named reads under `/v1/k8s/`, open to the watcher role (`agents/platform/scripts/watcher_policy.py`); and the Pub/Sub platform adapter's four subscription calls under `/v1/pubsub/gcp/`, open to the chat role and confined to the subscriptions the operator renders from the AgentPlugin configs (same file). `ROUTE_ROLES` in `agents/platform/scripts/credential_proxy.py` is the full table of routes and roles, the chat relays, the remote MCP relay and the sandbox's command and version-control routes among them.
+- The current command proxy supports `gcloud` and `kubectl`. Additional CLIs require explicit proxy support. The Google relays are the other non-CLI interfaces, each confined by a code table and bound to one caller role: the read-only Google Cloud REST relay, `GET /v1/gcp/<host>/<path>`, admitted per host and path by `agents/platform/scripts/api_policy.py` and open to the shell role only ([`designs/gcp-api-relay.md`](designs/gcp-api-relay.md)); the watchers' routes, the GKE read and the drift subscription under `/v1/watcher/gcp/` and, under `/v1/k8s/`, Kubernetes events, named reads and the event watcher's count lists (five cluster-scoped workload kinds, `limit=1`, a metadata-only `Accept`), open to the watcher role (`agents/platform/scripts/watcher_policy.py`); and the Pub/Sub platform adapter's four subscription calls under `/v1/pubsub/gcp/`, open to the chat role and confined to the subscriptions the operator renders from the AgentPlugin configs (same file). `ROUTE_ROLES` in `agents/platform/scripts/credential_proxy.py` is the full table of routes and roles, the chat relays, the remote MCP relay and the sandbox's command and version-control routes among them.
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the broker for this reason.
 
 The sandbox and the credential runtime must not share a process namespace, and must not run as the
@@ -102,9 +102,11 @@ and, under `spec.mode: next` with an `AgentProfile` bound, `kubeagents-credentia
 for each profile tier's ServiceAccount, as [spec-subagent-profiles.md](designs/spec-subagent-profiles.md) describes)
 as a bearer header, and the broker verifies
 it with a `TokenReview` before serving any path on that listener but `/healthz`;
-`CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. The one other TCP
-listener in the pod is the runtime's metrics-only one on 8766, unauthenticated like
-`/healthz`: it serves Prometheus counters whose label values are static enums and closed
+`CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. Two other TCP
+listeners are in the pod. Envoy's health listener on 8768 serves the Pod's readiness probe,
+routes `/healthz` alone to the runtime through a cluster with its own small circuit breaker,
+and is opened to no peer by the Service or the NetworkPolicy. The runtime's metrics-only one
+on 8766 is unauthenticated like `/healthz`: it serves Prometheus counters whose label values are static enums and closed
 vocabularies, holds no route, credential or policy, answers at most sixteen connections at a
 time with a ten-second deadline on each, and is the one port the broker's
 NetworkPolicy opens to the `gke-gmp-system` namespace, where the managed-Prometheus
