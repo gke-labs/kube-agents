@@ -13,7 +13,7 @@
 The platform is a **decoupled, persona-based** system:
 
 - **Platform Agent** — one Hermes profile (the `platform` profile). Fleet-wide synthesis. It is not the chat front door: the `default` profile is the Chat Agent, which owns chat ingress and delegates to this one (§6.1).
-- **Cluster subagent** — one Hermes profile **per managed cluster**, co-located in the same pod for the MVP. Runs its own cron for periodic local scans, and processes delegated tasks.
+- **Cluster subagent** — one Hermes profile **per managed cluster**, co-located in the same pod for the MVP. It processes delegated tasks and has no cron roster of its own (`profile_cron_tick.py` skips `cluster-*` profiles; see [`scheduling-on-profiles.md`](scheduling-on-profiles.md)).
 
 Two communication channels, with different shapes and different reliability requirements:
 
