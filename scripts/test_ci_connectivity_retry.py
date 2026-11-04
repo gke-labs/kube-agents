@@ -135,11 +135,13 @@ def write_stub(directory: pathlib.Path, name: str, body: str) -> None:
 
 
 def gateway_retry_knobs() -> str:
-    """The `readonly EVAL_LITELLM_*` declarations the section's deadline reads, lifted from the script."""
+    """The two `readonly EVAL_LITELLM_*` retry declarations the section's deadline reads, lifted from the script.
+
+    Named exactly, not by prefix: the script declares other EVAL_LITELLM_* settings the section does not read."""
     src = DEPLOY_SCRIPT.read_text(encoding="utf-8")
-    knobs = re.findall(r"^readonly EVAL_LITELLM_[A-Z_]+=.*$", src, re.MULTILINE)
+    knobs = re.findall(r"^readonly EVAL_LITELLM_(?:NUM_RETRIES|RETRY_AFTER_SECONDS)=.*$", src, re.MULTILINE)
     if len(knobs) != 2:  # pragma: no cover - a rename should say so loudly
-        raise AssertionError(f"expected the two EVAL_LITELLM_* knobs in {DEPLOY_SCRIPT}, found {knobs}")
+        raise AssertionError(f"expected the two EVAL_LITELLM_* retry knobs in {DEPLOY_SCRIPT}, found {knobs}")
     return "\n".join(knobs)
 
 
