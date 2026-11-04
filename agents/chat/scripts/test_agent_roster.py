@@ -1476,6 +1476,38 @@ class TestFilter(unittest.TestCase):
         self.assertEqual(degraded, agent_roster.FILTER_UNREAD.format(query="b", total=1))
         self.assertIn("cluster-p-b-us (the b cluster agent", clean)
 
+    def test_render_filtered_reports_a_scope_fault_as_a_plain_no_match(self):
+        # A scope the walk could not read leaves every profile read, so a
+        # no-match is still a fact: the answer routes to `platform`, not to a
+        # second call that would fault the same way. The walk is still not
+        # cached, which is the store's rule, not the answer's.
+        from unittest import mock
+
+        _forget()
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp) / "profiles"
+            base.mkdir()
+            _write_cluster_profile(base, "cluster-p-a-us", "p", "a", "us")
+            _age(base)
+            render = base.parent / "render.json"
+            render.write_text('{"present": true, "projects": ["q"]}\n')
+            _age(render)
+            env = {"KUBEAGENTS_SCOPE_FILE": str(render)}
+            real = Path.read_text
+
+            def flaky(path, *args, **kwargs):
+                if path == render:
+                    raise OSError(5, "EIO")
+                return real(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_text", autospec=True, side_effect=flaky):
+                out = _render_filtered("nope", base, env)
+            with _counting_reads() as counts:
+                _render_filtered("nope", base, env)
+        _forget()
+        self.assertEqual(out, agent_roster.FILTER_NONE.format(query="nope", total=1))
+        self.assertGreater(counts["reads"].call_count, 0, "the faulted walk was cached")
+
     def test_render_filtered_reads_the_cached_tree(self):
         _forget()
         with TemporaryDirectory() as tmp:

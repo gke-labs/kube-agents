@@ -212,7 +212,7 @@ def _summarize_soul(home: Path) -> str:
             return ""
         lines = soul.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        _note_degraded()
+        _note_degraded(profile=True)
         return ""
     for line in lines:
         s = line.strip()
@@ -233,7 +233,7 @@ def _responsibilities(home: Path) -> str:
     try:
         text = cap.read_text(encoding="utf-8", errors="replace").strip() if cap.is_file() else ""
     except OSError:
-        _note_degraded()
+        _note_degraded(profile=True)
         text = ""
     if text:
         return text
@@ -258,7 +258,7 @@ def _cluster_identity(home: Path) -> dict[str, str]:
             return {}
         lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        _note_degraded()
+        _note_degraded(profile=True)
         return {}
     identity: dict[str, str] = {}
     inside = False
@@ -306,7 +306,7 @@ def discover(base: Path | None = None) -> list[dict[str, str]] | None:
             agents.append(agent)
         except OSError as e:
             log(f"skipping unreadable profile {p.name}: {e}")
-            _note_degraded()
+            _note_degraded(profile=True)
     return agents
 
 
@@ -433,8 +433,10 @@ def format_matches(
     the exact matches first (a cluster named ``prod`` among ``prod-01`` ...
     ``prod-60`` is otherwise the one the cap drops), the rest in discovery
     order. ``degraded`` says the walk that produced ``agents`` skipped or
-    half-read a profile; a no-match from such a walk is reported as unread,
-    not as absent.
+    half-read a profile (the per-profile faults only: a scope or
+    management-project fault leaves every profile read, so a no-match is
+    still a fact); a no-match from such a walk is reported as unread, not as
+    absent.
     """
     if agents is None:
         return None
@@ -658,11 +660,19 @@ _cache: tuple | None = None
 # compares the count before and after its walk; a fault another caller noted
 # in that window costs it one skipped store, never a cached degraded roster.
 _faults = 0
+# The per-profile share of _faults (a profile skipped, a description or
+# identity lost): what render_filtered's no-match answer reads. A scope or
+# management-project fault counts on _faults alone, so it still keeps the
+# roster out of the cache but never turns a no-match into FILTER_UNREAD,
+# whose claim is that a profile may have gone unread.
+_profile_faults = 0
 
 
-def _note_degraded() -> None:
-    global _faults
+def _note_degraded(profile: bool = False) -> None:
+    global _faults, _profile_faults
     _faults += 1
+    if profile:
+        _profile_faults += 1
 
 
 def _mtime_ns(path: Path) -> int | None:
@@ -745,12 +755,15 @@ def _profile_stamps(root: Path, names: list[str], read_at: int | None = None) ->
 def _discover_and_render(
     base: Path | None,
 ) -> tuple[list[dict[str, str]] | None, str | None, bool]:
-    """The agents, the rendered roster, and whether the walk degraded.
+    """The agents, the rendered roster, and whether the walk skipped or half-read a profile.
 
     From the cache when nothing changed; a hit is clean by construction. The
     cache key is read before the walk and the unstamped profiles' own stamps
     after it, held to the walk's start, so neither can vouch for content a
-    write during the walk replaced.
+    write during the walk replaced. Any fault on the walk (a profile's, the
+    scope's or the management project's) keeps the roster out of the cache;
+    the flag returned is the per-profile share, which is what a filter's
+    no-match answer turns on.
     """
     global _cache
     root = PROFILES_BASE if base is None else base
@@ -763,7 +776,7 @@ def _discover_and_render(
         and _profile_stamps(root, [name for name, *_ in cached[1]]) == cached[1]
     ):
         return cached[2], cached[3], False
-    faults_before = _faults
+    faults_before, profile_faults_before = _faults, _profile_faults
     started = time.time_ns()
     agents = discover(root)
     roster = format_roster(agents)
@@ -773,11 +786,16 @@ def _discover_and_render(
         extra = [b for b in (_format_host(read_host_identity(agents, root)), _format_scope(root)) if b]
         text = "\n\n".join([roster, *extra])
     degraded = _faults != faults_before
+    if degraded and key is not None:
+        # Every fallback path above logs its own line but the three in-profile
+        # reads; this one says what the fault cost. A standing fault prints it
+        # every turn, which is the signal that the walk is back to every turn.
+        log(f"roster not cached: {_faults - faults_before} read fault(s) during this walk")
     if key is not None and agents is not None and not degraded:
         unstamped = _profile_stamps(root, _unstamped(agents), read_at=started)
         if unstamped is not None:
             _cache = (key, unstamped, agents, text)
-    return agents, text, degraded
+    return agents, text, _profile_faults != profile_faults_before
 
 
 def render(base: Path | None = None) -> str | None:
