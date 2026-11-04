@@ -289,7 +289,7 @@
       "cluster_slot": "c",
       "namespace": null,
       "probes": [],
-      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota false, where every other pool in the fleet runs a 20 GB disk and no kubelet block; the pool-level outlier the boot-disk and kubelet-config drift facets read",
+      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota false, where every other pool in the fleet runs a 20 GB disk and no kubelet block; planted ahead of the boot-disk and kubelet-config drift facets, which the drift SOP does not read yet",
       "state": [
         {
           "subject": "cluster",

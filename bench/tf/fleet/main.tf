@@ -663,7 +663,8 @@ resource "google_container_cluster" "seeded_c" {
   }
 
   # Upgrade-SOP background closure, as on seeded-a: REGULAR channel and a
-  # window. The consistency defect above is authorized networks alone.
+  # window. The consistency defects are authorized networks on the control
+  # plane (above) and the default pool's disk and kubelet config (below).
   release_channel {
     channel = "REGULAR"
   }

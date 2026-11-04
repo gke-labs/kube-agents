@@ -266,8 +266,8 @@ fixtures:
     defect: >-
       Slot c's default pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota
       false, where every other pool in the fleet runs a 20 GB disk and no
-      kubelet block: the pool-level outlier for the boot-disk and
-      kubelet-config drift facets. Day 1 for the same reason as drift-outlier,
+      kubelet block, planted ahead of the boot-disk and kubelet-config drift
+      facets, which the drift SOP does not read yet. Day 1 as for drift-outlier,
       the cohort's 24-hour age gate. A separate role, so this half drifting
       excuses nothing from the case that lists drift-outlier; until the
       reconcile rolls the change every project reads it drifted.

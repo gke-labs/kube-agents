@@ -1283,9 +1283,11 @@ class PassTest(_Harness):
         started = datetime.now(timezone.utc)
         done = self.run_script(world, "--wait", "60", "--interval", "1")
         assert (datetime.now(timezone.utc) - started).total_seconds() < 30, done.stderr
-        # One pass: drift-outlier and drift-pool-outlier each read slot c's
-        # document once per pass, so two describes is a single pass.
-        assert self.log.read_text().count("clusters describe seeded-c") == 2
+        # One pass: every role on slot c reads its document once per pass
+        # (the read cache is per role), so one describe per slot-c role.
+        slot_c_roles = sum(1 for spec in self.catalog["roles"].values() if spec["cluster_slot"] == "c")
+        assert slot_c_roles >= 2, slot_c_roles
+        assert self.log.read_text().count("clusters describe seeded-c") == slot_c_roles
         assert set(self.drift_files()) == {"drift-outlier"}
 
     def test_a_block_lost_beside_a_young_outlier_still_holds_the_wait(self):
