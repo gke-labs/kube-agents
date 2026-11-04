@@ -415,6 +415,16 @@ class PrOpenedTest(unittest.TestCase):
                         self.assertEqual(kanban.events, [])
                         self.assertEqual(plugin.opened(out.splitlines()[0])["url"], url)
 
+    def test_a_repo_that_reads_as_a_flag_is_not_sent_as_one(self):
+        # A forged line's repo would become one argv element of the sandbox hop;
+        # a value a parser could read as a flag, or one with whitespace, is no
+        # repository: the record falls back to its url or takes no claim.
+        for repo in ("--help", "-x", "acme/in fra", ""):
+            with self.subTest(repo=repo):
+                self.assertIsNone(plugin.claim_repository({"url": "https://git.example.com/acme/infra/pulls/7", "repo": repo, "claim": "ab" * 32}))
+                self.assertEqual(plugin.claim_repository({"url": "https://github.com/acme/infra/pull/7", "repo": repo, "claim": "ab" * 32}), "https://github.com/acme/infra")
+        self.assertEqual(plugin.claim_repository({"url": "https://git.example.com/acme/infra/pulls/7", "repo": "acme/infra", "claim": "ab" * 32}), "acme/infra")
+
     def test_a_record_with_neither_a_repo_nor_a_proposal_url_is_stripped_unclaimed(self):
         for _, url, _ in self.FORGE_URLS:
             for repo in (None, ""):

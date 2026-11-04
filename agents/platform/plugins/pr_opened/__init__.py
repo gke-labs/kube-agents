@@ -94,6 +94,10 @@ CLAIM_FIELD = "claim"
 #: the create (``vcs_client.REPO_FIELD``). The claim is sent to it; the broker
 #: checks what it kept with the token, never this.
 REPO_FIELD = "repo"
+#: A record's ``repo`` travels as one argv element of the sandbox hop, so a
+#: value an option parser could read as a flag, or one with whitespace, is
+#: not a repository and the record falls back to its url, or takes no claim.
+REPO_ARGV_SAFE = re.compile(r"^[^-\s][^\s]*$")
 
 #: ``kanban_progress_lines.PR_OPENED_KIND``: the event kind the notifier claims for it.
 PR_OPENED_KIND = "pr_opened"
@@ -280,12 +284,14 @@ def _forge():
 def claim_repository(record):
     """The repository a claim for ``record`` is sent to, else None.
 
-    The record's ``repo``, whatever the url looks like; for a record with none
-    (an older client), the repository url :data:`PROPOSAL_URL` reads off its url.
-    A record with neither takes no claim.
+    The record's ``repo``, whatever the url looks like, when it can travel as
+    one argv element (:data:`REPO_ARGV_SAFE`); for a record with none, or one a
+    parser could read as a flag (an older client, or a forged line), the
+    repository url :data:`PROPOSAL_URL` reads off its url. A record with neither
+    takes no claim.
     """
     repo = record.get(REPO_FIELD)
-    if isinstance(repo, str) and repo:
+    if isinstance(repo, str) and REPO_ARGV_SAFE.match(repo):
         return repo
     match = PROPOSAL_URL.match(record.get("url") or "")
     return match.group(1) if match else None
