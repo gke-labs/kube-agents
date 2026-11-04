@@ -535,10 +535,10 @@ before stage 3 of the rollout (turning replay on):
    two builds of one pull request and a second pull request) showed how big the gap is: the
    simulated estimate was 12%, ignoring other agents' kanban text as well raised it to 22%, and most
    of the remaining misses were tool results after a differently chosen action. Real record and
-   replay of the same cases, in "Measurements", reused 46–100%. So the deciding measurement is
-   **calibration**: record a set of cases, replay them for real, and report the real hit rate and
-   whether every verdict matched. It needs a replay switch in the proxy that is off by default and
-   only used on a dev install.
+   replay of the same cases, in "Measurements", reused 46–100%. So the deciding measurement comes
+   from real replay, in the replay lane below. Shadow mode stays for what only it can measure: how
+   often pull requests start on a saved recording at all (prompt changes, project rotation), and the
+   stored text for normalizer work.
 
    Shadow mode also checks that hits would be safe, not just how many there are. For each request
    it logs a hash of the model's live answer, and once the run is done, whether that run passed. For
@@ -548,10 +548,26 @@ before stage 3 of the rollout (turning replay on):
    collision report is a bar for stage 3. This stage needs no shared cache and no new permissions
    inside the cluster.
 
-2. **Calibrate with real replay on a dev install**: the same cases recorded and then replayed for
-   real, several times, reporting the real hit rate and whether each verdict matched the recording.
-   This is the number the decision rests on.
-3. **Turn on replay for pull requests**, once calibration shows it's worth it, the collision report
+2. **A replay lane that gates nothing.** Real replay can't run in the presubmit or the nightly
+   without changing their results, so it gets its own job: a periodic, non-blocking job that runs a
+   set of cases on `main`'s code with replay on, served from the nightly's recordings. Its results
+   don't block anything and aren't written to the evidence store. For this the nightly saves its
+   answers, keyed by fingerprint, as the trusted writer in "Who can write to the cache"; the lane
+   only reads them. For each conversation it records
+   how many messages and tokens were replayed before the first miss, what caused that miss (the
+   proxy has the cache, so it logs the closest saved request and the message and field that
+   differed), and whether the run's verdict matched the live nightly's. Every miss here is real: a
+   normalizer gap to fix, or a real difference in the cluster or the code. Because a conversation
+   runs live after its first miss, each one tells us its first miss only, which is what replay would
+   actually save.
+
+   Run it on a dev install first, with a few cases recorded and replayed several times, to check the
+   mechanics; then as the periodic job for the measurement week. The estimate the decision rests on
+   combines both: what replay saves per conversation (this lane) times how often pull request
+   conversations start on a saved recording (shadow mode).
+
+3. **Turn on replay for pull requests**, once the replay lane shows it's worth it and its verdicts
+   match the live ones, the collision report
    from shadow mode has been reviewed, the eval crew has decided the three gate questions above, and
    #1730 is fixed (or they're happy with stripping the recent-work section from the key).
 4. **Look at polling.** If shadow mode shows most of the remaining misses come from the `sleep 60`
