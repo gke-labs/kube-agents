@@ -154,6 +154,9 @@ class BitbucketFlagsTest(unittest.TestCase):
             (self._dc(PARAM_GITOPS_REPO="https://bitbucket.example.com/projects/INFRA/repos/gitops/browse"),
              "repo=INFRA/gitops "),
             (self._dc(PARAM_GITOPS_IDENTITY="svc-bot"), "repo=INFRA/gitops "),
+            # The clone dialog's URL carries the user who copied it.
+            (self._cloud(PARAM_GITOPS_REPO="https://alice@bitbucket.org/acme/infra.git"), "repo=acme/infra "),
+            (self._dc(PARAM_GITOPS_REPO="https://alice@bitbucket.example.com/scm/INFRA/gitops.git"), "repo=INFRA/gitops "),
         ):
             with self.subTest(case=case):
                 proc = self._validate(case)
@@ -216,10 +219,56 @@ class BitbucketFlagsTest(unittest.TestCase):
         self.assertIn("rc=0 ", proc.stdout, proc.stderr + proc.stdout)
         self.assertIn("ca=bitbucket-forge-ca", proc.stdout)
 
-    def test_a_switch_from_gitlab_takes_the_bitbucket_default_secret(self):
+    def test_a_forge_switch_refuses_to_keep_the_recorded_token(self):
+        """The recorded Secret holds the other forge's token: kept, the broker
+        would send an internal Data Center token to bitbucket.org, or the
+        reverse. Both default to bitbucket-forge-token, so a name check alone
+        does not see the switch."""
+        for label, case in (
+            ("gitlab to cloud", self._cloud(PARAM_GITOPS_RECORDED_FORGE="gitlab",
+                                            PARAM_GITLAB_TOKEN_SECRET="gitlab-forge-token")),
+            ("dc to cloud", self._cloud(PARAM_GITOPS_RECORDED_FORGE="bitbucket-datacenter",
+                                        PARAM_GITLAB_TOKEN_SECRET="bitbucket-forge-token")),
+            ("cloud to dc", self._dc(PARAM_GITOPS_RECORDED_FORGE="bitbucket",
+                                     PARAM_GITLAB_TOKEN_SECRET="bitbucket-forge-token")),
+            ("dc to cloud, custom name", self._cloud(PARAM_GITOPS_RECORDED_FORGE="bitbucket-datacenter",
+                                                     PARAM_GITLAB_TOKEN_SECRET="corp-token")),
+        ):
+            with self.subTest(case=label):
+                proc = self._validate(case)
+                out = proc.stdout + proc.stderr
+                self.assertRegex(proc.stdout, r"rc=[1-9]", out)
+                self.assertIn("--gitops-token-file", out)
+                self.assertIn("--gitops-token-secret", out)
+
+    def test_a_forge_switch_with_a_named_token_or_secret_goes_on(self):
+        tok = self._tmp / "tok"
+        tok.write_text("x")
         proc = self._validate(self._cloud(
-            PARAM_GITOPS_RECORDED_FORGE="gitlab", PARAM_GITLAB_TOKEN_SECRET="gitlab-forge-token"))
+            PARAM_GITOPS_RECORDED_FORGE="bitbucket-datacenter", PARAM_GITLAB_TOKEN_SECRET="bitbucket-forge-token",
+            PARAM_GITLAB_TOKEN_FILE=str(tok)))
         self.assertIn("rc=0 repo=acme/infra host= secret=bitbucket-forge-token", proc.stdout, proc.stderr)
+        proc = self._validate(self._cloud(
+            PARAM_GITOPS_RECORDED_FORGE="gitlab", PARAM_GITLAB_TOKEN_SECRET="bb-cloud",
+            PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="true"))
+        self.assertIn("rc=0 repo=acme/infra host= secret=bb-cloud", proc.stdout, proc.stderr)
+
+    def test_an_interactive_forge_switch_asks_for_the_new_token(self):
+        proc = self._validate(self._cloud(
+            PARAM_NON_INTERACTIVE="false", PARAM_GITOPS_RECORDED_FORGE="bitbucket-datacenter",
+            PARAM_GITLAB_TOKEN_SECRET="bitbucket-forge-token"))
+        self.assertIn("rc=0 ", proc.stdout, proc.stderr + proc.stdout)
+        proc = self._run_install_func(
+            "PARAM_GITOPS_FORGE=bitbucket PARAM_GITOPS_REPO=acme/infra PARAM_NON_INTERACTIVE=false "
+            "PARAM_GITOPS_RECORDED_FORGE=bitbucket-datacenter PARAM_GITLAB_TOKEN_SECRET=bitbucket-forge-token; "
+            'validate_gitops_forge_flags >/dev/null 2>&1; echo "replace=${PARAM_GITOPS_TOKEN_MUST_REPLACE:-}"'
+        )
+        self.assertIn("replace=true", proc.stdout, proc.stderr)
+
+    def test_parse_args_marks_a_named_secret(self):
+        proc = self._run_install_func(
+            'parse_args --gitops-token-secret=s1; echo "flag=$PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG"')
+        self.assertIn("flag=true", proc.stdout, proc.stderr)
 
     def test_a_switch_away_from_bitbucket_drops_the_recorded_identity(self):
         proc = self._validate({

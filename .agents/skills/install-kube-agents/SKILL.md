@@ -50,7 +50,7 @@ Several exits (the service-account ownership check, input validation, a missing 
 `--dry-run`, the GitHub App PEM import) write no report and leave an earlier run's in place.
 
 Resolve the latest stable release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases)
-(e.g. `0.4.0`; a GitLab install needs `0.9.0` or later, a Bitbucket install `0.25.0` or later) first, and substitute it for `<RELEASE_VERSION>` in every command you run or hand
+(e.g. `0.4.0`; a GitLab install needs `0.9.0` or later, a Bitbucket install `0.24.0` or later) first, and substitute it for `<RELEASE_VERSION>` in every command you run or hand
 over; never leave the placeholder unrendered.
 
 ### Stage 1: Detect and interview
@@ -562,7 +562,7 @@ connection check and token rotation. Read it before the dry run.
 
 Rules for the agent:
 
-- Use release 0.25.0 or later. An earlier release refuses `--gitops-forge=bitbucket`.
+- Use release 0.24.0 or later. An earlier release refuses `--gitops-forge=bitbucket`.
 - Ask which product it is. `bitbucket` is Bitbucket Cloud, at `bitbucket.org` only.
   `bitbucket-datacenter` is an instance the operator runs.
 - The operator creates the GitOps repository first, with one commit on its default branch.
@@ -582,6 +582,9 @@ Rules for the agent:
 - Do not ask the operator to paste the token. Either leave out `--gitops-token-file` (the install
   prints the command that creates the Secret), or pass the operator's file or password-manager
   command as `--gitops-token-file=<(…)`. `--gitlab-token-file` is the same flag under its old name.
+- When `install.env` records another forge with a token (GitLab, or the other Bitbucket product),
+  the run needs `--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run
+  stops before it changes anything, because the recorded Secret holds the old forge's token.
 - Only for a Data Center instance behind a private CA, add `--gitops-ca-file` (a regular PEM file).
 - Tell the operator that Bitbucket has no issue tracker: the fleet audits keep their ledger in the
   report store and post to chat, and still open pull requests in the GitOps repository.

@@ -291,7 +291,7 @@ Rules for the agent:
 
 When the GitOps repository is on Bitbucket Cloud (`bitbucket.org`) or on a Bitbucket Data Center
 instance, use the Bitbucket flags in place of the GitHub App flags. Bitbucket support starts in
-release 0.25.0. Use 0.25.0 or a later release as `<RELEASE_VERSION>`. A Bitbucket install has no
+release 0.24.0. Use 0.24.0 or a later release as `<RELEASE_VERSION>`. A Bitbucket install has no
 GitHub App and no token minter. The installer refuses `--github-app-id` and `--github-pem-path` with
 a Bitbucket forge. The Go and Cloud KMS prerequisites of the PEM import do not apply.
 
@@ -339,6 +339,10 @@ Rules for the agent:
   the transcript. Either leave out `--gitops-token-file` (the install prints the command that
   creates the Secret, and the operator runs it), or give it a file or a process substitution, as
   above. `--gitlab-token-file` is the same flag under its old name.
+- On an install whose `install.env` records another forge with a token (GitLab, or the other
+  Bitbucket product), give the new token with `--gitops-token-file` or name its Secret with
+  `--gitops-token-secret`: the installer refuses to keep the recorded Secret, which holds the old
+  forge's token.
 - Only for a Data Center instance whose certificate a private CA signed, add
   `--gitops-ca-file="$HOME/secure/internal-ca.pem"`. The installer stores it in the Secret
   `bitbucket-forge-ca`. The installer refuses it for Cloud.

@@ -517,6 +517,13 @@ PARAM_GITOPS_CA_FILE_FROM_FLAG="false"
 # that contradicts it.
 PARAM_GITOPS_HOST_FROM_FLAG="false"
 PARAM_GITHUB_APP_FROM_FLAG="false"
+# Whether --gitops-token-secret named this run's Secret. On a switch between
+# two forges with a token, a Secret install.env recorded holds the other
+# forge's token, so only a name the run gives is kept (see
+# validate_gitops_forge_flags). PARAM_GITOPS_TOKEN_MUST_REPLACE is set there
+# when an interactive run must replace the token rather than keep it.
+PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="false"
+PARAM_GITOPS_TOKEN_MUST_REPLACE="false"
 # The forge and host install.env records, before any flag changes them. A
 # GitHub Enterprise Server host is recorded with GITOPS_FORGE=github, a
 # self-managed GitLab host with GITOPS_FORGE=gitlab, so a host is kept only
@@ -1193,7 +1200,7 @@ parse_args() {
       --gitops-forge=*) PARAM_GITOPS_FORGE="${1#*=}"; shift ;;
       --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; PARAM_GITOPS_HOST_FROM_FLAG="true"; shift ;;
       --gitlab-token-file=*|--gitops-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
-      --gitlab-token-secret=*|--gitops-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
+      --gitlab-token-secret=*|--gitops-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="true"; shift ;;
       --gitops-identity=*) PARAM_GITOPS_IDENTITY="${1#*=}"; shift ;;
       --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;
@@ -5272,6 +5279,11 @@ bitbucket_repo_path() {
   local forge="$1" repo="$2" host="${3:-}"
   [[ "$repo" =~ [[:space:]] ]] && return 0
   repo="${repo%/}"
+  # The clone dialog's URL names the user who copied it
+  # (https://alice@bitbucket.org/...). The user is not part of the path.
+  if [[ "$repo" =~ ^https://[^/@]+@ ]]; then
+    repo="https://${repo#https://*@}"
+  fi
   if [ "$forge" = "bitbucket" ]; then
     case "$repo" in
       https://bitbucket.org/*|https://www.bitbucket.org/*) repo="${repo#https://}"; repo="${repo#*/}" ;;
@@ -5433,7 +5445,21 @@ validate_gitops_forge_flags() {
       print_info "Dropping the recorded ${recorded_label} identity '${PARAM_GITOPS_IDENTITY}': this run's GitOps forge is ${forge_label}."
       PARAM_GITOPS_IDENTITY=""
     fi
-    if [ "${PARAM_GITLAB_TOKEN_SECRET:-}" = "$(default_gitops_token_secret "$recorded_forge")" ]; then
+    # The token Secret install.env recorded holds the other forge's token,
+    # whatever its name: bitbucket and bitbucket-datacenter share the default
+    # name, and a custom name carries over too. Kept, the broker would send
+    # one forge's token to the other's host. So it is kept only when this run
+    # names the new token or the Secret that holds it.
+    if gitops_forge_uses_token "$recorded_forge" && gitops_forge_uses_token "$forge" &&
+      [ -z "${PARAM_GITLAB_TOKEN_FILE:-}" ] && [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ]; then
+      if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+        print_error "The recorded token Secret '${PARAM_GITLAB_TOKEN_SECRET:-}' holds the ${recorded_label} token, and this run's GitOps forge is ${forge_label}. Give the ${forge_label} token with --gitops-token-file, or name the Secret that holds it with --gitops-token-secret."
+        return 1
+      fi
+      PARAM_GITOPS_TOKEN_MUST_REPLACE="true"
+    fi
+    if [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ] &&
+      [ "${PARAM_GITLAB_TOKEN_SECRET:-}" = "$(default_gitops_token_secret "$recorded_forge")" ]; then
       PARAM_GITLAB_TOKEN_SECRET="$(default_gitops_token_secret "$forge")"
     fi
   fi
@@ -6076,6 +6102,12 @@ create_gitlab_token_secret() {
     [ "$rc" -eq 0 ] || return 1
     print_success "${label} token stored in Secret '${name}' (namespace ${namespace})."
     return 0
+  fi
+  if [ "${PARAM_GITOPS_TOKEN_MUST_REPLACE:-false}" = "true" ] && [ "$exists" = "true" ]; then
+    # A forge switch: the Secret holds the other forge's token, so keeping it
+    # is not offered.
+    print_warning "Secret '${name}' holds the token of the forge this install used before. Give the ${label} token now."
+    exists="false"
   fi
   if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
     if [ "$exists" = "true" ]; then

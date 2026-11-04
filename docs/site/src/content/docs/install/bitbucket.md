@@ -29,7 +29,7 @@ describes both, and marks each step that applies to one of them only.
 
 ## Before you start
 
-- **The release.** Bitbucket support is in release 0.25.0 and later. The latest release is on
+- **The release.** Bitbucket support is in release 0.24.0 and later. The latest release is on
   [GitHub Releases](https://github.com/gke-labs/kube-agents/releases/latest).
 - **The Data Center version.** Tested with Bitbucket Data Center 8.19.
 - **The repository.** Create the GitOps repository first. The installer does not create it. The
@@ -213,6 +213,13 @@ The installer refuses `--github-app-id` and `--github-pem-path` with a Bitbucket
 **The token source.** The installer reads the whole source and removes all whitespace from it. The
 source must hold only the token. A `pass` entry with more lines needs its first line only, as in
 the examples above.
+
+**A switch of forge.** When `install.env` records another forge with a token (GitLab, or the other
+Bitbucket product), the recorded token Secret holds that forge's token. The installer does not keep
+it. Give the new token with `--gitops-token-file`, or name the Secret that holds it with
+`--gitops-token-secret`. A non-interactive run without one of them stops before it changes
+anything. An interactive run asks for the new token after the apply and does not offer to keep the
+old one.
 
 **No token file.** In a non-interactive run without `--gitops-token-file`, the install completes
 and prints the command that creates the Secret. Until the Secret exists, every Bitbucket call

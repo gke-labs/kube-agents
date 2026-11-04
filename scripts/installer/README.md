@@ -414,7 +414,11 @@ names, and `GITOPS_TOKEN_FILE`, `GITOPS_TOKEN_SECRET` and `GITOPS_READ_TOKEN_FIL
 environment are aliases of the `GITLAB_*` variables. The generator writes `gitops_forge`,
 `gitops_host`, `gitops_repo_path`, `gitops_token_secret_name`, and, when set,
 `gitops_ca_secret_name` and `gitops_identity` into `terraform.tfvars`. A switch to another forge
-drops a recorded identity, and a default token Secret name becomes the new forge's default.
+drops a recorded identity, and a default token Secret name becomes the new forge's default. A
+switch between two forges with a token (GitLab, Bitbucket Cloud, Bitbucket Data Center) does not
+keep the recorded token Secret, which holds the old forge's token: the run must give
+`--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run stops, and an
+interactive run asks for the new token after the apply.
 
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.
