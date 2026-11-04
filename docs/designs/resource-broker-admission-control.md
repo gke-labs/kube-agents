@@ -96,11 +96,13 @@ Six facts follow:
 
 Since the Kubernetes API proxy landed, stock `kubectl` runs inside the sandbox shell and reads
 through the Kubernetes API proxy, which streams responses. The memory of fact 2 therefore moved
-from the credential proxy to the shell, whose limit (2 CPU, 2 GiB) the operator fixes. Measured on
+from the credential proxy to the shell, whose default limit is 2 CPU and 2 GiB
+(`spec.harness.experimental.shellSandbox.resources` raises it). Measured on
 a build with the Kubernetes API proxy, the same audit OOMKilled the shell three times in about
 three minutes and sent it into `CrashLoopBackOff`; two `kubectl get deploy,sts,ds,cronjob,pod -A
 -o json` processes held 91 to 95 % of its memory. Every agent's terminal runs in the shell, so each
-kill ends all of them, and no `PlatformAgent` field raises the shell's limit.
+kill ends all of them. Raising the shell's limit moves the threshold, as the next paragraph
+shows for the other containers.
 
 **Raising the limits moves the threshold, not the failure.** At the L size (credential proxy
 8 GB, event watcher 4 GB), the credential proxy was OOMKilled by the same two listings on clusters
