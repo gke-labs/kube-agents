@@ -285,6 +285,10 @@ type fakeChatRelay struct {
 	// before responses is read.
 	queue  map[string][]any
 	tokens []string
+	// beforeCall, when set, runs on each call before the fake records or
+	// answers it, outside its lock, so a test can hold one call back while
+	// others land.
+	beforeCall func(key string)
 }
 
 // fakeChatAPIError, as a response, makes the fake relay answer a call with
@@ -303,6 +307,19 @@ type relayCall struct {
 func newFakeChatRelay(t *testing.T) *fakeChatRelay {
 	f := &fakeChatRelay{t: t, responses: map[string]any{}, queue: map[string][]any{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Resource  []string       `json:"resource"`
+			Method    string         `json:"method"`
+			Arguments map[string]any `json:"arguments"`
+		}
+		decodeErr := json.NewDecoder(r.Body).Decode(&body)
+		key := strings.Join(body.Resource, ".") + "/" + body.Method
+		f.mu.Lock()
+		hook := f.beforeCall
+		f.mu.Unlock()
+		if hook != nil && decodeErr == nil {
+			hook(key)
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.tokens = append(f.tokens, strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
@@ -310,17 +327,11 @@ func newFakeChatRelay(t *testing.T) *fakeChatRelay {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		var body struct {
-			Resource  []string       `json:"resource"`
-			Method    string         `json:"method"`
-			Arguments map[string]any `json:"arguments"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if decodeErr != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		f.calls = append(f.calls, relayCall{body.Resource, body.Method, body.Arguments})
-		key := strings.Join(body.Resource, ".") + "/" + body.Method
 		resp, ok := f.responses[key]
 		if queued := f.queue[key]; len(queued) > 0 {
 			resp, ok = queued[0], true

@@ -523,9 +523,10 @@ func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
 // PostMessage posts a message value: a chat message laid out as a text
 // message with accessory buttons (renderGchatChat, gchat_chat.go), with
 // m.Text as the fallback the gateway posts when the layout is refused; one
-// with no chat message is Post, or postRatedText for a rated answer. A layout this renderer will not send, or one
-// Chat's API refuses, is ErrLayoutRefused, so the gateway posts the text
-// instead (Gateway.chatOutcome); a failed call is returned as it is.
+// with no chat message is Post, or postRatedText for a rated answer. A
+// layout this renderer will not send, or one Chat's API refuses, is
+// ErrLayoutRefused, so the gateway posts the text instead
+// (Gateway.chatOutcome); a failed call is returned as it is.
 func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
 	if m.Chat == nil && a.rates(m) {
 		return a.postRatedText(conversation, m)
@@ -656,6 +657,9 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 			layout = gchatHomeButtons(layout)
 		}
 	}
+	// Under the message's rewrite lock, so a rating tap's patch never lands
+	// over this one and a tap after it redraws what it left.
+	defer a.lockRewrite(messageID)()
 	layout = a.answeredLayout(messageID, m, layout)
 	arguments := map[string]any{
 		"name":       messageID,

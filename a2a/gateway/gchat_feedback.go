@@ -293,6 +293,20 @@ func (a *GoogleChatAdapter) rememberRating(message string, r gchatRating) {
 	remember(&ux.ratedOrder, message, func(k string) { delete(ux.rated, k) })
 }
 
+// rememberRatingIfAbsent is the rating buttons on record for message, or r,
+// recorded in the same lock section, when none is and r has a task.
+func (a *GoogleChatAdapter) rememberRatingIfAbsent(message string, r gchatRating) gchatRating {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ux := a.uxLocked()
+	if current := ux.rated[message]; current.task != "" || r.task == "" {
+		return current
+	}
+	ux.rated[message] = r
+	remember(&ux.ratedOrder, message, func(k string) { delete(ux.rated, k) })
+	return r
+}
+
 // postRatedText posts a rated answer that has no chat message: its text with
 // the rating buttons. When Chat refuses the buttons the text is posted alone.
 func (a *GoogleChatAdapter) postRatedText(conversation string, m OutMessage) (string, error) {
@@ -319,7 +333,8 @@ func (a *GoogleChatAdapter) postRatedText(conversation string, m OutMessage) (st
 // changes nothing. Otherwise the rating is recorded off the pull loop
 // (Rate carries its own deadline, the relay calls theirs), and then the
 // message is patched with the tapped button filled. A failed write logs and
-// leaves the message as it was. A kept 👎 then asks for a note
+// leaves the message as it was. The layout is computed and patched under the
+// message's rewrite lock (lockRewrite). A kept 👎 then asks for a note
 // (askForNote). The tap claims no question: a choice click on the message is
 // still a turn.
 func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
@@ -366,10 +381,14 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 			a.log.Warn("gchat: recording a rating failed", "message", message, "taskId", task, "err", err)
 			return
 		}
+		// Under the message's rewrite lock, so the layout reads what the
+		// previous patch left and this patch never lands over a later one.
+		unlock := a.lockRewrite(message)
 		a.rememberRating(message, chosen)
 		if err := a.patchRating(message, a.ratedLayout(snapshot, chosen)); err != nil {
 			a.log.Warn("gchat: filling the tapped rating button failed; the rating is kept", "message", message, "err", err)
 		}
+		unlock()
 		// The 👎 is kept whether or not its button filled: ask for a note.
 		if value == FeedbackDown {
 			a.askForNote(snapshot, task, askKept)
@@ -531,7 +550,8 @@ func noteViewer(ev *gchatEvent) (viewer, thread string, ok bool) {
 
 // askForNote posts the note card under the 👎 the rater on ev just gave
 // task. A threaded private card Chat refuses is posted once more at the top
-// level, still private; a second refusal logs and posts nothing.
+// level, still private; a second refusal, or any other failure, logs and
+// posts nothing more.
 func (a *GoogleChatAdapter) askForNote(ev *gchatEvent, task string, askKept bool) {
 	recorder := a.feedbackRecorder()
 	if recorder == nil {
@@ -544,7 +564,7 @@ func (a *GoogleChatAdapter) askForNote(ev *gchatEvent, task string, askKept bool
 	}
 	card := gchatNoteCard(task, recorder.KeptDays(), askKept)
 	_, err := a.createCard(ev.Space.Name, thread, viewer, card)
-	if err != nil && viewer != "" && thread != "" {
+	if errors.Is(gchatLayoutError(err, false), ErrLayoutRefused) && viewer != "" && thread != "" {
 		a.log.Info("gchat: a private note card in the thread was refused; posting it at the top level", "space", ev.Space.Name, "err", err)
 		_, err = a.createCard(ev.Space.Name, "", viewer, card)
 	}
@@ -619,7 +639,8 @@ func (a *GoogleChatAdapter) feedbackNoteClick(ev *gchatEvent) string {
 }
 
 // collapseNoteCard replaces the note card on ev's message with text. When
-// Chat refuses the patch, text is posted as a new card to the same viewer.
+// Chat refuses the patch, text is posted as a new card to the same viewer;
+// any other failure logs and posts nothing.
 func (a *GoogleChatAdapter) collapseNoteCard(ev *gchatEvent, text string) {
 	arguments := map[string]any{
 		gchatNameArg:       ev.Message.Name,
@@ -628,6 +649,10 @@ func (a *GoogleChatAdapter) collapseNoteCard(ev *gchatEvent, text string) {
 	}
 	err := a.apiCall([]string{gchatSpacesResource, gchatMessagesResource}, gchatPatchMethod, arguments, nil)
 	if err == nil {
+		return
+	}
+	if !errors.Is(gchatLayoutError(err, true), ErrLayoutRefused) {
+		a.log.Warn("gchat: collapsing the note card failed", "message", ev.Message.Name, "err", err)
 		return
 	}
 	viewer, thread, ok := noteViewer(ev)

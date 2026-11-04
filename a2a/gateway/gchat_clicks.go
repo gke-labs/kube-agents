@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
@@ -194,13 +195,28 @@ type gchatUX struct {
 	// name (gchat_feedback.go), and ratedOrder its ring.
 	rated      map[string]gchatRating
 	ratedOrder []string
+	// rewriting is the lock each message's rewrite holds from computing
+	// its layout to patching it (lockRewrite), by message name, held only
+	// while a rewrite holds or waits on it, so it needs no ring.
+	rewriting map[string]*gchatRewriteLock
+}
+
+// gchatRewriteLock orders the patches of one message: a rating tap, an
+// answered rewrite and an edit each compute their layout and patch it under
+// it, so each reads the state the previous patch left and none lands over a
+// later one. holders counts the rewrites holding or waiting on it, under the
+// adapter's lock.
+type gchatRewriteLock struct {
+	mu      sync.Mutex
+	holders int
 }
 
 func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 	if a.ux == nil {
 		a.ux = &gchatUX{questions: map[string]gchatQuestion{}, open: map[string]string{}, pending: map[string]gchatPendingClick{},
 			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{},
-			shown: map[string]gchatChatLayout{}, rated: map[string]gchatRating{}}
+			shown: map[string]gchatChatLayout{}, rated: map[string]gchatRating{},
+			rewriting: map[string]*gchatRewriteLock{}}
 	}
 	return a.ux
 }
@@ -499,16 +515,12 @@ func (a *GoogleChatAdapter) InboundVerified(conversation, messageID string, veri
 	forget(&ux.questionsOrder, p.message)
 	a.mu.Unlock()
 	a.goRewrite(func() {
+		defer a.lockRewrite(p.message)()
 		// The adapter's record wins: a tap since the click filled its
 		// button. A message it does not remember (posted before a restart)
-		// keeps the buttons the click's event showed.
-		rating := a.ratingOf(p.message)
-		if rating.task == "" && p.rating.task != "" {
-			// On record from here, so a later edit keeps the buttons as
-			// drawn (answeredLayout).
-			rating = p.rating
-			a.rememberRating(p.message, rating)
-		}
+		// keeps the buttons the click's event showed, on record from here,
+		// so a later edit keeps them as drawn (answeredLayout).
+		rating := a.rememberRatingIfAbsent(p.message, p.rating)
 		layout := gchatAnsweredLayout(gchatChatLayout{Text: p.text}, p.links, rating, line)
 		a.rewriteAnswered(conversation, p.message, layout, line)
 	})
@@ -540,6 +552,30 @@ func (a *GoogleChatAdapter) rewriteAnswered(conversation, messageID string, layo
 	a.log.Warn("gchat: rewriting an answered question failed; posting the answer in its conversation", "message", messageID, "err", err)
 	if _, err := a.Post(conversation, line); err != nil {
 		a.log.Warn("gchat: posting an answered line failed", "conversation", conversation, "err", err)
+	}
+}
+
+// lockRewrite takes message's rewrite lock and returns its release. The
+// adapter's lock is held only to find or drop the entry, never while waiting
+// or patching; the entry goes once no rewrite holds or waits on it.
+func (a *GoogleChatAdapter) lockRewrite(message string) (unlock func()) {
+	a.mu.Lock()
+	ux := a.uxLocked()
+	l := ux.rewriting[message]
+	if l == nil {
+		l = &gchatRewriteLock{}
+		ux.rewriting[message] = l
+	}
+	l.holders++
+	a.mu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		a.mu.Lock()
+		if l.holders--; l.holders == 0 {
+			delete(ux.rewriting, message)
+		}
+		a.mu.Unlock()
 	}
 }
 

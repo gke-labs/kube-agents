@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
@@ -899,6 +901,17 @@ func TestGchatRefusedPrivateThreadReplyRetriesAtTheTopLevel(t *testing.T) {
 	if got := recordedRatings(rec); len(got) != 1 || got[0].Rating != "down" {
 		t.Errorf("ratings = %+v, want the 👎 kept", got)
 	}
+
+	// Only a refusal retries: an outage posts no second card.
+	a, f, rec = newFeedbackGchatAdapter(t)
+	f.queue[create] = []any{fakeChatAPIError{status: 502, reason: "backend error"}}
+	a.classify(gchatSpaceEvent(gchatRatingEvent(t, "down")))
+	if n := relayCallCount(f); n != 2 {
+		t.Errorf("relay calls = %d, want the patch and one create, no retry after a 502", n)
+	}
+	if got := recordedRatings(rec); len(got) != 1 || got[0].Rating != "down" {
+		t.Errorf("ratings = %+v, want the 👎 kept", got)
+	}
 }
 
 func TestGchatUpRatingPostsNoCard(t *testing.T) {
@@ -1018,6 +1031,106 @@ func TestGchatRefusedCardPatchPostsTheLineAsANewPrivateMessage(t *testing.T) {
 	if text := collapsedText(t, body); text != gchatNoteThanks() {
 		t.Errorf("line = %q", text)
 	}
+
+	// Only a refusal falls back: a failed patch posts no second card.
+	a, f, _ = newFeedbackGchatAdapter(t)
+	f.queue["spaces.messages/patch"] = []any{fakeChatAPIError{status: 502, reason: "backend error"}}
+	a.classify(gchatSpaceEvent(gchatNoteEvent(t, noteInputs("x"), false)))
+	if n := relayCallCount(f); n != 1 {
+		t.Errorf("relay calls = %d, want the patch alone after a 502", n)
+	}
+}
+
+// In a space the note card is private to the rater's users/ name; with no
+// name it would be public, so neither the card nor the collapse fallback is
+// posted.
+func TestGchatNoteCardIsNotPostedInASpaceWithoutAUserName(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	ev := gchatSpaceEvent(gchatRatingEvent(t, "down"))
+	ev.click.User.Name = ""
+	a.classify(ev)
+	if got := recordedRatings(rec); len(got) != 1 || got[0].Rating != "down" {
+		t.Errorf("ratings = %+v, want the 👎 kept", got)
+	}
+	if n := relayCallCount(f); n != 1 {
+		t.Fatalf("relay calls = %d, want the answer patch alone", n)
+	}
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, 0, "spaces/AAA/messages/M1")), "down")
+
+	a, f, _ = newFeedbackGchatAdapter(t)
+	f.queue["spaces.messages/patch"] = []any{fakeChatAPIError{status: 400, reason: "cannot update"}}
+	ev = gchatSpaceEvent(gchatNoteEvent(t, noteInputs("x"), false))
+	ev.click.User.Name = ""
+	a.classify(ev)
+	if n := relayCallCount(f); n != 1 {
+		t.Errorf("relay calls = %d, want the refused patch alone", n)
+	}
+	checkNotePatch(t, f, 0, "spaces/AAA/messages/M1")
+}
+
+// A tap's patch and the answered rewrite's patch of one message are ordered:
+// a tap whose layout still had the choices, held back at the relay, lands
+// before the rewrite, never over it.
+func TestGchatRatingPatchNeverLandsOverTheAnsweredRewrite(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	name, err := a.PostMessage("gchat:dm/spaces/_c2fixtureAA", OutMessage{Text: "fallback", Chat: gchatFeedbackQuestion(), Feedback: "t-root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.syncRewrites = false
+	tapPatching := make(chan struct{})
+	// Not a sync.Once: its Do would hold the rewrite's patch back too.
+	var patches atomic.Int32
+	f.mu.Lock()
+	f.beforeCall = func(key string) {
+		if key == "spaces.messages/patch" && patches.Add(1) == 1 {
+			close(tapPatching)
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	f.mu.Unlock()
+
+	if _, reason := a.classify(gchatRatingEvent(t, "up")); reason == "" {
+		t.Fatal("a rating tap is a turn")
+	}
+	select {
+	case <-tapPatching:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tap never patched")
+	}
+	msg, reason := a.classify(gchatClickEvent(t))
+	if reason != "" {
+		t.Fatalf("choice click: %q", reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		a.mu.Lock()
+		_, shown := a.uxLocked().shown[name]
+		a.mu.Unlock()
+		if relayCallCount(f) >= 3 && shown {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("relay calls = %d, shown = %v; want the create, two patches and the rewrite on record", relayCallCount(f), shown)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if n := relayCallCount(f); n != 3 {
+		t.Fatalf("relay calls = %d, want the create and two patches", n)
+	}
+	body := checkPatch(t, f, 2, name)
+	if text, _ := body["text"].(string); !strings.HasSuffix(text, "✓ Test Sender: Look at the first one") {
+		t.Errorf("final text = %q, want the answered line", text)
+	}
+	buttons := bodyButtons(t, body)
+	for _, b := range buttons {
+		if classifyGchatButton(b) == gchatButtonChoice {
+			t.Errorf("the final patch shows a choice: %+v", b)
+		}
+	}
+	checkFilled(t, buttons, "up")
 }
 
 func TestGchatRedeliveredSendIsHandledOnce(t *testing.T) {
