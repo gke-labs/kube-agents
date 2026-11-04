@@ -444,15 +444,16 @@ On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/s
 `/feedback summary` is the one `/feedback <text>` the gateway answers itself. It posts one fenced block, short enough to read in full before pasting it into an email or a chat message, with no model in the loop. The block holds:
 
 - the image tag, the mode, the Kubernetes version, and the install's age and readiness;
+- the model as `provider/name` from the resource's `status.inference` (`unavailable` while the operator has not written it);
 - the `status.usage` counters;
 - a roll-up of the chat turns the gateway's own records still hold (ended, cancelled, active);
 - a short feedback template.
 
 The line is labelled `chat turns`, not `tasks`, because the script's `tasks` line counts kanban cards and the two pastes from one install would otherwise disagree under one label. The roll-up's window is fourteen days, or the install's session TTL when that is shorter, since the gateway deletes a conversation's records once it has been idle that long. The gateway's records hold a turn's start, a cancel and whether it is the conversation's running turn, not its outcome: a turn that ended any other way counts as ended, where the script's block tells done from failed.
 
-It names no cluster, project, namespace, task or person. The gateway refuses to post a block in which the install's own name, namespace, or any naming string from its declaration (the harness, scope, integration, security, telemetry and network-policy settings) appears, and says so instead. The block's own words, such as a bucket or interface name, are not refused.
+It names no cluster, project, namespace, task or person. The gateway audits the block outside its `model:` line, which carries only the provider and model name from the status. It refuses to post a block whose audited lines contain the install's own name, namespace, or any naming string from its declaration (the harness, scope, integration, security, telemetry and network-policy settings), and says so instead. The block's own words, such as a bucket or interface name, are not refused.
 
-The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the model, the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
+The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
 
 ### The Slack Home tab
 
