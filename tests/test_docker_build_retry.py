@@ -10,12 +10,12 @@ reasons; this file holds the shape, because deleting the retry fails no build
 and reports green until the next bad minute.
 
 The contract, read from the parsed YAML: each `docker/setup-buildx-action` and
-`docker/build-push-action` step, bar the named exemption, has an `id` and
+`docker/build-push-action` step, bar any named exemption, has an `id` and
 `continue-on-error: true`; the next step is a pause gated on that id's failure
 that runs the shared pause script; the step after is the same action, with the
 same inputs, on the same gate, and fails the job if it fails too. The pause
 script is run against a stub `sleep`, not read, so a script that drops the
-sleep or the warning fails here. The synthetic cases hold each way the shape
+sleep, the warning or the job-summary line fails here. The synthetic cases hold each way the shape
 can break, so a walk that matches nothing cannot pass.
 """
 
@@ -35,13 +35,15 @@ _JOB = "build"
 _PAUSE_VARIABLE = "RETRY_PAUSE_SECONDS"
 _FAILED_STEP_VARIABLE = "FAILED_STEP"
 _RETRIED_ACTIONS = ("docker/setup-buildx-action@", "docker/build-push-action@")
-# Its stage fetches nothing on top of `platform`; a failure is the gate's verdict.
-_EXEMPT_STEPS = frozenset({"Verify entrypoint shared-state gate (in-image)"})
-# The buildx setup and the five image builds that fetch from the network today.
+# Steps that need no retry, each with its reason. None today: even the gate
+# build resolves the tag-referenced bases of `platform` against the mirror.
+_EXEMPT_STEPS = frozenset()
+# The buildx setup and the six image builds today.
 # A floor, so a rename that drops steps out of the walk fails here.
-_MIN_RETRIED_STEPS = 6
+_MIN_RETRIED_STEPS = 7
 _WARNING_PREFIX = "::warning::"
 _SLEEP_LOG_NAME = "sleep.log"
+_SUMMARY_NAME = "summary.md"
 _STUB_PAUSE_SECONDS = "7"
 
 
@@ -126,17 +128,20 @@ class PauseScriptTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             stub = pathlib.Path(tmp) / "sleep"
             log = pathlib.Path(tmp) / _SLEEP_LOG_NAME
+            summary = pathlib.Path(tmp) / _SUMMARY_NAME
             stub.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\n')
             stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
             env = {
                 "PATH": f"{tmp}{os.pathsep}{os.environ['PATH']}",
                 _PAUSE_VARIABLE: _STUB_PAUSE_SECONDS,
                 _FAILED_STEP_VARIABLE: "Build Example",
+                "GITHUB_STEP_SUMMARY": str(summary),
             }
             result = subprocess.run(
                 ["bash", "-e", "-c", script], env=env, capture_output=True, text=True, check=True
             )
             self.assertEqual(log.read_text().split(), [_STUB_PAUSE_SECONDS])
+            self.assertIn("Build Example", summary.read_text())
         self.assertTrue(result.stdout.startswith(_WARNING_PREFIX), result.stdout)
         self.assertIn("Build Example", result.stdout)
 

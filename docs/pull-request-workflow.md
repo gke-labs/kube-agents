@@ -172,7 +172,13 @@ file that downloads something is not covered until it is added there. A download
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
 been fed the bytes of the failed one.
 
-That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
+`docker-build.yml` also retries whole steps: the buildx setup and each image build run once more,
+after a pause, when the first attempt fails. A new `docker/setup-buildx-action` or
+`docker/build-push-action` step there takes the same id, pause and retry steps, or joins
+`_EXEMPT_STEPS` with a reason. `python3 -m unittest tests.test_docker_build_retry` checks the
+shape.
+
+`tests/test_third_party_download_retry.py` gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
 the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
 nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
