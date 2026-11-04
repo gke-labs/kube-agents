@@ -61,7 +61,7 @@ func envIntOrDefault(key string, fallback int) int {
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil {
-		log.Printf("ALERT %s=%q is not an integer; using %d", key, raw, fallback)
+		log.Printf("ALERT %s=%q is not an integer; using %d", key, raw, fallback) // #nosec G706 -- %q escapes newlines and control characters, so the value cannot forge a log line
 		return fallback
 	}
 	return v
