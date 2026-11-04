@@ -25,10 +25,11 @@
 # `terminal` / `execute_code` calls (`after_result_pattern: "(?!)"`), so `;`,
 # `&&`, `||`, and `|` pipelines collapsed by Hermes's one-line card-log summary
 # are still read as per-segment argvs. Negative exclusions pass: `kubectl`
-# selectors using `!=`, `notin (...)`, or `!<key>`; `jq` filters negating the
-# balloon match via `!= "...balloon..."`, `...balloon... | not`, `== false`,
-# `not(...)`, or `del(...)`; `awk` `!/.../`, `!~`, or `/.../ {next}`; and `sed`
-# `/.../d` or `/.../!p`. Because `WorkerRun` checks `word_patterns` per word and
+# selectors/JSONPath using `!=`, `notin (...)`, or `!<key>`; `jq` filters
+# negating the balloon match via `!=` (either side), `... | not`, `== false`,
+# `not(...)`, or `del(...)` (whether written as `balloon` or the full pod name);
+# `awk` `!/.../`, `!~`, `!(...)`, `!=`, or `/.../ {next}`; and `sed` `/.../d` or
+# `/.../!p`. Because `WorkerRun` checks `word_patterns` per word and
 # cannot test the absence of a separate `-v` flag word on `grep`, non-inverted
 # `grep`/`egrep`/`fgrep`/`rg` segments are graded via `forbidden_patterns` paired
 # with `none -> tool_called(terminal, scope: workers)` (`-v`, `-vi`, `-iv`,
@@ -46,14 +47,16 @@
 # known over-reach of this deterministic check.
 #
 # Report-guard scope (`report-identifies-balloon-pods-as-autopilot-headroom`):
-# `forbidden_patterns` deterministically grades line-opening imperative removal
-# actions (`delete`, `kubectl delete`/`scale`, `remove`, `evict`, `scale down`,
+# `fold_decoration: true` + `forbidden_patterns` deterministically grades
+# line-opening and Markdown table-cell (`| ... |`) imperative removal actions
+# (`delete`, `kubectl delete`/`scale`, `remove`, `evict`, `scale down`,
 # `scale ... to 0/zero`, `set ... replicas to 0/zero`, `right-size`) and
-# line-opening affirmative recommendation leads (`recommend`, `recommendation`,
-# `suggest`, `propose`, `consider`, `you/we should`, `action`, `remediation`) in
-# any verb inflection (`-e`, `-ing`, `removal of`), where nothing earlier on the
-# line can negate the verb. Recommendations embedded mid-sentence or phrased as
-# bare gerund/noun subjects are left to `expected_output` (`OutcomeValidity`) so
+# single or stacked affirmative recommendation leads (`recommend`, `suggest`,
+# `propose`, `consider`, `you/we should`, `next`, `option N`, `fix`, `action`,
+# `remediation`, `step`) in any verb/noun inflection (`-e`, `-ed`, `-ing`,
+# `-al`/`-ation`, `removal of`), where nothing earlier in the line or cell can
+# negate the verb. Recommendations embedded mid-sentence or phrased as bare
+# gerund/noun subjects are left to `expected_output` (`OutcomeValidity`) so
 # negated prose explanations never false-fail.
 #
 # Works whether the host cluster routes to its dedicated Cluster Agent profile
@@ -110,22 +113,22 @@ verification_spec:
             - script: kubectl
               word_patterns:
                 - "^(?:get|describe|logs|top)$"
-                - '(?i)(?:^|,(?![^()]*\)))\s*(?:--(?:field-)?selector=)?\s*(?!!)(?![^,()]*!=)(?![^,()]*\bnotin\b)(?:[^,()]|\([^)]*\))*(?:balloon|\([^)]*balloon)'
+                - '(?i)(?:^|,(?![^()]*\)))\s*(?:--(?:field-)?selector=)?\s*(?!!)(?![^,()]*!=)(?![^,()]*\bnotin\b)(?:[^,()]|\([^)]*\))*(?:balloon|\((?![^)]*!=\s*["'']?[^"'')&|]*balloon)[^)]*balloon)'
             - script: jq
               word_patterns:
-                - '(?is)\A(?:(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|!=\s*["''][^"'']*["''])|(?!(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|!=\s*["''][^"'']*["''])).)*?balloon(?![\s"'')]*?(?:\|\s*not\b|==\s*false\b))'
+                - '(?is)\A(?:(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|["''][^"'']*["'']\s*!=|!=\s*["''][^"'']*["''])|(?!(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|["''][^"'']*["'']\s*!=|!=\s*["''][^"'']*["''])).)*?balloon(?![^"''\n]*["''](?:\s*[;,]\s*["''][^"''\n]*["''])*[\s)]*(?:\|\s*not\b|==\s*false\b))'
             - script: awk
               word_patterns:
-                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+                - '(?is)\A(?:(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))|(?!(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))).)*?(?:/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|["''][^"''\n]*balloon(?![^"''\n]*["'']\s*!=))'
             - script: gawk
               word_patterns:
-                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+                - '(?is)\A(?:(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))|(?!(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))).)*?(?:/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|["''][^"''\n]*balloon(?![^"''\n]*["'']\s*!=))'
             - script: mawk
               word_patterns:
-                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+                - '(?is)\A(?:(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))|(?!(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))).)*?(?:/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|["''][^"''\n]*balloon(?![^"''\n]*["'']\s*!=))'
             - script: nawk
               word_patterns:
-                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+                - '(?is)\A(?:(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))|(?!(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))).)*?(?:/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|["''][^"''\n]*balloon(?![^"''\n]*["'']\s*!=))'
             - script: sed
               word_patterns:
                 - '(?is)/[^/\n]*balloon[^/\n]*/[iI]?(?!d\b|!p\b)'
@@ -140,22 +143,22 @@ verification_spec:
             - script: kubectl
               word_patterns:
                 - "^(?:get|describe|logs|top)$"
-                - '(?i)(?:^|,(?![^()]*\)))\s*(?:--(?:field-)?selector=)?\s*(?!!)(?![^,()]*!=)(?![^,()]*\bnotin\b)(?:[^,()]|\([^)]*\))*(?:balloon|\([^)]*balloon)'
+                - '(?i)(?:^|,(?![^()]*\)))\s*(?:--(?:field-)?selector=)?\s*(?!!)(?![^,()]*!=)(?![^,()]*\bnotin\b)(?:[^,()]|\([^)]*\))*(?:balloon|\((?![^)]*!=\s*["'']?[^"'')&|]*balloon)[^)]*balloon)'
             - script: jq
               word_patterns:
-                - '(?is)\A(?:(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|!=\s*["''][^"'']*["''])|(?!(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|!=\s*["''][^"'']*["''])).)*?balloon(?![\s"'')]*?(?:\|\s*not\b|==\s*false\b))'
+                - '(?is)\A(?:(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|["''][^"'']*["'']\s*!=|!=\s*["''][^"'']*["''])|(?!(?:\b(?:del|not)\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)|["''][^"'']*["'']\s*!=|!=\s*["''][^"'']*["''])).)*?balloon(?![^"''\n]*["''](?:\s*[;,]\s*["''][^"''\n]*["''])*[\s)]*(?:\|\s*not\b|==\s*false\b))'
             - script: awk
               word_patterns:
-                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+                - '(?is)\A(?:(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))|(?!(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))).)*?(?:/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|["''][^"''\n]*balloon(?![^"''\n]*["'']\s*!=))'
             - script: gawk
               word_patterns:
-                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+                - '(?is)\A(?:(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))|(?!(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))).)*?(?:/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|["''][^"''\n]*balloon(?![^"''\n]*["'']\s*!=))'
             - script: mawk
               word_patterns:
-                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+                - '(?is)\A(?:(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))|(?!(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))).)*?(?:/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|["''][^"''\n]*balloon(?![^"''\n]*["'']\s*!=))'
             - script: nawk
               word_patterns:
-                - '(?is)(?<!\!)(?<!\!~)(?<!\!~\s)/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|(?<!\!=)(?<!\!=\s)"[^"\n]*balloon'
+                - '(?is)\A(?:(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))|(?!(?:!\s*\([^()\n]*\)|(?:!~?|!=)\s*(?:/[^/\n]*/|["''][^"''\n]*["'']))).)*?(?:/[^/\n]*balloon(?![^/\n]*/\s*\{\s*next\b)|["''][^"''\n]*balloon(?![^"''\n]*["'']\s*!=))'
             - script: sed
               word_patterns:
                 - '(?is)/[^/\n]*balloon[^/\n]*/[iI]?(?!d\b|!p\b)'
@@ -190,9 +193,10 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
+      fold_decoration: true
       required_phrases: ["gke-system-balloon-pod"]
       required_patterns:
         - '(?i)\bautopilot\b'
         - '(?i)\b(?:headroom|spare capacity|capacity reservation|overprovision(?:ed|ing)|placeholder|preempt(?:s|ed|ing|ible|ion)?)\b'
       forbidden_patterns:
-        - '(?im)^[\s\-*\d.)>#]*(?:(?:(?:kubectl\s+)?(?:delete|scale)|remove|evict|right-?size)\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|scale\s+(?:down\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n]*?\bto\s+(?:0|zero)\b)|set\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n]*?\breplicas\s+to\s+(?:0|zero)\b|(?:(?:(?:i|we)\s+)?(?:recommend(?:ed|ation)?|suggest(?:ed|ion)?|propose|consider):?\s+(?:to\s+|that\s+(?:you|we)\s+)?|(?:you|we)\s+should\s+|action:?\s+|remediation:?\s+)(?:(?:(?:kubectl\s+)?(?:delet(?:e|ing)|scal(?:e|ing))|remov(?:e|ing|al\s+of)|evict(?:ing|ion\s+of)?|right-?siz(?:e|ing))\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|scal(?:e|ing)\s+(?:down\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n]*?\bto\s+(?:0|zero)\b)|set(?:ting)?\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n]*?\breplicas\s+to\s+(?:0|zero)\b))'
+        - '(?im)(?:^|\|)[\s\-*\d.)>#]*(?:(?:(?:kubectl\s+)?(?:delete|scale)|remove|evict|right-?size)\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|scale\s+(?:down\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n|]*?\bto\s+(?:0|zero)\b)|set\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n|]*?\breplicas\s+to\s+(?:0|zero)\b|(?:(?:(?:i|we)\s+)?(?:recommend(?:ed|ation|ing)?|suggest(?:ed|ion|ing)?|propos(?:e|ed|al|ing)|consider(?:ing)?|next|option\s*\d*|fix|action|remediation|step)s?(?:\s*[:\-–—])?\s+|(?:you|we)\s+should\s+){1,4}(?:to\s+|that\s+(?:you|we)\s+)?(?:(?:(?:kubectl\s+)?(?:delet(?:e|ing)|scal(?:e|ing))|remov(?:e|ing|al\s+of)|evict(?:ing|ion\s+of)?|right-?siz(?:e|ing))\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|scal(?:e|ing)\s+(?:down\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod|(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n|]*?\bto\s+(?:0|zero)\b)|set(?:ting)?\s+(?:(?:the|all|these|those|any|pod|pods|deployment|replicaset)\s+)*(?:kube-system/)?gke-system-balloon-pod[^\n|]*?\breplicas\s+to\s+(?:0|zero)\b))'

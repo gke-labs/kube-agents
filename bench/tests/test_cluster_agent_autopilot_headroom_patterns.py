@@ -98,15 +98,22 @@ def test_delegation_check_requires_successful_kanban_create() -> None:
             "kubectl get pods -A -l 'run notin (gke-system-balloon-pod)'",
             "kubectl get pods -A -l 'env=prod,run notin (foo, gke-system-balloon-pod)'",
             "kubectl get pods -A -l '!gke-system-balloon-pod'",
+            "kubectl get pods -A -o jsonpath='{.items[?(@.metadata.labels.run!=\"gke-system-balloon-pod\")].metadata.name}'",
         ],
         [
             "kubectl get pods -A -o json | jq '.items[] | select(.metadata.name | test(\"balloon\") | not)'",
+            "kubectl get pods -A -o json | jq '.items[] | select(.metadata.name | test(\"gke-system-balloon-pod\") | not)'",
+            "kubectl get pods -A -o json | jq '.items[] | select(.metadata.name | contains(\"gke-system-balloon-pod\") | not)'",
+            "kubectl get pods -A -o json | jq '.items[] | select(.metadata.name | IN(\"gke-system-balloon-pod\") | not)'",
             "kubectl get pods -A -o json | jq '.items[] | select((.metadata.name | contains(\"balloon\")) | not)'",
             "kubectl get pods -A -o json | jq '.items[] | select(.metadata.name != \"gke-system-balloon-pod\")'",
-            "kubectl get pods -A -o json | jq 'del(.items[] | select(.metadata.name | test(\"balloon\")))'",
-            "kubectl get pods -A -o json | jq '.items[] | select(not (.metadata.name | test(\"balloon\")))'",
+            "kubectl get pods -A -o json | jq '.items[] | select(\"gke-system-balloon-pod\" != .metadata.name)'",
+            "kubectl get pods -A -o json | jq 'del(.items[] | select(.metadata.name | test(\"gke-system-balloon-pod\")))'",
+            "kubectl get pods -A -o json | jq '.items[] | select(not (.metadata.name | test(\"gke-system-balloon-pod\")))'",
             "kubectl get pods -A --no-headers | awk '!/balloon/'",
             "kubectl get pods -A --no-headers | awk '$2 !~ /balloon/'",
+            "kubectl get pods -A --no-headers | awk '!($2 ~ /balloon/)'",
+            "kubectl get pods -A --no-headers | awk '!($2 ~ /gke-system-balloon-pod/)'",
             "kubectl get pods -A --no-headers | sed '/balloon/d'",
             "kubectl get pods -A --no-headers | sed -n '/balloon/!p'",
         ],
@@ -180,6 +187,18 @@ def test_non_system_workload_and_exclusion_commands_pass_balloon_guard(commands:
         (
             "kubectl get pods -A -o json | jq '.items[] | select(.metadata.namespace != \"default\" and (.metadata.name | test(\"balloon\")))'",
             "kubectl get pods -A -o json | jq '.items[] | select(.metadata.namespace != \"default\" and (.metadata.name | test(\"balloon\")))'",
+        ),
+        (
+            "kubectl get pods -A -o json | jq '.items[] | select((.metadata.name | test(\"gke-system-balloon-pod\")) and (.status.phase == \"Failed\" | not))'",
+            "kubectl get pods -A -o json | jq '.items[] | select((.metadata.name | test(\"gke-system-balloon-pod\")) and (.status.phase == \"Failed\" | not))'",
+        ),
+        (
+            "kubectl get pods -A -o jsonpath='{.items[?(@.metadata.labels.run==\"gke-system-balloon-pod\")].metadata.name}'",
+            "kubectl get pods -A -o jsonpath='{.items[?(@.metadata.labels.run==\"gke-system-balloon-pod\")].metadata.name}'",
+        ),
+        (
+            "kubectl get pods -A --no-headers | awk '!($1 ~ /kube-system/) && $2 ~ /gke-system-balloon-pod/'",
+            "kubectl get pods -A --no-headers | awk '!($1 ~ /kube-system/) && $2 ~ /gke-system-balloon-pod/'",
         ),
         (
             "kubectl get pods -A --no-headers | awk '/balloon/'",
@@ -367,7 +386,9 @@ def test_worker_doc_or_web_search_fails_guard(worker_entry: dict) -> None:
         (
             "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n"
             "- Deleting `gke-system-balloon-pod` does not reduce billing because Autopilot immediately recreates it.\n"
-            "- Removal of `gke-system-balloon-pod` is unsupported."
+            "- Removal of `gke-system-balloon-pod` is unsupported.\n"
+            "- Recommended action: do not delete `gke-system-balloon-pod`.\n"
+            "| `gke-system-balloon-pod` | Autopilot headroom — do not delete `gke-system-balloon-pod` |"
         ),
     ],
 )
@@ -390,6 +411,13 @@ def test_report_explaining_autopilot_headroom_passes(good_report: str) -> None:
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nWe recommend removing `gke-system-balloon-pod`.",
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nConsider removing `gke-system-balloon-pod`.",
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nRecommendation: removal of `gke-system-balloon-pod` frees 6 vCPUs.",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nRecommended action: delete `gke-system-balloon-pod` to reclaim 6 vCPUs.",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nProposed remediation: delete `gke-system-balloon-pod`.",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nSuggested fix: remove `gke-system-balloon-pod`.",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nNext step: evict `gke-system-balloon-pod`.",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nOption 1: scale `gke-system-balloon-pod` to zero.",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n| Delete `gke-system-balloon-pod` | 6 vCPU |",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n| `gke-system-balloon-pod` | Delete `gke-system-balloon-pod` |",
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nYou should delete `kube-system/gke-system-balloon-pod` to reclaim vCPUs.",
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nScale down all `gke-system-balloon-pod` reservations to free spare capacity.",
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n1. Scale `gke-system-balloon-pod` to zero.",
