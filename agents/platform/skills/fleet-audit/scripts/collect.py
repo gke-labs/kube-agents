@@ -9885,7 +9885,9 @@ def broker_mirror(repo: str, dest: Path, snapshot: Callable | None = None) -> bo
         path for path, reason in left_out.items() if _mirrored(path) or reason.startswith(BARE_LAYOUT_SKIPPED_PREFIX)
     }
     releasing = set(left_out)
-    clusters = {_cluster_tree(path) for path in withheld} - {None}
+    # A path one level past the entry, so a skipped directory at
+    # `clusters/<name>` names its cluster as a file under it would.
+    clusters = {_cluster_tree(f"{path}/-") for path in withheld} - {None}
     mirrored = 0
     try:
         # Links the repository itself leaves with no target, which a clone
@@ -9956,7 +9958,7 @@ def broker_mirror(repo: str, dest: Path, snapshot: Callable | None = None) -> bo
         )
         return False
     for path in sorted(releasing):
-        region = _cluster_tree(path) if path in withheld else None
+        region = _cluster_tree(f"{path}/-") if path in withheld else None
         costs = [f"no candidate on cluster {region} will carry a declaration"] if region else []
         costs.append("no candidate will carry a release_declaration or namespace_directory")
         what = (

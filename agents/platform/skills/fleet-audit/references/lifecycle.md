@@ -266,7 +266,7 @@ file in the repository, not only its YAML. An entry the broker leaves out of the
 not follow, or a directory laid out as a bare repository) costs less, and a `WARNING` names each one
 with its reason. Every such entry costs `release_declaration` and `namespace_directory` everywhere. A
 YAML-named one, a bare layout, or a YAML file link that points into a cluster tree the copy dropped
-also costs `declaration` and `namespace_directory` on the cluster whose `clusters/<name>/` tree holds
+or into an entry the copy left out also costs `declaration` and `namespace_directory` on the cluster whose `clusters/<name>/` tree holds
 it. Either way the declaration rule's own search is the answer for what is missing.
 
 All three print `sha`, the commit of the snapshot they read. There is no `git` on this

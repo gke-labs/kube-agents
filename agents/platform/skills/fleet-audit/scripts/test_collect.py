@@ -10446,6 +10446,18 @@ class TestBrokerMirror(unittest.TestCase):
         self.assertNotIn("WARNING", err.getvalue())
         self.assertEqual({key[0] for key in index}, {"spot-capacity-test", "other"})
 
+    def test_a_bare_layout_at_a_cluster_directory_names_that_cluster(self):
+        """The snapshot names a skipped directory by its own path, so
+        `clusters/other` itself has to name cluster `other`."""
+        files = {k: v for k, v in self.two_clusters().items() if not k.startswith("clusters/other/")}
+        snapshot = _FakeSnapshot(files, skipped=self.left_out("clusters/other", self.BARE))
+        with TemporaryDirectory() as tmp, patch("sys.stderr", new_callable=io.StringIO) as err:
+            dest = Path(tmp) / "tree"
+            self.assertTrue(collect.broker_mirror(self.REPO, dest, snapshot))
+            clusters = collect._withheld_clusters(dest)
+        self.assertEqual(clusters, {"other"})
+        self.assertIn("cluster other", err.getvalue())
+
     def test_a_link_into_an_entry_the_snapshot_left_out_drops_its_tree(self):
         """In a clone the link reads a real file, which may declare an object
         the tree declares again, so the tree is not indexed partial."""

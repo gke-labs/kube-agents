@@ -444,8 +444,8 @@ drop the split and scale one broker, once both are gone:
 
 - **The content workspace is removed.** Its callers on `main` today: the fleet audit's
   remediation push and its reads (`audit_report.py`, `_land_group_via_broker` and
-  `detect_content_mode`), the collectors' repository mirror (`collect.py`), the deprecation scan
-  (`api_deprecation_scan.py`) and `inspect-repository`. The snapshot verb (`POST /v1/vcs/snapshot`)
+  `detect_content_mode`), the deprecation scan (`api_deprecation_scan.py`) and
+  `inspect-repository`. The snapshot verb (`POST /v1/vcs/snapshot`)
   covers the reads that the other `/v1/vcs` verbs do not: repositories the install does not
   manage, context repositories, and a shallow read. The read-only callers, such as
   `inspect-repository`'s `clone` and `api_deprecation_scan.py`, can move to it.
