@@ -5958,7 +5958,7 @@ def test_a_purge_cut_off_mid_board_step_leaves_the_sorted_marker(tmp_path: Path)
     _card_files(tmp_path, "t_mine", "t_old")
     argv = harness._purge_argv(["t_mine", "t_old"], floor=_FLOOR)
     argv[0], argv[5], argv[6] = str(tmp_path), str(tmp_path / "attachments"), str(tmp_path / "logs")
-    marker = tmp_path / "logs" / (harness._PURGE_SORTED_PREFIX + "t_mine")
+    marker = tmp_path / "logs" / Path(harness._purge_sorted_marker(["t_mine"])).name
     argv[7] = str(marker)
     holder = sqlite3.connect(tmp_path / "kanban.db", isolation_level=None)
     holder.execute("BEGIN IMMEDIATE")
@@ -5980,7 +5980,7 @@ def test_the_shell_fallback_clears_the_roots_only_without_the_marker(
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "")
     harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
     fallback = scripts[1]
-    marker = tmp_path / "logs" / (harness._PURGE_SORTED_PREFIX + "t_1")
+    marker = Path(harness._purge_sorted_marker(["t_1"]))
 
     _card_files(tmp_path, "t_1")
     marker.write_text("")
@@ -5989,3 +5989,15 @@ def test_the_shell_fallback_clears_the_roots_only_without_the_marker(
 
     subprocess.run(["sh", "-c", fallback], check=True)
     assert not _has_files(tmp_path, "t_1")
+
+
+def test_the_sorted_marker_is_this_processs_alone(tmp_path: Path) -> None:
+    """Each repetition is its own process: another's marker, live or stale, must not pass for this one's."""
+    probe = "import kube_agents_bench.harness as h; print(h._purge_sorted_marker(['t_1']))"
+    others = {
+        subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True).stdout.strip()
+        for _ in range(2)
+    }
+    mine = harness._purge_sorted_marker(["t_1"])
+    assert len(others) == 2 and mine not in others
+    assert all(m.endswith("-t_1") for m in {*others, mine})

@@ -1570,9 +1570,13 @@ _PURGE_BUSY_TIMEOUT_SECONDS = 10
 _PURGE_KEPT_MARKER = "kept"
 _PURGE_FOREIGN_MARKER = "foreign"
 _PURGE_DONE_MARKER = "purged"
-# The file the purge script leaves in the logs directory, named for the run's
-# first card, while it has sorted the roots and not yet exited.
+# The file the purge script leaves in the logs directory while it has sorted
+# the roots and not yet exited. Named for this process as well as the run's
+# first card: each repetition is its own process, so a concurrent repetition
+# handed the same card cannot remove this run's marker, and a marker a failed
+# fallback left behind cannot satisfy a later run's check.
 _PURGE_SORTED_PREFIX = ".purge-sorted-"
+_PURGE_SORTED_TOKEN = uuid.uuid4().hex
 
 
 def _purge_argv(
@@ -1597,7 +1601,7 @@ def _purge_argv(
 
 def _purge_sorted_marker(task_ids: list[str]) -> str:
     """The purge script's sorted marker for this run (:data:`_PURGE_SORTED_PREFIX`)."""
-    return f"{_LOGS_DIR}/{_PURGE_SORTED_PREFIX}{task_ids[0]}" if task_ids else ""
+    return f"{_LOGS_DIR}/{_PURGE_SORTED_PREFIX}{_PURGE_SORTED_TOKEN}-{task_ids[0]}" if task_ids else ""
 
 
 def _purge_card_state(
