@@ -544,6 +544,18 @@ class KubectlRawPathTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.refused(argv)
 
+    def test_a_limit_past_int64_is_refused_without_raising(self):
+        # `int()` on a string past `sys.int_info.default_max_str_digits` raises
+        # under Python 3.11; the policy never raises, so the length is bounded
+        # at an int64's widest decimal before the conversion.
+        widest = "9" * command_policy._RAW_LIMIT_MAX_DIGITS
+        self.assertTrue(evaluate(["kubectl", "get", "--raw", f"/api/v1/pods?limit={widest}"]).allowed)
+        for digits in (command_policy._RAW_LIMIT_MAX_DIGITS + 1, 4301):
+            argv = ["kubectl", "get", "--raw", f"/api/v1/pods?limit={'1' * digits}"]
+            with self.subTest(digits=digits):
+                decision = self.refused(argv)
+                self.assertIn("limit is not a positive integer", decision.message)
+
     def test_the_refusal_names_the_boundary_and_the_shape(self):
         decision = self.refused(["kubectl", "get", "--raw", "/api/v1/secrets"])
         self.assertIn("relative /api/v1/<resource>", decision.message)

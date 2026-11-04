@@ -891,6 +891,11 @@ _RAW_PATH_RE = re.compile(
 # and field selectors (`a.b/c!=d,e in (f,g)`), a resource version, a
 # base64 token. Nothing that re-shapes a URL.
 _RAW_QUERY_VALUE_RE = re.compile(r"^[A-Za-z0-9 _.,=:!/+()*-]*$")
+# The widest decimal an int64 `limit` can be (`metav1.ListOptions.Limit`); a
+# longer value is refused before `int()` reads it, because Python 3.11 raises
+# on a string past `sys.int_info.default_max_str_digits` and this policy
+# never raises.
+_RAW_LIMIT_MAX_DIGITS = 19
 # A percent-escape in a raw path or query, decoded here rather than by
 # `urllib.parse`: the conformance suite holds this module to imports that
 # cannot reach a file or a socket (tests/conformance, C3), and `urllib` is on
@@ -1454,8 +1459,10 @@ def _kubectl_raw_path_problem(value: str | None) -> str | None:
         seen.add(key)
         if not _RAW_QUERY_VALUE_RE.fullmatch(item):
             return f"query value for {key!r} carries characters a selector or token does not"
-        if key == "limit" and not (item.isdigit() and int(item) > 0):
-            return "limit is not a positive integer"
+        if key == "limit" and not (
+            item.isdigit() and len(item) <= _RAW_LIMIT_MAX_DIGITS and int(item) > 0
+        ):
+            return f"limit is not a positive integer of at most {_RAW_LIMIT_MAX_DIGITS} digits"
     return None
 
 
