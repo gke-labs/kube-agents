@@ -846,7 +846,6 @@ class MainTest(unittest.TestCase):
         with mock.patch.object(fs, "collect", return_value=snapshot), mock.patch.object(fs, "render", return_value=text):
             self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=io.StringIO(), stderr=err), fs.EXIT_LEAK)
 
-
     def test_the_audit_skips_the_origin_line_and_nothing_else(self):
         text = f"```\n  model: x/y\n  proposals by origin: chat 3 (as the agent reports)\n  kubernetes: {CLUSTER}\n```"
         stripped = fs._without_fixed_lines(text)
