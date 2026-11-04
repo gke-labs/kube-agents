@@ -2475,9 +2475,10 @@ type AgentStatus struct {
 // plugin's and, on a next install, the A2A gateway's metrics
 // listeners, and the six proposal readings (RemediationsMergedTotal,
 // RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
-// ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, all
-// of which it reads every five minutes on the leader; the agent's own
-// ServiceAccount holds no write verb on this status.
+// ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, and
+// the two people readings (PeopleSeen7d and PeopleSeen30d) from the A2A
+// gateway's, all of which it reads every five minutes on the leader; the
+// agent's own ServiceAccount holds no write verb on this status.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative count of sessions the agent opened: the
 	// triage sessions the event watcher opened for events the daemon
@@ -2714,6 +2715,26 @@ type AgentUsageStatus struct {
 	// RemediationsClosedUnmergedTotal. Does not move LastActiveTime.
 	// +optional
 	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
+
+	// PeopleSeen7d is the A2A gateway's count now of the distinct people who
+	// wrote on the chat platform it serves within the last 7 days:
+	// kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
+	// across gateway pods. A reading, not an accumulation: it falls as a
+	// person's last message ages out of the window. A 0 is a reading. Absent
+	// until the first reading, after two polls in a row without one, while a
+	// chat platform the install enables is served through Hermes (Google Chat
+	// or Slack on their legacy consumers, or Teams), and while the served CRD
+	// predates the field. Moves neither LastActiveTime nor
+	// LastHumanActiveTime.
+	// +optional
+	PeopleSeen7d *int64 `json:"peopleSeen7d,omitempty"`
+
+	// PeopleSeen30d is PeopleSeen7d over 30 days:
+	// kubeagents_a2a_gateway_people_seen under window 30d, the largest reading
+	// across gateway pods. A 0 is a reading. Absent on the same terms as
+	// PeopleSeen7d. Moves neither LastActiveTime nor LastHumanActiveTime.
+	// +optional
+	PeopleSeen30d *int64 `json:"peopleSeen30d,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher has
 	// built a client for: the management cluster and the Cluster Agent

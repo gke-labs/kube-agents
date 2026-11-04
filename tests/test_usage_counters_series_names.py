@@ -129,16 +129,16 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aSessionsSeries"))
 
     def test_the_a2a_gateways_people_gauge_keeps_its_name_and_window_labels(self):
-        """The gateway's people-seen gauge and its window label values.
-
-        Pinned on the producer's side only: the operator-side constant that
-        reads the gauge joins this test in a later pull request.
-        """
+        """The gateway's people-seen gauge and its window label values, and the operator's names for them."""
         name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "peopleSeenName"))
         self.assertEqual(name, "kubeagents_a2a_gateway_people_seen")
+        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aPeopleSeenSeries"))
         self.assertEqual(_go_const(_A2A_METRICS_GO, "labelWindow"), "window")
+        self.assertEqual(_go_const(_A2A_METRICS_GO, "labelWindow"), _go_const(_SCRAPE_GO, "a2aPeopleWindowLabel"))
         self.assertEqual(_go_const(_A2A_METRICS_GO, "peopleWindowShortLabel"), "7d")
+        self.assertEqual(_go_const(_A2A_METRICS_GO, "peopleWindowShortLabel"), _go_const(_SCRAPE_GO, "a2aPeopleWindowShort"))
         self.assertEqual(_go_const(_A2A_METRICS_GO, "peopleWindowLongLabel"), "30d")
+        self.assertEqual(_go_const(_A2A_METRICS_GO, "peopleWindowLongLabel"), _go_const(_SCRAPE_GO, "a2aPeopleWindowLong"))
 
     def test_the_chat_plugins_counter_is_the_one_the_poller_sums(self):
         plugin = _CHAT_METRICS_PY.read_text()

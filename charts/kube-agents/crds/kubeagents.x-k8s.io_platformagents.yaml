@@ -12191,6 +12191,28 @@ spec:
                         reacted to already did.
                       format: int64
                       type: integer
+                    peopleSeen7d:
+                      description: |-
+                        PeopleSeen7d is the A2A gateway's count now of the distinct people who
+                        wrote on the chat platform it serves within the last 7 days:
+                        kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
+                        across gateway pods. A reading, not an accumulation: it falls as a
+                        person's last message ages out of the window. A 0 is a reading. Absent
+                        until the first reading, after two polls in a row without one, while a
+                        chat platform the install enables is served through Hermes (Google Chat
+                        or Slack on their legacy consumers, or Teams), and while the served CRD
+                        predates the field. Moves neither LastActiveTime nor
+                        LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    peopleSeen30d:
+                      description: |-
+                        PeopleSeen30d is PeopleSeen7d over 30 days:
+                        kubeagents_a2a_gateway_people_seen under window 30d, the largest reading
+                        across gateway pods. A 0 is a reading. Absent on the same terms as
+                        PeopleSeen7d. Moves neither LastActiveTime nor LastHumanActiveTime.
+                      format: int64
+                      type: integer
                     proposalHumanTouches:
                       description: |-
                         ProposalHumanTouches is the forge's count now of the events people
