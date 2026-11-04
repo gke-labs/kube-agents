@@ -68,6 +68,12 @@ RUN_ID_SUFFIX = "_run_id"
 EVENTS_KEY = "events"
 EVENT_KIND_KEY = "kind"
 HEARTBEAT_KIND = "heartbeat"
+# gcloud writes warnings to stderr, and the shell tool merges stderr into the
+# output in whatever order the two streams arrive: the same command's warning
+# came before its JSON in one run and after it in the next. Warning lines are
+# moved to the end of a multi-line output.
+STDERR_WARNING_PREFIX = "WARNING: "
+LINE_BREAK = "\n"
 NUMBER_CLASS = "NUM"
 # A swapped number with at least this many digits counts as repeated wherever an
 # answer has it as a whole token (`kill 4821`). A shorter one counts only next
@@ -226,6 +232,20 @@ def stable_hash(value: Any) -> str:
     """SHA-256 of a value's canonical JSON."""
     data = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(data.encode(TEXT_ENCODING, ENCODING_ERRORS)).hexdigest()
+
+
+def warnings_last(text: str) -> str:
+    """`text` with its stderr warning lines moved to the end, in their order."""
+    if STDERR_WARNING_PREFIX not in text:
+        return text
+    lines = text.split(LINE_BREAK)
+    warnings = [line for line in lines if line.startswith(STDERR_WARNING_PREFIX)]
+    rest = [line for line in lines if not line.startswith(STDERR_WARNING_PREFIX)]
+    if not warnings or not any(rest):
+        return text
+    while rest and not rest[-1]:
+        rest.pop()
+    return LINE_BREAK.join(rest + warnings)
 
 
 def time_bucket(when: float, now: float) -> str:
@@ -389,6 +409,7 @@ class Normalizer:
     # -- text --------------------------------------------------------------
 
     def text(self, text: str) -> str:
+        text = warnings_last(text)
         nested = self.nested_json(text)
         if nested is not None:
             return json.dumps(self.walk(nested), sort_keys=True, ensure_ascii=False)

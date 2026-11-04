@@ -149,6 +149,20 @@ class AgeTest(unittest.TestCase):
         self.assertNotEqual(fp(request("cpu: 120m")), fp(request("cpu: 250m")))
 
 
+class StderrOrderTest(unittest.TestCase):
+    def test_a_warning_before_or_after_the_output_gives_one_key(self):
+        warning = "WARNING: --filter : operator evaluation is changing for consistency across Google APIs."
+        body = '{\n  "quotas": [{"limit": 16.0, "metric": "NVIDIA_A100_GPUS"}]\n}'
+        after = json.dumps({"exit_code": 0, "output": body + "\n" + warning})
+        before = json.dumps({"exit_code": 0, "output": warning + "\n" + body + "\n"})
+        self.assertEqual(norm(after), norm(before))
+
+    def test_the_rest_of_the_output_still_counts(self):
+        warning = "WARNING: something"
+        self.assertNotEqual(norm(warning + "\nlimit: 16"), norm(warning + "\nlimit: 64"))
+        self.assertEqual(norm(warning), warning)
+
+
 class TimeTest(unittest.TestCase):
     def test_iso_buckets(self):
         self.assertEqual(norm("2026-11-03T11:58:00Z"), "⟦TIME_past_within_hour⟧")
