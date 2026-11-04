@@ -2505,7 +2505,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- if .Values.platformAgent.enabled -}}
   {{- /* The agent pod is the one operator-rendered workload that scales: the gateway
          Deployment takes spec.replicas from availability.replicas, while the shell
-         StatefulSet and the credential proxy stay at 1. The operator now caps the gateway
+         StatefulSet and the credential proxy stay at 1 and kube-proxy stays at 2. The operator now caps the gateway
          at one replica (supportedGatewayReplicas in manifest_helpers.go), so above one
          this multiply and the surge below over-count; that errs towards refusing a quota
          rather than passing one the pods will not fit. The footprint records one

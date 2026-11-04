@@ -131,6 +131,7 @@ func TestTheCredentialProxyBudgetAndEveryOtherBudgetAreDisjoint(t *testing.T) {
 
 	callout := buildA2ACalloutDeployment(agent, "", 1)
 	verifier := buildA2AVerifierDeployment(agent)
+	kubeProxy := buildKubeProxyDeployment(agent, "", true, "tls-hash")
 	platformPDB := buildPlatformPDB(agent)
 	others := []struct {
 		name     string
@@ -140,6 +141,7 @@ func TestTheCredentialProxyBudgetAndEveryOtherBudgetAreDisjoint(t *testing.T) {
 		{"platform budget", platformPDB.Spec.Selector, labels.Set(platformPDB.Spec.Selector.MatchLabels)},
 		{"callout budget", buildA2ACalloutPDB(agent).Spec.Selector, labels.Set(callout.Spec.Template.Labels)},
 		{"verifier budget", buildA2AVerifierPDB(agent).Spec.Selector, labels.Set(verifier.Spec.Template.Labels)},
+		{"kube-proxy budget", buildKubeProxyPDB(agent).Spec.Selector, labels.Set(kubeProxy.Spec.Template.Labels)},
 	}
 	for _, o := range others {
 		if ours.Matches(o.pods) {

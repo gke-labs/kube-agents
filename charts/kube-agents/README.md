@@ -1148,7 +1148,7 @@ have no replica count to multiply, and the pre-delete cleanup hook Job (one pod,
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
 pod is multiplied by `platformAgent.deployment.availability.replicas` (an over-count above one,
 since the operator runs the gateway as a single replica whatever the value); the shell sandbox, the
-credential proxy and the PersistentVolumeClaims are not, because they do not scale with
+credential proxy, kube-proxy and the PersistentVolumeClaims are not, because they do not scale with
 it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
 merged over its footprint entry per key, as the operator renders it, so a raised limit is
 summed at the raised figure; on GKE Autopilot (a cluster serving the `auto.gke.io` AllowlistedWorkload resource) it is counted at

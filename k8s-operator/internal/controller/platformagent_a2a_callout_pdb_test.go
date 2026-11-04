@@ -142,6 +142,7 @@ func TestTheCalloutBudgetAndEveryOtherBudgetAreDisjoint(t *testing.T) {
 	// budgets, and the other two-replica-capable Deployments' selectors.
 	verifier := buildA2AVerifierDeployment(agent)
 	gateway := buildA2AGatewayDeployment(agent)
+	kubeProxy := buildKubeProxyDeployment(agent, "", true, "tls-hash")
 	platformPDB := buildPlatformPDB(agent)
 	others := []struct {
 		name     string
@@ -151,6 +152,7 @@ func TestTheCalloutBudgetAndEveryOtherBudgetAreDisjoint(t *testing.T) {
 		{"verifier budget", buildA2AVerifierPDB(agent).Spec.Selector, labels.Set(verifier.Spec.Template.Labels)},
 		{"a2a gateway selector", gateway.Spec.Selector, labels.Set(gateway.Spec.Template.Labels)},
 		{"platform budget", platformPDB.Spec.Selector, labels.Set(platformPDB.Spec.Selector.MatchLabels)},
+		{"kube-proxy budget", buildKubeProxyPDB(agent).Spec.Selector, labels.Set(kubeProxy.Spec.Template.Labels)},
 	}
 	for _, o := range others {
 		if ours.Matches(o.pods) {
