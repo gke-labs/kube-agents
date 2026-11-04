@@ -1270,6 +1270,18 @@ class CapSpawnBudgetTest(unittest.TestCase):
         self.assertEqual(admission.cap_spawn_budget(result, 6), 0)
         self.assertTrue(getattr(result, admission.RESULT_ATTR)[admission.RECORD_LIMITED])
 
+    def test_a_spent_cap_warns_every_tick_and_a_usable_cap_is_debug(self):
+        """A default install's 2 GiB budget caps every tick under its slot budget,
+        so that line is debug; a cap of zero is the tick's decision and warns."""
+        with self.assertLogs(admission.logger, level="DEBUG") as logs:
+            admission.cap_spawn_budget(self._result(2048, 800), 6)
+        self.assertEqual([r.levelname for r in logs.records], ["DEBUG"])
+        self.assertIn("bounds this tick to 2 new worker(s) (slot budget 6)", logs.output[0])
+        with self.assertLogs(admission.logger, level="DEBUG") as logs:
+            admission.cap_spawn_budget(self._result(640, 443), 5)
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING"])
+        self.assertIn("headroom of 197 MiB bounds this tick to 0 new worker(s)", logs.output[0])
+
 
 if __name__ == "__main__":
     unittest.main()

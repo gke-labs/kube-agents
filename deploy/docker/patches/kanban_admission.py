@@ -640,7 +640,12 @@ def cap_spawn_budget(result: Any, spawn_budget: Optional[int]) -> Optional[int]:
     if cap == 0:
         fields[RECORD_LIMITED] = True
     _record(result, **fields)
-    logger.warning(
+    # A cap of zero is the tick's decision and is logged as upstream logs a
+    # limited tick, every tick; a cap the loop can spend is the ordinary state
+    # of a default install (a 2 GiB budget caps every tick under its slot
+    # budget) and is debug, or the log fills at one line per tick.
+    log = logger.warning if cap == 0 else logger.debug
+    log(
         "%s headroom of %s MiB bounds this tick to %s new worker(s) (slot budget %s)",
         LOG_PREFIX, f"{budget_mib - usage_mib:,}", cap,
         "uncapped" if spawn_budget is None else spawn_budget,
