@@ -456,6 +456,20 @@ func TestTheExecTierFenceAdmitsItsCallersOnly(t *testing.T) {
 			t.Error("fence admits the gateway")
 		}
 	}
+	// The session pods only under the cluster view, which points them at the
+	// tier; the agent is already mode next.
+	for _, view := range []string{"true", ""} {
+		t.Setenv(a2aSessionClusterViewEnvVar, view)
+		admitted := false
+		for _, peer := range buildCredentialProxyExecTierNetworkPolicy(agent, "", credentialProxyProfileConfig{}).Spec.Ingress[0].From {
+			if peer.PodSelector != nil && reflect.DeepEqual(peer.PodSelector.MatchLabels, a2aSessionPodSelector()) {
+				admitted = true
+			}
+		}
+		if admitted != (view == "true") {
+			t.Errorf("with %s=%q the fence admits the session pods: %v", a2aSessionClusterViewEnvVar, view, admitted)
+		}
+	}
 }
 
 // With the tier on, the agent's name must leave room for the suffix in a
