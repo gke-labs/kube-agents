@@ -2,14 +2,13 @@
 """Keep a pull request with unresolved review threads out of the merge queue.
 
 `main` requires every review conversation resolved before a merge. The pool is
-the pull requests the enqueue sweep (`merge_gate.py sweep`) turns auto-merge on
-for: not a draft, carrying `lgtm` and `approved`. The script was written for
-Tide, which did not read the conversation rule: it picked the lowest-numbered
-pull request in its pool, GitHub refused the merge, and Tide retried it every
-~85 seconds ahead of every other one. #608 and #1197 held the whole queue that
-way for an hour on 2026-09-05; #1122 sat 5h46m and 231 attempts (#1202). Under
-the merge queue the label still keeps such a pull request out, and its comment
-tells the author why.
+every pull request that is not a draft and carries `lgtm` and `approved`, held
+or not. The script was written for Tide, which did not read the conversation
+rule: it picked the lowest-numbered pull request in its pool, GitHub refused
+the merge, and Tide retried it every ~85 seconds ahead of every other one. #608
+and #1197 held the whole queue that way for an hour on 2026-09-05; #1122 sat
+5h46m and 231 attempts (#1202). Under the merge queue the label still keeps
+such a pull request out, and its comment tells the author why.
 
 The enqueue sweep reads four labels as a hold. `do-not-merge` -- the bare one,
 not `do-not-merge/hold` -- is the one no Prow plugin writes, so this script

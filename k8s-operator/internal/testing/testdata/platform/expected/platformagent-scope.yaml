@@ -484,7 +484,9 @@ data:
         Name              tail
         Tag               agent.logs
         Path              /opt/data/logs/*.log
-        DB                /fluent-bit/state/fluent-bit.db
+        DB                /var/lib/fluent-bit/fluent-bit.db
+        DB.locking        true
+        DB.journal_mode   delete
         Refresh_Interval  5
         Rotate_Wait       30
         Mem_Buf_Limit     20MB
@@ -497,7 +499,9 @@ data:
         Tag               agent.audit
         Path              /opt/data/logs/audit.jsonl,/opt/data/profiles/*/logs/audit.jsonl
         Parser            audit_json
-        DB                /fluent-bit/state/fluent-bit-audit.db
+        DB                /var/lib/fluent-bit/fluent-bit-audit.db
+        DB.locking        true
+        DB.journal_mode   delete
         Refresh_Interval  5
         Rotate_Wait       30
         Mem_Buf_Limit     20MB
@@ -627,6 +631,273 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: kubeagents:tokenreview:kubeagents-system:platformagent
+rules:
+  - apiGroups:
+      - authentication.k8s.io
+    resources:
+      - tokenreviews
+    verbs:
+      - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+    kubeagents.x-k8s.io/agent-name: platformagent
+    kubeagents.x-k8s.io/agent-namespace: kubeagents-system
+  name: kubeagents:tokenreview:kubeagents-system:platformagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeagents:tokenreview:kubeagents-system:platformagent
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
+---
+apiVersion: v1
+data:
+  ca.crt: PFJFREFDVEVEX0ZPUl9URVNUUz4=
+  tls.crt: PFJFREFDVEVEX0ZPUl9URVNUUz4=
+  tls.key: PFJFREFDVEVEX0ZPUl9URVNUUz4=
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy-tls
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+type: Opaque
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: https
+      port: 8443
+      protocol: TCP
+      targetPort: https
+    - name: kube-metrics
+      port: 8444
+      protocol: TCP
+      targetPort: kube-metrics
+  selector:
+    app: platformagent-kube-proxy
+    kubeagents.x-k8s.io/component: kube-proxy
+status:
+  loadBalancer: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: platformagent-kube-proxy
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-kube-proxy
+      kubeagents.x-k8s.io/component: kube-proxy
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kubeagents.x-k8s.io/tls-cert-hash: <SHA256_FOR_TESTS>
+      labels:
+        app: platformagent-kube-proxy
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: kube-agents
+        kubeagents.x-k8s.io/component: kube-proxy
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - env:
+            - name: KUBE_PROXY_LISTEN_ADDR
+              value: :8443
+            - name: KUBE_PROXY_METRICS_PORT
+              value: "8444"
+            - name: KUBE_PROXY_TLS_CERT_FILE
+              value: /var/run/secrets/kubeagents/kube-proxy-tls/tls.crt
+            - name: KUBE_PROXY_TLS_KEY_FILE
+              value: /var/run/secrets/kubeagents/kube-proxy-tls/tls.key
+            - name: KUBE_PROXY_MODE
+              value: read-only-dry-run
+            - name: KUBE_PROXY_REDACT_SECRETS
+              value: "true"
+            - name: KUBE_PROXY_DEFAULT_CLUSTER
+              value: gke_example-project_us-central1-a_cluster-a
+            - name: CREDENTIAL_PROXY_AUDIENCE
+              value: kubeagents-credential-proxy
+            - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell
+            - name: CREDENTIAL_PROXY_KUBE_CA_FILE
+              value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
+              value: /var/run/secrets/kubernetes.io/serviceaccount/token
+            - name: OTEL_SERVICE_NAME
+              value: platformagent-kube-proxy
+            - name: OTEL_SDK_DISABLED
+              value: "true"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+          image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
+          imagePullPolicy: IfNotPresent
+          name: kube-proxy
+          ports:
+            - containerPort: 8443
+              name: https
+              protocol: TCP
+            - containerPort: 8444
+              name: kube-metrics
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /_kube_proxy/healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /var/run/secrets/kubeagents/kube-proxy-tls
+              name: kube-proxy-tls
+              readOnly: true
+            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              name: event-watcher-ksa-token
+              readOnly: true
+      securityContext:
+        fsGroup: 10000
+        runAsNonRoot: true
+        runAsUser: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: kubeagents-platform-agent
+      volumes:
+        - name: kube-proxy-tls
+          secret:
+            defaultMode: 288
+            secretName: platformagent-kube-proxy-tls
+        - name: event-watcher-ksa-token
+          projected:
+            defaultMode: 288
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3600
+                  path: token
+              - configMap:
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+                  name: kube-root-ca.crt
+status: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: platformagent-shell
+      ports:
+        - port: 8443
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 8444
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: platformagent-kube-proxy
+      kubeagents.x-k8s.io/component: kube-proxy
+  policyTypes:
+    - Ingress
+---
 apiVersion: v1
 automountServiceAccountToken: false
 kind: ServiceAccount
@@ -727,6 +998,10 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: KUBE_PROXY_URL
+              value: https://platformagent-kube-proxy.kubeagents-system.svc.cluster.local:8443
+            - name: KUBE_PROXY_CA_FILE
+              value: /var/run/secrets/kubeagents/kube-proxy-ca/ca.crt
             - name: GKE_PROJECT_ID
               value: example-project
             - name: GKE_CLUSTER_NAME
@@ -777,6 +1052,9 @@ spec:
               readOnly: true
             - mountPath: /var/run/secrets/kubeagents/credential-proxy
               name: credential-proxy-token
+              readOnly: true
+            - mountPath: /var/run/secrets/kubeagents/kube-proxy-ca
+              name: kube-proxy-ca
               readOnly: true
             - mountPath: /opt/data/SETTINGS.md
               name: settings
@@ -862,6 +1140,14 @@ spec:
         - emptyDir:
             sizeLimit: 1Mi
           name: hermes-sync-block
+        - name: kube-proxy-ca
+          secret:
+            defaultMode: 292
+            items:
+              - key: ca.crt
+                path: ca.crt
+            optional: true
+            secretName: platformagent-kube-proxy-tls
         - name: credential-proxy-token
           projected:
             defaultMode: 292
@@ -950,6 +1236,14 @@ spec:
             matchLabels:
               app: platformagent-credential-proxy
               kubeagents.x-k8s.io/component: credential-proxy
+    - ports:
+        - port: 8443
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: platformagent-kube-proxy
+              kubeagents.x-k8s.io/component: kube-proxy
   ingress:
     - from:
         - podSelector:
@@ -964,43 +1258,6 @@ spec:
   policyTypes:
     - Ingress
     - Egress
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: kube-agents
-  name: kubeagents:tokenreview:kubeagents-system:platformagent
-rules:
-  - apiGroups:
-      - authentication.k8s.io
-    resources:
-      - tokenreviews
-    verbs:
-      - create
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: kube-agents
-    kubeagents.x-k8s.io/agent-name: platformagent
-    kubeagents.x-k8s.io/agent-namespace: kubeagents-system
-  name: kubeagents:tokenreview:kubeagents-system:platformagent
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: kubeagents:tokenreview:kubeagents-system:platformagent
-subjects:
-  - kind: ServiceAccount
-    name: kubeagents-platform-agent
-    namespace: kubeagents-system
 ---
 apiVersion: v1
 kind: Service
@@ -1165,11 +1422,13 @@ spec:
               name: cred-proxy
             - containerPort: 8766
               name: cred-metrics
+            - containerPort: 8768
+              name: cred-health
           readinessProbe:
             failureThreshold: 3
             httpGet:
               path: /healthz
-              port: cred-proxy
+              port: cred-health
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
@@ -1216,6 +1475,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
+      terminationGracePeriodSeconds: 45
       volumes:
         - configMap:
             name: platformagent-credential-proxy-policy
@@ -1656,8 +1916,9 @@ spec:
               name: fluent-bit-config
               readOnly: true
               subPath: parsers.conf
-            - mountPath: /fluent-bit/state
-              name: fluent-bit-state
+            - mountPath: /var/lib/fluent-bit
+              name: system-metadata
+              subPath: fluent-bit-state/platformagent
       initContainers:
         - args:
             - |-
@@ -1862,9 +2123,6 @@ spec:
             defaultMode: 420
             name: platformagent-fluent-bit-config
           name: fluent-bit-config
-        - emptyDir:
-            sizeLimit: 128Mi
-          name: fluent-bit-state
         - name: system-metadata
           persistentVolumeClaim:
             claimName: system-metadata

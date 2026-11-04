@@ -119,6 +119,7 @@ version-control abstraction lands.
 | The shims themselves           | [`deploy/docker/Dockerfile`](../../deploy/docker/Dockerfile) — symlinks under `/opt/credential-proxy/bin`                                                                                                                                                                             |
 | Its command policy             | `/etc/credential-proxy/policy.json`, from `CREDENTIAL_PROXY_POLICY`                                                                                                                                                                                                                   |
 | Proxy placement and federation | [`credential_proxy_manifests.go`](../../k8s-operator/internal/controller/credential_proxy_manifests.go), `buildCredentialProxyEnv` in [`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go)                                               |
+| The Kubernetes API proxy       | [`kube-proxy.md`](kube-proxy.md) — [`k8s-api-proxy/`](../../k8s-api-proxy/) and [`kube_proxy_manifests.go`](../../k8s-operator/internal/controller/kube_proxy_manifests.go)                                                                                                           |
 | The STS credential file        | [`agents/platform/scripts/wif_credentials.py`](../../agents/platform/scripts/wif_credentials.py)                                                                                                                                                                                      |
 | The isolation contract         | [`docs/credential-isolation-design.md`](../credential-isolation-design.md)                                                                                                                                                                                                            |
 | The Session KV store           | [`agents/platform/scripts/session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py), SQLite under `/var/lib/kube-agents/session/`                                                                                                                                    |
@@ -2175,8 +2176,11 @@ from the test fleet now that cron runs have a working directory of their own. A 
 is listed before the pod's profile list is read, so a profile scaffolded between the two
 reads is never taken for stale; only cluster-prefixed names go, only when the pod lists the
 platform profile, and only under a profiles root that `find -P` reports as a real directory,
-by one `rm` per home as the model's account, which owns the homes; a home whose `rm` fails
-is named in one chat bullet each night until it goes. The listing runs as
+by one `rm` per home as the model's account, which owns the homes, each under that
+profile's lock, the one `create_profile` and `delete_profile` hold (#4389): taken without
+blocking, from the pod's last-moment recheck through the `rm`, so a name being scaffolded
+right then is left for the next night. A home whose `rm` fails is named in one chat bullet
+each night until it goes. The listing runs as
 `hermes`, the default principal, because its output is believed, under the sandbox's own
 `workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
 name cannot forge a row.
@@ -2539,18 +2543,21 @@ ReadWriteOnce data PVC that only the gateway pod mounts.
 
 So `CREDENTIAL_PROXY_ROLE` selects which services a container starts:
 
-| Role        | Starts                                               | Runs in                              |
-| ----------- | ---------------------------------------------------- | ------------------------------------ |
-| `broker`    | credential exec broker, Google Chat and Slack relays | the `<agent>-credential-proxy` pod   |
-| `api-proxy` | API authenticator, k8s-event-watcher, drift-detector | the gateway pod, as `agent-api-auth` |
-| `combined`  | all of them                                          | nothing, now — the default           |
+| Role        | Starts                                                                       | Runs in                                                                       |
+| ----------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `broker`    | credential exec broker, Google Chat and Slack relays                         | the `<agent>-credential-proxy` pod                                            |
+| `api-proxy` | API authenticator, k8s-event-watcher, drift-detector                         | the gateway pod, as `agent-api-auth`                                          |
+| `combined`  | all of them                                                                  | nothing, now — the default                                                    |
+| `exec`      | credential exec broker, without the event relays (the Cloud API relay stays) | the `<agent>-credential-proxy-exec-tier` pods, once the operator renders them |
 
 `combined` is the default, so an image paired with an operator that does not set the
 variable starts every service; `start-services.sh` refuses any other value rather than
-falling back to it. The `api-proxy` container loads no policy and builds no
-`CommandExecutor`: it compares one key and forwards, holding no credential path. It is
-called `agent-api-auth`, and `envoy-credential-proxy` names the `broker` container — the
-one that does proxy credentials.
+falling back to it. An `exec` pod serves only the exec routes that
+[`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §12 lists. The
+`api-proxy` container loads no policy and builds no `CommandExecutor`: it compares one key
+and forwards, holding no credential path. It is called `agent-api-auth`, and
+`envoy-credential-proxy` names the `broker` container — the one that does proxy
+credentials.
 
 ### How the proxy gets a token
 

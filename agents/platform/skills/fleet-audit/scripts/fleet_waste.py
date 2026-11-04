@@ -104,7 +104,7 @@ DEFAULT_TIMEOUT_S = 60
 # more -- per-cluster work is a handful of subprocess reads and a few HTTP
 # reads -- so the width is the one every other collector in the stream uses,
 # broker_admission.sweep_width(), resolved in collect_fleet (collect.py's
-# comment above its own collect_fleet has the reasoning). Six at the default
+# comment above its own collect_fleet has the reasoning). Five at the default
 # broker, inside urllib3's default connection pool of ten for the shared
 # Monitoring session; a broker configured past twelve slots makes urllib3 warn
 # that the pool is full and open the extra connections anyway.

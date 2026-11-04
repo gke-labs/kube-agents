@@ -11,7 +11,9 @@ from __future__ import annotations
 import http.client
 import json
 import shlex
+import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -3793,6 +3795,213 @@ def test_a_cards_state_is_cleared_once_its_artifacts_are_read(
     assert _TASK_ID in purges[0]
     assert harness._ATTACHMENTS_DIR in purges[0]
     assert harness._LOGS_DIR in purges[0]
+
+
+def test_a_cards_board_rows_are_deleted_with_its_state(
+    stub_agent: _StubAgentServer, instant_polls: None, no_cluster_exec: list[str]
+) -> None:
+    """A run left on the board primes the next one through the role-history digest (#1730)."""
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    (purge,) = [s for s in no_cluster_exec if "rm -rf" in s]
+    assert harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in purge
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID])))
+
+
+# hermes v2026.9.14's ``_ctx_role_history`` query, verbatim: what the next
+# card's worker is shown as "Recent work by @<assignee>".
+_ROLE_HISTORY_SQL = (
+    "SELECT t.id, t.title, r.summary, r.ended_at "
+    "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+    "WHERE r.profile = ? AND r.task_id != ? "
+    "  AND r.outcome = 'completed' "
+    "ORDER BY r.ended_at DESC LIMIT 5"
+)
+
+
+def _purge_board(root: Path) -> sqlite3.Connection:
+    """A board with the tables the purge touches, minus ``task_attachments``."""
+    kb = sqlite3.connect(root / "kanban.db")
+    kb.executescript(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT);"
+        "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, profile TEXT,"
+        " outcome TEXT, summary TEXT, ended_at INTEGER);"
+        "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
+        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
+        "CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, body TEXT);"
+        "CREATE TABLE kanban_notify_subs (task_id TEXT, chat_id TEXT);"
+        "CREATE TABLE kanban_worker_children (child_id TEXT PRIMARY KEY, creator_id TEXT, created_at INTEGER);"
+    )
+    for tid, status, ended in [("t_done", "done", 3), ("t_run", "running", 2), ("t_other", "done", 1)]:
+        _purge_card(kb, tid, status, ended=ended)
+    kb.execute("INSERT INTO task_links VALUES ('t_done', 't_other')")
+    kb.execute("INSERT INTO kanban_worker_children VALUES ('t_kid', 't_done', 0)")
+    kb.execute("INSERT INTO tasks VALUES ('t_next', 'next run', 'ready', 'platform')")
+    kb.commit()
+    return kb
+
+
+def _purge_card(
+    kb: sqlite3.Connection, tid: str, status: str, *, ended: int = 1, creator: str | None = None,
+    attributed_to: str | None = None,
+) -> None:
+    """One card with a completed run, and its ``created`` event as hermes writes it.
+
+    ``creator`` is the event's ``creator_task_id`` (``None`` for a cron, a person,
+    or a card someone else's worker filed); ``attributed_to`` is the
+    ``kanban_worker_children`` creator, which the adoption window can set to a
+    run's card when ``creator`` is not.
+    """
+    kb.execute("INSERT INTO tasks VALUES (?, ?, ?, 'platform')", (tid, tid, status))
+    kb.execute(
+        "INSERT INTO task_runs (task_id, profile, outcome, summary, ended_at) "
+        "VALUES (?, 'platform', 'completed', ?, ?)", (tid, f"fixed it in {tid}", ended),
+    )
+    kb.execute(
+        "INSERT INTO task_events (task_id, kind, payload) VALUES (?, 'created', ?)",
+        (tid, json.dumps({"creator_task_id": creator})),
+    )
+    if attributed_to:
+        kb.execute("INSERT INTO kanban_worker_children VALUES (?, ?, 0)", (tid, attributed_to))
+
+
+def _run_purge(root: Path, roots: list[str], fanned_out: list[str] = ()) -> list[str]:
+    """The in-pod script on the harness's own argv, pointed at a temporary tree."""
+    argv = harness._purge_argv(roots, fanned_out)
+    paths = [worker_trajectory.DATA_ROOT, harness._ATTACHMENTS_DIR, harness._LOGS_DIR]
+    local = [str(root), str(root / "attachments"), str(root / "logs")]
+    argv = [local[paths.index(a)] if a in paths else a for a in argv]
+    proc = subprocess.run(
+        [sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, *argv], capture_output=True, text=True, check=True,
+    )
+    return proc.stdout.splitlines()
+
+
+def test_the_purge_script_drops_a_settled_card_from_the_role_history(tmp_path: Path) -> None:
+    """Run in-pod against a board: the settled card is gone, a running one and others stay."""
+    kb = _purge_board(tmp_path)
+    before = [r[0] for r in kb.execute(_ROLE_HISTORY_SQL, ("platform", "t_next"))]
+    assert before == ["t_done", "t_run", "t_other"]
+
+    assert _run_purge(tmp_path, ["t_done", "t_run", "t_gone"]) == ["kept t_run", "purged"]
+
+    after = [r[0] for r in kb.execute(_ROLE_HISTORY_SQL, ("platform", "t_next"))]
+    assert after == ["t_run", "t_other"]
+    for table, column in [
+        ("tasks", "id"), ("task_runs", "task_id"), ("task_events", "task_id"),
+        ("task_links", "parent_id"), ("kanban_worker_children", "creator_id"),
+    ]:
+        assert kb.execute(f"SELECT COUNT(*) FROM {table} WHERE {column} = 't_done'").fetchone() == (0,)
+
+
+def test_the_purge_leaves_a_card_the_run_adopted_but_did_not_create(tmp_path: Path) -> None:
+    """A worker's ``kanban_create`` can hand back a card a cron filed seconds earlier by its key.
+
+    ``kanban_worker_children`` attributes it to the worker's card anyway, so the
+    capture lists it as fan-out; hermes' ``created`` event says who made it.
+    """
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_mine", "done", creator="t_done", attributed_to="t_done")
+    _purge_card(kb, "t_cron", "done", creator=None, attributed_to="t_done")
+    _purge_card(kb, "t_cron_kid", "done", creator="t_cron", attributed_to="t_cron")
+    _purge_card(kb, "t_garbled", "done", attributed_to="t_done")
+    _purge_card(kb, "t_listed", "done", attributed_to="t_done")
+    kb.execute("UPDATE task_events SET payload = 'not json' WHERE task_id = 't_garbled'")
+    kb.execute("UPDATE task_events SET payload = '[1]' WHERE task_id = 't_listed'")
+    kb.commit()
+    (tmp_path / "attachments" / "t_cron").mkdir(parents=True)
+    (tmp_path / "attachments" / "t_mine").mkdir()
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "t_mine.log").write_text("worker transcript")
+    (tmp_path / "logs" / "t_cron.log").write_text("someone else's transcript")
+
+    out = _run_purge(tmp_path, ["t_done"], ["t_mine", "t_cron", "t_cron_kid", "t_garbled", "t_listed"])
+
+    assert out == ["foreign t_cron", "foreign t_cron_kid", "foreign t_garbled", "foreign t_listed", "purged"]
+    on_board = {r[0] for r in kb.execute("SELECT id FROM tasks")}
+    assert {"t_cron", "t_cron_kid", "t_garbled", "t_listed"} <= on_board and not {"t_done", "t_mine"} & on_board
+    assert (tmp_path / "attachments" / "t_cron").is_dir() and (tmp_path / "logs" / "t_cron.log").exists()
+    assert not (tmp_path / "attachments" / "t_mine").exists()
+    assert not (tmp_path / "logs" / "t_mine.log").exists()
+
+
+def test_the_purge_keeps_a_fan_out_while_one_of_its_cards_runs(tmp_path: Path) -> None:
+    """``kanban_fanout_reaper`` reaches an overdue card only through its creator's and siblings' rows."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_parent", "done", creator=None)
+    _purge_card(kb, "t_c1", "done", creator="t_parent", attributed_to="t_parent")
+    _purge_card(kb, "t_c2", "running", creator="t_parent", attributed_to="t_parent")
+    kb.commit()
+
+    _purge_card(kb, "t_gc", "done", creator="t_c2", attributed_to="t_c2")
+    kb.commit()
+    for tid in ("t_c1", "t_c2", "t_gc"):
+        (tmp_path / "attachments" / tid).mkdir(parents=True)
+
+    out = _run_purge(tmp_path, ["t_parent"], ["t_c1", "t_c2", "t_gc"])
+
+    # t_gc is settled, but t_c2's worker is still reading it.
+    assert out == ["kept t_parent", "kept t_c1", "kept t_c2", "kept t_gc", "purged"]
+    rows = kb.execute("SELECT child_id FROM kanban_worker_children WHERE creator_id = 't_parent' ORDER BY 1")
+    assert [r[0] for r in rows] == ["t_c1", "t_c2"]
+    assert all((tmp_path / "attachments" / tid).is_dir() for tid in ("t_c1", "t_c2", "t_gc"))
+
+
+def test_the_purge_holds_no_fan_out_for_a_card_that_cannot_run(tmp_path: Path) -> None:
+    """A blocked fan-out card is no reaper's, nor a parent-linked follow-up: the rest goes."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_parent", "done", creator=None)
+    _purge_card(kb, "t_c1", "done", creator="t_parent", attributed_to="t_parent")
+    _purge_card(kb, "t_blocked", "blocked", creator="t_parent", attributed_to="t_parent")
+    _purge_card(kb, "t_follow", "ready", creator="t_parent", attributed_to="t_parent")
+    kb.execute("INSERT INTO task_links VALUES ('t_parent', 't_follow')")
+    kb.commit()
+
+    assert _run_purge(tmp_path, ["t_parent"], ["t_c1", "t_blocked", "t_follow"]) == ["purged"]
+    assert not {r[0] for r in kb.execute("SELECT id FROM tasks")} & {"t_parent", "t_c1", "t_blocked", "t_follow"}
+
+
+def test_a_purge_that_cannot_reach_the_board_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "kept t_1\n")
+    with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
+        harness._purge_card_state(["t_1", "t_2"], 5.0)
+    assert "cards t_1 were still running" in caplog.text
+    assert "could not delete the board rows of cards t_1, t_2" in caplog.text
+
+
+def test_settle_purges_the_cards_the_workers_fanned_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Cluster Agent profile outlives the run, so its cards' digest leaks too.
+
+    Only cards the run's workers filed: a card linked under one is left alone.
+    """
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        summary={"cards": [
+            {"task": "t_1", "fanned_out": ["t_child"], "children": ["t_child", "t_linked"]},
+            {"task": "t_child", "fanned_out": ["t_grandchild"], "children": ["t_grandchild"]},
+            {"task": "t_grandchild", "fanned_out": [], "children": []},
+            # Reached through a predecessor link only: someone else's card.
+            {"task": "t_linked", "fanned_out": ["t_linked_kid"], "children": ["t_linked_kid"]},
+            {"task": "t_linked_kid", "fanned_out": [], "children": []},
+        ]},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+    calls: list[tuple[list[str], list[str]]] = []
+    monkeypatch.setattr(
+        harness, "_purge_card_state", lambda ids, to, fanned_out=(): calls.append((list(ids), list(fanned_out)))
+    )
+
+    res = harness.AgentResult(output="ok", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    # The run's own card is taken as given; the fan-out is checked against hermes' record.
+    assert calls == [(["t_1"], ["t_child", "t_grandchild"])]
 
 
 def test_artifacts_are_read_before_the_card_state_is_purged(

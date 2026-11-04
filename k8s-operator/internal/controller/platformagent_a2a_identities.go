@@ -423,6 +423,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// The kept 👍 and 👎 ratings (a2a/gateway/feedback.go), the bucket's
 		// data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
 		"$KV.feedback.>",
+		// One hashed key per chat person (a2a/gateway/people.go), the
+		// bucket's data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
+		"$KV.people.>",
 		// The console adapter's notices (spec-chatops-gateway.md, "The
 		// console adapter"): core NATS, one subject per conversation.
 		"chat.console.*.out",
@@ -474,12 +477,13 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"Its $JS.API grant is scoped to what it emits, by name and by verb\n" +
 			"(#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on\n" +
 			"TASKS, and INFO, DIRECT.GET and consumer create/delete on\n" +
-			"KV_session-state, its own registry, and on KV_feedback, the kept\n" +
-			"answer ratings. So no STREAM.DELETE, PURGE,\n" +
+			"KV_session-state, its own registry, on KV_feedback, the kept\n" +
+			"answer ratings, and on KV_people, one hashed key per chat person.\n" +
+			"So no STREAM.DELETE, PURGE,\n" +
 			"UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here\n" +
 			"used to destroy every task's history and the five consumers on it -\n" +
 			"no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the\n" +
-			"topic streams or the other two buckets.",
+			"topic streams or the runtime-state, cap and PROFILE_LEASES buckets.",
 		auth:     a2aAuthStatic,
 		credsKey: a2aGatewayPasswordKey,
 		// $JS.ACK / $JS.FC.> are the delivery path's reply subjects: an
@@ -504,6 +508,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"agents.hb.>",
 			"$KV.session-state.>",
 			"$KV.feedback.>",
+			"$KV.people.>",
 			"chat.console.*.in",
 			// Proactive posts from the agent to the home channel, and a
 			// card's report back to its conversation, one subject per backend.
@@ -572,7 +577,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// principal create a
 		// consumer that delivers TASKS into its own inbox, and delete any
 		// stream on the bus. It provisions - it creates the five streams
-		// and five buckets, idempotently, with an info-then-add - so it
+		// and six buckets, idempotently, with an info-then-add - so it
 		// needs CREATE and INFO on exactly those and nothing else. A KV
 		// bucket is a stream named KV_<bucket>, which is why those appear
 		// in stream form.
@@ -605,6 +610,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.CREATE.KV_session-state",
 			"$JS.API.STREAM.CREATE.KV_cap",
 			"$JS.API.STREAM.CREATE.KV_feedback",
+			"$JS.API.STREAM.CREATE.KV_people",
 			"$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
 			"$JS.API.STREAM.INFO.TASKS",
@@ -615,6 +621,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.KV_session-state",
 			"$JS.API.STREAM.INFO.KV_cap",
 			"$JS.API.STREAM.INFO.KV_feedback",
+			"$JS.API.STREAM.INFO.KV_people",
 			"$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.INFO.PROFILE_SUBMITS",
 			"_INBOX.provision.>",

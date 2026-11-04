@@ -6556,5 +6556,26 @@ class DefaultRunTest(unittest.TestCase):
         self.assertEqual(ur.default_run(["/nonexistent/binary"]).rc, -1)
 
 
+class ReadsTellTheShimTheirDeadlineTest(unittest.TestCase):
+    """Each read's cap holds one admission wait and one run at most. The deadline under which
+    no retry fits is collector_run's to derive from the cap (test_collector_run.py holds the
+    rule and the binding); what is this file's is that the retrospective's reads, with and
+    without an environment of their own, reach a child that was told it."""
+
+    def test_a_read_with_and_without_its_own_environment_hands_the_child_the_deadline(self):
+        name = ur.collector_run.SHIM_RETRY_DEADLINE_ENV
+        done = subprocess.CompletedProcess(["kubectl"], 0, stdout="", stderr="")
+        with mock.patch.dict(os.environ, {"KUBECONFIG": "/outer"}), mock.patch.object(ur.subprocess, "run", return_value=done) as run:
+            os.environ.pop(name, None)
+            ur.default_run(["gcloud", "container", "operations", "list"])
+            inherited = run.call_args.kwargs["env"]
+            ur.default_run(["kubectl", "get", "nodes"], env={**os.environ, "KUBECONFIG": "/k"})
+            given = run.call_args.kwargs["env"]
+        expected = str(ur.collector_run.shim_retry_deadline(ur.GCLOUD_TIMEOUT_S))
+        self.assertEqual(("/outer", expected), (inherited["KUBECONFIG"], inherited[name]))
+        self.assertEqual(("/k", expected), (given["KUBECONFIG"], given[name]))
+        self.assertEqual("0", expected, "the cap admits no retry")
+
+
 if __name__ == "__main__":
     unittest.main()

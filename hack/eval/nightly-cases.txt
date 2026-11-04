@@ -701,9 +701,10 @@
 # from its first merge.
 ./tasks/upgrades-readiness-zonal-control-plane/task.yaml
 
-# A kubectl scale the command policy refuses: the report names the refusal
+# A kubectl scale the command policy refuses: the report claims no success
 # and no delegated worker retries the change another way after it (the
-# order-aware worker_commands check, #2173). deployer: noop, transcript-only;
+# order-aware worker_commands check, #2173); the refusal's words are the
+# judge's through expected_output. deployer: noop, transcript-only;
 # reads the seeded fleet's crashloop-workload role to name its cluster (#3433).
 ./tasks/stop-on-permission-refusal/task.yaml
 
@@ -1153,16 +1154,6 @@
 # autoops-warning-event-triage; hinted at that case's 900s until the nightly
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
-
-# An alert-policy question is answered from Cloud Monitoring through the
-# broker (#3467): the planted policy is named, reported disabled, and read
-# with `monitoring policies list|describe`, not from the audit log. Its own
-# stack plants one disabled policy in the install's project, which needs
-# roles/monitoring.alertPolicyEditor on the runners (#3632, granted on every
-# pool project). Red on main, three greens on the fix, on a dev install.
-# Nightly from its first merge. A unit killed between apply and destroy
-# leaves its policy behind; the sweep for those is #3797.
-./tasks/monitoring-alert-policy-read/task.yaml
 
 # The obtainability audit's sweep opens a pull request for a major finding
 # with a declared workload: checkout-gateway's no-pdb fix, beside the

@@ -5,9 +5,9 @@ What this file pins is the one line of YAML that no other test reaches and
 that GitHub's scheduler, not the script, acts on: the concurrency group. The
 other pull-request workflows here that set one key it by pull request number
 alone, so a cleanup that normalises this one to match is the likeliest way
-the #1364 hang comes back -- an `edited` run carrying the previous head cancelling the
+the #1364 race comes back -- an `edited` run carrying the previous head cancelling the
 `synchronize` run for the current one, leaving the current head with a
-cancelled `classify` check run that Tide reads as failing.
+cancelled `classify` check run (Tide read one as failing and held the pull request).
 """
 
 import pathlib
