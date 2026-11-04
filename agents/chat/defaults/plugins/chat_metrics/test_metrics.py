@@ -3,6 +3,7 @@
 Run: cd agents/chat/defaults/plugins && python3 -m pytest chat_metrics/test_metrics.py -q
 """
 
+import http.client
 import json
 import os
 import re
@@ -387,6 +388,22 @@ class ProposalsOpenedTest(unittest.TestCase):
             self.ledger.status = 503
             self.assertEqual(5, self.gauge.counts()[("chat", "slack")])
         self.assertEqual(1, len(again.output))
+
+    def test_a_truncated_or_malformed_http_answer_keeps_the_last_count(self):
+        # Session KV restarting mid-answer, or something non-HTTP on its port:
+        # the scrape keeps every family, and the streak logs once.
+        self.ledger.body = _served(chat={"slack": 3})
+        last = self.gauge.counts()
+        failures = (http.client.IncompleteRead(b"{", 10), http.client.BadStatusLine("garbage"))
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING") as logs:
+            for failure in failures:
+                with mock.patch.object(metrics.urllib.request, "urlopen", side_effect=failure):
+                    self.assertEqual(last, self.gauge.counts())
+                    exposition = metrics.ChatMetrics(proposals=self.gauge).render()
+                self.assertIn('kubeagents_proposals_opened{origin="chat",platform="slack"} 3\n', exposition)
+        ledger_lines = [line for line in logs.output if "proposals ledger" in line]
+        self.assertEqual(1, len(ledger_lines), logs.output)
+        self.assertIn("IncompleteRead", ledger_lines[0])
 
     def test_a_restart_of_the_process_serves_the_ledger_unchanged(self):
         # The ledger is durable on the pod's volume; the gauge holds nothing of

@@ -20,6 +20,7 @@ no listener, and a line in the log says so.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -209,7 +210,8 @@ class ProposalsOpenedGauge:
 
     Each successful read replaces the previous counts, zero-filled so every
     origin has a series. A read that fails (no API key, a connection error, a
-    non-200, an answer of the wrong shape) keeps the last counts and logs the
+    non-200, a truncated or malformed HTTP answer, an answer of the wrong
+    shape) keeps the last counts and logs the
     exception type once per failure streak. Before the first successful read
     there are no counts: :meth:`counts` returns None and the family is not
     rendered, so a scraper sees a miss rather than nine zero readings. The
@@ -248,7 +250,9 @@ class ProposalsOpenedGauge:
         with self._lock:
             try:
                 counts = self._read()
-            except (OSError, ValueError) as exc:  # URLError and timeouts are OSError; JSON errors and ProposalsReadError are ValueError
+            # URLError and timeouts are OSError; JSON errors and ProposalsReadError are ValueError;
+            # IncompleteRead, BadStatusLine and LineTooLong are HTTPException.
+            except (OSError, ValueError, http.client.HTTPException) as exc:
                 if not self._failing:
                     logger.warning("chat_metrics: the proposals ledger could not be read, keeping the last counts: %s", type(exc).__name__)
                     self._failing = True
