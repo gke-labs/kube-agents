@@ -191,6 +191,10 @@ def test_defaults_and_names_match_the_operator_source():
     assert 'agent.Name + "-shell"' in shell and f'Name:  "{cli.SHELL_CONTAINER}",' in shell
     assert 'agent.Name + "-gateway"' in proxy and cli.GATEWAY_SELECTOR == f"app={cli.PLATFORM_AGENT}-gateway"
     assert cli.SHELL_SELECTOR == f"app={cli.PLATFORM_AGENT}-shell"
+    assert 'agent.Name + "-credential-proxy"' in proxy
+    assert cli.PROXY_SELECTOR == f"app={cli.PLATFORM_AGENT}-credential-proxy"
+    assert cli.PROXY_DEPLOYMENT == f"deployment/{cli.PLATFORM_AGENT}-credential-proxy"
+    assert f'mountIntoContainer(containers, "{cli.AGENT_CONTAINER}"' in auth
     assert 'json:"shellSandbox,omitempty"' in (root.parents[1] / "api" / "v1alpha1" / "common_types.go").read_text()
 
 
@@ -306,8 +310,13 @@ def test_restore_patch_removes_the_object_the_scenario_created():
 
 class FakeHost:
     def __init__(self, fail_start=False):
+        import threading
         self.patches, self.fail_start = [], fail_start
         self.context, self.namespace = "c", "n"
+        self.stop = threading.Event()
+
+    def check(self):
+        cli.Host.check(self)
 
     def platform_agent(self):
         return {"spec": {"deployment": {"credentialProxy": {"resources": {"limits": {"memory": "8G"}}}}}}
@@ -330,12 +339,12 @@ class FakeRecorder:
 REPORTS = []
 
 
-def run_scenario(monkeypatch, tmp_path, host, lost=False, start=None):
+def run_scenario(monkeypatch, tmp_path, host, lost=False, start=None, seconds="0"):
     import contextlib
     import threading
     monkeypatch.setattr(cli, "Host", lambda args: host)
     monkeypatch.setattr(cli, "Recorder", FakeRecorder)
-    monkeypatch.setattr(cli, "report", lambda out, recorder: REPORTS.append(out))
+    monkeypatch.setattr(cli, "report", lambda out, recorder, strict=True: REPORTS.append((out, strict)))
     event = threading.Event()
     if lost:
         event.set()
@@ -346,7 +355,7 @@ def run_scenario(monkeypatch, tmp_path, host, lost=False, start=None):
 
     monkeypatch.setattr(cli, "lease", fake_lease)
     monkeypatch.setattr(cli, "KILL_POLL_SECONDS", 0)
-    args = cli.parse(["--host-context", "c", "--out", str(tmp_path), "proxy", "--watch", "proxy", "--seconds", "0"])
+    args = cli.parse(["--host-context", "c", "--out", str(tmp_path), "proxy", "--watch", "proxy", "--seconds", seconds])
     cli.scenario(args, "credentialProxy", "envoy-credential-proxy", "app=x", start or (lambda h, b, l: None))
     return host.patches
 
@@ -395,3 +404,93 @@ def test_fleet_delete_only_takes_subnets_of_the_harness_shape(monkeypatch, tmp_p
     assert deleted == ["kwok-01-subnet"]
     listing = next(c for c in calls if "list" in c)
     assert "--network" in listing and "default" in listing
+
+
+def test_quantity_reads_the_full_kubernetes_grammar():
+    assert cli.quantity("2e9") == 2e9 and cli.quantity("1E3") == 1e3
+    assert cli.quantity("1Pi") == 2**50 and cli.quantity("1E") == 1e18 and cli.quantity(".5") == 0.5
+
+
+def test_process_class_uses_argv_so_spaced_arguments_stay_one_word():
+    argv = ["/usr/bin/kubectl", "get", "-o", "jsonpath={range .items[*]}{.metadata.name}{end}", "pods", "-A"]
+    assert capture.process_class(" ".join(argv), argv) == "kubectl get pods -A"
+    sample = {"ts": 1, "cg_current": str(2**30), "procs": [[1, 0, 2048, " ".join(argv), argv]]}
+    assert capture.breakdown(sample)[0][0] == "kubectl get pods -A"
+
+
+def test_kubectl_class_skips_value_flags_and_reads_booleans_as_kubectl_does():
+    assert capture.process_class("kubectl --as admin get pods -A") == "kubectl get pods -A"
+    assert capture.process_class("kubectl -v 6 get pods -A") == "kubectl get pods -A"
+    assert capture.process_class("kubectl get pods --all-namespaces=0") == "kubectl get pods"
+    assert capture.process_class("kubectl get pods --all-namespaces=F") == "kubectl get pods"
+    assert capture.process_class("kubectl --timeout 30s get pods") == "kubectl get pods"
+    assert capture.process_class("kubectl --weird") == "kubectl ?"
+
+
+def test_render_report_survives_a_sample_with_no_cgroup_figure():
+    sample = {"ts": 100.0, "pod": "p", "cg_current": None, "sampler_rss_kib": None,
+              "procs": [[1, 0, 2048, "kubectl get pods -A"]]}
+    kill = {"pod": "p", "container": "shell", "restarts": 1, "exit_code": 137, "finished": "1970-01-01T00:01:40Z"}
+    assert "cgroup unknown" in cli.render_report("shell", [kill], [sample])
+
+
+def test_a_stopped_scenario_reports_without_the_no_samples_error(monkeypatch, tmp_path):
+    def boom(h, b, l):
+        raise SystemExit("trigger failed")
+    with pytest.raises(SystemExit, match="trigger failed"):
+        run_scenario(monkeypatch, tmp_path, FakeHost(), start=boom)
+    assert REPORTS[-1][1] is False
+
+
+def test_report_without_samples_raises_only_when_strict(tmp_path):
+    recorder = FakeRecorder()
+    cli.report(tmp_path, recorder, strict=False)  # a stopped run: writes the report, does not raise
+    assert (tmp_path / cli.REPORT_FILE).exists()
+    with pytest.raises(SystemExit, match="no samples"):
+        cli.report(tmp_path, recorder)
+
+
+def test_a_lease_lost_mid_run_ends_the_wait_and_restores(monkeypatch, tmp_path):
+    host = FakeHost()
+    holder = {}
+    def start(h, b, l):
+        holder["started"] = True
+    import threading
+    def lose_soon():
+        while "started" not in holder:
+            pass
+        host_event.set()
+    host_event = threading.Event()
+    monkeypatch.setattr(cli, "KILL_POLL_SECONDS", 0.01)
+    import contextlib
+    @contextlib.contextmanager
+    def fake_lease(h, note):
+        yield host_event
+    monkeypatch.setattr(cli, "Host", lambda args: host)
+    monkeypatch.setattr(cli, "Recorder", FakeRecorder)
+    monkeypatch.setattr(cli, "report", lambda out, recorder, strict=True: None)
+    monkeypatch.setattr(cli, "lease", fake_lease)
+    threading.Thread(target=lose_soon, daemon=True).start()
+    args = cli.parse(["--host-context", "c", "--out", str(tmp_path), "proxy", "--watch", "proxy", "--seconds", "30"])
+    import time
+    t0 = time.monotonic()
+    with pytest.raises(SystemExit, match="lease"):
+        cli.scenario(args, "credentialProxy", "envoy-credential-proxy", "app=x", start)
+    assert time.monotonic() - t0 < 5  # the wait ended on the lost lease, not on --seconds
+    assert host.patches[-1][0]["value"] == {"limits": {"memory": "8G"}}
+
+
+def test_waits_stop_on_a_lost_lease():
+    host = FakeHost()
+    host.stop.set()
+    with pytest.raises(SystemExit, match="lease"):
+        cli.wait_for_limits(host, "app=x", "c", {"memory": "2Gi"})
+
+
+def test_create_cluster_gives_gcloud_its_own_kubeconfig(monkeypatch, tmp_path):
+    args = cli.parse(["--project", "p", "--out", str(tmp_path), "fleet", "create", "--clusters", "1"])
+    envs = []
+    monkeypatch.setattr(cli, "run", lambda cmd, env=None, **kw: envs.append((cmd, env)) or "")
+    cli.create_cluster(cli.Fleet(args), "oom-01", 100, events_only=False)
+    create_env = next(env for cmd, env in envs if "create" in cmd and "clusters" in cmd)
+    assert create_env["KUBECONFIG"].endswith("create-oom-01.kubeconfig")

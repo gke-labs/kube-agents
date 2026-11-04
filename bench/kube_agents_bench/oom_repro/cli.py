@@ -99,6 +99,7 @@ NETWORK = "default"
 FLEET_LABEL_KEY = "purpose"
 FLEET_LABEL_VALUE = "oom-repro"
 FLEET_KUBECONFIG = "fleet.kubeconfig"
+CREATE_KUBECONFIG_FORMAT = "create-{cluster}.kubeconfig"
 # Real nodes: GKE scales kube-dns and konnectivity with the node count, KWOK's own fake nodes
 # included, and the KWOK controller needs a core and a half; 6 e2-standard-8 hold both.
 FULL_MACHINE_TYPE = "e2-standard-8"
@@ -163,9 +164,10 @@ WORKLOAD_POOL_FORMAT = "{project}.svc.id.goog"
 NETWORK_PREFIX = "10."
 ERROR_TAIL_CHARS = 600
 # Quantities, for comparing a request with a limit.
-QUANTITY = re.compile(r"^([0-9.]+)([A-Za-z]*)$")
-QUANTITY_SUFFIXES = {"": 1, "m": 1e-3, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12,
-                     "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
+# Kubernetes' quantity grammar: a decimal number with an optional exponent, then a suffix.
+QUANTITY = re.compile(r"^([+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)([A-Za-z]*)$")
+QUANTITY_SUFFIXES = {"": 1, "m": 1e-3, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15, "E": 1e18,
+                     "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40, "Pi": 2**50, "Ei": 2**60}
 # The repository's live-test lease (scripts/live_test_lease.py, docs/designs/live-test-lease.md).
 LEASE_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "live_test_lease.py"
 LEASE_ENVS_VAR = "KUBE_AGENTS_LIVE_TEST_ENVS"
@@ -249,13 +251,18 @@ def create_cluster(fleet: Fleet, name: str, block: int, events_only: bool) -> No
          "--network", NETWORK, "--region", fleet.region, "--range", f"{net}{PRIMARY_RANGE_SUFFIX}",
          "--secondary-range", f"{pods}={net}{POD_RANGE_SUFFIX},{services}={net}{SERVICE_RANGE_SUFFIX}",
          "--enable-private-ip-google-access", "-q"])
+    # clusters create fetches credentials itself; give it a kubeconfig of its own, so it neither writes
+    # the caller's kubeconfig nor races the other creates for one file.
+    scratch = fleet.kubeconfig.parent / CREATE_KUBECONFIG_FORMAT.format(cluster=name)
     run(["gcloud", "container", "clusters", "create", name, "--project", fleet.project, "--zone", fleet.zone,
          "--release-channel", RELEASE_CHANNEL,
          "--machine-type", EVENTS_MACHINE_TYPE if events_only else FULL_MACHINE_TYPE,
          "--num-nodes", str(EVENTS_REAL_NODES if events_only else FULL_REAL_NODES), "--disk-size", NODE_DISK_GB,
          "--enable-ip-alias", "--subnetwork", subnet, "--cluster-secondary-range-name", pods,
          "--services-secondary-range-name", services, "--labels", f"{FLEET_LABEL_KEY}={FLEET_LABEL_VALUE}",
-         "--workload-pool", WORKLOAD_POOL_FORMAT.format(project=fleet.project), "-q"])
+         "--workload-pool", WORKLOAD_POOL_FORMAT.format(project=fleet.project), "-q"],
+        env={**os.environ, "KUBECONFIG": str(scratch)})
+    scratch.unlink(missing_ok=True)
 
 
 def install_kwok(fleet: Fleet, cluster: str) -> None:
@@ -439,6 +446,12 @@ class Host:
     def __init__(self, args: argparse.Namespace) -> None:
         self.context = args.host_context
         self.namespace = args.namespace
+        # Set when the live-test lease is lost; every wait stops on it.
+        self.stop = threading.Event()
+
+    def check(self) -> None:
+        if self.stop.is_set():
+            raise SystemExit("stopped: the live-test lease could not be renewed")
 
     def kubectl(self, *args: str, stdin: str | None = None, check: bool = True, timeout: float | None = None) -> str:
         return run(["kubectl", "--context", self.context, "-n", self.namespace, *args], stdin=stdin, check=check,
@@ -456,6 +469,7 @@ class Host:
     def wait_running(self, selector: str) -> str:
         deadline = time.monotonic() + FLEET_WAIT_SECONDS
         while time.monotonic() < deadline:
+            self.check()
             pod = self.running_pod(selector)
             if pod:
                 return pod
@@ -542,6 +556,7 @@ def wait_for_limits(host: Host, selector: str, container: str, limits: dict) -> 
     """The running pod whose container carries ``limits``, once the operator has rolled it out."""
     deadline = time.monotonic() + FLEET_WAIT_SECONDS
     while time.monotonic() < deadline:
+        host.check()
         for p in host.pods(selector):
             if (p["status"].get("phase") == POD_RUNNING and not p["metadata"].get("deletionTimestamp")
                     and has_limits(p, container, limits)):
@@ -674,19 +689,20 @@ def render_report(container: str, kills: list[dict], samples: list[dict]) -> str
             lines += ["", "No sample of this pod in the seconds before the kill."]
             continue
         when = time.strftime(CLOCK_FORMAT, time.gmtime(sample["ts"]))
-        lines += ["", f"Last sample {when} UTC: cgroup {int(sample['cg_current']) // capture.MIB} MiB, of which the "
+        cgroup = f"{int(sample['cg_current']) // capture.MIB} MiB" if sample.get("cg_current") else "unknown (no cgroup v2)"
+        lines += ["", f"Last sample {when} UTC: cgroup {cgroup}, of which the "
                   f"sampler {int(sample.get('sampler_rss_kib') or 0) // capture.KIB} MiB (not in the shares below).",
                   "", "| Share | MiB | Process |", "| --- | --- | --- |"]
         lines += [f"| {share:.1f}% | {mib} | `{name}` |" for name, share, mib in capture.breakdown(sample)]
     return "\n".join(lines) + "\n"
 
 
-def report(out: Path, recorder: Recorder) -> None:
+def report(out: Path, recorder: Recorder, strict: bool = True) -> None:
     samples = read_samples(out / SAMPLES_FILE.format(container=recorder.container))
     text = render_report(recorder.container, recorder.events, samples)
     (out / REPORT_FILE).write_text(text)
     print(text)
-    if not samples:
+    if strict and not samples:
         # Zero kills with zero samples is not a result: nothing was watched.
         raise SystemExit(f"no samples of {recorder.container}: check --watch, --host-context and --namespace")
 
@@ -700,6 +716,7 @@ def scenario(args: argparse.Namespace, field: str, container: str, selector: str
     limits = DEFAULT_LIMITS[field]
     runtime_class = bool(getattr(args, "runc", False))
     with lease(host, f"oom-repro {field}") as lease_lost:
+        host.stop = lease_lost
         before = host.platform_agent()["spec"]
         (out / SNAPSHOT_FILE).write_text(json.dumps(before, indent=1))
         stopped: BaseException | None = None
@@ -720,7 +737,8 @@ def scenario(args: argparse.Namespace, field: str, container: str, selector: str
                 except SystemExit as exc:
                     print(f"RESTORE FAILED; put the spec back from {out / SNAPSHOT_FILE}: {exc}", flush=True)
                     raise
-        report(out, recorder)
+        # A run that stopped reports what it has; its own reason, not "no samples", is what it ends with.
+        report(out, recorder, strict=stopped is None)
         if stopped is not None:
             raise stopped
 
