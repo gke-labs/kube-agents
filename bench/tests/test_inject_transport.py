@@ -1354,6 +1354,62 @@ def test_a_respawn_after_a_standbys_503_forwards_to_the_new_holder(
     assert not infra(result)
 
 
+@pytest.mark.parametrize(
+    ("owned", "want_reset"),
+    [
+        # An earlier exchange's tunnel still goes to the old holder, now a
+        # standby: replaced on this exchange's first spawn.
+        ("pod/platform-agent-a2a-gateway-a", True),
+        # Already where the lease points: kept.
+        ("pod/platform-agent-a2a-gateway-b", False),
+        # No tunnel of this process's own on the port: established as usual.
+        (None, False),
+    ],
+)
+def test_a_first_spawn_replaces_an_owned_tunnel_aimed_at_an_old_holder(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, owned: str | None, want_reset: bool
+) -> None:
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    local_port = stub_gateway.server_address[1]
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(local_port))
+    calls: list[tuple[str, str | None]] = []
+
+    def _ensure(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        calls.append(("ensure", service))
+
+    def _reset(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        calls.append(("reset", service))
+
+    monkeypatch.setattr(harness, "_ensure_port_forward", _ensure)
+    monkeypatch.setattr(harness, "_reset_port_forward", _reset)
+    monkeypatch.setattr(harness, "_owned_forward_target", lambda port: owned)
+    monkeypatch.setattr(harness, "_gateway_door_target", lambda agent_service, service: "pod/platform-agent-a2a-gateway-b")
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    result = KubeAgentsHarness().run("hello")
+
+    assert calls[0] == ("reset" if want_reset else "ensure", "pod/platform-agent-a2a-gateway-b")
+    assert not infra(result)
+
+
+def test_the_owned_target_is_what_this_process_spawned() -> None:
+    port = 41234
+    with harness._PF_LOCK:
+        harness._PF_TARGETS[port] = "pod/x"
+    try:
+        # A target with no live process of ours: not owned.
+        assert harness._owned_forward_target(port) is None
+        with harness._PF_LOCK:
+            harness._PF_PROCESSES[port] = object()  # type: ignore[assignment]
+        assert harness._owned_forward_target(port) == "pod/x"
+    finally:
+        with harness._PF_LOCK:
+            harness._PF_TARGETS.pop(port, None)
+            harness._PF_PROCESSES.pop(port, None)
+
+
 class _KubectlReads:
     """A stand-in for ``subprocess.run`` answering the three reads the door
     target takes: the Lease's holder, the door Service's selector, and the

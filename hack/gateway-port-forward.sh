@@ -58,11 +58,27 @@ k() {
   fi
 }
 
-# The pod holding the gateway's Lease, if the door's Service selects it, or
-# the Service.
-door_target() {
-  local holder selector
-  holder="$(k get lease "${LEASE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+# The Lease's holder: "" when there's no Lease or nobody holds it. Fails,
+# saying why on stderr, when the read itself fails (a timeout, a Forbidden),
+# so the caller can tell that from a lease nobody holds.
+read_holder() {
+  local out err rc=0
+  err="$(mktemp)"
+  out="$(k get lease "${LEASE}" -o jsonpath='{.spec.holderIdentity}' 2>"${err}")" || rc=$?
+  if [ "${rc}" -ne 0 ] && ! grep -q NotFound "${err}"; then
+    echo "reading lease ${LEASE} failed: $(tr '\n' ' ' <"${err}")" >&2
+    rm -f "${err}"
+    return 1
+  fi
+  rm -f "${err}"
+  [ "${rc}" -eq 0 ] && printf '%s' "${out}"
+  return 0
+}
+
+# The target for a holder: its pod, if the door's Service selects it, or the
+# Service.
+target_for() {
+  local holder="$1" selector
   if [ -n "${holder}" ]; then
     selector="$(k get svc "${DOOR_SERVICE}" -o "go-template=${SELECTOR_TEMPLATE}" 2>/dev/null || true)"
     selector="${selector%,}"
@@ -78,7 +94,8 @@ door_target() {
 pf_pid=""
 trap '[ -z "${pf_pid}" ] || kill "${pf_pid}" 2>/dev/null; exit 0' INT TERM
 while true; do
-  target="$(door_target)"
+  holder="$(read_holder)" || holder=""
+  target="$(target_for "${holder}")"
   echo "forwarding 127.0.0.1:${LOCAL_PORT} to ${target}:${DOOR_PORT} in ${NAMESPACE}" >&2
   # kubectl itself is the background job, not the k function: $! must be
   # the process holding the port, or a kill leaves the forward running.
@@ -91,7 +108,16 @@ while true; do
   pf_pid=$!
   while kill -0 "${pf_pid}" 2>/dev/null; do
     sleep "${HOLDER_POLL_SECONDS}"
-    now="$(door_target)"
+    # A read that fails moves nothing: keep the forward that's up.
+    now_holder="$(read_holder)" || continue
+    # The Lease read alone shows a move. The Service check runs again only
+    # when the holder changed, or when the last answer was the Service (a
+    # holder it didn't select then may be selected now).
+    if [ "${now_holder}" = "${holder}" ] && [ "${target}" = "pod/${holder}" ]; then
+      continue
+    fi
+    holder="${now_holder}"
+    now="$(target_for "${holder}")"
     if [ "${now}" != "${target}" ]; then
       echo "the lease moved to ${now}; restarting the port-forward" >&2
       kill "${pf_pid}" 2>/dev/null || true

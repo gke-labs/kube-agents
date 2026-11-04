@@ -23,8 +23,18 @@ START_WAIT_SECONDS = 5
 FAKE_KUBECTL = r"""#!/usr/bin/env bash
 # args: -n <ns> <verb> ...
 shift 2
+echo "$1 $2" >>"${FAKE_DIR}/calls"
 case "$1 $2" in
-  "get lease") cat "${FAKE_DIR}/holder" ;;
+  "get lease")
+    if [ -e "${FAKE_DIR}/lease_fails" ]; then
+      echo 'Error from server (InternalError): an error on the server ("") has prevented the request from succeeding' >&2
+      exit 1
+    fi
+    if [ -e "${FAKE_DIR}/lease_missing" ]; then
+      echo 'Error from server (NotFound): leases.coordination.k8s.io "platform-agent-a2a-gateway" not found' >&2
+      exit 1
+    fi
+    cat "${FAKE_DIR}/holder" ;;
   "get svc") printf 'app=platform-agent-a2a-gateway,' ;;
   "get pods") cat "${FAKE_DIR}/pods" ;;
   port-forward*)
@@ -67,6 +77,10 @@ class GatewayPortForwardTest(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
 
+    def calls(self, verb: str) -> int:
+        path = self.dir / "calls"
+        return path.read_text().splitlines().count(verb) if path.exists() else 0
+
     def forwards(self) -> list[str]:
         return (self.dir / "forwards").read_text().split()
 
@@ -86,6 +100,48 @@ class GatewayPortForwardTest(unittest.TestCase):
         # only the helper's read of the Lease notices.
         (self.dir / "holder").write_text("gw-b")
         self.wait_for(["pod/gw-a", "pod/gw-b"], MOVE_WAIT_SECONDS)
+
+    def test_a_failed_lease_read_keeps_the_forward_that_is_up(self) -> None:
+        # An API blip mid-forward moves nothing: the forward to gw-a stays,
+        # and the failure is said.
+        (self.dir / "holder").write_text("gw-a")
+        self.start()
+        self.wait_for(["pod/gw-a"], START_WAIT_SECONDS)
+        (self.dir / "lease_fails").write_text("")
+        polls = self.calls("get lease")
+        deadline = time.monotonic() + MOVE_WAIT_SECONDS
+        while time.monotonic() < deadline and self.calls("get lease") < polls + 2:
+            time.sleep(0.2)
+        self.assertGreaterEqual(self.calls("get lease"), polls + 2, "the helper stopped polling")
+        self.assertEqual(self.forwards(), ["pod/gw-a"])
+        (self.dir / "lease_fails").unlink()
+        assert self.proc is not None
+        self.proc.send_signal(signal.SIGTERM)
+        _, stderr = self.proc.communicate(timeout=10)
+        self.assertIn(b"reading lease platform-agent-a2a-gateway failed", stderr)
+
+    def test_steady_polls_read_only_the_lease(self) -> None:
+        # The Service and its pods are checked when the holder changes, not
+        # on every poll.
+        (self.dir / "holder").write_text("gw-a")
+        self.start()
+        self.wait_for(["pod/gw-a"], START_WAIT_SECONDS)
+        polls = self.calls("get lease")
+        deadline = time.monotonic() + MOVE_WAIT_SECONDS
+        while time.monotonic() < deadline and self.calls("get lease") < polls + 2:
+            time.sleep(0.2)
+        self.assertGreaterEqual(self.calls("get lease"), polls + 2)
+        self.assertEqual((self.calls("get svc"), self.calls("get pods")), (1, 1))
+
+    def test_a_missing_lease_forwards_the_service_quietly(self) -> None:
+        (self.dir / "holder").write_text("")
+        (self.dir / "lease_missing").write_text("")
+        self.start()
+        self.wait_for(["svc/platform-agent-a2a-inject"], START_WAIT_SECONDS)
+        assert self.proc is not None
+        self.proc.send_signal(signal.SIGTERM)
+        _, stderr = self.proc.communicate(timeout=10)
+        self.assertNotIn(b"failed", stderr)
 
     def test_a_holder_the_service_does_not_select_gets_the_service(self) -> None:
         (self.dir / "holder").write_text("some-other-pod")

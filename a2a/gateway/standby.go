@@ -77,7 +77,7 @@ type standbyAnswer struct {
 func StartStandbyDoors(listens []string, namespace string, view *LeaseView, log *slog.Logger) (*StandbyDoors, error) {
 	s := &StandbyDoors{}
 	for _, listen := range listens {
-		_, port, err := net.SplitHostPort(listen)
+		port, err := listenPort(listen)
 		if err != nil {
 			s.Stop()
 			return nil, fmt.Errorf("standby door %s: %w", listen, err)
@@ -102,6 +102,21 @@ func StartStandbyDoors(listens []string, namespace string, view *LeaseView, log 
 		log.Info("standby door answering 503 until this replica leads", "listen", listen)
 	}
 	return s, nil
+}
+
+// listenPort is the port number a listen address binds, as net.Listen
+// resolves it: a padded, signed or named spelling ("0080", "http") becomes
+// the number, which is what kubectl port-forward takes.
+func listenPort(listen string) (string, error) {
+	_, name, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "", err
+	}
+	port, err := net.LookupPort("tcp", name)
+	if err != nil {
+		return "", err
+	}
+	return strconv.Itoa(port), nil
 }
 
 // Stop closes the standby's listeners and returns once they are closed, so

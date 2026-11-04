@@ -469,8 +469,12 @@ _MAX_ARTIFACTS = 8
 # than hold the run open.
 _EXEC_TIMEOUT = 60.0
 
-_PF_LOCK = threading.Lock()  # guards the three registries below
+_PF_LOCK = threading.Lock()  # guards the registries below
 _PF_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+# The kubectl target (``svc/<name>``, ``pod/<name>``) each owned forward was
+# spawned for, so a caller can tell a live tunnel aimed elsewhere from one
+# aimed where it wants.
+_PF_TARGETS: dict[int, str] = {}
 _PF_PORT_LOCKS: dict[int, threading.Lock] = {}
 _PF_LOG_DIR: Path | None = None
 # True while _PF_LOG_DIR is this process's own temp directory, and therefore
@@ -557,6 +561,7 @@ def _cleanup_port_forwards() -> None:
     """Terminate every port-forward this process spawned."""
     global _PF_LOG_DIR
     with _PF_LOCK:
+        _PF_TARGETS.clear()
         while _PF_PROCESSES:
             port, proc = _PF_PROCESSES.popitem()
             if proc.poll() is None:
@@ -763,6 +768,7 @@ def _ensure_port_forward(
 
         with _PF_LOCK:
             stale = _PF_PROCESSES.pop(local_port, None)
+            _PF_TARGETS.pop(local_port, None)
         if stale is not None:
             _stop_process(stale)
 
@@ -783,6 +789,7 @@ def _ensure_port_forward(
             raise RuntimeError(f"failed to spawn kubectl port-forward: {exc}") from exc
         with _PF_LOCK:
             _PF_PROCESSES[local_port] = proc
+            _PF_TARGETS[local_port] = cmd[2]
 
         try:
             deadline = time.monotonic() + 15
@@ -803,8 +810,16 @@ def _ensure_port_forward(
         except BaseException:
             with _PF_LOCK:
                 _PF_PROCESSES.pop(local_port, None)
+                _PF_TARGETS.pop(local_port, None)
             _stop_process(proc)
             raise
+
+
+def _owned_forward_target(local_port: int) -> str | None:
+    """The target this process's live forward on ``local_port`` was spawned
+    for, or ``None`` when it owns none there."""
+    with _PF_LOCK:
+        return _PF_TARGETS.get(local_port) if local_port in _PF_PROCESSES else None
 
 
 def _reset_port_forward(
@@ -828,6 +843,7 @@ def _reset_port_forward(
     with _port_establishment_lock(local_port):
         with _PF_LOCK:
             proc = _PF_PROCESSES.pop(local_port, None)
+            _PF_TARGETS.pop(local_port, None)
         if proc is None:
             _log.info("no port-forward owned on port %d; nothing to tear down", local_port)
         else:
@@ -2747,10 +2763,16 @@ class KubeAgentsHarness(AgentHarness):
         def _tunnel(reset: bool) -> None:
             if not own_tunnel:
                 return
-            forward = _reset_port_forward if reset else _ensure_port_forward
             # Resolved on every spawn: after a 503 from a standby or a tunnel
             # dropped with its pod, the lease names where the door is now.
             tunnel_target[0] = _gateway_door_target(agent_service, service)
+            # A tunnel this process already owns on the port (from an earlier
+            # exchange) may still go where the lease pointed then; a port that
+            # is open says nothing about where, so it is replaced.
+            owned = _owned_forward_target(local_port)
+            if owned is not None and owned != tunnel_target[0]:
+                reset = True
+            forward = _reset_port_forward if reset else _ensure_port_forward
             forward(local_port, service=tunnel_target[0], remote_port=_INJECT_REMOTE_PORT)
 
         # Same establishment retry as the api path's, for the same reason: a

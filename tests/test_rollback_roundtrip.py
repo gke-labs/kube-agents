@@ -472,6 +472,8 @@ FAKE_KUBECTL = textwrap.dedent(
                 want = dict(pair.split("=", 1) for pair in rest[rest.index("-l") + 1].split(","))
                 out = "".join("pod/%s\n" % p["name"] for p in s["scenario"].get("labelled_pods", [])
                               if all(p["labels"].get(k) == v for k, v in want.items()))
+            elif kind == "lease" and s["scenario"].get("lease_forbidden"):
+                sys.stderr.write('Error from server (Forbidden): leases.coordination.k8s.io "%s" is forbidden\n' % name); rc = 1
             elif kind == "svc" and fmt.startswith("go-template="):
                 obj = s["objects"].get("svc/%s" % name)
                 if obj is None:
@@ -1090,6 +1092,19 @@ class PortForwardTest(RoundTripTest):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
         self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+
+    def test_a_forbidden_lease_read_is_said_and_falls_back_to_the_service(self) -> None:
+        # A missing Lease is the quiet case; a read that fails otherwise is
+        # said, since the Service it falls back to can land on the standby.
+        result, after, _ = self.run_sim(healthy_next_state(lease_forbidden=True), **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("reading lease platform-agent-a2a-gateway failed", result.stderr)
+        self.assertIn("Forbidden", result.stderr)
+
+        result, _, _ = self.run_sim(healthy_next_state(), **self.tunnel_env())
+        self.assertNotIn("reading lease", result.stderr)
 
     def test_a_lease_holder_outside_the_inject_service_is_not_trusted(self) -> None:
         # The tunnel carries the door's token: a Lease naming a pod the inject

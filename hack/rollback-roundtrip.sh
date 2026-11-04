@@ -838,10 +838,21 @@ start_port_forward() {
 #
 # The holder is taken only if it is one of the pods the inject Service
 # selects: the tunnel carries the door's token, and a Lease's holder is a
-# string anyone who can write the Lease sets.
+# string anyone who can write the Lease sets. A Lease read that fails for a
+# reason other than a missing Lease is said, since the Service it falls back
+# to can land on the standby. Everything said goes to stderr: stdout is the
+# target this function returns.
 inject_target() {
-  local holder selector
-  holder="$(k get lease "${A2A_GATEWAY_NAME}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+  local holder selector err rc=0
+  err="$(mktemp)"
+  holder="$(k get lease "${A2A_GATEWAY_NAME}" -o jsonpath='{.spec.holderIdentity}' 2>"${err}")" || rc=$?
+  if [ "${rc}" -ne 0 ]; then
+    if ! grep -q NotFound "${err}"; then
+      note "reading lease ${A2A_GATEWAY_NAME} failed; forwarding to svc/${INJECT_NAME}: $(tr '\n' ' ' <"${err}")" >&2
+    fi
+    holder=""
+  fi
+  rm -f "${err}"
   if [ -n "${holder}" ]; then
     selector="$(k get svc "${INJECT_NAME}" -o "go-template=${SELECTOR_TEMPLATE}" 2>/dev/null || true)"
     selector="${selector%,}"
@@ -849,7 +860,6 @@ inject_target() {
       echo "pod/${holder}"
       return 0
     fi
-    # stderr: stdout is the target this function returns.
     note "lease ${A2A_GATEWAY_NAME} names ${holder}, which is not a pod svc/${INJECT_NAME} selects; forwarding to the service" >&2
   fi
   echo "svc/${INJECT_NAME}"

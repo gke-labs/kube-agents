@@ -158,3 +158,22 @@ func TestTheElectionKeepsTheStandbysViewOfTheHolder(t *testing.T) {
 		t.Fatal("the standby didn't stop")
 	}
 }
+
+// TestTheStandbysCommandNamesThePortNumber: the command a standby prints is
+// what kubectl takes, the port number net.Listen binds, whatever spelling
+// the listen address used.
+func TestTheStandbysCommandNamesThePortNumber(t *testing.T) {
+	for listen, want := range map[string]string{
+		"127.0.0.1:8099":  "8099",
+		"127.0.0.1:08099": "8099",
+		"127.0.0.1:http":  "80",
+	} {
+		got, err := listenPort(listen)
+		if err != nil || got != want {
+			t.Errorf("listenPort(%q) = %q, %v; want %q", listen, got, err, want)
+		}
+	}
+	if _, err := listenPort("127.0.0.1"); err == nil {
+		t.Error("a listen with no port was accepted")
+	}
+}
