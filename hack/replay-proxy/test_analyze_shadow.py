@@ -1,8 +1,10 @@
 """The offline would-hit analysis over synthetic shadow logs."""
 
 import contextlib
+import hashlib
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -299,6 +301,132 @@ class MissTest(unittest.TestCase):
         p2 = next(m for m in rep["top_misses"] if m["request_id"] == "p2")
         self.assertEqual(p2["closest_request_id"], "n1")
         self.assertEqual(p2["matched_messages"], 1)
+
+
+def write_store(requests):
+    """A REPLAY_STORE_DIR holding `requests`: request_id -> list of message texts."""
+    root = tempfile.mkdtemp(dir=TEMP_DIR)
+    os.makedirs(os.path.join(root, "blobs"))
+    os.makedirs(os.path.join(root, "requests"))
+    for request_id, messages in requests.items():
+        blobs = []
+        for text in messages:
+            # As request_store.py writes it: the message as compact JSON.
+            blob = json.dumps({"content": text, "role": "tool"}, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(blob.encode()).hexdigest()
+            with open(os.path.join(root, "blobs", digest + ".json"), "w") as handle:
+                handle.write(blob)
+            blobs.append(digest)
+        with open(os.path.join(root, "requests", request_id + ".json"), "w") as handle:
+            json.dump({"request_id": request_id, "messages": blobs}, handle)
+    return root
+
+
+class ClosestByTextTest(unittest.TestCase):
+    LINES = [
+        line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"], roles=["system", "user", "tool"]),
+        line("n2", 1.5, "nightly", "n", "B", ["s", "w", "tb"], roles=["system", "user", "tool"]),
+        presubmit("p1", 2, "10", "b1", "C", ["s", "w", "tc"], roles=["system", "user", "tool"]),
+    ]
+    TEXTS = {
+        "n1": ["sys", "work kanban task", "card: list the namespaces on cluster alpha"],
+        "n2": ["sys", "work kanban task", "card: check kube-system pods on cluster beta and report restarts"],
+        "p1": ["sys", "work kanban task", "card: check kube-system pods on cluster beta and report restart counts"],
+    }
+
+    def test_without_the_store_the_earliest_request_sharing_the_prefix_is_closest(self):
+        miss = report(self.LINES)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_request_id"], miss["matched_messages"]), ("n1", 2))
+
+    def test_with_the_store_the_one_whose_next_message_is_most_alike_is_closest(self):
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        miss = report(self.LINES, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_request_id"], miss["matched_messages"]), ("n2", 2))
+
+    def test_a_request_replay_could_not_have_used_is_never_closest(self):
+        # n2 finished after p1 started, so it was not available to p1.
+        lines = [dict(l) for l in self.LINES]
+        lines[1]["ts"] = 3
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+
+    def test_multi_line_output_is_compared_line_by_line_not_as_json(self):
+        # The stored blob is JSON, so read raw, a word at a line break glues to
+        # the next line's first word. n1 lists the same pods in another order
+        # (identical words); n2 shares the first two lines and nothing else.
+        texts = {
+            "n1": ["sys", "work", "web-c 1/1\nweb-a 1/1\nweb-b 2/2"],
+            "n2": ["sys", "work", "web-a 1/1\nweb-b 2/2\napi-x 0/3"],
+            "p1": ["sys", "work", "web-a 1/1\nweb-b 2/2\nweb-c 1/1"],
+        }
+        lines = [dict(l) for l in self.LINES]
+        lines[0]["ts"], lines[1]["ts"] = 1.5, 1  # n2 is the earliest, so the fallback would pick it
+        miss = report(lines, texts=analyze_shadow.StoredText(write_store(texts)))[0]["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+
+    def test_tool_call_arguments_count_as_words(self):
+        message = {"role": "assistant", "content": None,
+                   "tool_calls": [{"id": "c1", "function": {"name": "kubectl", "arguments": "get pods -n web"}}]}
+        self.assertEqual(analyze_shadow.message_text(message), "kubectl\nget pods -n web")
+
+    def test_missing_text_falls_back_to_the_earliest(self):
+        texts = analyze_shadow.StoredText(write_store({"n1": self.TEXTS["n1"]}))
+        miss = report(self.LINES, texts=texts)[0]["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+
+
+class ClosestByTextRulesTest(unittest.TestCase):
+    """The text ranking never reports a request replay could not have served."""
+
+    TEXTS = {
+        "n1": ["sys", "work", "card: list the namespaces on cluster alpha"],
+        "x": ["sys", "work", "card: check kube-system pods on cluster beta and report restarts"],
+        "p1": ["sys", "work", "card: check kube-system pods on cluster beta and report restart counts"],
+    }
+
+    def closest(self, candidate, extra=(), merged=None):
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]), candidate, *extra,
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        rep, _ = report(lines, texts=texts, merged=merged or {}, top=100)
+        return next(m for m in rep["top_misses"] if m["request_id"] == "p1")["closest_request_id"]
+
+    def test_an_earlier_finished_build_of_the_same_pr_is_usable(self):
+        self.assertEqual(self.closest(presubmit("x", 2, "10", "b1", "X", ["s", "w", "tx"])), "x")
+
+    def test_an_unfinished_build_of_the_same_pr_is_not(self):
+        still_running = presubmit("x2", 12, "10", "b1", "Y", ["q"])
+        self.assertEqual(self.closest(presubmit("x", 2, "10", "b1", "X", ["s", "w", "tx"]), [still_running]), "n1")
+
+    def test_another_prs_build_is_usable_only_as_the_merge_copy_after_it_merged(self):
+        other = presubmit("x", 2, "11", "c1", "X", ["s", "w", "tx"])
+        self.assertEqual(self.closest(other), "n1")
+        self.assertEqual(self.closest(other, merged={"11": 5.0}), "x")
+        self.assertEqual(self.closest(other, merged={"11": 20.0}), "n1")
+
+    def test_the_most_recent_requests_are_compared_when_there_are_more_than_the_cap(self):
+        count = analyze_shadow.MAX_PREFIX_CANDIDATES + 6
+        lines = [line(f"n{i}", 1 + i, "nightly", "n", f"A{i}", ["s", "w", f"t{i}"]) for i in range(count)]
+        lines.append(presubmit("p1", 1000, "10", "b2", "C", ["s", "w", "tc"]))
+        texts = {f"n{i}": ["sys", "work", f"card number {i} about something else"] for i in range(count)}
+        texts[f"n{count - 1}"] = texts["p1"] = ["sys", "work", "card: check kube-system pods on cluster beta"]
+        rep, _ = report(lines, texts=analyze_shadow.StoredText(write_store(texts)))
+        self.assertEqual(rep["top_misses"][0]["closest_request_id"], f"n{count - 1}")
+
+    def test_an_unreadable_stored_file_leaves_the_miss_unranked(self):
+        root = write_store(self.TEXTS)
+        with open(os.path.join(root, "requests", "x.json"), "wb") as handle:
+            handle.write(b"\xff\xfe{")
+        texts = analyze_shadow.StoredText(root)
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 line("x", 1.5, "nightly", "n", "X", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        self.assertEqual(report(lines, texts=texts)[0]["top_misses"][0]["closest_request_id"], "n1")
+
+    def test_a_store_without_requests_is_refused(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            analyze_shadow.main([write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--store", TEMP_DIR + "/typo"])
 
 
 class HealthTest(unittest.TestCase):

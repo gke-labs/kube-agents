@@ -33,31 +33,53 @@ Also reported: the share of hits first seen in another project, the tokens and
 model time hits would save, and for misses the closest earlier request by
 longest matching per-message-hash prefix (the `diag_message_hashes`, which
 do not drift between requests of one conversation), ranked by tokens lost. The
-stored, scrubbed text of both is under their request_id for a diff. The health
+stored, scrubbed text of both is under their request_id for a diff.
+
+Many earlier requests can share that prefix (every worker conversation opens
+the same way). With `--store`, the copied-out REPLAY_STORE_DIR, the closest is
+the one whose next message is most alike by the words they share, relative to
+both messages' length, among the 64 most recent distinct next messages. It falls
+back to the earliest available when the miss's own text wasn't stored, and
+without `--store`. The health
 counts show a broken setup; check them after the first day.
 
 A collision audit (did two requests that matched lead to different results?)
 is a later step: it joins each `Hit` from `iter_hits` with run verdicts and the
 stored text. Nothing here reads verdicts yet.
 
-Usage: python3 analyze_shadow.py LOG [LOG ...] [--merged MERGED.json] [--top N] [--json] [--ignore-storable]
+Usage: python3 analyze_shadow.py LOG [LOG ...] [--merged MERGED.json] [--store DIR] [--top N] [--json] [--ignore-storable]
 MERGED.json maps a pull request number to its merge time in epoch seconds.
 """
 
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
+import request_store
 import schema as F
 
 NIGHTLY = "nightly"
 PRESUBMIT = "presubmit"
 JOB_KINDS = (NIGHTLY, PRESUBMIT)
+# Requests sharing a prefix that a miss is compared against, newest first, one per distinct next message.
+MAX_PREFIX_CANDIDATES = 64
+STORE_MESSAGES_KEY = "messages"
+# The parts of a stored message whose words are compared.
+CONTENT_KEY = "content"
+TEXT_KEY = "text"
+TOOL_CALLS_KEY = "tool_calls"
+FUNCTION_KEY = "function"
+NAME_KEY = "name"
+ARGUMENTS_KEY = "arguments"
+# The score of an earlier request whose text could not be read.
+UNRANKED = -1.0
 ASSISTANT_ROLE = "assistant"
 # Stands in for an assistant message's content in the simulated key: its place
 # in the conversation counts, its words do not.
@@ -276,8 +298,64 @@ class KeySources(Sources):
         return [key]
 
 
+class StoredText:
+    """The scrubbed request text replay_proxy.py stored (a copied-out REPLAY_STORE_DIR)."""
+
+    def __init__(self, root: str):
+        self.root = root
+
+    def _read(self, *parts: str) -> Optional[str]:
+        try:
+            with open(os.path.join(self.root, *parts), encoding=request_store.TEXT_ENCODING) as handle:
+                return handle.read()
+        except (OSError, ValueError):  # missing, or not UTF-8: that miss stays unranked
+            return None
+
+    def message(self, request_id: str, index: int) -> Optional[str]:
+        """The text of message `index` of a stored request, or None when it was not stored."""
+        manifest = self._read(request_store.REQUESTS_DIR, request_id + request_store.JSON_SUFFIX)
+        try:
+            blobs = json.loads(manifest).get(STORE_MESSAGES_KEY) if manifest else None
+        except (ValueError, AttributeError):
+            return None
+        if not isinstance(blobs, list) or not 0 <= index < len(blobs):
+            return None
+        blob = self._read(request_store.BLOBS_DIR, str(blobs[index]) + request_store.JSON_SUFFIX)
+        try:
+            return message_text(json.loads(blob)) if blob is not None else None
+        except ValueError:
+            return None
+
+
+def message_text(message: Any) -> str:
+    """A stored message's words: its content and its tool calls, without the JSON around them."""
+    if not isinstance(message, dict):
+        return str(message)
+    parts: List[str] = []
+    content = message.get(CONTENT_KEY)
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        parts.extend(str(part.get(TEXT_KEY, "")) if isinstance(part, dict) else str(part) for part in content)
+    for call in message.get(TOOL_CALLS_KEY) or []:
+        function = call.get(FUNCTION_KEY) if isinstance(call, dict) else None
+        if isinstance(function, dict):
+            parts.extend((str(function.get(NAME_KEY, "")), str(function.get(ARGUMENTS_KEY, ""))))
+    return "\n".join(parts)
+
+
+def similarity(saved: str, current: str) -> float:
+    """How alike two messages are by the words they share, relative to both lengths (order ignored)."""
+    return difflib.SequenceMatcher(None, saved.split(), current.split(), autojunk=False).quick_ratio()
+
+
 class PrefixSources(Sources):
     """Every prefix of every request, for the closest-earlier-request search."""
+
+    def __init__(self, records: List[Record], merged: Dict[str, float], require_storable: bool, by_text: bool = False):
+        # Every request under each prefix, kept only when misses are ranked by text.
+        self.members: Optional[Dict[str, List[Record]]] = {} if by_text else None
+        super().__init__(records, merged, require_storable)
 
     def keys_of(self, record: Record) -> List[str]:
         if record.search_hashes is None:
@@ -285,20 +363,59 @@ class PrefixSources(Sources):
         root = record.search_settings_hash
         return [root] + record.chain(hashes=record.search_hashes, root=root)
 
-    def closest(self, request: Record) -> Tuple[Optional[Record], int]:
+    def add(self, key: str, record: Record) -> None:
+        super().add(key, record)
+        if self.members is not None:
+            self.members.setdefault(key, []).append(record)
+
+    def usable(self, record: Record, request: Record) -> bool:
+        """Whether `find` could return `record` for `request`, under the same rules."""
+        if record.kind == NIGHTLY:
+            return record.available_at <= request.ts
+        merged_at = self.merged.get(record.pr)
+        if (merged_at is not None and self.merge_build.get(record.pr) == record.build_key
+                and merged_at <= request.ts and record.pr != request.pr):
+            return True
+        return (bool(request.pr) and record.pr == request.pr and record.build != request.build
+                and self.build_end[record.build_key] <= request.ts)
+
+    def closest(self, request: Record, texts: Optional[StoredText] = None) -> Tuple[Optional[Record], int]:
         if request.search_hashes is None:
             return None, 0
         root = request.search_settings_hash
         best = self.find(root, request, nightly_only=False)
         if best is None:
             return None, 0
-        matched = 0
+        matched, key = 0, root
         for prefix in request.chain(hashes=request.search_hashes, root=root):
             found = self.find(prefix, request, nightly_only=False)
             if found is None:
                 break
-            best, matched = found, matched + 1
+            best, matched, key = found, matched + 1, prefix
+        if texts is not None and self.members is not None and matched < len(request.search_hashes):
+            best = self.most_alike(best, key, matched, request, texts)
         return best, matched
+
+    def most_alike(self, best: Record, key: str, index: int, request: Record, texts: StoredText) -> Record:
+        """Of the usable requests sharing `key`, the one whose message `index` is most like the request's."""
+        current = texts.message(request.request_id, index)
+        if current is None:
+            return best
+        seen = set()
+        ranked = (UNRANKED, best)
+        # Newest first: the latest run of the same case is the likeliest match.
+        for record in reversed(self.members.get(key, [])):
+            following = record.search_hashes[index] if index < len(record.search_hashes or []) else ""
+            if following in seen or not self.usable(record, request):
+                continue
+            seen.add(following)
+            if len(seen) > MAX_PREFIX_CANDIDATES:
+                break
+            text = texts.message(record.request_id, index)
+            score = similarity(text, current) if text is not None else UNRANKED
+            if score > ranked[0]:
+                ranked = (score, record)
+        return ranked[1]
 
 
 def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
@@ -356,14 +473,15 @@ def iter_hits(
 
 
 def find_misses(
-    records: List[Record], require_storable: bool = True, merged: Optional[Dict[str, float]] = None
+    records: List[Record], require_storable: bool = True, merged: Optional[Dict[str, float]] = None,
+    texts: Optional[StoredText] = None,
 ) -> List[Miss]:
     """High-estimate misses, each with its closest earlier request."""
-    prefixes = PrefixSources(records, merged or {}, require_storable)
+    prefixes = PrefixSources(records, merged or {}, require_storable, by_text=texts is not None)
     misses = []
     for record, hit in iter_hits(records, HIGH, require_storable, merged):
         if hit is None:
-            closest, matched = prefixes.closest(record)
+            closest, matched = prefixes.closest(record, texts)
             misses.append(Miss(record, closest, matched))
     return misses
 
@@ -406,6 +524,7 @@ def health(records: List[Record], skipped: Optional[Dict[str, int]] = None) -> D
 def summarize(
     records: List[Record], require_storable: bool = True, top: int = DEFAULT_TOP_MISSES,
     merged: Optional[Dict[str, float]] = None, skipped: Optional[Dict[str, int]] = None,
+    texts: Optional[StoredText] = None,
 ) -> Dict[str, Any]:
     presubmit = [r for r in records if r.kind == PRESUBMIT]
     total_tokens = sum(r.prompt_tokens for r in presubmit)
@@ -430,7 +549,7 @@ def summarize(
             "saved_model_ms": sum(h.request.latency_ms for h in hits),
             "cross_project_hit_percent": percent(sum(h.request.prompt_tokens for h in cross), hit_tokens),
         }
-    misses = sorted(find_misses(records, require_storable, merged), key=lambda m: m.request.prompt_tokens, reverse=True)
+    misses = sorted(find_misses(records, require_storable, merged, texts), key=lambda m: m.request.prompt_tokens, reverse=True)
     by_role: Dict[str, int] = {}
     for miss in misses:
         by_role[miss.first_difference_role] = by_role.get(miss.first_difference_role, 0) + miss.request.prompt_tokens
@@ -493,13 +612,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("logs", nargs="+", help="JSONL files written by replay_proxy.py")
     parser.add_argument("--merged", help="JSON file mapping a pull request number to its merge time (epoch seconds)")
+    parser.add_argument("--store", help="the copied-out REPLAY_STORE_DIR, to rank requests sharing a prefix by text")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP_MISSES, help="misses to list")
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.add_argument("--ignore-storable", action="store_true", help="count sightings replay would not have saved")
     args = parser.parse_args(argv)
+    if args.store and not os.path.isdir(os.path.join(args.store, request_store.REQUESTS_DIR)):
+        parser.error(f"--store {args.store} has no {request_store.REQUESTS_DIR}/ directory")
     records, skipped = load(args.logs)
     report = summarize(
-        records, require_storable=not args.ignore_storable, top=args.top, merged=load_merged(args.merged), skipped=skipped
+        records, require_storable=not args.ignore_storable, top=args.top, merged=load_merged(args.merged), skipped=skipped,
+        texts=StoredText(args.store) if args.store else None,
     )
     if args.json:
         report["skipped_lines"] = skipped
