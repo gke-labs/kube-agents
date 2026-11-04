@@ -167,7 +167,7 @@ const (
 )
 
 var discoveryPaths = sets.New(
-	"/api", "/apis", "/version", "/openapi/v2", "/openapi/v3", "/healthz", "/livez", "/readyz",
+	"/api", "/apis", "/version", "/openapi/v2", "/openapi/v3", "/healthz", "/livez", "/readyz", "/metrics",
 )
 
 var readVerbs = sets.New(verbGet, verbList, verbWatch)
