@@ -21,8 +21,9 @@ const (
 	testCallerToken   = "caller-token"
 	shellUsername     = "system:serviceaccount:agents:shell"
 	tokenReviewPath   = "/apis/authentication.k8s.io/v1/tokenreviews"
-	// The Basic credentials are fake. basicAuthHeader encodes them at run time, so the tree
-	// holds no base64 literal that secret scanners read as a credential.
+	// The Basic credentials are fake. This package's tests build their Basic headers at run
+	// time with basicAuthHeader, so no literal in this package reads as a credential to a
+	// secret scanner.
 	placeholderBasicUser = "placeholder-user"
 	placeholderBasicPass = "placeholder-pass"
 )
