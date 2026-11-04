@@ -161,9 +161,8 @@ CRD unchanged. `make install` in `k8s-operator/` applies them the same way.
 **This is an emergency stop, not a tuning knob.** It exists for the case where events arrive faster
 than the agent can triage them — a fleet-wide rollout gone wrong, a node pool flapping — and the
 cheapest way to get the agent back is to cut the inflow rather than chase the cards it has already
-been handed. It is all-or-nothing across every watched cluster: the watcher's reason and namespace
-filters live in the sidecar's entrypoint and are not exposed on the CRD, so there is no way to
-silence one noisy namespace through this field.
+been handed. It is all-or-nothing across every watched cluster. To silence one noisy namespace,
+cluster, reason or workload while the rest still alerts, use `alertExclude` below.
 
 If the board is merely busy rather than swamped, [`tuning.maxInProgress`](#specharnesstuning) is the
 knob for that — it throttles how many cards run at once without losing the events.
@@ -186,6 +185,38 @@ Three consequences before you press it:
 Unset means enabled. The watcher is how a fleet notices its own incidents, so an install that never
 mentions the field — which is every install today — keeps watching, and only an explicit `false`
 turns it off.
+
+`alertExclude` is the narrow tool: a list of rules for events that open no incident — no alert, no
+triage card, no share of the daily alert ceiling. Their clusters stay in scope, so the agent still
+reads them when asked; [`spec.scope.exclude`](#specscope) is what hides a cluster. Each rule sets one
+or more of `cluster`, `namespace`, `reason`, `kind` and `name`, and matches an event when every part
+it sets matches. `reason` also matches the family the watcher groups a reason in, so
+`CrashLoopBackOff` covers kubelet's `BackOff` events for a restarting container. `name` takes a
+trailing `*` as a prefix, since pod names carry generated suffixes.
+
+```yaml
+spec:
+  harness:
+    eventWatcher:
+      alertExclude:
+        - namespace: payments # every alert from this namespace, on every cluster
+        - cluster: { clusterName: staging-a } # every alert from this cluster
+        - reason: FailedScheduling
+          cluster:
+            projectId: my-project
+            location: us-central1
+            clusterName: batch
+        - namespace: shop
+          kind: Pod
+          name: inventory-api-*
+```
+
+A change rolls the pod, as `enabled` does. What the rules hold back is counted in the watcher's
+`k8s_event_watcher_events_filtered_total{gate="alert_excluded"}`, not in the end-of-day report. While
+the list is set, it replaces a `WATCHER_ALERT_EXCLUDE` entry in `spec.deployment.env`. The chart
+renders the list from `platformAgent.harness.eventWatcher.alertExclude`; a `helm upgrade` that
+removes the last rule removes the whole `eventWatcher` block from the CR, `enabled: false` with it,
+so set the emergency stop again after one.
 
 ### `spec.harness.driftDetector`
 
