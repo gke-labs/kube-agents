@@ -1009,7 +1009,8 @@ platformAgent:
     # A change rolls the gateway pod. See spec.harness.eventWatcher in the
     # PlatformAgent CRD reference. Removing the last rule through helm upgrade
     # removes the CR's whole eventWatcher block, so an enabled: false set there
-    # with kubectl patch is lost too; set it again afterwards.
+    # with kubectl patch is lost too; set it again afterwards. The watcher's
+    # tuning settings are under platformAgent.deployment.eventWatcher.
     eventWatcher:
       alertExclude: []
         # - namespace: payments
@@ -1249,6 +1250,7 @@ platformAgent:
     # each setting does. A duration that the watcher cannot read keeps its
     # default, and the container log names it. A change rolls the agent pod
     # and the credential-proxy pod, which also gets spec.deployment.env.
+    # Alert excludes are under platformAgent.harness.eventWatcher.alertExclude.
     eventWatcher: {}
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
