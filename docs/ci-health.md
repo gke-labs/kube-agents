@@ -247,13 +247,15 @@ each (`tiers.FORGE_TIERS`): the GitLab lane (`pull-kube-agents-smoke-test-gitlab
 forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones) against a pool project's
 GitLab repository, with its nightlies `ci-kube-agents-eval-nightly-gitlab` and `ci-kube-agents-eval-nightly-gitlab-next`
 running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
-`pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with its next-mode
-nightly (`ci-kube-agents-eval-nightly-ghes-next`, `ci-kube-agents-eval-nightly-gitlab-ce-next`). Each lane is listed in
-its own section of the Brief, its pull-request runs and then each nightly's nights, with its own counts and links, and in
-no gate number or case history. The daily digest carries one line on them (`forge_lane.digest_line`): last night's
-result per forge nightly, green, red or none last night; a lane with a reason (`forge_lane.LANES`' `off`) as off, with
-the reason, whatever its nights; and a nightly with no night on record.
-Nothing alerts on a forge night. Each job is read from
+`pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with a next-mode
+weekly job (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`). The GitLab lane has a
+section of the Brief, its pull-request runs and then each nightly's nights; the GHES and GitLab CE lanes share one
+"Self-managed lanes" section, a table of their pull-request runs and one of their weekly runs, each row naming its forge.
+All carry their own counts and links, and none is in a gate number or case history. The daily digest carries one line on
+them (`forge_lane.digest_line`): the last night's or week's result per scheduled job, by the lane's cadence, green, red
+or none in that time; a lane with a reason (`forge_lane.LANES`' `off`) as off, with the reason, whatever its runs; and a
+job with no run on record.
+Nothing alerts on a forge run. Each job is read from
 its own log prefix above its own watermark. The GHES and GitLab CE sources are wired for the jobs those lanes run
 (`GoogleCloudPlatform/oss-test-infra` adds them); a source lists nothing, as a note, until its job has run.
 

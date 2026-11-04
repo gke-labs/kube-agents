@@ -41,6 +41,9 @@ const PAGE = {
   inlineBrief: "inline-brief",
   inlineHealth: "inline-health",
   refreshMs: 60000,
+  // Rows a section of several forges lists per table (forge_lane.py caps
+  // each lane at RUNS_LISTED; this caps their merge at one lane's worth).
+  laneRowsListed: 20,
   // The ci-health workflow's cron: how old the inlined copy can be at most.
   republishMinutes: 15,
   tz: "America/Toronto",
@@ -1022,7 +1025,7 @@ function releasesHtml() {
 // is the only place they show. Each row links the build where it lives (log_url for a night,
 // gcs_base for a run that records it), else Spyglass under the lane's own job name.
 const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
-function laneRow(run) {
+function laneRow(run, withForge) {
   const url = laneBuildUrl(run);
   const build = url ? `<a href="${esc(url)}" rel="noopener">${esc(run.build)}</a>` : esc(run.build);
   const pr = run.pr == null ? "—" : `<a href="${PAGE.prUrl}/${enc(run.pr)}" rel="noopener">#${esc(run.pr)}</a>`;
@@ -1030,9 +1033,9 @@ function laneRow(run) {
   const cases = `${t.pass || 0} passed · ${t.fail || 0} failed${t.infra ? ` · ${t.infra} infra` : ""}`;
   const verdict = run.eval_verdict ? esc(run.eval_verdict) : `<span class="mut">no eval banner</span>`;
   const when = run.started ? et(parseIso(run.started)) : "—";
-  return `<tr><td>${build}</td><td>${pr}</td><td><span class="${run.green ? "p-pass" : "p-fail"}">${esc(run.result || "unknown")}</span></td><td>${verdict}</td><td>${esc(cases)}</td><td class="mut">${esc(when)}</td><td class="mut">${run.duration_s != null ? esc(minutesText(run.duration_s * 1000)) : "—"}</td></tr>`;
+  return `<tr>${withForge ? `<td>${esc(run.forge || "")}</td>` : ""}<td>${build}</td><td>${pr}</td><td><span class="${run.green ? "p-pass" : "p-fail"}">${esc(run.result || "unknown")}</span></td><td>${verdict}</td><td>${esc(cases)}</td><td class="mut">${esc(when)}</td><td class="mut">${run.duration_s != null ? esc(minutesText(run.duration_s * 1000)) : "—"}</td></tr>`;
 }
-const laneTable = (rows) => `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${rows.map(laneRow).join("")}</tbody></table>`;
+const laneTable = (rows, withForge) => `<table class="rel"><thead><tr>${withForge ? "<th>Forge</th>" : ""}<th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${rows.map((r) => laneRow(r, withForge)).join("")}</tbody></table>`;
 const laneRows = (list) => (Array.isArray(list) ? list.filter((r) => r && typeof r === "object" && r.build != null) : []);
 function laneHtml(lane) {
   const tier = String(lane.tier || "");
@@ -1065,9 +1068,49 @@ function laneHtml(lane) {
   }
   return `<div class="sec" id="${esc(tier)}"><h2>${esc(title)}</h2>${body}${nightsHtml}</div>`;
 }
+// A section of several forges (the self-managed ones): one table of their
+// pull-request runs and one of their scheduled runs, newest first, each row
+// naming its forge, so a red row says which forge broke.
+const forgeName = (lane) => String(lane.title || lane.tier || "").replace(/ lane$/, "");
+const startedMs = (run) => (run.started ? parseIso(run.started) : 0) || 0;
+function forgeSectionHtml(section, lanes) {
+  const title = lanes[0].section_title || section;
+  const tagged = (pick) => lanes.flatMap((l) => pick(l).map((r) => ({ ...r, forge: forgeName(l) }))).sort((a, b) => startedMs(b) - startedMs(a));
+  const runs = tagged((l) => laneRows(l.runs));
+  const inFlight = lanes.reduce((n, l) => n + (Array.isArray(l.running) ? l.running.length : 0), 0);
+  const flight = inFlight ? `<p class="mut small">${plural(inFlight, "build")} in flight, not yet recorded.</p>` : "";
+  const tally = (key, rows) => lanes.map((l) => {
+    const c = l[key] || {};
+    return `${esc(forgeName(l))} ${plural(c.on_record || 0, rows)}, ${c.green || 0} green`;
+  }).join("; ");
+  let body;
+  if (!runs.length) {
+    const tests = lanes.map((l) => `<code>/test ${esc(l.job || "")}</code>`).join(" or ");
+    body = `<p class="mut">No run on record. Each forge's pull-request job runs on demand (${tests}); its runs are listed here and counted nowhere else.</p>${flight}`;
+  } else {
+    body = `<p class="mut small">${tally("counts", "run")}. These runs sit outside the gate's numbers above.</p>${laneTable(runs.slice(0, PAGE.laneRowsListed), true)}${flight}`;
+  }
+  const scheduled = tagged((l) => (Array.isArray(l.nightly_jobs) ? l.nightly_jobs : []).flatMap((j) => laneRows(j && j.nights)));
+  const cadence = lanes[0].cadence === "weekly" ? "week" : "night";
+  let schedHtml;
+  if (!scheduled.length) {
+    const names = lanes.flatMap((l) => (Array.isArray(l.nightly_jobs) ? l.nightly_jobs : []).map((j) => j && j.job).filter(Boolean)).map((j) => `<code>${esc(j)}</code>`).join(" and ");
+    schedHtml = `<p class="mut small">No scheduled run on record.${names ? ` ${names} run the same list once a ${cadence}.` : ""}</p>`;
+  } else {
+    schedHtml = `<h3>Scheduled runs</h3><p class="mut small">${tally("night_counts", "run")}.</p>${laneTable(scheduled.slice(0, PAGE.laneRowsListed), true)}`;
+  }
+  return `<div class="sec" id="${esc(section)}"><h2>${esc(title)}</h2>${body}${schedHtml}</div>`;
+}
 function lanesHtml() {
   const lanes = Array.isArray(brief.lanes) ? brief.lanes.filter((l) => l && typeof l === "object" && l.tier) : [];
-  return lanes.map(laneHtml).join("");
+  const sections = [];
+  for (const lane of lanes) {
+    const key = String(lane.section || lane.tier);
+    const found = sections.find((s) => s.key === key);
+    if (found) found.lanes.push(lane);
+    else sections.push({ key, lanes: [lane] });
+  }
+  return sections.map((s) => (s.lanes.length > 1 ? forgeSectionHtml(s.key, s.lanes) : laneHtml(s.lanes[0]))).join("");
 }
 
 function briefHtml(link) {

@@ -6,6 +6,7 @@ import datetime
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from eval_dashboard import forge_lane, tiers  # noqa: E402
@@ -81,6 +82,10 @@ class LaneDocumentTest(unittest.TestCase):
         ], "pending_builds": [{"build_id": "400", "first_seen": "2026-10-07T16:00:00+00:00", "tier": "ghes"}]}
         lanes = forge_lane.lanes_document(data)
         self.assertEqual([(l["tier"], l["title"]) for l in lanes], [("gitlab", "GitLab lane"), ("ghes", "GHES lane"), ("gitlab-ce", "GitLab CE lane")])
+        # The self-managed forges share one Brief section and run weekly; the GitLab lane is its own, nightly.
+        self.assertEqual([(l["section"], l["section_title"], l["cadence"]) for l in lanes], [
+            ("gitlab", "GitLab lane", "nightly"), ("self-managed", "Self-managed lanes", "weekly"), ("self-managed", "Self-managed lanes", "weekly"),
+        ])
         self.assertEqual([[r["build"] for r in l["runs"]] for l in lanes], [["100"], ["200"], ["300"]])
         self.assertEqual([[e["build"] for e in l["running"]] for l in lanes], [[], ["400"], []])
         self.assertEqual(lanes[2]["counts"], {"on_record": 1, "green": 0, "red": 1})
@@ -88,8 +93,8 @@ class LaneDocumentTest(unittest.TestCase):
         empty = forge_lane.lanes_document({"runs": []})
         self.assertEqual([(l["job"], [j["job"] for j in l["nightly_jobs"]]) for l in empty], [
             ("pull-kube-agents-smoke-test-gitlab", ["ci-kube-agents-eval-nightly-gitlab", "ci-kube-agents-eval-nightly-gitlab-next"]),
-            ("pull-kube-agents-smoke-test-ghes", ["ci-kube-agents-eval-nightly-ghes-next"]),
-            ("pull-kube-agents-smoke-test-gitlab-ce", ["ci-kube-agents-eval-nightly-gitlab-ce-next"]),
+            ("pull-kube-agents-smoke-test-ghes", ["ci-kube-agents-eval-weekly-ghes-next"]),
+            ("pull-kube-agents-smoke-test-gitlab-ce", ["ci-kube-agents-eval-weekly-gitlab-ce-next"]),
         ])
 
     def test_a_lanes_nights_are_grouped_by_job_the_tables_first(self):
@@ -110,24 +115,26 @@ class LaneDocumentTest(unittest.TestCase):
 
     def test_the_digest_line_says_last_nights_result_or_that_a_lane_is_off(self):
         now = datetime.datetime(2026, 11, 3, 15, 0, tzinfo=datetime.timezone.utc)
-        off = "off (removed from Prow until the Vertex quota is fixed, GoogleCloudPlatform/oss-test-infra#2766)"
+        off = "off (not in Prow yet; the weekly jobs wait on the Vertex quota)"
         data = {"runs": [
             dict(run("10", job="ci-kube-agents-eval-nightly-gitlab", pr=None), started="2026-11-03T06:30:00+00:00"),
             dict(run("11", job="ci-kube-agents-eval-nightly-gitlab-next", pr=None, result="FAILURE"), started="2026-11-03T08:30:00+00:00"),
         ]}
         self.assertEqual(
             forge_lane.digest_line(data, now),
-            f"🦊 Forge nightlies: GitLab today green · GitLab next red · GHES next, GitLab CE next {off}",
+            f"🦊 Forge lanes: GitLab today green · GitLab next red · GHES weekly, GitLab CE weekly {off}",
         )
         self.assertIsNone(forge_lane.digest_line(None, now))
-        # A lane with a reason reads as off even with a red night last night, so a
-        # turned-off job never reads as red or missed.
+        # A lane with a reason reads as off even with a red run, and only its table's jobs are named:
+        # the one night each of the retired nightlies (still in data.json) does not join the line.
         red_off = {"runs": [
-            dict(run("12", tier="ghes", job="ci-kube-agents-eval-nightly-ghes-next", pr=None, result="FAILURE"), started="2026-11-03T10:00:00+00:00"),
+            dict(run("12", tier="ghes", job="ci-kube-agents-eval-weekly-ghes-next", pr=None, result="FAILURE"), started="2026-11-03T10:00:00+00:00"),
+            dict(run("13", tier="ghes", job="ci-kube-agents-eval-nightly-ghes-next", pr=None, result="FAILURE"), started="2026-11-03T05:00:00+00:00"),
         ]}
         line = forge_lane.digest_line(red_off, now)
-        self.assertIn(f"GHES next, GitLab CE next {off}", line)
-        self.assertNotIn("GHES next red", line)
+        self.assertIn(f"GHES weekly, GitLab CE weekly {off}", line)
+        self.assertNotIn("red", line.split("·")[-1])
+        self.assertNotIn("nightly-ghes-next", line)
         # Without a reason, an old night reads as missing last night and a night
         # with no recorded result as neither green nor red.
         old = {"runs": [
@@ -137,6 +144,12 @@ class LaneDocumentTest(unittest.TestCase):
         line = forge_lane.digest_line(old, now)
         self.assertIn("GitLab today no night last night", line)
         self.assertIn("GitLab next no result", line)
+        # A weekly lane once on: a run six days old is last week's, nine days is none last week.
+        with mock.patch.dict(forge_lane.LANES[tiers.TIER_GHES], {"off": None}):
+            weekly = {"runs": [dict(run("40", tier="ghes", job="ci-kube-agents-eval-weekly-ghes-next", pr=None), started="2026-10-28T10:00:00+00:00")]}
+            self.assertIn("GHES weekly green", forge_lane.digest_line(weekly, now))
+            weekly["runs"][0]["started"] = "2026-10-25T10:00:00+00:00"
+            self.assertIn("GHES weekly no run last week", forge_lane.digest_line(weekly, now))
         # A job outside the lane's table is named, so it never reads like the table's job of its mode.
         extra = {"runs": [
             dict(run("30", job="ci-kube-agents-eval-nightly-gitlab", pr=None), started="2026-11-03T06:30:00+00:00"),

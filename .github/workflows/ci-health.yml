@@ -244,14 +244,14 @@ env:
   # Its next-mode nightly, listed beside it under its own job; the job sets no
   # gcs_configuration, so it logs to Prow's bucket.
   GITLAB_NIGHTLY_NEXT_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/
-  # The self-managed forge lanes (kube-agents#3682), a tier and a Brief
-  # section each: their presubmits log to the lanes' own bucket, their
-  # next-mode nightlies to Prow's. Until a job has run, its listing holds
-  # nothing, which collect.py notes and does not refuse on.
+  # The self-managed forge lanes (kube-agents#3682), a tier each and one
+  # Brief section together: their presubmits log to the lanes' own bucket,
+  # their next-mode weekly jobs to Prow's. Until a job has run, its listing
+  # holds nothing, which collect.py notes and does not refuse on.
   GHES_PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/*
-  GHES_NIGHTLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-ghes-next/
+  GHES_WEEKLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/
   GITLAB_CE_PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*
-  GITLAB_CE_NIGHTLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-ce-next/
+  GITLAB_CE_WEEKLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
@@ -400,9 +400,9 @@ jobs:
             --gitlab-nightly-prefix "$GITLAB_NIGHTLY_PREFIX" \
             --lane-nightly-prefix "gitlab=$GITLAB_NIGHTLY_NEXT_PREFIX" \
             --lane-pr-glob "ghes=$GHES_PR_GLOB" \
-            --lane-nightly-prefix "ghes=$GHES_NIGHTLY_PREFIX" \
+            --lane-nightly-prefix "ghes=$GHES_WEEKLY_PREFIX" \
             --lane-pr-glob "gitlab-ce=$GITLAB_CE_PR_GLOB" \
-            --lane-nightly-prefix "gitlab-ce=$GITLAB_CE_NIGHTLY_PREFIX" \
+            --lane-nightly-prefix "gitlab-ce=$GITLAB_CE_WEEKLY_PREFIX" \
             --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \

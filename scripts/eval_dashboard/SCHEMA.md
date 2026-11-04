@@ -74,7 +74,7 @@ main-b periodic, `ci-kube-agents-eval-nightly-main-b`, whose runs are
 `nightly` runs too, told apart by `job`) and the forge lanes: the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, a
 pull-request build against a GitLab repository, with its today and next nightlies) and the self-managed
 GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`,
-each with a next-mode nightly). All archive the same
+each with a next-mode weekly job). All archive the same
 layout and are collected from the moment they start running.
 
 - `build_id` — the Prow build directory name, as a **string** (the ids
@@ -88,7 +88,7 @@ layout and are collected from the moment they start running.
   outside these is no tier and counts nowhere: a run tagged some new
   way is never the gate's by default. A forge lane's run is that lane's
   (`--gitlab-pr-glob`, `--lane-pr-glob` and the nightly prefixes): listed in
-  `brief.json`'s `lanes` block and the Brief's section for that lane,
+  `brief.json`'s `lanes` block and the Brief's section for that lane's forge,
   in no case history and no gate number. Every gate verdict — the
   health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
   mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
@@ -1101,11 +1101,15 @@ each `{build, first_seen, log_url}` — a night in flight, which the Brief's
 block, the report page and the digest say instead of "no night".
 
 `lanes` is one document per forge lane, in `tiers.FORGE_TIERS` order, from
-`forge_lane.py`; each is `{tier, title, job, runs[], running[],
-counts{on_record, green, red}, nightly_jobs[], nightly_job, nights[],
-night_counts{...}}`. What follows says it of the GitLab lane; the GHES and
-GitLab CE lanes are the same under their own tier and jobs
-(`forge_lane.LANES`). `runs[]` is the
+`forge_lane.py`; each is `{tier, title, section, section_title, cadence, job,
+runs[], running[], counts{on_record, green, red}, nightly_jobs[], nightly_job,
+nights[], night_counts{...}}`. `section` groups lanes on the Brief (`gitlab`;
+`self-managed` for GHES and GitLab CE, which render as one section whose
+tables name each row's forge), `section_title` titles it, and `cadence`
+(`nightly` or `weekly`) is how often the lane's scheduled jobs run; the
+`nightly_*` and `nights` keys hold a weekly lane's scheduled runs too. What
+follows says it of the GitLab lane; the GHES and GitLab CE lanes are the
+same under their own tier and jobs (`forge_lane.LANES`). `runs[]` is the
 lane's pull-request runs (`runs[].tier == "gitlab"` with a `pr`) **newest
 first**, the last `RUNS_LISTED` (20), each `{build, job, pr, head_sha,
 project, log_url, gcs_base, started, finished, duration_s, result, eval_verdict, green,
@@ -1123,9 +1127,10 @@ name the newest lane pull-request run carries, else the default.
 `nightly_jobs[]` is one `{job, nights[], night_counts}` per nightly, the
 lane table's jobs first (each listed with no night yet) and then any other
 job the lane's nights name; `nights[]` and `night_counts` above are over
-all of them together. Each lane's section on the Brief is its document;
+all of them together. The Brief's sections are built from these documents;
 the daily digest's one forge line (`forge_lane.digest_line`) reads the same
-document for each nightly's last result. The lanes' runs are in no gate
+documents for each scheduled job's last result, over a night or a week by
+the lane's cadence. The lanes' runs are in no gate
 number, no case history and no digest count.
 
 `trend` is `null` in the published `brief.json` (every page polls that

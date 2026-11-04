@@ -39,30 +39,47 @@ RUNNING_MAX_AGE = datetime.timedelta(hours=8)
 DEFAULT_JOB = "pull-kube-agents-smoke-test-gitlab"
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 RESULT_SUCCESS = "SUCCESS"
-# Why a lane's nightlies are off: the digest says it in place of their
-# nights, so a turned-off job never reads as red or missed. Drop it when
-# the jobs are back.
-FORGE_NIGHTLIES_OFF = "removed from Prow until the Vertex quota is fixed, GoogleCloudPlatform/oss-test-infra#2766"
-# Each forge lane as the Brief titles it, with its jobs: the pull-request
-# job, and the nightlies in the order the section lists them. A job the
-# lane's runs name and this table does not is listed after these.
+# Why a lane's scheduled jobs are off: the digest says it in place of their
+# runs, so a turned-off job never reads as red or missed. Drop it when the
+# jobs are in Prow.
+FORGE_WEEKLY_OFF = "not in Prow yet; the weekly jobs wait on the Vertex quota"
+CADENCE_NIGHTLY = "nightly"
+CADENCE_WEEKLY = "weekly"
+# How old a scheduled job's newest run may be and still be "last" night's or
+# week's: a weekly job's week plus a day of slack for a late start.
+WEEKLY_MAX_AGE = datetime.timedelta(days=8)
+# The Brief's sections: the GitLab lane alone, and the self-managed forges
+# together, one row per run with its forge named.
+SECTION_GITLAB = "gitlab"
+SECTION_SELF_MANAGED = "self-managed"
+SECTION_TITLES = {SECTION_GITLAB: "GitLab lane", SECTION_SELF_MANAGED: "Self-managed lanes"}
+# Each forge lane as the Brief names it, with its section, the cadence of its
+# scheduled jobs, and its jobs: the pull-request job, and the scheduled jobs
+# in the order the section lists them. A job the lane's runs name and this
+# table does not is listed after these.
 LANES = {
     tiers.TIER_GITLAB: {
         "title": "GitLab lane",
+        "section": SECTION_GITLAB,
+        "cadence": CADENCE_NIGHTLY,
         "job": DEFAULT_JOB,
         "nightly_jobs": (DEFAULT_NIGHTLY_JOB, "ci-kube-agents-eval-nightly-gitlab-next"),
     },
     tiers.TIER_GHES: {
         "title": "GHES lane",
+        "section": SECTION_SELF_MANAGED,
+        "cadence": CADENCE_WEEKLY,
         "job": "pull-kube-agents-smoke-test-ghes",
-        "nightly_jobs": ("ci-kube-agents-eval-nightly-ghes-next",),
-        "off": FORGE_NIGHTLIES_OFF,
+        "nightly_jobs": ("ci-kube-agents-eval-weekly-ghes-next",),
+        "off": FORGE_WEEKLY_OFF,
     },
     tiers.TIER_GITLAB_CE: {
         "title": "GitLab CE lane",
+        "section": SECTION_SELF_MANAGED,
+        "cadence": CADENCE_WEEKLY,
         "job": "pull-kube-agents-smoke-test-gitlab-ce",
-        "nightly_jobs": ("ci-kube-agents-eval-nightly-gitlab-ce-next",),
-        "off": FORGE_NIGHTLIES_OFF,
+        "nightly_jobs": ("ci-kube-agents-eval-weekly-gitlab-ce-next",),
+        "off": FORGE_WEEKLY_OFF,
     },
 }
 # The digest line on the forge lanes' nightlies (digest_line).
@@ -179,6 +196,9 @@ def lane_document(data: dict, tier: str, now: datetime.datetime | None = None) -
     return {
         "tier": tier,
         "title": LANES[tier]["title"],
+        "section": LANES[tier]["section"],
+        "section_title": SECTION_TITLES[LANES[tier]["section"]],
+        "cadence": LANES[tier]["cadence"],
         "job": lane_job(data, tier=tier),
         "runs": [lane_run(r) for r in runs[:RUNS_LISTED]],
         "running": running(data, now, tier),
@@ -208,29 +228,37 @@ def _night_label(lane: dict, job: str) -> str:
     noun = lane["title"].removesuffix(" lane")
     if job not in lane["nightly_jobs"]:
         return f"{noun} {job}"
+    if lane["cadence"] == CADENCE_WEEKLY:
+        return f"{noun} weekly"
     return f"{noun} {'next' if job.endswith(NEXT_JOB_SUFFIX) else 'today'}"
 
 
 def digest_line(data: dict | None, now: datetime.datetime) -> str | None:
-    """One line for the daily digest on every forge lane's nightlies: last
-    night's result per nightly job (green, red, or none last night); a lane
-    with a reason (LANES' ``off``) as off, with it, whatever its nights; and
-    a job with no night on record. None without data."""
+    """One line for the daily digest on every forge lane's scheduled jobs:
+    the last night's or week's result per job, by the lane's cadence (green,
+    red, or none in that time); a lane with a reason (LANES' ``off``) as off,
+    with it, its table's jobs only, whatever their runs; and a job with no
+    run on record. None without data."""
     if not data:
         return None
     parts: list[str] = []
     waiting: dict[str, list[str]] = {}
     for lane_doc in lanes_document(data, now):
         lane = LANES[lane_doc["tier"]]
+        weekly = lane["cadence"] == CADENCE_WEEKLY
         for entry in lane_doc["nightly_jobs"]:
             label = _night_label(lane, entry["job"])
             nights = entry["nights"]
-            if lane.get("off") or not nights:
-                waiting.setdefault(lane.get("off") or "", []).append(label)
+            if lane.get("off"):
+                if entry["job"] in lane["nightly_jobs"]:
+                    waiting.setdefault(lane["off"], []).append(label)
+                continue
+            if not nights:
+                waiting.setdefault("", []).append(label)
                 continue
             started = parse_iso(nights[0].get("started"))
-            if started is None or now - started > nightly.LAST_NIGHT_MAX_AGE:
-                parts.append(f"{label} no night last night")
+            if started is None or now - started > (WEEKLY_MAX_AGE if weekly else nightly.LAST_NIGHT_MAX_AGE):
+                parts.append(f"{label} {'no run last week' if weekly else 'no night last night'}")
             else:
                 # A night with no recorded result is neither, as in _counts.
                 newest = nights[0]
@@ -238,5 +266,5 @@ def digest_line(data: dict | None, now: datetime.datetime) -> str | None:
     for reason, labels in waiting.items():
         # A job without a reason has run before, its nights just outside
         # what data.json holds.
-        parts.append(f"{', '.join(labels)} off ({reason})" if reason else f"{', '.join(labels)} no night on record")
-    return f"{DIGEST_GLYPH} Forge nightlies: " + nightly.SEP.join(parts)
+        parts.append(f"{', '.join(labels)} off ({reason})" if reason else f"{', '.join(labels)} no run on record")
+    return f"{DIGEST_GLYPH} Forge lanes: " + nightly.SEP.join(parts)

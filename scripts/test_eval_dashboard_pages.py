@@ -946,27 +946,38 @@ class BrowserTest(unittest.TestCase):
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
         self.assertIn("1 run on record: 0 green, 1 not", page, "the night is not among the lane's pull-request runs")
 
-    def test_each_forge_lane_has_a_section_and_each_nightly_its_table(self):
-        """The GHES and GitLab CE lanes (kube-agents#3682) get a section each
-        beside the GitLab one, saying how each is run until it has a run; a
-        lane's nights are listed per nightly job."""
+    def test_the_self_managed_forges_share_a_section_each_row_naming_its_forge(self):
+        """The GHES and GitLab CE lanes (kube-agents#3682) share one
+        "Self-managed lanes" section beside the GitLab one, saying how each is
+        run until one has a run; their rows name their forge, so a red says
+        which broke. The GitLab lane's nights are listed per nightly job."""
         app = dom_text(self.index)
-        for title, noun, job in (("GHES lane", "GHES", "pull-kube-agents-smoke-test-ghes"), ("GitLab CE lane", "GitLab CE", "pull-kube-agents-smoke-test-gitlab-ce")):
-            self.assertIn(title, app)
-            self.assertIn(f"No {noun} run on record", app)
+        self.assertIn("Self-managed lanes", app)
+        self.assertNotIn(">GHES lane<", app)
+        self.assertIn("No run on record", app)
+        for job in ("pull-kube-agents-smoke-test-ghes", "pull-kube-agents-smoke-test-gitlab-ce"):
             self.assertIn(f"/test {job}", app)
+        self.assertIn("No scheduled run on record", app)
+        self.assertIn("once a week", app)
         data = copy.deepcopy(self.data)
         base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
         lane_base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800/"
         data["runs"] += [
             dict(base, build_id="2097282860221206800", tier="gitlab-ce", job="pull-kube-agents-smoke-test-gitlab-ce", pr=4480, result="SUCCESS", eval_verdict="GREEN", gcs_base=lane_base),
+            dict(base, build_id="2097282860221206802", tier="ghes", job="ci-kube-agents-eval-weekly-ghes-next", pr=None, result="FAILURE", eval_verdict="RED", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"),
             dict(base, build_id="2097282860221206801", tier="gitlab", job="ci-kube-agents-eval-nightly-gitlab-next", pr=None, result="FAILURE", eval_verdict="RED", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"),
         ]
         out = render_to(pathlib.Path(self.tmp.name) / "lanes", data, health=health_doc())
         page = dom_text(out / "index.html")
         self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800"', page)
-        self.assertIn("No GHES run on record", page, "the GitLab CE run is not the GHES lane's")
-        self.assertNotIn('href="run.html#build=2097282860221206800"', page, "nor the gate's")
+        self.assertNotIn('href="run.html#build=2097282860221206800"', page, "not the gate's")
+        # One table each for the pull-request and the scheduled runs, each row naming its forge.
+        self.assertIn("<th>Forge</th>", page)
+        self.assertIn("<td>GitLab CE</td>", page)
+        self.assertIn("<td>GHES</td>", page)
+        self.assertIn("Scheduled runs", page)
+        self.assertIn("GHES 1 run, 0 green; GitLab CE 0 runs, 0 green", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"', page)
         # The GitLab lane's next nightly is a table of its own; its today nightly says it has no night yet.
         self.assertIn("1 night on record: 0 green, 1 not", page)
         self.assertIn("No night of", page)

@@ -325,7 +325,7 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertEqual(argv.count("--gitlab-pr-glob"), 1)
 
     def test_the_forge_lanes_ride_as_lane_flags_in_order_until_disabled(self):
-        """The GHES and GitLab CE lanes and the GitLab next nightly reach
+        """The GHES and GitLab CE lanes (their weekly jobs) and the GitLab next nightly reach
         collect.py as repeated --lane-pr-glob / --lane-nightly-prefix values,
         in order and with their globs unexpanded; an empty knob drops them."""
         stubs = self.tmp / "stubs"
@@ -346,8 +346,8 @@ class RefreshScriptTest(unittest.TestCase):
             [argv[i + 1] for i, a in enumerate(argv) if a == "--lane-nightly-prefix"],
             [
                 "gitlab=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/",
-                "ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-ghes-next/",
-                "gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-ce-next/",
+                "ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/",
+                "gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/",
             ],
         )
         argv_log.unlink()

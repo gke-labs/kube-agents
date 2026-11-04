@@ -166,10 +166,11 @@ EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-
 EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/}"
 EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/}"
 EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/}"
-# The self-managed forge lanes (kube-agents#3682) and the GitLab lane's
-# next-mode nightly, as .github/workflows/ci-health.yml lists them.
+# The self-managed forge lanes (kube-agents#3682) with their weekly jobs,
+# and the GitLab lane's next-mode nightly, as .github/workflows/ci-health.yml
+# lists them.
 EVAL_DASHBOARD_LANE_PR_GLOBS="${EVAL_DASHBOARD_LANE_PR_GLOBS-ghes=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/* gitlab-ce=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*}"
-EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES="${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES-gitlab=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/ ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-ghes-next/ gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-ce-next/}"
+EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES="${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES-gitlab=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/ ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/ gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/}"
 # The release-candidate archive, which feeds the Brief's release-candidate table.
 # post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
 # rather than pr-logs/. Set to the empty string to leave the section on its

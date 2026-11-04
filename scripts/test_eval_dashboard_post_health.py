@@ -655,8 +655,8 @@ class Digest(RunHarness):
         ]}
         lines = [text for text in post_health.render_digest(health("GREEN"), T14, data).splitlines() if text.startswith("🦊")]
         self.assertEqual(lines, [
-            "🦊 Forge nightlies: GitLab today green · GitLab next red · GHES next, GitLab CE next off"
-            " (removed from Prow until the Vertex quota is fixed, GoogleCloudPlatform/oss-test-infra#2766)"
+            "🦊 Forge lanes: GitLab today green · GitLab next red · GHES weekly, GitLab CE weekly off"
+            " (not in Prow yet; the weekly jobs wait on the Vertex quota)"
         ])
         self.assertFalse([t for t in post_health.render_digest(health("GREEN"), T14).splitlines() if t.startswith("🦊")], "no data.json, no line")
 
@@ -690,8 +690,8 @@ class Digest(RunHarness):
             # the nightly-red issues, so the one line stands and says why
             # (test_eval_dashboard_nightly_digest.py covers the section).
             "🌙 Nightly section skipped: no GitHub token to read the nightly-red issues.\n"
-            "🦊 Forge nightlies: GitLab today, GitLab next no night on record · GHES next, GitLab CE next off"
-            " (removed from Prow until the Vertex quota is fixed, GoogleCloudPlatform/oss-test-infra#2766)\n"
+            "🦊 Forge lanes: GitLab today, GitLab next no run on record · GHES weekly, GitLab CE weekly off"
+            " (not in Prow yet; the weekly jobs wait on the Vertex quota)\n"
             f"{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
         self.assertEqual(post_health.NIGHTLY_URL, "https://storage.cloud.google.com/kube-agents-dashboards/evals/nightly.html")
