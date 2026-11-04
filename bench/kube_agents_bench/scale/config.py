@@ -1,0 +1,140 @@
+"""The measurement plan: target, factors, levels and operations, read from YAML.
+
+A phase is one plan file (``bench/scale/phase1.yaml``); a later phase is another
+file of the same shape, so repeating or extending the measurement changes data,
+not code. Every target value can be overridden from the environment, so the same
+plan runs against any project.
+"""
+
+from __future__ import annotations
+
+import itertools
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from kube_agents_bench.scale import kube
+
+BASE_FACTOR = "base"
+ENV_PREFIX = "SCALE_"
+TARGET_KEYS = (
+    "project_id",
+    "host_context",
+    "host_cluster",
+    "host_location",
+    "namespace",
+    "zone",
+    "cluster_prefix",
+    "cluster_label",
+    "mode",
+    "data_file",
+    "preflight",
+)
+REQUIRED_TARGET_KEYS = ("project_id", "host_cluster", "host_location", "namespace", "zone", "cluster_prefix", "cluster_label", "mode")
+
+DEFAULT_RUNS = 1
+
+
+@dataclass(frozen=True)
+class Operation:
+    name: str
+    kind: str
+    factors: tuple[str, ...]
+    runs: int = DEFAULT_RUNS
+    prompt: str = ""
+    follow_up: str = ""
+    window_seconds: int = 0
+    timeout_seconds: int = 0
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    factor: str
+    level: float
+    operation: Operation
+    run: int
+
+
+@dataclass
+class Plan:
+    phase: str
+    target: dict[str, str]
+    base: dict[str, float]
+    factors: dict[str, list[float]]
+    operations: list[Operation]
+    settings: dict[str, Any] = field(default_factory=dict)
+
+    def level_values(self, factor: str, level: float) -> dict[str, float]:
+        """Every factor's value at one point: the base, with ``factor`` set to ``level``."""
+        values = dict(self.base)
+        if factor != BASE_FACTOR:
+            values[factor] = level
+        return values
+
+    def matrix(self) -> list[RunSpec]:
+        """Every run the plan asks for, base first, in factor and level order.
+
+        The base point runs every operation once per configured run; each
+        factor's other levels run only the operations that list the factor.
+        """
+        specs: list[RunSpec] = []
+        for operation in self.operations:
+            for run in range(1, operation.runs + 1):
+                specs.append(RunSpec(BASE_FACTOR, 0, operation, run))
+        for factor, levels in self.factors.items():
+            for level, operation in itertools.product(levels, self.operations):
+                if level == self.base.get(factor) or factor not in operation.factors:
+                    continue
+                for run in range(1, operation.runs + 1):
+                    specs.append(RunSpec(factor, level, operation, run))
+        return specs
+
+
+def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target: bool = True) -> Plan:
+    environ = dict(os.environ) if environ is None else environ
+    raw = yaml.safe_load(path.read_text())
+    target = {key: str(value) for key, value in (raw.get("target") or {}).items()}
+    for key in TARGET_KEYS:
+        override = environ.get(ENV_PREFIX + key.upper())
+        if override:
+            target[key] = override
+    missing = [key for key in REQUIRED_TARGET_KEYS if not target.get(key)] if validate_target else []
+    if missing:
+        names = ", ".join(ENV_PREFIX + key.upper() for key in missing)
+        raise ValueError(f"{path}: target is missing {', '.join(missing)}; set {names}")
+    expected = ""
+    if validate_target:
+        expected = kube.context_name(target["project_id"], target["host_location"], target["host_cluster"])
+        target.setdefault("host_context", expected)
+    # The runner resets the install this context reaches; refuse any context but the host cluster's.
+    if validate_target and target["host_context"] != expected:
+        raise ValueError(f"{path}: host_context {target['host_context']!r} is not the host cluster's context "
+                         f"{expected!r}")
+    operations = [
+        Operation(
+            name=name,
+            kind=spec["kind"],
+            factors=tuple(spec.get("factors") or ()),
+            runs=int(spec.get("runs", DEFAULT_RUNS)),
+            prompt=spec.get("prompt", ""),
+            follow_up=spec.get("follow_up", ""),
+            window_seconds=int(spec.get("window_seconds", 0)),
+            timeout_seconds=int(spec.get("timeout_seconds", 0)),
+        )
+        for name, spec in (raw.get("operations") or {}).items()
+    ]
+    factors = {name: [float(level) for level in levels] for name, levels in raw["factors"].items()}
+    unknown = sorted({f for op in operations for f in op.factors} - set(factors))
+    if unknown:
+        raise ValueError(f"{path}: operations name unknown factors {unknown}")
+    return Plan(
+        phase=str(raw["phase"]),
+        target=target,
+        base={name: float(value) for name, value in raw["base"].items()},
+        factors=factors,
+        operations=operations,
+        settings=raw.get("settings") or {},
+    )

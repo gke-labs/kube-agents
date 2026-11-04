@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -238,6 +239,91 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 
 	if strings.Contains(exposition, "CallerSuppliedUnboundedResource42") {
 		t.Errorf("caller-supplied resource name leaked into Prometheus metrics:\n%s", exposition)
+	}
+}
+
+// TestMetricsOutcomesThatAreNotTheUpstreams checks the 5xx answers the upstream did not cause:
+// each keeps its own outcome rather than counting as upstream_error, and a Secret response
+// replaced with a 502 is not counted as scrubbed.
+func TestMetricsOutcomesThatAreNotTheUpstreams(t *testing.T) {
+	podList := func(_ string, _ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"apiVersion":"v1","kind":"PodList","items":[]}`)),
+		}, nil
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		name     string
+		authn    CallerAuthenticator
+		upstream func(string, *http.Request) (*http.Response, error)
+		ctx      context.Context
+		target   string
+		wantCode int
+		want     string
+		notWant  string
+	}{
+		{
+			name:     "authentication unavailable",
+			authn:    staticAuthenticator{err: fmt.Errorf("%w: %w", errAuthenticationUnavailable, errors.New("connection refused"))},
+			upstream: podList,
+			target:   "/api/v1/namespaces/default/pods",
+			wantCode: http.StatusServiceUnavailable,
+			want:     `outcome="auth_unavailable",resource="unknown",status_code="503"`,
+		},
+		{
+			name:  "caller gone",
+			authn: staticAuthenticator{caller: &CallerIdentity{Username: "shell"}},
+			upstream: func(_ string, req *http.Request) (*http.Response, error) {
+				return nil, req.Context().Err()
+			},
+			ctx:      canceled,
+			target:   "/api/v1/namespaces/default/pods",
+			wantCode: http.StatusBadGateway,
+			want:     `outcome="canceled",resource="pods",status_code="502"`,
+		},
+		{
+			name:     "unredactable secret",
+			authn:    staticAuthenticator{caller: &CallerIdentity{Username: "shell"}},
+			upstream: podList,
+			target:   "/api/v1/namespaces/default/secrets/db",
+			wantCode: http.StatusBadGateway,
+			want:     `outcome="upstream_error",resource="secrets",status_code="502"`,
+			notWant:  `kubeagents_kube_proxy_secrets_redacted_total{action="payload_scrubbed"} 1`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics := NewMetrics()
+			h, err := NewHandler(Config{
+				Authenticator:    tc.authn,
+				Upstream:         &fakeUpstream{handler: tc.upstream},
+				DefaultClusterID: InClusterID,
+				Policy:           Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
+				Logger:           slog.New(slog.DiscardHandler),
+				Metrics:          metrics,
+			})
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			if tc.ctx != nil {
+				req = req.WithContext(tc.ctx)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantCode)
+			}
+			exposition := scrapeMetricsText(t, metrics)
+			if !strings.Contains(exposition, tc.want) {
+				t.Errorf("metrics exposition lacks %q\n%s", tc.want, exposition)
+			}
+			if tc.notWant != "" && strings.Contains(exposition, tc.notWant) {
+				t.Errorf("metrics exposition has %q\n%s", tc.notWant, exposition)
+			}
+		})
 	}
 }
 

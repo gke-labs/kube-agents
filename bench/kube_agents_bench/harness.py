@@ -85,6 +85,11 @@ Environment:
         ``28099``). The remote side is always the Service's 8099.
     AGENT_INJECT_URL: A gateway base URL to use instead of spawning a
         port-forward.
+    AGENT_GATEWAY_LEASE: The gateway's Lease (default
+        ``<AGENT_SERVICE_NAME>-a2a-gateway``). When it names a holder, the
+        tunnel forwards to that pod rather than the Service, and finds the
+        holder again on every respawn, so a standby's 503 is retried against
+        the replica serving the door.
     AGENT_INJECT_TOKEN: The door's bearer token, required. The operator
         renders it into the ``<agent>-a2a-inject`` Secret under its eval
         flag, and this is read the way the presubmit reads the agent's own
@@ -271,6 +276,15 @@ _MAX_CARD_MESSAGE_LOG_CHARS = 200
 # forwarding cannot be mistaken for this tunnel.
 _INJECT_SERVICE_SUFFIX = "-a2a-inject"
 _INJECT_REMOTE_PORT = 8099
+# The A2A gateway's Lease, whose holder is the one replica serving the doors
+# once the gateway runs more than one (docs/designs/gateway-replicas.md). The
+# tunnel forwards to that pod, read again on every respawn; a standby answers
+# 503 and a respawn finds the new holder. With no Lease, or none readable,
+# the install runs one unelected gateway and the door's Service reaches it.
+_GATEWAY_LEASE_SUFFIX = "-a2a-gateway"
+_LEASE_READ_TIMEOUT = 15
+# How much of a failed kubectl read's stderr the warning quotes.
+_KUBECTL_STDERR_LOG_CHARS = 300
 _INJECT_DEFAULT_LOCAL_PORT = 28099
 # The Secret the operator renders the door's bearer token into, named in the
 # message a run without the token fails with. Suffix and key, so the message
@@ -492,8 +506,12 @@ _POD_CLOCK_TIMEOUT_SECONDS = 15.0
 # it would otherwise cost a second full timeout.
 _FALLBACK_CLEAR_TIMEOUT_SECONDS = 15.0
 
-_PF_LOCK = threading.Lock()  # guards the three registries below
+_PF_LOCK = threading.Lock()  # guards the registries below
 _PF_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+# The kubectl target (``svc/<name>``, ``pod/<name>``) each owned forward was
+# spawned for, so a caller can tell a live tunnel aimed elsewhere from one
+# aimed where it wants.
+_PF_TARGETS: dict[int, str] = {}
 _PF_PORT_LOCKS: dict[int, threading.Lock] = {}
 _PF_LOG_DIR: Path | None = None
 # True while _PF_LOG_DIR is this process's own temp directory, and therefore
@@ -580,6 +598,7 @@ def _cleanup_port_forwards() -> None:
     """Terminate every port-forward this process spawned."""
     global _PF_LOG_DIR
     with _PF_LOCK:
+        _PF_TARGETS.clear()
         while _PF_PROCESSES:
             port, proc = _PF_PROCESSES.popitem()
             if proc.poll() is None:
@@ -600,8 +619,10 @@ def _kubectl_target(service: str | None = None) -> list[str]:
     passes the gateway's inject Service, which lives in the same namespace and
     the same context.
     """
+    target = service or os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
     cmd = [
-        f"svc/{service or os.environ.get('AGENT_SERVICE_NAME', 'platform-agent')}",
+        # A resolved target (``pod/<name>``, ``svc/<name>``) is used as given.
+        target if "/" in target else f"svc/{target}",
         "-n",
         os.environ.get("AGENT_NAMESPACE", "kubeagents-system"),
     ]
@@ -609,6 +630,87 @@ def _kubectl_target(service: str | None = None) -> list[str]:
     if context:
         cmd.extend(["--context", context])
     return cmd
+
+
+def _kubectl_read(args: list[str], what: str, *, missing_ok: bool = False) -> str | None:
+    """Run a read-only ``kubectl`` in the agent's namespace and context and
+    return its stdout, or ``None`` when it fails.
+
+    A failure is logged with kubectl's stderr: a forbidden Lease read, say,
+    shows up in the run rather than silently forwarding the Service. A
+    ``NotFound`` is expected when ``missing_ok`` (no Lease on an unelected
+    install) and logged only at debug.
+    """
+    cmd = ["kubectl", *args, "-n", os.environ.get("AGENT_NAMESPACE", _DEFAULT_AGENT_NAMESPACE)]
+    context = os.environ.get("AGENT_CLUSTER_CONTEXT")
+    if context:
+        cmd.extend(["--context", context])
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=_LEASE_READ_TIMEOUT, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.warning("reading %s failed: %s", what, exc)
+        return None
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()[:_KUBECTL_STDERR_LOG_CHARS]
+        if missing_ok and "NotFound" in stderr:
+            _log.debug("%s not found", what)
+        else:
+            _log.warning("reading %s failed (kubectl exited %d): %s", what, proc.returncode, stderr)
+        return None
+    return proc.stdout
+
+
+def _gateway_door_target(agent_service: str, service: str) -> str:
+    """The port-forward target for a gateway door: the Lease holder's pod, or
+    the door's Service when no Lease names one.
+
+    ``AGENT_GATEWAY_LEASE`` overrides the Lease's name (default
+    ``<AGENT_SERVICE_NAME>-a2a-gateway``). Best effort: a Lease that is
+    missing, unreadable or held by nobody leaves the Service, which is what
+    every install that renders no Lease serves the door through.
+
+    The holder is taken only if it is one of the pods the door's Service
+    selects. The tunnel carries the door's bearer token, and a Lease's
+    holder is just a string anyone who can write the Lease sets: a holder
+    outside the gateway's own pods would otherwise be handed the token. The
+    Service's own endpoints are the same pods, so the Lease narrows the
+    choice among them and never adds a target the Service wouldn't reach.
+    """
+    fallback = f"svc/{service}"
+    lease = os.environ.get("AGENT_GATEWAY_LEASE") or agent_service + _GATEWAY_LEASE_SUFFIX
+    out = _kubectl_read(
+        ["get", "lease", lease, "-o", "jsonpath={.spec.holderIdentity}"],
+        f"lease {lease}",
+        missing_ok=True,
+    )
+    holder = (out or "").strip()
+    if not holder:
+        return fallback
+    raw = _kubectl_read(["get", "svc", service, "-o", "jsonpath={.spec.selector}"], f"service {service}'s selector")
+    try:
+        selector = json.loads(raw) if raw else {}
+    except ValueError:
+        selector = {}
+    if not isinstance(selector, dict) or not selector:
+        _log.warning("service %s has no readable selector; forwarding to it rather than the lease holder %s", service, holder)
+        return fallback
+    label_selector = ",".join(f"{k}={v}" for k, v in sorted(selector.items()))
+    names = _kubectl_read(
+        ["get", "pods", "-l", label_selector, "-o", "jsonpath={.items[*].metadata.name}"],
+        f"the pods service {service} selects",
+    )
+    if holder not in (names or "").split():
+        _log.warning(
+            "lease %s names %s, which is not a pod service %s selects; forwarding to the service",
+            lease,
+            holder,
+            service,
+        )
+        return fallback
+    _log.info("gateway lease %s is held by %s; forwarding to that pod", lease, holder)
+    return f"pod/{holder}"
 
 
 def _port_forward_command(
@@ -727,6 +829,7 @@ def _ensure_port_forward(
 
         with _PF_LOCK:
             stale = _PF_PROCESSES.pop(local_port, None)
+            _PF_TARGETS.pop(local_port, None)
         if stale is not None:
             _stop_process(stale)
 
@@ -747,6 +850,7 @@ def _ensure_port_forward(
             raise RuntimeError(f"failed to spawn kubectl port-forward: {exc}") from exc
         with _PF_LOCK:
             _PF_PROCESSES[local_port] = proc
+            _PF_TARGETS[local_port] = cmd[2]
 
         try:
             deadline = time.monotonic() + 15
@@ -767,8 +871,16 @@ def _ensure_port_forward(
         except BaseException:
             with _PF_LOCK:
                 _PF_PROCESSES.pop(local_port, None)
+                _PF_TARGETS.pop(local_port, None)
             _stop_process(proc)
             raise
+
+
+def _owned_forward_target(local_port: int) -> str | None:
+    """The target this process's live forward on ``local_port`` was spawned
+    for, or ``None`` when it owns none there."""
+    with _PF_LOCK:
+        return _PF_TARGETS.get(local_port) if local_port in _PF_PROCESSES else None
 
 
 def _reset_port_forward(
@@ -792,6 +904,7 @@ def _reset_port_forward(
     with _port_establishment_lock(local_port):
         with _PF_LOCK:
             proc = _PF_PROCESSES.pop(local_port, None)
+            _PF_TARGETS.pop(local_port, None)
         if proc is None:
             _log.info("no port-forward owned on port %d; nothing to tear down", local_port)
         else:
@@ -3053,11 +3166,23 @@ class KubeAgentsHarness(AgentHarness):
         # retries.
         own_tunnel = not base_url
 
+        # The last target the tunnel was aimed at, for the messages below.
+        tunnel_target = [f"svc/{service}"]
+
         def _tunnel(reset: bool) -> None:
             if not own_tunnel:
                 return
+            # Resolved on every spawn: after a 503 from a standby or a tunnel
+            # dropped with its pod, the lease names where the door is now.
+            tunnel_target[0] = _gateway_door_target(agent_service, service)
+            # A tunnel this process already owns on the port (from an earlier
+            # exchange) may still go where the lease pointed then; a port that
+            # is open says nothing about where, so it is replaced.
+            owned = _owned_forward_target(local_port)
+            if owned is not None and owned != tunnel_target[0]:
+                reset = True
             forward = _reset_port_forward if reset else _ensure_port_forward
-            forward(local_port, service=service, remote_port=_INJECT_REMOTE_PORT)
+            forward(local_port, service=tunnel_target[0], remote_port=_INJECT_REMOTE_PORT)
 
         # Same establishment retry as the api path's, for the same reason: a
         # tunnel that cannot come up is the run class, not an answer.
@@ -3069,15 +3194,15 @@ class KubeAgentsHarness(AgentHarness):
             except RuntimeError as exc:
                 transport_failures += 1
                 _log.warning(
-                    "inject: port-forward to svc/%s failed to establish (%d/%d): %s",
-                    service,
+                    "inject: port-forward to %s failed to establish (%d/%d): %s",
+                    tunnel_target[0],
                     transport_failures,
                     _MAX_TRANSPORT_FAILURES,
                     exc,
                 )
                 if transport_failures >= _MAX_TRANSPORT_FAILURES:
                     return _infra_failure(
-                        f"the inject tunnel to svc/{service} failed to establish "
+                        f"the inject tunnel to {tunnel_target[0]} failed to establish "
                         f"{transport_failures} times running; last failure: {exc}"
                     )
         if not base_url:
