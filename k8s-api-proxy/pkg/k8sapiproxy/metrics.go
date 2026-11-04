@@ -26,6 +26,10 @@ const (
 	requestsTotalName           = "requests_total"
 	rejectedRequestsTotalName   = "rejected_requests_total"
 	secretsRedactedTotalName    = "secrets_redacted_total"
+	cacheRequestsTotalName      = "cache_requests_total"
+	cacheEvictionsTotalName     = "cache_evictions_total"
+	cacheBytesName              = "cache_bytes"
+	cacheEntriesName            = "cache_entries"
 	requestDurationSecondsName  = "request_duration_seconds"
 	inFlightRequestsName        = "in_flight_requests"
 	processStartTimeSecondsName = "process_start_time_seconds"
@@ -39,6 +43,7 @@ const (
 	labelStatusCode  = "status_code"
 	labelReason      = "reason"
 	labelAction      = "action"
+	labelResult      = "result"
 
 	// OutcomeAllowed indicates that the request passed policy checks and received a non-5xx upstream response.
 	OutcomeAllowed = "allowed"
@@ -58,6 +63,22 @@ const (
 	SecretActionAcceptHeaderRewritten = "accept_header_rewritten"
 	// SecretActionPayloadScrubbed counts responses where Secret JSON payload scrubbing ran.
 	SecretActionPayloadScrubbed = "payload_scrubbed"
+
+	// CacheResultHit counts cache lookups that return a fresh cached response.
+	CacheResultHit = "hit"
+	// CacheResultMiss counts cache lookups that fetch a response from the upstream cluster.
+	CacheResultMiss = "miss"
+	// CacheResultCoalesced counts concurrent cache misses that share an in-flight upstream request.
+	CacheResultCoalesced = "coalesced"
+	// CacheResultBypass counts requests or responses that bypass the response cache.
+	CacheResultBypass = "bypass"
+
+	// CacheEvictionCapacity counts cached responses evicted to stay within the byte capacity limit.
+	CacheEvictionCapacity = "capacity"
+	// CacheEvictionExpired counts cached responses evicted after their TTL expired.
+	CacheEvictionExpired = "expired"
+	// CacheEvictionInvalidated counts cached responses evicted by write or auth-failure invalidation.
+	CacheEvictionInvalidated = "invalidated"
 
 	metricsLabelOther = "other"
 	metricsLabelNone  = "none"
@@ -172,6 +193,10 @@ type Metrics struct {
 	requestsTotal    *prometheus.CounterVec
 	rejectedTotal    *prometheus.CounterVec
 	secretsRedacted  *prometheus.CounterVec
+	cacheRequests    *prometheus.CounterVec
+	cacheEvictions   *prometheus.CounterVec
+	cacheBytes       prometheus.Gauge
+	cacheEntries     prometheus.Gauge
 	requestDuration  *prometheus.HistogramVec
 	inFlightRequests prometheus.Gauge
 	processStart     prometheus.Gauge
@@ -200,6 +225,30 @@ func NewMetrics() *Metrics {
 			Name:      secretsRedactedTotalName,
 			Help:      "Total core/v1 Secret redaction operations performed by kube-proxy, labeled by action.",
 		}, []string{labelAction}),
+		cacheRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      cacheRequestsTotalName,
+			Help:      "Total cache lookups in kube-proxy, labeled by result, verb, and resource.",
+		}, []string{labelResult, labelVerb, labelResource}),
+		cacheEvictions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      cacheEvictionsTotalName,
+			Help:      "Total cached responses evicted from the kube-proxy cache, labeled by reason.",
+		}, []string{labelReason}),
+		cacheBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      cacheBytesName,
+			Help:      "Current byte size of serialized responses stored in the kube-proxy cache.",
+		}),
+		cacheEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      cacheEntriesName,
+			Help:      "Current number of serialized responses stored in the kube-proxy cache.",
+		}),
 		requestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -223,6 +272,10 @@ func NewMetrics() *Metrics {
 		m.requestsTotal,
 		m.rejectedTotal,
 		m.secretsRedacted,
+		m.cacheRequests,
+		m.cacheEvictions,
+		m.cacheBytes,
+		m.cacheEntries,
 		m.requestDuration,
 		m.inFlightRequests,
 		m.processStart,
@@ -264,6 +317,38 @@ func (m *Metrics) recordSecretRedaction(action string) {
 	default:
 		m.secretsRedacted.WithLabelValues(metricsLabelOther).Inc()
 	}
+}
+
+func (m *Metrics) recordCacheRequest(result, verb, resource string) {
+	if m == nil {
+		return
+	}
+	rLabel := metricsLabelOther
+	switch result {
+	case CacheResultHit, CacheResultMiss, CacheResultCoalesced, CacheResultBypass:
+		rLabel = result
+	}
+	m.cacheRequests.WithLabelValues(rLabel, sanitizeVerbLabel(verb), sanitizeResourceLabel(resource)).Inc()
+}
+
+func (m *Metrics) recordCacheEviction(reason string) {
+	if m == nil {
+		return
+	}
+	rLabel := metricsLabelOther
+	switch reason {
+	case CacheEvictionCapacity, CacheEvictionExpired, CacheEvictionInvalidated:
+		rLabel = reason
+	}
+	m.cacheEvictions.WithLabelValues(rLabel).Inc()
+}
+
+func (m *Metrics) setCacheOccupancy(bytes int64, entries int) {
+	if m == nil {
+		return
+	}
+	m.cacheBytes.Set(float64(bytes))
+	m.cacheEntries.Set(float64(entries))
 }
 
 func (m *Metrics) recordRequest(verb, resource, subresource string, mode Mode, dryRun bool, outcome string, statusCode int, duration time.Duration) {

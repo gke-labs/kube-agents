@@ -57,6 +57,30 @@ func envIntOrDefault(key string, fallback int) int {
 	return v
 }
 
+func envInt64OrDefault(key string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func envDurationOrDefault(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := time.ParseDuration(raw)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
 func startMetricsListener(ctx context.Context, port int, metrics *k8sapiproxy.Metrics, logger *slog.Logger) {
 	if port == 0 {
 		logger.Info("metrics listener disabled: KUBE_PROXY_METRICS_PORT is unset")
@@ -113,6 +137,10 @@ func main() {
 		kubeTokenFile            = flag.String("kube-token-file", envOrDefault("CREDENTIAL_PROXY_KUBE_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"), "Host cluster ServiceAccount token file")
 		audience                 = flag.String("audience", envOrDefault("CREDENTIAL_PROXY_AUDIENCE", "kubeagents-credential-proxy"), "Required TokenReview JWT audience")
 		allowedCallers           = flag.String("allowed-callers", envOrDefault("CREDENTIAL_PROXY_ALLOWED_CALLERS", ""), "Comma-separated allowlist of caller ServiceAccount usernames")
+		cacheMaxBytes            = flag.Int64("cache-max-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_BYTES", k8sapiproxy.DefaultCacheMaxBytes), "Maximum bytes for the in-memory response cache (0 disables caching)")
+		cacheMaxEntryBytes       = flag.Int64("cache-max-entry-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_ENTRY_BYTES", k8sapiproxy.DefaultCacheMaxEntryBytes), "Maximum response body bytes eligible for caching")
+		cacheResourceTTL         = flag.Duration("cache-resource-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses")
+		cacheDiscoveryTTL        = flag.Duration("cache-discovery-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_DISCOVERY_TTL", k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses")
 	)
 	flag.Parse()
 
@@ -183,6 +211,16 @@ func main() {
 	metrics := k8sapiproxy.NewMetrics()
 	startMetricsListener(ctx, *metricsPort, metrics, logger)
 
+	var cacheCfg *k8sapiproxy.CacheConfig
+	if *cacheMaxBytes > 0 {
+		cacheCfg = &k8sapiproxy.CacheConfig{
+			MaxBytes:            *cacheMaxBytes,
+			MaxEntryBytes:       *cacheMaxEntryBytes,
+			DefaultResourceTTL:  *cacheResourceTTL,
+			DefaultDiscoveryTTL: *cacheDiscoveryTTL,
+		}
+	}
+
 	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
 		Authenticator:    authn,
 		Upstream:         upstreamTransport,
@@ -192,6 +230,7 @@ func main() {
 			RedactSecrets:            *redactSecrets,
 			AllowUpgradeSubresources: *allowUpgradeSubresources,
 		},
+		Cache:          cacheCfg,
 		Logger:         logger,
 		Metrics:        metrics,
 		TracerProvider: tp,

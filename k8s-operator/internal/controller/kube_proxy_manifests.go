@@ -31,33 +31,33 @@ import (
 )
 
 const (
-	kubeProxyPort             int32 = 8443
-	kubeProxyMetricsPort      int32 = 8444
-	kubeProxyMetricsPortName        = "kube-metrics"            // #nosec G101 -- Container port name, not a credential
-	kubeProxyMetricsPortEnv         = "KUBE_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not a credential
-	kubeProxyImageEnvVar            = "KUBE_PROXY_IMAGE"
-	kubeProxyRepositoryName         = "kube-proxy"
-	kubeProxyTLSSecretSuffix        = "-kube-proxy-tls" // #nosec G101 -- Secret name suffix, not a credential
-	kubeProxyTLSVolumeName          = "kube-proxy-tls"  // #nosec G101 -- Volume name, not a credential
-	kubeProxyTLSMountPath           = "/var/run/secrets/kubeagents/kube-proxy-tls"
-	kubeProxyCAVolumeName           = "kube-proxy-ca"
-	kubeProxyCAMountPath            = "/var/run/secrets/kubeagents/kube-proxy-ca"
-	kubeProxyCACertFile             = kubeProxyCAMountPath + "/ca.crt"
-	kubeProxyCPURequest             = "100m"
-	kubeProxyMemoryRequest          = "256Mi"
-	kubeProxyCPULimit               = "1"
-	kubeProxyMemoryLimit            = "512Mi"
-	kubeProxyTLSHashAnnotation      = "kubeagents.x-k8s.io/tls-cert-hash"
-	kubeProxyTLSClockSkew           = 5 * time.Minute
-	kubeProxyTLSValidity            = 10 * 365 * 24 * time.Hour
-	kubeProxySecretDefaultMode      = int32(0440)
-	kubeAPITokenExpirationSeconds   = int64(3600)
-	kubeAPITokenVolumeName          = "event-watcher-ksa-token"
-	kubeRootCAConfigMapName         = "kube-root-ca.crt"
-	kubeProxyProbeInitialDelay      = int32(2)
-	kubeProxyProbePeriod            = int32(10)
-	kubeProxyProbeTimeout           = int32(5)
-	kubeProxyProbeFailureThreshold  = int32(3)
+	kubeProxyPort                  int32 = 8443
+	kubeProxyMetricsPort           int32 = 8444
+	kubeProxyMetricsPortName             = "kube-metrics"            // #nosec G101 -- Container port name, not a credential
+	kubeProxyMetricsPortEnv              = "KUBE_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not a credential
+	kubeProxyImageEnvVar                 = "KUBE_PROXY_IMAGE"
+	kubeProxyRepositoryName              = "kube-proxy"
+	kubeProxyTLSSecretSuffix             = "-kube-proxy-tls" // #nosec G101 -- Secret name suffix, not a credential
+	kubeProxyTLSVolumeName               = "kube-proxy-tls"  // #nosec G101 -- Volume name, not a credential
+	kubeProxyTLSMountPath                = "/var/run/secrets/kubeagents/kube-proxy-tls"
+	kubeProxyCAVolumeName                = "kube-proxy-ca"
+	kubeProxyCAMountPath                 = "/var/run/secrets/kubeagents/kube-proxy-ca"
+	kubeProxyCACertFile                  = kubeProxyCAMountPath + "/ca.crt"
+	kubeProxyCPURequest                  = "100m"
+	kubeProxyMemoryRequest               = "512Mi"
+	kubeProxyCPULimit                    = "1"
+	kubeProxyMemoryLimit                 = "1Gi"
+	kubeProxyTLSHashAnnotation           = "kubeagents.x-k8s.io/tls-cert-hash"
+	kubeProxyTLSClockSkew                = 5 * time.Minute
+	kubeProxyTLSValidity                 = 10 * 365 * 24 * time.Hour
+	kubeProxySecretDefaultMode           = int32(0440)
+	kubeAPITokenExpirationSeconds        = int64(3600)
+	kubeAPITokenVolumeName               = "event-watcher-ksa-token"
+	kubeRootCAConfigMapName              = "kube-root-ca.crt"
+	kubeProxyProbeInitialDelay           = int32(2)
+	kubeProxyProbePeriod                 = int32(10)
+	kubeProxyProbeTimeout                = int32(5)
+	kubeProxyProbeFailureThreshold       = int32(3)
 )
 
 func kubeProxyName(agent *agentv1alpha1.PlatformAgent) string {

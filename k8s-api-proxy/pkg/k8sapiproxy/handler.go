@@ -49,6 +49,8 @@ type Config struct {
 	Metrics *Metrics
 	// TracerProvider emits OpenTelemetry server and upstream client spans; optional.
 	TracerProvider trace.TracerProvider
+	// Cache configures HTTP response caching and in-flight request coalescing; disabled when nil.
+	Cache *CacheConfig
 }
 
 // auditEventKey carries the request's *AuditEvent to the transport and the error handler.
@@ -61,6 +63,7 @@ type handler struct {
 	audit            AuditSink
 	metrics          *Metrics
 	tracerProvider   trace.TracerProvider
+	cache            *responseCache
 	factory          *request.RequestInfoFactory
 	proxy            *httputil.ReverseProxy
 }
@@ -95,6 +98,20 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	upstream := cfg.Upstream
 	metrics := cfg.Metrics
 	tp := cfg.TracerProvider
+	cache := newResponseCache(cfg.Cache, metrics)
+	baseRoundTrip := func(req *http.Request) (*http.Response, error) {
+		ev := eventFrom(req)
+		upCtx, upSpan := startUpstreamSpan(req.Context(), tp, ev.ClusterID, req.Method)
+		defer upSpan.End()
+		resp, err := upstream.RoundTripCluster(upCtx, ev.ClusterID, req.WithContext(upCtx))
+		// Redacting here rather than in ModifyResponse keeps the plan off resp.Request,
+		// which a transport may replace with a request of its own.
+		if plan, ok := req.Context().Value(secretRedactionKey{}).(*secretRedaction); ok && resp != nil {
+			redactSecretResponse(resp, plan, func(cause error) { ev.Err = cause })
+			metrics.recordSecretRedaction(SecretActionPayloadScrubbed)
+		}
+		return resp, err
+	}
 	return &handler{
 		authenticator:    cfg.Authenticator,
 		defaultClusterID: cfg.DefaultClusterID,
@@ -102,6 +119,7 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		audit:            audit,
 		metrics:          metrics,
 		tracerProvider:   tp,
+		cache:            cache,
 		factory:          NewRequestInfoFactory(),
 		proxy: &httputil.ReverseProxy{
 			// Rewrite rather than Director: the reverse proxy then also drops the caller's
@@ -113,17 +131,10 @@ func NewHandler(cfg Config) (http.Handler, error) {
 				pr.Out.URL = &url.URL{Path: pr.In.URL.Path, RawQuery: pr.In.URL.RawQuery}
 			},
 			Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				ev := eventFrom(req)
-				upCtx, upSpan := startUpstreamSpan(req.Context(), tp, ev.ClusterID, req.Method)
-				defer upSpan.End()
-				resp, err := upstream.RoundTripCluster(upCtx, ev.ClusterID, req.WithContext(upCtx))
-				// Redacting here rather than in ModifyResponse keeps the plan off resp.Request,
-				// which a transport may replace with a request of its own.
-				if plan, ok := req.Context().Value(secretRedactionKey{}).(*secretRedaction); ok && resp != nil {
-					redactSecretResponse(resp, plan, func(cause error) { ev.Err = cause })
-					metrics.recordSecretRedaction(SecretActionPayloadScrubbed)
+				if cache != nil {
+					return cache.roundTrip(req, baseRoundTrip)
 				}
-				return resp, err
+				return baseRoundTrip(req)
 			}),
 			FlushInterval: flushImmediately,
 			// The transport's error goes to the audit event, not to the caller: it can name
@@ -264,6 +275,10 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	sanitizeRequestHeaders(out.Header, h.policy.permitsUpgrade(info))
 	ev.Outcome = OutcomeForwarded
 	ctx := context.WithValue(out.Context(), auditEventKey{}, ev)
+	callerAccept := normalizeAcceptHeader(out.Header)
+	if h.cache != nil {
+		ctx = context.WithValue(ctx, cacheRequestMetaKey{}, cacheRequestMeta{info: info, callerAccept: callerAccept})
+	}
 	if secretRedacted {
 		plan := rewriteSecretRequest(out.Header, info)
 		if plan.view != viewTable {

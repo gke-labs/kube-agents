@@ -132,6 +132,7 @@ k8s-api-proxy/
     │   ├── handler.go            # Core http.Handler: auth -> route -> RequestInfo -> policy -> proxy
     │   ├── policy.go             # Verb allowlist, subresource denylist, dryRun=All check
     │   ├── secrets.go            # PartialObjectMetadata rewrite + Secret response redaction
+    │   ├── cache.go              # Pluggable CacheStore, MemoryCacheStore, singleflight coalescing, and RFC 9111/9211 cache
     │   ├── headers.go            # Strip Authorization, Impersonate-*, X-Remote-*, unsafe Upgrade headers
     │   ├── auth.go               # CallerAuthenticator interface + TokenReview authenticator with TTL cache
     │   ├── audit.go              # AuditSink interface, AuditEvent struct, and slog audit sink
@@ -193,17 +194,17 @@ const (
 	ModeReadWrite Mode = "read-write"
 )
 
-// Config configures the k8sapiproxy HTTP handler.
+// Config configures NewHandler.
 type Config struct {
-	Authenticator            CallerAuthenticator
-	Upstream                 UpstreamTransport
-	DefaultClusterID         string
-	Mode                     Mode
-	RedactSecrets            bool
-	AllowUpgradeSubresources bool
-	Metrics                  *Metrics
-	AuditSink                AuditSink
-	TracerProvider           trace.TracerProvider
+	Authenticator    CallerAuthenticator
+	Upstream         UpstreamTransport
+	DefaultClusterID string
+	Policy           Policy
+	Audit            AuditSink
+	Logger           *slog.Logger
+	Metrics          *Metrics
+	TracerProvider   trace.TracerProvider
+	Cache            *CacheConfig
 }
 ```
 
@@ -362,6 +363,27 @@ It also appends `kproxy/<caller-username>` to the outbound `User-Agent` header s
 
 For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httputil.ReverseProxy` runs with `FlushInterval: -1` so chunks flush immediately to the sandbox without buffering.
 
+### 8a. HTTP response cache and in-flight coalescing (`pkg/k8sapiproxy/cache.go`)
+
+When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTES > 0`), `pkg/k8sapiproxy` wraps the upstream transport with a response cache and `singleflight` request coalescer:
+
+1. **Pluggable `CacheStore` and default `MemoryCacheStore`**:
+   - `CacheStore` defines `Get(ctx, key)`, `Set(ctx, key, value, ttl)`, and `Delete(ctx, key)`. Optional `CacheStatsProvider` exposes `Stats() CacheStats` (`Bytes`, `Entries`, `CapacityEvicted`, `ExpiredEvicted`). Any store error fails open and forwards the request to the upstream cluster.
+   - When `CacheConfig.Store` is nil, `NewMemoryCacheStore` provides an in-memory store bounded to `DefaultCacheMaxBytes` (`64 MiB`) with `DefaultCacheMaxEntryBytes` (`2 MiB`, configured via `--cache-max-entry-bytes` / `KUBE_PROXY_CACHE_MAX_ENTRY_BYTES`). It evicts expired entries first and uses second-chance frequency decay with LRU ordering so one-time list scans do not evict hot entries.
+2. **Cache eligibility and default TTLs**:
+   - Resource `get` and `list` requests (`GET`, no subresource, no `watch=`, and no `dryRun`) use `DefaultResourceCacheTTL` (`30s`, configured via `--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL`).
+   - Discovery `GET` requests use `DefaultDiscoveryCacheTTL` (`15m`, configured via `--cache-discovery-ttl` / `KUBE_PROXY_CACHE_DISCOVERY_TTL`). Health and metrics paths in `nonCachedDiscoveryPaths` (`/healthz`, `/livez`, `/readyz`, `/metrics`) are never cached.
+   - Responses larger than `MaxEntryBytes` bypass the cache (`Cache-Status: k8s-api-proxy; bypass`) and stream directly to the caller without full buffering.
+3. **Cache key isolation and `Secret` redaction before storage**:
+   - Keys include `clusterID`, canonical URL path, canonical query string, normalized caller `Accept` header (captured before `Secret` `PartialObjectMetadata` header rewrites), and `Accept-Encoding`.
+   - `baseRoundTrip` executes `redactSecretResponse` before returning the response to `responseCache`, so raw `core/v1` `Secret` values never enter `CacheStore`.
+4. **Coalescing, RFC 9111 `Cache-Control`, and RFC 9211 `Cache-Status` / `Age`**:
+   - Concurrent cache misses for the same key coalesce through `singleflight.Group` into one upstream call.
+   - The proxy honors request `Cache-Control` directives (`no-store`, `no-cache`, `max-age=0`, `max-age=<seconds>`, `max-stale`) and upstream response `Cache-Control` (`no-store`, `max-age=0`, `max-age=<seconds>`), while caching `kube-apiserver`'s default `no-cache, private` responses under the configured TTL.
+   - Responses set `Cache-Status` (`k8s-api-proxy; hit`, `k8s-api-proxy; hit; coalesced`, `k8s-api-proxy; miss`, or `k8s-api-proxy; bypass`) and `Age`.
+5. **Write and auth-failure scope invalidation**:
+   - Non-dry-run mutating requests (`create`, `update`, `patch`, `delete`, `deletecollection`) that return `2xx` or `401`/`403`, and read requests that return `401`/`403`, invalidate cached entries for that cluster, API group/version/resource, and namespace (plus cluster-wide list entries).
+
 ### 9. Pluggable GKE HTTPS transport (`pkg/upstream`)
 
 `pkg/upstream` implements `k8sapiproxy.UpstreamTransport` for GKE clusters in `kube-agents`:
@@ -383,8 +405,12 @@ For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httput
 1. **Prometheus metrics (`/metrics` on port `8444`)**:
    - All label values come from closed vocabularies so caller-supplied paths or CRD resource names cannot increase series cardinality.
    - `kubeagents_kube_proxy_requests_total` (`verb`, `resource`, `subresource`, `mode`, `dry_run`, `outcome`, `status_code`): Total Kubernetes API requests processed by `kube-proxy`.
-   - `kubeagents_kube_proxy_rejected_requests_total` (`reason`, `verb`, `resource`, `subresource`, `mode`): Total requests rejected before reaching `kube-apiserver`, labeled by closed rejection reason (`unauthenticated`, `protocol_upgrade_blocked`, `invalid_route`, `discovery_path_blocked`, `auth_resource_blocked`, `secret_subresource_blocked`, `subresource_blocked`, `dry_run_required`, `verb_blocked`).
+   - `kubeagents_kube_proxy_rejected_requests_total` (`reason`, `verb`, `resource`, `subresource`, `mode`): Total requests rejected before reaching `kube-apiserver`, labeled by closed rejection reason (`unauthenticated`, `protocol_upgrade_blocked`, `invalid_route`, `discovery_path_blocked`, `auth_resource_blocked`, `secret_subresource_blocked`, `secret_write_blocked`, `subresource_blocked`, `dry_run_required`, `verb_blocked`).
    - `kubeagents_kube_proxy_secrets_redacted_total` (`action`): Total `core/v1` `Secret` redaction actions (`accept_header_rewritten` and `payload_scrubbed`).
+   - `kubeagents_kube_proxy_cache_requests_total` (`result`, `verb`, `resource`): Total cache lookups in `kube-proxy`, labeled by result (`hit`, `miss`, `coalesced`, `bypass`), verb, and resource.
+   - `kubeagents_kube_proxy_cache_evictions_total` (`reason`): Total cached responses evicted from the `kube-proxy` cache, labeled by reason (`capacity`, `expired`, `invalidated`).
+   - `kubeagents_kube_proxy_cache_bytes`: Gauge of the current byte size of serialized responses stored in the `kube-proxy` cache.
+   - `kubeagents_kube_proxy_cache_entries`: Gauge of the current number of serialized responses stored in the `kube-proxy` cache.
    - `kubeagents_kube_proxy_request_duration_seconds` (`verb`, `resource`, `outcome`): Histogram of request durations in seconds.
    - `kubeagents_kube_proxy_in_flight_requests`: Gauge of requests currently in flight.
    - `process_start_time_seconds`: Gauge of the process start timestamp since the Unix epoch in seconds.
@@ -400,7 +426,7 @@ For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httput
 
 The operator reconciles a dedicated **`<agent>-kube-proxy` Deployment and ClusterIP Service** alongside `<agent>-credential-proxy` ([`k8s-operator/internal/controller/kube_proxy_manifests.go`](../../k8s-operator/internal/controller/kube_proxy_manifests.go)):
 
-- **Separate Deployment and Service**: `<agent>-kube-proxy` runs as its own Deployment (`Recreate` strategy) and exposes port `8443` on the `<agent>-kube-proxy` ClusterIP Service, plus port `8444` (`kube-metrics`) for Prometheus scraping. A dedicated `NetworkPolicy` restricts ingress on port `8443` to the `<agent>-shell` pod, and admits `gmp-system` on port `8444`.
+- **Separate Deployment and Service**: `<agent>-kube-proxy` runs as its own Deployment (`Recreate` strategy, `100m` CPU / `512Mi` memory requests, `1` CPU / `1Gi` memory limits) and exposes port `8443` on the `<agent>-kube-proxy` ClusterIP Service, plus port `8444` (`kube-metrics`) for Prometheus scraping. A dedicated `NetworkPolicy` restricts ingress on port `8443` to the `<agent>-shell` pod, and admits `gmp-system` on port `8444`.
 - **Operator-managed TLS (`<agent>-kube-proxy-tls` Secret)**: The operator generates an ECDSA P-256 CA and server certificate with SANs `<agent>-kube-proxy`, `<agent>-kube-proxy.<namespace>`, `<agent>-kube-proxy.<namespace>.svc`, and `<agent>-kube-proxy.<namespace>.svc.cluster.local`. The `<agent>-kube-proxy` pod mounts `tls.crt` and `tls.key` at `/var/run/secrets/kubeagents/kube-proxy-tls`. The `<agent>-shell` pod mounts only the public `ca.crt` key read-only at `/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt`.
 - **Upstream identity**: `<agent>-kube-proxy` runs as `agentServiceAccountName(agent)` in its own isolated pod, using the same Workload Identity / Workload Identity Federation configuration, `scopedServiceAccountPool` mapping (`<agent>-credential-proxy-policy`), and `kubeagents:tokenreview:<namespace>:<agent>` / host-cluster reader RBAC bindings as `<agent>-credential-proxy` while restricting network ingress to `<agent>-shell` on `:8443` and `gmp-system` on `:8444`.
 - **Clean split of responsibilities**: `<agent>-credential-proxy` continues serving `/v1/vcs/*`, `/v1/gcp/*`, and `gcloud` `/v1/exec` on port `8765`. `<agent>-shell` receives `KUBE_PROXY_URL=https://<agent>-kube-proxy.<namespace>.svc.cluster.local:8443` and routes all `kubectl` operations through `<agent>-kube-proxy`.
