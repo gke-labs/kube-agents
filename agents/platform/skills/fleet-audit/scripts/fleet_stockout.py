@@ -199,16 +199,6 @@ PENDING_PHASE = "Pending"
 POD_SCHEDULED_CONDITION = "PodScheduled"
 CONDITION_FALSE = "False"
 UNSCHEDULABLE_REASON = "Unschedulable"
-# The label a Deployment's ReplicaSet stamps on its pods; its value is the
-# suffix the ReplicaSet's name adds to the Deployment's.
-POD_TEMPLATE_HASH_LABEL = "pod-template-hash"
-REPLICASET_KIND = "ReplicaSet"
-# Labels GKE stamps on a pool's nodes from the pool record, which a workload's
-# nodeSelector may name instead of the pool's own labels: the zone (any of the
-# pool's locations), the machine type and the accelerator.
-ZONE_LABEL = "topology.kubernetes.io/zone"
-INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"
-ACCELERATOR_LABEL = "cloud.google.com/gke-accelerator"
 
 # §3.3's ">32 cores", §3.4's "> 10" rules, §3.7's 90%, and §3.10(c)'s idle
 # reservation: at most half in use with at least this many instances idle.
@@ -1344,50 +1334,59 @@ def is_unschedulable(pod: dict) -> bool:
 
 
 def workload_of(pod: dict) -> str:
-    """The name a reader knows the pod by: its owner, with a ReplicaSet's
-    template hash stripped so a Deployment's pods read as the Deployment. A
-    pod with no owner is its own name."""
-    meta = pod.get("metadata") or {}
-    owner = next((o for o in meta.get("ownerReferences") or [] if isinstance(o, dict) and o.get("name")), None)
-    if owner is None:
-        return str(meta.get("name") or "")
-    name = str(owner["name"])
-    template_hash = str((meta.get("labels") or {}).get(POD_TEMPLATE_HASH_LABEL) or "")
-    if owner.get("kind") == REPLICASET_KIND and template_hash and name.endswith(f"-{template_hash}"):
-        return name[: -len(template_hash) - 1]
-    return name
+    """The name a reader knows the pod by: the cost collector's sizing owner
+    (the controller reference, a Deployment in place of its ReplicaSet, the
+    pod itself when unowned), so both streams name one workload the same way."""
+    # The cost stream's owner rule, shared rather than copied.
+    from fleet_waste import _sizing_owner
+
+    return _sizing_owner(pod.get("metadata") or {})[1]
 
 
-def pool_node_labels(pool: dict) -> dict[str, set[str]]:
-    """The labels a pool's nodes carry, as the pool record predicts them: the
-    pool's own `config.labels`, and the ones GKE stamps from the record, the
-    pool name, the zone (one of the pool's locations), the machine type and
-    the accelerator. Each key maps to the values a node of the pool may have."""
-    config = pool.get("config") or {}
-    labels: dict[str, set[str]] = {str(k): {str(v)} for k, v in (config.get("labels") or {}).items()}
-    labels[NODEPOOL_LABEL] = {str(pool.get("name", ""))}
-    if pool.get("locations"):
-        labels[ZONE_LABEL] = {str(zone) for zone in pool["locations"]}
-    if config.get("machineType"):
-        labels[INSTANCE_TYPE_LABEL] = {str(config["machineType"])}
-    accelerators = {
-        str(a.get("acceleratorType")) for a in config.get("accelerators") or [] if isinstance(a, dict) and a.get("acceleratorType")
-    }
-    if accelerators:
-        labels[ACCELERATOR_LABEL] = accelerators
-    return labels
+def pool_label_index(node_pools: list[dict], nodes: list[dict]) -> dict[tuple[str, str], set[str]]:
+    """Which pools carry each label, from the live `Node` objects plus each
+    pool's `config.labels`: the retrospective collector's reader, so a selector
+    resolves against the labels GKE stamped rather than a prediction of them."""
+    # The retrospective's label reader, shared rather than copied.
+    from upgrade_retrospective import pool_labels
+
+    return pool_labels({"nodePools": node_pools}, nodes)
 
 
-def pool_selected_by(pod: dict, pool: dict) -> bool:
-    """Whether the pod's `nodeSelector` pins it to this pool: every pair it asks
-    for is a label the pool's nodes carry (`pool_node_labels`). An empty
-    selector pins the pod nowhere and counts for no pool; a pod held by
-    tolerations or affinity alone is not read here."""
-    selector = (pod.get("spec") or {}).get("nodeSelector") or {}
+def pinned_pool(pod: dict, node_pools: list[dict], label_index: dict[tuple[str, str], set[str]]) -> str | None:
+    """The one pool a pod is pinned to, or None. Its `nodeSelector` must narrow
+    it to exactly one pool (a label every pool carries is no preference, and a
+    selector two pools satisfy pins it to neither), and it must tolerate that
+    pool's blocking taints, or the scheduler could never place it there. An
+    empty selector pins the pod nowhere; a pod held by affinity alone is not
+    read here."""
+    from upgrade_retrospective import (
+        RECORD_TAINT_EFFECTS,
+        _selector_pools,
+        _tolerates,
+        pod_tolerations,
+    )
+
+    spec = pod.get("spec") or {}
+    selector = spec.get("nodeSelector") or {}
     if not selector:
-        return False
-    labels = pool_node_labels(pool)
-    return all(str(value) in labels.get(str(key), set()) for key, value in selector.items())
+        return None
+    pools = _selector_pools(selector, label_index)
+    if len(pools) != 1:
+        return None
+    name = next(iter(pools))
+    pool = next((p for p in node_pools if p.get("name") == name), None)
+    if pool is None:
+        return None
+    taints = [
+        {"key": t.get("key") or "", "value": t.get("value") or "", "effect": RECORD_TAINT_EFFECTS.get(t.get("effect") or "", t.get("effect") or "")}
+        for t in (pool.get("config") or {}).get("taints") or []
+        if isinstance(t, dict)
+    ]
+    tolerations = pod_tolerations(spec)
+    if not all(_tolerates(tolerations, taint) for taint in taints):
+        return None
+    return name
 
 
 def read_unschedulable_pods(*, run: RunFn, env: dict) -> tuple[list[dict], str]:
@@ -1440,8 +1439,8 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
     beside a regional default pool pass -- the zone-locked pool this check is
     for. The excerpt names what was tested, a fact this call was given.
 
-    `unschedulable_pods` are the pods `pool_selected_by` pinned to this pool
-    that the scheduler refuses right now. They decide nothing: the arms do.
+    `unschedulable_pods` are the pods `pinned_pool` resolved to this pool that
+    the scheduler refuses right now. They decide nothing: the arms do.
     They are the live backlog the excerpt then names, because "at its
     ceiling" tells an operator the pool cannot grow and not that anything is
     waiting on it.
@@ -2172,6 +2171,14 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
                 f"Unschedulable pods"
             )
         pods_command_text = paged_command_text((PODS_KIND,), query=PENDING_PODS_QUERY, kubeconfig=kubeconfig)
+        # Each pod resolves to one pool at most, once, so two pools never
+        # share a backlog.
+        label_index = pool_label_index(node_pools, [i for i in items if i.get("kind") == "Node"])
+        pinned_by_pool: dict[str, list[dict]] = {}
+        for pending_pod in unschedulable_pods:
+            pinned_to = pinned_pool(pending_pod, node_pools, label_index)
+            if pinned_to is not None:
+                pinned_by_pool.setdefault(pinned_to, []).append(pending_pod)
         # A tainted multi-zone pool is no fallback: the zonal pool's pods do
         # not tolerate its taints, so a stockout leaves them nowhere to go.
         multi_zone_machine_types = frozenset(
@@ -2181,7 +2188,7 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         ) - {""}
         for pool in node_pools:
             live_count = live_node_count_by_pool.get(pool.get("name", ""), 0)
-            pinned = [p for p in unschedulable_pods if pool_selected_by(p, pool)]
+            pinned = pinned_by_pool.get(pool.get("name", ""), [])
             for hit in [check_single_zone_nodepool(pool, has_nap, live_count, multi_zone_machine_types=multi_zone_machine_types, unschedulable_pods=pinned)]:
                 if hit:
                     if pinned:
