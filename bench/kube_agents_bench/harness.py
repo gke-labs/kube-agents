@@ -663,7 +663,7 @@ def _pod_clock() -> int | None:
     from it.
     """
     out = _agent_shell(_POD_CLOCK_SCRIPT, _POD_CLOCK_TIMEOUT_SECONDS).strip()
-    if out.isdigit():
+    if out.isascii() and out.isdigit():
         return int(out)
     _log.warning(
         "could not read the agent pod's clock (%s); the purge will take every card the front "
@@ -1262,6 +1262,24 @@ _MAX_ARCHIVED_DESCENDANTS = 32
 
 _CARD_ID = re.compile(r"t_[0-9a-f]+")
 
+# Prints each given card whose ``tasks.created_at`` is earlier than the floor,
+# then ``listed``; read-only. The stall archive asks it before it archives, so
+# a card the front door's create handed back that predates the run keeps its
+# worker, as the purge keeps its rows (:data:`_PURGE_ROWS_SCRIPT`).
+_CREATED_BEFORE_SCRIPT = r"""
+import sqlite3, sys
+ROOT, FLOOR = sys.argv[1], int(sys.argv[2])
+try:
+    kb = sqlite3.connect("file:%s/kanban.db?mode=ro" % ROOT, uri=True, timeout=10)
+    for tid in sys.argv[3:]:
+        r = kb.execute("SELECT created_at FROM tasks WHERE id = ?", (tid,)).fetchone()
+        if r is not None and r[0] is not None and int(r[0]) < FLOOR:
+            print(tid)
+    print("listed")
+except sqlite3.Error as exc:
+    print("unread: %s" % exc)
+"""
+
 
 def _stalled_descendants(stalled: Sequence[str], timeout: float) -> list[str]:
     """The unsettled cards the stalled cards' workers fanned out, recursively."""
@@ -1290,7 +1308,22 @@ def _stalled_descendants(stalled: Sequence[str], timeout: float) -> list[str]:
     return ids
 
 
-def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
+def _created_before(ids: Sequence[str], floor: int, timeout: float) -> set[str] | None:
+    """Which of ``ids`` were created before ``floor``; ``None`` when the board could not be read."""
+    args = " ".join(_shell_quote(a) for a in [worker_trajectory.DATA_ROOT, str(floor), *ids])
+    out = _agent_shell(
+        f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
+        f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
+        f'"$PY" -c {_shell_quote(_CREATED_BEFORE_SCRIPT)} {args}',
+        timeout,
+    )
+    lines = [line.strip() for line in out.splitlines()]
+    if "listed" not in lines:
+        return None
+    return {line for line in lines if line in ids}
+
+
+def _archive_stalled_cards(stalled: Sequence[str], timeout: float, floor: int | None = None) -> None:
     """Archive the cards that ran to the ceiling, and the cards they fanned out.
 
     The unit has given up on them: its record is written and their files are
@@ -1310,6 +1343,19 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     its worker may still hold a slot, and the run log should not say
     otherwise.
     """
+    # A card created before the run's floor is not the run's (the front door's
+    # create handed it back by its key): its worker is someone else's to stop.
+    if floor is not None and stalled:
+        older = _created_before(stalled, floor, timeout)
+        if older is None:
+            _log.warning(
+                "could not read when stalled cards %s were created; archiving them all", ", ".join(stalled)
+            )
+        elif older:
+            _log.warning(
+                "not archiving stalled cards %s: created before this run started", ", ".join(sorted(older))
+            )
+            stalled = [t for t in stalled if t not in older]
     # The stalled cards first, so their workers can't file another child while
     # the rest is listed. Then the descendants, listed again until a pass finds
     # nothing new: a listed child's worker is alive until its own archive.
@@ -1371,8 +1417,10 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # front-door ``kanban_create`` whose ``idempotency_key`` matches a live card
 # returns that card in a result that looks like a create (#4591). Such a card
 # is printed ``foreign <id>`` and left alone, files included. The other own
-# cards' files go before the board step, so they still go when it fails;
-# with a floor but no board read to check it against, every one's files stay.
+# cards' files go before the board step, so they still go when it fails; with
+# a floor but no board read to check it against, every root's files go too: a
+# stranger's card losing its files is rarer, and cheaper, than the run's own
+# report outliving it.
 # A fan-out card after them is taken only when its ``created`` event names a
 # card already taken as its ``creator_task_id``: hermes writes that event only
 # for a create that made the card, so a card a worker's ``kanban_create``
@@ -1405,7 +1453,7 @@ def unlink(tid):
         os.remove(os.path.join(LOGS, tid + ".log"))
     except OSError:
         pass
-kb, older, checked, failed = None, set(), FLOOR is None, None
+kb, older, failed = None, set(), None
 try:
     kb = sqlite3.connect("%s/kanban.db" % ROOT, timeout=BUSY, isolation_level=None)
     if FLOOR is not None:
@@ -1413,13 +1461,12 @@ try:
             r = kb.execute("SELECT created_at FROM tasks WHERE id = ?", (tid,)).fetchone()
             if r is not None and r[0] is not None and int(r[0]) < FLOOR:
                 older.add(tid)
-        checked = True
 except sqlite3.Error as exc:
     failed = exc
 for tid in roots:
     if tid in older:
         print("%s %s" % (FOREIGN, tid))
-    elif checked:
+    else:
         unlink(tid)
 if failed is not None:
     print("rows kept: %s" % failed)
@@ -1537,19 +1584,24 @@ def _purge_card_state(
         return
     args = " ".join(_shell_quote(a) for a in _purge_argv(task_ids, fanned_out, floor))
     # With no floor every root is the run's own, so its files go from the shell
-    # first and still go when python cannot start; with one, the script decides.
-    unfloored = "" if floor is not None else (
+    # first and still go when python cannot start; with one, the script decides,
+    # and the shell clears them afterwards only if the script never ran.
+    clear_roots = (
         f"for t in {' '.join(_shell_quote(t) for t in task_ids)}; do "
         f'  rm -rf {_ATTACHMENTS_DIR}/"$t" {_LOGS_DIR}/"$t".log; '
         "done; "
     )
     script = (
-        unfloored
+        ("" if floor is not None else clear_roots)
         + f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
         f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
         f'"$PY" -c {_shell_quote(_PURGE_ROWS_SCRIPT)} {args}'
     )
     out = _agent_shell(script, timeout)
+    if floor is not None and not out.strip():
+        # No python, or the exec timed out: nothing sorted the roots, and the
+        # run's own reports must not outlive it.
+        _agent_shell(clear_roots, timeout)
     lines = out.splitlines()
 
     def marked(marker: str) -> list[str]:
@@ -1572,7 +1624,8 @@ def _purge_card_state(
         )
     if adopted := [t for t in foreign if t not in task_ids]:
         _log.info(
-            "left cards %s on the board: attributed to the run's workers, but not created by them",
+            "left cards %s on the board: not created by the run's own cards (a fan-out of a card "
+            "that predates the run, or a card a worker's create handed back by its key)",
             ", ".join(adopted),
         )
     if _PURGE_DONE_MARKER not in lines:
@@ -3427,7 +3480,7 @@ class KubeAgentsHarness(AgentHarness):
         # but an earlier one did is archived too: nothing says it ended.
         still = [t for t in known if statuses.get(t) not in _TERMINAL_STATUSES]
         if still:
-            _archive_stalled_cards(still, _EXEC_TIMEOUT)
+            _archive_stalled_cards(still, _EXEC_TIMEOUT, floor=self._pod_floor)
         # As every other path that learns card ids ends: the pod outlives the
         # run, and a worker log left on it is there for the next run to find.
         _purge_card_state(known, _EXEC_TIMEOUT, floor=self._pod_floor)
@@ -4043,7 +4096,8 @@ class KubeAgentsHarness(AgentHarness):
         Keyword-only with a default
         so a caller that has no stalled cards, in-tree or in a sibling branch,
         need not name it. ``floor`` is the run's :attr:`_pod_floor`, passed to
-        the purge: an awaited card created before it is left on the board.
+        the stall archive and the purge: an awaited card created before it is
+        neither archived nor deleted.
 
         The workers' own tool calls join the trajectory here, after the front
         agent's, each tagged with the profile that made them (see
@@ -4068,7 +4122,7 @@ class KubeAgentsHarness(AgentHarness):
         logs = _worker_logs(awaited, _EXEC_TIMEOUT)
         result.metadata["worker_commands"] = _worker_commands(logs)
         _dump_worker_logs(logs, stalled)
-        _archive_stalled_cards(stalled, _EXEC_TIMEOUT)
+        _archive_stalled_cards(stalled, _EXEC_TIMEOUT, floor=floor)
         captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
         if captured is None:
             result.metadata["worker_trajectory"] = None

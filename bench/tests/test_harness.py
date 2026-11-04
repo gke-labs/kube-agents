@@ -4034,15 +4034,32 @@ def test_the_purge_takes_every_root_when_the_pod_clock_was_not_read(tmp_path: Pa
     assert not _has_files(tmp_path, "t_old")
 
 
-def test_a_purge_that_cannot_check_the_floor_keeps_the_roots_files(tmp_path: Path) -> None:
-    """With a floor but no board to check it against, no root is known to be the run's."""
+def test_a_purge_that_cannot_check_the_floor_still_clears_the_roots_files(tmp_path: Path) -> None:
+    """With a floor but no board to check it against, the run's own report must not outlive it."""
     _card_files(tmp_path, "t_1")
     (tmp_path / "kanban.db").write_text("not a database")
 
     out = _run_purge(tmp_path, ["t_1"], floor=_FLOOR)
 
     assert len(out) == 1 and out[0].startswith("rows kept: ")
-    assert _has_files(tmp_path, "t_1")
+    assert not _has_files(tmp_path, "t_1")
+
+
+def test_a_floored_purge_whose_script_never_ran_clears_the_roots_files_from_the_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No python, or the exec timed out: nothing sorted the roots, so the shell clears them."""
+    scripts: list[str] = []
+    replies = iter(["", "", "purged\n"])
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or next(replies))
+
+    harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
+    assert len(scripts) == 2 and _is_purge(scripts[0])
+    assert scripts[1].startswith("for t in 't_1'") and f"rm -rf {harness._ATTACHMENTS_DIR}" in scripts[1]
+
+    # A script that ran sorted the roots itself: no second exec.
+    harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
+    assert len(scripts) == 3
 
 
 def test_a_purge_whose_board_step_fails_still_clears_the_runs_files(tmp_path: Path) -> None:
@@ -4066,13 +4083,15 @@ def test_a_purge_whose_board_step_fails_still_clears_the_runs_files(tmp_path: Pa
 def test_the_pod_clock_read_is_the_floor_or_none(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    replies = iter(["1700000000\n", "", "Error from server\n"])
+    # "²" is a digit to str.isdigit() and not to int(): it must not raise out of run().
+    replies = iter(["1700000000\n", "", "Error from server\n", "\u00b2\n"])
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: next(replies))
     assert harness._pod_clock() == _FLOOR
     with caplog.at_level("WARNING", logger="kube_agents_bench.harness"):
         assert harness._pod_clock() is None
         assert harness._pod_clock() is None
-    assert caplog.text.count("could not read the agent pod's clock") == 2
+        assert harness._pod_clock() is None
+    assert caplog.text.count("could not read the agent pod's clock") == 3
 
 
 def _clocked_pod(
@@ -4150,7 +4169,8 @@ def test_an_infra_status_turn_floors_its_purge_too(
 def test_an_unfloored_purge_clears_the_runs_files_from_the_shell_first(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no floor every root is the run's own, so its files go even if python never starts."""
     scripts: list[str] = []
-    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "")
+    # Both scripts ran ("purged"), so the floored one needs no shell fallback.
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "purged\n")
     harness._purge_card_state(["t_1"], 5.0)
     harness._purge_card_state(["t_1"], 5.0, floor=1_700_000_000)
     unfloored, floored = scripts
@@ -5834,3 +5854,82 @@ def test_pending_first_rate_limited_triage_sorted_after_moving_cards() -> None:
     # Default without is_terminal treats triage as pending (backwards compatibility)
     ordered_default = harness._pending_first(task_ids, statuses)
     assert ordered_default == task_ids
+
+
+def test_the_stall_archive_spares_a_card_created_before_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The front door's create handed it back by its key: its worker is someone else's to stop."""
+    archived: list[str] = []
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._shell_quote(harness._CREATED_BEFORE_SCRIPT) in script:
+            return "t_old\nlisted\n"
+        if "kanban archive" in script:
+            tid = next(t for t in ("t_old", "t_new") if f"'{t}'" in script)
+            archived.append(tid)
+            return f"Archived {tid}\n"
+        return "listed\n"
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    harness._archive_stalled_cards(["t_old", "t_new"], 5.0, floor=_FLOOR)
+    assert archived == ["t_new"]
+
+
+def test_the_stall_archive_archives_everything_when_the_board_is_unread(monkeypatch: pytest.MonkeyPatch) -> None:
+    archived: list[str] = []
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._shell_quote(harness._CREATED_BEFORE_SCRIPT) in script:
+            return ""
+        if "kanban archive" in script:
+            archived.append(next(t for t in ("t_old", "t_new") if f"'{t}'" in script))
+            return "Archived\n"
+        return "listed\n"
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    harness._archive_stalled_cards(["t_old", "t_new"], 5.0, floor=_FLOOR)
+    assert archived == ["t_old", "t_new"]
+
+
+def test_the_created_before_script_reads_the_board(tmp_path: Path) -> None:
+    kb = sqlite3.connect(tmp_path / "kanban.db")
+    kb.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, created_at INTEGER)")
+    kb.executemany("INSERT INTO tasks VALUES (?, ?)", [("t_old", _FLOOR - 1), ("t_same", _FLOOR), ("t_new", _FLOOR + 5)])
+    kb.commit()
+    proc = subprocess.run(
+        [sys.executable, "-c", harness._CREATED_BEFORE_SCRIPT, str(tmp_path), str(_FLOOR), "t_old", "t_same", "t_new", "t_gone"],
+        capture_output=True, text=True, check=True,
+    )
+    assert proc.stdout.splitlines() == ["t_old", "listed"]
+
+
+def test_settle_floors_its_stall_archive(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: None)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+    monkeypatch.setattr(harness, "_purge_card_state", lambda *a, **k: None)
+    seen: list[tuple[list[str], int | None]] = []
+    monkeypatch.setattr(
+        harness, "_archive_stalled_cards", lambda ids, to, floor=None: seen.append((list(ids), floor))
+    )
+    harness.KubeAgentsHarness._settle(
+        harness.AgentResult(output="ok", trajectory=[]), [], ["t_1"], stalled=["t_1"], floor=_FLOOR
+    )
+    assert seen == [(["t_1"], _FLOOR)]
+
+
+def test_a_card_already_done_on_the_first_read_floors_its_purge(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``if not outstanding`` settle: the opening turn already shows the card done."""
+    scripts, _ = _clocked_pod(monkeypatch, stub_agent)
+    done = _turn(
+        *_call("kanban_create", {"title": "t", "assignee": "cluster"}, {"ok": True, "task_id": _TASK_ID, "status": "ready"}, "c1"),
+        *_call("kanban_show", {"task_id": _TASK_ID}, {"task": {"id": _TASK_ID, "status": "done", "result": _RCA_RESULT}, "runs": []}, "c2"),
+        _text("done already"),
+    )
+    stub_agent.turns = [done]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    (purge,) = [s for s in scripts if _is_purge(s)]
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))

@@ -3152,6 +3152,32 @@ def test_a_board_that_stops_answering_is_infrastructure(
     assert "the kanban board could not be read 3 times running" in result.errors[0]
 
 
+def test_an_inject_lane_settle_floors_its_purge(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The settle the presubmit's inject lane takes carries the run-start floor (#4591)."""
+    floor = 1_700_000_000
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    real = local_shell(tmp_path, monkeypatch)
+    purges: list[str] = []
+
+    def clocked(script: str, timeout: float) -> str:
+        if script == harness._POD_CLOCK_SCRIPT:
+            return f"{floor}\n"
+        if harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script:
+            purges.append(script)
+        return real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    (purge,) = purges
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([CARD_A], floor=floor)))
+
+
 def test_a_board_that_stops_answering_floors_its_purge(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
