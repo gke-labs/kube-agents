@@ -7,7 +7,8 @@ two readings to the metrics object. The outcomes reading is the count of those
 proposals by state (step 1, the listing). The details reading is who closed the
 closed ones, the touches on all of them by kind and actor, how many human
 touches each terminal proposal carried, and how many old open proposals nobody
-has touched (step 2, per-proposal reads behind a cache and an hourly budget).
+has touched (step 2, per-proposal reads behind a cache and an hourly budget,
+which stop while the forge reports the credential's quota nearly spent).
 
 Each reading is all or nothing over the repositories that require it: a
 repository that fails a step withholds the reading that step feeds, and the
@@ -56,6 +57,15 @@ VCS_READINGS_CLAMPED_PAGE_SLACK = 2
 # Step 2's forge calls per hour: a fifth of an installation token's quota,
 # spread evenly over the sweeps in the hour.
 VCS_READINGS_DETAIL_CALLS_PER_HOUR = 1000
+# Step 2 also stops while the forge reports the credential's quota at or under
+# a floor, until the quota resets (#4615). The hourly budget is per install,
+# and installs that share one App installation each spend theirs against the
+# one quota (#4611); the agents' own forge calls draw on that quota too, so the
+# sweep leaves them the floor: a tenth of the forge's limit, never under three
+# hundred calls, and three hundred where the forge reports no limit. Where the
+# forge reports no quota at all, the hourly budget is the only bound, as before.
+VCS_READINGS_QUOTA_FLOOR = 300
+VCS_READINGS_QUOTA_FLOOR_SHARE = 10  # percent of the forge's reported limit
 VCS_READINGS_IGNORED_AFTER_SECONDS = 14 * 24 * 3600
 # The per-proposal gauge's cumulative `le` edges.
 VCS_READINGS_BUCKETS = (0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, math.inf)
@@ -107,6 +117,8 @@ REASON_TRUNCATED = "truncated"
 REASON_DETAIL_TRUNCATED = "detail_truncated"
 REASON_RATE_LIMITED = "rate_limited"
 REASON_WARMING = "warming"
+# Step 2 left proposals unread because the forge's quota is at the floor.
+REASON_QUOTA_FLOOR = "quota_floor"
 
 # A provider review state to its touch kind. `dismissed` has no kind: the
 # vocabulary is closed, and a dismissed review is no longer the reviewer's say.
@@ -249,6 +261,32 @@ def _epoch(stamp: str) -> float | None:
     return parsed.timestamp()
 
 
+def quota_floor(limit: int | None) -> int:
+    """The remaining quota at or under which step 2 stops, for a forge's `limit`."""
+    if limit is None:
+        return VCS_READINGS_QUOTA_FLOOR
+    return max(VCS_READINGS_QUOTA_FLOOR, limit * VCS_READINGS_QUOTA_FLOOR_SHARE // 100)
+
+
+def _known_quota(transport: Any) -> Any:
+    """The transport's latest quota reading when it says how much remains, else None.
+
+    A transport with no `quota` (the CLI's answers None) and a reading with no
+    `remaining` are both unknown.
+    """
+    read = getattr(transport, "quota", None)
+    if not callable(read):
+        return None
+    try:
+        reading = read()
+    except Exception:  # noqa: BLE001 -- an unreadable quota is an unknown one
+        return None
+    remaining = getattr(reading, "remaining", None)
+    if not isinstance(remaining, int) or isinstance(remaining, bool):
+        return None
+    return reading
+
+
 def _reason(exc: BaseException) -> str:
     if isinstance(exc, WorkspaceError) and exc.fields.get("code") == RATE_LIMITED_CODE:
         return REASON_RATE_LIMITED
@@ -313,6 +351,7 @@ class ReadingsSweep:
         interval: float = VCS_READINGS_TTL_SECONDS,
         app_credential: Callable[[Any], bool] | None = None,
         sleep: Callable[[float], Any] | None = None,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self._registry = registry
         self._transport_for = transport_for
@@ -347,6 +386,12 @@ class ReadingsSweep:
         # minute's searches went out, and how the sweep waits for the next.
         self._searches: dict[str, deque] = {}
         self._sleep = sleep if sleep is not None else self._stop.wait
+        # Per forge host, when step 2 may go on: the epoch second the forge
+        # said its quota resets, set when the quota was at the floor or a
+        # step-2 call was rate-limited. Kept across sweeps, since each sweep
+        # binds a fresh transport that knows no quota until it calls.
+        self._wall = wall_clock
+        self._paused: dict[str, float] = {}
 
     # ---- the timer -----------------------------------------------------
 
@@ -453,8 +498,9 @@ class ReadingsSweep:
         try:
             if not truncated:
                 self._evict_missing(key, proposals)
-            if not self._warm(key, proposals):
-                attempt.reasons.append(REASON_WARMING)
+            unread = self._warm(key, proposals)
+            if unread:
+                attempt.reasons.append(unread)
                 return attempt
         except Exception as exc:  # noqa: BLE001
             return self._failed(key, exc, attempt)
@@ -671,11 +717,13 @@ class ReadingsSweep:
             counts[state] = value
         return counts
 
-    def _warm(self, repo: str, proposals: list[dict]) -> bool:
+    def _warm(self, repo: str, proposals: list[dict]) -> str:
         """Step 2 for every listed proposal not current in the cache, under the
-        budget; True when every one is current. Each record is cached as read."""
+        budget and above the quota floor; "" when every one is current, else
+        why some are not (`quota_floor` or `warming`). Each record is cached
+        as read."""
         bound = self._bound[repo]
-        current = True
+        unread = ""
         for proposal in proposals:
             key = (*bound.scope, int(proposal.get("number")))
             record = self._cache.get(key)
@@ -685,15 +733,63 @@ class ReadingsSweep:
                 and record.state == proposal.get("state")
             ):
                 continue
+            if unread == REASON_QUOTA_FLOOR or self._quota_stopped(bound):
+                unread = REASON_QUOTA_FLOOR
+                continue
             if self._budget <= 0:
-                current = False
+                unread = REASON_WARMING
                 continue
             before = self._calls
             try:
                 self._cache[key] = self._details(repo, proposal)
+            except WorkspaceError as exc:
+                if _reason(exc) == REASON_RATE_LIMITED:
+                    self._pause_if_spent(bound)
+                raise
             finally:
                 self._budget -= self._calls - before
-        return current
+        return unread
+
+    def _quota_stopped(self, bound: _Repository) -> bool:
+        """Whether step 2 stops for `bound`'s host: paused until a reset that
+        has not passed, or the quota its transport last reported at the floor.
+
+        At the floor with a reset to come, the host is paused until then, so
+        later sweeps skip step 2 before their fresh transport has called.
+        """
+        until = self._paused.get(bound.host)
+        if until is not None:
+            if self._wall() < until:
+                return True
+            del self._paused[bound.host]
+        reading = _known_quota(bound.transport)
+        if reading is None:
+            return False
+        floor = quota_floor(reading.limit)
+        if reading.remaining > floor:
+            return False
+        self._pause(bound.host, reading, f"remaining={reading.remaining} floor={floor}")
+        return True
+
+    def _pause_if_spent(self, bound: _Repository) -> None:
+        """After a rate-limited step-2 call: when the quota reads spent, pause
+        the host until its reset, rather than failing again every pass. A
+        throttle with quota left (a secondary limit) pauses nothing."""
+        reading = _known_quota(bound.transport)
+        if reading is not None and reading.remaining == 0:
+            self._pause(bound.host, reading, "rate-limited, remaining=0")
+
+    def _pause(self, host: str, reading: Any, why: str) -> None:
+        reset_at = reading.reset_at
+        if reset_at is None or reset_at <= self._wall() or self._paused.get(host) == reset_at:
+            return
+        self._paused[host] = reset_at
+        LOGGER.info(
+            "proposal readings: per-proposal reads paused for %s until the forge's quota resets in %ds (%s)",
+            host,
+            int(reset_at - self._wall()),
+            why,
+        )
 
     def _details(self, repo: str, proposal: dict) -> ProposalRecord:
         """Step 2 for one proposal: its touches by kind and actor, and its closer."""

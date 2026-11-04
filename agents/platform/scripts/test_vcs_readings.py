@@ -47,8 +47,15 @@ def rate_limited() -> WorkspaceError:
 
 
 class FakeTransport:
+    """A fresh one per bind, as `sweep_transport_for` builds; it keeps the quota
+    the forge's answers reported (`FakeForge.quota`), as `HttpTransport` does."""
+
     def __init__(self, forge: "FakeForge"):
         self.forge = forge
+        self.reading = None
+
+    def quota(self):
+        return self.reading
 
     def whoami(self) -> str:
         self.forge.whoami_calls += 1
@@ -58,6 +65,9 @@ class FakeTransport:
 
     def api(self, method, path, **kwargs):
         self.forge.calls.append(path)
+        quota = self.forge.quota(path) if callable(self.forge.quota) else self.forge.quota
+        if quota is not None:
+            self.reading = quota
         if path == "user":
             return {"id": 7, "login": self.forge.login}
         return None
@@ -91,6 +101,9 @@ class FakeForge:
         self.before_page = None
         # Proposals whose reviews and comments run past the conversation bound.
         self.long_conversations: set[int] = set()
+        # The quota each answer reports: a reading, None for none, or a
+        # callable of the route that returns one.
+        self.quota = None
 
     def add(self, number, state="open", author=INSTALL_BARE, created=RECENT, updated=None, **events):
         self.proposals[number] = {
@@ -247,6 +260,7 @@ class Harness:
             clock=self.clock,
             interval=interval,
             app_credential=app_credential,
+            wall_clock=self.clock,
         )
 
     def last(self):
@@ -1001,6 +1015,173 @@ class SearchPacingTest(unittest.TestCase):
         for _ in range(60):
             bound.api("GET", "search/issues")
         self.assertEqual([], sleeps)
+
+
+QuotaReading = providers.QuotaReading
+QUOTA_LIMIT = 5000
+# The fake clock starts at 1000; the forge says its quota resets 900s on.
+QUOTA_RESET = 1900.0
+PER_PROPOSAL = 3  # reviews, view, commits for a proposal that is not closed
+
+
+class BareTransport(FakeTransport):
+    """A transport with no quota at all, as before #4615."""
+
+    quota = None
+
+
+def proposals_forge(count, quota=None):
+    forge = FakeForge()
+    for number in range(1, count + 1):
+        forge.add(number, "open")
+    forge.quota = quota
+    return forge
+
+
+class QuotaPacingTest(unittest.TestCase):
+    """#4615: step 2 paces on the quota the forge reports, under the hourly budget."""
+
+    def test_the_floor_is_a_tenth_of_the_limit_and_never_under_three_hundred(self):
+        self.assertEqual(500, vcs_readings.quota_floor(5000))
+        self.assertEqual(300, vcs_readings.quota_floor(1000))
+        self.assertEqual(300, vcs_readings.quota_floor(None))
+        self.assertEqual(1500, vcs_readings.quota_floor(15000))
+
+    def test_step_two_stops_at_the_floor_and_records_quota_floor(self):
+        for quota in (QuotaReading(QUOTA_LIMIT, 500, QUOTA_RESET), QuotaReading(None, 300, QUOTA_RESET)):
+            with self.subTest(quota=quota):
+                forge = proposals_forge(5, quota)
+                harness = Harness({REPO: forge}, interval=WIDE)
+
+                with self.assertLogs(LOGGER_NAME, level="INFO") as logs:
+                    harness.sweep.run_once()
+
+                self.assertEqual(0, forge.detail_calls())
+                outcomes, details = harness.last()
+                self.assertEqual(5, outcomes.open, "step 1 is not paced on the quota")
+                self.assertIsNone(details)
+                self.assertEqual(["quota_floor"], harness.metrics.failures)
+                self.assertTrue(any("paused" in line for line in logs.output))
+
+    def test_one_call_above_the_floor_proceeds(self):
+        for quota in (QuotaReading(QUOTA_LIMIT, 501, QUOTA_RESET), QuotaReading(None, 301, QUOTA_RESET)):
+            with self.subTest(quota=quota):
+                forge = proposals_forge(5, quota)
+                harness = Harness({REPO: forge}, interval=WIDE)
+                harness.sweep.run_once()
+                self.assertEqual(5 * PER_PROPOSAL, forge.detail_calls())
+                self.assertIsNotNone(harness.last()[1])
+                self.assertEqual([], harness.metrics.failures)
+
+    def test_step_two_stops_mid_sweep_when_its_own_calls_reach_the_floor(self):
+        left = [520]
+
+        def spending(route):
+            left[0] -= 1
+            return QuotaReading(QUOTA_LIMIT, left[0], QUOTA_RESET)
+
+        forge = proposals_forge(20, spending)
+        harness = Harness({REPO: forge}, interval=WIDE)
+        with self.assertLogs(LOGGER_NAME, level="INFO"):
+            harness.sweep.run_once()
+
+        # The listing leaves 519; seven proposals at three calls take it to 498.
+        self.assertEqual(7 * PER_PROPOSAL, forge.detail_calls())
+        self.assertEqual(["quota_floor"], harness.metrics.failures)
+        self.assertEqual(7, len(harness.sweep._cache))
+
+    def test_a_paused_host_resumes_once_the_reset_passes(self):
+        forge = proposals_forge(5, QuotaReading(QUOTA_LIMIT, 100, QUOTA_RESET))
+        harness = Harness({REPO: forge}, interval=WIDE)
+        with self.assertLogs(LOGGER_NAME, level="INFO"):
+            harness.sweep.run_once()
+        self.assertEqual(0, forge.detail_calls())
+
+        # The forge reports nothing now, and the next sweep's fresh transport
+        # knows no quota: the pause the sweep remembered holds to the reset.
+        forge.quota = None
+        harness.clock.now = QUOTA_RESET - 1
+        forge.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(0, forge.detail_calls())
+        self.assertEqual(["quota_floor", "quota_floor"], harness.metrics.failures)
+
+        harness.clock.now = QUOTA_RESET
+        forge.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(5 * PER_PROPOSAL, forge.detail_calls())
+        self.assertIsNotNone(harness.last()[1])
+        self.assertEqual(["quota_floor", "quota_floor"], harness.metrics.failures)
+
+    def test_above_the_floor_the_hourly_budget_is_still_the_ceiling(self):
+        forge = proposals_forge(500, QuotaReading(QUOTA_LIMIT, 4000, QUOTA_RESET))
+        harness = Harness({REPO: forge})
+        per_sweep = vcs_readings.VCS_READINGS_DETAIL_CALLS_PER_HOUR * vcs_readings.VCS_READINGS_TTL_SECONDS / 3600
+
+        harness.sweep.run_once()
+        first = forge.detail_calls()
+        self.assertGreater(first, 0)
+        self.assertLessEqual(first, per_sweep + PER_PROPOSAL)
+
+        forge.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(0, forge.detail_calls(), "plenty of quota, but the budget has not refilled")
+        self.assertEqual(["warming", "warming"], harness.metrics.failures)
+
+    def test_an_unknown_quota_paces_exactly_as_before(self):
+        def run(quota, transport=FakeTransport):
+            forge = proposals_forge(300, quota)
+            harness = Harness({REPO: forge})
+            harness.sweep._transport_for = lambda f, repo: transport(f)
+            for _ in range(6):
+                harness.sweep.run_once()
+                harness.clock.now += vcs_readings.VCS_READINGS_TTL_SECONDS
+            return forge.calls, harness.metrics.failures, len(harness.sweep._cache)
+
+        before = run(None, BareTransport)
+        self.assertGreater(before[2], 0)
+        for quota in (None, QuotaReading(QUOTA_LIMIT, None, QUOTA_RESET), QuotaReading(None, None, None)):
+            with self.subTest(quota=quota):
+                self.assertEqual(before, run(quota))
+
+    def test_a_rate_limited_step_two_with_the_quota_spent_pauses_until_the_reset(self):
+        forge = proposals_forge(3)
+        forge.quota = lambda route: QuotaReading(QUOTA_LIMIT, 0, QUOTA_RESET) if route == "reviews" else None
+        forge.fail["reviews"] = rate_limited()
+        harness = Harness({REPO: forge}, interval=WIDE)
+        with self.assertLogs(LOGGER_NAME, level="INFO"):
+            harness.sweep.run_once()
+        self.assertEqual(["rate_limited"], harness.metrics.failures)
+        self.assertEqual(1, forge.detail_calls())
+
+        # The listing reports no core quota (GitHub's search has its own), so
+        # only the pause keeps the next sweep from failing again.
+        del forge.fail["reviews"]
+        forge.quota = None
+        forge.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(0, forge.detail_calls())
+        self.assertEqual(["rate_limited", "quota_floor"], harness.metrics.failures)
+
+        harness.clock.now = QUOTA_RESET
+        forge.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(3 * PER_PROPOSAL, forge.detail_calls())
+        self.assertIsNotNone(harness.last()[1])
+
+    def test_a_throttle_with_quota_left_pauses_nothing(self):
+        forge = proposals_forge(3)
+        forge.quota = lambda route: QuotaReading(QUOTA_LIMIT, 4000, QUOTA_RESET) if route == "reviews" else None
+        forge.fail["reviews"] = rate_limited()
+        harness = Harness({REPO: forge}, interval=WIDE)
+        with self.assertLogs(LOGGER_NAME, level="WARNING"):
+            harness.sweep.run_once()
+
+        del forge.fail["reviews"]
+        forge.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(3 * PER_PROPOSAL, forge.detail_calls())
+        self.assertEqual(["rate_limited"], harness.metrics.failures)
 
 
 class SweepTimerTest(unittest.TestCase):
