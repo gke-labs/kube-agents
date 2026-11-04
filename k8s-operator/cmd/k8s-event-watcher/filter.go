@@ -51,6 +51,10 @@ type filterConfig struct {
 	// excludedNamespaces suppresses events from these namespaces.
 	// Exclude rules take precedence over allowedNamespaces rules.
 	excludedNamespaces map[string]struct{}
+	// alertExclude holds the --alert-exclude rules: an event any of them
+	// matches opens no incident (gateAlertExcluded). Set after
+	// newFilterConfig, from parseAlertExclude.
+	alertExclude []alertExcludeRule
 	// unhealthyMinCount specifies the minimum repeat threshold count for "Unhealthy"
 	// events before they pass. This prevents transient probe failures from triggering alerts.
 	unhealthyMinCount int
@@ -459,13 +463,20 @@ const (
 	// two and the kube-system addons use the ordinary one. See
 	// autopilotScaleToZero.
 	gateAutopilotScaleToZero filterGate = "autopilot_scale_to_zero"
+	// gateAlertExcluded is an event an --alert-exclude rule matches: its
+	// cluster stays in scope for reads, but it opens no incident.
+	gateAlertExcluded filterGate = "alert_excluded"
 )
 
 // Decide applies the filtering rules in order and returns the first gate that
 // rejected the event, or gateAccepted if it passed all of them:
 //  1. Reason is allowed.
 //  2. Namespace is not explicitly excluded (exclude wins).
-//  3. Namespace is in the allowed list (or allowed list is empty).
+//  3. Namespace is in the allowed list (or allowed list is empty), and no
+//     --alert-exclude rule matches (gateAlertExcluded). The two
+//     cluster-autoscaler verdicts are not checked against the rules: a rule
+//     whose reason names one would drop the verdict while leaving the pod's
+//     FailedScheduling, which carries another reason, to rule 6 without it.
 //  4. Repeat count threshold is met, for the families that flap: "Unhealthy"
 //     probe warnings, the crash-loop family, and retryable image pulls.
 //  5. The settle family (settleApplies) has lasted the settle period by the
@@ -497,6 +508,9 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 		if _, allowed := f.cfg.allowedNamespaces[ev.Namespace]; !allowed {
 			return gateNamespaceNotAllowed
 		}
+	}
+	if scaleUpVerdictFor(ev.Key.Reason) == scaleUpNone && alertExcluded(f.cfg.alertExclude, ev) {
+		return gateAlertExcluded
 	}
 	if ev.Key.Reason == "Unhealthy" && belowMinCount(ev.Count, f.cfg.unhealthyMinCount) {
 		return gateUnhealthyMinCount
