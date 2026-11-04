@@ -197,7 +197,7 @@ func TestHandlerRefusals(t *testing.T) {
 		wantCode             int
 		wantReason           metav1.StatusReason
 	}{
-		{"invalid path", http.MethodGet, "/api/v1/namespaces/%2e%2e/secrets", http.StatusBadRequest, metav1.StatusReasonBadRequest},
+		{"invalid path", http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/%2e%2e/secrets", http.StatusBadRequest, metav1.StatusReasonBadRequest},
 		{"invalid cluster", http.MethodGet, "/clusters/bad$id/api/v1/pods", http.StatusBadRequest, metav1.StatusReasonBadRequest},
 		{"write without dry run", http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/configmaps", http.StatusForbidden, metav1.StatusReasonForbidden},
 		{"exec", http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/pods/p/exec?command=sh", http.StatusForbidden, metav1.StatusReasonForbidden},

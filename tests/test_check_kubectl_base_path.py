@@ -36,7 +36,8 @@ FAKE = textwrap.dedent(
         sys.exit(1)
     u = urllib.parse.urlsplit(server)
     base = server if mode == "keep" else f"{{u.scheme}}://{{u.netloc}}"
-    sys.stdout.write(urllib.request.urlopen(base + raw).read().decode())
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))  # loopback, never a proxy
+    sys.stdout.write(opener.open(base + raw).read().decode())
     """
 )
 

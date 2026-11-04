@@ -37,33 +37,34 @@ func TestSplitClusterPath(t *testing.T) {
 		wantCluster string
 		wantPath    string
 		wantErr     bool
+		wantMsg     string // a substring of the refusal, so a case can't pass for another rule's reason
 	}{
 		// No prefix is refused (#4739): kubectl before 1.34 drops the kubeconfig server's
 		// /clusters/<ctx> base path on `get --raw`, and a default cluster answered that
 		// fleet read with the host's data.
-		{name: "no prefix", target: "/api/v1/pods", wantErr: true},
-		{name: "no prefix, discovery", target: "/apis/metrics.k8s.io/v1beta1/nodes", wantErr: true},
-		{name: "no prefix, root", target: "/", wantErr: true},
+		{name: "no prefix", target: "/api/v1/pods", wantErr: true, wantMsg: "name a cluster"},
+		{name: "no prefix, discovery", target: "/apis/metrics.k8s.io/v1beta1/nodes", wantErr: true, wantMsg: "name a cluster"},
+		{name: "no prefix, root", target: "/", wantErr: true, wantMsg: "name a cluster"},
 		{name: "gke prefix", target: "/clusters/" + gkeFleet + "/api/v1/namespaces/default/pods", wantCluster: gkeFleet, wantPath: "/api/v1/namespaces/default/pods"},
 		{name: "in-cluster prefix", target: "/clusters/in-cluster/apis/apps/v1/deployments", wantCluster: InClusterID, wantPath: "/apis/apps/v1/deployments"},
 		{name: "domain-scoped gke prefix", target: "/clusters/gke_example.com:proj_us-central1_c/api/v1/pods", wantCluster: "gke_example.com:proj_us-central1_c", wantPath: "/api/v1/pods"},
 		{name: "kind prefix", target: "/clusters/kind-dev.1/version", wantCluster: "kind-dev.1", wantPath: "/version"},
 		{name: "prefix alone is the root", target: "/clusters/in-cluster", wantCluster: InClusterID, wantPath: "/"},
-		{name: "encoded slash", target: "/api/v1/namespaces/default%2fsecrets/pods", wantErr: true},
-		{name: "encoded upper-case slash", target: "/api/v1/namespaces/default%2Fsecrets/pods", wantErr: true},
-		{name: "encoded dots", target: "/api/v1/namespaces/%2e%2e/secrets", wantErr: true},
-		{name: "encoded backslash", target: "/api/v1/namespaces/a%5cb/pods", wantErr: true},
-		{name: "encoded NUL", target: "/api/v1/namespaces/a%00/pods", wantErr: true},
-		{name: "encoded control character", target: "/api/v1/namespaces/a%0a/pods", wantErr: true},
-		{name: "dot-dot", target: "/api/v1/namespaces/default/pods/../../secrets", wantErr: true},
-		{name: "single dot", target: "/api/v1/./pods", wantErr: true},
-		{name: "double slash", target: "//api/v1/pods", wantErr: true},
-		{name: "inner double slash", target: "/api/v1//pods", wantErr: true},
-		{name: "missing cluster ID", target: "/clusters/", wantErr: true},
-		{name: "invalid cluster ID", target: "/clusters/bad$cluster/api/v1/pods", wantErr: true},
-		{name: "gke ID with too few parts", target: "/clusters/gke_proj_cluster/api", wantErr: true},
-		{name: "gke project with a dot and no domain", target: "/clusters/gke_example.com_us-central1_c/api", wantErr: true},
-		{name: "upper-case cluster ID", target: "/clusters/kind-Dev/api", wantErr: true},
+		{name: "encoded slash", target: "/clusters/in-cluster/api/v1/namespaces/default%2fsecrets/pods", wantErr: true, wantMsg: "percent-encoded"},
+		{name: "encoded upper-case slash", target: "/clusters/in-cluster/api/v1/namespaces/default%2Fsecrets/pods", wantErr: true, wantMsg: "percent-encoded"},
+		{name: "encoded dots", target: "/clusters/in-cluster/api/v1/namespaces/%2e%2e/secrets", wantErr: true, wantMsg: "percent-encoded"},
+		{name: "encoded backslash", target: "/clusters/in-cluster/api/v1/namespaces/a%5cb/pods", wantErr: true, wantMsg: "percent-encoded"},
+		{name: "encoded NUL", target: "/clusters/in-cluster/api/v1/namespaces/a%00/pods", wantErr: true, wantMsg: "control characters"},
+		{name: "encoded control character", target: "/clusters/in-cluster/api/v1/namespaces/a%0a/pods", wantErr: true, wantMsg: "control characters"},
+		{name: "dot-dot", target: "/clusters/in-cluster/api/v1/namespaces/default/pods/../../secrets", wantErr: true, wantMsg: "dot segments"},
+		{name: "single dot", target: "/clusters/in-cluster/api/v1/./pods", wantErr: true, wantMsg: "dot segments"},
+		{name: "double slash", target: "//clusters/in-cluster/api/v1/pods", wantErr: true, wantMsg: "empty path segments"},
+		{name: "inner double slash", target: "/clusters/in-cluster/api/v1//pods", wantErr: true, wantMsg: "empty path segments"},
+		{name: "missing cluster ID", target: "/clusters/", wantErr: true, wantMsg: "missing cluster ID"},
+		{name: "invalid cluster ID", target: "/clusters/bad$cluster/api/v1/pods", wantErr: true, wantMsg: "invalid cluster ID"},
+		{name: "gke ID with too few parts", target: "/clusters/gke_proj_cluster/api", wantErr: true, wantMsg: "invalid cluster ID"},
+		{name: "gke project with a dot and no domain", target: "/clusters/gke_example.com_us-central1_c/api", wantErr: true, wantMsg: "invalid cluster ID"},
+		{name: "upper-case cluster ID", target: "/clusters/kind-Dev/api", wantErr: true, wantMsg: "invalid cluster ID"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -78,6 +79,9 @@ func TestSplitClusterPath(t *testing.T) {
 				}
 				if perr.Code != http.StatusBadRequest || perr.RejectionReason != ReasonInvalidRoute {
 					t.Errorf("refusal = %d %q, want 400 %q", perr.Code, perr.RejectionReason, ReasonInvalidRoute)
+				}
+				if !strings.Contains(perr.Error(), tc.wantMsg) {
+					t.Errorf("refusal %q, want it to say %q", perr.Error(), tc.wantMsg)
 				}
 				return
 			}

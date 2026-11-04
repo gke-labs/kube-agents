@@ -86,7 +86,9 @@ RUN apt-get update && \
 # kubectl 1.35: the fleet runs GKE 1.35 and 1.36, inside kubectl's one-minor skew,
 # and from 1.34 `kubectl get --raw` keeps the kubeconfig server's /clusters/<context>
 # base path, which the k8s-api-proxy routes by (#4739). check_kubectl_base_path.py
-# below fails the build for a kubectl that drops it.
+# below fails the build for a kubectl that drops it. Keep this within one minor of
+# the GKE versions the fleet runs; a fleet cluster further out is outside kubectl's
+# supported skew, though reads usually still work.
 ARG KUBECTL_VERSION=1.35.10
 ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
 ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
