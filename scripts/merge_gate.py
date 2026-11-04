@@ -14,17 +14,17 @@ these names:
   - `Merge labels`: the label test of Tide's query for this repository, read
     from the labels.
 
-A smoke green from before the blocking job changed what it grades does not
-pass. While the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time, the
-same cutoff `pin_smoke_status.py` applies to its re-pins, `Smoke gate` stays
-pending on a green whose build first reported before that time, until a run
-from after it replaces it. The time is the earliest success status on the
-commit naming the same build, as that script reads it: a re-pin is a fresh copy
-with its own creation time. A green with no build link counts from the earliest
-success with none. That is one more read per green while the variable is set,
-skipped when the head `Smoke gate` is already green.
+A smoke green from before the blocking job changed what it grades does not pass.
+While the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time,
+`Smoke gate` stays pending on a green whose build first reported before that
+time, until a run from after it replaces it. The time is the earliest success
+status on the commit naming the same build: each re-pin that the retired
+`pin_smoke_status.py` posted is a fresh copy with its own creation time. A green
+with no build link counts from the earliest success with none. That is one more
+read per green while the variable is set, skipped when the head `Smoke gate` is
+already green.
 An `/override` links its own comment, so it counts from when it was posted. A
-green that `pin_smoke_status.py` expired carries its note and stays pending
+green that the retired `pin_smoke_status.py` expired carries its note and stays pending
 even after the variable is cleared. A green from before the cutoff that the
 script did not expire, because Tide already saw it as stale, has no note. So
 leave the variable set: clearing it lets such a green pass again. An
@@ -100,12 +100,11 @@ SMOKE_CONTEXT = "pull-kube-agents-smoke-test"
 SMOKE_GATE = "Smoke gate"
 LABELS_GATE = "Merge labels"
 GATES = (SMOKE_GATE, LABELS_GATE)
-#: The repository variable that holds the smoke cutoff (module docstring), read as
-#: `pin_smoke_status.py` reads it.
+#: The repository variable that holds the smoke cutoff (module docstring).
 NOT_BEFORE_ENV = "SMOKE_PIN_NOT_BEFORE"
 #: What `Smoke gate` says while it waits on a green from before the cutoff.
 SMOKE_PREDATES = f"smoke predates {NOT_BEFORE_ENV}; push a new commit to rerun {SMOKE_CONTEXT}"
-#: The note `pin_smoke_status.py` (EXPIRED_NOTE) adds to a pre-cutoff green that Tide still
+#: The note the retired `pin_smoke_status.py` added to a pre-cutoff green that Tide still
 #: credited. It holds that green with or without the variable, as it did for Tide.
 SMOKE_EXPIRED_NOTE = f"(predates {NOT_BEFORE_ENV}: retest)"
 #: Tide's query for this repository (`prow/oss/config.yaml` in oss-test-infra) wanted both.
@@ -364,7 +363,7 @@ def smoke_first_reported(api, sha):
 
     The earliest success status naming the same build (its target URL); for a
     status with no link, the earliest success with none, because each re-pin
-    copies it with a new creation time. None
+    copied it with a new creation time. None
     when the latest smoke status is not green or a creation time is unreadable
     or zoneless, which the cutoff counts as before it.
     """

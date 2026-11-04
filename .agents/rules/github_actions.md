@@ -65,9 +65,6 @@ after the `synchronize` run for the new one; in a group keyed on the number alon
 displaces that run, and the new head carries no check run under the workflow's name until the
 next push or edit. Keyed by head, a run can only supersede runs for its own head.
 
-`smoke-test-sticky.yml` has no group on purpose and says why in its header: it starts on `status`
-and `push`, never on `pull_request`, and a dropped pending run there would drop a re-pin.
-
 ## Detect changed files with git, not the API
 
 A `dorny/paths-filter` step on a workflow that starts on `pull_request` sets `token: ""`. With a
