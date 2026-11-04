@@ -102,10 +102,9 @@ project number), each with a 60-second timeout, and
 with `--readiness` three `gcloud` list reads per project (`compute backend-services list`,
 `compute instances list`, `container operations list`, each projected to the fields the per-entry
 rules read), one `gcloud container clusters get-credentials` and the `kubectl get`s per
-member that "Check upgrade readiness" lists (the PDB rule's, the webhook rule's, then one per
-group of kinds the per-entry rules read), plus whatever a registered rule reads itself through the
-script's own runner under the same cap (a rule that reads the audit log runs paged `gcloud logging
-read`s).
+member that "Check upgrade readiness" lists (the PDB rule's, the webhook rule's, then one paged
+read per kind the per-entry rules read), plus whatever a registered rule reads through the
+script's own runner under the same cap (the audit-log rule's paged `gcloud logging read`s).
 It changes nothing in GCP or in any cluster; the only things it writes are its own record under
 `/opt/data/state/fleet-upgrade-verification/`, the per-member kubeconfig files `--readiness`
 needs, and the `--output` file. A failed or timed-out gcloud read, `get-credentials`, PDB read,
@@ -202,8 +201,10 @@ backend, GKE's own URL-backed ones included, as a blocker.
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/` (`kubeconfig_<project>_<cluster>_<location>.yaml`, one file per
   target so concurrent reads never share a current-context; `--kubeconfig-dir` moves the
   directory), adding `--dns-endpoint` when the cluster record says its DNS endpoint accepts
-  external traffic, then one `kubectl get pdb,deploy,statefulset -A -o json`, the first of the
-  member's reads (the per-entry rules' reads follow it, below). A PDB is matched to
+  external traffic, then the PDB read, the first of the member's reads: PodDisruptionBudgets,
+  Deployments and StatefulSets, one kind at a time in pages of 500 through `kubectl get --raw`
+  (`/apis/policy/v1/poddisruptionbudgets?limit=500`, following `continue`), so no one reply
+  meets the credential proxy's output cap. A PDB is matched to
   the Deployments and StatefulSets in its namespace whose pod-template labels satisfy its
   selector (`matchLabels` and `matchExpressions`), and it blocks every drain when
   `maxUnavailable` is `0` or `0%`, or when `minAvailable` demands every expected pod: an integer
@@ -219,11 +220,11 @@ backend, GKE's own URL-backed ones included, as a blocker.
   does not include (a bare ReplicaSet, a custom controller), which is noted so it is never
   silently `ready`. DaemonSets are never matched: a drain deletes their pods rather than evicting
   them.
-- **Fail-closed webhooks**, from a second read with the same kubeconfig: `kubectl get
-validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A -o json`.
-  It is a read of its own so that a failure there grades only this rule `unknown` and never costs
-  the PDB result. In the agent sandbox the credential proxy cuts a list past its output cap on the
-  largest clusters; the error row names the cap, and the rule is `unknown` there. A webhook is graded when its `failurePolicy` is `Fail` (or absent, which
+- **Fail-closed webhooks**, from a second read with the same kubeconfig, paged the same way over
+  ValidatingWebhookConfigurations, MutatingWebhookConfigurations, Services, EndpointSlices and
+  Namespaces. A read of its own, so a failure there grades only this rule `unknown` and never
+  costs the PDB result. A page the credential proxy still cuts (the shim exits 74 with its
+  marker) fails the read; the error row names the cap, and the rule is `unknown` there. A webhook is graded when its `failurePolicy` is `Fail` (or absent, which
   `admissionregistration.k8s.io/v1` defaults to `Fail`) and its backend is a Service the API
   server cannot reach: the Service does not exist, no Service port equals the webhook's port (443
   when unset), or no ready endpoint sits behind that port in the Service's EndpointSlices (an
@@ -293,14 +294,13 @@ validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpoints
   goes in the note. Autopilot members read `n/a`.
 
 The per-entry rules run after those four, over the same cluster record and the reads after
-the webhook read, one per group of kinds: `kubectl get daemonset,cronjob,pvc,networkpolicy,namespace
--A -o json`; `kubectl get pods -A -o json` on its own, because the pod list is the one most
-likely to exceed the credential proxy's output cap and a cut read must cost only the rules that
-need pods; the Nodes through a jsonpath template that keeps each node's name, `providerID`, Pod CIDR, labels, taints,
-whether it is cordoned, node info, allocatable and conditions and drops the rest (so a few
-hundred nodes stay under that cap); and `kubectl get storageclass,pv -o json`. Each of them
-fails on its own: a refused or unparsable read, or one the credential proxy cut at its output
-cap (recorded as that kind's error naming the cap, never as unparsable JSON), costs only the
+the webhook read, one per group of kinds, paged the same way (`/api/v1/pods?limit=500`):
+DaemonSets, CronJobs, PersistentVolumeClaims, NetworkPolicies and Namespaces; Pods on their
+own, so a failure there costs only the rules that need pods; Nodes through a jsonpath template
+that keeps name, `providerID`, Pod CIDR, labels, taints, cordon, node info, allocatable and
+conditions (a few hundred nodes fit one read); and StorageClasses and PersistentVolumes. Each
+fails on its own: a refused or unparsable read, or a cut page (recorded as that kind's error
+naming the cap, never as unparsable JSON), costs only the
 rules that need its kinds, each of which says so as `unknown` and grades what it has, and it
 sets no exit code; the note names the kinds not read and the JSON records the error per kind
 under `read_errors` (every kind carries the reason when `get-credentials` or the PDB read failed:

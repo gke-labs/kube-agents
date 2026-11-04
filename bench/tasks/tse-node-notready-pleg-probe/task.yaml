@@ -36,15 +36,62 @@ fixtures: []
 validated: true
 
 verification_spec:
+  # The delegation, in two entries, because the two lanes see different
+  # things. The router's `kanban_create` is not read for its `assignee`: the
+  # inject door sends the Planning Agent's arguments as shapes ("<string, 3
+  # chars>", a2a/hermes-bridge/activity.go shapeOf), so no pattern over them
+  # can name the assignee, while the tool name survives on both transports.
+  # This entry reads that call alone: trace-blind (cases.py
+  # `trace_blind_checks`), so the scorer grades it on every record that shows
+  # the trace, the api lane's and the inject lane's alike, and a run that
+  # filed no card fails it on both.
   - name: delegated-to-tse-specialist
     role: objective
     mode: assert
     check:
       type: tool_called
       tool_names: ["kanban_create"]
-      arguments:
-        assignee: "^tse$"
       require_success: true
+  # The specialist's side: a card completed by the tse profile, read from
+  # the worker's calls, which the harness reads back from the pod tagged with
+  # the profile (worker_trajectory). A leaf in the workers scope is
+  # worker-blind (cases.py `worker_blind_checks`): graded on the api lane,
+  # set aside as not applicable on every inject record until the scorer
+  # grades worker entries there (#2619). Its own entry, not a leaf beside the
+  # router's in the entry above: a compound with a workers-scope leaf is
+  # worker-blind as a whole, which would take the delegation out of the
+  # inject lane's grading. Inside this entry the router leaf comes first, in a
+  # fail-fast `sequence`: with no card at all the workers scope has nothing
+  # to read and answers `error`, which blocks the repetition at the coverage
+  # rung before any fail is tallied; the router leaf turns that run into a
+  # definite fail on the api lane too. That leaf keeps the `assignee` read:
+  # the api lane, the one lane that grades this entry, records the argument
+  # readable, and a card the Planning Agent filed to another profile, whose
+  # worker fanned a child out to tse, is not the delegation the case asks
+  # for. A card filed and never worked still has no tagged entry and reads
+  # as `error`: the run is unobserved, and coverage blocks it.
+  # `kanban_complete` rather than any tse call: a card the specialist
+  # started and dropped is not a delegation that answered. "A card", not
+  # "the card": `tool_called` has no card selector, so the leaf reads a
+  # completion by the tse profile anywhere in the run's lineage, not the
+  # completion of the card the first leaf matched; the join is a verifier
+  # feature, not a leaf.
+  - name: tse-specialist-completed-the-card
+    role: objective
+    mode: assert
+    check:
+      type: sequence
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]
+          arguments:
+            assignee: "^tse$"
+          require_success: true
+        - type: tool_called
+          scope: workers
+          agent: "^tse$"
+          tool_names: ["kanban_complete"]
+          require_success: true
   - name: report-carries-five-section-escalation-bundle
     role: objective
     mode: assert
