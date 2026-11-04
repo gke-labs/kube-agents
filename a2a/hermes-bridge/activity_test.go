@@ -64,10 +64,27 @@ def call(tool, args, call_id, status="ok", error_type=None, ms=12):
 	return []string{path}
 }
 
+// waitForFile returns once path exists or d has passed. It runs off the test
+// goroutine, so it reports nothing: the caller's assertions fail instead.
+func waitForFile(path string, d time.Duration) {
+	for give := time.Now().Add(d); time.Now().Before(give); time.Sleep(50 * time.Millisecond) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+	}
+}
+
 // startBridgeCfg is startBridge with the caller's Config; the door is opened
 // on an ephemeral port unless the caller says otherwise. The lifecycle and
 // the consumer wait are startBridgeConfig's.
 func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Config)) *Bridge {
+	t.Helper()
+	return startBridgeCfgHooked(t, url, command, mutate, nil)
+}
+
+// startBridgeCfgHooked is startBridgeCfg plus a hook that sees the bridge
+// between New and Run.
+func startBridgeCfgHooked(t *testing.T, url string, command []string, mutate func(*Config), hook func(*Bridge)) *Bridge {
 	t.Helper()
 	cfg := Config{
 		NATSURL:        url,
@@ -86,7 +103,7 @@ func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Con
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	b, _ := startBridgeConfig(t, cfg, nil)
+	b, _ := startBridgeConfig(t, cfg, hook)
 	return b
 }
 
@@ -228,14 +245,30 @@ print("done")
 	}
 }
 
+// The deadline kills the stub only once its pre_tool_call is in: the
+// bridge records the open call before it answers the post, and the stub
+// writes its marker after the answer. Without the hold, the 2 s deadline
+// raced the stub's start, and a stub that had not posted yet left nothing
+// open to report.
 func TestActivity_AnOpenCallIsReportedInterruptedAtTheDeadline(t *testing.T) {
 	_, url := startServer(t)
-	startBridgeCfg(t, url, hermesStub(t, `
+	posted := filepath.Join(t.TempDir(), "posted")
+	startBridgeCfgHooked(t, url, hermesStub(t, fmt.Sprintf(`
 post("pre_tool_call", "terminal", {"cmd": "sleep 60", "secret": "x"}, {"tool_call_id": "c-open", "task_id": ""})
+open(%q, "w").close()
 time.sleep(30)
-`), func(c *Config) {
+`, posted)), func(c *Config) {
 		c.TaskDeadline = 2 * time.Second
 		c.KillGrace = 200 * time.Millisecond
+	}, func(b *Bridge) {
+		b.afterDeadline = func(d time.Duration, f func()) *time.Timer {
+			return time.AfterFunc(d, func() {
+				// Half of waitTerminal's budget, so a stub that never posts
+				// fails on the entry assertion below, not on the terminal wait.
+				waitForFile(posted, terminalWait/2)
+				f()
+			})
+		}
 	})
 	c := gatewayClient(t, url)
 
