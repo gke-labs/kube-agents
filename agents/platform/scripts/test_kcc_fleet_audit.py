@@ -449,6 +449,82 @@ class KccFleetAuditTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(payload, {"error": "kubectl timed out after 70s"})
 
+    def test_nonexistent_namespace_fails_closed_while_empty_existing_namespace_passes(self) -> None:
+        crd_table = (
+            f"{kcc.CONFIG_CONNECTOR_CRD} Cluster true True\n"
+            "sqlinstances.sql.cnrm.cloud.google.com Namespaced true True\n"
+        )
+        operator_payload = json.dumps(
+            {
+                "kind": "List",
+                "items": [
+                    {
+                        "kind": "ConfigConnector",
+                        "metadata": {"name": "configconnector.core.cnrm.cloud.google.com"},
+                        "status": {"healthy": True},
+                    }
+                ],
+            }
+        )
+
+        def fake_run(cmd: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+            if cmd[:3] == ["kubectl", "get", "crd"]:
+                return _completed(0, stdout=crd_table)
+            if cmd[2] == kcc.CONFIG_CONNECTOR_CRD:
+                return _completed(0, stdout=operator_payload)
+            if cmd[:3] == ["kubectl", "get", "namespace"]:
+                if cmd[3] == "empty-ns":
+                    return _completed(
+                        0, stdout=json.dumps({"kind": "Namespace", "metadata": {"name": "empty-ns"}})
+                    )
+                return _completed(
+                    1, stderr=f'Error from server (NotFound): namespaces "{cmd[3]}" not found'
+                )
+            return _completed(0, stdout=json.dumps({"kind": "List", "items": []}))
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            missing_buf = io.StringIO()
+            with mock.patch("sys.stdout", missing_buf):
+                rc_missing = kcc.audit_kcc(namespace="prod-dat")
+            empty_buf = io.StringIO()
+            with mock.patch("sys.stdout", empty_buf):
+                rc_empty = kcc.audit_kcc(namespace="empty-ns")
+
+        self.assertEqual(rc_missing, 0)
+        missing_out = missing_buf.getvalue()
+        self.assertIn("Could not verify namespace `prod-dat`", missing_out)
+        self.assertIn('namespaces "prod-dat" not found', missing_out)
+        self.assertIn("CLEAN_AUDIT_STOP: NO", missing_out)
+        self.assertNotIn("CLEAN_AUDIT_STOP: YES", missing_out)
+        self.assertNotIn("0 total across namespace `prod-dat`", missing_out)
+
+        self.assertEqual(rc_empty, 0)
+        empty_out = empty_buf.getvalue()
+        self.assertIn("0 total across namespace `empty-ns`", empty_out)
+        self.assertIn("CLEAN_AUDIT_STOP: YES", empty_out)
+
+    def test_operator_cr_with_healthy_true_and_errors_uses_operator_errors_reason(self) -> None:
+        evaluated_with_errors = kcc.evaluate_kcc_item(
+            {
+                "kind": "ConfigConnector",
+                "metadata": {"name": "configconnector.core.cnrm.cloud.google.com"},
+                "status": {"healthy": True, "errors": ["controller webhook degraded"]},
+            }
+        )
+        self.assertFalse(evaluated_with_errors["ready"])
+        self.assertEqual(evaluated_with_errors["reason"], "OperatorErrors")
+        self.assertEqual(evaluated_with_errors["message"], "controller webhook degraded")
+
+        evaluated_pending = kcc.evaluate_kcc_item(
+            {
+                "kind": "ConfigConnector",
+                "metadata": {"name": "configconnector.core.cnrm.cloud.google.com"},
+                "status": {},
+            }
+        )
+        self.assertFalse(evaluated_pending["ready"])
+        self.assertEqual(evaluated_pending["reason"], "StatusPending")
+
 
 if __name__ == "__main__":
     unittest.main()

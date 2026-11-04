@@ -368,13 +368,22 @@ def evaluate_kcc_item(item: dict) -> dict[str, object]:
             is_ready = True
             reason = "Healthy"
             message = f"mode={spec_mode}" if spec_mode else ""
-        elif healthy_flag is None and ready_cond is not None and ready_cond.get("status") == "True":
+        elif (
+            healthy_flag is None
+            and not errors_list
+            and ready_cond is not None
+            and ready_cond.get("status") == "True"
+        ):
             is_ready = True
             reason = sanitize_cell(ready_cond.get("reason") or "Ready")
             message = sanitize_cell(ready_cond.get("message") or "")
         else:
             is_ready = False
-            reason = "OperatorUnhealthy" if healthy_flag is False else "StatusPending"
+            reason = (
+                "OperatorUnhealthy"
+                if healthy_flag is False
+                else ("OperatorErrors" if errors_list else "StatusPending")
+            )
             raw_msg = "; ".join(errors_list) if errors_list else "status.healthy is not true"
             message = sanitize_cell(raw_msg)
     else:
@@ -463,6 +472,26 @@ def audit_kcc(
         chunk_size=chunk_size,
     )
 
+    # `kubectl get <crds> --namespace=<ns>` returns an empty List with exit 0 even when `<ns>`
+    # does not exist on the cluster. When `-n` was passed and zero namespaced objects came back,
+    # verify the namespace exists so a mistyped or deleted namespace never prints CLEAN_AUDIT_STOP: YES.
+    namespace_error = ""
+    if validated_ns is not None and not any(
+        isinstance(item.get("metadata"), dict) and item["metadata"].get("namespace")
+        for item in raw_items
+    ):
+        ns_code, ns_data = _run_bounded_kubectl_json(
+            ["get", "namespace", validated_ns],
+            env,
+            deadline,
+            monotonic_fn,
+        )
+        if ns_code != 0:
+            ns_reason = (
+                ns_data.get("stderr") or ns_data.get("error") or "kubectl get namespace failed"
+            )
+            namespace_error = sanitize_cell(ns_reason, UNREAD_REASON_MAX_CHARS)
+
     evaluated = [evaluate_kcc_item(item) for item in raw_items]
     evaluated.sort(key=lambda r: (str(r["namespace"]), str(r["kind"]), str(r["name"])))
 
@@ -484,17 +513,21 @@ def audit_kcc(
     if len(served_crd_scopes) > MAX_SAMPLE_CRDS_IN_SUMMARY:
         crd_preview += f", ... (+{len(served_crd_scopes) - MAX_SAMPLE_CRDS_IN_SUMMARY} more)"
 
-    has_unread = bool(unread_crds) or bool(unserved_crds)
-    managed_summary = (
-        UNREAD_COUNT_TEXT
-        if unread_crds and not managed_items
-        else (
+    has_unread = bool(unread_crds) or bool(unserved_crds) or bool(namespace_error)
+    if namespace_error:
+        managed_summary = (
+            f"unread (namespace `{sanitize_cell(validated_ns)}` not found or unreadable; "
+            "see the verdict below)"
+        )
+    elif unread_crds and not managed_items:
+        managed_summary = UNREAD_COUNT_TEXT
+    else:
+        managed_summary = (
             f"{len(managed_items)} total across {scope_label} "
             f"({len(managed_items) - len(unhealthy_managed)} Ready/Synchronized, "
             f"{len(unhealthy_managed)} Unhealthy)"
             + (f"; {len(unread_crds)} CRD(s) unread" if unread_crds else "")
         )
-    )
     operator_summary = (
         UNREAD_COUNT_TEXT
         if (
@@ -523,6 +556,8 @@ def audit_kcc(
         print(f"- **Active Resource Kinds:** {breakdown}")
     print("")
 
+    if namespace_error:
+        print(f"- Could not verify namespace `{sanitize_cell(validated_ns)}`: {namespace_error}")
     for crd_name in unserved_crds[:MAX_RENDERED_CRD_ISSUES]:
         print(f"- Unserved or unestablished KCC CRD `{sanitize_cell(crd_name)}`")
     if len(unserved_crds) > MAX_RENDERED_CRD_ISSUES:
@@ -546,14 +581,17 @@ def audit_kcc(
             "and are synchronized; call kanban_complete immediately.\n"
         )
     elif has_unread:
+        ns_clause = (
+            f"namespace `{sanitize_cell(validated_ns)}` unverified, " if namespace_error else ""
+        )
         print(
             "**Config Connector Audit Verdict: Incomplete or Degraded** "
-            f"({len(unread_crds)} unread CRDs, {len(unserved_crds)} unserved CRDs, "
+            f"({ns_clause}{len(unread_crds)} unread CRDs, {len(unserved_crds)} unserved CRDs, "
             f"{len(unhealthy_operator) + len(unhealthy_managed)} unhealthy objects)."
         )
         print(
-            "CLEAN_AUDIT_STOP: NO — Report unread CRDs as unread (never as 0 resources) "
-            "and inspect any unhealthy Config Connector objects listed below.\n"
+            "CLEAN_AUDIT_STOP: NO — Report any unverified namespace or unread CRDs as unread "
+            "(never as 0 resources) and inspect any unhealthy Config Connector objects listed below.\n"
         )
     else:
         print(
