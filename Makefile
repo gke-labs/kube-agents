@@ -205,6 +205,7 @@ PYTHON_TEST_FILES := $(sort \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
+	$(wildcard hack/replay-proxy/test_*.py) \
 	$(wildcard k8s-operator/internal/controller/test_*.py) \
 	$(wildcard scripts/test_*.py) \
 	$(wildcard tests/integration/test_*.py) \
@@ -645,9 +646,12 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 		exit 1; \
 	fi
 
-# The coverage directories the shards' CI jobs upload, one per shard, each with
-# the shard's combined .coverage and its failed-files list. CI downloads them
-# under COVERAGE_DIR before it runs coverage-merge.
+# The coverage directories the shards' CI jobs upload, each with the shard's
+# combined .coverage and its failed-files list. CI uploads one per shard per run
+# attempt (python-coverage-shard-<N>-attempt-<A>), downloads them under
+# COVERAGE_DIR, and keeps each shard's latest attempt under the bare name
+# python-coverage-shard-<N> (scripts/coverage_shard_attempts.py) before it runs
+# coverage-merge.
 COVERAGE_SHARD_DIRS ?= $(wildcard $(COVERAGE_DIR)/python-coverage-shard-*)
 # How many shard directories coverage-merge requires; CI passes its shard count.
 COVERAGE_SHARD_COUNT ?= 1
@@ -758,6 +762,18 @@ test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus p
 
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
+
+# The harness-scale measurement (docs/designs/agent-harness-bottlenecks.md). SCALE_CONFIG is a plan
+# file; the target project and clusters come from it and from SCALE_* in the environment
+# (SCALE_PROJECT_ID is required for scale-run). The data file is the plan's target.data_file.
+SCALE_CONFIG ?= bench/scale/phase1.yaml
+
+.PHONY: scale-plan scale-run
+scale-plan: ## Print the harness-scale measurement matrix for SCALE_CONFIG (default bench/scale/phase1.yaml).
+	@cd bench && python3 -m kube_agents_bench.scale.runner plan $(abspath $(SCALE_CONFIG))
+
+scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the target in SCALE_*, resuming from its data file.
+	@cd bench && python3 -m kube_agents_bench.scale.runner run $(abspath $(SCALE_CONFIG))
 
 # A broken bench case otherwise costs a full presubmit to discover: provision,
 # deploy, run the agent, score, read the log. Most of the ways a task.yaml is

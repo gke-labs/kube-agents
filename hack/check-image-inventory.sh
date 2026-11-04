@@ -176,6 +176,9 @@ check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 # deployed by hand or by an eval lane, never by an install.
 check_base_image golang hack/ghes-proxy/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static hack/ghes-proxy/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
+# The shadow-mode replay proxy, an eval fixture (hack/replay-proxy/README.md):
+# built by hand or by an eval lane, never by an install.
+check_base_image python hack/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 
 # The agent plugin images pin their base with a literal `FROM repo:tag@digest`
 # rather than an ARG pair, so the ARG check above never reaches them. This
