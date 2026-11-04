@@ -9357,14 +9357,14 @@ spec:
                                       Location is the cluster's region or
                                       zone.
                                     maxLength: 63
-                                    pattern: ^[a-z0-9][-a-z0-9]*$
+                                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                     type: string
                                   projectId:
                                     description: |-
                                       ProjectID is the cluster's Google Cloud project, plain (my-project) or
                                       domain-scoped (example.com:my-project).
                                     maxLength: 128
-                                    pattern: ^([a-z0-9.-]+:)?[a-z][-a-z0-9]*$
+                                    pattern: ^([a-z0-9.-]+:)?[a-z]([-a-z0-9]*[a-z0-9])?$
                                     type: string
                                 required:
                                   - clusterName
@@ -9383,7 +9383,7 @@ spec:
                                   payments-api-* matches every pod of that Deployment. A bare * is written
                                   by leaving name out.
                                 maxLength: 253
-                                pattern: ^[a-z0-9][-.a-z0-9]*\*?$
+                                pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|[a-z0-9][-.a-z0-9]*\*)$
                                 type: string
                               namespace:
                                 description:

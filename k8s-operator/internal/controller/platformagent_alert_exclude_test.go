@@ -185,6 +185,10 @@ func TestAlertExcludeSchemaRulesEnvtest(t *testing.T) {
 		"escaped reason":             {[]rule{{Reason: "<Back&Off>"}}, "spec.harness.eventWatcher.alertExclude[0].reason"},
 		"upper-case name":            {[]rule{{Name: "Payments-*"}}, "spec.harness.eventWatcher.alertExclude[0].name"},
 		"wildcard with another part": {[]rule{{Namespace: "shop", Name: "*"}}, "spec.harness.eventWatcher.alertExclude[0].name"},
+		"name ending in a dash":      {[]rule{{Name: "payments-api-"}}, "spec.harness.eventWatcher.alertExclude[0].name"},
+		"name with two dots":         {[]rule{{Name: "a..b"}}, "spec.harness.eventWatcher.alertExclude[0].name"},
+		"location ending in a dash":  {[]rule{{Cluster: &agentv1alpha1.EventWatcherAlertExcludeCluster{Location: "us-central1-", ClusterName: "batch"}}}, "location"},
+		"project ending in a dash":   {[]rule{{Cluster: &agentv1alpha1.EventWatcherAlertExcludeCluster{ProjectID: "my-project-", ClusterName: "batch"}}}, "projectId"},
 	}
 	for name, tc := range refused {
 		t.Run("refused/"+name, func(t *testing.T) {
@@ -202,8 +206,10 @@ func TestAlertExcludeSchemaRulesEnvtest(t *testing.T) {
 			Cluster:   &agentv1alpha1.EventWatcherAlertExcludeCluster{ProjectID: "p", Location: "us-central1", ClusterName: "batch"},
 			Namespace: "shop", Reason: "CrashLoopBackOff", Kind: "Pod", Name: "inventory-api-*",
 		}},
-		"64 rules":              slices.Repeat([]rule{{Namespace: "payments"}}, 64),
-		"domain-scoped project": {{Cluster: &agentv1alpha1.EventWatcherAlertExcludeCluster{ProjectID: "example.com:my-project", ClusterName: "batch"}}},
+		"64 rules":                slices.Repeat([]rule{{Namespace: "payments"}}, 64),
+		"domain-scoped project":   {{Cluster: &agentv1alpha1.EventWatcherAlertExcludeCluster{ProjectID: "example.com:my-project", ClusterName: "batch"}}},
+		"dotted name":             {{Name: "node-1.example"}},
+		"prefix ending in a dash": {{Name: "inventory-api-*"}},
 	}
 	for name, rules := range admitted {
 		t.Run("admitted/"+name, func(t *testing.T) {

@@ -705,7 +705,7 @@ type EventWatcherAlertExcludeRule struct {
 	// payments-api-* matches every pod of that Deployment. A bare * is written
 	// by leaving name out.
 	// +kubebuilder:validation:MaxLength=253
-	// +kubebuilder:validation:Pattern=`^[a-z0-9][-.a-z0-9]*\*?$`
+	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|[a-z0-9][-.a-z0-9]*\*)$`
 	// +optional
 	Name string `json:"name,omitempty"`
 }
@@ -717,13 +717,13 @@ type EventWatcherAlertExcludeCluster struct {
 	// ProjectID is the cluster's Google Cloud project, plain (my-project) or
 	// domain-scoped (example.com:my-project).
 	// +kubebuilder:validation:MaxLength=128
-	// +kubebuilder:validation:Pattern=`^([a-z0-9.-]+:)?[a-z][-a-z0-9]*$`
+	// +kubebuilder:validation:Pattern=`^([a-z0-9.-]+:)?[a-z]([-a-z0-9]*[a-z0-9])?$`
 	// +optional
 	ProjectID string `json:"projectId,omitempty"`
 
 	// Location is the cluster's region or zone.
 	// +kubebuilder:validation:MaxLength=63
-	// +kubebuilder:validation:Pattern=`^[a-z0-9][-a-z0-9]*$`
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +optional
 	Location string `json:"location,omitempty"`
 

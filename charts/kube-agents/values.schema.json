@@ -843,12 +843,12 @@
                           "projectId": {
                             "type": "string",
                             "maxLength": 128,
-                            "pattern": "^([a-z0-9.-]+:)?[a-z][-a-z0-9]*$"
+                            "pattern": "^([a-z0-9.-]+:)?[a-z]([-a-z0-9]*[a-z0-9])?$"
                           },
                           "location": {
                             "type": "string",
                             "maxLength": 63,
-                            "pattern": "^[a-z0-9][-a-z0-9]*$"
+                            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
                           },
                           "clusterName": {
                             "type": "string",
@@ -875,7 +875,7 @@
                       "name": {
                         "type": "string",
                         "maxLength": 253,
-                        "pattern": "^[a-z0-9][-.a-z0-9]*\\*?$"
+                        "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|[a-z0-9][-.a-z0-9]*\\*)$"
                       }
                     },
                     "anyOf": [
