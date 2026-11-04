@@ -265,6 +265,30 @@ class MissTest(unittest.TestCase):
         # Matching itself still uses message_hashes and the fingerprint.
         self.assertEqual(rep["estimates"]["simulated"]["hits"], 0)
 
+    def test_closest_search_uses_the_diag_settings_hash(self):
+        # A later message's CIDR changed settings_hash (tools mention an IP);
+        # diag_settings_hash did not, so the miss is the new message, not "settings".
+        first = line("n1", 1, "nightly", "n", "A", ["s", "u"], roles=["system", "user"])
+        first.update(diag_message_hashes=["ds", "du"], diag_settings_hash="dset")
+        second = presubmit("p1", 2, "10", "b1", "B", ["s", "u", "c"], roles=["system", "user", "user"])
+        second.update(settings_hash="drifted", diag_message_hashes=["ds", "du", "dc"], diag_settings_hash="dset")
+        rep, _ = report([first, second])
+        miss = rep["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+        self.assertEqual(miss["matched_messages"], 2)
+        self.assertEqual(miss["first_difference_role"], "user")
+
+    def test_estimated_tokens_weigh_in_and_are_reported(self):
+        lines = [
+            line("n1", 1, "nightly", "n", "A", ["a"]),
+            presubmit("p1", 2, "10", "b1", "A", ["a"], tokens=300),
+            presubmit("p2", 3, "10", "b1", "B", ["b"], tokens=100),
+        ]
+        lines[1]["tokens_estimated"] = True
+        rep, _ = report(lines)
+        self.assertEqual(rep["estimates"]["low"]["token_weighted_hit_percent"], 75.0)
+        self.assertEqual(rep["health"]["estimated_token_percent"], 60.0)  # of all lines, nightly included
+
     def test_closest_skips_the_same_build_and_other_prs(self):
         rep, _ = report([
             line("n1", 1, "nightly", "n", "A", ["s"]),
@@ -286,12 +310,14 @@ class HealthTest(unittest.TestCase):
             presubmit("p3", 4, "10", "b1", "C", ["c"], unstorable=["fallback_attempted", "repeats_swapped_number"]),
             presubmit("p4", 4, "10", "b1", "D", ["d"], unstorable=["observe_too_large"]),
             {"event": "replay_shadow_request", "ts": 5, "error": "RuntimeError", "job": {"kind": "presubmit"}},
+            {"event": "replay_shadow_request", "ts": 6, "error": "analysis_dropped", "job": {"kind": "presubmit"}},
         ])])
         rep = analyze_shadow.summarize(records, skipped=skipped)
         h = rep["health"]
         self.assertEqual(h["lines_by_kind"], {"nightly": 1, "presubmit": 4})
         self.assertEqual(h["observe_too_large"], 1)
         self.assertEqual(h["error_lines"], 1)
+        self.assertEqual(h["analysis_dropped"], 1)
         self.assertEqual(h["presubmit_without_pr"], 1)
         self.assertEqual(h["without_message_hashes"], 1)
         self.assertEqual(h["upstream_incomplete"], 1)
@@ -312,7 +338,7 @@ class LoadTest(unittest.TestCase):
         ])])
         self.assertEqual([r.request_id for r in records], ["p"])
         self.assertEqual(records[0].pr, "10")
-        self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "no_fingerprint": 1})
+        self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "analysis_dropped": 0, "no_fingerprint": 1})
 
     def test_records_from_several_files_are_merged_in_time_order(self):
         a = write([presubmit("p2", 5, "10", "b2", "A", ["a"])])

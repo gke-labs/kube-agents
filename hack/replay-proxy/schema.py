@@ -28,6 +28,9 @@ OBSERVE_FAILED = "observe_failed"
 LITELLM_MODEL_GROUP = "litellm_model_group"
 LITELLM_ATTEMPTED_FALLBACKS = "litellm_attempted_fallbacks"
 PROMPT_TOKENS = "prompt_tokens"
+# True when the response carried no usage and prompt_tokens is estimated from
+# the request's size.
+TOKENS_ESTIMATED = "tokens_estimated"
 CACHED_TOKENS = "cached_tokens"
 COMPLETION_TOKENS = "completion_tokens"
 FINGERPRINT = "fingerprint"
@@ -36,12 +39,16 @@ MESSAGE_HASHES = "message_hashes"
 # Per-message hashes for the closest-earlier-request search only: each message
 # frozen as it normalized when this proxy first saw it (diagnosis.py).
 DIAG_MESSAGE_HASHES = "diag_message_hashes"
+# The settings' own hash for that search: no message context (diagnosis.py).
+DIAG_SETTINGS_HASH = "diag_settings_hash"
 ROLES = "roles"
 ANSWER_HASH = "answer_hash"
 UNSTORABLE = "unstorable"
 STORED = "stored"
 STORE_SKIPPED = "store_skipped"
 ERROR = "error"
+# The `error` of a line whose analysis was dropped because the queue was full.
+ERROR_ANALYSIS_DROPPED = "analysis_dropped"
 
 # Fields of the start line.
 SCRUBBERS_LOADED = "scrubbers_loaded"
@@ -63,6 +70,6 @@ UNSTORABLE_NO_MODEL_GROUP = "no_model_group_header"
 UNSTORABLE_OTHER_MODEL_GROUP = "answered_by_other_model_group"
 UNSTORABLE_FALLBACK = "fallback_attempted"
 UNSTORABLE_REPEATS_NUMBER = "repeats_swapped_number"
-UNSTORABLE_SCRUB_ADDS_CREDENTIAL = "scrub_masks_credential"
+UNSTORABLE_SCRUB_MASKS_CREDENTIAL = "scrub_masks_credential"
 UNSTORABLE_SCRUBBERS_UNAVAILABLE = "scrubbers_unavailable"
 UNSTORABLE_SCRUB_FAILED = "scrub_failed"

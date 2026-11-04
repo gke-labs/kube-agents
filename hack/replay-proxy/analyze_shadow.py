@@ -11,8 +11,9 @@ answer" and Rollout step 1):
   request (never the same build), and, with `--merged`, from another pull
   request's last build before it merged, once it merged (the merge copy);
 - simulated: high, plus the requests that match when the assistant messages
-  in the history are left out of the comparison. In shadow mode every answer is a fresh sample, so a later
-  request matches exactly only when the model repeated every earlier answer;
+  in the history are left out of the comparison. In shadow mode every answer
+  is a fresh sample, so a later request matches exactly only when the model
+  repeated every earlier answer;
   under replay those answers would have been the recorded ones. It assumes the
   recorded answer's tool calls would have returned the results this run saw.
 
@@ -73,8 +74,10 @@ SKIP_OTHER_EVENT = "other_event"
 SKIP_UNTAGGED = "untagged"
 # The proxy's analysis failed for a request: the line carries `error` only.
 SKIP_ERROR = "error"
+# The proxy's queue was full and it dropped the request's analysis.
+SKIP_ANALYSIS_DROPPED = "analysis_dropped"
 SKIP_NO_FINGERPRINT = "no_fingerprint"
-SKIP_REASONS = (SKIP_NOT_JSON, SKIP_OTHER_EVENT, SKIP_UNTAGGED, SKIP_ERROR, SKIP_NO_FINGERPRINT)
+SKIP_REASONS = (SKIP_NOT_JSON, SKIP_OTHER_EVENT, SKIP_UNTAGGED, SKIP_ERROR, SKIP_ANALYSIS_DROPPED, SKIP_NO_FINGERPRINT)
 # Labels in Miss.first_difference_role besides a message role.
 DIFF_UNHASHED = "unhashed"
 DIFF_SETTINGS = "settings"
@@ -94,10 +97,12 @@ class Record:
     pr: str
     fingerprint: str
     settings_hash: str
+    diag_settings_hash: Optional[str]
     message_hashes: Optional[List[str]]
     diag_message_hashes: Optional[List[str]]
     roles: List[str]
     prompt_tokens: int
+    tokens_estimated: bool
     completion_tokens: int
     latency_ms: int
     unstorable: List[str]
@@ -120,12 +125,14 @@ class Record:
             pr=str(job.get(F.JOB_PR) or ""),
             fingerprint=str(entry[F.FINGERPRINT]),
             settings_hash=str(entry.get(F.SETTINGS_HASH) or ""),
+            diag_settings_hash=str(entry[F.DIAG_SETTINGS_HASH]) if entry.get(F.DIAG_SETTINGS_HASH) else None,
             # The proxy always writes message_hashes; a hand-made or truncated
             # line may lack them.
             message_hashes=list(hashes) if isinstance(hashes, list) else None,
             diag_message_hashes=list(diag) if isinstance(diag, list) else None,
             roles=list(entry.get(F.ROLES) or []),
             prompt_tokens=int(entry.get(F.PROMPT_TOKENS) or 0),
+            tokens_estimated=bool(entry.get(F.TOKENS_ESTIMATED)),
             completion_tokens=int(entry.get(F.COMPLETION_TOKENS) or 0),
             latency_ms=int(entry.get(F.LATENCY_MS) or 0),
             unstorable=[str(r) for r in entry.get(F.UNSTORABLE) or []],
@@ -145,10 +152,17 @@ class Record:
         """The per-message hashes the closest-request search walks: diagnosis hashes when logged."""
         return self.diag_message_hashes if self.diag_message_hashes is not None else self.message_hashes
 
-    def chain(self, skip_answers: bool = False, hashes: Optional[List[str]] = None) -> List[str]:
+    @property
+    def search_settings_hash(self) -> str:
+        """The settings hash the closest-request search roots its chain at: the diagnosis one when logged."""
+        return self.diag_settings_hash if self.diag_settings_hash is not None else self.settings_hash
+
+    def chain(
+        self, skip_answers: bool = False, hashes: Optional[List[str]] = None, root: Optional[str] = None
+    ) -> List[str]:
         """Prefix hashes: element k identifies the settings plus the first k+1 messages."""
         out = []
-        current = self.settings_hash
+        current = self.settings_hash if root is None else root
         for index, message_hash in enumerate((self.message_hashes if hashes is None else hashes) or []):
             role = self.roles[index] if index < len(self.roles) else ""
             part = ANSWER_PLACEHOLDER if skip_answers and role == ASSISTANT_ROLE else message_hash
@@ -268,16 +282,18 @@ class PrefixSources(Sources):
     def keys_of(self, record: Record) -> List[str]:
         if record.search_hashes is None:
             return []
-        return [record.settings_hash] + record.chain(hashes=record.search_hashes)
+        root = record.search_settings_hash
+        return [root] + record.chain(hashes=record.search_hashes, root=root)
 
     def closest(self, request: Record) -> Tuple[Optional[Record], int]:
         if request.search_hashes is None:
             return None, 0
-        best = self.find(request.settings_hash, request, nightly_only=False)
+        root = request.search_settings_hash
+        best = self.find(root, request, nightly_only=False)
         if best is None:
             return None, 0
         matched = 0
-        for prefix in request.chain(hashes=request.search_hashes):
+        for prefix in request.chain(hashes=request.search_hashes, root=root):
             found = self.find(prefix, request, nightly_only=False)
             if found is None:
                 break
@@ -302,6 +318,9 @@ def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
                     continue
                 if not isinstance(entry, dict) or entry.get(F.EVENT) != F.REQUEST_EVENT:
                     skipped[SKIP_OTHER_EVENT] += 1
+                    continue
+                if entry.get(F.ERROR) == F.ERROR_ANALYSIS_DROPPED:
+                    skipped[SKIP_ANALYSIS_DROPPED] += 1
                     continue
                 if entry.get(F.ERROR):
                     skipped[SKIP_ERROR] += 1
@@ -375,6 +394,12 @@ def health(records: List[Record], skipped: Optional[Dict[str, int]] = None) -> D
         "upstream_incomplete": by_reason.get(F.UNSTORABLE_UPSTREAM_INCOMPLETE, 0),
         "observe_failed": by_reason.get(F.UNSTORABLE_OBSERVE_FAILED, 0),
         "observe_too_large": by_reason.get(F.UNSTORABLE_OBSERVE_TOO_LARGE, 0),
+        "analysis_dropped": skipped.get(SKIP_ANALYSIS_DROPPED, 0),
+        # Prompt tokens on lines whose response carried no usage, estimated
+        # from the request's size.
+        "estimated_token_percent": percent(
+            sum(r.prompt_tokens for r in records if r.tokens_estimated), sum(r.prompt_tokens for r in records)
+        ),
     }
 
 

@@ -97,6 +97,23 @@ class DiagnosisHasherTest(unittest.TestCase):
             hasher.hashes([user(f"message {index}")], NOW)
         self.assertEqual(len(hasher.first_seen), 2)
 
+    def test_settings_hash_ignores_the_messages(self):
+        hasher = diagnosis.DiagnosisHasher()
+        tools = [{"type": "function", "function": {"name": "ping", "description": "pings 10.0.0.1 since 2026-11-03T11:00:00Z"}}]
+        base = [user("hello")]
+        bodies = [
+            {"model": "m", "tools": tools, "messages": base},
+            {"model": "m", "tools": tools, "messages": base + [user("pod 10.4.0.12")]},
+            {"model": "m", "tools": tools, "messages": base + [user("pod 10.4.0.12"), user("subnet 10.4.0.0/16")]},
+        ]
+        hashes = []
+        for offset, body in enumerate(bodies):
+            hasher.hashes(body["messages"], NOW + offset * 2 * HOUR)
+            hashes.append(hasher.settings_hash(body, {"c": "x"}, NOW + offset * 2 * HOUR))
+        self.assertEqual(len(set(hashes)), 1)
+        other = {"model": "m", "tools": [{"type": "function", "function": {"name": "pong"}}], "messages": base}
+        self.assertNotEqual(hasher.settings_hash(other, {"c": "x"}, NOW), hashes[0])
+
     def test_lone_surrogate(self):
         self.assertEqual(len(diagnosis.DiagnosisHasher().hashes([user("half \ud83d")], NOW)), 1)
 

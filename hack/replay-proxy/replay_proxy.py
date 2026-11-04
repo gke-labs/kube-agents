@@ -11,8 +11,16 @@ client, the proxy:
   usage, model latency, a hash of the answer and LiteLLM's fallback headers.
   Nothing in the line is request text, but its hashes can be guessed
   against, so the log is private, like the stored text;
+- adds `diag_message_hashes` and `diag_settings_hash` (diagnosis.py), used
+  only to find the closest earlier request for a miss;
 - scrubs the request text and keeps it under the store directory
   (request_store.py), or keeps nothing if the scrubbers cannot load.
+
+All of that runs on one background thread fed by a bounded queue
+(ANALYSIS_QUEUE_SIZE); the handler only enqueues, and drops the analysis (an
+`analysis_dropped` line) rather than wait when the queue is full. Memory is
+bounded: a request body over MAX_REQUEST_BYTES gets a 413, and the proxy stops
+observing a response after MAX_OBSERVED_BYTES (its bytes still flow).
 
 `/metrics` is answered here and never forwarded: the proxy carries the
 `app: litellm` label, and anything summing `/metrics` over those pods would
@@ -24,6 +32,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -51,6 +60,10 @@ HTTP_PAYLOAD_TOO_LARGE = 413
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 MAX_OBSERVED_BYTES = 8 * 1024 * 1024
 MAX_TOOL_CALLS = 256
+# Requests waiting for the background analysis; past this, analysis is dropped.
+ANALYSIS_QUEUE_SIZE = 1024
+# A rough prompt-token estimate for a line whose response carried no usage.
+BYTES_PER_TOKEN = 4
 DEFAULT_BIND_HOST = "0.0.0.0"
 BODY_METHODS = ("POST", "PUT", "PATCH")
 HEAD_METHOD = "HEAD"
@@ -159,6 +172,7 @@ class Metrics:
         "stored": "replay_shadow_requests_stored_total",
         "store_skipped": "replay_shadow_requests_store_skipped_total",
         "prompt_tokens": "replay_shadow_prompt_tokens_total",
+        "analysis_dropped": "replay_shadow_analysis_dropped_total",
     }
 
     def __init__(self, scrubbers_loaded: bool):
@@ -290,12 +304,9 @@ class ResponseObserver:
                 self.buffer = b""
             self._dispatch()
             return
-        try:
-            out = json.loads(bytes(self.body))
-        except ValueError:
-            return
+        out = json.loads(bytes(self.body))  # ValueError on a 200 body that is not JSON
         if not isinstance(out, dict):
-            return
+            raise TypeError("response is not an object")
         self.usage = out.get("usage")
         choices = out.get("choices") or []
         if choices and isinstance(choices[0], dict):
@@ -371,10 +382,14 @@ def unstorable_reasons(
         return reasons
     try:
         if scrubber.answer_masks_credential(message):
-            reasons.append(F.UNSTORABLE_SCRUB_ADDS_CREDENTIAL)
+            reasons.append(F.UNSTORABLE_SCRUB_MASKS_CREDENTIAL)
     except Exception:
         reasons.append(F.UNSTORABLE_SCRUB_FAILED)
     return reasons
+
+
+# Tells the analysis worker to stop.
+_STOP = object()
 
 
 class ShadowProxy:
@@ -389,6 +404,48 @@ class ShadowProxy:
         self.diagnosis = diagnosis.DiagnosisHasher()
         self.out = out if out is not None else sys.stdout
         self._log_lock = threading.Lock()
+        self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=ANALYSIS_QUEUE_SIZE)
+        self._worker = threading.Thread(target=self._work, name="replay-shadow-analysis", daemon=True)
+        self._worker.start()
+
+    def submit(self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int) -> None:
+        """Queue one request's analysis; never waits. A full queue drops it and logs that."""
+        try:
+            self._queue.put_nowait((body, received, upstream, request_bytes))
+        except queue.Full:
+            self.metrics.add("analysis_dropped")
+            self.log({F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
+                      F.JOB: self.job(), F.STATUS: upstream["status"], F.ERROR: F.ERROR_ANALYSIS_DROPPED})
+
+    def drain(self) -> None:
+        """Wait until every queued analysis has been logged (tests, shutdown)."""
+        self._queue.join()
+
+    def close(self) -> None:
+        """Log what is queued, then stop the worker."""
+        self._queue.put(_STOP)
+        self._worker.join()
+
+    def _work(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is _STOP:
+                self._queue.task_done()
+                return
+            body, received, upstream, request_bytes = item
+            try:
+                try:
+                    entry = self.analyze(body, received, upstream, request_bytes)
+                except Exception as exc:  # one bad request never stops the worker
+                    self.metrics.add("analysis_errors")
+                    # The type name only: an exception's message can quote request text.
+                    entry = {F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
+                             F.JOB: self.job(), F.STATUS: upstream["status"], F.ERROR: type(exc).__name__}
+                self.log(entry)
+            except Exception:  # a failed write to stdout loses this line, not the worker
+                self.metrics.add("analysis_errors")
+            finally:
+                self._queue.task_done()
 
     def log(self, entry: Dict[str, Any]) -> None:
         line = json.dumps(entry, sort_keys=True, separators=(",", ":"))
@@ -416,7 +473,9 @@ class ShadowProxy:
             F.SCRUBBERS_ERROR: self.scrubber.error,
         }
 
-    def analyze(self, body: Dict[str, Any], received: float, upstream: Dict[str, Any]) -> Dict[str, Any]:
+    def analyze(
+        self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int = 0
+    ) -> Dict[str, Any]:
         """The log line for one completed chat request; stores its scrubbed text as a side effect."""
         request_id = uuid.uuid4().hex
         entry: Dict[str, Any] = {
@@ -439,6 +498,9 @@ class ShadowProxy:
             F.LITELLM_ATTEMPTED_FALLBACKS: upstream["headers"].get(ATTEMPTED_FALLBACKS_HEADER),
         }
         entry.update(usage_tokens(upstream["usage"]))
+        entry[F.TOKENS_ESTIMATED] = entry[F.PROMPT_TOKENS] is None
+        if entry[F.TOKENS_ESTIMATED]:
+            entry[F.PROMPT_TOKENS] = request_bytes // BYTES_PER_TOKEN
         normalized = normalizer.normalize_request(body, received)
         fingerprint = normalizer.fingerprint(normalized, self.key_context)
         entry[F.FINGERPRINT] = fingerprint
@@ -460,6 +522,7 @@ class ShadowProxy:
         entry[F.MESSAGE_HASHES] = normalized.message_hashes
         messages = body.get(request_store.MESSAGES_KEY)
         entry[F.DIAG_MESSAGE_HASHES] = self.diagnosis.hashes(messages if isinstance(messages, list) else [], received)
+        entry[F.DIAG_SETTINGS_HASH] = self.diagnosis.settings_hash(body, self.key_context.as_dict(), received)
         entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)
         skipped = self.store.store(request_id, fingerprint, body)
         entry[F.STORED] = skipped is None
@@ -553,14 +616,7 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             return
         self.proxy.metrics.add("completions")
-        try:
-            entry = self.proxy.analyze(body, received, upstream)
-        except Exception as exc:  # the analysis must never cost the agent its answer
-            self.proxy.metrics.add("analysis_errors")
-            # The type name only: an exception's message can quote request text.
-            entry = {F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
-                     F.JOB: self.proxy.job(), F.STATUS: upstream["status"], F.ERROR: type(exc).__name__}
-        self.proxy.log(entry)
+        self.proxy.submit(body, received, upstream, len(raw))
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
 

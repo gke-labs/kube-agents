@@ -1,8 +1,9 @@
 """Per-message hashes for diagnosing misses, stable across one conversation.
 
-The fingerprint and `message_hashes` normalize every message with the whole
-request's context: its time (timestamps become how-far-from-now tokens) and
-whether any message names a CIDR (IPs then stay literal). So the same earlier
+The fingerprint, `settings_hash` and `message_hashes` normalize the request
+with its whole context: its time (timestamps become how-far-from-now tokens),
+whether a CIDR appears anywhere in the request (IPs then stay literal), and
+one mapping, so a placeholder number in the tools depends on the messages. So the same earlier
 message can hash differently in a later request of the same conversation, and
 the closest-earlier-request search would report a difference that is only
 drift. These hashes are for that search only; they never decide a match.
@@ -11,7 +12,10 @@ The proxy remembers when it first saw each raw message (one float per distinct
 message, oldest dropped past FIRST_SEEN_CAPACITY). A request's messages are
 normalized in order with a fresh mapping; each uses its own first-seen time as
 "now", and IPs stay literal only if a CIDR appeared in that message or an
-earlier one. This runs after the response has gone back, off the agent's path.
+earlier one. The settings (tools, model, parameters) get their own hash with a
+fresh mapping, IPs kept literal only for a CIDR in the settings themselves,
+and the conversation's first-seen time (its first message's) as "now". This
+runs on the proxy's background analysis thread, off the agent's path.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ import hashlib
 import json
 import threading
 from collections import OrderedDict
-from typing import Any, List
+from typing import Any, Dict, List
 
 import normalizer
 
@@ -49,6 +53,18 @@ class DiagnosisHasher:
                 while len(self.first_seen) > self.capacity:
                     self.first_seen.popitem(last=False)
             return seen
+
+    def settings_hash(self, body: Dict[str, Any], context: Dict[str, str], now: float) -> str:
+        """The request's settings alone, normalized without any message's context."""
+        kept = {k: v for k, v in body.items() if k not in normalizer.KEY_DROP_FIELDS and k != normalizer.MESSAGES_FIELD}
+        messages = body.get(normalizer.MESSAGES_FIELD)
+        reference = now
+        if isinstance(messages, list) and messages:
+            reference = self._first_seen(json.dumps(messages[0], sort_keys=True, ensure_ascii=False), now)
+        keep_ips = normalizer.CIDR_RE.search(json.dumps(kept, ensure_ascii=False)) is not None
+        norm = normalizer.Normalizer(reference, keep_ips)
+        settings = {k: norm.walk(kept[k], k) for k in sorted(kept)}
+        return normalizer.stable_hash({"settings": settings, "context": context})
 
     def hashes(self, messages: List[Any], now: float) -> List[str]:
         norm = normalizer.Normalizer(now, keep_ips=False)

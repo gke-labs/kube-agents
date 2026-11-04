@@ -204,6 +204,9 @@ class ProxyTestCase(unittest.TestCase):
         )
         self.server = replay_proxy.make_server(config, host="127.0.0.1", out=self.out)
         self.proxy = self.server.proxy
+        # Registered first, so it runs last: after a test's own cleanups have
+        # released anything holding the worker.
+        self.addCleanup(self.proxy.close)
         threading.Thread(target=self.server.serve_forever, args=(POLL_SECONDS,), daemon=True).start()
         self.port = self.server.server_address[1]
 
@@ -367,7 +370,7 @@ class ObserveFailureTest(ProxyTestCase):
         line = self.lines(1)[0]
         self.assertEqual(line["unstorable"], ["observe_failed"])
         self.assertTrue(line["observe_failed"])
-        self.assertIsNone(line["prompt_tokens"])
+        self.assertTrue(line["tokens_estimated"], "no usage was read, so the tokens are estimated")
         self.assertIsNone(line["answer_hash"])
         self.assertTrue(line["fingerprint"])
         self.assertGreaterEqual(self.proxy.metrics.get("analysis_errors"), 1)
@@ -381,6 +384,9 @@ class ObserveFailureTest(ProxyTestCase):
 
     def test_malformed_non_streamed_body(self):
         self.check(json.dumps({"choices": 5}).encode(), stream=False)
+
+    def test_non_streamed_body_that_is_not_json(self):
+        self.check(b"<html>upstream error page</html>", stream=False)
 
 
 class MergeDeltaTest(unittest.TestCase):
@@ -530,6 +536,87 @@ class DiagnosisHashTest(ProxyTestCase):
         expected = normalizer.normalize_request(body, line["ts"]).message_hashes
         self.assertEqual(line["message_hashes"], expected)
         self.assertEqual(len(line["diag_message_hashes"]), len(body["messages"]))
+
+
+class DiagSettingsTest(ProxyTestCase):
+    def test_diag_settings_hash_holds_while_settings_hash_drifts(self):
+        tools = [{"type": "function", "function": {"name": "ping", "description": "pings 10.0.0.1"}}]
+        first = chat("t_11111111", stream=False)
+        first["tools"] = tools
+        second = json.loads(json.dumps(first))
+        second["messages"].append({"role": "user", "content": "the pod is on 10.9.9.9 in 10.9.0.0/16"})
+        self.request("POST", "/v1/chat/completions", first)
+        self.request("POST", "/v1/chat/completions", second)
+        a, b = self.lines(2)
+        self.assertNotEqual(a["settings_hash"], b["settings_hash"], "the matching hash drifts, as before")
+        self.assertEqual(a["diag_settings_hash"], b["diag_settings_hash"])
+
+
+class EstimatedTokensTest(ProxyTestCase):
+    def test_missing_usage_is_estimated_from_the_request_size(self):
+        FakeLiteLLM.custom_body = sse("not json")
+        body = chat("t_11111111", stream=True)
+        self.request("POST", "/v1/chat/completions", body)
+        line = self.lines(1)[0]
+        self.assertTrue(line["tokens_estimated"])
+        self.assertEqual(line["prompt_tokens"], len(json.dumps(body).encode()) // replay_proxy.BYTES_PER_TOKEN)
+
+    def test_reported_usage_is_not_estimated(self):
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        line = self.lines(1)[0]
+        self.assertFalse(line["tokens_estimated"])
+        self.assertEqual(line["prompt_tokens"], 1000)
+
+
+class BackgroundAnalysisTest(ProxyTestCase):
+    def test_slow_analysis_does_not_delay_the_next_request_on_the_connection(self):
+        original = self.proxy.analyze
+
+        def slow(*args):
+            time.sleep(1.0)
+            return original(*args)
+
+        self.proxy.analyze = slow
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=LOG_WAIT_SECONDS)
+        self.addCleanup(conn.close)
+        started = time.monotonic()
+        for task in ("t_11111111", "t_22222222"):
+            conn.request("POST", "/v1/chat/completions", body=json.dumps(chat(task, stream=False)),
+                         headers={"Content-Type": "application/json"})
+            self.assertEqual(conn.getresponse().read()[:1], b"{")
+        self.assertLess(time.monotonic() - started, 0.8)
+        self.assertEqual(len(self.lines(2)), 2)
+
+
+class AnalysisQueueFullTest(ProxyTestCase):
+    def setUp(self):
+        original = getattr(replay_proxy, "ANALYSIS_QUEUE_SIZE", None)
+        replay_proxy.ANALYSIS_QUEUE_SIZE = 1
+        self.addCleanup(setattr, replay_proxy, "ANALYSIS_QUEUE_SIZE", original)
+        super().setUp()
+
+    def test_full_queue_drops_and_counts(self):
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = self.proxy.analyze
+
+        def blocked(*args):
+            started.set()
+            release.wait(LOG_WAIT_SECONDS)
+            return original(*args)
+
+        self.proxy.analyze = blocked
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.assertTrue(started.wait(LOG_WAIT_SECONDS))
+        self.request("POST", "/v1/chat/completions", chat("t_22222222", stream=False))  # queued
+        status, _, _ = self.request("POST", "/v1/chat/completions", chat("t_33333333", stream=False))  # dropped
+        self.assertEqual(status, 200)
+        self.assertEqual(self.proxy.metrics.get("analysis_dropped"), 1)
+        release.set()
+        self.proxy.drain()
+        lines = self.lines(3)
+        self.assertEqual(sum(1 for l in lines if l.get("error") == "analysis_dropped"), 1)
+        self.assertEqual(sum(1 for l in lines if l.get("fingerprint")), 2)
 
 
 class LocalEndpointTest(ProxyTestCase):
