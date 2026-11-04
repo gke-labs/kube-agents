@@ -1731,8 +1731,8 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # rather than /v1/exec's roles. A sweep run under any other role is refused
     # here and falls back to four (broker_admission.sweep_width).
     (ADMISSION_PATH, (CALLER_ROLE_SHELL,)),
-    # The profile role reaches this route and no other: the Cloud API relay,
-    # the MCP relay, the watcher and Pub/Sub routes all stay closed to it.
+    # The profile role reaches this route and the MCP relay's profile set: the
+    # Cloud API relay, the watcher and Pub/Sub routes all stay closed to it.
     # The scope role reaches it alone too (scope_policy).
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE)),
     # The feedback form verb: the sandbox's one way to file a report about
@@ -1747,8 +1747,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # The remote MCP relay belongs to the gateway, where Hermes runs the
     # mcp-remote children; the sandbox has no MCP client. Session pods are not
     # admitted here yet: that is a new read path for them, argued in the change
-    # that wires them, not by default.
-    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),
+    # that wires them, not by default. Profile workers are, for a task in hand
+    # and only for mcp_policy.PROFILE_SERVER_TOOLS (_handle_mcp_relay, #3658).
+    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),
     # The watchers' Google calls: theirs alone. The Hermes container beside
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
@@ -12133,6 +12134,34 @@ def _busy_phrase(exc: CommandSlotUnavailable) -> str:
     return "refused under resource pressure" if isinstance(exc, ResourcePressure) else "queued too long"
 
 
+def mcp_relay_decision(
+    principal: Principal | None, server_name: str, message: dict[str, Any] | None
+) -> tuple[command_policy.Decision, frozenset[str] | None]:
+    """The MCP relay's decision for one message, and the tools its caller is offered.
+
+    The second value narrows a ``tools/list`` reply: None for the table's own
+    set, or a profile worker's set (empty for a server outside it, so a later
+    change to the decision can't hand a profile worker the table's list).
+
+    A profile worker (#3658) reaches the relay only inside a task: a warm pod
+    between tasks holds no task credential, so it gets no reads. With one, it
+    is held to mcp_policy.PROFILE_SERVER_TOOLS. Everyone else gets the table.
+    """
+    if principal is None or principal.role != CALLER_ROLE_PROFILE:
+        return mcp_policy.evaluate(server_name, message), None
+    offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())
+    if principal.task is None:
+        return (
+            command_policy.Decision(
+                allowed=False,
+                rule_id=RULE_TASK_CREDENTIAL,
+                message="Profile workers reach MCP servers only with a task credential.",
+            ),
+            offered,
+        )
+    return mcp_policy.evaluate_for_profile(server_name, message), offered
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
@@ -13464,7 +13493,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         message = mcp_policy.parse(self.rfile.read(content_length))
-        decision = mcp_policy.evaluate(server_name, message)
+        decision, offered = mcp_relay_decision(principal, server_name, message)
         if not decision.allowed:
             LOGGER.warning("mcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
             reply = mcp_policy.refusal(message, decision) if entry is not None else None
@@ -13549,7 +13578,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             and decision.rule_id == mcp_policy.METHOD_TOOLS_LIST
             and upstream.status < HTTPStatus.MULTIPLE_CHOICES
         ):
-            filtered = mcp_policy.filter_tools_list(server_name, upstream.body)
+            filtered = mcp_policy.filter_tools_list(server_name, upstream.body, offered)
             if filtered is None:
                 refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
             else:
