@@ -30,6 +30,13 @@ The memory guard prevents the OOMKill. The fair share prevents one capability fr
 others. The cost check gives the agent a useful answer before work starts. The number of slots and
 the rates change with the memory and CPU that the containers have.
 
+On current builds, `kubectl` runs in the sandbox shell, so the shell is the container that is
+OOMKilled. The `compliance-audit` job holds 94 to 100 % of the shell's memory at each peak. One
+`kubectl` list of all workloads on a cluster of 105,000 Pods uses 10.1 GiB, about 100 KiB per
+object. The cost check therefore goes in the shell's `kubectl` wrapper, which every `kubectl` call
+in the shell passes through. The credential proxy's existing admission no longer applies to
+`kubectl`, because `kubectl` no longer runs there.
+
 ## 1. Scope
 
 **Owns:** the admission rules of the resource broker: the memory guard, the per-capability fair
@@ -103,6 +110,47 @@ three minutes and sent it into `CrashLoopBackOff`; two `kubectl get deploy,sts,d
 -o json` processes held 91 to 95 % of its memory. Every agent's terminal runs in the shell, so each
 kill ends all of them. Raising the shell's limit moves the threshold, as the next paragraph
 shows for the other containers.
+
+**Which capability holds the memory.** The harness samples each shell process with its parent, so
+each process can be traced to the capability that started it. In the last sample before each kill
+and at each peak:
+
+| Run (shell limit)         | `compliance-audit` (`collect.py` and its `kubectl` children) | Agent terminals | Other    |
+| ------------------------- | ------------------------------------------------------------ | --------------- | -------- |
+| Default 2 GiB, three runs | 94 to 99 %                                                   | 0 to 5 %        | 1 to 2 % |
+| L size 8 GB, two runs     | 100 %                                                        | 0 %             | 0 %      |
+
+In one 2 GiB run, agent terminals that ran `kubectl get pods -A` held most of the memory above
+512 MiB over the run, and the audit held the peak.
+
+**The cost of one call, measured alone.** One `kubectl`, with no other process, against one KWOK
+cluster of 105,000 Pods, read directly from the API server:
+
+| Command                                    | Peak resident memory | Output  | Per object |
+| ------------------------------------------ | -------------------- | ------- | ---------- |
+| `get deploy,sts,ds,cronjob,pod -A -o json` | 10,357 MiB           | 1.16 GB | ~100 KiB   |
+| `get pods -A -o json`                      | 9,955 MiB            | 1.15 GB | ~97 KiB    |
+| `get pods -A` (table)                      | 4,452 MiB            | 12 MB   | ~43 KiB    |
+
+The audit's one call for one large cluster does not fit in the L shell (8 GB) even when it runs
+alone. `kubectl` reads a list in pages of 500 objects, but it keeps every page until it prints, so
+its memory grows with the size of the list. The Kubernetes API proxy sees only one page per request
+and holds little: under the audit it stayed under 20 MiB. A table output halves the cost per object,
+which corrects fact 2 for that format only; `jsonpath` and `custom-columns` still decode the whole
+list.
+
+**The existing admission does not cover `kubectl` in the shell.** The fleet audit sizes its sweep
+from the credential proxy's admitted count (`broker_admission.sweep_width()`). That count assumes
+176 MiB per call (fact 3) and describes the credential proxy's memory. On current builds the calls
+run in the shell, so the audit sweeps four clusters at once into a shell that cannot hold one.
+
+**The Kubernetes API proxy has its own limit.** It runs as a separate Deployment with a memory limit
+of 512Mi, set by operator constants (`kube_proxy_manifests.go`), and no field changes it. It counts
+the requests in flight but does not limit them. Concurrent unpaged Pod lists, sent with `curl` from
+the shell to two clusters, raised its memory to 147, 198 and 465 MiB at 20, 20 and 80 requests in
+flight. At 129 requests it reached 509 MiB and was OOMKilled. Each stream held about 3.6 MiB, and the
+memory did not return between bursts. Normal agent traffic does not reach this, because the shell is
+OOMKilled first, but a larger shell limit moves the failure here.
 
 **Raising the limits moves the threshold, not the failure.** At the L size (credential proxy
 8 GB, event watcher 4 GB), the credential proxy was OOMKilled by the same two listings on clusters
@@ -191,9 +239,10 @@ K is about 250 MiB (broker and Envoy at their highest in the reproduction), well
 
 ### 4.3 Implementation
 
-- **Where.** The credential proxy: a thread in the broker process, which already starts the
-  children and knows their PIDs. The sandbox shell: a small process started by its entrypoint,
-  which reads `/proc` for the processes under the session tree.
+- **Where.** The sandbox shell first, because on current builds that is where `kubectl` runs and
+  where the kills happen: a small process started by its entrypoint, which reads `/proc` for the
+  processes under the session tree. The credential proxy: a thread in the broker process, which
+  already starts the children and knows their PIDs.
 - **Libraries.** The Python standard library reads the cgroup files and `/proc`, and
   `os.kill` sends the signal. `psutil` is an option for the process tree.
 - **Priority.** The guard sets its own `nice` value lower than the tool processes. The broker
@@ -265,17 +314,38 @@ read. Layer 1 bounds memory; layer 3 refuses most such reads before they start.
 
 ### 6.1 The rule
 
-Before the resource broker forwards a list of a collection with no `limit` and no selector, it
-asks the API server for one item: `?limit=1` returns `remainingItemCount`. It estimates the memory
-the caller's `kubectl` will need as `items × bytes per item`, where bytes per item is measured per
-resource (about 74 KiB per Pod for `kubectl` in the reproduction) and kept up to date from the
-guard's kills and the completed calls.
+The check runs in the shell's `kubectl` wrapper (`/usr/local/bin/kubectl`, built in
+`deploy/sandbox/Dockerfile`), in front of the real binary. Every `kubectl` in the shell passes
+through it: the skill scripts, the agents' terminals and the jobs. It is in the container that
+decodes the list, so it can read that container's free memory, and it sees the output format.
 
-- If the estimate is above the cost limit C (default: half of H in the container that will decode
-  the list), the read is refused with `422` and a message:
+Before it runs a `get` across all namespaces (`-A`) with no label or field selector, the wrapper
+asks the API server for one item: `?limit=1` returns `remainingItemCount`. It estimates the memory as `items × bytes per item`, summed over the
+resources in the call. Bytes per item comes from the format:
+
+| Output format                                      | Bytes per item (initial) |
+| -------------------------------------------------- | ------------------------ |
+| `-o json`, `-o yaml`, `jsonpath`, `custom-columns` | 100 KiB                  |
+| table, `-o wide`, `-o name`                        | 45 KiB                   |
+
+The initial values are the measurements in §2. KWOK Pods are small, so real objects cost more; the
+values are kept up to date from the guard's kills and the completed calls.
+
+- The budget B is H minus the memory now in use (`memory.current` less page cache). A call whose
+  estimate fits B runs. A call that does not fit B now but fits H − K waits up to W for memory to
+  free, then is refused with `429`.
+- A call whose estimate is above C = H − K, so it cannot fit even alone, is refused at once with
+  `422` and a message:
   "this read would need about 3.2 GiB in the shell; narrow it: add `-l`, `--field-selector` or
   `-n`, or use `-o name`, or page it with `--chunk-size` and process each page".
 - The count is cached per (cluster, resource) for 60 s, so one estimate covers a burst of reads.
+
+At the default shell limit (2 GiB, H = 1,792 MiB, K about 300 MiB) C allows about 15,000 objects in
+`-o json`; at the L size (8 GB) about 65,000; at 16 GiB about 140,000. One cluster of 105,000 Pods
+therefore needs a paged read at every size below 16 GiB.
+
+The Kubernetes API proxy is not the place for this check. It sees each 500-object page as a separate
+small request, so it cannot see that `kubectl` keeps every page.
 
 This is the same idea as Kubernetes API Priority and Fairness, which charges a list request more
 seats in proportion to the number of objects it returns.
@@ -298,6 +368,20 @@ because killing the watcher is the OOMKill. Its memory must be bounded inside th
   collecting the whole list first. The reproduction killed the watcher at 2 GiB with four clusters
   of 400,000 Events each; with pages of 500, the same lists need under 10 MiB in flight.
 - **Signal.** The watcher logs and counts a relist after its initial sync.
+
+## 7a. The Kubernetes API proxy
+
+The Kubernetes API proxy is one Go process. As for the event watcher, layer 1 does not apply,
+because stopping the process is the failure. It needs a bound inside the process:
+
+- **An in-flight limit.** A weighted semaphore in front of the reverse proxy refuses a request
+  past the limit with `429` and `Retry-After`. The initial limit is 64 at the 512Mi limit: (512 MiB −
+  about 100 MiB of memory kept between bursts) / about 3.6 MiB per stream is about 110, halved for
+  margin. The limit follows the live memory limit, as N does in §8.
+- **A Go memory limit.** `GOMEMLIMIT` at about 80 % of the container limit (400MiB at 512Mi) makes
+  the Go runtime collect and return memory before the kernel acts.
+- **A settable limit.** The proxy's resources become a `PlatformAgent` field, like the credential
+  proxy's and the shell's, so the install sizes can raise them.
 
 ## 8. Dynamic slots and rates
 
@@ -356,17 +440,23 @@ for everyone.
 ## 10. Rollout
 
 0. **Measure.** Done: on a build with the Kubernetes API proxy the `kubectl` memory lands in the
-   sandbox shell, which the audit OOMKilled (§2).
-1. **Memory guard** in the sandbox shell and the credential proxy. This alone meets G1 for those
+   sandbox shell, which the audit OOMKilled (§2). The audit holds 94 to 100 % at the peak, and one
+   of its calls costs about 100 KiB per object.
+1. **Paged reads in the fleet audit.** `collect.py` reads its workload dump with the Python
+   client, one page at a time, and reduces each page before the next. Its memory then follows the
+   page size, not the cluster size. Its sweep width follows the shell's memory, not the credential
+   proxy's admitted count. This removes the largest consumer before any admission rule is needed.
+2. **Memory guard** in the sandbox shell and the credential proxy. This alone meets G1 for those
    containers. Acceptance: the harness's `proxy` scenario at the default limits ends with zero
    OOMKills and one guard kill per oversized read.
-2. **Event watcher** paged initial lists and the size-weighted gate (§7). Acceptance: the
+3. **Event watcher** paged initial lists and the size-weighted gate (§7). Acceptance: the
    harness's `watcher` scenario at the default limits ends with zero OOMKills.
-3. **Capability key** from role and profile, then `KUBEAGENTS_CAPABILITY`.
-4. **Fair share and rate** in Envoy, the exec queue and the Kubernetes API proxy. Acceptance: a
+4. **Capability key** from role and profile, then `KUBEAGENTS_CAPABILITY`.
+5. **Fair share and rate** in Envoy, the exec queue and the Kubernetes API proxy. Acceptance: a
    flood from one capability in the harness leaves another capability's p95 wait under W.
-5. **Cost check** in the Kubernetes API proxy.
-6. **Dynamic N and ρ.**
+6. **Cost check** in the shell's `kubectl` wrapper (§6), and the in-flight limit and
+   `GOMEMLIMIT` in the Kubernetes API proxy (§7a).
+7. **Dynamic N and ρ.**
 
 Each step is a pull request with its own evaluation case where the model reads new text.
 
@@ -390,5 +480,6 @@ Each step is a pull request with its own evaluation case where the model reads n
 2. Should the guard kill the most recent large process instead of the largest, to favour long
    calls that are nearly done?
 3. Where does the capability key come from for the platform MCP server's tools?
-4. Does the Kubernetes API proxy's cost check need the caller's output format, or is the object
-   count enough?
+4. The output format changes the cost per object by a factor of two (§2), so the cost check needs
+   it; the shell's `kubectl` wrapper sees it. Should the wrapper also estimate calls that name one
+   namespace, for namespaces with very many objects?
