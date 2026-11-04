@@ -36,11 +36,11 @@ const sessionKindGroup = "group"
 
 // topLevelNothingRunningNotice answers a "stop" or a status question typed
 // in a message the adapter marked TopLevel: one that roots a conversation of
-// its own (a top-level Slack DM), so nothing is running in it and the task
-// the user means is in another thread. The notice says where to send it. A
-// thread with nothing running gets one of the in-thread replies below
-// (nothingRunningNotice or nothingRunningCardNotice): the user is already in
-// the right place.
+// its own (a top-level Slack or Google Chat DM), so nothing is running in it
+// and the task the user means is in another thread. The notice says where to
+// send it. A thread with nothing running gets one of the in-thread replies
+// below (nothingRunningNotice or nothingRunningCardNotice): the user is
+// already in the right place.
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
 
 // feedbackCommandNotice answers a bare "/feedback", the gateway's second slash
@@ -2048,8 +2048,9 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	}
 	running := rec.ActiveTask != nil && !rec.ActiveTask.Detached
 	if off {
-		// A top-level message in a Slack DM roots a conversation of its own,
-		// so a top-level /session off cannot reach the thread the user routed.
+		// A top-level message in a Slack or Google Chat DM roots a
+		// conversation of its own, so a top-level /session off cannot reach
+		// the thread the user routed.
 		// Say where it goes instead of answering for the fresh conversation.
 		if msg.TopLevel && !rec.SessionRouted {
 			g.post(rec.Key, topLevelSessionOffNotice)
@@ -2102,7 +2103,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		g.post(rec.Key, "🧵 session route on — the running task finishes first; the message after it opens a session pod; `/session off` returns to `"+g.cfg.DefaultAddressee+"`")
 		return true
 	case rest == "":
-		g.post(rec.Key, sessionOnAck(backend, rec.Kind, g.cfg.DefaultAddressee))
+		g.post(rec.Key, sessionOnAck(backend, rec.Kind, conversationIsOwnThread(backend, rec.Key), g.cfg.DefaultAddressee))
 		return true
 	case running && rec.AddressedToOwnSession():
 		// Already on the route with its own task running: the text is what
@@ -2123,26 +2124,45 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 }
 
 // topLevelSessionOffNotice answers a /session off typed at the top of a
-// Slack DM, where it roots a fresh conversation rather than reaching the
-// thread whose session the user means.
+// Slack or Google Chat DM, where it roots a fresh conversation rather than
+// reaching the thread whose session the user means.
 const topLevelSessionOffNotice = "ℹ️ `/session off` acts on the thread it's typed in — reply `/session off` in that question's thread"
 
 // sessionOnAck is the reply to a bare /session. It promises what the backend
 // will deliver: the Slack adapter forwards an unmentioned channel-thread
 // reply only once the gateway has started a task in that thread, and a
 // /session binding starts none, so in a Slack channel the next message needs
-// the mention. A Slack DM carries every message, but each top-level DM is a
-// conversation of its own, so the binding holds only for replies in the
-// thread the /session was typed in. The other backends route the next
-// message on their own rules.
-func sessionOnAck(backend, kind, defaultAddressee string) string {
-	if backend == slackBackend && kind == sessionKindDM {
+// the mention. A Slack or Google Chat DM carries every message, but each
+// top-level DM is a conversation of its own, so the binding holds only for
+// replies in the thread the /session was typed in. ownThread says the record
+// is keyed by such a thread. A DM record with no thread (a Google Chat DM
+// keyed by the whole space, a legacy Slack DM key) is the exception: every
+// later message shares its key, so it gets the generic wording. The other
+// backends route the next message on their own rules.
+func sessionOnAck(backend, kind string, ownThread bool, defaultAddressee string) string {
+	if kind == sessionKindDM && ownThread {
 		return "🧵 session route on — reply in this thread to open a session pod; `/session off` returns to `" + defaultAddressee + "`"
 	}
-	if backend == slackBackend {
+	if backend == slackBackend && kind != sessionKindDM {
 		return "🧵 session route on — mention me in your next message to open a session pod (a Slack thread carries unmentioned replies only once a task has started); `/session off` returns to `" + defaultAddressee + "`"
 	}
 	return "🧵 session route on — your next message opens a session pod; `/session off` returns to `" + defaultAddressee + "`"
+}
+
+// conversationIsOwnThread reports a conversation key that names one thread:
+// a Google Chat key with a thread, or a Slack key with a thread ts. A
+// whole-space Google Chat key, the thread-less legacy Slack DM key, a key
+// that does not parse and every other backend report false.
+func conversationIsOwnThread(backend, conversation string) bool {
+	switch backend {
+	case gchatBackend:
+		_, thread, ok := gchatSpaceThread(conversation)
+		return ok && thread != ""
+	case slackBackend:
+		_, threadTS, ok := slackChannelThread(conversation)
+		return ok && threadTS != ""
+	}
+	return false
 }
 
 // hasSession is the SessionLookup the gateway offers a SessionLookupSink:
