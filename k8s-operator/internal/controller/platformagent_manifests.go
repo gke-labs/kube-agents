@@ -104,6 +104,36 @@ const (
 	// records today, so turning an emitter on for a profile needs no change here.
 	fluentBitAuditTailPath = fluentBitDataMount + "/logs/" + auditFileName + "," +
 		fluentBitDataMount + "/profiles/*/logs/" + auditFileName
+	// fluentBitStateMount is where the fluent-bit sidecar keeps its two tail
+	// cursor databases (fluentBitLogsDBFile, fluentBitAuditDBFile): a per-agent
+	// directory on the namespace's system-metadata claim, mounted read-write at
+	// subPath fluentBitStateSubPathPrefix + agent.Name. On an emptyDir the cursors
+	// died with the pod, and with Read_from_Head On every replacement pod read
+	// both inputs from byte zero, replaying up to Mem_Buf_Limit of old lines per
+	// file into Cloud Logging. The metadata claim rather than the agent's data
+	// claim because the agent and the dashboard mount that one at its root: a
+	// cursor file they rewrite into something SQLite cannot open makes the sidecar
+	// exit at every start. Every other mount of system-metadata the operator
+	// renders uses subPath session (TestFluentBitKeepsItsCursorsOnTheMetadataClaim
+	// holds it there), so no rendered container that runs model-authored code can
+	// reach this directory; spec.deployment.extraVolumeMounts can still name the
+	// claim, and validateExtraVolumeMounts does not refuse it. Both databases are
+	// rendered with DB.journal_mode sqliteJournalModeDelete: the claim is the
+	// gofer-backed mount under a runtime class, where WAL mode corrupts
+	// (sqliteJournalModeDelete says why), and a corrupt cursor here outlives the
+	// pod where the emptyDir reset it.
+	fluentBitStateMount = "/var/lib/fluent-bit"
+	// fluentBitStateSubPathPrefix is the directory on the system-metadata claim
+	// under which each agent's cursor directory sits. The claim is one per
+	// namespace, so the agent's name keeps two agents' cursors apart. The kubelet
+	// creates a missing subPath directory with the volume root's mode, which
+	// fsGroup (agentFSGroup) has made group-writable, as it does for session.
+	fluentBitStateSubPathPrefix = "fluent-bit-state/"
+	// fluentBitLogsDBFile and fluentBitAuditDBFile are the two tail inputs' DB
+	// files under fluentBitStateMount, one per input; two inputs sharing one file
+	// would overwrite each other's positions.
+	fluentBitLogsDBFile  = "fluent-bit.db"
+	fluentBitAuditDBFile = "fluent-bit-audit.db"
 	// agentDataStorageSize is the default size of the agent's own /opt/data
 	// claim and, through shell_sandbox_manifests.go, of the sandbox's claim at
 	// the same path. spec.storage.size overrides it; ResolveDataStorageSize is
@@ -142,6 +172,24 @@ const (
 	credentialProxyMetricsPort     int32 = 8766
 	credentialProxyMetricsPortName       = "cred-metrics"                  // #nosec G101 -- Container port name, not a credential
 	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyHealthPort is Envoy's health listener in the broker
+	// container, where the readinessProbe goes. The credentialed listener
+	// sends every path, /healthz included, through one upstream cluster, and
+	// the fleet's open cluster watches hold that cluster's connections, so a
+	// probe through it is refused with the watches' 503 and three of those
+	// remove the pod from the Service. The health listener routes /healthz
+	// alone, through a cluster with a breaker of its own on the same socket,
+	// so ready still means the broker answers and no watch can mark it
+	// unready. The number is baked into the image's Envoy config
+	// (deploy/shared/envoy-credential-proxy.yaml); the operator declares the
+	// container port and the probe, and a test holds the two equal. Neither
+	// the Service nor the NetworkPolicy admits it: the kubelet probes the pod
+	// IP outside both. 8767 is left to the broker's own listener. A broker
+	// image older than this listener never becomes Ready under an operator
+	// that probes it, which is the standing rule that a pinned image is at
+	// least as new as the operator.
+	credentialProxyHealthPort     int32 = 8768
+	credentialProxyHealthPortName       = "cred-health" // #nosec G101 -- Container port name, not a credential
 	// credentialProxyPortEnv tells the runtime the credentialed port, so its
 	// refusal of a metrics port equal to it compares against the number the
 	// operator renders rather than the runtime's own default.
@@ -4558,6 +4606,10 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		{Name: "GITOPS_STATE_PATH", Value: path.Join(gitopsStateDir, "managed_repos")},
 		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 	}
+	// The scratch volumes' caps, for the broker's resource watermark gate. See
+	// credentialProxyStateLimitEnv for why they are values and why reserved;
+	// in the managed set, so the merge below reserves both names.
+	envVars = append(envVars, credentialProxyVolumeLimitEnv(agent)...)
 	// Set in both directions, deliberately. The broker's own default is off, so
 	// the "0" changes nothing on its own — what it buys is that the credential
 	// mode an install is in can be read off the Deployment rather than inferred
@@ -5120,6 +5172,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// changes which cards the front door files and nothing else: the pull
 		// request still goes through submit-suggestion and a human merges it.
 		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
+
+		// How many Cluster Agent profiles one reconcile run scaffolds before it
+		// leaves the rest for the next run (MAX_CREATES_PER_RUN_ENV in
+		// cluster_agent_reconcile.py). Parsed as a whole number; anything but a
+		// positive integer reads as the default, so an arbitrary value bounds
+		// how many profiles a run creates and reaches nothing else.
+		"BOOTSTRAP_MAX_CREATES_PER_TICK": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same
@@ -5760,15 +5819,20 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				ReadOnly:  true,
 			},
 			{
-				Name:      "fluent-bit-state",
-				MountPath: "/fluent-bit/state",
+				Name:      "system-metadata",
+				MountPath: fluentBitStateMount,
+				SubPath:   fluentBitStateSubPathPrefix + agent.Name,
 			},
 		},
 		// Read-only root and no /tmp, the only container here with neither. The config
-		// above buffers in memory (Mem_Buf_Limit, no storage.path), keeps its tail DB on
-		// the fluent-bit-state volume and outputs to stdout, so it writes nothing to the
-		// root filesystem. Handing it the agent's tmp-scratch would only give an
-		// LLM-driven container a path into the log shipper.
+		// above buffers in memory (Mem_Buf_Limit, no storage.path) and outputs to
+		// stdout, so it writes nothing to the root filesystem. Its one writable path
+		// is the cursor directory on the system-metadata claim (fluentBitStateMount),
+		// which no other container the operator renders mounts: the agent and the
+		// dashboard reach that claim only through subPath session, and only a CR's
+		// spec.deployment.extraVolumeMounts could hand them its root. Handing it the
+		// agent's tmp-scratch would only give an LLM-driven container a path into the
+		// log shipper.
 		SecurityContext: hardenedSecurityContext(),
 	})
 
@@ -5853,12 +5917,6 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 					},
 					DefaultMode: ptr.To(int32(420)),
 				},
-			},
-		},
-		{
-			Name: "fluent-bit-state",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(fluentBitStateSizeLimit))},
 			},
 		},
 		{
@@ -6145,7 +6203,9 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Name              tail
     Tag               agent.logs
     Path              ` + fluentBitDataMount + `/logs/*.log
-    DB                /fluent-bit/state/fluent-bit.db
+    DB                ` + fluentBitStateMount + `/` + fluentBitLogsDBFile + `
+    DB.locking        true
+    DB.journal_mode   ` + sqliteJournalModeDelete + `
     Refresh_Interval  5
     Rotate_Wait       30
     Mem_Buf_Limit     20MB
@@ -6158,7 +6218,9 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Tag               agent.audit
     Path              ` + fluentBitAuditTailPath + `
     Parser            audit_json
-    DB                /fluent-bit/state/fluent-bit-audit.db
+    DB                ` + fluentBitStateMount + `/` + fluentBitAuditDBFile + `
+    DB.locking        true
+    DB.journal_mode   ` + sqliteJournalModeDelete + `
     Refresh_Interval  5
     Rotate_Wait       30
     Mem_Buf_Limit     20MB

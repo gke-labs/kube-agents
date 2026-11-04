@@ -2726,6 +2726,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "upgrade-readiness-watch",
                 "upgrade-readiness-weekly-review",
                 "sa-role-watch",
+                "leeway-watch",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "
@@ -21859,16 +21860,31 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             )
         self.assertIn("Kustomize root", notes["a"])
 
-    def test_a_default_yes_taken_without_a_snapshot_is_not_kept_after_a_retry(self):
-        use_snapshot(self, {"clusters/c1/kustomization.yaml": "resources: []\n"}, error=[RuntimeError("down"), None])
+    def test_a_retry_that_works_answers_the_question_that_asked(self):
+        calls = []
+        use_snapshot(
+            self, {"clusters/c1/kustomization.yaml": "resources: []\n"}, error=[RuntimeError("down"), None], calls=calls
+        )
         self.patch_attr("content_mode", lambda: True)
         probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertTrue(probe.has_path("clusters/new.yaml"))  # no snapshot: a default yes
-            self.assertFalse(probe.has_path("clusters/new.yaml"))  # the retry's snapshot answers
-        self.assertFalse(probe.known_absent("clusters/other.yaml"))
+            self.assertFalse(probe.has_path("clusters/new.yaml"))
+            self.assertTrue(probe.has_path("clusters/c1/kustomization.yaml"))
+        self.assertEqual(probe.take_unanswered(), "")
         self.assertTrue(probe.known_absent("clusters/new.yaml"))
+        self.assertEqual(len(calls), 2)
         probe.close()
+
+    def test_both_attempts_failing_answer_with_a_default_yes_and_the_reason(self):
+        calls = []
+        use_snapshot(self, error=[RuntimeError("first"), RuntimeError("second")], calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(probe.has_path("clusters/new.yaml"))
+            self.assertTrue(probe.has_path("clusters/other.yaml"))
+        self.assertIn("RuntimeError: second", probe.unavailable)
+        self.assertEqual(len(calls), 2)
 
     def test_a_snapshot_that_failed_is_named_not_called_a_collision(self):
         use_snapshot(self, error=RuntimeError("down"))
@@ -21902,7 +21918,8 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 if target.exists():
                     target.unlink()
                 self.assertEqual(self.generate()[0], expected)
-                self.assertEqual(len(calls), 1)
+                # A failed snapshot is retried once, inside the same question.
+                self.assertEqual(len(calls), 2 if error else 1)
 
     def test_two_clusters_each_get_their_own_budget_of_one_name(self):
         """A PodDisruptionBudget's name is unique per namespace per cluster, and
@@ -30774,8 +30791,9 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
                     self.degrade_with_snapshot(broker_refusal(status, "busy"))
 
     def test_a_retried_snapshot_that_succeeds_clears_the_outage(self):
-        """The Config Connector scan takes the probe's snapshot twice when the
-        first fails; a second one that is taken answers for the first."""
+        """An outage on the first attempt and a snapshot on the second, both
+        inside the pass's first question: the retry answers for the outage, so
+        the pass goes on rather than stopping the command."""
         import urllib.error
 
         use_snapshot(
@@ -30786,24 +30804,24 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
         finding = kustomize_fix(self.PDB)
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertIsNotNone(probe.broker() or probe.broker())
             self.assertEqual(audit_report.degrade_unlisted_kustomize_additions([finding], probe), ["pdb-fix"])
+        self.assertIsNone(probe.outage)
         self.assertIn("does not list it", finding["remediation"]["note"])
 
-    def test_the_paragraph_scan_leaves_planning_its_retry(self):
-        """Review finding: the Config Connector paragraph scan asked the probe
-        twice after a refused snapshot, so planning got no retry. It makes one
-        attempt at most, and it reuses a snapshot the probe already took."""
+    def test_the_paragraph_scan_takes_the_probes_attempts_once(self):
+        """The paragraph scan asks the probe, which makes its attempts
+        (`PROBE_OPEN_ATTEMPTS`) in that one call; a later question makes
+        none, so the run asks the broker no more than the probe allows."""
         self.patch_attr("content_mode", lambda: True)
         calls = []
         refused = broker_refusal(403, "repository not managed")
-        use_snapshot(self, {}, error=[refused, refused], calls=calls)
+        use_snapshot(self, {}, error=[refused] * audit_report.PROBE_OPEN_ATTEMPTS, calls=calls)
         probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertIsNone(audit_report._kcc_paragraph_scan("acme/fleet", probe))
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), audit_report.PROBE_OPEN_ATTEMPTS)
             self.assertIsNone(probe.broker())
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), audit_report.PROBE_OPEN_ATTEMPTS)
 
     def test_the_paragraph_scan_reuses_the_probes_snapshot(self):
         self.patch_attr("content_mode", lambda: True)
@@ -31046,6 +31064,16 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         files = {**self.overlay(), self.PDB: "kind: PodDisruptionBudget\n"}
         finding = kustomize_fix(self.PDB)
         self.assertEqual(self.degrade_via_broker(files, [finding]), [])
+
+    def test_an_edit_on_the_base_is_kept_when_the_retry_takes_the_snapshot(self):
+        # The first attempt is refused (a 403 during a credential refresh) and
+        # the second works: the edit's question is answered from the snapshot,
+        # so the fix is kept rather than degraded as unchecked.
+        files = {**self.overlay(), self.PDB: "kind: PodDisruptionBudget\n"}
+        use_snapshot(self, files, error=[broker_refusal(403, "repository not managed"), None])
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_in_content_mode([finding]), [])
+        self.assertEqual(finding["remediation"]["kind"], "manifest")
 
     def test_content_mode_reads_the_nearest_of_nested_roots(self):
         nested = f"{self.OVERLAY}/extra/checkout-gateway-pdb.yaml"

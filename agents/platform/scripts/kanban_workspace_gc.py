@@ -77,6 +77,15 @@ the product ships writes one or reads one.  They are a worker's copies of
 shipped skills or scripts, patched and run in place of the originals (#3444),
 and a later session could find them and run them too.  They go on the first
 night, whatever their age, and the log names them (the first 40, then a count).
+
+Each of the three sandbox sweeps that read the profile homes (the inventory,
+the cron run prune and the override sweep) lists the whole profiles root in one
+``find`` rather than one per home: a fleet of several hundred Cluster Agents
+costs three SSH round trips a night, not three per profile.  Removal stays one
+``rm`` per home (and per name, up to `INVENTORY_LIMIT`), so a failure is still
+named.  ``find`` does not follow a symlink under its default ``-P``, on the
+command line or below it, so an entry the one listing names was reached
+through real directories only; that is the symlink check for those two sweeps.
 """
 
 from __future__ import annotations
@@ -90,11 +99,13 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Collection
+from contextlib import ExitStack
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import sandbox_exec  # noqa: E402
+from profile_scaffold import profile_lock  # noqa: E402
 
 # The statuses Hermes itself treats as terminal, from the child query in
 # ``_cleanup_workspace``. Used for both halves of the decision: a task is a
@@ -181,18 +192,31 @@ def expected_entries(profile: str) -> dict[str, str]:
 DISPLACED_MARK = ".displaced-"
 DISPLACED_STAMP = re.compile(r"\d{8}T\d{6}")
 
-# Lists a directory's entries as name, mtime, size and type, NUL terminated so
-# a name with a newline or a tab in it can't forge a second row.  By absolute
-# path for the same reason as `REMOTE_LS`.  The escapes are find's own: an
-# argv can't carry a NUL byte, so `-printf` gets the backslash sequences as
-# text and expands them in the sandbox.
+# Lists a tree's entries as path relative to the starting point, mtime, size
+# and type, NUL terminated so a name with a newline or a tab in it can't forge
+# a second row.  By absolute path for the same reason as `REMOTE_LS`.  The
+# escapes are find's own: an argv can't carry a NUL byte, so `-printf` gets the
+# backslash sequences as text and expands them in the sandbox.  Each sweep
+# reads a whole profiles root in one find: a home's entry arrives as
+# `<home>/<entry>`, a cron run as `<home>/cron/runs/<run>`.
 REMOTE_FIND = "/usr/bin/find"
-FIND_FORMAT = r"%f\t%T@\t%s\t%y\0"
+TREE_FIND_FORMAT = r"%P\t%T@\t%s\t%y\0"
+# How deep that find reads under the profiles root for the inventory and the
+# override sweep: the homes and their top-level entries.
+HOME_ENTRIES_DEPTH = 2
+# find's -path matches a glob against the whole path, so a root with one of
+# these in it is escaped before it goes into a pattern.
+GLOB_SPECIALS = "*?["
 
 # Cap on how many entries one home reports.  The log line is for a person,
 # and the install this was written against had about 150 probe scripts in one
 # home.
 INVENTORY_LIMIT = 40
+# Past INVENTORY_LIMIT, the most names one batched rm takes when each holds its
+# profile lock open until the rm: one file descriptor each, so a worker that
+# planted thousands of homes cannot exhaust the descriptors the rm's own
+# subprocess needs.
+HELD_BATCH_MAX = 200
 
 # Where the job's own record goes: `<agent home>/logs/`, which the gateway
 # pod's fluent-bit sidecar tails and ships to Cloud Logging.  Not stderr: the
@@ -202,6 +226,9 @@ INVENTORY_LIMIT = 40
 # kept. A week covers a failed audit someone wants to look at on Monday.
 CRON_RUNS_PARTS = ("cron", "runs")
 CRON_RUNS_MAX_AGE_DAYS = 7
+# How deep the cron sweep's one find reads under the profiles root: the home, the
+# runs root's components, and the run directory itself.
+CRON_RUNS_DEPTH = len(CRON_RUNS_PARTS) + 2
 CRON_RUN_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 # The shape of a profile name `sweep_stale_homes` will pass to `rm`: the same
 # one. `cluster_agent_profile.profile_name` rewrites every character outside
@@ -337,7 +364,8 @@ def _remove_remote(root: Path, names: list[str], sweep: Sweep) -> None:
 
 
 def _remove_remote_batched(root: Path, names: list[str], sweep: Sweep,
-                           keep: Callable[[str], bool] | None = None) -> tuple[list[str], list[str]]:
+                           keep: Callable[[str], bool] | None = None,
+                           hold: Callable[[str], object] | None = None) -> tuple[list[str], list[str]]:
     """`_remove_remote` one name at a time up to INVENTORY_LIMIT, then the rest in one call.
 
     One rm per name, so a name the worker made unremovable doesn't hide the
@@ -346,25 +374,34 @@ def _remove_remote_batched(root: Path, names: list[str], sweep: Sweep,
     each.  *keep*, when given, is asked about each name right before its
     batch's rm, so a caller's last-moment check is as fresh as the rm it
     guards rather than one check for the whole run.  A name it refuses is
-    neither removed nor failed.  Returns (removed, failed); the names are
-    left out of ``sweep.remote_removed`` for the caller to account for.
+    neither removed nor failed.  *hold*, when given, returns a context
+    manager for each name that yields whether the name may be touched (its
+    profile lock): it is entered before *keep* is asked and left after the
+    batch's rm, and a name it refuses is skipped like one *keep* refuses.
+    Returns (removed, failed); the names are left out of
+    ``sweep.remote_removed`` for the caller to account for.
     """
     batches = [[name] for name in names[:INVENTORY_LIMIT]]
-    if names[INVENTORY_LIMIT:]:
-        batches.append(names[INVENTORY_LIMIT:])
+    rest = names[INVENTORY_LIMIT:]
+    # Held names keep a descriptor each until their rm, so their tail is chunked.
+    step = HELD_BATCH_MAX if hold is not None else len(rest) or 1
+    batches.extend(rest[i:i + step] for i in range(0, len(rest), step))
     removed_all: list[str] = []
     failed_all: list[str] = []
     for batch in batches:
-        if keep is not None:
-            batch = [name for name in batch if keep(name)]
+        with ExitStack() as held:
+            if hold is not None:
+                batch = [name for name in batch if held.enter_context(hold(name))]
+            if keep is not None:
+                batch = [name for name in batch if keep(name)]
             if not batch:
                 continue
-        before = len(sweep.remote_removed)
-        _remove_remote(root, batch, sweep)
-        removed = sweep.remote_removed[before:]
-        del sweep.remote_removed[before:]
-        removed_all.extend(removed)
-        failed_all.extend(name for name in batch if name not in removed)
+            before = len(sweep.remote_removed)
+            _remove_remote(root, batch, sweep)
+            removed = sweep.remote_removed[before:]
+            del sweep.remote_removed[before:]
+            removed_all.extend(removed)
+            failed_all.extend(name for name in batch if name not in removed)
     return removed_all, failed_all
 
 
@@ -394,6 +431,15 @@ def agent_home() -> Path:
     Not ``HERMES_HOME``, which names the platform profile's home.
     """
     return Path(os.environ.get("PLATFORM_AGENT_HOME") or "/opt/data")
+
+
+def stale_home_lock_root() -> Path:
+    """The data root the stale-home sweep takes profile locks under (#4389).
+
+    `agent_home()`, never HERMES_HOME: under this script's roster HERMES_HOME is
+    profiles/platform, and a lock there is not the one create_profile takes.
+    """
+    return agent_home()
 
 
 def sandbox_root() -> Path:
@@ -434,8 +480,8 @@ class _SandboxGone(Exception):
     """Stop the inventory: every further listing would fail the same way."""
 
 
-def _parse_listing(output: str) -> list[Row]:
-    """Every well-formed `FIND_FORMAT` record, the name possibly holding tabs."""
+def _parse_tree_listing(output: str) -> list[Row]:
+    """Every well-formed `TREE_FIND_FORMAT` record, the path possibly holding tabs; sorted."""
     rows = []
     for record in output.split("\0"):
         parts = record.split("\t")
@@ -443,7 +489,7 @@ def _parse_listing(output: str) -> list[Row]:
             continue
         name = "\t".join(parts[:-3])
         mtime, size, kind = parts[-3:]
-        if not name or "/" in name:
+        if not name:
             continue
         try:
             rows.append((name, float(mtime), int(size), kind))
@@ -452,40 +498,57 @@ def _parse_listing(output: str) -> list[Row]:
     return sorted(rows)
 
 
+def _glob_escape(text: str) -> str:
+    """*text* as a find -path pattern that matches itself only."""
+    return "".join(f"[{c}]" if c in GLOB_SPECIALS else c for c in text)
+
+
+def _find_tree(argv: list[str], root: Path, gone: str, report: Callable[[str], None]) -> list[Row] | None:
+    """One sandbox find under *root*: the rows it printed, or None when it could not run.
+
+    Runs as the default sandbox principal: the listing is believed, and only the
+    model's own login sources a ``.bashrc`` it could have written.  Raises
+    `_SandboxGone`, after reporting *gone*, when the sandbox did not answer: every
+    further call would fail the same way.  A non-zero exit with output is
+    reported and the output still used, since find keeps going past an entry it
+    cannot read and the rows it did print are good; a root the sandbox has not
+    received yet lists as empty and says nothing.
+    """
+    try:
+        result = sandbox_exec.run(argv, timeout=LS_TIMEOUT_SECONDS, errors="surrogateescape")
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as exc:
+        report(f"{gone}: {exc}")
+        raise _SandboxGone from exc
+    except Exception as exc:  # noqa: BLE001 - a sweep must not die on one listing
+        report(f"could not list {root} in the sandbox: {exc}")
+        return None
+    rows = _parse_tree_listing(result.stdout)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        # GNU find prefixes the message with argv[0], which is the full path here.
+        if not rows and "\n" not in stderr and stderr.endswith(f": '{root}': No such file or directory"):
+            return []
+        report(f"listing {root} in the sandbox exited {result.returncode}; entries it didn't list "
+               f"were not checked: {' '.join(stderr.split())[:STDERR_EXCERPT_CHARS]}")
+    return rows
+
+
+def _entries_by_home(rows: list[Row]) -> dict[str, list[Row]]:
+    """A depth-two tree listing's `<home>/<entry>` rows, grouped by home with the entry as the name."""
+    entries: dict[str, list[Row]] = {}
+    for rel, mtime, size, kind in rows:
+        home, sep, entry = rel.partition("/")
+        if sep and entry and "/" not in entry:
+            entries.setdefault(home, []).append((entry, mtime, size, kind))
+    return entries
+
+
 def _is_expected(row: Row, expected: dict[str, str]) -> bool:
     name, _, _, kind = row
     if expected.get(name) == kind:
         return True
     base, mark, stamp = name.partition(DISPLACED_MARK)
     return bool(mark) and base in SKELETON_ENTRIES and bool(DISPLACED_STAMP.fullmatch(stamp))
-
-
-def _list(path: Path, inv: Inventory) -> list[Row] | None:
-    """One directory's entries in the sandbox; None when it couldn't be read.
-
-    Runs as the default sandbox principal: the listing is believed, and only
-    the model's own login sources a ``.bashrc`` it could have written.
-    """
-    try:
-        result = sandbox_exec.run(
-            [REMOTE_FIND, str(path), "-mindepth", "1", "-maxdepth", "1",
-             "-printf", FIND_FORMAT],
-            timeout=LS_TIMEOUT_SECONDS,
-            errors="surrogateescape",
-        )
-    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as exc:
-        inv.problems.append(f"inventory stopped, the shell sandbox did not answer: {exc}")
-        raise _SandboxGone from exc
-    except Exception as exc:  # noqa: BLE001
-        inv.problems.append(f"could not list {path} in the sandbox: {exc}")
-        return None
-    if result.returncode != 0:
-        inv.problems.append(
-            f"listing {path} in the sandbox exited {result.returncode}: "
-            f"{' '.join((result.stderr or '').split())[:STDERR_EXCERPT_CHARS]}"
-        )
-        return None
-    return _parse_listing(result.stdout)
 
 
 def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
@@ -503,8 +566,14 @@ def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
     remote_profiles = remote_root / PROFILES_DIR_NAME
     inv.remote_profiles = remote_profiles
     inv.agent_profiles_path = agent_profiles
+    # One find for the homes and their top-level entries. A home that is a symlink
+    # in the sandbox is not descended into (find -P), so it lists with no entries
+    # and is flagged by its type below rather than read as clean.
     try:
-        present = _list(remote_profiles, inv)
+        rows = _find_tree(
+            [REMOTE_FIND, str(remote_profiles), "-mindepth", "1", "-maxdepth", str(HOME_ENTRIES_DEPTH),
+             "-printf", TREE_FIND_FORMAT],
+            remote_profiles, "inventory stopped, the shell sandbox did not answer", inv.problems.append)
     except _SandboxGone:
         return inv
     try:
@@ -516,27 +585,30 @@ def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
         inv.problems.append(f"could not read {agent_profiles}: {exc}")
         return inv
     inv.agent_profiles = names
-    try:
-        if present is not None:
-            inv.stale_homes = [
-                row for row in present
-                if row[3] == "d" and not row[0].startswith(".") and row[0] not in names
-            ]
-            kinds = {row[0]: row[3] for row in present}
-            for name in names:
-                if kinds.get(name, "d") != "d":
-                    inv.problems.append(
-                        f"{remote_profiles / name} is type {kinds[name]!r} in the "
-                        "sandbox, not a directory; its inventory can't be trusted"
-                    )
-        for name in names:
-            rows = _list(remote_profiles / name, inv)
-            expected = expected_entries(name)
-            unexpected = [row for row in rows or [] if not _is_expected(row, expected)]
-            if unexpected:
-                inv.unexpected[str(remote_profiles / name)] = unexpected
-    except _SandboxGone:
-        pass
+    if rows is None:
+        return inv
+    present = [row for row in rows if "/" not in row[0]]
+    entries = _entries_by_home(rows)
+    inv.stale_homes = [
+        row for row in present
+        if row[3] == "d" and not row[0].startswith(".") and row[0] not in names
+    ]
+    kinds = {row[0]: row[3] for row in present}
+    for name in names:
+        kind = kinds.get(name)
+        if kind is None:
+            inv.problems.append(f"{remote_profiles / name} is missing in the sandbox; its inventory can't be taken")
+            continue
+        if kind != "d":
+            inv.problems.append(
+                f"{remote_profiles / name} is type {kind!r} in the "
+                "sandbox, not a directory; its inventory can't be trusted"
+            )
+            continue
+        expected = expected_entries(name)
+        unexpected = [row for row in entries.get(name, []) if not _is_expected(row, expected)]
+        if unexpected:
+            inv.unexpected[str(remote_profiles / name)] = unexpected
     return inv
 
 
@@ -571,7 +643,10 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
     ``rm``: the inventory's per-home listings and the earlier ``rm`` calls sit
     between the first pod read and a given home's turn, and a cluster
     re-scaffolded in that window under a name whose old sandbox home is still
-    stale would otherwise lose the home it just got.
+    stale would otherwise lose the home it just got.  That recheck and the
+    ``rm`` both run under the name's profile lock (#4389), the one
+    create_profile holds, so a scaffold cannot start between them either; a
+    held lock leaves the home for the next run.
     """
     names = [row[0] for row in inv.stale_homes if _is_stale_cluster_home(row[0])]
     if not names or inv.remote_profiles is None or inv.agent_profiles_path is None:
@@ -595,8 +670,18 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
         )
         return
     pod_profiles = inv.agent_profiles_path
+    lock_root = stale_home_lock_root()
+    # Each name under its profile lock, the one create_profile and delete_profile
+    # hold, taken without blocking: a held lock is a scaffold or delete of that
+    # name running now, so the home is left for the next run. Held from the
+    # recheck through the rm, so a scaffold cannot land in between (#4389).
+    # A lock that cannot be opened leaves its home too, and says so once.
+    lock_errors: list[str] = []
     removed, failed = _remove_remote_batched(
-        remote_profiles, names, sweep, keep=lambda name: not _pod_home_present(pod_profiles / name))
+        remote_profiles, names, sweep,
+        keep=lambda name: not _pod_home_present(pod_profiles / name),
+        hold=lambda name: profile_lock(lock_root, name, blocking=False,
+                                       on_error=lambda e, n=name: lock_errors.append(f"{n}: {e}")))
     sweep.stale_homes_removed.extend(removed)
     if failed:
         # One chat bullet for the run that names the homes, with the rm's own
@@ -608,6 +693,13 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
         more = f" and {len(failed) - INVENTORY_LIMIT} more" if len(failed) > INVENTORY_LIMIT else ""
         sweep.warnings.append(
             f"stale sandbox cluster home(s) not removed: {shown}{more}: {detail[:STDERR_EXCERPT_CHARS]}"
+        )
+    # After the rm bullet, which folds every warning appended since first_warning
+    # into itself: this one stands on its own.
+    if lock_errors:
+        sweep.warnings.append(
+            f"could not open the profile lock for {len(lock_errors)} stale sandbox cluster home(s), "
+            f"so they were not removed: {'; '.join(lock_errors)[:STDERR_EXCERPT_CHARS]}"
         )
 
 
@@ -753,29 +845,40 @@ def _old_local_runs(runs: Path, cutoff: float) -> list[Path]:
     return sorted(old)
 
 
-def _old_remote_runs(runs: Path, cutoff: float, sweep: Sweep) -> list[str]:
-    """Names of old entries under *runs* in the sandbox; [] when it has none.
+def _cron_runs_find(profiles_root: Path) -> list[str]:
+    """The one find that lists every home's run directories under *profiles_root*.
 
-    Raises `_SandboxGone` when the sandbox did not answer, as `_list` does: every
-    further profile would fail the same way.
+    It prunes at depth two everything but the `cron` directory, so a home's
+    skills and plugins trees are never walked, and prints only the entries at
+    `<home>/cron/runs/<run>`; -maxdepth stops it below them.  The pattern has
+    the root escaped, and `_old_remote_runs` checks the shape of each row again.
     """
-    try:
-        result = sandbox_exec.run(
-            [REMOTE_FIND, str(runs), "-mindepth", "1", "-maxdepth", "1", "-printf", FIND_FORMAT],
-            timeout=LS_TIMEOUT_SECONDS,
-            errors="surrogateescape",
-        )
-    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as exc:
-        sweep.warnings.append(f"cron run directories in the sandbox not pruned, it did not answer: {exc}")
-        raise _SandboxGone from exc
-    except Exception as exc:  # noqa: BLE001 - a sweep must not die on one root
-        sweep.warnings.append(f"listing {runs} in the sandbox failed: {exc}")
-        return []
-    if result.returncode != 0:
-        # No cron has run in this profile, which is the normal case for most.
-        return []
-    return [name for name, mtime, _, _ in _parse_listing(result.stdout)
-            if _is_run_name(name) and mtime < cutoff]
+    pattern = _glob_escape(str(profiles_root))
+    runs = "/".join(CRON_RUNS_PARTS)
+    return [REMOTE_FIND, str(profiles_root), "-mindepth", "1", "-maxdepth", str(CRON_RUNS_DEPTH),
+            "(", "-path", f"{pattern}/*/*", "!", "-path", f"{pattern}/*/{CRON_RUNS_PARTS[0]}",
+            "!", "-path", f"{pattern}/*/{CRON_RUNS_PARTS[0]}/*", "-prune", ")",
+            "-o", "-path", f"{pattern}/*/{runs}/*", "-printf", TREE_FIND_FORMAT]
+
+
+def _old_remote_runs(profiles_root: Path, cutoff: float, sweep: Sweep) -> dict[str, list[str]]:
+    """Old run names per home under *profiles_root* in the sandbox, from one find.
+
+    A run reached through a symlinked home, `cron` or `runs` is never listed:
+    find does not follow symlinks under -P.  Raises `_SandboxGone` when the
+    sandbox did not answer; every further call would fail the same way.
+    """
+    rows = _find_tree(_cron_runs_find(profiles_root), profiles_root,
+                      "cron run directories in the sandbox not pruned, it did not answer", sweep.warnings.append)
+    old: dict[str, list[str]] = {}
+    for rel, mtime, _, _ in rows or []:
+        parts = rel.split("/")
+        if len(parts) != CRON_RUNS_DEPTH or tuple(parts[1:-1]) != CRON_RUNS_PARTS:
+            continue
+        home, run = parts[0], parts[-1]
+        if _is_run_name(run) and mtime < cutoff:
+            old.setdefault(home, []).append(run)
+    return old
 
 
 def sweep_cron_runs(agent_profiles: Path, remote_root: Path | None, sweep: Sweep,
@@ -783,7 +886,8 @@ def sweep_cron_runs(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
     """Remove each profile's cron run directories older than the cutoff.
 
     The profile list comes from the agent pod, as the inventory's does, and
-    the sandbox half runs only when *remote_root* is given.
+    the sandbox half runs only when *remote_root* is given: one find for every
+    home's runs, then one rm per home that has old ones.
     """
     cutoff = (time.time() if now is None else now) - CRON_RUNS_MAX_AGE_DAYS * 86400
     try:
@@ -792,6 +896,12 @@ def sweep_cron_runs(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
     except OSError as exc:
         sweep.warnings.append(f"could not read {agent_profiles}: {exc}")
         return remote_root
+    old_remote: dict[str, list[str]] = {}
+    if remote_root is not None:
+        try:
+            old_remote = _old_remote_runs(remote_root / PROFILES_DIR_NAME, cutoff, sweep)
+        except _SandboxGone:
+            remote_root = None
     for name in names:
         runs = agent_profiles.joinpath(name, *CRON_RUNS_PARTS)
         local_ok = _real_dirs_local(_runs_components(agent_profiles / name))
@@ -814,15 +924,8 @@ def sweep_cron_runs(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
                 sweep.cron_runs_removed.append(f"{name}/{sweep.local_removed.pop()}")
         if remote_root is None:
             continue
-        remote_runs = remote_root.joinpath("profiles", name, *CRON_RUNS_PARTS)
-        try:
-            old = _old_remote_runs(remote_runs, cutoff, sweep)
-        except _SandboxGone:
-            remote_root = None
-            continue
-        if old and not _real_dirs_remote(_runs_components(remote_root / "profiles" / name), sweep):
-            sweep.warnings.append(f"{remote_runs} in the sandbox is reached through a symlink; not pruned")
-            old = []
+        remote_runs = remote_root.joinpath(PROFILES_DIR_NAME, name, *CRON_RUNS_PARTS)
+        old = old_remote.get(name, [])
         if old:
             before = len(sweep.remote_removed)
             _remove_remote(remote_runs, old, sweep)
@@ -840,37 +943,25 @@ def _local_overrides(home: Path) -> list[Path]:
     return sorted(e for e in entries if OVERRIDE_NAME.fullmatch(e.name) and (e.is_symlink() or e.is_dir()))
 
 
-def _remote_overrides(home: Path, sweep: Sweep) -> list[str]:
-    """Names of override trees at the top of *home* in the sandbox.
+def _remote_overrides(profiles_root: Path, sweep: Sweep) -> dict[str, list[str]]:
+    """Override tree names per home under *profiles_root* in the sandbox, from one find.
 
-    Raises `_SandboxGone` when the sandbox did not answer, as `_old_remote_runs` does.
+    A home that is a symlink is not descended into (find -P), so nothing is
+    found behind it.  A profiles root the sandbox has not received yet lists as
+    empty; any other failure, a home the worker locked from its own shell or an
+    entry that vanished mid-listing, is reported, and whatever the listing did
+    return is still swept.  Raises `_SandboxGone` when the sandbox did not
+    answer, as `_old_remote_runs` does.
     """
-    try:
-        result = sandbox_exec.run(
-            [REMOTE_FIND, str(home), "-mindepth", "1", "-maxdepth", "1", "-printf", FIND_FORMAT],
-            timeout=LS_TIMEOUT_SECONDS,
-            errors="surrogateescape",
-        )
-    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as exc:
-        sweep.warnings.append(f"override trees in the sandbox not removed, it did not answer: {exc}")
-        raise _SandboxGone from exc
-    except Exception as exc:  # noqa: BLE001 - a sweep must not die on one home
-        sweep.warnings.append(f"listing {home} in the sandbox failed: {exc}")
-        return []
-    found = sorted(name for name, _, _, kind in _parse_listing(result.stdout)
-                   if OVERRIDE_NAME.fullmatch(name) and kind in ("d", "l"))
-    if result.returncode != 0:
-        # A home the sandbox hasn't received yet (a profile scaffolded while it
-        # was down, a recreated volume) has nothing to sweep: find's only
-        # complaint is then about the home itself.  Any other failure, a home the
-        # worker locked from its own shell or an entry that vanished mid-listing,
-        # is reported, and whatever the listing did return is still swept.
-        stderr = (result.stderr or "").strip()
-        # GNU find prefixes the message with argv[0], which is the full path here.
-        if not found and "\n" not in stderr and stderr.endswith(f": '{home}': No such file or directory"):
-            return []
-        sweep.warnings.append(f"listing {home} in the sandbox exited {result.returncode}; override trees it "
-                              f"didn't list were not checked: {stderr[:STDERR_EXCERPT_CHARS]}")
+    rows = _find_tree(
+        [REMOTE_FIND, str(profiles_root), "-mindepth", str(HOME_ENTRIES_DEPTH), "-maxdepth", str(HOME_ENTRIES_DEPTH),
+         "-printf", TREE_FIND_FORMAT],
+        profiles_root, "override trees in the sandbox not removed, it did not answer", sweep.warnings.append)
+    found: dict[str, list[str]] = {}
+    for home, entries in _entries_by_home(rows or []).items():
+        names = sorted(name for name, _, _, kind in entries if OVERRIDE_NAME.fullmatch(name) and kind in ("d", "l"))
+        if names:
+            found[home] = names
     return found
 
 
@@ -879,8 +970,10 @@ def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
 
     A symlink is unlinked, never followed.  A home that is itself a symlink is
     left alone: on the agent pod it is reported when an override tree sits
-    behind it, and in the sandbox `find` doesn't follow it, so nothing is found.  Returns *remote_root*, or None once the sandbox has not
-    answered, so the caller's next sandbox step can skip it.
+    behind it, and in the sandbox `find` doesn't follow it, so nothing is found.
+    The sandbox is listed once for every home, then one rm per name up to
+    `INVENTORY_LIMIT` per home.  Returns *remote_root*, or None once the sandbox
+    has not answered, so the caller's next sandbox step can skip it.
     """
     try:
         names = sorted(e.name for e in agent_profiles.iterdir()
@@ -888,6 +981,12 @@ def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
     except OSError as exc:
         sweep.warnings.append(f"could not read {agent_profiles}: {exc}")
         return remote_root
+    remote_found: dict[str, list[str]] = {}
+    if remote_root is not None:
+        try:
+            remote_found = _remote_overrides(remote_root / PROFILES_DIR_NAME, sweep)
+        except _SandboxGone:
+            remote_root = None
     for name in names:
         home = agent_profiles / name
         if _real_dirs_local([home]):
@@ -900,17 +999,8 @@ def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
             sweep.warnings.append(f"{home} is reached through a symlink; its override trees were not removed")
         if remote_root is None:
             continue
-        remote_home = remote_root / "profiles" / name
-        try:
-            found = _remote_overrides(remote_home, sweep)
-        except _SandboxGone:
-            remote_root = None
-            continue
-        if found and not _real_dirs_remote([remote_root / "profiles", remote_home], sweep):
-            sweep.warnings.append(f"could not confirm {remote_home} in the sandbox is a real directory (a symlink, "
-                                  f"or the check failed); its override trees were not removed")
-            found = []
-        removed, _ = _remove_remote_batched(remote_home, found, sweep)
+        remote_home = remote_root / PROFILES_DIR_NAME / name
+        removed, _ = _remove_remote_batched(remote_home, remote_found.get(name, []), sweep)
         sweep.overrides_removed.extend(f"sandbox {name}/{e}" for e in removed)
     return remote_root
 

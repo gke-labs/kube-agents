@@ -192,7 +192,7 @@ Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
-Five KV buckets ride the same JetStream deployment:
+Six KV buckets ride the same JetStream deployment:
 
 - `runtime-state` - which agents are alive, what is in flight. Runtime state does not
   belong in git, and this is where it goes instead.
@@ -225,8 +225,8 @@ Five KV buckets ride the same JetStream deployment:
   asserted of one. 09 §3 owns the entry shape; the permissions are asserted in
   `a2a/authcallout` against the config the operator renders.
 - `feedback` - the 👍 and 👎 ratings chat users gave the gateway's answers, each with the
-  exchange it rated: user content that can hold cluster data. The one bucket with a max
-  age (`--ttl=720h`), which is its retention, and capped at 64MiB, which 👍 and 👎 share:
+  exchange it rated: user content that can hold cluster data. One of the two buckets with a
+  max age (`--ttl=720h`), which is its retention, and capped at 64MiB, which 👍 and 👎 share:
   past it a new rating is refused until older ones expire. The gateway's user is
   the only reader and writer of its records by grant, with the registry's four verbs on
   `KV_feedback`; provision and seed hold STREAM.INFO on it, which can list its keys (task
@@ -234,6 +234,16 @@ Five KV buckets ride the same JetStream deployment:
   and the session-state deliver-subject residue above applies to `$KV.feedback.>` the
   same way. The gateway keeps nothing in a bucket without a max age. The chatops gateway
   design owns what a record holds ("Answer feedback").
+- `people` - one hashed key and a last-put time per chat person the gateway has seen. The
+  other bucket with a max age (`--ttl=720h`), which is its retention: NATS deletes a person
+  30 days after their last turn. Capped at 32MiB, about a hundred thousand entries: past it
+  a put is refused and the count under-counts. The gateway's user is the only reader and
+  writer of its records by grant, with the registry's four verbs on `KV_people`; provision
+  and seed hold STREAM.INFO on it, which can list its keys (the hashed key alone), and the
+  session-state deliver-subject residue above applies to `$KV.people.>` the same way. The
+  gateway counts nobody in a bucket without a max age. The
+  [human interaction readings design](human-interaction-readings.md) owns what a record holds
+  ("People").
 - `PROFILE_LEASES` - each AgentProfile task's liveness lease, keyed
   `<profile>.<tier>.<pod>.<task>` (#3655). The dispatcher is its only writer, by grant.
   Workers renew by publishing on their own `a2a.dispatch.<profile>.<tier>.<pod>.lease`
@@ -696,7 +706,13 @@ operator has one for itself, keyed on the manager's own ServiceAccount: publish 
 profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic
 grants and no subjects. The callout derives that profile pod's task subjects from the
 profile, and its consumer names and inbox from the attested pod name (see the subagent
-profiles spec for why a static entry cannot work there).
+profiles spec for why a static entry cannot work there). **Amended 11/2:** the map is cut
+into numbered ConfigMaps, `<agent>-a2a-authmap-0` through `-<n-1>`, each under a byte budget
+that keeps it below the API server's 1 MiB object limit (the single object crossed it near
+640 bound profiles); every shard carries the whole map's version and `shard`/`shards`
+stamps, the callout is told the count and watches each name under a Role naming each, and
+it serves a new version only once every shard of it has arrived. A map that fits is one
+shard.
 
 The session entry is a different kind of entry and the difference is load-bearing. Every
 session pod runs as one shared ServiceAccount, so the ServiceAccount alone cannot tell two

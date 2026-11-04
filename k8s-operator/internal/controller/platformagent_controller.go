@@ -457,7 +457,10 @@ type PlatformAgentReconciler struct {
 	// gauges' publish reads them on every reconcile, at any age, to hold the
 	// pruned fields' samples back (heldUsageFields). Cleared per field by an
 	// echo that carries it, per CR by the poller's sweep of departed CRs and
-	// when the CR is deleted. Under prunedNewerFieldsMu.
+	// when the CR is deleted. updateStatusReady also records status.inference
+	// here (inferenceNewerField, through noteInferenceEcho) when the Ready
+	// write's echo drops the block, reads it through inferencePruned, and
+	// clears it when an echo carries the pair. Under prunedNewerFieldsMu.
 	prunedNewerFieldsMu sync.Mutex
 	prunedNewerFields   map[string]map[string]time.Time
 
@@ -710,6 +713,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// than leaving a mistyped agentRef silently statusless forever.
 			r.markOrphanedPlugins(ctx, req.Namespace, req.Name)
 			usageMetrics.forget(req.Namespace, req.Name)
+			inferenceMetrics.forget(req.Namespace, req.Name)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -720,6 +724,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// means unknown, not idle, so that field's sample is held back, the whole
 	// block or field by field as the writers recorded it (heldUsageFields).
 	usageMetrics.publishPhase(instance)
+	inferenceMetrics.publish(instance)
 	usageMetrics.publishUsageExcept(instance, r.heldUsageFields(instance))
 
 	log.Info("Reconciling PlatformAgent", "name", instance.Name, "namespace", instance.Namespace)
@@ -967,18 +972,24 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
-	// 10b. Reconcile the shell sandbox before the credential proxy, and both before
+	// 10b. Grant the broker and kube-proxy the one verb they need to authenticate
+	// their callers, and reconcile kube-proxy before the shell sandbox so the TLS
+	// CA Secret and proxy Service exist before the shell mounts and dials them.
+	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
+	otlpDisabled := otlpSource == otlpSourceNone
+	if err := r.reconcileKubeProxy(ctx, instance, otlpEndpoint, otlpDisabled); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 10c. Reconcile the shell sandbox before the credential proxy, and both before
 	// the workload that connects to them. Neither client blocks on the proxy — the
 	// wrapped CLIs report it unavailable and the chat relay retries its poll — but
 	// on a first install this order means the sandbox's ServiceAccount exists
 	// before the broker starts authenticating callers against it.
 	if err := r.reconcileShellSandbox(ctx, instance, settingsHash); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 10c. Grant the broker the one verb it needs to authenticate its callers,
-	// before anything that runs it.
-	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1039,8 +1050,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
-	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
-	otlpDisabled := otlpSource == otlpSourceNone
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
 	// The home-channel record, read once per pass: the projection in the
 	// A2A render and both condition writers take this value, so the file
@@ -1244,11 +1253,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 // usageStatusRequeue is how soon the steady-state requeue has to fire for the
-// pruned-status probe: the interval while a record is held for this CR. With no
+// pruned-status probe: the interval while a record is held for this CR, the
+// whole usage block's or status.inference's. With no
 // record it returns the secret re-read's interval, the ceiling the caller
 // already applies, so the min it feeds leaves the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) {
+	if r.usageStatusPruned(agent) || r.inferencePruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -2285,12 +2295,19 @@ func minterHeldMessage(cmName string, held []string) string {
 // Repositories belonging to a different organization are skipped because the minter instance is
 // bound to the primary organization directory (/etc/minty/<primary-org>/).
 //
-// A managed repository's policy is default.yaml with the repository list replaced by every
-// same-org managed repository (renderRepoPolicy). A context repository's policy is default.yaml
-// reduced to minterReadScope, listing every same-org context repository (renderReadOnlyPolicy):
-// the broker mints from it for its own clone and nothing else, so a private context repository
-// is readable without a write token ever covering it. A repository in both lists is managed and
-// keeps the write rendering. A default.yaml without the read scope renders no context policies.
+// A managed repository's policy is default.yaml with the repository list replaced by that one
+// repository (renderRepoPolicy). A context repository's policy is default.yaml reduced to
+// minterReadScope, listing that one repository (renderReadOnlyPolicy): the broker mints from it
+// for its own clone and nothing else, so a private context repository is readable without a
+// write token ever covering it. A repository in both lists is managed and keeps the write
+// rendering. A default.yaml without the read scope renders no context policies.
+//
+// One repository per key, not the whole list in every key. Each key used to carry every same-org
+// repository of its kind, which made the ConfigMap quadratic in the repository count: with the
+// chart's default.yaml it crossed the API server's 1 MiB object limit near 119 managed
+// repositories, and from there no repository could be onboarded. The broker mints a write token
+// per repository to match (agents/platform/scripts/github_token_refresh.py), as it always has
+// for read and sweep tokens.
 //
 // Key ownership contract:
 // The operator owns every <repo>.yaml key for an active managed or context repository (including
@@ -2370,20 +2387,17 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	// ConfigMap JSON, and CodeQL (go/allocation-size-overflow) flags their sum
 	// as an allocation size that untrusted input could overflow.
 	expected := make(map[string]string)
-	writeContent := renderRepoPolicy(baseTemplate, allBareRepos)
 	for _, bareRepo := range allBareRepos {
-		expected[bareRepo+minterPolicyKeySuffix] = writeContent
+		expected[bareRepo+minterPolicyKeySuffix] = renderRepoPolicy(baseTemplate, []string{bareRepo})
 	}
-	if len(contextBareRepos) > 0 {
-		readContent, ok := renderReadOnlyPolicy(baseTemplate, contextBareRepos)
+	for _, bareRepo := range contextBareRepos {
+		readContent, ok := renderReadOnlyPolicy(baseTemplate, []string{bareRepo})
 		if !ok {
 			logger.Info("skipping context_repos in minter policy sync; default.yaml has no read-only scope",
 				"scope", minterReadScope, "repos", contextBareRepos)
-		} else {
-			for _, bareRepo := range contextBareRepos {
-				expected[bareRepo+minterPolicyKeySuffix] = readContent
-			}
+			break
 		}
+		expected[bareRepo+minterPolicyKeySuffix] = readContent
 	}
 
 	updated := false
@@ -2693,6 +2707,10 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 // the one place that decides, and credential_proxy_manifests.go carries the
 // reasoning.
 func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash string) error {
+	if _, err := r.ensureKubeProxyTLSSecret(ctx, agent); err != nil {
+		return err
+	}
+
 	// The resources override is checked here as well as at admission, because
 	// the chart installs with the webhook off. Rendered, a request above its
 	// limit is refused by the API server as Invalid, which
@@ -4581,6 +4599,19 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// telemetry and policy results, which take a discovery to produce.
 	newActiveInterfaces := resolveActiveInterfaces(agent)
 
+	// The install's default model, read from its LiteLLM config. A negative clears
+	// both fields; a failed read keeps the pair the status carries, so a transient
+	// error never blanks it. Gated like activeInterfaces while the served CRD
+	// prunes the block.
+	newInference := agent.Status.Inference
+	switch model, read := r.readInferenceModel(ctx, agent); read {
+	case inferenceReadFound:
+		newInference = &agentv1alpha1.InferenceStatus{Provider: model.Provider, Model: model.Model}
+	case inferenceReadNegative:
+		newInference = &agentv1alpha1.InferenceStatus{}
+	}
+	inferenceUnchanged := r.inferencePruned(agent) || inferenceStatusEqual(agent.Status.Inference, newInference)
+
 	// Check if anything actually changed. The generation is in the list so that
 	// a spec edit which changes nothing derived here still gets one write:
 	// without it the status would keep describing the previous generation and
@@ -4601,6 +4632,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.Telemetry.OTLPEndpointSource == otlpSource &&
 		networkPolicyStatusUnchanged(agent.Status.NetworkPolicy, netpolProfile) &&
 		(r.usageStatusPruned(agent) || slices.Equal(agent.Status.Usage.ActiveInterfaces, newActiveInterfaces)) &&
+		inferenceUnchanged &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
@@ -4635,6 +4667,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// through as read: Update sends the whole status, so leaving them alone
 	// here is what keeps them intact once something does write them.
 	agent.Status.Usage.ActiveInterfaces = newActiveInterfaces
+	agent.Status.Inference = newInference
 
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
@@ -4690,10 +4723,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
+	// Copied before the write: decoding the response may reuse the pointer's target.
+	var wroteInference *inferenceModel
+	if newInference != nil {
+		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
+	}
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, err
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
+	r.noteInferenceEcho(ctx, agent, wroteInference)
 	return newPhase, nil
 }
 
@@ -5869,6 +5908,13 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
 			}),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).
+		Watches(
+			&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return liteLLMConfigMapRequests(ctx, obj, enqueueAgentsInNamespace)
+			}),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
 		).
 		Named("platformagent").
 		Complete(r)

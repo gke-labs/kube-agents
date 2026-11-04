@@ -344,11 +344,14 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
     @patch("gitops_workspace.get_managed_github_repos")
-    def test_scopes_token_to_all_managed_repos_in_org(
+    def test_scopes_token_to_the_one_repository_asked_for(
         self, get_managed_github_repos, urlopen, run
     ):
         import json
 
+        # The managed list used to widen the request to every same-org
+        # repository. Each repository's minter policy now names itself alone,
+        # so the request lists the one repository and the list is not read.
         get_managed_github_repos.return_value = [
             "owner/repo1",
             "owner/repo2",
@@ -375,8 +378,9 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         request = urlopen.call_args.args[0]
         body = json.loads(request.data.decode("utf-8"))
         self.assertEqual("owner", body["org_name"])
-        self.assertEqual(["repo1", "repo2"], body["repositories"])
+        self.assertEqual(["repo1"], body["repositories"])
         self.assertEqual("platform-agent-scope", body["scope"])
+        get_managed_github_repos.assert_not_called()
 
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
@@ -411,44 +415,19 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         self.assertEqual("fake-installation-token", token)
         self.assertEqual("", out.getvalue())
         self.assertEqual(
-            ("owner/repo1", "owner/repo2"),
+            ("owner/repo1",),
             getattr(token, "scoped_repositories", ()),
         )
 
-    @patch("github_token_refresh.log")
-    @patch("github_token_refresh.subprocess.run")
-    @patch("github_token_refresh.urllib.request.urlopen")
-    @patch("gitops_workspace.get_managed_github_repos")
-    def test_managed_repos_expansion_failure_logs_warning(
-        self, get_managed_github_repos, urlopen, run, mock_log
-    ):
-        import json
-
-        get_managed_github_repos.side_effect = RuntimeError("ConfigMap not found")
-
-        def fake_run(cmd, **kwargs):
-            if "print-identity-token" in cmd:
-                return MagicMock(stdout="fake-oidc-token\n")
-            return MagicMock()
-
-        run.side_effect = fake_run
-
-        response = MagicMock()
-        response.status = 200
-        response.read.return_value = b"fake-installation-token"
-        response.__enter__.return_value = response
-        urlopen.return_value = response
-
-        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
-            token = refresh_git_credentials("owner/repo1")
-
-        self.assertEqual("fake-installation-token", token)
-        request = urlopen.call_args.args[0]
-        body = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(["repo1"], body["repositories"])
-        mock_log.assert_any_call(
-            "WARNING: Could not expand managed repositories for token scoping: ConfigMap not found"
-        )
+    def test_mint_write_token_covers_the_one_repository(self):
+        """`--print-write-token`: one repository in the request and in the answer."""
+        with patch("github_token_refresh.broker_oidc_token", return_value="oidc"), \
+                patch("github_token_refresh.request_minty_token", return_value="fake-write-token") as minty, \
+                patch("gitops_workspace.get_managed_repo_keys") as get_managed_repo_keys:
+            answer = github_token_refresh.mint_write_token("Acme/GitOps", "ghe.example.com")
+        minty.assert_called_once_with("oidc", "Acme", ["GitOps"], "platform-agent-scope")
+        self.assertEqual({"token": "fake-write-token", "repositories": ["acme/gitops"]}, answer)
+        get_managed_repo_keys.assert_not_called()
 
     @patch("github_token_refresh.time.sleep")
     @patch("github_token_refresh.urllib.request.urlopen")

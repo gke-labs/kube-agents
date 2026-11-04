@@ -2108,6 +2108,16 @@ type TelemetrySpec struct {
 	// +kubebuilder:validation:Pattern=`^$|^https?://[^\s]+$`
 	// +optional
 	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
+
+	// PeopleSeen keeps one hashed key and a last-active time per verified
+	// chat person in the gateway's people bucket, for 30 days after their
+	// last turn, and serves the people seen in the last 7 and 30 days as
+	// kubeagents_a2a_gateway_people_seen. Next mode only. False writes no
+	// key, deletes every key the bucket holds at the gateway's next start,
+	// and serves no sample.
+	// +kubebuilder:default=true
+	// +optional
+	PeopleSeen *bool `json:"peopleSeen,omitempty"`
 }
 
 // NetworkPolicySpec configures the operator-generated egress NetworkPolicy.
@@ -2313,6 +2323,24 @@ type TelemetryStatus struct {
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }
 
+// InferenceStatus reports the Platform Agent's default model as the install's LiteLLM
+// config states it.
+//
+// A resource reference, a Vertex AI endpoint path or a Bedrock ARN, keeps its resource id
+// only, so a project id, a region or an account id never appears here. Both fields are
+// absent when the config states no default model.
+type InferenceStatus struct {
+	// Provider is the LiteLLM provider slug, the text before the first "/" of the
+	// default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
+	// +optional
+	Provider string `json:"provider,omitempty"`
+
+	// Model is the model name after the provider, as typed, or the resource id alone
+	// for a resource reference.
+	// +optional
+	Model string `json:"model,omitempty"`
+}
+
 // NetworkPolicyStatus reports the network wiring the operator resolved, and its source —
 // the same diagnostic split as TelemetryStatus: the value alone cannot say whether a DNS
 // IP was discovered or pinned.
@@ -2425,6 +2453,13 @@ type AgentStatus struct {
 	// aggregate counters of what it has done.
 	// +optional
 	Usage AgentUsageStatus `json:"usage,omitempty"`
+
+	// Inference reports the Platform Agent's default model, as the install's LiteLLM
+	// config states it. The key is absent until the operator reads the config; an
+	// empty object means the config states no default model; a read that fails keeps
+	// what is there; the key is absent while the served CRD predates it.
+	// +optional
+	Inference *InferenceStatus `json:"inference,omitempty"`
 }
 
 // AgentUsageStatus is the non-sensitive activity summary of an agent. Static
@@ -2434,9 +2469,9 @@ type AgentStatus struct {
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
 // update, and ToolExecutionsTotal, ToolExecutionsBlockedTotal, EventsIngestedTotal,
-// SessionsTotal, RemediationsProposedTotal, ChatMessagesInboundTotal,
-// LastActiveTime, LastHumanActiveTime, ClustersRegistered and
-// ClustersMonitored from the broker's, the event watcher's, the chat
+// SessionsTotal, ChatSessionsTotal, RemediationsProposedTotal,
+// ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime,
+// ClustersRegistered and ClustersMonitored from the broker's, the event watcher's, the chat
 // plugin's and, on a next install, the A2A gateway's metrics
 // listeners, and the six proposal readings (RemediationsMergedTotal,
 // RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
@@ -2449,13 +2484,27 @@ type AgentUsageStatus struct {
 	// delivered (its k8s_event_watcher_triage_sessions_total; a session
 	// whose inject was filtered, suppressed or failed is not counted) plus
 	// the chat conversations the gateway opened a session for (the session_store
-	// plugin's kubeagents_chat_sessions_total on a today install, the A2A
-	// gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// plugin's kubeagents_chat_sessions_total on a today install, that plus the
+	// A2A gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
 	// chat conversation that resumes after the session store's retention
 	// window (seven days by default) counts again. Read every five minutes
 	// and kept monotonic across restarts, like toolExecutionsTotal.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
+
+	// ChatSessionsTotal is the chat half of SessionsTotal: the chat
+	// conversations the gateway opened a session for (the session_store
+	// plugin's kubeagents_chat_sessions_total on a today install, that plus
+	// the A2A gateway's kubeagents_a2a_gateway_sessions_total on a next
+	// install), without the event watcher's triage sessions. A re-seed from
+	// a status that carries no chatSessionsTotal (an install with triage
+	// sessions and no chat yet, or a served CRD that holds the field back)
+	// seeds those triage sessions into the chat half, and the counter keeps
+	// them. Read every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal. Moves LastActiveTime, as SessionsTotal does; does
+	// not move LastHumanActiveTime. Absent while the served CRD predates it.
+	// +optional
+	ChatSessionsTotal int64 `json:"chatSessionsTotal,omitempty"`
 
 	// EventsIngestedTotal is the cumulative count of cluster events the event
 	// watcher accepted for triage: past its reason filter and its dedup

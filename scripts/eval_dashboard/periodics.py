@@ -147,14 +147,14 @@ REPORT_EXIT_FAILED = "failed"
 RUNBOOK_ROOT = "https://github.com/gke-labs/kube-agents/blob/main/"
 # The scope line every message carries: none of this reaches a user cluster.
 SCOPE_LINE = "CI eval infrastructure only."
-# When a failing job is news. The sweep runs every ten minutes and the bot
-# reads its latest finished build every fifteen, so the unit is the check, not
-# the build (one sweep build in three is never read), and one failed check
-# followed by a clean one is a flap: the sweep is said once it has failed this
-# many consecutive checks. The reconciles run daily and on every merge: their
-# first failed build is the news. Any project's failure fails a run, so a per-project
-# threshold could never fire before the run's; the per-project counts name the
-# projects that have failed in every one of those checks.
+# When a failing job is news. The sweep runs hourly and the bot reads its
+# latest finished build every fifteen minutes, so every build is read and
+# counted once, and one failed build followed by a clean one is a flap: the
+# sweep is said once it has failed this many consecutive checks. The
+# reconciles run daily and on every merge: their first failed build is the
+# news. Any project's failure fails a run, so a per-project threshold could
+# never fire before the run's; the per-project counts name the projects that
+# have failed in every one of those checks.
 SWEEP_RUN_ALERT_AFTER = 2
 FIRST_FAILURE = 1
 # A project named as persisting in the message: failed in this many consecutive
@@ -293,8 +293,8 @@ class Periodic:
     job: str
     label: str
     # A finished build older than this is a job that stopped running. It is a
-    # window, not the cadence: the sweep runs every ten minutes and the daily
-    # reconcile once a day. None for a job with no cadence (the postsubmit
+    # window, not the cadence: the sweep runs hourly and the daily reconcile
+    # once a day. None for a job with no cadence (the postsubmit
     # runs on merges), which no age makes stale.
     stale_after: timedelta | None
     artifact: str | None
@@ -322,10 +322,10 @@ SWEEP_EFFECT = "pull requests a run left behind stay open until the project's ne
 RECONCILE_EFFECT = "drifted fixtures stay drifted, and the eval cases that assert on them fail."
 WATCHED = (
     Periodic(
-        "ci-kube-agents-pull-sweep", "GitOps pull sweep", timedelta(hours=1), SWEEP_ARTIFACT,
+        "ci-kube-agents-pull-sweep", "GitOps pull sweep", timedelta(hours=2), SWEEP_ARTIFACT,
         "Eval GitOps repos", "leftover pull requests from eval runs are not being cleaned up",
         "leftover pull requests from eval runs are being cleaned up again",
-        f"runs every ten minutes and {SWEEP_DOES}", SWEEP_EFFECT,
+        f"runs hourly and {SWEEP_DOES}", SWEEP_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it",
         SWEEP_RUN_ALERT_AFTER,
         extra_artifacts=(GITLAB_SWEEP_ARTIFACT,),

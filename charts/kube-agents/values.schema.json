@@ -245,6 +245,19 @@
                   "type": "string"
                 }
               }
+            },
+            "sessionAffinity": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "slots": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
             }
           }
         },
@@ -598,6 +611,15 @@
         },
         "mode": {
           "enum": [null, "", "today", "next"]
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "peopleSeen": {
+              "type": "boolean"
+            }
+          }
         },
         "storage": {
           "type": ["object", "null"],
