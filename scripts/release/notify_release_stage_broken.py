@@ -36,8 +36,8 @@ candidate commit, the eval build the step-5 log links), adds a row for each
 later RED run, and closes on the next run whose eval passed. A night that fails on a
 stage before the eval passes leaves it alone. A night that skips the eval
 step, a `skip_promotion` night or a hand-dispatched `skip_pipeline` one,
-neither counts nor ends the streak; past `STALL_SKIP_NIGHTS_MAX` such nights
-the walk stops looking further back.
+neither counts nor ends the streak; past `STALL_SKIP_RUNS_MAX` such runs the
+walk stops looking further back.
 
 Two bounds on what a green run may close. A run being re-run leaves
 `status=completed`, so the newest run by number is read whatever its status,
@@ -320,10 +320,11 @@ NOT_CONFIGURED = "chat not configured: set CI_HEALTH_CHAT_SPACE and CI_HEALTH_CH
 # stage before the eval passes leaves it alone: the stage issue covers that
 # night.
 STALL_NIGHTS = 2
-# A week of skip nights is the most the walk looks past, over the whole walk;
-# each one passed over costs a jobs read per sweep. Past it the walk stops,
-# so with no issue open the streak counts only the RED nights it reached.
-STALL_SKIP_NIGHTS_MAX = 7
+# The most skip runs the walk looks past, over the whole walk: a week of them
+# at one a night. Each one passed over costs a jobs read per sweep, so the cap
+# counts runs, not dates. Past it the walk stops, so with no issue open the
+# streak counts only the RED nights it reached.
+STALL_SKIP_RUNS_MAX = 7
 STALL_LABEL = "ci:release-stalled"
 STALL_LABEL_COLOR = "b60205"
 STALL_LABEL_DESCRIPTION = "The release-candidate eval has returned RED several nights in a row"
@@ -344,6 +345,11 @@ STALL_COMMENT = "RED again: {runs}. The RC eval has now returned RED {n} nights 
 STALL_CLOSED_COMMENT = "{run} ({when}) passed the release-candidate eval; the release chain is moving again. Closing."
 CHAT_STALLED = STALL_TITLE + " — {url}"
 CHAT_MOVING = "✅ release chain moving again: run #{run_number} passed the gate — closed {url}"
+# The close for a run whose eval passed and a later stage then failed: the
+# stall is over, but the chain is not moving, and the same sweep has filed
+# the stage issue.
+STALL_CLOSED_STAGE_FAILED_COMMENT = "{run} ({when}) passed the release-candidate eval, so the stall is over; a later stage failed in that run and the stage issue holds it. Closing."
+CHAT_PAST_GATE = "✅ release chain past the gate: run #{run_number} passed the eval; a later stage failed, see the stage issue — closed {url}"
 EVAL_LINK_UNAVAILABLE = "(eval link unavailable)"
 # A night is the UTC date the run was created: `2026-11-04`.
 NIGHT_LENGTH = len("2026-11-04")
@@ -1104,9 +1110,9 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
     `closed`.
 
     A settled-RED night walks the RED runs in a row behind it, newest
-    first, passing over up to `STALL_SKIP_NIGHTS_MAX` nights that skip the
-    eval step (green, step 5 skipped: a `skip_promotion` night or a
-    hand-dispatched `skip_pipeline` one), and stops at the first run that
+    first, passing over up to `STALL_SKIP_RUNS_MAX` runs that skip the eval
+    step (green, step 5 skipped: a `skip_promotion` run or a hand-dispatched
+    `skip_pipeline` one), and stops at the first run that
     is not one (green, or red on a stage)
     or that the open issue already stamps; jobs are read only that far.
     The count is the number of distinct UTC dates those runs were created
@@ -1142,10 +1148,12 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
         if not passed:
             log(f"{name}: run #{current['run_number']} did not pass the release-candidate eval (it did not run); #{issue['number']} stays open")
             return NOTHING
-        api.comment(issue["number"], STALL_CLOSED_COMMENT.format(run=run_link(current), when=run_when(current)))
+        stage_failed = decision["kind"] != "green"
+        comment = STALL_CLOSED_STAGE_FAILED_COMMENT if stage_failed else STALL_CLOSED_COMMENT
+        api.comment(issue["number"], comment.format(run=run_link(current), when=run_when(current)))
         api.update_issue(issue["number"], state=ISSUE_CLOSED)
         log(f"{name}: run #{current['run_number']} passed the eval; closed stalled-chain #{issue['number']}")
-        post(sender, CHAT_MOVING.format(run_number=current["run_number"], url=ISSUE_URL.format(repo=api.repo, number=issue["number"])), dry_run, environ)
+        post(sender, (CHAT_PAST_GATE if stage_failed else CHAT_MOVING).format(run_number=current["run_number"], url=ISSUE_URL.format(repo=api.repo, number=issue["number"])), dry_run, environ)
         return "closed"
 
     if issue is None:
@@ -1165,10 +1173,10 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
         jobs = jobs_for(run)
         # A night that skips the eval step, a `skip_promotion` night or a
         # hand-dispatched `skip_pipeline` one, says nothing about the gate, so
-        # it neither counts nor ends the streak, up to `STALL_SKIP_NIGHTS_MAX`
-        # of them; at one more the walk stops.
+        # it neither counts nor ends the streak, up to `STALL_SKIP_RUNS_MAX`
+        # such runs; at one more the walk stops.
         if run["conclusion"] not in FAILING_CONCLUSIONS:
-            if eval_skipped(jobs) and skipped < STALL_SKIP_NIGHTS_MAX:
+            if eval_skipped(jobs) and skipped < STALL_SKIP_RUNS_MAX:
                 skipped += 1
                 continue
             break

@@ -1111,8 +1111,18 @@ class StalledChainTest(unittest.TestCase):
         chat = FakeChat()
         self.assertEqual(reconcile(github, chat)[0], "opened, stall-closed")
         self.assertIn(("PATCH", f"/repos/{REPO}/issues/4001", {"state": "closed"}), github.writes)
+        comment = next(w[2]["body"] for w in github.writes if w[1] == f"/repos/{REPO}/issues/4001/comments")
+        self.assertEqual(
+            comment,
+            f"[#33](https://github.com/{REPO}/actions/runs/{night_run_id(33)}) (2026-11-03 02:36 UTC) passed the release-candidate eval, "
+            "so the stall is over; a later stage failed in that run and the stage issue holds it. Closing.",
+        )
+        self.assertNotIn("moving again", comment)
         self.assertEqual(len(chat.posted), 2)
-        self.assertTrue(chat.posted[1].startswith("✅ release chain moving again: run #33 passed the gate"), chat.posted)
+        self.assertEqual(
+            chat.posted[1],
+            f"✅ release chain past the gate: run #33 passed the eval; a later stage failed, see the stage issue — closed https://github.com/{REPO}/issues/4001",
+        )
 
     def test_a_green_run_whose_eval_did_not_run_leaves_the_stalled_issue_open(self):
         """A `skip_promotion` night re-tests a candidate already through the
@@ -1192,11 +1202,11 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(chat.posted, [])
         self.assertIn("closed #3999", err)
 
-    def test_the_walk_looks_past_the_ceiling_of_skip_nights_and_no_further(self):
-        """`STALL_SKIP_NIGHTS_MAX` bounds the jobs reads one sweep spends on
-        skip nights: past it the walk stops looking, so with no issue open
-        the streak counts only the RED nights it reached."""
-        self.assertEqual(notifier.STALL_SKIP_NIGHTS_MAX, 7)
+    def test_the_walk_looks_past_the_ceiling_of_skip_runs_and_no_further(self):
+        """`STALL_SKIP_RUNS_MAX` bounds the jobs reads one sweep spends on
+        skip runs: past it the walk stops looking, so with no issue open the
+        streak counts only the RED nights it reached."""
+        self.assertEqual(notifier.STALL_SKIP_RUNS_MAX, 7)
         for skips, outcome in ((8, "nothing"), (7, "stall-opened")):
             with self.subTest(skips=skips):
                 gap = [skip_promotion_night(40 + index, 2 + index, SHA_32) for index in range(skips)]
