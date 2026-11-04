@@ -874,8 +874,9 @@ LISTEN_BACKLOG = 4096
 # a peer that does not, and the door's peers are under no such discipline.
 KEEPALIVE_IDLE_SECONDS = 60
 # How the stdlib's handle_one_request reports every socket timeout on the
-# connection to log_error ("Request timed out: %r"); _log_socket_timeout
-# reads which it was off raw_requestline.
+# connection to log_error ("Request timed out: %r"). _log_socket_timeout
+# reads the TimeoutError it passes rather than this text, which the tests
+# pin as never reaching the log.
 IDLE_CLOSE_LOG_PREFIX = "Request timed out"
 # The most connections the credentialed listeners (the Unix socket or TCP
 # port behind Envoy, and the agent API door) hold a thread for at once. The
@@ -916,6 +917,11 @@ ENVOY_BROKER_SOCKET_PATH = "/var/run/credential-proxy/backend.sock"
 # Envoy's per-cluster connection ceiling when a cluster's circuit_breakers
 # set none.
 ENVOY_DEFAULT_MAX_CONNECTIONS = 1024
+# The routing priority a route runs at unless it names another, and the one
+# a circuit-breaker threshold applies to when it names none. Envoy keeps a
+# breaker per priority; the shipped routes set none, so DEFAULT's is the
+# ceiling in force, whatever a HIGH threshold beside it says.
+ENVOY_DEFAULT_PRIORITY = "DEFAULT"
 FALLBACK_MAX_THREADS = ENVOY_DEFAULT_MAX_CONNECTIONS
 # The 503 a connection past the thread cap is written before it is closed: a
 # whole HTTP/1.1 response with an empty body, so a client that already sent
@@ -1505,8 +1511,16 @@ def thread_cap_from_env() -> int:
 
     The same grammar as every other positive-integer knob the broker reads
     (session_slot_limit_from_env), so the two cannot drift; the default is
-    derived from Envoy's config rather than pinned beside it.
+    derived from Envoy's config rather than pinned beside it, and only when
+    it is the cap: a pinned value reads no config and logs no derivation.
     """
+    raw = os.getenv(MAX_THREADS_ENV, "").strip()
+    try:
+        pinned = int(raw) if raw else 0
+    except ValueError:
+        pinned = 0
+    if pinned > 0:
+        return pinned
     return session_slot_limit_from_env(MAX_THREADS_ENV, default_max_threads())
 
 
@@ -1523,7 +1537,9 @@ def default_max_threads(paths: Sequence[Path] | None = None) -> int:
     for path in candidates:
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # Unreadable, or readable and not UTF-8: not this path's to
+            # decide the cap; the next, or the fallback.
             continue
         ceiling = _envoy_ceiling_from_text(text, path)
         if ceiling is not None:
@@ -1562,11 +1578,15 @@ def envoy_broker_connection_ceiling(config: Any) -> int | None:
 
     The sum, over the clusters in ``static_resources.clusters`` whose endpoint
     is the pipe at ENVOY_BROKER_SOCKET_PATH, of each cluster's
-    max_connections: the largest across its ``circuit_breakers.thresholds``
-    (one per priority; the shipped routes set none, so DEFAULT is the one in
-    use), and ENVOY_DEFAULT_MAX_CONNECTIONS for a cluster, or a threshold,
-    that sets none. None when no cluster forwards to the socket, or the sum
-    is zero, so the caller can say so rather than cap at nothing.
+    max_connections at the ENVOY_DEFAULT_PRIORITY: the first threshold in
+    ``circuit_breakers.thresholds`` that names that priority or none (Envoy
+    reads the first for a priority), and ENVOY_DEFAULT_MAX_CONNECTIONS for a
+    cluster with no such threshold, or a threshold that sets no count, since
+    Envoy applies its default to a priority no threshold names. A threshold
+    at another priority is not read: the shipped routes run at DEFAULT, and
+    a route that named HIGH would draw on a pool this does not count. None
+    when no cluster forwards to the socket, or the sum is zero, so the
+    caller can say so rather than cap at nothing.
     """
     clusters = _mapping(_mapping(config).get("static_resources")).get("clusters")
     total = 0
@@ -1577,11 +1597,13 @@ def envoy_broker_connection_ceiling(config: Any) -> int | None:
             continue
         found = True
         thresholds = _mapping(cluster.get("circuit_breakers")).get("thresholds")
-        ceilings = [
-            _connection_count(_mapping(threshold).get("max_connections"))
-            for threshold in (thresholds if isinstance(thresholds, list) else ())
-        ]
-        total += max(ceilings) if ceilings else ENVOY_DEFAULT_MAX_CONNECTIONS
+        ceiling = ENVOY_DEFAULT_MAX_CONNECTIONS
+        for threshold in (thresholds if isinstance(thresholds, list) else ()):
+            threshold = _mapping(threshold)
+            if threshold.get("priority", ENVOY_DEFAULT_PRIORITY) == ENVOY_DEFAULT_PRIORITY:
+                ceiling = _connection_count(threshold.get("max_connections"))
+                break
+        total += ceiling
     return total if found and total > 0 else None
 
 
@@ -1598,7 +1620,13 @@ def _cluster_forwards_to_broker(cluster: Mapping[str, Any]) -> bool:
 
 
 def _connection_count(value: Any) -> int:
-    """A threshold's max_connections, or Envoy's default when it is unset or not a count."""
+    """A threshold's max_connections, or Envoy's default when it is unset or not a count.
+
+    A quoted count (``"4096"``) is a count: Envoy's proto-JSON reading of a
+    UInt32Value accepts a digit string, so the breaker runs at it.
+    """
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return ENVOY_DEFAULT_MAX_CONNECTIONS
     return value
@@ -11817,9 +11845,11 @@ def _log_socket_timeout(handler: BaseHTTPRequestHandler, message: str, args: tup
 
     The stdlib's handle_one_request catches every TimeoutError raised under
     it, the wait for a request line and a body read or a direct write inside
-    a route alike, and reports each through log_error as
-    IDLE_CLOSE_LOG_PREFIX. Which it was is read off raw_requestline and the
-    request stream's count: the credentialed handler and the agent API door
+    a route alike, and reports each through log_error with the exception as
+    the one argument; the exception is what is read, since the text
+    (IDLE_CLOSE_LOG_PREFIX) is the stdlib's to reword. Which it was is read
+    off raw_requestline and the request stream's count: the credentialed
+    handler and the agent API door
     empty raw_requestline before each request line is read and the stdlib
     assigns it as its first statement, and _DeadlineSocketIO counts the bytes
     read while the request's deadline is armed. Both still empty, the timeout
@@ -11835,9 +11865,9 @@ def _log_socket_timeout(handler: BaseHTTPRequestHandler, message: str, args: tup
     assigns it inside parse_request and never resets it, and the door's
     kept-open connections have never served a request.
     """
-    if not message.startswith(IDLE_CLOSE_LOG_PREFIX):
+    if not args or not isinstance(args[0], TimeoutError):
         return False
-    kind = type(args[0]).__name__ if args else ""
+    kind = type(args[0]).__name__
     stream = getattr(handler, "_request_stream", None)
     received = stream.received if stream is not None else 0
     if getattr(handler, "raw_requestline", b"") or received:

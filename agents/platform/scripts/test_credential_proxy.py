@@ -3170,6 +3170,58 @@ class ResourcePressureRouteTest(unittest.TestCase):
                 probe.begin()
                 self.assertEqual((200, b'{"status":"ok"}'), (probe.status, probe.read()))
 
+    def test_a_vcs_request_admitted_after_its_slot_wait_reads_its_body_and_keeps_the_connection(self):
+        # The refusal above, admitted instead: the slot wait ends after the
+        # connection's window, counted from the request's first byte, has
+        # passed, and the body is then read under the route's own deadline,
+        # which runs from admission. Were the connection's deadline left
+        # armed, the first read would fail before any byte and the request
+        # would go unanswered. The body read is counted, so the answer is
+        # framed with no announced close, and the next request on the same
+        # connection is answered.
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        pad = "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS
+        body = json.dumps({"repository": "acme/fleet", "pad": pad}).encode("utf-8")
+
+        @contextlib.contextmanager
+        def admitted_after_the_window(*_args):
+            time.sleep(_SLOT_WAIT_PAST_THE_WINDOW_SECONDS)
+            yield
+
+        with (
+            mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS),
+            mock.patch.object(CredentialProxyHandler, "vcs", mock.Mock()),
+            mock.patch.object(CredentialProxyHandler, "max_request_bytes", 2 * len(body)),
+            mock.patch.object(CredentialProxyHandler, "_request_slot", admitted_after_the_window),
+            mock.patch.object(
+                credential_proxy.vcs_broker,
+                "route_table",
+                return_value={"publish": lambda payload: {"padded": len(payload["pad"])}},
+            ),
+            mock.patch.object(credential_proxy.vcs_broker, "UNGATED_VERBS", frozenset({"publish"})),
+        ):
+            request = (
+                b"POST /v1/vcs/publish HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=10) as client:
+                try:
+                    client.sendall(request)
+                    answer = http.client.HTTPResponse(client)
+                    answer.begin()
+                    payload = answer.read()
+                except OSError as exc:
+                    self.fail(f"the admitted request went unanswered: {exc}")
+                self.assertEqual(200, answer.status)
+                self.assertEqual({"padded": len(pad)}, json.loads(payload))
+                self.assertNotEqual("close", (answer.getheader("Connection") or "").lower())
+                client.sendall(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                probe = http.client.HTTPResponse(client)
+                probe.begin()
+                self.assertEqual((200, b'{"status":"ok"}'), (probe.status, probe.read()))
+
     def test_a_watcher_list_at_the_hard_watermark_is_refused_and_a_watch_passes(self):
         listing = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?limit=500")
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
@@ -16037,6 +16089,23 @@ class KeepAliveTest(_CredentialedUnixServer):
         )
         self.assertTrue(any(line.startswith("DEBUG:") and "closed idle" in line for line in logs.output), logs.output)
 
+    def test_the_timeout_report_is_read_off_the_exception_not_the_stdlibs_wording(self):
+        # handle_one_request passes the TimeoutError it caught as log_error's
+        # one argument; that, not the message's text, says it was a socket
+        # timeout, so a reworded stdlib message is still sorted into the idle
+        # close and the stalled request, and never reaches the access log.
+        idle = types.SimpleNamespace(raw_requestline=b"", requestline="", _request_stream=None)
+        with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+            self.assertTrue(credential_proxy._log_socket_timeout(idle, "Socket timed out: %r", (TimeoutError(),)))
+        self.assertTrue(any("closed idle" in line for line in logs.output), logs.output)
+        stalled = types.SimpleNamespace(raw_requestline=b"GET /h", requestline="", _request_stream=None)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertTrue(credential_proxy._log_socket_timeout(stalled, "Socket timed out: %r", (TimeoutError(),)))
+        self.assertTrue(any("request stalled" in line for line in logs.output), logs.output)
+        # send_error's report, the stdlib's other log_error call, is not one.
+        self.assertFalse(credential_proxy._log_socket_timeout(idle, "code %d, message %s", (404, "Not Found")))
+        self.assertFalse(credential_proxy._log_socket_timeout(idle, credential_proxy.IDLE_CLOSE_LOG_PREFIX + ": %r", ()))
+
     def test_a_request_that_stalls_mid_body_is_logged_as_stalled_not_idle(self):
         # The same socket timeout ends the idle wait and a body that stops
         # arriving; the stdlib reports both the same way. A request that
@@ -16141,20 +16210,32 @@ class KeepAliveTest(_CredentialedUnixServer):
 
     def test_the_idle_timeout_is_under_envoys(self):
         # Envoy, the only client, must close an idle connection first, or it
-        # would send on one the broker just closed. The cluster's timeout in
-        # the shipped config is the one that holds.
-        config = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "envoy-credential-proxy.yaml"
-        # The cluster's idle_timeout: searched from the clusters block on, so
-        # neither the listener's stream_idle_timeout nor an idle_timeout the
-        # connection manager above it may carry is the one read.
-        clusters = config.read_text().partition("clusters:")[2]
-        match = re.search(r"(?<![a-z_])idle_timeout:\s*(\d+)s", clusters)
-        self.assertIsNotNone(match, "the broker cluster in envoy-credential-proxy.yaml sets no idle_timeout")
-        seconds = int(match.group(1))
-        # 0s does not mean "at once": it disables Envoy's idle close, and the
-        # broker would then be the side closing first.
-        self.assertGreater(seconds, 0, "0s disables Envoy's idle timeout")
-        self.assertLess(seconds, credential_proxy.KEEPALIVE_IDLE_SECONDS)
+        # would send on one the broker just closed. Every cluster to the
+        # broker's socket is held to it, read from the parsed config, so a
+        # second cluster cannot hide behind the first's value and a comment
+        # or a timeout on the connection manager above is never the one read.
+        import yaml
+        _assert_every_broker_cluster_idles_under(self, yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8")))
+
+    def test_the_idle_timeout_pin_holds_every_broker_cluster(self):
+        # The pin against #4652's shape: two clusters to the socket, the
+        # first in the file carrying a timeout under the broker's and the
+        # second none (Envoy's default is an hour), or 0s, which disables the
+        # close; each fails, and both under the broker's passes.
+        import yaml
+        timeout = (
+            "      typed_extension_protocol_options:\n"
+            "        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:\n"
+            "          common_http_protocol_options:\n"
+            "            idle_timeout: {}\n"
+        )
+        runtime, health = "    - name: credential_runtime\n", "    - name: credential_health\n"
+        base = _TWO_CLUSTER_ENVOY_CONFIG.replace(health, health + timeout.format("30s"))
+        for runtime_timeout in (None, "0s", "3600s"):
+            with self.subTest(runtime_timeout=runtime_timeout), self.assertRaises(AssertionError):
+                text = base if runtime_timeout is None else base.replace(runtime, runtime + timeout.format(runtime_timeout))
+                _assert_every_broker_cluster_idles_under(self, yaml.safe_load(text))
+        _assert_every_broker_cluster_idles_under(self, yaml.safe_load(base.replace(runtime, runtime + timeout.format("30s"))))
 
 
 class ThreadCapTest(_CredentialedUnixServer):
@@ -16371,8 +16452,9 @@ _TWO_CLUSTER_CEILING = 4096 + 64
 
 def _ceiling_summed_by_hand(config):
     """The rule the broker derives its cap by, written out: per cluster to the
-    broker's socket, the largest max_connections across its thresholds, 1024
-    for a cluster or a threshold that sets none; summed."""
+    broker's socket, the max_connections of the first threshold at the DEFAULT
+    priority (the one a threshold that names none is at), 1024 for a cluster
+    with no such threshold or a threshold that sets no count; summed."""
     total = 0
     for cluster in config["static_resources"]["clusters"]:
         paths = [
@@ -16382,9 +16464,34 @@ def _ceiling_summed_by_hand(config):
         ]
         if "/var/run/credential-proxy/backend.sock" not in paths:
             continue
-        thresholds = cluster.get("circuit_breakers", {}).get("thresholds") or [{}]
-        total += max(threshold.get("max_connections", 1024) for threshold in thresholds)
+        thresholds = cluster.get("circuit_breakers", {}).get("thresholds") or []
+        at_default = [t for t in thresholds if t.get("priority", "DEFAULT") == "DEFAULT"] or [{}]
+        total += int(at_default[0].get("max_connections", 1024))
     return total
+
+
+_ENVOY_HTTP_PROTOCOL_OPTIONS = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions"
+_ENVOY_DURATION_SECONDS = re.compile(r"^(\d+(?:\.\d+)?)s$")
+
+
+def _assert_every_broker_cluster_idles_under(case, config):
+    """Every cluster to the broker's socket sets an upstream idle_timeout
+    above 0s (which disables Envoy's idle close) and under the broker's."""
+    clusters = [
+        cluster
+        for cluster in config["static_resources"]["clusters"]
+        if credential_proxy._cluster_forwards_to_broker(cluster)
+    ]
+    case.assertTrue(clusters, "no cluster to the broker's socket")
+    for cluster in clusters:
+        options = cluster.get("typed_extension_protocol_options", {}).get(_ENVOY_HTTP_PROTOCOL_OPTIONS, {})
+        value = options.get("common_http_protocol_options", {}).get("idle_timeout")
+        case.assertIsNotNone(value, f"cluster {cluster.get('name')} sets no idle_timeout; Envoy's default is an hour")
+        match = _ENVOY_DURATION_SECONDS.match(str(value))
+        case.assertIsNotNone(match, f"cluster {cluster.get('name')} idle_timeout {value!r} is not a seconds duration")
+        seconds = float(match.group(1))
+        case.assertGreater(seconds, 0, f"cluster {cluster.get('name')}: 0s disables Envoy's idle timeout")
+        case.assertLess(seconds, credential_proxy.KEEPALIVE_IDLE_SECONDS, f"cluster {cluster.get('name')}")
 
 
 class ThreadCapDefaultTest(unittest.TestCase):
@@ -16461,6 +16568,83 @@ class ThreadCapDefaultTest(unittest.TestCase):
             _ceiling_summed_by_hand(yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8"))),
             credential_proxy.default_max_threads(paths=(passed_over, _ENVOY_CONFIG)),
         )
+
+    def test_a_config_that_is_not_utf8_is_passed_over_and_does_not_stop_the_start(self):
+        # Readable and not UTF-8 (a CP1252 em dash pasted into a comment when
+        # an operator raises the breaker) is passed over for the next path,
+        # as an unreadable file is, and the fallback stands when none is
+        # left; the start takes the documented fallback, not a crash loop.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        not_utf8 = Path(tmp.name) / "envoy.yaml"
+        not_utf8.write_bytes(b"# raised \x97 for the fleet\n" + _ENVOY_CONFIG.read_bytes())
+        with self.assertRaises(UnicodeDecodeError):
+            not_utf8.read_text(encoding="utf-8")
+        import yaml
+        expected = _ceiling_summed_by_hand(yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8")))
+        self.assertEqual(expected, credential_proxy.default_max_threads(paths=(not_utf8, _ENVOY_CONFIG)))
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.default_max_threads(paths=(not_utf8,)))
+        self.assertTrue(any("thread cap default is 1024" in line for line in logs.output), logs.output)
+        with mock.patch.dict(os.environ), mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (not_utf8,)):
+            os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.thread_cap_from_env())
+
+    def test_the_default_priority_threshold_is_the_ceiling_not_the_largest_listed(self):
+        # Envoy keeps a breaker per priority and applies its default to a
+        # priority no threshold names; the routes run at DEFAULT. So a list
+        # naming only HIGH leaves the DEFAULT pool at 1024, whatever HIGH
+        # says, a HIGH threshold above DEFAULT's does not raise it, a
+        # threshold that names no priority is DEFAULT's, and of two at
+        # DEFAULT the first is the one Envoy reads.
+        runtime_breaker = (
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n"
+            "            max_connections: 4096\n          - priority: HIGH\n            max_connections: 4096\n"
+        )
+        self.assertIn(runtime_breaker, _TWO_CLUSTER_ENVOY_CONFIG)
+        cases = {
+            "      circuit_breakers:\n        thresholds:\n          - priority: HIGH\n            max_connections: 64\n": 1024,
+            "      circuit_breakers:\n        thresholds:\n          - priority: HIGH\n            max_connections: 8192\n"
+            "          - priority: DEFAULT\n            max_connections: 2048\n": 2048,
+            "      circuit_breakers:\n        thresholds:\n          - max_connections: 512\n": 512,
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: 256\n"
+            "          - priority: DEFAULT\n            max_connections: 4096\n": 256,
+        }
+        for breaker, runtime_ceiling in cases.items():
+            with self.subTest(breaker=breaker):
+                path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_breaker, breaker))
+                self.assertEqual(runtime_ceiling + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+
+    def test_a_quoted_max_connections_is_a_count_and_a_word_is_not(self):
+        # Envoy's proto-JSON reading of a UInt32Value accepts "4096", so the
+        # breaker runs at it and the cap has to as well; a value that is not
+        # a count is Envoy's default, as an unset one is.
+        for value, expected in (('"4096"', 4096), ("'64'", 64), ('"lots"', 1024), ('"-1"', 1024), ("true", 1024)):
+            with self.subTest(value=value):
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {value}\n", 1)
+                path, derived, config = self._derived(text)
+                self.assertEqual(expected + 64, derived)
+
+    def test_a_pinned_cap_reads_no_config_and_logs_no_derivation(self):
+        # The environment is read first: a pinned cap derives nothing, so an
+        # operator who pins it on a layout with no config at either path gets
+        # no warning about a default that is not in force.
+        with (
+            mock.patch.dict(os.environ, {credential_proxy.MAX_THREADS_ENV: "7"}),
+            mock.patch.object(credential_proxy, "default_max_threads", side_effect=AssertionError("derived under a pinned cap")),
+            self.assertNoLogs(credential_proxy.LOGGER),
+        ):
+            self.assertEqual(7, credential_proxy.thread_cap_from_env())
+        # A value that is not a count still takes the derived default, with the grammar's warning.
+        with (
+            mock.patch.dict(os.environ, {credential_proxy.MAX_THREADS_ENV: "many"}),
+            mock.patch.object(credential_proxy, "default_max_threads", return_value=4160),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            self.assertEqual(4160, credential_proxy.thread_cap_from_env())
+        self.assertTrue(any("not a positive integer" in line for line in logs.output), logs.output)
 
     def test_the_images_copy_of_the_config_is_read_first_and_the_dockerfile_puts_it_there(self):
         self.assertEqual(credential_proxy.ENVOY_CONFIG_PATH, credential_proxy.ENVOY_CONFIG_PATHS[0])
