@@ -13,7 +13,13 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from scripts.coverage_shard_attempts import DATA_FILE, FAILED_FILE, keep_latest_attempts  # noqa: E402
+from scripts.coverage_shard_attempts import keep_latest_attempts  # noqa: E402
+
+#: The two files a shard uploads: the Makefile's coverage data and its
+#: COVERAGE_FAILED_FILE. The script never opens them; the fixtures only check
+#: that each shard's own files move with its directory.
+DATA_FILE = ".coverage"
+FAILED_FILE = "failed-files.txt"
 
 SCRIPT = _REPO_ROOT / "scripts" / "coverage_shard_attempts.py"
 #: What a shard's failing-file list holds when it went red, and when it went green.
@@ -43,7 +49,7 @@ class KeepLatestAttemptsTest(unittest.TestCase):
         return (self.root / f"python-coverage-shard-{index}" / FAILED_FILE).read_text()
 
     def test_a_rerun_shard_replaces_its_red_attempt(self):
-        """Run 14418: shard 2 went red on attempt 1 and green on attempt 2.
+        """Run 14418 (run ID 41181129428): shard 2 went red on attempt 1 and green on attempt 2.
         The join on attempt 2 must read attempt 2's list, not attempt 1's."""
         self.shard(1, 1)
         self.shard(2, 1, RED)

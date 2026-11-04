@@ -10,7 +10,8 @@ This script keeps the highest attempt per shard, renames it to
 
 The attempt is in the name because the download cannot tell same-named
 artifacts apart. ``actions/download-artifact`` keeps the one with the highest
-artifact ID, and IDs do not follow upload order: on run 41181129428 the failed
+artifact ID, and IDs do not follow upload order: on run 14418 (run ID
+41181129428) the failed
 attempt-1 upload of shard 2 had a higher ID than the green attempt-2 upload, so
 the join of attempt 2 read the stale failing-file list and went red.
 
@@ -34,9 +35,6 @@ from pathlib import Path
 # shard attempt's directory as download-artifact extracts it.
 SHARD_PREFIX = "python-coverage-shard-"
 ATTEMPT_DIR_RE = re.compile(rf"^{re.escape(SHARD_PREFIX)}(?P<shard>\d+)-attempt-(?P<attempt>\d+)$")
-# The two files a shard writes; named here for the tests' fixtures.
-DATA_FILE = ".coverage"
-FAILED_FILE = "failed-files.txt"
 USAGE = "usage: coverage_shard_attempts.py <coverage-data-dir>"
 EXIT_USAGE = 2
 
