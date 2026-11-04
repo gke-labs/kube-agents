@@ -18,7 +18,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sync/singleflight"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/endpoints/request"
 )
@@ -29,21 +28,36 @@ const (
 	// DefaultCacheMaxEntryBytes is the default maximum size of a single cached response body (2 MiB).
 	DefaultCacheMaxEntryBytes int64 = 2 << 20
 	// DefaultResourceCacheTTL is the default TTL for cached resource get and list responses.
-	DefaultResourceCacheTTL = 30 * time.Second
+	DefaultResourceCacheTTL = 10 * time.Second
 	// DefaultDiscoveryCacheTTL is the default TTL for cached discovery responses.
 	DefaultDiscoveryCacheTTL = 15 * time.Minute
 
-	headerCacheControl = "Cache-Control"
-	headerCacheStatus  = "Cache-Status"
-	headerAge          = "Age"
+	headerCacheControl      = "Cache-Control"
+	headerCacheStatus       = "Cache-Status"
+	headerAge               = "Age"
+	headerIfNoneMatch       = "If-None-Match"
+	headerIfModifiedSince   = "If-Modified-Since"
+	headerIfMatch           = "If-Match"
+	headerIfUnmodifiedSince = "If-Unmodified-Since"
+	headerIfRange           = "If-Range"
 
 	cacheStatusHit       = "k8s-api-proxy; hit"
 	cacheStatusCoalesced = "k8s-api-proxy; hit; coalesced"
 	cacheStatusMiss      = "k8s-api-proxy; miss"
-	cacheStatusBypass    = "k8s-api-proxy; bypass"
+	// #nosec G101 -- RFC 9211 Cache-Status header value, not a credential.
+	cacheStatusBypass = "k8s-api-proxy; bypass"
 
-	cacheEnvelopeMagic   = "KPC1"
-	cacheEnvelopeMinSize = 8
+	cacheEnvelopeMagic     = "KPC1"
+	cacheEnvelopeMagicSize = 4
+	cacheEnvelopeMinSize   = 8
+	maxCacheMetaBytes      = 1 << 20
+	maxCacheBodyBytes      = 64 << 20
+	maxEntryHitCount       = 15
+	cacheKeyHashBytes      = 16
+
+	defaultMaxStaleDuration     = 24 * time.Hour
+	maxDeltaSeconds             = 1 << 31
+	defaultUpstreamFetchTimeout = 60 * time.Second
 )
 
 var (
@@ -126,7 +140,7 @@ type MemoryCacheStore struct {
 	items           map[string]*memoryCacheEntry
 	order           *list.List
 	now             func() time.Time
-	onEvict         func(reason string)
+	onEvict         func(key, reason string)
 	onOccupancy     func(bytes int64, entries int)
 }
 
@@ -160,14 +174,14 @@ func (s *MemoryCacheStore) Get(ctx context.Context, key string) ([]byte, bool, e
 		s.removeEntryLocked(ent)
 		s.expiredEvicted++
 		if s.onEvict != nil {
-			s.onEvict(CacheEvictionExpired)
+			s.onEvict(ent.key, CacheEvictionExpired)
 		}
 		if s.onOccupancy != nil {
 			s.onOccupancy(s.usedBytes, len(s.items))
 		}
 		return nil, false, nil
 	}
-	if ent.hits < 15 {
+	if ent.hits < maxEntryHitCount {
 		ent.hits++
 	}
 	s.order.MoveToFront(ent.element)
@@ -267,7 +281,7 @@ func (s *MemoryCacheStore) evictExpiredLocked(now time.Time) {
 			s.removeEntryLocked(ent)
 			s.expiredEvicted++
 			if s.onEvict != nil {
-				s.onEvict(CacheEvictionExpired)
+				s.onEvict(ent.key, CacheEvictionExpired)
 			}
 			if s.onOccupancy != nil {
 				s.onOccupancy(s.usedBytes, len(s.items))
@@ -291,7 +305,7 @@ func (s *MemoryCacheStore) evictOneLocked() {
 			s.removeEntryLocked(ent)
 			s.capacityEvicted++
 			if s.onEvict != nil {
-				s.onEvict(CacheEvictionCapacity)
+				s.onEvict(ent.key, CacheEvictionCapacity)
 			}
 			if s.onOccupancy != nil {
 				s.onOccupancy(s.usedBytes, len(s.items))
@@ -302,10 +316,11 @@ func (s *MemoryCacheStore) evictOneLocked() {
 		s.order.MoveToFront(back)
 	}
 	if back := s.order.Back(); back != nil {
-		s.removeEntryLocked(back.Value.(*memoryCacheEntry))
+		ent := back.Value.(*memoryCacheEntry)
+		s.removeEntryLocked(ent)
 		s.capacityEvicted++
 		if s.onEvict != nil {
-			s.onEvict(CacheEvictionCapacity)
+			s.onEvict(ent.key, CacheEvictionCapacity)
 		}
 		if s.onOccupancy != nil {
 			s.onOccupancy(s.usedBytes, len(s.items))
@@ -326,17 +341,34 @@ type cacheRequestMeta struct {
 	callerAccept string
 }
 
+type inflightCall struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+
+	val *sfResult
+	err error
+
+	// Guarded by responseCache.flightMu.
+	waiters  int
+	shared   bool
+	finished bool
+}
+
 type responseCache struct {
 	store               CacheStore
 	maxEntryBytes       int64
 	defaultResourceTTL  time.Duration
 	defaultDiscoveryTTL time.Duration
+	fetchTimeout        time.Duration
 	now                 func() time.Time
 	metrics             *Metrics
-	group               singleflight.Group
+
+	flightMu sync.Mutex
+	flights  map[string]*inflightCall
 
 	scopeMu   sync.Mutex
-	scopeKeys map[string]map[string]struct{}
+	scopeKeys map[string]map[string]time.Time
+	keyScope  map[string]string
 }
 
 func newResponseCache(cfg *CacheConfig, metrics *Metrics) *responseCache {
@@ -353,10 +385,35 @@ func newResponseCache(cfg *CacheConfig, metrics *Metrics) *responseCache {
 		mem.now = nowFn
 		store = mem
 	}
+	maxEntry := cfg.MaxEntryBytes
+	if maxEntry <= 0 {
+		maxEntry = DefaultCacheMaxEntryBytes
+	}
+	resTTL := cfg.DefaultResourceTTL
+	if resTTL <= 0 {
+		resTTL = DefaultResourceCacheTTL
+	}
+	discTTL := cfg.DefaultDiscoveryTTL
+	if discTTL <= 0 {
+		discTTL = DefaultDiscoveryCacheTTL
+	}
+	c := &responseCache{
+		store:               store,
+		maxEntryBytes:       maxEntry,
+		defaultResourceTTL:  resTTL,
+		defaultDiscoveryTTL: discTTL,
+		fetchTimeout:        defaultUpstreamFetchTimeout,
+		now:                 nowFn,
+		metrics:             metrics,
+		flights:             make(map[string]*inflightCall),
+		scopeKeys:           make(map[string]map[string]time.Time),
+		keyScope:            make(map[string]string),
+	}
 	if mem, ok := store.(*MemoryCacheStore); ok {
 		mem.mu.Lock()
 		if mem.onEvict == nil {
-			mem.onEvict = func(reason string) {
+			mem.onEvict = func(key, reason string) {
+				c.removeScopeKey(key)
 				metrics.recordCacheEviction(reason)
 			}
 		}
@@ -371,27 +428,7 @@ func newResponseCache(cfg *CacheConfig, metrics *Metrics) *responseCache {
 		st := sp.Stats()
 		metrics.setCacheOccupancy(st.Bytes, st.Entries)
 	}
-	maxEntry := cfg.MaxEntryBytes
-	if maxEntry <= 0 {
-		maxEntry = DefaultCacheMaxEntryBytes
-	}
-	resTTL := cfg.DefaultResourceTTL
-	if resTTL <= 0 {
-		resTTL = DefaultResourceCacheTTL
-	}
-	discTTL := cfg.DefaultDiscoveryTTL
-	if discTTL <= 0 {
-		discTTL = DefaultDiscoveryCacheTTL
-	}
-	return &responseCache{
-		store:               store,
-		maxEntryBytes:       maxEntry,
-		defaultResourceTTL:  resTTL,
-		defaultDiscoveryTTL: discTTL,
-		now:                 nowFn,
-		metrics:             metrics,
-		scopeKeys:           make(map[string]map[string]struct{}),
-	}
+	return c
 }
 
 type sfResult struct {
@@ -400,6 +437,7 @@ type sfResult struct {
 	body          []byte
 	cacheStatus   string
 	metric        string
+	auditErr      error
 	leaderClaimed atomic.Bool
 
 	tooLarge      bool
@@ -463,28 +501,30 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 		}
 	}
 
-	ch := c.group.DoChan(key, func() (any, error) {
-		return c.fetchAndPopulate(req.WithContext(context.WithoutCancel(req.Context())), key, ev.ClusterID, info, isDiscovery, next)
-	})
+	upReq := prepareCacheableUpstreamRequest(req)
+	call := c.acquireFlight(upReq, key, ev.ClusterID, info, isDiscovery, next)
 
-	var res singleflight.Result
 	select {
 	case <-req.Context().Done():
+		c.releaseWaiterOnCancel(key, call)
 		return nil, req.Context().Err()
-	case res = <-ch:
+	case <-call.done:
 	}
-	if res.Err != nil {
-		return nil, res.Err
+	if call.err != nil {
+		return nil, call.err
 	}
 
-	out := res.Val.(*sfResult)
+	out := call.val
+	if out.auditErr != nil {
+		ev.Err = out.auditErr
+	}
 	if out.tooLarge {
 		c.metrics.recordCacheRequest(CacheResultBypass, verbLabel, resLabel)
 		if out.claimStream() {
 			out.streamResp.Header.Set(headerCacheStatus, cacheStatusBypass)
 			return out.streamResp, nil
 		}
-		resp, err := next(req)
+		resp, err := next(upReq)
 		if err == nil && resp != nil {
 			resp.Header.Set(headerCacheStatus, cacheStatusBypass)
 		}
@@ -493,7 +533,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 
 	statusHeader := out.cacheStatus
 	metricResult := out.metric
-	if res.Shared && out.cacheStatus == cacheStatusMiss && !out.claimLeader() {
+	if call.shared && out.cacheStatus == cacheStatusMiss && !out.claimLeader() {
 		statusHeader = cacheStatusCoalesced
 		metricResult = CacheResultCoalesced
 	}
@@ -520,13 +560,112 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	}, nil
 }
 
-func (c *responseCache) fetchAndPopulate(
+func (c *responseCache) acquireFlight(
 	req *http.Request,
 	key string,
 	clusterID string,
 	info *request.RequestInfo,
 	isDiscovery bool,
 	next func(*http.Request) (*http.Response, error),
+) *inflightCall {
+	c.flightMu.Lock()
+	if call, ok := c.flights[key]; ok {
+		call.waiters++
+		call.shared = true
+		c.flightMu.Unlock()
+		return call
+	}
+	fetchTimeout := c.fetchTimeout
+	if fetchTimeout <= 0 {
+		fetchTimeout = defaultUpstreamFetchTimeout
+	}
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), fetchTimeout)
+	call := &inflightCall{
+		done:    make(chan struct{}),
+		cancel:  cancel,
+		waiters: 1,
+	}
+	c.flights[key] = call
+	c.flightMu.Unlock()
+
+	go c.runFlight(fetchCtx, key, call, clusterID, req, info, isDiscovery, next)
+	return call
+}
+
+func (c *responseCache) runFlight(
+	fetchCtx context.Context,
+	key string,
+	call *inflightCall,
+	clusterID string,
+	req *http.Request,
+	info *request.RequestInfo,
+	isDiscovery bool,
+	next func(*http.Request) (*http.Response, error),
+) {
+	sfEv := &AuditEvent{ClusterID: clusterID}
+	sfReq := req.WithContext(context.WithValue(fetchCtx, auditEventKey{}, sfEv))
+	val, err := c.fetchAndPopulate(sfReq, sfEv, key, clusterID, info, isDiscovery, next, call.cancel)
+
+	var closeUnclaimed io.Closer
+	c.flightMu.Lock()
+	if c.flights[key] == call {
+		delete(c.flights, key)
+	}
+	call.finished = true
+	call.val = val
+	call.err = err
+	if val != nil && val.tooLarge && val.streamResp != nil && call.waiters == 0 {
+		if val.claimStream() {
+			closeUnclaimed = val.streamResp.Body
+		}
+	}
+	close(call.done)
+	c.flightMu.Unlock()
+
+	if closeUnclaimed != nil {
+		_ = closeUnclaimed.Close()
+		call.cancel()
+	} else if val == nil || !val.tooLarge {
+		call.cancel()
+	}
+}
+
+func (c *responseCache) releaseWaiterOnCancel(key string, call *inflightCall) {
+	var closeUnclaimed io.Closer
+	var shouldCancel bool
+
+	c.flightMu.Lock()
+	call.waiters--
+	if call.waiters == 0 {
+		if !call.finished {
+			if c.flights[key] == call {
+				delete(c.flights, key)
+			}
+			shouldCancel = true
+		} else if call.val != nil && call.val.tooLarge && call.val.streamResp != nil && call.val.claimStream() {
+			closeUnclaimed = call.val.streamResp.Body
+			shouldCancel = true
+		}
+	}
+	c.flightMu.Unlock()
+
+	if closeUnclaimed != nil {
+		_ = closeUnclaimed.Close()
+	}
+	if shouldCancel {
+		call.cancel()
+	}
+}
+
+func (c *responseCache) fetchAndPopulate(
+	req *http.Request,
+	sfEv *AuditEvent,
+	key string,
+	clusterID string,
+	info *request.RequestInfo,
+	isDiscovery bool,
+	next func(*http.Request) (*http.Response, error),
+	cancelFetch context.CancelFunc,
 ) (*sfResult, error) {
 	resp, err := next(req)
 	if err != nil {
@@ -537,7 +676,12 @@ func (c *responseCache) fetchAndPopulate(
 	}
 
 	if resp.ContentLength > c.maxEntryBytes {
-		return &sfResult{tooLarge: true, streamResp: resp}, nil
+		c.evictKey(req.Context(), key)
+		resp.Body = &cancelOnCloseReadCloser{
+			ReadCloser: resp.Body,
+			cancel:     cancelFetch,
+		}
+		return &sfResult{tooLarge: true, streamResp: resp, auditErr: sfEv.Err}, nil
 	}
 
 	rawBody, exceeded, err := readBoundedBody(resp.Body, c.maxEntryBytes)
@@ -546,21 +690,21 @@ func (c *responseCache) fetchAndPopulate(
 		return nil, err
 	}
 	if exceeded {
-		resp.Body = &prefixedReadCloser{
-			Reader: io.MultiReader(bytes.NewReader(rawBody), resp.Body),
-			Closer: resp.Body,
+		c.evictKey(req.Context(), key)
+		resp.Body = &cancelOnCloseReadCloser{
+			ReadCloser: &prefixedReadCloser{
+				Reader: io.MultiReader(bytes.NewReader(rawBody), resp.Body),
+				Closer: resp.Body,
+			},
+			cancel: cancelFetch,
 		}
-		return &sfResult{tooLarge: true, streamResp: resp}, nil
+		return &sfResult{tooLarge: true, streamResp: resp, auditErr: sfEv.Err}, nil
 	}
 	_ = resp.Body.Close()
 
 	respCC := parseResponseCacheControl(resp.Header)
 	if resp.StatusCode != http.StatusOK || respCC.noStore || respCC.zeroMaxAge {
-		_ = c.store.Delete(req.Context(), key)
-		if sp, ok := c.store.(CacheStatsProvider); ok {
-			st := sp.Stats()
-			c.metrics.setCacheOccupancy(st.Bytes, st.Entries)
-		}
+		c.evictKey(req.Context(), key)
 		cacheStatus := cacheStatusMiss
 		metric := CacheResultMiss
 		if respCC.noStore || respCC.zeroMaxAge {
@@ -573,6 +717,7 @@ func (c *responseCache) fetchAndPopulate(
 			body:        rawBody,
 			cacheStatus: cacheStatus,
 			metric:      metric,
+			auditErr:    sfEv.Err,
 		}, nil
 	}
 
@@ -600,7 +745,7 @@ func (c *responseCache) fetchAndPopulate(
 				c.metrics.setCacheOccupancy(st.Bytes, st.Entries)
 			}
 			if info != nil && info.IsResourceRequest {
-				c.recordScopeKey(clusterID, info, key)
+				c.recordScopeKey(clusterID, info, key, now, storeTTL)
 			}
 		}
 	}
@@ -611,7 +756,32 @@ func (c *responseCache) fetchAndPopulate(
 		body:        rawBody,
 		cacheStatus: cacheStatusMiss,
 		metric:      CacheResultMiss,
+		auditErr:    sfEv.Err,
 	}, nil
+}
+
+func (c *responseCache) evictKey(ctx context.Context, key string) {
+	_ = c.store.Delete(ctx, key)
+	c.removeScopeKey(key)
+	if sp, ok := c.store.(CacheStatsProvider); ok {
+		st := sp.Stats()
+		c.metrics.setCacheOccupancy(st.Bytes, st.Entries)
+	}
+}
+
+func prepareCacheableUpstreamRequest(req *http.Request) *http.Request {
+	upReq := req.Clone(req.Context())
+	upReq.Header.Del(headerIfNoneMatch)
+	upReq.Header.Del(headerIfModifiedSince)
+	upReq.Header.Del(headerIfMatch)
+	upReq.Header.Del(headerIfUnmodifiedSince)
+	upReq.Header.Del(headerIfRange)
+	if normalizeAcceptEncoding(upReq.Header) == encodingGzip {
+		upReq.Header.Set(headerAcceptEncoding, encodingGzip)
+	} else {
+		upReq.Header.Del(headerAcceptEncoding)
+	}
+	return upReq
 }
 
 func isCacheableRequest(req *http.Request, info *request.RequestInfo, dryRun bool) (cacheable bool, isDiscovery bool) {
@@ -648,30 +818,70 @@ func resourceScopeID(clusterID, group, version, resource, namespace string) stri
 	return clusterID + "|" + group + "|" + version + "|" + resource + "|" + namespace
 }
 
-func (c *responseCache) recordScopeKey(clusterID string, info *request.RequestInfo, key string) {
+func (c *responseCache) recordScopeKey(clusterID string, info *request.RequestInfo, key string, now time.Time, ttl time.Duration) {
 	c.scopeMu.Lock()
 	defer c.scopeMu.Unlock()
 
+	c.pruneExpiredScopeKeysLocked(now)
 	nsScope := resourceScopeID(clusterID, info.APIGroup, info.APIVersion, info.Resource, info.Namespace)
-	c.addScopeKeyLocked(nsScope, key)
+	if prevScope, ok := c.keyScope[key]; ok && prevScope != nsScope {
+		if prevKeys, exists := c.scopeKeys[prevScope]; exists {
+			delete(prevKeys, key)
+			if len(prevKeys) == 0 {
+				delete(c.scopeKeys, prevScope)
+			}
+		}
+	}
+	keys, ok := c.scopeKeys[nsScope]
+	if !ok {
+		keys = make(map[string]time.Time)
+		c.scopeKeys[nsScope] = keys
+	}
+	keys[key] = now.Add(ttl)
+	c.keyScope[key] = nsScope
 }
 
-func (c *responseCache) addScopeKeyLocked(scope, key string) {
-	keys, ok := c.scopeKeys[scope]
+func (c *responseCache) removeScopeKey(key string) {
+	c.scopeMu.Lock()
+	defer c.scopeMu.Unlock()
+
+	scope, ok := c.keyScope[key]
 	if !ok {
-		keys = make(map[string]struct{})
-		c.scopeKeys[scope] = keys
+		return
 	}
-	keys[key] = struct{}{}
+	delete(c.keyScope, key)
+	if keys, exists := c.scopeKeys[scope]; exists {
+		delete(keys, key)
+		if len(keys) == 0 {
+			delete(c.scopeKeys, scope)
+		}
+	}
+}
+
+func (c *responseCache) pruneExpiredScopeKeysLocked(now time.Time) {
+	for scope, keys := range c.scopeKeys {
+		for k, exp := range keys {
+			if !now.Before(exp) {
+				delete(keys, k)
+				delete(c.keyScope, k)
+			}
+		}
+		if len(keys) == 0 {
+			delete(c.scopeKeys, scope)
+		}
+	}
 }
 
 func (c *responseCache) invalidateResourceScope(ctx context.Context, clusterID string, info *request.RequestInfo) {
+	now := c.now()
 	c.scopeMu.Lock()
+	c.pruneExpiredScopeKeysLocked(now)
 	var toDelete []string
 	collect := func(scope string) {
 		if keys, ok := c.scopeKeys[scope]; ok {
 			for k := range keys {
 				toDelete = append(toDelete, k)
+				delete(c.keyScope, k)
 			}
 			delete(c.scopeKeys, scope)
 		}
@@ -714,6 +924,31 @@ type requestCacheControl struct {
 	maxStale   time.Duration
 }
 
+func parseDeltaSeconds(val string) (time.Duration, bool) {
+	if val == "" {
+		return 0, false
+	}
+	for i := 0; i < len(val); i++ {
+		if val[i] < '0' || val[i] > '9' {
+			return 0, false
+		}
+	}
+	secs, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return time.Duration(maxDeltaSeconds) * time.Second, true
+		}
+		return 0, false
+	}
+	if secs < 0 {
+		return 0, false
+	}
+	if secs > maxDeltaSeconds {
+		secs = maxDeltaSeconds
+	}
+	return time.Duration(secs) * time.Second, true
+}
+
 func parseRequestCacheControl(h http.Header) requestCacheControl {
 	var cc requestCacheControl
 	for _, raw := range h.Values(headerCacheControl) {
@@ -732,23 +967,22 @@ func parseRequestCacheControl(h http.Header) requestCacheControl {
 				cc.noStore = true
 			case "max-age":
 				if hasVal {
-					if secs, err := strconv.Atoi(val); err == nil && secs >= 0 {
-						if secs == 0 {
+					if d, ok := parseDeltaSeconds(val); ok {
+						if d == 0 {
 							cc.zeroMaxAge = true
 						} else {
 							cc.hasMaxAge = true
-							cc.maxAge = time.Duration(secs) * time.Second
+							cc.maxAge = d
 						}
 					}
 				}
 			case "max-stale":
-				cc.hasStale = true
-				if hasVal {
-					if secs, err := strconv.Atoi(val); err == nil && secs >= 0 {
-						cc.maxStale = time.Duration(secs) * time.Second
-					}
-				} else {
-					cc.maxStale = 24 * time.Hour
+				if !hasVal {
+					cc.hasStale = true
+					cc.maxStale = defaultMaxStaleDuration
+				} else if d, ok := parseDeltaSeconds(val); ok {
+					cc.hasStale = true
+					cc.maxStale = d
 				}
 			}
 		}
@@ -779,12 +1013,12 @@ func parseResponseCacheControl(h http.Header) responseCacheControl {
 				cc.noStore = true
 			case "max-age":
 				if hasVal {
-					if secs, err := strconv.Atoi(val); err == nil && secs >= 0 {
-						if secs == 0 {
+					if d, ok := parseDeltaSeconds(val); ok {
+						if d == 0 {
 							cc.zeroMaxAge = true
 						} else {
 							cc.hasMaxAge = true
-							cc.maxAge = time.Duration(secs) * time.Second
+							cc.maxAge = d
 						}
 					}
 				}
@@ -811,29 +1045,33 @@ func encodeCachedResponse(meta cachedResponseMeta, body []byte) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
+	if len(metaBytes) > maxCacheMetaBytes || len(body) > maxCacheBodyBytes {
+		return nil, errors.New("cache entry exceeds envelope size limit")
+	}
 	out := make([]byte, cacheEnvelopeMinSize+len(metaBytes)+len(body))
-	copy(out[:4], cacheEnvelopeMagic)
-	binary.BigEndian.PutUint32(out[4:8], uint32(len(metaBytes)))
-	copy(out[8:8+len(metaBytes)], metaBytes)
-	copy(out[8+len(metaBytes):], body)
+	copy(out[:cacheEnvelopeMagicSize], cacheEnvelopeMagic)
+	// #nosec G115 -- len(metaBytes) is non-negative and bounded by maxCacheMetaBytes (1 MiB) above.
+	binary.BigEndian.PutUint32(out[cacheEnvelopeMagicSize:cacheEnvelopeMinSize], uint32(len(metaBytes)))
+	copy(out[cacheEnvelopeMinSize:cacheEnvelopeMinSize+len(metaBytes)], metaBytes)
+	copy(out[cacheEnvelopeMinSize+len(metaBytes):], body)
 	return out, nil
 }
 
 func decodeCachedResponse(raw []byte) (*cachedResponse, error) {
-	if len(raw) < cacheEnvelopeMinSize || string(raw[:4]) != cacheEnvelopeMagic {
+	if len(raw) < cacheEnvelopeMinSize || string(raw[:cacheEnvelopeMagicSize]) != cacheEnvelopeMagic {
 		return nil, errors.New("invalid cache envelope header")
 	}
-	metaLen := int(binary.BigEndian.Uint32(raw[4:8]))
+	metaLen := int(binary.BigEndian.Uint32(raw[cacheEnvelopeMagicSize:cacheEnvelopeMinSize]))
 	if metaLen < 0 || cacheEnvelopeMinSize+metaLen > len(raw) {
 		return nil, errors.New("invalid cache envelope metadata length")
 	}
 	var meta cachedResponseMeta
-	if err := json.Unmarshal(raw[8:8+metaLen], &meta); err != nil {
+	if err := json.Unmarshal(raw[cacheEnvelopeMinSize:cacheEnvelopeMinSize+metaLen], &meta); err != nil {
 		return nil, err
 	}
 	return &cachedResponse{
 		meta: meta,
-		body: raw[8+metaLen:],
+		body: raw[cacheEnvelopeMinSize+metaLen:],
 	}, nil
 }
 
@@ -848,7 +1086,12 @@ func isEntryFreshForRequest(entry *cachedResponse, reqCC requestCacheControl, no
 		allowed = reqCC.maxAge
 	}
 	if reqCC.hasStale {
-		allowed += reqCC.maxStale
+		maxAllowed := time.Duration(maxDeltaSeconds) * time.Second
+		if maxAllowed-allowed < reqCC.maxStale {
+			allowed = maxAllowed
+		} else {
+			allowed += reqCC.maxStale
+		}
 	}
 	return age <= allowed
 }
@@ -885,7 +1128,7 @@ func buildCacheKey(clusterID string, req *http.Request, callerAccept string) str
 	encoding := normalizeAcceptEncoding(req.Header)
 	raw := clusterID + "\x00" + req.Method + "\x00" + req.URL.Path + "\x00" + query + "\x00" + accept + "\x00" + encoding
 	sum := sha256.Sum256([]byte(raw))
-	return "k8s:" + clusterID + ":" + hex.EncodeToString(sum[:16])
+	return "k8s:" + clusterID + ":" + hex.EncodeToString(sum[:cacheKeyHashBytes])
 }
 
 func canonicalQuery(rawQuery string) string {
@@ -908,15 +1151,35 @@ func normalizeAcceptHeader(h http.Header) string {
 }
 
 func normalizeAcceptEncoding(h http.Header) string {
+	var seenGzip, gzipAccepted bool
 	for _, v := range h.Values(headerAcceptEncoding) {
 		for _, part := range strings.Split(v, ",") {
-			token, _, _ := strings.Cut(strings.TrimSpace(part), ";")
-			if strings.EqualFold(strings.TrimSpace(token), encodingGzip) {
-				return encodingGzip
+			token, params, hasParams := strings.Cut(strings.TrimSpace(part), ";")
+			if !strings.EqualFold(strings.TrimSpace(token), encodingGzip) {
+				continue
 			}
+			seenGzip = true
+			gzipAccepted = !hasParams || !hasZeroQuality(params)
 		}
 	}
+	if seenGzip && gzipAccepted {
+		return encodingGzip
+	}
 	return encodingIdentity
+}
+
+func hasZeroQuality(params string) bool {
+	for _, rawParam := range strings.Split(params, ";") {
+		k, v, ok := strings.Cut(strings.TrimSpace(rawParam), "=")
+		if !ok || !strings.EqualFold(strings.TrimSpace(k), "q") {
+			continue
+		}
+		q, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil || q <= 0 || q > 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func sanitizeCachedHeaders(h http.Header) http.Header {
@@ -960,4 +1223,20 @@ func readBoundedBody(r io.Reader, maxBytes int64) (data []byte, exceeded bool, e
 type prefixedReadCloser struct {
 	io.Reader
 	io.Closer
+}
+
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	once   sync.Once
+	cancel context.CancelFunc
+}
+
+func (r *cancelOnCloseReadCloser) Close() error {
+	err := r.ReadCloser.Close()
+	r.once.Do(func() {
+		if r.cancel != nil {
+			r.cancel()
+		}
+	})
+	return err
 }

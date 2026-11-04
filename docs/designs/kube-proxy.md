@@ -371,14 +371,14 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - `CacheStore` defines `Get(ctx, key)`, `Set(ctx, key, value, ttl)`, and `Delete(ctx, key)`. Optional `CacheStatsProvider` exposes `Stats() CacheStats` (`Bytes`, `Entries`, `CapacityEvicted`, `ExpiredEvicted`). Any store error fails open and forwards the request to the upstream cluster.
    - When `CacheConfig.Store` is nil, `NewMemoryCacheStore` provides an in-memory store bounded to `DefaultCacheMaxBytes` (`64 MiB`) with `DefaultCacheMaxEntryBytes` (`2 MiB`, configured via `--cache-max-entry-bytes` / `KUBE_PROXY_CACHE_MAX_ENTRY_BYTES`). It evicts expired entries first and uses second-chance frequency decay with LRU ordering so one-time list scans do not evict hot entries.
 2. **Cache eligibility and default TTLs**:
-   - Resource `get` and `list` requests (`GET`, no subresource, no `watch=`, and no `dryRun`) use `DefaultResourceCacheTTL` (`30s`, configured via `--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL`).
+   - Resource `get` and `list` requests (`GET`, no subresource, no `watch=`, and no `dryRun`) use `DefaultResourceCacheTTL` (`10s`, configured via `--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL`).
    - Discovery `GET` requests use `DefaultDiscoveryCacheTTL` (`15m`, configured via `--cache-discovery-ttl` / `KUBE_PROXY_CACHE_DISCOVERY_TTL`). Health and metrics paths in `nonCachedDiscoveryPaths` (`/healthz`, `/livez`, `/readyz`, `/metrics`) are never cached.
    - Responses larger than `MaxEntryBytes` bypass the cache (`Cache-Status: k8s-api-proxy; bypass`) and stream directly to the caller without full buffering.
 3. **Cache key isolation and `Secret` redaction before storage**:
    - Keys include `clusterID`, canonical URL path, canonical query string, normalized caller `Accept` header (captured before `Secret` `PartialObjectMetadata` header rewrites), and `Accept-Encoding`.
    - `baseRoundTrip` executes `redactSecretResponse` before returning the response to `responseCache`, so raw `core/v1` `Secret` values never enter `CacheStore`.
 4. **Coalescing, RFC 9111 `Cache-Control`, and RFC 9211 `Cache-Status` / `Age`**:
-   - Concurrent cache misses for the same key coalesce through `singleflight.Group` into one upstream call.
+   - Concurrent cache misses for the same key coalesce into one upstream call.
    - The proxy honors request `Cache-Control` directives (`no-store`, `no-cache`, `max-age=0`, `max-age=<seconds>`, `max-stale`) and upstream response `Cache-Control` (`no-store`, `max-age=0`, `max-age=<seconds>`), while caching `kube-apiserver`'s default `no-cache, private` responses under the configured TTL.
    - Responses set `Cache-Status` (`k8s-api-proxy; hit`, `k8s-api-proxy; hit; coalesced`, `k8s-api-proxy; miss`, or `k8s-api-proxy; bypass`) and `Age`.
 5. **Write and auth-failure scope invalidation**:

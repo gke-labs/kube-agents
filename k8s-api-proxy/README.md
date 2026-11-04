@@ -61,12 +61,12 @@ cannot redact becomes a 502, or on a watch ends the stream with an `ERROR` event
 `pkg/k8sapiproxy/cache.go` provides an optional HTTP response cache (`CacheConfig`, `CacheStore`,
 `CacheStatsProvider`, and the default `MemoryCacheStore`). By default, `cmd/k8s-api-proxy` enables a
 64 MiB in-memory cache (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTES`; `0` disables the cache)
-with a 2 MiB per-entry limit (`--cache-max-entry-bytes` / `KUBE_PROXY_CACHE_MAX_ENTRY_BYTES`), a 30s
+with a 2 MiB per-entry limit (`--cache-max-entry-bytes` / `KUBE_PROXY_CACHE_MAX_ENTRY_BYTES`), a 10s
 TTL for resource `get` and `list` responses (`--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL`),
 and a 15m TTL for discovery responses (`--cache-discovery-ttl` / `KUBE_PROXY_CACHE_DISCOVERY_TTL`).
 Health and metrics discovery paths (`/healthz`, `/livez`, `/readyz`, `/metrics`), watches,
-subresources, and dry-run writes are never cached. Concurrent cache misses coalesce through
-`singleflight.Group`, `Secret` payloads are redacted before cache storage, non-dry-run mutations and
+subresources, and dry-run writes are never cached. Concurrent cache misses coalesce into one
+upstream request, `Secret` payloads are redacted before cache storage, non-dry-run mutations and
 `401`/`403` responses invalidate the affected resource scope, and responses carry RFC 9211
 `Cache-Status` and `Age` headers while honoring RFC 9111 `Cache-Control` directives. Cache lookups,
 evictions, byte size, and entry count are exported on the metrics listener as

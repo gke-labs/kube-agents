@@ -238,6 +238,25 @@ const (
 	// leaves Ready alone: chat works, and some installs want no posts.
 	homeChannelUnsetConditionType = "HomeChannelUnset"
 	homeChannelUnsetReason        = "NoHomeChannel"
+	// The condition reporting that a next install has no chat platform at
+	// all, so nothing the agent raises unprompted reaches anyone in chat and
+	// its findings are read from the repository and the report store. The
+	// counterpart of HomeChannelUnset for the install that chose no chat;
+	// informational, written and cleared with it, not Degraded (#4055).
+	noChatPlatformConditionType = "NoChatPlatform"
+	noChatPlatformReason        = "NoChatPlatform"
+	// noChatPlatformMessageFormat takes where the audit findings go: with a
+	// GitOps repository registered they reach it as well as the report
+	// store; with none, the report store alone. The audits are what the
+	// store holds; an alert's triage still runs on the board, and the other
+	// scheduled reports have no store of their own.
+	noChatPlatformMessageFormat = "Neither Google Chat nor Slack is enabled (spec.mode next), so the agent's proactive posts -- " +
+		"alerts, drift reports, scheduled reports -- have no chat to go to. Its audit findings %s; alerts are still triaged " +
+		"on the board, and other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, " +
+		"or read the volume with kubectl exec. Enable spec.integration.slack or spec.integration.googleChat " +
+		"(SLACK_* or GOOGLE_CHAT_* in install.env) to deliver them in chat."
+	noChatPlatformWithRepo = "stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests)"
+	noChatPlatformNoRepo   = "stay in the report store on the data volume alone, since no GitOps repository is registered"
 	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
 	// install.env key and what the field holds.
 	homeChannelUnsetMessageFormat = "The A2A gateway holds %[1]s (spec.mode next) and %[2]s is empty, so the agent's " +
@@ -4223,9 +4242,11 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// Degraded still runs a gateway that drops proactive posts, and a bare
 	// helm install parks on ShellSandboxKeysMissing indefinitely (#3320).
 	homeMsg := homeChannelUnsetMessage(agent, a2a.homeRecord)
+	noChatMsg := noChatPlatformMsg(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
+		noChatPlatformConditionCurrent(agent, noChatMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) {
 		return nil
@@ -4234,6 +4255,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live, a2a.homeRecord)) &&
+			noChatPlatformConditionCurrent(live, noChatPlatformMsg(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition)
 	}) {
@@ -4244,6 +4266,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
+	setNoChatPlatformCondition(agent, noChatMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	return r.Status().Update(ctx, agent)
@@ -4553,6 +4576,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// compared on its message for the same reason EventWatcher's is.
 	homeChannelUnsetMsg := homeChannelUnsetMessage(agent, a2a.homeRecord)
 	homeChannelUnsetUnchanged := homeChannelUnsetConditionCurrent(agent, homeChannelUnsetMsg)
+	// Its counterpart for the install with no chat platform, same shape.
+	noChatPlatformMsgNow := noChatPlatformMsg(agent)
+	noChatPlatformUnchanged := noChatPlatformConditionCurrent(agent, noChatPlatformMsgNow)
 
 	// The A2AGateway condition, same class as EventWatcher and for the same
 	// reason it needs its own term: on an upgraded install, the way back
@@ -4636,6 +4662,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
+		noChatPlatformUnchanged &&
 		hostPathDroppedUnchanged &&
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
@@ -4713,6 +4740,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
+	setNoChatPlatformCondition(agent, noChatPlatformMsgNow, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 
@@ -4853,6 +4881,51 @@ func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannel
 		return msg + homeChannelUnsetLearnSuffix
 	}
 	return ""
+}
+
+// noChatPlatformMsg is the NoChatPlatform condition's message for this spec,
+// or "" when the condition is to be absent: the install is not on the next
+// stack, or has a chat platform (HomeChannelUnset then says what a missing
+// home channel costs).
+func noChatPlatformMsg(agent *agentv1alpha1.PlatformAgent) string {
+	if renderMode(agent, "gateway") != ModeNext || googleChatEnabled(agent) || slackEnabled(agent) {
+		return ""
+	}
+	where := noChatPlatformNoRepo
+	if agent.Spec.Integration != nil {
+		if ri, err := agent.Spec.Integration.ResolveGit(); err == nil && len(ri.Accepted(agentv1alpha1.RepositoryRoleGitOps)) > 0 {
+			where = noChatPlatformWithRepo
+		}
+	}
+	return fmt.Sprintf(noChatPlatformMessageFormat, where)
+}
+
+// noChatPlatformConditionCurrent reports whether the NoChatPlatform condition
+// already says msg, where "" means the condition is to be absent.
+func noChatPlatformConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, noChatPlatformConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == noChatPlatformReason && existing.Message == msg
+}
+
+// setNoChatPlatformCondition writes the NoChatPlatform condition, or removes
+// it when msg is "". The caller does the API write.
+func setNoChatPlatformCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, noChatPlatformConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               noChatPlatformConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             noChatPlatformReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
 }
 
 // homeChannelUnsetConditionCurrent reports whether the HomeChannelUnset

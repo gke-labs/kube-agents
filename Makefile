@@ -645,9 +645,12 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 		exit 1; \
 	fi
 
-# The coverage directories the shards' CI jobs upload, one per shard, each with
-# the shard's combined .coverage and its failed-files list. CI downloads them
-# under COVERAGE_DIR before it runs coverage-merge.
+# The coverage directories the shards' CI jobs upload, each with the shard's
+# combined .coverage and its failed-files list. CI uploads one per shard per run
+# attempt (python-coverage-shard-<N>-attempt-<A>), downloads them under
+# COVERAGE_DIR, and keeps each shard's latest attempt under the bare name
+# python-coverage-shard-<N> (scripts/coverage_shard_attempts.py) before it runs
+# coverage-merge.
 COVERAGE_SHARD_DIRS ?= $(wildcard $(COVERAGE_DIR)/python-coverage-shard-*)
 # How many shard directories coverage-merge requires; CI passes its shard count.
 COVERAGE_SHARD_COUNT ?= 1

@@ -64,6 +64,7 @@ func envInt64OrDefault(key string, fallback int64) int64 {
 	}
 	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
+		log.Printf("warning: %s is not a base-10 integer; using default %d", key, fallback)
 		return fallback
 	}
 	return v
@@ -76,6 +77,7 @@ func envDurationOrDefault(key string, fallback time.Duration) time.Duration {
 	}
 	v, err := time.ParseDuration(raw)
 	if err != nil {
+		log.Printf("warning: %s is not a valid duration; using default %s", key, fallback)
 		return fallback
 	}
 	return v
@@ -256,10 +258,10 @@ func main() {
 	}()
 
 	if *tlsCertFile != "" && *tlsKeyFile != "" {
-		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, defaultCluster=%s, redactSecrets=%v, metricsPort=%d)", *listenAddr, mode, *defaultClusterF, *redactSecrets, *metricsPort)
+		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, defaultCluster=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *defaultClusterF, *redactSecrets, *metricsPort, *cacheMaxBytes)
 		err = srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile)
 	} else {
-		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, defaultCluster=%s, redactSecrets=%v, metricsPort=%d)", *listenAddr, mode, *defaultClusterF, *redactSecrets, *metricsPort)
+		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, defaultCluster=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *defaultClusterF, *redactSecrets, *metricsPort, *cacheMaxBytes)
 		err = srv.ListenAndServe()
 	}
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {

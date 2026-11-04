@@ -364,9 +364,9 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 	}
 
 	// 5. Trigger TTL expiration and capacity eviction metrics and verify occupancy gauges.
-	// Advance to t=33s so /api/v1/namespaces/default/pods (stored at t=0, TTL 30s) and
-	// pod-a (stored at t=2s, TTL 30s) are expired while services (stored at t=8s, TTL 30s) remains fresh.
-	advance(25 * time.Second)
+	// Advance to t=13s so /api/v1/namespaces/default/pods (stored at t=0, TTL 10s) and
+	// pod-a (stored at t=2s, TTL 10s) are expired while services (stored at t=8s, TTL 10s) remains fresh.
+	advance(5 * time.Second)
 	if !nonCachedDiscoveryPaths.Has("/metrics") {
 		t.Fatalf("nonCachedDiscoveryPaths must include /metrics so live Prometheus scrapes are not cached")
 	}
@@ -1102,5 +1102,526 @@ func TestHandlerCacheLeaderCancelRefreshEvictionAndExpiredInvalidation(t *testin
 	exposition := scrapeMetricsText(t, metrics)
 	if strings.Contains(exposition, `kubeagents_kube_proxy_cache_evictions_total{reason="invalidated"}`) {
 		t.Errorf("expired entry should not be counted as invalidated eviction:\n%s", exposition)
+	}
+}
+
+type auditRecordingSink struct {
+	mu     sync.Mutex
+	events []AuditEvent
+}
+
+func (s *auditRecordingSink) Record(_ context.Context, ev AuditEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, ev)
+}
+
+func (s *auditRecordingSink) snapshot() []AuditEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]AuditEvent, len(s.events))
+	copy(out, s.events)
+	return out
+}
+
+func TestHandlerCacheSecretRefusalAuditAndLeaderCancelRace(t *testing.T) {
+	store := &countingGetStore{
+		MemoryCacheStore: NewMemoryCacheStore(DefaultCacheMaxBytes),
+		allSeen:          make(chan struct{}),
+		target:           2,
+	}
+	releaseUpstream := make(chan struct{})
+	auditSink := &auditRecordingSink{}
+
+	upstream := &fakeUpstream{
+		handler: func(_ string, req *http.Request) (*http.Response, error) {
+			<-releaseUpstream
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{headerContentType: []string{contentTypeJSON}},
+				Body:       io.NopCloser(strings.NewReader("not-valid-json")),
+				Request:    req,
+			}, nil
+		},
+	}
+
+	h, err := NewHandler(Config{
+		Authenticator: shellCaller,
+		Upstream:      upstream,
+		Policy:        Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Audit:         auditSink,
+		Logger:        slog.New(slog.DiscardHandler),
+		Cache:         &CacheConfig{Store: store},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	var rec1, rec2 *httptest.ResponseRecorder
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		rec1 = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/bad", nil))
+	}()
+	go func() {
+		defer wg.Done()
+		rec2 = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/bad", nil))
+	}()
+
+	<-store.allSeen
+	time.Sleep(15 * time.Millisecond)
+	close(releaseUpstream)
+	wg.Wait()
+
+	if rec1.Code != http.StatusBadGateway || rec2.Code != http.StatusBadGateway {
+		t.Fatalf("codes = (%d, %d), want (502, 502)", rec1.Code, rec2.Code)
+	}
+	events := auditSink.snapshot()
+	if len(events) != 2 {
+		t.Fatalf("len(events) = %d, want 2", len(events))
+	}
+	for i, ev := range events {
+		if ev.StatusCode != http.StatusBadGateway || ev.Err == nil {
+			t.Errorf("event[%d] StatusCode=%d Err=%v, want StatusCode=502 and non-nil Err", i, ev.StatusCode, ev.Err)
+		}
+	}
+
+	// Verify no data race on AuditEvent.Err when the leader cancels while a follower remains waiting
+	// on an unredactable Secret fetch.
+	storeRace := &countingGetStore{
+		MemoryCacheStore: NewMemoryCacheStore(DefaultCacheMaxBytes),
+		allSeen:          make(chan struct{}),
+		target:           2,
+	}
+	releaseRace := make(chan struct{})
+	hRace, err := NewHandler(Config{
+		Authenticator: shellCaller,
+		Upstream: &fakeUpstream{
+			handler: func(_ string, req *http.Request) (*http.Response, error) {
+				<-releaseRace
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{headerContentType: []string{contentTypeJSON}},
+					Body:       io.NopCloser(strings.NewReader("not-valid-json")),
+					Request:    req,
+				}, nil
+			},
+		},
+		Policy: Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Audit:  &auditRecordingSink{},
+		Logger: slog.New(slog.DiscardHandler),
+		Cache:  &CacheConfig{Store: storeRace},
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	var wgRace sync.WaitGroup
+	wgRace.Add(2)
+	go func() {
+		defer wgRace.Done()
+		serve(hRace, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/race", nil).WithContext(ctxCancel))
+	}()
+	go func() {
+		defer wgRace.Done()
+		serve(hRace, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/race", nil))
+	}()
+	<-storeRace.allSeen
+	cancel()
+	close(releaseRace)
+	wgRace.Wait()
+}
+
+type trackingReadCloser struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.closed.Store(true)
+	return nil
+}
+
+func TestHandlerCacheFlightCancelTimeoutAndTooLargeCleanup(t *testing.T) {
+	// 1. Sole waiter cancellation aborts upstream fetch immediately and does not wedge the key.
+	entered := make(chan struct{})
+	var callCount atomic.Int32
+	upstream := &fakeUpstream{
+		handler: func(_ string, req *http.Request) (*http.Response, error) {
+			if callCount.Add(1) == 1 {
+				close(entered)
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{headerContentType: []string{contentTypeJSON}},
+				Body:       io.NopCloser(strings.NewReader(`{"kind":"PodList","apiVersion":"v1","items":[]}`)),
+				Request:    req,
+			}, nil
+		},
+	}
+
+	h, _ := newTestHandler(t, Config{
+		Upstream: upstream,
+		Cache:    &CacheConfig{},
+	})
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done1 <- serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil).WithContext(ctx1))
+	}()
+	<-entered
+	cancel1()
+	rec1 := <-done1
+	if rec1.Code != http.StatusBadGateway {
+		t.Fatalf("canceled sole waiter code = %d, want 502", rec1.Code)
+	}
+
+	rec2 := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("subsequent GET after canceled flight code = %d, want 200", rec2.Code)
+	}
+
+	// 2. Upstream stall is bounded by fetchTimeout.
+	hTimeout, _ := newTestHandler(t, Config{
+		Upstream: &fakeUpstream{
+			handler: func(_ string, req *http.Request) (*http.Response, error) {
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			},
+		},
+		Cache: &CacheConfig{},
+	})
+	hTimeout.(*handler).cache.fetchTimeout = 30 * time.Millisecond
+	recTimeout := serve(hTimeout, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	if recTimeout.Code != http.StatusBadGateway {
+		t.Fatalf("stalled upstream code = %d, want 502", recTimeout.Code)
+	}
+
+	// 3. Unclaimed tooLarge streamResp.Body is closed when all waiters cancel.
+	largeBody := strings.Repeat("x", 256)
+	trackedBody := &trackingReadCloser{Reader: strings.NewReader(largeBody)}
+	enteredLarge := make(chan struct{})
+	releaseLarge := make(chan struct{})
+	hLarge, _ := newTestHandler(t, Config{
+		Upstream: &fakeUpstream{
+			handler: func(_ string, req *http.Request) (*http.Response, error) {
+				close(enteredLarge)
+				<-releaseLarge
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					Header:        http.Header{headerContentType: []string{contentTypeJSON}, headerContentLength: []string{strconv.Itoa(len(largeBody))}},
+					Body:          trackedBody,
+					ContentLength: int64(len(largeBody)),
+					Request:       req,
+				}, nil
+			},
+		},
+		Cache: &CacheConfig{MaxEntryBytes: 32},
+	})
+
+	ctxLarge, cancelLarge := context.WithCancel(context.Background())
+	doneLarge := make(chan struct{})
+	go func() {
+		defer close(doneLarge)
+		serve(hLarge, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil).WithContext(ctxLarge))
+	}()
+	<-enteredLarge
+	cancelLarge()
+	<-doneLarge
+	close(releaseLarge)
+
+	deadline := time.Now().Add(time.Second)
+	for !trackedBody.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !trackedBody.closed.Load() {
+		t.Errorf("unclaimed tooLarge streamResp.Body was not closed after caller canceled")
+	}
+}
+
+func TestHandlerCacheConditionalHeadersDoNotLeak304ToCoalescedCallers(t *testing.T) {
+	store := &countingGetStore{
+		MemoryCacheStore: NewMemoryCacheStore(DefaultCacheMaxBytes),
+		allSeen:          make(chan struct{}),
+		target:           2,
+	}
+	releaseUpstream := make(chan struct{})
+	var sawConditional atomic.Bool
+
+	upstream := &fakeUpstream{
+		handler: func(_ string, req *http.Request) (*http.Response, error) {
+			if req.Header.Get(headerIfNoneMatch) != "" || req.Header.Get(headerIfModifiedSince) != "" {
+				sawConditional.Store(true)
+				<-releaseUpstream
+				return &http.Response{
+					StatusCode: http.StatusNotModified,
+					Header:     http.Header{"Etag": []string{`"v1"`}},
+					Body:       io.NopCloser(strings.NewReader("")),
+					Request:    req,
+				}, nil
+			}
+			<-releaseUpstream
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{headerContentType: []string{contentTypeJSON}, "Etag": []string{`"v1"`}},
+				Body:       io.NopCloser(strings.NewReader(`{"swagger":"2.0"}`)),
+				Request:    req,
+			}, nil
+		},
+	}
+
+	h, _ := newTestHandler(t, Config{
+		Upstream: upstream,
+		Cache:    &CacheConfig{Store: store},
+	})
+
+	reqCond := httptest.NewRequest(http.MethodGet, "/openapi/v2", nil)
+	reqCond.Header.Set(headerIfNoneMatch, `"v1"`)
+	reqCond.Header.Set(headerIfModifiedSince, "Wed, 21 Oct 2015 07:28:00 GMT")
+	reqUncond := httptest.NewRequest(http.MethodGet, "/openapi/v2", nil)
+
+	var recCond, recUncond *httptest.ResponseRecorder
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		recCond = serve(h, reqCond)
+	}()
+	go func() {
+		defer wg.Done()
+		recUncond = serve(h, reqUncond)
+	}()
+
+	<-store.allSeen
+	time.Sleep(15 * time.Millisecond)
+	close(releaseUpstream)
+	wg.Wait()
+
+	if sawConditional.Load() {
+		t.Errorf("upstream received conditional headers from cacheable fetch")
+	}
+	for name, rec := range map[string]*httptest.ResponseRecorder{"conditional": recCond, "unconditional": recUncond} {
+		if rec.Code != http.StatusOK || rec.Body.String() != `{"swagger":"2.0"}` {
+			t.Errorf("%s caller got code=%d body=%q, want 200 and full body", name, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestHandlerCacheScopeKeysPrunedOnExpiryAndEviction(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	var nowMu sync.Mutex
+	clock := func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		nowMu.Lock()
+		now = now.Add(d)
+		nowMu.Unlock()
+	}
+
+	store := NewMemoryCacheStore(220)
+	store.now = clock
+	h, _ := newTestHandler(t, Config{
+		Cache: &CacheConfig{
+			Store:              store,
+			DefaultResourceTTL: 5 * time.Second,
+			Now:                clock,
+		},
+	})
+	rc := h.(*handler).cache
+
+	// Insert two entries in ns-a and ns-b; tight store capacity evicts ns-a when ns-b is stored.
+	serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns-a/pods", nil))
+	serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns-b/pods", nil))
+
+	rc.scopeMu.Lock()
+	if _, exists := rc.scopeKeys[resourceScopeID(InClusterID, "", "v1", "pods", "ns-a")]; exists {
+		t.Errorf("capacity-evicted ns-a scope should have been removed from scopeKeys")
+	}
+	rc.scopeMu.Unlock()
+
+	// Advance past TTL and record a new key in ns-c; expired ns-b scope must be pruned.
+	advance(6 * time.Second)
+	serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns-c/pods", nil))
+
+	rc.scopeMu.Lock()
+	if _, exists := rc.scopeKeys[resourceScopeID(InClusterID, "", "v1", "pods", "ns-b")]; exists {
+		t.Errorf("expired ns-b scope should have been pruned from scopeKeys")
+	}
+	if len(rc.keyScope) != 1 {
+		t.Errorf("len(rc.keyScope) = %d, want 1", len(rc.keyScope))
+	}
+	rc.scopeMu.Unlock()
+}
+
+func TestHandlerCacheForcedRefreshTooLargeEvictsStaleEntry(t *testing.T) {
+	const maxEntry = 64
+	smallBody := `{"kind":"PodList","apiVersion":"v1","items":[]}`
+	largeBody := `{"kind":"PodList","apiVersion":"v1","padding":"` + strings.Repeat("x", 128) + `"}`
+
+	for _, chunked := range []bool{false, true} {
+		var returnLarge atomic.Bool
+		var seq atomic.Int32
+		store := NewMemoryCacheStore(DefaultCacheMaxBytes)
+		upstream := &recordingTransport{
+			response: func(req *http.Request) *http.Response {
+				n := seq.Add(1)
+				body := smallBody
+				if returnLarge.Load() {
+					body = largeBody
+				} else {
+					body = `{"kind":"PodList","apiVersion":"v1","seq":` + strconv.Itoa(int(n)) + `}`
+				}
+				cl := int64(len(body))
+				hdr := http.Header{headerContentType: []string{contentTypeJSON}}
+				if chunked {
+					cl = -1
+				} else {
+					hdr.Set(headerContentLength, strconv.FormatInt(cl, 10))
+				}
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					Header:        hdr,
+					Body:          io.NopCloser(strings.NewReader(body)),
+					ContentLength: cl,
+					Request:       req,
+				}
+			},
+		}
+
+		h, _ := newTestHandler(t, Config{
+			Upstream: upstream,
+			Cache: &CacheConfig{
+				Store:         store,
+				MaxEntryBytes: maxEntry,
+			},
+		})
+
+		const path = "/api/v1/namespaces/default/pods"
+		if rec := serve(h, httptest.NewRequest(http.MethodGet, path, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+			t.Fatalf("chunked=%v initial GET status = %q, want miss", chunked, rec.Header().Get(headerCacheStatus))
+		}
+		if rec := serve(h, httptest.NewRequest(http.MethodGet, path, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
+			t.Fatalf("chunked=%v second GET status = %q, want hit", chunked, rec.Header().Get(headerCacheStatus))
+		}
+
+		// Force refresh when upstream response now exceeds MaxEntryBytes.
+		returnLarge.Store(true)
+		reqRefresh := httptest.NewRequest(http.MethodGet, path, nil)
+		reqRefresh.Header.Set(headerCacheControl, "no-cache")
+		recRefresh := serve(h, reqRefresh)
+		if recRefresh.Header().Get(headerCacheStatus) != cacheStatusBypass || recRefresh.Body.String() != largeBody {
+			t.Fatalf("chunked=%v refresh got status=%q bodyLen=%d", chunked, recRefresh.Header().Get(headerCacheStatus), recRefresh.Body.Len())
+		}
+
+		// Return to small responses and verify the stale pre-refresh entry was evicted.
+		returnLarge.Store(false)
+		recAfter := serve(h, httptest.NewRequest(http.MethodGet, path, nil))
+		if recAfter.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(recAfter.Body.String(), `"seq":3`) {
+			t.Errorf("chunked=%v GET after tooLarge refresh got status=%q body=%s, want miss with seq 3", chunked, recAfter.Header().Get(headerCacheStatus), recAfter.Body.String())
+		}
+	}
+}
+
+func TestParseCacheControlLargeDeltaSecondsClamping(t *testing.T) {
+	reqHdr := http.Header{
+		headerCacheControl: []string{"max-age=9999999999, max-stale=999999999999999999999999"},
+	}
+	reqCC := parseRequestCacheControl(reqHdr)
+	wantMax := time.Duration(maxDeltaSeconds) * time.Second
+	if !reqCC.hasMaxAge || reqCC.maxAge != wantMax {
+		t.Errorf("reqCC.maxAge = %v (has=%v), want %v", reqCC.maxAge, reqCC.hasMaxAge, wantMax)
+	}
+	if !reqCC.hasStale || reqCC.maxStale != wantMax {
+		t.Errorf("reqCC.maxStale = %v (has=%v), want %v", reqCC.maxStale, reqCC.hasStale, wantMax)
+	}
+
+	invalidStale := parseRequestCacheControl(http.Header{headerCacheControl: []string{"max-stale=invalid"}})
+	if invalidStale.hasStale {
+		t.Errorf("max-stale=invalid set hasStale=true")
+	}
+
+	respCC := parseResponseCacheControl(http.Header{headerCacheControl: []string{"max-age=9999999999"}})
+	if !respCC.hasMaxAge || respCC.maxAge != wantMax {
+		t.Errorf("respCC.maxAge = %v (has=%v), want %v", respCC.maxAge, respCC.hasMaxAge, wantMax)
+	}
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	entry := &cachedResponse{
+		meta: cachedResponseMeta{
+			StoredAt: now.Add(-5 * time.Second).UnixNano(),
+			FreshTTL: int64(10 * time.Second),
+		},
+	}
+	if !isEntryFreshForRequest(entry, reqCC, now) {
+		t.Errorf("entry with large clamped max-age and max-stale should be fresh")
+	}
+}
+
+func TestNormalizeAcceptEncodingQualityAndOutboundHeader(t *testing.T) {
+	cases := []struct {
+		header string
+		want   string
+	}{
+		{"", encodingIdentity},
+		{"gzip", encodingGzip},
+		{"gzip;q=1.0", encodingGzip},
+		{"br, gzip;q=0.8", encodingGzip},
+		{"gzip;q=0", encodingIdentity},
+		{"gzip;q=0.000, identity;q=1", encodingIdentity},
+		{"gzip;q=invalid", encodingIdentity},
+		{"br, deflate", encodingIdentity},
+	}
+	for _, tc := range cases {
+		h := http.Header{}
+		if tc.header != "" {
+			h.Set(headerAcceptEncoding, tc.header)
+		}
+		if got := normalizeAcceptEncoding(h); got != tc.want {
+			t.Errorf("normalizeAcceptEncoding(%q) = %q, want %q", tc.header, got, tc.want)
+		}
+	}
+
+	var seenEncodings []string
+	upstream := &recordingTransport{
+		response: func(req *http.Request) *http.Response {
+			enc := req.Header.Get(headerAcceptEncoding)
+			seenEncodings = append(seenEncodings, enc)
+			hdr := http.Header{headerContentType: []string{contentTypeJSON}}
+			if enc == encodingGzip {
+				hdr.Set(headerContentEncoding, encodingGzip)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     hdr,
+				Body:       io.NopCloser(strings.NewReader(`{"kind":"PodList","apiVersion":"v1","enc":` + strconv.Quote(enc) + `}`)),
+				Request:    req,
+			}
+		},
+	}
+	h, _ := newTestHandler(t, Config{
+		Upstream: upstream,
+		Cache:    &CacheConfig{},
+	})
+
+	reqBrGzip := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+	reqBrGzip.Header.Set(headerAcceptEncoding, "br, gzip")
+	rec1 := serve(h, reqBrGzip)
+	if rec1.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec1.Body.String(), `"enc":"gzip"`) {
+		t.Fatalf("br, gzip got status=%q body=%s", rec1.Header().Get(headerCacheStatus), rec1.Body.String())
+	}
+
+	reqRejectGzip := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+	reqRejectGzip.Header.Set(headerAcceptEncoding, "gzip;q=0, identity;q=1")
+	rec2 := serve(h, reqRejectGzip)
+	if rec2.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec2.Body.String(), `"enc":""`) {
+		t.Fatalf("gzip;q=0 got status=%q body=%s, want miss with empty outbound Accept-Encoding", rec2.Header().Get(headerCacheStatus), rec2.Body.String())
 	}
 }

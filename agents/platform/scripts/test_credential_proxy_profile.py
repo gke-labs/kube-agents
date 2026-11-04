@@ -1389,10 +1389,13 @@ class ProfileSlotShareTest(unittest.TestCase):
 
 
 class ProfileRouteTableTest(unittest.TestCase):
-    def test_the_profile_role_reaches_the_exec_route_alone(self):
+    def test_the_profile_role_reaches_exec_and_the_mcp_relay_alone(self):
+        # The MCP relay narrows a profile caller to PROFILE_SERVER_TOOLS inside
+        # its handler (#3658); every other route stays closed to the role.
+        reached = {"/v1/exec", credential_proxy.mcp_policy.MCP_RELAY_PREFIX}
         for prefix, roles in credential_proxy.ROUTE_ROLES:
             with self.subTest(prefix=prefix):
-                self.assertEqual(prefix == "/v1/exec", credential_proxy.CALLER_ROLE_PROFILE in roles)
+                self.assertEqual(prefix in reached, credential_proxy.CALLER_ROLE_PROFILE in roles)
 
     def test_the_shim_and_the_broker_name_one_header(self):
         import credential_proxy_client
