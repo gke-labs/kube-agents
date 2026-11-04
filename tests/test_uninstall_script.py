@@ -1180,6 +1180,11 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         vertex_at = text.find('export VERTEX_MANAGE_SERVING_PROJECT=""')
         self.assertNotEqual(vertex_at, -1, "uninstall.sh must blank VERTEX_MANAGE_SERVING_PROJECT")
         self.assertLess(vertex_at, call_at)
+        # The release's upgrade_install switch too: the generator refuses a
+        # misspelt HELM_UPGRADE_INSTALL, and a teardown must not stop on it.
+        helm_at = text.find('export HELM_UPGRADE_INSTALL=""')
+        self.assertNotEqual(helm_at, -1, "uninstall.sh must blank HELM_UPGRADE_INSTALL")
+        self.assertLess(helm_at, call_at)
         # And the daily alert ceilings: the generator refuses a value that is
         # not a whole number, and a teardown must not stop on it. The names
         # come from the generator's own list, so a key added there and not

@@ -124,6 +124,22 @@ type metrics struct {
 	// runs at process start, and constant for the life of the process by
 	// construction.
 	processStart prometheus.Gauge
+	// The fleet's shape, set by the fleet-shape probe (fleetshape.go) every
+	// --fleet-shape-interval and read between probes: plain gauges rather
+	// than per-cluster ones, because what they exist to answer is the size
+	// of the whole fleet (published for an automatic sizing profile the
+	// operator will read; nothing projects them yet), and
+	// per-cluster series would be one more family that grows with the
+	// fleet. fleetShapeClusters{outcome} says how many clusters the totals
+	// hold (counted) and how many they leave out (failed), so a total read
+	// beside a failed count above zero is read as partial. All six are 0
+	// until the first probe finishes, which counted=0 says.
+	fleetNodes           prometheus.Gauge
+	fleetMaxClusterNodes prometheus.Gauge
+	fleetControllers     prometheus.Gauge
+	fleetPods            prometheus.Gauge
+	fleetMaxClusterPods  prometheus.Gauge
+	fleetShapeClusters   *prometheus.GaugeVec
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -245,8 +261,36 @@ func newMetrics() *metrics {
 			Name: processStartTimeMetric,
 			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
 		}),
+		fleetNodes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_nodes",
+			Help: "Nodes across the clusters counted in the last fleet-shape probe: each cluster's currentNodeCount from its GKE description, summed. The direct cluster contributes 0 until a profile names it. 0 until the first probe finishes.",
+		}),
+		fleetMaxClusterNodes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_max_cluster_nodes",
+			Help: "The largest single cluster's node count in the last fleet-shape probe.",
+		}),
+		fleetControllers: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_controllers",
+			Help: "Deployments, StatefulSets, DaemonSets and CronJobs across the clusters counted in the last fleet-shape probe, read as one-item metadata-only lists plus the server's remainingItemCount.",
+		}),
+		fleetPods: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_pods",
+			Help: "Pods across the clusters counted in the last fleet-shape probe, read the same way.",
+		}),
+		fleetMaxClusterPods: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_max_cluster_pods",
+			Help: "The largest single cluster's pod count in the last fleet-shape probe.",
+		}),
+		fleetShapeClusters: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_shape_clusters",
+			Help: "Clusters in the last fleet-shape probe by outcome: counted (every read answered; in the totals) or failed (a describe or a list failed or timed out; left out of the totals, so a failed count above 0 means the totals are partial). counted=0 and failed=0 is no probe finished yet.",
+		}, []string{"outcome"}),
 	}
 	m.processStart.Set(processStartSeconds(time.Now()))
+	// Both children from the first scrape, so a reader finds counted=0
+	// before the first probe rather than an absent series.
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeCounted).Set(0)
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeFailed).Set(0)
 	reg.MustRegister(
 		m.eventsSeen,
 		m.eventsFiltered,
@@ -266,8 +310,25 @@ func newMetrics() *metrics {
 		m.clusterDiscoveryErrors,
 		m.clusterUp,
 		m.processStart,
+		m.fleetNodes,
+		m.fleetMaxClusterNodes,
+		m.fleetControllers,
+		m.fleetPods,
+		m.fleetMaxClusterPods,
+		m.fleetShapeClusters,
 	)
 	return m
+}
+
+// publishFleetShape sets the six fleet gauges from one probe's reading.
+func (m *metrics) publishFleetShape(shape fleetShape) {
+	m.fleetNodes.Set(float64(shape.nodes))
+	m.fleetMaxClusterNodes.Set(float64(shape.maxClusterNodes))
+	m.fleetControllers.Set(float64(shape.controllers))
+	m.fleetPods.Set(float64(shape.pods))
+	m.fleetMaxClusterPods.Set(float64(shape.maxClusterPods))
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeCounted).Set(float64(shape.counted))
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeFailed).Set(float64(shape.failed))
 }
 
 // deleteClusterGauges drops the two gauge series labelled with one cluster's

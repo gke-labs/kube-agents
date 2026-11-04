@@ -21,6 +21,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -282,6 +283,24 @@ func (s *clusterSet) profiles() []string {
 	out := make([]string, 0, len(s.running))
 	for p := range s.running {
 		out = append(out, p)
+	}
+	return out
+}
+
+// clusters is the running set as a slice, in profile order, for the
+// fleet-shape probe: a copy, so the probe reads the clusters as they stood
+// when it began and holds no lock while it reads them.
+func (s *clusterSet) clusters() []targetCluster {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	profiles := make([]string, 0, len(s.running))
+	for p := range s.running {
+		profiles = append(profiles, p)
+	}
+	sort.Strings(profiles)
+	out := make([]targetCluster, 0, len(profiles))
+	for _, p := range profiles {
+		out = append(out, s.running[p].cluster)
 	}
 	return out
 }

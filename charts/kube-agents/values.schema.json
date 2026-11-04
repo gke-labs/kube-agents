@@ -599,6 +599,15 @@
         "mode": {
           "enum": [null, "", "today", "next"]
         },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "peopleSeen": {
+              "type": "boolean"
+            }
+          }
+        },
         "storage": {
           "type": ["object", "null"],
           "additionalProperties": false,

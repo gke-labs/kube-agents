@@ -3784,6 +3784,16 @@ unit_cost_hint() {
     # early, and the presubmit wall estimate in
     # scripts/eval_rosters.py (#3987) is priced from these hints.
     consistency-drift-outlier) echo 600 ;;
+    # On the blocking roster since 2026-11-02 (#4095), the presubmit's one
+    # stack case: its tofu stack plants one alert policy, about 2s to apply
+    # and 1s to destroy, so the unit is the agent turn. Measured on the
+    # main-b nightlies 2026-10-27 to 11-02: median 201s, 43-974s over 21
+    # repetitions (243s, 66-448s over the 15 on gemini-4-argon). Priced at
+    # 600s rather than the 200s default it ran the nightly at: the
+    # hint sets its launch order and its share of the presubmit wall estimate
+    # in scripts/eval_rosters.py, and the main-a/main-b balance test in
+    # scripts/test_ci_eval_nightly.py sums it into main-b's stack chain.
+    monitoring-alert-policy-read) echo 600 ;;
     consistency-no-environment-label) echo 900 ;;
     # Not measured yet: the same stream as the case above, plus a stack that
     # opens the ledger, so it takes that case's hint until its record says

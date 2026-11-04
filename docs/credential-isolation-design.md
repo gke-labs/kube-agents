@@ -205,9 +205,9 @@ PlatformAgent gateway Pod
 credential-proxy Pod
 
   envoy-credential-proxy
-    Envoy listener
-              |
-              | private Unix socket
+    Envoy listener :8765        Envoy health listener :8768 (readinessProbe)
+              |                             |
+              | private Unix socket         | same socket, /healthz only
               v
     credential runtime
     real CLIs, Slack/Chat clients, Minty client
@@ -247,6 +247,26 @@ which one presented the token — the audience and the route table it feeds do �
 allowlist itself keeps other workloads out rather than telling those callers apart. The token
 crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
+
+Envoy opens a second listener, on port 8768 (`credentialProxyHealthPort` in the operator,
+the container port `cred-health`), where the broker Pod's `readinessProbe` reads `/healthz`.
+The credentialed listener sends every path through the `credential_runtime` cluster, and
+every open cluster watch holds one of that cluster's connections, so a probe through it is
+refused with the watches' 503 once the fleet reaches the cluster's connection ceiling, and
+three refusals remove the Pod from the Service. That ceiling is declared rather than
+inherited: `circuit_breakers.thresholds` on both priorities, 4096 connections, 1024 pending
+requests and 4096 requests, where Envoy's default is 1024 of each; the broker's listen
+backlog (`LISTEN_BACKLOG`) is sized to the same 4096 so that the breaker, never the queue,
+refuses first. The health listener routes `/healthz` alone to a `credential_health` cluster
+on the same Unix socket, behind a breaker of 64, so ready still means the broker answers and
+no watch can mark the Pod unready; any other path on it is a 404. The Service and the
+NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
+`start-services.sh` rebinds both listeners off loopback together, to the address the operator
+passes (`0.0.0.0`, so the Pod IP answers), and refuses to start Envoy if a render leaves one
+behind. There is no `livenessProbe`: the start script
+supervises both processes and restarts the runtime in place, and a probe-driven restart
+would drop every open watch and the broker's workspace state. Envoy's admin interface stays
+on its Unix socket, where nothing on the Pod network reaches it.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port
 8643 and forwards to the agent on loopback using a non-secret sentinel. It is a
@@ -1049,7 +1069,8 @@ file and never a `.git` it can write into.
 - Every container the operator builds — the credential-cleanup init container,
   the agent, the dashboard, `agent-api-auth`, the log shipper — has a read-only
   root filesystem;
-  writable state uses bounded `emptyDir` volumes. The sandbox and dashboard
+  writable state uses bounded `emptyDir` volumes, bar the log shipper's cursor
+  directory on the `system-metadata` claim, described below. The sandbox and dashboard
   share a 2Gi `/tmp` scratch volume: the entrypoint runs several hermes
   invocations with `HOME=/tmp` before the agent starts, and those two
   containers already share the data PVC, so the shared volume is not a new
@@ -1057,8 +1078,8 @@ file and never a `.git` it can write into.
   container's own writable layer, discarded whenever that container restarted.
   An `emptyDir` is scoped to the Pod, so its contents now survive a container
   crash or restart and are visible to both containers' next boot. The log
-  shipper gets no `/tmp`: it buffers in memory
-  and keeps its tail database on its own volume. Containers supplied through
+  shipper gets no `/tmp`: it buffers in memory, and its one writable path is
+  the directory below. Containers supplied through
   `spec.deployment.sidecars`/`initContainers` are appended to the Pod
   substantially as written; the webhook does not require a read-only root of
   them, so a CR can still add a writable container to this Pod. "As written"
@@ -1069,6 +1090,22 @@ file and never a `.git` it can write into.
   that discards a CR value, `POD_NAMESPACE` as a default a CR value beats.
   Neither edit touches the container's filesystem posture, which is what this
   bullet is about.
+- The log shipper's tail cursors, the two SQLite files that record how far it
+  has read each log, live in a per-agent directory on the namespace's
+  `system-metadata` claim, mounted into the shipper alone at a `subPath` of its
+  own. A cursor on an `emptyDir` died with the Pod, and every replacement
+  shipped each file again from its first line. The agent's data claim was not
+  used for it because the agent and the dashboard mount that claim at its root,
+  and a cursor file rewritten into something SQLite cannot open stops the
+  shipper at every start; the `system-metadata` claim is reached by those two
+  containers only through `subPath: session`, so no container the operator
+  renders for model-authored code can write the cursors. Of the rendered
+  containers the shipper is the only one with a mount under `fluent-bit-state/`;
+  a CR's `spec.deployment.extraVolumeMounts` can still name the claim without a
+  `subPath`, and the operator does not refuse it. The databases use the rollback
+  journal rather than WAL: the claim is the gofer-backed mount under a runtime
+  class, where WAL-mode SQLite corrupts, and a corrupt cursor on a claim
+  outlives the Pod.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
 - The operator reports Ready only when every workload it renders is ready, with

@@ -34,6 +34,7 @@ func summaryCR() map[string]any {
 			"usage": map[string]any{
 				"clustersRegistered": int64(3), "clustersMonitored": int64(2),
 				"chatMessagesInboundTotal": int64(41), "sessionsTotal": int64(7),
+				"chatSessionsTotal":   int64(4),
 				"toolExecutionsTotal": int64(19127), "eventsIngestedTotal": int64(10),
 				"remediationsProposedTotal": int64(4), "remediationsMergedTotal": int64(1),
 				"proposalsAuthored": int64(6), "remediationsOpen": int64(2),
@@ -130,7 +131,7 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 		"kube-agents usage & feedback summary (2026-10-21)",
 		"  version: 0.14.0", "  mode: next", "  kubernetes: v1.33.4-gke.1234000",
 		"  installed: 19 days; ready: true", "  interfaces: googlechat, slack",
-		"  toolExecutionsTotal: 19127", "  sessionsTotal: 7", "  remediationsProposedTotal: 4\n",
+		"  toolExecutionsTotal: 19127", "  sessionsTotal: 7\n  chatSessionsTotal: 4\n", "  remediationsProposedTotal: 4\n",
 		"  remediationsMergedTotal: 1 (as the forge reports)\n", "  proposalsAuthored: 6 (as the forge reports)\n",
 		"  remediationsOpen: 2 (as the forge reports)\n", "  remediationsClosedUnmergedTotal: 3 (as the forge reports)\n",
 		"  proposalHumanTouches: 5 (as the forge reports)\n",
@@ -165,7 +166,7 @@ func TestRenderUsageSummaryPrintsNoReadingForAnAbsentReading(t *testing.T) {
 	if want := "  remediationsOpen: 0 (as the forge reports)\n"; !strings.Contains(text, want) {
 		t.Errorf("block lacks %q:\n%s", want, text)
 	}
-	for _, counter := range []string{"clustersRegistered", "toolExecutionsTotal", "remediationsProposedTotal"} {
+	for _, counter := range []string{"clustersRegistered", "chatSessionsTotal", "toolExecutionsTotal", "remediationsProposedTotal"} {
 		if want := "  " + counter + ": 0\n"; !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}

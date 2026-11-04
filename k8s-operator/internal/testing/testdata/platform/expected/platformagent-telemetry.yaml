@@ -428,7 +428,9 @@ data:
         Name              tail
         Tag               agent.logs
         Path              /opt/data/logs/*.log
-        DB                /fluent-bit/state/fluent-bit.db
+        DB                /var/lib/fluent-bit/fluent-bit.db
+        DB.locking        true
+        DB.journal_mode   delete
         Refresh_Interval  5
         Rotate_Wait       30
         Mem_Buf_Limit     20MB
@@ -441,7 +443,9 @@ data:
         Tag               agent.audit
         Path              /opt/data/logs/audit.jsonl,/opt/data/profiles/*/logs/audit.jsonl
         Parser            audit_json
-        DB                /fluent-bit/state/fluent-bit-audit.db
+        DB                /var/lib/fluent-bit/fluent-bit-audit.db
+        DB.locking        true
+        DB.journal_mode   delete
         Refresh_Interval  5
         Rotate_Wait       30
         Mem_Buf_Limit     20MB
@@ -1105,11 +1109,13 @@ spec:
               name: cred-proxy
             - containerPort: 8766
               name: cred-metrics
+            - containerPort: 8768
+              name: cred-health
           readinessProbe:
             failureThreshold: 3
             httpGet:
               path: /healthz
-              port: cred-proxy
+              port: cred-health
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
@@ -1156,6 +1162,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
+      terminationGracePeriodSeconds: 45
       volumes:
         - configMap:
             name: platformagent-credential-proxy-policy
@@ -1588,8 +1595,9 @@ spec:
               name: fluent-bit-config
               readOnly: true
               subPath: parsers.conf
-            - mountPath: /fluent-bit/state
-              name: fluent-bit-state
+            - mountPath: /var/lib/fluent-bit
+              name: system-metadata
+              subPath: fluent-bit-state/platformagent
       initContainers:
         - args:
             - |-
@@ -1795,9 +1803,6 @@ spec:
             defaultMode: 420
             name: platformagent-fluent-bit-config
           name: fluent-bit-config
-        - emptyDir:
-            sizeLimit: 128Mi
-          name: fluent-bit-state
         - name: system-metadata
           persistentVolumeClaim:
             claimName: system-metadata
