@@ -989,11 +989,6 @@ def registered_cases() -> set[str] | None:
     return names
 
 
-def _roster_display(path: pathlib.Path) -> str:
-    """A roster file's path as the messages spell it, relative to the repository."""
-    return path.relative_to(REPO_ROOT).as_posix() if path.is_relative_to(REPO_ROOT) else path.as_posix()
-
-
 def certification_cases() -> set[str] | None:
     """Case names in hack/eval/certification-cases.txt; None when it cannot be read."""
     try:
@@ -1216,7 +1211,7 @@ def validate_case(
     if certification is not None:
         if name in certification and suite != CERTIFICATION_SUITE:
             problems.append(
-                f"is in {_roster_display(CERTIFICATION_CASES_FILE)} but declares no "
+                f"is in {_display(CERTIFICATION_CASES_FILE)} but declares no "
                 f"'{SUITE_KEY}: {CERTIFICATION_SUITE}'; add the line, or take the case off the roster"
             )
         # A parked case (FIXTURE_NOT_READY, KNOWN_UNREGISTERED) may carry its
@@ -1231,7 +1226,7 @@ def validate_case(
         ):
             problems.append(
                 f"declares '{SUITE_KEY}: {CERTIFICATION_SUITE}' but is not in "
-                f"{_roster_display(CERTIFICATION_CASES_FILE)}; a certification case runs on that lane only"
+                f"{_display(CERTIFICATION_CASES_FILE)}; a certification case runs on that lane only"
             )
 
     # The id key. devops-bench accepts task_id as an alias for id
@@ -1625,9 +1620,9 @@ def validate_all() -> dict[str, list[str]]:
     if not registered:
         return {
             ROSTER_PARSE_KEY: [
-                "hack/eval/presubmit-cases.txt and hack/eval/nightly-cases.txt "
-                "parsed to no cases -- either both are empty or this parse has "
-                "drifted"
+                "hack/eval/presubmit-cases.txt, hack/eval/nightly-cases.txt and "
+                "hack/eval/certification-cases.txt parsed to no cases -- either "
+                "all three are empty or this parse has drifted"
             ]
         }
     results: dict[str, list[str]] = {}

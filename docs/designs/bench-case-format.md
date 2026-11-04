@@ -545,11 +545,7 @@ case for months.
 
 A new case lands in the nightly file's sorted section, the last one, at its place in
 case-id order with its reason as the `#` lines directly above its entry (#3495; the roster
-test checks both, so two case pull requests don't edit the same lines). A case with
-`suite: certification` in its task file is the exception: it registers in
-`hack/eval/certification-cases.txt`, runs only under `EVAL_TIER=certification`, and never
-in the presubmit or nightly files
-([`bench/README.md`](../../bench/README.md#certification-suite)). It lands there by
+test checks both, so two case pull requests don't edit the same lines). It lands there by
 decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
@@ -567,6 +563,11 @@ seat, or because what they grade is not one of the core journeys the presubmit g
 for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A case the agent cannot pass
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
+
+The one exception is a case with `suite: certification` in its task file: it registers in
+`hack/eval/certification-cases.txt`, runs only under `EVAL_TIER=certification`, and never
+in the presubmit or nightly files
+([`bench/README.md`](../../bench/README.md#certification-suite)).
 
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was
