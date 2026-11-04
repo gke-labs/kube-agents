@@ -151,8 +151,9 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 
 // buildCredentialProxyExecTierDeployment derives the tier's Deployment from the
 // stateful broker's, as rendered for this reconcile, so the image, the policy,
-// the caller authentication, the profile identities and the drain stay the
-// same on both. What differs:
+// the caller authentication, the profile identities and the grace period stay
+// the same on both. The grace period is not yet a drain: the exec role does
+// not drain on SIGTERM as the broker does. What differs:
 //   - its own name, selector and labels, without has-credential-proxy, which
 //     opens the github-token-minter to a pod;
 //   - the replica count and RollingUpdate with maxUnavailable 1 and maxSurge
