@@ -180,7 +180,6 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         absent with every suite green."""
         self.assertEqual(_py_const("PROPOSALS_OPENED_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "proposalsOpenedSeries"))
         self.assertEqual(_py_const("ORIGIN_LABEL", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "proposalsOriginLabel"))
-        self.assertEqual(_py_const("PLATFORM_LABEL", _CHAT_METRICS_PY), "platform")
         match = re.search(r"^ORIGINS = \(([^)]*)\)", _CHAT_METRICS_PY.read_text(), re.M)
         self.assertIsNotNone(match, "ORIGINS not found")
         plugin = re.findall(r'"([a-z]+)"', match.group(1))

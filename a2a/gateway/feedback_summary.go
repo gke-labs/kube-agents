@@ -462,7 +462,9 @@ func inferenceModelLine(cr map[string]any) string {
 
 // usageSummaryOriginLine lists the origins whose reading is above zero in the
 // table's order, "none" when every reading is zero, and "no reading" when the
-// readings are absent.
+// readings are absent. The operator writes all nine or none; a status carrying only
+// some of them, which no operator writes, lists the present non-zero ones and
+// ignores the rest.
 func usageSummaryOriginLine(usage map[string]any) string {
 	var parts []string
 	present := false

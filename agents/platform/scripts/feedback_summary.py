@@ -771,7 +771,11 @@ def _without_fixed_lines(text: str) -> str:
 
 
 def _origin_line(usage: Mapping[str, Any]) -> str:
-    """The origins whose reading is above zero, in order; ``none`` when all read zero; ``no reading`` when absent."""
+    """The origins whose reading is above zero, in order; ``none`` when all read zero; ``no reading`` when absent.
+
+    The operator writes all nine or none; a status carrying only some of them,
+    which no operator writes, lists the present non-zero ones and ignores the rest.
+    """
     readings = [(field, usage.get(field)) for field in USAGE_ORIGIN_FIELDS]
     present = [(field, int(value)) for field, value in readings if value is not None]
     if not present:
