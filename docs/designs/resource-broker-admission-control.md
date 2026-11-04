@@ -328,18 +328,22 @@ decodes the list, so it can read that container's free memory, and it sees the o
 Before it runs a potentially large list, the wrapper counts the objects. A potentially large list
 is a `get` of one or more kinds across all namespaces (`-A`), or of a cluster-scoped kind such as
 `nodes`. A `get` of named objects, of one namespace, a watch and a `--raw` read pass straight
-through. For each kind, one request with `?limit=1` returns `remainingItemCount`. The estimate is
-`KUBECTL_BASE + items × bytes per item`, summed over the kinds in the call. `KUBECTL_BASE` is
-64 MiB, and bytes per item comes from the output format:
+through. For each kind, one request with `?limit=20` returns `remainingItemCount` and a sample of
+20 objects. The estimate is `KUBECTL_BASE + Σ items × factor × mean raw size`, where the mean raw
+size is the sample's mean JSON size as the API server sends it (with `managedFields`, which
+`kubectl` decodes even though its output leaves them out). `KUBECTL_BASE` is 64 MiB, and the factor
+comes from the output format:
 
-| Output format                                      | Bytes per item (initial) |
-| -------------------------------------------------- | ------------------------ |
-| `-o json`, `-o yaml`, `jsonpath`, `custom-columns` | 100 KiB                  |
-| table, `-o wide`, `-o name`                        | 45 KiB                   |
+| Output format                                      | Factor (× raw size) | Fixed value without a sample |
+| -------------------------------------------------- | ------------------- | ---------------------------- |
+| `-o json`, `-o yaml`, `jsonpath`, `custom-columns` | 6.1                 | 100 KiB                      |
+| table, `-o wide`, `-o name`                        | 2.7                 | 45 KiB                       |
 
-The initial values are the measurements in §2. KWOK Pods are small, so real objects cost more. The
-values are lower bounds until they are measured on real objects, and are then kept up to date from
-the guard's kills and the completed calls.
+The factors come from §2: 99.5 and 43.4 KiB per KWOK Pod of 16.7 KB. Object size varies: the scale
+test host's real Pods are 4 to 33 KB (mean 13.1 KB), so a fixed cost per object would be wrong in
+both directions, and the sample follows each cluster. Checked against measured peaks: the audit's
+dump of 107,994 objects was estimated at 10,476 MiB (measured 10,357), `get pods -A` of 104,944 Pods
+at 4,621 MiB (measured 4,452), and `get nodes -o json` of 2,895 Nodes at 334 MiB (measured 226).
 
 **Reservations.** Admission does not read free memory alone. Two wrappers that read it at the same
 time both see room, and both start; this is the gap of fact 6. Each admitted call writes a
@@ -438,6 +442,10 @@ The prototype found four requirements that §6.1 now states or that the implemen
    joins the path onto the server URL and authenticates as the kubeconfig says.
 4. **Advice that works through the proxy.** The refusal names per-namespace reads, not a `--raw`
    page loop, for the same reason.
+5. **Both layers on one defect.** A later version of the wrapper read a count cache entry in an
+   older format and raised an error. It failed open, the oversized `kubectl` ran, and the guard
+   killed it before the shell reached its limit. The cache now treats an entry it cannot read as a
+   miss.
 
 ## 7. The event watcher
 
