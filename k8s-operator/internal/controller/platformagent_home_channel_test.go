@@ -18,6 +18,11 @@ package controller
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -601,5 +606,54 @@ func TestPlatformAgentReconciler_Reconcile_HomeChannelRecordDrivesTheProjection(
 	}
 	if c := condition(); c != nil {
 		t.Fatalf("HomeChannelUnset survived the CR field: %+v", c)
+	}
+}
+
+// gatewayHomeChannelSource holds the gateway's refusal vocabulary, the
+// homeRefused* constants it writes into slack.refused. The a2a module cannot be
+// imported here, so the words are read from the source.
+const gatewayHomeChannelSource = "../../../a2a/gateway/slack_home_channel.go"
+
+// homeChannelRefusedReasons is a copy of the gateway's vocabulary: a word the
+// gateway writes and the operator does not map renders as a reason the operator
+// does not know. Every step fails rather than passing on nothing found.
+func TestHomeChannelRefusedReasonsMatchTheGatewaysVocabulary(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), gatewayHomeChannelSource, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v (if the gateway's home-channel file moved, this test's path must move with it; it is what keeps homeChannelRefusedReasons honest)", gatewayHomeChannelSource, err)
+	}
+	var gateway []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		for i, name := range spec.Names {
+			if !strings.HasPrefix(name.Name, "homeRefused") || i >= len(spec.Values) {
+				continue
+			}
+			lit, ok := spec.Values[i].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				t.Fatalf("%s in %s is not a string literal; this test reads the words as literals", name.Name, gatewayHomeChannelSource)
+			}
+			word, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				t.Fatalf("%s in %s: %v", name.Name, gatewayHomeChannelSource, err)
+			}
+			gateway = append(gateway, word)
+		}
+		return true
+	})
+	if len(gateway) == 0 {
+		t.Fatalf("no homeRefused* string constants in %s; they are what homeChannelRefusedReasons mirrors", gatewayHomeChannelSource)
+	}
+	operator := make([]string, 0, len(homeChannelRefusedReasons))
+	for word := range homeChannelRefusedReasons {
+		operator = append(operator, word)
+	}
+	sort.Strings(gateway)
+	sort.Strings(operator)
+	if strings.Join(gateway, ",") != strings.Join(operator, ",") {
+		t.Errorf("the gateway writes refusal words %q, homeChannelRefusedReasons maps %q: a word on one side only renders as %q or is never written", gateway, operator, homeChannelRefusedUnknown)
 	}
 }
