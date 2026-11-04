@@ -361,6 +361,17 @@ class Forge:
         """
         return None
 
+    @staticmethod
+    def quota_scope(path: str) -> str:
+        """Which of the host's request quotas `path`'s credential spends.
+
+        "" is one quota for the whole host, which is right for a forge with
+        one static token. A forge whose credential is minted per owner
+        names the owner, so a quota one owner drained pauses no other's
+        reads (the readings sweep keys its pause on host and scope).
+        """
+        return ""
+
     def refuse_labels(self, verb: str, payload: Mapping[str, Any]) -> None:
         """Refuse a label field on a forge that has no labels. No call is made.
 

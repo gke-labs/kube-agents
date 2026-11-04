@@ -504,8 +504,9 @@ class HttpTransport:
     `quota_from_headers` is the forge's reader of its quota headers
     (`Forge.quota_from_headers`), handed in as `whoami_route` is. Every
     answer, a refusal included, is read through it, and the latest reading it
-    gave is what `quota()` answers; an answer it reads nothing from keeps the
-    one before, so a search answer does not erase the `core` reading.
+    gave is what `quota()` answers; an answer it reads nothing from, or no
+    `remaining` from, keeps the one before, so a search answer does not erase
+    the `core` reading.
     """
 
     def __init__(
@@ -725,7 +726,9 @@ class HttpTransport:
             reading = self._quota_from_headers(headers)
         except Exception:  # noqa: BLE001 -- a quota reading never fails the call it rode on
             return
-        if isinstance(reading, QuotaReading):
+        # A reading that says nothing of what remains would only erase a
+        # good one; the previous reading stands.
+        if isinstance(reading, QuotaReading) and reading.remaining is not None:
             self._quota = reading
 
     def _error_text(self, exc: urllib.error.HTTPError, deadline: float) -> str:

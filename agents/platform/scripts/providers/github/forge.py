@@ -185,6 +185,13 @@ class GitHubForge(Forge):
             return None
         return quota_reading(headers, RATE_LIMIT_HEADER, RATE_REMAINING_HEADER, RATE_RESET_HEADER)
 
+    @staticmethod
+    def quota_scope(path: str) -> str:
+        """The repository's owner, casefolded: the sweep token is minted per
+        owner (`mint_sweep_token` asks Minty for the owner's installation), and
+        each App installation has a quota of its own."""
+        return path.strip("/").split("/", 1)[0].casefold()
+
     def __init__(
         self,
         refresh: Callable[[str, str], None] | None = None,

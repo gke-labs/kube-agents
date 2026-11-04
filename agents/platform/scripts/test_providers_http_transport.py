@@ -512,11 +512,26 @@ class QuotaTest(unittest.TestCase):
         sender.api("GET", "user")
         self.assertEqual(4321, sender.quota().remaining)
 
+    def test_a_reading_with_no_remaining_keeps_the_reading_before(self):
+        limit_only = {"X-RateLimit-Limit": "5000", "X-RateLimit-Reset": "1767229200"}
+        sender = self.quota_transport(
+            Opener(_Response(b"{}", headers=GITHUB_CORE), _Response(b"{}", headers=limit_only))
+        )
+        sender.api("GET", "user")
+        sender.api("GET", "user")
+        self.assertEqual(providers.QuotaReading(5000, 4321, 1767225600.0), sender.quota())
+
     def test_malformed_values_read_as_unknown_fields(self):
         headers = {"X-RateLimit-Limit": "lots", "X-RateLimit-Remaining": "-3", "X-RateLimit-Reset": "12"}
+        self.assertEqual(
+            providers.QuotaReading(None, None, 12.0), FORGES["github"].quota_from_headers(
+                {name.lower(): value for name, value in headers.items()}
+            )
+        )
+        # With no `remaining`, the transport keeps none of it.
         sender = self.quota_transport(Opener(_Response(b"{}", headers=headers)))
         sender.api("GET", "user")
-        self.assertEqual(providers.QuotaReading(None, None, 12.0), sender.quota())
+        self.assertIsNone(sender.quota())
 
     def test_a_github_answer_for_another_resource_is_not_read(self):
         search = {**GITHUB_CORE, "X-RateLimit-Remaining": "3", "X-RateLimit-Resource": "search"}
@@ -580,6 +595,13 @@ class ForgeQuotaHeadersTest(unittest.TestCase):
         self.assertEqual(providers.QuotaReading(None, 12, None), read({"ratelimit-remaining": "12"}))
         self.assertIsNone(read({}))
         self.assertIsNone(read({"x-ratelimit-remaining": "5"}), "GitHub's spelling is not GitLab's")
+
+    def test_the_quota_scope_is_the_owner_on_github_and_the_host_elsewhere(self):
+        self.assertEqual("acme", FORGES["github"].quota_scope("Acme/infra"))
+        self.assertEqual("acme", FORGES["github"].quota_scope("acme/apps"))
+        for name in ("gitlab", "gitea", "bitbucket", "bitbucket-datacenter"):
+            with self.subTest(forge=name):
+                self.assertEqual("", FORGES[name].quota_scope("acme/infra"))
 
     def test_gitea_and_bitbucket_report_no_quota(self):
         everything = {
