@@ -53,6 +53,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -4356,6 +4357,16 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				ResourceNames: []string{a2aHomeChannelRecordName(agent)},
 				Verbs:         []string{"get", "patch"},
 			},
+			// The election's Lease, one named object: the gateway reads
+			// and renews it (a2a/gateway/election.go). No create, which
+			// RBAC can't scope to a name, so the operator creates it
+			// (ensureA2AGatewayLease); no delete and no list.
+			{
+				APIGroups:     []string{"coordination.k8s.io"},
+				Resources:     []string{"leases"},
+				ResourceNames: []string{a2aGatewayLeaseName(agent)},
+				Verbs:         []string{"get", "update"},
+			},
 		},
 	}
 	// The resolved scope under mode next, one named ConfigMap, read only:
@@ -5067,6 +5078,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{
 			FieldPath: "metadata.namespace",
 		}}},
+		// The election (a2a/gateway/election.go): the Lease
+		// the gateway campaigns for and its identity there.
+		a2aGatewayLeaseEnv(agent)[0],
+		a2aGatewayLeaseEnv(agent)[1],
 		// The attribution salt is SESSION_KV_SALT, the
 		// same Secret key the platform agent hashes
 		// session metadata with — one human, one
@@ -5229,6 +5244,9 @@ type a2aProvisionState struct {
 	// the document goes stale, whichever is first; zero for no deadline.
 	scopeCondition *metav1.Condition
 	scopeRequeue   time.Duration
+	// leaseRequeue is how long until a held-back recreate of the gateway's
+	// Lease is due (ensureA2AGatewayLease); zero when none is held.
+	leaseRequeue time.Duration
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -5758,6 +5776,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, fmt.Errorf("failed to apply A2A gateway %T: %w", obj, err)
 		}
 	}
+	// The election's Lease, before the Deployment whose pods campaign for
+	// it, beside the Role that grants them it.
+	leaseWait, err := r.ensureA2AGatewayLease(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+	state.leaseRequeue = leaseWait
 
 	// The inject backend's principal map, BEFORE the Deployment that mounts
 	// it: the ConfigMap volume is not optional, so a gateway pod scheduled
@@ -6304,6 +6329,8 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 	doorMeta := metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The election's Lease, after the gateway that held it.
+		{&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayLeaseName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to

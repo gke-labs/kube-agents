@@ -337,7 +337,10 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    PDB, the spread, the Lease (with its owner reference and
    an `Owns` watch, recreated one `leaseDuration` after a deletion) and its Role. Its tests pin
    each, including the held-back recreate, the first roll across the election, and a pin to a
-   pre-election image and back.
+   pre-election image and back. It lands in two parts: first the Lease, its Role grant and the
+   gateway's election env, at one replica with `Recreate`, so the election runs on every install
+   before a standby exists; then the replicas, the strategy and their guard, the readiness probe,
+   the PDB and the spread.
 5. **The cards-pending mark on the record** (planned separately).
 6. **Live runs** on a `next` lane: a rollout, a node drain and a force delete of the active pod
    while a task streams, measuring the gap and showing every event rendered once.
