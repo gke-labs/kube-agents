@@ -3918,6 +3918,65 @@ def test_a_stop_that_drops_once_in_transport_is_retried(
     assert answers[0][0] is True
 
 
+def test_a_stop_answered_by_a_standby_waits_its_retry_after(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop's retry waits a standby's Retry-After before it respawns, as
+    the opening exchange's does."""
+    real_submit = inject.InjectTask.submit
+    drops: list[int] = []
+    sleeps: list[float] = []
+    real_sleep = time.sleep
+
+    def flaky(self: Any) -> str:
+        if self.prompt == stop_hook.STOP_WORD and not drops:
+            drops.append(1)
+            raise inject.InjectUnavailable("HTTP 503: standby", retryable=True, answered=True, retry_after=2.0)
+        return real_submit(self)
+
+    def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        real_sleep(min(seconds, 0.01))
+
+    def arrange(stub: _StubGatewayServer) -> None:
+        refuse_no_task(stub)
+        monkeypatch.setattr(inject.InjectTask, "submit", flaky)
+        monkeypatch.setattr(harness.time, "sleep", _sleep)
+
+    _, answers = run_stopped_ask(stub_gateway, monkeypatch, arrange)
+
+    assert drops == [1]
+    assert 2.0 in sleeps, sleeps
+    assert answers[0][0] is True
+
+
+def test_a_failed_read_after_a_standbys_503_moves_off_the_owned_forward(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owned forward is the replica that just answered as a standby: a
+    respawn whose lease read fails goes to the Service, not back to it."""
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(stub_gateway.server_address[1]))
+    calls: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(harness, "_ensure_port_forward", lambda port, *, service=None, remote_port=0: calls.append(("ensure", service)))
+    monkeypatch.setattr(harness, "_reset_port_forward", lambda port, *, service=None, remote_port=0: calls.append(("reset", service)))
+    monkeypatch.setattr(harness, "_owned_forward_target", lambda port: "pod/platform-agent-a2a-gateway-a")
+    monkeypatch.setattr(harness, "_gateway_door_target", lambda agent_service, service: None)
+    monkeypatch.setattr(harness.time, "sleep", lambda seconds: None)
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.poll_status = 503
+    stub_gateway.poll_retry_after = "2"
+    stub_gateway.poll_failures = 1
+    stub_gateway.poll_fail_after_seconds = 0.5
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    KubeAgentsHarness().run("take your time")
+
+    assert ("reset", "svc/platform-agent-a2a-inject") in calls, calls
+
+
 # A mid-turn stop (stop_hook.MID_TURN_DIRECTIVE): the `stop` goes from the
 # opening exchange's polls while the task is working, before its terminal.
 

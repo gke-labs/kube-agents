@@ -278,13 +278,14 @@ _INJECT_REMOTE_PORT = 8099
 # The A2A gateway's Lease, whose holder is the one replica serving the doors
 # once the gateway runs more than one (docs/designs/gateway-replicas.md). The
 # tunnel forwards to that pod, read again on every respawn; a standby answers
-# 503 and a respawn finds the new holder. With no Lease, or none readable,
-# the install runs one unelected gateway and the door's Service reaches it.
+# 503 and a respawn finds the new holder. With no Lease, or no holder, the
+# install runs one unelected gateway and the door's Service reaches it.
 _GATEWAY_LEASE_SUFFIX = "-a2a-gateway"
 # The most the harness waits on a 503's Retry-After before it respawns the
-# tunnel: a gateway standby asks for its election's retry period (2s), and a
-# handover leaves the lease with no holder for about that long, so retrying at
-# once would spend the transport budget before the new leader serves.
+# tunnel: a gateway standby asks for its election's retry period
+# (electionRetryPeriod in a2a/gateway/election.go), and a handover leaves the
+# lease with no holder for about that long, so retrying at once would spend
+# the transport budget before the new leader serves.
 _RETRY_AFTER_CAP = 10.0
 _LEASE_READ_TIMEOUT = 15
 # How much of a failed kubectl read's stderr the warning quotes.
@@ -2966,7 +2967,11 @@ class KubeAgentsHarness(AgentHarness):
         # The last target the tunnel was aimed at, for the messages below.
         tunnel_target = [f"svc/{service}"]
 
-        def _tunnel(reset: bool) -> None:
+        def _tunnel(reset: bool, after_standby: bool = False) -> None:
+            """Establish or respawn the inject tunnel. ``after_standby``: the
+            failure being retried was a standby's 503 (it carried a
+            Retry-After) through the forward this process owns, so that
+            forward is not one to keep when the lease can't be read."""
             if not own_tunnel:
                 return
             # Resolved on every spawn: after a 503 from a standby or a tunnel
@@ -2974,8 +2979,10 @@ class KubeAgentsHarness(AgentHarness):
             resolved = _gateway_door_target(agent_service, service)
             owned = _owned_forward_target(local_port)
             # A read that failed says nothing about where the door is: keep
-            # the forward this process owns, or the Service if it owns none.
-            tunnel_target[0] = resolved or owned or f"svc/{service}"
+            # the forward this process owns, or the Service if it owns none
+            # or the owned one just answered as a standby.
+            keep = None if after_standby else owned
+            tunnel_target[0] = resolved or keep or f"svc/{service}"
             # A tunnel this process already owns on the port (from an earlier
             # exchange) may still go where the lease pointed then; a port that
             # is open says nothing about where, so it is replaced.
@@ -3104,7 +3111,7 @@ class KubeAgentsHarness(AgentHarness):
                         raise
                     _wait_retry_after(exc)
                     try:
-                        _tunnel(reset=True)
+                        _tunnel(reset=True, after_standby=exc.retry_after is not None)
                     except RuntimeError as pf_exc:
                         # Counted, not raised: the ceiling above ends it.
                         _log.warning(
@@ -3275,7 +3282,7 @@ class KubeAgentsHarness(AgentHarness):
                         ) from exc
                     _wait_retry_after(exc)
                     try:
-                        _tunnel(reset=True)
+                        _tunnel(reset=True, after_standby=exc.retry_after is not None)
                     except RuntimeError as pf_exc:
                         _log.warning("inject: port-forward respawn failed before retry: %s", pf_exc)
             if started:
