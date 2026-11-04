@@ -63,7 +63,7 @@ the operator's scrape, so enabling them without it is refused at render.
 {{- $fell := "kubeagents:platformagent:proposals_fell_14d" }}
 {{- $times := "kubeagents_platformagent_usage_time_seconds" }}
 {{- $phase := "kubeagents_platformagent_phase" }}
-{{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
+{{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-kube-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
 {{- /* The exec tier's scrape job, while the tier renders: an exec tier no scrape reaches is as dark as a broker. */}}
 {{- if gt (include "kube-agents.credentialProxyExecReplicas" . | int) 0 }}
 {{- $jobs = append $jobs (printf "%s-credential-proxy-exec-tier-monitoring" $agent) }}

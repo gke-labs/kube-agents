@@ -11875,6 +11875,24 @@ spec:
                       format: int32
                       type: integer
                   type: object
+                inference:
+                  description: |-
+                    Inference reports the Platform Agent's default model, as the install's LiteLLM
+                    config states it. The key is absent until the operator reads the config; an
+                    empty object means the config states no default model; a read that fails keeps
+                    what is there; the key is absent while the served CRD predates it.
+                  properties:
+                    model:
+                      description: |-
+                        Model is the model name after the provider, as typed, or the resource id alone
+                        for a resource reference.
+                      type: string
+                    provider:
+                      description: |-
+                        Provider is the LiteLLM provider slug, the text before the first "/" of the
+                        default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
+                      type: string
+                  type: object
                 lastReconcileTime:
                   description:
                     LastReconcileTime is the timestamp when the operator

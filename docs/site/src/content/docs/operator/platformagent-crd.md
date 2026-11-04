@@ -903,7 +903,7 @@ spec:
 - `sharedVpcHosts` and `metricsScopes` — project IDs of Shared VPC host projects, and of the scoping projects of Cloud Monitoring Metrics Scopes. Neither is a Resource Manager container: each is resolved on every run to the projects it reaches, and those projects then take the `projects` path above. [`spec.scope.sharedVpcHosts` and `spec.scope.metricsScopes`](#specscopesharedvpchosts-and-specscopemetricsscopes) has the lookups, the roles they need, and how a monitored project the scope names by number reads.
 - `maxProjects` — the most projects the reconcile lists per run, the management project included, 1 to 5000, 100 by default: explicit projects, selector members and container members fill it in that fixed order, and a project past it reads `over-cap` (profiles kept, nothing created).
 
-  The reconcile lists with four workers at every cap and sizes its listing budget from it, 300 seconds per default cap's worth of projects, and the bootstrap gate's ceiling on the reconcile follows the budget, so an estate of a few hundred projects declares the number it has rather than reading half of itself `over-cap`; the snapshot records the cap in force under `maxProjects`.
+  The reconcile lists with four workers at every cap and sizes its listing budget from it, 300 seconds per default cap's worth of projects, and the bootstrap gate's ceiling on the reconcile follows the budget, so an estate of a few hundred projects declares the number it has rather than reading half of itself `over-cap`; the snapshot records the cap in force under `maxProjects`. Each run creates at most 100 profiles and leaves the rest to the next run, so a wide scope onboards in batches a run apart rather than against that ceiling; `BOOTSTRAP_MAX_CREATES_PER_TICK` under [`spec.deployment.env`](#specdeployment) sets the number.
 
   The Terraform composition refuses a plan whose explicit projects and selector members exceed it, while a selector is declared or the cap is below its default, and renders the same value here from its `scope.max_projects` (`SCOPE_MAX_PROJECTS` in `install.env`). A CR edited by hand takes the value directly. The 100-entry cap on each declared list is unchanged: a hand-written list past a hundred entries is the shape folders exist for.
 
@@ -1290,7 +1290,7 @@ So each base has one spelling, the one the broker targets and protects. Changing
 
 ## `status`
 
-The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, and what each condition reports, follows.
+The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, where `inference` comes from, and what each condition reports, follows.
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
 `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
@@ -1331,6 +1331,22 @@ sweep.
 
 The operator also serves every counter, cluster gauge, proposal reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
+`inference.provider` and `inference.model` are the install's default model, the one LiteLLM serves
+under `model-default`. The operator reads the LiteLLM config ConfigMap the `litellm` Deployment
+mounts, or, with no such Deployment, the newest `litellm-config` or `litellm-config-*` ConfigMap
+that carries `config.yaml`. It takes the `litellm_params.model` of the `model_list` entry named
+`model-default`, or the first provider-qualified entry when no entry has that name, and splits it at
+its first `/`. A Vertex AI endpoint path (`projects/…`) or a Bedrock ARN keeps its resource id only,
+so no project id, region or account id is written; every other name is kept as typed, an
+organisation prefix such as `meta-llama/` included.
+
+The pair is written whole or not at all. Both fields are absent when the namespace has no LiteLLM
+config, when the `litellm` Deployment mounts none, or when the default model has no provider or no
+name. A Deployment that mounts none leaves any remaining `litellm-config*` ConfigMaps unread, and a
+`model-default` entry with a malformed model does not fall back to another entry. A read that fails keeps the last pair. The
+Ready status update writes the block, and a change to the ConfigMap or to the `litellm`
+Deployment's pod template re-reads it within a reconcile.
+
 `usage.activeInterfaces` is `dashboard` unless `harness.hermes.dashboardEnabled` is `false`, plus
 `googlechat`, `slack` and `teams` for each `integration` entry with `enabled: true`. It is resolved
 from the spec on every reconcile and written by the Ready status update when it changes; a pass that
@@ -1342,6 +1358,7 @@ operator notices from the write's echo, stops treating the missing field as a ch
 minutes at a time, and lands it once this release's CRD is applied: within five minutes on a quiet
 install, at once when the Ready status update next writes for any other reason. The other status
 writers carry the field through as they read it, so a pass that ends `Degraded` lands nothing new.
+`inference` follows the same rule under a served CRD that predates it.
 
 The counters and the two times land through the poller above, which consults the same five-minute
 record. Under a served CRD that predates `status.usage` they accumulate in the
@@ -1736,21 +1753,32 @@ force-syncs either way.
 A `cluster-*` profile's `config.yaml` is never force-synced: it carries the `cluster_identity`
 stamp the cluster reconciler matches the profile to its cluster by, and an overwrite would strip
 it. It is back-filled from the cluster template instead, on the same fill-only terms — keys the
-template declares and the live file has lost are restored at the next start, and `cluster_identity`
+template declares and the live file has lost are restored on a pass, and `cluster_identity`
 and every value the file already holds are left alone, except the retired `memory.provider` key,
-which the entrypoint drops. The persona files and `skills/` beside it still force-sync.
+which the entrypoint drops.
+
+A cluster profile takes these steps, the persona copy, the `skills/` replace, the shared plugin
+refresh, the back-fill and the repairs below, on a pass. A pass runs only when the profile's
+`.scaffold-stamp` does not match the image: the first start on a new image, a start after a pass
+that warned, or one after the stamp was deleted.
+
+The entrypoint hashes what a pass reads from the image once per start and stamps each cluster
+profile it refreshed without a warning. On a same-image restart a stamped profile is left as it
+is, hand edits included. Delete `profiles/cluster-*/.scaffold-stamp` to send a profile through
+the pass on the next start. Without the stamp script every profile is refreshed and none is
+stamped.
 
 The remote MCP server entries inside both of these files do follow the image (see
 [the config reference](/kube-agents/reference/config/)). The back-fill recurses only through
 mappings and a server's `args` is a list, so it would otherwise stay as the image that scaffolded
 the profile spelled it for the life of the volume.
 
-At every start the entrypoint repairs it in each cluster profile's `config.yaml`, and in the
-platform profile's when it is the front door: for a server the template routes through the
-credential proxy's MCP relay (`gke` and `developer_knowledge`), the whole `args` list and the
-`MCP_REMOTE_BEARER_FILE` entry in its `env` become the template's, so a hand edit to either is
-reverted at the next start; for any other remote server the image ships, only the `User-Agent`
-header value is set. Nothing else in the file is changed.
+The entrypoint repairs it in each cluster profile's `config.yaml` on a pass through the profile,
+and in the platform profile's at every start when it is the front door: for a server the template
+routes through the credential proxy's MCP relay (`gke` and `developer_knowledge`), the whole
+`args` list and the `MCP_REMOTE_BEARER_FILE` entry in its `env` become the template's, so a hand
+edit to either is reverted at the next pass or start; for any other remote server the image
+ships, only the `User-Agent` header value is set. Nothing else in the file is changed.
 
 The `plugins.enabled` list follows the image for the same reason: it is a list, so the back-fill
 never enters it. In the `default`, `platform` and every cluster profile it gains the names the
