@@ -14005,12 +14005,14 @@ class PrincipalPodTest(unittest.TestCase):
         self.assertEqual(principal.pod, "agent-a2a-session-abc12")
         self.assertEqual(self.CALLER, principal.describe())
         record = credential_proxy._tool_audit(
-            credential_proxy.AUDIT_STATUS_STARTED, "req-1", principal.describe(), "kubectl", "get", pod=principal.pod
+            credential_proxy.AUDIT_STATUS_STARTED, "req-1", principal.describe(), "kubectl", "get", pod=principal.pod,
+            broker_tier="stateful", klass="interactive",
         )
         self.assertEqual(record["pod"], "agent-a2a-session-abc12")
         self.assertEqual(record["principal"], self.CALLER)
         bare = credential_proxy._tool_audit(
-            credential_proxy.AUDIT_STATUS_STARTED, "req-2", self.CALLER, "kubectl", "get", pod=""
+            credential_proxy.AUDIT_STATUS_STARTED, "req-2", self.CALLER, "kubectl", "get", pod="",
+            broker_tier="stateful", klass="interactive",
         )
         self.assertNotIn("pod", bare)
 
@@ -18231,6 +18233,17 @@ class FeedbackRouteTest(_ExecRouteServer):
         self.assertEqual((status, body["status"]), (400, "BLOCKED"))
         self.assertFalse(any(token in line for line in logs.output), "the token reached the log")
         self.assertTrue(any("feedback submit" in line for line in logs.output))
+
+    def test_the_audit_record_names_the_tier_and_the_interactive_class(self):
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            self.post_as(credential_proxy.CALLER_ROLE_SHELL, {**self.GOOD_PAYLOAD, "user_confirmed": False})
+        audits = [record.audit for record in logs.records if hasattr(record, "audit")]
+        self.assertTrue(audits)
+        for audit in audits:
+            self.assertEqual(
+                (audit["event_type"], audit["broker_tier"], audit["class"]),
+                ("tool_execution_audit", "stateful", "interactive"),
+            )
 
     def test_a_refusal_reason_is_redacted_before_it_is_logged(self):
         token = "ghp_" + "b" * 36
