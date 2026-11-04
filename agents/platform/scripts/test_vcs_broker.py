@@ -3836,6 +3836,8 @@ class SnapshotTest(unittest.TestCase):
             self.broker.snapshot({"repository": self.REPOSITORY})
         fields = caught.exception.fields
         self.assertEqual(1 << 20, fields["ceiling"])
+        # The commit measured, as `PATH_NOT_FOUND` carries it.
+        self.assertEqual(git(self.seed, "rev-parse", "HEAD").stdout.strip(), fields["revision"])
         self.assertEqual(
             [("README.md", "blob"), ("manifests", "tree"), ("run.sh", "blob"), ("zeros", "tree")],
             [(entry["path"], entry["type"]) for entry in fields["entries"]],

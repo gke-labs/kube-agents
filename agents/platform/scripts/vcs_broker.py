@@ -1215,7 +1215,7 @@ class VcsBroker:
             # The second check: the measure above is the one that keeps a
             # large tar off the disk.
             if size > self.max_snapshot_bytes:
-                raise self._snapshot_too_large(repo, size)
+                raise self._snapshot_too_large(repo, size, revision=revision)
             blob = base64.b64encode(archive.read_bytes()).decode("ascii")
         finally:
             self._discard_scratch(root)
@@ -1231,16 +1231,24 @@ class VcsBroker:
         }
 
     def _snapshot_too_large(
-        self, repo: str, size: int, entries: list[dict[str, Any]] | None = None
+        self,
+        repo: str,
+        size: int,
+        entries: list[dict[str, Any]] | None = None,
+        revision: str | None = None,
     ) -> WorkspaceError:
         """The 413, with the entries one level down when the measure listed them.
 
         `ceiling` goes with it, so a caller can choose entries that fit
-        without knowing this install's setting.
+        without knowing this install's setting, and the `revision` measured,
+        as on `PATH_NOT_FOUND`, so a caller that reads no part still learns
+        which commit it was refused.
         """
         fields: dict[str, Any] = {"code": "SNAPSHOT_TOO_LARGE", "ceiling": self.max_snapshot_bytes}
         if entries is not None:
             fields["entries"] = entries
+        if revision:
+            fields["revision"] = revision
         return WorkspaceError(
             f"the snapshot of {repo} is {size} bytes, over the "
             f"{self.max_snapshot_bytes}-byte ceiling. Name `paths` to "
@@ -1273,7 +1281,7 @@ class VcsBroker:
             )
         size = _tar_bytes(listed.stdout or "")
         if size > self.max_snapshot_bytes:
-            raise self._snapshot_too_large(repo, size, _snapshot_entries(listed.stdout or "", paths))
+            raise self._snapshot_too_large(repo, size, _snapshot_entries(listed.stdout or "", paths), revision)
 
     def snapshot_source(self, repository: Any) -> tuple[Any, tuple[str, str, str] | None]:
         """The repository `snapshot` resolves, and the read outside the host table, if any.

@@ -78,10 +78,11 @@ class FakeParts:
     that names none. Any other request is served from ``tree``.
     """
 
-    def __init__(self, tree, refusals, ceiling=1000, revisions=("abc1234",)):
+    def __init__(self, tree, refusals, ceiling=1000, revisions=("abc1234",), refused_revision=None):
         self.tree = tree
         self.refusals = refusals
         self.ceiling = ceiling
+        self.refused_revision = refused_revision
         self.revisions = list(revisions)
         self.calls = []
 
@@ -90,7 +91,11 @@ class FakeParts:
         self.calls.append(key)
         if key in self.refusals:
             raise scan.vcs_client.VcsError(
-                "too large", code=scan.vcs_client.SNAPSHOT_TOO_LARGE, entries=self.refusals[key], ceiling=self.ceiling
+                "too large",
+                code=scan.vcs_client.SNAPSHOT_TOO_LARGE,
+                entries=self.refusals[key],
+                ceiling=self.ceiling,
+                revision=self.refused_revision,
             )
         Path(into).mkdir(parents=True, exist_ok=True)
         write_tree(into, {p: c for p, c in self.tree.items() if any(p == q or p.startswith(q + "/") for q in paths)})
@@ -556,9 +561,39 @@ class InPartsTest(unittest.TestCase):
 
         self.assertEqual(scan.NARROW_PATHS_PER_SNAPSHOT, vcs_broker.MAX_SNAPSHOT_PATHS)
         self.assertEqual(scan.NARROW_PATH_BYTES_PER_SNAPSHOT, vcs_broker.MAX_SNAPSHOT_PATHS_BYTES)
+        self.assertEqual(scan.NARROW_PATH_BYTES, vcs_broker.MAX_SNAPSHOT_PATH_BYTES)
         self.assertEqual(scan.CEILING_ENV, vcs_broker.MAX_SNAPSHOT_BYTES_ENV)
         self.assertEqual(scan.MANIFEST_SUFFIXES, vcs_broker.SNAPSHOT_MANIFEST_SUFFIXES)
         self.assertEqual(scan.ENTRY_TREE, vcs_broker.SNAPSHOT_ENTRY_TREE)
+
+    def test_a_refused_tree_with_no_manifest_names_its_commit_and_says_so(self):
+        fake = FakeParts(self.TREE, {None: [entry("charts", 5000, manifests=0)]}, refused_revision="fedcba9")
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual(([None], "fedcba9", True, 0, []), (fake.calls, read.sha, read.in_parts, read.parts, read.unread))
+        table = scan.load_table()
+        report = scan.build_report(table, (1, 24), (1, 27), [], [("acme/infra", lambda: read)])
+        out = scan.render_report(report)
+        self.assertIn("## acme/infra — repo manifests as of fedcba9", out)
+        self.assertIn("the whole tree is over the broker's snapshot ceiling, so the scan took the parts that hold manifests; no part of it holds one", out)
+        self.assertEqual(0, report["summary"]["unread"])
+
+    def test_the_branch_moving_after_the_refusal_is_noted(self):
+        fake = FakeParts(self.TREE, {None: [entry("top.yaml", 20, kind="blob")]}, refused_revision="fedcba9")
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual(["fedcba9", "abc1234"], read.revisions)
+        self.assertEqual("fedcba9", read.sha)
+
+    def test_a_name_the_broker_would_refuse_is_listed_alone_and_the_rest_is_read(self):
+        odd = "k8s\\manifests"
+        fake = FakeParts(self.TREE, {None: [
+            entry("clusters", 600, manifests=2), entry(odd, 20), entry("x" * 4097, 20), entry("top.yaml", 20, kind="blob"),
+        ]})
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual([None, ("clusters", "top.yaml")], fake.calls)
+        self.assertEqual(sorted(read.files), ["clusters/a/pdb.yaml", "clusters/b/cron.yaml", "top.yaml"])
+        reasons = {unread["path"]: unread["reason"] for unread in read.unread}
+        self.assertEqual({odd, "x" * 4097}, set(reasons))
+        self.assertIn("4096 bytes", reasons["x" * 4097])
 
     def test_a_refusal_that_names_no_entries_is_still_an_error(self):
         fake = FakeParts(self.TREE, {None: None})
