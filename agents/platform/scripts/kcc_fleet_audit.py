@@ -6,12 +6,13 @@ compact `kubectl get crd -o custom-columns=... --no-headers` call (avoiding Open
 schema bloat over the credential proxy's 8 MiB per-stream output cap, 4 MiB when
 `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES` is unset), partitions served established CRDs by
 scope (`Cluster` vs `Namespaced`), and queries active custom resources in parallel
-chunked `kubectl get` batches (`BATCH_CHUNK_SIZE = 35`, `MAX_PARALLEL_WORKERS = 4`)
-instead of issuing up to 233 sequential per-CRD RPCs. Automatically falls back to
-per-CRD reads if a batch fails or hits credential-proxy output truncation, fails closed
-(`CLEAN_AUDIT_STOP: NO`) whenever any CRD cannot be read, and summarizes KCC operator
-health (`ConfigConnector`, `ConfigConnectorContext`) and managed resource synchronization.
-Part of kube-agents #3142.
+chunked `kubectl get ... -o jsonpath=...` batches (`BATCH_CHUNK_SIZE = 35`,
+`MAX_PARALLEL_WORKERS = 4`) instead of issuing up to 233 sequential per-CRD RPCs or
+streaming full `.spec` / `managedFields` payloads across the proxy. Automatically falls
+back to per-CRD reads if a batch fails or hits credential-proxy output truncation, fails
+closed (`CLEAN_AUDIT_STOP: NO`) whenever any CRD cannot be read, and summarizes KCC
+operator health (`ConfigConnector`, `ConfigConnectorContext`) and managed resource
+synchronization. Part of kube-agents #3142.
 """
 
 from __future__ import annotations
@@ -53,6 +54,24 @@ CRD_DISCOVERY_CMD: tuple[str, ...] = (
 DISCOVERY_MIN_COLS_SCOPE = 2
 DISCOVERY_MIN_COLS_SERVED = 3
 DISCOVERY_MIN_COLS_ESTABLISHED = 4
+
+KCC_RECORD_SEP = "\x1e"
+KCC_FIELD_SEP = "\x1f"
+KCC_PROJECTED_FIELD_COUNT = 6
+# Project only the 6 fields `evaluate_kcc_item` inspects (`.kind`, `.metadata.namespace`,
+# `.metadata.name`, `.metadata.generation`, `.status`, `.spec.mode`) instead of `-o json`
+# so `kubectl` drops `.spec`, `.metadata.managedFields`, and `last-applied-configuration`
+# payloads before crossing the credential proxy's 8 MiB per-stream cap (and satisfies
+# `scripts/check_cluster_reads.py` without allow-list entries). `kubectl`'s JSONPath printer
+# marshals map/slice values (such as `.status`) as compact single-line JSON with control
+# characters escaped (`\u001e` / `\u001f`), so ASCII RS/US framing stays lossless even when
+# `.status` messages or `.spec.mode` values contain tabs, spaces, or newlines.
+KCC_OBJECT_JSONPATH = (
+    'jsonpath={range .items[*]}{.kind}{"\\x1f"}{.metadata.namespace}{"\\x1f"}'
+    '{.metadata.name}{"\\x1f"}{.metadata.generation}{"\\x1f"}{.status}{"\\x1f"}'
+    '{.spec.mode}{"\\x1e"}{end}'
+)
+NAMESPACE_CHECK_JSONPATH = "jsonpath={.metadata.name}"
 
 # Batching tuning: 35 CRDs per `kubectl get crd1,crd2,...` reduces ~233 KCC CRDs to 8 RPCs
 # across 4 worker threads (~3-5s total). MAX_PARALLEL_WORKERS matches collect.py's 4-slot
@@ -160,14 +179,77 @@ def run_cmd(
         return 1, str(exc)
 
 
-def run_kubectl_json(
+def _run_bounded_cmd(
     args: list[str],
     env: dict[str, str],
+    deadline: float,
+    monotonic_fn: Callable[[], float],
+) -> tuple[int, str]:
+    """Compute remaining wall-clock budget at execution start rather than submission."""
+    timeout = min(float(KUBECTL_TIMEOUT_SECONDS), deadline - monotonic_fn())
+    return run_cmd(args, env, timeout=timeout)
+
+
+def parse_projected_kcc_items(stdout: str) -> tuple[int, list[dict], str]:
+    """Parse `KCC_OBJECT_JSONPATH` output into reconstructed item dicts.
+
+    Note: never call unrestricted `str.strip()` on `stdout`, because Python classifies
+    ASCII RS (`\\x1e`) and US (`\\x1f`) as whitespace (`str.isspace() == True`).
+    """
+    raw = stdout.strip("\r\n")
+    if not raw:
+        return 0, [], ""
+    if not raw.endswith(KCC_RECORD_SEP):
+        return 1, [], "incomplete projected kubectl output"
+
+    items: list[dict] = []
+    for record in raw[:-1].split(KCC_RECORD_SEP):
+        fields = record.split(KCC_FIELD_SEP, KCC_PROJECTED_FIELD_COUNT - 1)
+        if len(fields) != KCC_PROJECTED_FIELD_COUNT:
+            return 1, [], "malformed projected kubectl output"
+        kind_raw, ns_raw, name_raw, gen_raw, status_raw, spec_mode_raw = fields
+        if not kind_raw or kind_raw == "null" or not name_raw or name_raw == "null":
+            return 1, [], "projected kubectl item missing kind or metadata.name"
+
+        metadata: dict[str, object] = {"name": name_raw}
+        if ns_raw and ns_raw != "null":
+            metadata["namespace"] = ns_raw
+        if gen_raw and gen_raw != "null":
+            try:
+                metadata["generation"] = int(gen_raw)
+            except ValueError:
+                return 1, [], f"invalid metadata.generation {gen_raw!r} from kubectl"
+
+        status_obj: dict[str, object] = {}
+        if status_raw and status_raw != "null":
+            try:
+                parsed_status = json.loads(status_raw)
+            except Exception as exc:
+                return 1, [], f"invalid .status JSON from kubectl ({exc})"
+            if parsed_status is not None:
+                if not isinstance(parsed_status, dict):
+                    return 1, [], "unexpected non-object .status JSON from kubectl"
+                status_obj = parsed_status
+
+        item: dict[str, object] = {
+            "kind": kind_raw,
+            "metadata": metadata,
+            "status": status_obj,
+        }
+        if spec_mode_raw and spec_mode_raw != "null":
+            item["spec"] = {"mode": spec_mode_raw}
+        items.append(item)
+
+    return 0, items, ""
+
+
+def run_kubectl_projected(
+    cmd: list[str],
+    env: dict[str, str],
     timeout: float = KUBECTL_TIMEOUT_SECONDS,
-) -> tuple[int, dict]:
+) -> tuple[int, list[dict], str]:
     if timeout <= 0:
-        return 1, {"error": BUDGET_EXHAUSTED_ERROR}
-    cmd = ["kubectl", *args, "-o", "json"]
+        return 1, [], BUDGET_EXHAUSTED_ERROR
     try:
         res = subprocess.run(
             cmd,
@@ -178,36 +260,35 @@ def run_kubectl_json(
             timeout=timeout,
             check=False,
         )
-        if res.returncode == 0 and res.stdout.strip():
+        if res.returncode == 0:
             stderr_msg = res.stderr.strip()
             if PROXY_TRUNCATED_MARKER in stderr_msg.lower():
-                return 1, {"error": stderr_msg}
-            try:
-                parsed = json.loads(res.stdout)
-                if isinstance(parsed, dict):
-                    return 0, parsed
-                return 1, {"error": "unexpected non-object JSON output from kubectl"}
-            except Exception as exc:
-                err_text = f"{stderr_msg} ({exc})" if stderr_msg else str(exc)
-                return 1, {"error": err_text}
-        return res.returncode or 1, {
-            "stderr": res.stderr.strip() or f"kubectl exit {res.returncode} with no output"
-        }
+                return 1, [], stderr_msg
+            parse_code, parsed_items, parse_err = parse_projected_kcc_items(res.stdout)
+            if parse_code == 0:
+                return 0, parsed_items, ""
+            err_text = f"{stderr_msg} ({parse_err})" if stderr_msg else parse_err
+            return 1, [], err_text
+        return (
+            res.returncode,
+            [],
+            res.stderr.strip() or f"kubectl exit {res.returncode} with no output",
+        )
     except subprocess.TimeoutExpired:
-        return 1, {"error": f"kubectl timed out after {timeout:.0f}s"}
+        return 1, [], f"kubectl timed out after {timeout:.0f}s"
     except Exception as exc:
-        return 1, {"error": str(exc)}
+        return 1, [], str(exc)
 
 
-def _run_bounded_kubectl_json(
-    args: list[str],
+def _run_bounded_kubectl_projected(
+    cmd: list[str],
     env: dict[str, str],
     deadline: float,
     monotonic_fn: Callable[[], float],
-) -> tuple[int, dict]:
+) -> tuple[int, list[dict], str]:
     """Compute remaining wall-clock budget at worker execution start rather than queue submission."""
     timeout = min(float(KUBECTL_TIMEOUT_SECONDS), deadline - monotonic_fn())
-    return run_kubectl_json(args, env, timeout=timeout)
+    return run_kubectl_projected(cmd, env, timeout=timeout)
 
 
 def discover_kcc_crds(
@@ -250,21 +331,13 @@ def discover_kcc_crds(
     return served_scopes, sorted(unserved), ""
 
 
-def _extract_items(payload: dict) -> list[dict]:
-    if "items" in payload and isinstance(payload["items"], list):
-        return [item for item in payload["items"] if isinstance(item, dict)]
-    if payload.get("kind") and isinstance(payload.get("metadata"), dict):
-        return [payload]
-    return []
-
-
-def _build_get_args(crd_names: list[str], scope: str, namespace: str | None) -> list[str]:
+def _build_get_cmd(crd_names: list[str], scope: str, namespace: str | None) -> list[str]:
     joined = ",".join(crd_names)
     if scope == CRD_SCOPE_CLUSTER:
-        return ["get", joined]
+        return ["kubectl", "get", joined, "-o", KCC_OBJECT_JSONPATH]
     if namespace is not None:
-        return ["get", joined, f"--namespace={namespace}"]
-    return ["get", joined, "-A"]
+        return ["kubectl", "get", joined, f"--namespace={namespace}", "-o", KCC_OBJECT_JSONPATH]
+    return ["kubectl", "get", joined, "-A", "-o", KCC_OBJECT_JSONPATH]
 
 
 def collect_kcc_objects(
@@ -295,8 +368,8 @@ def collect_kcc_objects(
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
             executor.submit(
-                _run_bounded_kubectl_json,
-                _build_get_args(chunk, scope, namespace),
+                _run_bounded_kubectl_projected,
+                _build_get_cmd(chunk, scope, namespace),
                 env,
                 deadline,
                 monotonic_fn,
@@ -305,14 +378,15 @@ def collect_kcc_objects(
         }
         for future, (scope, chunk) in future_map.items():
             try:
-                code, data = future.result()
+                code, batch_items, err = future.result()
             except Exception as exc:
-                code, data = 1, {"error": str(exc)}
+                code, batch_items, err = 1, [], str(exc)
             if code == 0:
-                items.extend(_extract_items(data))
+                items.extend(batch_items)
             elif len(chunk) == 1:
-                reason = data.get("stderr") or data.get("error") or "kubectl get failed"
-                failed_singletons.append((chunk[0], sanitize_cell(reason, UNREAD_REASON_MAX_CHARS)))
+                failed_singletons.append(
+                    (chunk[0], sanitize_cell(err or "kubectl get failed", UNREAD_REASON_MAX_CHARS))
+                )
             else:
                 for crd_name in chunk:
                     retry_candidates.append((scope, crd_name))
@@ -323,8 +397,8 @@ def collect_kcc_objects(
         with ThreadPoolExecutor(max_workers=retry_workers) as executor:
             retry_futures = {
                 executor.submit(
-                    _run_bounded_kubectl_json,
-                    _build_get_args([crd_name], scope, namespace),
+                    _run_bounded_kubectl_projected,
+                    _build_get_cmd([crd_name], scope, namespace),
                     env,
                     deadline,
                     monotonic_fn,
@@ -333,14 +407,15 @@ def collect_kcc_objects(
             }
             for fut, crd_name in retry_futures.items():
                 try:
-                    code, data = fut.result()
+                    code, single_items, err = fut.result()
                 except Exception as exc:
-                    code, data = 1, {"error": str(exc)}
+                    code, single_items, err = 1, [], str(exc)
                 if code == 0:
-                    items.extend(_extract_items(data))
+                    items.extend(single_items)
                 else:
-                    reason = data.get("stderr") or data.get("error") or "kubectl get failed"
-                    unread_crds[crd_name] = sanitize_cell(reason, UNREAD_REASON_MAX_CHARS)
+                    unread_crds[crd_name] = sanitize_cell(
+                        err or "kubectl get failed", UNREAD_REASON_MAX_CHARS
+                    )
 
     return items, unread_crds
 
@@ -480,17 +555,16 @@ def audit_kcc(
         isinstance(item.get("metadata"), dict) and item["metadata"].get("namespace")
         for item in raw_items
     ):
-        ns_code, ns_data = _run_bounded_kubectl_json(
-            ["get", "namespace", validated_ns],
+        ns_code, ns_out = _run_bounded_cmd(
+            ["kubectl", "get", "namespace", validated_ns, "-o", NAMESPACE_CHECK_JSONPATH],
             env,
             deadline,
             monotonic_fn,
         )
         if ns_code != 0:
-            ns_reason = (
-                ns_data.get("stderr") or ns_data.get("error") or "kubectl get namespace failed"
+            namespace_error = sanitize_cell(
+                ns_out or "kubectl get namespace failed", UNREAD_REASON_MAX_CHARS
             )
-            namespace_error = sanitize_cell(ns_reason, UNREAD_REASON_MAX_CHARS)
 
     evaluated = [evaluate_kcc_item(item) for item in raw_items]
     evaluated.sort(key=lambda r: (str(r["namespace"]), str(r["kind"]), str(r["name"])))
