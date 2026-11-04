@@ -78,6 +78,10 @@ CREATE TABLE task_events (
     payload TEXT,
     created_at INTEGER
 );
+CREATE TABLE task_links (
+    parent_id TEXT NOT NULL,
+    child_id TEXT NOT NULL
+);
 """
 
 NOW = 1_800_000_000
@@ -721,23 +725,28 @@ class ReasonTest(unittest.TestCase):
 
 
 class RssCapTest(unittest.TestCase):
+    def setUp(self):
+        # Every sweep reads this empty fixture tree, never the host's /proc.
+        self.tree = FakeTree()
+        self.addCleanup(self.tree.close)
+
     def enforce(self, conn, engine, sizes_mib, **kwargs):
+        kwargs.setdefault("proc_root", str(self.tree.proc))
         return admission.enforce_worker_rss_caps(
             conn, settings=settings(worker_rss_cap_mib=1536), engine=engine,
             rss_fn=lambda pid: None if sizes_mib.get(pid) is None else sizes_mib[pid] * MIB,
             identity_fn=lambda pid, task_id, run_started_at: True, **kwargs,
         )
 
-    def test_a_stale_rows_pid_that_predates_the_run_is_never_measured_or_killed(self):
-        """After a container restart the namespace hands a predecessor's pid to a
-        new process while the stale running row is still host-local; a process
-        that started before the row's run is not its worker, and the row is left
-        to the crash sweep."""
-        tree = FakeTree()
-        self.addCleanup(tree.close)
+    def test_a_predecessors_pid_reused_by_a_newer_worker_is_never_measured_or_killed(self):
+        """The restart collision: the stale row's run started under the previous
+        container; the process now at its pid is a newer worker of another card.
+        The command line names that card, so the stale row is left to the crash
+        sweep and nothing is signalled."""
+        tree = self.tree
         tree.process(1, ppid=0, rss_kib=1)
-        # Started 95 s before NOW; the run row says NOW.
-        tree.process(900, ppid=1, rss_kib=4000 * MIB, starttime=500)
+        tree.process(900, ppid=1, rss_kib=4000 * MIB, starttime=tree.DEFAULT_STARTTIME + 500,
+                     cmdline=["hermes", "-p", "platform", "chat", "-q", "work kanban task t_new"])
         conn = board()
         running(conn, "t_stale", pid=900)
         engine = FakeEngine(alive={900})
@@ -746,43 +755,56 @@ class RssCapTest(unittest.TestCase):
         )
         self.assertEqual((got, engine.kills, status(conn, "t_stale")), ([], [], "running"))
 
+    def test_without_a_command_line_a_run_older_than_this_dispatcher_is_not_measured(self):
+        """The same collision where /proc hides command lines: the stale run
+        predates this dispatcher process, so its pid names nothing here."""
+        root = str(self.tree.proc)
+        self.tree.process(901, ppid=1, starttime=self.tree.DEFAULT_STARTTIME + 500)
+        self.assertFalse(admission.is_runs_worker(
+            901, "t_stale", NOW - 600, proc_root=root, dispatcher_started_at=NOW - 100, clock_ticks=100,
+        ))
+        # A run this dispatcher started, with a process that started with it: the worker.
+        self.assertTrue(admission.is_runs_worker(
+            901, "t_mine", NOW, proc_root=root, dispatcher_started_at=NOW - 100, clock_ticks=100,
+        ))
+
+    def test_the_command_line_decides_when_it_is_readable(self):
+        root = str(self.tree.proc)
+        self.tree.process(910, ppid=1, cmdline=["hermes", "-p", "platform", "chat", "-q", "work kanban task t_mine"])
+        self.tree.process(911, ppid=1, cmdline=["hermes", "-p", "platform", "chat", "-q", "work kanban task t_other"])
+        # Named worker: yes, even for a run older than this dispatcher (a gateway restart in place).
+        self.assertTrue(admission.is_runs_worker(910, "t_mine", NOW - 600, proc_root=root, dispatcher_started_at=NOW - 100))
+        self.assertFalse(admission.is_runs_worker(911, "t_mine", NOW, proc_root=root))
+
     def test_the_runs_own_worker_is_measured(self):
-        tree = FakeTree()
-        self.addCleanup(tree.close)
+        tree = self.tree
         tree.process(1, ppid=0, rss_kib=1)
-        tree.process(901, ppid=1, rss_kib=4000 * MIB)  # default start: 10 s after the run
+        tree.process(902, ppid=1, rss_kib=4000 * MIB,
+                     cmdline=["hermes", "-p", "platform", "chat", "-q", "work kanban task t_own"])
         conn = board()
-        running(conn, "t_own", pid=901)
-        engine = FakeEngine(alive={901})
-        engine.dies_on_term = {901}
+        running(conn, "t_own", pid=902)
+        engine = FakeEngine(alive={902})
+        engine.dies_on_term = {902}
         got = admission.enforce_worker_rss_caps(
             conn, settings=settings(worker_rss_cap_mib=1536), engine=engine, proc_root=str(tree.proc),
         )
         self.assertEqual((got, status(conn, "t_own")), (["t_own"], "blocked"))
 
-    def test_without_a_boot_time_the_command_line_names_the_worker(self):
-        tree = FakeTree()
-        self.addCleanup(tree.close)
-        tree.no_boot_time()
-        tree.process(1, ppid=0, rss_kib=1)
-        tree.process(910, ppid=1, cmdline=["hermes", "-p", "platform", "chat", "-q", "work kanban task t_mine"])
-        tree.process(911, ppid=1, cmdline=["hermes", "-p", "platform", "chat", "-q", "work kanban task t_other"])
-        tree.process(912, ppid=1)
-        root = str(tree.proc)
-        self.assertTrue(admission.is_runs_worker(910, "t_mine", NOW, proc_root=root))
-        self.assertFalse(admission.is_runs_worker(911, "t_mine", NOW, proc_root=root))
-        self.assertFalse(admission.is_runs_worker(912, "t_mine", NOW, proc_root=root))
-
-    def test_a_start_inside_the_skew_counts_as_the_worker(self):
-        tree = FakeTree()
-        self.addCleanup(tree.close)
-        # 1 s before the run's second: the dispatcher records the run on a second clock.
-        tree.process(920, ppid=1, starttime=(100 - 1) * 100)
-        self.assertTrue(admission.is_runs_worker(920, "t_x", NOW, proc_root=str(tree.proc)))
-        tree.process(921, ppid=1, starttime=(100 - 3) * 100)
-        self.assertFalse(admission.is_runs_worker(921, "t_x", NOW, proc_root=str(tree.proc)))
-        # No run start on the row and a boot time present: the command line is not consulted; no.
-        self.assertFalse(admission.is_runs_worker(920, "t_x", None, proc_root=str(tree.proc)))
+    def test_the_start_time_bound_and_the_unverifiable_case(self):
+        root = str(self.tree.proc)
+        # No command line, no dispatcher start: a process older than the run is not its worker.
+        self.tree.process(920, ppid=1, starttime=500)
+        self.assertFalse(admission.is_runs_worker(920, "t_x", NOW, proc_root=root, clock_ticks=100))
+        # 1 s before the run's second: inside the skew; 3 s: outside.
+        self.tree.process(921, ppid=1, starttime=(100 - 1) * 100)
+        self.assertTrue(admission.is_runs_worker(921, "t_x", NOW, proc_root=root, clock_ticks=100))
+        self.tree.process(922, ppid=1, starttime=(100 - 3) * 100)
+        self.assertFalse(admission.is_runs_worker(922, "t_x", NOW, proc_root=root, clock_ticks=100))
+        # No run start on the row: no.
+        self.assertFalse(admission.is_runs_worker(921, "t_x", None, proc_root=root, clock_ticks=100))
+        # No boot time and no command line: unverifiable, no.
+        self.tree.no_boot_time()
+        self.assertFalse(admission.is_runs_worker(921, "t_x", NOW, proc_root=root, clock_ticks=100))
 
     def test_an_oversized_worker_is_terminated_and_its_card_blocked_with_capacity(self):
         conn = board()
@@ -862,7 +884,7 @@ class RssCapTest(unittest.TestCase):
         with self.assertLogs(admission.logger, level="WARNING") as logs:
             got = admission.enforce_worker_rss_caps(
                 conn, settings=settings(worker_rss_cap_mib=1536), engine=engine, rss_fn=measure_and_race,
-                identity_fn=lambda pid, task_id, run_started_at: True,
+                identity_fn=lambda pid, task_id, run_started_at: True, proc_root=str(self.tree.proc),
             )
         self.assertEqual(got, [])
         self.assertEqual(engine.kills, [(15, signal.SIGTERM)])
@@ -1064,6 +1086,35 @@ class OverdueTest(unittest.TestCase):
         for tid in ("t_unrouted", "t_blank", "t_no_profile", "t_guarded"):
             with self.subTest(tid=tid):
                 self.assertEqual(status(conn, tid), "ready")
+
+    def test_a_child_of_a_running_request_is_never_refused(self):
+        """A fan-out's per-cluster cards wait for the coordinator's own slots;
+        the thread is subscribed to the coordinator, so a child's wait is not
+        news and its refusal would tell the user to narrow a scope they did not
+        exceed. A dependency parent or a creator card marks a child."""
+        conn = board()
+        ready(conn, "t_linked", age=600)
+        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES ('t_parent', 't_linked')")
+        ready(conn, "t_spawned_by_worker", age=600)
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'created', ?, ?)",
+            ("t_spawned_by_worker", json.dumps({"creator_task_id": "t_parent"}), NOW - 600),
+        )
+        ready(conn, "t_top_level", age=600)
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'created', ?, ?)",
+            ("t_top_level", json.dumps({"creator": "chat"}), NOW - 600),
+        )
+        self.assertEqual(self.refuse(conn), ["t_top_level"])
+        for tid in ("t_linked", "t_spawned_by_worker"):
+            with self.subTest(tid=tid):
+                self.assertEqual(status(conn, tid), "ready")
+
+    def test_a_board_without_the_links_table_refuses_nothing_rather_than_wrongly(self):
+        conn = board()
+        conn.execute("DROP TABLE task_links")
+        ready(conn, "t_old", age=600)
+        self.assertEqual(self.refuse(conn), [])
 
     def test_a_card_at_its_profiles_cap_is_not_refused(self):
         """Upstream's per-profile cap is a quota, not capacity; a row the loop

@@ -1250,10 +1250,14 @@ const (
 	defaultAdmissionFailClosed        = true
 	// admissionMemoryBudgetFloorMiB is the least budget the operator renders, the
 	// CRD's Minimum on memoryBudgetMiB (common_types.go) applied to the derived
-	// figure too: a request the operator cannot read as a budget (a bare "2", a
-	// 256Mi) would otherwise render 0, which the dispatcher reads as no budget and
-	// answers with upstream's meminfo guard, or a figure under the floor that
-	// refuses every card. The clamp is logged; the CR is the place to fix it.
+	// figure too. A request the operator cannot read as a budget (a bare "2", a
+	// 256Mi, an explicit 0) would otherwise render 0, which the dispatcher reads
+	// as no budget and answers with upstream's meminfo guard, silently. At the
+	// floor the dispatcher still admits nothing on any measured container (the
+	// idle working set is above 512 MiB) and refuses every card after the queue
+	// bound; what the clamp buys is a refusal that names its figures in the log
+	// and in every reply, instead of a silent fallback. The CR is the place to
+	// fix the request.
 	admissionMemoryBudgetFloorMiB = 512
 )
 
@@ -1593,10 +1597,12 @@ func agentMemoryRequestMiB(agent *agentv1alpha1.PlatformAgent) int {
 }
 
 // memoryMiB is the list's memory quantity in whole MiB, rounded down, and whether
-// the list carries one.
+// the list carries one. An explicit zero is carried: the API defaults a request to
+// the limit only when the request is unset, so "0" is a request of zero, which the
+// floor clamp answers, not a missing one that the limit stands in for.
 func memoryMiB(list corev1.ResourceList) (int, bool) {
 	quantity, ok := list[corev1.ResourceMemory]
-	if !ok || quantity.IsZero() {
+	if !ok {
 		return 0, false
 	}
 	return int(quantity.Value() / bytesPerMiB), true

@@ -5656,11 +5656,14 @@ func TestKanbanAdmissionIsPinnedInTheManagedScope(t *testing.T) {
 		1907, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
 
 	// A request the operator cannot read as a budget is clamped to the CRD's floor rather
-	// than rendered as 0 (which the dispatcher reads as no budget) or as a figure under the
-	// floor (which refuses every card): a bare "2" is two bytes, and 256Mi is under the floor.
-	for name, quantity := range map[string]string{"bare number request": "2", "sub-floor request": "256Mi"} {
+	// than rendered as 0, which the dispatcher reads as no budget and answers with the
+	// meminfo guard in silence; at the floor it refuses every card, loudly, with the figures
+	// in the reason. A bare "2" is two bytes, 256Mi is under the floor, and an explicit "0"
+	// beside a limit is a request of zero, not an unset request the limit stands in for.
+	for name, quantity := range map[string]string{"bare number request": "2", "sub-floor request": "256Mi", "explicit zero request": "0"} {
 		small := withResources(corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(quantity)},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
 		})
 		assertAdmission(t, name, managedAdmission(t, small),
 			admissionMemoryBudgetFloorMiB, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)

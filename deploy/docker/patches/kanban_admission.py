@@ -35,6 +35,8 @@ Three admission decisions, each a function the dispatcher patch
   card, with the same kind. Never a card the tick
   skipped for a reason of its own: unassigned, not a profile, respawn-guarded,
   per-profile capped; a row the ready loop never reached is asked all four.
+  Nor a child of a request already running: its wait belongs to the
+  coordinator the thread is subscribed to.
 
 A ``capacity`` block carries one sentence of cause and the options, so the
 front door can answer with the alternatives instead of retrying. Every log
@@ -48,6 +50,7 @@ all four keys; the defaults below apply when a key is missing or malformed.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -230,6 +233,18 @@ _RUNNING_SQL = (
 
 #: Running cards per assignee, upstream's per-profile cap count.
 _RUNNING_FOR_ASSIGNEE_SQL = "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND assignee = ?"
+
+#: A child card waits as part of a request that is already running, so its
+#: wait is not capacity refused to anyone: a card with a dependency parent in
+#: ``task_links``, or one a dispatcher worker filed, which upstream records as
+#: ``creator_task_id`` on the ``created`` event. The sibling kanban_priority
+#: patch tells a child the same way for the queued notice.
+_CHILD_LINK_SQL = "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1"
+CREATED_EVENT_KIND = "created"
+CREATOR_TASK_FIELD = "creator_task_id"
+_CREATED_EVENT_SQL = (
+    "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id LIMIT 1"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -467,13 +482,14 @@ def _clock_ticks() -> int:
     return int(ticks) if ticks and ticks > 0 else DEFAULT_CLOCK_TICKS
 
 
-def process_started_at(pid: int, *, proc_root: str = PROC_ROOT) -> Optional[float]:
+def process_started_at(pid: int, *, proc_root: str = PROC_ROOT,
+                       clock_ticks: Optional[int] = None) -> Optional[float]:
     """When ``pid`` started, as an epoch; None when the boot time or the start time is unreadable."""
     boot = _boot_time(proc_root)
     started = _stat_field(proc_root, pid, STAT_STARTTIME_INDEX)
     if boot is None or started is None or not started.isdigit():
         return None
-    return boot + int(started) / _clock_ticks()
+    return boot + int(started) / (clock_ticks or _clock_ticks())
 
 
 def _cmdline(proc_root: str, pid: int) -> Optional[str]:
@@ -484,24 +500,56 @@ def _cmdline(proc_root: str, pid: int) -> Optional[str]:
         return None
 
 
-def is_runs_worker(pid: int, task_id: str, run_started_at: Any, *, proc_root: str = PROC_ROOT) -> bool:
+def is_runs_worker(pid: int, task_id: str, run_started_at: Any, *, proc_root: str = PROC_ROOT,
+                   dispatcher_started_at: Optional[float] = None,
+                   clock_ticks: Optional[int] = None) -> bool:
     """Whether the process at ``pid`` is the worker the card's run recorded.
 
     After a container restart the pid namespace starts over and a stale
     running row's pid is handed to a new process within seconds, so a pid on
-    its own identifies nothing. A process that started before the run cannot
-    be its worker; without a readable boot time the command line decides,
-    because upstream's spawn names the task in it; unverifiable means no,
-    and the row is left to the crash sweep rather than measured.
+    its own identifies nothing, and the process that lands on it is newer
+    than the stale run, not older. Three questions, in order:
+
+    1. The command line, when readable: upstream's spawn names the task in
+       it (``work kanban task <id>``), so it decides either way.
+    2. Otherwise, a run that started before this dispatcher process did was
+       recorded by a predecessor in an earlier pid namespace; its pid names
+       nothing here, so no.
+    3. Otherwise, a process that started before the run cannot be its
+       worker; one that started at or after it (less a small skew) is.
+
+    Unverifiable means no, and the row is left to the crash sweep rather
+    than measured.
     """
-    started = process_started_at(pid, proc_root=proc_root)
-    run_start = _positive_int(run_started_at)
-    if started is not None and run_start is not None:
-        return started >= run_start - START_SKEW_SECONDS
     cmdline = _cmdline(proc_root, pid)
-    if cmdline is None:
+    if cmdline is not None:
+        return f"{WORKER_CMDLINE_TASK_MARK}{task_id}" in cmdline
+    run_start = _positive_int(run_started_at)
+    if run_start is None:
         return False
-    return f"{WORKER_CMDLINE_TASK_MARK}{task_id}" in cmdline
+    if dispatcher_started_at is not None and run_start < dispatcher_started_at - START_SKEW_SECONDS:
+        return False
+    started = process_started_at(pid, proc_root=proc_root, clock_ticks=clock_ticks)
+    if started is None:
+        return False
+    return started >= run_start - START_SKEW_SECONDS
+
+
+def is_child_card(conn, task_id: str) -> bool:
+    """Whether the card waits as part of a request already running: a dependency
+    parent in ``task_links``, or a creator card on its ``created`` event.
+    Doubt reads as a child, so a card is not refused on a question that could
+    not be answered."""
+    try:
+        if conn.execute(_CHILD_LINK_SQL, (task_id,)).fetchone():
+            return True
+        row = conn.execute(_CREATED_EVENT_SQL, (task_id, CREATED_EVENT_KIND)).fetchone()
+        if row and row[0]:
+            payload = json.loads(row[0])
+            return isinstance(payload, Mapping) and bool(payload.get(CREATOR_TASK_FIELD))
+        return False
+    except Exception:  # noqa: BLE001 - doubt is not a reason to refuse
+        return True
 
 
 def _children_map(proc_root: str) -> dict:
@@ -806,7 +854,10 @@ def refuse_overdue_ready(conn, result: Any, *, limited_by_capacity: bool,
     (``EXCLUDED_ID_FIELDS``, ``EXCLUDED_TUPLE_FIELDS``, or :func:`_own_reason`
     for a row the loop never reached) is never refused; ``per_profile_cap`` is
     the dispatcher's ``kanban.max_in_progress_per_profile``, so that question
-    is asked too. The wait is measured from the card's last entry into the
+    is asked too. Nor is a child of a request already running
+    (:func:`is_child_card`): a fan-out's per-cluster cards wait for the
+    coordinator's own slots, and the thread is subscribed to the coordinator,
+    not to them. The wait is measured from the card's last entry into the
     ready lane. Returns the ids blocked, which also join ``result.auto_blocked``.
     """
     if not limited_by_capacity or dry_run:
@@ -827,6 +878,9 @@ def refuse_overdue_ready(conn, result: Any, *, limited_by_capacity: bool,
             own_reason = _own_reason(engine, conn, task_id, assignee, profile_cap)
             if own_reason is not None:
                 logger.debug("%s %s waits for %s, not capacity; left alone", LOG_PREFIX, task_id, own_reason)
+                continue
+            if is_child_card(conn, task_id):
+                logger.debug("%s %s waits as part of a request already running; left alone", LOG_PREFIX, task_id)
                 continue
             reason = capacity_reason(
                 f"the card waited {waited:,} s for a worker slot against the {bound:,} s bound"
@@ -939,7 +993,9 @@ def enforce_worker_rss_caps(conn, *, signal_fn=None, settings: Optional[Admissio
     when the process is the run's own worker (:func:`is_runs_worker`): after a
     container restart the namespace hands a predecessor's pid to a new process
     while the stale row is still host-local, and that process is somebody
-    else's. A worker the ladder could not signal keeps its card, so a card is
+    else's; the command line, then the run's age against this dispatcher
+    process, then the process's start against the run tell them apart. A
+    worker the ladder could not signal keeps its card, so a card is
     never blocked under a live worker the dispatcher cannot stop; the next tick
     measures it again. A worker with a SIGKILL delivered is treated as gone,
     whatever the first probe said. ``signal_fn``, ``rss_fn`` and
@@ -947,8 +1003,9 @@ def enforce_worker_rss_caps(conn, *, signal_fn=None, settings: Optional[Admissio
     """
     engine = engine or _ENGINE
     stopped: list = []
+    dispatcher_started_at = process_started_at(os.getpid(), proc_root=proc_root)
     is_worker = identity_fn or (lambda pid, task_id, run_started_at: is_runs_worker(
-        pid, task_id, run_started_at, proc_root=proc_root))
+        pid, task_id, run_started_at, proc_root=proc_root, dispatcher_started_at=dispatcher_started_at))
     try:
         settings = settings or load_settings(engine=engine)
         cap_mib = settings.worker_rss_cap_mib

@@ -139,6 +139,9 @@ CREATE TABLE IF NOT EXISTS task_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, run_id INTEGER,
     kind TEXT NOT NULL, payload TEXT, created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS task_links (
+    parent_id TEXT NOT NULL, child_id TEXT NOT NULL
+);
 """
 
 
@@ -1080,13 +1083,18 @@ def drive(h: Harness) -> None:
         # reads boot and start times there, so it is bypassed for the drive's
         # real process; the image's real-tree half runs it on Linux.
         print(f"  note: no {admission.PROC_ROOT} on this host; the worker identity check is bypassed in the drive")
-        h.KA.is_runs_worker = lambda pid, task_id, run_started_at, proc_root=admission.PROC_ROOT: True
+        h.KA.is_runs_worker = lambda pid, task_id, run_started_at, **kwargs: True
     h.configure(memory_budget_mib=BUDGET_MIB, worker_rss_cap_mib=WORKER_CAP_MIB)
     h.use_sample(_sample(USAGE_OK_MIB))
     conn = h.board()
     heavy = h.new_card(conn, "Fleet-wide audit")
     light = h.new_card(conn, "Small question")
-    sleeper = subprocess.Popen(["sleep", SLEEP_SECONDS])
+    # The worker stand-in carries the task mark in its command line, as
+    # upstream's spawn does, so the identity check reads it as the run's worker.
+    sleeper = subprocess.Popen([
+        sys.executable, "-c", f"import time; time.sleep({SLEEP_SECONDS})",
+        f"{admission.WORKER_CMDLINE_TASK_MARK}{heavy}",
+    ])
     try:
         h.claim(conn, heavy, sleeper.pid)
         h.claim(conn, light, os.getpid())
@@ -1303,15 +1311,17 @@ def real_half() -> None:
     # The queue clock's event kinds are a copy of what the pinned release
     # writes when a card returns to ready; a release that renames one would
     # otherwise measure that lane re-entry from the card's creation. Parsed
-    # from the writers' call sites, in upstream's two modules and the
-    # repository's scheduling patch, which writes the reclaim event.
-    written = event_kinds_written([
-        HERMES / applier.DB_RELATIVE, HERMES / applier.DISPATCH_RELATIVE,
-        HERMES / "hermes_cli" / "kanban_scheduling.py",
-    ])
+    # from the writers' call sites in upstream's two modules. The repository's
+    # scheduling patch writes its reclaim event with a raw INSERT, so its kind
+    # is read from the constant the patch owns, not parsed.
+    written = event_kinds_written([HERMES / applier.DB_RELATIVE, HERMES / applier.DISPATCH_RELATIVE])
     for kind in KA.READY_ENTRY_EVENT_KINDS:
         check(f"the installed release writes the {kind!r} event the queue clock reads",
               kind in written, f"kinds written: {sorted(written)}")
+    from hermes_cli import kanban_scheduling as KS
+    check("the scheduling patch's reclaim event kind is one the queue clock reads",
+          KS.RECLAIM_EVENT_KIND in KA.READY_ENTRY_EVENT_KINDS,
+          f"{KS.RECLAIM_EVENT_KIND!r} not in {KA.READY_ENTRY_EVENT_KINDS!r}")
 
     def configure(config: dict) -> None:
         KA._ENGINE.config = lambda: config

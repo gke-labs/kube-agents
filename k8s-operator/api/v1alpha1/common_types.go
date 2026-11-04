@@ -1100,7 +1100,9 @@ type AdmissionSpec struct {
 	// budget or a slot held for the other class of card, before it is blocked
 	// with kind "capacity" instead of left in the queue. A card that waits for another reason is not touched: one that is
 	// unassigned, not spawnable, held by the respawn guard or by a per-profile
-	// cap stays ready. Absent means 120.
+	// cap stays ready, and so does a child of a request already running (a
+	// fan-out's per-cluster cards), whose wait belongs to the coordinator the
+	// thread is subscribed to. Absent means 120.
 	//
 	// Two minutes is 24 ticks at the 5s dispatch interval: long enough for a
 	// worker that is finishing to give its slot back, short enough that the
