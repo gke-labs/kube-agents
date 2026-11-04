@@ -19,9 +19,12 @@ resources and its scratch volumes fit under them). Three sources:
 - the kustomize manifests under `k8s-operator/config`, parsed as YAML, which
   they are with no templating (`kustomize_docs`). The CRD schemas name
   `emptyDir` and `resources` as properties, not as a volume or a container, so
-  they are skipped; a strategic-merge patch (an `overlays/` file, or one named
-  `*patch*`) carries a partial container and is skipped by `kustomize_pods`,
-  which reads whole objects only.
+  they are skipped; a strategic-merge patch carries a partial container and
+  is skipped by `kustomize_pods`, which reads whole objects only. A patch is a
+  file whose stem carries `patch` as a `-` or `_` delimited word, the tree's
+  convention (`deployment-patch.yaml`, `webhookcainjection_patch.yaml`); a
+  whole object under `overlays/`, or one whose name merely contains the
+  letters (`dispatcher.yaml`), is read.
 
 `pod_specs` finds the pod template inside a workload of any kind, and
 `workload_pods` labels each one with where it came from, so a failure names
@@ -30,6 +33,7 @@ the object.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -58,14 +62,15 @@ GOLDEN_DIR = "k8s-operator/internal/testing/testdata/platform/expected"
 KUSTOMIZE_ROOT = "k8s-operator/config"
 YAML_SUFFIXES = (".yaml", ".yml")
 YAML_SKIP_PARTS = ("crds", "crd")
-# A kustomize overlay holds strategic-merge patches: a Deployment document that
-# names one container with the fields the overlay changes and nothing else.
-KUSTOMIZE_PATCH_PARTS = ("overlays",)
-KUSTOMIZE_PATCH_MARK = "patch"
+# A strategic-merge patch is a Deployment document that names one container
+# with the fields it changes and nothing else; the tree names one with the
+# word `patch` in the file's stem, delimited by `-` or `_`.
+KUSTOMIZE_PATCH_TOKEN = "patch"
+STEM_DELIMITERS = re.compile(r"[-_]")
 
-# The workload kinds whose spec carries a pod template, and the field it sits under.
+# A Pod carries its spec directly; every other workload kind carries a pod
+# template, a CronJob under `jobTemplate`.
 POD_KIND = "Pod"
-CRONJOB_KIND = "CronJob"
 
 
 def tracked(roots: tuple[str, ...]) -> list[Path]:
@@ -110,8 +115,8 @@ def kustomize_docs() -> list[tuple[str, list]]:
 
 
 def is_kustomize_patch(path: str) -> bool:
-    parts = Path(path).parts
-    return any(part in KUSTOMIZE_PATCH_PARTS for part in parts) or KUSTOMIZE_PATCH_MARK in parts[-1]
+    """True when the file's stem carries `patch` as a delimited word."""
+    return KUSTOMIZE_PATCH_TOKEN in STEM_DELIMITERS.split(Path(path).stem)
 
 
 def pod_specs(doc: dict) -> list[dict]:
@@ -119,7 +124,7 @@ def pod_specs(doc: dict) -> list[dict]:
     spec = doc.get("spec") or {}
     if doc.get("kind") == POD_KIND:
         return [spec]
-    if doc.get("kind") == CRONJOB_KIND or "jobTemplate" in spec:
+    if "jobTemplate" in spec:
         return [spec["jobTemplate"]["spec"]["template"]["spec"]]
     template = (spec.get("template") or {}).get("spec")
     return [template] if template else []

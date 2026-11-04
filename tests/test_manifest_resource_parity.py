@@ -39,10 +39,16 @@ A `medium: Memory` emptyDir is charged to memory, not disk, and is excluded.
 Today's violations are pinned in BASELINE, one entry per workload, container
 and rule with the figure observed and the issue that removes it. The baseline
 may only shrink: a violation not listed fails, a listed one no longer observed
-fails until its line is removed, a larger figure fails, and a smaller one
-fails until the line is lowered to it, so the file never carries headroom a
-regression could spend. `python3 tests/test_manifest_resource_parity.py`
-prints the entries as observed, in the baseline's form, for that edit.
+fails until its line is removed, a larger figure fails, a smaller one fails
+until the line is lowered to it, and the same figure with a different detail
+(the missing declarations swapped for others at the same count) fails as a
+changed violation, so the file never carries headroom a regression could
+spend. `python3 tests/test_manifest_resource_parity.py` prints the entries as
+observed, in the baseline's form, for that edit.
+
+The chart half needs helm. On CI (`CI` set) a missing helm fails the gate
+rather than passing it with the chart unread, as the rollout-quota suite
+does; elsewhere `test_the_chart_renders_its_pods` shows the skip.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_manifest_resource_parity.py' -v
@@ -51,6 +57,7 @@ Run:
 from __future__ import annotations
 
 import math
+import os
 import re
 import sys
 import tempfile
@@ -69,7 +76,9 @@ from _rendered_manifests import (  # noqa: E402
     REPO_ROOT,
     golden_docs,
     golden_pods,
+    is_kustomize_patch,
     kustomize_pods,
+    pod_specs,
     rendered_chart,
     workload_pods,
 )
@@ -81,6 +90,13 @@ BROKEN_FIXTURE = TESTDATA / "broken-emptydir.yaml"
 UNTRACKED_GOLDEN_NAME = "platformagent-untracked.yaml"
 # An editor's duplicate, as `test_a_golden_named_with_a_space_keeps_its_key` writes it.
 SPACED_GOLDEN_NAME = "platformagent copy.yaml"
+# Set on every GitHub Actions runner; with it a missing helm is a failure, not a skip.
+CI_ENV = "CI"
+NO_HELM_ON_CI = (
+    "helm is not on PATH but CI is set: the chart half of this gate would pass with the chart"
+    " unread on a runner. Install helm rather than skipping."
+)
+NO_HELM = "helm is not installed; the chart half of the gate is not read"
 
 # The operator's allowance for a writing container's logs and writable layer
 # on top of the emptyDir it writes; the Go constant is the source of truth.
@@ -148,22 +164,28 @@ DECIMAL_SUFFIXES = {
 
 
 def parse_quantity(value: object) -> Fraction:
-    """A Kubernetes quantity as an exact number: bytes for storage, cores for CPU."""
+    """A Kubernetes quantity as an exact number: bytes for storage, cores for CPU.
+
+    The grammar is `resource.ParseQuantity`'s, which admits no whitespace, plus
+    the API server's rule for a request, limit or sizeLimit: not negative."""
     if isinstance(value, bool):
         raise ValueError(f"not a quantity: {value!r}")
     if isinstance(value, (int, float)):
-        return Fraction(value)
-    match = QUANTITY_RE.match(str(value).strip())
-    if match is None:
-        raise ValueError(f"not a quantity: {value!r}")
-    number = Fraction(match["num"])
-    suffix = match["suffix"] or ""
-    if suffix in BINARY_SUFFIXES:
-        return number * BINARY_SUFFIXES[suffix]
-    if suffix in DECIMAL_SUFFIXES:
-        return number * DECIMAL_SUFFIXES[suffix]
-    if suffix:
-        return number * Fraction(10) ** int(suffix[1:])
+        number = Fraction(value)
+    else:
+        match = QUANTITY_RE.match(str(value))
+        if match is None:
+            raise ValueError(f"not a quantity: {value!r}")
+        number = Fraction(match["num"])
+        suffix = match["suffix"] or ""
+        if suffix in BINARY_SUFFIXES:
+            number *= BINARY_SUFFIXES[suffix]
+        elif suffix in DECIMAL_SUFFIXES:
+            number *= DECIMAL_SUFFIXES[suffix]
+        elif suffix:
+            number *= Fraction(10) ** int(suffix[1:])
+    if number < 0:
+        raise ValueError(f"negative quantity: {value!r}")
     return number
 
 
@@ -458,6 +480,13 @@ def compare(observed: dict, baseline: dict, sources_read: set[str]) -> list[str]
                 f"better than the baseline ({known['measure']} -> {finding.measure}){where}: lower the entry's"
                 f" measure to {finding.measure} so the gain holds: {key}"
             )
+        elif finding.detail != known.get("detail"):
+            # The same count of a different thing: declarations swapped for others.
+            problems.append(
+                f"changed violation at the baseline's measure {finding.measure}{where}: now {finding.detail!r},"
+                f" the baseline says {known.get('detail')!r}. Fix the manifest; the entry pins the detail as well as"
+                f" the figure:\n{_entry_line(finding, known.get('issue'))}"
+            )
     for key, entry in sorted(baseline.items()):
         if key in observed:
             continue
@@ -479,6 +508,8 @@ class ResourceParityGateTest(unittest.TestCase):
     longMessage = False
 
     def test_rendered_pods_match_the_baseline(self):
+        if not HELM and os.environ.get(CI_ENV):
+            self.fail(NO_HELM_ON_CI)
         pods = rendered_pods()
         by_source = {s: [p for p in pods if p.source == s] for s in (SOURCE_CHART, SOURCE_GOLDEN, SOURCE_KUSTOMIZE)}
         sources_read = {SOURCE_GOLDEN, SOURCE_KUSTOMIZE}
@@ -490,6 +521,25 @@ class ResourceParityGateTest(unittest.TestCase):
         self.assertGreaterEqual(count_containers(pods), MIN_CONTAINERS, "too few containers read; the check has gone blind")
         problems = compare(observe(pods), load_baseline(), sources_read)
         self.assertEqual([], problems, "\n\n".join(problems))
+
+    @unittest.skipUnless(HELM, NO_HELM)
+    def test_the_chart_renders_its_pods(self):
+        # Off CI a missing helm shows here as a skip; on CI it fails the gate above.
+        self.assertGreaterEqual(len(workload_pods(rendered_chart(), SOURCE_CHART)), MIN_CHART_PODS, "the chart rendered too few pods; the check has gone blind")
+
+    def test_a_patch_is_named_by_a_delimited_word(self):
+        # The three patches in the tree are excluded; a stem that merely contains
+        # the letters, or a whole object under an overlay, is read.
+        self.assertTrue(is_kustomize_patch("k8s-operator/config/integrations/litellm/overlays/chatgpt/deployment-patch.yaml"))
+        self.assertTrue(is_kustomize_patch("k8s-operator/config/default/webhookcainjection_patch.yaml"))
+        self.assertFalse(is_kustomize_patch("k8s-operator/config/integrations/dispatcher.yaml"))
+        self.assertFalse(is_kustomize_patch("k8s-operator/config/integrations/litellm/overlays/chatgpt/pvc.yaml"))
+
+    def test_a_cronjob_patch_without_a_job_template_carries_no_pod(self):
+        # A strategic-merge patch that suspends a CronJob has a spec and no jobTemplate.
+        self.assertEqual([], pod_specs({"kind": "CronJob", "spec": {"suspend": True}}))
+        template = {"spec": {"containers": []}}
+        self.assertEqual([template["spec"]], pod_specs({"kind": "CronJob", "spec": {"jobTemplate": {"spec": {"template": template}}}}))
 
     def test_an_untracked_golden_is_read(self):
         # `go test -update` writes a golden without staging it; the gate reads it before `git add`.
@@ -649,8 +699,9 @@ class ResourceParityRulesTest(unittest.TestCase):
         self.assertEqual(parse_quantity("2e3"), 2000)
         self.assertEqual(parse_quantity("1k"), 1000)
         self.assertEqual(parse_quantity(2), 2)
-        with self.assertRaises(ValueError):
-            parse_quantity("1GiB")
+        for rejected in ("1GiB", " 1Gi ", "-1Gi", -1):
+            with self.subTest(value=rejected), self.assertRaises(ValueError):
+                parse_quantity(rejected)
 
 
 class ResourceParityRatchetTest(unittest.TestCase):
@@ -660,8 +711,17 @@ class ResourceParityRatchetTest(unittest.TestCase):
         finding = Finding(RULE_DECLARED, "golden Deployment/x", "c", measure, "missing limits.cpu")
         return {finding.key: Observed(finding, ["a.yaml"])}
 
-    def _baseline(self, measure: int) -> dict:
-        return {("golden Deployment/x", "c", RULE_DECLARED): {"workload": "golden Deployment/x", "container": "c", "rule": RULE_DECLARED, "measure": measure, "issue": 1}}
+    def _baseline(self, measure: int, detail: str = "missing limits.cpu") -> dict:
+        return {
+            ("golden Deployment/x", "c", RULE_DECLARED): {
+                "workload": "golden Deployment/x",
+                "container": "c",
+                "rule": RULE_DECLARED,
+                "measure": measure,
+                "detail": detail,
+                "issue": 1,
+            }
+        }
 
     def test_a_matching_entry_passes(self):
         self.assertEqual([], compare(self._observed(2), self._baseline(2), {SOURCE_GOLDEN}))
@@ -696,6 +756,12 @@ class ResourceParityRatchetTest(unittest.TestCase):
     def test_a_better_figure_fails_until_lowered(self):
         [problem] = compare(self._observed(1), self._baseline(2), {SOURCE_GOLDEN})
         self.assertIn("lower the entry's measure to 1", problem)
+
+    def test_a_changed_detail_at_the_same_measure_fails(self):
+        # One missing declaration swapped for another: the count holds, the violation moved.
+        [problem] = compare(self._observed(2), self._baseline(2, "missing limits.memory"), {SOURCE_GOLDEN})
+        self.assertIn("changed violation at the baseline's measure 2", problem)
+        self.assertIn("now 'missing limits.cpu', the baseline says 'missing limits.memory'", problem)
 
 
 class CredentialProxyGoldenTest(unittest.TestCase):

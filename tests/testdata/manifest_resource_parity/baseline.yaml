@@ -2,10 +2,12 @@
 # tests/test_manifest_resource_parity.py landed (2026-11-02), each with the
 # issue that removes it. The file may only shrink: the test fails on a
 # violation not listed here, on a listed one no longer observed (remove the
-# line), on a figure larger than `measure` (a regression), and on a smaller one
-# (lower `measure` to it, so the gain holds). Never add a line for a new
-# violation; fix the manifest. `python3 tests/test_manifest_resource_parity.py`
-# prints the entries as observed, in this form.
+# line), on a figure larger than `measure` (a regression), on a smaller one
+# (lower `measure` to it, so the gain holds), and on the same `measure` with a
+# different `detail` (one missing declaration swapped for another). Never add a
+# line for a new violation; fix the manifest.
+# `python3 tests/test_manifest_resource_parity.py` prints the entries as
+# observed, in this form.
 #
 # `workload` is `<source> <Kind>/<name>`: `chart` for the rendered chart,
 # `golden` for the operator goldens (one key for every golden fixture that
