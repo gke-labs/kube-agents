@@ -498,6 +498,10 @@ should set `maxInProgress` to fit: about 430 MiB per worker over the 1.8 GiB the
 a 4Gi limit fits about five. Raise it once you know your worker footprint and your model quota —
 that quota is the other shared resource, and for most deployments it binds before memory does.
 
+[`docs/designs/safe-throttling.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/safe-throttling.md)
+is the design for admission by memory beside this count: a pressure guard on the container's own
+memory counters, a resident cap per worker, and a `capacity` refusal that names the alternatives.
+
 The cap comes from the operator, not from the image or the agent's own `config.yaml`. The operator
 pins `kanban.max_in_progress` in the managed scope at `/etc/hermes`: the CR's value, or `6` when it
 says nothing. Hermes applies that file over the agent's config on every load, so a value an existing
