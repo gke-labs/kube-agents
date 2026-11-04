@@ -1962,19 +1962,23 @@ func (s *Server) handleReadTopics(ctx context.Context, rawArgs json.RawMessage) 
 // minting one, to the alias the bridge's send_message sends turns under; a conversation_token
 // (the server's token, as a send_message answer reports it) goes as is (serverPollEventsArgs).
 func (s *Server) handlePollEvents(ctx context.Context, rawArgs json.RawMessage) (string, error) {
-	var args struct {
-		Conversation      string `json:"conversation"`
-		ConversationToken string `json:"conversation_token"`
+	convArg, tokenArg, err := pollEventsConversationArgs(rawArgs)
+	if err != nil {
+		return "", err
 	}
-	if len(rawArgs) > 0 {
-		_ = json.Unmarshal(rawArgs, &args)
+	// A token the bridge itself minted (as manage_session list prints it) names the bridge's
+	// conversation, which the server knows by its alias, not by that token.
+	if tokenArg != "" {
+		if c, ok := s.store.LookupConversation(tokenArg); ok {
+			convArg, tokenArg = c.Alias, ""
+		}
 	}
 	conversation := ""
-	if strings.TrimSpace(args.ConversationToken) == "" {
-		conversation = s.ReadOnlyConversationFor(ctx, args.Conversation).Alias
+	if tokenArg == "" {
+		conversation = s.ReadOnlyConversationFor(ctx, convArg).Alias
 	}
 	// Unreadable arguments are refused here, before the connect, naming the bridge's argument.
-	fwd, err := serverPollEventsArgs(rawArgs, conversation)
+	fwd, err := serverPollEventsArgs(rawArgs, conversation, tokenArg)
 	if err != nil {
 		return "", err
 	}

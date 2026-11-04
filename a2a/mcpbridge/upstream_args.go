@@ -257,14 +257,14 @@ func (s *Server) upstreamArgs(ctx context.Context, toolName string, rawArgs json
 const maxPollWaitSeconds = 60
 
 // serverPollEventsArgs translates the bridge's poll_events arguments to the in-cluster server's
-// (a2a/mcp pollEventsArgs). conversation_token, the server's own token as a send_message answer
-// reports it, goes as is and conversation is dropped; otherwise conversation is the alias the
-// bridge resolved (the name the bridge's send_message sent the turn under). The bridge's own
-// console tokens are not the server's, so one never goes as conversation_token. since is a
+// (a2a/mcp pollEventsArgs). serverToken, the server's own token as a send_message answer reports
+// it, goes as conversation_token and conversation is dropped; otherwise conversation is the alias
+// the bridge resolved (the name the bridge's send_message sent the turn under). The bridge's own
+// console tokens are not the server's, so the caller never passes one as serverToken. since is a
 // non-negative whole number (a numeric string is read as its number); wait_seconds is read as
 // send_message's wait is (parseWaitSeconds) and clamped to 0..maxPollWaitSeconds. Any other
 // argument is dropped.
-func serverPollEventsArgs(raw json.RawMessage, conversation string) (json.RawMessage, error) {
+func serverPollEventsArgs(raw json.RawMessage, conversation, serverToken string) (json.RawMessage, error) {
 	args := map[string]any{}
 	if len(raw) > 0 {
 		dec := json.NewDecoder(strings.NewReader(string(raw)))
@@ -275,8 +275,7 @@ func serverPollEventsArgs(raw json.RawMessage, conversation string) (json.RawMes
 		args = map[string]any{}
 	}
 	fwd := map[string]any{}
-	token, _ := args["conversation_token"].(string)
-	if token = strings.TrimSpace(token); token != "" {
+	if token := strings.TrimSpace(serverToken); token != "" {
 		fwd["conversation_token"] = token
 	} else if conversation = strings.TrimSpace(conversation); conversation != "" {
 		fwd["conversation"] = conversation
@@ -314,4 +313,35 @@ func serverPollEventsArgs(raw json.RawMessage, conversation string) (json.RawMes
 		fwd["wait_seconds"] = int(wait)
 	}
 	return json.Marshal(fwd)
+}
+
+// pollEventsConversationArgs reads poll_events' conversation and conversation_token. Either, when
+// present and not null, must be a string: a value of another type is refused rather than read as
+// absent, which would poll the active conversation instead of the one the caller named.
+func pollEventsConversationArgs(raw json.RawMessage) (conversation, token string, err error) {
+	if len(raw) == 0 {
+		return "", "", nil
+	}
+	var args map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return "", "", fmt.Errorf("invalid poll_events arguments: %v", err)
+	}
+	read := func(key string) (string, error) {
+		v, ok := args[key]
+		if !ok || string(v) == "null" {
+			return "", nil
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			return "", fmt.Errorf("invalid %s %s: want the conversation's name or token as a string", key, v)
+		}
+		return strings.TrimSpace(s), nil
+	}
+	if conversation, err = read("conversation"); err != nil {
+		return "", "", err
+	}
+	if token, err = read("conversation_token"); err != nil {
+		return "", "", err
+	}
+	return conversation, token, nil
 }

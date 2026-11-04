@@ -224,7 +224,7 @@ func pollEventsDefinition() ToolDefinition {
 			"properties": map[string]any{
 				"conversation_token": map[string]any{
 					"type":        "string",
-					"description": "The conversation's token as a send_message answer reports it (\"later reports can be read with poll_events (conversation_token ...)\"). Takes precedence over conversation.",
+					"description": "The server's token for the conversation, as a send_message answer reports it (\"later reports can be read with poll_events (conversation_token ...)\"). Takes precedence over conversation. A console:conv-… token from manage_session list belongs in conversation, though the bridge maps it here too.",
 				},
 				"conversation": map[string]any{
 					"type":        "string",

@@ -170,3 +170,43 @@ func TestPollEventsHostPathWinsWhenAHostIsSet(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+func TestPollEventsMapsTheBridgesOwnTokenGivenAsConversationToken(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	entry, err := srv.store.CreateConversation("triage", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A host model copies the console:conv-… token manage_session list prints into
+	// conversation_token; the server knows that conversation by its alias.
+	for _, given := range []string{"console:" + entry.Token, entry.Token} {
+		res := srv.CallTool(context.Background(), ToolPollEvents, json.RawMessage(`{"conversation_token":"`+given+`","since":3}`))
+		if res.IsError {
+			t.Fatalf("poll_events with conversation_token %q: %+v", given, res)
+		}
+		args := nextCallNamed(t, gw, ToolPollEvents)
+		if args["conversation"] != "triage" || args["since"] != float64(3) {
+			t.Fatalf("conversation_token %q forwarded %v; want conversation triage and since 3", given, args)
+		}
+		if _, ok := args["conversation_token"]; ok {
+			t.Fatalf("conversation_token %q went to the server as its token: %v", given, args)
+		}
+	}
+}
+
+func TestPollEventsRefusesANonStringConversation(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	for _, raw := range []string{`{"conversation_token":123,"since":5}`, `{"conversation":7}`, `{"conversation":["a"]}`} {
+		res := srv.CallTool(context.Background(), ToolPollEvents, json.RawMessage(raw))
+		if !res.IsError || !strings.Contains(res.Content[0].Text, "want the conversation's name or token as a string") {
+			t.Fatalf("poll_events %s answered %+v; want a refusal naming the argument", raw, res)
+		}
+	}
+	select {
+	case call := <-gw.calls:
+		t.Fatalf("a refused poll_events reached the server: %+v", call)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
