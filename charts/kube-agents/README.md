@@ -933,6 +933,15 @@ lost. Move them to `platformAgent.deployment.env` first. A re-tag to a chart wit
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives
 the buckets, the defaults and a sizing method.
 
+`platformAgent.deployment.incidentMaxOpenPullRequests` limits how many triage pull requests are open
+or being opened at once when `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` is `"true"` in
+`platformAgent.deployment.env`. Above `0` it becomes an `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS`
+entry in the CR's `spec.deployment.env`; `0`, the default, is no limit and renders no entry. The same
+rules as `alertDailyLimits` apply: an entry with the same name in `platformAgent.deployment.env`
+wins, and a `valueFrom` entry for it fails the render while the key is above `0`. The
+[chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#limiting-the-open-triage-pull-requests)
+says what is counted and what a held triage does.
+
 #### PlatformAgent annotations
 
 `platformAgent.annotations` is copied onto the CR's `metadata.annotations`, and

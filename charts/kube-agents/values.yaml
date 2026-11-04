@@ -1203,6 +1203,16 @@ platformAgent:
     # are then lost. Move them to env above first. The site's chatops page, "Daily alert ceiling", gives the
     # buckets and a sizing method.
     alertDailyLimits: {}
+    # The most triage pull requests open or being opened at once, when
+    # INCIDENT_TRIAGE_OPEN_PULL_REQUEST is "true" in env above. A triage whose
+    # pull request would pass the limit still runs, but its report asks for a
+    # reply, and a note in the alert's thread says that the limit held its pull
+    # request back. Rendered as INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS in
+    # spec.deployment.env when above 0. 0 is no limit. An entry with the same
+    # name in env above wins, and a valueFrom entry for it fails the render
+    # while this key is above 0. The site's chatops page, "Limiting the open
+    # triage pull requests", has the rules.
+    incidentMaxOpenPullRequests: 0
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 1Gi requests, or 2 CPU

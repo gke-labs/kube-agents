@@ -2770,7 +2770,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             ("_chat_platforms_disabled", lambda: False),
             ("_register_session_routing", MagicMock()),
             ("_post_initial_alert", MagicMock(return_value="spaces/A/threads/B")),
-            ("_build_agent_query", lambda payload, session_id="": "q"),
+            ("_build_agent_query", lambda payload, session_id="", **_: "q"),
             ("_triage_sleep", MagicMock()),
         ):
             p = patch.object(session_kv_server, name, value)
@@ -11845,7 +11845,7 @@ class TestTriageStartRetry(unittest.TestCase):
         for target, value in (
             ("time", MagicMock(monotonic=self.clock.monotonic, time=time.time)),
             ("_triage_sleep", self.clock.sleep),
-            ("_build_agent_query", lambda payload, session_id="": "q"),
+            ("_build_agent_query", lambda payload, session_id="", **_: "q"),
             ("_gateway_api_token", lambda: "tok"),
         ):
             p = patch.object(session_kv_server, target, value)
@@ -12235,7 +12235,7 @@ class TestTriageStartBurst(unittest.TestCase):
             patch.dict(os.environ, {"PLATFORM_API_URL": f"http://127.0.0.1:{self.server.server_port}"}),
             patch.object(session_kv_server, "enabled_chat_platforms", lambda: [session_kv_server.DEFAULT_CHAT_PLATFORM]),
             patch.object(session_kv_server, "_chat_platforms_disabled", lambda: True),
-            patch.object(session_kv_server, "_build_agent_query", lambda payload, session_id="": "q"),
+            patch.object(session_kv_server, "_build_agent_query", lambda payload, session_id="", **_: "q"),
             patch.object(session_kv_server, "_gateway_api_token", lambda: "tok"),
             # A real pool, not the parked stand-in, and retry waits on the same scale.
             patch.object(session_kv_server, "_TRIAGE_START_POOL", None),
@@ -12395,6 +12395,245 @@ class TestDataVolumeWarning(unittest.TestCase):
         self.assertGreater(total, 0)
         self.assertLessEqual(free, total)
         self.assertIsNone(session_kv_server._data_volume_usage("/nonexistent/data-volume"))
+
+
+class TestIncidentTriagePullRequestLimit(unittest.TestCase):
+    """INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS, the limit on triage pull requests open or being opened.
+
+    With the opt-in on and a limit set, a triage whose pull request would pass
+    the limit gets the default query and a note in its thread. A branch counts
+    while its pull request is open on the forge, and from the routing on while
+    it is reserved, so a burst counts itself before any pull request exists.
+    """
+
+    OPEN = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
+    LIMIT = "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS"
+    PREFIX = "platform-agent/incident-"
+
+    def setUp(self):
+        import sqlite3
+        import types
+
+        session_kv_server.init_db()
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DELETE FROM triage_pr_reservations")
+        env = patch.dict(os.environ, {self.OPEN: "true", self.LIMIT: "2"}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        # The forge's open list: one page per entry of self.pages, or an exception.
+        self.pages = [[]]
+        self.forge_calls = []
+
+        def call(verb, payload, repo, retry_transient=False):
+            self.forge_calls.append((verb, payload, repo))
+            if isinstance(self.pages, Exception):
+                raise self.pages
+            page = payload["page"]
+            return {
+                "proposals": [{"source": source} for source in self.pages[page - 1]],
+                "truncated": page < len(self.pages),
+            }
+
+        forge = types.ModuleType("forge")
+        forge.call = call
+        modules = patch.dict(sys.modules, {"forge": forge})
+        modules.start()
+        self.addCleanup(modules.stop)
+        repos = patch.object(session_kv_server.gitops_workspace, "get_managed_repos", return_value=["acme/gitops"])
+        repos.start()
+        self.addCleanup(repos.stop)
+        self.board = os.path.join(tempfile.mkdtemp(), "kanban.db")
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("CREATE TABLE tasks (id TEXT, session_id TEXT, assignee TEXT, title TEXT, status TEXT)")
+        board = patch.object(session_kv_server, "KANBAN_DB_PATH", self.board)
+        board.start()
+        self.addCleanup(board.stop)
+
+    def payload(self, name, **extra):
+        return {
+            "reason": "BackOff", "namespace": "prod", "kind_of_object": "Pod", "name": name,
+            "message": "restarting", "cluster": "gke-1", **extra,
+        }
+
+    def start(self, session_id, name, notice=None, **extra):
+        return session_kv_server._TriageStart(session_id, self.payload(name, **extra), None, notice, time.monotonic())
+
+    def decide(self, session_id, name, **extra):
+        return session_kv_server._triage_pull_request_decision(self.start(session_id, name, **extra))
+
+    def branch(self, session_id, name):
+        return session_kv_server._incident_branch(session_id, self.payload(name))
+
+    def reservations(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return dict(conn.execute("SELECT branch, session_id FROM triage_pr_reservations").fetchall())
+
+    def test_no_limit_unset_zero_negative_or_garbage_changes_nothing(self):
+        for value in (None, "0", "-3", "many"):
+            with self.subTest(value=value), patch.dict(os.environ, {}, clear=False):
+                if value is None:
+                    os.environ.pop(self.LIMIT, None)
+                else:
+                    os.environ[self.LIMIT] = value
+                self.assertEqual(self.decide("k8s-evt-1", "api-0"), (None, None))
+        self.assertEqual(self.forge_calls, [])
+        self.assertEqual(self.reservations(), {})
+
+    def test_the_limit_needs_the_opt_in_and_an_event(self):
+        with patch.dict(os.environ, {self.OPEN: "false"}, clear=False):
+            self.assertEqual(self.decide("k8s-evt-1", "api-0"), (None, None))
+        for kind in (session_kv_server.INJECT_KIND_DRIFT, session_kv_server.INJECT_KIND_STALL):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.decide("k8s-evt-1", "api-0", kind=kind), (None, None))
+        self.assertEqual(self.forge_calls, [])
+
+    def test_under_the_limit_the_branch_is_reserved_and_the_pull_request_card_filed(self):
+        self.pages = [[self.PREFIX + "other-0123abcd", "feature/unrelated"]]
+        self.assertEqual(self.decide("k8s-evt-1", "api-0"), (True, None))
+        self.assertEqual(self.reservations(), {self.branch("k8s-evt-1", "api-0"): "k8s-evt-1"})
+        verb, payload, repo = self.forge_calls[0]
+        self.assertEqual((verb, payload["state"], repo), ("proposal-list", "open", "acme/gitops"))
+
+    def test_at_the_limit_the_triage_gets_the_default_query_and_the_note(self):
+        # Two open triage pull requests; the third proposal is not a triage's.
+        self.pages = [[self.PREFIX + "a-1111aaaa", self.PREFIX + "b-2222bbbb", "platform-agent/fix-x"]]
+        open_pull_request, note = self.decide("k8s-evt-1", "api-0")
+        self.assertIs(open_pull_request, False)
+        self.assertEqual(note, session_kv_server.TRIAGE_PR_CAP_NOTE.format(count=2, limit=2))
+        self.assertIn("This install already has 2 triage Pull Requests open or being opened, and its limit is 2.", note)
+        self.assertEqual(self.reservations(), {})
+
+    def test_a_burst_counts_its_own_reservations(self):
+        """No pull request exists yet when a node failure breaks many pods at once."""
+        decisions = [self.decide(f"k8s-evt-{i}", f"web-{i}")[0] for i in range(4)]
+        self.assertEqual(decisions, [True, True, False, False])
+        self.assertEqual(len(self.reservations()), 2)
+
+    def test_an_incident_already_counted_revises_its_pull_request(self):
+        """Its card revises the open pull request on its branch, so it adds nothing."""
+        mine = self.branch("k8s-evt-9", "api-0")
+        self.pages = [[mine, self.PREFIX + "b-2222bbbb"]]
+        self.assertEqual(self.decide("k8s-evt-9", "api-0"), (True, None))
+        # Its branch is no longer open but still reserved, so two branches
+        # count; a new session for the same coordinates reuses the branch.
+        self.pages = [[self.PREFIX + "b-2222bbbb"]]
+        self.assertEqual(self.decide("k8s-evt-10", "api-0"), (True, None))
+        self.assertEqual(self.reservations()[mine], "k8s-evt-10")
+        self.assertIs(self.decide("k8s-evt-3", "web-3")[0], False)
+
+    def test_a_reservation_whose_pull_request_opened_is_counted_once(self):
+        self.decide("k8s-evt-1", "api-0")
+        self.pages = [[self.branch("k8s-evt-1", "api-0")]]
+        self.assertEqual(self.decide("k8s-evt-2", "web-2"), (True, None))
+        self.assertNotIn(self.branch("k8s-evt-1", "api-0"), self.reservations())
+
+    def test_a_settled_pull_request_card_releases_its_reservation(self):
+        import sqlite3
+
+        self.decide("k8s-evt-1", "api-0")
+        self.decide("k8s-evt-2", "web-2")
+        with sqlite3.connect(self.board) as conn:
+            conn.executemany(
+                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                [
+                    # The triage card settles first; only the pull-request card releases.
+                    ("t1", "k8s-evt-2", "cluster-gke-1", "Triage prod/Pod/web-2", "done"),
+                    ("t2", "k8s-evt-1", "platform", "Open GitOps PR for prod/Pod/api-0 (BackOff) on gke-1", "done"),
+                ],
+            )
+        self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
+        self.assertEqual(set(self.reservations().values()), {"k8s-evt-2", "k8s-evt-3"})
+
+    def test_a_reservation_past_the_backstop_is_released(self):
+        import sqlite3
+
+        self.decide("k8s-evt-1", "api-0")
+        self.decide("k8s-evt-2", "web-2")
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute(
+                "UPDATE triage_pr_reservations SET reserved_at = ? WHERE session_id = 'k8s-evt-1'",
+                (time.time() - session_kv_server.TRIAGE_PR_RESERVATION_MAX_S - 1,),
+            )
+        self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
+
+    def test_an_uncounted_forge_reads_as_at_the_limit(self):
+        for pages in (RuntimeError("forge down"), [[]] * (session_kv_server.TRIAGE_PR_LIST_MAX_PAGES + 1)):
+            with self.subTest(pages=type(pages).__name__):
+                self.pages = pages
+                open_pull_request, note = self.decide("k8s-evt-1", "api-0")
+                self.assertIs(open_pull_request, False)
+                self.assertEqual(note, session_kv_server.TRIAGE_PR_UNCOUNTED_NOTE.format(limit=2))
+        self.assertEqual(self.reservations(), {})
+
+    def test_with_the_uncounted_switch_off_an_uncounted_forge_counts_reservations_only(self):
+        self.pages = RuntimeError("forge down")
+        with patch.object(session_kv_server, "TRIAGE_PR_UNCOUNTED_AT_LIMIT", False):
+            decisions = [self.decide(f"k8s-evt-{i}", f"web-{i}")[0] for i in range(3)]
+        self.assertEqual(decisions, [True, True, False])
+
+    def test_a_slow_forge_is_abandoned_at_the_timeout(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def slow(*_args, **_kwargs):
+            release.wait(5)
+            return {"proposals": [], "truncated": False}
+
+        sys.modules["forge"].call = slow
+        with patch.object(session_kv_server, "TRIAGE_PR_COUNT_TIMEOUT_S", 0.05):
+            self.assertEqual(self.decide("k8s-evt-1", "api-0")[0], False)
+
+    def test_the_query_follows_the_decision(self):
+        payload = self.payload("api-0")
+        with_pr = session_kv_server._build_agent_query(payload, "k8s-evt-1")
+        self.assertIn("Make exactly two `kanban_create` calls", with_pr)
+        self.assertEqual(session_kv_server._build_agent_query(payload, "k8s-evt-1", open_pull_request=True), with_pr)
+        held = session_kv_server._build_agent_query(payload, "k8s-evt-1", open_pull_request=False)
+        with patch.dict(os.environ, {self.OPEN: "false"}, clear=False):
+            self.assertEqual(held, session_kv_server._build_agent_query(payload, "k8s-evt-1"))
+        self.assertIn("Make exactly one `kanban_create` call", held)
+        self.assertNotIn(self.PREFIX, held)
+
+    def _run_start(self, start, urlopen_effects):
+        with patch.object(session_kv_server, "_gateway_api_token", lambda: "tok"), \
+                patch("session_kv_server.urllib.request.urlopen", side_effect=urlopen_effects), \
+                patch.object(session_kv_server, "_triage_sleep", lambda _s: None), \
+                patch.object(session_kv_server, "_send_to_chat", return_value="thread") as send, \
+                patch.object(session_kv_server, "_start_agent_turn", wraps=session_kv_server._start_agent_turn) as turn:
+            session_kv_server._run_triage_start(start)
+        return send, turn
+
+    def test_a_held_triage_posts_the_note_in_its_thread_once_its_turn_starts(self):
+        self.pages = [[self.PREFIX + "a-1111aaaa", self.PREFIX + "b-2222bbbb"]]
+        notice = session_kv_server._TriageNotice("slack", "1700000000.0001", "alert")
+        send, turn = self._run_start(self.start("k8s-evt-1", "api-0", notice=notice), [_answered(), _answered()])
+        self.assertIn("Make exactly one `kanban_create` call", turn.call_args.args[2])
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[1], session_kv_server.TRIAGE_PR_CAP_NOTE.format(count=2, limit=2))
+        self.assertEqual(send.call_args.args[3], "1700000000.0001")
+
+    def test_a_reserved_triage_posts_nothing_and_files_both_cards(self):
+        notice = session_kv_server._TriageNotice("slack", "1700000000.0001", "alert")
+        send, turn = self._run_start(self.start("k8s-evt-1", "api-0", notice=notice), [_answered(), _answered()])
+        self.assertIn("Make exactly two `kanban_create` calls", turn.call_args.args[2])
+        send.assert_not_called()
+
+    def test_a_triage_that_does_not_start_releases_its_reservation(self):
+        send, _ = self._run_start(self.start("k8s-evt-1", "api-0"), [_http_error(401)])
+        self.assertEqual(self.reservations(), {})
+        send.assert_not_called()
+
+    def test_the_pvc_dotenv_cannot_set_the_limit(self):
+        with tempfile.NamedTemporaryFile("wb", suffix=".env", delete=False) as f:
+            f.write(b"INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS=1000\n")
+            path = f.name
+        self.addCleanup(os.remove, path)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.LIMIT, None)
+            session_kv_server._load_dotenv_ignoring_operator_switches(path)
+            self.assertIsNone(os.environ.get(self.LIMIT))
 
 
 if __name__ == "__main__":

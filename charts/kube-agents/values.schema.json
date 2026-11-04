@@ -1030,6 +1030,11 @@
                 }
               }
             },
+            "incidentMaxOpenPullRequests": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "maximum": 2147483647
+            },
             "credentialProxy": {
               "type": "object",
               "additionalProperties": false,

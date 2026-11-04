@@ -5173,6 +5173,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// request still goes through submit-suggestion and a human merges it.
 		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
 
+		// The most triage pull requests open or being opened at once while
+		// the switch above is on (INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS in
+		// session_kv_server.py). Parsed as a whole number, and a value that
+		// does not parse, is negative or is 0 means no limit, so it bounds a
+		// count of pull requests and reaches nothing else.
+		"INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS": {},
+
 		// How many Cluster Agent profiles one reconcile run scaffolds before it
 		// leaves the rest for the next run (MAX_CREATES_PER_RUN_ENV in
 		// cluster_agent_reconcile.py). Parsed as a whole number; anything but a

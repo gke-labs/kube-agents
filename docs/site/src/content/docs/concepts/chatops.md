@@ -686,6 +686,20 @@ StatefulSet, DaemonSet, Job and CronJob pods, and bare pods, each get a branch o
 
 The setting has limits. Drift and controller-stall reports are not covered; they still wait for a reply. On Slack with `KAGE_SLACK_UX` on, the report's button for the recommended or single fix is left off when the report says that fix's pull request `is being opened automatically`; buttons for the other options stay. A typed `apply Option B` still works and opens its own pull request. Changing the value rolls the agent pod. The agent ignores the variable in its own `.env` file, so only the install can turn it on. It is an environment variable for now and can move to a `PlatformAgent` field once it has proven itself.
 
+### Limiting the open triage pull requests
+
+A failure that breaks many workloads at once, such as a node or storage fault, starts many triages, and with `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` on each one opens a pull request. Set `platformAgent.deployment.incidentMaxOpenPullRequests` to limit how many are open or being opened at once. The chart renders it as `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS`. `0`, the default, is no limit.
+
+```yaml
+platformAgent:
+  deployment:
+    incidentMaxOpenPullRequests: 5
+```
+
+A triage whose pull request would pass the limit still runs, but its report asks for a reply, as without the setting, and a note in the thread says that the limit held its pull request back. An incident whose branch already has a pull request is not held: its card revises that pull request. If the open pull requests cannot be counted, because the forge fails or does not answer in time, the triage is held the same way, with a note that says so. As with the switch, the agent ignores the variable in its own `.env` file.
+
+The limit counts triage pull requests only: the open pull requests whose branch starts with `platform-agent/incident-`, plus each triage routed to open one whose pull request does not exist yet. A pull request opened by a reply does not count. A routed triage stops counting when its pull request opens (it then counts as open), when its pull-request card is `done` or `archived`, or after 24 hours.
+
 ## First-run onboarding
 
 On a fresh install the first chat interaction gets a guided onboarding instead of a cold start. One `no_agent` cron job on the Planning Agent profile (`agents/chat/defaults/cron/jobs.json`), `oobe`, drives it. Every minute it runs three stages: delivery first, then the scan, then the first-run audits. The old `bootstrap-inventory-scan` and `bootstrap-inventory-delivery` entries ship disabled.
