@@ -236,7 +236,13 @@ class Stack:
             body["sha"] = existing[1]
         status, _ = self.http("PUT", f"/repos/{self.settings.gitops_repo}/contents/{self.kustomization_path}", body)
         if status not in PUT_OK_STATUSES:
-            raise RuntimeError(f"cannot commit {self.kustomization_path} (HTTP {status})")
+            # The call tries a write again after no answer, so a commit that
+            # landed while its answer was lost comes back as a conflict.
+            # The file is read back: the stack's text there is the commit.
+            now = self.remote_file(self.kustomization_path, branch)
+            if now is None or now[0] != kustomization_text():
+                raise RuntimeError(f"cannot commit {self.kustomization_path} (HTTP {status})")
+            log(f"the commit of {self.kustomization_path} answered HTTP {status}, and the file is there; it landed")
         log(f"planted {self.kustomization_path} in {self.settings.gitops_repo}")
 
     # -- teardown --------------------------------------------------------------
@@ -329,7 +335,12 @@ class Stack:
         body = {"message": COMMIT_REMOVE.format(case=CASE), "sha": existing[1], "branch": branch}
         status, _ = self.http("DELETE", f"/repos/{self.settings.gitops_repo}/contents/{self.kustomization_path}", body)
         if status != HTTP_OK:
-            raise RuntimeError(f"cannot delete {self.kustomization_path} (HTTP {status})")
+            # As for the commit: a delete that landed while its answer was
+            # lost comes back as a 404 or a conflict. The file is read back:
+            # absent is deleted.
+            if self.remote_file(self.kustomization_path, branch) is not None:
+                raise RuntimeError(f"cannot delete {self.kustomization_path} (HTTP {status})")
+            log(f"the delete of {self.kustomization_path} answered HTTP {status}, and the file is gone; it landed")
         log(f"removed {self.kustomization_path} from {self.settings.gitops_repo}")
 
 

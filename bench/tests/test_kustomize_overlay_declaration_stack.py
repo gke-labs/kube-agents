@@ -52,10 +52,14 @@ _spec.loader.exec_module(plant)
 class FakeGitHub:
     """A repository with files on `main` and open pull requests; records writes."""
 
-    def __init__(self, files=None, pulls=None, refuse=()):
+    def __init__(self, files=None, pulls=None, refuse=(), landed_then=None):
         self.files = dict(files or {})
         self.pulls = list(pulls or [])
         self.refuse = set(refuse)
+        # {(method, path): status}: the write lands, and the answer the client
+        # sees is this status, as when the first answer was lost and the
+        # retry met the write already done.
+        self.landed_then = dict(landed_then or {})
         self.writes: list[tuple[str, str, dict | None]] = []
 
     def __call__(self, method, path, body):
@@ -76,11 +80,11 @@ class FakeGitHub:
                 return 200, {"content": base64.b64encode(self.files[name].encode()).decode(), "sha": f"sha-{name}"}
             if method == "PUT":
                 self.files[name] = base64.b64decode(body["content"]).decode()
-                return 201, {}
+                return self.landed_then.get(("PUT", f"/contents/{name}"), 201), {}
             if method == "DELETE":
                 assert body["sha"] == f"sha-{name}"
                 del self.files[name]
-                return 200, {}
+                return self.landed_then.get(("DELETE", f"/contents/{name}"), 200), {}
         if method == "GET" and rest.startswith("/pulls?"):
             return 200, [p["pull"] for p in self.pulls]
         match = re.fullmatch(r"/pulls/(\d+)/files\?.*", rest)
@@ -191,6 +195,28 @@ def test_the_teardown_leaves_a_file_and_pull_requests_that_are_not_the_stacks():
     assert _stack(github).teardown()
     assert github.writes == []
     assert github.files[KUSTOMIZATION] == "resources: []\n"
+
+
+def test_a_commit_that_landed_but_answered_a_conflict_is_committed():
+    # The first PUT's answer was lost; the retry met the file already there.
+    github = FakeGitHub(files={DECLARATION: "kind: Deployment\n"}, landed_then={("PUT", f"/contents/{KUSTOMIZATION}"): 422})
+    _stack(github).plant()
+    assert github.files[KUSTOMIZATION] == plant.kustomization_text()
+
+
+def test_a_refused_commit_still_fails_the_plant():
+    github = FakeGitHub(files={DECLARATION: "kind: Deployment\n"}, refuse={("PUT", f"/contents/{KUSTOMIZATION}")})
+    with pytest.raises(RuntimeError, match="cannot commit"):
+        _stack(github).plant()
+
+
+def test_a_delete_that_landed_but_answered_not_found_is_deleted():
+    github = FakeGitHub(
+        files={DECLARATION: "kind: Deployment\n", KUSTOMIZATION: plant.kustomization_text()},
+        landed_then={("DELETE", f"/contents/{KUSTOMIZATION}"): 404},
+    )
+    assert _stack(github).teardown()
+    assert KUSTOMIZATION not in github.files
 
 
 def test_a_refused_delete_fails_the_destroy():
