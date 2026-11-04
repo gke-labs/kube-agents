@@ -172,8 +172,9 @@ file that downloads something is not covered until it is added there. A download
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
 been fed the bytes of the failed one.
 
-`docker-build.yml` also retries whole steps: the buildx setup and each image build run once more,
-after a pause, when the first attempt fails. A new `docker/setup-buildx-action` or
+`docker-build.yml` also retries whole steps: the buildx setup and each image build that fetches
+from the network run once more, after a pause, when the first attempt fails. The in-image gate
+check runs once, because its failure is a test verdict. A new `docker/setup-buildx-action` or
 `docker/build-push-action` step there takes the same id, pause and retry steps, or joins
 `_EXEMPT_STEPS` with a reason. `python3 -m unittest tests.test_docker_build_retry` checks the
 shape.

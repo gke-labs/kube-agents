@@ -37,8 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # Every step that reaches a service this repository does not control -- the
-    # buildx setup and each image build, the gate build included -- runs once
-    # more if its first attempt fails. Five failed attempts between 2026-10-22
+    # buildx setup and each image build but the in-image gate check -- runs
+    # once more if its first attempt fails. Five failed attempts between 2026-10-22
     # and 2026-11-03 each died on a different service, and each passed on a
     # manual re-run of the same commit:
     #
@@ -57,9 +57,13 @@ jobs:
     # keeps every layer the failed attempt finished, so the retry runs only the
     # RUN that failed. A real build break fails both attempts and the job.
     #
+    # The in-image gate check runs once: its RUN is a behavioural test whose
+    # intermittent failure flaky-check-notify.yml must still see. A mirror error
+    # can still red it; that red stays visible and a hand re-run records it.
+    #
     # The pause step logs a warning annotation and a line in the job summary, so
-    # an attempt that needed the retry stays visible; flaky-check-notify.yml no longer
-    # sees it, because the job passes. RETRY_PAUSE_SECONDS outlasts the mirror's
+    # an attempt that needed the retry stays visible; flaky-check-notify.yml no
+    # longer sees it, because the job passes. RETRY_PAUSE_SECONDS outlasts the mirror's
     # per-minute quota window and gives a repository mid-publish time to finish.
     # tests/test_docker_build_retry.py holds the retry on every such step.
     env:
@@ -220,16 +224,15 @@ jobs:
       # for. The host-side unit tests cannot reach it: see the stage comment in the
       # Dockerfile.
       #
-      # Retried like the builds: the stage fetches nothing new, but the solve still
-      # resolves the tag-referenced bases of `platform` against the mirror. The
-      # retry also gives an intermittent gate failure (a race in the entrypoint) a
-      # second chance; the read-only step below runs the same check once more with
-      # no retry, so such a race has to pass twice in a row to go green.
+      # The one build here with no retry. Its RUN is the gate check, a behavioural
+      # test, so a failure on the first attempt is a verdict on the code, and a
+      # retry would hide an intermittent one from flaky-check-notify.yml. Its solve
+      # still resolves the tag-referenced bases against the mirror, so a mirror
+      # error can still red this step; that red stays visible and a hand re-run
+      # records it as a flake, which is the accepted cost.
       - name: Verify entrypoint shared-state gate (in-image)
-        id: build-gate
-        continue-on-error: true
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with: &build-gate-with
+        with:
           context: .
           file: deploy/docker/Dockerfile
           target: entrypoint-gate-test
@@ -241,17 +244,6 @@ jobs:
           tags: entrypoint-gate-test:latest
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
-
-      - name: Wait before retrying Verify entrypoint shared-state gate (in-image)
-        if: steps.build-gate.outcome == 'failure'
-        env:
-          FAILED_STEP: Verify entrypoint shared-state gate (in-image)
-        run: *retry-pause
-
-      - name: Verify entrypoint shared-state gate (in-image) (retry)
-        if: steps.build-gate.outcome == 'failure'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with: *build-gate-with
 
       # The same check again, against the rootfs the operator actually gives the pod.
       # The RUN above cannot cover this: a build layer is writable by definition, so it

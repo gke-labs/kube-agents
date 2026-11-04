@@ -10,13 +10,14 @@ reasons; this file holds the shape, because deleting the retry fails no build
 and reports green until the next bad minute.
 
 The contract, read from the parsed YAML: each `docker/setup-buildx-action` and
-`docker/build-push-action` step, bar any named exemption, has an `id` and
-`continue-on-error: true`; the next step is a pause gated on that id's failure
-that runs the shared pause script; the step after is the same action, with the
-same inputs, on the same gate, and fails the job if it fails too. The pause
-script is run against a stub `sleep`, not read, so a script that drops the
-sleep, the warning or the job-summary line fails here. The synthetic cases hold each way the shape
-can break, so a walk that matches nothing cannot pass.
+`docker/build-push-action` step, bar the named exemptions (which must run
+once), has an `id` and `continue-on-error: true`; the next step is a pause
+gated on that id's failure that runs the shared pause script; the step after is
+the same action, with the same inputs, on the same gate, and fails the job if
+it fails too. The pause script is run against a stub `sleep`, not read, so a
+script that drops the sleep, the warning or the job-summary line fails here.
+The synthetic cases hold each way the shape can break, so a walk that matches
+nothing cannot pass.
 """
 
 import copy
@@ -35,12 +36,19 @@ _JOB = "build"
 _PAUSE_VARIABLE = "RETRY_PAUSE_SECONDS"
 _FAILED_STEP_VARIABLE = "FAILED_STEP"
 _RETRIED_ACTIONS = ("docker/setup-buildx-action@", "docker/build-push-action@")
-# Steps that need no retry, each with its reason. None today: even the gate
-# build resolves the tag-referenced bases of `platform` against the mirror.
-_EXEMPT_STEPS = frozenset()
-# The buildx setup and the six image builds today.
+# Steps that must run once, each with its reason. The checker refuses a retry on
+# them as firmly as it demands one everywhere else.
+_EXEMPT_STEPS = frozenset(
+    {
+        # Its RUN is the entrypoint gate check, a behavioural test: a retry would
+        # hide an intermittent failure from flaky-check-notify.yml. A mirror error
+        # can still red it, visibly; that is the accepted cost.
+        "Verify entrypoint shared-state gate (in-image)",
+    }
+)
+# The buildx setup and the five image builds that fetch from the network today.
 # A floor, so a rename that drops steps out of the walk fails here.
-_MIN_RETRIED_STEPS = 7
+_MIN_RETRIED_STEPS = 6
 _WARNING_PREFIX = "::warning::"
 _SLEEP_LOG_NAME = "sleep.log"
 _SUMMARY_NAME = "summary.md"
@@ -64,7 +72,12 @@ def check_retries(steps, exempt=_EXEMPT_STEPS):
         step = steps[index]
         name = step.get("name", f"step {index}")
         is_retry = str(step.get("if", "")).endswith(".outcome == 'failure'")
-        if not _uses_retried_action(step) or name in exempt or is_retry:
+        if _uses_retried_action(step) and name in exempt:
+            if step.get("continue-on-error") or step.get("id"):
+                problems.append(f"{name}: exempt, so it runs once with no id or continue-on-error")
+            index += 1
+            continue
+        if not _uses_retried_action(step) or is_retry:
             index += 1
             continue
         step_id = step.get("id")
@@ -201,6 +214,16 @@ class CheckerTest(unittest.TestCase):
     def test_exempt_step_is_skipped(self):
         steps = [{"name": "Gate", "uses": "docker/build-push-action@abc"}]
         self.assertEqual(check_retries(steps, exempt=frozenset({"Gate"})), ([], []))
+
+    def test_exempt_step_with_retry_is_refused(self):
+        steps = copy.deepcopy(self._good())
+        problems, _ = check_retries(steps, exempt=frozenset({"Build"}))
+        self.assertTrue(problems)
+
+    def test_retry_uses_different_action(self):
+        self.assertTrue(
+            self._problems_after(lambda s: s[3].update(uses="docker/setup-buildx-action@abc"))
+        )
 
 
 if __name__ == "__main__":
