@@ -116,6 +116,7 @@ The entries that share the Platform Agent's roster without being audits. The tab
 | `upgrade-readiness-weekly-review` | script, `upgrade_readiness_review.py` | Weekly, Saturday 06:00 | Upgrade Readiness Weekly Review |
 | `upgrade-readiness-weekly-brief` | prompt, after `upgrade_readiness_brief_queue.py` | Weekly, Saturday 07:00 | Upgrade Readiness Weekly Brief |
 | `sa-role-watch` | script, `sa_role_watch.py` | Hourly at :25 | Service Account Role Watch |
+| `leeway-watch` | script, `leeway_watch.py` | Daily 08:30 | Topology Skew & Leeway Watch |
 | `chat-delivery-watch` | script, `chat_delivery_watch.py` | Every 30 minutes | Chat Delivery Watch |
 
 <!-- prettier-ignore-end -->
@@ -132,6 +133,7 @@ The entries that share the Platform Agent's roster without being audits. The tab
 - `upgrade-readiness-watch`: once a day reads the version each cluster's release channel offers and, when a cluster is below a version the watch has not reported or reported more than a week ago, runs the `fleet-upgrade-verification` readiness report, saves it on the gateway pod and posts one line with the blocked clusters.
 - `upgrade-readiness-weekly-review` and `upgrade-readiness-weekly-brief`: the Saturday pair for upgrade readiness. The review is one more `no_agent` script, which grades every cluster in scope and registers each blocker and risk on the findings queue. The brief is the exception: a prompt job an hour later that composes the week's brief from that review and the queue under its own SOP, a model turn that is not an audit and is not counted among the audits above.
 - `sa-role-watch`: every hour reads the IAM policy of the management project and of each project in `spec.scope` and names any role bound to the agent's Google service account (the one the agent's ServiceAccount names for Workload Identity, and the credential broker's own when federation is armed) that the `read-only` permission set does not carry: when it appears, once a day while it is held, and when it goes, since a role granted after install would otherwise go unnoticed.
+- `leeway-watch`: runs `leeway report --topology-tier-c-signals` across the fleet daily and saves the report under `<profile home>/leeway/reports/`. It publishes to the `topology-skew` A2A blackboard topic when configured, and posts to chat on new, escalated, or weekly-refreshed findings, or when a tracked finding resolves.
 - `chat-delivery-watch`: keeps a per-job count of scheduled reports that failed to reach chat and, past a threshold, opens a GitHub ledger issue and writes an `ALERT` line that fluent-bit ships to Cloud Logging, the two channels that still work when chat does not. [The relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) explains why it uses neither chat nor a `PlatformAgent` condition yet.
 
 ### Pollers file cards; watchdogs deliver reports

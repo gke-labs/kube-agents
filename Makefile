@@ -254,33 +254,41 @@ PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/
 # Longest-first is the schedule that closes that gap, and the simulation over
 # that run's per-file times puts the sweep at its floor, the total divided by
 # the worker count, instead of two minutes above it. These are the files that
-# took over 30 s in that run, longest first; the rest of the sweep is a long
-# tail that no order can move by much. A file named here that no glob reaches
+# took over 30 s on 2026-11-02 (run 41513724822, the sweep on the agent
+# image's Python), longest first; the rest of the sweep is a long tail that
+# no order can move by much. A file named here that no glob reaches
 # fails tests/test_python_test_sweep.py, which is what keeps the list honest
 # when a test moves or is deleted. A file that grows heavy later costs the
 # tail again until someone adds it; the per-file blocks the sweep prints carry
 # the `Ran N tests in S s` line to find it by.
 PYTHON_TEST_HEAVY_FILES := \
-	scripts/test_eval_dashboard_pages.py \
 	tests/test_rollback_roundtrip.py \
 	agents/platform/scripts/test_credential_proxy.py \
-	tests/test_bootstrap_discovery_plant.py \
 	tests/test_fleet_fixture_state.py \
-	scripts/test_task_registration.py \
-	tests/test_install_script.py \
-	tests/test_bootstrap_ranking_plant.py \
-	scripts/test_eval_dashboard_fixture_state.py \
-	tests/test_gitops_fix_cycle_scripts.py \
+	scripts/test_eval_dashboard_pages.py \
+	scripts/test_ci_eval_nightly.py \
 	tests/test_python_test_sweep.py \
-	scripts/test_skill_overlay.py \
 	tests/integration/test_seam_injector_kv.py \
-	scripts/test_eval_dashboard_nightly.py \
-	scripts/test_ci_env_agent_pod_diagnostics.py \
-	scripts/test_eval_dashboard_trend.py \
-	scripts/test_eval_dashboard_publish.py \
+	tests/test_bootstrap_discovery_plant.py \
 	agents/platform/skills/fleet-audit/scripts/test_audit_report.py \
+	tests/test_install_script.py \
+	scripts/test_eval_dashboard_nightly.py \
+	scripts/test_skill_overlay.py \
+	tests/test_gitops_fix_cycle_scripts.py \
+	scripts/test_eval_dashboard_fixture_state.py \
+	scripts/test_eval_dashboard_trend.py \
+	scripts/test_task_registration.py \
 	tests/test_installer_common.py \
-	agents/platform/scripts/test_credential_proxy_metrics.py
+	tests/test_bootstrap_ranking_plant.py \
+	scripts/test_ci_pause_scheduled_audits.py \
+	agents/platform/scripts/test_credential_proxy_metrics.py \
+	scripts/test_ci_env_agent_pod_diagnostics.py \
+	scripts/test_ci_eval_lane_safeguards.py \
+	tests/test_ci_eval_revalidation.py \
+	scripts/test_eval_dashboard_publish.py \
+	agents/platform/scripts/test_cluster_preflight.py \
+	agents/platform/scripts/test_providers_github_enterprise.py \
+	agents/platform/scripts/test_session_kv_server.py
 
 # The order the workers take files in: the heavy files above that are in
 # PYTHON_TEST_FILES, in that order, then every other file in PYTHON_TEST_FILES
