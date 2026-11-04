@@ -1414,7 +1414,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             (_REPO_ROOT / "upgrade.sh", 'print_info "Import the App key with install.sh'),
         ):
             with self.subTest(script=script.name):
-                text = script.read_text()
+                text = script.read_text(encoding="utf-8")
                 self.assertEqual(text.count(refusal), 1)
                 start = text.index(refusal)
                 block = text[start : text.index(advice, start)]
