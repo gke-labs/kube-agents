@@ -26,8 +26,8 @@ the JSON hand-off -- so those are what this module pins. In particular:
    admitted case that lost every repetition to infrastructure, or every case
    lost -- and reds on a case result the loop never wrote: unaccounted work
    is not a pass, and it is not weather either.
-3. **The `Task <id> Result: [...]` line keeps its shape**, because people and
-   scripts grep build logs for it.
+3. **The `Task <id> Result: [...]` line keeps its shape**, because the dashboard
+   collector and people grep the grading artifact for it.
 4. **The environment carries every threshold**, since all of them are meant
    to be tuned against observed movement on main.
 5. **`record` is the only writer, and only on main.** It refuses with
@@ -1083,9 +1083,9 @@ def test_record_writes_a_today_key_without_a_mode(tmp_path):
 
 
 def test_record_refuses_to_run_on_the_today_lane(tmp_path, monkeypatch, capsys):
-    """The today lane's periodic grades an install rolled back from next over
-    the api transport: its key reads today, but today's window measures a
-    fresh today install. The shell keeps it out; this is the second guard."""
+    """A today-lane run on main, if one ran, would grade an install rolled
+    back from next over the api transport: its key would read today, but
+    today's window measures a fresh today install. The shell keeps it out; this is the second guard."""
     monkeypatch.setenv("EVAL_ROLLBACK_LANE", "1")
     store = store_with(tmp_path)
     assert run_record(store, case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])) == 2

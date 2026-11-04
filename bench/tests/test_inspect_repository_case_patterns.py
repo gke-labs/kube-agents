@@ -314,9 +314,10 @@ def test_a_verb_inside_a_shell_heredoc_fails():
 
 
 def test_a_clone_inside_a_shell_heredoc_is_not_credited():
-    # A spurious red that the case header records: the row is an argv of
-    # `bash`, so it does not meet the required run. Beside a typed clone, the
-    # heredoc row passes.
+    # A spurious red that the case header records, when the card's tagged
+    # call did not reach the trajectory: the row is an argv of `bash`, so it
+    # does not meet the required run. Beside a typed clone, the heredoc row
+    # passes.
     row = f"bash <<'EOF' python3 {SCRIPT} clone --repo gke-labs/kube-agents --prefix tags.env EOF"
     assert not _passes(row)
     assert _passes(row, CLONE_PUBLIC)

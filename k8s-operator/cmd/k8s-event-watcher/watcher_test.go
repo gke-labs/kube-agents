@@ -34,6 +34,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -460,17 +461,25 @@ func TestRun_RelistMarksAreRecordedBeforeTheRelistIsDelivered(t *testing.T) {
 	client := fake.NewClientset()
 	allowPreflight(client)
 	var lists atomic.Int64
-	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
+	relisted := []corev1.Event{
+		listedEvent("pod-2", "FailedScheduling", "api.1"),
+		listedEvent("pod-2", "TriggeredScaleUp", "api.2"),
+	}
+	client.PrependReactor("list", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		// A field-selected list is the mark pass ahead of a paged list; a
+		// real server answers it with the matching Events of the same
+		// snapshot. The first reflector list is empty, every later one holds
+		// the two Events.
+		if isMarkPass(action) {
+			if lists.Load() < 1 {
+				return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "10"}}, nil
+			}
+			return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "20"}, Items: selectReason(relisted, action)}, nil
+		}
 		if lists.Add(1) == 1 {
 			return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "10"}}, nil
 		}
-		return true, &corev1.EventList{
-			ListMeta: metav1.ListMeta{ResourceVersion: "20"},
-			Items: []corev1.Event{
-				listedEvent("pod-2", "FailedScheduling", "api.1"),
-				listedEvent("pod-2", "TriggeredScaleUp", "api.2"),
-			},
-		}, nil
+		return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "20"}, Items: relisted}, nil
 	})
 	var openWatch atomic.Pointer[watch.FakeWatcher]
 	client.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
@@ -1597,4 +1606,33 @@ func TestObserveWatch_ForwardsInOrderAndReleasesOnStop(t *testing.T) {
 	if !fw.IsStopped() {
 		t.Error("Stop did not stop the upstream watch")
 	}
+}
+
+// isMarkPass reports whether a list action is one of the field-selected
+// lists the watcher makes ahead of a paged list to put the autoscaler marks
+// on record (see listInPages), as opposed to the reflector's own list.
+func isMarkPass(action k8stesting.Action) bool {
+	la, ok := action.(k8stesting.ListAction)
+	if !ok {
+		return false
+	}
+	fields := la.GetListRestrictions().Fields
+	return fields != nil && !fields.Empty()
+}
+
+// selectReason answers a mark pass as the API server would: the Events whose
+// reason the action's field selector names.
+func selectReason(events []corev1.Event, action k8stesting.Action) []corev1.Event {
+	fields := action.(k8stesting.ListAction).GetListRestrictions().Fields
+	var out []corev1.Event
+	for _, ev := range events {
+		if fields.Matches(fieldsSetOf(ev)) {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+func fieldsSetOf(ev corev1.Event) fields.Set {
+	return fields.Set{"reason": ev.Reason}
 }

@@ -68,7 +68,7 @@ __all__ = [
 # - this repository's: what this package and the case tooling read --
 #   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
 #   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
-#   ``scope_exclude.py``) -- and ``task_version``, a
+#   ``scope_exclude.py``), ``writes_alone`` (read by ``lane.py``) -- and ``task_version``, a
 #   case's own revision note that nothing reads. A new one is added here, in a
 #   pull request before any case a pull-request job grades uses it (the
 #   presubmit roster, or a lane list such as hack/eval/gitlab-cases.txt).
@@ -80,7 +80,7 @@ DEVOPS_BENCH_CASE_KEYS = (
 REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
-        "audit_streams", scope_exclude.KEY, "task_version",
+        "audit_streams", scope_exclude.KEY, "task_version", "writes_alone",
     }
 )
 CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | REPOSITORY_CASE_KEYS

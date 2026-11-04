@@ -80,16 +80,16 @@
 #     A grep is also not exempt with a pipe (`| head -20`), with an option
 #     whose value is a separate word (`--include '*.md'`, `--context 3`), or
 #     with a `2>&1` or `&>/dev/null` trailer, which a typed card keeps.
-#   - A clone inside a shell heredoc on a card log row (`bash <<'EOF' …
-#     clone … EOF`) is an argv of `bash`, so it does not meet the required
-#     run, which is a spurious red. The required run also misses a clone that
-#     sits behind another command in a chain, because the worker log keeps a
-#     chain's first command (vcs-review-feedback-read-back explains it). In
-#     the recorded runs, each clone was its own command or followed a `cd`.
-#   - A worker-filed card's call is read as typed, and each line is a
-#     command, also in a heredoc body. So a note that a heredoc writes
-#     (`cat > notes.md <<'EOF'`) and that quotes a verb run counts as that
-#     run, and a note that quotes a clone run meets the required run.
+#   - The required run also reads each card's tagged call as typed, so a
+#     clone chained behind another command, or inside a shell heredoc
+#     (`bash <<'EOF' … clone … EOF`), is credited when the call reached the
+#     trajectory. A card whose call did not reach it is read from its log
+#     row only, which keeps a chain's first command and reads a heredoc as
+#     an argv of `bash`, so such a clone is missed: a spurious red.
+#   - A typed call is read with each line as a command, also in a heredoc
+#     body. So a note that a heredoc writes (`cat > notes.md <<'EOF'`) and
+#     that quotes a clone run meets the required run on any card, and one
+#     that quotes a verb run counts as that run on a worker-filed card.
 #   - A workspace verb matches as any word after the script, not only as the
 #     subcommand. So an option value that is a bare open, list, grep, fetch
 #     or close (`clone … --into list`) counts as the verb and fails the
@@ -172,12 +172,12 @@ verification_spec:
   # direct download first: that habit exists on main, before any skill is
   # read, and a follow-up issue owns it. The runs read each shell segment of
   # hermes's one-line rendering of a command as an argv: it skips a leading
-  # `cd` and keeps the first command of a chain, so a `clone` chained behind
-  # another command (`mkdir d && … clone`) is not on the line, which is this
-  # check's known limit. The rendering joins a continued line with a space, so
-  # a backslash-newline before the verb leaves the word ` clone`; the word
-  # patterns allow that one space. An objective, because a safeguard cannot
-  # carry the red.
+  # `cd` and keeps the first command of a chain. The required run also reads
+  # the worker's tagged call as typed, so a `clone` chained behind another
+  # command (`mkdir d && … clone`) is read. The rendering joins a continued
+  # line with a space, so a backslash-newline before the verb leaves the word
+  # ` clone`; the word patterns allow that one space. An objective, because a
+  # safeguard cannot carry the red.
   - name: the-snapshot-route-and-no-workspace-handle
     role: objective
     mode: assert

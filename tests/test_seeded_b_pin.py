@@ -6,8 +6,10 @@ data source. These tests pin what it decides: the lagging version is the
 newest previous-minor patch REGULAR itself offers, not the newest across every
 channel (the all-channel list put seeded-b on a RAPID patch, and GKE refuses a
 minor bump from a patch the enrolled channel does not carry, #3025); a cluster
-running such a patch is held at it, or stepped to a newer REGULAR patch of the
-same minor when one exists, which is the one upgrade GKE allows it; a read that
+in the lag minor keeps its running patch, listed or not, so REGULAR moving past
+it is a state the fleet holds; a cluster below the lag minor takes the
+next minor, stepped first to a newer REGULAR patch of its own minor when its
+running one is off-channel, which is the one upgrade GKE allows it; a read that
 fails is the data source failing, never a create.
 """
 
@@ -130,6 +132,29 @@ class ChooseTest(unittest.TestCase):
     def test_a_held_cluster_does_not_step_to_an_older_regular_patch(self):
         chosen = pin.choose(REGULAR_DEFAULT, REGULAR_VALID, RUNNING_RAPID)
         self.assertEqual(chosen["pin"], RUNNING_RAPID, "1.34.11-gke.1209000 is below the running 1.34.12; a control plane cannot be downgraded")
+
+    def test_a_running_patch_in_the_lag_minor_is_held_whatever_regular_adds(self):
+        # In the lag minor the pin is the running version, listed or not: a
+        # pin at REGULAR's newest patch would relist seeded-b on every apply
+        # and the upgrades cases read it for a patch REGULAR has moved past.
+        chosen = pin.choose(REGULAR_DEFAULT, REGULAR_VALID, "1.35.8-gke.1439001")
+        self.assertFalse(chosen["held"])
+        self.assertEqual(chosen["pin"], "1.35.8-gke.1439001", "REGULAR's newer 1.35.8-gke.1626001 is not asked for")
+        self.assertEqual(chosen["lag_target"], "1.35.8-gke.1626001", "the lag target is still reported")
+
+    def test_a_running_patch_in_the_lag_minor_that_regular_dropped_stays_put(self):
+        # The state the upgrades cases read seeded-b for: REGULAR has moved
+        # past the running patch. Stepping to a listed patch would relist it.
+        chosen = pin.choose(REGULAR_DEFAULT, REGULAR_VALID, "1.35.8-gke.1300000")
+        self.assertTrue(chosen["held"])
+        self.assertEqual(chosen["pin"], "1.35.8-gke.1300000")
+
+    def test_a_held_patch_in_the_lag_minor_does_not_step(self):
+        # The same-minor step exists to make a minor bump possible from an
+        # off-channel patch; with no bump due it would only relist the patch.
+        chosen = pin.choose(REGULAR_DEFAULT, ["1.35.8-gke.1700000"] + REGULAR_VALID, "1.35.8-gke.1300000")
+        self.assertTrue(chosen["held"])
+        self.assertEqual(chosen["pin"], "1.35.8-gke.1300000")
 
     def test_a_running_patch_regular_carries_takes_the_minor_bump(self):
         chosen = pin.choose(REGULAR_DEFAULT, REGULAR_VALID, RUNNING_REGULAR)

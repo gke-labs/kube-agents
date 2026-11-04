@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -35,9 +36,11 @@ func waitRunning(t *testing.T, r *rig) {
 		_, err := js.Consumer(context.Background(), lib.TasksStream, r.g.relayDurable)
 		return err == nil
 	})
-	// Bound, and then Run starts the adapter: wait for that too, so a stop
+	// Bound, and then Run starts the adapter: wait for the bind to have
+	// returned (the durable exists before the subscription finishes, and a
+	// client closed in between fails the bind and ends the run), so a stop
 	// is answered by the adapter returning.
-	waitFor(t, "the gateway running", func() bool { return strings.Contains(r.logs.String(), "answer feedback") })
+	waitFor(t, "the gateway running", func() bool { return strings.Contains(r.logs.String(), "event relay bound") })
 }
 
 func stoppedBatch() []relayItem {
@@ -266,4 +269,43 @@ func TestAFailedAckIsTriedAgain(t *testing.T) {
 	d := &flakyAck{fakeDelivery: fakeDelivery{env: &lib.Envelope{TaskID: "t"}, subj: "s", seq: 1}}
 	r.g.settle(relayItem{env: d.env, d: d})
 	waitFor(t, "the retried ack", d.acked)
+}
+
+// TestAFencedRecordWriteGivesTheBatchBack: when a newer term owns the
+// conversation's record, the deposed gateway gives its rendered batch back
+// rather than ack it, so the new leader's record still gets the events.
+func TestAFencedRecordWriteGivesTheBatchBack(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	waitRunning(t, r)
+	ctx := context.Background()
+	conv := "discord:g1/t-fenced"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-fenced", Text: "how is the fleet?"}
+	origin := r.awaitTask(t, targetPlatform)
+	// This gateway is at term 1; a newer leader at term 2 owns the record.
+	r.g.reg.setEpoch(1)
+	newer := NewRegistry(r.client)
+	newer.setEpoch(2)
+	rec, err := newer.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatalf("record: %v", err)
+	}
+	if err := newer.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(lib.StatusUpdate{Status: lib.TaskStatus{State: lib.StateWorking}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: targetPlatform}, origin.TaskID, origin.ContextID, origin.CorrelationID, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &nakRecorder{fakeDelivery: fakeDelivery{env: env, subj: lib.TaskEventsSubject(targetPlatform, origin.TaskID), seq: 77}}
+	r.g.relayBatch(conv, []relayItem{{env: env, subject: d.subj, d: d}})
+	if d.acks != 0 || len(d.naks) != 1 {
+		t.Fatalf("acks %d, naks %v: a fenced record write must give the batch back", d.acks, d.naks)
+	}
+	if !strings.Contains(r.logs.String(), "fenced by a newer term") {
+		t.Fatalf("no log line for the fenced write:\n%s", r.logs.String())
+	}
 }

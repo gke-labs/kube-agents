@@ -8,6 +8,7 @@ import importlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import unittest
@@ -418,6 +419,39 @@ class CollectProjectTest(unittest.TestCase):
         that stands for a project reads as a fleet of Standard clusters."""
         entry = cf.collect_project("proj-1", run=self.fake_run(self.clean()))
         self.assertNotIn("autopilot", entry)
+
+    def test_every_list_read_issues_its_projection_and_descends_lists_with_brackets(self):
+        """The five list reads go out with their `--format=json(...)`
+        projections (a read back on the whole resource meets the credential
+        proxy's output cap on a project with thousands of instances), and the
+        instance read spells `metadata.items[].key`: in a `json()` projection
+        a plain dotted component applied to a list projects nothing, so
+        `metadata.items.key` would drop `metadata` from every item and §2.1
+        would read no console wherever the project's common metadata sets no
+        startup script. The fakes answer by substring, so only the argv says."""
+        issued = []
+        inner = self.fake_run(self.clean())
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            return inner(argv, **kwargs)
+
+        cf.collect_project("proj-1", run=run)
+        formats = {" ".join(argv[1:argv.index("list") + 1]): argv[-1] for argv in issued if argv[0] == "gcloud" and "list" in argv}
+        self.assertEqual(
+            {
+                "compute instances list": cf.INSTANCES_FORMAT,
+                "compute instance-groups managed list": cf.MIGS_FORMAT,
+                "compute sole-tenancy node-groups list": cf.NODE_GROUPS_FORMAT,
+                "compute disks list": cf.DISKS_FORMAT,
+                "compute snapshots list": cf.SNAPSHOTS_FORMAT,
+            },
+            formats,
+        )
+        for fmt in formats.values():
+            self.assertRegex(fmt, r"^--format=json\([^()]+\)$", fmt)
+        self.assertEqual(cf.INSTANCES_FORMAT, "--format=json(name,status,zone,metadata.items[].key)")
+        self.assertNotIn("items.key", cf.INSTANCES_FORMAT.replace("items[].key", ""))
 
     def test_every_commands_entry_is_an_object_with_a_string_check_and_int_rc(self):
         """`cross_check_manifest` reads `entry.get("check")` with no isinstance
@@ -1004,12 +1038,15 @@ class CollectProjectTest(unittest.TestCase):
     def test_the_recorded_command_is_the_argv_that_ran(self):
         """The pre-manifest revision recorded `--project=<id>` while running
         `--project <id>`, and recorded the project-wide enumeration for a
-        finding produced by a per-instance read."""
+        finding produced by a per-instance read. Each part of the recorded
+        line is one argv that ran, quoted so a shell reads it back as the same
+        argv: the list reads' `--format=json(...)` projections carry `(`, `)`
+        and `[]`, which bash refuses unquoted."""
         seen = []
 
         def run(argv, **kwargs):
+            seen.append(list(argv))
             joined = " ".join(argv)
-            seen.append(joined)
             if "instances list" in joined:
                 return run_of(0, one_running_instance())
             if "get-serial-port-output" in joined:
@@ -1017,9 +1054,17 @@ class CollectProjectTest(unittest.TestCase):
             return run_of(0, "[]")
 
         entry = cf.collect_project("proj-1", run=run)
+        self.assertTrue(entry["commands"])
         for record in entry["commands"]:
             for part in record["command"].split(" && "):
-                self.assertIn(part.strip(), seen)
+                self.assertIn(shlex.split(part.strip()), seen, part)
+            self.assertIn("'--format=json(", record["command"])
+            # The symptom itself: bash parses the whole recorded line.
+            proc = subprocess.run(["bash", "-n", "-c", record["command"]], capture_output=True, text=True)
+            self.assertEqual(0, proc.returncode, (record["command"], proc.stderr))
+        for candidate in entry["candidates"]:
+            if candidate.get("command"):
+                self.assertIn(shlex.split(candidate["command"]), seen, candidate["command"])
 
     def test_the_serial_read_names_port_one(self):
         """§2.1's command and its evidence example both spell `--port=1`, and
@@ -1217,7 +1262,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             "object": candidate["object"],
             "impact": candidate["impact"],
             "evidence": {
-                "command": "gcloud compute instances list --project proj-1 --format=json",
+                "command": f"gcloud compute instances list --project proj-1 {shlex.quote(cf.INSTANCES_FORMAT)}",
                 "excerpt": candidate["excerpt"],
             },
             "recommendation": {
@@ -1311,7 +1356,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         data["scope"]["clusters"][0]["checks_run"].append(
             {
                 "check": "sole-tenant-headroom",
-                "command": "gcloud compute sole-tenancy node-groups list --project proj-1 --format=json",
+                "command": f"gcloud compute sole-tenancy node-groups list --project proj-1 {shlex.quote(cf.NODE_GROUPS_FORMAT)}",
             }
         )
         with self.assertRaises(audit_report.ValidationError) as caught:
@@ -1392,7 +1437,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
                         "checks_run": [
                             {
                                 "check": "gce-startup-script-status",
-                                "command": "gcloud compute instances list --project proj-1 --format=json",
+                                "command": f"gcloud compute instances list --project proj-1 {shlex.quote(cf.INSTANCES_FORMAT)}",
                             }
                         ],
                     }

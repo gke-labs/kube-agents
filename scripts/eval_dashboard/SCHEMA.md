@@ -48,9 +48,9 @@ only — anything that renames, removes or re-types a field bumps
     }
   ],
   "coverage": {
-    "domains_total": 11,
-    "domains_covered": 10,
-    "uncovered": ["fleet-audits"]
+    "domains_total": 13,
+    "domains_covered": 12,
+    "uncovered": ["observability"]
   }
 }
 ```
@@ -59,7 +59,9 @@ only — anything that renames, removes or re-types a field bumps
 
 ### `runs[]` — one entry per finished Prow build, oldest first
 
-Parsed from `build-log.txt` plus Prow's `started.json`/`finished.json`.
+Parsed from `artifacts/eval-grading.log` (the per-case grading blocks and the suite
+table; builds from before the artifact existed carry them in the log) and `build-log.txt`,
+read as one text in that order, plus Prow's `started.json`/`finished.json`.
 A build with no `finished.json` is still running and is skipped entirely.
 Three jobs feed it, each a source with a watermark of its own: the
 presubmit gate (`pull-kube-agents-smoke-test`, one build per pull-request
@@ -209,9 +211,9 @@ layout and are collected from the moment they start running.
       repetition whose `reason` is shown, so the quote and the check beside
       it come from the same run of the agent; nothing is quoted when that
       rep has none (when no rep carries a reason, the first rep with an
-      excerpt is the one the row is about, link included). The PR gate comment's Reason line stays the grader's
-      `reason` and falls back to the excerpt only for a rep that has no
-      reason at all.
+      excerpt is the one the row is about, link included). The PR gate comment carries neither the
+      `reason` nor the excerpt: the pull request is public, and both stay
+      behind the run link.
     - `agent_s`, `turn1_s` — **optional, additive**: how long the
       repetition took, in seconds, from the
       `rep N timing: agent_s=<x> turn1_s=<y>` line `bench-gate case` prints
@@ -557,6 +559,13 @@ what the renderer does with them.
   Absent on a nightly record means it predates the field and was read from
   the bucket the nightly used before 2026-09-15, `gs://kube-agents-prow`;
   `nightly.py` links it there.
+- `runs[].gcs_base` — the build directory the run was read from, as a
+  `gs://` URL with its trailing slash, on a run read from a bucket Deck
+  cannot read (`PRIVATE_LOG_BUCKETS`: the smoke lanes'
+  `gs://kube-agents-evals-presubmit-logs`). The pages and the health bot
+  link such a run's build and transcripts in the Cloud Console; a run
+  without the field, in `gs://kube-agents-prow` or from before the field,
+  keeps its Spyglass link, which still renders it.
 - `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
   `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
   pod**: `classify.py` gives it its own run-level headline (`infra`, never
@@ -663,7 +672,8 @@ what the renderer does with them.
   build read through it is `tier: "nightly"`, `pr: null`, `job` the
   prefix's last segment (or `--nightly-job`). Given without a value it is
   `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/`
-  (the nightly's own bucket; the presubmit and the RC lane stay on the
+  (the nightly's own bucket; the presubmit has its own,
+  `gs://kube-agents-evals-presubmit-logs`, and the RC lane stays on the
   cluster default `gs://kube-agents-prow`); omitted, no
   nightly scan happens (`--merge-with` alone still recomputes without
   touching the bucket). A prefix that does not list is read three ways. A
@@ -788,7 +798,7 @@ the question imports it.
 `index.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b&view=gate|agent`
 `run.html#build=<prow build id>`
 `grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
-`cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`, or `cases.html#view=scenarios[&domain=<domain slug>]`
+`cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`, or `cases.html#view=scenarios[&domain=<domain slug>]`, or `cases.html#view=domains`
 `nightly.html[#build=<prow build id>&cases=a,b]` (either key may be left out)
 `trend.html#cases=a,b`, or `trend.html#domain=<domain>`, each `[&metric=<judged metric>][&mode=next|today][&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]]`
 
@@ -858,7 +868,7 @@ gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
 
 `{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
 strip_runs, admitted[], health, history, merges, catches, domains[],
-confidence_bar{}, cases{}, runs[], pending[], releases[], nightly{}, gitlab{},
+scorecard, confidence_bar{}, cases{}, runs[], pending[], releases[], nightly{}, gitlab{},
 trend{}}`. `runs[]` is the **presubmit's** last `run_days` of
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
@@ -890,7 +900,7 @@ confidence, times, transcript_url}`. `status` is
 `blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
 (active, off the roster, no demotion date: the held-out seat a coverage tracker takes in the
 presubmit file, which is what pdb-remediation-pr showed while seated, 2026-09-28 to 10-14; a dated one reads
-`demoted`, which is what the compliance canary shows while seated),
+`demoted`, which is what the compliance canary showed while seated, 2026-09-29 to 11-02),
 `demoted` (off the roster, active or nightly-only, with `demoted_on` read from the hold-out
 entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`; a case demoted under the
 2026-09-22 protocol is a nightly case and keeps this status and its date), `nightly_only`
@@ -949,7 +959,16 @@ case passed every graded repetition, as the Nightly report links it
 rows in file order as `{slug, meaning}` (empty when the file cannot be read),
 and `confidence_bar` is `{rate, min_runs, window_days, proving_min_rate}`,
 the thresholds `confidence` was computed with, so the view prints the rule
-it applied.
+it applied. `scorecard` is the domain view's (`cases.html#view=domains`):
+`understudies.py`'s document as written, `{schema_version, generated_at,
+bar{rate, min_runs, nights}, store_read, nightly_red_read, domains[]}`, each
+domain `{slug, name, owner, backup, seats[], uncovered_since,
+days_uncovered, allowlist_issue, held_out, expired_days, nightly_red{open,
+oldest_days}, understudies[], candidates, understudy_ready}` (an
+understudy is `{case, passed, graded, nights, rate, meets_bar, held_out,
+store{state, runs, passes}}`; `nightly_red`, `understudies` and
+`understudy_ready` are `null` when not read), or `null` when the render was
+given none ([`docs/ci-health.md`](../../docs/ci-health.md#the-domain-scorecard)).
 
 `pending[]` is `pending_builds` as `{build, first_seen}`, the Grid's "still
 running" columns — the presubmit's entries only (a night in flight,
@@ -1072,8 +1091,9 @@ block, the report page and the digest say instead of "no night".
 nightly_job, nights[], night_counts{...}}` from `forge_lane.py`: the GitLab
 lane's pull-request runs (`runs[].tier == "gitlab"` with a `pr`) **newest
 first**, the last `RUNS_LISTED` (20), each `{build, job, pr, head_sha,
-project, log_url, started, finished, duration_s, result, eval_verdict, green,
-tasks{pass, fail, infra}}`; `nights[]` the same shape for the lane's nightly
+project, log_url, gcs_base, started, finished, duration_s, result, eval_verdict, green,
+tasks{pass, fail, infra}}` (a row's build link is `log_url`, else the Console
+browser for `gcs_base`, else Spyglass); `nights[]` the same shape for the lane's nightly
 runs (`pr` null, `log_url` the periodic's Spyglass page), `nightly_job` the
 newest night's job else the default, `night_counts` over every night on
 record (`green` is Prow's `SUCCESS`; `tasks` counts the
