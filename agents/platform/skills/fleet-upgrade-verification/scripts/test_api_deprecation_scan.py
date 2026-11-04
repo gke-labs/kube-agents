@@ -525,8 +525,8 @@ class InPartsTest(unittest.TestCase):
         self.assertEqual(["top.yaml"], sorted(read.files))
         reasons = {unread["path"]: unread["reason"] for unread in read.unread}
         self.assertEqual({"huge.yaml", "clusters"}, set(reasons))
-        self.assertIn("1000-byte snapshot ceiling on its own (CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES)", reasons["huge.yaml"])
-        self.assertIn("named no entries below it", reasons["clusters"])
+        self.assertIn("1000-byte snapshot bound on its own (the lower of the broker's CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", reasons["huge.yaml"])
+        self.assertIn("named no entries below it: too large", reasons["clusters"])
 
     def test_past_the_cap_the_rest_is_listed_as_not_read(self):
         fake = FakeParts(self.TREE, {None: [entry("clusters", 900, manifests=2), entry("top.yaml", 200, kind="blob")]})
@@ -577,11 +577,18 @@ class InPartsTest(unittest.TestCase):
         self.assertIn("the whole tree is over the broker's snapshot ceiling, so the scan took the parts that hold manifests; no part of it holds one", out)
         self.assertEqual(0, report["summary"]["unread"])
 
-    def test_the_branch_moving_after_the_refusal_is_noted(self):
+    def test_the_branch_moving_after_the_refusal_is_noted_and_the_header_names_the_commit_read(self):
         fake = FakeParts(self.TREE, {None: [entry("top.yaml", 20, kind="blob")]}, refused_revision="fedcba9")
         read = scan.read_repo_content("acme/infra", snapshot=fake)
-        self.assertEqual(["fedcba9", "abc1234"], read.revisions)
-        self.assertEqual("fedcba9", read.sha)
+        self.assertEqual((["abc1234"], "fedcba9", "abc1234"), (read.revisions, read.refused_revision, read.sha))
+        report = scan.build_report(scan.load_table(), (1, 24), (1, 27), [], [("acme/infra", lambda: read)])
+        out = scan.render_report(report)
+        self.assertIn("## acme/infra — repo manifests as of abc1234", out)
+        self.assertIn(
+            "- the branch moved during the read: the whole tree was measured at fedcba9 and refused; "
+            "the parts were read from abc1234",
+            out,
+        )
 
     def test_a_name_the_broker_would_refuse_is_listed_alone_and_the_rest_is_read(self):
         odd = "k8s\\manifests"
@@ -594,6 +601,46 @@ class InPartsTest(unittest.TestCase):
         reasons = {unread["path"]: unread["reason"] for unread in read.unread}
         self.assertEqual({odd, "x" * 4097}, set(reasons))
         self.assertIn("4096 bytes", reasons["x" * 4097])
+
+    def test_a_part_refused_for_another_reason_is_listed_with_that_reason_and_the_rest_is_read(self):
+        fake = FakeParts(self.TREE, {None: [entry("clusters", 900, manifests=2), entry("top.yaml", 200, kind="blob")]})
+        real = fake.__call__
+
+        def refusing(repo, into=None, paths=None, **kwargs):
+            if paths == ["clusters"]:
+                fake.calls.append(tuple(paths))
+                raise scan.vcs_client.VcsError("a path in `paths` names nothing in acme/infra at main", code="PATH_NOT_FOUND")
+            return real(repo, into=into, paths=paths, **kwargs)
+
+        read = scan.read_repo_content("acme/infra", snapshot=refusing)
+        self.assertEqual([None, ("clusters",), ("top.yaml",)], fake.calls)
+        self.assertEqual(["top.yaml"], sorted(read.files))
+        self.assertEqual([{"path": "clusters", "reason": "a path in `paths` names nothing in acme/infra at main"}], read.unread)
+
+    def test_a_batch_refused_as_too_large_continues_from_the_entries_its_refusal_names(self):
+        tree = {**self.TREE, "apps/web.yaml": PDB_V1BETA1}
+        fake = FakeParts(tree, {
+            None: [entry("apps", 400), entry("clusters", 500, manifests=2)],
+            ("apps", "clusters"): [entry("apps/web.yaml", 100, kind="blob"), entry("clusters/a", 300), entry("clusters/b", 300)],
+        })
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual([None, ("apps", "clusters"), ("apps/web.yaml", "clusters/a", "clusters/b")], fake.calls)
+        self.assertEqual(sorted(read.files), ["apps/web.yaml", "clusters/a/pdb.yaml", "clusters/b/cron.yaml"])
+        self.assertEqual([], read.unread)
+
+    def test_a_name_that_did_not_decode_is_listed_alone(self):
+        fake = FakeParts(self.TREE, {None: [entry("caf\ufffd", 20), entry("top.yaml", 20, kind="blob")]})
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual([None, ("top.yaml",)], fake.calls)
+        self.assertEqual([{"path": "caf\ufffd", "reason": scan.UNREAD_NOT_UTF8}], read.unread)
+
+    def test_parts_are_sized_to_the_client_s_unpack_bound_when_the_ceiling_is_above_it(self):
+        mib = 1 << 20
+        fake = FakeParts(self.TREE, {None: [entry("clusters", 40 * mib, manifests=2), entry("top.yaml", 40 * mib, kind="blob")]}, ceiling=256 * mib)
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        # 80 MiB fits the 256 MiB ceiling but not the client's 64 MiB unpack bound: two snapshots.
+        self.assertEqual([None, ("clusters",), ("top.yaml",)], fake.calls)
+        self.assertEqual(3, len(read.files))
 
     def test_a_refusal_that_names_no_entries_is_still_an_error(self):
         fake = FakeParts(self.TREE, {None: None})
@@ -612,8 +659,8 @@ class InPartsTest(unittest.TestCase):
         out = scan.render_report(report)
         self.assertIn("## acme/infra — repo manifests as of abc1234", out)
         self.assertIn("- read in parts (2 snapshot(s)): the whole tree is over the broker's snapshot ceiling", out)
-        self.assertIn("- the branch moved while the parts were read; they come from abc1234, def5678", out)
-        self.assertIn("- partial: huge.yaml was not read: a file over the broker's 1000-byte", out)
+        self.assertIn("- the branch moved during the read: the parts were read from abc1234, def5678", out)
+        self.assertIn("- partial: huge.yaml was not read: a file over the 1000-byte snapshot bound on its own", out)
         self.assertEqual(1, report["summary"]["unread"])
         self.assertEqual(2, report["summary"]["hits"])
 

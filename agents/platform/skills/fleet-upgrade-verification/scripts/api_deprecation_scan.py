@@ -126,9 +126,19 @@ UNREAD_NAME_TOO_LONG = "its name is longer than the {limit} bytes the broker tak
 ENTRY_TREE = "tree"
 NARROW_PART_NAME = "part-{index}"
 CEILING_ENV = "CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
-UNREAD_OVER_CEILING = "a file over the broker's {ceiling}-byte snapshot ceiling on its own ({env})"
+# A part is sized to the lower of the broker's ceiling and vcs_client's own
+# unpack bound (SNAPSHOT_MAX_UNPACKED_BYTES): with the ceiling raised past it,
+# a part the broker serves would be refused by the client, with no entries.
+UNREAD_OVER_CEILING = (
+    "a file over the {limit}-byte snapshot bound on its own "
+    "(the lower of the broker's {env} and the client's unpack bound)"
+)
 UNREAD_PAST_CAP = "past the cap of {cap} snapshots for one repository"
-UNREAD_NO_LISTING = "over the broker's {ceiling}-byte snapshot ceiling, and the refusal named no entries below it ({env})"
+UNREAD_NO_LISTING = "refused as too large, and the refusal named no entries below it: {refusal}"
+# The broker decodes its listing with replacement, so a name that is not UTF-8
+# comes back with U+FFFD and names nothing when it is asked for.
+REPLACEMENT_CHARACTER = "\ufffd"
+UNREAD_NOT_UTF8 = "its name is not UTF-8, so the broker's listing could not name it to ask for"
 
 # `[v]MAJOR.MINOR[.PATCH][-gke.BUILD]`: the GKE form Phase 1 prints, and the bare
 # minor the removal table and a human's `--target-version 1.27` use. Only the
@@ -339,10 +349,11 @@ class Snapshot:
     files: dict[str, bytes] = field(default_factory=dict)
     skipped: list[dict] = field(default_factory=list)
     stopped: str | None = None
-    # A tree read in parts: that it was, how many snapshots, the revisions
-    # (the refused one first; more than one when the branch moved), and the
-    # parts not read.
+    # A tree read in parts: that it was, the commit the whole tree was refused
+    # at, how many snapshots, the revisions the parts were read from (more than
+    # one when the branch moved between them), and the parts not read.
     in_parts: bool = False
+    refused_revision: str | None = None
     parts: int = 0
     revisions: list[str] = field(default_factory=list)
     unread: list[dict] = field(default_factory=list)
@@ -421,6 +432,8 @@ def _name_refusal(path: str) -> str | None:
     """Why the broker would refuse ``path`` in `paths`, or None when it takes it."""
     if len(path.encode()) > NARROW_PATH_BYTES:
         return UNREAD_NAME_TOO_LONG.format(limit=NARROW_PATH_BYTES)
+    if REPLACEMENT_CHARACTER in path:
+        return UNREAD_NOT_UTF8
     try:
         workspace_paths.validate_path(path)
     except workspace_paths.WorkspaceError as refused:
@@ -468,7 +481,8 @@ def read_repo_in_parts(
     scan could not read is listed under ``unread`` with its reason: never a
     section that reads as whole when it is not.
     """
-    read = Snapshot(source="", sha=None, in_parts=True, revisions=[revision] if revision else [])
+    read = Snapshot(source="", sha=None, in_parts=True, refused_revision=revision or None)
+    limit = min(ceiling, vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES)
     pending = [entry for entry in entries if _holds_manifests(entry)]
     total_bytes = 0
     while pending and not read.stopped:
@@ -477,15 +491,15 @@ def read_repo_in_parts(
             if reason is not None:
                 pending.remove(entry)
                 read.unread.append({"path": entry["path"], "reason": reason})
-        alone = [entry for entry in pending if entry["bytes"] > ceiling]
-        requests = _batches([entry for entry in pending if entry["bytes"] <= ceiling], ceiling)
+        alone = [entry for entry in pending if entry["bytes"] > limit]
+        requests = _batches([entry for entry in pending if entry["bytes"] <= limit], limit)
         pending = []
         for entry in alone:
             if entry.get("type") == ENTRY_TREE:
                 requests.append([entry])
             else:
                 read.unread.append(
-                    {"path": entry["path"], "reason": UNREAD_OVER_CEILING.format(ceiling=ceiling, env=CEILING_ENV)}
+                    {"path": entry["path"], "reason": UNREAD_OVER_CEILING.format(limit=limit, env=CEILING_ENV)}
                 )
         for batch in requests:
             # Checked before the next clone, not only inside `read_tree` after it.
@@ -505,14 +519,16 @@ def read_repo_in_parts(
             try:
                 answer = snapshot(repo, paths=[entry["path"] for entry in batch], into=part)
             except vcs_client.VcsError as refused:
-                if refused.code == vcs_client.SNAPSHOT_TOO_LARGE and len(batch) == 1:
-                    if refused.entries is None:
-                        reason = UNREAD_NO_LISTING.format(ceiling=ceiling, env=CEILING_ENV)
-                        read.unread.append({"path": batch[0]["path"], "reason": reason})
-                    else:
-                        pending.extend(entry for entry in refused.entries if _holds_manifests(entry))
-                    continue
-                read.unread.extend({"path": entry["path"], "reason": str(refused)} for entry in batch)
+                if refused.code == vcs_client.SNAPSHOT_TOO_LARGE and refused.entries is not None:
+                    # The entries below every asked path, whatever the batch's size
+                    # (a part can grow past the ceiling when the branch moves).
+                    pending.extend(entry for entry in refused.entries if _holds_manifests(entry))
+                elif refused.code == vcs_client.SNAPSHOT_TOO_LARGE and len(batch) == 1:
+                    read.unread.append(
+                        {"path": batch[0]["path"], "reason": UNREAD_NO_LISTING.format(refusal=refused)}
+                    )
+                else:
+                    read.unread.extend({"path": entry["path"], "reason": str(refused)} for entry in batch)
                 continue
             if answer.get("revision") and answer["revision"] not in read.revisions:
                 read.revisions.append(answer["revision"])
@@ -524,7 +540,9 @@ def read_repo_in_parts(
             total_bytes += sum(len(data) for data in got.files.values())
             read.skipped.extend(list(answer.get("skipped") or []) + got.skipped)
             read.stopped = got.stopped
-    read.sha = read.revisions[0] if read.revisions else None
+    # The section names a commit its files came from; the refused one only
+    # when no part was read.
+    read.sha = read.revisions[0] if read.revisions else read.refused_revision
     read.source = SOURCE_REPO.format(sha=read.sha or SHA_UNKNOWN)
     return read
 
@@ -709,6 +727,7 @@ def scan_snapshot(snapshot: Snapshot, in_range: list[Removal], members: list[Mem
         "skipped": skipped,
         "stopped": snapshot.stopped,
         "in_parts": snapshot.in_parts,
+        "refused_revision": snapshot.refused_revision,
         "parts": snapshot.parts,
         "revisions": list(snapshot.revisions),
         "unread": list(snapshot.unread),
@@ -727,6 +746,7 @@ def error_section(message: str) -> dict:
         "skipped": [],
         "stopped": None,
         "in_parts": False,
+        "refused_revision": None,
         "parts": 0,
         "revisions": [],
         "unread": [],
@@ -781,9 +801,12 @@ def render_section(name: str, section: dict, floor: Version, target: Version) ->
             "snapshot ceiling, so the scan took the parts that hold manifests"
             + ("" if section["parts"] or section["unread"] else "; no part of it holds one")
         )
-    if len(section["revisions"]) > 1:
+    refused = section["refused_revision"]
+    if len(section["revisions"]) > 1 or (refused and section["revisions"] and section["revisions"] != [refused]):
         lines.append(
-            "- the branch moved while the parts were read; they come from "
+            "- the branch moved during the read: "
+            + (f"the whole tree was measured at {refused} and refused; " if refused else "")
+            + "the parts were read from "
             + MEMBER_SEPARATOR.join(section["revisions"])
         )
     for unread in section["unread"]:

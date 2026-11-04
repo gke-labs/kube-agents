@@ -3949,6 +3949,7 @@ class SnapshotTest(unittest.TestCase):
         with mock.patch.object(vcs_broker, "_tar_bytes", return_value=0), self.assertRaises(WorkspaceError) as caught:
             self.broker.snapshot({"repository": self.REPOSITORY})
         self.assertEqual((413, "SNAPSHOT_TOO_LARGE"), (caught.exception.status, caught.exception.fields.get("code")))
+        self.assertEqual(self.main_tip, caught.exception.fields["revision"])
         self.assertTrue([argv for argv, _ in self.calls if "archive" in argv])
         self.assertEqual([], list(self.scratch.iterdir()))
 
