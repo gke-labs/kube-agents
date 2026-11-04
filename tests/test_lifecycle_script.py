@@ -914,17 +914,18 @@ resource "google_service_account" "agent" {
 
     def test_guard_node_pool_shape_reads_a_typed_null_number_as_unset(self):
         """terraform console prints an unset number input as tonumber(null); read raw, it
-        would count as a named input and let the shrink through."""
+        would count as a named input and let the shrink through. The machine type matches
+        the small output so the guard, which refuses on the first mismatch, reaches the
+        disk size, the one attribute whose input is a number."""
         proc = self._run_guard(
             "guard_node_pool_shape",
             state_list=self._STANDARD_ADDRESS,
-            state_show=self._standard_cluster_state("n2-standard-8", 200, "pd-balanced"),
-            tfvar_pool_shapes={"standard_machine_type": "tostring(null)",
-                               "standard_disk_size_gb": "tonumber(null)"},
+            state_show=self._standard_cluster_state("e2-standard-4", 200, "pd-balanced"),
+            tfvar_pool_shapes={"standard_disk_size_gb": "tonumber(null)"},
             tfvar_sizing_profile="tostring(null)",
         )
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("standard_machine_type resolved to 'e2-standard-4'", proc.stderr)
+        self.assertIn("standard_disk_size_gb resolved to '100'", proc.stderr)
 
     def test_guard_pubsub_subscription_no_op_when_chat_disabled(self):
         """A subscription in state whose feature is switched off is a teardown, not a rename."""
