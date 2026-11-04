@@ -1994,12 +1994,31 @@ class ServeWiringTest(unittest.TestCase):
         # The harness serves on the socket, where Envoy holds port 8765 in the
         # shipped layout; the refusal has to hold there too.
         args_port = 8765
-        refusal = credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="/run/backend.sock"))
+        envoy = {8765: "credential_proxy", 8768: "credential_health"}
+        refusal = credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="/run/backend.sock"), envoy)
         self.assertIn("8765", refusal)
         self.assertIn("credentialed", refusal)
-        self.assertIsNone(credential_proxy._metrics_port_refusal(8766, types.SimpleNamespace(port=args_port, unix_socket="")))
-        self.assertIn("credentialed", credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="")))
-        self.assertIn("1-65535", credential_proxy._metrics_port_refusal(70000, types.SimpleNamespace(port=args_port, unix_socket="")))
+        self.assertIsNone(credential_proxy._metrics_port_refusal(8766, types.SimpleNamespace(port=args_port, unix_socket=""), envoy))
+        self.assertIn("credentialed", credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket=""), envoy))
+        self.assertIn("1-65535", credential_proxy._metrics_port_refusal(70000, types.SimpleNamespace(port=args_port, unix_socket=""), envoy))
+        # Envoy's other listener, the readiness probe's: refused by Envoy's
+        # name for it, and not refused when no config told the broker of it.
+        refusal = credential_proxy._metrics_port_refusal(8768, types.SimpleNamespace(port=args_port, unix_socket=""), envoy)
+        self.assertIn("Envoy", refusal)
+        self.assertIn("credential_health", refusal)
+        self.assertIsNone(credential_proxy._metrics_port_refusal(8768, types.SimpleNamespace(port=args_port, unix_socket=""), {}))
+
+    def test_a_metrics_port_envoy_holds_is_refused_by_name_and_never_bound(self):
+        # serve() reads the ports off the shipped config itself; 8768 is the
+        # readiness probe's listener there, which the operator never gives the
+        # metrics listener, so this is the hand-edit case the refusal is for.
+        with mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (_ENVOY_CONFIG,)):
+            started, logs = self._serve(8768)
+        started.assert_not_called()
+        self.assertTrue(
+            any("ALERT" in line and credential_proxy.METRICS_PORT_ENV in line and "credential_health" in line and "8768" in line for line in logs),
+            logs,
+        )
 
     def test_a_zero_or_refused_port_is_reported_as_what_it_is(self):
         # Three ways to arrive at 0, three different things an operator
@@ -2030,10 +2049,11 @@ class ServeWiringTest(unittest.TestCase):
         self.assertEqual(["credentialed", "health"], order)
 
     def test_a_health_port_the_other_listeners_hold_is_refused_by_name_and_never_bound(self):
-        for health_port, named in ((8766, "metrics"), (0, None), (70000, "1-65535")):
+        for health_port, named in ((8766, "metrics"), (8768, "credential_health"), (0, None), (70000, "1-65535")):
             with self.subTest(health_port=health_port):
                 health_started = mock.MagicMock()
-                started, logs = self._serve(8766, health_port=health_port, health_started=health_started)
+                with mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (_ENVOY_CONFIG,)):
+                    started, logs = self._serve(8766, health_port=health_port, health_started=health_started)
                 health_started.assert_not_called()
                 if named is None:
                     self.assertTrue(any("health listener disabled" in line for line in logs), logs)

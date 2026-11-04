@@ -17214,6 +17214,119 @@ class ThreadCapDefaultTest(unittest.TestCase):
         )
 
 
+
+_LISTENER_PORTS_ENVOY_CONFIG = """
+static_resources:
+  listeners:
+    - name: quoted
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: "8770"
+    - address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 8771
+    - name: whole_float
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 8772.0
+    - name: on_a_pipe
+      address:
+        pipe:
+          path: /var/run/envoy/admin.sock
+    - name: ephemeral
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 0
+    - name: past_the_range
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 70000
+    - name: a_bool
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: true
+    - name: a_word
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: eight
+    - name: second_on_8771
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8771
+"""
+
+
+class EnvoyListenerPortsTest(unittest.TestCase):
+    """The ports Envoy's listeners bind, read from its config so the metrics
+    and health listeners can be refused them by name: Envoy runs in the
+    broker's container after the broker, and a port the broker took first is
+    one Envoy's bind fails on."""
+
+    def _written(self, text, encoding="utf-8"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "envoy.yaml"
+        if isinstance(text, bytes):
+            path.write_bytes(text)
+        else:
+            path.write_text(text, encoding=encoding)
+        return path
+
+    def test_the_shipped_config_names_the_credentialed_and_the_health_listener(self):
+        import yaml
+        ports = credential_proxy.envoy_listener_ports_in(yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8")))
+        self.assertEqual({8765: "credential_proxy", 8768: "credential_health"}, ports)
+        # The credentialed listener's port is the broker's own default, so
+        # the two refusals (by args.port and by Envoy's list) agree on it.
+        with mock.patch.dict(os.environ), mock.patch.object(sys, "argv", ["credential_proxy.py"]):
+            os.environ.pop("CREDENTIAL_PROXY_PORT", None)
+            self.assertIn(credential_proxy.parse_args().port, ports)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            self.assertEqual(ports, credential_proxy.envoy_listener_ports(paths=(_ENVOY_CONFIG,)))
+        self.assertTrue(any("8768 (credential_health)" in line and str(_ENVOY_CONFIG) in line for line in logs.output), logs.output)
+
+    def test_a_port_is_read_as_envoy_reads_a_uint32_and_nothing_else_is_a_port(self):
+        import yaml
+        ports = credential_proxy.envoy_listener_ports_in(yaml.safe_load(_LISTENER_PORTS_ENVOY_CONFIG))
+        # A quoted digit string and a whole float are the integer; an unnamed
+        # listener maps to ""; a pipe, port 0, a value past 65535, a bool and
+        # a word bind no TCP port Envoy would load; the first listener on a
+        # port keeps its name.
+        self.assertEqual({8770: "quoted", 8771: "", 8772: "whole_float"}, ports)
+        for shape in (None, [], "listeners", {"static_resources": {"listeners": "none"}}, {"static_resources": {"listeners": [None, 3]}}):
+            with self.subTest(shape=shape):
+                self.assertEqual({}, credential_proxy.envoy_listener_ports_in(shape))
+
+    def test_the_first_readable_config_decides_and_none_readable_is_empty_with_a_warning(self):
+        missing = self._written("").parent / "absent.yaml"
+        broken = self._written("static_resources: [")
+        not_utf8 = self._written(b"\xff\xfe static_resources: {}")
+        first = self._written("static_resources:\n  listeners:\n    - name: first\n      address:\n        socket_address:\n          port_value: 8780\n")
+        second = self._written("static_resources:\n  listeners:\n    - name: second\n      address:\n        socket_address:\n          port_value: 8781\n")
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual({8780: "first"}, dict(credential_proxy.envoy_listener_ports((missing, broken, not_utf8, first, second))))
+        self.assertTrue(any("does not parse as YAML" in line and "the listener ports" in line for line in logs.output), logs.output)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual({}, dict(credential_proxy.envoy_listener_ports((missing, broken, not_utf8))))
+        self.assertTrue(any("no Envoy config is readable" in line and str(missing) in line for line in logs.output), logs.output)
+        self.assertEqual({}, dict(credential_proxy.envoy_listener_ports(())))
+
+    def test_a_walk_that_raises_costs_the_ports_not_the_start(self):
+        path = self._written("static_resources: {}")
+        with mock.patch.object(credential_proxy, "envoy_listener_ports_in", side_effect=TypeError("unforeseen")), \
+                self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual({}, dict(credential_proxy.envoy_listener_ports((path,))))
+        self.assertTrue(any("could not be walked" in line and "TypeError" in line for line in logs.output), logs.output)
+
+
 class HealthListenerTest(unittest.TestCase):
     """GET /healthz on a port of its own, bounded as the metrics listener is."""
 
@@ -17265,12 +17378,25 @@ class HealthListenerTest(unittest.TestCase):
 
     def test_the_other_listeners_ports_and_a_non_port_are_refused_by_name(self):
         args = types.SimpleNamespace(port=8765, unix_socket="/run/backend.sock")
-        self.assertIsNone(credential_proxy._health_port_refusal(8767, args, 8766))
-        self.assertIn("credentialed", credential_proxy._health_port_refusal(8765, args, 8766))
-        self.assertIn("metrics", credential_proxy._health_port_refusal(8766, args, 8766))
-        self.assertIn("1-65535", credential_proxy._health_port_refusal(70000, args, 8766))
-        # No metrics listener (port 0): nothing to collide with there.
-        self.assertIsNone(credential_proxy._health_port_refusal(8767, args, 0))
+        # Envoy's listeners as the shipped config declares them: the
+        # credentialed one on the broker's port and the readiness probe's.
+        envoy = {8765: "credential_proxy", 8768: "credential_health"}
+        self.assertIsNone(credential_proxy._health_port_refusal(8767, args, 8766, envoy))
+        self.assertIn("credentialed", credential_proxy._health_port_refusal(8765, args, 8766, envoy))
+        self.assertIn("metrics", credential_proxy._health_port_refusal(8766, args, 8766, envoy))
+        self.assertIn("1-65535", credential_proxy._health_port_refusal(70000, args, 8766, envoy))
+        # Envoy's health listener: the broker starts first in the container,
+        # so a broker that took 8768 would be the one Envoy's bind fails on.
+        refusal = credential_proxy._health_port_refusal(8768, args, 8766, envoy)
+        self.assertIn("Envoy", refusal)
+        self.assertIn("credential_health", refusal)
+        self.assertIn("8768", refusal)
+        # A listener the config left unnamed is still Envoy's port.
+        self.assertIn("Envoy", credential_proxy._health_port_refusal(8769, args, 8766, {8769: ""}))
+        # No metrics listener (port 0): nothing to collide with there; and
+        # with no Envoy port known (no config readable), 8768 is any port.
+        self.assertIsNone(credential_proxy._health_port_refusal(8767, args, 0, envoy))
+        self.assertIsNone(credential_proxy._health_port_refusal(8768, args, 8766, {}))
 
     def test_an_occupied_port_is_logged_not_raised(self):
         with socket.socket() as holder:

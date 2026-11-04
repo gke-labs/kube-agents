@@ -945,6 +945,12 @@ ENVOY_MAX_CONNECTIONS_LIMIT = 2**32 - 1
 # breaker never fires and one below it refuses connections Envoy carries.
 ENVOY_DEFAULT_PRIORITY = "DEFAULT"
 ENVOY_ROUTING_PRIORITIES: Mapping[str, int] = {ENVOY_DEFAULT_PRIORITY: 0, "HIGH": 1}
+# What a WARNING about an Envoy config that could not be read says it was
+# not read for. The thread cap's derivation (default_max_threads) and the
+# listener ports the auxiliary listeners are refused by name
+# (envoy_listener_ports) read the same file.
+ENVOY_READ_FOR_THREAD_CAP = "the thread cap"
+ENVOY_READ_FOR_LISTENER_PORTS = "the listener ports"
 FALLBACK_MAX_THREADS = ENVOY_DEFAULT_MAX_CONNECTIONS
 # The 503 a connection past the thread cap is written before it is closed: a
 # whole HTTP/1.1 response with an empty body, so a client that already sent
@@ -1623,32 +1629,46 @@ def default_max_threads(paths: Sequence[Path] | None = None) -> int:
     return FALLBACK_MAX_THREADS
 
 
-def _envoy_ceiling_from_text(text: str, path: Path) -> int | None:
-    """envoy_broker_connection_ceiling over a config's text; None, with a WARNING, when it cannot be read.
+def _parsed_envoy_config(text: str, path: Path, purpose: str) -> tuple[bool, Any]:
+    """Whether ``text`` parses as YAML, and the document; a WARNING naming ``purpose`` when it does not.
 
-    Fail-safe: nothing the parse or the walk raises leaves this function. The
-    derivation runs at the start of every broker and agent API door, and a
-    config Envoy itself starts on (yaml-cpp has no recursion limit to hit and
-    reads a count the broker could not) must not keep the broker from
-    starting; the path is passed over for the next, or the fallback.
+    Fail-safe: nothing the parser raises leaves this function. The readers
+    run at the start of every broker and agent API door, and a config Envoy
+    itself starts on (yaml-cpp has no recursion limit to hit) must not keep
+    the broker from starting; the path is passed over for the next.
     """
     try:
         import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
     except ImportError:
-        LOGGER.warning("pyyaml is not importable; %s is not read for the thread cap", path)
-        return None
+        LOGGER.warning("pyyaml is not importable; %s is not read for %s", path, purpose)
+        return False, None
     try:
-        config = yaml.safe_load(text)
+        return True, yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        LOGGER.warning("%s does not parse as YAML (%s); not read for the thread cap", path, exc)
-        return None
+        LOGGER.warning("%s does not parse as YAML (%s); not read for %s", path, exc, purpose)
+        return False, None
     except Exception as exc:  # a RecursionError on a nested document, or anything else the parser raises
-        LOGGER.warning("%s could not be parsed (%s: %s); not read for the thread cap", path, type(exc).__name__, exc)
+        LOGGER.warning("%s could not be parsed (%s: %s); not read for %s", path, type(exc).__name__, exc, purpose)
+        return False, None
+
+
+def _envoy_ceiling_from_text(text: str, path: Path) -> int | None:
+    """envoy_broker_connection_ceiling over a config's text; None, with a WARNING, when it cannot be read.
+
+    Fail-safe: nothing the parse or the walk raises leaves this function
+    (_parsed_envoy_config), and a config that reads a count the broker could
+    not is passed over for the next, or the fallback, not a crash loop.
+    """
+    parsed, config = _parsed_envoy_config(text, path, ENVOY_READ_FOR_THREAD_CAP)
+    if not parsed:
         return None
     try:
         ceiling = envoy_broker_connection_ceiling(config)
     except Exception as exc:  # a shape the walk did not foresee; the fallback, not a crash loop
-        LOGGER.warning("%s could not be walked (%s: %s); not read for the thread cap", path, type(exc).__name__, exc)
+        LOGGER.warning(
+            "%s could not be walked (%s: %s); not read for %s",
+            path, type(exc).__name__, exc, ENVOY_READ_FOR_THREAD_CAP,
+        )
         return None
     if ceiling is None:
         LOGGER.warning(
@@ -1818,6 +1838,86 @@ def _connection_count(value: Any) -> int | None:
 def _mapping(value: Any) -> Mapping[str, Any]:
     """``value`` when it is a mapping, else an empty one: a parsed config's absent keys read as absent."""
     return value if isinstance(value, Mapping) else {}
+
+
+def envoy_listener_ports(paths: Sequence[Path] | None = None) -> Mapping[int, str]:
+    """Port to listener name for the TCP listeners of the first readable Envoy config in ``paths``.
+
+    ENVOY_CONFIG_PATHS by default, in default_max_threads's order: the
+    image's copy, then the repository's; the first that reads and parses
+    decides (envoy_listener_ports_in). Empty, with a WARNING, when none
+    does: the refusals by name (_metrics_port_refusal) then know no Envoy
+    port, and a collision with one is left to bind(). The config is the
+    image's own file; nothing a caller sends reaches this. The ports are
+    the file's: start-services.sh re-addresses every listener to the
+    operator's address and leaves the ports alone.
+    """
+    candidates = tuple(ENVOY_CONFIG_PATHS if paths is None else paths)
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        parsed, config = _parsed_envoy_config(text, path, ENVOY_READ_FOR_LISTENER_PORTS)
+        if not parsed:
+            continue
+        try:
+            ports = envoy_listener_ports_in(config)
+        except Exception as exc:  # a shape the walk did not foresee; no port known, not a crash loop
+            LOGGER.warning(
+                "%s could not be walked (%s: %s); not read for %s",
+                path, type(exc).__name__, exc, ENVOY_READ_FOR_LISTENER_PORTS,
+            )
+            continue
+        LOGGER.info(
+            "Envoy listener ports %s read from %s; the metrics and health listeners are refused them by name",
+            ", ".join(f"{port} ({name or 'unnamed'})" for port, name in sorted(ports.items())) or "(none)",
+            path,
+        )
+        return ports
+    LOGGER.warning(
+        "no Envoy config is readable at %s; the metrics and health listeners are refused no Envoy port by name",
+        ", ".join(str(path) for path in candidates) or "(no path)",
+    )
+    return {}
+
+
+def envoy_listener_ports_in(config: Any) -> dict[int, str]:
+    """Port to listener name for every listener in a parsed Envoy config that binds a TCP port.
+
+    ``static_resources.listeners[].address.socket_address.port_value``, read
+    as Envoy's proto-JSON reads the uint32 (_listener_port): an integer, a
+    digit string or a whole float, 1 to 65535. Not in the map: a listener on
+    a pipe, one on port 0 (Envoy takes an ephemeral port, which no hand-set
+    value names) and one whose port_value Envoy would not load. A listener
+    with no name maps its port to ""; two listeners on one port keep the
+    first's name, since both would hold it.
+    """
+    listeners = _mapping(_mapping(config).get("static_resources")).get("listeners")
+    ports: dict[int, str] = {}
+    for listener in listeners if isinstance(listeners, list) else ():
+        listener = _mapping(listener)
+        socket_address = _mapping(_mapping(listener.get("address")).get("socket_address"))
+        port = _listener_port(socket_address.get("port_value"))
+        if port is None or port in ports:
+            continue
+        name = listener.get("name")
+        ports[port] = name if isinstance(name, str) else ""
+    return ports
+
+
+def _listener_port(value: Any) -> int | None:
+    """A socket_address's port_value as Envoy reads it, or None when it is no port in METRICS_PORT_MIN-METRICS_PORT_MAX.
+
+    The uint32 grammar _connection_count reads (a digit string and a whole
+    float are the integer, a bool is not a number), held to the port range:
+    Envoy's validation refuses a value past it, and 0 binds an ephemeral
+    port.
+    """
+    count = _connection_count(value)
+    if count is None or not METRICS_PORT_MIN <= count <= METRICS_PORT_MAX:
+        return None
+    return count
 
 
 class ThreadingUnixHTTPServer(HandlerErrorsToLog, ThreadCap, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -16582,6 +16682,11 @@ def serve(args: argparse.Namespace) -> None:
     # reachable-off-pod refusal above on purpose: that rule guards a listener
     # that hands out credentials, and this one serves counters.
     metrics_port = int(getattr(args, "metrics_port", 0) or 0)
+    health_port = int(getattr(args, "health_port", 0) or 0)
+    # The ports Envoy's listeners bind, for the refusals below: Envoy runs
+    # in this container on the same address, and its listeners are the ones
+    # the broker does not otherwise know about. Read only when a port is set.
+    envoy_ports = envoy_listener_ports() if metrics_port or health_port else {}
     if not metrics_port:
         raw = os.getenv(METRICS_PORT_ENV)
         LOGGER.info(
@@ -16589,7 +16694,7 @@ def serve(args: argparse.Namespace) -> None:
             METRICS_PORT_ENV, "unset" if raw is None or not raw.strip() else repr(raw),
         )
     else:
-        refusal = _metrics_port_refusal(metrics_port, args)
+        refusal = _metrics_port_refusal(metrics_port, args, envoy_ports)
         if refusal is not None:
             LOGGER.error(
                 "ALERT %s=%d %s; the broker serves no /metrics until it restarts with "
@@ -16599,8 +16704,7 @@ def serve(args: argparse.Namespace) -> None:
         else:
             start_metrics_listener(args.host, metrics_port)
     # The health-only listener, on the same terms: after the credentialed
-    # server, never fatal, and on a port neither of the other two holds.
-    health_port = int(getattr(args, "health_port", 0) or 0)
+    # server, never fatal, and on a port no other listener in the Pod holds.
     if not health_port:
         raw = os.getenv(HEALTH_PORT_ENV)
         LOGGER.info(
@@ -16608,7 +16712,7 @@ def serve(args: argparse.Namespace) -> None:
             HEALTH_PORT_ENV, "unset" if raw is None or not raw.strip() else repr(raw),
         )
     else:
-        refusal = _health_port_refusal(health_port, args, metrics_port)
+        refusal = _health_port_refusal(health_port, args, metrics_port, envoy_ports)
         if refusal is not None:
             LOGGER.error(
                 "ALERT %s=%d %s; the broker serves no %s on a port of its own until it "
@@ -16634,33 +16738,50 @@ def serve(args: argparse.Namespace) -> None:
     LOGGER.info("credential proxy stopped")
 
 
-def _metrics_port_refusal(metrics_port: int, args: argparse.Namespace) -> str | None:
+def _metrics_port_refusal(
+    metrics_port: int, args: argparse.Namespace, envoy_ports: Mapping[int, str]
+) -> str | None:
     """Why the metrics listener must not open on this port, or None if it may.
 
-    Both are hand-edit cases the operator's managed env never produces, refused
+    All are hand-edit cases the operator's managed env never produces, refused
     by name so the ALERT says what to fix rather than what bind() thought of
     it. args.port is the operator's credentialProxyPort, set in the broker's
-    managed env, and Envoy's listener carries the same number, held to that
-    constant by OperatorContractTest; so the comparison is against the port
-    that is bound, by this process on the TCP branch or by Envoy in front of
-    the Unix socket. Which of two processes wins a port depends on start
-    order, and the loser must never be the one holding the credentials.
+    managed env, and Envoy's credentialed listener carries the same number,
+    held to that constant by OperatorContractTest; so the comparison is
+    against the port that is bound, by this process on the TCP branch or by
+    Envoy in front of the Unix socket. ``envoy_ports`` is every port a
+    listener in Envoy's config binds (envoy_listener_ports): that one again,
+    and the health listener the operator's readiness probe reads. Envoy runs
+    in the broker's container (start-services.sh), after the broker, on the
+    same address, so a port of its the broker took first is one Envoy's bind
+    fails on, which ends the container, credentialed path and all; and a
+    port both bind, where the two sockets' options allow it, splits the
+    kubelet's probe between them with no line saying so. Which of two
+    processes wins a port depends on start order, and the loser must never
+    be the one holding the credentials.
     """
     if not METRICS_PORT_MIN <= metrics_port <= METRICS_PORT_MAX:
         return f"is not a port in {METRICS_PORT_MIN}-{METRICS_PORT_MAX}"
     if metrics_port == args.port:
         return f"is the credentialed listener's port {args.port}"
+    if metrics_port in envoy_ports:
+        name = envoy_ports[metrics_port]
+        if name:
+            return f"is Envoy's {name} listener's port {metrics_port}"
+        return f"is an Envoy listener's port {metrics_port}"
     return None
 
 
-def _health_port_refusal(health_port: int, args: argparse.Namespace, metrics_port: int) -> str | None:
+def _health_port_refusal(
+    health_port: int, args: argparse.Namespace, metrics_port: int, envoy_ports: Mapping[int, str]
+) -> str | None:
     """Why the health listener must not open on this port, or None if it may.
 
-    _metrics_port_refusal's two cases, and the metrics port itself: the three
-    listeners are three ports, and which of two processes wins a port depends
-    on start order.
+    _metrics_port_refusal's cases, and the metrics port itself: every
+    listener in the Pod has a port of its own, and which of two processes
+    wins a port depends on start order.
     """
-    refusal = _metrics_port_refusal(health_port, args)
+    refusal = _metrics_port_refusal(health_port, args, envoy_ports)
     if refusal is not None:
         return refusal
     if health_port == metrics_port:
