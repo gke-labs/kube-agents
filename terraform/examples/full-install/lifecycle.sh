@@ -1208,7 +1208,7 @@ guard_minter_key() {
     warn "Its versions are disabled, as a restore leaves them."
     warn "Enable each version with gcloud rather than re-importing the key, then apply again:"
     warn "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
-    warn "If a version was disabled on purpose, for example a revoked App key, import a new key instead."
+    warn "If a version was disabled on purpose, for example a revoked App key, import the new App key into a new Cloud KMS key instead."
   else
     warn "Import the GitHub App private key before applying (see https://github.com/abcxyz/github-token-minter),"
     warn "or set enable_github_minter = false in terraform.tfvars."

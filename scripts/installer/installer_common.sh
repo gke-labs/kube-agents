@@ -2463,7 +2463,7 @@ print_minter_restore_advice() {
   print_info "Its versions are disabled, as a restore leaves them."
   print_info "Enable each version with gcloud rather than re-importing the key, then re-run:"
   print_info "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
-  print_info "If a version was disabled on purpose, for example a revoked App key, import a new key instead."
+  print_info "If a version was disabled on purpose, for example a revoked App key, import the new App key into a new Cloud KMS key instead."
   return 0
 }
 

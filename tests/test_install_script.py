@@ -1407,7 +1407,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             "gcloud kms keys versions enable <version> --key minter-key --keyring minter-ring --location us-central1 --project p1",
             out,
         )
-        self.assertIn("If a version was disabled on purpose, for example a revoked App key, import a new key instead.", out)
+        self.assertIn("If a version was disabled on purpose, for example a revoked App key, import the new App key into a new Cloud KMS key instead.", out)
         self.assertNotIn("versions restore", out)
 
     def test_print_minter_restore_advice_names_the_restore_when_versions_are_also_disabled(self):
