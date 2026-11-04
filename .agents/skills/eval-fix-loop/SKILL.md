@@ -63,20 +63,20 @@ Pick exactly one class, by the first rule that matches, and write the rule you u
 | Infrastructure  | A 429, a timeout, a lost lease, a missing token, a forge-less install for a ledger check                                                                                                         | Not a red; fix the environment and re-run                                                                                         |
 
 Write the class with three evidence quotes and one sentence on why the next-nearest class does not apply. If two classes apply to different checks of the same case, split: one loop per class.
-Then write the Step 3b card; no code and no run beyond the record before it.
+Then, for any class but Infrastructure, write the Step 3b card; no code and no run beyond the record before it. An Infrastructure red is fixed and re-run first, with no card.
 
 ## Step 3b: the decision card
 
-One card per loop, written from the record after Step 3. It goes to the human first; code starts on the human's word. Fixed headings, this order, each kept to the size it names.
+One card per loop, written from the record after Step 3. It goes to the human first; code starts on the human's word. Fixed headings, this order, each within the size its text names.
 
 1. **The case in customer terms.** Two sentences: who asks, and what they should get back.
 2. **What the agent does.** One verbatim line per failing shape, its count over the record, and the `file:line` of the code that produced the text.
 3. **Root cause.** One paragraph: the Step 3 class, the evidence line that selects it, and why the next-nearest class does not apply.
-4. **Behaviour or case.** Say whether the case's bar is the product's own stated rule, and quote the rule. If the case is loose or unbound, give the one-line tweak: bind the claim to the planted object, or require the thing the customer must see.
+4. **Behaviour or case.** In two sentences, say whether the case's bar is the product's own stated rule, and quote the rule. If the case is loose or unbound, give the one-line tweak: bind the claim to the planted object, or require the thing the customer must see.
 5. **What the customer wants to see.** Before and after, real text, each under 10 lines. The after carries the verdict, the one proving number, and the one thing they did not ask but should know.
-6. **The fix, one lever per cause.** Prose for a prompt contradiction, code for a code behaviour, a fixture change for a fixture gap; never prose to cover code. Give the size in lines, the resource cost in requests and objects, and where it lives; name a Hermes patch as one, with the note that it moves when Hermes goes. When one root cause takes two levers, both halves ship in one pull request.
+6. **The fix, one lever per cause.** One paragraph per lever. Prose for a prompt contradiction, code for a code behaviour, a fixture change for a fixture gap; never prose to cover code. Give the size in lines, the resource cost in requests and objects, and where it lives; name a Hermes patch as one, with the note that it moves when Hermes goes. When one root cause takes two levers, both halves ship in one pull request.
 7. **Do less.** The one-line option, and what it would certify falsely.
-8. **Live run needs.** Install, forge, fixture, model, minutes.
+8. **Live run needs.** One line each: install, forge, fixture, model, minutes.
 9. **Not covered.** At most three bullets.
 10. **Rec and principle.** One line each.
 
