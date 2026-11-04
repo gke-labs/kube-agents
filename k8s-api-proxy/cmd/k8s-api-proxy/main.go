@@ -22,6 +22,8 @@ import (
 )
 
 const (
+	decimalBase             = 10
+	int64Bits               = 64
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
 )
 
@@ -62,7 +64,7 @@ func envInt64OrDefault(key string, fallback int64) int64 {
 	if raw == "" {
 		return fallback
 	}
-	v, err := strconv.ParseInt(raw, 10, 64)
+	v, err := strconv.ParseInt(raw, decimalBase, int64Bits)
 	if err != nil {
 		log.Printf("warning: %s is not a base-10 integer; using default %d", key, fallback)
 		return fallback

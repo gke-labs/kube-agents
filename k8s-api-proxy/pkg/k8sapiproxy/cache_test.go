@@ -131,15 +131,20 @@ type faultyCacheStore struct {
 	getErr      error
 	setErr      error
 	deleteErr   error
+	// forget makes Get miss, as a store that drops entries without telling the scope index.
+	forget bool
 }
 
 func (s *faultyCacheStore) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	s.mu.Lock()
 	s.getCalls++
-	err := s.getErr
+	err, forget := s.getErr, s.forget
 	s.mu.Unlock()
 	if err != nil {
 		return nil, false, err
+	}
+	if forget {
+		return nil, false, nil
 	}
 	return s.inner.Get(ctx, key)
 }
@@ -1456,6 +1461,66 @@ func (a *switchAuthenticator) AuthenticateRequest(r *http.Request) (*CallerIdent
 		return nil, errors.New("token expired")
 	}
 	return shellCaller.AuthenticateRequest(r)
+}
+
+func TestHandlerCacheInvalidationSkipsEntriesTheStoreDropped(t *testing.T) {
+	custom := &faultyCacheStore{inner: NewMemoryCacheStore(DefaultCacheMaxBytes)}
+	metrics := NewMetrics()
+	h, _ := newTestHandler(t, Config{
+		Policy:  Policy{Mode: ModeReadWrite, RedactSecrets: true},
+		Metrics: metrics,
+		Cache:   &CacheConfig{Store: custom, DefaultResourceTTL: time.Minute},
+	})
+	const target = "/api/v1/namespaces/default/pods"
+
+	if rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		t.Fatalf("warm-up Cache-Status = %q, want miss", rec.Header().Get(headerCacheStatus))
+	}
+	custom.mu.Lock()
+	custom.forget = true
+	custom.mu.Unlock()
+	if rec := serve(h, httptest.NewRequest(http.MethodDelete, target+"/p1", nil)); rec.Code != http.StatusOK {
+		t.Fatalf("DELETE code = %d, want 200", rec.Code)
+	}
+	if exposition := scrapeMetricsText(t, metrics); strings.Contains(exposition, `kubeagents_kube_proxy_cache_evictions_total{reason="invalidated"}`) {
+		t.Errorf("an entry the store already dropped was counted as invalidated:\n%s", exposition)
+	}
+}
+
+func TestHandlerCacheAuditRecordsResultAndDropsReplayedAuditID(t *testing.T) {
+	const auditID = "upstream-audit-id"
+	sink := &auditRecordingSink{}
+	upstream := &fakeUpstream{
+		handler: func(_ string, _ *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{headerContentType: []string{contentTypeJSON}, headerAuditID: []string{auditID}},
+				Body:       io.NopCloser(strings.NewReader(`{"kind":"PodList","apiVersion":"v1"}`)),
+			}, nil
+		},
+	}
+	h, _ := newTestHandler(t, Config{
+		Audit:    sink,
+		Upstream: upstream,
+		Cache:    &CacheConfig{DefaultResourceTTL: time.Minute},
+	})
+	const target = "/api/v1/namespaces/default/pods"
+
+	for _, want := range []struct{ result, auditID string }{{CacheResultMiss, auditID}, {CacheResultHit, ""}} {
+		rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+		if got := rec.Header().Get(headerAuditID); got != want.auditID {
+			t.Errorf("%s: Audit-Id = %q, want %q", want.result, got, want.auditID)
+		}
+	}
+	events := sink.snapshot()
+	if len(events) != 2 {
+		t.Fatalf("audit events = %d, want 2", len(events))
+	}
+	for i, want := range []string{CacheResultMiss, CacheResultHit} {
+		if events[i].Cache != want || events[i].Outcome != OutcomeForwarded {
+			t.Errorf("event %d: Cache = %q Outcome = %q, want %q forwarded", i, events[i].Cache, events[i].Outcome, want)
+		}
+	}
 }
 
 func TestHandlerCacheServesNothingBeforeAuthentication(t *testing.T) {

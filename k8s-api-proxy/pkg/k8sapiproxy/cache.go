@@ -39,6 +39,7 @@ const (
 
 	headerCacheControl      = "Cache-Control"
 	headerCacheStatus       = "Cache-Status"
+	headerAuditID           = "Audit-Id"
 	headerAge               = "Age"
 	headerIfNoneMatch       = "If-None-Match"
 	headerIfModifiedSince   = "If-Modified-Since"
@@ -80,6 +81,8 @@ var (
 		"Date",
 		"Age",
 		"Cache-Status",
+		// The API server's ID for one request; replayed, it would name another caller's request.
+		"Audit-Id",
 	)
 )
 
@@ -443,12 +446,14 @@ func newResponseCache(cfg *CacheConfig, metrics *Metrics) *responseCache {
 }
 
 type sfResult struct {
-	statusCode    int
-	header        http.Header
-	body          []byte
-	cacheStatus   string
-	metric        string
-	auditErr      error
+	statusCode  int
+	header      http.Header
+	body        []byte
+	cacheStatus string
+	metric      string
+	auditErr    error
+	// auditID is the upstream's Audit-Id, which only the leader's response carries.
+	auditID       string
 	leaderClaimed atomic.Bool
 
 	tooLarge      bool
@@ -487,9 +492,13 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	}
 
 	verbLabel, resLabel, _ := ClassifyRequestLabels(req, info)
+	recordResult := func(result string) {
+		ev.Cache = result
+		c.metrics.recordCacheRequest(result, verbLabel, resLabel)
+	}
 	reqCC := parseRequestCacheControl(req.Header)
 	if reqCC.noStore || isConditionalRequest(req.Header) {
-		c.metrics.recordCacheRequest(CacheResultBypass, verbLabel, resLabel)
+		recordResult(CacheResultBypass)
 		resp, err := next(req)
 		if err == nil && resp != nil {
 			if info != nil && info.IsResourceRequest && isAuthFailureStatus(resp.StatusCode) {
@@ -506,7 +515,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	if !reqCC.noCache && !reqCC.zeroMaxAge {
 		if raw, ok, err := c.store.Get(req.Context(), key); err == nil && ok {
 			if entry, err := decodeCachedResponse(raw); err == nil && isEntryFreshForRequest(entry, reqCC, now) {
-				c.metrics.recordCacheRequest(CacheResultHit, verbLabel, resLabel)
+				recordResult(CacheResultHit)
 				return buildResponseFromCache(req, entry, now), nil
 			}
 		}
@@ -530,7 +539,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 		ev.Err = out.auditErr
 	}
 	if out.tooLarge {
-		c.metrics.recordCacheRequest(CacheResultBypass, verbLabel, resLabel)
+		recordResult(CacheResultBypass)
 		if out.claimStream() {
 			out.streamResp.Header.Set(headerCacheStatus, cacheStatusBypass)
 			return out.streamResp, nil
@@ -548,7 +557,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 		statusHeader = cacheStatusCoalesced
 		metricResult = CacheResultCoalesced
 	}
-	c.metrics.recordCacheRequest(metricResult, verbLabel, resLabel)
+	recordResult(metricResult)
 
 	hdr := cloneHeader(out.header)
 	if statusHeader != "" {
@@ -556,6 +565,9 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	}
 	if statusHeader == cacheStatusCoalesced {
 		hdr.Set(headerAge, "0")
+	}
+	if statusHeader == cacheStatusMiss && out.auditID != "" {
+		hdr.Set(headerAuditID, out.auditID)
 	}
 	hdr.Set(headerContentLength, strconv.Itoa(len(out.body)))
 	return &http.Response{
@@ -732,6 +744,7 @@ func (c *responseCache) fetchAndPopulate(
 			cacheStatus: cacheStatus,
 			metric:      metric,
 			auditErr:    sfEv.Err,
+			auditID:     resp.Header.Get(headerAuditID),
 		}, nil
 	}
 
@@ -773,6 +786,7 @@ func (c *responseCache) fetchAndPopulate(
 		cacheStatus: cacheStatusMiss,
 		metric:      CacheResultMiss,
 		auditErr:    sfEv.Err,
+		auditID:     resp.Header.Get(headerAuditID),
 	}, nil
 }
 
