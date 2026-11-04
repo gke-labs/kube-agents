@@ -143,6 +143,21 @@ export_forwarded_profile_home() { # export_forwarded_profile_home <HERMES_PROFIL
   narrow_to_profile "$name"
 }
 
+# export_default_kubeconfig sets KUBECONFIG to $SANDBOX_DATA_ROOT/.kubeconfig
+# for the default root and the platform profile when no profile kubeconfig.yaml
+# was pinned. Single-cluster profiles (profiles/<cluster>) leave KUBECONFIG
+# unset when their kubeconfig.yaml is absent so cluster_preflight.sh check 2
+# reports a missing pin instead of reading the default kubeconfig.
+export_default_kubeconfig() {
+  if [ -z "${KUBECONFIG-}" ] && [ -f "$SANDBOX_DATA_ROOT/.kubeconfig" ]; then
+    case ${HERMES_HOME-} in
+    "" | "$SANDBOX_DATA_ROOT" | "$PROFILES_ROOT/platform")
+      export KUBECONFIG="$SANDBOX_DATA_ROOT/.kubeconfig"
+      ;;
+    esac
+  fi
+}
+
 # Before the working directory is looked at, and before the interactive branch:
 # the profile is the session's, whatever the session runs.
 profile_named=0
@@ -155,6 +170,7 @@ cmd=${SSH_ORIGINAL_COMMAND-}
 # No command means an interactive session. sshd would have started the login
 # shell; ForceCommand replaces that, so start it here.
 if [ -z "$cmd" ]; then
+  export_default_kubeconfig
   exec /bin/bash -l
 fi
 
@@ -315,4 +331,5 @@ fi
 # What sshd would have done with no ForceCommand set: the login shell, -c, the
 # client's command string. Reproduced rather than approximated, so scp, tar and
 # anything else that is not a Hermes wrapper behaves exactly as before.
+export_default_kubeconfig
 exec /bin/bash -c "$cmd"

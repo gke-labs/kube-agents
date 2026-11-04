@@ -5,6 +5,7 @@ import ast
 import functools
 import os
 import pathlib
+import random
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 import collector_run as cr  # noqa: E402
+import credential_proxy_client as client  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 # Every script under a skill's scripts/ tree, nested packages included.
@@ -146,14 +148,64 @@ class DefaultRunTest(unittest.TestCase):
 
     def test_env_and_timeout_reach_the_child(self):
         done = subprocess.CompletedProcess(["gcloud"], 0, stdout="", stderr="")
+        given = {"KUBECONFIG": "/k"}
         with mock.patch.object(subprocess, "run", return_value=done) as run:
-            cr.default_run(["gcloud"], env={"KUBECONFIG": "/k"}, timeout=7)
-        self.assertEqual(run.call_args.kwargs["env"], {"KUBECONFIG": "/k"})
+            cr.default_run(["gcloud"], env=given, timeout=7)
+        self.assertEqual(run.call_args.kwargs["env"], {"KUBECONFIG": "/k", cr.SHIM_RETRY_DEADLINE_ENV: "0"})
         self.assertEqual(run.call_args.kwargs["timeout"], 7)
+        self.assertEqual(given, {"KUBECONFIG": "/k"}, "the caller's dict was written to")
 
     def test_the_timeout_has_no_default(self):
         with self.assertRaises(TypeError):
             cr.default_run(["gcloud"])
+
+
+class ShimDeadlineTest(unittest.TestCase):
+    """Every child `default_run` starts is told the shim's retry deadline, derived from the
+    cap: a read with no `env` inherits the process environment plus the variable, a read
+    handed one gets its dict plus the variable, and a caller that named one keeps it."""
+
+    NAME = cr.SHIM_RETRY_DEADLINE_ENV
+    DONE = subprocess.CompletedProcess(["gcloud"], 0, stdout="", stderr="")
+
+    def child_env_of(self, **kwargs):
+        with mock.patch.object(subprocess, "run", return_value=self.DONE) as run:
+            cr.default_run(["gcloud"], **kwargs)
+        return run.call_args.kwargs["env"]
+
+    def test_the_variable_is_the_shim_s(self):
+        self.assertEqual(client.RETRY_DEADLINE_ENV, cr.SHIM_RETRY_DEADLINE_ENV)
+
+    def test_the_deadline_is_the_cap_less_the_gcloud_run_bound_and_never_negative(self):
+        self.assertEqual(300, cr.BROKER_GCLOUD_RUN_S)
+        self.assertEqual([0, 0, 0, 100], [cr.shim_retry_deadline(t) for t in (60, 240, 300, 400)])
+        self.assertEqual(cr.shim_retry_deadline(400), cr.shim_retry_deadline(400.9), "a float cap is read as its whole seconds")
+
+    def test_a_read_with_no_env_inherits_the_process_environment_plus_the_deadline(self):
+        with mock.patch.dict(os.environ, {"COLLECTOR_TEST_MARK": "1"}):
+            os.environ.pop(self.NAME, None)
+            env = self.child_env_of(timeout=120)
+            self.assertNotIn(self.NAME, os.environ, "the process environment was written to")
+            self.assertEqual({**os.environ, self.NAME: "0"}, env)
+        self.assertEqual("1", env["COLLECTOR_TEST_MARK"])
+
+    def test_a_read_handed_an_env_gets_it_plus_the_deadline(self):
+        env = self.child_env_of(env={"KUBECONFIG": "/k", "PATH": "/bin"}, timeout=400)
+        self.assertEqual({"KUBECONFIG": "/k", "PATH": "/bin", self.NAME: "100"}, env)
+
+    def test_a_caller_s_own_deadline_is_kept(self):
+        self.assertEqual("20", self.child_env_of(env={self.NAME: "20"}, timeout=60)[self.NAME])
+        with mock.patch.dict(os.environ, {self.NAME: "20"}):
+            self.assertEqual("20", self.child_env_of(timeout=60)[self.NAME])
+
+    def test_no_retry_fits_under_the_deadline_of_any_collector_s_cap(self):
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        for name, timeout_const in COLLECTORS.items():
+            with self.subTest(collector=name):
+                deadline = float(cr.shim_retry_deadline(getattr(load_collector(name), timeout_const)))
+                self.assertGreater(shortest, deadline)
+                self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
+                self.assertIsNone(client.retry_wait(1, 0.0, "5", random.Random(1), lambda: 0.0, deadline=deadline), "the gate's shortest wait fits")
 
 
 class RunAndGateTest(unittest.TestCase):

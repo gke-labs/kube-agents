@@ -23,7 +23,6 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import merge_gate as gate
-import pin_smoke_status
 
 REPO = "gke-labs/kube-agents"
 SHA = "a" * 40
@@ -167,10 +166,10 @@ class SmokeTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(gate.smoke_required([path]))
 
-    def test_a_k8s_api_proxy_only_change_skips_the_smoke(self):
-        """The module ships in no image until a file outside it says so, and that file runs the smoke."""
-        self.assertFalse(gate.smoke_required(["k8s-api-proxy/go.mod", "k8s-api-proxy/pkg/k8sapiproxy/policy.go"]))
+    def test_a_k8s_api_proxy_change_runs_the_smoke(self):
+        """Now that sandbox kubectl routes through kube-proxy, k8s-api-proxy changes run the smoke test."""
         for files in (
+            ["k8s-api-proxy/go.mod", "k8s-api-proxy/pkg/k8sapiproxy/policy.go"],
             ["k8s-api-proxy/go.mod", "deploy/sandbox/Dockerfile"],
             ["k8s-api-proxy/go.mod", "deploy/kube-proxy/Dockerfile"],
             ["k8s-api-proxyx/main.go"],
@@ -178,24 +177,6 @@ class SmokeTest(unittest.TestCase):
         ):
             with self.subTest(files=files):
                 self.assertTrue(gate.smoke_required(files))
-
-    def test_k8s_api_proxy_leaves_the_smoke_skip_once_the_sandbox_uses_it(self):
-        """Once sandbox kubectl can route through the proxy, a proxy-only change alters what the
-        agent runs, so the pull request that wires it in drops the skip (issue #4087)."""
-        root = _HERE.parent
-        wiring = [
-            root / "deploy/sandbox/entrypoint.sh",
-            root / "deploy/sandbox/session-command.sh",
-            root / "agents/platform/scripts/credential_proxy_client.py",
-            *sorted((root / "k8s-operator/internal/controller").glob("*.go")),
-        ]
-        wired = [p for p in wiring if p.is_file() and "KUBE_PROXY_URL" in p.read_text()]
-        if wired:
-            self.assertTrue(
-                gate.smoke_required(["k8s-api-proxy/go.mod"]),
-                f"{wired[0].relative_to(root)} wires in the proxy: remove k8s-api-proxy/ from "
-                "SMOKE_SKIP_RE and from the Prow skip_if_only_changed, then delete this test",
-            )
 
     def test_an_overlong_file_list_needs_the_smoke_and_an_empty_one_does_not(self):
         """Prow skips a `skip_if_only_changed` job when no file changed."""
@@ -249,7 +230,7 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(skipped[gate.SMOKE_GATE][0], gate.SUCCESS)
 
     def test_a_re_pin_copy_counts_from_the_builds_first_report(self):
-        """A re-pin after the cutoff is a fresh copy of a green from before it."""
+        """A re-pin after the cutoff was a fresh copy of a green from before it."""
         api = FakeAPI(all_statuses=[smoke_status("2026-10-23T19:00:00Z"), smoke_status("2026-10-23T12:00:00Z")])
         self.assertEqual(gate.smoke_first_reported(api, SHA), datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc))
 
@@ -264,7 +245,7 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(gate.smoke_first_reported(api, SHA), datetime(2026, 10, 23, 19, 0, tzinfo=timezone.utc))
 
     def test_a_status_with_no_build_link_counts_from_the_earliest_with_none(self):
-        """A re-pin copies a link-less green with a new time; the copy must not pass for a new verdict."""
+        """A re-pin copied a link-less green with a new time; the copy must not pass for a new verdict."""
         api = FakeAPI(
             all_statuses=[
                 smoke_status("2026-10-23T19:00:00Z", target_url=""),
@@ -284,7 +265,7 @@ class CutoffTest(unittest.TestCase):
             with self.subTest(statuses=statuses):
                 self.assertIsNone(gate.smoke_first_reported(FakeAPI(all_statuses=statuses), SHA))
 
-    def test_the_variable_is_read_as_pin_smoke_status_reads_it(self):
+    def test_the_variable_is_read_as_a_utc_time(self):
         for raw, want in (("", None), ("  ", None), ("2026-10-23T18:00:00Z", CUTOFF), ("2026-10-23T14:00:00-04:00", CUTOFF)):
             with self.subTest(raw=raw):
                 self.assertEqual(gate.not_before_from_env({gate.NOT_BEFORE_ENV: raw}), want)
@@ -306,7 +287,7 @@ class CutoffTest(unittest.TestCase):
             self.assertEqual(gate.main(["--repo", REPO, "group", "--ref", "x", "--gate", gate.LABELS_GATE]), 0)
         self.assertIsNone(group.call_args.kwargs["not_before"])
 
-    def test_a_green_pin_smoke_status_expired_waits_with_or_without_the_variable(self):
+    def test_an_expired_green_waits_with_or_without_the_variable(self):
         def unread():
             raise AssertionError("the status history was read for an expired green")
 
@@ -316,9 +297,9 @@ class CutoffTest(unittest.TestCase):
                 results = gate.verdicts(pull(statuses=expired), no_files, not_before, unread)
                 self.assertEqual(results[gate.SMOKE_GATE], (gate.PENDING, gate.SMOKE_PREDATES))
 
-    def test_the_expired_note_is_the_one_pin_smoke_status_writes(self):
-        self.assertEqual(gate.SMOKE_EXPIRED_NOTE, pin_smoke_status.EXPIRED_NOTE)
-        self.assertIn(gate.SMOKE_EXPIRED_NOTE, pin_smoke_status.expired_description("x" * 200))
+    def test_the_expired_note_is_the_one_on_existing_statuses(self):
+        # The retired pin_smoke_status.py wrote this note; greens that carry it stay on old heads.
+        self.assertEqual(gate.SMOKE_EXPIRED_NOTE, "(predates SMOKE_PIN_NOT_BEFORE: retest)")
 
     def test_the_queue_refuses_a_green_from_before_the_cutoff(self):
         raw = {"number": 42, "head": {"sha": SHA}, "base": {"ref": "main"}, "labels": []}
@@ -530,6 +511,41 @@ def node(number, labels, auto_merge=False, queue_entry=None, contexts=(), timeli
             "statusCheckRollup": {"contexts": {"nodes": list(contexts)}},
         }}]},
     }
+
+
+class PullsQueryTest(unittest.TestCase):
+    """The open-PR query pages small enough to answer, and reads every page."""
+
+    def test_the_page_size_is_below_the_size_that_timed_out(self):
+        # The sweep 504'd at 50; the fix is a smaller page, not more retries.
+        self.assertLess(gate.PULLS_PAGE_SIZE, 50)
+        self.assertGreaterEqual(gate.PULLS_PAGE_SIZE, 1)
+
+    def test_the_query_graphql_pulls_sends_asks_for_the_page_size(self):
+        # Drives the call site, so a page key that regressed to a literal is caught.
+        api = FakeAPI()
+        with mock.patch.object(gate, "PULLS_PAGE_SIZE", 13):
+            gate.graphql_pulls(api)
+        self.assertIn("first: 13, after: $after", api.queries[0])
+
+    def test_every_page_is_read_and_the_cursor_is_followed(self):
+        class PagingAPI:
+            def __init__(self):
+                self.repo = REPO
+                self.afters = []
+
+            def graphql(self, query, variables):
+                self.afters.append(variables["after"])
+                if variables["after"] is None:
+                    page = {"pageInfo": {"hasNextPage": True, "endCursor": "CURSOR1"}, "nodes": [node(1, APPROVED)]}
+                else:
+                    page = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [node(2, APPROVED)]}
+                return {"repository": {"pullRequests": page}}
+
+        api = PagingAPI()
+        pulls = gate.graphql_pulls(api)
+        self.assertEqual([pull["number"] for pull in pulls], [1, 2])
+        self.assertEqual(api.afters, [None, "CURSOR1"])
 
 
 class RollupTest(unittest.TestCase):

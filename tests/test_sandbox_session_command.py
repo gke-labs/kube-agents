@@ -216,6 +216,29 @@ class SessionCommandProfileHomeTest(unittest.TestCase):
             f"home=[{self.mirrored}] kc=[{self.mirrored}/kubeconfig.yaml]",
         )
 
+    def test_default_kubeconfig_exported_for_root_and_platform_only(self) -> None:
+        """When .kubeconfig exists at the data root, the root and platform
+        profiles export it as KUBECONFIG, while a cluster profile without a
+        pinned kubeconfig.yaml keeps KUBECONFIG unset."""
+        default_kc = self.root / ".kubeconfig"
+        default_kc.write_text("kubeconfig\n")
+        unpinned_cluster = self.profiles / "cluster-unpinned"
+        unpinned_cluster.mkdir()
+
+        root_proc = self._run(str(self.workspace))
+        self.assertIn(f"home=[{self.root}] kc=[{default_kc}]", root_proc.stdout)
+
+        platform_proc = self._run(str(self.workspace), named=f"{self.root}/profiles/platform")
+        self.assertIn(
+            f"home=[{self.profiles / 'platform'}] kc=[{default_kc}]",
+            platform_proc.stdout,
+        )
+
+        cluster_proc = self._run(
+            str(self.workspace), named=f"{self.root}/profiles/cluster-unpinned"
+        )
+        self.assertIn(f"home=[{unpinned_cluster}] kc=[]", cluster_proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
