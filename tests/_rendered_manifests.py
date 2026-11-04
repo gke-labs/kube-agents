@@ -21,10 +21,10 @@ resources and its scratch volumes fit under them). Three sources:
   `emptyDir` and `resources` as properties, not as a volume or a container, so
   they are skipped; a strategic-merge patch carries a partial container and
   is skipped by `kustomize_pods`, which reads whole objects only. A patch is a
-  file whose stem carries `patch` as a `-` or `_` delimited word, the tree's
-  convention (`deployment-patch.yaml`, `webhookcainjection_patch.yaml`); a
-  whole object under `overlays/`, or one whose name merely contains the
-  letters (`dispatcher.yaml`), is read.
+  file some `kustomization.yaml` declares, under `patches[].path` or
+  `patchesStrategicMerge[]` (`declared_patches`); an inline `patch: |` is not
+  a file, and a file's name decides nothing, so a whole object under
+  `overlays/` or one named `dispatcher.yaml` is read.
 
 `pod_specs` finds the pod template inside a workload of any kind, and
 `workload_pods` labels each one with where it came from, so a failure names
@@ -33,7 +33,8 @@ the object.
 
 from __future__ import annotations
 
-import re
+import functools
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -63,10 +64,11 @@ KUSTOMIZE_ROOT = "k8s-operator/config"
 YAML_SUFFIXES = (".yaml", ".yml")
 YAML_SKIP_PARTS = ("crds", "crd")
 # A strategic-merge patch is a Deployment document that names one container
-# with the fields it changes and nothing else; the tree names one with the
-# word `patch` in the file's stem, delimited by `-` or `_`.
-KUSTOMIZE_PATCH_TOKEN = "patch"
-STEM_DELIMITERS = re.compile(r"[-_]")
+# with the fields it changes and nothing else; a kustomization declares one
+# as a file path under either key (a `patch:` entry is inline text, not a
+# file). A JSON 6902 patch file is a list, which `_yaml_files` drops anyway.
+KUSTOMIZATION_NAMES = ("kustomization.yaml", "kustomization.yml")
+KUSTOMIZE_PATCH_KEYS = ("patches", "patchesStrategicMerge")
 
 # A Pod carries its spec directly; every other workload kind carries a pod
 # template, a CronJob under `jobTemplate`.
@@ -114,9 +116,38 @@ def kustomize_docs() -> list[tuple[str, list]]:
     return _yaml_files(tracked((KUSTOMIZE_ROOT,)), YAML_SKIP_PARTS)
 
 
-def is_kustomize_patch(path: str) -> bool:
-    """True when the file's stem carries `patch` as a delimited word."""
-    return KUSTOMIZE_PATCH_TOKEN in STEM_DELIMITERS.split(Path(path).stem)
+def patch_paths_in(kustomization: Path, root: Path = REPO_ROOT) -> set[str]:
+    """The patch files one kustomization declares, as paths relative to root.
+
+    `patches[]` entries carry `path:` (a file) or `patch:` (inline text);
+    `patchesStrategicMerge[]` entries are a file name or an inline document,
+    told apart by a newline. Paths resolve against the kustomization's
+    directory, as kustomize resolves them."""
+    doc = yaml.safe_load(kustomization.read_text(encoding="utf-8")) or {}
+    names = []
+    for key in KUSTOMIZE_PATCH_KEYS:
+        for entry in doc.get(key) or []:
+            if isinstance(entry, dict):
+                entry = entry.get("path")
+            if isinstance(entry, str) and "\n" not in entry:
+                names.append(entry)
+    base = kustomization.parent.relative_to(root)
+    return {Path(os.path.normpath(base / name)).as_posix() for name in names}
+
+
+@functools.lru_cache(maxsize=1)
+def declared_patches() -> frozenset[str]:
+    """Every patch file a tracked kustomization under KUSTOMIZE_ROOT declares, repository-relative."""
+    found: set[str] = set()
+    for path in tracked((KUSTOMIZE_ROOT,)):
+        if path.name in KUSTOMIZATION_NAMES:
+            found |= patch_paths_in(path)
+    return frozenset(found)
+
+
+def is_kustomize_patch(path: str, declared: frozenset[str] | None = None) -> bool:
+    """True when a kustomization declares the repository-relative path as a patch file."""
+    return path in (declared_patches() if declared is None else declared)
 
 
 def pod_specs(doc: dict) -> list[dict]:
@@ -125,7 +156,8 @@ def pod_specs(doc: dict) -> list[dict]:
     if doc.get("kind") == POD_KIND:
         return [spec]
     if "jobTemplate" in spec:
-        return [spec["jobTemplate"]["spec"]["template"]["spec"]]
+        # A CronJob's pod; a patch may carry the key with no template under it.
+        spec = (spec.get("jobTemplate") or {}).get("spec") or {}
     template = (spec.get("template") or {}).get("spec")
     return [template] if template else []
 

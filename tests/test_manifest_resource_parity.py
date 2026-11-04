@@ -48,7 +48,8 @@ observed, in the baseline's form, for that edit.
 
 The chart half needs helm. On CI (`CI` set) a missing helm fails the gate
 rather than passing it with the chart unread, as the rollout-quota suite
-does; elsewhere `test_the_chart_renders_its_pods` shows the skip.
+does; elsewhere the gate skips, naming helm, so it never passes with the
+chart unread.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_manifest_resource_parity.py' -v
@@ -74,10 +75,12 @@ sys.path.insert(0, str(_HERE))
 from _rendered_manifests import (  # noqa: E402
     HELM,
     REPO_ROOT,
+    declared_patches,
     golden_docs,
     golden_pods,
     is_kustomize_patch,
     kustomize_pods,
+    patch_paths_in,
     pod_specs,
     rendered_chart,
     workload_pods,
@@ -96,7 +99,7 @@ NO_HELM_ON_CI = (
     "helm is not on PATH but CI is set: the chart half of this gate would pass with the chart"
     " unread on a runner. Install helm rather than skipping."
 )
-NO_HELM = "helm is not installed; the chart half of the gate is not read"
+NO_HELM = "helm is not installed; the gate is not run without its chart half"
 
 # The operator's allowance for a writing container's logs and writable layer
 # on top of the emptyDir it writes; the Go constant is the source of truth.
@@ -135,6 +138,7 @@ POD_SCOPE = ""
 SOURCE_CHART = "chart"
 SOURCE_GOLDEN = "golden"
 SOURCE_KUSTOMIZE = "kustomize"
+SOURCES = (SOURCE_CHART, SOURCE_GOLDEN, SOURCE_KUSTOMIZE)
 GOLDEN_WORKLOAD_PREFIX = f"{SOURCE_GOLDEN} "
 CHART_WORKLOAD_PREFIX = f"{SOURCE_CHART} "
 
@@ -508,36 +512,58 @@ class ResourceParityGateTest(unittest.TestCase):
     longMessage = False
 
     def test_rendered_pods_match_the_baseline(self):
-        if not HELM and os.environ.get(CI_ENV):
-            self.fail(NO_HELM_ON_CI)
+        if not HELM:
+            if os.environ.get(CI_ENV):
+                self.fail(NO_HELM_ON_CI)
+            self.skipTest(NO_HELM)
         pods = rendered_pods()
-        by_source = {s: [p for p in pods if p.source == s] for s in (SOURCE_CHART, SOURCE_GOLDEN, SOURCE_KUSTOMIZE)}
-        sources_read = {SOURCE_GOLDEN, SOURCE_KUSTOMIZE}
-        if HELM:
-            sources_read.add(SOURCE_CHART)
-            self.assertGreaterEqual(len(by_source[SOURCE_CHART]), MIN_CHART_PODS, "the chart rendered too few pods; the check has gone blind")
+        by_source = {s: [p for p in pods if p.source == s] for s in SOURCES}
+        self.assertGreaterEqual(len(by_source[SOURCE_CHART]), MIN_CHART_PODS, "the chart rendered too few pods; the check has gone blind")
         self.assertGreaterEqual(len(by_source[SOURCE_GOLDEN]), MIN_GOLDEN_PODS, "the goldens hold too few pods; the check has gone blind")
         self.assertGreaterEqual(len(by_source[SOURCE_KUSTOMIZE]), MIN_KUSTOMIZE_PODS, "the kustomize manifests hold too few pods; the check has gone blind")
         self.assertGreaterEqual(count_containers(pods), MIN_CONTAINERS, "too few containers read; the check has gone blind")
-        problems = compare(observe(pods), load_baseline(), sources_read)
+        problems = compare(observe(pods), load_baseline(), set(SOURCES))
         self.assertEqual([], problems, "\n\n".join(problems))
 
-    @unittest.skipUnless(HELM, NO_HELM)
-    def test_the_chart_renders_its_pods(self):
-        # Off CI a missing helm shows here as a skip; on CI it fails the gate above.
-        self.assertGreaterEqual(len(workload_pods(rendered_chart(), SOURCE_CHART)), MIN_CHART_PODS, "the chart rendered too few pods; the check has gone blind")
-
-    def test_a_patch_is_named_by_a_delimited_word(self):
-        # The three patches in the tree are excluded; a stem that merely contains
-        # the letters, or a whole object under an overlay, is read.
-        self.assertTrue(is_kustomize_patch("k8s-operator/config/integrations/litellm/overlays/chatgpt/deployment-patch.yaml"))
+    def test_a_patch_is_a_file_a_kustomization_declares(self):
+        # The tree's three patches are excluded because a kustomization lists
+        # them; a file's name decides nothing, so a whole object under an
+        # overlay, or one named with the word, is read.
+        declared = declared_patches()
+        self.assertEqual(
+            {
+                "k8s-operator/config/default/webhookcainjection_patch.yaml",
+                "k8s-operator/config/integrations/litellm/overlays/chatgpt/deployment-patch.yaml",
+                "k8s-operator/config/integrations/litellm/overlays/vertex_ai/deployment-patch.yaml",
+            },
+            set(declared),
+        )
         self.assertTrue(is_kustomize_patch("k8s-operator/config/default/webhookcainjection_patch.yaml"))
         self.assertFalse(is_kustomize_patch("k8s-operator/config/integrations/dispatcher.yaml"))
         self.assertFalse(is_kustomize_patch("k8s-operator/config/integrations/litellm/overlays/chatgpt/pvc.yaml"))
+        self.assertFalse(is_kustomize_patch("k8s-operator/config/integrations/patch-service.yaml", declared))
+
+    def test_a_kustomization_declares_patches_under_both_keys(self):
+        # `patches[].path` and a `patchesStrategicMerge[]` file name resolve
+        # against the kustomization's directory; inline text under either key
+        # is not a file.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kdir = root / "config" / "overlays" / "dev"
+            kdir.mkdir(parents=True)
+            (kdir / "kustomization.yaml").write_text(
+                "resources:\n  - ../../base\n"
+                "patches:\n  - path: overrides.yaml\n  - patch: |\n      kind: Deployment\n"
+                "patchesStrategicMerge:\n  - ../legacy_patch.yaml\n  - |\n    kind: Deployment\n",
+                encoding="utf-8",
+            )
+            self.assertEqual({"config/overlays/dev/overrides.yaml", "config/overlays/legacy_patch.yaml"}, patch_paths_in(kdir / "kustomization.yaml", root))
 
     def test_a_cronjob_patch_without_a_job_template_carries_no_pod(self):
-        # A strategic-merge patch that suspends a CronJob has a spec and no jobTemplate.
+        # A strategic-merge patch that suspends a CronJob has a spec and no
+        # jobTemplate; one that sets a job field has a jobTemplate and no template.
         self.assertEqual([], pod_specs({"kind": "CronJob", "spec": {"suspend": True}}))
+        self.assertEqual([], pod_specs({"kind": "CronJob", "spec": {"jobTemplate": {"spec": {"backoffLimit": 1}}}}))
         template = {"spec": {"containers": []}}
         self.assertEqual([template["spec"]], pod_specs({"kind": "CronJob", "spec": {"jobTemplate": {"spec": {"template": template}}}}))
 
