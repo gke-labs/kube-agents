@@ -37,7 +37,9 @@ SIZED_METRICS = (hl.MEMORY_PEAK, hl.CPU_PEAK)
 EVIDENCE_METRICS_SHOWN = 12
 PROFILE_CAPTION = (
     "{projects:,} projects, {autopilot:.0%} of clusters on Autopilot, {workloads:,} workloads a day "
-    "(each counted as one Pod created). Nodes and objects per cluster keep the measured clusters' shape."
+    "(each counted as one Pod created). Nodes and objects per cluster keep the measured clusters' shape. "
+    "The fleet sizes count small clusters like the measured ones; a fleet of larger clusters reaches these "
+    "limits at fewer clusters."
 )
 STORY = (
     "Pick a fleet size and the container size you have in mind. The forecast says whether one "
@@ -54,7 +56,8 @@ SPLIT_NONE = "One install holds all {clusters:,.0f} clusters."
 SPLIT_NEEDED = (
     "One install holds about {held:.0f} clusters ({source}), so {clusters:,.0f} clusters need "
     "**{installs:,} installs of about {per_install:.0f} clusters**, or {stall_installs:,} for Stall Watch "
-    "to read every cluster each half hour."
+    "to read every cluster each half hour. Both counts come from small test clusters; a fleet of larger "
+    "clusters needs more installs."
 )
 VERDICT_OK = "**Yes.** {split} The {size} container size is enough for each install."
 VERDICT_SHORT = (
