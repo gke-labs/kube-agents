@@ -25,6 +25,8 @@
 // lookup, which this fake answers 404 (the Pod reads as having no owner);
 // Nodes and Pods are served, at the sizes the issue of fleet scale names, for
 // the collectors that page through them, which have no Go consumer here yet.
+// The generator has one more consumer: cmd/kwok-seed creates its Nodes, Pods
+// and Events on a real API server for the scale lane under tests/scale/kwok.
 //
 // What it does not do: selectors beyond `reason=<value>` on Events (every other request sees every object), namespaced
 // paths (the three resources are served at the cluster scope only), writes
