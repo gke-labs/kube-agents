@@ -957,7 +957,13 @@ def fixture_catalog_disagreements() -> list[str]:
     # The other direction for a project-scoped catalogue role: the overlay is
     # where such a role's day-N gate and objects are written down.
     for role, spec in sorted(catalog.items()):
-        if isinstance(spec, dict) and spec.get("cluster_slot") is None and role not in overlay_project_roles:
+        if not isinstance(spec, dict):
+            problems.append(
+                f"bench/tf/fleet/fixtures.json: {role!r} is not a mapping, so it "
+                "has no cluster_slot, probes or state the runner can read"
+            )
+            continue
+        if spec.get("cluster_slot") is None and role not in overlay_project_roles:
             problems.append(
                 f"bench/tf/fleet/fixtures.json: {role!r} is project-scoped "
                 "(cluster_slot null), but fleet-fixtures.yaml does not list it "
@@ -1170,7 +1176,7 @@ def _catalog_slot_roles() -> set[str]:
 def _catalog_project_roles() -> set[str]:
     """Catalogue roles with `cluster_slot: null`: Compute Engine objects the
     runner probes in the project and publishes with no kubeconfig."""
-    return set(_catalog_roles()) - _catalog_slot_roles()
+    return {role for role, spec in _catalog_roles().items() if isinstance(spec, dict) and spec.get("cluster_slot") is None}
 
 
 def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) -> None:
