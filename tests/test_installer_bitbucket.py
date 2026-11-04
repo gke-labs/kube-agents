@@ -275,6 +275,8 @@ class BitbucketFlagsTest(unittest.TestCase):
             "PARAM_GITOPS_FORGE": "gitlab", "PARAM_GITOPS_REPO": "g/p", "PARAM_NON_INTERACTIVE": "true",
             "PARAM_GITOPS_RECORDED_FORGE": "bitbucket", "PARAM_GITOPS_IDENTITY": _UUID,
             "PARAM_GITOPS_RECORDED_IDENTITY": _UUID,
+            # A switch between two token forges needs the new token's Secret named.
+            "PARAM_GITLAB_TOKEN_SECRET": "gitlab-forge-token", "PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG": "true",
         })
         self.assertIn("rc=0 ", proc.stdout, proc.stderr + proc.stdout)
         self.assertIn("Dropping the recorded Bitbucket Cloud identity", proc.stdout + proc.stderr)
