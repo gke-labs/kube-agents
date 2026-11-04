@@ -4,7 +4,7 @@
 and 2. Owner of the producer side: [`usage-counters-producer.md`](usage-counters-producer.md), which
 this document amends; the rows there for `remediationsMergedTotal` and
 `remediationsClosedUnmergedTotal` point here. [`human-interaction-readings.md`](human-interaction-readings.md) generalises the readings slot of section 6 to a target per reading. Workstream 3, who started each proposal, is
-[`proposal-origin.md`](proposal-origin.md) (proposed): it leaves the `proposal-create` count here
+[`proposal-origin.md`](proposal-origin.md) (implemented): it leaves the `proposal-create` count here
 exact and adds nine per-origin readings taken in the agent pod through the readings slot of §6.
 
 ## 1. Intent

@@ -464,7 +464,7 @@ On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/s
 - the image tag, the mode, the Kubernetes version, and the install's age and readiness;
 - the model as `provider/name` from the resource's `status.inference` (`unavailable` while the operator has not written it);
 - the `status.usage` counters and readings;
-- one `proposals by origin:` line, the origins whose count is above zero, as the agent reports them;
+- one `proposals by origin:` line, the origins whose count is above zero, as the agent reports them (`none` when all are zero, `no reading` when the status has none);
 - the credential broker's top five `tool/subcommand` pairs since its pod started, from `status.usage.topTools` (`unavailable` while the status holds no list);
 - a roll-up of the chat turns the gateway's own records still hold (ended, cancelled, active);
 - a short feedback template.
