@@ -54,8 +54,8 @@ them. This harness builds a fleet of that shape with
 `--prefix kwok- --nodes 3000 --namespaces 300 fleet create --clusters 2`, then
 `--prefix kwok- fleet create --clusters 2 --first 3 --events-only`. The Pods-ready wait ended at about 80,000 of 90,000 per cluster, and more Pods turned ready afterwards (86,000 to
 89,000 at the shell run). The global options are not saved between commands: give
-`--prefix` to `fleet create`, `events` and `fleet delete`, and the fleet's sizes (`--nodes`,
-`--namespaces`, `--deployments`) to `fleet create` and `events`. `proxy` and `watcher` use none of
+`--prefix` to `fleet create`, `fleet load`, `events` and `fleet delete`, and the fleet's sizes (`--nodes`,
+`--namespaces`, `--deployments`) to `fleet create`, `fleet load` and `events`. `proxy` and `watcher` use none of
 them. The commands under "Run it" build the default
 fleet of 1,500 nodes and 45,000 Pods per cluster.
 
