@@ -88,6 +88,9 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 from credential_proxy_client import (  # noqa: F401  (re-export)
     ADMISSION_BOUND_BACKGROUND,
     ADMISSION_BOUND_DRAINING,
+    ADMISSION_REPLICAS_KEY,
+    ADMISSION_TIER_ADMITTED_KEY,
+    ADMISSION_TIER_INTERACTIVE_CAP_KEY,
     API_RELAY_PREFIX,
     BACKGROUND_NICE,
     BUSY_BOUND_KEY,
@@ -96,6 +99,8 @@ from credential_proxy_client import (  # noqa: F401  (re-export)
     CLASS_LABEL,
     CONTEXT_FLAG,
     END_OF_FLAGS,
+    EXEC_REPLICAS_FILE,
+    EXEC_REPLICAS_FILE_ENV,
     EXEC_ROLE,
     KUBECONFIG_FLAG,
     ClusterTarget,
@@ -790,10 +795,15 @@ HEALTHZ_PATH = "/healthz"
 # worker pools by (`broker_admission.sweep_width`). Read-only: the slot cap, the
 # count the child memory budget fits at this container's effective limit, the
 # smaller of the two, the interactive cap inside it, and the session role's own
-# cap. Only the broker knows the
-# effective limit: on GKE Autopilot without bursting it is the memory request,
-# rewritten after the operator rendered the pod.
+# cap; on an exec pod, also the tier's totals (`exec_tier_replicas`). Only the
+# broker knows the effective limit: on GKE Autopilot without bursting it is the
+# memory request, rewritten after the operator rendered the pod.
 ADMISSION_PATH = "/v1/exec/admission"
+# The largest exec-tier replica count the report multiplies by: the CR field's
+# bound (credential-broker-exec-tier.md §12). A larger count in the replicas
+# file is held to it.
+EXEC_REPLICAS_MAX = 32
+EXEC_REPLICAS_RE = re.compile(r"[0-9]+")
 # Requests that keep serving while the broker drains (SHUTDOWN_DRAIN_SECONDS),
 # by method and path: the health probe; a relay's settle routes, so the
 # gateway's acks for pulls already answered land; and the event pulls. Slack's
@@ -1868,6 +1878,28 @@ def exec_pod_serves(method: str, path: str) -> bool:
     if method == "POST":
         return path == "/v1/exec" or path.startswith(API_RELAY_PREFIX)
     return path in (HEALTHZ_PATH, ADMISSION_PATH) or path.startswith(API_RELAY_PREFIX)
+
+
+def exec_tier_replicas() -> int | None:
+    """The exec tier's replica count from the file the operator mounts, or None.
+
+    Read on each call, because a scale change rewrites the ConfigMap and does
+    not restart the pod (§3.5). A file that is absent (as on the stateful pod),
+    cannot be read or holds no positive integer gives None, with a debug line
+    only, because the admission route reads it on each request.
+    """
+    path = os.environ.get(EXEC_REPLICAS_FILE_ENV) or EXEC_REPLICAS_FILE
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        LOGGER.debug("could not read the exec tier's replica count path=%s: %s", path, type(exc).__name__)
+        return None
+    replicas = int(text) if EXEC_REPLICAS_RE.fullmatch(text) else 0
+    if replicas < 1:
+        LOGGER.debug("the exec tier's replica count is not a positive integer path=%s", path)
+        return None
+    return min(replicas, EXEC_REPLICAS_MAX)
 
 
 # How long a managed-repository allowlist read is reused.
@@ -12349,17 +12381,26 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return False
 
     def _admission_report(self) -> dict[str, int | None]:
-        """The five numbers ADMISSION_PATH answers with, and nothing else of the
-        budget's internals. `interactive_cap` is what interactive work, the
-        shell's sweeps included, may hold at once (`class_cap`), which a sweep
-        sizes itself inside (`broker_admission.width_for`)."""
-        return {
+        """The five per-replica numbers ADMISSION_PATH answers with, and nothing
+        else of the budget's internals. `interactive_cap` is what interactive
+        work, the shell's sweeps included, may hold at once (`class_cap`), which
+        a sweep sizes itself inside (`broker_admission.width_for`). When the exec
+        tier's replicas file holds a count, the report adds it and the tier's
+        admitted count and interactive cap, each the per-replica one times the
+        count; the per-replica numbers stay as they are."""
+        report = {
             "slot_cap": self.executor.max_concurrent_commands,
             "budget_admits": self.executor.requests_the_budget_admits(),
             "admitted": self.executor.admitted_requests(),
             "interactive_cap": self.executor.class_cap(CLASS_INTERACTIVE),
             "session_cap": getattr(self.session_slots, "limit", DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS),
         }
+        replicas = exec_tier_replicas()
+        if replicas is not None:
+            report[ADMISSION_REPLICAS_KEY] = replicas
+            report[ADMISSION_TIER_ADMITTED_KEY] = report["admitted"] * replicas
+            report[ADMISSION_TIER_INTERACTIVE_CAP_KEY] = report["interactive_cap"] * replicas
+        return report
 
     def _refused_while_shutting_down(self, **fields: Any) -> bool:
         """Answer a Chat event pull 503 SHUTDOWN_ERROR while the stop is under way."""

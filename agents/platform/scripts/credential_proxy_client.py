@@ -78,6 +78,11 @@ EXEC_ROLE = "exec"
 EXEC_URL_ENV = "CREDENTIAL_PROXY_EXEC_URL"
 EXEC_REPLICAS_FILE_ENV = "CREDENTIAL_PROXY_EXEC_REPLICAS_FILE"
 EXEC_REPLICAS_FILE = "/etc/credential-proxy-exec-tier/replicas"
+# The keys the admission route adds for the whole tier when the replicas file
+# holds a count (§3.5); `broker_admission` sizes a sweep by them.
+ADMISSION_REPLICAS_KEY = "replicas"
+ADMISSION_TIER_ADMITTED_KEY = "tier_admitted"
+ADMISSION_TIER_INTERACTIVE_CAP_KEY = "tier_interactive_cap"
 BUSY_BOUND_KEY = "bound"
 ADMISSION_BOUND_DRAINING = "draining"
 ADMISSION_BOUND_BACKGROUND = "background"
